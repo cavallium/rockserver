@@ -35,11 +35,11 @@ class NativeMetadataRecoveryTest {
         try(var pool=helper.pool(path)) {
             var child=helper.open(pool,definition.targets().getFirst());child.initializeConfiguration(new byte[]{1});child.applyNoop(new ApplyPosition(3,0));child.apply(new ApplyPosition(3,1),helper.put(child.ownership().owner().groupId(),0,1,7));
             assertTrue(pool.topologySeeds().isEmpty());var target=pool.openMetadataRecovery(registration);configure(target,definition);
-            assertTrue(target.userHandlesDetached());assertTrue(target.metadataRecoveryPending());assertFalse(target.admissionOpen());
+            assertTrue(target.userHandlesDetached());assertTrue(target.metadataRecoveryPending());assertFalse(target.metadataRecoveryImageInstalled());assertFalse(target.admissionOpen());
             assertEquals(Set.of(registration.groupId(),child.ownership().owner().groupId()),pool.persistedRangeGroups(8));
             assertTrue(pool.retainedMetadataOwners().stream().anyMatch(owner->owner.owner().groupId().equals(registration.groupId()) && owner.retired() && owner.pending()));
             assertThrows(IllegalStateException.class,()->outcome(target,definition,original.operationId(),original.receiptDigest()));assertThrows(IllegalStateException.class,target::metadataOutcomeState);
-            target.installMetadataSnapshot(image,nativeTest.limits);assertEquals(registration.imageCut(),target.applied());assertTrue(target.metadataRecoveryPending());
+            target.installMetadataSnapshot(image,nativeTest.limits);assertEquals(registration.imageCut(),target.applied());assertTrue(target.metadataRecoveryImageInstalled());assertTrue(target.metadataRecoveryPending());
             assertThrows(IllegalStateException.class,()->target.operationResult(original.operationId(),original.receiptDigest()));
             assertThrows(IllegalStateException.class,()->target.completeMetadataRecovery(registration,new ApplyPosition(1,3),target.configuration()));
             // Committed source tail may replay while every public authoritative outcome remains fenced.

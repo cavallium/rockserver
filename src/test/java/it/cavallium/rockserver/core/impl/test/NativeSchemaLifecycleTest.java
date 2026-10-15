@@ -110,7 +110,7 @@ class NativeSchemaLifecycleTest {
             }
             store.applySchemaActivation(new ApplyPosition(1,6),installed,catalogue,new ApplyPosition(2,20));
             assertTrue(store.canonicalStaleSchemaControl(stale)); store.validate(stale);
-            var estimate=store.estimateReceiptRetention(stale,true); assertEquals(92,estimate.additionalBytes()); assertEquals(1,estimate.additionalCount()); assertFalse(estimate.maintenance());
+            var estimate=store.estimateReceiptRetention(stale,true); assertEquals(48+32+new CommandResult(CommandResult.Status.STALE_SCHEMA,List.of()).encode().length,estimate.additionalBytes()); assertEquals(1,estimate.additionalCount()); assertFalse(estimate.maintenance());
             assertEquals(CommandResult.Status.STALE_SCHEMA,CommandResult.decode(store.apply(new ApplyPosition(1,7),stale)).status());
             assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,8),oldSuccess)).status());
             assertEquals(CommandResult.Status.STALE_SCHEMA,CommandResult.decode(store.apply(new ApplyPosition(1,9),stale)).status());

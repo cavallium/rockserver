@@ -20,8 +20,17 @@ public final class NativeTopologyLearnerSchema {
         var ordered=NativeSchemaInstallation.validateLifecycle(current,history,activated,activations,pending,cut);
         if(current==null) {if(!source.isEmpty() || origin!=null && (!Arrays.equals(schema.digest(),origin.seed().header().schemaDigest()) || !names.keySet().equals(origin.seed().physicalNames().keySet()) || !merges.equals(origin.seed().mergeColumns())))throw new IllegalArgumentException("Evolved learner source lacks verified schema history");return Map.of();}
         if(activated==null || pending!=null || !Arrays.equals(current.definition().targetSchema().digest(),schema.digest()) || !current.targetMerges().equals(merges))throw new IllegalArgumentException("Learner current schema is not activated");
-        var first=ordered.getFirst();if(origin!=null && (!Arrays.equals(first.definition().sourceSchema().digest(),origin.seed().header().schemaDigest()) || !first.sourceNames().equals(origin.seed().physicalNames()) || !first.sourceMerges().equals(origin.seed().mergeColumns()) || first.fence().position().index()<=origin.activation().position().index()))throw new IllegalArgumentException("Learner schema history lacks original birth anchor");
+        var first=ordered.getFirst();if(origin!=null && (!Arrays.equals(first.definition().sourceSchema().digest(),origin.seed().header().schemaDigest()) || !first.sourceNames().equals(origin.seed().physicalNames()) && !verifiedAdoptedAnchor(origin,first) || !first.sourceMerges().equals(origin.seed().mergeColumns()) || first.fence().position().index()<=origin.activation().position().index()))throw new IllegalArgumentException("Learner schema history lacks original birth anchor");
         allNames.putAll(historicalAliases);allNames.putAll(names);var result=new TreeMap<String,byte[]>();for(var entry:source.entrySet()){byte[] key=HexFormat.of().parseHex(entry.getKey()),value=entry.getValue();if(key[16]==0x28 || key[16]==0x2a){var record=NativeSchemaInstallation.decode(value);value=new NativeSchemaInstallation(record.definition(),record.fence(),record.position(),select(allNames,record.sourceNames().keySet()),select(allNames,record.targetNames().keySet()),record.sourceMerges(),record.targetMerges()).encode();}result.put(entry.getKey(),value.clone());}return copy(result);
+    }
+    /** Fixed-size commitment to the first actual immutable normalized INSTALL; full proof rows remain in STATE. */
+    public static byte[] adoptionAnchorDigest(Map<String,byte[]> rows) {
+        NativeSchemaInstallation first=null;
+        for(var row:rows.entrySet()){byte[] key=HexFormat.of().parseHex(row.getKey());if(key.length!=33 || key[16]!=0x2a)continue;var record=NativeSchemaInstallation.decode(row.getValue());if(first==null || record.position().index()<first.position().index())first=record;}
+        return first==null?null:RangeImportAdmission.sha256(first.encode());
+    }
+    private static boolean verifiedAdoptedAnchor(NativeTopologyImageOrigin origin,NativeSchemaInstallation first) {
+        return origin.learnerAdoptionDigest()!=null && origin.adoptedSchemaAnchorDigest()!=null && Arrays.equals(origin.adoptedSchemaAnchorDigest(),RangeImportAdmission.sha256(first.encode()));
     }
     private static UUID uuid(byte[] key){var bytes=ByteBuffer.wrap(key,17,16);return new UUID(bytes.getLong(),bytes.getLong());}
     private static Map<UUID,String> select(Map<UUID,String> names,Set<UUID> columns){var result=new HashMap<UUID,String>();for(UUID column:columns)result.put(column,Objects.requireNonNull(names.get(column)));return result;}

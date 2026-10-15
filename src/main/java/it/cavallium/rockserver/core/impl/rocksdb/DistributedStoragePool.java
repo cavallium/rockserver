@@ -119,7 +119,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         Objects.requireNonNull(registration);nativeMutation.acquireUninterruptibly();try {
             synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}
             if(pendingTopologySeed!=null || pendingLearnerHistory!=null)throw new IllegalStateException("Unknown topology ownership force requires exact original retry");
-            UUID group=registration.groupId();var pending=pendingMetadataRecoveries.get(group);if(pending!=null && !pending.equals(registration))throw new IllegalStateException("Unknown metadata registration force requires original retry");
+            UUID group=registration.groupId();if(currentRecoveries.containsKey(group) || pendingCurrentRecovery!=null)throw new IllegalStateException("CURRENT owner cannot become recovered metadata");var pending=pendingMetadataRecoveries.get(group);if(pending!=null && !pending.equals(registration))throw new IllegalStateException("Unknown metadata registration force requires original retry");
             if(!pendingMetadataRecoveries.isEmpty() && (pending==null || pendingMetadataRecoveries.size()!=1))throw new IllegalStateException("Unknown global metadata registry force requires original retry");
             var previous=metadataRecoveries.get(group);if(previous!=null && !previous.equals(registration))registration.requireSuccessorOf(previous);
             var range=registration.range();var owner=new RangeOwnership.Owner(group,range.rangeEpoch());var interval=new RangeOwnership.Interval(registration.sourceDirectory().domainId(),registration.sourceDirectory().columns(),range.lowerInclusive(),range.upperExclusive());ownership.validateMetadataRecovery(owner,interval);
@@ -134,6 +134,41 @@ public final class DistributedStoragePool implements AutoCloseable {
             var store=new ReplicatedRangeStore(loaded.db().get(),ownership,owner,registration.sourceDirectory().schemaDigest(),Map.of(),handles.get(STATE_COLUMN),handles.get(RECEIPTS_COLUMN),registration.mergeColumns(),true,registration);
             store.configureSnapshotAdmission(snapshotAdmission);store.configureSchemaPreparationPool(this);store.configureRetiredTopologyDirectory(registration.sourceDirectory());ranges.add(store);return store;
         }finally{nativeMutation.release();}
+    }
+    private volatile Map<UUID,NativeCurrentRangeRecovery> currentRecoveries=Map.of();
+    private NativeCurrentRangeRecovery pendingCurrentRecovery;
+    private volatile TopologySeedForceObserver currentRecoveryForceObserver=after->{};
+    public void currentRecoveryForceObserver(TopologySeedForceObserver observer){currentRecoveryForceObserver=Objects.requireNonNull(observer);}
+    public List<NativeCurrentRangeRecovery> currentRangeRecoveries(){return List.copyOf(currentRecoveries.values());}
+    private void recoverCurrentRangeRecoveries() {
+        try {var found=new HashMap<UUID,NativeCurrentRangeRecovery>();
+            for(var history:ownershipHistory){UUID group=history.owner().groupId();byte[] key=groupSchemaKey(group,0x72);int size=loaded.db().get().get(handles.get(STATE_COLUMN),key,new byte[0]);if(size==org.rocksdb.RocksDB.NOT_FOUND)continue;if(size>NativeCurrentRangeRecovery.MAX_BYTES)throw new IllegalArgumentException("Current registration exceeds bound");var registration=NativeCurrentRangeRecovery.decode(loaded.db().get().get(handles.get(STATE_COLUMN),key));var range=registration.range();var interval=currentInterval(registration);
+                if(found.put(group,registration)!=null || !group.equals(registration.groupId()) || !history.owner().equals(new RangeOwnership.Owner(group,range.rangeEpoch())) || !history.interval().domainId().equals(interval.domainId()) || !history.interval().columns().containsAll(interval.columns()) || !Arrays.equals(history.interval().lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(history.interval().upperExclusive(),interval.upperExclusive()) || topologyBirths.containsKey(group) || topologyLearners.containsKey(group) || metadataRecoveries.containsKey(group))throw new IllegalArgumentException("Current recovery lacks exclusive permanent local history");
+            }currentRecoveries=Map.copyOf(found);requireTopologyRegistryCapacity(topologySeeds,metadataRecoveries);
+        }catch(IOException|RocksDBException invalid){throw new IllegalStateException("Cannot recover CURRENT registrations",invalid);}
+    }
+    private RangeOwnership.Interval currentInterval(NativeCurrentRangeRecovery registration){var range=registration.range();return new RangeOwnership.Interval(registration.schema().domainId(),registration.schema().columnIds(),range.lowerInclusive(),range.upperExclusive());}
+    /** Trusted current placement qualification; durable receiver registration itself grants no USER or vote admission. */
+    public ReplicatedRangeStore openCurrentRangeRecovery(NativeCurrentRangeRecovery registration)throws RocksDBException {
+        Objects.requireNonNull(registration);UUID group=registration.groupId();var owner=new RangeOwnership.Owner(group,registration.range().rangeEpoch());var interval=currentInterval(registration);
+        nativeMutation.acquireUninterruptibly();try {
+            synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}
+            if(pendingTopologySeed!=null || pendingLearnerHistory!=null || !newImportReservations.isEmpty() || !pendingMetadataRecoveries.isEmpty())throw new IllegalStateException("Unknown ownership force requires original retry");
+            if(pendingCurrentRecovery!=null && !pendingCurrentRecovery.equals(registration))throw new IllegalArgumentException("Unknown CURRENT force requires exact retry");
+            var saved=currentRecoveries.get(group);if(saved!=null && !saved.equals(registration))throw new IllegalArgumentException("Current recovery changed original registration");
+            if(saved==null){
+                if(topologyBirths.containsKey(group) || topologyRetirements.containsKey(group) || topologyLearners.containsKey(group) || metadataRecoveries.containsKey(group) || pendingCurrentRecovery==null && ownershipHistory.stream().anyMatch(history->history.owner().groupId().equals(group)))throw new IllegalArgumentException("Current recovery cannot replace a historical local owner");
+                ownership.validateRegistration(owner,interval);
+                for(var column:registration.physicalNames().entrySet()){String name=column.getValue();if(RESERVED_COLUMNS.contains(name))throw new IllegalArgumentException("Reserved CURRENT receiver CF alias");var binding=bindings.get(column.getKey());if(binding!=null && (!binding.name().equals(name) || binding.mergeAdmitted()!=registration.mergeColumns().contains(column.getKey())))throw new IllegalArgumentException("CURRENT alias/operator conflicts with permanent logical binding");if(bindings.entrySet().stream().anyMatch(other->!other.getKey().equals(column.getKey()) && other.getValue().name().equals(name)))throw new IllegalArgumentException("CURRENT CF alias belongs to another logical column");}
+                var next=new HashMap<>(currentRecoveries);next.put(group,registration);var history=proposedOwnershipHistory(owner,interval);final byte[] historyBytes;
+                try{requireTopologyRegistryCapacity(topologySeeds,metadataRecoveries,next);historyBytes=encodeOwnershipHistory(history);}catch(IOException invalid){throw new IllegalStateException("Current registration capacity exhausted",invalid);}
+                try {if(artifacts.qualified() || !registration.mergeColumns().isEmpty())artifacts.bind(registration.schema(),registration.physicalNames());}catch(IOException invalid){throw new IllegalStateException("Current recovery operators are not qualified locally",invalid);}
+                pendingCurrentRecovery=registration;ownershipHistory=history;ownershipHistoryDurable=false;currentRecoveryForceObserver.boundary(false);
+                try(var batch=new org.rocksdb.WriteBatch();var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)){batch.put(handles.get(STATE_COLUMN),OWNERSHIP_HISTORY_KEY,historyBytes);batch.put(handles.get(STATE_COLUMN),groupSchemaKey(group,0x72),registration.encode());loaded.db().get().write(options,batch);}currentRecoveryForceObserver.boundary(true);
+                ownershipHistoryDurable=true;currentRecoveries=Map.copyOf(next);pendingCurrentRecovery=null;
+            }
+        }finally{nativeMutation.release();}
+        var store=openRange(owner,interval,registration.schema().digest(),registration.physicalNames(),registration.mergeColumns());var schema=registration.schema();if(!Arrays.equals(store.schemaDigest(),schema.digest())){var checkpoint=recoverSchema(group);if(checkpoint.current()==null || !Arrays.equals(store.schemaDigest(),checkpoint.current().definition().targetSchema().digest()))throw new IllegalArgumentException("CURRENT owner lacks verified subsequent schema");schema=checkpoint.current().definition().targetSchema();}store.enableLogicalSchema(schema);return store;
     }
     private static final int MAX_TOPOLOGY_LEARNERS=8,MAX_TOPOLOGY_LEARNER_BYTES=32*1024*1024;
     private volatile Map<UUID,NativeTopologyLearnerRegistration> topologyLearners=Map.of();
@@ -157,6 +192,8 @@ public final class DistributedStoragePool implements AutoCloseable {
         Objects.requireNonNull(registration);var range=registration.definition().targets().getFirst();UUID group=range.groupId();var owner=new RangeOwnership.Owner(group,range.rangeEpoch());var interval=learnerInterval(registration);
         nativeMutation.acquireUninterruptibly();try {
             synchronized(admission) { if(closing)throw new IllegalStateException("Pool is closing"); }
+            if(pendingCurrentRecovery!=null)throw new IllegalStateException("Unknown CURRENT registration requires exact retry");
+            if(currentRecoveries.containsKey(group))throw new IllegalArgumentException("CURRENT owner cannot become learner");
             if(pendingTopologySeed!=null || !newImportReservations.isEmpty())throw new IllegalStateException("Unknown seed/import history requires exact original retry");
             if(pendingLearnerHistory!=null && !pendingLearnerHistory.equals(group))throw new IllegalStateException("Unknown learner history requires exact original retry");
             var pending=pendingTopologyLearners.get(group);var saved=topologyLearners.get(group);if(pending!=null && !pending.equals(registration) || saved!=null && !saved.equals(registration))throw new IllegalArgumentException("Learner registration changed original authorization/image");
@@ -210,12 +247,17 @@ public final class DistributedStoragePool implements AutoCloseable {
         for(var id:seeds.keySet().stream().sorted().toList()) { byte[] encoded=seeds.get(id).encode(); out.writeInt(encoded.length); out.write(encoded); }
         return bytes.toByteArray();
     }
-    private static void requireTopologyRegistryCapacity(Map<UUID,NativeTopologySeed> seeds,Map<UUID,NativeMetadataRecoveryRegistration> metadata)throws IOException {
-        if(seeds.size()+metadata.size()>MAX_TOPOLOGY_SEEDS)throw new IOException("Shared topology/metadata registration count exhausted");
+    private void requireTopologyRegistryCapacity(Map<UUID,NativeTopologySeed> seeds,Map<UUID,NativeMetadataRecoveryRegistration> metadata)throws IOException {
+        var current=new HashMap<>(currentRecoveries);if(pendingCurrentRecovery!=null)current.put(pendingCurrentRecovery.groupId(),pendingCurrentRecovery);
+        requireTopologyRegistryCapacity(seeds,metadata,current);
+    }
+    private void requireTopologyRegistryCapacity(Map<UUID,NativeTopologySeed> seeds,Map<UUID,NativeMetadataRecoveryRegistration> metadata,Map<UUID,NativeCurrentRangeRecovery> current)throws IOException {
+        if(seeds.size()+metadata.size()+current.size()>MAX_TOPOLOGY_SEEDS)throw new IOException("Shared topology/metadata registration count exhausted");
         long bytes=16;
         for(var seed:seeds.values())bytes+=4L+seed.encodedSize();
         // Registry entries plus each local digest, readiness/image receipt and pending install pointer.
         for(var registration:metadata.values())bytes+=260L+registration.encodedSize();
+        for(var registration:current.values())bytes+=260L+65620L+registration.encodedSize();
         if(bytes>MAX_TOPOLOGY_SEED_BYTES)throw new IOException("Shared topology/metadata registration bytes exhausted");
     }
     private void requireTopologySeedRows(NativeTopologySeed seed) throws RocksDBException {
@@ -275,6 +317,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         var ordered=parents.stream().sorted(java.util.Comparator.comparing(parent -> parent.ownership().owner().groupId().toString())).toList(); nativeMutation.acquireUninterruptibly();
         try {
             synchronized(admission) { if(closing) throw new IllegalStateException("Pool is closing"); }
+            if(pendingCurrentRecovery!=null)throw new IllegalStateException("Unknown CURRENT registration requires exact retry");
             if(pendingLearnerHistory!=null)throw new IllegalStateException("Unknown learner history requires exact original retry");
             return withTopologyParents(ordered,0,() -> {
                 var freezes=new HashMap<UUID,NativeTopologyFreeze>(); Map<UUID,String> names=null; Set<UUID> merges=null;
@@ -402,7 +445,8 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
     private void retainOwnershipHistory(RangeOwnership.Owner owner,RangeOwnership.Interval interval) throws RocksDBException {
         if(pendingLearnerHistory!=null)throw new IllegalStateException("Unknown learner history requires exact original retry");
-        if(pendingTopologySeed!=null) throw new IllegalStateException("Unknown topology seed completion requires exact retry");
+        if(pendingCurrentRecovery!=null)throw new IllegalStateException("Unknown CURRENT registration requires exact retry");
+            if(pendingTopologySeed!=null) throw new IllegalStateException("Unknown topology seed completion requires exact retry");
         var next=proposedOwnershipHistory(owner,interval);
         try { byte[] encoded=encodeOwnershipHistory(next); if(next.equals(ownershipHistory) && ownershipHistoryDurable)return; ownershipHistory=next; ownershipHistoryDurable=false; try(var batch=new org.rocksdb.WriteBatch();var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)) { batch.put(handles.get(STATE_COLUMN),OWNERSHIP_HISTORY_KEY,encoded); for(var pending:newImportReservations.values())batch.put(handles.get(STATE_COLUMN),groupSchemaKey(pending.groupId(),0x40),pending.encode()); if(!newImportReservations.isEmpty())batch.put(handles.get(STATE_COLUMN),BIRTHS_KEY,encodeBirthRegistry(bindings)); loaded.db().get().write(options,batch); } ownershipHistoryDurable=true; if(!newImportReservations.isEmpty())birthsDurable=true; }
         catch(IOException failure) { throw new IllegalStateException("Native ownership history exhausted",failure); }
@@ -863,7 +907,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                 handles.put(new String(descriptor.getName(), StandardCharsets.US_ASCII), handle));
         recoverBirths();
         recoverOwnershipHistory();
-        recoverCapacityClaims(); recoverTopologySeeds();recoverTopologyLearners();recoverMetadataRecoveries();
+        recoverCapacityClaims(); recoverTopologySeeds();recoverTopologyLearners();recoverMetadataRecoveries();recoverCurrentRangeRecoveries();
     }
 
     public static void stageOperator(Path poolPath,DistributedSchema.Operator operator,
@@ -980,7 +1024,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         nativeMutation.acquireUninterruptibly();handleLifetime.readLock().lock();try{
             synchronized(admission){if(closing || closed)throw new IllegalStateException("Pool is closing");}
             var result=new ArrayList<RetainedMetadataOwner>();var db=loaded.db().get();var state=handles.get(STATE_COLUMN);
-            for(var record:ownershipHistory){var group=record.owner().groupId();boolean retired=topologyRetirements.containsKey(group) || metadataRecoveries.containsKey(group);boolean pending=topologyBirths.containsKey(group)&&db.get(state,groupSchemaKey(group,0x63))==null || topologyLearners.containsKey(group)&&db.get(state,groupSchemaKey(group,0x68))==null;
+            for(var record:ownershipHistory){var group=record.owner().groupId();boolean retired=topologyRetirements.containsKey(group) || metadataRecoveries.containsKey(group);boolean pending=topologyBirths.containsKey(group)&&db.get(state,groupSchemaKey(group,0x63))==null || topologyLearners.containsKey(group)&&db.get(state,groupSchemaKey(group,0x68))==null || currentRecoveries.containsKey(group)&&db.get(state,groupSchemaKey(group,0x73))==null;
                 byte[] key=groupSchemaKey(group,0x40);int size=db.get(state,key,new byte[0]);if(size!=org.rocksdb.RocksDB.NOT_FOUND){if(size>NativeSstImportManifest.MAX_BYTES)throw new IllegalStateException("Import metadata inventory exceeds bound");var manifest=NativeSstImportManifest.decode(db.get(state,key));if(!manifest.groupId().equals(group) || ownershipHistory.stream().noneMatch(original->original.owner().groupId().equals(group) && manifest.rangeEpoch()==original.owner().epoch() && manifest.domainId().equals(original.interval().domainId()) && original.interval().columns().containsAll(manifest.physicalNames().keySet()) && Arrays.equals(manifest.lowerInclusive(),original.interval().lowerInclusive()) && Arrays.equals(manifest.upperExclusive(),original.interval().upperExclusive())))throw new IllegalStateException("Import metadata inventory changed ownership");pending|=db.get(state,groupSchemaKey(group,0x43))==null;}
                 result.add(new RetainedMetadataOwner(record.owner(),record.interval(),retired,pending));
             }
@@ -1172,22 +1216,24 @@ public final class DistributedStoragePool implements AutoCloseable {
                 if (closing) throw new IllegalStateException("Pool is closing");
             }
         if(metadataRecoveries.containsKey(owner.groupId()) || pendingMetadataRecoveries.containsKey(owner.groupId()))throw new IllegalStateException("Registered source metadata cannot reopen as a USER owner");
+            if(pendingCurrentRecovery!=null)throw new IllegalStateException("Unknown CURRENT registration requires exact retry");
             if(pendingTopologySeed!=null) throw new IllegalStateException("Unknown topology seed completion requires exact retry");
             if(pendingLearnerHistory!=null)throw new IllegalStateException("Unknown learner history requires exact original retry");
-            var topologySource=topologyRetirements.get(owner.groupId()); var topologyChild=topologyBirths.get(owner.groupId());var learner=topologyLearners.get(owner.groupId());
+            var topologySource=topologyRetirements.get(owner.groupId()); var topologyChild=topologyBirths.get(owner.groupId());var learner=topologyLearners.get(owner.groupId());var currentRecovery=currentRecoveries.get(owner.groupId());
+            if(currentRecovery!=null && topologySource==null && (!interval.equals(currentInterval(currentRecovery)) || !Arrays.equals(schema,currentRecovery.schema().digest()) || !names.equals(currentRecovery.physicalNames()) || !merges.equals(currentRecovery.mergeColumns()) || newImport!=null))throw new IllegalArgumentException("CURRENT open changed exact receiver bindings");
             if(pendingTopologyLearners.containsKey(owner.groupId()))throw new IllegalStateException("Learner force requires exact registration retry");
             if(learner==null && loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(owner.groupId(),0x67))!=null)throw new IllegalArgumentException("Learner registration lacks qualified pool history");
             if(learner!=null && (!interval.equals(learnerInterval(learner)) || !Arrays.equals(schema,learner.schema().digest()) || !names.equals(learner.physicalNames()) || !merges.equals(learner.mergeColumns()) || newImport!=null))throw new IllegalArgumentException("Learner open changed qualified receiver bindings");
             byte[] nativeBirth=loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(owner.groupId(),0x61)),nativeRetirement=loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(owner.groupId(),0x62));
-            if(nativeBirth!=null && topologyChild==null && learner==null || nativeRetirement!=null && topologySource==null) throw new IllegalArgumentException("Topology owner lacks original seed artifact");
+            if(nativeBirth!=null && topologyChild==null && learner==null && currentRecovery==null || nativeRetirement!=null && topologySource==null) throw new IllegalArgumentException("Topology owner lacks original seed artifact");
             if(topologyChild!=null) {
                 var original=topologySeeds.get(topologyChild.intentId()); var descriptor=topologyChild.resolveDescriptor(original);
                 if(!owner.equals(new RangeOwnership.Owner(descriptor.groupId(),descriptor.rangeEpoch())) || !interval.equals(topologyInterval(original,descriptor)) || !Arrays.equals(schema,original.header().schemaDigest()) || !names.equals(original.physicalNames()) || !merges.equals(original.mergeColumns())) throw new IllegalArgumentException("Topology target open changed original birth");
             }
             if(topologySource!=null && (newImport!=null || !owner.equals(new RangeOwnership.Owner(owner.groupId(),topologySource.header().participant(TopologyChange.Stage.FREEZE,owner.groupId()).rangeEpoch())))) throw new IllegalArgumentException("Topology source cannot be reused");
-            if(topologySource!=null || topologyChild!=null || learner!=null) for(var existing:ranges) if(existing.ownership().owner().equals(owner)) {
-                if(learner!=null && !Arrays.equals(existing.schemaDigest(),schema)) {
-                    var preparation=existing.learnerSchemaPreparation();
+            if(topologySource!=null || topologyChild!=null || learner!=null || currentRecovery!=null) for(var existing:ranges) if(existing.ownership().owner().equals(owner)) {
+                if((learner!=null || currentRecovery!=null) && !Arrays.equals(existing.schemaDigest(),schema)) {
+                    var preparation=learner==null?null:existing.learnerSchemaPreparation();
                     if(preparation!=null){schema=preparation.schema().digest();names=preparation.physicalNames();merges=preparation.mergeColumns();}
                     else {var checkpoint=recoverSchema(owner.groupId());var current=checkpoint.current();
                     if(current==null)throw new IllegalArgumentException("Opened learner lacks verified current schema");
@@ -1238,11 +1284,11 @@ public final class DistributedStoragePool implements AutoCloseable {
                 if(!original) throw new IllegalArgumentException("Bootstrap differs from verified schema lifecycle");
 
                 var definition=recovered.definition(); schemaOrigins.put(definition.sourceSchema().domainId(),definition);
-                if(topologySource==null && topologyChild==null && learner==null) recoveryOwnership=prepareSchemaRecovery(interval.domainId(),checkpoint.chain());
+                if(topologySource==null && topologyChild==null && learner==null && currentRecovery==null) recoveryOwnership=prepareSchemaRecovery(interval.domainId(),checkpoint.chain());
                 schema=definition.targetSchema().digest(); names=recovered.targetNames(); merges=recovered.targetMerges();
                 interval=new RangeOwnership.Interval(interval.domainId(),names.keySet(),interval.lowerInclusive(),interval.upperExclusive());
             }
-            if(topologySource==null && topologyChild==null && learner==null && recoveryOwnership==null) for(var origin:schemaOrigins.values()) {
+            if(topologySource==null && topologyChild==null && learner==null && currentRecovery==null && recoveryOwnership==null) for(var origin:schemaOrigins.values()) {
                 if(!origin.sourceSchema().domainId().equals(interval.domainId())) continue;
                 var descriptor=origin.sourceDirectory().ranges().stream().filter(participant -> participant.groupId().equals(owner.groupId()) && participant.rangeEpoch()==owner.epoch()).findFirst().orElse(null);
                 if(descriptor==null || !Arrays.equals(descriptor.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(descriptor.upperExclusive(),interval.upperExclusive())) continue;
@@ -1293,7 +1339,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             }
             pressureColumns = List.copyOf(handles.values());
             retainOwnershipHistory(owner,interval);
-            if(topologySource==null && topologyChild==null && learner==null && recoveryOwnership==null && recoveryTransition==null) {
+            if(topologySource==null && topologyChild==null && learner==null && currentRecovery==null && recoveryOwnership==null && recoveryTransition==null) {
                 for(var origin:schemaOrigins.values()) if(origin.sourceSchema().domainId().equals(interval.domainId())
                         && Arrays.equals(origin.sourceSchema().digest(),schema) && origin.sourceSchema().columnIds().equals(interval.columns())
                         && origin.sourceDirectory().ranges().stream().anyMatch(participant -> participant.groupId().equals(owner.groupId()) && participant.rangeEpoch()==owner.epoch())) {
@@ -1302,7 +1348,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             }
             if(topologySource!=null || topologyChild!=null) { var registered=ownership.get(owner); if(!registered.interval().equals(interval) || registered.state()!=(topologySource!=null ? RangeOwnership.State.RETIRED : RangeOwnership.State.FENCED)) throw new IllegalArgumentException("Recovered topology ownership changed"); }
             else if(newImport!=null) { /* Already registered fenced before native birth. */ }
-            else if(importBirth!=null || learner!=null) ownership.register(owner,interval,RangeOwnership.State.FENCED);
+            else if(importBirth!=null || learner!=null || currentRecovery!=null) ownership.register(owner,interval,RangeOwnership.State.FENCED);
             else if(recoveryOwnership!=null) ownership.registerRecoveredSchema(owner,interval,RangeOwnership.State.FENCED,recoveryOwnership);
             else if(recoveryTransition==null) ownership.register(owner, interval, RangeOwnership.State.ACTIVE);
             else ownership.registerSchema(owner,interval,RangeOwnership.State.FENCED,recoveryTransition);
@@ -1311,6 +1357,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                         handles.get(STATE_COLUMN), handles.get(RECEIPTS_COLUMN), merges);
                 store.configureSnapshotAdmission(snapshotAdmission); store.configureSchemaPreparationPool(this);
                 store.validateTopologyActivationRecovery();
+                if(currentRecovery!=null && topologySource==null && store.currentRangeRecoveryReady() && !store.pendingInstallation())ownership.activate(owner);
                 if(topologySource==null && (topologyChild!=null && learner==null && store.topologyActivation()!=null || learner!=null && store.topologyLearnerServing()) && !store.pendingInstallation()) ownership.activate(owner);
                 for(var entry:names.entrySet()) bindings.putIfAbsent(entry.getKey(),new Binding(entry.getValue(),merges.contains(entry.getKey())));
                 ranges.add(store);
