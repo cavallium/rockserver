@@ -1757,30 +1757,30 @@ regressions and the full two-pool workflow are in
 `current-leaf-runtime-source-and-backup-gate2.log`.
 
 Recovery registrations with legal retained schema history can exceed the ordinary
-row ceiling. GROUP images now apply canonical metadata limits only to exact
-own-group registration/permission keys; USER rows and total image limits stay
-unchanged. A forty-change history passes interrupted install, cold retry and
-successive re-export/install, and malformed/foreign/ordinary oversized rows are
-rejected before value allocation. All 28 current/metadata/image cases pass in both
-configured executions (`current-typed-registration-image-gate.log`). Native image operations now admit the actual encoded recovery-registration workspace
-before value allocation/decoding and retain a shared high-water envelope across
-nested install scans. All 30 selected native cases pass in both executions
-(`current-typed-metadata-memory-gate.log`), including denial/release, multi-pass
-reuse and an ordinary USER image acquiring no metadata lease. The node applies a
-conservative decoded-graph policy to measured encoded bytes; this is not an
-allocator-byte measurement. Runtime source capture, cold artifact scans and adapter lifecycle operations now
-bind that workspace to the shared protected node/pool budget. The integrated gate
-passes seven core eligibility cases and 27 adapter/source/resource cases
-(`recovery-image-eligibility-memory-adapter-second-gate.log`), including missing-image
-CURRENT and META cold reload, actual configuration-tail evidence refresh while USER
-access stays fenced, and original retired-source metadata snapshots at a later real
-cut. The final resource envelope is unproven.
+row ceiling. GROUP images apply canonical limits only to exact own-group recovery
+metadata keys; USER rows and total image limits stay unchanged. Image operations now
+reserve measured registration and schema value bytes before allocation/decoding,
+retaining a shared high-water envelope across nested scans. Source preflight uses
+the owned snapshot cut; target preflight holds the same apply lane through
+qualification, preventing own-tail schema growth between sizing and use. The
+35-case native gate passes in both executions, including a small original
+registration followed by forty schema changes and more than 4 MiB of separate
+history, malformed-key denial, exact retry, and a 3 MiB USER image requiring no
+metadata charge (`registered-recovery-schema-workspace-integrated-first-gate.log`).
+The node applies a conservative decoded-graph policy to measured encoded bytes;
+this is not a physical allocator-byte measurement or the final resource proof.
 
-An additional memory-admission gap is confirmed for a small original CURRENT
-registration followed by a large later schema history: image scans decode and retain
-those separate schema rows without charging them as registration workspace. Exact
-own-group schema-row size admission before allocation is still required. The shared
-high-water scope can cover it without charging USER image bytes or raising node caps.
+Runtime cold inventory now discovers forced CURRENT and META registrations before
+native ownership and Raft-directory checks. It opens their actual native APIs,
+retains exact original source scope and rejects namespace, pool, membership and
+exposure-quota conflicts without manufacturing SEED/ACTIVATE evidence. The
+53-case Runtime/metadata/resource gate passes, including original startup behavior,
+missing-image child/ancestor cold retry and exact quota denial/retry
+(`registered-recovery-runtime-quota-regression-gate.log`). Registry debt is covered
+once by the existing shared native reservation, and runtime metadata graphs remain
+charged until actual pool closure. Native pool opening still decodes bounded
+registries before node graph admission; that startup limitation remains unproven.
+This is cold reconstruction, not the asynchronous configured-member recovery actor.
 
 The Ratis core now separates initial native-image eligibility from final USER
 readiness. Seven controlled real-division tests pass for vote/pre-vote/forced
@@ -1788,8 +1788,8 @@ leadership refusal, image-gated append/apply, revocation versus vote persistence
 and initial snapshot installation with a retained newer committed configuration/tail
 (`ratis-initial-image-voting-shutdown-fixed-gate.log`). Transport start is forbidden
 by the fixture. This is not multi-node quorum or network evidence. Adapter lifecycle and native configuration-tail publication pass the integrated
-checks described above; later completed-member checkpoint qualification and the
-full catch-up/retirement driver remain unfinished.
+checks described above; fresh remote image permissions and the full
+catch-up/retirement driver remain unfinished.
 
 The committed image-gated runtime checkpoint also passes the complete same-service
 split/import/operator/MERGE/backup/cold-reopen selection (four cases) and fifteen
@@ -1817,7 +1817,23 @@ reopens. Snapshot publication refreshes eligibility after native pins drain. The
 initial source artifact remains valid read-only inventory; restoring it cannot
 regress completed state. No new format marker or compatibility reader was added.
 
-Completed META member checkpoint qualification, durable metadata-DAG
+Completed META owners now qualify their own same-current-cut checkpoints using
+locally retained completion and baseline-image receipts. The original transfer
+image keeps its strict permission and reinstalls fenced; an own checkpoint must
+match actual native configuration and a framed digest of portable STATE/RECEIPTS
+before the first destructive intent. Retained completion is authority only during
+INSTALLING, never public readiness. Cold retry requires the exact pending cut/hash.
+Restoration cannot jump ahead of actual native state without a qualified intent.
+The six-case native gate passes twice, including resealed receipt tampering,
+interruption/cold retry and untouched descendant USER data. The adapter reuses its
+owned metadata pin rather than acquiring a second pin; publication, reinitialize,
+and cold reopen succeed with a one-pin limit. Twenty native cases pass twice plus
+seven Ratis eligibility and four adapter lifecycle cases
+(`metadata-own-checkpoint-one-pin-adapter-first-gate.log`); the final framing-buffer
+reuse also passes its focused native/adapter workflows
+(`metadata-own-checkpoint-one-pin-final-gate.log`).
+
+Durable metadata-DAG
 obligation discovery, asynchronous configured-member catch-up, quorum retirement,
 source quiescence and physical parent reclamation remain unfinished. In particular,
 Raft commitment alone must not report an absent native image as installed, replay
