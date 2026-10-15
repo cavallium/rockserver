@@ -25,6 +25,54 @@ class NativeMetadataRecoveryTest {
     void configure(ReplicatedRangeStore target,TopologyChange.Definition definition)throws Exception {
         target.enableSessionControls();target.enableCdc(definition.parents().getFirst().rangeId());
     }
+    @Test void sourceSchemaActivatedBeforeRetirementRecoversAsMetadataWithoutUserHandlesOrHistoricalSeed()throws Exception {
+        Path initial=root.resolve("evolved-source-meta"),checkpoint=root.resolve("evolved-own-meta"),receiver=root.resolve("evolved-meta-receiver");
+        var limits=new NativeRangeImage.Limits(4<<20,32<<20,8);var base=helper.outer.schema();UUID added=new UUID(0,9501);
+        var columns=new ArrayList<>(base.columns());columns.add(new DistributedSchema.Column(9501,added,"created-before-retirement",base.column(helper.outer.fixed).schema(),null));
+        var evolved=new DistributedSchema(base.clusterId(),base.databaseId(),base.domainId(),base.schemaEpoch()+1,base.routingPrefixBytes(),columns);
+        var originalDirectory=helper.topology.split(base,9502).sourceDirectory();
+        var create=new SchemaChange.Definition(new UUID(0,9503),new OperationId(new UUID(0,9504),1,0),originalDirectory,base,evolved);
+        var children=helper.topology.split(evolved,9505).targets();
+        var definition=new TopologyChange.Definition(new UUID(0,9505),create.targetDirectory(),helper.topology.directory(evolved,create.targetDirectory().generation()+1,children));
+        var range=definition.parents().getFirst();var lineage=nativeTest.lineage(range);
+        DistributedCommand original,created;byte[] originalResult,createdResult;NativeSchemaInstallation installation;NativeSchemaActivationProof activation;NativeMetadataRecoveryRegistration registration;NativeRangeImage.Manifest own;
+        try(var pool=helper.pool(root.resolve("evolved-meta-source"))){
+            var source=helper.open(pool,range);source.initializeConfiguration(new byte[]{1});source.enableSessionControls();source.enableCdc(range.rangeId());source.applyNoop(new ApplyPosition(1,0));
+            original=new DistributedCommand(range.groupId(),range.rangeEpoch(),base.digest(),new OperationId(helper.outer.session,1,0),List.of(new Mutation(Mutation.Kind.PUT,helper.outer.fixed,helper.helper.key(1),helper.helper.key(9))));
+            originalResult=source.apply(new ApplyPosition(1,source.applied().index()+1),original);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(originalResult).status());
+            source.applySchemaFence(new ApplyPosition(1,source.applied().index()+1),create.header());var aliases=new HashMap<>(helper.outer.names);aliases.put(added,"created-before-retirement");
+            installation=pool.installSchema(source,new ApplyPosition(1,source.applied().index()+1),create,aliases,Set.of());
+            activation=source.applySchemaActivation(new ApplyPosition(1,source.applied().index()+1),installation.proof(),nativeTest.catalogue,new ApplyPosition(1,30));
+            created=new DistributedCommand(range.groupId(),range.rangeEpoch(),evolved.digest(),new OperationId(helper.outer.session,1,1),List.of(new Mutation(Mutation.Kind.PUT,added,helper.helper.key(1),helper.helper.key(7))));
+            createdResult=source.apply(new ApplyPosition(1,source.applied().index()+1),created);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(createdResult).status());
+            var freeze=source.applyTopologyFreeze(new ApplyPosition(1,source.applied().index()+1),definition,nativeTest.admission(definition));
+            var authority=TopologyChange.State.begin(definition.header()).beginFencing().frozen(freeze.proof(helper.topology.replica.replicaId()));
+            pool.seedTopology(definition,authority,List.of(source),helper.topology.replica);assertTrue(source.topologyRetired());assertTrue(freeze.position().index()>activation.position().index());
+            var image=NativeRangeImage.writeMetadata(initial,source,limits);assertArrayEquals(evolved.digest(),image.schemaDigest());assertEquals(evolved.columnIds(),image.interval().columns());
+            var cfg=source.configuration();registration=new NativeMetadataRecoveryRegistration(new UUID(0,9506),nativeTest.catalogue,new ApplyPosition(1,40),definition.sourceDirectory(),freeze,helper.topology.replica,helper.topology.replica,cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of());
+            NativeRangeImage.visitMetadata(initial,limits,(section,column,key,value)->assertNotEquals(NativeRangeImage.Section.USER,section));
+        }
+        try(var pool=helper.pool(receiver)){
+            var handles=Set.copyOf(helper.handles(pool).keySet());assertTrue(Collections.disjoint(handles,helper.outer.names.values()));assertFalse(handles.contains("created-before-retirement"));assertTrue(pool.topologySeeds().isEmpty());
+            var target=pool.openMetadataRecovery(registration);configure(target,definition);assertTrue(target.userHandlesDetached());assertFalse(target.admissionOpen());
+            assertArrayEquals(create.targetDirectory().payloadDigest(),target.metadataRecoveryRegistration().sourceDirectory().payloadDigest());assertArrayEquals(evolved.digest(),target.schemaDigest());
+            target.installMetadataSnapshot(initial,limits);assertTrue(target.metadataRecoveryPending());assertThrows(IllegalStateException.class,target::metadataOutcomeState);target.completeMetadataRecovery(registration,target.applied(),target.configuration());
+            assertArrayEquals(installation.encode(),target.schemaInstallation().encode());assertEquals(activation,target.schemaActivation());assertArrayEquals(evolved.digest(),target.installedSchema().digest());assertEquals(evolved.columnIds(),target.metadataOutcomeState().columns());
+            assertArrayEquals(originalResult,outcome(target,definition,original.operationId(),original.receiptDigest()).result());assertArrayEquals(createdResult,outcome(target,definition,created.operationId(),created.receiptDigest()).result());
+            var page=target.pollRetiredCdc(lineage,DistributedCdcCheckpoint.Cursor.beginning(),256,8<<20);assertEquals(3,page.records().size());assertArrayEquals(base.digest(),page.records().getFirst().command().schemaDigest());assertArrayEquals(evolved.digest(),page.records().get(1).command().schemaDigest());assertEquals(added,page.records().get(1).events().getFirst().mutation().columnId());assertEquals(registration.freeze(),page.records().getLast().barrier());
+            assertThrows(IllegalStateException.class,target::activate);assertThrows(IllegalStateException.class,target::capture);assertThrows(IllegalStateException.class,()->target.readCurrentPoint(added,helper.helper.key(1)));assertThrows(IllegalStateException.class,()->target.apply(new ApplyPosition(1,target.applied().index()+1),new DistributedCommand(range.groupId(),range.rangeEpoch(),evolved.digest(),new OperationId(helper.outer.session,1,2),List.of(new Mutation(Mutation.Kind.PUT,added,helper.helper.key(2),helper.helper.key(8))))));
+            target.applyNoop(new ApplyPosition(1,target.applied().index()+1),new byte[]{2});own=NativeRangeImage.writeMetadata(checkpoint,target,limits);assertEquals(target.applied(),target.validateMetadataRecoveryImage(checkpoint,limits).position());
+            target.installMetadataSnapshot(checkpoint,limits);assertEquals(own.position(),target.applied());assertFalse(target.metadataRecoveryPending());assertEquals(handles,helper.handles(pool).keySet());assertTrue(pool.topologySeeds().isEmpty());assertEquals(Set.of(range.groupId()),pool.persistedRangeGroups(8));
+            assertThrows(IOException.class,()->target.installMetadataSnapshot(checkpoint,limits,batch->{throw new IOException("Interrupt evolved metadata restore");}));assertTrue(target.pendingInstallation());assertTrue(target.metadataRecoveryPending());assertFalse(target.admissionOpen());
+        }
+        try(var pool=helper.pool(receiver)){
+            var handles=Set.copyOf(helper.handles(pool).keySet());var target=pool.openMetadataRecovery(registration);configure(target,definition);assertTrue(target.userHandlesDetached());assertTrue(target.pendingInstallation());assertTrue(target.metadataRecoveryPending());assertNull(target.applied());
+            target.installMetadataSnapshot(checkpoint,limits);assertEquals(own.position(),target.applied());assertFalse(target.metadataRecoveryPending());assertArrayEquals(installation.encode(),target.schemaInstallation().encode());assertEquals(activation,target.schemaActivation());assertEquals(evolved.columnIds(),target.metadataOutcomeState().columns());
+            assertArrayEquals(originalResult,outcome(target,definition,original.operationId(),original.receiptDigest()).result());assertArrayEquals(createdResult,outcome(target,definition,created.operationId(),created.receiptDigest()).result());assertEquals(registration.freeze(),target.pollRetiredCdc(lineage,DistributedCdcCheckpoint.Cursor.beginning(),256,8<<20).records().getLast().barrier());
+            NativeRangeImage.writeMetadata(root.resolve("evolved-cold-meta-reexport"),target,limits);assertEquals(handles,helper.handles(pool).keySet());assertTrue(Collections.disjoint(handles,helper.outer.names.values()));assertFalse(handles.contains("created-before-retirement"));assertTrue(pool.topologySeeds().isEmpty());assertFalse(target.admissionOpen());assertThrows(IllegalStateException.class,target::capture);
+        }
+    }
+
     @Test void absentHistoricalMemberInstallsOnlyMetadataThenQualifiesActualTailAndReopens()throws Exception {
         Path image=root.resolve("source-metadata"),path=root.resolve("receiver");NativeMetadataRecoveryRegistration registration;TopologyChange.Definition definition;DistributedCommand original,ack;byte[] result;
         try(var source=nativeTest.new Fixture(root.resolve("source"))) {
