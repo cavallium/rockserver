@@ -95,7 +95,7 @@ import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /** Initial synchronous apply adapter; the pool owner drains Ratis before closing native handles. */
-public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.leader.MigrationLogStateMachine,org.apache.ratis.server.impl.LinearizableQueryStateMachine, org.apache.ratis.server.impl.CommittedApplyStateMachine,org.apache.ratis.server.impl.LogResourceStateMachine,org.apache.ratis.server.impl.RecoveryEligibilityStateMachine {
+public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.leader.MigrationLogStateMachine,org.apache.ratis.server.impl.LinearizableQueryStateMachine, org.apache.ratis.server.impl.CommittedApplyStateMachine,org.apache.ratis.server.impl.LogResourceStateMachine,org.apache.ratis.server.impl.RecoveryEligibilityStateMachine,org.apache.ratis.server.impl.RecoveryOwnerQueryStateMachine {
     private RatisReferencedFiles referencedFiles;
     private static final org.apache.ratis.statemachine.StateMachine.DataApi NO_REFERENCED_DATA=new org.apache.ratis.statemachine.StateMachine.DataApi() {
         @Override public CompletableFuture<?> write(org.apache.ratis.proto.RaftProtos.LogEntryProto entry) {
@@ -5434,11 +5434,18 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try{refreshRecoveryAfterNativeCompletion();}catch(IOException problem){synchronized(gate){storageFailure=problem;}failDeferred(problem);throw new IllegalStateException("Recovery evidence did not follow completed native metadata",problem);}
     }
 
+    @Override public boolean isRecoveryOwnerQuery(Message request) {
+        if(request==null || request.getContent().size()!=RatisRecoverySupersessionRpc.REQUEST_BYTES)return false;
+        try{return ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisRecoverySupersessionRpc.REQUEST_BYTES)==RatisRecoverySupersessionRpc.KIND;}
+        catch(IllegalArgumentException invalid){return false;}
+    }
+
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
         try {
             if(genesisActive())throw new IOException("Genesis requires a fresh STATE barrier");
-            requireDiscoverySettled();
             int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);
+            if(kind==RatisRecoverySupersessionRpc.KIND)return queryRecoverySupersession(request,minIndex);
+            requireDiscoverySettled();
             if (ScopedTransactionRpc.ownerSnapshot(kind) || ScopedTransactionRpc.ownerExport(kind) || kind>=RatisSnapshotCohortRpc.CAPTURE && kind<=RatisSnapshotCohortRpc.CANCEL) {
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
                 return query(request);
@@ -5451,6 +5458,24 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             return query(request);
         } catch (Throwable failure) { return CompletableFuture.failedFuture(failure); }
+    }
+
+    /** Negative receiver authority only; no read-index, native image or public outcome is implied. */
+    private CompletableFuture<Message> queryRecoverySupersession(Message request,long minIndex)throws IOException {
+        if(minIndex!=0 || request.getContent().size()!=RatisRecoverySupersessionRpc.REQUEST_BYTES)throw new IOException("Supersession query requires its exact owner-local frame and zero minimum index");
+        try(var credit=reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,256L+8L*RatisRecoverySupersessionRpc.REQUEST_BYTES+4L*RatisRecoverySupersessionRpc.MAX_REPLY_BYTES,1)) {
+            synchronized(gate) {
+                if(role!=RatisNodePlan.Role.DATA || getLifeCycleState()!=LifeCycle.State.RUNNING || storageFailure!=null || nodeResourceBudget==null || topologyLocalReplica==null)throw new IOException("Supersession query requires its healthy initialized DATA owner");
+                var server=getServer().getNow(null);
+                if(server==null || !server.getId().toString().equals(topologyLocalReplica.peerId()))throw new IOException("Supersession query changed its actual server");
+                var division=server.getDivision(getGroupId());var info=division.getInfo();
+                if(division.getStateMachine()!=this || !info.isAlive() || info.getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Supersession query lost its running division");
+                var value=store.acknowledgedRecoverySupersession();if(value==null)throw new IOException("Supersession force has not been acknowledged");
+                if(!getGroupId().getUuid().equals(value.groupId()))throw new IOException("Supersession query changed its native group");
+                var target=RatisRecoverySupersessionRpc.decode(request.getContent().toByteArray());target.requireBinding(value,topologyLocalReplica);
+                return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(RatisRecoverySupersessionRpc.reply(target))));
+            }
+        }
     }
 
     @Override public CompletableFuture<Message> query(Message request) {

@@ -1186,7 +1186,10 @@ class RaftServerImpl implements RaftServer.Division,
     final long minIndex = request.getType().getStaleRead().getMinIndex();
     final long commitIndex = state.getLog().getLastCommittedIndex();
     LOG.debug("{}: minIndex={}, commitIndex={} from {}", getMemberId(), minIndex, commitIndex, request.getClientId());
-    if (commitIndex < minIndex) {
+    final boolean ownerQuery = commitIndex < minIndex && minIndex == 0
+        && stateMachine instanceof RecoveryOwnerQueryStateMachine owner
+        && owner.isRecoveryOwnerQuery(request.getMessage());
+    if (commitIndex < minIndex && !ownerQuery) {
       final StaleReadException e = new StaleReadException(
           "Unable to serve stale-read due to server commit index = " + commitIndex + " < min = " + minIndex);
       return CompletableFuture.completedFuture(

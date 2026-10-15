@@ -74,9 +74,10 @@ public final class NativeRecoverySupersession {
 
     private final Scope scope;
     private final CapturedState captured;
-    private final byte[] encoded,digest;
-    public NativeRecoverySupersession(Scope scope,CapturedState captured){this.scope=Objects.requireNonNull(scope);this.captured=Objects.requireNonNull(captured);encoded=encodeFields();digest=RangeImportAdmission.sha256(encoded);}
+    private final byte[] encoded,digest,scopeDigest;
+    public NativeRecoverySupersession(Scope scope,CapturedState captured){this.scope=Objects.requireNonNull(scope);this.captured=Objects.requireNonNull(captured);encoded=encodeFields();digest=RangeImportAdmission.sha256(encoded);scopeDigest=scope.digest();}
     public Scope scope(){return scope;}public CapturedState captured(){return captured;}public UUID groupId(){return scope.groupId();}public RangeDescriptor range(){return scope.range();}public ReplicaDescriptor receiver(){return scope.receiver();}public RangeDirectory sourceDirectory(){return scope.sourceDirectory();}
+    public byte[] scopeDigest(){return scopeDigest.clone();}
     public int encodedSize(){return encoded.length;}public byte[] encode(){return encoded.clone();}public byte[] digest(){return digest.clone();}
 
     public void requireCurrent(NativeCurrentRangeRecovery current){scope.requireCurrent(current);}

@@ -36,6 +36,14 @@ public final class RatisTopologySourceSnapshotClient {
         admission.beforeReply(reply.getMessage().getContent().size());
         try{return RatisRecoveryImageRpc.reply(reply.getMessage().getContent().toByteArray(),request);}catch(IllegalArgumentException malformed){throw new IOException("Malformed recovery image receipt",malformed);}
     }
+    public void superseded(RatisRecoverySupersessionRpc.Request request,it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor receiver)throws IOException {
+        if(!client.getGroupId().equals(RaftGroupId.valueOf(request.group())) || !request.receiver().equals(it.cavallium.rockserver.core.common.distributed.TopologyChange.Owner.of(receiver)))throw new IOException("Supersession probe client/receiver differs from exact fence");
+        var peer=RaftPeerId.valueOf(receiver.peerId());
+        var reply=RatisRoutedClient.rpc(()->client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(RatisRecoverySupersessionRpc.request(request))),0,peer));
+        if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !client.getGroupId().equals(reply.getRaftGroupId()) || !peer.equals(reply.getServerId()) || reply.getMessage().getContent().size()!=RatisRecoverySupersessionRpc.MAX_REPLY_BYTES)throw new IOException("Supersession probe did not acknowledge exact receiver fence",reply==null?null:reply.getException());
+        admission.beforeReply(reply.getMessage().getContent().size());
+        try{RatisRecoverySupersessionRpc.reply(reply.getMessage().getContent().toByteArray(),request);}catch(IllegalArgumentException malformed){throw new IOException("Malformed supersession acknowledgement",malformed);}
+    }
     private Prepared prepared(int kind,Request request)throws IOException{
         var reply=call(request(kind,request),request,MAX_REPLY_BYTES);
         try{var result=RatisTopologySourceSnapshotRpc.reply(reply.getMessage().getContent().toByteArray(),kind,request);if(!RaftPeerId.valueOf(result.sourceOwner().peerId()).equals(reply.getServerId()))throw new IOException("Source image reply crossed actual source owner");return result;}catch(AbandonedException abandoned){if(!RaftPeerId.valueOf(abandoned.receipt().sourceOwner().peerId()).equals(reply.getServerId()))throw new IOException("Abandoned source reply crossed actual owner",abandoned);throw abandoned;}catch(IllegalArgumentException malformed){throw new IOException("Malformed source snapshot reply",malformed);}
