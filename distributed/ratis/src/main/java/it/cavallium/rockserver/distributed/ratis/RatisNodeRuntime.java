@@ -2114,7 +2114,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         } finally { synchronized (this) { closing=false; } }
     }
     private static RaftServer buildServer(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException {
-        RaftProperties properties=RatisDurability.properties(logs);GrpcConfigKeys.setMessageSizeMax(properties,org.apache.ratis.util.SizeInBytes.valueOf(RatisTopologySourceSnapshotRpc.MAX_REPLY_BYTES+4096L)); org.apache.ratis.RaftConfigKeys.Rpc.setType(properties,org.apache.ratis.rpc.SupportedRpcType.GRPC);
+        RaftProperties properties=RatisDurability.properties(logs);org.apache.ratis.RaftConfigKeys.Rpc.setType(properties,org.apache.ratis.rpc.SupportedRpcType.GRPC);
         String address=plan.address(); int colon=address.lastIndexOf(':'); String host=address.substring(0,colon);
         if (host.startsWith("[")) host=host.substring(1,host.length()-1);
         GrpcConfigKeys.Server.setHost(properties,host); GrpcConfigKeys.Server.setPort(properties,Integer.parseInt(address.substring(colon+1)));

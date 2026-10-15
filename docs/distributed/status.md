@@ -76,6 +76,14 @@ This section and the remaining gates at the end describe the current branch.
   executions plus 35 adapter cases, including existing actor/journal and local
   discovery behavior. Initial adoption/CAT transports are still controlled;
   independent multi-voter network acceptance remains open.
+- Production gRPC startup now derives its transport envelope from the admitted
+  Raft appender batch plus Ratis's required 1 MiB headroom, also covering bounded
+  source replies. The prior narrower source-only envelope prevented the default
+  Runtime server from starting. Peer clients consume the same property; logical
+  appender, queue, image and resource-admission bounds remain unchanged. The
+  durability check and three independent Runtime JVM starts pass in
+  `runtime-quorum-transport-envelope32.log`; that run then fails at a separate
+  genesis fixture ordering error. Full cold-quorum acceptance is still pending.
 - Redundant format-version words are removed from the current command, schema,
   directory, acceptance, session journals, native image and internal state rows.
   Java and Rust readers, command admission offsets and receipt budgets use the

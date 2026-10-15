@@ -20,6 +20,10 @@ public final class RatisDurability {
         RaftServerConfigKeys.Log.setWriteBufferSize(properties, SizeInBytes.valueOf(64L * 1024));
         RaftServerConfigKeys.Log.Appender.setBufferByteLimit(properties, SizeInBytes.valueOf(
                 it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_FILE_BYTES + 4096L));
+        // Peer replication must carry the admitted batch plus Ratis's required framing headroom.
+        org.apache.ratis.grpc.GrpcConfigKeys.setMessageSizeMax(properties,SizeInBytes.valueOf(Math.max(
+                RaftServerConfigKeys.Log.Appender.bufferByteLimit(properties).getSize()+SizeInBytes.ONE_MB.getSize(),
+                RatisTopologySourceSnapshotRpc.MAX_REPLY_BYTES+4096L)));
         RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf(RatisRangeStateMachine.COMMITTED_SEGMENT_BYTES));
         RaftServerConfigKeys.Log.setUnsafeFlushEnabled(properties, false);
         RaftServerConfigKeys.Log.setAsyncFlushEnabled(properties, false);
