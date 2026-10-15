@@ -47,7 +47,7 @@ class RatisNodeLocalMetadataBootstrapTest {
                         });
                         CompletableFuture<Void> closing=null;
                         try {
-                            var observer=node.bootstrapDeferredLocalMetadata();assertTrue(entered.await(10,TimeUnit.SECONDS));assertTrue(observer.cancel(false));assertTrue(store.activeSnapshotPins()>0);
+                            var observer=node.bootstrapDeferredRecovery();assertTrue(entered.await(10,TimeUnit.SECONDS));assertTrue(observer.cancel(false));assertTrue(store.activeSnapshotPins()>0);
                             closing=CompletableFuture.runAsync(()->{try{node.close();}catch(IOException failure){throw new CompletionException(failure);}});
                             long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(2);while(node.state()!=RatisNodeRuntime.State.STOPPING && System.nanoTime()<deadline)Thread.sleep(1);
                             assertEquals(RatisNodeRuntime.State.STOPPING,node.state());assertFalse(closing.isDone());assertTrue(machine.recoveryEligibilityGate().discoveryPending());release.countDown();closing.get(15,TimeUnit.SECONDS);
@@ -55,12 +55,12 @@ class RatisNodeLocalMetadataBootstrapTest {
                         }finally{release.countDown();if(closing!=null)closing.get(15,TimeUnit.SECONDS);}
                         continue;
                     }
-                    node.bootstrapDeferredLocalMetadata().get(20,TimeUnit.SECONDS);
+                    node.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS);
                     var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class).snapshot();assertNotNull(graph);assertTrue(graph.activeRequests().get(group).metadataOnly());assertArrayEquals(consuming.digest(),graph.activeRequests().get(group).header().definitionDigest());
                     assertFalse(machine.recoveryEligibilityGate().discoveryPending());assertEquals(cut,store.applied());assertEquals(cut.index(),server.getDivision(id).getRaftLog().getSnapshotIndex());assertEquals(cut.index(),machine.getLastAppliedTermIndex().getIndex());assertEquals(0,store.activeSnapshotPins());
                     var image=machine.getLatestSnapshot().getFiles().getFirst().getPath();assertEquals(NativeRangeImage.Kind.METADATA,NativeRangeImage.kind(image,NativeRangeImage.IoAdmission.UNLIMITED));
                     assertTrue(machine.query(Message.EMPTY).isCompletedExceptionally(),"Retired META settlement grants no USER query");
-                    node.bootstrapDeferredLocalMetadata().get(20,TimeUnit.SECONDS);assertFalse(machine.recoveryEligibilityGate().discoveryPending());assertEquals(0,store.activeSnapshotPins());
+                    node.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS);assertFalse(machine.recoveryEligibilityGate().discoveryPending());assertEquals(0,store.activeSnapshotPins());
                     source.routes.forEach((domain,route)->assertArrayEquals(routes.get(domain),route.directory().payloadDigest()));assertFalse(field(node,"configuredRecoveryServiceStarted",Boolean.class));
                 }
             }
