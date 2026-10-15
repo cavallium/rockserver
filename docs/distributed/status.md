@@ -1833,6 +1833,26 @@ seven Ratis eligibility and four adapter lifecycle cases
 reuse also passes its focused native/adapter workflows
 (`metadata-own-checkpoint-one-pin-final-gate.log`).
 
+The combined current/META/source-head/two-pool/standalone gate passes 46 distinct
+cases (`current-meta-source-head-two-pool-standalone-integrated-gate.log`): 22 core
+cases in each configured core execution, seven Ratis eligibility cases and 17
+adapter/workflow cases. Source-head continuity rejects decreasing directory/schema/
+configuration versions and same-epoch schema digest changes. These versions track
+logical state progression, not protocol or storage-format releases.
+
+Source artifact release now targets the original node from the settled transfer,
+even after that node loses leadership. The relocation journal forces that owner
+before RELEASE, and exact owner-local retries recover a forced release after a lost
+reply. Fresh captures and transfers keep their actual leader requirements; resuming
+an unfinished image transfer after leader change remains open. The bounded native
+catalogue lineage resolver returns the original published non-relocation birth and
+both merge parents. Missing history cannot imply ordinary bootstrap: that origin
+requires an explicit trusted original-placement witness. The resolver validates
+one stable completed catalogue cut; fresh read-barrier and recovery actor wiring
+remain caller responsibilities. The combined focused gate passes 15 cases
+(`owner-release-lineage-second-gate.log`), including actual native split/merge,
+leadership-loss cleanup and relocation recovery with controlled transports.
+
 Durable metadata-DAG
 obligation discovery, asynchronous configured-member catch-up, quorum retirement,
 source quiescence and physical parent reclamation remain unfinished. In particular,
