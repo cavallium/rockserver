@@ -72,6 +72,41 @@ class RatisCurrentToMetadataRuntimeTest {
             }
         }
     }
+    @Test void sealedMetaSupersedesUnfinishedCurrentWithoutRestoringItsObsoleteGroupImage()throws Exception {
+        for(boolean installed:List.of(false,true))try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("unfinished-source-"+installed),false)) {
+            var split=source.split();var parent=split.targets().getFirst();var rootRange=split.parents().getFirst();var catalogue=source.plan.catalogue();var helper=new RatisNodeRecoverySourceTest();
+            var rootRequest=new Request(new UUID(1202,1),split.header(),catalogue.groupId(),rootRange.replicas().getFirst(),Purpose.ANCESTOR_METADATA,rootRange.groupId(),split.sourceDirectory());var rootMetadata=prepareWithoutPin(source,rootRequest);var rootHead=helper.head(source,new RatisSourceHeadRpc.Request(rootRequest,rootMetadata.image().position()));
+            var currentRequest=new Request(new UUID(1202,2),null,catalogue.groupId(),parent.replicas().getFirst(),Purpose.CURRENT_LEAF,parent.groupId(),split.targetDirectory());var current=prepareWithoutPin(source,currentRequest);var currentHead=helper.head(source,new RatisSourceHeadRpc.Request(currentRequest,current.image().position()));var obsoleteImage=image(source,currentRequest);
+            Prepared metadata=null;RatisSourceHeadRpc.Head metadataHead=null;
+            try(var env=new RatisNodeRuntimeTest.Env(root.resolve("unfinished-receiver-"+installed),false,source.first.digest())) {
+                var pool=RatisPoolFixtures.ID;var domain=new RatisNodePlan.Domain(split.sourceDirectory(),Map.of(source.first.columnIds().iterator().next(),"data"),Set.of());var plan=new RatisNodePlan(source.plan.nodeId(),source.plan.nodeIncarnation(),List.of(domain),catalogue,List.of(),List.of(),Map.of(),8,List.of(RatisPoolFixtures.spec(pool,false)),Map.of(source.first.domainId(),pool),Map.of(catalogue.groupId(),pool));
+                var route=new RatisRoutedClient(split.sourceDirectory(),new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor range,UUID column,byte[] key){throw new AssertionError();}public CommandResult command(RangeDescriptor range,DistributedCommand command){throw new AssertionError();}});var epochs=new RatisSessionEpochs(source.catalogue,source.first.clusterId(),source.first.databaseId(),catalogue.groupId(),catalogue.epoch(),catalogue.schemaDigest(),catalogue.sessionsColumn());
+                try {
+                    for(int round=0;round<3;round++) {
+                        var server=new RatisNodeRuntimeTest.FakeServer();server.skipFirstNoop=true;
+                        try(var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),epochs,Map.of(source.first.domainId(),route),env.scheduler,env.timer,()->20L,env.settings(),round==0?RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT:RatisNodeRuntime.Startup.RECOVER,server::create,List.of(source.first))) {
+                            node.relocationTransport(range->sourceClient(source,range),(range,owner)->sourceClient(source,range));node.start();
+                            if(round==0) {
+                                var rootStore=node.registerRecovery(rootMetadata);var rootMachine=server.machines.get(RaftGroupId.valueOf(rootRange.groupId()));install(rootMachine,image(source,rootRequest),rootMetadata.image());floor(server,rootRange.groupId(),rootMetadata.image().position().index());assertTrue(node.completeRecovery(rootMetadata,rootHead));assertFalse(rootStore.admissionOpen());releaseInstalled(source,server,rootMetadata);
+                                var store=node.registerRecovery(current);var machine=server.machines.get(RaftGroupId.valueOf(parent.groupId()));assertFalse(store.currentRangeRecoveryImageInstalled());assertFalse(store.currentRangeRecoveryReady());assertFalse(store.admissionOpen());assertNull(store.applied());assertNull(machine.getLatestSnapshot());
+                                if(installed){install(machine,obsoleteImage,current.image());floor(server,parent.groupId(),current.image().position().index());assertTrue(store.currentRangeRecoveryImageInstalled());assertFalse(store.currentRangeRecoveryReady());}
+                                var consumed=splitSelected(source,split.targetDirectory(),parent);var request=new Request(new UUID(1202,3),consumed.header(),catalogue.groupId(),parent.replicas().getFirst(),Purpose.ANCESTOR_METADATA,parent.groupId(),consumed.sourceDirectory());metadata=prepareWithoutPin(source,request);var sourceMachine=source.server.machines.get(RaftGroupId.valueOf(parent.groupId()));sourceMachine.notifyTermIndexUpdated(1,metadata.image().position().index()+1);metadataHead=helper.head(source,new RatisSourceHeadRpc.Request(request,metadata.image().position()));
+                                assertSame(store,node.registerRecovery(metadata));assertPending(node,server,pool,parent.groupId());if(!installed){assertNull(store.applied());assertNull(machine.getLatestSnapshot());}assertThrows(IOException.class,()->node.registerRecovery(current));assertThrows(IOException.class,()->node.completeRecovery(current,currentHead));assertTrue(Files.isRegularFile(obsoleteImage),"Unfinished CURRENT has no fabricated receiver-install/release authority");
+                            } else {
+                                var store=node.registerRecovery(metadata);var machine=server.machines.get(RaftGroupId.valueOf(parent.groupId()));
+                                if(round==1) {
+                                    assertPending(node,server,pool,parent.groupId());if(!installed){assertNull(store.applied());assertNull(machine.getLatestSnapshot(),"Cold META must not restore the uninstalled obsolete GROUP image");}else assertEquals(NativeRangeImage.Kind.GROUP,NativeRangeImage.kind(machine.getLatestSnapshot().getFiles().getFirst().getPath(),NativeRangeImage.IoAdmission.UNLIMITED));
+                                    assertThrows(IOException.class,()->node.registerRecovery(current));assertThrows(IOException.class,()->node.completeRecovery(current,currentHead));install(machine,image(source,metadata.request()),metadata.image());assertTrue(store.metadataRecoveryImageInstalled());assertTrue(store.metadataRecoveryPending());machine.notifyTermIndexUpdated(1,metadataHead.completedCut().index());floor(server,parent.groupId(),metadata.image().position().index());assertTrue(node.completeRecovery(metadata,metadataHead));releaseInstalled(source,server,metadata);assertEquals(store.applied().index(),machine.takeSnapshot());
+                                } else {
+                                    assertTrue(store.metadataRecoveryImageInstalled());assertFalse(store.metadataRecoveryPending());assertFalse(store.admissionOpen());assertTrue(store.userHandlesDetached());assertNull(store.currentRangeRecoveryRegistration());assertFalse(store.currentRangeRecoveryReady());assertTrue(node.completeRecovery(metadata,metadataHead));assertThrows(IOException.class,()->node.registerRecovery(current));assertThrows(IOException.class,()->node.completeRecovery(current,currentHead));assertEquals(NativeRangeImage.Kind.METADATA,NativeRangeImage.kind(machine.getLatestSnapshot().getFiles().getFirst().getPath(),NativeRangeImage.IoAdmission.UNLIMITED));assertTrue(Files.isRegularFile(obsoleteImage));
+                                }
+                            }
+                        }
+                    }
+                }finally{route.close();}
+            }
+        }
+    }
     private static void assertPending(RatisNodeRuntime node,RatisNodeRuntimeTest.FakeServer server,UUID pool,UUID group)throws Exception {
         var store=field(server.machines.get(RaftGroupId.valueOf(group)),"store",ReplicatedRangeStore.class);assertTrue(store.metadataRecoveryPending());assertFalse(store.metadataRecoveryImageInstalled());assertFalse(store.admissionOpen());assertTrue(store.userHandlesDetached());assertNull(store.currentRangeRecoveryRegistration());assertFalse(store.currentRangeRecoveryReady());assertTrue(node.nativePool(pool).currentRangeRecoveries().stream().noneMatch(current->current.groupId().equals(group)));assertEquals(Mode.MISSING,server.machines.get(RaftGroupId.valueOf(group)).recoveryEligibilityGate().snapshot().mode());assertThrows(IllegalStateException.class,store::capture);
     }

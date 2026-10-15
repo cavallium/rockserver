@@ -1073,7 +1073,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 var existing=stores.get(request.sourceGroup());var machine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));
                 boolean registeredMetadata=request.metadataOnly() && existing!=null && existing.metadataRecoveryRegistrationForced(proposedMetadata);
                 if(request.metadataOnly() && metadata==null && existing!=null && !registeredMetadata){
-                    if(existing.currentRangeRecoveryRegistration()!=null && current==null || current!=null && frozen==null && (!existing.currentRangeRecoveryReady() || !existing.currentRangeRecoveryImageInstalled()) || existing.pendingInstallation() || existing.activeSnapshotPins()!=0 || existing.applied()!=null && !RatisRelocationOwnerRpc.covers(prepared.image().position(),existing.applied()))throw new IOException("Existing META source has busy or newer native prefix; recapture first");
+                    if(existing.currentRangeRecoveryRegistration()!=null && current==null || current!=null && frozen==null && existing.currentRangeRecoveryReady() && !existing.currentRangeRecoveryImageInstalled() || existing.pendingInstallation() || existing.activeSnapshotPins()!=0 || existing.applied()!=null && !RatisRelocationOwnerRpc.covers(prepared.image().position(),existing.applied()))throw new IOException("Existing META source has busy or newer native prefix; recapture first");
                     if(machine!=null)machine.requireRecoveryRegistrationDrained();
                 }
                 boolean changedMetadata=proposedMetadata!=null && !proposedMetadata.equals(metadata);

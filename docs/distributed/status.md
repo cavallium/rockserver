@@ -2039,11 +2039,22 @@ checkpoint floor refusal, born-owner cold reopen, descendant ownership exclusion
 learner/schema consumers and standalone codec/async behavior.
 
 The node replaces the old graph credit once and reuses its exposure identity.
-A DONE CURRENT journal may start the fresh META attempt; unfinished attempts stay
-fixed. Renewal rejects both the initial UUID and an effective UUID reached after
+Direct Runtime registration now permits fresh sealed META over uninstalled or
+installed-but-unfinished CURRENT, preserving authority, membership, pending-install,
+native-drain and snapshot-floor checks. The configured-recovery actor still permits
+only a DONE CURRENT journal to start META; unfinished actor attempts stay fixed.
+Renewal rejects both the initial UUID and an effective UUID reached after
 abandonment, before rewriting the journal. Source fixtures now complete actual
 receiver-image qualification and durable RELEASE before further captures; the
 initial integration failure exposed retained test captures exceeding admission.
+
+The new Runtime workflow passes both uninstalled and installed-but-unfinished
+variants: seal the same source group, register META, cold-open pending META, install
+its genuine image and own tail, complete, checkpoint and cold-open ready. The old
+CURRENT image is never restored for the uninstalled variant and its source artifact
+stays retained without fabricated installation/RELEASE evidence. Both Runtime cases
+and the existing metadata transition pass in
+`discovery-inventory-unfinished-runtime-first-gate.log`.
 
 Validation passes 115 distinct cases across 16 classes in
 `current-to-meta-final-regression-gate.log`, including native force boundaries,
@@ -2114,7 +2125,7 @@ All-node cold restart additionally needs qualification of genuine local META
 sources so fenced sources do not all wait for another source. Explicit true-genesis
 authority must remain distinct from a returning empty configured member.
 
-Discovery must safely supersede unfinished CURRENT attempts after sealing, including
+The automatic discovery driver must supersede unfinished CURRENT attempts after sealing, including
 terminal cleanup of their obsolete source captures without claiming GROUP install.
 Catch-up from a stale pre-relocation membership and leader-change source transfer
 also remain open. FENCED import roots require genuine import provenance rather than
