@@ -1020,7 +1020,9 @@ public final class ReplicatedRangeStore {
         int metadataSize=db.get(state,topologyOwnershipKey(0x6f),new byte[0]);if(metadataSize!=RocksDB.NOT_FOUND && (metadataSize!=32 || metadataRecoveryRegistration==null || !Arrays.equals(metadataRecoveryRegistration.digest(),db.get(state,topologyOwnershipKey(0x6f)))))throw new IllegalArgumentException("Metadata recovery lacks exact registry context");
         if(metadataSize==RocksDB.NOT_FOUND && metadataRecoveryRegistration!=null)throw new IllegalArgumentException("Metadata recovery lost its durable pointer");
         if(metadataRecoveryRegistration!=null && (!metadataRecoveryRegistration.groupId().equals(groupId) || metadataRecoveryRegistration.range().rangeEpoch()!=rangeEpoch))throw new IllegalArgumentException("Metadata registration changed native group identity");
-        metadataRecoveryReady=metadataRecoveryRegistration!=null && Arrays.equals(db.get(state,topologyOwnershipKey(0x70)),metadataRecoveryRegistration.digest());
+        byte[] metadataReady=db.get(state,topologyOwnershipKey(0x70));
+        if(metadataReady!=null && (metadataRecoveryRegistration==null || !Arrays.equals(metadataReady,metadataRecoveryRegistration.digest()) || !Arrays.equals(db.get(state,topologyOwnershipKey(0x71)),metadataImageReceipt(metadataRecoveryRegistration))))throw new IllegalArgumentException("Metadata completion lost its local registration/image authority");
+        metadataRecoveryReady=metadataReady!=null && pendingInstallation==null;
         int recoverySize=db.get(state,topologyOwnershipKey(0x6d),new byte[0]);if(recoverySize>NativeTopologyRecoveryFence.MAX_BYTES)throw new IllegalArgumentException("Recovery fence exceeds bound");byte[] recovery=recoverySize==RocksDB.NOT_FOUND?null:db.get(state,topologyOwnershipKey(0x6d));topologyRecoveryFence=recovery==null?null:NativeTopologyRecoveryFence.decode(recovery);if(topologyRecoveryFence!=null)topologyRecoveryFence.requireGroup(groupId,rangeEpoch);
         byte[] learner=db.get(state,topologyOwnershipKey(0x67));topologyLearner=learner==null ? null : NativeTopologyLearnerRegistration.decode(learner);
         if(topologyLearner!=null) { var range=topologyLearner.definition().targets().getFirst();if(!range.groupId().equals(groupId) || range.rangeEpoch()!=rangeEpoch || !topologyLearner.schema().domainId().equals(interval.domainId()) || !Arrays.equals(range.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(range.upperExclusive(),interval.upperExclusive()))throw new IllegalArgumentException("Learner registration differs from receiver ownership"); }
@@ -3940,7 +3942,7 @@ public final class ReplicatedRangeStore {
     }
     public NativeRangeImage.Manifest installMetadataSnapshotAdmitted(Path image,NativeRangeImage.Limits limits,
             InstallationObserver observer,NativeRangeImage.IoAdmission admission)throws IOException,RocksDBException {
-        enterNative();try(var metadataScope=NativeRangeImage.openMetadataAdmission(admission)){if(!topologyRetired())throw new IllegalStateException("Metadata install requires durable source retirement/recovery registration");return installUnderAdmission(image,limits,observer,true,null);}
+        enterNative();try(var metadataScope=NativeRangeImage.openMetadataAdmission(admission);var metadataPass=metadataScope.pass()){if(!topologyRetired())throw new IllegalStateException("Metadata install requires durable source retirement/recovery registration");return installUnderAdmission(image,limits,observer,true,metadataPass);}
         finally{try{drainScopedReleases();}finally{leaveNative();}}
     }
 
@@ -3986,6 +3988,63 @@ public final class ReplicatedRangeStore {
         }
         return Map.copyOf(rows);
     }
+    /** Validates an initial META image or a locally qualified own checkpoint; grants no new readiness. */
+    public NativeRangeImage.Manifest validateMetadataRecoveryImage(Path image,NativeRangeImage.Limits limits)throws IOException,RocksDBException {
+        enterNative();
+        try(var scope=NativeRangeImage.openMetadataAdmission(NativeRangeImage.IoAdmission.UNLIMITED);var metadata=scope.pass()) {
+            applyLane.lock();
+            try{metadata.reserve(imageMetadataBytes(null,limits,false));return qualifyMetadataRecoveryImage(image,limits,null,false).manifest();}
+            finally{applyLane.unlock();}
+        }finally{leaveNative();}
+    }
+    private record MetadataImageQualification(NativeRangeImage.Manifest manifest,boolean preserveReady) {}
+    private static java.security.MessageDigest metadataDigest() {
+        try{return java.security.MessageDigest.getInstance("SHA-256");}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
+    }
+    private static void digestMetadataRow(java.security.MessageDigest digest,NativeRangeImage.Section section,byte[] key,byte[] value) {
+        digest.update(ByteBuffer.allocate(9).put((byte)(section.ordinal()+1)).putInt(key.length).putInt(value.length).array());digest.update(key);digest.update(value);
+    }
+    private static boolean sameConfiguration(Configuration first,Configuration second) {
+        return first!=null && second!=null && first.term()==second.term() && first.index()==second.index() && Arrays.equals(first.data(),second.data());
+    }
+    private MetadataImageQualification qualifyMetadataRecoveryImage(Path image,NativeRangeImage.Limits limits,NativeRangeImage.Manifest expected,boolean installing)throws IOException,RocksDBException {
+        try {
+            var registration=metadataRecoveryRegistration;if(registration==null)throw new IOException("META checkpoint lacks local recovery registration");
+            byte[] ready=db.get(state,topologyOwnershipKey(0x70));boolean trusted=Arrays.equals(ready,registration.digest()) && Arrays.equals(db.get(state,topologyOwnershipKey(0x71)),metadataImageReceipt(registration));
+            Configuration[] configuration={null};NativeTopologyFreeze[] freeze={null};var candidate=metadataDigest();
+            var actual=NativeRangeImage.visitMetadata(image,limits,(section,column,key,value)->{
+                digestMetadataRow(candidate,section,key,value);
+                if(section==NativeRangeImage.Section.STATE){if(Arrays.equals(key,configurationKey))configuration[0]=Configuration.decode(value);if(Arrays.equals(key,topologyFreezeKey()))freeze[0]=NativeTopologyFreeze.decode(value);}
+            });
+            if(expected!=null && !Arrays.equals(expected.sha256(),actual.sha256()))throw new IOException("META image changed during qualification");
+            if(!actual.owner().equals(owner) || !actual.interval().equals(interval) || !Arrays.equals(actual.schemaDigest(),schemaDigest) || !actual.deterministicMergeColumns().equals(deterministicMergeColumns)
+                    || !registration.freeze().equals(freeze[0]))throw new IOException("META image changed registered identity/schema/coverage/FREEZE");
+            var cfg=configuration[0];if(cfg==null)throw new IOException("META image lacks completed configuration");
+            if(installing && pendingInstallation!=null && !Arrays.equals(pendingInstallation,ByteBuffer.allocate(48).putLong(actual.position().term()).putLong(actual.position().index()).put(actual.sha256()).array()))throw new IOException("META pending installation requires exact original image retry");
+            boolean initial=actual.position().equals(registration.imageCut()) && Arrays.equals(actual.sha256(),registration.imageHash());
+            if(initial) {
+                if(cfg.term()!=registration.configurationTerm() || cfg.index()!=registration.configurationIndex() || !Arrays.equals(cfg.data(),registration.sourceConfiguration()))throw new IOException("META image changed registered source configuration");
+                return new MetadataImageQualification(actual,false);
+            }
+            if(!trusted || !NativeMetadataRecoveryRegistration.covers(actual.position(),registration.imageCut()))throw new IOException("META checkpoint lacks locally completed baseline authority");
+            if(cfg.index()<registration.configurationIndex() || cfg.term()<registration.configurationTerm() || cfg.index()==registration.configurationIndex() && (cfg.term()!=registration.configurationTerm() || !Arrays.equals(cfg.data(),registration.sourceConfiguration())))throw new IOException("META checkpoint regressed registered configuration");
+            var localCut=topologyRecoveryCut();var localConfiguration=configurationUnderAdmission();
+            if(localCut==null || !NativeMetadataRecoveryRegistration.covers(localCut,actual.position()))throw new IOException("META checkpoint exceeds actual qualified native prefix");
+            if(localConfiguration!=null && (cfg.index()>localConfiguration.index() || cfg.term()>localConfiguration.term() || cfg.index()==localConfiguration.index() && !sameConfiguration(cfg,localConfiguration)))throw new IOException("META checkpoint changed actual native configuration");
+            if(pendingInstallation==null && actual.position().equals(localCut)) {
+                if(!sameConfiguration(cfg,localConfiguration))throw new IOException("META checkpoint differs from actual native configuration");
+                var nativeRows=metadataDigest();
+                try(var pin=captureMetadataForRecovery()) {
+                    if(!actual.position().equals(pin.position()))throw new IOException("META checkpoint pin changed completed cut");
+                    pin.visitState((key,value)->{if(!NativeRangeImage.metadataLocalPointer(key))digestMetadataRow(nativeRows,NativeRangeImage.Section.STATE,key,value);});
+                    pin.visitReceipts((key,value)->digestMetadataRow(nativeRows,NativeRangeImage.Section.RECEIPTS,key,value));
+                }
+                if(!java.security.MessageDigest.isEqual(candidate.digest(),nativeRows.digest()))throw new IOException("META checkpoint differs from actual native metadata");
+            }else if(installing && pendingInstallation==null)throw new IOException("META own restore requires its exact current completed cut");
+            return new MetadataImageQualification(actual,true);
+        }catch(IllegalArgumentException invalid){throw new IOException("Invalid META checkpoint authority",invalid);}
+    }
+
     /** Full read-only CURRENT image qualification; locally retained completion, never image rows, grants checkpoint authority. */
     public NativeRangeImage.Manifest validateCurrentRangeRecoveryImage(Path image,NativeRangeImage.Limits limits)throws IOException,RocksDBException {
         enterNative();
@@ -4112,17 +4171,9 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             // Own-tail schema changes share this lane; measure and hold their exact graph before normalization.
-            if(targetMetadata!=null)targetMetadata.reserve(imageMetadataBytes(null,limits,true));
-            if(metadata) {
-                if(applied!=null && !NativeMetadataRecoveryRegistration.covers(expected.position(),applied))throw new IOException("Metadata snapshot regresses actual completed source prefix");
-                var registration=metadataRecoveryRegistration;
-                if(registration!=null) {
-                    if(!expected.position().equals(registration.imageCut()) || !Arrays.equals(expected.sha256(),registration.imageHash()))throw new IOException("Metadata snapshot differs from exact registered image");
-                    Configuration[] configuration={null};NativeTopologyFreeze[] freeze={null};NativeRangeImage.visitMetadata(image,limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE){if(Arrays.equals(key,configurationKey))configuration[0]=Configuration.decode(value);if(Arrays.equals(key,topologyFreezeKey()))freeze[0]=NativeTopologyFreeze.decode(value);}});
-                    if(!registration.freeze().equals(freeze[0]))throw new IOException("Metadata image changed registered original FREEZE");
-                    if(configuration[0]==null || configuration[0].term()!=registration.configurationTerm() || configuration[0].index()!=registration.configurationIndex() || !Arrays.equals(configuration[0].data(),registration.sourceConfiguration()))throw new IOException("Metadata image changed registered source configuration");
-                }
-            }
+            if(targetMetadata!=null)targetMetadata.reserve(imageMetadataBytes(null,limits,!metadata));
+            if(metadata && applied!=null && !NativeMetadataRecoveryRegistration.covers(expected.position(),applied))throw new IOException("Metadata snapshot regresses actual completed source prefix");
+            final MetadataImageQualification metadataImage=metadata && metadataRecoveryRegistration!=null?qualifyMetadataRecoveryImage(image,limits,expected,true):null;
             if(pendingLearnerImagePermission!=null)throw new IllegalStateException("Unknown later image force requires exact permission retry");
             final NativeTopologyLearnerImagePermission permission=topologyLearner!=null && learnerImagePermission!=null && expected.position().equals(learnerImagePermission.imageCut()) && Arrays.equals(expected.sha256(),learnerImagePermission.imageHash()) ? learnerImagePermission : null;
             final CurrentImageQualification currentImage=!metadata && currentRangeRecovery!=null?qualifyCurrentRangeRecoveryImage(image,limits,expected,true):null;
@@ -4189,7 +4240,7 @@ public final class ReplicatedRangeStore {
                 // Publish recovery authority before the first destructive interval change.
                 try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
                     batch.put(state, installingKey, pendingInstallation);
-                    if(metadata && metadataRecoveryRegistration!=null){metadataRecoveryReady=false;batch.delete(state,topologyOwnershipKey(0x70));}
+                    if(metadata && metadataRecoveryRegistration!=null){metadataRecoveryReady=false;if(!metadataImage.preserveReady())batch.delete(state,topologyOwnershipKey(0x70));}
                     if(currentRangeRecovery!=null){currentRangeRecoveryReady=false;for(var row:localSchemaRows.entrySet())batch.put(state,HexFormat.of().parseHex(row.getKey()),row.getValue());}
                     if(learnerSchemaPreparation!=null){for(var row:localSchemaRows.entrySet())batch.put(state,HexFormat.of().parseHex(row.getKey()),row.getValue());}
                     batch.delete(state, markerKey);
@@ -4244,6 +4295,7 @@ public final class ReplicatedRangeStore {
                     recoverImportMetadata();recoverTopologyOwnership();recoverRelocationCompletions();validateTopologyActivationRecovery();
                     installationGeneration++;
                     pendingInstallation = null;
+                    if(metadataImage!=null && metadataImage.preserveReady()){metadataRecoveryReady=true;if(!metadataImageInstalledUnderLane())throw new IllegalStateException("META checkpoint lost completed image authority");}
                     if(currentImage!=null && currentImage.completion()!=null){currentRangeRecoveryReady=true;validateTopologyActivationRecovery();}
                     qualifyLearnerServing();
                     return actual;
@@ -5056,7 +5108,7 @@ public final class ReplicatedRangeStore {
                     if (upper != null && Arrays.compareUnsigned(key, upper) >= 0) break;
                     if (prefix != null && (key.length < prefix.length
                             || !Arrays.equals(prefix, 0, prefix.length, key, 0, prefix.length))) break;
-                    visitor.accept(key, iterator.value());
+                    if(!metadataOnly || cf!=state || !NativeRangeImage.metadataLocalPointer(key))visitor.accept(key, iterator.value());
                     iterator.next();
                 }
                 iterator.status();
