@@ -40,7 +40,7 @@ class RatisTopologySourceSnapshotRpcTest {
             var recovery=new Request(new UUID(94,2),definition.header(),initial.request().catalogue(),voter,Purpose.RECOVERY);
             assertEquals(Purpose.RECOVERY,request(request(PREPARE,recovery)).purpose());
             assertArrayEquals(RatisTopologyLearnerRecoveryRpc.request(recovery),RatisTopologyLearnerRecoveryRpc.request(RatisTopologyLearnerRecoveryRpc.decode(RatisTopologyLearnerRecoveryRpc.request(recovery))));
-            var prepared=new Prepared(recovery,initial.image(),initial.schema(),initial.sourceOwner(),initial.sourceCfg(),initial.schemaRows());
+            var prepared=new Prepared(recovery,initial.image(),initial.schema(),initial.sourceOwner(),initial.sourceCfg(),initial.schemaRows(),initial.metadataFreeze());
             var encoded=RatisTopologyLearnerRecoveryRpc.reply(prepared);assertArrayEquals(encoded,RatisTopologyLearnerRecoveryRpc.reply(RatisTopologyLearnerRecoveryRpc.reply(encoded,recovery)));
             assertThrows(IllegalArgumentException.class,()->new Request(recovery.transferId(),definition.header(),recovery.catalogue(),voter,Purpose.BOOTSTRAP));
             assertThrows(IllegalArgumentException.class,()->RatisTopologyLearnerRecoveryRpc.request(initial.request()));
@@ -57,7 +57,7 @@ class RatisTopologySourceSnapshotRpcTest {
             assertSame(prepared,service.transfer(request).get(5,TimeUnit.SECONDS));service.release(request);
             byte[] data=prepared.sourceCfg().data();
             for(var config:List.of(new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(0,0,data),new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(2,0,data),new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(1,2,data)))
-                assertThrows(IllegalArgumentException.class,()->new Prepared(request,prepared.image(),prepared.schema(),prepared.sourceOwner(),config,prepared.schemaRows()));
+                assertThrows(IllegalArgumentException.class,()->new Prepared(request,prepared.image(),prepared.schema(),prepared.sourceOwner(),config,prepared.schemaRows(),prepared.metadataFreeze()));
             assertThrows(IllegalArgumentException.class,()->new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(1,-1,data));
         }
     }

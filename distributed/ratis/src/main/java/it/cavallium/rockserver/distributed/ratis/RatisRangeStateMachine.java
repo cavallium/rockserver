@@ -876,14 +876,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         ReplicatedRangeStore.SnapshotPin pin=request.metadataOnly()?store.captureMetadataForRecovery():request.relocation()?store.captureForRecovery():store.capture();boolean returned=false;
         try {
             var position=pin.position();if(position==null || position.term()<1 || !java.util.Arrays.equals(qualifiedSchema.digest(),pin.schemaDigest()))throw new IOException("Source image lacks qualified committed schema/prefix");
-            var rows=new java.util.HashMap<String,byte[]>();pin.visitState((key,value)->{if(it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerSchema.row(key))rows.put(java.util.HexFormat.of().formatHex(key),value.clone());});
+            var rows=new java.util.HashMap<String,byte[]>();var metadataFreeze=new NativeTopologyFreeze[1];pin.visitState((key,value)->{if(it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerSchema.row(key))rows.put(java.util.HexFormat.of().formatHex(key),value.clone());if(request.metadataOnly() && RatisTopologySourceSnapshotRpc.metadataFreezeKey(pin.groupId(),key)){if(metadataFreeze[0]!=null)throw new IllegalArgumentException("Duplicate snapshot metadata FREEZE");metadataFreeze[0]=NativeTopologyFreeze.decode(value);}});
+            RatisTopologySourceSnapshotRpc.requireMetadataFreeze(request,metadataFreeze[0],position,pin.interval().lowerInclusive(),pin.interval().upperExclusive());
             if(request.relocation())artifacts.capture(request,definition,pin,qualifiedSchema,evidence.owner());else artifacts.capture(request,pin,qualifiedSchema,evidence.owner());
             var file=artifacts.originalImagePath(request,position);NativeRangeImage.Manifest image;
             if(!Files.exists(file))image=request.metadataOnly()?NativeRangeImage.writeMetadataAdmitted(file,pin,pin.interval(),limits,imageAdmission):NativeRangeImage.writeAdmitted(file,pin,pin.interval(),limits,imageAdmission);
             else image=request.metadataOnly()?NativeRangeImage.visitMetadataAdmitted(file,limits,(section,column,key,value)->{},imageAdmission):NativeRangeImage.inspectAdmitted(file,limits,imageAdmission);
             if(!position.equals(image.position()))throw new IOException("Published source snapshot cut changed");
             var md5=org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(file,imageAdmission));var snapshot=new SingleFileSnapshotInfo(new FileInfo(file,md5),TermIndex.valueOf(position.term(),position.index()));
-            var prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,image,qualifiedSchema,evidence.owner(),pin.configuration(),rows);var retained=artifacts.retainAdmitted(prepared,snapshot,imageAdmission);
+            var prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,image,qualifiedSchema,evidence.owner(),pin.configuration(),rows,metadataFreeze[0]);var retained=artifacts.retainAdmitted(prepared,snapshot,imageAdmission);
             var after=sourceSnapshotEvidence(request,definition,qualifiedDirectory);if(!after.owner().equals(evidence.owner()) || !RatisRelocationOwnerRpc.covers(after.completedCut(),position))throw new IOException("Source lost completed image owner");
             var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,retained.snapshot(),()->closeSourceCapture(request.transferId(),pin));returned=true;return lease;
         }finally{if(!returned)closeSourceCapture(request.transferId(),pin);}

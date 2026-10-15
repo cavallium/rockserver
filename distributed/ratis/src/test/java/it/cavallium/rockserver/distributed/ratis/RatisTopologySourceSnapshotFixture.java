@@ -70,7 +70,7 @@ final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSna
         captures.incrementAndGet();var captureImage=request.transferId().equals(id(50))?image:image.resolveSibling("native-"+request.transferId()+".image");var pin=store.capture();boolean adopted=false;
         try {
             var manifest=NativeRangeImage.writeAdmitted(captureImage,pin,pin.interval(),new NativeRangeImage.Limits(4*1024*1024,8*1024*1024,16),admission);
-            var prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,schema,donor,pin.configuration(),Map.of());
+            var prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,schema,donor,pin.configuration(),Map.of(),null);
             var snapshot=new SingleFileSnapshotInfo(new FileInfo(captureImage,MD5Hash.newInstance(NativeRangeImage.md5Admitted(captureImage,admission))),manifest.position().term(),manifest.position().index());
             var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,snapshot,()->{pin.close();pinCloses.incrementAndGet();});adopted=true;return lease;
         }finally{if(!adopted){pin.close();pinCloses.incrementAndGet();}}

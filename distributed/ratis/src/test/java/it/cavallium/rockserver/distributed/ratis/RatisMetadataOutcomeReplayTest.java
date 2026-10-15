@@ -36,21 +36,48 @@ class RatisMetadataOutcomeReplayTest {
             var owned=java.nio.file.Files.createDirectory(root.resolve("artifact-ledger"));var image=root.resolve("source-metadata.image");
             RatisTopologySourceSnapshotRpc.Prepared prepared;
             try(var artifacts=new RatisTopologySourceSnapshotArtifacts(owned,limits,2*limits.maxImageBytes(),128L<<20,1)) {
-                artifacts.reserve(request);NativeRangeImage.Manifest manifest;
+                artifacts.reserve(request);NativeRangeImage.Manifest manifest;var metadataFreeze=new NativeTopologyFreeze[1];ReplicatedRangeStore.Configuration configuration;
                 try(var pin=source.store.captureMetadataForRecovery()) {
+                    pin.visitState((key,value)->{if(RatisTopologySourceSnapshotRpc.metadataFreezeKey(pin.groupId(),key))metadataFreeze[0]=NativeTopologyFreeze.decode(value);});configuration=pin.configuration();
                     artifacts.capture(request,pin,source.schema,source.local);
                     manifest=NativeRangeImage.writeMetadataAdmitted(image,pin,pin.interval(),limits,NativeRangeImage.IoAdmission.UNLIMITED);
                 }
                 assertThrows(java.io.IOException.class,()->NativeRangeImage.inspect(image,limits));
-                prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,source.schema,source.local,source.store.configuration(),Map.of());
+                prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,source.schema,source.local,configuration,Map.of(),metadataFreeze[0]);
+                assertThrows(IllegalArgumentException.class,()->new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,source.schema,source.local,configuration,Map.of(),null));
+                var freeze=prepared.metadataFreeze();assertNotNull(freeze);var wrongBounds=new NativeTopologyFreeze(freeze.header(),freeze.groupId(),freeze.position(),NativeTopologyFreeze.boundsDigest(new byte[]{1},null),freeze.admissionDigest());
+                assertThrows(IllegalArgumentException.class,()->new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,source.schema,source.local,configuration,Map.of(),wrongBounds));
+                var future=new NativeTopologyFreeze(freeze.header(),freeze.groupId(),new ApplyPosition(manifest.position().term(),manifest.position().index()+1),freeze.boundsDigest(),freeze.admissionDigest());assertThrows(IllegalArgumentException.class,()->new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,source.schema,source.local,configuration,Map.of(),future));
+                var changedDefinition=new TopologyChange.Definition(new UUID(0,9210),source.definition.sourceDirectory(),source.definition.targetDirectory());var changedHeader=new NativeTopologyFreeze(changedDefinition.header(),freeze.groupId(),freeze.position(),freeze.boundsDigest(),freeze.admissionDigest());assertThrows(IllegalArgumentException.class,()->new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,source.schema,source.local,configuration,Map.of(),changedHeader));
+                assertThrows(IllegalArgumentException.class,()->new RatisTopologySourceSnapshotRpc.Prepared(current,manifest,source.schema,source.local,configuration,Map.of(),freeze));
+                var decoded=RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,prepared),RatisTopologySourceSnapshotRpc.PREPARE,request);assertEquals(freeze,decoded.metadataFreeze());
                 var info=new org.apache.ratis.statemachine.impl.SingleFileSnapshotInfo(new org.apache.ratis.server.storage.FileInfo(image,org.apache.ratis.util.MD5FileUtil.computeMd5ForFile(image.toFile())),manifest.position().term(),manifest.position().index());
+                var changedAdmission=freeze.admissionDigest();changedAdmission[0]^=1;var foreignFreeze=new NativeTopologyFreeze(freeze.header(),freeze.groupId(),freeze.position(),freeze.boundsDigest(),changedAdmission);var foreign=new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,source.schema,source.local,configuration,Map.of(),foreignFreeze);
+                assertThrows(java.io.IOException.class,()->artifacts.retain(foreign,info));assertFalse(java.nio.file.Files.exists(owned.resolve(request.transferId()+".prepared")),"Mismatched image FREEZE cannot be published");
                 artifacts.retain(prepared,info);
             }
             try(var artifacts=new RatisTopologySourceSnapshotArtifacts(owned,limits,2*limits.maxImageBytes(),128L<<20,1)) {
-                assertArrayEquals(prepared.image().sha256(),artifacts.lookup(request).prepared().image().sha256());
+                assertArrayEquals(prepared.image().sha256(),artifacts.lookup(request).prepared().image().sha256());assertEquals(prepared.metadataFreeze(),artifacts.lookup(request).prepared().metadataFreeze());
                 artifacts.released(request);assertTrue(artifacts.isReleased(request));assertEquals(0,artifacts.reservedImageBytes());
             }
             try(var artifacts=new RatisTopologySourceSnapshotArtifacts(owned,limits,2*limits.maxImageBytes(),128L<<20,1)){assertTrue(artifacts.isReleased(request));}
+        }
+    }
+    @Test void coldCapturingMetadataPromotesOriginalImageWithItsExactFreeze()throws Exception {
+        var helper=new RatisSourceOutcomeTest();
+        try(var fixture=helper.new Fixture(root.resolve("capturing-source"),false)) {
+            var source=fixture.home.source;var request=new RatisTopologySourceSnapshotRpc.Request(new UUID(0,9220),source.definition.header(),source.catalogue,source.local,RatisTopologySourceSnapshotRpc.Purpose.ANCESTOR_METADATA,source.groupId,source.directory);
+            var owned=java.nio.file.Files.createDirectory(root.resolve("capturing-ledger"));NativeRangeImage.Manifest image;
+            try(var artifacts=new RatisTopologySourceSnapshotArtifacts(owned,limits,2*limits.maxImageBytes(),128L<<20,1);var pin=source.store.captureMetadataForRecovery()) {
+                artifacts.reserve(request);artifacts.capture(request,pin,source.schema,source.local);
+                image=NativeRangeImage.writeMetadataAdmitted(artifacts.originalImagePath(request,pin.position()),pin,pin.interval(),limits,NativeRangeImage.IoAdmission.UNLIMITED);
+                assertEquals(RatisTopologySourceSnapshotArtifacts.PublicationPhase.CAPTURING,artifacts.publicationPhase(request));assertFalse(java.nio.file.Files.exists(owned.resolve(request.transferId()+".prepared")));
+            }
+            try(var cold=new RatisTopologySourceSnapshotArtifacts(owned,limits,2*limits.maxImageBytes(),128L<<20,1)) {
+                var recovered=cold.lookup(request);assertNotNull(recovered);assertEquals(source.freeze,recovered.prepared().metadataFreeze());assertEquals(image.position(),recovered.prepared().image().position());assertArrayEquals(image.sha256(),recovered.prepared().image().sha256());
+                assertEquals(RatisTopologySourceSnapshotArtifacts.PublicationPhase.READY,cold.publicationPhase(request));assertTrue(java.nio.file.Files.exists(owned.resolve(request.transferId()+".prepared")));
+                cold.released(request);assertTrue(cold.isReleased(request));assertEquals(0,cold.reservedImageBytes());
+            }
         }
     }
     @Test void pendingMetadataReplaysCreditPublicationDuplicatesAndFencedPublicationArtifact()throws Exception {

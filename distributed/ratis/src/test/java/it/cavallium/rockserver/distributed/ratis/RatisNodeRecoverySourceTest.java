@@ -61,6 +61,24 @@ class RatisNodeRecoverySourceTest {
             }
         }
     }
+    private void registerRemoteMetadataBeforeTransfer(RatisTwoPoolWorkflowFixture fixture,TopologyChange.Definition split,RatisTopologySourceSnapshotRpc.Prepared prepared,Path image,NativeRangeImage.Limits limits)throws Exception {
+        var request=prepared.request();var wire=RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,prepared),RatisTopologySourceSnapshotRpc.PREPARE,request);
+        var binding=fixture.plan.catalogue();var catalogue=new RatisCatalogue(fixture.catalogue,request.clusterId(),request.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
+        var view=catalogue.readView(request.domainId());var leaf=split.targets().getFirst();var birth=catalogue.readRecoveryBirth(request.domainId(),leaf.rangeId(),leaf.groupId(),leaf.rangeEpoch(),view.cut());
+        assertArrayEquals(request.header().encode(),birth.birth().header().encode());assertNotNull(wire.metadataFreeze());assertEquals(prepared.metadataFreeze(),wire.metadataFreeze());
+        var configuration=wire.sourceCfg();var registration=new NativeMetadataRecoveryRegistration(request.transferId(),request.catalogue(),birth.catalogueCut(),request.sourceDirectory(),wire.metadataFreeze(),request.receiver(),wire.sourceOwner(),configuration.term(),configuration.index(),configuration.data(),wire.image().position(),wire.image().sha256(),wire.image().deterministicMergeColumns());
+        Path path=root.resolve("remote-metadata-receiver");var helper=new RatisTopologyRecoveryAnchorTest();
+        try(var pool=helper.pool(path)) {
+            var receiver=pool.openMetadataRecovery(registration);assertTrue(receiver.metadataRecoveryPending());assertFalse(receiver.metadataRecoveryImageInstalled());assertTrue(receiver.userHandlesDetached());assertNull(receiver.topologyBirth());assertTrue(pool.topologySeeds().isEmpty());
+            receiver.installMetadataSnapshot(image,limits);assertTrue(receiver.metadataRecoveryImageInstalled());assertTrue(receiver.metadataRecoveryPending());
+            var head=head(fixture,new RatisSourceHeadRpc.Request(request,wire.image().position()));assertEquals(wire.image().position(),head.completedCut(),"This fixture has no later parent log tail to replay");
+            receiver.completeMetadataRecovery(registration,head.completedCut(),head.configuration());assertFalse(receiver.metadataRecoveryPending());assertEquals(head.completedCut(),receiver.metadataOutcomeState().applied());assertTrue(receiver.userHandlesDetached());
+        }
+        try(var pool=helper.pool(path)) {
+            assertEquals(List.of(registration),pool.metadataRecoveries());var receiver=pool.openMetadataRecovery(registration);assertFalse(receiver.metadataRecoveryPending());assertTrue(receiver.metadataRecoveryImageInstalled());assertTrue(receiver.userHandlesDetached());assertNull(receiver.topologyBirth());assertTrue(pool.topologySeeds().isEmpty());
+        }
+        assertArrayEquals(new byte[]{11},fixture.store(leaf.groupId()).readCurrentPoint(fixture.first.columnIds().iterator().next(),new byte[]{7}));
+    }
     @Test void splitExportsCurrentLeafAndOriginalMetadataThroughActualHostAndColdArtifacts()throws Exception {
         try(var fixture=new RatisTwoPoolWorkflowFixture(root,false)) {
             var split=fixture.split();var parent=split.parents().getFirst();var leaf=split.targets().getFirst();
@@ -80,6 +98,7 @@ class RatisNodeRecoverySourceTest {
             var owners=field(fixture.node,"pools",Map.class);var owner=owners.get(fixture.fast);var artifacts=field(owner,"artifacts",RatisTopologySourceSnapshotArtifacts.class);
             var userSaved=artifacts.lookup(user);var metadataSaved=artifacts.lookup(metadata);var limits=field(artifacts,"imageLimits",NativeRangeImage.Limits.class);
             assertArrayEquals(userPrepared.image().sha256(),NativeRangeImage.inspect(userSaved.image(),limits).sha256());assertArrayEquals(metadataPrepared.image().sha256(),NativeRangeImage.inspectMetadata(metadataSaved.image(),limits).sha256());
+            registerRemoteMetadataBeforeTransfer(fixture,split,metadataPrepared,metadataSaved.image(),limits);
             assertThrows(java.io.IOException.class,()->NativeRangeImage.inspect(metadataSaved.image(),limits));assertThrows(java.io.IOException.class,()->NativeRangeImage.inspectMetadata(userSaved.image(),limits));
             var forged=new RangeDirectory(current.clusterId(),current.databaseId(),current.domainId(),current.schemaEpoch(),current.schemaDigest(),current.generation()+1,current.columns(),current.routingPrefixBytes(),current.ranges());
             var catalogue=new RatisCatalogue(fixture.catalogue,fixture.first.clusterId(),fixture.first.databaseId(),fixture.plan.catalogue().groupId(),fixture.plan.catalogue().epoch(),fixture.plan.catalogue().schemaDigest(),fixture.plan.catalogue().directoryColumn());

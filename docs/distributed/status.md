@@ -1864,6 +1864,23 @@ split/schema workflow through the production client and dispatcher, stale/nonlea
 namespace/ahead-cut rejection, quota denial, and original split/merge definitions.
 Node recovery actor dispatch and obligation retention are still unfinished.
 
+META source preparation now returns the actual native FREEZE receipt from the
+same captured snapshot as its image. This is required to force receiver metadata
+registration before chunks arrive. The single current Prepared/capture formats
+include that receipt directly, with bounded encoding and no compatibility reader.
+Publication validates the receipt against the actual image STATE row, including its
+original admission digest; cold reconstruction reuses the forced capture receipt.
+The 49-case source/relocation/recovery gate passes
+(`metadata-freeze-remote-registration-first-gate.log`). Its Runtime-source workflow
+uses decoded PREPARE plus a fresh CAT birth query to register an empty native META
+receiver, install its image, complete at the actual source head and cold reopen
+without USER handles or fabricated SEED/ACTIVATE; source descendant data survives.
+Cold CAPTURING promotion also passes: a forced capture recipe and immutable META
+image with no prepared sidecar reconstruct the original FREEZE/cut/hash, publish
+READY and release cleanly (`metadata-freeze-cold-capturing-gate.log`, three cases).
+This is controlled native/adapter evidence, not complete node actor integration or
+remote quorum acceptance.
+
 Durable metadata-DAG
 obligation discovery, asynchronous configured-member catch-up, quorum retirement,
 source quiescence and physical parent reclamation remain unfinished. In particular,
