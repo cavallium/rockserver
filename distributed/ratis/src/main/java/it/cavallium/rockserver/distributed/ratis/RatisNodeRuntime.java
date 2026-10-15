@@ -121,7 +121,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private record RecoveryAttempt(UUID pool,UUID group,byte[] preparedDigest,NativeCurrentRangeRecovery current,NativeMetadataRecoveryRegistration metadata,int previousBytes) {}
     private RecoveryAttempt recoveryAttempt;
     private final Map<UUID,byte[]> recoveryCompletionAttempts=new HashMap<>();
-    private RatisConfiguredRecoveries configuredRecoveries;private RatisConfiguredRecoveryGraph recoveryGraph;private RatisNodeResourceBudget.Lease recoveryGraphCredit;private RatisTransactionRecoveryService configuredRecoveryService;private boolean configuredRecoveryServiceStarted;
+    private volatile Map<UUID,RatisLocalNoneDiscovery> localNoneDiscoveries=Map.of();
+    private RatisNodeResourceBudget.Lease localNoneCredit;
+    private RatisConfiguredRecoveries configuredRecoveries;private RatisConfiguredRecoveryGraph recoveryGraph;private RatisNodeResourceBudget.Lease recoveryGraphCredit;private RatisTransactionRecoveryService configuredRecoveryService;private boolean configuredRecoveryServiceStarted,configuredDiscoveryNext=true;private CompletableFuture<Void> configuredRecoveryServiceStart;
     synchronized void relocationTransport(RatisClientPool.Factory leaders,RatisClientPool.OwnerFactory owners)throws IOException{
         if(started || starting || installing || closeRequested || closing || closed)throw new IllegalStateException("Relocation transport fixed before start");var replacement=new RatisRelocationDataClient(plan.clusterId(),plan.databaseId(),plan.catalogue().groupId(),leaders,owners);try{relocationClients.close();}catch(IOException|RuntimeException failed){try{replacement.close();}catch(IOException cleanup){failed.addSuppressed(cleanup);}throw failed;}relocationClients=replacement;
     }
@@ -672,7 +674,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             public UUID pool(RatisTopologySourceSnapshotRpc.Request request)throws IOException{return configuredRecoveryPool(request);}
             public RatisJournalAccess journal(UUID pool,UUID group,Path directory)throws IOException{return configuredRecoveryJournal(pool,group,directory);}
         },this::configuredRecoveryHost);
-        configuredRecoveryService=new RatisTransactionRecoveryService(scheduler,configuredRecoveries::cycle);
+        configuredRecoveryService=new RatisTransactionRecoveryService(scheduler,this::configuredRecoveryCycle);
         Path graphRoot=Files.createDirectories(root.resolve("configured-recovery-graph"));SessionJournalFiles.force(graphRoot);SessionJournalFiles.force(root);
         diskCensus=new RatisDiskRunwayService(diskRunway,this::diskScopes,scheduler);diskCensus.initialCensus();
         recoveryGraphCredit=resources.reserve(metadataClaims.graphPool(),RatisNodeResourceBudget.Kind.PROTECTED,4096,1);
@@ -1148,7 +1150,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     /** Acknowledges the forced original request; source and native work continue under node ownership. */
     public CompletableFuture<Void> recoverConfigured(RatisTopologySourceSnapshotRpc.Request request){
-        synchronized(this){if(!started || starting || closeRequested || closing || closed)return CompletableFuture.failedFuture(new IOException("Configured recovery node unavailable"));var accepted=configuredRecoveries.enqueue(request);if(!accepted.isCompletedExceptionally())try{startConfiguredRecoveryService();}catch(RuntimeException failed){return CompletableFuture.failedFuture(failed);}return accepted;}
+        final CompletableFuture<Void> accepted;
+        synchronized(this){if(!started || starting || closeRequested || closing || closed)return CompletableFuture.failedFuture(new IOException("Configured recovery node unavailable"));accepted=configuredRecoveries.enqueue(request);}
+        return accepted.isCompletedExceptionally()?accepted:accepted.thenCombine(startConfiguredRecoveryService(),(ignored,started)->null);
     }
     /** Freezes the discovered graph on owned IO; it grants neither dispatch nor DATA startup permission. */
     CompletableFuture<Void> discoverConfiguredRecovery() {
@@ -1169,6 +1173,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             try {
                 recoveryGraph.retryPending();
                 var frozen=freezeFreshRecoveryGraph();
+                settleLocalNoneDiscovery(frozen);
                 for(var obligation:frozen.plan().localObligations()) {
                     var machine=machines.get(RaftGroupId.valueOf(obligation.range().groupId()));
                     if(machine==null || !machine.recoveryEligibilityGate().discoveryPending())continue;
@@ -1203,6 +1208,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         synchronized(this){if(closeRequested || closing || closed)throw new IOException("Node close prevents discovery settlement");publication.publish();}
     }
     private RatisConfiguredRecoveryGraph.Snapshot freezeFreshRecoveryGraph()throws IOException {
+        localNoneDiscoveries=Map.of();
         try(var workspace=resources.reserve(metadataClaims.graphPool(),RatisNodeResourceBudget.Kind.PROTECTED,4096,1)){
             var discovered=relocationClients.discover(plan,(retained,incoming)->workspace.growTo(Math.max(workspace.bytes(),Math.addExact(4096L,Math.multiplyExact(16L,Math.addExact(retained,incoming))))));
             var requests=new ArrayList<RatisTopologySourceSnapshotRpc.Request>();var retained=recoveryGraph.snapshot();
@@ -1213,6 +1219,29 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 requests.add(candidate);
             }
             recoveryGraph.force(discovered,requests);return recoveryGraph.snapshot();
+        }
+    }
+    private void settleLocalNoneDiscovery(RatisConfiguredRecoveryGraph.Snapshot frozen)throws IOException {
+        var obligated=new HashSet<UUID>();for(var obligation:frozen.plan().localObligations())obligated.add(obligation.range().groupId());
+        var selected=new HashMap<UUID,RatisLocalNoneDiscovery>();
+        for(var local:machines.entrySet()) {
+            var id=local.getKey();var machine=local.getValue();var entry=groups.require(id.getUuid());var store=stores.get(id.getUuid());
+            if(entry.role()!=RatisNodePlan.Role.DATA || obligated.contains(id.getUuid()) || machine==null || !machine.recoveryEligibilityGate().discoveryPending())continue;
+            if(store==null || !pools.containsKey(groupPools.get(id.getUuid())))throw new IOException("NONE lost registered native pool ownership");
+            awaitLocalRecoveryReload(machine.abandonLocalDiscovery());
+            long required=4096L+1024L*(selected.size()+1);
+            if(localNoneCredit==null)localNoneCredit=resources.reserve(metadataClaims.graphPool(),RatisNodeResourceBudget.Kind.PROTECTED,required,1);
+            else localNoneCredit.growTo(Math.max(localNoneCredit.bytes(),required));
+            selected.put(id.getUuid(),new RatisLocalNoneDiscovery(frozen,entry,store,machine,server.getDivision(id),plan.catalogue().groupId()));
+        }
+        var publication=Map.copyOf(selected);
+        synchronized(this) {
+            if(closeRequested || closing || closed || recoveryGraph.snapshot()!=frozen)throw new IOException("NONE lost fresh graph/node ownership before publication");
+            for(var entry:publication.entrySet()) {
+                var id=RaftGroupId.valueOf(entry.getKey());var machine=machines.get(id);
+                if(!entry.getValue().current(frozen,groups.require(entry.getKey()),stores.get(entry.getKey()),machine,server.getDivision(id),machine.readinessStamp()))throw new IOException("NONE local owner changed before publication");
+            }
+            localNoneDiscoveries=publication;
         }
     }
     private void requireLocalRecoveryGraphOwner(RatisConfiguredRecoveryGraph.Snapshot frozen,RatisConfiguredRecoveryDiscovery.Obligation obligation,RatisRangeStateMachine machine)throws IOException {
@@ -1252,7 +1281,19 @@ public final class RatisNodeRuntime implements AutoCloseable {
             public void fulfilled(Reservation reservation)throws IOException{require(reservation.path(),reservation.maximum(),false);}
         };
     }
-    private void startConfiguredRecoveryService(){if(!configuredRecoveryServiceStarted){configuredRecoveryService.start(timer,Duration.ofSeconds(1));configuredRecoveryServiceStarted=true;}}
+    private boolean hasDeferredRecovery(){return machines.values().stream().anyMatch(machine->machine.recoveryEligibilityGate().discoveryPending());}
+    private void configuredRecoveryCycle() {
+        if(!configuredRecoveries.idle())return;
+        final boolean discover;
+        synchronized(this){if(!started || starting || installing || closeRequested || closing || closed || !configuredRecoveries.idle())return;discover=hasDeferredRecovery() && (configuredRecoveries.size()==0 || configuredDiscoveryNext);configuredDiscoveryNext=!discover;}
+        if(discover)bootstrapDeferredRecovery();else configuredRecoveries.cycle();
+    }
+    private CompletableFuture<Void> startConfiguredRecoveryService(){
+        final CompletableFuture<Void> actual;
+        synchronized(this){if(configuredRecoveryServiceStarted)return configuredRecoveryServiceStart.copy();if(closeRequested || closing || closed)return CompletableFuture.failedFuture(new IOException("Configured recovery service owner is stopping"));configuredRecoveryServiceStarted=true;configuredRecoveryServiceStart=actual=new CompletableFuture<>();}
+        try{configuredRecoveryService.start(timer,Duration.ofSeconds(1));actual.complete(null);}catch(RuntimeException failed){synchronized(this){configuredRecoveryServiceStarted=false;}actual.completeExceptionally(failed);}
+        return actual.copy();
+    }
     RatisConfiguredRecovery.Phase configuredRecoveryPhase(UUID group){return configuredRecoveries.phase(group);}
     public Throwable configuredRecoveryFailure(){return configuredRecoveries==null?null:configuredRecoveries.failure();}
     private UUID configuredRecoveryPool(RatisTopologySourceSnapshotRpc.Request request)throws IOException {
@@ -1419,7 +1460,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (participantRecoveryService!=null) participantRecoveryService.start(timer,recoverySettings.period());
             if (retirementService!=null) retirementService.start(timer,Duration.ofSeconds(1));
             synchronized (this) { started=true; }
-            synchronized(this){if(configuredRecoveries.size()!=0)startConfiguredRecoveryService();}
+            if(configuredRecoveries.size()!=0 || hasDeferredRecovery())startConfiguredRecoveryService().join();
         } catch (IOException | RuntimeException | Error failure) {
             synchronized (this) { closeRequested=true; }
             for (var machine:machines.values()) machine.beginShutdown();
@@ -1492,19 +1533,35 @@ public final class RatisNodeRuntime implements AutoCloseable {
             var id=entry.group().getGroupId();var machine=machines.get(id);var store=stores.get(id.getUuid());
             if (machine==null || store==null) throw new IllegalStateException("Registered readiness owner is missing");
             var local=entry.group().getPeer(RaftPeerId.valueOf(plan.peerId()));
-            boolean serving=!store.topologyRecoveryOnly() && !entry.retired() && local!=null && local.getStartupRole()!=RaftPeerRole.LISTENER;
+            boolean serving=localReadinessStamp(id,machine).discovery()!=RatisNodeReadiness.Discovery.NONE_AT_CUT && !store.topologyRecoveryOnly() && !entry.retired() && local!=null && local.getStartupRole()!=RaftPeerRole.LISTENER;
             sources.add(new RatisNodeReadiness.GroupSource(entry.group(),entry.descriptor(),entry.directory()==null ? null : entry.directory().domainId(),
                     entry.directory()==null ? plan.catalogue().schemaDigest() : entry.directory().schemaDigest(),entry.role(),RaftPeerId.valueOf(plan.peerId()),serving,store,machine,
-                    () -> server==null ? null : server.getDivision(id),machine::readinessStamp));
+                    () -> server==null ? null : server.getDivision(id),()->localReadinessStamp(id,machine)));
         }
         return RatisNodeReadiness.evaluate(plan.nodeId(),plan.nodeIncarnation(),this::readinessStamp,sources);
     }
+    private RatisNodeReadiness.MachineStamp localReadinessStamp(RaftGroupId id,RatisRangeStateMachine machine) {
+        var stamp=machine.readinessStamp();var none=localNoneDiscoveries.get(id.getUuid());
+        try {
+            if(none!=null && recoveryGraph!=null && server!=null && none.current(recoveryGraph.snapshot(),groups.require(id.getUuid()),stores.get(id.getUuid()),machine,server.getDivision(id),stamp))
+                return new RatisNodeReadiness.MachineStamp(stamp.admissionGeneration(),stamp.configurationStamp(),stamp.configurationPending(),RatisNodeReadiness.Discovery.NONE_AT_CUT,stamp.storageFailure(),stamp.observerFailure());
+        }catch(IOException unavailable){/* A lost owner remains pending. */}
+        return stamp;
+    }
+    private record ReadinessPlacement(Object groups,Object none,Object graph) {
+        @Override public boolean equals(Object other){return other instanceof ReadinessPlacement placement && groups.equals(placement.groups) && none==placement.none && graph==placement.graph;}
+        @Override public int hashCode(){return Objects.hash(groups,System.identityHashCode(none),System.identityHashCode(graph));}
+    }
+    private boolean requiresParticipantRecovery() {
+        for(var group:groups.dataGroups()){var id=RaftGroupId.valueOf(group);var machine=machines.get(id);if(machine==null || localReadinessStamp(id,machine).discovery()!=RatisNodeReadiness.Discovery.NONE_AT_CUT)return true;}
+        return false;
+    }
     private synchronized RatisNodeReadiness.NodeStamp readinessStamp() {
         var registry=participantRecoveries;
-        var recovery=registry==null ? new RatisNodeReadiness.Recovery(groups.dataGroups().isEmpty(),0,0,participantRecoveryFailure())
+        var recovery=registry==null ? new RatisNodeReadiness.Recovery(!requiresParticipantRecovery(),0,0,participantRecoveryFailure())
                 : recoveryStamp(registry.recoveryStatus());
         Throwable failure=maintenanceFailure();if(failure==null)failure=retirementFailure();if(failure==null)failure=transactionExpiryFailure();if(failure==null && poolPressure!=null)failure=poolPressure.failure();
-        return new RatisNodeReadiness.NodeStamp(state(),installing,groups.entries(),recovery,failure);
+        return new RatisNodeReadiness.NodeStamp(state(),installing,new ReadinessPlacement(groups.entries(),localNoneDiscoveries,recoveryGraph==null?null:recoveryGraph.snapshot()),recovery,failure);
     }
     private RatisNodeReadiness.Recovery recoveryStamp(RatisParticipantRecoveryRegistry.RecoveryStatus status) {
         return new RatisNodeReadiness.Recovery(status.scanned(),status.unresolvedDecisions(),status.activeWorkers(),participantRecoveryFailure());
@@ -1666,6 +1723,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             }poolClosed=true;
             for (var client:homeClients.values()) client.close();
             if(nativeExtentEnv!=null){nativeExtentEnv.close();nativeExtentEnv=null;}
+            localNoneDiscoveries=Map.of();if(localNoneCredit!=null){localNoneCredit.close();localNoneCredit=null;}
             if(recoveryGraph!=null){recoveryGraph.close();recoveryGraph=null;}if(recoveryGraphCredit!=null){recoveryGraphCredit.close();recoveryGraphCredit=null;}
             if (lock!=null && lock.isValid()) lock.release(); if (lockChannel!=null) lockChannel.close();
             synchronized (this) { closed=true; }

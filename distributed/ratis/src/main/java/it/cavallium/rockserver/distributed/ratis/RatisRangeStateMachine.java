@@ -395,6 +395,37 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if(getLifeCycleState()!=LifeCycle.State.NEW || role!=RatisNodePlan.Role.DATA)throw new IllegalStateException("Recovery discovery is fixed on NEW DATA state machines");
         store.deferDiscovery();recoveryEligibility.deferDiscovery();
     }
+    private volatile boolean localDiscoveryAbandoning;
+    boolean localDiscoveryIdle() {
+        synchronized(gate){return !localDiscoveryAbandoning && !localMetadataStopped && !localMetadataPreparing && !localCurrentPreparing && localMetadataCandidate==null && localCurrentCandidate==null;}
+    }
+    /** Retire warm private work before a newer complete graph can classify this owner as NONE. */
+    CompletableFuture<Void> abandonLocalDiscovery() {
+        final LocalCurrentCandidate current;final LocalMetadataCandidate metadata;
+        synchronized(gate) {
+            current=localCurrentCandidate;metadata=localMetadataCandidate;
+            if(localDiscoveryAbandoning || localCurrentPreparing || localMetadataPreparing
+                    || current!=null && (current.permit.working || current.permit.actual!=null && !current.permit.actual.isDone())
+                    || metadata!=null && (metadata.permit.working || metadata.permit.actual!=null && !metadata.permit.actual.isDone()))return CompletableFuture.failedFuture(new IOException("Actual local discovery work has not drained"));
+            if(current==null && metadata==null)return CompletableFuture.completedFuture(null);
+            if(localMetadataStopped || !recoveryEligibility.discoveryPending() || getLifeCycleState()!=LifeCycle.State.RUNNING)return CompletableFuture.failedFuture(new IOException("Local discovery supersession requires its live RUNNING inventory owner"));
+            localDiscoveryAbandoning=true;
+        }
+        final CompletableFuture<Void> retired;
+        try{store.deferDiscovery();if(current!=null && current.permit.covered!=null)retired=retireCoveredCurrent(current.permit,false);else{recoveryEligibility.deferDiscovery();retired=CompletableFuture.completedFuture(null);}}
+        catch(Throwable failure){synchronized(gate){localDiscoveryAbandoning=false;}return CompletableFuture.failedFuture(failure);}
+        var completion=new CompletableFuture<Void>();
+        retired.whenComplete((unused,failure)->{
+            Throwable problem=failure;
+            try {
+                if(problem==null){if(current!=null && current.permit.covered==null)releaseLocalCurrentResources(current.permit);if(metadata!=null)releaseLocalMetadata(metadata.permit);
+                    synchronized(gate){if(localCurrentCandidate!=current || localMetadataCandidate!=metadata)throw new IllegalStateException("Superseded local discovery owner changed");localCurrentCandidate=null;localMetadataCandidate=null;}}
+            }catch(Throwable cleanup){problem=cleanup;}
+            finally{synchronized(gate){localDiscoveryAbandoning=false;}}
+            if(problem==null)completion.complete(null);else completion.completeExceptionally(problem);
+        });
+        return completion.copy();
+    }
     static final class LocalMetadataCandidate {
         private final LocalMetadataPermit permit;
         private LocalMetadataCandidate(LocalMetadataPermit permit){this.permit=permit;}
@@ -413,7 +444,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     /** Trusted Node IO has already forced this graph cut and exact consuming definition. */
     LocalMetadataCandidate prepareLocalMetadataDiscovery(ApplyPosition graphCut,TopologyChange.Definition consuming)throws IOException {
         Objects.requireNonNull(graphCut);Objects.requireNonNull(consuming);LocalMetadataCandidate candidate;
-        synchronized(gate){if(localMetadataStopped || localMetadataPreparing)throw new IOException("Local META discovery work unavailable");candidate=localMetadataCandidate;if(candidate!=null && (candidate.permit.working || candidate.permit.actual!=null && !candidate.permit.actual.isDone()))throw new IOException("Local META actual reload remains active");if(candidate!=null && (!RatisRelocationOwnerRpc.covers(graphCut,candidate.graphCut()) || !Arrays.equals(candidate.permit.consuming.digest(),consuming.digest())))throw new IOException("Local META retry changed its frozen graph candidate");if(candidate!=null && candidate.permit.reinitialized && candidate.permit.actual!=null && candidate.permit.actual.isDone() && !candidate.permit.actual.isCompletedExceptionally())requireLocalMetadataCandidate(candidate);else{localMetadataPreparing=true;if(candidate!=null)candidate.permit.working=true;}}
+        synchronized(gate){if(localDiscoveryAbandoning || localMetadataStopped || localMetadataPreparing)throw new IOException("Local META discovery work unavailable");candidate=localMetadataCandidate;if(candidate!=null && (candidate.permit.working || candidate.permit.actual!=null && !candidate.permit.actual.isDone()))throw new IOException("Local META actual reload remains active");if(candidate!=null && (!RatisRelocationOwnerRpc.covers(graphCut,candidate.graphCut()) || !Arrays.equals(candidate.permit.consuming.digest(),consuming.digest())))throw new IOException("Local META retry changed its frozen graph candidate");if(candidate!=null && candidate.permit.reinitialized && candidate.permit.actual!=null && candidate.permit.actual.isDone() && !candidate.permit.actual.isCompletedExceptionally())requireLocalMetadataCandidate(candidate);else{localMetadataPreparing=true;if(candidate!=null)candidate.permit.working=true;}}
         AutoCloseable metadata=null;ReplicatedRangeStore.SnapshotPin pin=null;RatisDiskRunway.RecoveryLease disk=null;
         try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
             if(candidate!=null && candidate.permit.reinitialized && candidate.permit.actual!=null && candidate.permit.actual.isDone() && !candidate.permit.actual.isCompletedExceptionally()){verifyLocalMetadataBaseline(candidate);return candidate;}
@@ -454,7 +485,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private static boolean sameConfiguration(ReplicatedRangeStore.Configuration a,ReplicatedRangeStore.Configuration b){return a!=null && b!=null && a.term()==b.term() && a.index()==b.index() && Arrays.equals(a.data(),b.data());}
     private void requireLocalMetadataCandidate(LocalMetadataCandidate candidate)throws IOException {
-        if(candidate==null || candidate!=localMetadataCandidate || localMetadataStopped || candidate.permit.released || candidate.permit.revision!=recoveryEligibility.revision() || !recoveryEligibility.discoveryPending() || !sameReplicaIdentity(candidate.permit.receiver,topologyLocalReplica))throw new IOException("Local META candidate scope/revision was revoked");
+        if(candidate==null || candidate!=localMetadataCandidate || localDiscoveryAbandoning || localMetadataStopped || candidate.permit.released || candidate.permit.revision!=recoveryEligibility.revision() || !recoveryEligibility.discoveryPending() || !sameReplicaIdentity(candidate.permit.receiver,topologyLocalReplica))throw new IOException("Local META candidate scope/revision was revoked");
     }
     private void verifyLocalMetadataBaseline(LocalMetadataCandidate candidate)throws IOException {
         requireLocalMetadataCandidate(candidate);
@@ -554,7 +585,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     /** Fresh forced CAT graph identifies this exact current leaf, never an absent/genesis permission. */
     LocalCurrentCandidate prepareLocalCurrentDiscovery(ApplyPosition graphCut,RangeDirectory directory)throws IOException {
         Objects.requireNonNull(graphCut);Objects.requireNonNull(directory);LocalCurrentCandidate candidate;
-        synchronized(gate){if(localMetadataStopped || localCurrentPreparing || localMetadataCandidate!=null)throw new IOException("Local CURRENT discovery work unavailable");candidate=localCurrentCandidate;if(candidate!=null && (candidate.permit.working || candidate.permit.actual!=null && !candidate.permit.actual.isDone()))throw new IOException("Actual CURRENT reload remains active");if(candidate!=null && (!RatisRelocationOwnerRpc.covers(graphCut,candidate.graphCut()) || !sameCurrentScope(candidate.permit.directory,directory,candidate.permit.range)))throw new IOException("CURRENT retry changed frozen graph/leaf scope");if(candidate==null || !candidate.permit.reinitialized || candidate.permit.actual==null || !candidate.permit.actual.isDone() || candidate.permit.actual.isCompletedExceptionally()){localCurrentPreparing=true;if(candidate!=null)candidate.permit.working=true;}}
+        synchronized(gate){if(localDiscoveryAbandoning || localMetadataStopped || localCurrentPreparing || localMetadataCandidate!=null)throw new IOException("Local CURRENT discovery work unavailable");candidate=localCurrentCandidate;if(candidate!=null && (candidate.permit.working || candidate.permit.actual!=null && !candidate.permit.actual.isDone()))throw new IOException("Actual CURRENT reload remains active");if(candidate!=null && (!RatisRelocationOwnerRpc.covers(graphCut,candidate.graphCut()) || !sameCurrentScope(candidate.permit.directory,directory,candidate.permit.range)))throw new IOException("CURRENT retry changed frozen graph/leaf scope");if(candidate==null || !candidate.permit.reinitialized || candidate.permit.actual==null || !candidate.permit.actual.isDone() || candidate.permit.actual.isCompletedExceptionally()){localCurrentPreparing=true;if(candidate!=null)candidate.permit.working=true;}}
         AutoCloseable metadata=null;
         try(var admission=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
             if(candidate!=null && candidate.permit.reinitialized && candidate.permit.actual!=null && candidate.permit.actual.isDone() && !candidate.permit.actual.isCompletedExceptionally()){verifyLocalCurrentBaseline(candidate);return candidate;}
@@ -594,7 +625,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if(cfg[0]==null || cfg[0].index()>cut.index() || cfg[0].term()>cut.term() || cfg[0].index()==cut.index() && cfg[0].term()!=cut.term())throw new IOException("CURRENT GROUP floor lacks genuine configuration");validateConfiguration(cfg[0].data());requireSchemaMembership(range,cfg[0].data());
     }
     private void requireLocalCurrentCandidate(LocalCurrentCandidate candidate)throws IOException {
-        if(candidate==null || candidate!=localCurrentCandidate || localMetadataStopped || candidate.permit.released || candidate.permit.revision!=recoveryEligibility.revision() || !recoveryEligibility.discoveryPending() || !sameReplicaIdentity(candidate.permit.receiver,topologyLocalReplica))throw new IOException("CURRENT candidate scope/revision revoked");
+        if(candidate==null || candidate!=localCurrentCandidate || localDiscoveryAbandoning || localMetadataStopped || candidate.permit.released || candidate.permit.revision!=recoveryEligibility.revision() || !recoveryEligibility.discoveryPending() || !sameReplicaIdentity(candidate.permit.receiver,topologyLocalReplica))throw new IOException("CURRENT candidate scope/revision revoked");
         if(!Objects.equals(candidate.permit.registration,store.currentRangeRecoveryRegistration()) || store.metadataRecoveryRegistration()!=null || store.topologyRetired())throw new IOException("CURRENT candidate changed native registration/role");
     }
     private void verifyLocalCurrentBaseline(LocalCurrentCandidate candidate)throws IOException {
@@ -1930,7 +1961,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     long transactionGeneration() { return admissionGeneration.get(); }
     RatisNodeReadiness.MachineStamp readinessStamp(){
-        synchronized(admissions){return new RatisNodeReadiness.MachineStamp(admissionGeneration.get(),schemaConfigurationStamp,schemaConfigurationPending,recoveryEligibility.discoveryPending(),storageFailure,schemaActivationObserverFailure!=null?schemaActivationObserverFailure:topologyActivationObserverFailure);}
+        synchronized(admissions){return new RatisNodeReadiness.MachineStamp(admissionGeneration.get(),schemaConfigurationStamp,schemaConfigurationPending,recoveryEligibility.discoveryPending()?RatisNodeReadiness.Discovery.PENDING:RatisNodeReadiness.Discovery.SETTLED,storageFailure,schemaActivationObserverFailure!=null?schemaActivationObserverFailure:topologyActivationObserverFailure);}
     }
 
     long transactionTerm() { var a=store.applied(); return a==null ? -1 : a.term(); }

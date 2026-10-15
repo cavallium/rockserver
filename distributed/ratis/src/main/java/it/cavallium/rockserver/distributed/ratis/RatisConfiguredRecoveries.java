@@ -93,7 +93,7 @@ final class RatisConfiguredRecoveries {
     CompletableFuture<Void> discover(java.util.concurrent.Callable<Void> action) {
         Objects.requireNonNull(action);final CompletableFuture<Void> pending;
         synchronized(this){if(stopping)return CompletableFuture.failedFuture(new IOException("Configured recoveries stopped"));if(actual!=null)return CompletableFuture.failedFuture(new RejectedExecutionException("Configured recovery operation already active"));actual=pending=new CompletableFuture<>();enqueued=null;waiters=1;}
-        try{io.execute(()->{try{if(isStopping())throw new CancellationException("Discovery stopped before dispatch");closeActive();action.call();finish(pending,null);}catch(Throwable failure){finish(pending,failure);}});}catch(RuntimeException failure){finish(pending,failure);}
+        try{io.execute(()->{try{if(isStopping())throw new CancellationException("Discovery stopped before dispatch");if(activeSlot!=null && !slots.isEmpty())cursor=(activeSlot.index+1)%slots.size();closeActive();action.call();finish(pending,null);}catch(Throwable failure){finish(pending,failure);}});}catch(RuntimeException failure){finish(pending,failure);}
         return pending.copy();
     }
 

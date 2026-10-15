@@ -101,6 +101,37 @@ class RatisConfiguredRecoveriesTest {
         }
     }
 
+    @Test void discoveryBetweenSuccessfulStepsRotatesBothUnfinishedRecoverySlots()throws Exception {
+        try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("fair-source"),false)) {
+            var prepared=new HashMap<UUID,Prepared>();var registrations=new HashMap<UUID,AtomicInteger>();
+            for(var directory:List.of(source.firstDirectory,source.secondDirectory)) {
+                var range=directory.ranges().getFirst();var store=source.store(range.groupId());
+                var request=new Request(UUID.randomUUID(),null,source.plan.catalogue().groupId(),range.replicas().getFirst(),Purpose.CURRENT_LEAF,range.groupId(),directory);
+                var image=NativeRangeImage.write(root.resolve(range.groupId()+".group"),store,new NativeRangeImage.Limits(4<<20,32<<20,8));
+                prepared.put(range.groupId(),new Prepared(request,image,directory.domainId().equals(source.first.domainId())?source.first:source.second,range.replicas().getFirst(),store.configuration(),Map.of(),null));registrations.put(range.groupId(),new AtomicInteger());
+            }
+            var resources=budget(64L<<20);var path=Files.createDirectory(root.resolve("fair-manager"));byte[] identity=new byte[32];identity[0]=1;
+            var manager=new RatisConfiguredRecoveries(path,new byte[32],2,Map.of(POOL,2),resources,new RatisConfiguredRecoveries.Owner(){
+                public UUID pool(Request request){requireRequest(prepared.get(request.sourceGroup()).request(),request);return POOL;}
+                public RatisJournalAccess journal(UUID pool,UUID group,Path directory){return RatisJournalAccess.standalone();}
+            },admission->new RatisConfiguredRecovery.Host(){
+                public CompletableFuture<Prepared> prepare(Request request){var value=prepared.get(request.sourceGroup());try{admission.beforeReply(value.encodedSize());return CompletableFuture.completedFuture(value);}catch(IOException denied){return CompletableFuture.failedFuture(denied);}}
+                public CompletableFuture<byte[]> register(Prepared value){registrations.get(value.request().sourceGroup()).incrementAndGet();return CompletableFuture.completedFuture(identity.clone());}
+                public CompletableFuture<Prepared> transfer(Request request){return CompletableFuture.completedFuture(prepared.get(request.sourceGroup()));}
+                public CompletableFuture<RatisRecoveryImageRpc.Evidence> probe(RatisRecoveryImageRpc.Request request){var value=prepared.get(request.source().sourceGroup());return CompletableFuture.completedFuture(new RatisRecoveryImageRpc.Evidence(request.digest(),TopologyChange.Owner.of(value.request().receiver()),value.image().position(),value.sourceCfg(),identity,true));}
+                public CompletableFuture<RatisSourceHeadRpc.Head> head(RatisSourceHeadRpc.Request request){var value=prepared.get(request.source().sourceGroup());return CompletableFuture.completedFuture(new RatisSourceHeadRpc.Head(request,new ApplyPosition(1,100),value.request().sourceDirectory(),value.sourceOwner(),value.image().position(),value.sourceCfg()));}
+                public CompletableFuture<Boolean> complete(Prepared value,RatisSourceHeadRpc.Head head){return CompletableFuture.completedFuture(false);}
+                public CompletableFuture<Void> release(Prepared value){return CompletableFuture.completedFuture(null);}
+            });
+            try {
+                for(var value:prepared.values())manager.enqueue(value.request()).get(10,TimeUnit.SECONDS);
+                for(int visit=0;visit<8;visit++){step(manager);manager.discover(()->null).get(10,TimeUnit.SECONDS);}
+                for(var entry:registrations.entrySet()){assertEquals(1,entry.getValue().get(),"Discovery must not repeatedly restart only one slot");assertNotEquals(RatisConfiguredRecovery.Phase.DONE,manager.phase(entry.getKey()));}
+            }finally{manager.close(Duration.ofSeconds(10));}
+            assertEquals(new RatisNodeResourceBudget.Usage(0,0),resources.stats().protectedLane());
+        }
+    }
+
     @Test void cancelledObserversAndStopWaitForActualBlockedHostAndReleaseAllHeapCredits()throws Exception {
         try(var fixture=new Fixture()) {
             var resources=budget(64L<<20);var manager=fixture.open(root.resolve("blocked"),resources);manager.enqueue(fixture.source.initial).get(10,TimeUnit.SECONDS);step(manager);

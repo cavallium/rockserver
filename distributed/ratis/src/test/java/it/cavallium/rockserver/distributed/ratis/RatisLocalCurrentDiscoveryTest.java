@@ -57,7 +57,8 @@ class RatisLocalCurrentDiscoveryTest {
             f.machine.reloadLocalCurrentDiscovery(candidate).get(10,TimeUnit.SECONDS);assertEquals(a,f.store.applied());assertFalse(f.store.admissionOpen());assertTrue(f.machine.recoveryEligibilityGate().discoveryPending());assertEquals(a.index(),f.server.getDivision(f.machine.getGroupId()).getRaftLog().getSnapshotIndex());assertThrows(IOException.class,()->f.machine.settleLocalCurrentDiscovery(candidate,publication->{throw new IOException("Node closing fence");}));assertFalse(f.store.admissionOpen());assertSame(candidate,f.machine.prepareLocalCurrentDiscovery(new ApplyPosition(f.graphCut.term(),f.graphCut.index()+1),f.directory));assertEquals(LifeCycle.State.RUNNING,f.machine.getLifeCycleState());assertTrue(f.machine.settleLocalCurrentDiscovery(candidate,publication->publication.publish()));assertTrue(f.store.admissionOpen());assertArrayEquals(new byte[]{(byte)f.expected},f.store.readCurrentPoint(f.schema.columnIds().iterator().next(),new byte[]{7}));assertEquals(f.registration,f.store.currentRangeRecoveryRegistration());assertEquals(0,f.store.activeSnapshotPins());assertEquals(0,f.resources.stats().protectedLane().bytes());assertEquals(0,f.runway.stats().owners());
         }
     }
-    @Test void retainedGroupFloorCoversGenuineNativeLogPrefixWithoutWritingAnotherUserImage()throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void retainedGroupFloorCoversGenuineNativeLogPrefixWithoutWritingAnotherUserImage(boolean supersede)throws Exception {
         try(var f=new Fixture("covered",Mode.AHEAD)) {
             var division=f.server.getDivision(f.machine.getGroupId());var log=division.getRaftLog();var a=f.store.applied();var s=f.floor.position();assertTrue(a.index()>s.index());
             var before=f.machine.getLatestSnapshot().getFiles().getFirst().getPath();byte[] bytes=Files.readAllBytes(before);var attributes=Files.readAttributes(before,java.nio.file.attribute.BasicFileAttributes.class);
@@ -73,6 +74,12 @@ class RatisLocalCurrentDiscoveryTest {
             assertThrows(IOException.class,()->f.machine.settleLocalCurrentDiscovery(candidate,publication->{throw new IOException("Transient Node publication refusal");}));
             assertTrue(f.store.activeSnapshotPins()>0);assertSame(candidate,f.machine.prepareLocalCurrentDiscovery(new ApplyPosition(f.graphCut.term(),f.graphCut.index()+1),f.directory));
             assertEquals(s.index(),f.machine.getLatestSnapshot().getIndex());assertArrayEquals(bytes,Files.readAllBytes(before));assertEquals(attributes.lastModifiedTime(),Files.getLastModifiedTime(before));
+            if(supersede) {
+                f.machine.abandonLocalDiscovery().get(10,TimeUnit.SECONDS);assertTrue(f.machine.localDiscoveryIdle());assertEquals(a,f.store.applied());
+                assertTrue(f.machine.recoveryEligibilityGate().discoveryPending());assertFalse(f.store.admissionOpen());assertEquals(0,f.store.activeSnapshotPins());assertEquals(0,f.resources.stats().protectedLane().bytes());assertEquals(0,f.runway.stats().owners());
+                assertThrows(IOException.class,()->f.machine.settleLocalCurrentDiscovery(candidate,publication->publication.publish()));
+                assertNull(f.store.operationResult(next.operationId(),next.receiptDigest()));assertEquals(s.index(),log.getSnapshotIndex());assertArrayEquals(bytes,Files.readAllBytes(before));return;
+            }
             assertTrue(f.machine.settleLocalCurrentDiscovery(candidate,publication->publication.publish()));
             long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);while((f.store.applied()==null || f.store.applied().index()<tail || f.resources.stats().protectedLane().bytes()!=0) && System.nanoTime()<deadline)Thread.sleep(5);
             assertEquals(new ApplyPosition(a.term(),tail),f.store.applied());assertArrayEquals(new byte[]{14},f.store.readCurrentPoint(f.schema.columnIds().iterator().next(),new byte[]{7}));

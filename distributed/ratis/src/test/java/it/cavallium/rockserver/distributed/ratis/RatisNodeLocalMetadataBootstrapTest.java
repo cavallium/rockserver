@@ -61,7 +61,7 @@ class RatisNodeLocalMetadataBootstrapTest {
                     var image=machine.getLatestSnapshot().getFiles().getFirst().getPath();assertEquals(NativeRangeImage.Kind.METADATA,NativeRangeImage.kind(image,NativeRangeImage.IoAdmission.UNLIMITED));
                     assertTrue(machine.query(Message.EMPTY).isCompletedExceptionally(),"Retired META settlement grants no USER query");
                     node.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS);assertFalse(machine.recoveryEligibilityGate().discoveryPending());assertEquals(0,store.activeSnapshotPins());
-                    source.routes.forEach((domain,route)->assertArrayEquals(routes.get(domain),route.directory().payloadDigest()));assertFalse(field(node,"configuredRecoveryServiceStarted",Boolean.class));
+                    source.routes.forEach((domain,route)->assertArrayEquals(routes.get(domain),route.directory().payloadDigest()));assertTrue(field(node,"configuredRecoveryServiceStarted",Boolean.class));
                 }
             }
         }
