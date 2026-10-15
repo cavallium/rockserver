@@ -100,6 +100,37 @@ class NativeRangeImageTest {
         assertEquals(2,requests.get());
     }
 
+    @Test void schemaMetadataAdmissionPrecedesAllocationAndRejectsWrongKeyShape()throws Exception {
+        byte[] original=imageWithOneUserRow();var limits=new Limits(512*1024,4*1024*1024,4);
+        try(var pool=new Pool(directory.resolve("schema-admission-pool"))){
+            pool.store.applyNoop(new ApplyPosition(1,0));
+            for(int tag:new int[]{0x27,0x28,0x2a,0x2b,0x2c}){
+                int keyLength=tag==0x2a || tag==0x2b?33:17;
+                int valueLength=tag==0x27?NativeSchemaFence.BYTES:tag==0x28 || tag==0x2a?128*1024:NativeSchemaActivationProof.BYTES;
+                byte[] schemaKey=ByteBuffer.allocate(keyLength).putLong(GROUP.getMostSignificantBits()).putLong(GROUP.getLeastSignificantBits()).put((byte)tag).array();
+                var reservations=new java.util.concurrent.atomic.AtomicInteger();
+                IoAdmission deny=new IoAdmission(){
+                    public void beforeBytes(int bytes){}
+                    public AutoCloseable reserveMetadata(int rawBytes)throws IOException{assertEquals(valueLength,rawBytes);reservations.incrementAndGet();throw new IOException("schema workspace denied");}
+                };
+                pool.db.put(pool.handles.get(3),schemaKey,new byte[valueLength]);
+                try(var pin=pool.store.capture()){assertEquals("schema workspace denied",assertThrows(IOException.class,()->NativeRangeImage.writeAdmitted(directory.resolve("denied-schema-write"),pin,interval(),limits,deny)).getMessage());}
+                pool.db.delete(pool.handles.get(3),schemaKey);
+                var path=directory.resolve("denied-schema-read");writeExtraStateRow(path,original,schemaKey,valueLength);
+                assertEquals("schema workspace denied",assertThrows(IOException.class,()->NativeRangeImage.inspectAdmitted(path,limits,deny)).getMessage());assertEquals(2,reservations.get());
+                byte[] wrongKey=Arrays.copyOf(schemaKey,keyLength==17?33:17);writeExtraStateRow(path,original,wrongKey,valueLength);
+                assertThrows(IOException.class,()->NativeRangeImage.inspectAdmitted(path,limits,deny));assertEquals(2,reservations.get());
+                pool.db.put(pool.handles.get(3),wrongKey,new byte[valueLength]);
+                try(var pin=pool.store.capture()){assertThrows(IOException.class,()->NativeRangeImage.writeAdmitted(directory.resolve("wrong-schema-write"),pin,interval(),limits,deny));}assertEquals(2,reservations.get());pool.db.delete(pool.handles.get(3),wrongKey);
+            }
+        }
+    }
+    private void writeExtraStateRow(Path destination,byte[] original,byte[] key,int valueLength)throws Exception {
+        int end=original.length-41;var bytes=new java.io.ByteArrayOutputStream();bytes.write(original,0,end);var output=new java.io.DataOutputStream(bytes);
+        output.writeByte(Section.STATE.ordinal()+1);output.writeInt(key.length);output.writeInt(valueLength);output.write(key);output.write(new byte[valueLength]);output.write(original,end,41);
+        byte[] forged=bytes.toByteArray(),checksum=MessageDigest.getInstance("SHA-256").digest(Arrays.copyOf(forged,forged.length-32));System.arraycopy(checksum,0,forged,forged.length-32,32);Files.write(destination,forged);
+    }
+
     @Test
     void exportsOneNativeCutWithExactSortedIntervalsAndOriginalReceipts() throws Exception {
         try (Pool pool = new Pool(directory.resolve("pool"))) {

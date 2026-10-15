@@ -83,7 +83,7 @@ public final class NativeRangeImage {
     @FunctionalInterface public interface IoAdmission {
         /** Before the actual read/write; the caller owns cancellation and any waiting. Maximum quantum is 1 MiB. */
         void beforeBytes(int bytes)throws IOException;
-        /** Reserve actual encoded registration bytes before allocation; implementations must cover decoded/copy graphs too. */
+        /** Reserve actual encoded registration/schema value bytes before allocation; implementations must cover decoded/copy graphs too. */
         default AutoCloseable reserveMetadata(int rawBytes)throws IOException{return ()->{};}
         IoAdmission UNLIMITED=bytes->{};
     }
@@ -188,7 +188,7 @@ public final class NativeRangeImage {
             throw new IllegalArgumentException("Image requires exact pin interval/columns and a completed position");
         }
         try(var metadataScope=openMetadataAdmission(admission);var metadataPass=metadataScope.pass()) {
-        metadataPass.reserve(pin.recoveryRegistrationBytes(limits));
+        metadataPass.reserve(pin.imageMetadataBytes(limits));
         NativeTopologyImageOrigin origin=pin.topologyImageOrigin();
         byte[] originBytes=origin==null ? null : origin.encode();
         if(originBytes!=null && ((long)originBytes.length+17>limits.maxRowBytes() || (long)originBytes.length+17>limits.maxImageBytes())) throw new IOException("Topology image origin exceeds configured byte limit");
@@ -387,7 +387,8 @@ public final class NativeRangeImage {
                 if(section==Section.STATE && key.length>16 && key[16]==0x79 && (key.length!=49 || valueLength!=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.CREDIT_BYTES))throw new IOException("Invalid catalogue history credit length");
                 if(section==Section.STATE && key.length>16 && key[16]==0x15 && (key.length!=17 || valueLength!=8))throw new IOException("Invalid ACK namespace count length");
                 if(section==Section.STATE && key.length>16 && key[16]>=0x6d && key[16]<=0x71)throw new IOException("Receiver-local recovery fence is not portable image authority");
-                if(recoveryRegistration(header,section,key))metadataPass.reserve(valueLength);
+                boolean schemaMetadata=section==Section.STATE && ownGroup(header,key) && schemaMetadataRow(key,valueLength);
+                if(schemaMetadata || recoveryRegistration(header,section,key))metadataPass.reserve(valueLength);
                 byte[] value = new byte[valueLength];
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
@@ -534,10 +535,29 @@ public final class NativeRangeImage {
         }
     }
 
-    private static boolean recoveryRegistration(Header header,Section section,byte[] key) {
-        if(header.metadata() || section!=Section.STATE || key.length!=17 || key[16]!=0x67 && key[16]!=0x6a && key[16]!=0x72)return false;
+    /** Shared by the reader and size-only native preflight, before loading a schema value. */
+    static boolean schemaMetadataRow(byte[] key,int valueLength)throws IOException {
+        if(key.length<=16)return false;
+        int tag=key[16]&255;
+        int keyLength=switch(tag){case 0x27,0x28,0x2c->17;case 0x2a,0x2b->33;default->0;};
+        if(keyLength==0)return false;
+        int bound=switch(tag){
+            case 0x27->it.cavallium.rockserver.core.common.distributed.NativeSchemaFence.BYTES;
+            case 0x28,0x2a->it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation.MAX_BYTES;
+            default->it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof.BYTES;
+        };
+        if(key.length!=keyLength || valueLength<0 || valueLength>bound || tag!=0x28 && tag!=0x2a && valueLength!=bound)throw new IOException("Invalid image schema metadata key/value length");
+        return true;
+    }
+    private static boolean ownGroup(Header header,byte[] key) {
+        if(key.length<16)return false;
         var group=ByteBuffer.wrap(key);
         return group.getLong()==header.owner().groupId().getMostSignificantBits() && group.getLong()==header.owner().groupId().getLeastSignificantBits();
+    }
+
+    private static boolean recoveryRegistration(Header header,Section section,byte[] key) {
+        if(header.metadata() || section!=Section.STATE || key.length!=17 || key[16]!=0x67 && key[16]!=0x6a && key[16]!=0x72)return false;
+        return ownGroup(header,key);
     }
 
     private static long rowByteLimit(Header header,Section section,byte[] key,Limits limits) {

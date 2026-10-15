@@ -44,44 +44,75 @@ class NativeCurrentRangeRecoveryTest {
         }
     }
 
+    private static final class MetadataGate implements NativeRangeImage.IoAdmission {
+        final int limit;int held,peak,acquired,released;
+        MetadataGate(int limit){this.limit=limit;}
+        public void beforeBytes(int bytes){}
+        public AutoCloseable reserveMetadata(int rawBytes)throws java.io.IOException {
+            if(rawBytes>limit-held)throw new java.io.IOException("controlled metadata capacity denial");
+            held+=rawBytes;acquired+=rawBytes;peak=Math.max(peak,held);
+            return ()->{held-=rawBytes;released+=rawBytes;assertTrue(held>=0);};
+        }
+        void reset(){assertEquals(0,held);assertEquals(acquired,released);peak=acquired=released=0;}
+        void settled(){assertEquals(0,held);assertEquals(acquired,released);}
+    }
+    int schemaValueBytes(Map<String,byte[]> rows){return Math.toIntExact(rows.values().stream().mapToLong(value->value.length).sum());}
     @Test void typedMetadataChargesActualBytesReusesInstallAndScanEnvelopeAndReleasesOnFailure()throws Exception {
         Path original=root.resolve("metadata-source-image"),exported=root.resolve("metadata-reexport");
         try(var source=helper.new Fixture(root.resolve("metadata-source"),helper.first,"source-")) {
-            source.child.apply(new ApplyPosition(1,2),source.write(8));
-            var image=NativeRangeImage.write(original,source.child,helper.limits);
-            var registration=registration(source.child,source.definition.targetDirectory(),image,helper.second,helper.first,"metadata-current-");
-            var held=new java.util.concurrent.atomic.AtomicInteger();var reservations=new java.util.concurrent.atomic.AtomicInteger();
-            NativeRangeImage.IoAdmission gate=new NativeRangeImage.IoAdmission(){
-                public void beforeBytes(int bytes){}
-                public AutoCloseable reserveMetadata(int rawBytes){
-                    assertEquals(registration.encodedSize(),rawBytes);assertEquals(0,held.get());
-                    held.addAndGet(rawBytes);reservations.incrementAndGet();return ()->assertEquals(rawBytes,held.getAndAdd(-rawBytes));
-                }
-            };
+            source.evolve();source.child.apply(new ApplyPosition(1,5),source.write(8));
+            int sourceSchemaBytes=schemaValueBytes(schemaRows(source.child));assertTrue(sourceSchemaBytes>0);
+            var sourceGate=new MetadataGate(sourceSchemaBytes);
+            NativeRangeImage.Manifest image;
+            try(var pin=source.child.captureForRecovery()){image=NativeRangeImage.writeAdmitted(original,pin,pin.interval(),helper.limits,sourceGate);}
+            assertEquals(sourceSchemaBytes,sourceGate.peak);sourceGate.settled();sourceGate.reset();NativeRangeImage.inspectAdmitted(original,helper.limits,sourceGate);assertEquals(sourceSchemaBytes,sourceGate.peak);sourceGate.settled();
+            var registration=registration(source.child,source.child.schemaInstallation().definition().targetDirectory(),image,helper.second,helper.first,"metadata-current-");
+            int installationBytes=registration.encodedSize()+sourceSchemaBytes;
+            int exportedBytes=registration.encodedSize()+schemaValueBytes(registration.localSchemaRows());
+            var gate=new MetadataGate(Math.max(installationBytes,exportedBytes));
             try(var pool=helper.helper.pool(root.resolve("metadata-receiver"))){
-                var receiver=pool.openCurrentRangeRecovery(registration);
-                NativeRangeImage.IoAdmission denied=new NativeRangeImage.IoAdmission(){
-                    public void beforeBytes(int bytes){}
-                    public AutoCloseable reserveMetadata(int rawBytes)throws java.io.IOException{assertEquals(registration.encodedSize(),rawBytes);throw new java.io.IOException("controlled metadata denial");}
-                };
-                assertThrows(java.io.IOException.class,()->receiver.installSnapshotAdmitted(original,helper.limits,batch->fail("Denied metadata must precede installation"),denied));
+                var receiver=pool.openCurrentRangeRecovery(registration);var denied=new MetadataGate(registration.encodedSize()-1);
+                assertThrows(java.io.IOException.class,()->receiver.installSnapshotAdmitted(original,helper.limits,batch->fail("Denied metadata must precede installation"),denied));denied.settled();
                 assertFalse(receiver.pendingInstallation());assertNull(receiver.applied());
-                receiver.installSnapshotAdmitted(original,helper.limits,batch->assertEquals(registration.encodedSize(),held.get()),gate);
-                assertEquals(0,held.get());assertEquals(1,reservations.get());
+                // The install retains its registration base while scanning the distinct source schema graph.
+                receiver.installSnapshotAdmitted(original,helper.limits,batch->assertEquals(installationBytes,gate.held),gate);
+                assertEquals(installationBytes,gate.peak);gate.settled();gate.reset();
                 receiver.completeCurrentRangeRecovery(registration,image.position(),receiver.configuration());
                 try(var pin=receiver.captureForRecovery()){NativeRangeImage.writeAdmitted(exported,pin,pin.interval(),helper.limits,gate);}
-                assertEquals(0,held.get());assertEquals(2,reservations.get());
+                assertEquals(exportedBytes,gate.peak);gate.settled();gate.reset();
             }
             try(var scope=NativeRangeImage.openMetadataAdmission(gate)){
                 NativeRangeImage.inspect(exported,helper.limits);NativeRangeImage.inspectAdmitted(exported,helper.limits,NativeRangeImage.IoAdmission.UNLIMITED);
-                assertEquals(registration.encodedSize(),held.get());assertEquals(3,reservations.get());
+                assertEquals(exportedBytes,gate.held);assertEquals(exportedBytes,gate.acquired);
             }
-            assertEquals(0,held.get());
+            gate.settled();gate.reset();
             byte[] damaged=java.nio.file.Files.readAllBytes(exported);damaged[damaged.length-1]^=1;Path invalid=root.resolve("metadata-invalid");java.nio.file.Files.write(invalid,damaged);
-            assertThrows(java.io.IOException.class,()->NativeRangeImage.inspectAdmitted(invalid,helper.limits,gate));
-            assertEquals(0,held.get());assertEquals(4,reservations.get());
-            NativeRangeImage.inspectAdmitted(exported,helper.limits,gate);
-            assertEquals(0,held.get());assertEquals(5,reservations.get());
+            assertThrows(java.io.IOException.class,()->NativeRangeImage.inspectAdmitted(invalid,helper.limits,gate));assertEquals(exportedBytes,gate.peak);gate.settled();gate.reset();
+            NativeRangeImage.inspectAdmitted(exported,helper.limits,gate);assertEquals(exportedBytes,gate.peak);gate.settled();
+        }
+    }
+
+    @Test void smallInitialCurrentRegistrationDoesNotPrepayLargeLaterSchemaHistory()throws Exception {
+        var limits=new NativeRangeImage.Limits(4<<20,32<<20,64);Path original=root.resolve("late-history-original"),checkpoint=root.resolve("late-history-checkpoint");
+        try(var source=helper.new Fixture(root.resolve("late-history-source"),helper.first,"source-")){
+            source.child.apply(new ApplyPosition(1,2),source.write(8));var image=NativeRangeImage.write(original,source.child,limits);
+            var registration=registration(source.child,source.definition.targetDirectory(),image,helper.second,helper.first,"late-current-");assertTrue(registration.encodedSize()<1024*1024);
+            try(var pool=helper.helper.pool(root.resolve("late-history-receiver"))){
+                var receiver=pool.openCurrentRangeRecovery(registration);receiver.installSnapshot(original,limits);receiver.completeCurrentRangeRecovery(registration,image.position(),receiver.configuration());var directory=registration.directory();
+                for(int n=0;n<40;n++){
+                    long id=27000+n;var change=addColumn(directory,receiver.installedSchema(),id,"late-column-"+id+"x".repeat(3900));var aliases=new HashMap<>(pool.schemaPhysicalNames(receiver));aliases.put(new UUID(0,id),"late-alias-"+id);long next=receiver.applied().index()+1;
+                    receiver.applySchemaFence(new ApplyPosition(1,next),change.header());var installed=pool.installSchema(receiver,new ApplyPosition(1,next+1),change,aliases,Set.of());receiver.applySchemaActivation(new ApplyPosition(1,next+2),installed.proof(),helper.catalogue,new ApplyPosition(1,100+n));directory=change.targetDirectory();
+                }
+                int history=schemaValueBytes(schemaRows(receiver));assertTrue(history>4*1024*1024);assertEquals(registration.encodedSize(),receiver.currentRangeRecoveryRegistration().encodedSize());int encoded=registration.encodedSize()+history;
+                var deniedWrite=new MetadataGate(encoded-1);try(var pin=receiver.captureForRecovery()){assertThrows(java.io.IOException.class,()->NativeRangeImage.writeAdmitted(checkpoint,pin,pin.interval(),limits,deniedWrite));}assertFalse(java.nio.file.Files.exists(checkpoint));assertEquals(0,deniedWrite.acquired);deniedWrite.settled();
+                var write=new MetadataGate(encoded);try(var pin=receiver.captureForRecovery()){NativeRangeImage.writeAdmitted(checkpoint,pin,pin.interval(),limits,write);}assertEquals(encoded,write.peak);write.settled();
+                var deniedRead=new MetadataGate(encoded-1);assertThrows(java.io.IOException.class,()->NativeRangeImage.inspectAdmitted(checkpoint,limits,deniedRead));assertTrue(deniedRead.peak>4*1024*1024);deniedRead.settled();
+                var read=new MetadataGate(encoded);NativeRangeImage.inspectAdmitted(checkpoint,limits,read);assertEquals(encoded,read.peak);read.settled();
+                var deniedQualification=new MetadataGate(2*encoded-1);try(var scope=NativeRangeImage.openMetadataAdmission(deniedQualification)){assertThrows(java.io.IOException.class,()->receiver.validateCurrentRangeRecoveryImage(checkpoint,limits));}deniedQualification.settled();
+                var qualification=new MetadataGate(2*encoded);try(var scope=NativeRangeImage.openMetadataAdmission(qualification)){receiver.validateCurrentRangeRecoveryImage(checkpoint,limits);receiver.validateCurrentRangeRecoveryImage(checkpoint,limits);assertEquals(2*encoded,qualification.held);assertEquals(2*encoded,qualification.acquired);}qualification.settled();
+                receiver.fence();var before=receiver.applied();var deniedInstall=new MetadataGate(2*encoded-1);assertThrows(java.io.IOException.class,()->receiver.installSnapshotAdmitted(checkpoint,limits,batch->fail("Denied schema workspace must precede installation"),deniedInstall));deniedInstall.settled();assertEquals(before,receiver.applied());assertFalse(receiver.pendingInstallation());
+                var install=new MetadataGate(2*encoded);receiver.installSnapshotAdmitted(checkpoint,limits,batch->assertEquals(2*encoded,install.held),install);assertEquals(2*encoded,install.acquired);install.settled();receiver.activate();assertEquals(41,receiver.installedSchema().schemaEpoch());assertArrayEquals(helper.helper.helper.key(8),receiver.readCurrentPoint(helper.helper.outer.fixed,helper.helper.helper.key(1)));
+            }
         }
     }
 
