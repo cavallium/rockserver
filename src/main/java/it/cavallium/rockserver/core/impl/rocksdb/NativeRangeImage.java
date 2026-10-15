@@ -183,19 +183,23 @@ public final class NativeRangeImage {
     public static Manifest writeMetadataAdmitted(Path destination,ReplicatedRangeStore.SnapshotPin pin,RangeOwnership.Interval interval,Limits limits,IoAdmission admission)throws IOException,RocksDBException {
         return writeAdmitted(destination,pin,interval,limits,admission,true);
     }
-    /** Exact current-format length from a stable metadata pin; never visits USER columns. */
-    public static long metadataEncodedBytes(ReplicatedRangeStore.SnapshotPin pin,Limits limits)throws IOException,RocksDBException {
+    /** Exact current-format length from one stable pin, using the same row encoder as publication. */
+    public static long encodedBytes(ReplicatedRangeStore.SnapshotPin pin,Limits limits)throws IOException,RocksDBException {
         Objects.requireNonNull(pin);Objects.requireNonNull(limits);
-        if(!pin.metadataOnly() || pin.position()==null || pin.topologyImageOrigin()!=null)throw new IllegalArgumentException("Metadata sizing requires a completed metadata-only pin");
+        if(pin.position()==null)throw new IllegalArgumentException("Image sizing requires a completed pin");
         try(var scope=openMetadataAdmission(IoAdmission.UNLIMITED);var pass=scope.pass()) {
             pass.reserve(pin.imageMetadataBytes(limits));
-            var header=new Header(new RangeOwnership.Owner(pin.groupId(),pin.rangeEpoch()),pin.interval(),pin.schemaDigest(),pin.position(),Set.copyOf(pin.deterministicMergeColumns()),true);validateHeader(header,limits);
-            var counted=new BoundedOutput(OutputStream.nullOutputStream(),limits.maxImageBytes());var output=new DataOutputStream(counted);writeHeader(output,header);var tracker=new Rows(header,limits);
-            RowVisitor append=(section,column,key,value)->{tracker.accept(section,column,key,value);output.writeByte(section.ordinal()+1);output.writeInt(key.length);output.writeInt(value.length);output.write(key);output.write(value);};
-            pin.visitState((key,value)->{if(!metadataLocalPointer(key))append.accept(Section.STATE,null,key,value);});
-            pin.visitReceipts((key,value)->append.accept(Section.RECEIPTS,null,key,value));tracker.finish();
+            var header=new Header(new RangeOwnership.Owner(pin.groupId(),pin.rangeEpoch()),pin.interval(),pin.schemaDigest(),pin.position(),Set.copyOf(pin.deterministicMergeColumns()),pin.metadataOnly());validateHeader(header,limits);
+            var counted=new BoundedOutput(OutputStream.nullOutputStream(),limits.maxImageBytes());var output=new DataOutputStream(counted);
+            var origin=pin.topologyImageOrigin();var tracker=writeImageRows(output,pin,pin.interval(),limits,header,imageOrigin(origin,pin,pin.interval(),limits));
             output.writeByte(0);output.writeLong(tracker.count);output.write(new byte[32]);output.flush();return counted.count;
         }
+    }
+    private static byte[] imageOrigin(NativeTopologyImageOrigin origin,ReplicatedRangeStore.SnapshotPin pin,RangeOwnership.Interval interval,Limits limits)throws IOException {
+        byte[] encoded=origin==null?null:origin.encode();
+        if(encoded!=null && ((long)encoded.length+17>limits.maxRowBytes() || (long)encoded.length+17>limits.maxImageBytes()))throw new IOException("Topology image origin exceeds configured byte limit");
+        if(origin!=null)try{origin.requireImage(pin.groupId(),pin.rangeEpoch(),interval.domainId(),interval.lowerInclusive(),interval.upperExclusive(),pin.position());}catch(IllegalArgumentException invalid){throw new IOException("Topology image origin differs from snapshot cut",invalid);}
+        return encoded;
     }
     private static Manifest writeAdmitted(Path destination,ReplicatedRangeStore.SnapshotPin pin,RangeOwnership.Interval interval,Limits limits,IoAdmission admission,boolean metadata)throws IOException,RocksDBException {
         Objects.requireNonNull(admission).beforeBytes(1);
@@ -208,13 +212,7 @@ public final class NativeRangeImage {
         }
         try(var metadataScope=openMetadataAdmission(admission);var metadataPass=metadataScope.pass()) {
         metadataPass.reserve(pin.imageMetadataBytes(limits));
-        NativeTopologyImageOrigin origin=pin.topologyImageOrigin();
-        byte[] originBytes=origin==null ? null : origin.encode();
-        if(originBytes!=null && ((long)originBytes.length+17>limits.maxRowBytes() || (long)originBytes.length+17>limits.maxImageBytes())) throw new IOException("Topology image origin exceeds configured byte limit");
-        if(origin!=null) {
-            try { origin.requireImage(pin.groupId(),pin.rangeEpoch(),interval.domainId(),interval.lowerInclusive(),interval.upperExclusive(),pin.position()); }
-            catch(IllegalArgumentException invalid) { throw new IOException("Topology image origin differs from snapshot cut",invalid); }
-        }
+        var origin=pin.topologyImageOrigin();byte[] originBytes=imageOrigin(origin,pin,interval,limits);
         Header header = new Header(new RangeOwnership.Owner(pin.groupId(), pin.rangeEpoch()), interval,
                 pin.schemaDigest(), pin.position(), Set.copyOf(pin.deterministicMergeColumns()),metadata);
         validateHeader(header, limits);
@@ -233,36 +231,7 @@ public final class NativeRangeImage {
                         admittedOutput(Channels.newOutputStream(channel),admission)), whole), limits.maxImageBytes());
                 var bodyOutput = new DigestOutputStream(counted, body);
                 var output = new DataOutputStream(bodyOutput);
-                writeHeader(output, header);
-                var tracker = new Rows(header, limits);
-                RowVisitor append = (section, column, key, value) -> {
-                    tracker.accept(section, column, key, value);
-                    output.writeByte(section.ordinal() + 1);
-                    if (column != null) writeUuid(output, column);
-                    output.writeInt(key.length);
-                    output.writeInt(value.length);
-                    output.write(key);
-                    output.write(value);
-                };
-                if(!metadata)for (UUID column : sorted(interval.columns())) {
-                    pin.visitColumn(column, interval.lowerInclusive(), interval.upperExclusive(),
-                            (key, value) -> append.accept(Section.USER, column, key, value));
-                }
-                byte[] originKey=ByteBuffer.allocate(17).putLong(pin.groupId().getMostSignificantBits()).putLong(pin.groupId().getLeastSignificantBits()).put((byte)0x64).array();
-                boolean[] originWritten={false};
-                pin.visitState((key,value) -> {
-                    if(metadata && metadataLocalPointer(key))return;
-                    if(key.length==17 && key[16]>=0x6d && key[16]<=0x71)return; // Recovery fences are local receiver authority, never transferable image state.
-                    if(Arrays.equals(key,originKey)) throw new IOException("Image-only topology origin cannot be persisted as native state");
-                    if(originBytes!=null && !originWritten[0] && Arrays.compareUnsigned(key,originKey)>0) { append.accept(Section.STATE,null,originKey,originBytes); originWritten[0]=true; }
-                    append.accept(Section.STATE,null,key,value);
-                });
-                if(originBytes!=null && !originWritten[0]) append.accept(Section.STATE,null,originKey,originBytes);
-                pin.visitReceipts((key, value) -> append.accept(Section.RECEIPTS, null, key, value));
-                tracker.finish();
-                try { pin.validateSessionMetadataImage(); pin.validateCatalogueHistoryImage(); pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries);
-                pin.validateSnapshotHomeImage(); }
-                catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("Native image metadata accounting/recovery proof differs",invalid); }
+                var tracker=writeImageRows(output,pin,interval,limits,header,originBytes);
                 output.writeByte(0);
                 output.writeLong(tracker.count);
                 bodyOutput.on(false);
@@ -291,6 +260,40 @@ public final class NativeRangeImage {
     public static Manifest visitMetadata(Path image,Limits limits,RowVisitor visitor)throws IOException{return visit(image,limits,visitor,true,null,null,IoAdmission.UNLIMITED,true);}
     public static Manifest visitAdmitted(Path image,Limits limits,RowVisitor visitor,IoAdmission admission)throws IOException{return visit(image,limits,visitor,true,null,null,Objects.requireNonNull(admission));}
     public static Manifest visitMetadataAdmitted(Path image,Limits limits,RowVisitor visitor,IoAdmission admission)throws IOException{return visit(image,limits,visitor,true,null,null,Objects.requireNonNull(admission),true);}
+    private static Rows writeImageRows(DataOutputStream output,ReplicatedRangeStore.SnapshotPin pin,RangeOwnership.Interval interval,Limits limits,Header header,byte[] originBytes)throws IOException,RocksDBException {
+        boolean metadata=pin.metadataOnly();
+        writeHeader(output, header);
+        var tracker = new Rows(header, limits);
+        RowVisitor append = (section, column, key, value) -> {
+            tracker.accept(section, column, key, value);
+            output.writeByte(section.ordinal() + 1);
+            if (column != null) writeUuid(output, column);
+            output.writeInt(key.length);
+            output.writeInt(value.length);
+            output.write(key);
+            output.write(value);
+        };
+        if(!metadata)for (UUID column : sorted(interval.columns())) {
+            pin.visitColumn(column, interval.lowerInclusive(), interval.upperExclusive(),
+                    (key, value) -> append.accept(Section.USER, column, key, value));
+        }
+        byte[] originKey=ByteBuffer.allocate(17).putLong(pin.groupId().getMostSignificantBits()).putLong(pin.groupId().getLeastSignificantBits()).put((byte)0x64).array();
+        boolean[] originWritten={false};
+        pin.visitState((key,value) -> {
+            if(metadata && metadataLocalPointer(key))return;
+            if(key.length==17 && key[16]>=0x6d && key[16]<=0x71)return; // Recovery fences are local receiver authority, never transferable image state.
+            if(Arrays.equals(key,originKey)) throw new IOException("Image-only topology origin cannot be persisted as native state");
+            if(originBytes!=null && !originWritten[0] && Arrays.compareUnsigned(key,originKey)>0) { append.accept(Section.STATE,null,originKey,originBytes); originWritten[0]=true; }
+            append.accept(Section.STATE,null,key,value);
+        });
+        if(originBytes!=null && !originWritten[0]) append.accept(Section.STATE,null,originKey,originBytes);
+        pin.visitReceipts((key, value) -> append.accept(Section.RECEIPTS, null, key, value));
+        tracker.finish();
+        try { pin.validateSessionMetadataImage(); pin.validateCatalogueHistoryImage(); pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries);
+        pin.validateSnapshotHomeImage(); }
+        catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("Native image metadata accounting/recovery proof differs",invalid); }
+        return tracker;
+    }
     /** Receiver-local ownership rows omitted from the portable metadata projection of a GROUP image. */
     public static boolean metadataLocalPointer(byte[] key){if(key.length<17)return false;int tag=key[16]&255;return key.length==17 && (tag>=0x61 && tag<=0x64 || tag>=0x67 && tag<=0x74) || key.length==33 && tag==0x68;}
 

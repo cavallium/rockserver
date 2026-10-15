@@ -977,12 +977,50 @@ public final class ReplicatedRangeStore {
         } finally { applyLane.unlock(); }
     }
 
+    private final Object discoveryPublication=new Object();
+    private volatile boolean discoveryPending;
+    private DiscoveryActivation discoveryActivation;
+
+    /** Adapter startup inventory keeps native foreground work closed independently of Raft eligibility. */
+    public void deferDiscovery() {
+        synchronized(discoveryPublication){discoveryPending=true;discoveryActivation=null;}fence();
+    }
+    /** Heavy activation/control reconstruction runs while the independent foreground fence remains closed. */
+    public DiscoveryActivation prepareCurrentDiscoveryActivation(boolean sessions,RangeMutationHistory.Limits history) {
+        Objects.requireNonNull(history);enterNative();applyLane.lock();
+        try {
+            requireCurrentDiscoveryOwner();
+            synchronized(discoveryPublication){discoveryActivation=null;if(ownership.get(owner).state()==RangeOwnership.State.ACTIVE)ownership.fence(owner);}
+            activateUnderAdmission();requireNativeActive();
+            enableScopedHistoryUnderLane(history);if(sessions)sessionControlsEnabled=true;
+            synchronized(discoveryPublication){if(!discoveryPending || closing)throw new IllegalStateException("Discovery activation was revoked");return discoveryActivation=new DiscoveryActivation();}
+        }catch(RocksDBException failure){throw new IllegalStateException("Cannot prepare CURRENT discovery activation",failure);}
+        finally {applyLane.unlock();leaveNative();}
+    }
+    /** Exact adapter-owned publication token; publish only inside its final qualified eligibility publication. */
+    public final class DiscoveryActivation {
+        private DiscoveryActivation(){}
+        public void publish() {
+            synchronized(discoveryPublication) {
+                if(discoveryActivation!=this || !discoveryPending || closing)throw new IllegalStateException("Discovery activation was revoked");
+                requireNativeActive();discoveryPending=false;discoveryActivation=null;
+            }
+        }
+    }
+    private void requireCurrentDiscoveryOwner()throws RocksDBException {
+        if(!discoveryPending || metadataRecoveryRegistration!=null || topologyRecoveryOnly() || pendingInstallation!=null || importPending() || topologyBirthPending() || topologyRetired() || retiredMetadataOnly || applied==null || applied.term()<1)throw new IllegalStateException("No completed fenced CURRENT discovery owner");
+        var current=ownership.get(owner).state();if(current!=RangeOwnership.State.FENCED && current!=RangeOwnership.State.ACTIVE)throw new IllegalStateException("CURRENT discovery owner is not fenced/active");
+        var cfg=configurationUnderAdmission();if(cfg==null || cfg.index()>applied.index() || cfg.term()>applied.term() || cfg.index()==applied.index() && cfg.term()!=applied.term())throw new IllegalStateException("CURRENT discovery configuration exceeds native prefix");
+        validateTopologyActivationRecovery();
+    }
     public void fence() {
         applyLane.lock();
         try {
-            var current = ownership.get(owner);
-            if (current.state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
-            else if (current.state() != RangeOwnership.State.FENCED && current.state()!=RangeOwnership.State.RETIRED && current.state()!=RangeOwnership.State.INSTALLING) throw new IllegalStateException("Range cannot be fenced");
+            synchronized(discoveryPublication) {
+                discoveryActivation=null;var current = ownership.get(owner);
+                if (current.state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
+                else if (current.state() != RangeOwnership.State.FENCED && current.state()!=RangeOwnership.State.RETIRED && current.state()!=RangeOwnership.State.INSTALLING) throw new IllegalStateException("Range cannot be fenced");
+            }
             // INSTALLING already denies USER work; shutdown must preserve its recovery ownership.
             invalidateScopedUnderLane(RangeMutationHistory.Status.INVALIDATED);
         } finally { applyLane.unlock(); drainScopedReleases(); }
@@ -1007,6 +1045,9 @@ public final class ReplicatedRangeStore {
     }
 
     private void requireActive() {
+        if(discoveryPending)throw new IllegalStateException("Native discovery is pending");requireNativeActive();
+    }
+    private void requireNativeActive() {
         if (currentRangeRecovery!=null && !currentRangeRecoveryReady || pendingInstallation != null || importPending() || topologyBirthPending() || topologyRetired() || ownership.get(owner).state() != RangeOwnership.State.ACTIVE) {
             throw new IllegalStateException("Range is fenced");
         }
@@ -1091,9 +1132,16 @@ public final class ReplicatedRangeStore {
     }
     /** Read-only target qualification; source image validation remains NativeRangeImage's responsibility. */
     public void validateTopologyImageOrigin(NativeTopologyImageOrigin origin) throws IOException,RocksDBException {
-        enterNative();applyLane.lock();try { qualifyTopologyImageOrigin(origin); } finally { applyLane.unlock();leaveNative(); }
+        enterNative();applyLane.lock();try { qualifyTopologyImageOrigin(origin,false); } finally { applyLane.unlock();leaveNative(); }
     }
-    private NativeTopologyActivation qualifyTopologyImageOrigin(NativeTopologyImageOrigin origin) throws IOException,RocksDBException {
+    /** Fresh CURRENT role only; original local birth/seed remain mandatory even when actual A is absent. */
+    public void validateCurrentDiscoveryImageOrigin(NativeTopologyImageOrigin origin)throws IOException,RocksDBException {
+        enterNative();applyLane.lock();try{requireCurrentDiscoveryTarget();qualifyTopologyImageOrigin(origin,true);}finally{applyLane.unlock();leaveNative();}
+    }
+    private void requireCurrentDiscoveryTarget() {
+        if(!discoveryPending || metadataRecoveryRegistration!=null || topologyRetired() || topologyRecoveryFence!=null || ownership.get(owner).state()!=RangeOwnership.State.FENCED)throw new IllegalStateException("No fenced CURRENT discovery image target");
+    }
+    private NativeTopologyActivation qualifyTopologyImageOrigin(NativeTopologyImageOrigin origin,boolean discovery) throws IOException,RocksDBException {
         if(topologyRetired())throw new IOException("Retired topology parent cannot restore USER image");
         if(currentRangeRecovery!=null){if(!Objects.equals(origin,currentRangeRecovery.origin()))throw new IOException("CURRENT image changed qualified source provenance");return origin==null?null:origin.activation();}
         if(topologyLearner!=null) { if(learnerImagePermission!=null && Objects.equals(origin,learnerImagePermission.origin()))return topologyLearner.origin()==null ? null : topologyLearner.origin().activation();if(topologyLearner.origin()==null) { if(origin!=null)throw new IOException("Ordinary learner source acquired foreign birth provenance");return null; }if(origin==null)throw new IOException("Learner image lacks original topology provenance");try { origin.requireLearner(topologyLearner);return origin.activation(); } catch(IllegalArgumentException invalid) { throw new IOException("Learner image changed qualified source origin",invalid); } }
@@ -1103,7 +1151,8 @@ public final class ReplicatedRangeStore {
             origin.requireImage(groupId,rangeEpoch,interval.domainId(),interval.lowerInclusive(),interval.upperExclusive(),origin.activation().position());
             var seed=schemaPreparationPool.topologySeed(topologyBirth.intentId());if(seed==null)throw new IllegalArgumentException("Target original local seed missing");topologyBirth.requireSeed(seed);var local=origin.localActivation(seed);
             if(topologyActivation!=null && !Arrays.equals(topologyActivation.encode(),local.encode()))throw new IllegalArgumentException("Topology image changes target original activation/cut/publication");
-            var cut=topologyRecoveryCut();if(configurationUnderAdmission()==null || cut==null || cut.term()<=0 || cut.index()<0)throw new IllegalArgumentException("Topology image requires configured positive original local child prefix");
+            var cut=topologyRecoveryCut();var cfg=configurationUnderAdmission();
+            if(cfg==null || cut==null && (!discovery || cfg.term()!=0 || cfg.index()!=-1) || cut!=null && (cut.term()<=0 || cut.index()<0))throw new IllegalArgumentException("Topology image requires original configured prefix or qualified CURRENT bootstrap");
             return local;
         } catch(IllegalArgumentException invalid) { throw new IOException("Topology image differs from retained local birth",invalid); }
     }
@@ -1669,15 +1718,14 @@ public final class ReplicatedRangeStore {
     /** Group-local ephemeral limits, configured once; ordinary read/export pins remain independent. */
     public void enableScopedHistory(RangeMutationHistory.Limits limits) {
         Objects.requireNonNull(limits); enterNative(); applyLane.lock();
-        try {
-            requireActive();
-            if (catalogueScopeCompaction) throw new IllegalStateException("Catalogue scope compaction excludes DATA scoped history");
-            if (scopedHistory!=null) {
-                if (!scopedLimits.equals(limits)) throw new IllegalArgumentException("Scoped history limits already configured"); return;
-            }
-            scopedHistory=new RangeMutationHistory(limits); scopedLimits=limits;
-            if (applied!=null && applied.term()>0) scopedHistory.advance(applied,List.of());
-        } finally { applyLane.unlock(); leaveNative(); }
+        try {requireActive();enableScopedHistoryUnderLane(limits);}
+        finally {applyLane.unlock();leaveNative();}
+    }
+    private void enableScopedHistoryUnderLane(RangeMutationHistory.Limits limits) {
+        if(catalogueScopeCompaction)throw new IllegalStateException("Catalogue scope compaction excludes DATA scoped history");
+        if(scopedHistory!=null){if(!scopedLimits.equals(limits))throw new IllegalArgumentException("Scoped history limits already configured");return;}
+        scopedHistory=new RangeMutationHistory(limits);scopedLimits=limits;
+        if(applied!=null && applied.term()>0)scopedHistory.advance(applied,List.of());
     }
     public RangeMutationHistory.Stats scopedHistoryStats() {
         applyLane.lock(); try { if (scopedHistory==null) throw new UnsupportedOperationException("Scoped history is not enabled"); return scopedHistory.stats(); }
@@ -3984,8 +4032,14 @@ public final class ReplicatedRangeStore {
     public NativeRangeImage.Manifest installSnapshotAdmitted(Path image,NativeRangeImage.Limits limits,
             InstallationObserver observer,NativeRangeImage.IoAdmission admission)throws IOException,RocksDBException {
         enterNative();
-        try(var metadataScope=NativeRangeImage.openMetadataAdmission(admission);var metadataPass=metadataScope.pass()) { return installUnderAdmission(image,limits,observer,false,metadataPass); }
+        try(var metadataScope=NativeRangeImage.openMetadataAdmission(admission);var metadataPass=metadataScope.pass()) { return installUnderAdmission(image,limits,observer,false,metadataPass,false); }
         finally { try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
+    /** Adapter supplies the fresh CURRENT role; native installation retains exact pending image retry identity. */
+    public NativeRangeImage.Manifest installCurrentDiscoverySnapshotAdmitted(Path image,NativeRangeImage.Limits limits,InstallationObserver observer,NativeRangeImage.IoAdmission admission)throws IOException,RocksDBException {
+        enterNative();
+        try(var metadataScope=NativeRangeImage.openMetadataAdmission(admission);var metadataPass=metadataScope.pass()){return installUnderAdmission(image,limits,observer,false,metadataPass,true);}
+        finally{try{drainScopedReleases();}finally{leaveNative();}}
     }
     public NativeRangeImage.Manifest installMetadataSnapshot(Path image,NativeRangeImage.Limits limits)throws IOException,RocksDBException{return installMetadataSnapshot(image,limits,batches->{});}
     /** Trusted sealed-source snapshot replacement. Descendant USER CFs and intervals are never visited. */
@@ -3994,7 +4048,7 @@ public final class ReplicatedRangeStore {
     }
     public NativeRangeImage.Manifest installMetadataSnapshotAdmitted(Path image,NativeRangeImage.Limits limits,
             InstallationObserver observer,NativeRangeImage.IoAdmission admission)throws IOException,RocksDBException {
-        enterNative();try(var metadataScope=NativeRangeImage.openMetadataAdmission(admission);var metadataPass=metadataScope.pass()){if(!topologyRetired())throw new IllegalStateException("Metadata install requires durable source retirement/recovery registration");return installUnderAdmission(image,limits,observer,true,metadataPass);}
+        enterNative();try(var metadataScope=NativeRangeImage.openMetadataAdmission(admission);var metadataPass=metadataScope.pass()){if(!topologyRetired())throw new IllegalStateException("Metadata install requires durable source retirement/recovery registration");return installUnderAdmission(image,limits,observer,true,metadataPass,false);}
         finally{try{drainScopedReleases();}finally{leaveNative();}}
     }
 
@@ -4241,7 +4295,7 @@ public final class ReplicatedRangeStore {
     }
 
     private NativeRangeImage.Manifest installUnderAdmission(Path image, NativeRangeImage.Limits limits,
-            InstallationObserver observer,boolean metadata,NativeRangeImage.MetadataPass targetMetadata) throws IOException, RocksDBException {
+            InstallationObserver observer,boolean metadata,NativeRangeImage.MetadataPass targetMetadata,boolean discovery) throws IOException, RocksDBException {
         if(importPending()) throw new IllegalStateException("Unpublished native import cannot be replaced by snapshot replay");
         var context=homeRecoveryContext;
         var snapshotContext=snapshotHomeContext;
@@ -4254,6 +4308,7 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(observer);
         applyLane.lock();
         try {
+            if(discovery){requireCurrentDiscoveryTarget();if(applied!=null && !NativeMetadataRecoveryRegistration.covers(expected.position(),applied))throw new IOException("CURRENT discovery snapshot regresses native prefix");}
             // Own-tail schema changes share this lane; measure and hold their exact graph before normalization.
             if(targetMetadata!=null)targetMetadata.reserve(imageMetadataBytes(null,limits,!metadata));
             if(metadata && applied!=null && !NativeMetadataRecoveryRegistration.covers(expected.position(),applied))throw new IOException("Metadata snapshot regresses actual completed source prefix");
@@ -4261,7 +4316,7 @@ public final class ReplicatedRangeStore {
             if(pendingLearnerImagePermission!=null)throw new IllegalStateException("Unknown later image force requires exact permission retry");
             final NativeTopologyLearnerImagePermission permission=topologyLearner!=null && learnerImagePermission!=null && expected.position().equals(learnerImagePermission.imageCut()) && Arrays.equals(expected.sha256(),learnerImagePermission.imageHash()) ? learnerImagePermission : null;
             final CurrentImageQualification currentImage=!metadata && currentRangeRecovery!=null?qualifyCurrentRangeRecoveryImage(image,limits,expected,true):null;
-            final NativeTopologyActivation localActivation=metadata?null:currentImage!=null?currentImage.activation():qualifyTopologyImageOrigin(expected.topologyOrigin());
+            final NativeTopologyActivation localActivation=metadata?null:currentImage!=null?currentImage.activation():qualifyTopologyImageOrigin(expected.topologyOrigin(),discovery);
             if(!metadata && topologyLearner!=null) {
                 if(permission==null && (!expected.position().equals(topologyLearner.imageCut()) || !Arrays.equals(expected.sha256(),topologyLearner.imageHash())))throw new IOException("Learner image lacks exact original or freshly qualified later permission");
                 var configuration=new Configuration[1];NativeRangeImage.visit(image,limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==1)configuration[0]=Configuration.decode(value);});
@@ -4488,7 +4543,7 @@ public final class ReplicatedRangeStore {
     }
 
     /** Memory-only admission state; no native reads or snapshot acquisition. */
-    public boolean admissionOpen() { return !topologyRecoveryOnly() && !closing && pendingInstallation==null && !importPending() && !topologyBirthPending() && !topologyRetired() && ownership.get(owner).state()==RangeOwnership.State.ACTIVE; }
+    public boolean admissionOpen() { return !discoveryPending && !topologyRecoveryOnly() && !closing && pendingInstallation==null && !importPending() && !topologyBirthPending() && !topologyRetired() && ownership.get(owner).state()==RangeOwnership.State.ACTIVE; }
     /** Memory-only scope validation before entering the short proposal coordination lane. */
     public void validateScope(TransactionScope scope) {
         Objects.requireNonNull(scope); requireSchemaAdmission(); if (!admissionOpen()) throw new IllegalStateException("Range admission is closed"); validateSnapshotScope(scope);
@@ -4843,11 +4898,17 @@ public final class ReplicatedRangeStore {
     private SnapshotPin captureUnderAdmission(boolean recovery) throws RocksDBException {
         return captureUnderAdmission(recovery,false);
     }
-    private SnapshotPin captureUnderAdmission(boolean recovery,boolean metadata) throws RocksDBException {
-        if(metadata)requireTopologyMetadataOwner();else {if (!recovery) { requireServing(); requireSchemaAdmission(); } if(!recovery || topologyLearner==null && currentRangeRecovery==null)requireActive();}
+    /** Fresh CURRENT classification may capture without reopening ordinary USER admission. */
+    public SnapshotPin captureCurrentForDiscovery()throws RocksDBException {
+        enterNative();try{return captureUnderAdmission(true,false,true);}finally{leaveNative();}
+    }
+    private SnapshotPin captureUnderAdmission(boolean recovery,boolean metadata)throws RocksDBException{return captureUnderAdmission(recovery,metadata,false);}
+    private SnapshotPin captureUnderAdmission(boolean recovery,boolean metadata,boolean discovery) throws RocksDBException {
+        if(discoveryPending && !discovery && !metadata)throw new IllegalStateException("Native discovery is pending");
+        if(discovery){if(!discoveryPending)throw new IllegalStateException("Native discovery is not pending");}else if(metadata)requireTopologyMetadataOwner();else {if (!recovery) { requireServing(); requireSchemaAdmission(); } if(!recovery || topologyLearner==null && currentRangeRecovery==null)requireActive();}
         applyLane.lock();
         try {
-            if(metadata)requireTopologyMetadataOwner();else {if(!recovery) { requireServing(); requireSchemaAdmission(); } if(recovery && (topologyLearner!=null || currentRangeRecovery!=null))requireTopologyLearnerImage();else requireActive();}
+            if(discovery)requireCurrentDiscoveryOwner();else if(metadata)requireTopologyMetadataOwner();else {if(!recovery) { requireServing(); requireSchemaAdmission(); } if(recovery && (topologyLearner!=null || currentRangeRecovery!=null))requireTopologyLearnerImage();else requireActive();}
             if(schemaCaptureGate!=null) throw new IllegalStateException("INSTALL preparation blocks new native captures");
             ensureReceiptUsage();
             PoolSnapshotAdmission.Lease lease = snapshotAdmission == null ? null : snapshotAdmission.reserve();

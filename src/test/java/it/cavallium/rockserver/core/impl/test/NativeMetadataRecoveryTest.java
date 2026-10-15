@@ -20,12 +20,12 @@ class NativeMetadataRecoveryTest {
         try(var source=nativeTest.new Fixture(root.resolve("sizing-source"))) {
             source.parent.apply(new ApplyPosition(1,1),source.write(source.parent,0,9));source.freeze();source.seed();
             try(var pin=source.parent.captureMetadataForRecovery()) {
-                long bytes=NativeRangeImage.metadataEncodedBytes(pin,nativeTest.limits);Path image=root.resolve("sized-meta");
+                long bytes=NativeRangeImage.encodedBytes(pin,nativeTest.limits);Path image=root.resolve("sized-meta");
                 var manifest=NativeRangeImage.writeMetadataAdmitted(image,pin,pin.interval(),nativeTest.limits,NativeRangeImage.IoAdmission.UNLIMITED);
                 assertEquals(bytes,manifest.bytes());assertEquals(bytes,java.nio.file.Files.size(image));assertEquals(pin.position(),manifest.position());
                 NativeRangeImage.visitMetadata(image,nativeTest.limits,(section,column,key,value)->assertNotEquals(NativeRangeImage.Section.USER,section));
             }
-            try(var pin=source.child.captureForRecovery()){assertThrows(IllegalArgumentException.class,()->NativeRangeImage.metadataEncodedBytes(pin,nativeTest.limits));}
+            try(var pin=source.child.captureForRecovery()){long bytes=NativeRangeImage.encodedBytes(pin,nativeTest.limits);Path image=root.resolve("sized-group");var manifest=NativeRangeImage.write(image,pin,pin.interval(),nativeTest.limits);assertEquals(bytes,manifest.bytes());assertEquals(bytes,java.nio.file.Files.size(image));assertNotNull(manifest.topologyOrigin());}
         }
     }
     NativeMetadataRecoveryRegistration registration(NativeTopologyCdcTest.Fixture source,NativeRangeImage.Manifest image) throws Exception {
