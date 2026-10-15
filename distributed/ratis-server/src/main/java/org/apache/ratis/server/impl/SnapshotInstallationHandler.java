@@ -117,7 +117,15 @@ class SnapshotInstallationHandler {
     }
   }
 
+  private void requireDiscoverySettled() throws IOException {
+    final RecoveryEligibilityStateMachine.Gate gate = server.getRecoveryEligibilityGate();
+    if (gate != null && gate.discoveryPending()) {
+      throw new IOException("DATA recovery role discovery is pending");
+    }
+  }
+
   InstallSnapshotReplyProto installSnapshot(InstallSnapshotRequestProto request) throws IOException {
+    requireDiscoverySettled();
     BatchLogger.print(BatchLogKey.INSTALL_SNAPSHOT_REQUEST, getMemberId(),
         suffix -> LOG.info("{}: receive installSnapshot: {} {}",
             getMemberId(), ServerStringUtils.toInstallSnapshotRequestString(request), suffix));
@@ -224,6 +232,7 @@ class SnapshotInstallationHandler {
     final long lastIncludedIndex = lastIncluded.getIndex();
     final CompletableFuture<Void> future;
     synchronized (server) {
+      requireDiscoverySettled();
       final boolean recognized = state.recognizeLeader(Op.INSTALL_SNAPSHOT, leaderId, leaderTerm);
       currentTerm = state.getCurrentTerm();
       if (!recognized) {
@@ -305,6 +314,7 @@ class SnapshotInstallationHandler {
     final long firstAvailableLogIndex = firstAvailableLogTermIndex.getIndex();
     final CompletableFuture<Void> future;
     synchronized (server) {
+      requireDiscoverySettled();
       final boolean recognized = state.recognizeLeader(UpdateType.INSTALL_SNAPSHOT_NOTIFICATION, leaderId, leaderTerm);
       currentTerm = state.getCurrentTerm();
       if (!recognized) {

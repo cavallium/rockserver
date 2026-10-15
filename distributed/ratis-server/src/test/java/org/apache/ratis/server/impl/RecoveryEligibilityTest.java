@@ -150,6 +150,9 @@ public class RecoveryEligibilityTest {
     final Machine machine;
     final RpcControl control = new RpcControl();
     Fixture(Path path, BaseStateMachine stateMachine) throws Exception {
+      this(path, stateMachine, true);
+    }
+    Fixture(Path path, BaseStateMachine stateMachine, boolean installSnapshotEnabled) throws Exception {
       this.machine = stateMachine instanceof Machine ? (Machine)stateMachine : null;
       var properties = new RaftProperties();
       RaftConfigKeys.Rpc.setType(properties, new InProcessRpcType());
@@ -160,7 +163,7 @@ public class RecoveryEligibilityTest {
       RaftServerConfigKeys.Rpc.setTimeoutMax(properties, TimeDuration.valueOf(2, TimeUnit.HOURS));
       RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMin(properties, TimeDuration.valueOf(1, TimeUnit.HOURS));
       RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMax(properties, TimeDuration.valueOf(2, TimeUnit.HOURS));
-      RaftServerConfigKeys.Log.Appender.setInstallSnapshotEnabled(properties, true);
+      RaftServerConfigKeys.Log.Appender.setInstallSnapshotEnabled(properties, installSnapshotEnabled);
       RaftServerConfigKeys.LeaderElection.setPreVote(properties, true);
       RaftServerConfigKeys.Notification.setNoLeaderTimeout(properties, TimeDuration.ZERO);
       var parameters = new Parameters(); parameters.put("test.rpc", control, RpcControl.class);
@@ -374,6 +377,53 @@ public class RecoveryEligibilityTest {
     gate.publish(RecoveryEligibilityStateMachine.Evidence.missing());
     gate.publish(RecoveryEligibilityStateMachine.Evidence.normal());
     assertThrows(IllegalStateException.class, fresh::requireCurrent);
+  }
+
+  @Test void discoveryFenceSurvivesOrdinaryPublicationAndRejectsChunksUntilExplicitSettlement() throws Exception {
+    var machine = new Machine(); machine.gate.publish(RecoveryEligibilityStateMachine.Evidence.normal());
+    var oldPermit = machine.gate.snapshotPermit(); machine.gate.deferDiscovery();
+    try (var fixture = new Fixture(root.resolve("discovery-chunks"), machine)) {
+      final var originalMetadata = fixture.server.getRaftStorage().getMetadataFile().getMetadata();
+      long staleRevision = machine.gate.revision();
+      machine.gate.publish(RecoveryEligibilityStateMachine.Evidence.normal());
+      assertTrue(machine.gate.discoveryPending());
+      assertEquals(RecoveryEligibilityStateMachine.Mode.MISSING, machine.gate.snapshot().mode());
+      assertThrows(IllegalStateException.class, oldPermit::requireCurrent);
+      assertThrows(IllegalStateException.class, machine.gate::snapshotPermit);
+      assertFalse(machine.gate.settleDiscovery(staleRevision, RecoveryEligibilityStateMachine.Evidence.normal()));
+      var revoked = machine.gate.revoke(); machine.gate.restoreUnchanged(revoked);
+      assertTrue(machine.gate.discoveryPending());
+      for (boolean done : List.of(false, true)) {
+        var request = fixture.snapshot(IMAGE, 0, 0, done ? new byte[]{11,22,33} : new byte[]{11}, done);
+        assertThrows(IOException.class, () -> fixture.server.installSnapshot(request));
+      }
+      assertEquals(originalMetadata, fixture.server.getRaftStorage().getMetadataFile().getMetadata());
+      assertNull(machine.snapshot); assertFalse(machine.nativeImage); assertTrue(machine.applied.isEmpty());
+      assertFalse(fixture.server.isInitialImageReady()); assertFalse(fixture.vote(false).getServerReply().getSuccess());
+      assertFalse(Files.exists(machine.storage.getSnapshotFile(1, 5).toPath()));
+      assertTrue(machine.gate.settleDiscovery(machine.gate.revision(), RecoveryEligibilityStateMachine.Evidence.missing()));
+      assertFalse(machine.gate.discoveryPending()); assertFalse(fixture.server.isVotingEligible());
+      assertEquals(InstallSnapshotResult.SUCCESS, fixture.server.installSnapshot(
+          fixture.snapshot(IMAGE, 0, 0, new byte[]{11,22,33}, true)).getResult());
+      assertTrue(machine.reloaded.await(5, TimeUnit.SECONDS)); assertTrue(fixture.server.isVotingEligible());
+      assertFalse(machine.gate.settleDiscovery(machine.gate.revision(), RecoveryEligibilityStateMachine.Evidence.normal()));
+      assertThrows(IllegalStateException.class, oldPermit::requireCurrent);
+    }
+  }
+
+  @Test void discoveryFenceRejectsSnapshotNotificationsBeforeLeaderMetadataOrStateMachineEffects() throws Exception {
+    var machine = new Machine(); machine.gate.deferDiscovery();
+    try (var fixture = new Fixture(root.resolve("discovery-notification"), machine, false)) {
+      final var originalMetadata = fixture.server.getRaftStorage().getMetadataFile().getMetadata();
+      var notification = InstallSnapshotRequestProto.newBuilder().setServerRequest(request(9)).setLeaderTerm(2)
+          .setNotification(InstallSnapshotRequestProto.NotificationProto.newBuilder()
+              .setFirstAvailableTermIndex(TermIndex.valueOf(1, 6).toProto())).build();
+      assertThrows(IOException.class, () -> fixture.server.installSnapshot(notification));
+      assertEquals(originalMetadata, fixture.server.getRaftStorage().getMetadataFile().getMetadata());
+      assertNull(fixture.server.getState().getLeaderId());
+      assertNull(machine.snapshot); assertFalse(machine.nativeImage); assertTrue(machine.applied.isEmpty());
+      assertTrue(machine.gate.discoveryPending());
+    }
   }
 
 }

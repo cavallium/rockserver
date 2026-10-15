@@ -2075,6 +2075,21 @@ identity, cancellation and blocked-read shutdown. This is controlled filesystem
 and injected-transport evidence, not power-loss or real-quorum acceptance.
 
 Automatic Runtime discovery and graph-driven dispatch remain unfinished.
+The core eligibility Gate now has a separate pre-initialization discovery fence.
+Ordinary recovery publication/revocation cannot clear it; explicit revision-checked
+classification settlement supplies the qualified baseline. Pending discovery masks
+vote/apply readiness and rejects outbound snapshot permits plus every inbound
+snapshot chunk/notification before replacement or leader-metadata effects. It is
+not an online install-drain primitive. Node startup does not yet install this
+fence or defer native image restoration.
+
+The core fence gate passes 25 cases in `discovery-fence-core-regression-gate.log`,
+including sticky revocation, stale classification refusal, actual blocked snapshot
+RPC handlers and producer reader cleanup. The downstream gate passes 37 cases in
+`discovery-fence-adapter-regression-gate.log` across NodeRuntime, graph Runtime,
+CURRENT-to-META and metadata-transition workflows. Both are controlled no-socket
+checks; they do not establish complete startup classification.
+
 An unresolved role fence must be installed before server construction: Ratis also
 initializes persisted DATA divisions. Preserve their real log floor while deferring
 GROUP import, replay, voting, export and incoming snapshot installation until CAT

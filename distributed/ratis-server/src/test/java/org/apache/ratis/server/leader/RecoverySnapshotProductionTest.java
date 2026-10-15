@@ -41,6 +41,20 @@ class RecoverySnapshotProductionTest {
     private void readers(Path file,long expected)throws Exception{if(Files.isDirectory(Path.of("/proc/self/fd")))assertEquals(expected,files.readers(file));}
     private static Evidence recovered(long nativeIndex){return Evidence.recovered(TermIndex.valueOf(1,7),TermIndex.valueOf(1,nativeIndex),TermIndex.valueOf(1,7),0,-1,RaftConfigurationProto.getDefaultInstance());}
     private static int drain(RockserverSnapshotRequests.Requests requests){int bytes=0;while(requests.hasNext())bytes+=requests.next().getSnapshotChunk().getFileChunks(0).getData().size();return bytes;}
+    @Test void discoveryFenceClosesExistingProducerAndRejectsNewExportsDespiteOrdinaryReadyPublication()throws Exception {
+        var file=Files.write(root.resolve("snapshot.1_7"),new byte[3073]);var snapshot=snapshot(file,7);latest=snapshot;
+        var gate=new Gate();gate.publish(Evidence.normal());var source=source(file,gate);var receiver=RaftPeerId.valueOf("receiver");
+        var permit=gate.snapshotPermit();
+        try(var requests=RockserverSnapshotRequests.openSource(source,receiver,"before-discovery",snapshot,1024,permit)) {
+            requests.next();readers(file,1);gate.deferDiscovery();gate.publish(Evidence.normal());
+            assertThrows(IllegalStateException.class,requests::next);assertFalse(requests.hasNext());readers(file,0);
+        }
+        assertThrows(IllegalStateException.class,()->RockserverSnapshotRequests.open(source,receiver,"pending",snapshot,1024));
+        assertThrows(IllegalStateException.class,()->RockserverSnapshotRequests.openSource(source,receiver,"pending-source",snapshot,1024,permit));readers(file,0);
+        assertTrue(gate.settleDiscovery(gate.revision(),Evidence.normal()));
+        try(var requests=RockserverSnapshotRequests.open(source,receiver,"classified",snapshot,1024)){assertEquals(3073,drain(requests));}
+        readers(file,0);
+    }
     @Test void missingRejectsBothOutboundEntryPointsAndExistingIteratorBeforeOpeningAReader()throws Exception {
         var file=Files.write(root.resolve("snapshot.1_7"),new byte[3073]);var snapshot=snapshot(file,7);latest=snapshot;var gate=new Gate();var source=source(file,gate);var receiver=RaftPeerId.valueOf("receiver");
         assertThrows(IllegalStateException.class,gate::snapshotPermit);gate.publish(Evidence.normal());var permit=gate.snapshotPermit();gate.publish(Evidence.missing());
