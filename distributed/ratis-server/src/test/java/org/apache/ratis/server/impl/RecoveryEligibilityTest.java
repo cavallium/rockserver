@@ -7,6 +7,7 @@ import java.nio.file.*;
 import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.conf.*;
 import org.apache.ratis.datastream.SupportedDataStreamType;
@@ -81,14 +82,25 @@ public class RecoveryEligibilityTest {
     final List<Long> applied = new CopyOnWriteArrayList<>();
     final CountDownLatch appliedConfiguration = new CountDownLatch(1), reloaded = new CountDownLatch(1);
     volatile CountDownLatch eligibilityEntered, eligibilityContinue;
+    final AtomicInteger controlledEligibilityReads = new AtomicInteger();
     @Override public TermIndex getLastAppliedTermIndex() {
       var entered = eligibilityEntered; var proceed = eligibilityContinue;
-      if (entered != null && proceed != null && Thread.currentThread().getName().equals("controlled-vote")) {
+      if (entered != null && proceed != null && Thread.currentThread().getName().equals("controlled-vote")
+          && controlledEligibilityReads.incrementAndGet() == 2) {
         entered.countDown();
         try { if (!proceed.await(5, TimeUnit.SECONDS)) { throw new AssertionError("eligibility barrier timeout"); } }
         catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new AssertionError(failure); }
       }
       return super.getLastAppliedTermIndex();
+    }
+    @Override public void notifyLeaderChanged(RaftGroupMemberId member, RaftPeerId leader) {
+      assertFalse(Thread.holdsLock(gate), "SM leader callback entered under recovery Gate");
+    }
+    @Override public void notifyExtendedNoLeader(RoleInfoProto role) {
+      assertFalse(Thread.holdsLock(gate), "SM follower callback entered under recovery Gate");
+    }
+    @Override public void notifyNotLeader(Collection<TransactionContext> pending) {
+      assertFalse(Thread.holdsLock(gate), "SM shutdown callback entered under recovery Gate");
     }
     public Gate recoveryEligibilityGate() { return gate; }
     public SnapshotInfo getLatestSnapshot() { return snapshot; }
@@ -150,6 +162,7 @@ public class RecoveryEligibilityTest {
       RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMax(properties, TimeDuration.valueOf(2, TimeUnit.HOURS));
       RaftServerConfigKeys.Log.Appender.setInstallSnapshotEnabled(properties, true);
       RaftServerConfigKeys.LeaderElection.setPreVote(properties, true);
+      RaftServerConfigKeys.Notification.setNoLeaderTimeout(properties, TimeDuration.ZERO);
       var parameters = new Parameters(); parameters.put("test.rpc", control, RpcControl.class);
       proxy = new RaftServerProxy(SELF, ignored -> stateMachine, properties, parameters, null);
       server = new RaftServerImpl(RaftGroup.valueOf(GROUP, PEERS), stateMachine, proxy, RaftStorage.StartupOption.RECOVER);

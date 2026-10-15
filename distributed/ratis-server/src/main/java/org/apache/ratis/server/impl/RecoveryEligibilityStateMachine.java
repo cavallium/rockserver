@@ -48,7 +48,10 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
    * Publish MISSING before replacing any native/snapshot baseline, outside native, apply-lane and
    * division locks. It joins any already admitted vote/self-vote persistence before returning.
    * Core post-pause invalidation may publish in division-to-Gate order after native locks are released.
-   * Never acquire a division lock, run callbacks, or perform native/file IO while holding Gate.
+   * Publication never enters a division lock or runs callbacks/IO. Core eligibility reads use cached
+   * metadata only; core holds division-to-Gate across vote/self-vote grant and Raft metadata fsync.
+   * That required Raft vote-file force is the only file IO admitted under Gate. User SM role
+   * callbacks, native IO and apply-lane acquisition remain outside Gate.
    */
   final class Gate {
     private record Publication(long revision, Evidence evidence) { }
