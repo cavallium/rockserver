@@ -47,6 +47,32 @@ class RatisNodeResourceBudgetTest {
         assertTrue(lease.released());
         try(var next=budget.reserve(pool,RatisNodeResourceBudget.Kind.ORDINARY,64,1)) {assertEquals(64,budget.stats(pool).ordinary().bytes());}
     }
+    @Test void growthAdmitsOnlyTheByteDeltaAndDenialPreservesBothCounters()throws Exception {
+        var a=UUID.randomUUID();var b=UUID.randomUUID();
+        var budget=new RatisNodeResourceBudget(limits(100,2),Map.of(a,limits(80,1),b,limits(80,1)));
+        var first=budget.reserve(a,RatisNodeResourceBudget.Kind.ORDINARY,40,1);
+        try(var second=budget.reserve(b,RatisNodeResourceBudget.Kind.ORDINARY,20,1)) {
+            first.growTo(80);first.growTo(80);
+            assertEquals(new RatisNodeResourceBudget.Usage(100,2),budget.stats().ordinary());
+            assertEquals(new RatisNodeResourceBudget.Usage(80,1),budget.stats(a).ordinary());
+            assertThrows(IOException.class,()->first.growTo(81));
+            assertThrows(IOException.class,()->second.growTo(21));
+            assertEquals(new RatisNodeResourceBudget.Usage(100,2),budget.stats().ordinary());
+            assertEquals(new RatisNodeResourceBudget.Usage(20,1),budget.stats(b).ordinary());
+            second.shrinkTo(10,1);
+            assertThrows(IOException.class,()->first.growTo(81)); // Pool limit still applies with node space available.
+            assertEquals(new RatisNodeResourceBudget.Usage(90,2),budget.stats().ordinary());
+            assertThrows(IllegalArgumentException.class,()->first.growTo(79));
+            assertThrows(IllegalArgumentException.class,()->first.growTo(RatisNodeResourceBudget.MAX_BYTES+1));
+            first.shrinkTo(50,1);first.growTo(60);
+            assertEquals(new RatisNodeResourceBudget.Usage(70,2),budget.stats().ordinary());
+            assertEquals(new RatisNodeResourceBudget.Usage(0,0),budget.stats().protectedLane());
+        } finally {first.close();}
+        assertThrows(IllegalStateException.class,()->first.growTo(1));
+        assertEquals(new RatisNodeResourceBudget.Usage(0,0),budget.stats().ordinary());
+        assertEquals(new RatisNodeResourceBudget.Usage(0,0),budget.stats(a).ordinary());
+        assertEquals(new RatisNodeResourceBudget.Usage(0,0),budget.stats(b).ordinary());
+    }
     @Test void shrinkOnlyRefundsKnownFreedBytesAndUndeclaredPoolsReject() throws Exception {
         var pool=UUID.randomUUID(); var budget=new RatisNodeResourceBudget(limits(64,2),Map.of(pool,limits(64,2)));
         try(var lease=budget.reserve(pool,RatisNodeResourceBudget.Kind.ORDINARY,64,1)) {

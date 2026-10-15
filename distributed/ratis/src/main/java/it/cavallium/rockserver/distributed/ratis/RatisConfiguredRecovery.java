@@ -21,11 +21,16 @@ final class RatisConfiguredRecovery implements AutoCloseable {
         CompletableFuture<Boolean> complete(Prepared prepared,RatisSourceHeadRpc.Head frozenHead);
         CompletableFuture<Void> release(Prepared prepared);
     }
+    interface Metadata extends RatisProofQueryService.ResourceLease,RatisTopologySourceSnapshotClient.ReplyAdmission {
+        void requireRawBytes(int bytes)throws IOException;
+        @Override default void beforeReply(int bytes)throws IOException{requireRawBytes(bytes);}
+    }
+    @FunctionalInterface interface Scope {void require(Request request)throws IOException;}
     private record State(Request initial,Request request,Phase phase,Prepared prepared,byte[] registration,
                          RatisSourceHeadRpc.Head head,Abandoned abandoned) {}
     private static final int MAX_WAITERS=16;
     private final Path file;private final byte[] binding;private final Executor executor;private final Host host;
-    private final RatisJournalAccess files;private final RatisProofQueryService.ResourceLease metadata;
+    private final RatisJournalAccess files;private final Metadata metadata;
     private final FileChannel channel;private final FileLock lock;
     private final CompletableFuture<Void> stopped=new CompletableFuture<>();
     private State state,dirty;private Phase phase;private CompletableFuture<Phase> actual;private int waiters;
@@ -33,17 +38,19 @@ final class RatisConfiguredRecovery implements AutoCloseable {
 
     /** Metadata and journal replacement capacity must be reserved before this constructor reads or copies state. */
     RatisConfiguredRecovery(Path directory,byte[] binding,Request initial,Host host,Executor executor,
-                            RatisJournalAccess files,RatisProofQueryService.ResourceLease metadata)throws IOException {
+                            RatisJournalAccess files,Metadata metadata,Scope scope)throws IOException {
         this.binding=Objects.requireNonNull(binding).clone();this.host=Objects.requireNonNull(host);this.executor=Objects.requireNonNull(executor);this.files=Objects.requireNonNull(files);this.metadata=Objects.requireNonNull(metadata);
-        if(binding.length!=32 || initial.relocation()){metadata.close();throw new IllegalArgumentException("Invalid configured recovery binding/purpose");}
+        if(binding.length!=32 || initial!=null && initial.relocation()){metadata.close();throw new IllegalArgumentException("Invalid configured recovery binding/purpose");}
         var root=directory.toAbsolutePath().normalize();if(!Files.isDirectory(root,LinkOption.NOFOLLOW_LINKS)){metadata.close();throw new IOException("Recovery journal requires an owned existing directory");}
         file=root.resolve("recovery");Path lockFile=root.resolve("recovery.lock");try{channel=FileChannel.open(lockFile,StandardOpenOption.CREATE,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS);}catch(IOException failed){metadata.close();throw failed;}FileLock acquired=null;
         try {
             try{acquired=channel.tryLock();}catch(OverlappingFileLockException busy){throw new IOException("Recovery journal already owned",busy);}if(acquired==null)throw new IOException("Recovery journal already owned");lock=acquired;
             files.register(file,RatisSchemaClientJournal.MAX_BYTES);
             int count=0;try(var entries=Files.newDirectoryStream(root)){for(var entry:entries){if(++count>3 || !Set.of("recovery","recovery.pending","recovery.lock").contains(entry.getFileName().toString()) || !Files.isRegularFile(entry,LinkOption.NOFOLLOW_LINKS))throw new IOException("Foreign object in recovery journal");}}
-            if(Files.exists(file,LinkOption.NOFOLLOW_LINKS)){state=decode(RatisSchemaClientJournal.readOwned(file,files));requireRequest(initial,state.initial());SessionJournalFiles.force(file);}
+            if(Files.exists(file,LinkOption.NOFOLLOW_LINKS)){long size=Files.size(file);if(size>RatisSchemaClientJournal.MAX_BYTES)throw new IOException("Recovery journal exceeds bound");metadata.requireRawBytes(Math.toIntExact(size));state=decode(RatisSchemaClientJournal.readOwned(file,files));if(initial!=null)requireRequest(initial,state.initial());}
+            else if(initial==null){var unpublished=root.resolve("recovery.pending");if(!Files.isRegularFile(unpublished,LinkOption.NOFOLLOW_LINKS) || Files.size(unpublished)>RatisSchemaClientJournal.MAX_BYTES)throw new IOException("Recovery has no retained original request");metadata.requireRawBytes(Math.toIntExact(Files.size(unpublished)));state=decode(RatisSchemaClientJournal.readOwned(unpublished,files));if(state.phase()!=Phase.PREPARE || state.abandoned()!=null)throw new IOException("Missing canonical recovery journal after host dispatch");requireRequest(state.initial(),state.request());}
             else state=new State(initial,initial,Phase.PREPARE,null,null,null,null);
+            scope.require(state.initial());
             // A pending replacement never authorized another host action. The forced main state,
             // or the undispatched initial request, remains the exact retry authority.
             var pending=root.resolve("recovery.pending");if(Files.exists(pending,LinkOption.NOFOLLOW_LINKS)){if(Files.size(pending)>RatisSchemaClientJournal.MAX_BYTES)throw new IOException("Recovery sidecar exceeds bound");Files.delete(pending);SessionJournalFiles.force(root);}
@@ -51,6 +58,7 @@ final class RatisConfiguredRecovery implements AutoCloseable {
         }catch(IOException|RuntimeException|Error failed){try{if(acquired!=null)acquired.release();}catch(IOException cleanup){failed.addSuppressed(cleanup);}try{channel.close();}catch(IOException cleanup){failed.addSuppressed(cleanup);}metadata.close();throw failed;}
     }
     synchronized Phase phase(){return phase;}
+    synchronized Request initial(){return state.initial();}
     /** Timer use allocates no observer while actual IO remains in flight. */
     void advance(){requestStep(false);}
     CompletableFuture<Phase> step(){return requestStep(true);}
@@ -109,11 +117,15 @@ final class RatisConfiguredRecovery implements AutoCloseable {
     @Override public void close()throws IOException {var done=stop();if(!done.isDone())throw new IOException("Recovery close waits for actual host and journal IO");try{done.join();}catch(CompletionException failed){throw new IOException("Recovery close failed",failed.getCause());}}
     private static Throwable unwrap(Throwable problem){while((problem instanceof CompletionException || problem instanceof ExecutionException) && problem.getCause()!=null)problem=problem.getCause();return problem;}
     private void persist(State value)throws IOException {
-        validate(value);var fields=encode(value);long size=40;for(var entry:fields.entrySet())size+=6L+entry.getKey().length()+entry.getValue().length;
-        if(size>RatisSchemaClientJournal.MAX_BYTES)throw new IOException("Recovery journal metadata bound exhausted");
+        validate(value);long size=40+field("binding",32)+field("initial",encodedRequestBytes(value.initial()))+field("request",encodedRequestBytes(value.request()))+field("phase",value.phase().name().length());
+        if(value.prepared()!=null)size+=field("prepared",value.prepared().encodedSize());if(value.registration()!=null)size+=field("registration",32);if(value.head()!=null)size+=field("head",RatisSourceHeadRpc.encodedReplyBytes(value.head()));
+        if(value.abandoned()!=null){var receipt=value.abandoned();size+=field("abandoned",73L+encodedRequestBytes(receipt.original())+57L+receipt.sourceOwner().peerId().length()+receipt.sourceOwner().address().length());}
+        if(size>RatisSchemaClientJournal.MAX_BYTES)throw new IOException("Recovery journal metadata bound exhausted");metadata.requireRawBytes(Math.toIntExact(size));var fields=encode(value);
+        long actual=40;for(var entry:fields.entrySet())actual+=field(entry.getKey(),entry.getValue().length);if(actual!=size)throw new IOException("Recovery journal sizing differs from encoded fields");
         long original=Files.exists(file,LinkOption.NOFOLLOW_LINKS)?Files.size(file):0;var reservation=new RatisJournalAccess.Reservation(file,RatisSchemaClientJournal.MAX_BYTES,Math.addExact(original,size));
         files.reserve(reservation);RatisSchemaClientJournal.writeOwned(file,fields,files);files.fulfilled(reservation);
     }
+    private static long field(String name,long bytes){return 6L+name.length()+bytes;}
     private Map<String,byte[]> encode(State value){
         var fields=new HashMap<String,byte[]>();fields.put("binding",binding);fields.put("initial",request(PREPARE,value.initial()));fields.put("request",request(PREPARE,value.request()));fields.put("phase",value.phase().name().getBytes(StandardCharsets.US_ASCII));
         if(value.prepared()!=null)fields.put("prepared",reply(PREPARE,value.prepared()));if(value.registration()!=null)fields.put("registration",value.registration());if(value.head()!=null)fields.put("head",RatisSourceHeadRpc.reply(value.head()));if(value.abandoned()!=null)fields.put("abandoned",reply(PREPARE,value.abandoned()));return fields;

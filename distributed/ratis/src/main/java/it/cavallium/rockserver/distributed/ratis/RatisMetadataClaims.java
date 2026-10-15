@@ -11,6 +11,8 @@ import java.util.*;
 /** Forced canonical metadata and promise ceilings. These are not filesystem or LSM-space reservations. */
 final class RatisMetadataClaims {
     static final long POOL_BYTES=(144L<<20)+185;
+    /** One forced recovery state, its atomic replacement, and bounded lock/path metadata per DATA group. */
+    static final long CONFIGURED_RECOVERY_BYTES=2L*RatisSchemaClientJournal.MAX_BYTES+4096;
     private static final int MAX_CLAIMS=DistributedStoragePool.MAX_RETAINED_METADATA_OWNERS*RatisNodeResourceBudget.MAX_POOLS,RECORD_BYTES=73,MAX_BYTES=40+MAX_CLAIMS*RECORD_BYTES;
     static final long JOURNAL_BYTES=2L*MAX_BYTES;
     record Claim(UUID pool,UUID group,RatisNodePlan.Role role,long bytes,byte[] policy) {
@@ -31,6 +33,7 @@ final class RatisMetadataClaims {
     }
     synchronized long bytes(){return total(claims);}
     synchronized int groups(){return claims.size();}
+    synchronized boolean contains(UUID group){return claims.containsKey(group);}
     synchronized long bytes(UUID pool){if(!poolLimits.containsKey(pool))throw new IllegalArgumentException("Undeclared metadata pool");long total=POOL_BYTES;for(var claim:claims.values())if(claim.pool().equals(pool))total=Math.addExact(total,claim.bytes());return total;}
     private long total(Map<UUID,Claim> values){long total=JOURNAL_BYTES+Math.multiplyExact(POOL_BYTES,poolLimits.size());for(var claim:values.values())total=Math.addExact(total,claim.bytes());return total;}
     private void validate(Map<UUID,Claim> values)throws IOException {
@@ -59,7 +62,7 @@ final class RatisMetadataClaims {
     private static void uuid(ByteBuffer buffer,UUID id){buffer.putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits());}private static UUID uuid(ByteBuffer buffer){return new UUID(buffer.getLong(),buffer.getLong());}
     static Claim claim(UUID pool,UUID group,RatisNodePlan.Role role,RatisRangeStateMachine.RetentionLimits retention,RatisSchemaReplicaService.Limits operators){
         long receiptCount=Math.addExact(retention.dataCount(),retention.maintenanceCount()),receiptBytes=Math.addExact(retention.dataBytes(),retention.maintenanceBytes());long bytes=receiptBytes+61L*receiptCount+53L*ReplicatedRangeStore.MAX_SESSION_ACK_NAMESPACES+202058;
-        switch(role){case TRANSACTION_HOME->bytes+=32L<<20;case SNAPSHOT_HOME->bytes+=16L<<20;case CATALOGUE->bytes+=CatalogueHistory.MAX_BYTES+64L*(16+RangeDirectoryCodec.MAX_ENCODED_BYTES)+16+SessionEpochLedger.MAX_BYTES+2L*((64L<<20)+13)+operators.maximumDiskBytes()+66405L*operators.maximumUploads()+33;case DATA->{long manifest=RatisRangeImportRecord.MAX_MANIFEST_BYTES;bytes+=(128L<<20)+97+132L*33+294+(16L<<20)+64L*33+2L*(17+NativeTopologyLearnerImagePermission.MAX_BYTES)+130;bytes+=17+manifest+Math.max(17+manifest+24,17+88+17+168)+25+4096L*249;bytes+=4L*17+NativeTopologyFreeze.MAX_BYTES+NativeTopologyBirth.BYTES+NativeTopologyActivation.MAX_BYTES+32;}}
+        switch(role){case TRANSACTION_HOME->bytes+=32L<<20;case SNAPSHOT_HOME->bytes+=16L<<20;case CATALOGUE->bytes+=CatalogueHistory.MAX_BYTES+64L*(16+RangeDirectoryCodec.MAX_ENCODED_BYTES)+16+SessionEpochLedger.MAX_BYTES+2L*((64L<<20)+13)+operators.maximumDiskBytes()+66405L*operators.maximumUploads()+33;case DATA->{long manifest=RatisRangeImportRecord.MAX_MANIFEST_BYTES;bytes+=(128L<<20)+97+132L*33+294+(16L<<20)+64L*33+2L*(17+NativeTopologyLearnerImagePermission.MAX_BYTES)+130;bytes+=17+manifest+Math.max(17+manifest+24,17+88+17+168)+25+4096L*249;bytes+=4L*17+NativeTopologyFreeze.MAX_BYTES+NativeTopologyBirth.BYTES+NativeTopologyActivation.MAX_BYTES+32+CONFIGURED_RECOVERY_BYTES;}}
         var policy=ByteBuffer.allocate(53).put((byte)role.ordinal()).putLong(retention.dataCount()).putLong(retention.dataBytes()).putLong(retention.maintenanceCount()).putLong(retention.maintenanceBytes()).putInt(role==RatisNodePlan.Role.CATALOGUE?operators.maximumUploads():0).putLong(role==RatisNodePlan.Role.CATALOGUE?operators.maximumDiskBytes():0).putLong(bytes).array();return new Claim(pool,group,role,bytes,OperatorUpload.sha256(policy));
     }
 }

@@ -1944,17 +1944,47 @@ cases. Logs are `configured-recovery-early-release-accounting-gate.log`,
 were diagnosed; the final five-case gate covers corrected Runtime fixtures,
 unknown post-force routing publication, cold retries and preserved schema fences.
 
-This is per-attempt driver/Runtime integration with controlled Raft wire delivery
-and log floors. Node-owned cold discovery, bounded scheduling, aggregate journal
-admission and shutdown wiring remain unfinished. Reply decoding and cold journal
-reads need admission before copies when that manager is connected. CURRENT-to-META
-conversion, META registration successors, and conversion of an existing source with
-a retained GROUP snapshot still need dedicated Runtime transitions; first-time
-META conversion conservatively refuses any retained snapshot before native force.
-DAG obligation retention and leader-change source transfer also remain unfinished.
+The node now owns bounded `configured-recovery/<pool>/<group>` journals and a
+single recovery IO worker. Startup inventories and charges retained slots without
+dispatching Host actions; CONTROL schedules finite quanta after start. Attempts
+rotate after errors or eight nonterminal steps, preserving their exact journal
+identity. New admission forces the initial request before acknowledging it; its
+zero-delay CONTROL tick coalesces with that enqueue. Empty nodes retain their
+existing timer behavior. Node close stops CONTROL and drains actual Host/journal
+work plus the IO executor before closing transport or native dependencies.
+
+Each DATA claim prepays one bounded main-plus-pending journal slot. Writes also
+use protected filesystem runway; retained DONE files keep their disk promise.
+A shared node/pool heap lease grows before actual reply copies, cold journal reads
+and encoded replacements, and remains held until actual driver stop. Retained
+index paths have separate bounded credit. Temporary registration/completion HEAD
+workspaces grow from actual reply lengths. Source clients use a three-second
+request timeout and no internal retry loop; durable attempts own exact retries.
+The installed Ratis client builder's default infinite retry was verified from its
+actual bytecode before changing that policy.
+
+Current validation passes 106 distinct cases across 17 classes, including the
+unchanged standalone/codec selection, existing Runtime/seed/learner/two-pool paths,
+actual node-owned META and CURRENT image transfer, cold DONE reopening, registry
+REGISTER/RELEASE/COMPLETE retries, denied workspace without Host effects, bounded
+observers, a forced zero-delay enqueue race, and node close during blocked source
+connection setup. Long retained paths refuse before acquiring journal authority
+when their index credit is unavailable. Evidence is
+`configured-recoveries-node-regression-gate.log` and
+`configured-recoveries-node-path-credit-final-gate.log` in the task-owned native
+output directory. Earlier passing unchanged selections are reused alongside the
+final ten-case manager/Runtime/client gate.
+
+These are controlled Raft wire delivery and log-floor fixtures. Automatic CAT/DAG
+obligation discovery, CURRENT-to-META conversion, META registration successors,
+and conversion of an existing source with a retained GROUP snapshot still need
+dedicated Runtime transitions; first-time META conversion conservatively refuses
+any retained snapshot before native force. DAG obligation retention and
+leader-change source transfer also remain unfinished. Canonical journal promises
+and runway accounting do not establish the complete physical allocation envelope.
 
 Durable metadata-DAG
-obligation discovery, asynchronous configured-member catch-up, quorum retirement,
+obligation discovery, DAG-driven configured-member catch-up, quorum retirement,
 source quiescence and physical parent reclamation remain unfinished. In particular,
 Raft commitment alone must not report an absent native image as installed, replay
 historical USER state, or let a registered empty member vote. Existing all-owner

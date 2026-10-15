@@ -12,6 +12,18 @@ class RatisMetadataClaimsTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     static final UUID POOL=new UUID(9910,1),GROUP=new UUID(9910,2);
     static RatisMetadataClaims.Claim claim(UUID group){return RatisMetadataClaims.claim(POOL,group,RatisNodePlan.Role.DATA,RatisRangeStateMachine.RetentionLimits.defaults(),RatisSchemaReplicaService.Limits.defaults());}
+    @Test void dataRecoverySlotSharesNodeAndPoolPromisesAndSurvivesReopen()throws Exception {
+        assertEquals((64L<<20)+4096,RatisMetadataClaims.CONFIGURED_RECOVERY_BYTES);
+        var retained=claim(GROUP);assertTrue(retained.bytes()>RatisMetadataClaims.CONFIGURED_RECOVERY_BYTES);
+        long poolRequired=RatisMetadataClaims.POOL_BYTES+retained.bytes(),nodeRequired=RatisMetadataClaims.JOURNAL_BYTES+poolRequired;
+        var nodePath=root.resolve("recovery-node-limit");var nodeDenied=new RatisMetadataClaims(nodePath,nodeRequired-1,Map.of(POOL,poolRequired));
+        assertThrows(IOException.class,()->nodeDenied.reserve(List.of(retained)));assertFalse(Files.exists(nodePath));
+        var poolPath=root.resolve("recovery-pool-limit");var poolDenied=new RatisMetadataClaims(poolPath,nodeRequired,Map.of(POOL,poolRequired-1));
+        assertThrows(IOException.class,()->poolDenied.reserve(List.of(retained)));assertFalse(Files.exists(poolPath));
+        var path=root.resolve("recovery-exact");var exact=new RatisMetadataClaims(path,nodeRequired,Map.of(POOL,poolRequired));exact.reserve(List.of(retained));
+        var cold=new RatisMetadataClaims(path,nodeRequired,Map.of(POOL,poolRequired));cold.reserve(List.of(retained));
+        assertEquals(nodeRequired,cold.bytes());assertEquals(poolRequired,cold.bytes(POOL));assertEquals(1,cold.groups());
+    }
     @Test void unknownForceRetryAndColdRetainedGroupsDoNotDuplicateOrRefundClaims()throws Exception {
         var path=root.resolve("claims");var fail=new AtomicBoolean(true);var retained=claim(GROUP);long ceiling=RatisMetadataClaims.JOURNAL_BYTES+RatisMetadataClaims.POOL_BYTES+retained.bytes();
         var budget=new RatisMetadataClaims(path,ceiling,Map.of(POOL,ceiling),(file,bytes)->{SessionJournalFiles.write(file,bytes,8<<20);if(fail.getAndSet(false))throw new IOException("Unknown force reply");});

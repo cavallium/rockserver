@@ -9,8 +9,12 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySourceSnaps
 
 /** Borrowed transport. Unknown replies retry the same UUID and immutable request at its actual owner. */
 public final class RatisTopologySourceSnapshotClient {
-    private final RaftClient client;
-    public RatisTopologySourceSnapshotClient(RaftClient client){this.client=Objects.requireNonNull(client);}
+    @FunctionalInterface public interface ReplyAdmission {
+        ReplyAdmission UNLIMITED=bytes->{};
+        void beforeReply(int bytes)throws IOException;
+    }
+    private final RaftClient client;private final ReplyAdmission admission;
+    public RatisTopologySourceSnapshotClient(RaftClient client,ReplyAdmission admission){this.client=Objects.requireNonNull(client);this.admission=Objects.requireNonNull(admission);}
     public RatisSourceHeadRpc.Head head(RatisSourceHeadRpc.Request request)throws IOException{
         var reply=call(RatisSourceHeadRpc.request(request),request.source(),RatisSourceHeadRpc.MAX_REPLY_BYTES);
         try{var head=RatisSourceHeadRpc.reply(reply.getMessage().getContent().toByteArray(),request);if(!RaftPeerId.valueOf(head.sourceOwner().peerId()).equals(reply.getServerId()))throw new IOException("Source head crossed actual source owner");return head;}catch(IllegalArgumentException malformed){throw new IOException("Malformed source head reply",malformed);}
@@ -21,13 +25,15 @@ public final class RatisTopologySourceSnapshotClient {
         if(!request.sourceOwner(owner) || !client.getGroupId().equals(RaftGroupId.valueOf(request.sourceGroup())))throw new IOException("Source release owner/group differs from immutable transfer");
         byte[] input=request(RELEASE,request);var peer=RaftPeerId.valueOf(owner.peerId());
         var reply=RatisRoutedClient.rpc(()->client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(input)),0,peer));
-        if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !client.getGroupId().equals(reply.getRaftGroupId()) || !peer.equals(reply.getServerId()) || reply.getMessage().getContent().size()>MAX_REQUEST_BYTES || !Arrays.equals(input,reply.getMessage().getContent().toByteArray()))throw new IOException("Source release did not acknowledge exact request at its original owner",reply==null?null:reply.getException());
+        if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !client.getGroupId().equals(reply.getRaftGroupId()) || !peer.equals(reply.getServerId()) || reply.getMessage().getContent().size()>MAX_REQUEST_BYTES)throw new IOException("Source release did not acknowledge exact request at its original owner",reply==null?null:reply.getException());
+        admission.beforeReply(reply.getMessage().getContent().size());if(!Arrays.equals(input,reply.getMessage().getContent().toByteArray()))throw new IOException("Source release changed exact request acknowledgement");
     }
     public RatisRecoveryImageRpc.Evidence imageInstalled(RatisRecoveryImageRpc.Request request)throws IOException {
         if(!client.getGroupId().equals(RaftGroupId.valueOf(request.source().sourceGroup())))throw new IOException("Image probe client belongs to another group");
         var receiver=RaftPeerId.valueOf(request.source().receiver().peerId());
         var reply=RatisRoutedClient.rpc(()->client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(RatisRecoveryImageRpc.request(request))),0,receiver));
         if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !client.getGroupId().equals(reply.getRaftGroupId()) || !receiver.equals(reply.getServerId()) || reply.getMessage().getContent().size()>RatisRecoveryImageRpc.MAX_REPLY_BYTES)throw new IOException("Image probe did not reach exact receiver",reply==null?null:reply.getException());
+        admission.beforeReply(reply.getMessage().getContent().size());
         try{return RatisRecoveryImageRpc.reply(reply.getMessage().getContent().toByteArray(),request);}catch(IllegalArgumentException malformed){throw new IOException("Malformed recovery image receipt",malformed);}
     }
     private Prepared prepared(int kind,Request request)throws IOException{
@@ -38,6 +44,6 @@ public final class RatisTopologySourceSnapshotClient {
         UUID group=request.sourceGroup();if(!client.getGroupId().equals(RaftGroupId.valueOf(group)))throw new IOException("Source snapshot client belongs to another group");
         var reply=RatisRoutedClient.rpc(()->client.io().sendReadOnly(Message.valueOf(ByteString.copyFrom(input))));
         if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !client.getGroupId().equals(reply.getRaftGroupId()) || reply.getMessage().getContent().size()>maximum)throw new IOException("Source snapshot action failed; exact request remains recoverable",reply==null?null:reply.getException());
-        return reply;
+        admission.beforeReply(reply.getMessage().getContent().size());return reply;
     }
 }

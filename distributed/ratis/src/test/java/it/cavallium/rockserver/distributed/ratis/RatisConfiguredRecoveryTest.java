@@ -32,7 +32,7 @@ class RatisConfiguredRecoveryTest {
             initial=new Request(new UUID(992,1),null,new UUID(992,2),range.replicas().get(1),Purpose.CURRENT_LEAF,range.groupId(),directory);
             images=new RatisTopologySourceSnapshotService(source,RatisTopologySourceSnapshotService.Limits.defaults(8L<<20),source.scheduler,source.transferAdmission());registration[0]=1;
         }
-        RatisConfiguredRecovery open(Path path,RatisJournalAccess files)throws Exception {Files.createDirectories(path);return new RatisConfiguredRecovery(path,binding,initial,this,io,files,releasedMetadata::incrementAndGet);}
+        RatisConfiguredRecovery open(Path path,RatisJournalAccess files)throws Exception {Files.createDirectories(path);return new RatisConfiguredRecovery(path,binding,initial,this,io,files,metadata(releasedMetadata::incrementAndGet),request->requireRequest(initial,request));}
         public CompletableFuture<Prepared> prepare(Request request) {
             prepares++;lastPrepared=request;
             if(abandon){abandon=false;try{return CompletableFuture.failedFuture(new AbandonedException(new Abandoned(request,new UUID(992,3),source.store.applied(),source.donor,OperatorUpload.sha256(source.store.configuration().data()))));}catch(Exception failed){return CompletableFuture.failedFuture(failed);}}
@@ -77,9 +77,10 @@ class RatisConfiguredRecoveryTest {
         try(var fixture=new Fixture()) {
             fixture.abandon=true;var path=root.resolve("attempt");try(var recovery=fixture.open(path,RatisJournalAccess.standalone())){assertEquals(RatisConfiguredRecovery.Phase.PREPARE,step(recovery));assertEquals(0,fixture.source.captures.get());}
             try(var cold=fixture.open(path,RatisJournalAccess.standalone())){assertEquals(RatisConfiguredRecovery.Phase.REGISTER,step(cold));assertEquals(new UUID(992,3),fixture.lastPrepared.transferId());fixture.notCaughtUp=true;while(cold.phase()!=RatisConfiguredRecovery.Phase.DONE)step(cold);assertEquals(2,fixture.heads);}
-            byte[] wrong=fixture.binding.clone();wrong[0]=1;assertThrows(IOException.class,()->new RatisConfiguredRecovery(path,wrong,fixture.initial,fixture,fixture.io,RatisJournalAccess.standalone(),()->{}));assertEquals(1,fixture.source.captures.get());
+            byte[] wrong=fixture.binding.clone();wrong[0]=1;assertThrows(IOException.class,()->new RatisConfiguredRecovery(path,wrong,fixture.initial,fixture,fixture.io,RatisJournalAccess.standalone(),metadata(()->{}),request->{}));assertEquals(1,fixture.source.captures.get());
         }
     }
+    static RatisConfiguredRecovery.Metadata metadata(Runnable release){return new RatisConfiguredRecovery.Metadata(){public void requireRawBytes(int bytes){}public void close(){release.run();}};}
     static class Forwarding implements RatisJournalAccess {
         final RatisJournalAccess delegate=RatisJournalAccess.standalone();
         public RootLease backendRoot(Path root)throws IOException{return delegate.backendRoot(root);}public void register(Path path,int maximum)throws IOException{delegate.register(path,maximum);}public byte[] read(Path path,int maximum)throws IOException{return delegate.read(path,maximum);}public void write(Path path,byte[] body,int maximum)throws IOException{delegate.write(path,body,maximum);}public void remove(Path path,byte[] body,int maximum,SessionJournalFiles.Removal removal)throws IOException{delegate.remove(path,body,maximum,removal);}public void deleted(Path path)throws IOException{delegate.deleted(path);}public void reclaimedTree(Path path)throws IOException{delegate.reclaimedTree(path);}public void reserve(Reservation reservation)throws IOException{delegate.reserve(reservation);}public void fulfilled(Reservation reservation)throws IOException{delegate.fulfilled(reservation);}

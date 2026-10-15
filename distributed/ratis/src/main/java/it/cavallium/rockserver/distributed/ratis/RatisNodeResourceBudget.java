@@ -42,7 +42,9 @@ public final class RatisNodeResourceBudget {
     public final class Lease implements AutoCloseable {
         private final Pool pool;private final Kind kind;private long bytes;private int owners;private boolean released;
         private Lease(Pool pool,Kind kind,long bytes,int owners){this.pool=pool;this.kind=kind;this.bytes=bytes;this.owners=owners;}
-        /** Only known freed storage/owners may shrink; construction reserves its complete upper bound first. */
+        /** Admit additional storage before allocation, retaining this lease's pool, lane and owner count. */
+        public void growTo(long retainedBytes)throws IOException{synchronized(RatisNodeResourceBudget.this){if(released)throw new IllegalStateException("Node resource lease already released");if(retainedBytes<bytes || retainedBytes>MAX_BYTES)throw new IllegalArgumentException("Node resource lease may only grow");long additional=retainedBytes-bytes;var global=counter(kind);var local=counter(pool,kind);if(additional>lane(limits,kind).bytes-global.bytes || additional>lane(pool.limits,kind).bytes-local.bytes)throw new IOException("Shared node/pool "+kind+" resource admission exhausted");global.bytes+=additional;local.bytes+=additional;bytes=retainedBytes;}}
+        /** Only known freed storage/owners may shrink; growth must be admitted before allocation. */
         public void shrinkTo(long retainedBytes,int retainedOwners){synchronized(RatisNodeResourceBudget.this){if(released)throw new IllegalStateException("Node resource lease already released");if(retainedBytes<0 || retainedBytes>bytes || retainedOwners<0 || retainedOwners>owners)throw new IllegalArgumentException("Node resource lease may only shrink");refund(bytes-retainedBytes,owners-retainedOwners);bytes=retainedBytes;owners=retainedOwners;}}
         public boolean released(){synchronized(RatisNodeResourceBudget.this){return released;}}
         private void refund(long freedBytes,int freedOwners){var global=counter(kind);var local=counter(pool,kind);global.bytes-=freedBytes;global.owners-=freedOwners;local.bytes-=freedBytes;local.owners-=freedOwners;}

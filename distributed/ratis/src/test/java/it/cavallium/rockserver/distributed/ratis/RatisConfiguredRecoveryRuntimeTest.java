@@ -23,14 +23,13 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySeedRuntime
 /** Actual source/receiver Runtime ports and native image chunks; only Raft wire delivery/log floor are controlled. */
 class RatisConfiguredRecoveryRuntimeTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
-    @Test void journaledDriverRecoversMetadataAndCurrentChildrenWithoutHistoricalUserImages()throws Exception {
+    @Test void nodeOwnedRecoveryRecoversMetadataAndCurrentChildrenAndColdJournals()throws Exception {
         try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("source"),false);var env=new RatisNodeRuntimeTest.Env(root.resolve("receiver"),false,source.first.digest())) {
             var split=source.split();var catalogue=source.plan.catalogue();var pool=RatisPoolFixtures.ID;
             var domain=new RatisNodePlan.Domain(split.sourceDirectory(),Map.of(source.first.columnIds().iterator().next(),"receiver-data"),Set.of());
             var plan=new RatisNodePlan(source.plan.nodeId(),source.plan.nodeIncarnation(),List.of(domain),catalogue,List.of(),List.of(),Map.of(),4,List.of(RatisPoolFixtures.spec(pool,false)),Map.of(source.first.domainId(),pool),Map.of(catalogue.groupId(),pool));
             var route=new RatisRoutedClient(split.sourceDirectory(),new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor range,UUID column,byte[] key){throw new AssertionError("No external USER fixture transport");}public CommandResult command(RangeDescriptor range,DistributedCommand command){throw new AssertionError("No external USER fixture transport");}});
             var epochs=new RatisSessionEpochs(source.catalogue,source.first.clusterId(),source.first.databaseId(),catalogue.groupId(),catalogue.epoch(),catalogue.schemaDigest(),catalogue.sessionsColumn());
-            var executor=Executors.newSingleThreadExecutor();
             try {
                 for(int round=0;round<2;round++) {
                     var receiver=new RatisNodeRuntimeTest.FakeServer();receiver.skipFirstNoop=true;
@@ -51,8 +50,11 @@ class RatisConfiguredRecoveryRuntimeTest {
                             var sourceField=RatisRangeStateMachine.class.getDeclaredField("sourceSnapshots");sourceField.setAccessible(true);var originals=new HashMap<RatisRangeStateMachine,Object>();for(var range:java.util.stream.Stream.concat(split.parents().stream(),split.targets().stream()).toList()){var machine=source.server.machines.get(RaftGroupId.valueOf(range.groupId()));originals.put(machine,sourceField.get(machine));sourceField.set(machine,transport);}
                             try {
                                 var requests=new ArrayList<RatisTopologySourceSnapshotRpc.Request>();var parent=split.parents().getFirst();requests.add(new RatisTopologySourceSnapshotRpc.Request(new UUID(994,1),split.header(),catalogue.groupId(),parent.replicas().getFirst(),RatisTopologySourceSnapshotRpc.Purpose.ANCESTOR_METADATA,parent.groupId(),split.sourceDirectory()));int number=1;for(var child:split.targets())requests.add(new RatisTopologySourceSnapshotRpc.Request(new UUID(994,++number),null,catalogue.groupId(),child.replicas().getFirst(),RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF,child.groupId(),split.targetDirectory()));
-                                for(var request:requests){var path=Files.createDirectories(root.resolve("receiver-attempts").resolve(pool.toString()).resolve(request.sourceGroup().toString()));var budget=field(node,"resources",RatisNodeResourceBudget.class);var lease=budget.reserve(pool,RatisNodeResourceBudget.Kind.PROTECTED,64L<<20,1);
-                                    try(var driver=new RatisConfiguredRecovery(path,plan.identityDigest(),request,node.configuredRecoveryHost(),executor,RatisJournalAccess.standalone(),lease::close)) {if(round==1)assertEquals(RatisConfiguredRecovery.Phase.DONE,driver.phase());for(int steps=0;steps<16 && driver.phase()!=RatisConfiguredRecovery.Phase.DONE;steps++)driver.step().get(15,TimeUnit.SECONDS);assertEquals(RatisConfiguredRecovery.Phase.DONE,driver.phase());}
+                                var manager=field(node,"configuredRecoveries",RatisConfiguredRecoveries.class);var control=field(node,"configuredRecoveryService",RatisTransactionRecoveryService.class);
+                                for(var request:requests){
+                                    if(round==0){node.recoverConfigured(request).get(15,TimeUnit.SECONDS);assertTrue(Files.isRegularFile(env.nodeRoot.resolve("configured-recovery").resolve(pool.toString()).resolve(request.sourceGroup().toString()).resolve("recovery")));assertEquals(RatisConfiguredRecovery.Phase.PREPARE,node.configuredRecoveryPhase(request.sourceGroup()));}
+                                    for(int steps=0;steps<64 && node.configuredRecoveryPhase(request.sourceGroup())!=RatisConfiguredRecovery.Phase.DONE;steps++){control.tick().get(15,TimeUnit.SECONDS);manager.step().get(15,TimeUnit.SECONDS);}
+                                    assertEquals(RatisConfiguredRecovery.Phase.DONE,node.configuredRecoveryPhase(request.sourceGroup()));assertNull(node.configuredRecoveryFailure());
                                 }
                             }finally{for(var entry:originals.entrySet())sourceField.set(entry.getKey(),entry.getValue());}
                         }
@@ -62,7 +64,36 @@ class RatisConfiguredRecoveryRuntimeTest {
                         assertArrayEquals(new byte[]{22},source.store(source.secondDirectory.ranges().getFirst().groupId()).readCurrentPoint(source.second.columnIds().iterator().next(),new byte[]{7}));
                     }
                 }
-            }finally{executor.shutdown();assertTrue(executor.awaitTermination(10,TimeUnit.SECONDS));route.close();}
+            }finally{route.close();}
+        }
+    }
+    @Test void initialZeroDelayControlTickCannotDisplaceTheFirstAcceptedRequest()throws Exception {
+        try(var env=new RatisNodeRuntimeTest.Env(root.resolve("initial-tick"),false)) {
+            var armed=new java.util.concurrent.atomic.AtomicBoolean();var reference=new java.util.concurrent.atomic.AtomicReference<RatisNodeRuntime>();
+            var immediate=new reactor.core.scheduler.Scheduler(){
+                public reactor.core.Disposable schedulePeriodically(Runnable task,long initial,long period,TimeUnit unit){var scheduled=env.timer.schedulePeriodically(task,initial,period,unit);if(armed.get()){task.run();try{field(reference.get(),"configuredRecoveryService",RatisTransactionRecoveryService.class).tick().get(10,TimeUnit.SECONDS);}catch(Exception failed){throw new java.util.concurrent.CompletionException(failed);}}return scheduled;}
+                public reactor.core.Disposable schedule(Runnable task){return env.timer.schedule(task);}public Worker createWorker(){return env.timer.createWorker();}public void dispose(){env.timer.dispose();}public boolean isDisposed(){return env.timer.isDisposed();}
+            };
+            var receiver=new RatisNodeRuntimeTest.FakeServer();
+            try(var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,Map.of(env.routed.directory().domainId(),env.routed),env.scheduler,immediate,()->20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,receiver::create,List.of())) {
+                reference.set(node);node.relocationTransport(range->{throw new AssertionError("No source action is dispatched by initial admission");},(range,owner)->{throw new AssertionError("No owner RPC in initial admission");});node.start();
+                var manager=field(node,"configuredRecoveries",RatisConfiguredRecoveries.class);var io=field(manager,"io",ThreadPoolExecutor.class);var entered=new CountDownLatch(1);var release=new CountDownLatch(1);io.execute(()->{entered.countDown();try{release.await();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();}});assertTrue(entered.await(10,TimeUnit.SECONDS));armed.set(true);
+                var directory=env.routed.directory();var range=directory.ranges().getFirst();var request=new RatisTopologySourceSnapshotRpc.Request(new UUID(994,8),null,env.plan.catalogue().groupId(),range.replicas().stream().filter(replica->replica.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow(),RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF,range.groupId(),directory);CompletableFuture<Void> accepted;
+                try{accepted=node.recoverConfigured(request);if(accepted.isDone())accepted.get(10,TimeUnit.SECONDS);assertFalse(accepted.isDone(),"The forced enqueue remains behind actual IO; a zero-delay tick must coalesce with it");}finally{release.countDown();}
+                accepted.get(10,TimeUnit.SECONDS);assertEquals(RatisConfiguredRecovery.Phase.PREPARE,node.configuredRecoveryPhase(range.groupId()));assertNull(node.configuredRecoveryFailure());
+            }
+        }
+    }
+    @Test void nodeCloseKeepsNativeAndTransportOwnersUntilActualSourceCallReturns()throws Exception {
+        try(var env=new RatisNodeRuntimeTest.Env(root.resolve("close-source"),false)) {
+            var base=env.settings();var settings=new RatisNodeRuntime.Settings(base.images(),base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),java.time.Duration.ofSeconds(5),base.exports(),base.resources());var receiver=new RatisNodeRuntimeTest.FakeServer();var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+            try(var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,Map.of(env.routed.directory().domainId(),env.routed),env.scheduler,env.timer,()->20L,settings,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,receiver::create,List.of())) {
+                node.relocationTransport(range->{entered.countDown();try{if(!release.await(10,TimeUnit.SECONDS))throw new IOException("Fixture source release timed out");}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}throw new IOException("Source connection outcome is unresolved");},(range,owner)->{throw new AssertionError("No owner RPC before PREPARE");});node.start();
+                var directory=env.routed.directory();var range=directory.ranges().getFirst();var request=new RatisTopologySourceSnapshotRpc.Request(new UUID(994,9),null,env.plan.catalogue().groupId(),range.replicas().stream().filter(replica->replica.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow(),RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF,range.groupId(),directory);node.recoverConfigured(request).get(10,TimeUnit.SECONDS);var manager=field(node,"configuredRecoveries",RatisConfiguredRecoveries.class);var call=manager.step();assertTrue(entered.await(10,TimeUnit.SECONDS));
+                var closing=CompletableFuture.runAsync(()->{try{node.close();}catch(IOException failed){throw new java.util.concurrent.CompletionException(failed);}});
+                try{for(int tries=0;tries<100 && node.state()!=RatisNodeRuntime.State.STOPPING;tries++)Thread.sleep(10);assertEquals(RatisNodeRuntime.State.STOPPING,node.state());assertFalse(closing.isDone());assertFalse(call.isDone());assertEquals(0,receiver.closes);assertFalse(node.nativePool(node.poolId(range.groupId())).persistedRangeGroups(16).isEmpty());}finally{release.countDown();}
+                closing.get(10,TimeUnit.SECONDS);assertEquals(RatisNodeRuntime.State.CLOSED,node.state());assertEquals(1,receiver.closes);assertEquals(0,manager.size());assertThrows(ExecutionException.class,()->call.get(10,TimeUnit.SECONDS));
+            }finally{release.countDown();}
         }
     }
     private static ReplicatedRangeStore store(RatisNodeRuntimeTest.FakeServer server,UUID group)throws Exception{return field(server.machines.get(RaftGroupId.valueOf(group)),"store",ReplicatedRangeStore.class);}
