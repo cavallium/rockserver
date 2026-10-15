@@ -1776,6 +1776,12 @@ CURRENT and META cold reload, actual configuration-tail evidence refresh while U
 access stays fenced, and original retired-source metadata snapshots at a later real
 cut. The final resource envelope is unproven.
 
+An additional memory-admission gap is confirmed for a small original CURRENT
+registration followed by a large later schema history: image scans decode and retain
+those separate schema rows without charging them as registration workspace. Exact
+own-group schema-row size admission before allocation is still required. The shared
+high-water scope can cover it without charging USER image bytes or raising node caps.
+
 The Ratis core now separates initial native-image eligibility from final USER
 readiness. Seven controlled real-division tests pass for vote/pre-vote/forced
 leadership refusal, image-gated append/apply, revocation versus vote persistence,
@@ -1785,7 +1791,33 @@ by the fixture. This is not multi-node quorum or network evidence. Adapter lifec
 checks described above; later completed-member checkpoint qualification and the
 full catch-up/retirement driver remain unfinished.
 
-Completed-member checkpoint qualification, durable metadata-DAG
+The committed image-gated runtime checkpoint also passes the complete same-service
+split/import/operator/MERGE/backup/cold-reopen selection (four cases) and fifteen
+standalone async/command-codec cases in both configured core executions
+(`image-gated-runtime-two-pool-standalone-regression.log`, source `d824f3a`). The
+native role-callback lock refinement passes the seven eligibility cases separately
+(`ratis-eligibility-callback-lock-gate.log`). These checks use controlled transports.
+
+Completed CURRENT members now validate and restore their own later GROUP
+checkpoints using their original registration, baseline image receipt and completion
+already trusted in local native state. Initial receivers still require the exact
+source image and cannot import completion as authority. Restore preserves that local
+completion through INSTALLING while withholding readiness, and cold retry requires
+the original pending cut/hash. Ordinary and topology-born cases pass the 32-case
+native gate (`completed-current-own-checkpoint-native-first-gate.log`); the focused
+session-control configuration follow-up passes eight native cases in both executions
+(`completed-current-own-checkpoint-session-adapter-gate.log`). The latter run's
+adapter fixture failure was corrected and independently rerun below.
+The three adapter workflows and seven core eligibility cases pass with the same
+native checkpoint and hash-matched adapter source in the validation checkout
+(`completed-current-own-checkpoint-adapter-cdc-fixed-gate.log`). The CURRENT workflow
+uses actual catalogue grant/bind/PUT commands, matches source/receiver CDC bytes,
+keeps USER access fenced through tail catch-up, then completes, snapshots and cold
+reopens. Snapshot publication refreshes eligibility after native pins drain. The
+initial source artifact remains valid read-only inventory; restoring it cannot
+regress completed state. No new format marker or compatibility reader was added.
+
+Completed META member checkpoint qualification, durable metadata-DAG
 obligation discovery, asynchronous configured-member catch-up, quorum retirement,
 source quiescence and physical parent reclamation remain unfinished. In particular,
 Raft commitment alone must not report an absent native image as installed, replay

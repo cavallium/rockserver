@@ -2262,8 +2262,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(registration!=null && (!manifest.position().equals(registration.imageCut()) || !Arrays.equals(manifest.sha256(),registration.imageHash()) || cutConfiguration[0]==null || cutConfiguration[0].term()!=registration.configurationTerm() || cutConfiguration[0].index()!=registration.configurationIndex() || !Arrays.equals(cutConfiguration[0].data(),registration.sourceConfiguration())))throw new IOException("Metadata snapshot lacks exact forced recovery image permission");
         } else if(current!=null) {
             var server=getServer().getNow(null);
-            if(topologyLocalReplica==null || !sameReplicaIdentity(current.receiver(),topologyLocalReplica) || server==null || !server.getId().toString().equals(current.receiver().peerId()) || !manifest.position().equals(current.imageCut()) || !Arrays.equals(manifest.sha256(),current.imageHash()) || cutConfiguration[0]==null || cutConfiguration[0].term()!=current.configurationTerm() || cutConfiguration[0].index()!=current.configurationIndex() || !Arrays.equals(cutConfiguration[0].data(),current.sourceConfiguration()))throw new IOException("CURRENT snapshot lacks exact forced receiver image permission");
-            try{store.validateTopologyImageOrigin(manifest.topologyOrigin());}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify CURRENT image provenance",invalid);}
+            if(topologyLocalReplica==null || !sameReplicaIdentity(current.receiver(),topologyLocalReplica) || server==null || !server.getId().toString().equals(current.receiver().peerId()))throw new IOException("CURRENT snapshot receiver identity differs");
+            try {
+                var qualified=store.validateCurrentRangeRecoveryImage(image,limits);
+                if(!qualified.position().equals(manifest.position()) || !Arrays.equals(qualified.sha256(),manifest.sha256()))throw new IOException("CURRENT image changed during native qualification");
+            }catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify CURRENT image provenance",invalid);}
         }
         var learner=store.topologyLearnerRegistration();
         if(!metadata && current==null && learner!=null){
@@ -2311,9 +2314,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public long takeSnapshot() throws IOException {
         // A retired parent's shared USER rows may already belong to its children.
         boolean metadata=metadataSnapshotOwner();
-        if(store.topologyBirthPending() || store.topologyRecoveryOnly() || store.metadataRecoveryPending() || !metadata && store.currentRangeRecoveryRegistration()!=null || store.metadataRecoveryRegistration()!=null)return -1;
+        if(store.topologyBirthPending() || store.topologyRecoveryOnly() || store.metadataRecoveryPending() || store.metadataRecoveryRegistration()!=null)return -1;
         if(metadata){var freeze=store.topologyFreeze();var cut=store.applied();if(freeze==null || cut==null || cut.index()<=freeze.position().index())return -1;}
         var recovery=diskRunway==null?null:diskRunway.reserveRecovery(diskPool,Math.addExact(2*limits.maxImageBytes(),65536));
+        long published;
         try (var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission);var pin = metadata?store.captureMetadataForRecovery():snapshotPin()) {
             if (pin.position() == null) return -1;
             var position = TermIndex.valueOf(pin.position().term(), pin.position().index());
@@ -2332,9 +2336,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (durableSnapshot == null || position.getIndex() > durableSnapshot.getIndex()) durableSnapshot = info;
                 snapshots.updateLatestSnapshot(info);
             }
-            return position.getIndex();
+            published=position.getIndex();
         } catch (Exception failure) { throw new IOException("Could not publish native snapshot", failure); }
         finally {if(recovery!=null)recovery.actualFinished();}
+        refreshRecoveryAfterNativeCompletion();return published;
     }
 
     private ReplicatedRangeStore.SnapshotPin snapshotPin() throws Exception {
