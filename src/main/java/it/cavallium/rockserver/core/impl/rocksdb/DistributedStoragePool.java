@@ -256,7 +256,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         long bytes=16;
         for(var seed:seeds.values())bytes+=4L+seed.encodedSize();
         // Registry entries plus each local digest, readiness/image receipt and pending install pointer.
-        for(var registration:metadata.values())bytes+=260L+registration.encodedSize();
+        for(var registration:metadata.values())bytes+=260L+65620L+registration.encodedSize();
         for(var registration:current.values())bytes+=260L+65620L+registration.encodedSize();
         if(bytes>MAX_TOPOLOGY_SEED_BYTES)throw new IOException("Shared topology/metadata registration bytes exhausted");
     }
@@ -1026,15 +1026,23 @@ public final class DistributedStoragePool implements AutoCloseable {
             var result=new ArrayList<RetainedMetadataOwner>();var db=loaded.db().get();var state=handles.get(STATE_COLUMN);
             for(var record:ownershipHistory){var group=record.owner().groupId();boolean retired=topologyRetirements.containsKey(group) || metadataRecoveries.containsKey(group);boolean pending=topologyBirths.containsKey(group)&&db.get(state,groupSchemaKey(group,0x63))==null || topologyLearners.containsKey(group)&&db.get(state,groupSchemaKey(group,0x68))==null || currentRecoveries.containsKey(group)&&db.get(state,groupSchemaKey(group,0x73))==null;
                 byte[] key=groupSchemaKey(group,0x40);int size=db.get(state,key,new byte[0]);if(size!=org.rocksdb.RocksDB.NOT_FOUND){if(size>NativeSstImportManifest.MAX_BYTES)throw new IllegalStateException("Import metadata inventory exceeds bound");var manifest=NativeSstImportManifest.decode(db.get(state,key));if(!manifest.groupId().equals(group) || ownershipHistory.stream().noneMatch(original->original.owner().groupId().equals(group) && manifest.rangeEpoch()==original.owner().epoch() && manifest.domainId().equals(original.interval().domainId()) && original.interval().columns().containsAll(manifest.physicalNames().keySet()) && Arrays.equals(manifest.lowerInclusive(),original.interval().lowerInclusive()) && Arrays.equals(manifest.upperExclusive(),original.interval().upperExclusive())))throw new IllegalStateException("Import metadata inventory changed ownership");pending|=db.get(state,groupSchemaKey(group,0x43))==null;}
+                var metadata=metadataRecoveries.get(group);if(metadata!=null)pending|=!metadataRecoveryCompleted(db,state,metadata);
                 result.add(new RetainedMetadataOwner(record.owner(),record.interval(),retired,pending));
             }
             var historical=new HashSet<UUID>();for(var owner:result)historical.add(owner.owner().groupId());
             for(var registration:metadataRecoveries.values())if(historical.add(registration.groupId())) {
                 var range=registration.range();var interval=new RangeOwnership.Interval(registration.sourceDirectory().domainId(),registration.sourceDirectory().columns(),range.lowerInclusive(),range.upperExclusive());
-                result.add(new RetainedMetadataOwner(new RangeOwnership.Owner(range.groupId(),range.rangeEpoch()),interval,true,!Arrays.equals(db.get(state,groupSchemaKey(range.groupId(),0x70)),registration.digest()) || db.get(state,groupSchemaKey(range.groupId(),0x7f))!=null));
+                result.add(new RetainedMetadataOwner(new RangeOwnership.Owner(range.groupId(),range.rangeEpoch()),interval,true,!metadataRecoveryCompleted(db,state,registration)));
             }
             if(result.size()>MAX_RETAINED_METADATA_OWNERS)throw new IllegalStateException("Permanent metadata owner inventory exhausted");return List.copyOf(result);
         }finally{handleLifetime.readLock().unlock();nativeMutation.release();}
+    }
+    private static boolean metadataRecoveryCompleted(org.rocksdb.RocksDB db,org.rocksdb.ColumnFamilyHandle state,NativeMetadataRecoveryRegistration registration)throws RocksDBException {
+        UUID group=registration.groupId();byte[] readyKey=groupSchemaKey(group,0x70);int size=db.get(state,readyKey,new byte[0]);if(size==org.rocksdb.RocksDB.NOT_FOUND)return false;if(size<85 || size>65620)throw new IllegalStateException("Invalid retained META completion size");
+        byte[] marker=java.nio.ByteBuffer.allocate(16).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).array();if(db.get(state,marker,new byte[0])!=16)throw new IllegalStateException("Retained META completion lacks native marker");var bytes=java.nio.ByteBuffer.wrap(db.get(state,marker));var cut=new ApplyPosition(bytes.getLong(),bytes.getLong());
+        ReplicatedRangeStore.requireMetadataCompletion(registration,db.get(state,readyKey),cut);
+        byte[] receipt=java.nio.ByteBuffer.allocate(48).putLong(registration.imageCut().term()).putLong(registration.imageCut().index()).put(registration.imageHash()).array();
+        return Arrays.equals(db.get(state,groupSchemaKey(group,0x71)),receipt) && db.get(state,groupSchemaKey(group,0x7f))==null;
     }
     /** Bounded durable group inventory, including virgin births and retained inactive metadata. */
     public Set<UUID> persistedRangeGroups(int maximum) throws RocksDBException {

@@ -506,6 +506,7 @@ public final class ReplicatedRangeStore {
     private volatile NativeCurrentRangeRecovery currentRangeRecovery;
     private volatile boolean currentRangeRecoveryReady;
     private byte[] pendingCurrentCompletion;
+    private byte[] pendingMetadataCompletion;
     @FunctionalInterface public interface CurrentRecoveryForceObserver {void boundary(boolean afterPersistence)throws RocksDBException;}
     private volatile CurrentRecoveryForceObserver currentRecoveryCompletionForceObserver=after->{};
     public void currentRecoveryCompletionForceObserver(CurrentRecoveryForceObserver observer){currentRecoveryCompletionForceObserver=Objects.requireNonNull(observer);}
@@ -1021,7 +1022,7 @@ public final class ReplicatedRangeStore {
         if(metadataSize==RocksDB.NOT_FOUND && metadataRecoveryRegistration!=null)throw new IllegalArgumentException("Metadata recovery lost its durable pointer");
         if(metadataRecoveryRegistration!=null && (!metadataRecoveryRegistration.groupId().equals(groupId) || metadataRecoveryRegistration.range().rangeEpoch()!=rangeEpoch))throw new IllegalArgumentException("Metadata registration changed native group identity");
         byte[] metadataReady=db.get(state,topologyOwnershipKey(0x70));
-        if(metadataReady!=null && (metadataRecoveryRegistration==null || !Arrays.equals(metadataReady,metadataRecoveryRegistration.digest()) || !Arrays.equals(db.get(state,topologyOwnershipKey(0x71)),metadataImageReceipt(metadataRecoveryRegistration))))throw new IllegalArgumentException("Metadata completion lost its local registration/image authority");
+        if(metadataReady!=null){if(metadataRecoveryRegistration==null || !Arrays.equals(db.get(state,topologyOwnershipKey(0x71)),metadataImageReceipt(metadataRecoveryRegistration)))throw new IllegalArgumentException("Metadata completion lost its local registration/image authority");requireMetadataCompletion(metadataRecoveryRegistration,metadataReady,topologyRecoveryCut());}
         metadataRecoveryReady=metadataReady!=null && pendingInstallation==null;
         int recoverySize=db.get(state,topologyOwnershipKey(0x6d),new byte[0]);if(recoverySize>NativeTopologyRecoveryFence.MAX_BYTES)throw new IllegalArgumentException("Recovery fence exceeds bound");byte[] recovery=recoverySize==RocksDB.NOT_FOUND?null:db.get(state,topologyOwnershipKey(0x6d));topologyRecoveryFence=recovery==null?null:NativeTopologyRecoveryFence.decode(recovery);if(topologyRecoveryFence!=null)topologyRecoveryFence.requireGroup(groupId,rangeEpoch);
         byte[] learner=db.get(state,topologyOwnershipKey(0x67));topologyLearner=learner==null ? null : NativeTopologyLearnerRegistration.decode(learner);
@@ -1146,7 +1147,7 @@ public final class ReplicatedRangeStore {
             if(!groupId.equals(registration.groupId()) || rangeEpoch!=descriptor.rangeEpoch())throw new IllegalArgumentException("Metadata registration changed source owner");
             ownership.validateMetadataRecovery(owner,target);byte[] digest=registration.sourceDirectory().schemaDigest();
             // Fence first. A failed/unknown force must never reopen the previous USER owner.
-            metadataRecoveryRegistration=registration;metadataRecoveryReady=false;
+            metadataRecoveryRegistration=registration;metadataRecoveryReady=false;pendingMetadataCompletion=null;
             force.force();ownership.recoverMetadata(owner,target);interval=target;schemaDigest=digest;columns=Map.of();deterministicMergeColumns=registration.mergeColumns();topologyRecoveryFence=null;
             retiredMetadataOnly=true;installedGeneration=null;logicalSchema=null;retiredRoutingPrefix=registration.sourceDirectory().routingPrefixBytes();
         }finally{applyLane.unlock();nativeLifecycle.writeLock().unlock();}
@@ -1155,10 +1156,37 @@ public final class ReplicatedRangeStore {
     public void completeMetadataRecovery(NativeMetadataRecoveryRegistration expected,ApplyPosition requiredCut,Configuration requiredConfiguration)throws RocksDBException {
         Objects.requireNonNull(expected);Objects.requireNonNull(requiredCut);Objects.requireNonNull(requiredConfiguration);enterNative();applyLane.lock();try {
             if(!expected.equals(metadataRecoveryRegistration))throw new IllegalArgumentException("Metadata completion changed original recovery registration");
+            var proposed=recoveryCompletion(expected.digest(),requiredCut,requiredConfiguration,applied);byte[] original=db.get(state,topologyOwnershipKey(0x70));
+            if(pendingMetadataCompletion!=null && !sameCompletionRecipe(pendingMetadataCompletion,proposed))throw new IllegalArgumentException("Unknown META completion force requires original retry");
+            if(original!=null){requireMetadataCompletion(expected,original,applied);if(!sameCompletionRecipe(original,proposed))throw new IllegalArgumentException("META completion changed original evidence");if(metadataRecoveryReady)return;}
             requireTopologyMetadataOwner(false);if(!metadataImageInstalledUnderLane() || !NativeMetadataRecoveryRegistration.covers(requiredCut,expected.imageCut()) || !NativeMetadataRecoveryRegistration.covers(applied,requiredCut))throw new IllegalStateException("Metadata recovery lacks actual current completed prefix");
-            var configuration=configurationUnderAdmission();if(configuration==null || configuration.term()!=requiredConfiguration.term() || configuration.index()!=requiredConfiguration.index() || !Arrays.equals(configuration.data(),requiredConfiguration.data()))throw new IllegalArgumentException("Metadata source configuration changed");
-            byte[] receipt=expected.digest();try(var options=new WriteOptions().setDisableWAL(false).setSync(true)){db.put(state,options,topologyOwnershipKey(0x70),receipt);}metadataRecoveryReady=true;
+            if(pendingMetadataCompletion==null && original==null){var configuration=configurationUnderAdmission();if(!sameConfiguration(configuration,requiredConfiguration))throw new IllegalArgumentException("Metadata source configuration changed");}
+            byte[] receipt=original!=null?original:pendingMetadataCompletion!=null?pendingMetadataCompletion:proposed;requireMetadataCompletion(expected,receipt,applied);pendingMetadataCompletion=receipt;
+            try(var options=new WriteOptions().setDisableWAL(false).setSync(true)){db.put(state,options,topologyOwnershipKey(0x70),receipt);}metadataRecoveryReady=true;pendingMetadataCompletion=null;
         }finally{applyLane.unlock();leaveNative();}
+    }
+    /** Acknowledges an already-ready historical completion without changing admission or ownership. */
+    public boolean recoveryCompletionRecorded(ApplyPosition requiredCut,Configuration requiredConfiguration)throws RocksDBException {
+        Objects.requireNonNull(requiredCut);Objects.requireNonNull(requiredConfiguration);
+        return readSchemaMetadata(()->{
+            boolean metadata=metadataRecoveryRegistration!=null;
+            if(pendingInstallation!=null || (metadata?!metadataRecoveryReady:currentRangeRecovery==null || !currentRangeRecoveryReady))return false;
+            byte[] receipt=db.get(state,topologyOwnershipKey(metadata?0x70:0x73));
+            byte[] digest;
+            if(metadata){requireMetadataCompletion(metadataRecoveryRegistration,receipt,applied);digest=metadataRecoveryRegistration.digest();}
+            else {NativeCurrentRangeRecovery.requireCompletion(currentRangeRecovery,receipt,applied);digest=currentRangeRecovery.digest();}
+            if(!(metadata?metadataImageInstalledUnderLane():currentImageInstalledUnderLane()))throw new IllegalStateException("Completed recovery lost its registered image");
+            if(!sameCompletionRecipe(receipt,recoveryCompletion(digest,requiredCut,requiredConfiguration,applied)))throw new IllegalArgumentException("Recovery completion changed original evidence");
+            return true;
+        });
+    }
+    private static byte[] recoveryCompletion(byte[] registration,ApplyPosition required,Configuration configuration,ApplyPosition completed){byte[] cfg=configuration.data();return ByteBuffer.allocate(84+cfg.length).put(registration).putLong(required.term()).putLong(required.index()).putLong(configuration.term()).putLong(configuration.index()).putInt(cfg.length).put(cfg).putLong(completed==null?0:completed.term()).putLong(completed==null?-1:completed.index()).array();}
+    private static boolean sameCompletionRecipe(byte[] first,byte[] second){return first.length>=85 && second.length>=85 && first.length==second.length && Arrays.equals(first,0,first.length-16,second,0,second.length-16);}
+    static void requireMetadataCompletion(NativeMetadataRecoveryRegistration registration,byte[] receipt,ApplyPosition cut){
+        if(cut==null)throw new IllegalArgumentException("META completion lacks completed native cut");
+        if(receipt==null || receipt.length<85 || receipt.length>65620)throw new IllegalArgumentException("Invalid META completion receipt");var in=ByteBuffer.wrap(receipt);byte[] digest=new byte[32];in.get(digest);var required=new ApplyPosition(in.getLong(),in.getLong());long term=in.getLong(),index=in.getLong();int length=in.getInt();
+        if(length<1 || length>65536 || length!=in.remaining()-16)throw new IllegalArgumentException("Invalid META completion configuration");byte[] configuration=new byte[length];in.get(configuration);new Configuration(term,index,configuration);var completed=new ApplyPosition(in.getLong(),in.getLong());
+        if(!Arrays.equals(digest,registration.digest()) || required.term()<1 || index>completed.index() || term>completed.term() || index==completed.index() && term!=completed.term() || !NativeMetadataRecoveryRegistration.covers(required,registration.imageCut()) || !NativeMetadataRecoveryRegistration.covers(completed,required) || !NativeMetadataRecoveryRegistration.covers(cut,completed))throw new IllegalArgumentException("META completion exceeds genuine image/own tail");
     }
     void publishTopologyRetirement(NativeTopologySeed seed) { topologyRetirement=seed.digest(); }
     /** Metadata-only parent/birth status at its own completed prefix; no USER snapshot is acquired. */
@@ -3461,12 +3489,12 @@ public final class ReplicatedRangeStore {
     public void completeCurrentRangeRecovery(NativeCurrentRangeRecovery expected,ApplyPosition requiredCut,Configuration requiredConfiguration)throws RocksDBException {
         Objects.requireNonNull(expected);Objects.requireNonNull(requiredCut);Objects.requireNonNull(requiredConfiguration);enterNative();applyLane.lock();try {
             if(!expected.equals(currentRangeRecovery))throw new IllegalArgumentException("CURRENT completion changed original registration");
-            byte[] cfg=requiredConfiguration.data();byte[] receipt=ByteBuffer.allocate(84+cfg.length).put(expected.digest()).putLong(requiredCut.term()).putLong(requiredCut.index()).putLong(requiredConfiguration.term()).putLong(requiredConfiguration.index()).putInt(cfg.length).put(cfg).putLong(applied==null?0:applied.term()).putLong(applied==null?-1:applied.index()).array();
-            if(pendingCurrentCompletion!=null && !Arrays.equals(pendingCurrentCompletion,receipt))throw new IllegalArgumentException("Unknown CURRENT completion force requires original retry");
-            if(currentRangeRecoveryReady){byte[] original=db.get(state,topologyOwnershipKey(0x73));if(original==null || !Arrays.equals(receipt,0,receipt.length-16,original,0,original.length-16))throw new IllegalArgumentException("CURRENT completion changed original evidence");return;}
+            byte[] proposed=recoveryCompletion(expected.digest(),requiredCut,requiredConfiguration,applied);byte[] original=db.get(state,topologyOwnershipKey(0x73));
+            if(pendingCurrentCompletion!=null && !sameCompletionRecipe(pendingCurrentCompletion,proposed))throw new IllegalArgumentException("Unknown CURRENT completion force requires original retry");
+            if(original!=null){NativeCurrentRangeRecovery.requireCompletion(expected,original,applied);if(!sameCompletionRecipe(original,proposed))throw new IllegalArgumentException("CURRENT completion changed original evidence");if(currentRangeRecoveryReady)return;}
             requireTopologyLearnerImage();var actual=configurationUnderAdmission();
-            if(requiredCut.term()<1 || !NativeMetadataRecoveryRegistration.covers(applied,requiredCut) || actual==null || actual.term()!=requiredConfiguration.term() || actual.index()!=requiredConfiguration.index() || !Arrays.equals(actual.data(),cfg) || actual.index()>applied.index() || actual.term()>applied.term() || logicalSchema==null || !Arrays.equals(schemaDigest,logicalSchema.digest()) || !Arrays.equals(schemaDigest,expected.schema().digest()) && !schemaHistory.containsKey(schemaIdentity(expected.schema().digest())) || activeSchemaFence!=null || activeSchemaInstallation!=null && activeSchemaActivation==null)throw new IllegalStateException("CURRENT completion lacks actual image, own tail, configuration or schema");
-            pendingCurrentCompletion=receipt;currentRecoveryCompletionForceObserver.boundary(false);try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)){batch.put(state,topologyOwnershipKey(0x73),receipt);db.write(options,batch);}currentRecoveryCompletionForceObserver.boundary(true);currentRangeRecoveryReady=true;pendingCurrentCompletion=null;ownership.activate(owner);
+            if(requiredCut.term()<1 || !NativeMetadataRecoveryRegistration.covers(applied,requiredCut) || actual==null || pendingCurrentCompletion==null && original==null && !sameConfiguration(actual,requiredConfiguration) || actual.index()>applied.index() || actual.term()>applied.term() || logicalSchema==null || !Arrays.equals(schemaDigest,logicalSchema.digest()) || !Arrays.equals(schemaDigest,expected.schema().digest()) && !schemaHistory.containsKey(schemaIdentity(expected.schema().digest())) || activeSchemaFence!=null || activeSchemaInstallation!=null && activeSchemaActivation==null)throw new IllegalStateException("CURRENT completion lacks actual image, own tail, configuration or schema");
+            byte[] receipt=original!=null?original:pendingCurrentCompletion!=null?pendingCurrentCompletion:proposed;NativeCurrentRangeRecovery.requireCompletion(expected,receipt,applied);pendingCurrentCompletion=receipt;currentRecoveryCompletionForceObserver.boundary(false);try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)){batch.put(state,topologyOwnershipKey(0x73),receipt);db.write(options,batch);}currentRecoveryCompletionForceObserver.boundary(true);currentRangeRecoveryReady=true;pendingCurrentCompletion=null;ownership.activate(owner);
         }finally{applyLane.unlock();leaveNative();}
     }
     private void requireTopologyLearnerImage() throws RocksDBException {
@@ -3885,7 +3913,7 @@ public final class ReplicatedRangeStore {
     private void applyNoopUnderAdmission(ApplyPosition position, byte[] configuration) throws RocksDBException {
         applyLane.lock();
         try {
-            if(pendingCurrentCompletion!=null)throw new IllegalStateException("Unknown CURRENT completion force requires original retry");
+            // Committed accounting may advance; an uncertain completion retains its original receipt/cut.
             if(currentRangeRecovery!=null && !currentImageInstalledUnderLane())throw new IllegalStateException("CURRENT log replay requires registered image first");
             if(metadataRecoveryRegistration!=null && !metadataImageInstalledUnderLane())throw new IllegalStateException("Metadata log replay requires its registered source image first");
             if(importIntent!=null && position.index()>=importIntent.position().index())throw new IllegalStateException("Pending native import owns its original committed apply position");
@@ -4018,7 +4046,7 @@ public final class ReplicatedRangeStore {
     private MetadataImageQualification qualifyMetadataRecoveryImage(Path image,NativeRangeImage.Limits limits,NativeRangeImage.Manifest expected,boolean installing,SnapshotPin comparisonPin)throws IOException,RocksDBException {
         try {
             var registration=metadataRecoveryRegistration;if(registration==null)throw new IOException("META checkpoint lacks local recovery registration");
-            byte[] ready=db.get(state,topologyOwnershipKey(0x70));boolean trusted=Arrays.equals(ready,registration.digest()) && Arrays.equals(db.get(state,topologyOwnershipKey(0x71)),metadataImageReceipt(registration));
+            byte[] ready=db.get(state,topologyOwnershipKey(0x70));boolean trusted=ready!=null && Arrays.equals(db.get(state,topologyOwnershipKey(0x71)),metadataImageReceipt(registration));if(trusted)requireMetadataCompletion(registration,ready,topologyRecoveryCut());
             Configuration[] configuration={null};NativeTopologyFreeze[] freeze={null};var candidate=metadataDigest();var frame=ByteBuffer.allocate(9);
             var actual=NativeRangeImage.visitMetadata(image,limits,(section,column,key,value)->{
                 digestMetadataRow(candidate,frame,section,key,value);

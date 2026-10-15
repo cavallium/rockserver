@@ -425,6 +425,24 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             recoveryReplacement=false;refreshRecoveryEligibility();
         }
     }
+    /** Runtime supplied fresh authority is read before entering this short apply coordination seam. */
+    boolean completeRecoveryRegistration(RatisTopologySourceSnapshotRpc.Prepared prepared,RatisSourceHeadRpc.Head head,boolean frozenRetry,Runnable beforeForce)throws Exception {
+        synchronized(gate){
+            requireDataRole();requireHealthy();var scope=prepared.request();
+            if(getLifeCycleState()!=LifeCycle.State.RUNNING || recoveryReplacement || nativeApply!=null || !deferred.isEmpty() || !pendingNoops.isEmpty() || !configurations.isEmpty() || schemaConfigurationPending || store.pendingInstallation())return false;
+            boolean installed=scope.metadataOnly()?store.metadataRecoveryImageInstalled():store.currentRangeRecoveryImageInstalled();if(!installed)return false;
+            boolean completed=scope.metadataOnly()?!store.metadataRecoveryPending():store.currentRangeRecoveryReady();var cut=store.applied();var configuration=store.configuration();var snapshot=durableSnapshot;
+            if(cut==null || configuration==null || !RatisRelocationOwnerRpc.covers(cut,head.completedCut()) || !completed && !frozenRetry && (configuration.term()!=head.configuration().term() || configuration.index()!=head.configuration().index() || !Arrays.equals(configuration.data(),head.configuration().data())) || snapshot==null || !RatisRelocationOwnerRpc.covers(new ApplyPosition(snapshot.getTerm(),snapshot.getIndex()),prepared.image().position()))return false;
+            var descriptor=scope.metadataOnly()?scope.range():RatisSourceHeadRpc.requireContinuity(scope,head.currentDirectory());
+            if(!completed && !scope.metadataOnly() && (!Arrays.equals(store.schemaDigest(),head.currentDirectory().schemaDigest()) || !store.ownership().interval().equals(new RangeOwnership.Interval(head.currentDirectory().domainId(),head.currentDirectory().columns(),descriptor.lowerInclusive(),descriptor.upperExclusive())) || store.schemaFence()!=null))return false;
+            var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(scope.receiver().peerId()) || topologyLocalReplica==null || !sameReplicaIdentity(scope.receiver(),topologyLocalReplica))throw new IOException("Recovery completion changed actual receiver identity");var division=server.getDivision(getGroupId());var info=division.getInfo();
+            if(division.getStateMachine()!=this || !info.isAlive() || info.getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Recovery completion lacks actual running receiver division");
+            requireSchemaMembership(descriptor,configuration.data());var actual=division.getRaftConf();requireActualMembership(actual,descriptor);
+            if(actual.getLogEntryIndex()!=configuration.index() && !(configuration.term()==0 && configuration.index()==-1 && actual.getLogEntryIndex()<=0) || division.getRaftLog().getSnapshotIndex()<prepared.image().position().index())return false;
+            if(!completed)beforeForce.run();if(scope.metadataOnly())store.completeMetadataRecovery(store.metadataRecoveryRegistration(),head.completedCut(),head.configuration());else store.completeCurrentRangeRecovery(store.currentRangeRecoveryRegistration(),head.completedCut(),head.configuration());
+        }
+        refreshRecoveryEligibility();return true;
+    }
     private void refreshRecoveryAfterNativeCompletion()throws IOException {
         if(store.currentRangeRecoveryRegistration()!=null || store.metadataRecoveryRegistration()!=null)refreshRecoveryEligibility();
     }

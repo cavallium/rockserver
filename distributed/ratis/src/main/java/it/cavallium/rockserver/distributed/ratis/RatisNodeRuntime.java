@@ -120,6 +120,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private NativeTopologyLearnerRegistration learnerAttempt;private UUID learnerAttemptPool;
     private record RecoveryAttempt(UUID pool,UUID group,byte[] preparedDigest,NativeCurrentRangeRecovery current,NativeMetadataRecoveryRegistration metadata) {}
     private RecoveryAttempt recoveryAttempt;
+    private final Map<UUID,byte[]> recoveryCompletionAttempts=new HashMap<>();
     synchronized void relocationTransport(RatisClientPool.Factory leaders,RatisClientPool.OwnerFactory owners)throws IOException{
         if(started || starting || installing || closeRequested || closing || closed)throw new IllegalStateException("Relocation transport fixed before start");var replacement=new RatisRelocationDataClient(plan.clusterId(),plan.databaseId(),plan.catalogue().groupId(),leaders,owners);try{relocationClients.close();}catch(IOException|RuntimeException failed){try{replacement.close();}catch(IOException cleanup){failed.addSuppressed(cleanup);}throw failed;}relocationClients=replacement;
     }
@@ -476,7 +477,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         for(var owner:pools.values()){
             var current=owner.pool.currentRangeRecoveries();var metadata=owner.pool.metadataRecoveries();long encoded=0,registry=16;
             for(var seed:owner.pool.topologySeeds())registry=Math.addExact(registry,4L+seed.encodedSize());
-            for(var registration:metadata){encoded=Math.addExact(encoded,registration.encodedSize());registry=Math.addExact(registry,260L+registration.encodedSize());}
+            for(var registration:metadata){encoded=Math.addExact(encoded,registration.encodedSize());registry=Math.addExact(registry,260L+65620L+registration.encodedSize());}
             for(var registration:current){encoded=Math.addExact(encoded,registration.encodedSize());registry=Math.addExact(registry,260L+65620+registration.encodedSize());}
             // POOL_BYTES already reserves the native shared 64 MiB registry, including per-group
             // registration/digest/image/completion rows. Count that promise once, not once per DTO.
@@ -1081,6 +1082,54 @@ public final class RatisNodeRuntime implements AutoCloseable {
             }
         }catch(IOException failure){throw failure;}catch(Exception failure){throw new IOException("Configured native recovery registration failed",failure);}finally{endSeedLifecycle();}
     }
+    /** Trusted actor seam: both values come from actual transport and are journaled before dispatch.
+     * False means no completion force was attempted; the actor may obtain a newer source head. */
+    public boolean completeRecovery(RatisTopologySourceSnapshotRpc.Prepared prepared,RatisSourceHeadRpc.Head frozenHead)throws IOException {
+        Objects.requireNonNull(prepared);Objects.requireNonNull(frozenHead);var scope=prepared.request();
+        synchronized(this){if(!started || server==null || installing || starting || closing || closeRequested || closed || recoveryAttempt!=null || learnerAttempt!=null || seedAttempt!=null)throw new IOException("Recovery completion node owner unavailable");installing=true;}
+        try {
+            if(scope.relocation() || !scope.catalogue().equals(plan.catalogue().groupId()) || !scope.clusterId().equals(plan.clusterId()) || !scope.databaseId().equals(plan.databaseId()))throw new IOException("Recovery completion namespace/purpose differs");
+            var receiver=scope.receiver();if(!receiver.nodeId().equals(plan.nodeId()) || !receiver.nodeIncarnation().equals(plan.nodeIncarnation()) || !receiver.peerId().equals(plan.peerId()) || !receiver.address().equals(plan.address()))throw new IOException("Recovery completion receiver identity differs");
+            RatisTopologySourceSnapshotRpc.requireRequest(scope,frozenHead.request().source());if(!prepared.image().position().equals(frozenHead.request().minimumImageCut()))throw new IOException("Recovery completion changed original image cut");
+            var owner=owner(scope.sourceGroup());if(!owner.spec.id().equals(plan.incomingPoolId(scope.domainId(),scope.sourceGroup())))throw new IOException("Recovery completion changed configured pool");
+            try(var workspace=resources.imageMetadataAdmission(owner.spec.id(),NativeRangeImage.IoAdmission.UNLIMITED).reserveMetadata(Math.addExact(prepared.encodedSize(),RatisSourceHeadRpc.MAX_REPLY_BYTES))){
+                var store=stores.get(scope.sourceGroup());var machine=machines.get(RaftGroupId.valueOf(scope.sourceGroup()));if(store==null || machine==null)throw new IOException("Recovery completion has no forced local registration");
+                if(scope.metadataOnly()){
+                    var saved=store.metadataRecoveryRegistration();if(saved==null)throw new IOException("Recovery completion has no META registration");var expected=new NativeMetadataRecoveryRegistration(scope.transferId(),scope.catalogue(),saved.catalogueCut(),scope.sourceDirectory(),prepared.metadataFreeze(),receiver,prepared.sourceOwner(),prepared.sourceCfg().term(),prepared.sourceCfg().index(),prepared.sourceCfg().data(),prepared.image().position(),prepared.image().sha256(),prepared.image().deterministicMergeColumns());if(!saved.equals(expected))throw new IOException("META completion changed original Prepared recipe");
+                }else{
+                    var saved=store.currentRangeRecoveryRegistration();if(saved==null)throw new IOException("Recovery completion has no CURRENT registration");var expected=new NativeCurrentRangeRecovery(scope.transferId(),scope.catalogue(),saved.catalogueCut(),scope.sourceDirectory(),prepared.schema(),scope.sourceGroup(),receiver,prepared.sourceOwner(),prepared.image().position(),prepared.image().sha256(),prepared.sourceCfg().term(),prepared.sourceCfg().index(),prepared.sourceCfg().data(),prepared.image().topologyOrigin(),saved.physicalNames(),saved.mergeColumns(),prepared.schemaRows());if(!saved.equals(expected))throw new IOException("CURRENT completion changed original Prepared recipe");
+                }
+                byte[] identity=OperatorUpload.sha256(ByteBuffer.allocate(64).put(OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,prepared))).put(OperatorUpload.sha256(RatisSourceHeadRpc.reply(frozenHead))).array());var pending=recoveryCompletionAttempts.get(scope.sourceGroup());if(pending!=null && !Arrays.equals(pending,identity))throw new IOException("Unknown recovery completion requires exact frozen head retry");
+                if(pending==null && store.recoveryCompletionRecorded(frozenHead.completedCut(),frozenHead.configuration())){recoveryCompletionAttempts.remove(scope.sourceGroup());return true;}
+                var catalogue=epochs.catalogue(plan.catalogue().directoryColumn());var current=catalogue.readView(scope.domainId());if(current.directory()==null)throw new IOException("Recovery completion domain missing; rediscover placement");var fresh=relocationClients.head(frozenHead.request());
+                if(!Arrays.equals(fresh.currentDirectory().payloadDigest(),current.directory().payloadDigest()) || !RatisRelocationOwnerRpc.covers(fresh.catalogueCut(),current.cut()) || !RatisRelocationOwnerRpc.covers(fresh.catalogueCut(),frozenHead.catalogueCut()) || !RatisRelocationOwnerRpc.covers(fresh.completedCut(),frozenHead.completedCut()))throw new IOException("Recovery completion authority regressed or changed during proof");
+                if(scope.metadataOnly()){
+                    var definition=epochs.topologyCatalogue(plan.catalogue().directoryColumn()).readDefinition(scope.header().definitionDigest());if(definition==null)throw new IOException("Recovery completion original META definition absent");scope.header().requireDefinition(definition);var target=definition.targets().getFirst();var birth=catalogue.readRecoveryBirth(scope.domainId(),target.rangeId(),target.groupId(),target.rangeEpoch(),fresh.catalogueCut());if(birth.birth()==null || !Arrays.equals(birth.birth().encode(),definition.encode()))throw new IOException("Recovery completion META publication changed");
+                }else{
+                    var frozenRange=RatisSourceHeadRpc.requireContinuity(scope,frozenHead.currentDirectory());var freshRange=RatisSourceHeadRpc.requireContinuity(scope,fresh.currentDirectory());if(!frozenRange.equals(freshRange))throw new IOException("Recovery completion configured cohort changed; rediscover placement");
+                    if(fresh.currentDirectory().schemaEpoch()<frozenHead.currentDirectory().schemaEpoch() || fresh.currentDirectory().generation()<frozenHead.currentDirectory().generation())throw new IOException("Recovery completion placement regressed");
+                    var birth=catalogue.readRecoveryBirth(scope.domainId(),scope.range().rangeId(),scope.sourceGroup(),scope.rangeEpoch(),fresh.catalogueCut());if(birth.birth()!=null){if(prepared.image().topologyOrigin()==null)throw new IOException("Recovery completion born group lost image origin");prepared.image().topologyOrigin().seed().header().requireDefinition(birth.birth());}else if(prepared.image().topologyOrigin()!=null || plan.directory(scope.domainId()).ranges().stream().noneMatch(range->range.rangeId().equals(scope.range().rangeId()) && range.groupId().equals(scope.sourceGroup()) && range.rangeEpoch()==scope.rangeEpoch()))throw new IOException("Recovery completion lacks immutable ordinary bootstrap witness");
+                }
+                boolean complete=machine.completeRecoveryRegistration(prepared,frozenHead,pending!=null,()->recoveryCompletionAttempts.put(scope.sourceGroup(),identity));if(!complete){if(pending!=null)throw new IOException("Unknown completion retry is not currently ready; frozen head remains required");return false;}
+                if(!scope.metadataOnly()){
+                    var route=data(scope.domainId());var target=frozenHead.currentDirectory();if(route.directory().schemaEpoch()<=target.schemaEpoch() && !Arrays.equals(route.directory().schemaDigest(),target.schemaDigest()))for(var activation:store.activatedSchemas())observeSchemaActivation(activation.definition(),activation.proof());
+                    if(route.directory().generation()<=target.generation())route.refresh(target);
+                }
+                recoveryCompletionAttempts.remove(scope.sourceGroup());return true;
+            }
+        }catch(IOException failure){throw failure;}catch(Exception failure){throw new IOException("Recovery completion failed; exact frozen head remains required after force",failure);}finally{endSeedLifecycle();}
+    }
+    /** Borrowed actor ports; RatisConfiguredRecovery invokes them only on its admitted IO executor. */
+    RatisConfiguredRecovery.Host configuredRecoveryHost(){return new RatisConfiguredRecovery.Host(){
+        public CompletableFuture<RatisTopologySourceSnapshotRpc.Prepared> prepare(RatisTopologySourceSnapshotRpc.Request request){return recoveryAction(()->relocationClients.prepare(request));}
+        public CompletableFuture<byte[]> register(RatisTopologySourceSnapshotRpc.Prepared prepared){return recoveryAction(()->{var store=registerRecovery(prepared);return prepared.request().metadataOnly()?store.metadataRecoveryRegistration().digest():store.currentRangeRecoveryRegistration().digest();});}
+        public CompletableFuture<RatisTopologySourceSnapshotRpc.Prepared> transfer(RatisTopologySourceSnapshotRpc.Request request){return recoveryAction(()->relocationClients.transfer(request));}
+        public CompletableFuture<RatisRecoveryImageRpc.Evidence> probe(RatisRecoveryImageRpc.Request request){return recoveryAction(()->{var machine=machines.get(RaftGroupId.valueOf(request.source().sourceGroup()));if(machine==null)throw new IOException("Recovery probe has no local receiver");return machine.recoveryImageEvidence(request);});}
+        public CompletableFuture<RatisSourceHeadRpc.Head> head(RatisSourceHeadRpc.Request request){return recoveryAction(()->relocationClients.head(request));}
+        public CompletableFuture<Boolean> complete(RatisTopologySourceSnapshotRpc.Prepared prepared,RatisSourceHeadRpc.Head head){return recoveryAction(()->completeRecovery(prepared,head));}
+        public CompletableFuture<Void> release(RatisTopologySourceSnapshotRpc.Prepared prepared){return recoveryAction(()->{relocationClients.release(prepared.request(),prepared.sourceOwner());return null;});}
+    };}
+    private static <T>CompletableFuture<T> recoveryAction(java.util.concurrent.Callable<T> action){try{return CompletableFuture.completedFuture(action.call());}catch(Exception failed){return CompletableFuture.failedFuture(failed);}}
     private ApplyPosition qualifyRecovery(RatisTopologySourceSnapshotRpc.Prepared prepared)throws IOException {
         var request=prepared.request();RatisRangeStateMachine.requireSchemaMembership(request.range(),prepared.sourceCfg().data());var catalogue=epochs.catalogue(plan.catalogue().directoryColumn());var view=catalogue.readView(request.domainId());if(view.directory()==null)throw new IOException("Recovery domain missing; rediscover placement");requirePropagationCoverage(request.domainId(),view.directory());
         var head=relocationClients.head(new RatisSourceHeadRpc.Request(request,prepared.image().position()));if(!head.sourceOwner().equals(prepared.sourceOwner()) || !Arrays.equals(head.currentDirectory().payloadDigest(),view.directory().payloadDigest()) || !RatisRelocationOwnerRpc.covers(head.catalogueCut(),view.cut()))throw new IOException("Recovery source/CAT proof changed during qualification");

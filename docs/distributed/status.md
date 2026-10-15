@@ -1916,11 +1916,42 @@ wire-exact and avoids payload copies at Runtime admission; 36 source-service,
 publication, artifact and metadata-replay consumer cases pass
 (`recovery-prepared-size-source-consumers-gate.log`).
 
-CURRENT-to-META conversion, META registration successors, and conversion of an
-existing source with a retained GROUP snapshot still need dedicated Runtime
-transitions; first-time META conversion conservatively refuses any retained
-snapshot before native force. The journaled asynchronous configured-member driver,
-DAG obligation retention and leader-change source transfer remain unfinished.
+Runtime completion now qualifies the actual receiver image, native own-tail/configuration,
+durable SM snapshot and Ratis log floor before forcing its exact completion receipt.
+META uses the full current receipt layout directly, including the original required
+cut/configuration and completed native cut; cold inventory and checkpoint qualification
+consume that same layout. Lost replies preserve the original recipe while committed
+NOOP/configuration accounting advances. Already-settled exact retries need no source
+and preserve later schema fences; warm attempts with unfinished eligibility/routing
+publication must finish those local effects before reporting success.
+
+The asynchronous per-attempt driver now forces PREPARE, registration, image transfer,
+receiver proof, RELEASE, source HEAD and completion phases through one owned journal.
+It releases the capture pin after the receiver image proof, before HEAD, allowing
+schema INSTALL to drain pins. Unknown host/journal outcomes retain their original
+inputs; observer cancellation and stop keep resources until actual IO settles.
+Its Runtime-port workflow transfers real image chunks for META and both CURRENT
+children, preserves genuine birth/activation provenance and unrelated pool data,
+then cold reopens native owners and DONE journals without repeating source actions.
+
+Current evidence covers 103 distinct cases: 23 native recovery cases in both core
+executions, 15 standalone/codec cases in both core executions, seven eligibility
+cases, 46 existing Runtime/seed/learner/two-pool cases and twelve recovery adapter
+cases. Logs are `configured-recovery-early-release-accounting-gate.log`,
+`configured-recovery-runtime-standalone-regression-gate.log` and the final passing
+`configured-recovery-settlement-verified-gate.log` in the task-owned
+`native-completion-integration-output` directory. Earlier failures in those logs
+were diagnosed; the final five-case gate covers corrected Runtime fixtures,
+unknown post-force routing publication, cold retries and preserved schema fences.
+
+This is per-attempt driver/Runtime integration with controlled Raft wire delivery
+and log floors. Node-owned cold discovery, bounded scheduling, aggregate journal
+admission and shutdown wiring remain unfinished. Reply decoding and cold journal
+reads need admission before copies when that manager is connected. CURRENT-to-META
+conversion, META registration successors, and conversion of an existing source with
+a retained GROUP snapshot still need dedicated Runtime transitions; first-time
+META conversion conservatively refuses any retained snapshot before native force.
+DAG obligation retention and leader-change source transfer also remain unfinished.
 
 Durable metadata-DAG
 obligation discovery, asynchronous configured-member catch-up, quorum retirement,

@@ -94,6 +94,7 @@ class NativeMetadataRecoveryTest {
             target.apply(new ApplyPosition(1,3),ack);assertThrows(IllegalStateException.class,()->outcome(target,definition,original.operationId(),original.receiptDigest()));
             var wrong=new ReplicatedRangeStore.Configuration(0,-1,new byte[]{2});assertThrows(IllegalArgumentException.class,()->target.completeMetadataRecovery(registration,target.applied(),wrong));
             target.completeMetadataRecovery(registration,new ApplyPosition(1,3),target.configuration());assertFalse(target.metadataRecoveryPending());
+            target.completeMetadataRecovery(registration,new ApplyPosition(1,3),target.configuration());assertThrows(IllegalArgumentException.class,()->target.completeMetadataRecovery(registration,new ApplyPosition(1,2),target.configuration()),"Completed META retry binds its original required cut");
             assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(outcome(target,definition,original.operationId(),original.receiptDigest()).result()).status());
             assertNull(outcome(target,definition,new OperationId(new UUID(0,1101),2,0),new byte[32]).result());
             var page=target.pollRetiredCdc(nativeTest.lineage(definition.parents().getFirst()),DistributedCdcCheckpoint.Cursor.beginning(),256,8<<20);assertEquals(2,page.records().size());assertEquals(registration.freeze(),page.records().getLast().barrier());
