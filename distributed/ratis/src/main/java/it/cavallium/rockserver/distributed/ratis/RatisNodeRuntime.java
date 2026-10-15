@@ -1359,7 +1359,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (schemaFencingReplicas!=null && !schemaFencingReplicasClosed) { schemaFencingReplicas.close(); schemaFencingReplicasClosed=true; }
             if(topologyOwners!=null && !topologyOwnersClosed){topologyOwners.close();topologyOwnersClosed=true;}
             if (importOwners!=null && !importOwnersClosed) { importOwners.close(); importOwnersClosed=true; }
-            for(var owner:pools.values())if(!owner.closed){owner.pool.close();owner.closed=true;for(var lease:owner.recoveryMetadata)try{lease.close();}catch(Exception failed){throw new IOException("Recovered native metadata ownership release failed",failed);}owner.recoveryMetadata.clear();}poolClosed=true;
+            for(var owner:pools.values()){
+                if(!owner.closed){owner.pool.close();owner.closed=true;}
+                while(!owner.recoveryMetadata.isEmpty()){try{owner.recoveryMetadata.getFirst().close();}catch(Exception failed){throw new IOException("Recovered native metadata ownership release failed",failed);}owner.recoveryMetadata.removeFirst();}
+            }poolClosed=true;
             for (var client:homeClients.values()) client.close();
             if(nativeExtentEnv!=null){nativeExtentEnv.close();nativeExtentEnv=null;}
             if (lock!=null && lock.isValid()) lock.release(); if (lockChannel!=null) lockChannel.close();

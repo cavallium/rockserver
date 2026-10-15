@@ -72,5 +72,25 @@ class RatisNodeRegisteredRecoveryTest {
         }}
     }
     @Test void wrongPoolAndDuplicateNativeRegistrationsRejectBeforeServerConstruction()throws Exception {try(var fixture=new Fixture(true)){fixture.force(true,false);var server=new RatisNodeRuntimeTest.FakeServer();assertThrows(IOException.class,()->fixture.open(RatisNodeRuntime.Startup.RECOVER,server,fixture.settings()));assertFalse(server.created);}}
-    @Test void sourceConfigurationMustMatchExactPublishedMembershipBeforeServerConstruction()throws Exception {try(var fixture=new Fixture(false)){fixture.force(false,true);var server=new RatisNodeRuntimeTest.FakeServer();assertThrows(IllegalArgumentException.class,()->fixture.open(RatisNodeRuntime.Startup.RECOVER,server,fixture.settings()));assertFalse(server.created);}}
+    @Test void sourceConfigurationMustMatchExactPublishedMembershipBeforeServerConstruction()throws Exception {try(var fixture=new Fixture(false)){fixture.force(false,true);var server=new RatisNodeRuntimeTest.FakeServer();assertThrows(IllegalArgumentException.class,()->fixture.open(RatisNodeRuntime.Startup.RECOVER,server,fixture.settings()));assertFalse(server.created);}}    @Test void foreignClusterAndDatabaseRegistrationsRejectBeforeRaftExposure()throws Exception {
+        for(boolean foreignCluster:List.of(true,false)){
+            Path caseRoot=Files.createDirectory(root.resolve(foreignCluster?"foreign-cluster":"foreign-database"));Path originalRoot=root;root=caseRoot;
+            try(var fixture=new Fixture(false)){
+                var child=fixture.children.getFirst();var schema=new DistributedSchema(foreignCluster?new UUID(985,1):fixture.schema.clusterId(),foreignCluster?fixture.schema.databaseId():new UUID(985,2),fixture.schema.domainId(),fixture.schema.schemaEpoch(),0,fixture.schema.columns());var directory=fixture.directory(schema,child.directory().generation(),child.directory().ranges());
+                fixture.children.set(0,new NativeCurrentRangeRecovery(child.transferId(),child.catalogue(),child.catalogueCut(),directory,schema,child.groupId(),child.receiver(),child.sourceOwner(),child.imageCut(),child.imageHash(),child.configurationTerm(),child.configurationIndex(),child.sourceConfiguration(),null,child.physicalNames(),child.mergeColumns(),child.sourceSchemaRows()));
+                fixture.force(false,false);var server=new RatisNodeRuntimeTest.FakeServer();var rejected=assertThrows(IOException.class,()->fixture.open(RatisNodeRuntime.Startup.RECOVER,server,fixture.settings()));assertTrue(rejected.getMessage().contains("namespace/domain pool"));assertFalse(server.created);assertFalse(Files.exists(fixture.env.nodeRoot.resolve("topology-exposure/registered")));
+            }finally{root=originalRoot;}
+        }
+    }
+    @Test void exactAdditionalExposureDebtRejectsBeforeRaftAndRetainsNativeRegistrationsForRetry()throws Exception {
+        try(var fixture=new Fixture(false)){
+            fixture.force(false,false);var original=fixture.settings();var policy=original.resources();var spec=fixture.plan.pools().get(fixture.pool);long baseline=RatisMetadataClaims.JOURNAL_BYTES+RatisMetadataClaims.POOL_BYTES;
+            for(var group:List.of(fixture.metadata.groupId(),fixture.children.get(0).groupId(),fixture.children.get(1).groupId()))baseline=Math.addExact(baseline,RatisMetadataClaims.claim(fixture.pool,group,RatisNodePlan.Role.DATA,original.retention(),spec.replicas()).bytes());
+            long exposure=Math.multiplyExact(224L,fixture.children.size()+1);var bounded=new RatisNodeRuntime.ResourceLimits(policy.node(),policy.pool(),policy.maximumSourceImageDiskBytes(),Math.addExact(baseline,exposure)-1,policy.maximumOperatorCacheBytes(),policy.maximumNativeCacheBytes(),policy.committedApply(),policy.diskRunway(),policy.migration(),policy.nativeExtents());
+            var settings=new RatisNodeRuntime.Settings(original.images(),original.retention(),original.clockPeriod(),original.propagationVisits(),original.maxPropagationRanges(),original.shutdownTimeout(),original.exports(),bounded);var deniedServer=new RatisNodeRuntimeTest.FakeServer();
+            var denied=assertThrows(IOException.class,()->fixture.open(RatisNodeRuntime.Startup.RECOVER,deniedServer,settings));assertTrue(denied.getMessage().contains("recovery exposure exceeds node durable metadata ceiling"));assertFalse(deniedServer.created);assertFalse(Files.exists(fixture.env.nodeRoot.resolve("topology-exposure/registered")));
+            var retry=new RatisNodeRuntimeTest.FakeServer();retry.skipFirstNoop=true;try(var node=fixture.open(RatisNodeRuntime.Startup.RECOVER,retry,original)){node.start();assertEquals(fixture.metadata,store(retry,fixture.metadata.groupId()).metadataRecoveryRegistration());for(var child:fixture.children)assertEquals(child,store(retry,child.groupId()).currentRangeRecoveryRegistration());}
+        }
+    }
+
 }
