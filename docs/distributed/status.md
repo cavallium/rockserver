@@ -2092,6 +2092,12 @@ Lost write acknowledgements retry the exact candidate without fresh CAT reads or
 new request identities. Cold loading validates canonical bytes before forcing
 the main file and parent; valid pending files promote without another body copy.
 The graph is loaded before server construction and grants no dispatch authority.
+It now forces one active request per discovered local group alongside retained
+history. Active requests exactly cover current obligations; an inactive historical
+UUID cannot become active again. Pending-force retry binds the selection as well
+as graph contents, and cold decoding validates its references and scope. Runtime
+rediscovery uses this selector instead of the first matching historical request.
+Count-based workspace admission precedes selector/table construction.
 
 The final graph gate passes 100 distinct cases across 15 classes in
 `configured-graph-final-regression-gate.log`: 85 adapter cases and 15 standalone
@@ -2136,8 +2142,30 @@ resource denial and completed-CURRENT stale-query refusal. Existing node, graph,
 configured recovery, CURRENT-to-META and snapshot lifecycle workflows also pass.
 The positive-CFG case interrupts after configuration copy and before the final
 native marker. These are controlled no-socket checks.
-META inventory and classification/resume remain unfinished; unsupported META floors
-are explicitly refused, so universal Node fencing is not yet enabled.
+Deferred META inventory now qualifies original local retirement/seed/FREEZE or a
+forced receiver META registration. The current registration retains an 80-byte
+CURRENT predecessor anchor (registration digest, original cut and image hash),
+derived from the actual replaced CURRENT and preserved by META successors. This
+permits inventory of its exact initial GROUP image or a validated own checkpoint
+even with absent A. Covered ordinary GROUP floors retain their existing native
+prefix qualification. Historical GROUP configuration need not equal the final
+META cohort; META images still require final membership. None of these checks
+grant GROUP installation or USER authority.
+
+Equal-cut GROUP/META files prefer META only when their portable STATE/RECEIPTS
+projections match; source outcome credits remain included. Different normalized
+schema aliases/history can still be conservatively refused. Classification/resume
+and universal Node fencing remain unfinished.
+
+The predecessor native gate passes 32 cases in both core executions in
+`meta-predecessor-native-first-gate.log`. The integrated gate passes 32 cases across
+five classes in `meta-inventory-active-graph-verified-gate.log`, including fifteen
+inventory cases, active renewal/cold selection, unknown force and malformed
+selector refusal. The final consumer gate passes 96 distinct cases across fourteen
+classes in `meta-startup-final-consumer-regression-gate.log`: 81 adapter cases and
+15 standalone codec/async cases, with both core executions passing. These gates
+cover source, receiver, replay, snapshot lifecycle, accounting and node consumers;
+they do not establish automatic startup reconciliation or real-quorum acceptance.
 
 An unresolved role fence must be installed before server construction: Ratis also
 initializes persisted DATA divisions. Preserve their real log floor while deferring

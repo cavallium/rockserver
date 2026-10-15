@@ -2331,11 +2331,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
     }
     private java.util.List<Path> discoveryInventoryDirectories(Path published){return java.util.List.of(published,recoveryDir,groupFloorDirectory());}
-    private record DiscoveryFloor(TermIndex position,byte[] hash) {}
+    private record DiscoveryFloor(TermIndex position,byte[] groupHash,byte[] metadataHash,byte[] projection) {}
+    private record DiscoveryImage(NativeRangeImage.Manifest manifest,NativeRangeImage.Kind kind,byte[] projection) {}
     /** Retained published floors stay at their actual paths; installation staging remains inert. */
     private void recoverDiscoveryInventory()throws Exception {
         Path published=snapshots.getSnapshotFile(0,0).toPath().getParent();SingleFileSnapshotInfo latest=null;
-        var unique=new java.util.HashMap<Long,DiscoveryFloor>();
+        var unique=new java.util.HashMap<Long,DiscoveryFloor>();int uniqueImages=0;
         for(var directory:discoveryInventoryDirectories(published)) {
             if(!Files.exists(directory,java.nio.file.LinkOption.NOFOLLOW_LINKS))continue;
             if(!Files.isDirectory(directory,java.nio.file.LinkOption.NOFOLLOW_LINKS))throw new IOException("Discovery inventory rejects nonregular snapshot directories");
@@ -2347,13 +2348,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     requireDiscoveryInventoryObject(file,false);Path sidecar=MD5FileUtil.getDigestFileForFile(file.toFile()).toPath();
                     if(Files.exists(sidecar,java.nio.file.LinkOption.NOFOLLOW_LINKS))requireDiscoveryInventoryObject(sidecar,true);
                     var position=SimpleStateMachineStorage.getTermIndexFromSnapshotFile(file.toFile());
-                    var manifest=validateImage(file,position,null,SnapshotImageUse.DISCOVERY_INVENTORY);
-                    var previous=unique.get(position.getIndex());
-                    if(previous!=null && (!previous.position().equals(position) || !Arrays.equals(previous.hash(),manifest.sha256())))throw new IOException("Discovery floors conflict at one Raft index");
-                    if(previous==null){if(unique.size()>=MAX_DISCOVERY_INVENTORY_FLOORS)throw new IOException("Discovery inventory retained floor bound exceeded");unique.put(position.getIndex(),new DiscoveryFloor(position,manifest.sha256()));}
+                    var qualified=validateDiscoveryImage(file,position);var manifest=qualified.manifest();
+                    var previous=unique.get(position.getIndex());boolean metadata=qualified.kind()==NativeRangeImage.Kind.METADATA;
+                    byte[] sameKind=previous==null?null:metadata?previous.metadataHash():previous.groupHash();
+                    boolean preferMetadata=metadata && previous!=null && previous.metadataHash()==null;
+                    if(previous!=null && (!previous.position().equals(position) || sameKind!=null && !Arrays.equals(sameKind,manifest.sha256()) || sameKind==null && (previous.projection()==null || qualified.projection()==null || !Arrays.equals(previous.projection(),qualified.projection()))))throw new IOException("Discovery floors conflict at one Raft index");
+                    if(sameKind==null && ++uniqueImages>MAX_DISCOVERY_INVENTORY_FLOORS)throw new IOException("Discovery inventory retained floor bound exceeded");
+                    unique.put(position.getIndex(),new DiscoveryFloor(position,metadata?(previous==null?null:previous.groupHash()):manifest.sha256(),metadata?manifest.sha256():(previous==null?null:previous.metadataHash()),qualified.projection()));
                     force(file);if(Files.exists(sidecar,java.nio.file.LinkOption.NOFOLLOW_LINKS))force(sidecar);
                     var info=new SingleFileSnapshotInfo(new FileInfo(file,org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(file,snapshotMetadataAdmission))),position);
-                    if(latest==null || info.getIndex()>latest.getIndex())latest=info;
+                    if(latest==null || info.getIndex()>latest.getIndex() || info.getIndex()==latest.getIndex() && preferMetadata)latest=info;
                 }
             }
             force(directory);
@@ -2367,6 +2371,54 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if(latest!=null && a!=null && a.index()==latest.getIndex() && a.term()!=latest.getTerm())throw new IOException("Native marker conflicts with inventory floor");
         durableSnapshot=latest;if(latest!=null)snapshots.updateLatestSnapshot(latest);
         setLastAppliedTermIndex(a==null?TermIndex.INITIAL_VALUE:TermIndex.valueOf(a.term(),a.index()));
+    }
+
+    private DiscoveryImage validateDiscoveryImage(Path image,TermIndex position)throws IOException {
+        var kind=NativeRangeImage.kind(image,snapshotMetadataAdmission);
+        if(kind==NativeRangeImage.Kind.GROUP && !metadataSnapshotOwner())return new DiscoveryImage(validateImage(image,position,null,SnapshotImageUse.DISCOVERY_INVENTORY),kind,null);
+        try {
+            var registration=store.metadataRecoveryRegistration();var freeze=registration==null?store.topologyFreeze():registration.freeze();
+            if(freeze==null || role!=RatisNodePlan.Role.DATA || !recoveryEligibility.discoveryPending())throw new IOException("META inventory lacks original sealed source authority");
+            var range=registration==null?topologyDescriptor:registration.range();
+            if(range==null || topologyLocalReplica==null || topologyStorage==null || getServer().getNow(null)==null || !getServer().getNow(null).getId().toString().equals(topologyLocalReplica.peerId()))throw new IOException("META inventory lacks configured local receiver identity");
+            var participant=new TopologyChange.Participant(range.rangeId(),range.groupId(),range.rangeEpoch(),range.configurationVersion(),range.replicas().stream().map(TopologyChange.Owner::of).toList());
+            if(!participant.equals(freeze.header().participant(TopologyChange.Stage.FREEZE,range.groupId())) || range.replicas().stream().noneMatch(r->sameReplicaIdentity(r,topologyLocalReplica)))throw new IOException("META inventory changed original sealed cohort");
+            if(registration!=null && (!sameReplicaIdentity(registration.receiver(),topologyLocalReplica) || !store.metadataRecoveryRegistrationForced(registration)))throw new IOException("META inventory lacks forced receiver-local registration");
+            else if(registration==null) {
+                var seed=topologyStorage.topologySeed(freeze.header().intentId());
+                if(!store.topologyRetired() || seed==null || !sameReplicaIdentity(seed.localReplica(),topologyLocalReplica) || !freeze.equals(seed.parentFreezes().get(range.groupId())) || !Arrays.equals(seed.header().encode(),freeze.header().encode()))throw new IOException("META inventory lacks genuine local retirement/seed/FREEZE");
+            }
+            var cfg=new ReplicatedRangeStore.Configuration[1];var imageFreeze=new NativeTopologyFreeze[1];var projection=java.security.MessageDigest.getInstance("SHA-256");var frame=ByteBuffer.allocate(9);
+            NativeRangeImage.RowVisitor visitor=(section,column,key,value)->{
+                if(section==NativeRangeImage.Section.STATE){if(key.length==17 && key[16]==1)cfg[0]=ReplicatedRangeStore.Configuration.decode(value);if(key.length==17 && key[16]==0x60)imageFreeze[0]=NativeTopologyFreeze.decode(value);}
+                if(section!=NativeRangeImage.Section.USER && !(section==NativeRangeImage.Section.STATE && NativeRangeImage.metadataLocalPointer(key))){frame.clear().put((byte)(section.ordinal()+1)).putInt(key.length).putInt(value.length);projection.update(frame.array());projection.update(key);projection.update(value);}
+            };
+            var manifest=kind==NativeRangeImage.Kind.METADATA?NativeRangeImage.visitMetadataAdmitted(image,limits,visitor,snapshotMetadataAdmission):NativeRangeImage.visitAdmitted(image,limits,visitor,snapshotMetadataAdmission);
+            var interval=store.ownership().interval();
+            if(!manifest.owner().equals(store.ownership().owner()) || !manifest.interval().domainId().equals(interval.domainId()) || !Arrays.equals(manifest.interval().lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(manifest.interval().upperExclusive(),interval.upperExclusive()) || !manifest.position().equals(new ApplyPosition(position.getTerm(),position.getIndex())))throw new IOException("META inventory floor changed group/epoch/domain/bounds/cut");
+            if(kind==NativeRangeImage.Kind.METADATA) {
+                if(!freeze.equals(imageFreeze[0]) || !manifest.interval().equals(interval) || !Arrays.equals(manifest.schemaDigest(),store.schemaDigest()) || !manifest.deterministicMergeColumns().equals(store.deterministicMergeColumns()))throw new IOException("META inventory changed original FREEZE/schema/projection");
+                freeze.requireCut(manifest.position());
+                if(registration!=null){var qualified=store.validateMetadataRecoveryImage(image,limits);if(!Arrays.equals(qualified.sha256(),manifest.sha256()))throw new IOException("META inventory changed during native qualification");}
+            } else if(registration!=null) {
+                var actual=store.applied();
+                var qualified=registration.currentPredecessor()==null && !store.pendingInstallation() && actual!=null && RatisRelocationOwnerRpc.covers(actual,manifest.position())
+                        ?validateCoveredMetadataFloor(image,position,registration):store.validateMetadataGroupFloorInventory(image,limits);
+                if(!Arrays.equals(qualified.sha256(),manifest.sha256()))throw new IOException("GROUP predecessor changed during native qualification");
+            } else {
+                boolean same=manifest.interval().equals(interval) && Arrays.equals(manifest.schemaDigest(),store.schemaDigest()) && manifest.deterministicMergeColumns().equals(store.deterministicMergeColumns());
+                if(!same && !store.qualifiedHistoricalImage(manifest))throw new IOException("Sealed GROUP inventory lacks retained schema provenance");
+                if(imageFreeze[0]!=null && !freeze.equals(imageFreeze[0]) || !RatisRelocationOwnerRpc.covers(freeze.position(),manifest.position()) && imageFreeze[0]==null)throw new IOException("Sealed GROUP inventory changed or omitted original FREEZE");
+                if(store.currentRangeRecoveryRegistration()!=null || store.topologyLearnerRegistration()!=null)throw new IOException("Adopted sealed GROUP inventory requires a forced META predecessor anchor");
+                var birth=store.topologyBirth();var origin=manifest.topologyOrigin();
+                if(birth==null){if(origin!=null)throw new IOException("Ordinary sealed GROUP acquired foreign birth");}
+                else {var seed=topologyStorage.topologySeed(birth.intentId());if(seed==null || origin==null || store.topologyActivation()==null)throw new IOException("Sealed GROUP lacks original local birth");birth.requireSeed(seed);var local=origin.localActivation(seed);if(!Arrays.equals(local.encode(),store.topologyActivation().encode()))throw new IOException("Sealed GROUP changed original activation");}
+            }
+            if(cfg[0]==null || cfg[0].index()>manifest.position().index() || cfg[0].term()>manifest.position().term() || cfg[0].index()==manifest.position().index() && cfg[0].term()!=manifest.position().term())throw new IOException("META inventory lacks bounded configuration at floor");
+            validateConfiguration(cfg[0].data());if(kind==NativeRangeImage.Kind.METADATA)requireSchemaMembership(range,cfg[0].data());
+            var saved=MD5FileUtil.readStoredMd5ForFile(image.toFile());if(saved!=null && !saved.equals(org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(image,snapshotMetadataAdmission))))throw new IOException("META inventory MD5 mismatch");
+            return new DiscoveryImage(manifest,kind,projection.digest());
+        }catch(org.rocksdb.RocksDBException|IllegalArgumentException invalid){throw new IOException("META inventory qualification failed",invalid);}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
     }
 
     private static void validateConfiguration(byte[] bytes) throws IOException {

@@ -118,4 +118,26 @@ class RatisConfiguredRecoveryGraphTest {
         var after=Files.readAttributes(file,java.nio.file.attribute.BasicFileAttributes.class);assertArrayEquals(exact,Files.readAllBytes(file));assertEquals(before.lastModifiedTime(),after.lastModifiedTime());if(before.fileKey()!=null)assertEquals(before.fileKey(),after.fileKey());
     }
 
+    @Test void activeRenewalSurvivesColdReopenAndCannotResurrectHistoricalRequest()throws Exception {
+        var node=node("data");var plan=discover(node,genesis,10);Path path=directory("active-renewal");var first=requests(node,plan,9000);var renewed=List.of(first.getFirst().successor(id(9001)));var group=first.getFirst().sourceGroup();
+        try(var graph=new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP)) {
+            graph.force(plan,first);graph.force(plan,renewed);assertEquals(2,graph.snapshot().frozenRequests().size());assertEquals(renewed.getFirst().transferId(),graph.snapshot().activeRequests().get(group).transferId());
+            assertThrows(IOException.class,()->graph.force(plan,first));assertThrows(IOException.class,()->graph.force(plan,List.of()));assertThrows(IOException.class,()->graph.force(plan,List.of(renewed.getFirst(),renewed.getFirst())));
+        }
+        var access=new FilesAccess();try(var graph=new RatisConfiguredRecoveryGraph(path,node,access,HEAP)) {
+            assertEquals(renewed.getFirst().transferId(),graph.snapshot().activeRequests().get(group).transferId());assertEquals(2,graph.snapshot().frozenRequests().size());assertThrows(IOException.class,()->graph.force(plan,first));assertEquals(0,access.writes);
+            access.after=true;assertThrows(IOException.class,()->graph.force(plan,renewed));access.after=false;int uncertainWrites=access.writes;
+            assertThrows(IOException.class,()->graph.force(plan,first),"Identical retained history cannot change an uncertain active selection");assertEquals(uncertainWrites,access.writes);assertTrue(graph.retryPending());
+            var next=List.of(renewed.getFirst().successor(id(9002)));access.after=true;assertThrows(IOException.class,()->graph.force(plan,next));assertEquals(renewed.getFirst().transferId(),graph.snapshot().activeRequests().get(group).transferId());access.after=false;assertTrue(graph.retryPending());assertEquals(next.getFirst().transferId(),graph.snapshot().activeRequests().get(group).transferId());
+        }
+        try(var graph=new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP)){assertEquals(id(9002),graph.snapshot().activeRequests().get(group).transferId());assertEquals(3,graph.snapshot().frozenRequests().size());}
+    }
+
+    @Test void malformedActiveSelectionCannotAuthorizeAGroupOnColdLoad()throws Exception {
+        var node=node("data");var plan=discover(node,genesis,10);Path path=directory("active-frame");try(var graph=new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP)){graph.force(plan,requests(node,plan,9100));}
+        byte[] original=SessionJournalFiles.read(path.resolve("graph"),RatisConfiguredRecoveryGraph.MAX_BYTES);
+        for(int index:List.of(-1,1)) {var malformed=original.clone();java.nio.ByteBuffer.wrap(malformed).putInt(malformed.length-4,index);SessionJournalFiles.write(path.resolve("graph"),malformed,RatisConfiguredRecoveryGraph.MAX_BYTES);assertThrows(IOException.class,()->new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP));}
+        var missing=Arrays.copyOf(original,original.length-4);java.nio.ByteBuffer.wrap(missing).putInt(missing.length-4,0);SessionJournalFiles.write(path.resolve("graph"),missing,RatisConfiguredRecoveryGraph.MAX_BYTES);assertThrows(IOException.class,()->new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP));
+    }
+
 }

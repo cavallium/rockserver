@@ -79,7 +79,7 @@ class RatisRecoverySnapshotLifecycleTest {
     @Test void metadataReceiverUsesStrictSemanticSnapshotInstallAndColdReloadWithoutUserAdmission()throws Exception {
         var helper=new RatisSourceOutcomeTest();NativeMetadataRecoveryRegistration registration;Path receiver=root.resolve("metadata-receiver"),raft=root.resolve("metadata-raft");
         try(var f=helper.new Fixture(root.resolve("metadata-source"),false)) {
-            var source=f.home.source;var image=root.resolve("metadata.image");var manifest=NativeRangeImage.writeMetadata(image,source.store,limits);var cfg=source.store.configuration();registration=new NativeMetadataRecoveryRegistration(new UUID(0,9701),source.catalogue,new ApplyPosition(1,1),source.directory,source.freeze,source.local,source.local,cfg.term(),cfg.index(),cfg.data(),manifest.position(),manifest.sha256(),Set.of());
+            var source=f.home.source;var image=root.resolve("metadata.image");var manifest=NativeRangeImage.writeMetadata(image,source.store,limits);var cfg=source.store.configuration();registration=new NativeMetadataRecoveryRegistration(new UUID(0,9701),source.catalogue,new ApplyPosition(1,1),source.directory,source.freeze,source.local,source.local,cfg.term(),cfg.index(),cfg.data(),manifest.position(),manifest.sha256(),Set.of(),null);
             try(var pool=new RatisTopologyRecoveryAnchorTest().pool(receiver)) {
                 var target=pool.openMetadataRecovery(registration);target.enableSessionControls();target.enableCdc(source.rangeId);try(var adapter=new Adapter(target,pool,source.directory,source.local,raft,false)) {
                     assertTrue(target.metadataRecoveryPending());assertEquals(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.MISSING,adapter.machine.recoveryEligibilityGate().snapshot().mode());adapter.install(image,manifest);
@@ -95,13 +95,13 @@ class RatisRecoverySnapshotLifecycleTest {
         var helper=new RatisSourceOutcomeTest();Path receiver=root.resolve("successor-metadata-receiver"),raft=root.resolve("successor-metadata-raft");
         try(var fixture=helper.new Fixture(root.resolve("successor-metadata-source"),false)) {
             var source=fixture.home.source;Path initial=root.resolve("successor-initial.image");var first=NativeRangeImage.writeMetadata(initial,source.store,limits);var cfg=source.store.configuration();
-            var original=new NativeMetadataRecoveryRegistration(new UUID(0,9710),source.catalogue,new ApplyPosition(1,1),source.directory,source.freeze,source.local,source.local,cfg.term(),cfg.index(),cfg.data(),first.position(),first.sha256(),Set.of());
+            var original=new NativeMetadataRecoveryRegistration(new UUID(0,9710),source.catalogue,new ApplyPosition(1,1),source.directory,source.freeze,source.local,source.local,cfg.term(),cfg.index(),cfg.data(),first.position(),first.sha256(),Set.of(),null);
             try(var pool=new RatisTopologyRecoveryAnchorTest().pool(receiver)) {
                 var target=pool.openMetadataRecovery(original);target.enableSessionControls();
                 try(var adapter=new Adapter(target,pool,source.directory,source.local,raft,false)){adapter.install(initial,first);target.completeMetadataRecovery(original,first.position(),cfg);assertFalse(target.metadataRecoveryPending());}
             }
             fixture.applyControl(source.clock(998,20));Path next=root.resolve("successor-later.image");var later=NativeRangeImage.writeMetadata(next,source.store,limits);var nextCfg=source.store.configuration();assertTrue(later.position().index()>first.position().index());
-            var successor=new NativeMetadataRecoveryRegistration(new UUID(0,9711),source.catalogue,new ApplyPosition(1,2),source.directory,source.freeze,source.local,source.local,nextCfg.term(),nextCfg.index(),nextCfg.data(),later.position(),later.sha256(),Set.of());
+            var successor=new NativeMetadataRecoveryRegistration(new UUID(0,9711),source.catalogue,new ApplyPosition(1,2),source.directory,source.freeze,source.local,source.local,nextCfg.term(),nextCfg.index(),nextCfg.data(),later.position(),later.sha256(),Set.of(),null);
             try(var pool=new RatisTopologyRecoveryAnchorTest().pool(receiver)) {
                 var target=pool.openMetadataRecovery(successor);assertTrue(target.metadataRecoveryPending());assertEquals(first.position(),target.applied());assertFalse(target.metadataRecoveryImageInstalled());
                 for(int attempt=0;attempt<2;attempt++)try(var adapter=new Adapter(target,pool,source.directory,source.local,raft,true)) {
@@ -118,7 +118,7 @@ class RatisRecoverySnapshotLifecycleTest {
     @Test void completedMetadataOwnerPublishesOwnSnapshotWithOnePinAndColdReopens()throws Exception {
         var helper=new RatisSourceOutcomeTest();NativeMetadataRecoveryRegistration registration;long cut;Path receiver=root.resolve("ready-metadata-receiver"),raft=root.resolve("ready-metadata-raft");
         try(var f=helper.new Fixture(root.resolve("ready-metadata-source"),false)) {
-            var source=f.home.source;Path initial=root.resolve("ready-metadata.image");var image=NativeRangeImage.writeMetadata(initial,source.store,limits);var cfg=source.store.configuration();registration=new NativeMetadataRecoveryRegistration(new UUID(0,9705),source.catalogue,new ApplyPosition(1,1),source.directory,source.freeze,source.local,source.local,cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of());
+            var source=f.home.source;Path initial=root.resolve("ready-metadata.image");var image=NativeRangeImage.writeMetadata(initial,source.store,limits);var cfg=source.store.configuration();registration=new NativeMetadataRecoveryRegistration(new UUID(0,9705),source.catalogue,new ApplyPosition(1,1),source.directory,source.freeze,source.local,source.local,cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of(),null);
             try(var pool=new RatisTopologyRecoveryAnchorTest().pool(receiver)) {
                 pool.configureSnapshotAdmission(new PoolSnapshotAdmission.Limits(1,8L<<30,java.time.Duration.ofSeconds(60),0));var target=pool.openMetadataRecovery(registration);target.enableSessionControls();
                 try(var adapter=new Adapter(target,pool,source.directory,source.local,raft,false)) {

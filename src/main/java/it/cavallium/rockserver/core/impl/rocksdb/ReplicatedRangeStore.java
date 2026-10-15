@@ -4111,22 +4111,49 @@ public final class ReplicatedRangeStore {
             finally{applyLane.unlock();}
         } finally{leaveNative();}
     }
+    /** Read-only inventory of a CURRENT predecessor, including a file ahead of native A. Never install authority. */
+    public NativeRangeImage.Manifest validateMetadataGroupFloorInventory(Path image,NativeRangeImage.Limits limits)throws IOException,RocksDBException {
+        enterNative();
+        try(var scope=NativeRangeImage.openMetadataAdmission(NativeRangeImage.IoAdmission.UNLIMITED);var metadata=scope.pass()) {
+            applyLane.lock();
+            try {
+                var registration=metadataRecoveryRegistration;var anchor=registration==null?null:registration.currentPredecessor();
+                if(anchor==null || !Arrays.equals(registration.digest(),db.get(state,topologyOwnershipKey(0x6f))))throw new IOException("GROUP inventory lacks its forced META CURRENT predecessor");
+                metadata.reserve(imageMetadataBytes(null,limits,true));byte[][] adoption=new byte[3][];Configuration[] configuration={null};
+                var actual=NativeRangeImage.visit(image,limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE){if(Arrays.equals(key,configurationKey))configuration[0]=Configuration.decode(value);if(key.length==17 && Arrays.equals(key,0,16,markerKey,0,16) && key[16]>=0x72 && key[16]<=0x74)adoption[key[16]-0x72]=value;}});
+                var range=registration.range();var cfg=configuration[0];
+                if(!actual.owner().equals(owner) || !actual.interval().domainId().equals(registration.sourceDirectory().domainId()) || !Arrays.equals(actual.interval().lowerInclusive(),range.lowerInclusive()) || !Arrays.equals(actual.interval().upperExclusive(),range.upperExclusive()) || !NativeMetadataRecoveryRegistration.covers(registration.imageCut(),actual.position()) || cfg==null || cfg.index()>actual.position().index() || cfg.term()>actual.position().term() || cfg.index()==actual.position().index() && cfg.term()!=actual.position().term())throw new IOException("GROUP inventory changed META predecessor identity/configuration/cut");
+                if(actual.position().equals(anchor.imageCut()) && Arrays.equals(actual.sha256(),anchor.imageHash()))return actual;
+                if(adoption[0]==null || adoption[1]==null || adoption[2]==null)throw new IOException("GROUP checkpoint lacks CURRENT adoption evidence");
+                var previous=NativeCurrentRangeRecovery.decode(adoption[0]);registration.requireTransitionOf(previous);
+                NativeCurrentRangeRecovery.requireCompletion(previous,adoption[1],actual.position());
+                return qualifyCurrentRangeRecoveryImage(image,limits,actual,false,previous,adoption[1]).manifest();
+            }catch(IllegalArgumentException invalid){throw new IOException("Invalid META GROUP inventory authority",invalid);}
+            finally{applyLane.unlock();}
+        }finally{leaveNative();}
+    }
     private record CurrentImageQualification(NativeRangeImage.Manifest manifest,NativeTopologyActivation activation,
                                              Map<String,byte[]> schemaRows,byte[] completion) {}
     private CurrentImageQualification qualifyCurrentRangeRecoveryImage(Path image,NativeRangeImage.Limits limits,
             NativeRangeImage.Manifest expected,boolean installing)throws IOException,RocksDBException {
         try {
-        var registration=currentRangeRecovery;
-        if(registration==null || topologyRetired() || pendingCurrentCompletion!=null)throw new IOException("CURRENT image lacks settled local recovery authority");
-        // Read this before scanning the candidate. The importer never writes this receiver-local receipt.
-        byte[] trustedCompletion=db.get(state,topologyOwnershipKey(0x73));
-        if(trustedCompletion!=null)NativeCurrentRangeRecovery.requireCompletion(registration,trustedCompletion,topologyRecoveryCut());
+            var registration=currentRangeRecovery;
+            if(registration==null || topologyRetired() || pendingCurrentCompletion!=null)throw new IOException("CURRENT image lacks settled local recovery authority");
+            // Read this before scanning the candidate. The importer never writes this receiver-local receipt.
+            byte[] trustedCompletion=db.get(state,topologyOwnershipKey(0x73));
+            if(trustedCompletion!=null)NativeCurrentRangeRecovery.requireCompletion(registration,trustedCompletion,topologyRecoveryCut());
+            return qualifyCurrentRangeRecoveryImage(image,limits,expected,installing,registration,trustedCompletion);
+        }catch(IllegalArgumentException invalid){throw new IOException("Invalid CURRENT recovery image authority",invalid);}
+    }
+    private CurrentImageQualification qualifyCurrentRangeRecoveryImage(Path image,NativeRangeImage.Limits limits,
+            NativeRangeImage.Manifest expected,boolean installing,NativeCurrentRangeRecovery registration,byte[] trustedCompletion)throws IOException,RocksDBException {
+        try {
         var rows=new HashMap<String,byte[]>();long[] rowBytes={0};
         byte[][] adoption=new byte[3][];Configuration[] configuration={null};
         var actual=NativeRangeImage.visit(image,limits,(section,column,key,value)->{
             if(section!=NativeRangeImage.Section.STATE)return;
             if(Arrays.equals(key,configurationKey))configuration[0]=Configuration.decode(value);
-            if(key.length==17 && key[16]>=0x72 && key[16]<=0x74)adoption[key[16]-0x72]=value;
+            if(key.length==17 && Arrays.equals(key,0,16,markerKey,0,16) && key[16]>=0x72 && key[16]<=0x74)adoption[key[16]-0x72]=value;
             if(topologySchemaRow(key)){
                 if((rowBytes[0]+=key.length+(long)value.length)>NativeTopologyLearnerSchema.MAX_BYTES || rows.size()>=NativeTopologyLearnerSchema.MAX_ROWS)throw new IOException("CURRENT image schema evidence exceeds bound");
                 rows.put(HexFormat.of().formatHex(key),value);
@@ -4150,7 +4177,7 @@ public final class ReplicatedRangeStore {
             localRows=registration.localSchemaRows();activation=registration.origin()==null?null:registration.origin().activation();
         } else {
             if(trustedCompletion==null || !Arrays.equals(adoption[0],registration.encode()) || !Arrays.equals(adoption[1],trustedCompletion)
-                    || !Arrays.equals(adoption[2],currentImageReceipt()))throw new IOException("CURRENT checkpoint lacks exact retained completion/registration/image receipt");
+                    || !Arrays.equals(adoption[2],ByteBuffer.allocate(48).putLong(registration.imageCut().term()).putLong(registration.imageCut().index()).put(registration.imageHash()).array()))throw new IOException("CURRENT checkpoint lacks exact retained completion/registration/image receipt");
             NativeCurrentRangeRecovery.requireCompletion(registration,trustedCompletion,actual.position());
             var retained=topologySchemaRows();
             var origin=registration.origin()==null?null:new NativeTopologyImageOrigin(registration.origin().seed(),registration.origin().activation(),registration.digest(),NativeTopologyLearnerSchema.adoptionAnchorDigest(retained));

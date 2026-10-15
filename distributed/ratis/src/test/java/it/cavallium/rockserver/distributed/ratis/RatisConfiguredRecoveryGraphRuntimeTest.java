@@ -88,6 +88,22 @@ class RatisConfiguredRecoveryGraphRuntimeTest {
     private void advanceClock(Fixture fixture,long sequence)throws Exception {
         var ledger=fixture.epochs.read();assertEquals(CommandResult.Status.SUCCESS,fixture.epochs.execute(fixture.epochs.prepare(new OperationId(new UUID(1240,1),0,sequence),ledger,ledger.advanceTime(ledger.logicalTimeMillis()+1))).status());
     }
+    @Test void rediscoveryUsesDurableActiveAttemptInsteadOfFirstMatchingHistoricalRequest()throws Exception {
+        try(var fixture=new Fixture("active")) {
+            UUID group,renewedId=new UUID(Long.MAX_VALUE,Long.MAX_VALUE);Map<UUID,byte[]> history;
+            var server=new RatisNodeRuntimeTest.FakeServer();
+            try(var node=fixture.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,server)) {
+                node.start();node.discoverConfiguredRecovery().get(15,TimeUnit.SECONDS);var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class);var snapshot=graph.snapshot();var previous=snapshot.activeRequests().values().iterator().next();group=previous.sourceGroup();
+                var active=new ArrayList<>(snapshot.activeRequests().values());active.removeIf(request->request.sourceGroup().equals(group));active.add(previous.successor(renewedId));
+                field(node,"configuredRecoveries",RatisConfiguredRecoveries.class).discover(()->{graph.force(snapshot.plan(),active);return null;}).get(15,TimeUnit.SECONDS);
+                assertEquals(renewedId,graph.snapshot().activeRequests().get(group).transferId());assertNotEquals(renewedId,graph.snapshot().frozenRequests().stream().filter(request->request.sourceGroup().equals(group)).findFirst().orElseThrow().transferId());history=frozen(graph.snapshot());
+                node.discoverConfiguredRecovery().get(15,TimeUnit.SECONDS);assertEquals(renewedId,graph.snapshot().activeRequests().get(group).transferId());requireFrozen(history,graph.snapshot());assertEquals(4096L+16L*graph.retainedEncodedBytes(),field(node,"recoveryGraphCredit",RatisNodeResourceBudget.Lease.class).bytes());fixture.assertNoDispatch(node,server);
+            }
+            try(var node=fixture.open(RatisNodeRuntime.Startup.RECOVER,new RatisNodeRuntimeTest.FakeServer())) {
+                var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class);assertEquals(renewedId,graph.snapshot().activeRequests().get(group).transferId());requireFrozen(history,graph.snapshot());node.start();node.discoverConfiguredRecovery().get(15,TimeUnit.SECONDS);assertEquals(renewedId,graph.snapshot().activeRequests().get(group).transferId());requireFrozen(history,graph.snapshot());
+            }
+        }
+    }
     @Test void cancelledDiscoveryAndNodeCloseRetainActualCatGraphNativeAndTransportOwnership()throws Exception {
         try(var fixture=new Fixture("blocked")) {
             var server=new RatisNodeRuntimeTest.FakeServer();var node=fixture.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,server);CompletableFuture<Void> closing=null;

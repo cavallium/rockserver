@@ -86,7 +86,7 @@ class RatisMetadataOutcomeReplayTest {
             var source=f.home.source;var image=root.resolve("metadata-"+expirePending+".image");
             var credit=f.prepare(new RatisSourceOutcomeRpc.Proposal(RatisSourceOutcomeRecord.Kind.CREDIT,f.request,List.of())).record();
             var manifest=NativeRangeImage.writeMetadata(image,source.store,limits);var cfg=source.store.configuration();
-            var registration=new NativeMetadataRecoveryRegistration(new UUID(0,9100),source.catalogue,new ApplyPosition(1,1),source.directory,source.freeze,source.local,source.local,cfg.term(),cfg.index(),cfg.data(),manifest.position(),manifest.sha256(),Set.of());
+            var registration=new NativeMetadataRecoveryRegistration(new UUID(0,9100),source.catalogue,new ApplyPosition(1,1),source.directory,source.freeze,source.local,source.local,cfg.term(),cfg.index(),cfg.data(),manifest.position(),manifest.sha256(),Set.of(),null);
             var target=pool.openMetadataRecovery(registration);target.enableSessionControls();target.enableCdc(source.rangeId);target.installMetadataSnapshot(image,limits);
             var machine=new RatisRangeStateMachine(target,source.group,limits);machine.cdcBinding(source.cluster,source.database,source.rangeId);
             var storage=RaftStorage.newBuilder().setDirectory(root.resolve("receiver-raft-"+expirePending).toFile()).setOption(RaftStorage.StartupOption.FORMAT).setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB).build();storage.initialize();

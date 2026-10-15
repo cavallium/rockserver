@@ -277,7 +277,8 @@ public final class NativeRangeImage {
     public static Manifest visitMetadata(Path image,Limits limits,RowVisitor visitor)throws IOException{return visit(image,limits,visitor,true,null,null,IoAdmission.UNLIMITED,true);}
     public static Manifest visitAdmitted(Path image,Limits limits,RowVisitor visitor,IoAdmission admission)throws IOException{return visit(image,limits,visitor,true,null,null,Objects.requireNonNull(admission));}
     public static Manifest visitMetadataAdmitted(Path image,Limits limits,RowVisitor visitor,IoAdmission admission)throws IOException{return visit(image,limits,visitor,true,null,null,Objects.requireNonNull(admission),true);}
-    static boolean metadataLocalPointer(byte[] key){if(key.length<17)return false;int tag=key[16]&255;return key.length==17 && (tag>=0x61 && tag<=0x64 || tag>=0x67 && tag<=0x74) || key.length==33 && tag==0x68;}
+    /** Receiver-local ownership rows omitted from the portable metadata projection of a GROUP image. */
+    public static boolean metadataLocalPointer(byte[] key){if(key.length<17)return false;int tag=key[16]&255;return key.length==17 && (tag>=0x61 && tag<=0x64 || tag>=0x67 && tag<=0x74) || key.length==33 && tag==0x68;}
 
     public static Manifest inspectAdmitted(Path image,Limits limits,IoAdmission admission)throws IOException{return visit(image,limits,(section,column,key,value)->{},true,null,null,Objects.requireNonNull(admission));}
 

@@ -18,7 +18,7 @@ class NativeMetadataRecoveryTest {
     final NativeTopologySeedTest helper=nativeTest.helper;
     NativeMetadataRecoveryRegistration registration(NativeTopologyCdcTest.Fixture source,NativeRangeImage.Manifest image) throws Exception {
         var cfg=source.parent.configuration();
-        return new NativeMetadataRecoveryRegistration(new UUID(0,1100),nativeTest.catalogue,new ApplyPosition(1,20),source.definition.sourceDirectory(),source.freeze,helper.topology.replica,helper.topology.replica,cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of());
+        return new NativeMetadataRecoveryRegistration(new UUID(0,1100),nativeTest.catalogue,new ApplyPosition(1,20),source.definition.sourceDirectory(),source.freeze,helper.topology.replica,helper.topology.replica,cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of(),null);
     }
     ReplicatedRangeStore.TopologyOperationOutcome outcome(ReplicatedRangeStore target,TopologyChange.Definition definition,OperationId id,byte[] digest)throws Exception {
         var schema=helper.outer.schema();return target.readTopologyOperationOutcome(schema.clusterId(),schema.databaseId(),schema.domainId(),nativeTest.lineage(definition.parents().getFirst()),id,digest);
@@ -50,7 +50,7 @@ class NativeMetadataRecoveryTest {
             var authority=TopologyChange.State.begin(definition.header()).beginFencing().frozen(freeze.proof(helper.topology.replica.replicaId()));
             pool.seedTopology(definition,authority,List.of(source),helper.topology.replica);assertTrue(source.topologyRetired());assertTrue(freeze.position().index()>activation.position().index());
             var image=NativeRangeImage.writeMetadata(initial,source,limits);assertArrayEquals(evolved.digest(),image.schemaDigest());assertEquals(evolved.columnIds(),image.interval().columns());
-            var cfg=source.configuration();registration=new NativeMetadataRecoveryRegistration(new UUID(0,9506),nativeTest.catalogue,new ApplyPosition(1,40),definition.sourceDirectory(),freeze,helper.topology.replica,helper.topology.replica,cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of());
+            var cfg=source.configuration();registration=new NativeMetadataRecoveryRegistration(new UUID(0,9506),nativeTest.catalogue,new ApplyPosition(1,40),definition.sourceDirectory(),freeze,helper.topology.replica,helper.topology.replica,cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of(),null);
             NativeRangeImage.visitMetadata(initial,limits,(section,column,key,value)->assertNotEquals(NativeRangeImage.Section.USER,section));
         }
         try(var pool=helper.pool(receiver)){
@@ -156,6 +156,32 @@ class NativeMetadataRecoveryTest {
         assertTrue(offset>=0);System.arraycopy(after,0,bytes,offset,after.length);byte[] checksum=java.security.MessageDigest.getInstance("SHA-256").digest(Arrays.copyOf(bytes,bytes.length-32));System.arraycopy(checksum,0,bytes,bytes.length-32,32);java.nio.file.Files.write(destination,bytes);return destination;
     }
 
+    @Test void forcedCurrentPredecessorInventoriesInitialAndCompletedGroupFilesWithoutRestoringNativeA()throws Exception {
+        var currentHelper=new NativeCurrentRangeRecoveryTest();Path initial=root.resolve("inventory-current"),checkpoint=root.resolve("inventory-checkpoint"),sealedFile=root.resolve("inventory-meta"),receiver=root.resolve("inventory-receiver");
+        NativeCurrentRangeRecovery current;NativeMetadataRecoveryRegistration metadata;TopologyChange.Definition definition;
+        try(var source=nativeTest.new Fixture(root.resolve("inventory-source"))) {
+            source.parent.apply(new ApplyPosition(1,1),source.write(source.parent,0,9));definition=source.definition;var image=NativeRangeImage.write(initial,source.parent,nativeTest.limits);var cfg=source.parent.configuration();
+            current=new NativeCurrentRangeRecovery(new UUID(0,1300),nativeTest.catalogue,new ApplyPosition(1,10),definition.sourceDirectory(),helper.outer.schema(),source.parent.ownership().owner().groupId(),helper.topology.replica,helper.topology.replica,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),currentHelper.names(helper.outer.schema(),"inventory-"),Set.of(),currentHelper.schemaRows(source.parent));
+            try(var completed=helper.pool(root.resolve("inventory-completed"))) {
+                var store=completed.openCurrentRangeRecovery(current);configure(store,definition);store.installSnapshot(initial,nativeTest.limits);store.completeCurrentRangeRecovery(current,image.position(),store.configuration());store.applyNoop(new ApplyPosition(1,2));NativeRangeImage.write(checkpoint,store,nativeTest.limits);
+            }
+            source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(sealedFile,source.parent,nativeTest.limits);cfg=source.parent.configuration();var anchor=NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current);
+            metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1301),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of(),anchor);
+            assertEquals(metadata,NativeMetadataRecoveryRegistration.decode(metadata.encode()));assertEquals(anchor,NativeMetadataRecoveryRegistration.decode(metadata.encode()).currentPredecessor());byte[] changed=anchor.registrationDigest();changed[0]^=1;assertArrayEquals(current.digest(),anchor.registrationDigest());
+            var badAnchor=new NativeMetadataRecoveryRegistration.CurrentPredecessor(changed,anchor.imageCut(),anchor.imageHash());var foreign=new NativeMetadataRecoveryRegistration(metadata.transferId(),metadata.catalogue(),metadata.catalogueCut(),metadata.sourceDirectory(),metadata.freeze(),metadata.receiver(),metadata.sourceOwner(),metadata.configurationTerm(),metadata.configurationIndex(),metadata.sourceConfiguration(),metadata.imageCut(),metadata.imageHash(),metadata.mergeColumns(),badAnchor);assertThrows(IllegalArgumentException.class,()->foreign.requireTransitionOf(current));
+            try(var pool=helper.pool(receiver)) {
+                var store=pool.openCurrentRangeRecovery(current);configure(store,definition);assertThrows(IllegalArgumentException.class,()->pool.openMetadataRecovery(foreign));assertSame(store,pool.openMetadataRecovery(metadata));assertNull(store.applied());assertFalse(store.pendingInstallation());assertEquals(image.position(),store.validateMetadataGroupFloorInventory(initial,nativeTest.limits).position());assertEquals(new ApplyPosition(1,2),store.validateMetadataGroupFloorInventory(checkpoint,nativeTest.limits).position());assertNull(store.applied());assertFalse(store.metadataRecoveryImageInstalled());
+            }
+            var noAnchor=new NativeMetadataRecoveryRegistration(metadata.transferId(),metadata.catalogue(),metadata.catalogueCut(),metadata.sourceDirectory(),metadata.freeze(),metadata.receiver(),metadata.sourceOwner(),metadata.configurationTerm(),metadata.configurationIndex(),metadata.sourceConfiguration(),metadata.imageCut(),metadata.imageHash(),metadata.mergeColumns(),null);assertEquals(80,metadata.encodedSize()-noAnchor.encodedSize());
+            try(var pool=helper.pool(root.resolve("inventory-unanchored"))){var store=pool.openMetadataRecovery(noAnchor);assertThrows(IOException.class,()->store.validateMetadataGroupFloorInventory(initial,nativeTest.limits));}
+        }
+        try(var pool=helper.pool(receiver)) {
+            var store=pool.openMetadataRecovery(metadata);configure(store,definition);assertNull(store.applied());assertEquals(current.imageCut(),store.validateMetadataGroupFloorInventory(initial,nativeTest.limits).position());assertEquals(new ApplyPosition(1,2),store.validateMetadataGroupFloorInventory(checkpoint,nativeTest.limits).position());assertFalse(store.metadataRecoveryImageInstalled());assertTrue(store.metadataRecoveryPending());
+            var wrong=current.digest();wrong[0]^=1;var foreign=replaceMetadataBytes(checkpoint,root.resolve("inventory-foreign-checkpoint"),current.digest(),wrong);assertThrows(IOException.class,()->store.validateMetadataGroupFloorInventory(foreign,nativeTest.limits));assertNull(store.applied());assertThrows(IOException.class,()->store.installSnapshot(initial,nativeTest.limits));
+            store.installMetadataSnapshot(sealedFile,nativeTest.limits);store.completeMetadataRecovery(metadata,metadata.imageCut(),store.configuration());assertFalse(store.metadataRecoveryPending());
+        }
+    }
+
     @Test void completedCurrentAtomicallyBecomesMetadataAcrossUnknownForceAndColdReopen()throws Exception {
         var currentHelper=new NativeCurrentRangeRecoveryTest();
         for(boolean after:List.of(false,true)) {
@@ -168,7 +194,7 @@ class NativeMetadataRecoveryTest {
                 var target=pool.openCurrentRangeRecovery(current);configure(target,definition);target.installSnapshot(groupImage,nativeTest.limits);
                 source.freeze();source.seed();source.parent.applyNoop(new ApplyPosition(1,3),new byte[]{2});
                 var sealed=NativeRangeImage.writeMetadata(metaImage,source.parent,nativeTest.limits);cfg=source.parent.configuration();
-                metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1201),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+                metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1201),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of(),NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current));
                 metadata.requireTransitionOf(current);
                 assertTrue(pool.metadataRecoveries().isEmpty());assertEquals(current,target.currentRangeRecoveryRegistration());
                 target.completeCurrentRangeRecovery(current,image.position(),target.configuration());
@@ -210,7 +236,7 @@ class NativeMetadataRecoveryTest {
                 if(stage==2)assertThrows(IOException.class,()->target.installSnapshot(groupImage,nativeTest.limits,batch->{throw new IOException("Interrupted GROUP restore");}));
                 actual=target.applied();assertFalse(target.currentRangeRecoveryReady());assertEquals(stage==2,target.pendingInstallation());
                 source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(metaImage,source.parent,nativeTest.limits);cfg=source.parent.configuration();
-                metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1251),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+                metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1251),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of(),NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current));
                 pool.metadataRecoveryForceObserver(boundary->{if(boundary==after)throw new RocksDBException("Lost sealed supersession acknowledgement");});
                 assertThrows(RocksDBException.class,()->pool.openMetadataRecovery(metadata));
                 assertEquals(actual,target.applied());assertNull(target.currentRangeRecoveryRegistration());assertFalse(target.pendingInstallation());assertTrue(target.userHandlesDetached());assertTrue(target.metadataRecoveryPending());assertFalse(target.metadataRecoveryImageInstalled());assertFalse(target.admissionOpen());
@@ -237,7 +263,7 @@ class NativeMetadataRecoveryTest {
             assertThrows(IOException.class,()->target.installSnapshot(groupImage,nativeTest.limits,new ReplicatedRangeStore.InstallationObserver(){public void afterBatch(int count){}public void afterCompletionForce()throws IOException{throw new IOException("Lost final image force acknowledgement");}}));
             assertNull(target.applied());assertTrue(target.pendingInstallation());
             source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(metaImage,source.parent,nativeTest.limits);cfg=source.parent.configuration();
-            var metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1261),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+            var metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1261),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of(),NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current));
             assertSame(target,pool.openMetadataRecovery(metadata));assertEquals(image.position(),target.applied());assertFalse(target.pendingInstallation());assertFalse(target.metadataRecoveryImageInstalled());
             target.installMetadataSnapshot(metaImage,nativeTest.limits);target.completeMetadataRecovery(metadata,target.applied(),target.configuration());assertFalse(target.metadataRecoveryPending());
         }
@@ -261,7 +287,7 @@ class NativeMetadataRecoveryTest {
             for(var child:source.children){var f=child.applyTopologyFreeze(new ApplyPosition(1,child.applied().index()+1),definition,images.admission(definition));authority=authority.frozen(f.proof(images.first.replicaId())).frozen(f.proof(images.second.replicaId()));if(child==source.child)freeze=f;}
             source.pool.seedTopology(definition,authority,source.children,images.first);
             var sealed=NativeRangeImage.writeMetadata(meta,source.child,images.limits);var cfg=source.child.configuration();
-            metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1273),current.catalogue(),new ApplyPosition(1,50),directory,freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+            metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1273),current.catalogue(),new ApplyPosition(1,50),directory,freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of(),NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current));
             assertSame(target,pool.openMetadataRecovery(metadata));assertNull(target.applied());assertFalse(target.pendingInstallation());assertTrue(target.userHandlesDetached());assertFalse(target.metadataRecoveryImageInstalled());
         }
         try(var pool=helper.pool(path)) {
@@ -278,7 +304,7 @@ class NativeMetadataRecoveryTest {
             var current=new NativeCurrentRangeRecovery(new UUID(0,1280),nativeTest.catalogue,new ApplyPosition(1,10),definition.sourceDirectory(),helper.outer.schema(),source.parent.ownership().owner().groupId(),helper.topology.replica,helper.topology.replica,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),currentHelper.names(helper.outer.schema(),"drained-current-"),Set.of(),currentHelper.schemaRows(source.parent));
             var target=pool.openCurrentRangeRecovery(current);configure(target,definition);
             source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(meta,source.parent,nativeTest.limits);cfg=source.parent.configuration();
-            metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1281),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+            metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1281),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of(),NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current));
             var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
             var installer=workers.submit(()->target.installSnapshot(group,nativeTest.limits,batch->{entered.countDown();try{if(!release.await(10,TimeUnit.SECONDS))throw new IOException("Installer barrier timeout");}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}throw new IOException("Interrupted original install");}));
             try {
@@ -308,7 +334,7 @@ class NativeMetadataRecoveryTest {
             var current=new NativeCurrentRangeRecovery(new UUID(0,1290),nativeTest.catalogue,new ApplyPosition(1,10),definition.sourceDirectory(),helper.outer.schema(),source.parent.ownership().owner().groupId(),helper.topology.replica,helper.topology.replica,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),currentHelper.names(helper.outer.schema(),"floor-current-"),Set.of(),currentHelper.schemaRows(source.parent));
             var target=pool.openCurrentRangeRecovery(current);configure(target,definition);target.installSnapshot(group,nativeTest.limits);target.completeCurrentRangeRecovery(current,image.position(),target.configuration());
             source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(meta,source.parent,nativeTest.limits);cfg=source.parent.configuration();
-            var stale=new NativeMetadataRecoveryRegistration(new UUID(0,1291),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+            var stale=new NativeMetadataRecoveryRegistration(new UUID(0,1291),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of(),NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current));
             target.applyTopologyFreeze(new ApplyPosition(1,2),definition,nativeTest.admission(definition));target.applyNoop(new ApplyPosition(1,3));NativeRangeImage.write(own,target,nativeTest.limits);target.fence();
             assertThrows(IOException.class,()->target.installSnapshot(own,nativeTest.limits,new ReplicatedRangeStore.InstallationObserver(){
                 public void afterBatch(int count)throws IOException{if(!forced)throw new IOException("Interrupted own checkpoint");}
@@ -317,7 +343,7 @@ class NativeMetadataRecoveryTest {
             assertNull(target.applied());assertTrue(target.pendingInstallation());assertThrows(IllegalArgumentException.class,()->pool.openMetadataRecovery(stale));
             assertEquals(current,target.currentRangeRecoveryRegistration());assertTrue(pool.metadataRecoveries().isEmpty());assertTrue(target.pendingInstallation());
             source.parent.applyNoop(new ApplyPosition(1,3));var nextImage=NativeRangeImage.writeMetadata(latest,source.parent,nativeTest.limits);cfg=source.parent.configuration();
-            var next=new NativeMetadataRecoveryRegistration(new UUID(0,1292),current.catalogue(),new ApplyPosition(1,21),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),nextImage.position(),nextImage.sha256(),Set.of());
+            var next=new NativeMetadataRecoveryRegistration(new UUID(0,1292),current.catalogue(),new ApplyPosition(1,21),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),nextImage.position(),nextImage.sha256(),Set.of(),NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current));
             assertSame(target,pool.openMetadataRecovery(next));assertEquals(forced?new ApplyPosition(1,3):null,target.applied());assertFalse(target.pendingInstallation());
             target.installMetadataSnapshot(latest,nativeTest.limits);target.completeMetadataRecovery(next,target.applied(),target.configuration());assertFalse(target.metadataRecoveryPending());
         }
@@ -334,7 +360,7 @@ class NativeMetadataRecoveryTest {
                 current=new NativeCurrentRangeRecovery(new UUID(0,1210),nativeTest.catalogue,new ApplyPosition(1,10),definition.sourceDirectory(),helper.outer.schema(),source.parent.ownership().owner().groupId(),helper.topology.replica,helper.topology.replica,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),currentHelper.names(helper.outer.schema(),"cold-role-"),Set.of(),currentHelper.schemaRows(source.parent));
                 var target=pool.openCurrentRangeRecovery(current);configure(target,definition);target.installSnapshot(groupImage,nativeTest.limits);target.completeCurrentRangeRecovery(current,image.position(),target.configuration());
                 source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(metaImage,source.parent,nativeTest.limits);cfg=source.parent.configuration();
-                metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1211),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+                metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1211),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of(),NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current));
                 pool.metadataRecoveryForceObserver(boundary->{if(boundary==after)throw new RocksDBException("Close immediately after uncertain role force");});
                 assertThrows(RocksDBException.class,()->pool.openMetadataRecovery(metadata));assertNull(target.currentRangeRecoveryRegistration());assertTrue(target.metadataRecoveryPending());assertFalse(target.admissionOpen());
                 // No warm registration retry, image installation, or completion precedes this close.
@@ -372,7 +398,7 @@ class NativeMetadataRecoveryTest {
             try(var pool=helper.pool(path)) {
                 pool.metadataRecoveryForceObserver(boundary->{if(boundary==after)throw new RocksDBException("Uncertain registration force");});
                 assertThrows(RocksDBException.class,()->pool.openMetadataRecovery(registration));assertTrue(pool.metadataRecoveries().isEmpty());
-                var other=new NativeMetadataRecoveryRegistration(new UUID(0,1102),registration.catalogue(),registration.catalogueCut(),registration.sourceDirectory(),registration.freeze(),registration.receiver(),registration.sourceOwner(),registration.configurationTerm(),registration.configurationIndex(),registration.sourceConfiguration(),registration.imageCut(),registration.imageHash(),registration.mergeColumns());
+                var other=new NativeMetadataRecoveryRegistration(new UUID(0,1102),registration.catalogue(),registration.catalogueCut(),registration.sourceDirectory(),registration.freeze(),registration.receiver(),registration.sourceOwner(),registration.configurationTerm(),registration.configurationIndex(),registration.sourceConfiguration(),registration.imageCut(),registration.imageHash(),registration.mergeColumns(),registration.currentPredecessor());
                 assertThrows(IllegalStateException.class,()->pool.openMetadataRecovery(other));assertThrows(IllegalStateException.class,()->helper.open(pool,definition.parents().getFirst()));
                 pool.metadataRecoveryForceObserver(boundary->{});var target=pool.openMetadataRecovery(registration);assertSame(target,pool.openMetadataRecovery(registration));assertTrue(target.metadataRecoveryPending());
             }
@@ -387,9 +413,9 @@ class NativeMetadataRecoveryTest {
                 source.freeze();source.seed();var original=registration(source,NativeRangeImage.writeMetadata(first,source.parent,nativeTest.limits));
                 var target=pool.openMetadataRecovery(original);configure(target,source.definition);target.installMetadataSnapshot(first,nativeTest.limits);target.completeMetadataRecovery(original,original.imageCut(),target.configuration());
                 source.parent.applyNoop(new ApplyPosition(1,source.parent.applied().index()+1));var image=NativeRangeImage.writeMetadata(latest,source.parent,nativeTest.limits);var cfg=source.parent.configuration();
-                var changed=new NativeMetadataRecoveryRegistration(original.transferId(),original.catalogue(),new ApplyPosition(1,21),original.sourceDirectory(),original.freeze(),original.receiver(),original.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of());
+                var changed=new NativeMetadataRecoveryRegistration(original.transferId(),original.catalogue(),new ApplyPosition(1,21),original.sourceDirectory(),original.freeze(),original.receiver(),original.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of(),original.currentPredecessor());
                 assertThrows(IllegalArgumentException.class,()->pool.openMetadataRecovery(changed),"An attempt identity cannot acquire another image recipe");
-                next=new NativeMetadataRecoveryRegistration(new UUID(0,1104),original.catalogue(),new ApplyPosition(1,21),original.sourceDirectory(),original.freeze(),original.receiver(),original.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of());
+                next=new NativeMetadataRecoveryRegistration(new UUID(0,1104),original.catalogue(),new ApplyPosition(1,21),original.sourceDirectory(),original.freeze(),original.receiver(),original.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of(),original.currentPredecessor());
                 pool.metadataRecoveryForceObserver(boundary->{if(boundary==after)throw new RocksDBException("Lost successor registration force acknowledgement");});
                 assertThrows(RocksDBException.class,()->pool.openMetadataRecovery(next));assertEquals(List.of(original),pool.metadataRecoveries());assertTrue(target.metadataRecoveryPending());
                 if(after){assertTrue(target.metadataRecoveryRegistrationForced(next));target.installMetadataSnapshot(latest,nativeTest.limits);tail=new ApplyPosition(1,image.position().index()+1);target.applyNoop(tail,new byte[]{2});target.completeMetadataRecovery(next,tail,target.configuration());}
@@ -412,7 +438,7 @@ class NativeMetadataRecoveryTest {
             var replay=target.readCommittedSourceOutcome(request);assertEquals(credit,replay.credit());assertNull(replay.publication());assertFalse(replay.fenced());
             target.completeMetadataRecovery(original,original.imageCut(),target.configuration());assertEquals(credit,target.sourceOutcomeCredit(request.original().operationId(),request.original().receiptDigest()));
             byte[] result=promises.success();var publication=source.parent.publishSourceOutcome(new ApplyPosition(1,3),request,result);var ack=new DistributedCommand(request.original().groupId(),1,source.parent.schemaDigest(),new OperationId(request.original().operationId().sessionId(),1,2),List.of(),List.of(),1);source.parent.apply(new ApplyPosition(1,4),ack);
-            var saved=NativeRangeImage.writeMetadata(latest,source.parent,nativeTest.limits);var cfg=source.parent.configuration();next=new NativeMetadataRecoveryRegistration(new UUID(0,1103),original.catalogue(),new ApplyPosition(1,21),source.definition.sourceDirectory(),source.freeze,original.receiver(),original.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),saved.position(),saved.sha256(),Set.of());
+            var saved=NativeRangeImage.writeMetadata(latest,source.parent,nativeTest.limits);var cfg=source.parent.configuration();next=new NativeMetadataRecoveryRegistration(new UUID(0,1103),original.catalogue(),new ApplyPosition(1,21),source.definition.sourceDirectory(),source.freeze,original.receiver(),original.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),saved.position(),saved.sha256(),Set.of(),original.currentPredecessor());
             assertSame(target,pool.openMetadataRecovery(next));assertTrue(target.metadataRecoveryPending());assertThrows(IllegalStateException.class,target::sourceOutcomeCredits);
             // The current source legitimately consumed the credit and fenced the published result.
             // Replacing metadata must carry that state forward instead of requiring an obsolete credit row.
