@@ -400,6 +400,34 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     boolean genesisActive(){return genesisDirectory!=null;}
     /** Issuance ends the creation voting exemption even if the subsequent graph cannot be read. */
     void suspendGenesis(){synchronized(gate){if(genesisActive() && recoveryEligibility.snapshot().mode()==org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.GENESIS)recoveryEligibility.publish(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.suspendedGenesis());}}
+    private volatile boolean genesisAbandoning;
+    boolean matchesGenesis(RangeDirectory directory){var original=genesisDirectory;return original!=null && Arrays.equals(original.payloadDigest(),directory.payloadDigest());}
+    /** The forced graph no longer selects this original creation scope. Runs on owned Node IO. */
+    void abandonGenesis(LocalDiscoverySettlement publisher)throws IOException {
+        final RangeDirectory original;
+        synchronized(gate){
+            original=genesisDirectory;if(original==null)return;
+            if(!localDiscoveryIdle() || recoveryReplacement || getLifeCycleState()!=LifeCycle.State.RUNNING || store.admissionOpen()
+                    || recoveryEligibility.snapshot().mode()!=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED)throw new IOException("Genesis abandonment lacks suspended native ownership");
+            genesisAbandoning=true;
+        }
+        org.apache.ratis.server.impl.RockserverRaftServers.GenesisDrain hold=null;boolean published=false;Throwable failure=null;
+        try {
+            var server=getServer().getNow(null);if(server==null)throw new IOException("Genesis abandonment lacks actual division");
+            hold=org.apache.ratis.server.impl.RockserverRaftServers.holdGenesis(server.getDivision(getGroupId()),this);var actual=hold;
+            awaitUpdaterWork(actual.drained());
+            publisher.publish(()->{synchronized(gate){
+                if(genesisDirectory!=original || !genesisAbandoning || recoveryReplacement || getLifeCycleState()!=LifeCycle.State.RUNNING
+                        || nativeApply!=null || !deferred.isEmpty() || !pendingNoops.isEmpty() || !configurations.isEmpty())throw new IOException("Genesis abandonment lost its drained owner");
+                synchronized(recoveryEligibility){actual.requireHeld();recoveryEligibility.deferDiscovery();genesisDirectory=null;}
+            }});published=genesisDirectory==null;if(!published)throw new IOException("Genesis abandonment owner did not publish");
+        }catch(IOException|RuntimeException|Error problem){failure=problem;throw problem;}
+        finally {
+            try {if(hold!=null){var retirement=published?hold.release():hold.abort();try{awaitUpdaterWork(retirement);}finally{if(!published && retirement.isDone())synchronized(gate){if(genesisDirectory==original && recoveryEligibility.discoveryPending())genesisDirectory=null;}}}}
+            catch(IOException|RuntimeException cleanup){if(failure!=null)failure.addSuppressed(cleanup);else throw cleanup;}
+            finally{synchronized(gate){genesisAbandoning=false;}}
+        }
+    }
     /** Node has durably bound the exact original scope and observed fresh unissued CAT. */
     boolean authorizeGenesis(RangeDirectory directory,LocalDiscoverySettlement publisher)throws IOException {
         var range=directory.ranges().stream().filter(value->value.groupId().equals(initialGroup.getGroupId().getUuid())).findFirst().orElseThrow(()->new IOException("Genesis range absent"));
@@ -418,7 +446,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     /** A complete fresh CURRENT graph and forced issuance closure precede this live creation completion. */
     boolean completeGenesis(RangeDirectory directory,LocalDiscoverySettlement publisher)throws IOException {
-        var original=genesisDirectory;if(original==null)return false;if(!Arrays.equals(original.payloadDigest(),directory.payloadDigest()))throw new IOException("Genesis publication differs from its original scope");
+        var original=genesisDirectory;if(original==null || genesisAbandoning)return false;if(!Arrays.equals(original.payloadDigest(),directory.payloadDigest()))throw new IOException("Genesis publication differs from its original scope");
         var range=directory.ranges().stream().filter(value->value.groupId().equals(initialGroup.getGroupId().getUuid())).findFirst().orElseThrow();long revision=recoveryEligibility.revision();
         try(var metadata=reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,genesisMetadataBytes(directory,range),1)) {
             var view=store.genesisState(directory,range);var a=view.applied();var cfg=store.configuration();
@@ -430,7 +458,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var info=division.getInfo();if(division.getStateMachine()!=this || !info.isAlive() || info.getLifeCycleState()!=LifeCycle.State.RUNNING || info.getCurrentTerm()<a.term() || !org.apache.ratis.server.impl.RockserverRaftServers.hasAppliedPrefix(division,this,TermIndex.valueOf(a.term(),a.index())) || division.getRaftLog().getLastCommittedIndex()<a.index() || !getLastAppliedTermIndex().equals(TermIndex.valueOf(a.term(),a.index())))return false;
             var activation=prepareCurrentDiscoveryActivation();
             if(!a.equals(store.applied()) || !sameConfiguration(cfg,store.configuration()))return false;
-            publisher.publish(()->{synchronized(gate){if(genesisDirectory!=original || revision!=recoveryEligibility.revision() || recoveryReplacement || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || !a.equals(store.applied()) || !getLastAppliedTermIndex().equals(TermIndex.valueOf(a.term(),a.index())) || division.getStateMachine()!=this || !division.getInfo().isAlive() || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING || division.getRaftConf()!=actual || division.getInfo().getCurrentTerm()<a.term() || !org.apache.ratis.server.impl.RockserverRaftServers.hasAppliedPrefix(division,this,TermIndex.valueOf(a.term(),a.index())))throw new IOException("Genesis completion lost actual native/core owner");
+            publisher.publish(()->{synchronized(gate){if(genesisDirectory!=original || genesisAbandoning || revision!=recoveryEligibility.revision() || recoveryReplacement || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || !a.equals(store.applied()) || !getLastAppliedTermIndex().equals(TermIndex.valueOf(a.term(),a.index())) || division.getStateMachine()!=this || !division.getInfo().isAlive() || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING || division.getRaftConf()!=actual || division.getInfo().getCurrentTerm()<a.term() || !org.apache.ratis.server.impl.RockserverRaftServers.hasAppliedPrefix(division,this,TermIndex.valueOf(a.term(),a.index())))throw new IOException("Genesis completion lost actual native/core owner");
                 // Adapter USER guards remain closed until native activation and the exact Gate publication both succeed.
                 try{synchronized(recoveryEligibility){if(recoveryEligibility.revision()!=revision)throw new IllegalStateException("Genesis completion revoked");activation.publish();if(!recoveryEligibility.publishIfCurrent(revision,org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.normal()))throw new IllegalStateException("Genesis completion revoked");genesisDirectory=null;}}catch(RuntimeException failure){store.deferDiscovery();recoveryEligibility.publish(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.suspendedGenesis());throw new IOException("Genesis native publication failed",failure);}
             }});return !genesisActive();
@@ -442,7 +470,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private volatile boolean localDiscoveryAbandoning;
     boolean localDiscoveryIdle() {
-        synchronized(gate){return !localDiscoveryAbandoning && !localMetadataStopped && !localMetadataPreparing && !localCurrentPreparing && localMetadataCandidate==null && localCurrentCandidate==null;}
+        synchronized(gate){return !genesisAbandoning && !localDiscoveryAbandoning && !localMetadataStopped && !localMetadataPreparing && !localCurrentPreparing && localMetadataCandidate==null && localCurrentCandidate==null;}
     }
     /** Retire warm private work before a newer complete graph can classify this owner as NONE. */
     CompletableFuture<Void> abandonLocalDiscovery() {
@@ -744,7 +772,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }catch(Exception failure){throw failure instanceof IOException io?io:new IOException("CURRENT local reload failed",failure);}
     }
     boolean settleLocalCurrentDiscovery(LocalCurrentCandidate candidate,LocalDiscoverySettlement publicationOwner)throws IOException {
-        Objects.requireNonNull(publicationOwner);if(candidate==null || candidate.permit.owner!=this)throw new IOException("Foreign CURRENT candidate");var permit=candidate.permit;if(permit.settled){if(permit.covered!=null)awaitCoveredRetirement(retireCoveredCurrent(permit,true));return true;}
+        Objects.requireNonNull(publicationOwner);if(candidate==null || candidate.permit.owner!=this)throw new IOException("Foreign CURRENT candidate");var permit=candidate.permit;if(permit.settled){if(permit.covered!=null)awaitUpdaterWork(retireCoveredCurrent(permit,true));return true;}
         verifyLocalCurrentBaseline(candidate);if(permit.actual==null || !permit.actual.isDone() || permit.actual.isCompletedExceptionally() || !permit.reinitialized || permit.activation==null)throw new IOException("Actual CURRENT reload has not completed");
         var server=getServer().getNow(null);if(server==null)throw new IOException("CURRENT settlement lacks division");var division=server.getDivision(getGroupId());if(division.getStateMachine()!=this || !division.getInfo().isAlive() || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING || getLifeCycleState()!=LifeCycle.State.RUNNING || durableSnapshot==null || !durableSnapshot.getTermIndex().equals(TermIndex.valueOf(permit.manifest.position().term(),permit.manifest.position().index())) || division.getRaftLog().getSnapshotIndex()!=permit.manifest.position().index())throw new IOException("CURRENT actual reload/log floor is not exact");
         var configuration=division.getRaftConf();var nativeConfiguration=RaftConfigurationProto.parseFrom(permit.configuration.data());var actual=org.apache.ratis.server.raftlog.LogProtoUtils.toRaftConfigurationProtoBuilder(configuration).build();long index=configuration.getLogEntryIndex();boolean bootstrap=permit.configuration.term()==0 && permit.configuration.index()==-1 && index==0 && division.getRaftLog().getTermIndex(0)==null;
@@ -753,10 +781,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         var evidence=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.recovered(TermIndex.valueOf(permit.manifest.position().term(),permit.manifest.position().index()),TermIndex.valueOf(permit.cut.term(),permit.cut.index()),durableSnapshot.getTermIndex(),permit.configuration.term(),permit.configuration.index(),nativeConfiguration);
         try {publicationOwner.publish(()->{synchronized(gate){requireLocalCurrentCandidate(candidate);synchronized(recoveryEligibility){if(recoveryEligibility.revision()!=permit.revision || !recoveryEligibility.discoveryPending())throw new IOException("CURRENT publication revision changed");permit.activation.publish();localCurrentBaseline=permit.manifest.position();if(!recoveryEligibility.settleDiscovery(permit.revision,evidence)){localCurrentBaseline=null;throw new IOException("CURRENT publication revision changed");}permit.settled=true;localCurrentCandidate=null;}}});if(!permit.settled)throw new IOException("CURRENT publication owner did not publish");}
         catch(RuntimeException failed){storageFailure=failed;store.deferDiscovery();recoveryEligibility.deferDiscovery();throw new IOException("CURRENT activation publication failed closed",failed);}
-        if(permit.covered!=null)awaitCoveredRetirement(retireCoveredCurrent(permit,true));else releaseLocalCurrent(permit);return true;
+        if(permit.covered!=null)awaitUpdaterWork(retireCoveredCurrent(permit,true));else releaseLocalCurrent(permit);return true;
     }
-    private static void awaitCoveredRetirement(CompletableFuture<Void> actual)throws IOException {
-        boolean interrupted=false;try{for(;;)try{actual.get();return;}catch(InterruptedException retry){interrupted=true;}catch(java.util.concurrent.ExecutionException failed){throw new IOException("Covered CURRENT updater did not retire",failed.getCause());}}finally{if(interrupted)Thread.currentThread().interrupt();}
+    private static void awaitUpdaterWork(CompletableFuture<Void> actual)throws IOException {
+        boolean interrupted=false;try{for(;;)try{actual.get();return;}catch(InterruptedException retry){interrupted=true;}catch(java.util.concurrent.ExecutionException failed){throw new IOException("Discovery updater work did not finish",failed.getCause());}}finally{if(interrupted)Thread.currentThread().interrupt();}
     }
     private void releaseLocalCurrent(LocalCurrentPermit permit) {
         if(permit.covered!=null){retireCoveredCurrent(permit,false);return;}releaseLocalCurrentResources(permit);

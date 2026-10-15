@@ -228,6 +228,121 @@ class RecoveryGenesisTest {
       assertThrows(IllegalStateException.class,machine.gate::snapshotPermit);assertNull(machine.getLatestSnapshot());
     }
   }
+  static final class BlockedGenesisMachine extends GenesisMachine {
+    final CountDownLatch entered = new CountDownLatch(1), proceed = new CountDownLatch(1);
+    final java.util.concurrent.atomic.AtomicBoolean marker = new java.util.concurrent.atomic.AtomicBoolean(true);
+    volatile boolean failCallback;
+    @Override public void notifyTermIndexUpdated(long term, long index) {
+      if (index == 0) {
+        entered.countDown();
+        try { if (!proceed.await(10, TimeUnit.SECONDS)) throw new AssertionError("Metadata callback was not released"); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+        if (failCallback) throw new IllegalStateException("Controlled selected metadata callback failure");
+      }
+      assertTrue(marker.get(), "Metadata callback dispatched after GENESIS marker retirement");
+      super.notifyTermIndexUpdated(term, index);
+    }
+  }
+  static void appendGenesisMetadata(RecoveryEligibilityTest.Fixture fixture) throws Exception {
+    var request = ServerProtoUtils.toAppendEntriesRequestProto(
+        RaftGroupMemberId.valueOf(RecoveryEligibilityTest.LEADER, RecoveryEligibilityTest.GROUP), RecoveryEligibilityTest.SELF,
+        1, List.of(metadata(0, 0), metadata(1, 0)), 1, false, null, List.of(), 31, null);
+    assertEquals(AppendEntriesReplyProto.AppendResult.SUCCESS, fixture.server.appendEntries(request).getResult());
+  }
+  @Test void genesisDrainAcknowledgesActualCallbackReturnAndHoldsThroughMarkerPublication() throws Exception {
+    var machine = new BlockedGenesisMachine();
+    try (var fixture = open("drain-boundary", machine, true)) {
+      genesis(machine); appendGenesisMetadata(fixture);
+      RockserverRaftServers.GenesisDrain hold;
+      try {
+        assertTrue(machine.entered.await(5, TimeUnit.SECONDS));
+        machine.gate.publish(RecoveryEligibilityStateMachine.Evidence.suspendedGenesis());
+        hold = RockserverRaftServers.holdGenesis(fixture.server, machine);
+        assertThrows(IOException.class, hold::requireHeld); assertFalse(hold.drained().isDone());
+        var canceled = hold.drained(); canceled.cancel(false); assertFalse(hold.drained().isDone());
+        assertThrows(IOException.class, () -> RockserverRaftServers.holdGenesis(fixture.server, machine));
+      } finally { machine.proceed.countDown(); }
+      hold.drained().get(5, TimeUnit.SECONDS); hold.requireHeld();
+      assertEquals(List.of(0L), machine.applied); assertEquals(0, fixture.server.getState().getStateMachineUpdater().getLastAppliedIndex());
+      synchronized (machine.gate) { hold.requireHeld(); machine.marker.set(false); machine.gate.deferDiscovery(); }
+      assertThrows(IOException.class, hold::requireHeld);
+      Thread.sleep(150); assertTrue(hold.drained().isDone());
+      assertThrows(IOException.class, fixture.server.getState().getStateMachineUpdater()::requireCoveredAvailable);
+      assertEquals(List.of(0L), machine.applied);
+      hold.release().get(5, TimeUnit.SECONDS);
+      fixture.server.getState().getStateMachineUpdater().requireCoveredAvailable();
+      Thread.sleep(150); assertEquals(List.of(0L), machine.applied); assertTrue(machine.gate.discoveryPending());
+      assertNull(machine.getLatestSnapshot()); assertEquals(-1, fixture.server.getRaftLog().getSnapshotIndex());
+    }
+  }
+  @Test void genesisDrainReleaseWithoutDeferredDiscoveryFencesAndFailsRetirement() throws Exception {
+    var machine = new GenesisMachine();
+    try (var fixture = open("drain-release-unfenced", machine, true)) {
+      assertTrue(machine.gate.settleDiscovery(machine.gate.revision(), RecoveryEligibilityStateMachine.Evidence.suspendedGenesis()));
+      var hold = RockserverRaftServers.holdGenesis(fixture.server, machine);
+      hold.drained().get(5, TimeUnit.SECONDS); hold.requireHeld();
+      assertFalse(machine.gate.discoveryPending());
+      assertThrows(ExecutionException.class, () -> hold.release().get(5, TimeUnit.SECONDS));
+      assertTrue(machine.gate.discoveryPending());
+      assertThrows(IOException.class, hold::requireHeld);
+      fixture.server.getState().getStateMachineUpdater().requireCoveredAvailable();
+      assertTrue(machine.applied.isEmpty()); assertNull(machine.getLatestSnapshot());
+      assertEquals(-1, fixture.server.getRaftLog().getSnapshotIndex());
+    }
+  }
+  @Test void genesisDrainAbortAndCallbackFailureRetireOnlyAfterSelectedCallbackReturns() throws Exception {
+    for (boolean failure : List.of(false, true)) {
+      var machine = new BlockedGenesisMachine(); machine.failCallback = failure;
+      try (var fixture = open("drain-abort-" + failure, machine, true)) {
+        genesis(machine); appendGenesisMetadata(fixture);
+        CompletableFuture<Void> retired; RockserverRaftServers.GenesisDrain hold;
+        try {
+          assertTrue(machine.entered.await(5, TimeUnit.SECONDS)); machine.gate.publish(RecoveryEligibilityStateMachine.Evidence.suspendedGenesis());
+          hold = RockserverRaftServers.holdGenesis(fixture.server, machine);
+          retired = failure ? hold.release() : hold.abort();
+          assertFalse(retired.isDone()); assertFalse(hold.drained().isDone());
+        } finally { machine.proceed.countDown(); }
+        if (failure) assertThrows(ExecutionException.class, () -> retired.get(5, TimeUnit.SECONDS));
+        else retired.get(5, TimeUnit.SECONDS);
+        assertThrows(ExecutionException.class, () -> hold.drained().get(5, TimeUnit.SECONDS));
+        assertTrue(machine.applied.size() <= 1); assertFalse(machine.applied.contains(1L));
+      }
+    }
+  }
+  @Test void genesisDrainRevocationBeforeAcknowledgementWaitsForSelectedCallback() throws Exception {
+    var machine = new BlockedGenesisMachine();
+    try (var fixture = open("drain-revoked", machine, true)) {
+      genesis(machine); appendGenesisMetadata(fixture);
+      RockserverRaftServers.GenesisDrain hold;
+      try {
+        assertTrue(machine.entered.await(5, TimeUnit.SECONDS)); machine.gate.publish(RecoveryEligibilityStateMachine.Evidence.suspendedGenesis());
+        hold = RockserverRaftServers.holdGenesis(fixture.server, machine); machine.gate.deferDiscovery();
+        assertFalse(hold.drained().isDone());
+      } finally { machine.proceed.countDown(); }
+      assertThrows(ExecutionException.class, () -> hold.drained().get(5, TimeUnit.SECONDS));
+      assertThrows(ExecutionException.class, () -> hold.abort().get(5, TimeUnit.SECONDS));
+      assertEquals(List.of(0L), machine.applied); assertTrue(machine.gate.discoveryPending());
+    }
+  }
+  @Test void genesisDrainStopRetainsActualOwnerWhileSelectedMetadataCallbackIsBlocked() throws Exception {
+    var machine = new BlockedGenesisMachine();
+    try (var fixture = open("drain-stop", machine, true); var closer = Executors.newVirtualThreadPerTaskExecutor()) {
+      genesis(machine); appendGenesisMetadata(fixture);
+      try {
+        assertTrue(machine.entered.await(5, TimeUnit.SECONDS)); machine.gate.publish(RecoveryEligibilityStateMachine.Evidence.suspendedGenesis());
+        var hold = RockserverRaftServers.holdGenesis(fixture.server, machine);
+        var closing = closer.submit(fixture.server::close);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        var updater = fixture.server.getState().getStateMachineUpdater();
+        while (!updater.isStopRequested() && System.nanoTime() < deadline) Thread.sleep(1);
+        assertTrue(updater.isStopRequested()); assertFalse(hold.drained().isDone()); assertFalse(closing.isDone());
+        var retired = hold.abort(); assertFalse(retired.isDone()); machine.proceed.countDown();
+        assertThrows(ExecutionException.class, () -> retired.get(5, TimeUnit.SECONDS));
+        assertThrows(ExecutionException.class, () -> hold.drained().get(5, TimeUnit.SECONDS));
+        closing.get(5, TimeUnit.SECONDS); assertEquals(List.of(0L), machine.applied);
+      } finally { machine.proceed.countDown(); }
+    }
+  }
   @Test void genesisNeverExportsOrRevivesAnOldSnapshotPermitAndDiscoveryRemainsSticky() {
     var gate = new RecoveryEligibilityStateMachine.Gate(); gate.publish(RecoveryEligibilityStateMachine.Evidence.normal());
     var old = gate.snapshotPermit(); gate.publish(RecoveryEligibilityStateMachine.Evidence.genesis());

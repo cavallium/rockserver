@@ -1180,6 +1180,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     if(!complete)return null;
                 }
                 var frozen=freezeFreshRecoveryGraph();
+                var selections=new HashMap<UUID,RatisConfiguredRecoveryDiscovery.Obligation>();for(var obligation:frozen.plan().localObligations())selections.put(obligation.range().groupId(),obligation);
+                for(var local:machines.values())if(local.genesisActive()) {
+                    var selected=selections.get(local.getGroupId().getUuid());
+                    if(selected==null || selected.purpose()!=RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF || !local.matchesGenesis(selected.sourceDirectory()))local.abandonGenesis(this::publishLocalDiscovery);
+                }
                 settleLocalNoneDiscovery(frozen);
                 for(var obligation:frozen.plan().localObligations()) {
                     var machine=machines.get(RaftGroupId.valueOf(obligation.range().groupId()));
