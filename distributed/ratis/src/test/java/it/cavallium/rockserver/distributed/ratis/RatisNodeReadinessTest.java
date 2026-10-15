@@ -111,16 +111,24 @@ class RatisNodeReadinessTest {
     @Test void pendingConfigurationStorageFailureAndChangedOwnerFailClosed() throws Exception {
         try(var f=new RatisTopologyFreezeTest.Fixture(root)) {
             var evidence=new Evidence(f);var actual=f.machine.readinessStamp();
-            for(var sample:List.of(new MachineStamp(actual.admissionGeneration(),actual.configurationStamp(),true,null,null),
-                    new MachineStamp(actual.admissionGeneration(),actual.configurationStamp(),false,new IOException("native write failed"),null))) {
+            for(var sample:List.of(new MachineStamp(actual.admissionGeneration(),actual.configurationStamp(),true,false,null,null),
+                    new MachineStamp(actual.admissionGeneration(),actual.configurationStamp(),false,false,new IOException("native write failed"),null))) {
                 var result=report(()->node("placement",SETTLED),source(f,true,()->evidence.division,()->sample));
                 assertFalse(result.ready());assertFalse(result.recoverySettled());
                 assertTrue(has(result,sample.configurationPending() ? Reason.CONFIGURATION_PENDING : Reason.STORAGE_FAILED));
             }
             var calls=new AtomicInteger();
             var changed=report(()->node("placement",SETTLED),source(f,true,()->evidence.division,
-                    ()->new MachineStamp(actual.admissionGeneration()+calls.getAndIncrement(),actual.configurationStamp(),false,null,null)));
+                    ()->new MachineStamp(actual.admissionGeneration()+calls.getAndIncrement(),actual.configurationStamp(),false,false,null,null)));
             assertTrue(has(changed,Reason.OWNER_CHANGED));assertFalse(changed.recoverySettled());
+        }
+    }
+    @Test void pendingDiscoveryNeverCountsAsRecoveredEvenForNonServingGroup()throws Exception {
+        try(var f=new RatisTopologyFreezeTest.Fixture(root)) {
+            var evidence=new Evidence(f);var actual=f.machine.readinessStamp();
+            var pending=new MachineStamp(actual.admissionGeneration(),actual.configurationStamp(),false,true,null,null);
+            var result=report(()->node("placement",SETTLED),source(f,false,()->evidence.division,()->pending));
+            assertTrue(result.localServingReady());assertFalse(result.recoverySettled());assertFalse(result.groups().getFirst().recoverySampled());assertTrue(has(result,Reason.DISCOVERY_PENDING));
         }
     }
     @Test void registryRecoveryIsDistinctFromLocalServingReadiness() throws Exception {

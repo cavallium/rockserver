@@ -88,6 +88,25 @@ class RatisConfiguredRecoveryGraphRuntimeTest {
     private void advanceClock(Fixture fixture,long sequence)throws Exception {
         var ledger=fixture.epochs.read();assertEquals(CommandResult.Status.SUCCESS,fixture.epochs.execute(fixture.epochs.prepare(new OperationId(new UUID(1240,1),0,sequence),ledger,ledger.advanceTime(ledger.logicalTimeMillis()+1))).status());
     }
+    @Test void localMetadataBootstrapSettlesUncertainGraphThenStillReadsFreshCat()throws Exception {
+        try(var fixture=new Fixture("bootstrap-pending")) {
+            try(var node=fixture.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new RatisNodeRuntimeTest.FakeServer())) {
+                node.start();node.discoverConfiguredRecovery().get(15,TimeUnit.SECONDS);
+                var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class);var files=field(graph,"files",RatisJournalAccess.class);var credit=field(node,"recoveryGraphCredit",RatisNodeResourceBudget.Lease.class);var fail=new AtomicBoolean(true);graph.close();
+                var uncertain=(RatisJournalAccess)Proxy.newProxyInstance(RatisJournalAccess.class.getClassLoader(),new Class<?>[]{RatisJournalAccess.class},(proxy,method,args)->{
+                    final Object result;try{result=method.invoke(files,args);}catch(InvocationTargetException failed){throw failed.getCause();}
+                    if(method.getName().equals("write") && fail.getAndSet(false))throw new IOException("Lost graph force acknowledgement");return result;
+                });
+                graph=new RatisConfiguredRecoveryGraph(fixture.env.nodeRoot.resolve("configured-recovery-graph"),fixture.plan,uncertain,(kept,incoming)->credit.growTo(Math.max(credit.bytes(),4096L+16L*Math.addExact(kept,incoming))));
+                RatisTopologySeedRuntimeTest.field(node,"recoveryGraph",graph);advanceClock(fixture,1);
+                assertThrows(ExecutionException.class,()->node.discoverConfiguredRecovery().get(15,TimeUnit.SECONDS));
+                var pending=field(graph,"dirty",RatisConfiguredRecoveryGraph.Snapshot.class);assertNotNull(pending);int calls=fixture.calls.get();advanceClock(fixture,2);
+                node.bootstrapDeferredLocalMetadata().get(15,TimeUnit.SECONDS);
+                assertTrue(fixture.calls.get()>calls,"Settling an old force cannot substitute for fresh role authority");assertNull(field(graph,"dirty",RatisConfiguredRecoveryGraph.Snapshot.class));assertTrue(graph.snapshot().plan().catalogueCut().index()>pending.plan().catalogueCut().index());assertEquals(4096L+16L*graph.retainedEncodedBytes(),credit.bytes());
+                assertFalse(field(node,"configuredRecoveryServiceStarted",Boolean.class));assertEquals(0,fixture.hostCalls.get());
+            }
+        }
+    }
     @Test void rediscoveryUsesDurableActiveAttemptInsteadOfFirstMatchingHistoricalRequest()throws Exception {
         try(var fixture=new Fixture("active")) {
             UUID group,renewedId=new UUID(Long.MAX_VALUE,Long.MAX_VALUE);Map<UUID,byte[]> history;
@@ -104,11 +123,12 @@ class RatisConfiguredRecoveryGraphRuntimeTest {
             }
         }
     }
-    @Test void cancelledDiscoveryAndNodeCloseRetainActualCatGraphNativeAndTransportOwnership()throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void cancelledDiscoveryAndNodeCloseRetainActualCatGraphNativeAndTransportOwnership(boolean bootstrap)throws Exception {
         try(var fixture=new Fixture("blocked")) {
             var server=new RatisNodeRuntimeTest.FakeServer();var node=fixture.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,server);CompletableFuture<Void> closing=null;
             try {
-                node.start();var resources=field(node,"resources",RatisNodeResourceBudget.class);var credit=field(node,"recoveryGraphCredit",RatisNodeResourceBudget.Lease.class);var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class);fixture.block.set(true);var observer=node.discoverConfiguredRecovery();assertTrue(fixture.entered.await(10,TimeUnit.SECONDS));assertTrue(observer.cancel(false));assertTrue(field(node,"installing",Boolean.class));assertNull(graph.snapshot());assertFalse(credit.released());assertTrue(resources.stats().protectedLane().bytes()>=credit.bytes()+4096);
+                node.start();var resources=field(node,"resources",RatisNodeResourceBudget.class);var credit=field(node,"recoveryGraphCredit",RatisNodeResourceBudget.Lease.class);var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class);fixture.block.set(true);var observer=bootstrap?node.bootstrapDeferredLocalMetadata():node.discoverConfiguredRecovery();assertTrue(fixture.entered.await(10,TimeUnit.SECONDS));assertTrue(observer.cancel(false));assertTrue(field(node,"installing",Boolean.class));assertNull(graph.snapshot());assertFalse(credit.released());assertTrue(resources.stats().protectedLane().bytes()>=credit.bytes()+4096);
                 closing=CompletableFuture.runAsync(()->{try{node.close();}catch(IOException failed){throw new CompletionException(failed);}});long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(2);while(node.state()!=RatisNodeRuntime.State.STOPPING && System.nanoTime()<deadline)Thread.sleep(1);assertEquals(RatisNodeRuntime.State.STOPPING,node.state());assertFalse(closing.isDone());assertFalse(credit.released());assertEquals(0,server.closes);assertEquals(0,fixture.clientCloses.get());assertEquals(1,node.nativePool(RatisPoolFixtures.ID).retainedMetadataOwners().size());var store=field(server.machines.get(RaftGroupId.valueOf(fixture.split.parents().getFirst().groupId())),"store",ReplicatedRangeStore.class);assertNotNull(store.configuration());
                 fixture.release.countDown();closing.get(15,TimeUnit.SECONDS);assertEquals(RatisNodeRuntime.State.CLOSED,node.state());assertTrue(credit.released());assertEquals(1,server.closes);assertTrue(fixture.clientCloses.get()>0);assertEquals(new RatisNodeResourceBudget.Usage(0,0),resources.stats().ordinary());assertEquals(new RatisNodeResourceBudget.Usage(0,0),resources.stats().protectedLane());assertTrue(Files.isRegularFile(fixture.env.nodeRoot.resolve("configured-recovery-graph/graph")));assertEquals(0,fixture.hostCalls.get());
             }finally{fixture.release.countDown();if(closing!=null)closing.get(15,TimeUnit.SECONDS);node.close();}
