@@ -254,7 +254,7 @@ class SnapshotInstallationHandler {
             ServerStringUtils.toInstallSnapshotRequestString(request));
         InstallSnapshotReplyProto reply =  toInstallSnapshotReplyProto(leaderId, getMemberId(),
             currentTerm, snapshotChunkRequest.getRequestIndex(), InstallSnapshotResult.SNAPSHOT_EXPIRED);
-        return future.thenApply(dummy -> reply);
+        return future.thenApply(dummy -> reply.toBuilder().setTerm(state.getCurrentTerm()).build());
       }
       if (snapshotChunkRequest.getRequestIndex() == 0) {
         nextChunkIndex.set(0);
@@ -271,7 +271,7 @@ class SnapshotInstallationHandler {
           nextChunkIndex.set(snapshotChunkRequest.getRequestIndex() + 1);
           final InstallSnapshotReplyProto reply =  toInstallSnapshotReplyProto(leaderId, getMemberId(),
               currentTerm, snapshotChunkRequest.getRequestIndex(), InstallSnapshotResult.ALREADY_INSTALLED);
-          return future.thenApply(dummy -> reply);
+          return future.thenApply(dummy -> reply.toBuilder().setTerm(state.getCurrentTerm()).build());
         }
 
         final int expectedChunkIndex = nextChunkIndex.get();
@@ -302,7 +302,7 @@ class SnapshotInstallationHandler {
     }
     final InstallSnapshotReplyProto reply = toInstallSnapshotReplyProto(leaderId, getMemberId(),
         currentTerm, snapshotChunkRequest.getRequestIndex(), InstallSnapshotResult.SUCCESS);
-    return future.thenApply(dummy -> reply);
+    return future.thenApply(dummy -> reply.toBuilder().setTerm(state.getCurrentTerm()).build());
   }
 
   private CompletableFuture<InstallSnapshotReplyProto> notifyStateMachineToInstallSnapshot(
@@ -341,7 +341,7 @@ class SnapshotInstallationHandler {
               InstallSnapshotResult.ALREADY_INSTALLED, snapshotIndex);
           final InstallSnapshotReplyProto reply = toInstallSnapshotReplyProto(leaderId, getMemberId(), currentTerm,
               InstallSnapshotResult.ALREADY_INSTALLED, snapshotIndex);
-          return future.thenApply(dummy -> reply);
+          return future.thenApply(dummy -> reply.toBuilder().setTerm(state.getCurrentTerm()).build());
         }
         server.getState().getReadRequests().fail(server.getReadException("wait for", firstAvailableLogIndex, true));
 
@@ -422,7 +422,7 @@ class SnapshotInstallationHandler {
             InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, INVALID_LOG_INDEX, server.getPeer());
         final InstallSnapshotReplyProto reply =  toInstallSnapshotReplyProto(leaderId, getMemberId(),
             currentTerm, InstallSnapshotResult.SNAPSHOT_UNAVAILABLE);
-        return future.thenApply(dummy -> reply);
+        return future.thenApply(dummy -> reply.toBuilder().setTerm(state.getCurrentTerm()).build());
       }
 
       // If a snapshot has been installed, return SNAPSHOT_INSTALLED with the installed snapshot index and reset
@@ -443,7 +443,7 @@ class SnapshotInstallationHandler {
         installedIndex.set(latestInstalledIndex);
         final InstallSnapshotReplyProto reply = toInstallSnapshotReplyProto(leaderId, getMemberId(),
             currentTerm, InstallSnapshotResult.SNAPSHOT_INSTALLED, latestInstalledSnapshotTermIndex.getIndex());
-        return future.thenApply(dummy -> reply);
+        return future.thenApply(dummy -> reply.toBuilder().setTerm(state.getCurrentTerm()).build());
       }
 
       // Otherwise, Snapshot installation is in progress.
@@ -453,7 +453,7 @@ class SnapshotInstallationHandler {
       }
       final InstallSnapshotReplyProto reply = toInstallSnapshotReplyProto(leaderId, getMemberId(),
           currentTerm, InstallSnapshotResult.IN_PROGRESS);
-      return future.thenApply(dummy -> reply);
+      return future.thenApply(dummy -> reply.toBuilder().setTerm(state.getCurrentTerm()).build());
     }
   }
 

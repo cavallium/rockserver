@@ -37,6 +37,44 @@ class RatisConfiguredRecoveryGraphTest {
         public void write(Path path,byte[] body,int maximum)throws IOException{writes++;if(before)throw new IOException("Before publication");if(pending){delegate.write(path.resolveSibling("graph.pending"),body,maximum);throw new IOException("Before canonical rename");}delegate.write(path,body,maximum);if(after)throw new IOException("After forced publication");}
         public void remove(Path path,byte[] body,int maximum,SessionJournalFiles.Removal removal)throws IOException{delegate.remove(path,body,maximum,removal);}public void deleted(Path path)throws IOException{delegate.deleted(path);}public void reclaimedTree(Path directory)throws IOException{delegate.reclaimedTree(directory);}public void reserve(Reservation reservation)throws IOException{delegate.reserve(reservation);}public void fulfilled(Reservation reservation)throws IOException{delegate.fulfilled(reservation);}
     }
+    @Test void sourceSuccessorIsForcedRetainedAndCannotReactivateHistoricalUuid()throws Exception {
+        var node=node("data");var plan=discover(node,genesis,10);var original=requests(node,plan,8000).getFirst();Path path=directory("source-successor");
+        var receipt=new Abandoned(original,id(8001),new ApplyPosition(2,3),LOCAL,new byte[32]);var files=new FilesAccess();
+        try(var graph=new RatisConfiguredRecoveryGraph(path,node,files,HEAP)){
+            graph.force(plan,List.of(original));graph.observeSourceAbandonment(receipt);
+            assertEquals(id(8001),graph.snapshot().activeRequests().get(original.sourceGroup()).transferId());assertEquals(2,graph.snapshot().frozenRequests().size());
+            int writes=files.writes;graph.observeSourceAbandonment(receipt);assertEquals(writes,files.writes);
+            var next=new Abandoned(receipt.successorRequest(),id(8002),new ApplyPosition(2,4),LOCAL,new byte[32]);graph.observeSourceAbandonment(next);
+            assertThrows(IOException.class,()->graph.observeSourceAbandonment(receipt));
+            assertThrows(IOException.class,()->graph.observeSourceAbandonment(new Abandoned(next.successorRequest(),original.transferId(),new ApplyPosition(2,5),LOCAL,new byte[32])));
+            assertEquals(id(8002),graph.snapshot().activeRequests().get(original.sourceGroup()).transferId());
+        }
+        try(var graph=new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP)){
+            assertEquals(id(8002),graph.snapshot().activeRequests().get(original.sourceGroup()).transferId());assertEquals(3,graph.snapshot().frozenRequests().size());assertEquals(plan.catalogueCut(),graph.snapshot().plan().catalogueCut());
+        }
+    }
+    @Test void sourceSuccessorUnknownForceRetriesExactCandidateAndColdReadNeverAcknowledgesUnforcedSelection()throws Exception {
+        for(boolean after:List.of(false,true)){
+            var node=node("data");var plan=discover(node,genesis,10);var original=requests(node,plan,8100).getFirst();var receipt=new Abandoned(original,id(8101),new ApplyPosition(1,3),LOCAL,new byte[32]);Path path=directory("source-unknown-"+after);var files=new FilesAccess();
+            try(var graph=new RatisConfiguredRecoveryGraph(path,node,files,HEAP)){
+                graph.force(plan,List.of(original));files.before=!after;files.after=after;
+                assertThrows(IOException.class,()->graph.observeSourceAbandonment(receipt));assertEquals(original.transferId(),graph.snapshot().activeRequests().get(original.sourceGroup()).transferId());
+                assertThrows(IOException.class,()->graph.observeSourceAbandonment(new Abandoned(original,id(8102),new ApplyPosition(1,3),LOCAL,new byte[32])));
+                files.before=false;files.after=false;graph.observeSourceAbandonment(receipt);assertEquals(receipt.successorId(),graph.snapshot().activeRequests().get(original.sourceGroup()).transferId());
+            }
+            try(var graph=new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP)){graph.observeSourceAbandonment(receipt);assertEquals(receipt.successorId(),graph.snapshot().activeRequests().get(original.sourceGroup()).transferId());}
+        }
+    }
+    @Test void coldSourceSuccessorLostAckPublishesOnlyValidatedOldOrNewSelection()throws Exception {
+        for(boolean after:List.of(false,true)){
+            var node=node("data");var plan=discover(node,genesis,10);var original=requests(node,plan,8200).getFirst();var receipt=new Abandoned(original,id(8201),new ApplyPosition(1,3),LOCAL,new byte[32]);Path path=directory("source-cold-"+after);var files=new FilesAccess();
+            try(var graph=new RatisConfiguredRecoveryGraph(path,node,files,HEAP)){graph.force(plan,List.of(original));files.before=!after;files.after=after;assertThrows(IOException.class,()->graph.observeSourceAbandonment(receipt));}
+            try(var graph=new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP)){
+                assertEquals(after?receipt.successorId():original.transferId(),graph.snapshot().activeRequests().get(original.sourceGroup()).transferId());
+                graph.observeSourceAbandonment(receipt);assertEquals(receipt.successorId(),graph.snapshot().activeRequests().get(original.sourceGroup()).transferId());assertEquals(2,graph.snapshot().frozenRequests().size());
+            }
+        }
+    }
     @Test void frozenGraphColdReopensAndTopologyProgressRetainsDefinitionsAndAttempts()throws Exception {
         var node=node("data");var initial=discover(node,genesis,10);var first=requests(node,initial,1000);var next=discover(node,split.targetDirectory(),20,split);var second=requests(node,next,1100);Path path=directory("progress");
         try(var graph=new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP)){assertNull(graph.snapshot());graph.force(initial,first);assertEquals(1,graph.snapshot().frozenRequests().size());graph.force(next,second);assertEquals(1,graph.snapshot().retainedDefinitions().size());assertEquals(4,graph.snapshot().frozenRequests().size());assertTrue(graph.retainedEncodedBytes()>0);}

@@ -823,7 +823,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             synchronized(gate){
                 if(getLifeCycleState()!=LifeCycle.State.PAUSED || !recoveryReplacement || store.metadataRecoveryRegistration()==null || store.pendingInstallation())throw new IOException("META registration resume lacks paused replacement ownership");
                 requireRecoveryRegistrationDrained();
-                try{getLifeCycle().transition(LifeCycle.State.STARTING);recover(false);activateRecoveredOwner();getLifeCycle().transition(LifeCycle.State.RUNNING);if(committedGroup!=null)committedGroup.resume();}
+                try{
+                    if(recoveryEligibility.discoveryPending()) {
+                        var registration=store.metadataRecoveryRegistration();
+                        if(metadataFloorPreparation==null || !metadataFloorPreparation.equals(registration) || !store.metadataRecoveryRegistrationForced(registration))
+                            throw new IOException("Inventory META resume lacks exact qualified forced recipe");
+                        // Registration alone changed the role. Preserve native A/CFG and every retained
+                        // floor; only the later graph-qualified receiver may import its genuine META image.
+                        getLifeCycle().transition(LifeCycle.State.STARTING);
+                    }else {
+                        getLifeCycle().transition(LifeCycle.State.STARTING);recover(false);activateRecoveredOwner();
+                    }
+                    getLifeCycle().transition(LifeCycle.State.RUNNING);if(committedGroup!=null)committedGroup.resume();
+                }
                 catch(Exception failed){throw failRecovery(failed);}
             }
             recoveryReplacement=false;refreshRecoveryEligibility();
@@ -2597,23 +2609,109 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public SimpleStateMachineStorage getStateMachineStorage() { return snapshots; }
     private it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration metadataFloorPreparation;
+    /** Only a genuine CURRENT predecessor may abandon its drained, persisted incomplete image target. */
+    void requireMetadataRecoveryCoverage(it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration proposed)throws IOException {
+        try {
+            var actual=store.applied();if(actual!=null && !RatisRelocationOwnerRpc.covers(proposed.imageCut(),actual))throw new IOException("META image does not cover completed native prefix");
+            var pending=store.pendingInstallationCut();
+            if(store.pendingInstallation() || pending!=null) {
+                var current=store.currentRangeRecoveryRegistration();
+                if(current==null || proposed.currentPredecessor()==null || !proposed.currentPredecessor().equals(it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current)))throw new IOException("Pending installation lacks exact CURRENT supersession authority");
+                proposed.requireTransitionOf(current);
+                if(pending==null || !RatisRelocationOwnerRpc.covers(proposed.imageCut(),pending))throw new IOException("META image does not cover persisted incomplete CURRENT target");
+            }
+        }catch(org.rocksdb.RocksDBException|IllegalArgumentException invalid){throw new IOException("Cannot qualify CURRENT installation supersession",invalid);}
+    }
+    /** Node already matched the freshly forced active graph to this exact completed native registration. */
+    void allowRegisteredRecovery(RatisTopologySourceSnapshotRpc.Prepared prepared,LocalDiscoverySettlement publisher)throws IOException {
+        long revision=recoveryEligibility.revision();var request=prepared.request();
+        if(!recoveryEligibility.discoveryPending())return;
+        var metadata=store.metadataRecoveryRegistration();var current=store.currentRangeRecoveryRegistration();
+        try {
+            if(request.metadataOnly()) {
+                if(metadata==null || !store.metadataRecoveryRegistrationForced(metadata)
+                        || !metadata.transferId().equals(request.transferId()) || !metadata.catalogue().equals(request.catalogue())
+                        || !metadata.receiver().equals(request.receiver()) || !Arrays.equals(metadata.sourceDirectory().payloadDigest(),request.sourceDirectory().payloadDigest())
+                        || !metadata.freeze().equals(prepared.metadataFreeze()) || !metadata.imageCut().equals(prepared.image().position())
+                        || !Arrays.equals(metadata.imageHash(),prepared.image().sha256()))throw new IOException("META receive permission differs from actual forced registration");
+            }else {
+                if(current==null || !current.transferId().equals(request.transferId()) || !current.catalogue().equals(request.catalogue())
+                        || !current.receiver().equals(request.receiver()) || !Arrays.equals(current.directory().payloadDigest(),request.sourceDirectory().payloadDigest())
+                        || !current.imageCut().equals(prepared.image().position()) || !Arrays.equals(current.imageHash(),prepared.image().sha256()))throw new IOException("CURRENT receive permission differs from completed native registration");
+            }
+        }catch(org.rocksdb.RocksDBException failed){throw new IOException("Cannot qualify forced receive registration",failed);}
+        publisher.publish(()->{synchronized(gate){
+            if(revision!=recoveryEligibility.revision() || !recoveryEligibility.discoveryPending() || getLifeCycleState()!=LifeCycle.State.RUNNING
+                    || genesisActive() || recoveryReplacement || store.admissionOpen()
+                    || metadata!=store.metadataRecoveryRegistration() || current!=store.currentRangeRecoveryRegistration())throw new IOException("Registered recovery receiver ownership changed");
+            if(!recoveryEligibility.settleDiscovery(revision,org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing()))throw new IOException("Registered receiver discovery settlement revoked");
+        }});
+    }
+    private record MetadataFloorConfiguration(ReplicatedRangeStore.Configuration value,boolean referenceOnly) {}
+    /** Partial CURRENT CFG rows are references until their final native A is published. */
+    private MetadataFloorConfiguration metadataFloorConfiguration(it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration proposed)throws IOException,org.rocksdb.RocksDBException {
+        var cfg=store.configuration();var applied=store.applied();
+        if(applied!=null) {
+            if(cfg==null)throw new IOException("Completed native prefix has no CFG");
+            return new MetadataFloorConfiguration(cfg,false);
+        }
+        var current=store.currentRangeRecoveryRegistration();var pending=store.pendingInstallationCut();
+        if(current==null || pending==null) {
+            if(cfg!=null)return new MetadataFloorConfiguration(cfg,false);
+            throw new IOException("Missing native CFG has no incomplete CURRENT reference");
+        }
+        if(proposed.currentPredecessor()==null
+                || !proposed.currentPredecessor().equals(it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current)))
+            throw new IOException("Partial native CFG has no exact incomplete CURRENT reference");
+        proposed.requireTransitionOf(current);
+        if(!RatisRelocationOwnerRpc.covers(proposed.imageCut(),pending))throw new IOException("META image does not cover incomplete CURRENT reference");
+        ReplicatedRangeStore.Configuration reference;
+        if(pending.equals(current.imageCut()))reference=new ReplicatedRangeStore.Configuration(current.configurationTerm(),current.configurationIndex(),current.sourceConfiguration());
+        else {
+            var snapshot=durableSnapshot;
+            if(snapshot==null || !pending.equals(new ApplyPosition(snapshot.getTerm(),snapshot.getIndex())))throw new IOException("Incomplete own CURRENT checkpoint has no exact retained floor");
+            reference=store.validatePendingCurrentRangeRecoveryConfiguration(snapshot.getFile().getPath(),limits);
+        }
+        if(reference.index()>pending.index() || reference.term()>pending.term())throw new IOException("CURRENT reference CFG exceeds its genuine image cut");
+        if(cfg!=null && !sameConfiguration(cfg,reference))throw new IOException("Partially imported CFG differs from exact CURRENT image reference");
+        validateConfiguration(reference.data());requireSchemaMembership(proposed.range(),reference.data());
+        return new MetadataFloorConfiguration(reference,true);
+    }
     /** Read-only qualification before forcing a META recipe over an existing quiescent owner. */
     void qualifyMetadataRecoveryFloor(it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration proposed)throws IOException {
-        synchronized(gate){requireRecoveryRegistrationDrained();if(store.pendingInstallation() || store.activeSnapshotPins()!=0)throw new IOException("META floor has active native installation/readers");
+        synchronized(gate){requireRecoveryRegistrationDrained();requireMetadataRecoveryCoverage(proposed);if(store.activeSnapshotPins()!=0)throw new IOException("META floor has active native readers");
             var snapshot=durableSnapshot;if(snapshot!=null)validateCoveredMetadataFloor(snapshot.getFile().getPath(),snapshot.getTermIndex(),proposed);
             var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(proposed.receiver().peerId()) || topologyLocalReplica==null || !sameReplicaIdentity(proposed.receiver(),topologyLocalReplica))throw new IOException("META floor receiver identity differs");
             var division=server.getDivision(getGroupId());if(division.getStateMachine()!=this || !division.getInfo().isAlive() || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("META floor has no actual running division");var actual=division.getRaftConf();requireActualMembership(actual,proposed.range());
-            try{var cfg=store.configuration();var nativeCut=store.applied();if(cfg==null || nativeCut==null && (snapshot!=null || cfg.term()!=0 || cfg.index()!=-1) || nativeCut!=null && (!RatisRelocationOwnerRpc.covers(proposed.imageCut(),nativeCut) || cfg.index()>nativeCut.index() || cfg.term()>nativeCut.term()) || actual.getLogEntryIndex()!=cfg.index() && !(cfg.term()==0 && cfg.index()==-1 && actual.getLogEntryIndex()<=0))throw new IOException("META floor actual/native configuration or image coverage differs");requireSchemaMembership(proposed.range(),cfg.data());}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify existing META floor configuration",invalid);}metadataFloorPreparation=proposed;
+            try{var qualified=metadataFloorConfiguration(proposed);var cfg=qualified.value();var nativeCut=store.applied();var ceiling=nativeCut!=null?nativeCut:store.pendingInstallationCut();if(ceiling==null && proposed.currentPredecessor()!=null)ceiling=proposed.currentPredecessor().imageCut();if(cfg==null || ceiling==null && (cfg.term()!=0 || cfg.index()!=-1) || ceiling!=null && (!RatisRelocationOwnerRpc.covers(proposed.imageCut(),ceiling) || cfg.index()>ceiling.index() || cfg.term()>ceiling.term()) || !qualified.referenceOnly() && actual.getLogEntryIndex()!=cfg.index() && !(cfg.term()==0 && cfg.index()==-1 && actual.getLogEntryIndex()<=0))throw new IOException("META floor actual/native configuration or image coverage differs");requireSchemaMembership(proposed.range(),cfg.data());}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify existing META floor configuration",invalid);}metadataFloorPreparation=proposed;
         }
     }
     private NativeRangeImage.Manifest validateCoveredMetadataFloor(Path image,TermIndex position,it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration proposed)throws IOException {
         try(var metadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)){
-            if(store.pendingInstallation())throw new IOException("Pending native install cannot use a preceding log floor");var nativeCut=store.applied();if(nativeCut==null || !RatisRelocationOwnerRpc.covers(proposed.imageCut(),nativeCut))throw new IOException("META image does not cover existing native prefix");
+            requireMetadataRecoveryCoverage(proposed);var nativeCut=store.applied();
             var kind=NativeRangeImage.kind(image,snapshotMetadataAdmission);var cfg=new ReplicatedRangeStore.Configuration[1];var freeze=new NativeTopologyFreeze[1];NativeRangeImage.RowVisitor visitor=(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE && key.length==17){if(key[16]==1){if(cfg[0]!=null)throw new IOException("Duplicate floor configuration");cfg[0]=ReplicatedRangeStore.Configuration.decode(value);}if(key[16]==0x60)freeze[0]=NativeTopologyFreeze.decode(value);}};
             var manifest=kind==NativeRangeImage.Kind.GROUP?NativeRangeImage.visitAdmitted(image,limits,visitor,snapshotMetadataAdmission):NativeRangeImage.visitMetadataAdmitted(image,limits,visitor,snapshotMetadataAdmission);var range=proposed.range();
-            if(!manifest.owner().equals(new RangeOwnership.Owner(proposed.groupId(),range.rangeEpoch())) || !manifest.interval().domainId().equals(proposed.sourceDirectory().domainId()) || !Arrays.equals(manifest.interval().lowerInclusive(),range.lowerInclusive()) || !Arrays.equals(manifest.interval().upperExclusive(),range.upperExclusive()) || manifest.position().term()!=position.getTerm() || manifest.position().index()!=position.getIndex() || !RatisRelocationOwnerRpc.covers(nativeCut,manifest.position()) || !RatisRelocationOwnerRpc.covers(proposed.imageCut(),manifest.position()))throw new IOException("Retained floor owner/geometry/cut differs from covered META source");
+            boolean completedFloor=nativeCut!=null && RatisRelocationOwnerRpc.covers(nativeCut,manifest.position());
+            var predecessor=proposed.currentPredecessor();boolean predecessorFloor=kind==NativeRangeImage.Kind.GROUP && predecessor!=null
+                    && predecessor.imageCut().equals(manifest.position()) && Arrays.equals(predecessor.imageHash(),manifest.sha256());
+            if(!completedFloor && !predecessorFloor && kind==NativeRangeImage.Kind.GROUP && store.currentRangeRecoveryRegistration()!=null
+                    && manifest.position().equals(store.pendingInstallationCut())) {
+                store.validatePendingCurrentRangeRecoveryConfiguration(image,limits);predecessorFloor=true;
+            }
+            if(!completedFloor && !predecessorFloor && kind==NativeRangeImage.Kind.GROUP) {
+                var registered=store.metadataRecoveryRegistration();
+                if(registered!=null && registered.currentPredecessor()!=null && registered.currentPredecessor().equals(predecessor)
+                        && store.metadataRecoveryRegistrationForced(registered)) {
+                    var qualified=store.validateMetadataGroupFloorInventory(image,limits);
+                    if(!Arrays.equals(qualified.sha256(),manifest.sha256()))throw new IOException("Retained CURRENT predecessor changed during qualification");
+                    predecessorFloor=true;
+                }
+            }
+            if(!completedFloor && !predecessorFloor)throw new IOException("Retained floor has neither completed native prefix nor exact CURRENT image anchor");
+            if(!manifest.owner().equals(new RangeOwnership.Owner(proposed.groupId(),range.rangeEpoch())) || !manifest.interval().domainId().equals(proposed.sourceDirectory().domainId()) || !Arrays.equals(manifest.interval().lowerInclusive(),range.lowerInclusive()) || !Arrays.equals(manifest.interval().upperExclusive(),range.upperExclusive()) || manifest.position().term()!=position.getTerm() || manifest.position().index()!=position.getIndex() || !RatisRelocationOwnerRpc.covers(proposed.imageCut(),manifest.position()))throw new IOException("Retained floor owner/geometry/cut differs from covered META source");
             if(kind==NativeRangeImage.Kind.METADATA && !proposed.freeze().equals(freeze[0]))throw new IOException("Retained META floor changed original FREEZE");
-            var historical=cfg[0];var current=store.configuration();if(historical==null || current==null || historical.index()>manifest.position().index() || historical.term()>manifest.position().term() || current.index()>nativeCut.index() || current.term()>nativeCut.term() || current.index()<historical.index() || current.term()<historical.term() || current.index()==historical.index() && (current.term()!=historical.term() || !Arrays.equals(current.data(),historical.data())))throw new IOException("Retained floor configuration is not covered by native prefix");
+            var historical=cfg[0];var current=metadataFloorConfiguration(proposed).value();if(historical==null || current==null || historical.index()>manifest.position().index() || historical.term()>manifest.position().term() || nativeCut!=null && (current.index()>nativeCut.index() || current.term()>nativeCut.term())
+                    || completedFloor && (current.index()<historical.index() || current.term()<historical.term() || current.index()==historical.index() && (current.term()!=historical.term() || !Arrays.equals(current.data(),historical.data()))))throw new IOException("Retained floor configuration is not covered by native prefix");
             validateConfiguration(historical.data());requireSchemaMembership(range,current.data());var saved=MD5FileUtil.readStoredMd5ForFile(image.toFile());if(saved!=null && !saved.equals(org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(image,snapshotMetadataAdmission))))throw new IOException("Retained GROUP floor MD5 changed");return manifest;
         }catch(org.rocksdb.RocksDBException|IllegalArgumentException invalid){throw new IOException("Retained META log floor qualification failed",invalid);}
     }
@@ -2735,10 +2833,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private java.util.List<Path> discoveryInventoryDirectories(Path published){return java.util.List.of(published,recoveryDir,groupFloorDirectory());}
     private record DiscoveryFloor(TermIndex position,byte[] groupHash,byte[] metadataHash,byte[] projection) {}
-    private record DiscoveryImage(NativeRangeImage.Manifest manifest,NativeRangeImage.Kind kind,byte[] projection) {}
+    private record DiscoveryImage(NativeRangeImage.Manifest manifest,NativeRangeImage.Kind kind,byte[] projection,ReplicatedRangeStore.Configuration configuration) {}
     /** Retained published floors stay at their actual paths; installation staging remains inert. */
     private void recoverDiscoveryInventory()throws Exception {
         Path published=snapshots.getSnapshotFile(0,0).toPath().getParent();SingleFileSnapshotInfo latest=null;
+        var inventoryConfiguration=store.configuration();ApplyPosition predecessorReference=null;
         var unique=new java.util.HashMap<Long,DiscoveryFloor>();int uniqueImages=0;
         for(var directory:discoveryInventoryDirectories(published)) {
             if(!Files.exists(directory,java.nio.file.LinkOption.NOFOLLOW_LINKS))continue;
@@ -2752,6 +2851,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     if(Files.exists(sidecar,java.nio.file.LinkOption.NOFOLLOW_LINKS))requireDiscoveryInventoryObject(sidecar,true);
                     var position=SimpleStateMachineStorage.getTermIndexFromSnapshotFile(file.toFile());
                     var qualified=validateDiscoveryImage(file,position);var manifest=qualified.manifest();
+                    if(qualified.kind()==NativeRangeImage.Kind.GROUP && inventoryConfiguration!=null && qualified.configuration()!=null
+                            && sameConfiguration(inventoryConfiguration,qualified.configuration())
+                            && (predecessorReference==null || manifest.position().index()>predecessorReference.index()))predecessorReference=manifest.position();
                     var previous=unique.get(position.getIndex());boolean metadata=qualified.kind()==NativeRangeImage.Kind.METADATA;
                     byte[] sameKind=previous==null?null:metadata?previous.metadataHash():previous.groupHash();
                     boolean preferMetadata=metadata && previous!=null && previous.metadataHash()==null;
@@ -2769,6 +2871,18 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         var a=store.applied();var cfg=store.configuration();boolean installing=store.pendingInstallation();var pending=installing?store.pendingInstallationCut():null;
         if(installing && pending==null)throw new IOException("Pending native inventory lacks its genuine installation cut");
         var reference=installing?pending:a;
+        if(reference==null) {
+            var registration=store.metadataRecoveryRegistration();
+            if(registration!=null && registration.currentPredecessor()!=null && store.metadataRecoveryPending()
+                    && store.metadataRecoveryRegistrationForced(registration) && !store.metadataRecoveryImageInstalled()) {
+                // The successful META force retired 7f and its old recipe. Its forced predecessor
+                // anchor still bounds partially imported CFG; it is not a completed native A/image.
+                reference=registration.currentPredecessor().imageCut();
+                if(predecessorReference!=null && predecessorReference.index()>reference.index())reference=predecessorReference;
+                if(!RatisRelocationOwnerRpc.covers(registration.imageCut(),reference))throw new IOException("Forced META registration regresses CURRENT inventory reference");
+                if(cfg!=null)requireSchemaMembership(registration.range(),cfg.data());
+            }
+        }
         if(a!=null && cfg==null || cfg!=null && (reference==null?cfg.term()!=0 || cfg.index()!=-1:cfg.index()>reference.index() || cfg.term()>reference.term() || cfg.index()==reference.index() && cfg.term()!=reference.term()))throw new IOException("Native inventory configuration exceeds actual applied/pending image cut");
         if(cfg!=null)validateConfiguration(cfg.data());
         if(latest!=null && a!=null && a.index()==latest.getIndex() && a.term()!=latest.getTerm())throw new IOException("Native marker conflicts with inventory floor");
@@ -2778,7 +2892,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private DiscoveryImage validateDiscoveryImage(Path image,TermIndex position)throws IOException {
         var kind=NativeRangeImage.kind(image,snapshotMetadataAdmission);
-        if(kind==NativeRangeImage.Kind.GROUP && !metadataSnapshotOwner())return new DiscoveryImage(validateImage(image,position,null,SnapshotImageUse.DISCOVERY_INVENTORY),kind,null);
+        if(kind==NativeRangeImage.Kind.GROUP && !metadataSnapshotOwner())return new DiscoveryImage(validateImage(image,position,null,SnapshotImageUse.DISCOVERY_INVENTORY),kind,null,null);
         try {
             var registration=store.metadataRecoveryRegistration();var freeze=registration==null?store.topologyFreeze():registration.freeze();
             if(freeze==null || role!=RatisNodePlan.Role.DATA || !recoveryEligibility.discoveryPending())throw new IOException("META inventory lacks original sealed source authority");
@@ -2820,7 +2934,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(cfg[0]==null || cfg[0].index()>manifest.position().index() || cfg[0].term()>manifest.position().term() || cfg[0].index()==manifest.position().index() && cfg[0].term()!=manifest.position().term())throw new IOException("META inventory lacks bounded configuration at floor");
             validateConfiguration(cfg[0].data());if(kind==NativeRangeImage.Kind.METADATA)requireSchemaMembership(range,cfg[0].data());
             var saved=MD5FileUtil.readStoredMd5ForFile(image.toFile());if(saved!=null && !saved.equals(org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(image,snapshotMetadataAdmission))))throw new IOException("META inventory MD5 mismatch");
-            return new DiscoveryImage(manifest,kind,projection.digest());
+            return new DiscoveryImage(manifest,kind,projection.digest(),cfg[0]);
         }catch(org.rocksdb.RocksDBException|IllegalArgumentException invalid){throw new IOException("META inventory qualification failed",invalid);}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
     }
 
@@ -2979,7 +3093,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             try{synchronized(gate){
                 requireRecoveryRegistrationDrained();
                 if(getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Recovery registration source is not running");
-                var actual=store.applied();if(store.pendingInstallation() || store.activeSnapshotPins()!=0 || actual!=null && !RatisRelocationOwnerRpc.covers(imageCut,actual))throw new IOException("Recovery registration image does not cover the drained native prefix");
+                var actual=store.applied();
+                if(store.pendingInstallation()) {
+                    if(metadataFloorPreparation==null || !metadataFloorPreparation.imageCut().equals(imageCut))throw new IOException("Pending CURRENT installation lacks qualified META recipe");
+                    requireMetadataRecoveryCoverage(metadataFloorPreparation);
+                }
+                if(store.activeSnapshotPins()!=0 || actual!=null && !RatisRelocationOwnerRpc.covers(imageCut,actual))throw new IOException("Recovery registration image does not cover the drained native prefix");
                 getLifeCycle().transition(LifeCycle.State.PAUSING);store.fence();getLifeCycle().transition(LifeCycle.State.PAUSED);
             }}catch(IOException refused){
                 // No pause or native registration happened. Restore ordinary eligibility outside
@@ -3056,6 +3175,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private Image retainedImage(Path file)throws IOException {
         var position=SimpleStateMachineStorage.getTermIndexFromSnapshotFile(file.toFile());
+        if(recoveryEligibility.discoveryPending()) {
+            requireDiscoveryInventoryObject(file,false);
+            var inventory=validateDiscoveryImage(file,position);
+            return new Image(file,position,inventory.manifest(),inventory.kind());
+        }
         return new Image(file,position,validateImage(file,position,null,SnapshotImageUse.RETAINED_INVENTORY),NativeRangeImage.kind(file,snapshotMetadataAdmission));
     }
 

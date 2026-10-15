@@ -126,7 +126,7 @@ public final class ReplicatedRangeStore {
             var lineage=new it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage(rangeId,groupId,rangeEpoch);
             if(cdc!=null) { if(!cdc.lineage().equals(lineage)) throw new IllegalStateException("CDC lineage changed"); return; }
             var candidate=new NativeRangeCdc(databaseOwner,state,lineage);
-            if(pendingInstallation==null) candidate.recover(applied,cdcAuthorityTime());
+            if(pendingInstallation==null && (metadataRecoveryRegistration==null || metadataImageInstalledUnderLane()))candidate.recover(applied,cdcAuthorityTime());
             cdc=candidate;
         } finally { applyLane.unlock(); leaveNative(); }
     }
@@ -4183,6 +4183,20 @@ public final class ReplicatedRangeStore {
             finally{applyLane.unlock();}
         } finally{leaveNative();}
     }
+    /** Reference CFG of the exact durable interrupted CURRENT image, without completing or installing it. */
+    public Configuration validatePendingCurrentRangeRecoveryConfiguration(Path image,NativeRangeImage.Limits limits)throws IOException,RocksDBException {
+        enterNative();
+        try(var scope=NativeRangeImage.openMetadataAdmission(NativeRangeImage.IoAdmission.UNLIMITED);var metadata=scope.pass()) {
+            applyLane.lock();
+            try {
+                byte[] pending=db.get(state,installingKey);
+                if(pending==null || !Arrays.equals(pending,pendingInstallation) || applied!=null)throw new IOException("No exact incomplete CURRENT installation");
+                metadata.reserve(imageMetadataBytes(null,limits,true));var qualified=qualifyCurrentRangeRecoveryImage(image,limits,null,false);var actual=qualified.manifest();
+                if(!Arrays.equals(pending,ByteBuffer.allocate(48).putLong(actual.position().term()).putLong(actual.position().index()).put(actual.sha256()).array()))throw new IOException("CURRENT reference differs from persisted installation intent");
+                return qualified.configuration();
+            }finally{applyLane.unlock();}
+        }finally{leaveNative();}
+    }
     /** Read-only inventory of a CURRENT predecessor, including a file ahead of native A. Never install authority. */
     public NativeRangeImage.Manifest validateMetadataGroupFloorInventory(Path image,NativeRangeImage.Limits limits)throws IOException,RocksDBException {
         enterNative();
@@ -4205,7 +4219,7 @@ public final class ReplicatedRangeStore {
         }finally{leaveNative();}
     }
     private record CurrentImageQualification(NativeRangeImage.Manifest manifest,NativeTopologyActivation activation,
-                                             Map<String,byte[]> schemaRows,byte[] completion) {}
+                                             Map<String,byte[]> schemaRows,byte[] completion,Configuration configuration) {}
     private CurrentImageQualification qualifyCurrentRangeRecoveryImage(Path image,NativeRangeImage.Limits limits,
             NativeRangeImage.Manifest expected,boolean installing)throws IOException,RocksDBException {
         try {
@@ -4281,7 +4295,7 @@ public final class ReplicatedRangeStore {
             if(pendingInstallation!=null && !Arrays.equals(pendingInstallation,ByteBuffer.allocate(48).putLong(actual.position().term()).putLong(actual.position().index()).put(actual.sha256()).array()))throw new IOException("CURRENT pending installation requires exact original image retry");
             if(retainedConfiguration!=null && (cfg.index()<retainedConfiguration.index() || cfg.term()<retainedConfiguration.term()))throw new IOException("CURRENT snapshot regresses actual configuration");
         }
-        return new CurrentImageQualification(actual,activation,localRows,trustedCompletion);
+        return new CurrentImageQualification(actual,activation,localRows,trustedCompletion,cfg);
         } catch(IllegalArgumentException invalid){throw new IOException("Invalid CURRENT recovery image authority",invalid);}
     }
     private static boolean sameSchemaRows(Map<String,byte[]> first,Map<String,byte[]> second) {

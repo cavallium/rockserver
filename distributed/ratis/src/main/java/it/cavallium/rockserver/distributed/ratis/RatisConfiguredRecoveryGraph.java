@@ -53,6 +53,16 @@ final class RatisConfiguredRecoveryGraph implements AutoCloseable {
         var tables=new Tables(candidate);int size=tables.size();heap.beforeBytes(retainedEncodedBytes(),Math.toIntExact(tables.retainedSize()+size+32));validate(candidate);byte[] body=tables.encode();
         dirty=candidate;dirtyBody=body;dirtyBytes=new Tables(candidate).retainedSize();settle();
     }
+    /** Caller verified the owner-directed source acknowledgement; select its exact successor before receiver registration. */
+    synchronized void observeSourceAbandonment(Abandoned receipt)throws IOException {
+        requireOpen();Objects.requireNonNull(receipt);if(current==null)throw new IOException("Source successor lacks a forced graph selection");
+        var original=receipt.original();var successor=receipt.successorRequest();var active=current.activeRequests().get(original.sourceGroup());
+        if(active==null || !sameRequest(active,original) && !sameRequest(active,successor))throw new IOException("Source abandonment does not follow the active recovery request");
+        if(sameRequest(active,successor) && dirty==null)return;
+        heap.beforeBytes(retainedEncodedBytes(),Math.toIntExact(4096L+64L*current.activeRequests().size()));
+        var selected=new ArrayList<Request>(current.activeRequests().size());for(var request:current.activeRequests().values())selected.add(request.sourceGroup().equals(original.sourceGroup())?successor:request);
+        force(current.plan(),selected);
+    }
     synchronized boolean retryPending()throws IOException {requireOpen();if(dirty==null)return false;settle();return true;}
     private void promotePending(Path pending)throws IOException {
         long peak=(Files.exists(file,LinkOption.NOFOLLOW_LINKS)?Files.size(file):0)+Files.size(pending);

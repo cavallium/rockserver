@@ -23,6 +23,41 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySeedRuntime
 /** Actual source/receiver Runtime ports and native image chunks; only Raft wire delivery/log floor are controlled. */
 class RatisConfiguredRecoveryRuntimeTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
+    @Test void sourceAbandonmentPortForcesExactGraphSuccessorBeforeReturningReceipt()throws Exception {
+        try(var env=new RatisNodeRuntimeTest.Env(root.resolve("source-successor"),false)) {
+            var receiver=new RatisNodeRuntimeTest.FakeServer();
+            try(var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,Map.of(env.routed.directory().domainId(),env.routed),env.scheduler,env.timer,()->20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,receiver::create,List.of())) {
+                var directory=env.routed.directory();var range=directory.ranges().getFirst();
+                var replica=range.replicas().stream().filter(r->r.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow();
+                var request=new RatisTopologySourceSnapshotRpc.Request(new UUID(994,80),null,env.plan.catalogue().groupId(),replica,RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF,range.groupId(),directory);
+                var cut=new ApplyPosition(1,10);var roots=new ArrayList<RatisConfiguredRecoveryDiscovery.Root>();var obligations=new ArrayList<RatisConfiguredRecoveryDiscovery.Obligation>();var requests=new ArrayList<RatisTopologySourceSnapshotRpc.Request>();
+                for(var configured:directory.ranges()) {
+                    roots.add(new RatisConfiguredRecoveryDiscovery.Root(directory,configured));var local=configured.replicas().stream().filter(r->r.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow();
+                    obligations.add(new RatisConfiguredRecoveryDiscovery.Obligation(request.purpose(),directory,configured,local,null));
+                    requests.add(configured.groupId().equals(range.groupId())?request:new RatisTopologySourceSnapshotRpc.Request(new UUID(994,82),null,env.plan.catalogue().groupId(),local,request.purpose(),configured.groupId(),directory));
+                }
+                var plan=new RatisConfiguredRecoveryDiscovery.Plan(cut,roots,List.of(),List.of(),obligations);
+                var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class);
+                var source=range.replicas().stream().filter(r->r.role()==ReplicaDescriptor.Role.VOTER).findFirst().orElseThrow();
+                var receipt=new RatisTopologySourceSnapshotRpc.Abandoned(request,new UUID(994,81),new ApplyPosition(1,2),source,new byte[32]);
+                var client=mock(RaftClient.class);var io=mock(BlockingApi.class);when(client.getGroupId()).thenReturn(RaftGroupId.valueOf(range.groupId()));when(client.io()).thenReturn(io);
+                when(io.sendReadOnly(any(Message.class))).thenAnswer(call->{
+                    var actual=RatisTopologySourceSnapshotRpc.request(((Message)call.getArgument(0)).getContent().toByteArray());RatisTopologySourceSnapshotRpc.requireRequest(request,actual);
+                    return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(source.peerId())).setGroupId(RaftGroupId.valueOf(range.groupId())).setCallId(1).setSuccess(true).setMessage(Message.valueOf(ByteString.copyFrom(RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,receipt)))).build();
+                });
+                node.relocationTransport(ignored->client,(ignored,owner)->client);
+                node.start();graph.force(plan,requests);
+                var host=node.configuredRecoveryHost(bytes->{});
+                for(int retry=0;retry<2;retry++) {
+                    var failed=assertThrows(ExecutionException.class,()->host.prepare(request).get(10,TimeUnit.SECONDS));
+                    var observed=assertInstanceOf(RatisTopologySourceSnapshotRpc.AbandonedException.class,failed.getCause()).receipt();
+                    assertArrayEquals(RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,receipt),RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,observed));
+                    RatisTopologySourceSnapshotRpc.requireRequest(receipt.successorRequest(),graph.snapshot().activeRequests().get(range.groupId()));
+                    assertEquals(requests.size()+1,graph.snapshot().frozenRequests().size());assertEquals(cut,graph.snapshot().plan().catalogueCut());
+                }
+            }
+        }
+    }
     @Test void nodeOwnedRecoveryRecoversMetadataAndCurrentChildrenAndColdJournals()throws Exception {
         try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("source"),false);var env=new RatisNodeRuntimeTest.Env(root.resolve("receiver"),false,source.first.digest())) {
             var split=source.split();var catalogue=source.plan.catalogue();var pool=RatisPoolFixtures.ID;
