@@ -43,13 +43,29 @@ final class RatisConfiguredRecoveryGraph implements AutoCloseable {
     /** Raw retained graph and uncertain encoded candidate; caller keeps its admission until close. */
     synchronized long retainedEncodedBytes(){return currentBytes+(dirtyBody==null?0:dirtyBytes+dirtyBody.length+32);}
     synchronized void force(RatisConfiguredRecoveryDiscovery.Plan plan,List<Request> selected)throws IOException {
-        requireOpen();Objects.requireNonNull(plan);Objects.requireNonNull(selected);
+        forceSelection(plan,selected,List.of(),null);
+    }
+    /** Already forced driver identities precede fresh graph selection, including admitted META renewal. */
+    synchronized void forceDiscovered(RatisConfiguredRecoveryDiscovery.Plan plan,List<Request> selected,List<Request> journaled)throws IOException {
+        forceSelection(plan,selected,List.copyOf(journaled),null);
+    }
+    private void forceSelection(RatisConfiguredRecoveryDiscovery.Plan plan,List<Request> selected,List<Request> journaled,Request acknowledgedSuccessor)throws IOException {
+        requireOpen();Objects.requireNonNull(plan);Objects.requireNonNull(selected);Objects.requireNonNull(journaled);
         if(selected.size()>RatisNodePlan.MAX_LOCAL_GROUPS)throw new IOException("Active recovery requests exceed node bound");
-        long entries=selected.size()+plan.roots().size()+3L*plan.definitions().size();if(current!=null)entries=Math.addExact(entries,current.frozenRequests().size()+3L*current.retainedDefinitions().size());
+        for(var request:selected)if(request.purpose()==Purpose.CURRENT_LEAF){
+            var obligation=plan.localObligations().stream().filter(value->value.range().groupId().equals(request.sourceGroup())).findFirst().orElseThrow(()->new IOException("CURRENT request has no fresh obligation"));
+            if(!Arrays.equals(request.sourceDirectory().payloadDigest(),obligation.sourceDirectory().payloadDigest())){
+                var previous=current==null?null:current.activeRequests().get(request.sourceGroup());
+                if((previous==null || !sameRequest(previous,request)) && (acknowledgedSuccessor==null || !sameRequest(acknowledgedSuccessor,request)) && journaled.stream().noneMatch(value->sameRequest(value,request)))throw new IOException("New CURRENT identity cannot invent a historical source scope");
+            }
+        }
+        if(journaled.size()>RatisNodePlan.MAX_LOCAL_GROUPS)throw new IOException("Journaled recovery identities exceed graph bound");
+        var incoming=new ArrayList<Request>(selected.size()+journaled.size());incoming.addAll(selected);incoming.addAll(journaled);
+        long entries=incoming.size()+plan.roots().size()+3L*plan.definitions().size();if(current!=null)entries=Math.addExact(entries,current.frozenRequests().size()+3L*current.retainedDefinitions().size());
         heap.beforeBytes(retainedEncodedBytes(),Math.toIntExact(Math.addExact(4096L,Math.multiplyExact(64L,entries))));
         var active=selection(plan,selected);
-        if(dirty!=null){if(!samePlan(plan,dirty.plan()) || !sameRequests(mergeRequests(current,selected),dirty.frozenRequests()) || !sameSelection(active,dirty.activeRequests()))throw new IOException("Unknown graph force requires exact original candidate retry");settle();return;}
-        var retained=mergeDefinitions(current,plan.definitions());var requests=mergeRequests(current,selected);var candidate=new Snapshot(plan,retained,requests,active);requireProgress(current,candidate);
+        if(dirty!=null){if(!samePlan(plan,dirty.plan()) || !sameRequests(mergeRequests(current,incoming),dirty.frozenRequests()) || !sameSelection(active,dirty.activeRequests()))throw new IOException("Unknown graph force requires exact original candidate retry");settle();return;}
+        var retained=mergeDefinitions(current,plan.definitions());var requests=mergeRequests(current,incoming);var candidate=new Snapshot(plan,retained,requests,active);requireProgress(current,candidate);
         var tables=new Tables(candidate);int size=tables.size();heap.beforeBytes(retainedEncodedBytes(),Math.toIntExact(tables.retainedSize()+size+32));validate(candidate);byte[] body=tables.encode();
         dirty=candidate;dirtyBody=body;dirtyBytes=new Tables(candidate).retainedSize();settle();
     }
@@ -61,7 +77,7 @@ final class RatisConfiguredRecoveryGraph implements AutoCloseable {
         if(sameRequest(active,successor) && dirty==null)return;
         heap.beforeBytes(retainedEncodedBytes(),Math.toIntExact(4096L+64L*current.activeRequests().size()));
         var selected=new ArrayList<Request>(current.activeRequests().size());for(var request:current.activeRequests().values())selected.add(request.sourceGroup().equals(original.sourceGroup())?successor:request);
-        force(current.plan(),selected);
+        forceSelection(current.plan(),selected,List.of(),successor);
     }
     synchronized boolean retryPending()throws IOException {requireOpen();if(dirty==null)return false;settle();return true;}
     private void promotePending(Path pending)throws IOException {
@@ -146,9 +162,18 @@ final class RatisConfiguredRecoveryGraph implements AutoCloseable {
         var result=new HashMap<UUID,Request>();for(var request:selected)if(result.putIfAbsent(request.sourceGroup(),request)!=null)throw new IOException("Duplicate active recovery group");
         var seen=new HashSet<UUID>();for(var obligation:plan.localObligations()) {
             var request=result.get(obligation.range().groupId());
-            if(!seen.add(obligation.range().groupId()) || request==null || request.purpose()!=obligation.purpose() || !request.receiver().equals(obligation.localReplica()) || request.sourceDirectory()==null || !Arrays.equals(request.sourceDirectory().payloadDigest(),obligation.sourceDirectory().payloadDigest()) || (request.header()==null?obligation.header()!=null:obligation.header()==null || !Arrays.equals(request.header().definitionDigest(),obligation.header().definitionDigest())))throw new IOException("Active recovery request differs from current discovered obligation");
+            if(!seen.add(obligation.range().groupId()) || request==null || !matchesObligation(request,obligation))throw new IOException("Active recovery request differs from current discovered obligation");
         }
         return Map.copyOf(result);
+    }
+    static boolean matchesObligation(Request request,RatisConfiguredRecoveryDiscovery.Obligation obligation){
+        if(request.purpose()!=obligation.purpose() || !request.sourceGroup().equals(obligation.range().groupId()) || !request.receiver().equals(obligation.localReplica()) || request.sourceDirectory()==null)return false;
+        if(request.purpose()==Purpose.CURRENT_LEAF){
+            if(request.header()!=null || obligation.header()!=null)return false;
+            try{RatisSourceHeadRpc.requireContinuity(request,obligation.sourceDirectory());return request.sourceDirectory().generation()!=obligation.sourceDirectory().generation() || Arrays.equals(request.sourceDirectory().payloadDigest(),obligation.sourceDirectory().payloadDigest());}
+            catch(IllegalArgumentException changed){return false;}
+        }
+        return Arrays.equals(request.sourceDirectory().payloadDigest(),obligation.sourceDirectory().payloadDigest()) && (request.header()==null?obligation.header()==null:obligation.header()!=null && Arrays.equals(request.header().definitionDigest(),obligation.header().definitionDigest()));
     }
     private static boolean sameSelection(Map<UUID,Request> a,Map<UUID,Request> b){if(!a.keySet().equals(b.keySet()))return false;for(var entry:a.entrySet())if(!sameRequest(entry.getValue(),b.get(entry.getKey())))return false;return true;}
     /** An incomplete unpublished sidecar cannot have authorized host work. Valid but foreign data is never discarded. */

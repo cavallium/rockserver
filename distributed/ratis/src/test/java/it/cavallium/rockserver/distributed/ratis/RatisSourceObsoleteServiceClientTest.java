@@ -33,12 +33,13 @@ class RatisSourceObsoleteServiceClientTest {
     }
     private static final class Host implements InvocationHandler {
         final RatisTopologySourceSnapshotFixture fixture;final AtomicInteger proofs=new AtomicInteger(),forces=new AtomicInteger(),cleanups=new AtomicInteger(),closesAtForce=new AtomicInteger();
-        volatile boolean failForce,failCleanup,forced,failProof,releasedConflict;volatile CountDownLatch entered,release,forceEntered,forceRelease,captureEntered,captureRelease,parked;volatile boolean failCapture,unknownCaptureFailure,parkTransfer;final Map<UUID,byte[]> durable=new ConcurrentHashMap<>();final Set<UUID> parkedIds=ConcurrentHashMap.newKeySet();
+        volatile boolean failForce,failCleanup,forced,failProof,releasedConflict,acknowledgeAbsent,failAbsence;volatile CountDownLatch absenceEntered,absenceRelease;volatile CountDownLatch entered,release,forceEntered,forceRelease,captureEntered,captureRelease,parked;volatile boolean failCapture,unknownCaptureFailure,parkTransfer;final Map<UUID,byte[]> durable=new ConcurrentHashMap<>();final Set<UUID> parkedIds=ConcurrentHashMap.newKeySet();
         Host(RatisTopologySourceSnapshotFixture fixture){this.fixture=fixture;}
         RatisTopologySourceSnapshotService.Host proxy(){return (RatisTopologySourceSnapshotService.Host)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{RatisTopologySourceSnapshotService.Host.class},this);}
         public Object invoke(Object proxy,Method method,Object[] args)throws Throwable {
             switch(method.getName()) {
                 case "retryObsolete"->{var request=(RatisRecoveryObsoleteRpc.Request)args[0];var saved=durable.get(request.original().transferId());if(saved!=null && !Arrays.equals(saved,request.digest()))throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Conflicting terminal");return saved!=null;}
+                case "acknowledgeUnownedObsolete"->{if(absenceEntered!=null){absenceEntered.countDown();assertTrue(absenceRelease.await(5,TimeUnit.SECONDS));}if(failAbsence)throw new IOException("Unknown source absence directory force");return acknowledgeAbsent;}
                 case "requireObsolete"->{proofs.incrementAndGet();if(failProof)throw new IOException("Wrong receiver fence proof");if(entered!=null){entered.countDown();assertTrue(release.await(5,TimeUnit.SECONDS));}if(failProof)throw new IOException("Wrong receiver fence proof");return null;}
                 case "forceObsolete"->{forces.incrementAndGet();if(releasedConflict)throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Canonical installed RELEASE already forced");var request=(RatisRecoveryObsoleteRpc.Request)args[0];if(forceEntered!=null){forceEntered.countDown();assertTrue(forceRelease.await(5,TimeUnit.SECONDS));}closesAtForce.set(fixture.pinCloses.get());if(failForce)throw new IOException("Unknown obsolete force");forced=true;durable.put(request.original().transferId(),request.digest());return null;}
                 case "obsolete"->{assertTrue(forced);cleanups.incrementAndGet();if(failCleanup)throw new IOException("Unknown obsolete cleanup");return null;}
@@ -147,8 +148,35 @@ class RatisSourceObsoleteServiceClientTest {
             var host=new Host(f);try(var service=new RatisTopologySourceSnapshotService(host.proxy(),limits(),f.scheduler,f.transferAdmission())) {
                 var accepted=obsolete(f,11);service.prepare(accepted.original());
                 for(int i=0;i<RatisTopologySourceSnapshotService.MAX_RELEASED-1;i++)service.obsolete(obsolete(f,2000+i)).get(5,TimeUnit.SECONDS);
-                int proofs=host.proofs.get();assertThrows(ExecutionException.class,()->service.obsolete(obsolete(f,5000)).get(5,TimeUnit.SECONDS));assertEquals(proofs,host.proofs.get());assertEquals(0,f.pinCloses.get());
+                int proofs=host.proofs.get();assertThrows(ExecutionException.class,()->service.obsolete(obsolete(f,5000)).get(5,TimeUnit.SECONDS));assertEquals(proofs+1,host.proofs.get(),"Permanent slot admission follows fresh proof and absence classification");assertEquals(0,f.pinCloses.get());
                 service.obsolete(accepted).get(5,TimeUnit.SECONDS);assertEquals(1,f.pinCloses.get());assertEquals(0,service.stats().leases());assertEquals(0,f.graph.stats().ordinary().owners());assertEquals(0,f.graph.stats().protectedLane().owners());
+                host.acknowledgeAbsent=true;var full=service.stats();int forces=host.forces.get();
+                for(int n=0;n<65;n++){var absent=obsolete(f,6000+n);RatisRecoveryObsoleteRpc.reply(service.obsolete(absent).get(5,TimeUnit.SECONDS),absent);}
+                assertEquals(forces,host.forces.get());assertEquals(full,service.stats());assertEquals(0,f.graph.stats().protectedLane().owners());
+            }
+        }
+    }
+    @Test void unknownAbsenceForceKeepsQualifiedControlUntilExactLocalRetryWithoutTerminalFloor()throws Exception {
+        try(var f=new RatisTopologySourceSnapshotFixture(root)){
+            var host=new Host(f);host.acknowledgeAbsent=true;host.failAbsence=true;
+            try(var service=new RatisTopologySourceSnapshotService(host.proxy(),limits(),f.scheduler,f.transferAdmission())){
+                var request=obsolete(f,7000);assertThrows(ExecutionException.class,()->service.obsolete(request).get(5,TimeUnit.SECONDS));
+                assertEquals(1,host.proofs.get());assertEquals(1,f.graph.stats().protectedLane().owners());assertTrue(service.stats().metadataBytes()>0);assertEquals(0,host.forces.get());assertEquals(0,host.cleanups.get());
+                host.failAbsence=false;host.failProof=true;RatisRecoveryObsoleteRpc.reply(service.obsolete(request).get(5,TimeUnit.SECONDS),request);
+                assertEquals(1,host.proofs.get());assertEquals(0,service.stats().metadataBytes());assertEquals(0,f.graph.stats().protectedLane().owners());
+                // Absence ACK leaves no permanent in-memory shortcut: another request needs fresh proof.
+                assertThrows(ExecutionException.class,()->service.obsolete(request).get(5,TimeUnit.SECONDS));assertEquals(2,host.proofs.get());assertEquals(0,service.stats().metadataBytes());
+            }
+        }
+    }
+    @Test void canceledAbsenceObserverAndStopRetainActualControlAndRejectLatePrepareUntilDrain()throws Exception {
+        try(var f=new RatisTopologySourceSnapshotFixture(root)){
+            var host=new Host(f);host.acknowledgeAbsent=true;host.absenceEntered=new CountDownLatch(1);host.absenceRelease=new CountDownLatch(1);
+            try(var service=new RatisTopologySourceSnapshotService(host.proxy(),limits(),f.scheduler,f.transferAdmission())){
+                var request=obsolete(f,7001);var observer=service.obsolete(request);assertTrue(host.absenceEntered.await(5,TimeUnit.SECONDS));
+                try{assertTrue(observer.cancel(true));assertEquals(1,f.graph.stats().protectedLane().owners());assertThrows(ExecutionException.class,()->service.prepareAsync(request.original()).get(5,TimeUnit.SECONDS));assertEquals(0,f.captures.get());var stopped=service.stop();assertFalse(stopped.isDone());host.absenceRelease.countDown();stopped.get(5,TimeUnit.SECONDS);}
+                finally{host.absenceRelease.countDown();}
+                assertEquals(0,host.forces.get());assertEquals(0,host.cleanups.get());assertEquals(0,service.stats().metadataBytes());assertEquals(0,f.graph.stats().protectedLane().owners());
             }
         }
     }

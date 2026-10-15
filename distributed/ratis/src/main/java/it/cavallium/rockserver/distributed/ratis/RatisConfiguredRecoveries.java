@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
 import java.io.IOException;
+import it.cavallium.rockserver.core.common.distributed.NativeRecoverySupersession;
 import java.nio.file.*;
 import java.time.Duration;
 import java.util.*;
@@ -14,6 +15,9 @@ final class RatisConfiguredRecoveries {
         UUID pool(Request request)throws IOException;
         /** Force the DATA group's durable slot promise before creating or opening its journal. */
         RatisJournalAccess journal(UUID pool,UUID group,Path directory)throws IOException;
+    }
+    record RetainedRequests(Request selected,List<Request> requests) {
+        RetainedRequests {Objects.requireNonNull(selected);requests=List.copyOf(requests);}
     }
     @FunctionalInterface interface HostFactory {RatisConfiguredRecovery.Host create(RatisTopologySourceSnapshotClient.ReplyAdmission admission);}
     private static final int MAX_WAITERS=16,STEPS_PER_VISIT=8;
@@ -41,7 +45,7 @@ final class RatisConfiguredRecoveries {
     private final RatisNodeResourceBudget resources;private final Owner owner;private final HostFactory hosts;
     private final Map<UUID,PoolIndex> pools=new LinkedHashMap<>();
     private final Map<UUID,Slot> groups=new HashMap<>();private final ArrayList<Slot> slots=new ArrayList<>();
-    private final ThreadPoolExecutor io;
+    private final ThreadPoolExecutor io;private volatile Thread ioThread;
     private final CompletableFuture<Void> stopped=new CompletableFuture<>();
     private CompletableFuture<Void> actual;private Request enqueued;private int waiters,stopWaiters;
     private RatisConfiguredRecovery active;private Slot activeSlot;private int cursor,visits;
@@ -64,7 +68,7 @@ final class RatisConfiguredRecoveries {
                 inventory();
                 for(var pool:pools.keySet()){Path directory=root.resolve(pool.toString());if(!Files.exists(directory,LinkOption.NOFOLLOW_LINKS)){Files.createDirectory(directory);SessionJournalFiles.force(root);}}
             }
-            io=new ThreadPoolExecutor(1,1,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(8),Thread.ofPlatform().daemon(true).name("ratis-configured-recovery-",0).factory(),new ThreadPoolExecutor.AbortPolicy());
+            io=new ThreadPoolExecutor(1,1,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(8),task->Thread.ofPlatform().daemon(true).name("ratis-configured-recovery-io").unstarted(()->{ioThread=Thread.currentThread();task.run();}),new ThreadPoolExecutor.AbortPolicy());
         }catch(IOException|RuntimeException|Error failure){groups.clear();slots.clear();for(var index:pools.values())index.close();pools.clear();throw failure;}
     }
     private void inventory()throws IOException {
@@ -97,6 +101,47 @@ final class RatisConfiguredRecoveries {
         return pending.copy();
     }
 
+    synchronized boolean ownsDiscoveryIo(){return Thread.currentThread()==ioThread && actual!=null && enqueued==null && active==null && !stopping;}
+    /** Borrow exact validated bodies on admitted IO, including the positive host's current actor. */
+    RetainedRequests retainedOnIo(UUID group,RatisTopologySourceSnapshotClient.ReplyAdmission admission)throws IOException {
+        Objects.requireNonNull(group);Objects.requireNonNull(admission);
+        // An admitted graph read may finish while stop waits for its actual owner; it dispatches no host work.
+        synchronized(this){if(Thread.currentThread()!=ioThread || actual==null || enqueued!=null)throw new IOException("Retained recovery lookup requires owned recovery IO");}
+        Slot slot;synchronized(this){slot=groups.get(group);}if(slot==null)return null;
+        if(activeSlot==slot)return active.retainedRequests(admission);
+        var metadata=new Metadata(slot.pool);
+        try {
+            validateFiles(slot.directory);
+            try(var driver=new RatisConfiguredRecovery(slot.directory,binding,null,hosts.create(metadata),io,slot.files,metadata,initial->{if(!initial.sourceGroup().equals(slot.group) || !owner.pool(initial).equals(slot.pool))throw new IOException("Retained recovery escaped its pool/group");})) {
+                synchronized(this){slot.phase=driver.phase();}
+                return driver.retainedRequests(admission);
+            }
+        }finally{metadata.close();}
+    }
+    void ensureOnIo(Request selected)throws IOException {
+        Objects.requireNonNull(selected);if(!ownsDiscoveryIo())throw new IOException("Recovery journal reconciliation requires discovery IO ownership");
+        UUID pool=owner.pool(selected);if(!pools.containsKey(pool) || selected.relocation())throw new IOException("Invalid selected configured recovery scope");
+        Slot slot;synchronized(this){slot=groups.get(selected.sourceGroup());}if(slot!=null && !slot.pool.equals(pool))throw new IOException("Selected recovery changed retained pool");
+        if(slot==null)slot=addSlot(pool,selected.sourceGroup(),root.resolve(pool.toString()).resolve(selected.sourceGroup().toString()));
+        if(!Files.exists(slot.directory,LinkOption.NOFOLLOW_LINKS)){Files.createDirectory(slot.directory);SessionJournalFiles.force(slot.directory.getParent());}
+        var metadata=new Metadata(pool);boolean opened=false;try{open(slot,Files.exists(slot.directory.resolve("recovery"),LinkOption.NOFOLLOW_LINKS)?null:selected,metadata);opened=true;synchronized(this){slot.phase=null;}active.ensureSelected(selected);synchronized(this){slot.phase=active.phase();}}finally{if(opened)closeActive();else metadata.close();}
+    }
+    /** Borrow the already-serialized discovery IO owner; never enqueue or wait on this same executor. */
+    void reconcileOnIo(Request selected,NativeRecoverySupersession.Scope scope,List<Request> aliases)throws IOException {
+        Objects.requireNonNull(selected);Objects.requireNonNull(scope);Objects.requireNonNull(aliases);
+        if(Thread.currentThread()!=ioThread)throw new IOException("Supersession reconciliation requires configured recovery IO owner");
+        synchronized(this){if(stopping || actual==null || enqueued!=null || active!=null)throw new IOException("Supersession reconciliation requires idle discovery ownership");}
+        if(!selected.metadataOnly() || aliases.isEmpty())throw new IOException("Supersession requires selected META and original CURRENT aliases");
+        UUID pool=owner.pool(selected);if(!pools.containsKey(pool))throw new IOException("Undeclared supersession pool");for(var alias:aliases)if(!owner.pool(alias).equals(pool) || !alias.sourceGroup().equals(selected.sourceGroup()))throw new IOException("Supersession alias changed pool/group");
+        Slot slot;synchronized(this){slot=groups.get(selected.sourceGroup());}if(slot!=null && !slot.pool.equals(pool))throw new IOException("Supersession changed retained group pool");
+        if(slot==null){var directory=root.resolve(pool.toString()).resolve(selected.sourceGroup().toString());slot=addSlot(pool,selected.sourceGroup(),directory);}
+        if(!Files.exists(slot.directory,LinkOption.NOFOLLOW_LINKS)){Files.createDirectory(slot.directory);SessionJournalFiles.force(slot.directory.getParent());}
+        var metadata=new Metadata(pool);boolean opened=false;
+        try {
+            var original=Files.exists(slot.directory.resolve("recovery"),LinkOption.NOFOLLOW_LINKS)?null:aliases.getFirst();open(slot,original,metadata);opened=true;
+            synchronized(this){slot.phase=null;}active.reconcile(selected,scope,aliases);synchronized(this){slot.phase=active.phase();}
+        }finally{if(opened)closeActive();else metadata.close();}
+    }
     /** The returned observation acknowledges the forced initial journal, independently of host work. */
     CompletableFuture<Void> enqueue(Request request) {
         Objects.requireNonNull(request);final CompletableFuture<Void> pending;final Metadata metadata;final UUID pool;
@@ -164,6 +209,7 @@ final class RatisConfiguredRecoveries {
     }
     synchronized RatisConfiguredRecovery.Phase phase(UUID group){var slot=groups.get(group);return slot==null?null:slot.phase;}
     Throwable failure(){return lastFailure;}
+    synchronized boolean contains(UUID group){return groups.containsKey(Objects.requireNonNull(group));}
     synchronized int size(){return slots.size();}
     synchronized boolean running(){return actual!=null;}
     synchronized boolean idle(){return actual==null;}

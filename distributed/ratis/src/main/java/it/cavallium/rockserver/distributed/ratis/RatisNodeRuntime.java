@@ -128,6 +128,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private volatile Map<UUID,RatisLocalNoneDiscovery> localNoneDiscoveries=Map.of();
     private RatisNodeResourceBudget.Lease localNoneCredit;
     private RatisConfiguredRecoveries configuredRecoveries;private RatisConfiguredRecoveryGraph recoveryGraph;private RatisNodeResourceBudget.Lease recoveryGraphCredit;private RatisTransactionRecoveryService configuredRecoveryService;private boolean configuredRecoveryServiceStarted,configuredDiscoveryNext=true;private CompletableFuture<Void> configuredRecoveryServiceStart;
+    private long recoveryDiscoveryRequested,recoveryDiscoveryObserved;private int recoveryDiscoveryCycles;
     synchronized void relocationTransport(RatisClientPool.Factory leaders,RatisClientPool.OwnerFactory owners)throws IOException{
         if(started || starting || installing || closeRequested || closing || closed)throw new IllegalStateException("Relocation transport fixed before start");var replacement=new RatisRelocationDataClient(plan.clusterId(),plan.databaseId(),plan.catalogue().groupId(),leaders,owners);try{relocationClients.close();}catch(IOException|RuntimeException failed){try{replacement.close();}catch(IOException cleanup){failed.addSuppressed(cleanup);}throw failed;}relocationClients=replacement;
     }
@@ -827,11 +828,15 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if(!Arrays.equals(definition.sourceDirectory().payloadDigest(),scope.sourceDirectory().payloadDigest()))throw new IOException("Obsolete capture changed frozen source directory");
             var current=epochs.catalogue(plan.catalogue().directoryColumn()).readView(original.domainId());
             if(current.directory()==null || !RatisRelocationOwnerRpc.covers(current.cut(),scope.catalogueCut()) || current.directory().generation()<definition.targetDirectory().generation() || current.directory().ranges().stream().anyMatch(range->range.groupId().equals(group)))throw new IOException("Obsolete capture lacks fresh consumed CURRENT placement");
-            var freeze=store.topologyFreeze();if(freeze==null)throw new IOException("Obsolete capture source lacks actual native FREEZE");var range=scope.range();
-            freeze.requireRequest(scope.header(),new RatisTopologyAuthority.View(scope.catalogue(),current.cut(),definition,state).admissionDigest());freeze.requireParent(group,range.rangeEpoch(),scope.sourceDirectory().domainId(),scope.sourceDirectory().schemaDigest(),range.lowerInclusive(),range.upperExclusive());freeze.requireCut(store.applied());
-            if(!store.ownership().owner().equals(new RangeOwnership.Owner(group,range.rangeEpoch())))throw new IOException("Obsolete capture changed actual native source lineage");
-            relocationClients.superseded(request.evidence(),range,scope.receiver());
-            var after=server.getDivision(machine.getGroupId());if(!after.getMemberId().equals(division.getMemberId()) || after.getStateMachine()!=machine || !after.getInfo().isAlive() || after.getInfo().getLifeCycleState()!=org.apache.ratis.util.LifeCycle.State.RUNNING || !freeze.equals(store.topologyFreeze()))throw new IOException("Obsolete source owner changed during receiver proof");freeze.requireCut(store.applied());
+            var freeze=store.topologyFreeze();var range=scope.range();
+            if(freeze!=null){freeze.requireRequest(scope.header(),new RatisTopologyAuthority.View(scope.catalogue(),current.cut(),definition,state).admissionDigest());freeze.requireParent(group,range.rangeEpoch(),scope.sourceDirectory().domainId(),scope.sourceDirectory().schemaDigest(),range.lowerInclusive(),range.upperExclusive());}
+            var interval=store.ownership().interval();
+            if(!store.ownership().owner().equals(new RangeOwnership.Owner(group,range.rangeEpoch())) || !interval.domainId().equals(scope.sourceDirectory().domainId()) || !Arrays.equals(interval.lowerInclusive(),range.lowerInclusive()) || !Arrays.equals(interval.upperExclusive(),range.upperExclusive()))throw new IOException("Obsolete capture changed actual native source lineage");
+            var receiver=scope.receiver();
+            if(receiver.nodeId().equals(plan.nodeId()) && receiver.nodeIncarnation().equals(plan.nodeIncarnation()) && receiver.peerId().equals(plan.peerId()) && receiver.address().equals(plan.address())) {
+                var fence=store.acknowledgedRecoverySupersession();if(fence==null)throw new IOException("Local receiver supersession has not acknowledged");request.evidence().requireBinding(fence,receiver);
+            }else relocationClients.superseded(request.evidence(),range,receiver);
+            var after=server.getDivision(machine.getGroupId());if(!after.getMemberId().equals(division.getMemberId()) || after.getStateMachine()!=machine || !after.getInfo().isAlive() || after.getInfo().getLifeCycleState()!=org.apache.ratis.util.LifeCycle.State.RUNNING || !Objects.equals(freeze,store.topologyFreeze()))throw new IOException("Obsolete source owner changed during receiver proof");
         }
     }
     private RatisTopologySourceSnapshotService.Host sourceSnapshotHost(PoolOwner owner){var sourceArtifacts=owner.artifacts;return new RatisTopologySourceSnapshotService.Host(){
@@ -871,6 +876,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
         public boolean retryObsolete(RatisRecoveryObsoleteRpc.Request request)throws Exception{return sourceArtifacts.retryObsolete(request);}
         public void requireObsolete(RatisRecoveryObsoleteRpc.Request request)throws Exception{qualifySourceObsolete(owner,request);}
+        public boolean acknowledgeUnownedObsolete(RatisRecoveryObsoleteRpc.Request request)throws Exception{
+            var original=request.original();var cleanup=owner.sourceCleanup.get(original.transferId());if(cleanup!=null){cleanup.close();owner.sourceCleanup.remove(original.transferId(),cleanup);}
+            var machine=machines.get(RaftGroupId.valueOf(original.sourceGroup()));if(machine==null)throw new IOException("Unowned obsolete source disappeared");machine.drainSourceCapture(original.transferId());return sourceArtifacts.acknowledgeAbsentObsolete(request);
+        }
         public void forceObsolete(RatisRecoveryObsoleteRpc.Request request)throws Exception{sourceArtifacts.forceObsolete(request);}
         public void obsolete(RatisRecoveryObsoleteRpc.Request request)throws Exception{
             var original=request.original();var cleanup=owner.sourceCleanup.get(original.transferId());if(cleanup!=null){cleanup.close();owner.sourceCleanup.remove(original.transferId(),cleanup);}
@@ -1313,7 +1322,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     CompletableFuture<Void> bootstrapDeferredRecovery() {
         synchronized(this){if(!started || starting || installing || closing || closeRequested || closed)return CompletableFuture.failedFuture(new IOException("Discovery bootstrap node unavailable"));}
         return configuredRecoveries.discover(()->{
-            synchronized(this){if(!started || starting || installing || closing || closeRequested || closed || recoveryAttempt!=null || supersessionAttempt!=null || seedAttempt!=null || learnerAttempt!=null)throw new IOException("Discovery bootstrap owner unavailable");installing=true;}
+            synchronized(this){if(!started || starting || installing || closing || closeRequested || closed || recoveryAttempt!=null && recoveryAttempt.current()==null || supersessionAttempt!=null || seedAttempt!=null || learnerAttempt!=null)throw new IOException("Discovery bootstrap owner unavailable");installing=true;}
+            final long discoveryGeneration;synchronized(this){discoveryGeneration=recoveryDiscoveryRequested;}
             try {
                 recoveryGraph.retryPending();forcePendingGenesisIdentity();
                 if(needsGenesisObservation())try(var workspace=resources.reserve(metadataClaims.graphPool(),RatisNodeResourceBudget.Kind.PROTECTED,4096,1)) {
@@ -1321,6 +1331,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     if(!complete)return null;
                 }
                 var frozen=freezeFreshRecoveryGraph();
+                var remoteRecoveries=reconcileConfiguredRecovery(frozen);
+                // The CURRENT force remains owned by its driver. A selected META can now fence
+                // it through supersedeRecovery without retrying an obsolete positive source HEAD.
+                if(recoveryAttempt!=null)return null;
                 var selections=new HashMap<UUID,RatisConfiguredRecoveryDiscovery.Obligation>();for(var obligation:frozen.plan().localObligations())selections.put(obligation.range().groupId(),obligation);
                 for(var local:machines.values())if(local.genesisActive()) {
                     var selected=selections.get(local.getGroupId().getUuid());
@@ -1328,6 +1342,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 }
                 settleLocalNoneDiscovery(frozen);
                 for(var obligation:frozen.plan().localObligations()) {
+                    if(remoteRecoveries.contains(obligation.range().groupId()))continue;
                     var machine=machines.get(RaftGroupId.valueOf(obligation.range().groupId()));
                     if(machine==null || !machine.recoveryEligibilityGate().discoveryPending() && !machine.genesisActive())continue;
                     requireLocalRecoveryGraphOwner(frozen,obligation,machine);
@@ -1357,6 +1372,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         }
                     }
                 }
+                synchronized(this){recoveryDiscoveryObserved=discoveryGeneration;recoveryDiscoveryCycles=0;}
                 return null;
             }finally{try{shrinkRecoveryGraphCredit();}finally{endSeedLifecycle();}}
         });
@@ -1364,18 +1380,64 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private void publishLocalDiscovery(RatisRangeStateMachine.LocalDiscoveryPublication publication)throws IOException {
         synchronized(this){if(closeRequested || closing || closed)throw new IOException("Node close prevents discovery settlement");publication.publish();}
     }
+    /** Retained source effects are settled by the same driver before local META discovery may run. */
+    private Set<UUID> reconcileConfiguredRecovery(RatisConfiguredRecoveryGraph.Snapshot frozen)throws Exception {
+        var managed=new HashSet<UUID>();
+        for(var obligation:frozen.plan().localObligations()) {
+            var group=obligation.range().groupId();var selected=frozen.activeRequests().get(group);
+            if(selected==null)throw new IOException("Recovery obligation lost its selected request");
+            var store=stores.get(group);var machine=machines.get(RaftGroupId.valueOf(group));
+            NativeCurrentRangeRecovery current=store==null?null:store.currentRangeRecoveryRegistration();
+            NativeRecoverySupersession fence=store==null?null:store.acknowledgedRecoverySupersession();
+            for(var pool:pools.values()) {
+                if(current==null)for(var value:pool.pool.currentRangeRecoveries())if(value.groupId().equals(group)){current=value;break;}
+                if(fence==null)for(var value:pool.pool.recoverySupersessions())if(value.scope().groupId().equals(group)){fence=value;break;}
+            }
+            boolean retained=configuredRecoveries.contains(group) || current!=null || fence!=null;
+            var aliases=frozen.frozenRequests().stream().filter(request->request.purpose()==RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF && request.sourceGroup().equals(group)).toList();
+            if(selected.metadataOnly() && retained && !aliases.isEmpty()) {
+                long directoryBytes=RangeDirectoryCodec.encodedSize(selected.sourceDirectory());for(var alias:aliases)directoryBytes=Math.max(directoryBytes,RangeDirectoryCodec.encodedSize(alias.sourceDirectory()));
+                long workspaceBytes=Math.addExact(4096L,Math.multiplyExact(16L,512L+3L*directoryBytes+selected.header().encodedSize()+32L*aliases.size()));
+                try(var workspace=resources.reserve(metadataClaims.graphPool(),RatisNodeResourceBudget.Kind.PROTECTED,workspaceBytes,1)) {
+                var digests=new ArrayList<byte[]>(aliases.size());for(var alias:aliases)digests.add(OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,alias)));
+                var scope=new NativeRecoverySupersession.Scope(selected.catalogue(),frozen.plan().catalogueCut(),selected.header(),selected.sourceDirectory(),group,selected.receiver(),OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,selected)),digests);
+                if(fence!=null) {
+                    var previous=fence.scope();
+                    var normalized=new NativeRecoverySupersession.Scope(scope.catalogue(),previous.catalogueCut(),scope.header(),scope.sourceDirectory(),scope.groupId(),scope.receiver(),scope.selectedMetadataRequestDigest(),scope.currentRequestDigests());
+                    if(!previous.equals(normalized) || !RatisRelocationOwnerRpc.covers(scope.catalogueCut(),previous.catalogueCut()))throw new IOException("Fresh recovery graph changed acknowledged supersession scope");
+                    scope=previous;
+                }
+                configuredRecoveries.reconcileOnIo(selected,scope,aliases);if(!completedConfiguredRecovery(group,store))managed.add(group);
+                }
+            }else if(configuredRecoveries.contains(group) || machine==null || store==null || current!=null && !store.currentRangeRecoveryReady()
+                    || store!=null && store.metadataRecoveryRegistration()!=null && store.metadataRecoveryPending()) {
+                configuredRecoveries.ensureOnIo(selected);if(!completedConfiguredRecovery(group,store))managed.add(group);
+            }
+        }
+        return Set.copyOf(managed);
+    }
+    private boolean completedConfiguredRecovery(UUID group,ReplicatedRangeStore store)throws Exception {
+        if(configuredRecoveries.phase(group)!=RatisConfiguredRecovery.Phase.DONE || store==null)return false;
+        var metadata=store.metadataRecoveryRegistration();
+        return metadata==null?store.currentRangeRecoveryReady():store.metadataRecoveryRegistrationForced(metadata) && store.metadataRecoveryImageInstalled() && !store.metadataRecoveryPending();
+    }
     private RatisConfiguredRecoveryGraph.Snapshot freezeFreshRecoveryGraph()throws IOException {
         localNoneDiscoveries=Map.of();forcePendingGenesisIdentity();
         try(var workspace=resources.reserve(metadataClaims.graphPool(),RatisNodeResourceBudget.Kind.PROTECTED,4096,1)){
             var discovered=relocationClients.discover(plan,(retained,incoming)->workspace.growTo(Math.max(workspace.bytes(),Math.addExact(4096L,Math.multiplyExact(16L,Math.addExact(retained,incoming))))),this::observeGenesisIssuance);
-            var requests=new ArrayList<RatisTopologySourceSnapshotRpc.Request>();var retained=recoveryGraph.snapshot();
+            var requests=new ArrayList<RatisTopologySourceSnapshotRpc.Request>();var journaled=new LinkedHashMap<UUID,RatisTopologySourceSnapshotRpc.Request>();var retained=recoveryGraph.snapshot();
             for(var obligation:discovered.localObligations()){
                 RatisTopologySourceSnapshotRpc.Request candidate=null;
-                if(retained!=null){var previous=retained.activeRequests().get(obligation.range().groupId());if(previous!=null && matchesDiscoveredRequest(previous,obligation))candidate=previous;}
+                var driver=configuredRecoveries.retainedOnIo(obligation.range().groupId(),bytes->workspace.growTo(Math.addExact(workspace.bytes(),Math.multiplyExact(16L,bytes))));
+                if(driver!=null) {
+                    for(var request:driver.requests()){var previous=journaled.putIfAbsent(request.transferId(),request);if(previous!=null)try{RatisTopologySourceSnapshotRpc.requireRequest(previous,request);}catch(IllegalArgumentException changed){throw new IOException("Admitted recovery UUID changed canonical body",changed);}}
+                    if(matchesDiscoveredRequest(driver.selected(),obligation))candidate=driver.selected();
+                }
+                if(candidate==null && retained!=null){var previous=retained.activeRequests().get(obligation.range().groupId());if(previous!=null && matchesDiscoveredRequest(previous,obligation))candidate=previous;}
                 if(candidate==null)candidate=new RatisTopologySourceSnapshotRpc.Request(UUID.randomUUID(),obligation.header(),plan.catalogue().groupId(),obligation.localReplica(),obligation.purpose(),obligation.range().groupId(),obligation.sourceDirectory());
                 requests.add(candidate);
             }
-            recoveryGraph.force(discovered,requests);return recoveryGraph.snapshot();
+            recoveryGraph.forceDiscovered(discovered,requests,List.copyOf(journaled.values()));return recoveryGraph.snapshot();
         }
     }
     private void observeGenesisIssuance(RatisCatalogueViewRpc.View view)throws IOException {
@@ -1440,11 +1502,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             for(;;)try{actual.get();return;}catch(InterruptedException wait){interrupted=true;}catch(java.util.concurrent.ExecutionException failure){throw new IOException("Local discovery actual reload failed",failure.getCause());}
         }finally{if(interrupted)Thread.currentThread().interrupt();}
     }
-    private static boolean matchesDiscoveredRequest(RatisTopologySourceSnapshotRpc.Request request,RatisConfiguredRecoveryDiscovery.Obligation obligation){
-        // Both inputs were validated against canonical definitions; compare their cached scope digests without serializing directories.
-        return request.purpose()==obligation.purpose() && request.sourceGroup().equals(obligation.range().groupId()) && request.receiver().equals(obligation.localReplica()) && Arrays.equals(request.sourceDirectory().payloadDigest(),obligation.sourceDirectory().payloadDigest())
-                && (request.header()==null?obligation.header()==null:obligation.header()!=null && Arrays.equals(request.header().definitionDigest(),obligation.header().definitionDigest()));
-    }
+    private static boolean matchesDiscoveredRequest(RatisTopologySourceSnapshotRpc.Request request,RatisConfiguredRecoveryDiscovery.Obligation obligation){return RatisConfiguredRecoveryGraph.matchesObligation(request,obligation);}
     private void shrinkRecoveryGraphCredit(){if(recoveryGraphCredit!=null && recoveryGraph!=null)recoveryGraphCredit.shrinkTo(Math.addExact(4096L,Math.multiplyExact(16L,recoveryGraph.retainedEncodedBytes())),1);}
     private RatisJournalAccess recoveryGraphJournal(){
         Path main=root.resolve("configured-recovery-graph/graph").toAbsolutePath().normalize(),pending=main.resolveSibling("graph.pending");UUID pool=metadataClaims.graphPool();
@@ -1461,11 +1519,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
             public void fulfilled(Reservation reservation)throws IOException{require(reservation.path(),reservation.maximum(),false);}
         };
     }
-    private boolean needsRecoveryDiscovery(){return needsGenesisObservation() || machines.values().stream().anyMatch(machine->machine.recoveryEligibilityGate().discoveryPending());}
+    private synchronized boolean needsRecoveryDiscovery(){return recoveryDiscoveryRequested!=recoveryDiscoveryObserved || recoveryDiscoveryCycles>=30 || needsGenesisObservation() || machines.values().stream().anyMatch(machine->machine.recoveryEligibilityGate().discoveryPending());}
     private void configuredRecoveryCycle() {
         if(!configuredRecoveries.idle())return;
         final boolean discover;
-        synchronized(this){if(!started || starting || installing || closeRequested || closing || closed || !configuredRecoveries.idle())return;discover=needsRecoveryDiscovery() && (configuredRecoveries.size()==0 || configuredDiscoveryNext);configuredDiscoveryNext=!discover;}
+        synchronized(this){if(!started || starting || installing || closeRequested || closing || closed || !configuredRecoveries.idle())return;if(recoveryDiscoveryCycles<30)recoveryDiscoveryCycles++;discover=(recoveryAttempt==null || recoveryAttempt.current()!=null) && supersessionAttempt==null && learnerAttempt==null && seedAttempt==null && needsRecoveryDiscovery() && (configuredRecoveries.size()==0 || configuredDiscoveryNext);configuredDiscoveryNext=!discover;}
         if(discover)bootstrapDeferredRecovery();else configuredRecoveries.cycle();
     }
     private CompletableFuture<Void> startConfiguredRecoveryService(){
@@ -1485,7 +1543,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         var owner=pools.get(pool);Path expected=root.resolve("configured-recovery").resolve(pool.toString()).resolve(group.toString()).toAbsolutePath().normalize();
         if(owner==null || !expected.equals(directory.toAbsolutePath().normalize()))throw new IOException("Configured recovery journal changed paid slot");requireNoSymlinks(expected);
         synchronized(this){
-            if(installing || starting || closing || closeRequested || closed)throw new IOException("Configured recovery journal node owner unavailable");
+            if(installing && (configuredRecoveries==null || !configuredRecoveries.ownsDiscoveryIo()) || starting || closing || closeRequested || closed)throw new IOException("Configured recovery journal node owner unavailable");
             metadataClaims.reserve(List.of());var claim=metadataClaim(owner.spec,group,RatisNodePlan.Role.DATA);long extra=metadataClaims.contains(group)?0:claim.bytes();long total=Math.addExact(metadataClaims.bytes(),extra);for(var retained:pools.values())total=Math.addExact(total,retained.recoveryExposureBytes);
             if(total>settings.resources().maximumDurableMetadataBytes() || metadataClaims.bytes(pool)+extra+owner.recoveryExposureBytes>owner.spec.maximumDurableMetadataBytes())throw new IOException("Configured recovery durable metadata ceiling exhausted");metadataClaims.reserve(List.of(claim));
         }
@@ -1505,20 +1563,59 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     /** Borrowed actor ports; RatisConfiguredRecovery invokes them only on its admitted IO executor. */
     RatisConfiguredRecovery.Host configuredRecoveryHost(RatisTopologySourceSnapshotClient.ReplyAdmission admission){return new RatisConfiguredRecovery.Host(){
-        public CompletableFuture<RatisTopologySourceSnapshotRpc.Prepared> prepare(RatisTopologySourceSnapshotRpc.Request request){return configuredRecoveryAction(()->{
-            try{return relocationClients.prepare(request,admission);}
+        public RatisTopologySourceSnapshotRpc.Request resolveCurrentAlias(RatisConfiguredRecovery.CurrentAlias ref)throws IOException{
+            var graph=recoveryGraph.snapshot();if(graph==null)throw new IOException("Recovery alias has no retained graph");
+            var request=graph.frozenRequests().stream().filter(value->value.transferId().equals(ref.transferId())).findFirst().orElseThrow(()->new IOException("Recovery graph lost original CURRENT alias"));
+            if(request.purpose()!=RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF || !Arrays.equals(OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,request)),ref.digest()))throw new IOException("Recovery alias changed its canonical graph body");return request;
+        }
+        public CompletableFuture<byte[]> forceSupersession(NativeRecoverySupersession.Scope scope){return configuredRecoveryAction(()->supersedeRecovery(scope).digest());}
+        public CompletableFuture<RatisConfiguredRecovery.CleanupDisposition> cleanup(RatisTopologySourceSnapshotRpc.Request alias,ReplicaDescriptor source,RatisConfiguredRecovery.CleanupAction action,NativeRecoverySupersession.Scope scope,byte[] fenceDigest){return configuredRecoveryAction(()->{
+            if(action==RatisConfiguredRecovery.CleanupAction.RELEASE){relocationClients.release(alias,source);return RatisConfiguredRecovery.CleanupDisposition.RELEASED;}
+            relocationClients.obsolete(new RatisRecoveryObsoleteRpc.Request(alias,scope,fenceDigest),source,admission);return RatisConfiguredRecovery.CleanupDisposition.OBSOLETE;
+        });}
+        public CompletableFuture<RatisTopologySourceSnapshotRpc.Prepared> prepare(RatisTopologySourceSnapshotRpc.Request request){return configuredRecoveryProgress(()->{
+            ensureConfiguredRecoverySelection(request);requireConfiguredRecoveryAncestors(request,true);try{return relocationClients.prepare(request,admission);}
             catch(RatisTopologySourceSnapshotRpc.AbandonedException abandoned){
                 if(recoveryGraph.snapshot()!=null)recoveryGraph.observeSourceAbandonment(abandoned.receipt());
                 throw abandoned;
             }
         });}
-        public CompletableFuture<byte[]> register(RatisTopologySourceSnapshotRpc.Prepared prepared){return configuredRecoveryAction(()->{var store=registerRecovery(prepared);return prepared.request().metadataOnly()?store.metadataRecoveryRegistration().digest():store.currentRangeRecoveryRegistration().digest();});}
-        public CompletableFuture<RatisTopologySourceSnapshotRpc.Prepared> transfer(RatisTopologySourceSnapshotRpc.Request request){return configuredRecoveryAction(()->relocationClients.transfer(request,admission));}
+        public CompletableFuture<byte[]> register(RatisTopologySourceSnapshotRpc.Prepared prepared){return configuredRecoveryProgress(()->{requireConfiguredRecoveryAncestors(prepared.request(),false);var store=registerRecovery(prepared);return prepared.request().metadataOnly()?store.metadataRecoveryRegistration().digest():store.currentRangeRecoveryRegistration().digest();});}
+        public CompletableFuture<RatisTopologySourceSnapshotRpc.Prepared> transfer(RatisTopologySourceSnapshotRpc.Request request){return configuredRecoveryProgress(()->relocationClients.transfer(request,admission));}
         public CompletableFuture<RatisRecoveryImageRpc.Evidence> probe(RatisRecoveryImageRpc.Request request){return configuredRecoveryAction(()->{var machine=machines.get(RaftGroupId.valueOf(request.source().sourceGroup()));if(machine==null)throw new IOException("Recovery probe has no local receiver");return machine.recoveryImageEvidence(request);});}
-        public CompletableFuture<RatisSourceHeadRpc.Head> head(RatisSourceHeadRpc.Request request){return configuredRecoveryAction(()->relocationClients.head(request,admission));}
-        public CompletableFuture<Boolean> complete(RatisTopologySourceSnapshotRpc.Prepared prepared,RatisSourceHeadRpc.Head head){return configuredRecoveryAction(()->completeRecovery(prepared,head));}
+        public CompletableFuture<RatisSourceHeadRpc.Head> head(RatisSourceHeadRpc.Request request){return configuredRecoveryProgress(()->relocationClients.head(request,admission));}
+        public CompletableFuture<Boolean> complete(RatisTopologySourceSnapshotRpc.Prepared prepared,RatisSourceHeadRpc.Head head){return configuredRecoveryProgress(()->{requireConfiguredRecoveryAncestors(prepared.request(),false);return completeRecovery(prepared,head);});}
         public CompletableFuture<Void> release(RatisTopologySourceSnapshotRpc.Prepared prepared){return configuredRecoveryAction(()->{relocationClients.release(prepared.request(),prepared.sourceOwner());return null;});}
     };}
+    private void ensureConfiguredRecoverySelection(RatisTopologySourceSnapshotRpc.Request request)throws IOException {
+        var frozen=recoveryGraph.snapshot();
+        if(frozen!=null) {
+            var selected=frozen.activeRequests().get(request.sourceGroup());
+            if(selected!=null && selected.purpose()==request.purpose() && frozen.frozenRequests().stream().anyMatch(value->value.transferId().equals(request.transferId()) && Arrays.equals(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,value),RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,request))))return;
+        }
+        synchronized(this){if(installing || starting || closeRequested || closing || closed)throw new IOException("Configured recovery graph owner unavailable");installing=true;}
+        try{recoveryGraph.retryPending();freezeFreshRecoveryGraph();}
+        finally{try{shrinkRecoveryGraphCredit();}finally{endSeedLifecycle();}}
+    }
+    private void requireConfiguredRecoveryAncestors(RatisTopologySourceSnapshotRpc.Request request,boolean retainedPrepare)throws IOException {
+        if(request.purpose()!=RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF)return;
+        var frozen=recoveryGraph.snapshot();if(frozen==null)throw new IOException("CURRENT recovery has no forced discovery graph");
+        var selected=frozen.activeRequests().get(request.sourceGroup());
+        byte[] body=RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,request);
+        boolean selectedBody=selected!=null && Arrays.equals(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,selected),body);
+        boolean retainedBody=retainedPrepare && frozen.frozenRequests().stream().anyMatch(alias->alias.transferId().equals(request.transferId()) && Arrays.equals(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,alias),body));
+        if(selected==null || selected.purpose()!=RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF || !selectedBody && !retainedBody)throw new IOException("CURRENT driver no longer owns the forced graph selection");
+        var ancestors=new HashSet<UUID>();ancestors.add(request.sourceGroup());
+        boolean changed;do{changed=false;for(var edge:frozen.plan().edges())if(ancestors.contains(edge.child().group()))changed|=ancestors.add(edge.parent().group());}while(changed);
+        for(var obligation:frozen.plan().localObligations())if(obligation.purpose()==RatisTopologySourceSnapshotRpc.Purpose.ANCESTOR_METADATA && ancestors.contains(obligation.range().groupId())) {
+            var machine=machines.get(RaftGroupId.valueOf(obligation.range().groupId()));
+            if(machine==null)throw new IOException("CURRENT recovery waits for local ancestor META installation");
+            requireLocalRecoveryGraphOwner(frozen,obligation,machine);machine.requireMetadataDiscoveryReady(obligation.header());
+        }
+    }
+    private <T>CompletableFuture<T> configuredRecoveryProgress(java.util.concurrent.Callable<T> action){return configuredRecoveryAction(()->{
+        try{return action.call();}catch(Exception failure){if(!(failure instanceof RatisTopologySourceSnapshotRpc.AbandonedException))synchronized(this){recoveryDiscoveryRequested=Math.incrementExact(recoveryDiscoveryRequested);}throw failure;}
+    });}
     private <T>CompletableFuture<T> configuredRecoveryAction(java.util.concurrent.Callable<T> action){synchronized(this){if(!started || starting || closing || closeRequested || closed)return CompletableFuture.failedFuture(new IOException("Configured recovery host is stopping/not started"));}return recoveryAction(action);}
     private static <T>CompletableFuture<T> recoveryAction(java.util.concurrent.Callable<T> action){try{return CompletableFuture.completedFuture(action.call());}catch(Exception failed){return CompletableFuture.failedFuture(failed);}}
     private record QualifiedRecovery(ApplyPosition cut,RangeDirectory directory) {}
@@ -1647,7 +1744,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (participantRecoveryService!=null) participantRecoveryService.start(timer,recoverySettings.period());
             if (retirementService!=null) retirementService.start(timer,Duration.ofSeconds(1));
             synchronized (this) { started=true; }
-            if(configuredRecoveries.size()!=0 || needsRecoveryDiscovery())startConfiguredRecoveryService().join();
+            if(!plan.domains().isEmpty() || configuredRecoveries.size()!=0 || needsRecoveryDiscovery())startConfiguredRecoveryService().join();
         } catch (IOException | RuntimeException | Error failure) {
             synchronized (this) { closeRequested=true; }
             for (var machine:machines.values()) machine.beginShutdown();

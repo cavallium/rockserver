@@ -16,6 +16,24 @@ does not establish complete distributed API parity or production acceptance.
 Earlier checkpoints below retain the limitations known at their validation time.
 This section and the remaining gates at the end describe the current branch.
 
+- Configured CURRENT recovery now durably selects META in the same driver journal,
+  fences the actual receiver, and settles every retained request alias at every
+  original source voter before META PREPARE. Fresh graph discovery adopts forced
+  driver identities, including ABANDONED successors and admitted META renewal.
+  CURRENT preparation cannot bypass local ancestor META readiness before its first
+  graph. DATA nodes keep bounded periodic discovery armed without existing jobs.
+  Source OBSOLETE works through the actual Raft owner route on an unready replica
+  with no applied prefix, local FREEZE or local receiver fence. A qualified absent
+  source UUID needs no permanent tombstone; genuine unrelated recovery anchors
+  remain retained. Forced READY image files outlive capture without retaining the
+  native snapshot pin, while file and image-quota ownership lasts through cleanup.
+  Controlled source transport and actual receiver Raft dispatch cover lost PREPARE
+  ACK, native fencing, cold retry, source cleanup and genuine META PREPARE. Coverage
+  combines 174 adapter cases and 15 server eligibility cases in
+  `automatic-supersession-final-regression.log` with the passing 24-case
+  `automatic-supersession-final-repair.log`, reusing unchanged passing cases.
+  Genuine local META activation after fencing, its completion witness and full
+  independent endpoint/quorum acceptance remain pending.
 - Redundant format-version words are removed from the current command, schema,
   directory, acceptance, session journals, native image and internal state rows.
   Java and Rust readers, command admission offsets and receipt budgets use the
@@ -2041,8 +2059,9 @@ learner/schema consumers and standalone codec/async behavior.
 The node replaces the old graph credit once and reuses its exposure identity.
 Direct Runtime registration now permits fresh sealed META over uninstalled or
 installed-but-unfinished CURRENT, preserving authority, membership, pending-install,
-native-drain and snapshot-floor checks. The configured-recovery actor still permits
-only a DONE CURRENT journal to start META; unfinished actor attempts stay fixed.
+native-drain and snapshot-floor checks. The configured-recovery actor now retains
+unfinished CURRENT evidence while forcing the receiver fence and original source
+cohort cleanup; only their durable acknowledgements permit META PREPARE.
 Renewal rejects both the initial UUID and an effective UUID reached after
 abandonment, before rewriting the journal. Source fixtures now complete actual
 receiver-image qualification and durable RELEASE before further captures; the

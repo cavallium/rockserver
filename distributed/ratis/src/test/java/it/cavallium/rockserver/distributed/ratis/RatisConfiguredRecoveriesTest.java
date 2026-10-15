@@ -24,6 +24,7 @@ class RatisConfiguredRecoveriesTest {
         final RatisConfiguredRecoveryTest.Fixture source;
         final AtomicInteger claims=new AtomicInteger();
         volatile CountDownLatch registered;
+        java.util.function.Consumer<Request> beforePrepare=request->{};
         Fixture()throws Exception{helper.root=root;source=helper.new Fixture();}
         RatisConfiguredRecoveries open(Path path,RatisNodeResourceBudget resources)throws Exception {
             if(!Files.exists(path))Files.createDirectory(path);
@@ -31,7 +32,7 @@ class RatisConfiguredRecoveriesTest {
                 public UUID pool(Request request)throws IOException{try{requireRequest(source.initial,request);return POOL;}catch(IllegalArgumentException invalid){throw new IOException("Wrong fixture request",invalid);}}
                 public RatisJournalAccess journal(UUID pool,UUID group,Path directory){assertEquals(POOL,pool);assertEquals(source.initial.sourceGroup(),group);claims.incrementAndGet();return RatisJournalAccess.standalone();}
             },admission->new RatisConfiguredRecovery.Host(){
-                public CompletableFuture<Prepared> prepare(Request request){return source.prepare(request).thenApply(value->{try{admission.beforeReply(value.encodedSize());return value;}catch(IOException denied){throw new CompletionException(denied);}});}
+                public CompletableFuture<Prepared> prepare(Request request){beforePrepare.accept(request);return source.prepare(request).thenApply(value->{try{admission.beforeReply(value.encodedSize());return value;}catch(IOException denied){throw new CompletionException(denied);}});}
                 public CompletableFuture<byte[]> register(Prepared prepared){var pending=source.register(prepared);if(registered!=null)registered.countDown();return pending;}
                 public CompletableFuture<Prepared> transfer(Request request){return source.transfer(request);}
                 public CompletableFuture<RatisRecoveryImageRpc.Evidence> probe(RatisRecoveryImageRpc.Request request){return source.probe(request);}
@@ -41,6 +42,37 @@ class RatisConfiguredRecoveriesTest {
             });
         }
         public void close()throws Exception{source.close();}
+    }
+    @Test void retainedDiscoveryRequestsAreAdmittedWithoutHostDispatchAndSurviveColdInventory()throws Exception {
+        try(var fixture=new Fixture()) {
+            var resources=budget(64L<<20);var path=root.resolve("retained-manager");var group=fixture.source.initial.sourceGroup();
+            var manager=fixture.open(path,resources);manager.enqueue(fixture.source.initial).get(10,TimeUnit.SECONDS);
+            try {
+                var current=manager;
+                assertThrows(IOException.class,()->current.retainedOnIo(group,bytes->{}));
+                manager.discover(()->{
+                    assertNull(current.retainedOnIo(new UUID(993,99),bytes->{throw new AssertionError("Missing slot owns no request bodies");}));
+                    assertThrows(IOException.class,()->current.retainedOnIo(group,bytes->{throw new IOException("Borrow denied");}));
+                    assertTrue(current.ownsDiscoveryIo(),"Denied borrow must close the opened actor");
+                    var admitted=new AtomicInteger();var retained=current.retainedOnIo(group,admitted::set);
+                    requireRequest(fixture.source.initial,retained.selected());assertEquals(1,retained.requests().size());requireRequest(fixture.source.initial,retained.requests().getFirst());
+                    assertEquals(256+48+encodedRequestBytes(fixture.source.initial),admitted.get());assertTrue(current.ownsDiscoveryIo());return null;
+                }).get(10,TimeUnit.SECONDS);
+                assertEquals(0,fixture.source.prepares);assertEquals(RatisConfiguredRecovery.Phase.PREPARE,manager.phase(group));
+                fixture.beforePrepare=request->{
+                    assertFalse(current.ownsDiscoveryIo(),"Host runs inside the active actor, not staging discovery");
+                    try{var retained=current.retainedOnIo(group,bytes->{});requireRequest(request,retained.selected());assertEquals(1,retained.requests().size());}
+                    catch(IOException failure){throw new CompletionException(failure);}
+                };
+                step(manager);assertEquals(RatisConfiguredRecovery.Phase.REGISTER,manager.phase(group));assertEquals(1,fixture.source.prepares);
+            }finally{manager.close(Duration.ofSeconds(10));}
+            assertEquals(0,resources.stats().protectedLane().owners());manager=fixture.open(path,resources);
+            try {
+                var cold=manager;manager.discover(()->{var retained=cold.retainedOnIo(group,bytes->{});requireRequest(fixture.source.initial,retained.selected());assertEquals(1,retained.requests().size());return null;}).get(10,TimeUnit.SECONDS);
+                assertEquals(1,fixture.source.prepares);assertEquals(RatisConfiguredRecovery.Phase.REGISTER,manager.phase(group));
+            }finally{manager.close(Duration.ofSeconds(10));}
+            assertEquals(0,resources.stats().protectedLane().owners());
+        }
     }
     @Test void coldRegisterReleaseAndCompleteResumeWithoutReplayingSettledPorts()throws Exception {
         try(var fixture=new Fixture()) {

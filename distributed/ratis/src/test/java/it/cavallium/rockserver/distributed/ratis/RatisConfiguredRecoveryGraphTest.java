@@ -19,6 +19,23 @@ class RatisConfiguredRecoveryGraphTest {
     final RangeDirectory genesis=directory(1,List.of(range(20,null,null)));
     final TopologyChange.Definition split=new TopologyChange.Definition(id(30),genesis,directory(2,List.of(range(21,null,new byte[]{64}),range(22,new byte[]{64},null))));
     final TopologyChange.Definition merge=new TopologyChange.Definition(id(31),split.targetDirectory(),directory(3,List.of(range(23,null,null))));
+    @Test void fixedCurrentIdentitySurvivesFreshSchemaAndConfigurationWhileNewHistoricalIdsAreRejected()throws Exception {
+        var node=node("data");var initial=discover(node,genesis,10);var original=requests(node,initial,9000).getFirst();
+        byte[] digest=new byte[32];digest[0]=1;var prior=genesis.ranges().getFirst();
+        var evolvedRange=new RangeDescriptor(prior.rangeId(),prior.groupId(),prior.rangeEpoch(),prior.configurationVersion()+1,prior.lowerInclusive(),prior.upperExclusive(),prior.topologyState(),prior.replicas());
+        var evolved=new RangeDirectory(CLUSTER,DATABASE,DOMAIN,2,digest,2,genesis.columns(),genesis.routingPrefixBytes(),List.of(evolvedRange));var fresh=discover(node,evolved,20);var path=directory("current-continuity");
+        var successor=new Abandoned(original,id(9001),new ApplyPosition(2,3),LOCAL,new byte[32]);
+        try(var graph=new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP)){
+            graph.force(initial,List.of(original));graph.force(fresh,List.of(original));assertEquals(original,graph.snapshot().activeRequests().get(prior.groupId()));
+            assertThrows(IOException.class,()->graph.force(fresh,List.of(original.successor(id(9002)))));
+            graph.observeSourceAbandonment(successor);assertEquals(successor.successorRequest(),graph.snapshot().activeRequests().get(prior.groupId()));
+        }
+        try(var graph=new RatisConfiguredRecoveryGraph(path,node,RatisJournalAccess.standalone(),HEAP)){
+            assertArrayEquals(request(PREPARE,successor.successorRequest()),request(PREPARE,graph.snapshot().activeRequests().get(prior.groupId())));graph.force(fresh,List.of(successor.successorRequest()));
+            var children=split.targets().stream().map(value->new RangeDescriptor(value.rangeId(),value.groupId(),value.rangeEpoch(),evolvedRange.configurationVersion(),value.lowerInclusive(),value.upperExclusive(),value.topologyState(),evolvedRange.replicas())).toList();var target=new RangeDirectory(CLUSTER,DATABASE,DOMAIN,2,digest,3,evolved.columns(),evolved.routingPrefixBytes(),children);var consuming=new TopologyChange.Definition(id(9003),evolved,target);var consumed=discover(node,target,30,consuming);
+            graph.force(consumed,requests(node,consumed,9100));assertTrue(graph.snapshot().activeRequests().get(prior.groupId()).metadataOnly());assertArrayEquals(request(PREPARE,successor.successorRequest()),request(PREPARE,graph.snapshot().frozenRequests().stream().filter(value->value.transferId().equals(successor.successorId())).findFirst().orElseThrow()));
+        }
+    }
     RatisNodePlan node(String physical){var catalogue=new RatisNodePlan.Catalogue(id(8),1,new byte[32],id(9),id(10),List.of(LOCAL));var domains=List.of(new RatisNodePlan.Domain(genesis,Map.of(COLUMN,physical),Set.of()));return new RatisNodePlan(LOCAL.nodeId(),LOCAL.nodeIncarnation(),domains,catalogue,List.of(),List.of(),Map.of(),8,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(domains),RatisPoolFixtures.groups(catalogue,List.of()));}
     RatisConfiguredRecoveryDiscovery.Plan discover(RatisNodePlan node,RangeDirectory current,long index,TopologyChange.Definition... definitions)throws IOException {
         var births=new HashMap<UUID,TopologyChange.Definition>();for(var d:definitions)for(var r:d.targets())births.put(r.groupId(),d);var cut=new ApplyPosition(1,index);

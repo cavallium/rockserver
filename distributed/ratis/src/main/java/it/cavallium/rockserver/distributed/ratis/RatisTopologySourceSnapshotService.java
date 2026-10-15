@@ -39,6 +39,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     public interface Host {
         default RatisSourceHeadRpc.Head head(RatisSourceHeadRpc.Request request)throws Exception{throw new IOException("Source head owner unavailable");}
         default boolean retryObsolete(RatisRecoveryObsoleteRpc.Request request)throws Exception{return false;}
+        default boolean acknowledgeUnownedObsolete(RatisRecoveryObsoleteRpc.Request request)throws Exception{return false;}
         default void requireObsolete(RatisRecoveryObsoleteRpc.Request request)throws Exception{throw new IOException("Obsolete source authority unavailable");}
         default void forceObsolete(RatisRecoveryObsoleteRpc.Request request)throws Exception{throw new IOException("Obsolete source force unavailable");}
         default void obsolete(RatisRecoveryObsoleteRpc.Request request)throws Exception{throw new IOException("Obsolete source cleanup unavailable");}
@@ -69,7 +70,8 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     private final Map<UUID,Entry> entries=new LinkedHashMap<>();private final Map<UUID,byte[]> released=new HashMap<>();private final Set<UUID> releaseLookups=new HashSet<>();
     private static final int OBSOLETE_TERMINAL_BYTES=128;
     private final Map<UUID,ObsoleteOwner> obsoletePending=new HashMap<>();private final Map<UUID,byte[]> obsoleteTerminals=new HashMap<>();
-    private long imageBytes,metadataBytes;private int active;private boolean stopping;
+    // At most MAX_LEASES transient controls, separately admitted by their protected graph leases.
+    private long imageBytes,metadataBytes,obsoleteControlBytes;private int active;private boolean stopping;
     public RatisTopologySourceSnapshotService(Host host,Limits limits,RWScheduler scheduler,ResourceAdmission admission){this.host=Objects.requireNonNull(host);this.limits=Objects.requireNonNull(limits);this.admission=Objects.requireNonNull(admission);executor=Objects.requireNonNull(scheduler).executor(RequestContext.batch(),OperationFamily.FULL_SCAN_AGGREGATE);}
     /** The actual image write/inspect/hash runs in bounded BATCH work, outside the proof/control worker. */
     public CompletableFuture<Prepared> prepareAsync(Request request){
@@ -107,7 +109,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             resource.close();synchronized(RatisTopologySourceSnapshotService.this){preparations.remove(this);}drained.complete(null);checkStopped();if(problem==null)result.complete(prepared);else result.completeExceptionally(problem);
         }
     }
-    public synchronized Stats stats(){return new Stats(entries.size(),active,imageBytes,metadataBytes,released.size());}
+    public synchronized Stats stats(){return new Stats(entries.size(),active,imageBytes,Math.addExact(metadataBytes,obsoleteControlBytes),released.size());}
     private void awaitImageBytes(Request request,int bytes)throws IOException {
         while(true){synchronized(this){requireOpen();}if(host.chunkReady(request,bytes))return;
             try{Thread.sleep(10);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Source image admission interrupted",interrupted);}
@@ -201,7 +203,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     /** A qualified negative fence cancels old work, joins actual owners, and never claims image installation. */
     public CompletableFuture<byte[]> obsolete(RatisRecoveryObsoleteRpc.Request request) {
         Objects.requireNonNull(request);var original=request.original();RatisProofQueryService.ResourceLease resource=null;ObsoleteTask task;
-        long weight=Math.addExact(4096L,Math.multiplyExact(8L,request.encodedSize()));long needed=Math.addExact(OBSOLETE_TERMINAL_BYTES,Math.multiplyExact(2L,request.encodedSize()));
+        long weight=Math.addExact(4096L,Math.multiplyExact(8L,request.encodedSize()));long control=Math.addExact(128L,Math.multiplyExact(2L,request.encodedSize()));
         try {
             byte[] identity;
             synchronized(this){var retained=obsoletePending.get(original.transferId());if(retained!=null && retained.busy)throw new IOException("Actual obsolete cleanup is active");identity=retained==null?null:request.digest();}
@@ -210,10 +212,9 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                 var terminal=obsoleteTerminals.get(original.transferId());if(terminal!=null){if(!Arrays.equals(terminal,identity))throw new IOException("Obsolete transfer changed exact terminal request");if(resource!=null)resource.close();return CompletableFuture.completedFuture(ScopedTransactionRpc.frame(RatisRecoveryObsoleteRpc.KIND,identity));}
                 if(released.containsKey(original.transferId()))throw new IOException("Installed RELEASE cannot become OBSOLETE");
                 var owner=obsoletePending.get(original.transferId());
-                if(owner==null){requireOpen();if(!hasTerminalSlot(original.transferId()) || obsoletePending.values().stream().filter(value->value.busy).count()>=MAX_LEASES)throw new IOException("Obsolete source identity/execution admission exhausted");
+                if(owner==null){requireOpen();if(obsoletePending.size()>=MAX_LEASES)throw new IOException("Obsolete control admission exhausted");
                     var entry=entries.get(original.transferId());if(entry!=null)requireSame(entry,original);
-                    long charge=Math.max(0,needed-(entry==null?0:obsoletePromiseBytes(entry.request)));if(charge>limits.maximumMetadataBytes()-metadataBytes)throw new IOException("Obsolete metadata admission exhausted");
-                    owner=new ObsoleteOwner(request,identity,charge,resource);owner.funding=entry;obsoletePending.put(original.transferId(),owner);metadataBytes+=charge;resource=null;
+                    owner=new ObsoleteOwner(request,identity,resource);owner.controlCharge=control;owner.funding=entry;obsoletePending.put(original.transferId(),owner);obsoleteControlBytes=Math.addExact(obsoleteControlBytes,control);resource=null;
                 }else if(!Arrays.equals(owner.identity,identity))throw new IOException("Obsolete source requires original pending request");
                 if(owner.busy || obsoletePending.values().stream().filter(value->value.busy).count()>=MAX_LEASES)throw new IOException("Actual obsolete cleanup admission is active/full");owner.busy=true;active++;task=new ObsoleteTask(owner);
             }
@@ -222,9 +223,9 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         }catch(Exception failure){if(resource!=null)resource.close();return CompletableFuture.failedFuture(failure);}
     }
     private final class ObsoleteOwner {
-        final RatisRecoveryObsoleteRpc.Request request;final byte[] identity;long charge;final RatisProofQueryService.ResourceLease resource;
-        Entry entry,funding;boolean busy,qualified,forcePossible,leaseClosed,leaseClaimed;
-        ObsoleteOwner(RatisRecoveryObsoleteRpc.Request request,byte[] identity,long charge,RatisProofQueryService.ResourceLease resource){this.request=request;this.identity=identity;this.charge=charge;this.resource=resource;}
+        final RatisRecoveryObsoleteRpc.Request request;final byte[] identity;long charge,controlCharge;final RatisProofQueryService.ResourceLease resource;
+        Entry entry,funding;boolean busy,qualified,forcePossible,leaseClosed,leaseClaimed,permanent,absent;
+        ObsoleteOwner(RatisRecoveryObsoleteRpc.Request request,byte[] identity,RatisProofQueryService.ResourceLease resource){this.request=request;this.identity=identity;this.resource=resource;}
     }
     private final class ObsoleteTask implements Runnable,RWScheduler.RejectionAwareTask {
         final ObsoleteOwner owner;final CompletableFuture<byte[]> result=new CompletableFuture<>();final java.util.concurrent.atomic.AtomicInteger phase=new java.util.concurrent.atomic.AtomicInteger();
@@ -232,10 +233,11 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         public void run(){if(!phase.compareAndSet(0,1))return;try{Thread.ofVirtual().name("ratis-obsolete-source-owner").start(this::actual);}catch(RuntimeException rejected){finish(null,rejected);}}
         private void actual(){Throwable failure=null;byte[] reply=null;
             try {
-                boolean durable;
+                owner.absent=false;boolean durable;
                 try{durable=host.retryObsolete(owner.request);if(durable)owner.forcePossible=true;}
                 catch(RatisTopologySourceSnapshotArtifacts.AdmissionRejected conflict){owner.forcePossible=false;throw conflict;}
                 catch(Exception unknown){owner.forcePossible=true;throw unknown;}
+                if(durable)admitPermanentObsolete(owner);
                 if(!durable && !owner.qualified)host.requireObsolete(owner.request);
                 var original=owner.request.original();List<Preparation> builds;List<Transfer> chunks;
                 synchronized(RatisTopologySourceSnapshotService.this) {
@@ -251,9 +253,18 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                     if(released.containsKey(original.transferId()))throw new IOException("Installed RELEASE already settled source capture");
                     owner.entry=entries.get(original.transferId());if(owner.entry!=null){owner.entry.obsolete=owner;owner.entry.busy=true;owner.leaseClaimed=true;}
                 }
-                if(!durable){owner.forcePossible=true;try{host.forceObsolete(owner.request);}catch(RatisTopologySourceSnapshotArtifacts.AdmissionRejected conflict){owner.forcePossible=false;throw conflict;}}
-                if(owner.entry!=null && owner.entry.lease!=null && !owner.leaseClosed){owner.entry.lease.close();owner.leaseClosed=true;}
-                host.obsolete(owner.request);reply=ScopedTransactionRpc.frame(RatisRecoveryObsoleteRpc.KIND,owner.identity);
+                if(!durable && (owner.entry==null || owner.entry.lease==null)){
+                    boolean previous=owner.forcePossible;owner.forcePossible=true;
+                    try{owner.absent=host.acknowledgeUnownedObsolete(owner.request);owner.forcePossible=previous;}
+                    catch(RatisTopologySourceSnapshotArtifacts.AdmissionRejected conflict){owner.forcePossible=false;throw conflict;}
+                }
+                if(!owner.absent){
+                    admitPermanentObsolete(owner);
+                    if(!durable){owner.forcePossible=true;try{host.forceObsolete(owner.request);}catch(RatisTopologySourceSnapshotArtifacts.AdmissionRejected conflict){owner.forcePossible=false;throw conflict;}}
+                    if(owner.entry!=null && owner.entry.lease!=null && !owner.leaseClosed){owner.entry.lease.close();owner.leaseClosed=true;}
+                    host.obsolete(owner.request);
+                }
+                reply=ScopedTransactionRpc.frame(RatisRecoveryObsoleteRpc.KIND,owner.identity);
             }catch(Throwable problem){if(problem instanceof InterruptedException)Thread.currentThread().interrupt();failure=problem;}finish(reply,failure);
         }
         public void reject(RuntimeException failure){if(phase.compareAndSet(0,2))finish(null,failure);}
@@ -261,21 +272,29 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             boolean success=failure==null,discard=!owner.forcePossible;
             if(success || discard)try{owner.resource.close();}catch(Throwable cleanup){failure=cleanup;success=false;discard=false;}
             synchronized(RatisTopologySourceSnapshotService.this){owner.busy=false;active--;if(owner.entry!=null){if(owner.leaseClaimed)owner.entry.busy=false;if(discard && owner.entry.obsolete==owner)owner.entry.obsolete=null;}
-                if(success || discard){obsoletePending.remove(owner.request.original().transferId(),owner);metadataBytes-=owner.charge;}
-                if(success){obsoleteTerminals.put(owner.request.original().transferId(),owner.identity);metadataBytes+=OBSOLETE_TERMINAL_BYTES;if(owner.entry!=null && entries.remove(owner.entry.request.transferId(),owner.entry)){imageBytes-=owner.entry.imageCharge;metadataBytes-=owner.entry.metadataCharge;}}
+                if(success || discard){obsoletePending.remove(owner.request.original().transferId(),owner);metadataBytes-=owner.charge;obsoleteControlBytes-=owner.controlCharge;owner.controlCharge=0;}
+                if(success){if(!owner.absent){obsoleteTerminals.put(owner.request.original().transferId(),owner.identity);metadataBytes+=OBSOLETE_TERMINAL_BYTES;}if(owner.entry!=null && entries.remove(owner.entry.request.transferId(),owner.entry)){imageBytes-=owner.entry.imageCharge;metadataBytes-=owner.entry.metadataCharge;}}
                 RatisTopologySourceSnapshotService.this.notifyAll();
             }
             checkStopped();if(success)result.complete(reply);else result.completeExceptionally(failure);
         }
+    }
+    private synchronized void admitPermanentObsolete(ObsoleteOwner owner)throws IOException {
+        if(owner.permanent)return;UUID id=owner.request.original().transferId();
+        if(!hasTerminalSlot(id))throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Obsolete permanent identity quota exhausted");
+        long needed=Math.addExact(OBSOLETE_TERMINAL_BYTES,Math.multiplyExact(2L,owner.request.encodedSize()));
+        long funding=owner.charge+(owner.funding==null?0:obsoletePromiseBytes(owner.funding.request));long charge=Math.max(0,needed-funding);
+        if(charge>limits.maximumMetadataBytes()-metadataBytes)throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Obsolete permanent metadata quota exhausted");
+        owner.charge=Math.addExact(owner.charge,charge);metadataBytes=Math.addExact(metadataBytes,charge);owner.permanent=true;obsoleteControlBytes-=owner.controlCharge;owner.controlCharge=0;
     }
     /** A naturally retiring capture transfers prepaid terminal credit to its still-qualifying owner. */
     private long removedEntryMetadata(Entry entry) {
         var owner=obsoletePending.get(entry.request.transferId());long transfer=owner!=null && owner.funding==entry?Math.min(entry.metadataCharge,obsoletePromiseBytes(entry.request)):0;
         if(transfer!=0){owner.charge+=transfer;owner.funding=null;}return entry.metadataCharge-transfer;
     }
-    private boolean qualifiedObsolete(UUID id){var owner=obsoletePending.get(id);return owner!=null && owner.qualified;}
+    private boolean qualifiedObsolete(UUID id){var owner=obsoletePending.get(id);return owner!=null && (owner.qualified || owner.forcePossible);}
     private boolean hasTerminalSlot(UUID id) {
-        var identities=new HashSet<>(released.keySet());identities.addAll(obsoletePending.keySet());identities.addAll(obsoleteTerminals.keySet());identities.addAll(releaseLookups);
+        var identities=new HashSet<>(released.keySet());for(var owner:obsoletePending.values())if(owner.permanent)identities.add(owner.request.original().transferId());identities.addAll(obsoleteTerminals.keySet());identities.addAll(releaseLookups);
         for(var entry:entries.values())if(entry.request.purpose()==Purpose.CURRENT_LEAF)identities.add(entry.request.transferId());for(var build:preparations)if(build.request.purpose()==Purpose.CURRENT_LEAF)identities.add(build.request.transferId());
         return identities.contains(id) || identities.size()<MAX_RELEASED;
     }

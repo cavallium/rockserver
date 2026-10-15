@@ -1186,7 +1186,7 @@ class RaftServerImpl implements RaftServer.Division,
     final long minIndex = request.getType().getStaleRead().getMinIndex();
     final long commitIndex = state.getLog().getLastCommittedIndex();
     LOG.debug("{}: minIndex={}, commitIndex={} from {}", getMemberId(), minIndex, commitIndex, request.getClientId());
-    final boolean ownerQuery = commitIndex < minIndex && minIndex == 0
+    final boolean ownerQuery = minIndex == 0
         && stateMachine instanceof RecoveryOwnerQueryStateMachine owner
         && owner.isRecoveryOwnerQuery(request.getMessage());
     if (commitIndex < minIndex && !ownerQuery) {
@@ -1195,7 +1195,9 @@ class RaftServerImpl implements RaftServer.Division,
       return CompletableFuture.completedFuture(
           newExceptionReply(request, new StateMachineException(getMemberId(), e)));
     }
-    return processQueryFuture(stateMachine.queryStale(request.getMessage(), minIndex), request);
+    return processQueryFuture(ownerQuery
+        ? ((RecoveryOwnerQueryStateMachine) stateMachine).queryRecoveryOwner(request.getMessage())
+        : stateMachine.queryStale(request.getMessage(), minIndex), request);
   }
   ReadException getReadException(String op, long installSnapshot, boolean started) {
     return installSnapshot == RaftLog.INVALID_LOG_INDEX ? null : new ReadException(getMemberId() + ": Failed to " + op

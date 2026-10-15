@@ -101,7 +101,7 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     private byte[] reservationBytes(Request request){byte[] encoded=request(PREPARE,request);return ByteBuffer.allocate(12+encoded.length).putLong(imageLimits.maxImageBytes()).putInt(encoded.length).put(encoded).array();}
     /** Durable inventory admission precedes source pin acquisition and image materialization. */
     public synchronized void reserve(Request request)throws IOException {
-        requireOpen();requireNotObsolete(request);UUID id=request.transferId();if(exists(path(id,"recovery-reserved")))throw new AdmissionRejected("Source transfer collides with topology recovery anchor");if(exists(path(id,"released")) || exists(path(id,"released.pending")))throw new AdmissionRejected("Source transfer already has durable or pending release authority");
+        requireOpen();requireNamespaceAvailable(request.transferId());requireNotObsolete(request);UUID id=request.transferId();if(exists(path(id,"recovery-reserved")))throw new AdmissionRejected("Source transfer collides with topology recovery anchor");if(exists(path(id,"released")) || exists(path(id,"released.pending")))throw new AdmissionRejected("Source transfer already has durable or pending release authority");
         var file=path(id,"reserved");if(exists(file)){var prior=reservation(id);if(!Arrays.equals(request(PREPARE,request),request(PREPARE,prior.request())))throw new AdmissionRejected("Original source reservation request changed");SessionJournalFiles.force(file);SessionJournalFiles.force(root);inventory(null,null);return;}
         var usage=inventoryUsage();long imageCharge=Math.multiplyExact(2,imageLimits.maxImageBytes()),metadataCharge=Math.max(remainingCapturePromise(request,false),Math.max(RELEASE_METADATA_PROMISE,request.purpose()==Purpose.CURRENT_LEAF?obsoleteMetadataPromise(request):0))+3L*(44L+encodedRequestBytes(request));
         if(usage.count()>=maximumArtifacts || publicationCount()>=MAX_RELEASED || imageCharge>maximumImageBytes-usage.imageBytes() || metadataCharge>maximumMetadataBytes-usage.metadataBytes())throw new AdmissionRejected("Durable source image/metadata reservation exhausted");
@@ -109,7 +109,7 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     }
     /** Shares the existing forced image/scratch/metadata quota with source transfers. */
     synchronized Path reserveTopologyRecovery(UUID id)throws IOException {
-        requireOpen();var reservation=path(id,"recovery-reserved");
+        requireOpen();requireNamespaceAvailable(id);var reservation=path(id,"recovery-reserved");
         if(pendingObsolete.containsKey(id) || exists(path(id,"obsolete")) || exists(path(id,"obsolete.pending")) || exists(path(id,"reserved")) || exists(path(id,"released")) || exists(path(id,"released.pending")) || exists(path(id,"publication")))throw new IOException("Recovery anchor collides with source transfer");
         if(!exists(reservation)) {
             var usage=inventoryUsage();long imageCharge=Math.multiplyExact(2,imageLimits.maxImageBytes());
@@ -133,7 +133,7 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         capture(request,pin,schema,owner,request.sourceDirectory(),request.range());
     }
     private void capture(Request request,ReplicatedRangeStore.SnapshotPin pin,DistributedSchema schema,ReplicaDescriptor owner,RangeDirectory directory,RangeDescriptor parent)throws Exception {
-        requireNotObsolete(request);var reserved=reservation(request.transferId());requireRequestIo(request,reserved.request());
+        requireNamespaceAvailable(request.transferId());requireNotObsolete(request);var reserved=reservation(request.transferId());requireRequestIo(request,reserved.request());
         if(!pin.groupId().equals(parent.groupId()) || pin.rangeEpoch()!=parent.rangeEpoch() || !Arrays.equals(pin.interval().lowerInclusive(),parent.lowerInclusive()) || !Arrays.equals(pin.interval().upperExclusive(),parent.upperExclusive()) || !pin.interval().domainId().equals(directory.domainId()) || !pin.interval().columns().equals(directory.columns()) || !Arrays.equals(pin.schemaDigest(),schema.digest()))throw new IOException("Source capture pin changed original range/schema");
         var rows=new TreeMap<String,byte[]>();var metadataFreeze=new NativeTopologyFreeze[1];pin.visitState((key,value)->{if(NativeTopologyLearnerSchema.row(key))rows.put(HexFormat.of().formatHex(key),value.clone());if(request.metadataOnly() && metadataFreezeKey(pin.groupId(),key)){if(metadataFreeze[0]!=null)throw new IllegalArgumentException("Duplicate capture metadata FREEZE");metadataFreeze[0]=NativeTopologyFreeze.decode(value);}});
         var origin=request.metadataOnly()?null:pin.topologyImageOrigin();var capture=new Capture(request,pin.interval().lowerInclusive(),pin.interval().upperExclusive(),pin.position(),schema,owner,pin.configuration(),NativeTopologyLearnerSchema.copy(rows),origin==null?new byte[32]:digest(origin.encode()),metadataFreeze[0]);byte[] encoded=encodeCapture(capture);var prior=publication(request);if(prior!=null&&prior.phase()==PublicationPhase.CAPTURING&&!prior.cut().equals(pin.position()))throw new OriginalCutUnavailable();beginPublication(request,capture.cut(),capture.owner(),capture.configuration(),digest(encoded));var file=path(request.transferId(),"capture");
@@ -203,12 +203,14 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     private static void blob(DataOutputStream out,byte[] bytes)throws IOException{out.writeInt(bytes.length);out.write(bytes);}private static byte[] blob(DataInputStream in,int maximum)throws IOException{int size=in.readInt();if(size<0 || size>maximum || size>in.available())throw new IOException("Invalid source capture field");return in.readNBytes(size);}private static void uuid(DataOutputStream out,UUID id)throws IOException{out.writeLong(id.getMostSignificantBits());out.writeLong(id.getLeastSignificantBits());}private static UUID uuid(DataInputStream in)throws IOException{return new UUID(in.readLong(),in.readLong());}
     private synchronized void writeMetadata(Path file,byte[] body,int maximum)throws IOException{SessionJournalFiles.write(file,body,maximum);}
     private final Set<UUID> bulkOwners=new HashSet<>();
+    private final ThreadLocal<UUID> bulkIdentity=new ThreadLocal<>();
     private final ThreadLocal<NativeRangeImage.IoAdmission> imageAdmission=ThreadLocal.withInitial(()->NativeRangeImage.IoAdmission.UNLIMITED);
     private AutoCloseable ownBulk(UUID id,NativeRangeImage.IoAdmission admission)throws IOException{
         Objects.requireNonNull(admission);synchronized(this){requireOpen();if(bulkOwners.size()>=maximumArtifacts || !bulkOwners.add(id))throw new IOException("Source artifact bulk owner is active");}
-        imageAdmission.set(Objects.requireNonNull(admission));
-        return ()->{imageAdmission.remove();synchronized(this){bulkOwners.remove(id);}};
+        bulkIdentity.set(id);imageAdmission.set(Objects.requireNonNull(admission));
+        return ()->{bulkIdentity.remove();imageAdmission.remove();synchronized(this){bulkOwners.remove(id);}};
     }
+    private void requireNamespaceAvailable(UUID id)throws IOException{if(bulkOwners.contains(id)&&!id.equals(bulkIdentity.get()))throw new IOException("Actual source namespace owner is active");}
     private void requireIdle(UUID id)throws IOException{if(bulkOwners.contains(id))throw new IOException("Actual source artifact validation/publication is active");}
     /** Full image validation is owned per transfer; no rate callback executes under the artifact monitor. */
     public Saved lookupAdmitted(Request request,NativeRangeImage.IoAdmission admission)throws IOException{
@@ -257,11 +259,32 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         directory(owned);SessionJournalFiles.force(owned);SessionJournalFiles.force(root);
     }
     public synchronized Path originalImagePath(Request request,ApplyPosition cut)throws IOException {
-        requireNotObsolete(request);var original=capture(request.transferId());requireRequestIo(request,original.request());if(!cut.equals(original.cut()))throw new IOException("Source original cut changed");var file=sourcePath(request.transferId(),cut);ensureOriginalDirectory(request.transferId());return file;
+        requireNamespaceAvailable(request.transferId());requireNotObsolete(request);var original=capture(request.transferId());requireRequestIo(request,original.request());if(!cut.equals(original.cut()))throw new IOException("Source original cut changed");var file=sourcePath(request.transferId(),cut);ensureOriginalDirectory(request.transferId());return file;
     }
     private SnapshotInfo restoreOriginal(Saved saved)throws IOException {
         requireOpen();var prepared=saved.prepared();requireNotObsolete(prepared.request());requirePrepared(metadata(prepared.request().transferId()),prepared);if(exists(path(prepared.request().transferId(),"released")))throw new IOException("Released source image cannot be restored");
         Path target=sourcePath(prepared.request().transferId(),prepared.image().position());ensureOriginalDirectory(prepared.request().transferId());publishImage(saved.image(),target,prepared);return snapshot(target,prepared);
+    }
+    /** Qualified/drained caller may acknowledge a never-owned UUID without creating a terminal floor. */
+    public boolean acknowledgeAbsentObsolete(RatisRecoveryObsoleteRpc.Request request)throws IOException {
+        UUID id=request.original().transferId();
+        try(var owner=ownBulk(id,NativeRangeImage.IoAdmission.UNLIMITED)){
+            if(!absentObsoleteNamespace(request))return false;
+            obsoleteForceObserver.boundary(false);removal.force(root);obsoleteForceObserver.boundary(true);
+            return absentObsoleteNamespace(request);
+        }catch(IOException failed){throw failed;}catch(Exception failed){throw new IOException("Source namespace absence acknowledgement failed",failed);}
+    }
+    private synchronized boolean absentObsoleteNamespace(RatisRecoveryObsoleteRpc.Request request)throws IOException {
+        requireOpen();UUID id=request.original().transferId();var pending=pendingObsolete.get(id);if(pending!=null){requireObsoleteRequest(request,pending);return false;}
+        boolean owned=false;int count=0;
+        try(var files=Files.newDirectoryStream(root,id+".*")){for(var file:files){if(++count>20)throw new IOException("Source UUID namespace exceeds bound");String suffix=file.getFileName().toString().substring(37);
+            if(suffix.equals("recovery") || suffix.equals("recovery-reserved") || suffix.equals("recovery-reserved.pending"))throw new AdmissionRejected("Obsolete absence conflicts with recovery namespace");
+            if(suffix.equals("released")){decodeReceipt(read(file,RELEASE_BODY_BYTES+32),id);throw new AdmissionRejected("Installed RELEASE is definitive; absence cannot replace it");}
+            if(suffix.equals("obsolete")){requireObsoleteRequest(request,obsoleteRecord(file,id));owned=true;continue;}
+            if(suffix.equals("source")){directory(file);owned=true;continue;}
+            if(!Set.of("reserved","reserved.pending","capture","capture.pending","prepared","prepared.pending","image","image.pending","publication","publication.pending","abandoned-settled","abandoned-settled.pending","released.pending","settled","settled.pending","obsolete.pending","obsolete-settled","obsolete-settled.pending").contains(suffix))throw new AdmissionRejected("Foreign source UUID namespace prevents absence acknowledgement");
+            regular(file,Math.max(imageLimits.maxImageBytes(),Math.max(MAX_METADATA_FILE,MAX_OBSOLETE_FILE)));owned=true;
+        }}return !owned;
     }
     /** Re-establishes ACK for an existing durable terminal only; never creates fresh authority. */
     public boolean retryObsolete(RatisRecoveryObsoleteRpc.Request request)throws IOException {

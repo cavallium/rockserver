@@ -53,12 +53,14 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
     RatisNodeResourceBudget remoteResources;
     final UUID remotePool=new UUID(965,1);
 
-    RatisTwoPoolWorkflowFixture(Path root,boolean pendingImport)throws Exception {
+    RatisTwoPoolWorkflowFixture(Path root,boolean pendingImport)throws Exception {this(root,pendingImport,List.of());}
+    RatisTwoPoolWorkflowFixture(Path root,boolean pendingImport,List<ReplicaDescriptor> additionalFirstReplicas)throws Exception {
         this.root=root;operatorJar=RatisSchemaClientWorkflowTest.jar();appendOperator=new DistributedSchema.Operator("append",0,RatisSchemaClientWorkflowTest.AppendOperator.class.getName(),OperatorUpload.sha256(operatorJar),1,1,"append-contract",1);schemaReplicas=new RatisSchemaReplicaClient(4,this::schemaOwnerClient);importSource=root.resolve("original-import.sst");Files.createDirectories(root);first=new RatisNodeServiceTest().schema();env=new Environment(root);
         try {
         local=new ReplicaDescriptor(new UUID(9,1),new UUID(9,2),new UUID(9,3),"node9","127.0.0.1:4512",ReplicaDescriptor.Role.VOTER);
         second=new DistributedSchema(first.clusterId(),first.databaseId(),new UUID(960,3),1,0,List.of(new DistributedSchema.Column(72,new UUID(960,4),"archive",ColumnSchema.of(IntArrayList.of(1),new ObjectArrayList<>(),true),null)));
-        firstDirectory=directory(first,new UUID(961,1),local,RangeDescriptor.TopologyState.ACTIVE);secondDirectory=directory(second,new UUID(961,2),new ReplicaDescriptor(local.nodeId(),local.nodeIncarnation(),new UUID(960,5),local.peerId(),local.address(),ReplicaDescriptor.Role.VOTER),pendingImport?RangeDescriptor.TopologyState.FENCED:RangeDescriptor.TopologyState.ACTIVE);
+        var firstVoters=new ArrayList<ReplicaDescriptor>();firstVoters.add(local);firstVoters.addAll(additionalFirstReplicas);
+        firstDirectory=directory(first,new UUID(961,1),firstVoters,RangeDescriptor.TopologyState.ACTIVE);secondDirectory=directory(second,new UUID(961,2),List.of(new ReplicaDescriptor(local.nodeId(),local.nodeIncarnation(),new UUID(960,5),local.peerId(),local.address(),ReplicaDescriptor.Role.VOTER)),pendingImport?RangeDescriptor.TopologyState.FENCED:RangeDescriptor.TopologyState.ACTIVE);
         imported=pendingImport?importDefinition():null;
         var domains=List.of(new RatisNodePlan.Domain(firstDirectory,Map.of(first.columnIds().iterator().next(),"data"),Set.of()),new RatisNodePlan.Domain(secondDirectory,Map.of(second.columnIds().iterator().next(),"archive"),Set.of()));
         var remote=new ReplicaDescriptor(new UUID(8,1),new UUID(8,2),new UUID(8,8),"node8","127.0.0.1:4511",ReplicaDescriptor.Role.VOTER);var binding=new RatisNodePlan.Catalogue(env.outer.catalogue,1,new byte[32],env.outer.directoryColumn,env.outer.sessions,List.of(remote));
@@ -79,7 +81,7 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
         }catch(Exception|Error failure){try{close();}catch(Exception cleanup){failure.addSuppressed(cleanup);}throw failure;}
     }
     it.cavallium.rockserver.core.impl.RWScheduler scheduler(){return env.scheduler;}
-    private static RangeDirectory directory(DistributedSchema schema,UUID group,ReplicaDescriptor owner,RangeDescriptor.TopologyState state){return new RangeDirectory(schema.clusterId(),schema.databaseId(),schema.domainId(),schema.schemaEpoch(),schema.digest(),1,schema.columnIds(),schema.routingPrefixBytes(),List.of(new RangeDescriptor(group,group,1,0,null,null,state,List.of(owner))));}
+    private static RangeDirectory directory(DistributedSchema schema,UUID group,List<ReplicaDescriptor> owners,RangeDescriptor.TopologyState state){return new RangeDirectory(schema.clusterId(),schema.databaseId(),schema.domainId(),schema.schemaEpoch(),schema.digest(),1,schema.columnIds(),schema.routingPrefixBytes(),List.of(new RangeDescriptor(group,group,1,0,null,null,state,owners)));}
     private OperationId operation(){return new OperationId(new UUID(962,2),0,sequence++);}
     private void publish()throws Exception {
         var o=env.outer;var schemas=new RatisSchemaCatalogue(catalogue,o.cluster,o.database,o.catalogue,1,new byte[32],o.directoryColumn);
@@ -131,8 +133,8 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
         }
         assertEquals(CommandResult.Status.SUCCESS,topology.execute(command).status());
     }
-    TopologyChange.Definition split()throws Exception {
-        var sourceDirectory=routes.get(first.domainId()).directory();var parent=sourceDirectory.ranges().getFirst();var left=new RangeDescriptor(new UUID(963,1),new UUID(963,2),1,0,null,new byte[]{64},RangeDescriptor.TopologyState.ACTIVE,List.of(local));var right=new RangeDescriptor(new UUID(963,3),new UUID(963,4),1,0,new byte[]{64},null,RangeDescriptor.TopologyState.ACTIVE,List.of(local));var target=new RangeDirectory(sourceDirectory.clusterId(),sourceDirectory.databaseId(),sourceDirectory.domainId(),sourceDirectory.schemaEpoch(),sourceDirectory.schemaDigest(),sourceDirectory.generation()+1,sourceDirectory.columns(),sourceDirectory.routingPrefixBytes(),List.of(left,right));var definition=new TopologyChange.Definition(new UUID(963,5),sourceDirectory,target);
+    TopologyChange.Definition publishSplit()throws Exception {
+        var sourceDirectory=routes.get(first.domainId()).directory();var parent=sourceDirectory.ranges().getFirst();var left=new RangeDescriptor(new UUID(963,1),new UUID(963,2),1,0,null,new byte[]{64},RangeDescriptor.TopologyState.ACTIVE,parent.replicas());var right=new RangeDescriptor(new UUID(963,3),new UUID(963,4),1,0,new byte[]{64},null,RangeDescriptor.TopologyState.ACTIVE,parent.replicas());var target=new RangeDirectory(sourceDirectory.clusterId(),sourceDirectory.databaseId(),sourceDirectory.domainId(),sourceDirectory.schemaEpoch(),sourceDirectory.schemaDigest(),sourceDirectory.generation()+1,sourceDirectory.columns(),sourceDirectory.routingPrefixBytes(),List.of(left,right));var definition=new TopologyChange.Definition(new UUID(963,5),sourceDirectory,target);
         var binding=plan.catalogue();var topology=new RatisTopologyCatalogue(catalogue,first.clusterId(),first.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
         var schemaHead=new RatisSchemaAdministration(catalogue,first.clusterId(),first.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn()).readHead(first.domainId());var importHead=new RatisRangeImportCatalogue(catalogue,first.clusterId(),first.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn()).readHead(first.domainId());
         topologyCommand(topology,topology.prepareDefinition(operation(),definition,topology.readCapacity()));
@@ -140,9 +142,18 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
         topologyCommand(topology,topology.prepareFencing(operation(),definition,topology.readHead(first.domainId()),schemaHead,importHead));
         var view=RatisTopologyAuthority.readNative(env.catalogue.store,env.outer.directoryColumn,first.clusterId(),first.databaseId(),RatisTopologyAuthority.Request.of(definition.header(),TopologyChange.Stage.FREEZE));var freeze=new RatisTopologyFreezeRecord(definition,parent.groupId(),view.admissionDigest());var machine=server.machines.get(RaftGroupId.valueOf(parent.groupId()));machine.queryLinearizable(Message.valueOf(ByteString.copyFrom(RatisTopologyFreezeRpc.prepareRequest(freeze)))).get(5,TimeUnit.SECONDS);var frozen=NativeTopologyFreeze.decode(apply(parent.groupId(),freeze.encode()).getContent().toByteArray());
         topologyCommand(topology,topology.prepareProof(operation(),definition,topology.readHead(first.domainId()),frozen.proof(local.replicaId())));
+        // ManualTimer does not run the periodic census while recovery assertions take time.
+        field(node,"diskCensus",RatisDiskRunwayService.class).initialCensus();
         var seed=node.seedTopology(new RatisTopologySeedRpc.Request(definition,binding.groupId(),parent.groupId(),local.replicaId()));
         for(var child:definition.targets())topologyCommand(topology,topology.prepareProof(operation(),definition,topology.readHead(first.domainId()),seed.proof(child.groupId())));
         topologyCommand(topology,topology.preparePublication(operation(),definition,topology.readHead(first.domainId()),schemaHead,importHead));
+        assertEquals(TopologyChange.Phase.PUBLISHED,topology.readHead(first.domainId()).phase());return definition;
+    }
+    TopologyChange.Definition split()throws Exception {
+        var definition=publishSplit();var binding=plan.catalogue();
+        var topology=new RatisTopologyCatalogue(catalogue,first.clusterId(),first.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
+        var schemaHead=new RatisSchemaAdministration(catalogue,first.clusterId(),first.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn()).readHead(first.domainId());
+        var importHead=new RatisRangeImportCatalogue(catalogue,first.clusterId(),first.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn()).readHead(first.domainId());
         var published=RatisTopologyAuthority.readNative(env.catalogue.store,env.outer.directoryColumn,first.clusterId(),first.databaseId(),RatisTopologyAuthority.Request.of(definition.header(),TopologyChange.Stage.ACTIVATE));
         for(var child:definition.targets()){var record=RatisTopologyActivationRecord.of(published,child.groupId());var targetMachine=server.machines.get(RaftGroupId.valueOf(child.groupId()));targetMachine.queryLinearizable(Message.valueOf(ByteString.copyFrom(RatisTopologyActivationRpc.prepareRequest(record)))).get(5,TimeUnit.SECONDS);var activation=NativeTopologyActivation.decode(apply(child.groupId(),record.encode()).getContent().toByteArray());topologyCommand(topology,topology.prepareProof(operation(),definition,topology.readHead(first.domainId()),activation.proof()));}
         topologyCommand(topology,topology.prepareRetirement(operation(),definition,topology.readHead(first.domainId()),schemaHead,importHead));

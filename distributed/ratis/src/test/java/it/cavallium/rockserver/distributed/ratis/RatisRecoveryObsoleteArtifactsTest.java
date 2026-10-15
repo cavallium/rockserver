@@ -216,6 +216,28 @@ class RatisRecoveryObsoleteArtifactsTest {
             assertThrows(IOException.class,()->ledger.forceObsolete(obsolete(f,current(f,1124))));
             assertFalse(Files.exists(owned.resolve(current(f,1124).transferId()+".obsolete")));assertTrue(f.store.activeSnapshotPins()>0);assertEquals(2*limits.maxImageBytes(),ledger.reservedImageBytes());
             ledger.forceObsolete(request);assertFalse(ledger.isObsolete(request));lease.close();ledger.obsolete(request);assertTrue(ledger.isObsolete(request));assertEquals(0,ledger.reservedImageBytes());
+            long floors;try(var files=Files.list(owned)){floors=files.filter(path->path.getFileName().toString().endsWith(".obsolete")).count();}
+            for(int n=0;n<65;n++)assertTrue(ledger.acknowledgeAbsentObsolete(obsolete(f,current(f,2000+n))));
+            try(var files=Files.list(owned)){assertEquals(floors,files.filter(path->path.getFileName().toString().endsWith(".obsolete")).count());}assertEquals(0,ledger.reservedImageBytes());
+        }
+    }
+    @Test void absentNamespaceForceFailuresNeverCreateFloorsAndExactRetryRechecksTheSameNamespace()throws Exception {
+        for(boolean after:List.of(false,true)){
+            Path owned=Files.createDirectory(root.resolve("absent-force-"+after));try(var f=new RatisTopologySourceSnapshotFixture(root.resolve("source-"+after));var ledger=open(owned)){
+                var request=obsolete(f,current(f,8000));var once=new AtomicBoolean(true);ledger.obsoleteForceObserver(boundary->{if(boundary==after&&once.getAndSet(false))throw new IOException("Unknown absence force acknowledgement");});
+                assertThrows(IOException.class,()->ledger.acknowledgeAbsentObsolete(request));assertFalse(once.get());assertFalse(Files.exists(owned.resolve(request.original().transferId()+".obsolete")));assertEquals(0,ledger.reservedImageBytes());
+                ledger.obsoleteForceObserver(boundary->{});assertTrue(ledger.acknowledgeAbsentObsolete(request));try(var files=Files.list(owned)){assertEquals(List.of("artifacts.lock"),files.map(path->path.getFileName().toString()).toList());}
+                ledger.reserve(request.original());assertFalse(ledger.acknowledgeAbsentObsolete(request));
+            }
+        }
+    }
+    @Test void absenceAcknowledgementOwnsTheNamespaceThroughActualDirectoryForceAndRecheck()throws Exception {
+        Path owned=Files.createDirectory(root.resolve("absent-active"));try(var f=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var ledger=open(owned);var worker=Executors.newSingleThreadExecutor()){
+            var request=obsolete(f,current(f,8001));var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+            ledger.obsoleteForceObserver(after->{if(!after){entered.countDown();try{assertTrue(release.await(5,TimeUnit.SECONDS));}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}}});
+            var actual=worker.submit(()->ledger.acknowledgeAbsentObsolete(request));
+            try{assertTrue(entered.await(5,TimeUnit.SECONDS));assertThrows(IOException.class,()->ledger.reserve(request.original()));assertThrows(IOException.class,ledger::close);assertFalse(actual.isDone());}finally{release.countDown();}
+            assertTrue(actual.get(5,TimeUnit.SECONDS));assertFalse(Files.exists(owned.resolve(request.original().transferId()+".reserved")));assertFalse(Files.exists(owned.resolve(request.original().transferId()+".obsolete")));
         }
     }
     @Test void activeBulkOwnerRefusesForceUntilActualValidationReturns()throws Exception {

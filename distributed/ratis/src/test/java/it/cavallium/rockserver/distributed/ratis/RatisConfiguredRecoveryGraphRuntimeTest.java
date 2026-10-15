@@ -52,7 +52,7 @@ class RatisConfiguredRecoveryGraphRuntimeTest {
             return (RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args)->switch(method.getName()){case "io"->io;case "getGroupId"->RaftGroupId.valueOf(range.groupId());case "close"->{clientCloses.incrementAndGet();yield null;}default->throw new AssertionError(method);});
         }
         void assertNoDispatch(RatisNodeRuntime node,RatisNodeRuntimeTest.FakeServer server)throws Exception {
-            assertEquals(0,hostCalls.get());assertEquals(0,field(node,"configuredRecoveries",RatisConfiguredRecoveries.class).size());assertFalse(field(node,"configuredRecoveryServiceStarted",Boolean.class));assertEquals(1,node.localGroups().size());assertEquals(1,server.machines.size());assertTrue(node.nativePool(RatisPoolFixtures.ID).metadataRecoveries().isEmpty());assertTrue(node.nativePool(RatisPoolFixtures.ID).currentRangeRecoveries().isEmpty());assertTrue(node.nativePool(RatisPoolFixtures.ID).topologySeeds().isEmpty());
+            assertEquals(0,hostCalls.get());assertEquals(0,field(node,"configuredRecoveries",RatisConfiguredRecoveries.class).size());assertTrue(field(node,"configuredRecoveryServiceStarted",Boolean.class),"DATA discovery service stays armed even without actor dispatch");assertEquals(1,node.localGroups().size());assertEquals(1,server.machines.size());assertTrue(node.nativePool(RatisPoolFixtures.ID).metadataRecoveries().isEmpty());assertTrue(node.nativePool(RatisPoolFixtures.ID).currentRangeRecoveries().isEmpty());assertTrue(node.nativePool(RatisPoolFixtures.ID).topologySeeds().isEmpty());
             var sources=field(field(source.node,"pools",Map.class).get(source.fast),"sources",RatisTopologySourceSnapshotService.class);assertTrue(field(sources,"entries",Map.class).isEmpty());for(var range:split.parents())assertEquals(0,source.store(range.groupId()).activeSnapshotPins());for(var range:split.targets())assertEquals(0,source.store(range.groupId()).activeSnapshotPins());
         }
         public void close()throws Exception{release.countDown();route.close();env.close();source.close();}
@@ -103,7 +103,7 @@ class RatisConfiguredRecoveryGraphRuntimeTest {
                 var pending=field(graph,"dirty",RatisConfiguredRecoveryGraph.Snapshot.class);assertNotNull(pending);int calls=fixture.calls.get();advanceClock(fixture,2);
                 node.bootstrapDeferredRecovery().get(15,TimeUnit.SECONDS);
                 assertTrue(fixture.calls.get()>calls,"Settling an old force cannot substitute for fresh role authority");assertNull(field(graph,"dirty",RatisConfiguredRecoveryGraph.Snapshot.class));assertTrue(graph.snapshot().plan().catalogueCut().index()>pending.plan().catalogueCut().index());assertEquals(4096L+16L*graph.retainedEncodedBytes(),credit.bytes());
-                assertFalse(field(node,"configuredRecoveryServiceStarted",Boolean.class));assertEquals(0,fixture.hostCalls.get());
+                assertTrue(field(node,"configuredRecoveryServiceStarted",Boolean.class),"DATA discovery service stays armed even without actor dispatch");assertEquals(0,fixture.hostCalls.get());
             }
         }
     }

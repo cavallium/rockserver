@@ -515,6 +515,23 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private volatile LocalMetadataCandidate localMetadataCandidate;private volatile boolean localMetadataPreparing,localMetadataStopped;
     private volatile ApplyPosition localMetadataBaseline;
+    /** A driver completion flag alone is not a durable local ancestor baseline. */
+    void requireMetadataDiscoveryReady(TopologyChange.Header header)throws IOException {
+        requireHealthy();
+        if(role!=RatisNodePlan.Role.DATA || getLifeCycleState()!=LifeCycle.State.RUNNING || recoveryEligibility.discoveryPending()
+                || recoveryEligibility.snapshot().mode()!=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.RECOVERY)
+            throw new IOException("Ancestor META discovery is not settled");
+        try {
+            var freeze=store.topologyFreeze();var registration=store.metadataRecoveryRegistration();
+            if(freeze==null || !Arrays.equals(freeze.header().encode(),header.encode()) || !store.topologyRetired() || store.pendingInstallation()
+                    || registration==null && localMetadataBaseline==null
+                    || registration!=null && (!store.metadataRecoveryRegistrationForced(registration) || store.metadataRecoveryPending() || !store.metadataRecoveryImageInstalled()))
+                throw new IOException("Ancestor lacks its actual completed META baseline");
+            var baseline=registration==null?localMetadataBaseline:registration.imageCut();var applied=store.applied();var snapshot=durableSnapshot;
+            if(!RatisRelocationOwnerRpc.covers(applied,baseline) || snapshot==null || !RatisRelocationOwnerRpc.covers(applied,new ApplyPosition(snapshot.getTerm(),snapshot.getIndex())))
+                throw new IOException("Ancestor META native/snapshot prefix is incomplete");
+        }catch(org.rocksdb.RocksDBException failure){throw new IOException("Cannot verify ancestor META native baseline",failure);}
+    }
     /** Trusted Node IO has already forced this graph cut and exact consuming definition. */
     LocalMetadataCandidate prepareLocalMetadataDiscovery(ApplyPosition graphCut,TopologyChange.Definition consuming)throws IOException {
         Objects.requireNonNull(graphCut);Objects.requireNonNull(consuming);LocalMetadataCandidate candidate;
@@ -1384,7 +1401,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var md5=org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(file,imageAdmission));var snapshot=new SingleFileSnapshotInfo(new FileInfo(file,md5),TermIndex.valueOf(position.term(),position.index()));
             var prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,image,qualifiedSchema,evidence.owner(),pin.configuration(),rows,metadataFreeze[0]);var retained=artifacts.retainAdmitted(prepared,snapshot,imageAdmission);
             var after=sourceSnapshotEvidence(request,definition,qualifiedDirectory);if(!after.owner().equals(evidence.owner()) || !RatisRelocationOwnerRpc.covers(after.completedCut(),position))throw new IOException("Source lost completed image owner");
-            snapshotPermit.requireCurrent();var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,retained.snapshot(),()->closeSourceCapture(request.transferId(),pin));returned=true;return lease;
+            // READY owns forced immutable files. Native reads have ended before the PREPARE ACK;
+            // retaining the pin until remote cleanup can deadlock mutually recovering sources.
+            snapshotPermit.requireCurrent();closeSourceCapture(request.transferId(),pin);
+            var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,retained.snapshot(),()->{});returned=true;return lease;
         }finally{if(!returned)closeSourceCapture(request.transferId(),pin);}
     }
     RatisRecoveryImageRpc.Evidence recoveryImageEvidence(RatisRecoveryImageRpc.Request request)throws Exception {
@@ -5505,16 +5525,34 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     @Override public boolean isRecoveryOwnerQuery(Message request) {
-        if(role!=RatisNodePlan.Role.DATA || store.acknowledgedRecoverySupersession()==null || request==null || request.getContent().size()!=RatisRecoverySupersessionRpc.REQUEST_BYTES)return false;
-        try{return ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisRecoverySupersessionRpc.REQUEST_BYTES)==RatisRecoverySupersessionRpc.KIND;}
+        if(role!=RatisNodePlan.Role.DATA || request==null)return false;
+        try{int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisRecoveryObsoleteRpc.MAX_REQUEST_BYTES);
+            return kind==RatisRecoveryObsoleteRpc.KIND || kind==RatisRecoverySupersessionRpc.KIND && store.acknowledgedRecoverySupersession()!=null && request.getContent().size()==RatisRecoverySupersessionRpc.REQUEST_BYTES;}
         catch(IllegalArgumentException invalid){return false;}
+    }
+    @Override public CompletableFuture<Message> queryRecoveryOwner(Message request) {
+        try{
+            if(!isRecoveryOwnerQuery(request))throw new IOException("Unclassified recovery owner request");
+            int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisRecoveryObsoleteRpc.MAX_REQUEST_BYTES);
+            if(kind==RatisRecoverySupersessionRpc.KIND)return queryRecoverySupersession(request,0);
+            try(var credit=readConstructionLease(kind,request.getContent().asReadOnlyByteBuffer())){
+                var obsolete=RatisRecoveryObsoleteRpc.decode(request.getContent().toByteArray());
+                synchronized(gate){
+                    var server=getServer().getNow(null);
+                    if(role!=RatisNodePlan.Role.DATA || getLifeCycleState()!=LifeCycle.State.RUNNING || storageFailure!=null || sourceSnapshots==null || topologyLocalReplica==null || server==null || !server.getId().toString().equals(topologyLocalReplica.peerId()) || !getGroupId().getUuid().equals(obsolete.original().sourceGroup()) || !store.ownership().owner().groupId().equals(obsolete.original().sourceGroup()))throw new IOException("Negative source cleanup lost actual DATA owner");
+                    var division=server.getDivision(getGroupId());if(division.getStateMachine()!=this || !division.getInfo().isAlive() || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Negative source cleanup division is not running");
+                    if(obsolete.original().range().replicas().stream().noneMatch(replica->replica.role()==ReplicaDescriptor.Role.VOTER && sameReplicaIdentity(replica,topologyLocalReplica)))throw new IOException("Negative source cleanup is not addressed to an original source voter");
+                }
+                return sourceSnapshots.obsolete(obsolete).thenApply(reply->Message.valueOf(ByteString.copyFrom(reply)));
+            }
+        }catch(Throwable failure){return CompletableFuture.failedFuture(failure);}
     }
 
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
         try {
             if(genesisActive())throw new IOException("Genesis requires a fresh STATE barrier");
             if(role==RatisNodePlan.Role.DATA && recoveryEligibility.discoveryPending()) {
-                if(isRecoveryOwnerQuery(request))return queryRecoverySupersession(request,minIndex);
+                if(store.acknowledgedRecoverySupersession()!=null && isRecoveryOwnerQuery(request)){if(minIndex!=0)throw new IOException("Recovery owner query requires zero minimum index");return queryRecoveryOwner(request);}
                 requireDiscoverySettled();
             }
             int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);
