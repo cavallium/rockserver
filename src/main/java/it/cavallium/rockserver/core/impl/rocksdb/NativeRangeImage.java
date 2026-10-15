@@ -33,6 +33,7 @@ import java.util.*;
 /** Portable logical range image from one native snapshot cut; no host paths or physical SST identity. */
 public final class NativeRangeImage {
     private static final int MAGIC = 0x4e52494d; // NRIM
+    private static final int METADATA_MAGIC = 0x4e524d4d; // NRMM: sealed GROUP metadata, never a USER image.
     private static final int HASH_BYTES = 32;
     private static final Comparator<UUID> UUID_ORDER = (a, b) -> {
         int first = Long.compareUnsigned(a.getMostSignificantBits(), b.getMostSignificantBits());
@@ -101,7 +102,7 @@ public final class NativeRangeImage {
     private record HomeContext(UUID cluster,UUID database,UUID column) {}
     private record SnapshotHomeContext(UUID cluster,UUID database,UUID column) {}
     private record Header(RangeOwnership.Owner owner, RangeOwnership.Interval interval,
-                          byte[] schema, ApplyPosition position, Set<UUID> mergeColumns) {}
+                          byte[] schema, ApplyPosition position, Set<UUID> mergeColumns,boolean metadata) {}
 
     private NativeRangeImage() {}
 
@@ -123,8 +124,18 @@ public final class NativeRangeImage {
         return writeAdmitted(destination,pin,interval,limits,IoAdmission.UNLIMITED);
     }
     public static Manifest writeAdmitted(Path destination,ReplicatedRangeStore.SnapshotPin pin,RangeOwnership.Interval interval,Limits limits,IoAdmission admission)throws IOException,RocksDBException {
+        return writeAdmitted(destination,pin,interval,limits,admission,false);
+    }
+    public static Manifest writeMetadata(Path destination,ReplicatedRangeStore store,Limits limits)throws IOException,RocksDBException {
+        try(var pin=store.captureMetadataForRecovery()){return writeMetadataAdmitted(destination,pin,pin.interval(),limits,IoAdmission.UNLIMITED);}
+    }
+    public static Manifest writeMetadataAdmitted(Path destination,ReplicatedRangeStore.SnapshotPin pin,RangeOwnership.Interval interval,Limits limits,IoAdmission admission)throws IOException,RocksDBException {
+        return writeAdmitted(destination,pin,interval,limits,admission,true);
+    }
+    private static Manifest writeAdmitted(Path destination,ReplicatedRangeStore.SnapshotPin pin,RangeOwnership.Interval interval,Limits limits,IoAdmission admission,boolean metadata)throws IOException,RocksDBException {
         Objects.requireNonNull(admission).beforeBytes(1);
         Objects.requireNonNull(pin, "pin");
+        if(pin.metadataOnly()!=metadata)throw new IllegalArgumentException("Image kind differs from native capture authority");
         Objects.requireNonNull(interval, "interval");
         Objects.requireNonNull(limits, "limits");
         if (!pin.interval().equals(interval) || !pin.columns().equals(interval.columns()) || pin.position() == null) {
@@ -138,7 +149,7 @@ public final class NativeRangeImage {
             catch(IllegalArgumentException invalid) { throw new IOException("Topology image origin differs from snapshot cut",invalid); }
         }
         Header header = new Header(new RangeOwnership.Owner(pin.groupId(), pin.rangeEpoch()), interval,
-                pin.schemaDigest(), pin.position(), Set.copyOf(pin.deterministicMergeColumns()));
+                pin.schemaDigest(), pin.position(), Set.copyOf(pin.deterministicMergeColumns()),metadata);
         validateHeader(header, limits);
         Path target = destination.toAbsolutePath();
         Path directory = target.getParent();
@@ -166,14 +177,15 @@ public final class NativeRangeImage {
                     output.write(key);
                     output.write(value);
                 };
-                for (UUID column : sorted(interval.columns())) {
+                if(!metadata)for (UUID column : sorted(interval.columns())) {
                     pin.visitColumn(column, interval.lowerInclusive(), interval.upperExclusive(),
                             (key, value) -> append.accept(Section.USER, column, key, value));
                 }
                 byte[] originKey=ByteBuffer.allocate(17).putLong(pin.groupId().getMostSignificantBits()).putLong(pin.groupId().getLeastSignificantBits()).put((byte)0x64).array();
                 boolean[] originWritten={false};
                 pin.visitState((key,value) -> {
-                    if(key.length==17 && (key[16]==0x6d || key[16]==0x6e))return; // Recovery fences are local receiver authority, never transferable image state.
+                    if(metadata && metadataLocalPointer(key))return;
+                    if(key.length==17 && key[16]>=0x6d && key[16]<=0x71)return; // Recovery fences are local receiver authority, never transferable image state.
                     if(Arrays.equals(key,originKey)) throw new IOException("Image-only topology origin cannot be persisted as native state");
                     if(originBytes!=null && !originWritten[0] && Arrays.compareUnsigned(key,originKey)>0) { append.accept(Section.STATE,null,originKey,originBytes); originWritten[0]=true; }
                     append.accept(Section.STATE,null,key,value);
@@ -207,6 +219,10 @@ public final class NativeRangeImage {
     public static Manifest inspect(Path image, Limits limits) throws IOException {
         return visit(image, limits, (section, column, key, value) -> {});
     }
+    public static Manifest inspectMetadata(Path image,Limits limits)throws IOException{return visitMetadata(image,limits,(section,column,key,value)->{});}
+    public static Manifest visitMetadata(Path image,Limits limits,RowVisitor visitor)throws IOException{return visit(image,limits,visitor,true,null,null,IoAdmission.UNLIMITED,true);}
+    public static Manifest visitMetadataAdmitted(Path image,Limits limits,RowVisitor visitor,IoAdmission admission)throws IOException{return visit(image,limits,visitor,true,null,null,Objects.requireNonNull(admission),true);}
+    static boolean metadataLocalPointer(byte[] key){if(key.length<17)return false;int tag=key[16]&255;return key.length==17 && (tag>=0x61 && tag<=0x64 || tag>=0x67 && tag<=0x71) || key.length==33 && tag==0x68;}
 
     public static Manifest inspectAdmitted(Path image,Limits limits,IoAdmission admission)throws IOException{return visit(image,limits,(section,column,key,value)->{},true,null,null,Objects.requireNonNull(admission));}
 
@@ -227,25 +243,32 @@ public final class NativeRangeImage {
 
     /** Receiver policy qualification, including durable terminal-publication namespace promises. */
     public static Manifest inspectSessionMetadata(Path image,Limits limits,int maximumNamespaces) throws IOException {
+        return inspectSessionMetadata(image,limits,maximumNamespaces,false);
+    }
+    static Manifest inspectSessionMetadata(Path image,Limits limits,int maximumNamespaces,boolean metadata) throws IOException {
         if(maximumNamespaces<1 || maximumNamespaces>ReplicatedRangeStore.MAX_SESSION_ACK_NAMESPACES)throw new IllegalArgumentException("Invalid receiver session metadata capacity");
         var retained=new HashSet<OperationId>();var promises=new HashSet<OperationId>();long[] floor={0};
-        var manifest=visit(image,limits,(section,column,key,value)->{if(section!=Section.STATE || key.length<=16)return;
+        var manifest=visitKind(image,limits,(section,column,key,value)->{if(section!=Section.STATE || key.length<=16)return;
             if(key[16]==3)floor[0]=ByteBuffer.wrap(value,0,8).getLong();
             if(key[16]==2){var id=ByteBuffer.wrap(key,17,24);long epoch=id.getLong();retained.add(new OperationId(new UUID(id.getLong(),id.getLong()),epoch,0));}
             if(key[16]==0x65){var original=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.decode(value).request().original();if(original.acknowledgedThrough()>=0)promises.add(new OperationId(original.operationId().sessionId(),original.operationId().epoch(),0));}
-        });
+        },metadata);
         promises.removeIf(id->id.epoch()<floor[0] || retained.contains(id));if(retained.size()+promises.size()>maximumNamespaces)throw new IOException("Image exceeds receiver ACK namespace capacity");return manifest;
     }
 
     /** Effective receiver receipt ceiling, including already promised source outcomes. */
     public static Manifest inspectReceiptCapacity(Path image,Limits limits,long maximumCount,long maximumBytes) throws IOException {
+        return inspectReceiptCapacity(image,limits,maximumCount,maximumBytes,false);
+    }
+    static Manifest inspectReceiptCapacity(Path image,Limits limits,long maximumCount,long maximumBytes,boolean metadata) throws IOException {
         if(maximumCount<1 || maximumBytes<88)throw new IllegalArgumentException("Invalid receiver receipt capacity");long[] total={0,0};
-        var manifest=visit(image,limits,(section,column,key,value)-> {
+        var manifest=visitKind(image,limits,(section,column,key,value)-> {
             if(section==Section.RECEIPTS){total[0]++;total[1]=Math.addExact(total[1],key.length+(long)value.length);}
             if(section==Section.STATE && key.length>16 && key[16]==0x65){var credit=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.decode(value);total[0]++;total[1]=Math.addExact(total[1],credit.request().reservedBytes());}
             if(total[0]>maximumCount || total[1]>maximumBytes)throw new IOException("Image receipts/promises exceed receiver capacity");
-        });return manifest;
+        },metadata);return manifest;
     }
+    static Manifest visitKind(Path image,Limits limits,RowVisitor visitor,boolean metadata)throws IOException{return metadata?visitMetadata(image,limits,visitor):visit(image,limits,visitor);}
 
     /** Qualified TX HOME reverse proof, including an image with no credit rows. Does not activate native admission. */
     public static Manifest inspectHomeRecoveryReservations(Path image,Limits limits,UUID cluster,UUID database,UUID column) throws IOException {
@@ -269,6 +292,9 @@ public final class NativeRangeImage {
     public static Manifest visit(Path image, Limits limits, RowVisitor visitor) throws IOException { return visit(image,limits,visitor,true,null,null); }
     private static Manifest visit(Path image, Limits limits, RowVisitor visitor,boolean verifyCreditUsers,HomeContext required,SnapshotHomeContext snapshotHome) throws IOException {return visit(image,limits,visitor,verifyCreditUsers,required,snapshotHome,IoAdmission.UNLIMITED);}
     private static Manifest visit(Path image, Limits limits, RowVisitor visitor,boolean verifyCreditUsers,HomeContext required,SnapshotHomeContext snapshotHome,IoAdmission admission) throws IOException {
+        return visit(image,limits,visitor,verifyCreditUsers,required,snapshotHome,admission,false);
+    }
+    private static Manifest visit(Path image, Limits limits, RowVisitor visitor,boolean verifyCreditUsers,HomeContext required,SnapshotHomeContext snapshotHome,IoAdmission admission,boolean metadata) throws IOException {
         Objects.requireNonNull(limits, "limits");
         Objects.requireNonNull(visitor, "visitor");
         long size = Files.size(image);
@@ -279,7 +305,7 @@ public final class NativeRangeImage {
             var counted = new BoundedInput(new DigestInputStream(source, whole), size);
             var bodyInput = new DigestInputStream(counted, body);
             var input = new DataInputStream(bodyInput);
-            Header header = readHeader(input, counted, limits);
+            Header header = readHeader(input, counted, limits,metadata);
             if (snapshotHome!=null && !header.interval().columns().equals(Set.of(snapshotHome.column()))) throw new IOException("Snapshot HOME image column is not dedicated");
             var tracker = new Rows(header, limits);
             while (true) {
@@ -304,7 +330,7 @@ public final class NativeRangeImage {
                 if(section==Section.STATE && key.length>16 && key[16]==0x78 && (key.length!=17 || valueLength!=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.STATE_BYTES))throw new IOException("Invalid catalogue history state length");
                 if(section==Section.STATE && key.length>16 && key[16]==0x79 && (key.length!=49 || valueLength!=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.CREDIT_BYTES))throw new IOException("Invalid catalogue history credit length");
                 if(section==Section.STATE && key.length>16 && key[16]==0x15 && (key.length!=17 || valueLength!=8))throw new IOException("Invalid ACK namespace count length");
-                if(section==Section.STATE && key.length>16 && (key[16]==0x6d || key[16]==0x6e))throw new IOException("Receiver-local recovery fence is not portable image authority");
+                if(section==Section.STATE && key.length>16 && key[16]>=0x6d && key[16]<=0x71)throw new IOException("Receiver-local recovery fence is not portable image authority");
                 byte[] value = new byte[valueLength];
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
@@ -365,7 +391,7 @@ public final class NativeRangeImage {
     }
 
     private static void writeHeader(DataOutputStream output, Header header) throws IOException {
-        output.writeInt(MAGIC);
+        output.writeInt(header.metadata()?METADATA_MAGIC:MAGIC);
         writeUuid(output, header.owner().groupId());
         output.writeLong(header.owner().epoch());
         output.write(header.schema());
@@ -378,8 +404,8 @@ public final class NativeRangeImage {
         writeIds(output, header.mergeColumns());
     }
 
-    private static Header readHeader(DataInputStream input, BoundedInput counted, Limits limits) throws IOException {
-        if (input.readInt() != MAGIC) throw new IOException("Unsupported image magic");
+    private static Header readHeader(DataInputStream input, BoundedInput counted, Limits limits,boolean metadata) throws IOException {
+        if (input.readInt() != (metadata?METADATA_MAGIC:MAGIC)) throw new IOException("Image kind differs from requested USER/metadata authority");
         var owner = new RangeOwnership.Owner(readUuid(input), input.readLong());
         byte[] schema = new byte[HASH_BYTES];
         input.readFully(schema);
@@ -389,7 +415,7 @@ public final class NativeRangeImage {
         byte[] lower = readBound(input, counted, limits);
         byte[] upper = readBound(input, counted, limits);
         Set<UUID> mergeColumns = readIds(input, counted, limits, true);
-        var header = new Header(owner, new RangeOwnership.Interval(domain, columns, lower, upper), schema, position, mergeColumns);
+        var header = new Header(owner, new RangeOwnership.Interval(domain, columns, lower, upper), schema, position, mergeColumns,metadata);
         validateHeader(header, limits);
         return header;
     }
@@ -452,6 +478,7 @@ public final class NativeRangeImage {
     }
 
     private static final class Rows {
+        private boolean metadataConfiguration;
         private final Header header;
         private final Limits limits;
         private final byte[] groupPrefix;
@@ -521,6 +548,11 @@ public final class NativeRangeImage {
         }
 
         void accept(Section section, UUID column, byte[] key, byte[] value) throws IOException {
+            if(header.metadata() && (section==Section.USER || section==Section.STATE && metadataLocalPointer(key)))throw new IOException("Metadata image contains USER data or foreign local ownership authority");
+            if(header.metadata() && section==Section.STATE && key.length==17 && key[16]==1) {
+                try {var configuration=ReplicatedRangeStore.Configuration.decode(value);var cut=header.position();if(configuration.term()>cut.term() || configuration.index()>cut.index() || configuration.index()==cut.index() && configuration.term()!=cut.term())throw new IllegalArgumentException("Configuration exceeds metadata cut");metadataConfiguration=true;}
+                catch(IllegalArgumentException invalid){throw new IOException("Invalid sealed source configuration",invalid);}
+            }
             if ((long) key.length + value.length > limits.maxRowBytes()) throw new IOException("Image row exceeds byte limit");
             if (section == Section.USER) {
                 if (column == null || !header.interval().columns().contains(column)) throw new IOException("Unknown image user column");
@@ -888,6 +920,7 @@ public final class NativeRangeImage {
         }
 
         void finish() throws IOException {
+            if(header.metadata() && (topologyFreeze==null || !metadataConfiguration))throw new IOException("Metadata image lacks sealed source FREEZE/configuration authority");
             if(minimumAcknowledgementEpoch<epochFloor || (acknowledgementNamespaceCount==null ? acknowledgementNamespaces!=0 : acknowledgementNamespaceCount!=acknowledgementNamespaces))throw new IOException("Image ACK namespace count or epoch differs from inventory");
             if(topologyFreeze!=null && (schemaFence!=null || prepared.stream().anyMatch(p -> !committed.containsKey(p.preparation().transactionId()) && !aborted.containsKey(p.preparation().transactionId())) || gates.values().stream().anyMatch(SnapshotGate::active))) throw new IOException("Frozen topology image contains unresolved native work");
             try { cdc.finish(header.owner(),header.position()); cdc.requireAuthorityClock(sessionAuthority==null ? -1 : sessionAuthority.logicalTimeMillis()); }

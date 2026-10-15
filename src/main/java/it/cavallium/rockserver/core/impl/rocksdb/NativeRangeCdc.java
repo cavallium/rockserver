@@ -85,11 +85,11 @@ final class NativeRangeCdc {
             if(authorityClock < -1 || summary!=null && clock!=authorityClock) throw new IllegalArgumentException("CDC retention clock differs from persisted authority");
         }
     }
-    void validateImage(java.nio.file.Path image,NativeRangeImage.Limits limits,ApplyPosition cut) throws java.io.IOException {
+    void validateImage(java.nio.file.Path image,NativeRangeImage.Limits limits,ApplyPosition cut,boolean metadata) throws java.io.IOException {
         try {
-            var validation=new ImageState(); var result=NativeRangeImage.visit(image,limits,(section,column,key,value)->{
+            var validation=new ImageState(); var result=NativeRangeImage.visitKind(image,limits,(section,column,key,value)->{
                 if(section==NativeRangeImage.Section.STATE) validation.accept(key,value,new RangeOwnership.Owner(lineage.groupId(),lineage.rangeEpoch()),cut);
-            });
+            },metadata);
             validation.finish(result.owner(),result.position());
             if(validation.lineage!=null && !lineage.equals(validation.lineage)) throw new java.io.IOException("Snapshot CDC lineage differs from configured range");
         } catch(IllegalArgumentException | IllegalStateException invalid) { throw new java.io.IOException("Invalid snapshot CDC lineage",invalid); }

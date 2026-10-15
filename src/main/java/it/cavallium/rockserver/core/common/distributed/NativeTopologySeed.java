@@ -57,6 +57,7 @@ public final class NativeTopologySeed {
     public Map<UUID,NativeTopologyFreeze> parentFreezes() { return freezes; }
     public Map<UUID,String> physicalNames() { return names; }
     public Set<UUID> mergeColumns() { return merges; }
+    public int encodedSize() { return encoded.length; }
     public byte[] encode() { return encoded.clone(); }
     public byte[] digest() { return digest.clone(); }
     public NativeTopologyBirth birth(UUID targetGroup) { var birth=new NativeTopologyBirth(definition.intentId(),targetGroup,digest); birth.requireSeed(this); return birth; }

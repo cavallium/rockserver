@@ -92,6 +92,49 @@ public final class DistributedStoragePool implements AutoCloseable {
     private volatile Map<UUID,NativeTopologySeed> topologySeeds=Map.of();
     private volatile Map<UUID,NativeTopologyBirth> topologyBirths=Map.of();
     private volatile Map<UUID,NativeTopologySeed> topologyRetirements=Map.of();
+    private static final byte[] METADATA_RECOVERIES_KEY="METADATA-RECOVERIES".getBytes(StandardCharsets.US_ASCII);
+    private volatile Map<UUID,NativeMetadataRecoveryRegistration> metadataRecoveries=Map.of();
+    private final Map<UUID,NativeMetadataRecoveryRegistration> pendingMetadataRecoveries=new HashMap<>();
+    private volatile TopologySeedForceObserver metadataRecoveryForceObserver=after->{};
+    public void metadataRecoveryForceObserver(TopologySeedForceObserver observer){metadataRecoveryForceObserver=Objects.requireNonNull(observer);}
+    public List<NativeMetadataRecoveryRegistration> metadataRecoveries(){return List.copyOf(metadataRecoveries.values());}
+    private byte[] encodeMetadataRecoveries(Map<UUID,NativeMetadataRecoveryRegistration> records)throws IOException {
+        long extra=records.keySet().stream().filter(group->ownershipHistory.stream().noneMatch(record->record.owner().groupId().equals(group))).count();
+        if(ownershipHistory.size()+extra>MAX_RETAINED_METADATA_OWNERS)throw new IOException("Permanent metadata owner inventory exhausted");
+        requireTopologyRegistryCapacity(topologySeeds,records);
+        var bytes=new ByteArrayOutputStream();var out=new DataOutputStream(bytes);out.writeInt(0x4d445253);out.writeInt(records.size());
+        for(var group:records.keySet().stream().sorted(RangeDirectoryCodec.UUID_ORDER).toList()){byte[] value=records.get(group).encode();out.writeInt(value.length);out.write(value);}
+        out.flush();return bytes.toByteArray();
+    }
+    private void recoverMetadataRecoveries() {
+        try{var db=loaded.db().get();var state=handles.get(STATE_COLUMN);int size=db.get(state,METADATA_RECOVERIES_KEY,new byte[0]);if(size==org.rocksdb.RocksDB.NOT_FOUND)return;if(size>MAX_TOPOLOGY_SEED_BYTES)throw new IOException("Metadata registry exceeds bound");byte[] bytes=db.get(state,METADATA_RECOVERIES_KEY);var in=new DataInputStream(new ByteArrayInputStream(bytes));if(in.readInt()!=0x4d445253)throw new IOException("Invalid metadata registry");int count=in.readInt();if(count<0 || count>MAX_TOPOLOGY_SEEDS)throw new IOException("Invalid metadata registry count");var found=new HashMap<UUID,NativeMetadataRecoveryRegistration>();
+            for(int n=0;n<count;n++){int length=in.readInt();if(length<1 || length>NativeMetadataRecoveryRegistration.MAX_BYTES || length>in.available())throw new IOException("Invalid metadata registration length");var registration=NativeMetadataRecoveryRegistration.decode(in.readNBytes(length));if(found.put(registration.groupId(),registration)!=null)throw new IOException("Duplicate metadata registration");byte[] key=groupSchemaKey(registration.groupId(),0x6f);if(db.get(state,key,new byte[0])!=32 || !Arrays.equals(registration.digest(),db.get(state,key)))throw new IOException("Metadata registration lost its exact local pointer");}
+            if(in.available()!=0 || !Arrays.equals(bytes,encodeMetadataRecoveries(found)))throw new IOException("Noncanonical metadata registry");
+            for(var registration:found.values()){var range=registration.range();ownership.recoverMetadata(new RangeOwnership.Owner(range.groupId(),range.rangeEpoch()),new RangeOwnership.Interval(registration.sourceDirectory().domainId(),registration.sourceDirectory().columns(),range.lowerInclusive(),range.upperExclusive()));}
+            metadataRecoveries=Map.copyOf(found);
+        }catch(IOException|RocksDBException|IllegalArgumentException failure){throw new IllegalStateException("Cannot recover original metadata registrations",failure);}
+    }
+    /** Opens a non-USER source owner even when this receiver never executed the historical local seed. */
+    public ReplicatedRangeStore openMetadataRecovery(NativeMetadataRecoveryRegistration registration)throws RocksDBException {
+        Objects.requireNonNull(registration);nativeMutation.acquireUninterruptibly();try {
+            synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}
+            if(pendingTopologySeed!=null || pendingLearnerHistory!=null)throw new IllegalStateException("Unknown topology ownership force requires exact original retry");
+            UUID group=registration.groupId();var pending=pendingMetadataRecoveries.get(group);if(pending!=null && !pending.equals(registration))throw new IllegalStateException("Unknown metadata registration force requires original retry");
+            if(!pendingMetadataRecoveries.isEmpty() && (pending==null || pendingMetadataRecoveries.size()!=1))throw new IllegalStateException("Unknown global metadata registry force requires original retry");
+            var previous=metadataRecoveries.get(group);if(previous!=null && !previous.equals(registration))registration.requireSuccessorOf(previous);
+            var range=registration.range();var owner=new RangeOwnership.Owner(group,range.rangeEpoch());var interval=new RangeOwnership.Interval(registration.sourceDirectory().domainId(),registration.sourceDirectory().columns(),range.lowerInclusive(),range.upperExclusive());ownership.validateMetadataRecovery(owner,interval);
+            ReplicatedRangeStore existing=null;for(var store:ranges)if(store.ownership().owner().groupId().equals(group)){existing=store;break;}
+            if(!registration.equals(previous) || pending!=null) {
+                var next=new HashMap<>(metadataRecoveries);next.putAll(pendingMetadataRecoveries);next.put(group,registration);byte[] registry;try{registry=encodeMetadataRecoveries(next);}catch(IOException failure){throw new IllegalStateException("Metadata registration capacity unavailable",failure);}var published=Map.copyOf(next);byte[] pointer=registration.digest();pendingMetadataRecoveries.put(group,registration);
+                ReplicatedRangeStore.MetadataRecoveryForce force=()->{metadataRecoveryForceObserver.boundary(false);try(var batch=new org.rocksdb.WriteBatch();var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)){batch.put(handles.get(STATE_COLUMN),METADATA_RECOVERIES_KEY,registry);batch.put(handles.get(STATE_COLUMN),groupSchemaKey(group,0x6f),pointer);for(int tag:List.of(0x6d,0x6e,0x70,0x71))batch.delete(handles.get(STATE_COLUMN),groupSchemaKey(group,tag));loaded.db().get().write(options,batch);}metadataRecoveryForceObserver.boundary(true);};
+                if(existing==null){force.force();ownership.recoverMetadata(owner,interval);}else existing.prepareMetadataRecovery(registration,force);
+                metadataRecoveries=published;pendingMetadataRecoveries.remove(group);
+            }
+            if(existing!=null)return existing;
+            var store=new ReplicatedRangeStore(loaded.db().get(),ownership,owner,registration.sourceDirectory().schemaDigest(),Map.of(),handles.get(STATE_COLUMN),handles.get(RECEIPTS_COLUMN),registration.mergeColumns(),true,registration);
+            store.configureSnapshotAdmission(snapshotAdmission);store.configureSchemaPreparationPool(this);store.configureRetiredTopologyDirectory(registration.sourceDirectory());ranges.add(store);return store;
+        }finally{nativeMutation.release();}
+    }
     private static final int MAX_TOPOLOGY_LEARNERS=8,MAX_TOPOLOGY_LEARNER_BYTES=32*1024*1024;
     private volatile Map<UUID,NativeTopologyLearnerRegistration> topologyLearners=Map.of();
     private final Map<UUID,NativeTopologyLearnerRegistration> pendingTopologyLearners=new HashMap<>();
@@ -161,10 +204,19 @@ public final class DistributedStoragePool implements AutoCloseable {
     public NativeTopologySeed topologySeed(UUID intent) { return topologySeeds.get(Objects.requireNonNull(intent)); }
     private record PendingTopologySeed(NativeTopologySeed seed,List<ReplicatedRangeStore> parents,List<HistoricalOwner> history,Map<UUID,NativeTopologySeed> seeds,RangeOwnership.TopologyTransfer transfer,NativeTopologyRecoveryFence fence) {}
     private byte[] encodeTopologySeeds(Map<UUID,NativeTopologySeed> seeds) throws IOException {
-        if(seeds.size()>MAX_TOPOLOGY_SEEDS) throw new IllegalStateException("Topology seed count exhausted");
+        var metadata=new HashMap<>(metadataRecoveries);metadata.putAll(pendingMetadataRecoveries);
+        requireTopologyRegistryCapacity(seeds,metadata);
         var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(0x54535247); out.writeInt(seeds.size());
-        for(var id:seeds.keySet().stream().sorted().toList()) { byte[] encoded=seeds.get(id).encode(); out.writeInt(encoded.length); out.write(encoded); if(bytes.size()>MAX_TOPOLOGY_SEED_BYTES) throw new IllegalStateException("Topology seed bytes exhausted"); }
+        for(var id:seeds.keySet().stream().sorted().toList()) { byte[] encoded=seeds.get(id).encode(); out.writeInt(encoded.length); out.write(encoded); }
         return bytes.toByteArray();
+    }
+    private static void requireTopologyRegistryCapacity(Map<UUID,NativeTopologySeed> seeds,Map<UUID,NativeMetadataRecoveryRegistration> metadata)throws IOException {
+        if(seeds.size()+metadata.size()>MAX_TOPOLOGY_SEEDS)throw new IOException("Shared topology/metadata registration count exhausted");
+        long bytes=16;
+        for(var seed:seeds.values())bytes+=4L+seed.encodedSize();
+        // Registry entries plus each local digest, readiness/image receipt and pending install pointer.
+        for(var registration:metadata.values())bytes+=260L+registration.encodedSize();
+        if(bytes>MAX_TOPOLOGY_SEED_BYTES)throw new IOException("Shared topology/metadata registration bytes exhausted");
     }
     private void requireTopologySeedRows(NativeTopologySeed seed) throws RocksDBException {
         for(var range:java.util.stream.Stream.concat(seed.definition().parents().stream(),seed.definition().targets().stream()).toList()) {
@@ -296,7 +348,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             var descriptor=seed.definition().parents().stream().filter(range->range.groupId().equals(group)).findFirst().orElseThrow();var owner=new RangeOwnership.Owner(group,descriptor.rangeEpoch());
             for(var existing:ranges)if(existing.ownership().owner().equals(owner)) { if(existing.detachRetiredUserHandles()) { existing.configureRetiredTopologyDirectory(seed.definition().sourceDirectory());drainDeferredDrops(); }return existing; }
             var registered=ownership.get(owner);if(registered.state()!=RangeOwnership.State.RETIRED || !registered.interval().equals(topologyInterval(seed,descriptor)))throw new IllegalArgumentException("Retired ownership history changed");
-            var store=new ReplicatedRangeStore(loaded.db().get(),ownership,owner,seed.header().schemaDigest(),Map.of(),handles.get(STATE_COLUMN),handles.get(RECEIPTS_COLUMN),seed.mergeColumns(),true);
+            var store=new ReplicatedRangeStore(loaded.db().get(),ownership,owner,seed.header().schemaDigest(),Map.of(),handles.get(STATE_COLUMN),handles.get(RECEIPTS_COLUMN),seed.mergeColumns(),true,null);
             store.configureSnapshotAdmission(snapshotAdmission);store.configureSchemaPreparationPool(this);store.validateTopologyActivationRecovery();store.configureRetiredTopologyDirectory(seed.definition().sourceDirectory());ranges.add(store);drainDeferredDrops();return store;
         } finally { nativeMutation.release(); }
     }
@@ -811,7 +863,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                 handles.put(new String(descriptor.getName(), StandardCharsets.US_ASCII), handle));
         recoverBirths();
         recoverOwnershipHistory();
-        recoverCapacityClaims(); recoverTopologySeeds();recoverTopologyLearners();
+        recoverCapacityClaims(); recoverTopologySeeds();recoverTopologyLearners();recoverMetadataRecoveries();
     }
 
     public static void stageOperator(Path poolPath,DistributedSchema.Operator operator,
@@ -928,15 +980,21 @@ public final class DistributedStoragePool implements AutoCloseable {
         nativeMutation.acquireUninterruptibly();handleLifetime.readLock().lock();try{
             synchronized(admission){if(closing || closed)throw new IllegalStateException("Pool is closing");}
             var result=new ArrayList<RetainedMetadataOwner>();var db=loaded.db().get();var state=handles.get(STATE_COLUMN);
-            for(var record:ownershipHistory){var group=record.owner().groupId();boolean retired=topologyRetirements.containsKey(group);boolean pending=topologyBirths.containsKey(group)&&db.get(state,groupSchemaKey(group,0x63))==null || topologyLearners.containsKey(group)&&db.get(state,groupSchemaKey(group,0x68))==null;
+            for(var record:ownershipHistory){var group=record.owner().groupId();boolean retired=topologyRetirements.containsKey(group) || metadataRecoveries.containsKey(group);boolean pending=topologyBirths.containsKey(group)&&db.get(state,groupSchemaKey(group,0x63))==null || topologyLearners.containsKey(group)&&db.get(state,groupSchemaKey(group,0x68))==null;
                 byte[] key=groupSchemaKey(group,0x40);int size=db.get(state,key,new byte[0]);if(size!=org.rocksdb.RocksDB.NOT_FOUND){if(size>NativeSstImportManifest.MAX_BYTES)throw new IllegalStateException("Import metadata inventory exceeds bound");var manifest=NativeSstImportManifest.decode(db.get(state,key));if(!manifest.groupId().equals(group) || ownershipHistory.stream().noneMatch(original->original.owner().groupId().equals(group) && manifest.rangeEpoch()==original.owner().epoch() && manifest.domainId().equals(original.interval().domainId()) && original.interval().columns().containsAll(manifest.physicalNames().keySet()) && Arrays.equals(manifest.lowerInclusive(),original.interval().lowerInclusive()) && Arrays.equals(manifest.upperExclusive(),original.interval().upperExclusive())))throw new IllegalStateException("Import metadata inventory changed ownership");pending|=db.get(state,groupSchemaKey(group,0x43))==null;}
                 result.add(new RetainedMetadataOwner(record.owner(),record.interval(),retired,pending));
-            }return List.copyOf(result);
+            }
+            var historical=new HashSet<UUID>();for(var owner:result)historical.add(owner.owner().groupId());
+            for(var registration:metadataRecoveries.values())if(historical.add(registration.groupId())) {
+                var range=registration.range();var interval=new RangeOwnership.Interval(registration.sourceDirectory().domainId(),registration.sourceDirectory().columns(),range.lowerInclusive(),range.upperExclusive());
+                result.add(new RetainedMetadataOwner(new RangeOwnership.Owner(range.groupId(),range.rangeEpoch()),interval,true,!Arrays.equals(db.get(state,groupSchemaKey(range.groupId(),0x70)),registration.digest()) || db.get(state,groupSchemaKey(range.groupId(),0x7f))!=null));
+            }
+            if(result.size()>MAX_RETAINED_METADATA_OWNERS)throw new IllegalStateException("Permanent metadata owner inventory exhausted");return List.copyOf(result);
         }finally{handleLifetime.readLock().unlock();nativeMutation.release();}
     }
     /** Bounded durable group inventory, including virgin births and retained inactive metadata. */
     public Set<UUID> persistedRangeGroups(int maximum) throws RocksDBException {
-        if(maximum<1 || maximum>65536)throw new IllegalArgumentException("Invalid native group inventory ceiling");nativeMutation.acquireUninterruptibly();handleLifetime.readLock().lock();try{synchronized(admission){if(closing || closed)throw new IllegalStateException("Pool is closing");}var groups=new HashSet<UUID>();for(var entry:ownershipHistory){groups.add(entry.owner().groupId());if(groups.size()>maximum)throw new IllegalStateException("Native group inventory exceeds declared ceiling");}try(var iterator=loaded.db().get().newIterator(handles.get(STATE_COLUMN))){iterator.seekToFirst();while(iterator.isValid()){var key=iterator.key();if(key.length<16 || Arrays.equals(key,OWNERSHIP_HISTORY_KEY) || Arrays.equals(key,BIRTHS_KEY) || Arrays.equals(key,TOPOLOGY_SEEDS_KEY) || Arrays.equals(key,CAPACITY_KEY)){iterator.next();continue;}var input=java.nio.ByteBuffer.wrap(key);groups.add(new UUID(input.getLong(),input.getLong()));if(groups.size()>maximum)throw new IllegalStateException("Native group inventory exceeds declared ceiling");var next=Arrays.copyOf(key,16);int index=15;while(index>=0 && (next[index]&255)==255){next[index]=0;index--;}if(index<0)break;next[index]++;iterator.seek(next);}iterator.status();}return Set.copyOf(groups);}finally{handleLifetime.readLock().unlock();nativeMutation.release();}
+        if(maximum<1 || maximum>65536)throw new IllegalArgumentException("Invalid native group inventory ceiling");nativeMutation.acquireUninterruptibly();handleLifetime.readLock().lock();try{synchronized(admission){if(closing || closed)throw new IllegalStateException("Pool is closing");}var groups=new HashSet<UUID>();for(var entry:ownershipHistory){groups.add(entry.owner().groupId());if(groups.size()>maximum)throw new IllegalStateException("Native group inventory exceeds declared ceiling");}try(var iterator=loaded.db().get().newIterator(handles.get(STATE_COLUMN))){iterator.seekToFirst();while(iterator.isValid()){var key=iterator.key();if(key.length<16 || Arrays.equals(key,OWNERSHIP_HISTORY_KEY) || Arrays.equals(key,BIRTHS_KEY) || Arrays.equals(key,TOPOLOGY_SEEDS_KEY) || Arrays.equals(key,METADATA_RECOVERIES_KEY) || Arrays.equals(key,CAPACITY_KEY)){iterator.next();continue;}var input=java.nio.ByteBuffer.wrap(key);groups.add(new UUID(input.getLong(),input.getLong()));if(groups.size()>maximum)throw new IllegalStateException("Native group inventory exceeds declared ceiling");var next=Arrays.copyOf(key,16);int index=15;while(index>=0 && (next[index]&255)==255){next[index]=0;index--;}if(index<0)break;next[index]++;iterator.seek(next);}iterator.status();}return Set.copyOf(groups);}finally{handleLifetime.readLock().unlock();nativeMutation.release();}
     }
     public void configureSnapshotAdmission(PoolSnapshotAdmission.Limits limits) {configureSnapshotAdmission(limits,null);}
     public void configureSnapshotAdmission(PoolSnapshotAdmission.Limits limits,PoolSnapshotAdmission.Shared shared) {
@@ -1113,6 +1171,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             synchronized (admission) {
                 if (closing) throw new IllegalStateException("Pool is closing");
             }
+        if(metadataRecoveries.containsKey(owner.groupId()) || pendingMetadataRecoveries.containsKey(owner.groupId()))throw new IllegalStateException("Registered source metadata cannot reopen as a USER owner");
             if(pendingTopologySeed!=null) throw new IllegalStateException("Unknown topology seed completion requires exact retry");
             if(pendingLearnerHistory!=null)throw new IllegalStateException("Unknown learner history requires exact original retry");
             var topologySource=topologyRetirements.get(owner.groupId()); var topologyChild=topologyBirths.get(owner.groupId());var learner=topologyLearners.get(owner.groupId());
