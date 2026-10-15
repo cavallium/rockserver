@@ -31,6 +31,7 @@ final class RatisMetadataClaims {
     }
     synchronized long bytes(){return total(claims);}
     synchronized int groups(){return claims.size();}
+    synchronized long bytes(UUID pool){if(!poolLimits.containsKey(pool))throw new IllegalArgumentException("Undeclared metadata pool");long total=POOL_BYTES;for(var claim:claims.values())if(claim.pool().equals(pool))total=Math.addExact(total,claim.bytes());return total;}
     private long total(Map<UUID,Claim> values){long total=JOURNAL_BYTES+Math.multiplyExact(POOL_BYTES,poolLimits.size());for(var claim:values.values())total=Math.addExact(total,claim.bytes());return total;}
     private void validate(Map<UUID,Claim> values)throws IOException {
         if(values.size()>MAX_CLAIMS || total(values)>nodeLimit)throw new IOException("Node durable metadata ceiling exhausted");var sums=new HashMap<UUID,Long>();for(var id:poolLimits.keySet())sums.put(id,POOL_BYTES);
