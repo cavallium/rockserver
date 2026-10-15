@@ -722,21 +722,20 @@ class RaftServerImpl implements RaftServer.Division,
 
   synchronized void changeToLeader() {
     synchronized (votingLock()) {
-    if (!votingEligibleUnderGate()) {
-      if (getInfo().isCandidate()) {
-        changeToFollower(state.getCurrentTerm(), false, false, "recovery voting baseline revoked", new AtomicBoolean());
+      if (!votingEligibleUnderGate()) {
+        if (getInfo().isCandidate()) {
+          changeToFollower(state.getCurrentTerm(), false, false, "recovery voting baseline revoked", new AtomicBoolean());
+        }
+        return;
       }
-      return;
+      Preconditions.assertTrue(getInfo().isCandidate());
+      role.shutdownLeaderElection();
+      setRole(RaftPeerRole.LEADER, "changeToLeader");
     }
-    Preconditions.assertTrue(getInfo().isCandidate());
-    role.shutdownLeaderElection();
-    setRole(RaftPeerRole.LEADER, "changeToLeader");
+    // Role callbacks and appender startup are outside Gate; the role transition already linearized.
     final LeaderStateImpl leader = role.updateLeaderState(this);
     state.becomeLeader();
-
-    // start sending AppendEntries RPC to followers
     leader.start();
-    }
   }
 
   @Override
@@ -800,18 +799,20 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   synchronized boolean changeToCandidate(boolean forceStartLeaderElection) {
+    final RoleInfoProto extendedNoLeader;
     synchronized (votingLock()) {
-    if (!votingEligibleUnderGate()) { return false; }
-    Preconditions.assertTrue(getInfo().isFollower());
-    role.shutdownFollowerState();
-    setRole(RaftPeerRole.CANDIDATE, "changeToCandidate");
-    if (state.shouldNotifyExtendedNoLeader()) {
-      stateMachine.followerEvent().notifyExtendedNoLeader(getRoleInfoProto());
+      if (!votingEligibleUnderGate()) { return false; }
+      Preconditions.assertTrue(getInfo().isFollower());
+      role.shutdownFollowerState();
+      setRole(RaftPeerRole.CANDIDATE, "changeToCandidate");
+      extendedNoLeader = state.shouldNotifyExtendedNoLeader() ? getRoleInfoProto() : null;
+      // Forced initialization may persist a self-vote, so it shares the revocation boundary.
+      role.startLeaderElection(this, forceStartLeaderElection);
     }
-    // start election
-    role.startLeaderElection(this, forceStartLeaderElection);
+    if (extendedNoLeader != null) {
+      stateMachine.followerEvent().notifyExtendedNoLeader(extendedNoLeader);
+    }
     return true;
-    }
   }
 
   @Override
@@ -1609,24 +1610,29 @@ class RaftServerImpl implements RaftServer.Division,
       // Check life cycle state again to avoid the PAUSING/PAUSED state.
       assertLifeCycleState(LifeCycle.States.RUNNING);
 
+      final RaftPeer candidate;
+      boolean voteGranted;
       synchronized (votingLock()) {
-      if (!votingEligibleUnderGate()) {
-        return toRequestVoteReplyProto(candidateId, getMemberId(), false,
-            state.getCurrentTerm(), false, state.getLastEntry(), callId);
+        if (!votingEligibleUnderGate()) {
+          return toRequestVoteReplyProto(candidateId, getMemberId(), false,
+              state.getCurrentTerm(), false, state.getLastEntry(), callId);
+        }
+        final VoteContext context = new VoteContext(this, phase, candidateId);
+        candidate = context.recognizeCandidate(candidateTerm);
+        voteGranted = context.decideVote(candidate, candidateLastEntry);
       }
-      final VoteContext context = new VoteContext(this, phase, candidateId);
-      final RaftPeer candidate = context.recognizeCandidate(candidateTerm);
-      final boolean voteGranted = context.decideVote(candidate, candidateLastEntry);
       if (candidate != null && phase == Phase.ELECTION) {
-        // change server state in the ELECTION phase
         final AtomicBoolean termUpdated = new AtomicBoolean();
+        // Leader shutdown can invoke user SM callbacks; never hold Gate around them.
         future = changeToFollower(candidateTerm, true, false, "candidate:" + candidateId, termUpdated);
-        if (voteGranted) {
-          state.grantVote(candidate.getId());
+        synchronized (votingLock()) {
+          // Revocation during a role callback must prevent the subsequent grant.
+          voteGranted = voteGranted && votingEligibleUnderGate();
+          if (voteGranted) { state.grantVote(candidate.getId()); }
+          if (termUpdated.get() || voteGranted) { state.persistMetadata(); }
         }
-        if (termUpdated.get() || voteGranted) {
-          state.persistMetadata(); // sync metafile
-        }
+      } else {
+        synchronized (votingLock()) { voteGranted = voteGranted && votingEligibleUnderGate(); }
       }
       if (voteGranted) {
         role.getFollowerState().ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.REQUEST_VOTE));
@@ -1638,7 +1644,6 @@ class RaftServerImpl implements RaftServer.Division,
       if (LOG.isInfoEnabled()) {
         LOG.info("{} replies to {} vote request: {}. Peer's state: {}",
             getMemberId(), phase, toRequestVoteReplyString(reply), state);
-      }
       }
     }
     if (future != null) {
