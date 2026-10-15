@@ -28,7 +28,7 @@ class NativeExtentNodeTest {
             var plan=plan(f);var policy=RatisNativeExtentPolicy.defaults();var server=new RatisNodeRuntimeTest.FakeServer();
             try(var node=open(f,plan,server,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,policy)){node.start();assertTrue(nativeEnv(node).isOwningHandle());
                 for(var schema:f.schemas){var store=f.store(server,group(plan,schema));put(store,schema,0,(byte)1,new byte[]{(byte)(schema==f.first?7:9)});var pool=node.nativePool(node.poolId(group(plan,schema)));pool.flushLocal(pool.maintenanceSession(),schema.columnIds().iterator().next());}
-                assertEquals(2,SessionJournalFiles.read(f.env.nodeRoot.resolve("node.identity"),65+RatisNativeExtentPolicy.BYTES)[0]);assertTrue(Files.isRegularFile(f.env.nodeRoot.resolve("native-extents.journal")));
+                assertEquals(2,SessionJournalFiles.read(f.env.nodeRoot.resolve("node.identity"),RatisNodeIdentity.MAX_BYTES)[0]);assertTrue(Files.isRegularFile(f.env.nodeRoot.resolve("native-extents.journal")));
             }
             server=new RatisNodeRuntimeTest.FakeServer();try(var node=open(f,plan,server,RatisNodeRuntime.Startup.RECOVER,policy)){node.start();for(var schema:f.schemas)assertArrayEquals(new byte[]{(byte)(schema==f.first?7:9)},f.store(server,group(plan,schema)).readCurrentPoint(schema.columnIds().iterator().next(),new byte[]{1}));}
         }
@@ -76,7 +76,7 @@ class NativeExtentNodeTest {
     @Test void boundUnexposedJournalCannotBeRecreatedAfterInterruptedPoolInitialization()throws Exception {
         var helper=new RatisNodeMultiDomainTest();helper.root=root;try(var f=helper.new Fixture()){
             var plan=plan(f);var failed=new RatisNodeRuntimeTest.FakeServer();failed.failCreate=true;assertThrows(IOException.class,()->open(f,plan,failed,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,RatisNativeExtentPolicy.defaults()));
-            assertEquals(1,SessionJournalFiles.read(f.env.nodeRoot.resolve("node.identity"),65+RatisNativeExtentPolicy.BYTES)[0]);var journal=f.env.nodeRoot.resolve("native-extents.journal");Files.delete(journal);
+            assertEquals(1,SessionJournalFiles.read(f.env.nodeRoot.resolve("node.identity"),RatisNodeIdentity.MAX_BYTES)[0]);var journal=f.env.nodeRoot.resolve("native-extents.journal");Files.delete(journal);
             var retry=new RatisNodeRuntimeTest.FakeServer();assertThrows(IOException.class,()->open(f,plan,retry,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,RatisNativeExtentPolicy.defaults()));assertFalse(retry.created);assertFalse(Files.exists(journal));
         }
     }

@@ -101,7 +101,7 @@ public final class RatisNodeService implements AutoCloseable {
     }
     static RatisNodeService openRestore(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,
             RatisNodeRuntime.ServerFactory factory,RatisSchemaReplicaService.OperatorPolicy policy,RatisNodeRuntime.HomeClientFactory homes,RatisNodeRuntime.RestoreNativeInitialization staging)throws IOException {
-        return open(manifest,root,config,resources,factory,policy,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,homes,true,Objects.requireNonNull(staging));
+        return open(manifest,root,config,resources,factory,policy,RatisNodeRuntime.Startup.AUTHORIZED_RESTORE_TARGET,homes,true,Objects.requireNonNull(staging));
     }
     private static RatisNodeService open(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,
             RatisNodeRuntime.ServerFactory factory,RatisSchemaReplicaService.OperatorPolicy policy,RatisNodeRuntime.Startup startup,

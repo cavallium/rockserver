@@ -492,14 +492,14 @@ class RatisNodeRuntimeTest {
             var failed=new FakeServer(); failed.failCreate=true;
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,failed));
             assertEquals(0,failed.starts);
-            byte[] identity=SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),65+RatisNativeExtentPolicy.BYTES);
-            assertEquals(33+RatisNativeExtentPolicy.BYTES,identity.length); assertEquals(1,identity[0]);
+            byte[] identity=SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),RatisNodeIdentity.MAX_BYTES);
+            assertEquals(RatisNodeIdentity.create(env.plan,env.settings().resources().nativeExtents(),RatisNodeIdentity.Purpose.INITIAL_PLACEMENT).encodedSize(),identity.length); assertEquals(1,identity[0]);
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
             var resumed=new FakeServer();
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,resumed)) {
                 node.start(); assertTrue(resumed.exposedBeforeStart); assertTrue(node.started());
             }
-            assertEquals(2,SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),65+RatisNativeExtentPolicy.BYTES)[0]);
+            assertEquals(2,SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),RatisNodeIdentity.MAX_BYTES)[0]);
             try (var recovered=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { recovered.start(); }
         }
     }
@@ -515,7 +515,7 @@ class RatisNodeRuntimeTest {
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,failed)) {
                 assertThrows(IOException.class,node::start); assertTrue(failed.exposedBeforeStart);
             }
-            assertEquals(2,SessionJournalFiles.read(identity,65+RatisNativeExtentPolicy.BYTES)[0]);
+            assertEquals(2,SessionJournalFiles.read(identity,RatisNodeIdentity.MAX_BYTES)[0]);
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
         }
@@ -524,20 +524,20 @@ class RatisNodeRuntimeTest {
         try (var env=new Env(root)) {
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer())) { node.start(); }
             Path identity=env.nodeRoot.resolve("node.identity");
-            byte[] canonical=SessionJournalFiles.read(identity,65+RatisNativeExtentPolicy.BYTES);
-            assertEquals(33+RatisNativeExtentPolicy.BYTES,canonical.length); assertEquals(2,canonical[0]);
+            byte[] canonical=SessionJournalFiles.read(identity,RatisNodeIdentity.MAX_BYTES);
+            assertEquals(RatisNodeIdentity.create(env.plan,env.settings().resources().nativeExtents(),RatisNodeIdentity.Purpose.INITIAL_PLACEMENT).encodedSize(),canonical.length); assertEquals(2,canonical[0]);
             assertArrayEquals(env.plan.identityDigest(),Arrays.copyOfRange(canonical,1,33));
             for (int length=0;length<canonical.length;length++) assertIdentityRejected(env,Arrays.copyOf(canonical,length));
             assertIdentityRejected(env,Arrays.copyOf(canonical,canonical.length+1));
             byte[] phase=canonical.clone(); phase[0]=3; assertIdentityRejected(env,phase);
             byte[] binding=canonical.clone(); binding[1]^=1; assertIdentityRejected(env,binding);
-            SessionJournalFiles.write(identity,canonical,65+RatisNativeExtentPolicy.BYTES);
+            SessionJournalFiles.write(identity,canonical,RatisNodeIdentity.MAX_BYTES);
             try (var recovered=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { recovered.start(); }
-            assertArrayEquals(canonical,SessionJournalFiles.read(identity,65+RatisNativeExtentPolicy.BYTES));
+            assertArrayEquals(canonical,SessionJournalFiles.read(identity,RatisNodeIdentity.MAX_BYTES));
         }
     }
     private static void assertIdentityRejected(Env env,byte[] identity) throws Exception {
-        SessionJournalFiles.write(env.nodeRoot.resolve("node.identity"),identity,66+RatisNativeExtentPolicy.BYTES);
+        SessionJournalFiles.write(env.nodeRoot.resolve("node.identity"),identity,RatisNodeIdentity.MAX_BYTES);
         var fake=new FakeServer();
         assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,fake)); assertFalse(fake.created);
         assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
@@ -953,8 +953,8 @@ class RatisNodeRuntimeTest {
             server=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> switch (method.getName()) {
                 case "getId" -> RaftPeerId.valueOf(plan.peerId()); case "toString" -> "controlled-node-server";
                 case "start" -> {
-                    starts++; byte[] identity=SessionJournalFiles.read(logs.getParent().resolve("node.identity"),65+RatisNativeExtentPolicy.BYTES);
-                    exposedBeforeStart=identity.length==33+RatisNativeExtentPolicy.BYTES && identity[0]==2;
+                    starts++; byte[] identity=SessionJournalFiles.read(logs.getParent().resolve("node.identity"),RatisNodeIdentity.MAX_BYTES);
+                    exposedBeforeStart=identity.length>=38+RatisNativeExtentPolicy.BYTES && identity[0]==2;
                     if (failStart) throw new IOException("fixture start failure");
                     initialize(plan.localGroups().getFirst()); yield null;
                 }

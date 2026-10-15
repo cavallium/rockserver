@@ -42,7 +42,7 @@ import reactor.core.scheduler.Scheduler;
 /** Bootstrap and forced-topology node owner. Running means verified divisions, not quorum/read/API readiness. */
 public final class RatisNodeRuntime implements AutoCloseable {
     public enum State { OPEN, STARTING, RUNNING, STOPPING, CLOSED }
-    public enum Startup { RECOVER, AUTHORIZED_INITIAL_PLACEMENT }
+    public enum Startup { RECOVER, AUTHORIZED_GENESIS, AUTHORIZED_INITIAL_PLACEMENT, AUTHORIZED_RESTORE_TARGET }
     /** Creation must not expose transport or start any group; the runtime seals exposure before calling start. */
     @FunctionalInterface interface ServerFactory {
         RaftServer create(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException;
@@ -132,7 +132,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisTopologyOwnerClient topologyOwners;private boolean topologyOwnersClosed;
     private long groupManagementCall;
     private final Set<UUID> virginSeedAdds=new HashSet<>();
-    private static final int NODE_IDENTITY_BYTES=65+RatisNativeExtentPolicy.BYTES;
+    private static final int NODE_IDENTITY_BYTES=RatisNodeIdentity.MAX_BYTES;
+    private RatisNodeIdentity nodeIdentity;
     private org.rocksdb.NativeExtentEnv nativeExtentEnv;private boolean nativeExtentBound;
     private final Map<UUID,PoolOwner> pools=new LinkedHashMap<>();private final Map<UUID,UUID> groupPools=new ConcurrentHashMap<>(); private RaftServer server; private RatisCatalogueClock clock;
     static RatisNodeResourceBudget.Limits poolResources(RatisNodeResourceBudget.Limits spec,RatisNodeResourceBudget.Limits ceiling){return new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(Math.min(spec.ordinary().bytes(),ceiling.ordinary().bytes()),Math.min(spec.ordinary().owners(),ceiling.ordinary().owners())),new RatisNodeResourceBudget.Lane(Math.min(spec.protectedLane().bytes(),ceiling.protectedLane().bytes()),Math.min(spec.protectedLane().owners(),ceiling.protectedLane().owners())));}
@@ -282,7 +283,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas,SchemaReplicaClientFactory replicaFactory,RestoreNativeInitialization restoreInitialization) throws IOException {
         if(factory==null)factory=DEFAULT_SERVER_FACTORY;
-        if(restoreInitialization!=null && startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT)throw new IOException("Restore staging requires exact authorized initialization");
+        if(restoreInitialization!=null && startup!=Startup.AUTHORIZED_RESTORE_TARGET)throw new IOException("Restore staging requires exact authorized initialization");
         requireNativeCacheCapacity(plan,settings.resources().maximumNativeCacheBytes());
         if(factory==DEFAULT_SERVER_FACTORY)RatisStreamingTransport.server(plan,new RaftProperties());
         var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schemas,snapshotHomes,recoveries,replicas);
@@ -411,13 +412,14 @@ public final class RatisNodeRuntime implements AutoCloseable {
         Path identity=root.resolve("node.identity"), logs=root.resolve("raft"), nativePath=root.resolve("native");
         boolean establishedPlacement=false;
         if (Files.exists(identity,LinkOption.NOFOLLOW_LINKS)) {
-            int phase=identityPhase(SessionJournalFiles.read(identity,NODE_IDENTITY_BYTES));nativeExtentBound=phase>=1;boolean exposed=phase==2;establishedPlacement=exposed;
-            if (!exposed && startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Interrupted initial placement requires explicit authorization to resume");
+            nodeIdentity=readIdentity(SessionJournalFiles.read(identity,NODE_IDENTITY_BYTES));int phase=nodeIdentity.phase();nativeExtentBound=phase>=1;boolean exposed=phase==2;establishedPlacement=exposed;
+            if(startup!=Startup.RECOVER && nodeIdentity.purpose()!=initializationPurpose(startup))throw new IOException("Original node initialization purpose changed");
+            if (!exposed && startup==Startup.RECOVER) throw new IOException("Interrupted initial placement requires explicit authorization to resume");
             if (exposed) {
                 for(var spec:plan.pools().values())if(!Files.isRegularFile(spec.nativePath(root).resolve("CURRENT")))throw new IOException("Established native pool state is missing; refuse empty-voter recovery: "+spec.id());
             }
         } else {
-            if (startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Node identity is absent; explicit placement initialization is required");
+            if (startup==Startup.RECOVER) throw new IOException("Node identity is absent; explicit placement initialization is required");
             if(Files.exists(root.resolve("exports"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Unidentified source export authority must not be adopted");
             for(var name:NODE_FILES)for(var suffix:List.of("",".pending",".lock")){if(name.equals("node.lock") && suffix.isEmpty())continue;if(Files.exists(root.resolve(name+suffix),LinkOption.NOFOLLOW_LINKS))throw new IOException("Unidentified node authority must not be adopted: "+name+suffix);}
             if(Files.exists(root.resolve("metadata-claims"),LinkOption.NOFOLLOW_LINKS) || Files.exists(root.resolve("metadata-claims.pending"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Unidentified metadata claims must not be adopted");
@@ -426,6 +428,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 if(directory.equals("native")){requireInitialPoolStaging(path);continue;}
                 if (Files.exists(path)) try (var entries=Files.list(path)) { if (entries.findAny().isPresent()) throw new IOException("Unidentified node data must not be adopted"); }
             }
+            nodeIdentity=RatisNodeIdentity.create(plan,settings.resources().nativeExtents(),initializationPurpose(startup));
             SessionJournalFiles.write(identity,identity(false),NODE_IDENTITY_BYTES);
         }
         for (String directory:List.of("native","raft","sessions","recovery","schema-replicas")) { Path path=Files.createDirectories(root.resolve(directory)); SessionJournalFiles.force(path); }
@@ -1453,22 +1456,19 @@ public final class RatisNodeRuntime implements AutoCloseable {
         return descriptor.replicas().stream().filter(replica -> replica.nodeId().equals(plan.nodeId()) && replica.nodeIncarnation().equals(plan.nodeIncarnation())
                 && replica.peerId().equals(plan.peerId()) && replica.address().equals(plan.address())).findFirst().orElseThrow(() -> new IllegalArgumentException("DATA placement lacks this durable node replica identity"));
     }
+    private static RatisNodeIdentity.Purpose initializationPurpose(Startup startup) {
+        return switch(startup){case AUTHORIZED_GENESIS->RatisNodeIdentity.Purpose.GENESIS;case AUTHORIZED_INITIAL_PLACEMENT->RatisNodeIdentity.Purpose.INITIAL_PLACEMENT;case AUTHORIZED_RESTORE_TARGET->RatisNodeIdentity.Purpose.RESTORE_TARGET;case RECOVER->throw new IllegalArgumentException("Recovery cannot create a node identity");};
+    }
     private byte[] identity(boolean exposed) {
-        return ByteBuffer.allocate(33+RatisNativeExtentPolicy.BYTES).put((byte)(exposed?2:nativeExtentBound?1:0)).put(plan.identityDigest()).put(settings.resources().nativeExtents().encode()).array();
+        nodeIdentity=nodeIdentity.withPhase(exposed?2:nativeExtentBound?1:0);return nodeIdentity.encode();
     }
     private void observeSchemaActivation(SchemaChange.Definition definition,NativeSchemaActivationProof proof) {
         groups.schemaActivated(definition,proof);data(definition.header().domainId()).refreshSchema(definition,proof);
     }
-    private boolean identityExposed(byte[] bytes)throws IOException{return identityPhase(bytes)==2;}
-    private int identityPhase(byte[] bytes) throws IOException {
-        if (bytes.length!=33+RatisNativeExtentPolicy.BYTES) throw new IOException("Invalid node identity shape");
-        var input=ByteBuffer.wrap(bytes);
-        int phase=input.get()&255;
-        if (phase>2) throw new IOException("Invalid node exposure phase");
-        byte[] digest=new byte[32]; input.get(digest);
-        if (!Arrays.equals(digest,plan.identityDigest())) throw new IOException("Node identity/schema/placement binding changed");
-        byte[] policy=new byte[RatisNativeExtentPolicy.BYTES];input.get(policy);if(!Arrays.equals(policy,settings.resources().nativeExtents().encode()))throw new IOException("Original native extent policy changed");
-        return phase;
+    private boolean identityExposed(byte[] bytes)throws IOException{return readIdentity(bytes).phase()==2;}
+    private RatisNodeIdentity readIdentity(byte[] bytes)throws IOException {
+        try{return RatisNodeIdentity.decode(bytes,plan,settings.resources().nativeExtents());}
+        catch(IllegalArgumentException invalid){throw new IOException("Invalid original node identity",invalid);}
     }
     private boolean clockOwnerReady() {
         synchronized (this) { if (closeRequested || closed || serverClosed) return false; }

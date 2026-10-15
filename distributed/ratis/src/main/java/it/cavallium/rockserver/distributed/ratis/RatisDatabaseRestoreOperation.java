@@ -98,11 +98,11 @@ public final class RatisDatabaseRestoreOperation implements RatisDatabaseRestore
     private void requireOriginalIdentity()throws IOException {
         Path identity=nodeRoot.resolve("node.identity");if(!Files.exists(identity,LinkOption.NOFOLLOW_LINKS))return;
         if(!Files.isRegularFile(identity,LinkOption.NOFOLLOW_LINKS))throw new IOException("Restore node identity is not an original durable file");
-        var bytes=SessionJournalFiles.read(identity,65+RatisNativeExtentPolicy.BYTES);
-        if(bytes.length>0 && bytes[0]>=1 && !Files.exists(nodeRoot.resolve("restore.owner"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Initialized restore lost durable original operation ownership");
-        if(bytes.length!=33+RatisNativeExtentPolicy.BYTES || bytes[0]<0 || bytes[0]>2
-                || !Arrays.equals(Arrays.copyOfRange(bytes,1,33),manifest.plan().identityDigest())
-                || !Arrays.equals(Arrays.copyOfRange(bytes,33,bytes.length),manifest.settings().resources().nativeExtents().encode()))throw new IOException("Restore cannot adopt unrelated durable node identity");
+        final RatisNodeIdentity saved;
+        try{saved=RatisNodeIdentity.decode(SessionJournalFiles.read(identity,RatisNodeIdentity.MAX_BYTES),manifest.plan(),manifest.settings().resources().nativeExtents());}
+        catch(IllegalArgumentException invalid){throw new IOException("Restore cannot adopt unrelated durable node identity",invalid);}
+        if(saved.purpose()!=RatisNodeIdentity.Purpose.RESTORE_TARGET)throw new IOException("Restore requires its original restore-target identity purpose");
+        if(saved.phase()>=1 && !Files.exists(nodeRoot.resolve("restore.owner"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Initialized restore lost durable original operation ownership");
     }
     @Override public RatisDatabaseRestoreController.Execution provision(RatisDatabaseRestorePlanner.Plan original,Map<UUID,Path> operators)throws IOException {
         synchronized(this){if(!busy || workThread!=Thread.currentThread() || closing || closed)throw new IOException("Provisioning requires its active restore operation owner");}

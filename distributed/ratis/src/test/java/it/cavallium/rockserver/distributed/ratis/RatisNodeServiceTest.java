@@ -199,8 +199,8 @@ class RatisNodeServiceTest {
         var schema=schema();
         try (var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
             initialize(env,schema);
-            Path identity=env.nodeRoot.resolve("node.identity"); byte[] changed=SessionJournalFiles.read(identity,65+RatisNativeExtentPolicy.BYTES); changed[5]^=1;
-            SessionJournalFiles.write(identity,changed,65+RatisNativeExtentPolicy.BYTES);
+            Path identity=env.nodeRoot.resolve("node.identity"); byte[] changed=SessionJournalFiles.read(identity,RatisNodeIdentity.MAX_BYTES); changed[5]^=1;
+            SessionJournalFiles.write(identity,changed,RatisNodeIdentity.MAX_BYTES);
             var fake=new RatisNodeRuntimeTest.FakeServer();
             assertThrows(IOException.class,() -> RatisNodeService.recover(manifest(env,schema),env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create));
             assertFalse(fake.created); assertEquals(1,env.catalogue.closes.get()); assertEquals(1,env.transportCloses); assertTrue(env.timer.isDisposed());
