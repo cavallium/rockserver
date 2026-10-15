@@ -1085,7 +1085,7 @@ public final class ReplicatedRangeStore {
         private final LocalMetadataDiscovery candidate;private final NativeRangeImage.Manifest manifest;
         private LocalMetadataActivation(LocalMetadataDiscovery candidate,NativeRangeImage.Manifest manifest){this.candidate=candidate;this.manifest=manifest;}
         public NativeRangeImage.Manifest manifest(){return manifest;}
-        public void publish(){synchronized(discoveryPublication){if(localMetadataPublication!=this || localMetadataCandidate!=candidate || candidate.generation!=localMetadataDiscoveryGeneration || !candidate.prefix.cut().equals(applied) || recoverySupersession!=candidate.supersession || !recoverySupersessionAcknowledged || closing)throw new IllegalStateException("Local META activation was revoked");localMetadataDiscoveryActive=true;discoveryPending=false;localMetadataPublication=null;}}
+        public void publish(){synchronized(discoveryPublication){if(localMetadataPublication!=this || localMetadataCandidate!=candidate || candidate.generation!=localMetadataDiscoveryGeneration || !candidate.prefix.cut().equals(applied) || recoverySupersession!=candidate.supersession || !recoverySupersessionAcknowledged || closing)throw new IllegalStateException("Local META activation was revoked");localMetadataDiscoveryActive=true;discoveryPending=false;localMetadataPublication=null;localMetadataCandidate=null;}}
     }
 
 

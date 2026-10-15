@@ -16,7 +16,7 @@ import org.apache.ratis.client.api.BlockingApi;
 import org.apache.ratis.protocol.*;
 import org.apache.ratis.server.RaftServer;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.api.io.TempDir;
 import static org.junit.jupiter.api.Assertions.*;
 import static it.cavallium.rockserver.distributed.ratis.RatisTopologySeedRuntimeTest.field;
@@ -25,18 +25,18 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySeedRuntime
 class RatisAutomaticRecoveryReconciliationTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
 
-    @ParameterizedTest @ValueSource(booleans={false,true})
-    void lostCurrentAcknowledgementIsAutomaticallyFencedAndCleanedBeforeMetaPrepareAcrossColdRetry(boolean registrationForceLoss)throws Exception {
+    @ParameterizedTest @CsvSource({"false,false","true,false","false,true"})
+    void retainedCurrentIsAutomaticallyFencedAndCleanedBeforeMetaPrepareAcrossColdRetry(boolean registrationForceLoss,boolean nativeOnly)throws Exception {
         var local=new ReplicaDescriptor(new UUID(13210,1),new UUID(13210,2),new UUID(13210,3),"receiver13210","127.0.0.1:4598",ReplicaDescriptor.Role.LISTENER);
         try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("source"),false,List.of(local))) {
             var directory=source.firstDirectory;var parent=directory.ranges().getFirst();var group=parent.groupId();var binding=source.plan.catalogue();
-            // A CURRENT registration requires an absent DATA owner, so the force-loss case starts
+            // A CURRENT registration requires an absent DATA owner, so the native-registration cases start
             // with only a genuine local HOME and the original remote DATA geometry as its witness.
-            var bootstrapRange=registrationForceLoss?new RangeDescriptor(parent.rangeId(),group,parent.rangeEpoch(),parent.configurationVersion(),parent.lowerInclusive(),parent.upperExclusive(),parent.topologyState(),List.of(source.local)):parent;
-            var bootstrapDirectory=registrationForceLoss?new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),directory.schemaDigest(),directory.generation(),directory.columns(),directory.routingPrefixBytes(),List.of(bootstrapRange)):directory;
+            var bootstrapRange=registrationForceLoss || nativeOnly?new RangeDescriptor(parent.rangeId(),group,parent.rangeEpoch(),parent.configurationVersion(),parent.lowerInclusive(),parent.upperExclusive(),parent.topologyState(),List.of(source.local)):parent;
+            var bootstrapDirectory=registrationForceLoss || nativeOnly?new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),directory.schemaDigest(),directory.generation(),directory.columns(),directory.routingPrefixBytes(),List.of(bootstrapRange)):directory;
             var domain=new RatisNodePlan.Domain(bootstrapDirectory,Map.of(source.first.columnIds().iterator().next(),"data"),Set.of());
             var homes=new ArrayList<RatisNodePlan.Home>();
-            if(registrationForceLoss){
+            if(registrationForceLoss || nativeOnly){
                 var homeId=new UUID(13210,10);var homeColumn=new UUID(13210,11);
                 var homeReplica=new ReplicaDescriptor(local.nodeId(),local.nodeIncarnation(),new UUID(13210,12),local.peerId(),local.address(),ReplicaDescriptor.Role.VOTER);
                 var homeRange=new RangeDescriptor(homeId,homeId,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(homeReplica));
@@ -46,7 +46,7 @@ class RatisAutomaticRecoveryReconciliationTest {
             var plan=new RatisNodePlan(local.nodeId(),local.nodeIncarnation(),List.of(domain),binding,homes,List.of(),Map.of(),8,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(domain)),RatisPoolFixtures.groups(binding,homes));
             var receiverRoot=Files.createDirectory(root.resolve("receiver"));SessionJournalFiles.force(receiverRoot);SessionJournalFiles.force(root);
             var epochs=new RatisSessionEpochs(source.catalogue,directory.clusterId(),directory.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.sessionsColumn());
-            var server=new AtomicReference<RaftServer>();var lost=new AtomicBoolean(registrationForceLoss);var currentPrepares=new AtomicInteger();var metaPrepares=new AtomicInteger();var obsoleteCalls=new AtomicInteger();
+            var server=new AtomicReference<RaftServer>();var lost=new AtomicBoolean(registrationForceLoss || nativeOnly);var currentPrepares=new AtomicInteger();var metaPrepares=new AtomicInteger();var obsoleteCalls=new AtomicInteger();
             var sourceOwner=field(source.node,"pools",Map.class).get(source.fast);var artifacts=field(sourceOwner,"artifacts",RatisTopologySourceSnapshotArtifacts.class);var sources=field(sourceOwner,"sources",RatisTopologySourceSnapshotService.class);
             // The source validates OBSOLETE against the actual receiver's persisted fence via query120.
             var originalTransport=field(source.node,"relocationClients",RatisRelocationDataClient.class);
@@ -61,11 +61,19 @@ class RatisAutomaticRecoveryReconciliationTest {
                 RatisNodeRuntime node=null;
                 try {
                     node=open(source,plan,receiverRoot,epochs,route,server,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,lost,currentPrepares,metaPrepares,obsoleteCalls);
-                    node.discoverConfiguredRecovery().get(20,TimeUnit.SECONDS);
-                    var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class).snapshot();var original=graph.activeRequests().get(group);
-                    assertNotNull(original);assertFalse(original.metadataOnly());assertEquals(local,original.receiver());
-                    node.recoverConfigured(original).get(20,TimeUnit.SECONDS);var manager=field(node,"configuredRecoveries",RatisConfiguredRecoveries.class);
-                    var initialManager=manager;NativeCurrentRangeRecovery forcedRegistration=null;
+                    final RatisTopologySourceSnapshotRpc.Request original;
+                    if(nativeOnly){
+                        original=new RatisTopologySourceSnapshotRpc.Request(new UUID(13210,19),null,binding.groupId(),local,RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF,group,directory);
+                        var prepared=new RatisNodeRecoverySourceTest().prepare(source,original);node.registerRecovery(prepared);
+                        assertNull(field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class).snapshot());
+                        assertTrue(field(field(node,"configuredRecoveries",RatisConfiguredRecoveries.class),"groups",Map.class).isEmpty());
+                        assertNotNull(rawState(node.nativePool(RatisPoolFixtures.ID),group,0x72));assertNull(rawState(node.nativePool(RatisPoolFixtures.ID),group,0x73));assertNull(rawState(node.nativePool(RatisPoolFixtures.ID),group,null));
+                    }else{
+                        node.discoverConfiguredRecovery().get(20,TimeUnit.SECONDS);
+                        var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class).snapshot();original=graph.activeRequests().get(group);
+                        assertNotNull(original);assertFalse(original.metadataOnly());assertEquals(local,original.receiver());node.recoverConfigured(original).get(20,TimeUnit.SECONDS);
+                    }
+                    var manager=field(node,"configuredRecoveries",RatisConfiguredRecoveries.class);var initialManager=manager;NativeCurrentRangeRecovery forcedRegistration=null;
                     if(registrationForceLoss){
                         manager.step().get(20,TimeUnit.SECONDS);assertEquals(RatisConfiguredRecovery.Phase.REGISTER,manager.phase(group));
                         var once=new AtomicBoolean(true);var pool=node.nativePool(RatisPoolFixtures.ID);
@@ -76,16 +84,21 @@ class RatisAutomaticRecoveryReconciliationTest {
                         assertArrayEquals(forcedRegistration.encode(),rawState(pool,group,0x72),"The actual registration WriteBatch must have persisted before its ACK is lost");
                         assertNull(rawState(pool,group,0x73));assertNull(store(node,group));assertEquals(RatisConfiguredRecovery.Phase.REGISTER,manager.phase(group));
                         pool.currentRecoveryForceObserver(after->{});
-                    }else{
+                    }else if(!nativeOnly){
                         var prepareFailure=assertThrows(ExecutionException.class,()->initialManager.step().get(20,TimeUnit.SECONDS));
                         assertTrue(hasLostPrepareAcknowledgement(prepareFailure),()->"Expected injected lost PREPARE ACK; actual failure: "+failureChain(prepareFailure));
                         assertTrue(lost.get());assertEquals(RatisConfiguredRecovery.Phase.PREPARE,manager.phase(group));
                     }
-                    assertEquals(1,currentPrepares.get());
+                    assertEquals(nativeOnly?0:1,currentPrepares.get());
                     var nativePool=node.nativePool(RatisPoolFixtures.ID);byte[] factualMarker=rawState(nativePool,group,null),factualConfiguration=rawState(nativePool,group,1);
                     assertEquals(1,sources.stats().leases());assertEquals(0,source.store(group).activeSnapshotPins(),"Forced READY files release the native capture pin before PREPARE ACK");assertTrue(sources.stats().reservedImageBytes()>0);assertNotNull(artifacts.lookup(original));assertEquals(0,metaPrepares.get());
                     var consuming=source.publishSplit();assertTrue(source.store(group).topologyRetired());
                     node.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS);
+                    if(nativeOnly){
+                        var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class).snapshot();assertTrue(graph.activeRequests().get(group).metadataOnly());
+                        var alias=graph.frozenRequests().stream().filter(request->request.transferId().equals(original.transferId())).findFirst().orElseThrow();RatisTopologySourceSnapshotRpc.requireRequest(original,alias);
+                        assertEquals(0,currentPrepares.get(),"First META discovery must not dispatch another CURRENT PREPARE");
+                    }
                     // Resolve the journal from the manager's actual owned slot.
                     var slot=field(manager,"groups",Map.class).get(group);var journal=field(slot,"directory",Path.class).resolve("recovery");
                     var before=RatisSchemaClientJournal.read(journal);assertEquals("FENCE_RECEIVER",ascii(before.get("phase")));assertArrayEquals(consuming.header().encode(),NativeRecoverySupersession.Scope.decode(before.get("supersessionScope")).header().encode());

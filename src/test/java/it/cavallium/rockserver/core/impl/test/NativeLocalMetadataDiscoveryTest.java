@@ -51,6 +51,7 @@ class NativeLocalMetadataDiscoveryTest {
                 var holder=executor.submit(()->{lane.lock();try{entered.countDown();release.await();}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new CompletionException(failure);}finally{lane.unlock();}});assertTrue(entered.await(5,TimeUnit.SECONDS));
                 try{executor.submit(ready::publish).get(5,TimeUnit.SECONDS);}finally{release.countDown();}holder.get(5,TimeUnit.SECONDS);
             }
+            assertNull(retainedCandidate.get(f.target));assertThrows(IllegalStateException.class,candidate::capture);assertThrows(IllegalStateException.class,()->activation(candidate,image));assertThrows(IllegalStateException.class,ready::publish);
             assertTrue(f.target.localMetadataDiscoveryActive());assertFalse(f.target.topologyRecoveryOnly());closedUser(f);assertNull(f.target.metadataRecoveryRegistration());assertFalse(f.target.metadataRecoveryImageInstalled());assertEquals(cut,f.target.metadataOutcomeState().applied());
             try(var pin=f.target.captureMetadataForRecovery()){assertEquals(cut,pin.position());assertThrows(IllegalArgumentException.class,()->pin.get(helper.outer.fixed,helper.helper.key(1)));}
             f.target.applyNoop(new ApplyPosition(1,3));assertEquals(new ApplyPosition(1,3),f.target.metadataOutcomeState().applied());closedUser(f);

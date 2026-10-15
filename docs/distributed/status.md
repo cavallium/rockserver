@@ -11,7 +11,7 @@ The full target remains [architecture.md](architecture.md), with the identified
 consumer behavior in [consumer-contracts.md](consumer-contracts.md). This checkpoint
 does not establish complete distributed API parity or production acceptance.
 
-## Current acceptance (2026-10-15)
+## Current acceptance (2026-10-16)
 
 Earlier checkpoints below retain the limitations known at their validation time.
 This section and the remaining gates at the end describe the current branch.
@@ -60,6 +60,22 @@ This section and the remaining gates at the end describe the current branch.
   source leases and image quota after forced READY.
   The initial image adoption and CAT transport remain controlled fixtures; this
   is not independent endpoint/quorum or production-performance acceptance.
+- Recovery interruption coverage now includes a native-only CURRENT registration
+  with no driver/graph until first META discovery, and genuine completed META
+  registration provenance through local completion, UUID renewal and two cold
+  reopens. Actual receiver-fence workflows cover lost acknowledgement after the META
+  file and parent force, exact-image warm/cold retry, and cancellation plus Node
+  close while the actual updater is blocked. Candidate credits remain retained
+  until actual work stops; no remote META PREPARE or retired USER access occurs.
+  Successful native activation now consumes its candidate reference so the copied
+  CFG is not retained after the adapter releases its fixed metadata credit.
+  `local-meta-native-only-first-meta22.log` passes three reconciliation cases;
+  `local-meta-actual-interruptions25.log` passes five JNI cases in both core
+  executions and five actual-core workflows. The final coupled
+  `local-meta-interruption-final26.log` passes five JNI cases in both core
+  executions plus 35 adapter cases, including existing actor/journal and local
+  discovery behavior. Initial adoption/CAT transports are still controlled;
+  independent multi-voter network acceptance remains open.
 - Redundant format-version words are removed from the current command, schema,
   directory, acceptance, session journals, native image and internal state rows.
   Java and Rust readers, command admission offsets and receipt budgets use the
