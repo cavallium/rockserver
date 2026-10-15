@@ -388,12 +388,17 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate recoveryEligibility=new org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate();
     private volatile boolean recoveryReplacement=true;
     @Override public org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate recoveryEligibilityGate(){return recoveryEligibility;}
+    /** Startup inventory grants no restoration, USER, voting, or snapshot-source authority. */
+    void deferRecoveryDiscovery() {
+        if(getLifeCycleState()!=LifeCycle.State.NEW || role!=RatisNodePlan.Role.DATA)throw new IllegalStateException("Recovery discovery is fixed on NEW DATA state machines");
+        store.fence();recoveryEligibility.deferDiscovery();
+    }
     /** Caller must revoke outside division/native/apply locks before starting a live replacement. */
     void prepareRecoveryReplacement(){recoveryReplacement=true;recoveryEligibility.publish(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing());}
     /** Native reads finish before the immutable Gate assignment; no division callback runs under Gate. */
     void refreshRecoveryEligibility()throws IOException {
         long revision=recoveryEligibility.revision(),generation=admissionGeneration.get();
-        if(recoveryReplacement || getLifeCycleState()!=LifeCycle.State.RUNNING)return;
+        if(recoveryReplacement || recoveryEligibility.discoveryPending() || getLifeCycleState()!=LifeCycle.State.RUNNING)return;
         org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence evidence;
         try {
             var current=store.currentRangeRecoveryRegistration();var metadata=store.metadataRecoveryRegistration();
@@ -447,6 +452,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if(store.currentRangeRecoveryRegistration()!=null || store.metadataRecoveryRegistration()!=null)refreshRecoveryEligibility();
     }
     private void activateRecoveredOwner()throws IOException{
+        if(recoveryEligibility.discoveryPending())throw new IOException("Discovery inventory cannot activate native ownership");
         if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending() || store.topologyRecoveryOnly()){validateRoleNativeState();return;}
         if(store.importPending()){if(rangeImportApply==null)throw new IOException("Unpublished native import lacks configured adapter");rangeImportApply.requireGroup(store.ownership().owner().groupId());store.fence();return;}
         else store.activate();
@@ -718,6 +724,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     void role(RatisNodePlan.Role role,HomeValueValidator values) {
         if (getLifeCycleState()!=LifeCycle.State.NEW || roleConfigured) throw new IllegalStateException("Range role is fixed before initialization");
         java.util.Objects.requireNonNull(role);
+        if(recoveryEligibility.discoveryPending() && role!=RatisNodePlan.Role.DATA)throw new IllegalStateException("Deferred discovery belongs only to DATA");
         boolean home=role==RatisNodePlan.Role.TRANSACTION_HOME || role==RatisNodePlan.Role.SNAPSHOT_HOME;
         if (home!=(values!=null) || role!=RatisNodePlan.Role.DATA && (snapshotHomes!=null || transactionHomes!=null || snapshotRecovery!=null)) throw new IllegalArgumentException("Invalid range role capabilities");
         this.role=role; homeValues=values; roleConfigured=true;
@@ -903,7 +910,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return new SourceSnapshotEvidence(local,cut,cfg);
     }
     RatisTopologySourceSnapshotService.Lease captureSourceSnapshot(RatisTopologySourceSnapshotRpc.Request request,TopologyChange.Definition definition,RangeDirectory qualifiedDirectory,DistributedSchema qualifiedSchema,RatisTopologySourceSnapshotArtifacts artifacts,NativeRangeImage.IoAdmission imageAdmission)throws Exception{
-        var snapshotPermit=recoveryEligibility.snapshotPermit();imageAdmission.beforeBytes(1);qualifiedSchema.requireMatches(qualifiedDirectory);
+        requireDiscoverySettled();var snapshotPermit=recoveryEligibility.snapshotPermit();imageAdmission.beforeBytes(1);qualifiedSchema.requireMatches(qualifiedDirectory);
         var saved=artifacts.lookupAdmitted(request,imageAdmission);var evidence=sourceSnapshotEvidence(request,definition,qualifiedDirectory,saved!=null,saved!=null);var division=getServer().getNow(null).getDivision(getGroupId());
         if(saved!=null){var prepared=saved.prepared();var after=sourceSnapshotEvidence(request,definition,qualifiedDirectory,true,true);if(!RatisRelocationOwnerRpc.covers(after.completedCut(),prepared.image().position()) || !prepared.sourceOwner().equals(after.owner()) || !after.owner().equals(evidence.owner()))throw new IOException("Cold source image lacks its original actual owner/prefix");snapshotPermit.requireCurrent();return new RatisTopologySourceSnapshotService.Lease(prepared,division,saved.snapshot(),()->{});}
         ReplicatedRangeStore.SnapshotPin pin=request.metadataOnly()?store.captureMetadataForRecovery():request.relocation()?store.captureForRecovery():store.capture();boolean returned=false;
@@ -2224,22 +2231,32 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     || !groupId.getUuid().equals(store.ownership().owner().groupId())) {
                 throw new IOException("Raft group differs from native ownership");
             }
-            store.configureSourceOutcomeCapacity(retentionLimits.dataCount()+retentionLimits.maintenanceCount(),retentionLimits.dataBytes()+retentionLimits.maintenanceBytes());
+            boolean inventory=recoveryEligibility.discoveryPending();
+            if(!inventory)store.configureSourceOutcomeCapacity(retentionLimits.dataCount()+retentionLimits.maintenanceCount(),retentionLimits.dataBytes()+retentionLimits.maintenanceBytes());
             store.fence();
             raftRoot = storage.getStorageDir().getRoot().toPath();
             snapshotTmp = storage.getStorageDir().getTmpDir().toPath();
             recoveryDir = raftRoot.resolve("native-snapshot-recovery");
-            snapshots.init(storage);
-            recover(false);
-            activateRecoveredOwner();
-            if (role==RatisNodePlan.Role.DATA && !store.importPending() && !store.topologyBirthPending() && !store.topologyRecoveryOnly() && store.ownership().state()!=it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
-            else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
-            if (enableSessionControls && !store.importPending() && !store.topologyBirthPending()) store.enableSessionControls();
+            if(inventory) {
+                Path directory=storage.getStorageDir().getStateMachineDir().toPath();
+                int workspace=Math.toIntExact(8192L+3L*MAX_DISCOVERY_INVENTORY_ENTRIES*(512L+4L*(directory.toString().length()+128)));
+                try(var retained=snapshotMetadataAdmission.reserveMetadata(workspace)) {
+                    Files.createDirectories(directory);for(var root:discoveryInventoryDirectories(directory))preflightDiscoveryInventory(root); // also bounds stock storage.init's scan
+                    snapshots.init(storage);recoverDiscoveryInventory();
+                }
+            } else {
+                snapshots.init(storage);recover(false);
+                activateRecoveredOwner();
+                if (role==RatisNodePlan.Role.DATA && !store.importPending() && !store.topologyBirthPending() && !store.topologyRecoveryOnly() && store.ownership().state()!=it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+                else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
+                if (enableSessionControls && !store.importPending() && !store.topologyBirthPending()) store.enableSessionControls();
+            }
             getLifeCycle().transition(LifeCycle.State.RUNNING);recoveryReplacement=false;refreshRecoveryEligibility();
         } catch (Exception failure) { throw failRecovery(failure); }
     }
 
     private void recover(boolean installing) throws Exception {
+        if(recoveryEligibility.discoveryPending())throw new IOException("Recovery discovery must settle before native restoration");
         recoverStagingImages();
         SingleFileSnapshotInfo discovered = snapshots.loadLatestSnapshot();
         if (discovered == null) {
@@ -2290,6 +2307,68 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         setLastAppliedTermIndex(a == null ? TermIndex.INITIAL_VALUE : TermIndex.valueOf(a.term(), a.index()));
     }
 
+    // At most eight unique cut/hash floors across three fixed roots, with sixteen entries per root.
+    // Inventory bounds are independent of snapshot retention; excess files stay intact on refusal.
+    static final int MAX_DISCOVERY_INVENTORY_FLOORS=8;
+    private static final int MAX_DISCOVERY_INVENTORY_ENTRIES=2*MAX_DISCOVERY_INVENTORY_FLOORS;
+    private void requireDiscoveryInventoryObject(Path file,boolean md5)throws IOException {
+        if(!Files.isRegularFile(file,java.nio.file.LinkOption.NOFOLLOW_LINKS))throw new IOException("Discovery inventory rejects nonregular snapshot objects");
+        if(Files.size(file)>(md5?256L:Math.addExact(limits.maxImageBytes(),32)))throw new IOException("Discovery inventory snapshot object exceeds bound");
+    }
+    private void preflightDiscoveryInventory(Path directory)throws IOException {
+        if(!Files.exists(directory,java.nio.file.LinkOption.NOFOLLOW_LINKS))return;
+        if(!Files.isDirectory(directory,java.nio.file.LinkOption.NOFOLLOW_LINKS))throw new IOException("Discovery inventory rejects nonregular snapshot directories");
+        int entries=0;
+        try(var files=Files.newDirectoryStream(directory)) {
+            for(var file:files) {
+                if(++entries>MAX_DISCOVERY_INVENTORY_ENTRIES)throw new IOException("Discovery inventory directory entry bound exceeded");
+                String name=file.getFileName().toString();
+                if(SimpleStateMachineStorage.SNAPSHOT_REGEX.matcher(name).matches()) {
+                    requireDiscoveryInventoryObject(file,false);
+                    var sidecar=MD5FileUtil.getDigestFileForFile(file.toFile()).toPath();if(Files.exists(sidecar,java.nio.file.LinkOption.NOFOLLOW_LINKS))requireDiscoveryInventoryObject(sidecar,true);
+                }else if(SimpleStateMachineStorage.SNAPSHOT_MD5_REGEX.matcher(name).matches())requireDiscoveryInventoryObject(file,true);
+            }
+        }
+    }
+    private java.util.List<Path> discoveryInventoryDirectories(Path published){return java.util.List.of(published,recoveryDir,groupFloorDirectory());}
+    private record DiscoveryFloor(TermIndex position,byte[] hash) {}
+    /** Retained published floors stay at their actual paths; installation staging remains inert. */
+    private void recoverDiscoveryInventory()throws Exception {
+        Path published=snapshots.getSnapshotFile(0,0).toPath().getParent();SingleFileSnapshotInfo latest=null;
+        var unique=new java.util.HashMap<Long,DiscoveryFloor>();
+        for(var directory:discoveryInventoryDirectories(published)) {
+            if(!Files.exists(directory,java.nio.file.LinkOption.NOFOLLOW_LINKS))continue;
+            if(!Files.isDirectory(directory,java.nio.file.LinkOption.NOFOLLOW_LINKS))throw new IOException("Discovery inventory rejects nonregular snapshot directories");
+            int entries=0;
+            try(var files=Files.newDirectoryStream(directory)) {
+                for(var file:files) {
+                    if(++entries>MAX_DISCOVERY_INVENTORY_ENTRIES)throw new IOException("Discovery inventory directory entry bound exceeded");
+                    if(!SimpleStateMachineStorage.SNAPSHOT_REGEX.matcher(file.getFileName().toString()).matches())continue;
+                    requireDiscoveryInventoryObject(file,false);Path sidecar=MD5FileUtil.getDigestFileForFile(file.toFile()).toPath();
+                    if(Files.exists(sidecar,java.nio.file.LinkOption.NOFOLLOW_LINKS))requireDiscoveryInventoryObject(sidecar,true);
+                    var position=SimpleStateMachineStorage.getTermIndexFromSnapshotFile(file.toFile());
+                    var manifest=validateImage(file,position,null,SnapshotImageUse.DISCOVERY_INVENTORY);
+                    var previous=unique.get(position.getIndex());
+                    if(previous!=null && (!previous.position().equals(position) || !Arrays.equals(previous.hash(),manifest.sha256())))throw new IOException("Discovery floors conflict at one Raft index");
+                    if(previous==null){if(unique.size()>=MAX_DISCOVERY_INVENTORY_FLOORS)throw new IOException("Discovery inventory retained floor bound exceeded");unique.put(position.getIndex(),new DiscoveryFloor(position,manifest.sha256()));}
+                    force(file);if(Files.exists(sidecar,java.nio.file.LinkOption.NOFOLLOW_LINKS))force(sidecar);
+                    var info=new SingleFileSnapshotInfo(new FileInfo(file,org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(file,snapshotMetadataAdmission))),position);
+                    if(latest==null || info.getIndex()>latest.getIndex())latest=info;
+                }
+            }
+            force(directory);
+        }
+        force(raftRoot);
+        var a=store.applied();var cfg=store.configuration();boolean installing=store.pendingInstallation();var pending=installing?store.pendingInstallationCut():null;
+        if(installing && pending==null)throw new IOException("Pending native inventory lacks its genuine installation cut");
+        var reference=installing?pending:a;
+        if(a!=null && cfg==null || cfg!=null && (reference==null?cfg.term()!=0 || cfg.index()!=-1:cfg.index()>reference.index() || cfg.term()>reference.term() || cfg.index()==reference.index() && cfg.term()!=reference.term()))throw new IOException("Native inventory configuration exceeds actual applied/pending image cut");
+        if(cfg!=null)validateConfiguration(cfg.data());
+        if(latest!=null && a!=null && a.index()==latest.getIndex() && a.term()!=latest.getTerm())throw new IOException("Native marker conflicts with inventory floor");
+        durableSnapshot=latest;if(latest!=null)snapshots.updateLatestSnapshot(latest);
+        setLastAppliedTermIndex(a==null?TermIndex.INITIAL_VALUE:TermIndex.valueOf(a.term(),a.index()));
+    }
+
     private static void validateConfiguration(byte[] bytes) throws IOException {
         if (RaftConfigurationProto.parseFrom(bytes).getPeersCount() == 0) throw new IOException("Configuration has no voters");
     }
@@ -2299,10 +2378,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return role==RatisNodePlan.Role.DATA && (store.metadataRecoveryRegistration()!=null || store.topologyRetired() && store.topologyFreeze()!=null);
     }
     private NativeRangeImage.Manifest validateImage(Path image,TermIndex position)throws IOException{return validateImage(image,position,null);}
-    private enum SnapshotImageUse { INSTALLATION, RETAINED_INVENTORY }
+    private enum SnapshotImageUse { INSTALLATION, RETAINED_INVENTORY, DISCOVERY_INVENTORY }
     private NativeRangeImage.Manifest validateImage(Path image,TermIndex position,ReplicatedRangeStore.SnapshotPin pin)throws IOException {return validateImage(image,position,pin,SnapshotImageUse.INSTALLATION);}
     private NativeRangeImage.Manifest validateImage(Path image,TermIndex position,ReplicatedRangeStore.SnapshotPin pin,SnapshotImageUse use)throws IOException {
         try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
+        if(recoveryEligibility.discoveryPending() && use!=SnapshotImageUse.DISCOVERY_INVENTORY)throw new IOException("Discovery inventory grants no image installation permission");
+        if(use==SnapshotImageUse.DISCOVERY_INVENTORY && (role!=RatisNodePlan.Role.DATA || !recoveryEligibility.discoveryPending() || NativeRangeImage.kind(image,snapshotMetadataAdmission)!=NativeRangeImage.Kind.GROUP || metadataSnapshotOwner()))throw new IOException("Discovery inventory requires a genuine DATA GROUP floor");
         final ReplicatedRangeStore.Configuration[] cutConfiguration = {null};
         final NativeTopologyFreeze[] cutFreeze={null};
         boolean metadata=metadataSnapshotOwner();
@@ -2370,7 +2451,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (cfg == null || cfg.index() > manifest.position().index() || cfg.term() > manifest.position().term()) {
             throw new IOException("Snapshot lacks configuration at its cut");
         }
-        validateConfiguration(cfg.data());updateDataVoter(cfg.data());
+        validateConfiguration(cfg.data());if(use!=SnapshotImageUse.DISCOVERY_INVENTORY)updateDataVoter(cfg.data());
         boolean currentSchema=manifest.interval().equals(store.ownership().interval())
                 && Arrays.equals(manifest.schemaDigest(),store.schemaDigest())
                 && manifest.deterministicMergeColumns().equals(store.deterministicMergeColumns());
@@ -2395,6 +2476,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     @Override public long takeSnapshot() throws IOException {
+        if(recoveryEligibility.discoveryPending())return -1;
         // A retired parent's shared USER rows may already belong to its children.
         boolean metadata=metadataSnapshotOwner();
         if(store.topologyBirthPending() || store.topologyRecoveryOnly() || store.metadataRecoveryPending())return -1;
@@ -2661,6 +2743,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         catch(java.util.concurrent.ExecutionException|java.util.concurrent.TimeoutException failure){throw new IOException("Topology replacement preparation did not drain",failure);}
     }
     @Override public void reinitialize() throws IOException {
+        if(recoveryEligibility.discoveryPending())throw new IOException("Recovery discovery must settle before reinitialization");
         try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
         if(recoveryEligibility.snapshot().mode()!=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.MISSING)prepareRecoveryReplacement();
         recoveryReplacement=true;
@@ -3410,6 +3493,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return new AppliedRecord(command.operationId(),store.operationResult(command.operationId(),command.receiptDigest()));
     }
     @Override public CompletableFuture<Message> applyTransaction(TransactionContext transaction) {
+        try{requireDiscoverySettled();}catch(IllegalStateException pending){return CompletableFuture.failedFuture(pending);}
         Deferred completion = null;
         var logEntry=transaction.getLogEntry();
         org.apache.ratis.server.impl.CommittedApplyStateMachine.ApplyPermit committed=null;
@@ -4690,6 +4774,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     @Override public void notifyConfigurationChanged(long term, long index, RaftConfigurationProto configuration) {
+        if(term!=0)requireDiscoverySettled();
         synchronized (gate) {
             // Snapshot transport's current membership is not an applied configuration at D.
             if (term == 0) return;
@@ -4721,6 +4806,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     @Override public void notifyTermIndexUpdated(long term, long index) {
+        requireDiscoverySettled();
         Throwable failure = null;
         synchronized (gate) {
             try {
@@ -4751,6 +4837,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
         try {
+            requireDiscoverySettled();
             int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);
             if (ScopedTransactionRpc.ownerSnapshot(kind) || ScopedTransactionRpc.ownerExport(kind) || kind>=RatisSnapshotCohortRpc.CAPTURE && kind<=RatisSnapshotCohortRpc.CANCEL) {
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
@@ -4772,6 +4859,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public CompletableFuture<Message> queryLinearizable(Message request) { return query(request,true); }
     private CompletableFuture<Message> query(Message request,boolean freshBarrier) {
         try {
+            requireDiscoverySettled();
             int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),Math.max(RatisSnapshotCohortRpc.MAX_REQUEST_BYTES,Math.max(RatisOperationRerouteAdmissionRpc.MAX_BYTES,RatisSourceOutcomeRpc.MAX_REQUEST_BYTES)));
             try (var construction=readConstructionLease(kind,request.getContent().asReadOnlyByteBuffer())) {
             byte[] encoded = request.getContent().toByteArray();
@@ -5431,7 +5519,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         var output=ByteBuffer.allocate(4+(value==null ? 0 : value.length)); ScopedTransactionRpc.putBlob(output,value); return output.array();
     }
 
+    private void requireDiscoverySettled() {
+        if(role==RatisNodePlan.Role.DATA && recoveryEligibility.discoveryPending())throw new IllegalStateException("DATA recovery discovery has not settled");
+    }
     private void requireHealthy() {
+        requireDiscoverySettled();
         if (storageFailure != null) throw new IllegalStateException("Range requires repair", storageFailure);
         if (getLifeCycleState() != LifeCycle.State.RUNNING) throw new IllegalStateException("Range is paused or starting");
     }

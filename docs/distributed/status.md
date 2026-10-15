@@ -2107,8 +2107,8 @@ Ordinary recovery publication/revocation cannot clear it; explicit revision-chec
 classification settlement supplies the qualified baseline. Pending discovery masks
 vote/apply readiness and rejects outbound snapshot permits plus every inbound
 snapshot chunk/notification before replacement or leader-metadata effects. It is
-not an online install-drain primitive. Node startup does not yet install this
-fence or defer native image restoration.
+not an online install-drain primitive. Node startup does not yet invoke the DATA
+inventory hook or settle its selected recovery role.
 
 The core fence gate passes 25 cases in `discovery-fence-core-regression-gate.log`,
 including sticky revocation, stale classification refusal, actual blocked snapshot
@@ -2116,6 +2116,28 @@ RPC handlers and producer reader cleanup. The downstream gate passes 37 cases in
 `discovery-fence-adapter-regression-gate.log` across NodeRuntime, graph Runtime,
 CURRENT-to-META and metadata-transition workflows. Both are controlled no-socket
 checks; they do not establish complete startup classification.
+
+NEW DATA state machines can now inventory genuine GROUP snapshot floors while
+discovery remains fenced. Canonical and retained recovery/group-floor directories
+share an eight-unique-floor limit and sixteen entries per fixed root, with path
+workspace admitted before Ratis's own scan. Retained files stay at their actual
+paths; duplicate copies are accepted and conflicting cuts/hashes, invalid MD5,
+nonregular objects and symlinks fail closed. Inventory preserves the real Raft
+floor S and actual native A, including absent A or A below S, without importing
+USER rows, activating ownership or enabling history/session controls. A partially
+copied configuration is bounded by the persisted incomplete-install target P;
+P never becomes completed A. DATA query, source capture and direct apply/noop paths
+remain closed before body/lease construction while classification is pending.
+
+`discovery-inventory-final-regression-gate.log` passes 72 cases across ten adapter
+classes, including ten inventory cases with genuine JNI images, positive-CFG partial
+installation, retained-only rename-gap layouts, truthful cold A, hash conflicts,
+resource denial and completed-CURRENT stale-query refusal. Existing node, graph,
+configured recovery, CURRENT-to-META and snapshot lifecycle workflows also pass.
+The positive-CFG case interrupts after configuration copy and before the final
+native marker. These are controlled no-socket checks.
+META inventory and classification/resume remain unfinished; unsupported META floors
+are explicitly refused, so universal Node fencing is not yet enabled.
 
 An unresolved role fence must be installed before server construction: Ratis also
 initializes persisted DATA divisions. Preserve their real log floor while deferring

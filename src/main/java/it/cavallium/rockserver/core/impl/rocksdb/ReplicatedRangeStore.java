@@ -931,6 +931,8 @@ public final class ReplicatedRangeStore {
     public int activeTrackedSnapshotPins() { return trackedSnapshotPins.get(); }
     public long trackedSnapshotScopeBytes() { return trackedSnapshotScopeBytes.get(); }
     public boolean pendingInstallation() { return pendingInstallation != null; }
+    /** Persisted incomplete image target; never evidence that its native prefix completed. */
+    public ApplyPosition pendingInstallationCut()throws RocksDBException{return readSchemaMetadata(()->snapshotInstallationCut(db.get(state,installingKey)));}
     public RangeOwnership.Ownership ownership() { nativeLifecycle.readLock().lock(); try { return ownership.get(owner); } finally { nativeLifecycle.readLock().unlock(); } }
     public byte[] schemaDigest() { var generation=installedGeneration; return generation==null ? schemaDigest.clone() : generation.schema().digest(); }
     public Set<UUID> deterministicMergeColumns() { var generation=installedGeneration; return generation==null ? deterministicMergeColumns : generation.deterministicMergeColumns(); }
