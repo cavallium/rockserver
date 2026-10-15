@@ -109,6 +109,10 @@ public final class RockserverRaftServers {
         drain.updater.notifyUpdater();return drain;
     }
 
+    /** The local checkpoint path needs this core's updater ownership, not only the Division facade. */
+    public static boolean ownsLocalUpdater(RaftServer.Division division,StateMachine expected) {
+        return division instanceof RaftServerImpl server && server.getStateMachine()==expected;
+    }
     /** Actual updater progress; Division.Info may report the native-backed SM cut ahead of this cursor. */
     public static boolean hasAppliedPrefix(RaftServer.Division division,StateMachine expected,TermIndex cut) {
         return division instanceof RaftServerImpl server && server.getStateMachine()==expected

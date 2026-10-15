@@ -16,7 +16,7 @@ final class RatisConfiguredRecoveries {
         /** Force the DATA group's durable slot promise before creating or opening its journal. */
         RatisJournalAccess journal(UUID pool,UUID group,Path directory)throws IOException;
     }
-    record RetainedRequests(Request selected,List<Request> requests) {
+    record RetainedRequests(Request selected,List<Request> requests,RatisConfiguredRecovery.Phase phase,RatisConfiguredRecovery.CleanupWitness witness,RatisConfiguredRecovery.LocalMetadataCompletion localCompletion) {
         RetainedRequests {Objects.requireNonNull(selected);requests=List.copyOf(requests);}
     }
     @FunctionalInterface interface HostFactory {RatisConfiguredRecovery.Host create(RatisTopologySourceSnapshotClient.ReplyAdmission admission);}
@@ -118,6 +118,11 @@ final class RatisConfiguredRecoveries {
             }
         }finally{metadata.close();}
     }
+    /** Explicit admission visits its accepted job next, as enqueue does for a newly opened actor. */
+    void selectNextOnIo(UUID group)throws IOException {
+        if(!ownsDiscoveryIo())throw new IOException("Recovery selection requires discovery IO ownership");
+        synchronized(this){var slot=groups.get(group);if(slot==null)throw new IOException("Selected recovery has no admitted slot");cursor=slot.index;visits=0;}
+    }
     void ensureOnIo(Request selected)throws IOException {
         Objects.requireNonNull(selected);if(!ownsDiscoveryIo())throw new IOException("Recovery journal reconciliation requires discovery IO ownership");
         UUID pool=owner.pool(selected);if(!pools.containsKey(pool) || selected.relocation())throw new IOException("Invalid selected configured recovery scope");
@@ -185,13 +190,13 @@ final class RatisConfiguredRecoveries {
             driver.step().whenComplete((phase,failure)->post(()->{
                 try {
                     synchronized(this){slot.phase=driver.phase();}visits++;
-                    if(failure!=null || phase==RatisConfiguredRecovery.Phase.DONE || visits>=STEPS_PER_VISIT){cursor=(slot.index+1)%slots.size();if(!isStopping())closeActive();}
+                    if(failure!=null || RatisConfiguredRecovery.terminal(phase) || visits>=STEPS_PER_VISIT){cursor=(slot.index+1)%slots.size();if(!isStopping())closeActive();}
                     finish(pending,unwrap(failure));
                 }catch(Throwable failed){finish(pending,failed);}
             }));
         }catch(Throwable failure){try{Slot failed=activeSlot!=null?activeSlot:selected;if(failed!=null && !slots.isEmpty())cursor=(failed.index+1)%slots.size();closeActive();}catch(Throwable cleanup){failure.addSuppressed(cleanup);}finish(pending,failure);}
     }
-    private Slot select(){for(int checked=0;checked<slots.size();checked++){var slot=slots.get(cursor);if(slot.phase!=RatisConfiguredRecovery.Phase.DONE)return slot;cursor=(cursor+1)%slots.size();}return null;}
+    private Slot select(){for(int checked=0;checked<slots.size();checked++){var slot=slots.get(cursor);if(!RatisConfiguredRecovery.terminal(slot.phase))return slot;cursor=(cursor+1)%slots.size();}return null;}
     private void open(Slot slot,Request request,Metadata metadata)throws IOException {
         try {
             synchronized(this){slot.phase=null;} // A lost constructor-force ACK must be rediscovered, even after cached DONE.

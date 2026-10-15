@@ -509,12 +509,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final class LocalMetadataPermit {
         final RatisRangeStateMachine owner=RatisRangeStateMachine.this;final ApplyPosition graphCut,cut;final TopologyChange.Definition consuming;final ReplicaDescriptor receiver;final long revision;
         final ReplicatedRangeStore.Configuration configuration;final AutoCloseable metadata;final RatisDiskRunway.RecoveryLease disk;
-        ReplicatedRangeStore.SnapshotPin pin;NativeRangeImage.Manifest manifest;Path image;
+        ReplicatedRangeStore.SnapshotPin pin;NativeRangeImage.Manifest manifest;Path image;byte[] projection;
+        final ReplicatedRangeStore.LocalMetadataDiscovery nativeDiscovery;ReplicatedRangeStore.LocalMetadataActivation activation;
         CompletableFuture<Void> actual;volatile boolean working=true,prepared,authorized,reinitialized,settled,released;
-        LocalMetadataPermit(ApplyPosition graphCut,TopologyChange.Definition consuming,long revision,ReplicatedRangeStore.Configuration cfg,ReplicatedRangeStore.SnapshotPin pin,AutoCloseable metadata,RatisDiskRunway.RecoveryLease disk){this.graphCut=graphCut;this.consuming=consuming;this.revision=revision;this.receiver=topologyLocalReplica;configuration=cfg;this.pin=pin;cut=pin.position();this.metadata=metadata;this.disk=disk;}
+        LocalMetadataPermit(ApplyPosition graphCut,TopologyChange.Definition consuming,long revision,ReplicatedRangeStore.Configuration cfg,ReplicatedRangeStore.SnapshotPin pin,AutoCloseable metadata,RatisDiskRunway.RecoveryLease disk,ReplicatedRangeStore.LocalMetadataDiscovery nativeDiscovery){this.graphCut=graphCut;this.consuming=consuming;this.revision=revision;this.receiver=topologyLocalReplica;configuration=cfg;this.pin=pin;cut=pin.position();this.metadata=metadata;this.disk=disk;this.nativeDiscovery=nativeDiscovery;}
     }
     private volatile LocalMetadataCandidate localMetadataCandidate;private volatile boolean localMetadataPreparing,localMetadataStopped;
-    private volatile ApplyPosition localMetadataBaseline;
+    private volatile ApplyPosition localMetadataBaseline,localMetadataCompletedCut;
+    private volatile byte[] localMetadataImageHash;
     /** A driver completion flag alone is not a durable local ancestor baseline. */
     void requireMetadataDiscoveryReady(TopologyChange.Header header)throws IOException {
         requireHealthy();
@@ -524,13 +526,62 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try {
             var freeze=store.topologyFreeze();var registration=store.metadataRecoveryRegistration();
             if(freeze==null || !Arrays.equals(freeze.header().encode(),header.encode()) || !store.topologyRetired() || store.pendingInstallation()
-                    || registration==null && localMetadataBaseline==null
+                    || registration==null && (localMetadataBaseline==null || store.recoverySupersession()!=null && localMetadataCompletedCut==null)
                     || registration!=null && (!store.metadataRecoveryRegistrationForced(registration) || store.metadataRecoveryPending() || !store.metadataRecoveryImageInstalled()))
                 throw new IOException("Ancestor lacks its actual completed META baseline");
             var baseline=registration==null?localMetadataBaseline:registration.imageCut();var applied=store.applied();var snapshot=durableSnapshot;
             if(!RatisRelocationOwnerRpc.covers(applied,baseline) || snapshot==null || !RatisRelocationOwnerRpc.covers(applied,new ApplyPosition(snapshot.getTerm(),snapshot.getIndex())))
                 throw new IOException("Ancestor META native/snapshot prefix is incomplete");
         }catch(org.rocksdb.RocksDBException failure){throw new IOException("Cannot verify ancestor META native baseline",failure);}
+    }
+    boolean localMetadataBaselineReady(){return localMetadataBaseline!=null && !recoveryReplacement && getLifeCycleState()==LifeCycle.State.RUNNING && !recoveryEligibility.discoveryPending() && (store.recoverySupersession()==null || store.metadataRecoveryRegistration()!=null && !store.metadataRecoveryPending() || store.localMetadataDiscoveryActive());}
+    boolean localMetadataCompletionReady(){return localMetadataBaselineReady() && localMetadataCompletedCut!=null;}
+    ApplyPosition localMetadataImageCut(){var cut=localMetadataBaseline;if(cut==null)throw new IllegalStateException("Local META checkpoint is not settled");return cut;}
+    /** Fresh GROUP HEAD is mandatory before the driver can record local completion or admit descendants. */
+    RatisConfiguredRecovery.LocalMetadataCompletion confirmLocalMetadataCompletion(RatisTopologySourceSnapshotRpc.Request request,RatisSourceHeadRpc.Head head,RatisConfiguredRecovery.LocalMetadataCompletion previous)throws IOException {
+        requireHealthy();requireRecoveryRegistrationDrained();
+        if(!request.metadataOnly() || !localMetadataBaselineReady() || localMetadataImageHash==null || getLifeCycleState()!=LifeCycle.State.RUNNING || topologyStorage==null)return null;
+        RatisSourceHeadRpc.reply(RatisSourceHeadRpc.reply(head),new RatisSourceHeadRpc.Request(request,localMetadataBaseline));
+        try {
+            var cut=store.applied();var cfg=store.configuration();var snapshot=durableSnapshot;var updater=getLastAppliedTermIndex();
+            if(cut==null || cfg==null || snapshot==null || !RatisRelocationOwnerRpc.covers(cut,head.completedCut()) || !RatisRelocationOwnerRpc.covers(cut,localMetadataBaseline)
+                    || !RatisRelocationOwnerRpc.covers(new ApplyPosition(updater.getTerm(),updater.getIndex()),head.completedCut()) || !sameConfiguration(cfg,head.configuration()))return null;
+            var server=getServer().getNow(null);if(server==null)return null;var division=server.getDivision(getGroupId());
+            if(division.getStateMachine()!=this || !division.getInfo().isAlive() || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING
+                    || !org.apache.ratis.server.impl.RockserverRaftServers.hasAppliedPrefix(division,this,TermIndex.valueOf(head.completedCut().term(),head.completedCut().index())))return null;
+            var actual=division.getRaftConf();var actualCfg=org.apache.ratis.server.raftlog.LogProtoUtils.toRaftConfigurationProtoBuilder(actual).build();
+            boolean bootstrap=cfg.term()==0 && cfg.index()==-1 && actual.getLogEntryIndex()==0 && division.getRaftLog().getTermIndex(0)==null;
+            if(!actualCfg.equals(RaftConfigurationProto.parseFrom(cfg.data())) || actual.getLogEntryIndex()!=cfg.index() && !bootstrap)return null;
+            var registration=store.metadataRecoveryRegistration();var seed=topologyStorage.topologySeed(request.header().intentId());var freeze=store.topologyFreeze();
+            if(freeze==null || !Arrays.equals(freeze.header().encode(),request.header().encode()))throw new IOException("Local META completion lost original FREEZE");
+            RatisConfiguredRecovery.LocalMetadataOrigin originKind;byte[] originDigest;
+            if(registration!=null){if(!store.metadataRecoveryRegistrationForced(registration) || store.metadataRecoveryPending() || !store.metadataRecoveryImageInstalled() || !registration.freeze().equals(freeze))throw new IOException("Local META completion lost registered origin");originKind=RatisConfiguredRecovery.LocalMetadataOrigin.METADATA_REGISTRATION;originDigest=registration.digest();}
+            else{if(seed==null || !Arrays.equals(seed.header().encode(),request.header().encode()) || !freeze.equals(seed.parentFreezes().get(request.sourceGroup())))throw new IOException("Local META completion lost original seed");originKind=RatisConfiguredRecovery.LocalMetadataOrigin.LOCAL_SEED;originDigest=seed.digest();}
+            var completed=new RatisConfiguredRecovery.LocalMetadataCompletion(OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,request)),localMetadataBaseline,localMetadataImageHash,cut,cfg,head,originKind,originDigest,OperatorUpload.sha256(freeze.encode()));
+            if(previous!=null){
+                previous.require(request);
+                if(localMetadataBaseline.equals(previous.imageCut()) && !Arrays.equals(localMetadataImageHash,previous.imageHash()))throw new IOException("Cold local META checkpoint changed its exact equal-cut hash");
+                if(!RatisRelocationOwnerRpc.covers(cut,previous.completedCut()) || !RatisRelocationOwnerRpc.covers(localMetadataBaseline,previous.imageCut()) || previous.originKind()!=originKind || !Arrays.equals(previous.originDigest(),originDigest) || !Arrays.equals(previous.freezeDigest(),completed.freezeDigest()))throw new IOException("Cold local META completion lost retained native provenance/prefix");
+                var before=previous.configuration();if(cfg.term()<before.term() || cfg.index()<before.index() || cfg.index()==before.index() && !sameConfiguration(cfg,before))throw new IOException("Cold local META completion regressed native configuration");
+            }
+            if(!sameConfiguration(cfg,store.configuration()))return null;
+            synchronized(gate){if(!localMetadataBaselineReady() || !Objects.equals(cut,store.applied()))return null;localMetadataCompletedCut=cut;}
+            return completed;
+        }catch(org.rocksdb.RocksDBException failure){throw new IOException("Cannot qualify local META completion",failure);}
+    }
+    void beginLocalMetadataDiscovery(LocalDiscoverySettlement publisher,java.time.Duration timeout)throws IOException {
+        if(localMetadataCandidate!=null || localMetadataBaselineReady())return;
+        if(role!=RatisNodePlan.Role.DATA || getLifeCycleState()!=LifeCycle.State.RUNNING || genesisActive())throw new IOException("Local META discovery lacks a live DATA owner");
+        var server=getServer().getNow(null);if(server==null)throw new IOException("Local META discovery lacks division");
+        var hold=org.apache.ratis.server.impl.RockserverRaftServers.holdDiscovery(server.getDivision(getGroupId()),this,org.apache.ratis.server.impl.RockserverRaftServers.DiscoveryRole.CURRENT);
+        boolean drained=false;Throwable problem=null;
+        try {
+            awaitUpdaterWork(hold.drained());drained=true;
+            publisher.publish(()->{synchronized(gate){synchronized(recoveryEligibility){hold.requireHeld();if(!recoveryEligibility.discoveryPending())recoveryEligibility.deferDiscovery();localMetadataCompletedCut=null;recoveryReplacement=false;}}});
+            admissionGeneration.incrementAndGet();invalidateProposalCandidates();store.deferDiscovery();capturedSnapshots.invalidate();awaitNativeReaders(timeout);requireRecoveryRegistrationDrained();
+        }catch(IOException|RuntimeException|Error failure){problem=failure;throw failure;}
+        catch(Exception failure){problem=failure;throw new IOException("Local META native readers did not drain",failure);}
+        finally{try{awaitUpdaterWork(drained?hold.release():hold.abort());}catch(IOException|RuntimeException failure){if(problem!=null)problem.addSuppressed(failure);else throw failure;}}
     }
     /** Trusted Node IO has already forced this graph cut and exact consuming definition. */
     LocalMetadataCandidate prepareLocalMetadataDiscovery(ApplyPosition graphCut,TopologyChange.Definition consuming)throws IOException {
@@ -540,15 +591,21 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
             if(candidate!=null && candidate.permit.reinitialized && candidate.permit.actual!=null && candidate.permit.actual.isDone() && !candidate.permit.actual.isCompletedExceptionally()){verifyLocalMetadataBaseline(candidate);return candidate;}
             if(candidate==null) {
-                metadata=snapshotMetadataAdmission.reserveMetadata(65536+8192);long revision=recoveryEligibility.revision();
-                requireLocalMetadataSource(graphCut,consuming);var cfg=store.configuration();pin=store.captureMetadataForRecovery();
+                metadata=snapshotMetadataAdmission.reserveMetadata(8192+4*65536);long revision=recoveryEligibility.revision();
+                var nativeDiscovery=requireLocalMetadataSource(graphCut,consuming);
+                if(store.acknowledgedRecoverySupersession()!=null && store.metadataRecoveryRegistration()==null && nativeDiscovery==null)return null;
+                var cfg=nativeDiscovery==null?store.configuration():nativeDiscovery.configuration();pin=nativeDiscovery==null?store.captureMetadataForRecovery():nativeDiscovery.capture();
                 if(!Objects.equals(pin.position(),store.applied()) || !sameConfiguration(cfg,pin.configuration()))throw new IOException("Local META pin changed completed native baseline");
                 long bytes=NativeRangeImage.encodedBytes(pin,limits);if(diskRunway!=null)disk=diskRunway.reserveRecovery(diskPool,Math.addExact(Math.multiplyExact(2,bytes),65536));
-                var permit=new LocalMetadataPermit(graphCut,consuming,revision,cfg,pin,metadata,disk);candidate=new LocalMetadataCandidate(permit);
+                var permit=new LocalMetadataPermit(graphCut,consuming,revision,cfg,pin,metadata,disk,nativeDiscovery);candidate=new LocalMetadataCandidate(permit);
                 synchronized(gate){if(localMetadataStopped || revision!=recoveryEligibility.revision())throw new IOException("Local META candidate was revoked during capture");localMetadataCandidate=candidate;}
                 metadata=null;pin=null;disk=null;
             }
             var permit=candidate.permit;verifyLocalMetadataBaseline(candidate);publishLocalMetadataCandidate(permit);verifyLocalMetadataBaseline(candidate);
+            if(permit.nativeDiscovery!=null){
+                if(permit.pin!=null){permit.pin.close();permit.pin=null;}
+                if(permit.activation==null)permit.activation=permit.nativeDiscovery.prepareActivation(permit.image,limits,enableSessionControls,Math.addExact(retentionLimits.dataCount(),retentionLimits.maintenanceCount()),Math.addExact(retentionLimits.dataBytes(),retentionLimits.maintenanceBytes()));
+            }
             synchronized(gate){requireLocalMetadataCandidate(candidate);if(getLifeCycleState()==LifeCycle.State.RUNNING)getLifeCycle().transition(LifeCycle.State.PAUSING);if(getLifeCycleState()==LifeCycle.State.PAUSING)getLifeCycle().transition(LifeCycle.State.PAUSED);if(getLifeCycleState()!=LifeCycle.State.PAUSED)throw new IOException("Local META candidate lost paused lifecycle");permit.prepared=true;}
             return candidate;
         }catch(Exception failure){throw failure instanceof IOException io?io:new IOException("Cannot prepare local META discovery checkpoint",failure);}
@@ -560,10 +617,17 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(stopped!=null)releaseLocalMetadata(stopped.permit);
         }
     }
-    private void requireLocalMetadataSource(ApplyPosition graphCut,TopologyChange.Definition consuming)throws Exception {
-        if(role!=RatisNodePlan.Role.DATA || !recoveryEligibility.discoveryPending() || getLifeCycleState()!=LifeCycle.State.RUNNING || recoveryReplacement || graphCut.term()<1 || graphCut.index()<1 || consuming.kind()==TopologyChange.Kind.RELOCATE)throw new IOException("Local META discovery lacks pending DATA graph authority");
-        requireRecoveryRegistrationDrained();if(store.pendingInstallation() || store.activeSnapshotPins()!=0 || store.currentRangeRecoveryRegistration()!=null && !store.currentRangeRecoveryReady())throw new IOException("Local META discovery has unresolved native work/readers");
-        var a=store.applied();var cfg=store.configuration();var freeze=store.topologyFreeze();
+    private ReplicatedRangeStore.LocalMetadataDiscovery requireLocalMetadataSource(ApplyPosition graphCut,TopologyChange.Definition consuming)throws Exception {
+        if(role!=RatisNodePlan.Role.DATA || !recoveryEligibility.discoveryPending() || getLifeCycleState()!=LifeCycle.State.RUNNING || recoveryReplacement && store.acknowledgedRecoverySupersession()==null || graphCut.term()<1 || graphCut.index()<1 || consuming.kind()==TopologyChange.Kind.RELOCATE)throw new IOException("Local META discovery lacks pending DATA graph authority");
+        requireRecoveryRegistrationDrained();
+        var supersession=store.acknowledgedRecoverySupersession();ReplicatedRangeStore.LocalMetadataDiscovery nativeDiscovery=null;
+        if(supersession!=null && store.metadataRecoveryRegistration()==null){
+            if(topologyStorage==null || !Arrays.equals(supersession.scope().header().encode(),consuming.header().encode()) || !RatisRelocationOwnerRpc.covers(graphCut,supersession.scope().catalogueCut()))throw new IOException("Local META discovery changed acknowledged receiver scope");
+            var snapshot=durableSnapshot;nativeDiscovery=topologyStorage.prepareLocalMetadataDiscovery(store,supersession,snapshot==null?null:new ApplyPosition(snapshot.getTerm(),snapshot.getIndex()));
+            if(nativeDiscovery==null)return null;
+        }
+        if(store.pendingInstallation() || store.activeSnapshotPins()!=0 || nativeDiscovery==null && store.currentRangeRecoveryRegistration()!=null && !store.currentRangeRecoveryReady())throw new IOException("Local META discovery has unresolved native work/readers");
+        var a=store.applied();var cfg=nativeDiscovery==null?store.configuration():nativeDiscovery.configuration();var freeze=nativeDiscovery==null?store.topologyFreeze():nativeDiscovery.freeze();
         if(a==null || cfg==null || cfg.index()>a.index() || cfg.term()>a.term() || cfg.index()==a.index() && cfg.term()!=a.term() || freeze==null || !Arrays.equals(freeze.header().encode(),consuming.header().encode()))throw new IOException("Local META discovery lacks genuine completed source FREEZE/configuration");
         var range=consuming.parents().stream().filter(r->r.groupId().equals(store.ownership().owner().groupId())).findFirst().orElseThrow(()->new IOException("Local META source is outside consuming definition"));
         var interval=store.ownership().interval();var source=consuming.sourceDirectory();
@@ -573,6 +637,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if(registration!=null){if(!RatisRelocationOwnerRpc.covers(graphCut,registration.catalogueCut()) || store.metadataRecoveryPending() || !store.metadataRecoveryImageInstalled() || !store.metadataRecoveryRegistrationForced(registration) || !registration.freeze().equals(freeze) || !sameReplicaIdentity(registration.receiver(),topologyLocalReplica))throw new IOException("Local META source has incomplete registered recovery");}
         else {var seed=topologyStorage.topologySeed(consuming.intentId());if(!store.topologyRetired() || seed==null || !sameReplicaIdentity(seed.localReplica(),topologyLocalReplica) || !freeze.equals(seed.parentFreezes().get(range.groupId())) || !Arrays.equals(seed.header().encode(),consuming.header().encode()))throw new IOException("Local META source lacks actual original retirement seed");}
         var latest=durableSnapshot;if(latest!=null && !RatisRelocationOwnerRpc.covers(a,new ApplyPosition(latest.getTerm(),latest.getIndex())))throw new IOException("Local META source does not cover retained Raft floor");
+        return nativeDiscovery;
     }
     private static boolean sameConfiguration(ReplicatedRangeStore.Configuration a,ReplicatedRangeStore.Configuration b){return a!=null && b!=null && a.term()==b.term() && a.index()==b.index() && Arrays.equals(a.data(),b.data());}
     private void requireLocalMetadataCandidate(LocalMetadataCandidate candidate)throws IOException {
@@ -599,10 +664,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         MD5FileUtil.saveMD5File(target.toFile(),org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(target,snapshotMetadataAdmission)));force(target);force(MD5FileUtil.getDigestFileForFile(target.toFile()).toPath());force(groupFloorDirectory());force(recoveryDir);force(raftRoot);
     }
     private void publishLocalMetadataCandidate(LocalMetadataPermit permit)throws Exception {
-        requireLocalMetadataCandidate(localMetadataCandidate);var position=TermIndex.valueOf(permit.cut.term(),permit.cut.index());var target=snapshots.getSnapshotFile(permit.cut.term(),permit.cut.index()).toPath();Files.createDirectories(recoveryDir);var retained=recoveryDir.resolve(target.getFileName());byte[] projection=localMetadataProjection(permit.pin);
+        requireLocalMetadataCandidate(localMetadataCandidate);var position=TermIndex.valueOf(permit.cut.term(),permit.cut.index());var target=snapshots.getSnapshotFile(permit.cut.term(),permit.cut.index()).toPath();Files.createDirectories(recoveryDir);var retained=recoveryDir.resolve(target.getFileName());if(permit.projection==null){if(permit.pin==null)throw new IOException("Local META checkpoint lost captured projection");permit.projection=localMetadataProjection(permit.pin);}byte[] projection=permit.projection;
         preserveLocalGroupFloor(target,permit,projection);preserveLocalGroupFloor(retained,permit,projection);
         if(Files.exists(retained,java.nio.file.LinkOption.NOFOLLOW_LINKS) && NativeRangeImage.kind(retained,snapshotMetadataAdmission)==NativeRangeImage.Kind.GROUP){Files.deleteIfExists(MD5FileUtil.getDigestFileForFile(retained.toFile()).toPath());Files.delete(retained);force(recoveryDir);}
-        if(!Files.exists(retained,java.nio.file.LinkOption.NOFOLLOW_LINKS))NativeRangeImage.writeMetadataAdmitted(retained,permit.pin,permit.pin.interval(),limits,snapshotMetadataAdmission);
+        if(!Files.exists(retained,java.nio.file.LinkOption.NOFOLLOW_LINKS)){if(permit.pin==null)throw new IOException("Local META checkpoint lost its forced image");NativeRangeImage.writeMetadataAdmitted(retained,permit.pin,permit.pin.interval(),limits,snapshotMetadataAdmission);}
         var qualified=validateDiscoveryImage(retained,position);if(qualified.kind()!=NativeRangeImage.Kind.METADATA || !Arrays.equals(projection,qualified.projection()))throw new IOException("Local META checkpoint differs from captured native state");
         if(permit.manifest!=null && !Arrays.equals(permit.manifest.sha256(),qualified.manifest().sha256()))throw new IOException("Local META retry changed its frozen candidate hash");permit.manifest=qualified.manifest();permit.image=target;
         var md5=org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(retained,snapshotMetadataAdmission));MD5FileUtil.saveMD5File(retained.toFile(),md5);force(retained);force(MD5FileUtil.getDigestFileForFile(retained.toFile()).toPath());force(recoveryDir);
@@ -630,8 +695,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             verifyLocalMetadataBaseline(localMetadataCandidate);if(!permit.authorized || !permit.working || !permit.prepared || permit.manifest==null || getLifeCycleState()!=LifeCycle.State.PAUSED)throw new IOException("Pending discovery has no exact local META reload permit");
             var qualified=validateDiscoveryImage(permit.image,TermIndex.valueOf(permit.cut.term(),permit.cut.index()));if(qualified.kind()!=NativeRangeImage.Kind.METADATA || !Arrays.equals(qualified.manifest().sha256(),permit.manifest.sha256()))throw new IOException("Private local META reload image changed");
             // Native A already equals this checkpoint. Never call installSnapshot/recover(true).
-            store.configureSourceOutcomeCapacity(retentionLimits.dataCount()+retentionLimits.maintenanceCount(),retentionLimits.dataBytes()+retentionLimits.maintenanceBytes());
-            if(enableSessionControls)store.enableSessionControls();validateRoleNativeState();refreshSessionAdmission(permit.consuming.sourceDirectory());
+            if(permit.nativeDiscovery==null){store.configureSourceOutcomeCapacity(retentionLimits.dataCount()+retentionLimits.maintenanceCount(),retentionLimits.dataBytes()+retentionLimits.maintenanceBytes());if(enableSessionControls)store.enableSessionControls();}
+            validateRoleNativeState();refreshSessionAdmission(permit.consuming.sourceDirectory());
             synchronized(gate){requireLocalMetadataCandidate(localMetadataCandidate);getLifeCycle().transition(LifeCycle.State.STARTING);setLastAppliedTermIndex(TermIndex.valueOf(permit.cut.term(),permit.cut.index()));getLifeCycle().transition(LifeCycle.State.RUNNING);recoveryReplacement=false;permit.reinitialized=true;}
         }catch(Exception failure){throw failure instanceof IOException io?io:new IOException("Local META reload failed",failure);}
     }
@@ -642,7 +707,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(!value.equals(store.acknowledgedRecoverySupersession()) || !recoveryEligibility.discoveryPending()
                     || !localDiscoveryIdle() || topologyLocalReplica==null || !sameReplicaIdentity(value.receiver(),topologyLocalReplica))
                 throw new IOException("Supersession publication lost its exact fenced receiver");
-            recoveryReplacement=true;topologyLocalReplica=value.receiver();
+            recoveryReplacement=true;localMetadataBaseline=null;localMetadataImageHash=null;localMetadataCompletedCut=null;topologyLocalReplica=value.receiver();
         }
     }
     /** Node IO owns the immutable replacement scope and its prepaid durable force. */
@@ -695,7 +760,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(index<=permit.cut.index()) {if(!actual.equals(nativeConfiguration) || index!=permit.configuration.index() && !bootstrap)throw new IOException("Local META actual/native configuration differs at baseline");}
             else {var entry=division.getRaftLog().get(index);if(division.getRaftLog().getLastCommittedIndex()<index || entry==null || !entry.hasConfigurationEntry() || !entry.getConfigurationEntry().equals(actual) || entry.getTerm()<permit.cut.term())throw new IOException("Local META newer configuration lacks genuine committed tail");}
             var evidence=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.recovered(TermIndex.valueOf(permit.cut.term(),permit.cut.index()),TermIndex.valueOf(permit.cut.term(),permit.cut.index()),durableSnapshot.getTermIndex(),permit.configuration.term(),permit.configuration.index(),nativeConfiguration);
-            publicationOwner.publish(()->{synchronized(gate){requireLocalMetadataCandidate(candidate);localMetadataBaseline=permit.cut;if(!recoveryEligibility.settleDiscovery(permit.revision,evidence)){localMetadataBaseline=null;throw new IOException("Local META settlement revision changed");}permit.settled=true;localMetadataCandidate=null;}});
+            publicationOwner.publish(()->{synchronized(gate){requireLocalMetadataCandidate(candidate);synchronized(recoveryEligibility){
+                if(recoveryEligibility.revision()!=permit.revision || !recoveryEligibility.discoveryPending())throw new IOException("Local META settlement revision changed");
+                if(permit.nativeDiscovery!=null){if(permit.activation==null)throw new IOException("Local META native activation is not prepared");permit.activation.publish();}
+                localMetadataBaseline=permit.cut;localMetadataImageHash=permit.manifest.sha256();if(!recoveryEligibility.settleDiscovery(permit.revision,evidence)){localMetadataBaseline=null;throw new IOException("Local META settlement revision changed");}permit.settled=true;localMetadataCandidate=null;
+            }if(committedGroup!=null)committedGroup.resume();}});
             if(!permit.settled)throw new IOException("Local META publication owner did not publish");
             releaseLocalMetadata(permit);return true;
         }catch(org.apache.ratis.server.raftlog.RaftLogIOException failure){throw new IOException("Cannot qualify committed local META configuration",failure);}
@@ -843,7 +912,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if(index<=permit.cut.index()){if(!actual.equals(nativeConfiguration) || index!=permit.configuration.index() && !bootstrap)throw new IOException("CURRENT actual/native configuration differs at baseline");}
         else {var entry=division.getRaftLog().get(index);if(division.getRaftLog().getLastCommittedIndex()<index || entry==null || !entry.hasConfigurationEntry() || !entry.getConfigurationEntry().equals(actual) || entry.getTerm()<permit.cut.term())throw new IOException("CURRENT newer configuration lacks committed tail");}
         var evidence=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.recovered(TermIndex.valueOf(permit.manifest.position().term(),permit.manifest.position().index()),TermIndex.valueOf(permit.cut.term(),permit.cut.index()),durableSnapshot.getTermIndex(),permit.configuration.term(),permit.configuration.index(),nativeConfiguration);
-        try {publicationOwner.publish(()->{synchronized(gate){requireLocalCurrentCandidate(candidate);synchronized(recoveryEligibility){if(recoveryEligibility.revision()!=permit.revision || !recoveryEligibility.discoveryPending())throw new IOException("CURRENT publication revision changed");permit.activation.publish();localCurrentBaseline=permit.manifest.position();if(!recoveryEligibility.settleDiscovery(permit.revision,evidence)){localCurrentBaseline=null;throw new IOException("CURRENT publication revision changed");}permit.settled=true;localCurrentCandidate=null;}}});if(!permit.settled)throw new IOException("CURRENT publication owner did not publish");}
+        try {publicationOwner.publish(()->{synchronized(gate){requireLocalCurrentCandidate(candidate);synchronized(recoveryEligibility){if(recoveryEligibility.revision()!=permit.revision || !recoveryEligibility.discoveryPending())throw new IOException("CURRENT publication revision changed");permit.activation.publish();localCurrentBaseline=permit.manifest.position();if(!recoveryEligibility.settleDiscovery(permit.revision,evidence)){localCurrentBaseline=null;throw new IOException("CURRENT publication revision changed");}permit.settled=true;localCurrentCandidate=null;}if(committedGroup!=null)committedGroup.resume();}});if(!permit.settled)throw new IOException("CURRENT publication owner did not publish");}
         catch(RuntimeException failed){storageFailure=failed;store.deferDiscovery();recoveryEligibility.deferDiscovery();throw new IOException("CURRENT activation publication failed closed",failed);}
         if(permit.covered!=null)awaitUpdaterWork(retireCoveredCurrent(permit,true));else releaseLocalCurrent(permit);return true;
     }
@@ -857,7 +926,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         synchronized(permit){try{if(permit.pin!=null){permit.pin.close();permit.pin=null;}if(permit.disk!=null)permit.disk.actualFinished();if(!permit.released){permit.metadata.close();permit.released=true;}}catch(Exception failure){storageFailure=failure;store.deferDiscovery();recoveryEligibility.publish(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing());throw new IllegalStateException("CURRENT actual resources did not release",failure);}}
     }
     /** Caller must revoke outside division/native/apply locks before starting a live replacement. */
-    void prepareRecoveryReplacement(){recoveryReplacement=true;recoveryEligibility.publish(genesisActive()?org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.suspendedGenesis():org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing());}
+    void prepareRecoveryReplacement(){recoveryReplacement=true;localMetadataCompletedCut=null;recoveryEligibility.publish(genesisActive()?org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.suspendedGenesis():org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing());}
     /** Native reads finish before the immutable Gate assignment; no division callback runs under Gate. */
     void refreshRecoveryEligibility()throws IOException {
         long revision=recoveryEligibility.revision(),generation=admissionGeneration.get();
@@ -870,7 +939,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             if(current==null && metadata==null && localMetadataBaseline==null && localCurrentBaseline==null)evidence=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.normal();
             else {
-                var image=current!=null?current.imageCut():metadata!=null?metadata.imageCut():localCurrentBaseline!=null?localCurrentBaseline:localMetadataBaseline;boolean installed=current!=null?store.currentRangeRecoveryImageInstalled():metadata!=null?store.metadataRecoveryImageInstalled():localCurrentBaseline!=null?!store.topologyRetired() && store.admissionOpen():store.topologyRetired() && store.topologyFreeze()!=null;
+                boolean localMeta=metadata==null && localMetadataBaseline!=null;
+                var image=metadata!=null?metadata.imageCut():localMeta?localMetadataBaseline:current!=null?current.imageCut():localCurrentBaseline;
+                boolean installed=metadata!=null?store.metadataRecoveryImageInstalled():localMeta?store.topologyRetired() && store.topologyFreeze()!=null && (store.recoverySupersession()==null || store.localMetadataDiscoveryActive()):current!=null?store.currentRangeRecoveryImageInstalled():localCurrentBaseline!=null && !store.topologyRetired() && store.admissionOpen();
                 var cut=store.applied();var cfg=store.configuration();var snapshot=durableSnapshot;
                 if(!installed || store.pendingInstallation() || cut==null || cfg==null || snapshot==null || !RatisRelocationOwnerRpc.covers(new ApplyPosition(snapshot.getTerm(),snapshot.getIndex()),image))evidence=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing();
                 else evidence=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.recovered(TermIndex.valueOf(image.term(),image.index()),TermIndex.valueOf(cut.term(),cut.index()),snapshot.getTermIndex(),cfg.term(),cfg.index(),RaftConfigurationProto.parseFrom(cfg.data()));
@@ -2985,6 +3056,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if(kind==NativeRangeImage.Kind.GROUP && !metadataSnapshotOwner())return new DiscoveryImage(validateImage(image,position,null,SnapshotImageUse.DISCOVERY_INVENTORY),kind,null,null);
         try {
             var registration=store.metadataRecoveryRegistration();var freeze=registration==null?store.topologyFreeze():registration.freeze();
+            if(freeze==null && registration==null && topologyStorage!=null && store.acknowledgedRecoverySupersession()!=null){
+                freeze=topologyStorage.qualifyLocalMetadataFreeze(store,store.acknowledgedRecoverySupersession());
+            }
             if(freeze==null || role!=RatisNodePlan.Role.DATA || !recoveryEligibility.discoveryPending())throw new IOException("META inventory lacks original sealed source authority");
             var range=registration==null?topologyDescriptor:registration.range();
             if(range==null || topologyLocalReplica==null || topologyStorage==null || getServer().getNow(null)==null || !getServer().getNow(null).getId().toString().equals(topologyLocalReplica.peerId()))throw new IOException("META inventory lacks configured local receiver identity");
@@ -3033,13 +3107,17 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var value=store.acknowledgedRecoverySupersession();var server=getServer().getNow(null);
             if(value==null || role!=RatisNodePlan.Role.DATA || !recoveryEligibility.discoveryPending() || topologyLocalReplica==null || server==null || !server.getId().toString().equals(topologyLocalReplica.peerId()) || !sameReplicaIdentity(value.receiver(),topologyLocalReplica))throw new IOException("Superseded GROUP inventory lacks exact forced local receiver");
             var qualified=store.validateSupersededGroupFloorInventory(image,limits);var cfg=new ReplicatedRangeStore.Configuration[1];
-            var manifest=NativeRangeImage.visitAdmitted(image,limits,(section,column,key,bytes)->{if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==1)cfg[0]=ReplicatedRangeStore.Configuration.decode(bytes);},snapshotMetadataAdmission);
+            var projection=java.security.MessageDigest.getInstance("SHA-256");var frame=ByteBuffer.allocate(9);
+            var manifest=NativeRangeImage.visitAdmitted(image,limits,(section,column,key,bytes)->{
+                if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==1)cfg[0]=ReplicatedRangeStore.Configuration.decode(bytes);
+                if(section!=NativeRangeImage.Section.USER && !(section==NativeRangeImage.Section.STATE && NativeRangeImage.metadataLocalPointer(key))){frame.clear().put((byte)(section.ordinal()+1)).putInt(key.length).putInt(bytes.length);projection.update(frame.array());projection.update(key);projection.update(bytes);}
+            },snapshotMetadataAdmission);
             if(!Arrays.equals(qualified.sha256(),manifest.sha256()) || manifest.position().term()!=position.getTerm() || manifest.position().index()!=position.getIndex())throw new IOException("Superseded GROUP floor changed native qualification or filename");
             if(cfg[0]==null || cfg[0].index()>manifest.position().index() || cfg[0].term()>manifest.position().term() || cfg[0].index()==manifest.position().index() && cfg[0].term()!=manifest.position().term())throw new IOException("Superseded GROUP inventory lacks configuration at its floor");
             validateConfiguration(cfg[0].data());
             var saved=MD5FileUtil.readStoredMd5ForFile(image.toFile());if(saved!=null && !saved.equals(org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(image,snapshotMetadataAdmission))))throw new IOException("Superseded GROUP inventory MD5 mismatch");
-            return new DiscoveryImage(manifest,NativeRangeImage.Kind.GROUP,null,cfg[0]);
-        }catch(org.rocksdb.RocksDBException|IllegalArgumentException invalid){throw new IOException("Superseded GROUP inventory qualification failed",invalid);}
+            return new DiscoveryImage(manifest,NativeRangeImage.Kind.GROUP,projection.digest(),cfg[0]);
+        }catch(org.rocksdb.RocksDBException|IllegalArgumentException invalid){throw new IOException("Superseded GROUP inventory qualification failed",invalid);}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
     }
 
     private static void validateConfiguration(byte[] bytes) throws IOException {

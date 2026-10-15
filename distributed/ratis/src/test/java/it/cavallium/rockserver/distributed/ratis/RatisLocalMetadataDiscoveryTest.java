@@ -32,7 +32,7 @@ public class RatisLocalMetadataDiscoveryTest {
         public RpcFactory newFactory(Parameters parameters){return new ServerFactory(){
             public RpcType getRpcType(){return new NoSocketRpcType();}
             public RaftServerRpc newRaftServerRpc(RaftServer server){return (RaftServerRpc)java.lang.reflect.Proxy.newProxyInstance(RaftServerRpc.class.getClassLoader(),new Class<?>[]{RaftServerRpc.class},(proxy,method,args)->switch(method.getName()){
-                case "getRpcType"->new NoSocketRpcType();case "getInetSocketAddress"->InetSocketAddress.createUnresolved("no-socket",0);case "start","close","addRaftPeers","handleException"->null;case "toString"->"NoSocketRpc";default->throw new AssertionError("Unexpected socket-free RPC "+method);
+                case "getRpcType"->new NoSocketRpcType();case "getInetSocketAddress"->InetSocketAddress.createUnresolved("no-socket",0);case "start","close","addRaftPeers","handleException","notifyNotLeader"->null;case "toString"->"NoSocketRpc";default->throw new AssertionError("Unexpected socket-free RPC "+method);
             });}
         };}
     }

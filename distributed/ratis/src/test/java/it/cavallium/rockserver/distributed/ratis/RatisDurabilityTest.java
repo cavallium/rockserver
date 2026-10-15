@@ -9,6 +9,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class RatisDurabilityTest {
     @Test void smallOwnedWriteBufferPreservesLegalEntryAndSynchronousDurability() {
         var properties=RatisDurability.properties(Path.of("raft-config-fixture"));
+        assertFalse(RaftServerConfigKeys.ThreadPool.proxyCached(properties));
+        assertEquals(1,RaftServerConfigKeys.ThreadPool.proxySize(properties));
         assertEquals(64L*1024,RaftServerConfigKeys.Log.writeBufferSize(properties).getSize());
         assertEquals(NativeSstImportManifest.MAX_FILE_BYTES+4096L,RaftServerConfigKeys.Log.Appender.bufferByteLimit(properties).getSize());
         assertFalse(RaftServerConfigKeys.Log.unsafeFlushEnabled(properties));

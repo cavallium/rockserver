@@ -32,7 +32,7 @@ class RatisConfiguredRecoveriesTest {
                 public UUID pool(Request request)throws IOException{try{requireRequest(source.initial,request);return POOL;}catch(IllegalArgumentException invalid){throw new IOException("Wrong fixture request",invalid);}}
                 public RatisJournalAccess journal(UUID pool,UUID group,Path directory){assertEquals(POOL,pool);assertEquals(source.initial.sourceGroup(),group);claims.incrementAndGet();return RatisJournalAccess.standalone();}
             },admission->new RatisConfiguredRecovery.Host(){
-                public CompletableFuture<Prepared> prepare(Request request){beforePrepare.accept(request);return source.prepare(request).thenApply(value->{try{admission.beforeReply(value.encodedSize());return value;}catch(IOException denied){throw new CompletionException(denied);}});}
+                public CompletableFuture<RatisConfiguredRecovery.Preparation> prepare(Request request,RatisConfiguredRecovery.CleanupWitness witness){beforePrepare.accept(request);return source.prepare(request,witness).thenApply(value->{try{admission.beforeReply(((RatisConfiguredRecovery.RemotePrepared)value).prepared().encodedSize());return value;}catch(IOException denied){throw new CompletionException(denied);}});}
                 public CompletableFuture<byte[]> register(Prepared prepared){var pending=source.register(prepared);if(registered!=null)registered.countDown();return pending;}
                 public CompletableFuture<Prepared> transfer(Request request){return source.transfer(request);}
                 public CompletableFuture<RatisRecoveryImageRpc.Evidence> probe(RatisRecoveryImageRpc.Request request){return source.probe(request);}
@@ -42,6 +42,29 @@ class RatisConfiguredRecoveriesTest {
             });
         }
         public void close()throws Exception{source.close();}
+    }
+    @Test void localDoneIsSkippedAndItsCleanupWitnessRemainsAdmittedAcrossColdRenewal()throws Exception {
+        var helper=new RatisConfiguredRecoverySupersessionTest();helper.root=Files.createDirectory(root.resolve("local-fixture"));
+        try(var fixture=helper.new Fixture("source")){
+            fixture.localMetadata=true;Path journals=Files.createDirectory(root.resolve("local-manager"));var resources=budget(64L<<20);
+            RatisConfiguredRecoveries.Owner owner=new RatisConfiguredRecoveries.Owner(){public UUID pool(Request request)throws IOException{if(!request.sourceGroup().equals(fixture.selected.sourceGroup()))throw new IOException("Foreign local group");return POOL;}public RatisJournalAccess journal(UUID pool,UUID group,Path path){return RatisJournalAccess.standalone();}};
+            var witness=new java.util.concurrent.atomic.AtomicReference<RatisConfiguredRecovery.CleanupWitness>();
+            var manager=new RatisConfiguredRecoveries(journals,fixture.base.binding,2,Map.of(POOL,2),resources,owner,admission->fixture);
+            try{
+                var first=manager;manager.discover(()->{first.reconcileOnIo(fixture.selected,fixture.scope,fixture.aliases);return null;}).get(5,TimeUnit.SECONDS);
+                for(int n=0;n<40 && manager.phase(fixture.selected.sourceGroup())!=RatisConfiguredRecovery.Phase.LOCAL_DONE;n++)step(manager);
+                assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,manager.phase(fixture.selected.sourceGroup()));assertEquals(1,fixture.metadataPrepares);assertEquals(0,fixture.base.registers);assertEquals(0,fixture.base.releases);
+                manager.discover(()->{var retained=first.retainedOnIo(fixture.selected.sourceGroup(),bytes->assertTrue(bytes>0));assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,retained.phase());assertNotNull(retained.localCompletion());witness.set(retained.witness());assertNotNull(witness.get());return null;}).get(5,TimeUnit.SECONDS);
+                step(manager);step(manager);assertEquals(1,fixture.metadataPrepares);
+            }finally{manager.close(Duration.ofSeconds(10));}assertEquals(0,resources.stats().protectedLane().owners());
+            manager=new RatisConfiguredRecoveries(journals,fixture.base.binding,2,Map.of(POOL,2),resources,owner,admission->fixture);
+            try{
+                assertNull(manager.phase(fixture.selected.sourceGroup()));step(manager);assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,manager.phase(fixture.selected.sourceGroup()));assertEquals(1,fixture.metadataPrepares);
+                var cold=manager;var renewed=fixture.selected.successor(new UUID(12060,90));manager.discover(()->{var retained=cold.retainedOnIo(renewed.sourceGroup(),bytes->{});assertEquals(witness.get(),retained.witness());cold.ensureOnIo(renewed);return null;}).get(5,TimeUnit.SECONDS);
+                assertEquals(RatisConfiguredRecovery.Phase.PREPARE,manager.phase(renewed.sourceGroup()));step(manager);assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,manager.phase(renewed.sourceGroup()));assertEquals(2,fixture.metadataPrepares);assertEquals(1,fixture.fences);
+                manager.discover(()->{var retained=cold.retainedOnIo(renewed.sourceGroup(),bytes->{});requireRequest(renewed,retained.selected());assertEquals(witness.get(),retained.witness());assertNotNull(retained.localCompletion());return null;}).get(5,TimeUnit.SECONDS);
+            }finally{manager.close(Duration.ofSeconds(10));}assertEquals(0,resources.stats().protectedLane().owners());
+        }
     }
     @Test void retainedDiscoveryRequestsAreAdmittedWithoutHostDispatchAndSurviveColdInventory()throws Exception {
         try(var fixture=new Fixture()) {
@@ -109,6 +132,7 @@ class RatisConfiguredRecoveriesTest {
             var request=new Request(new UUID(993,3),split.header(),source.plan.catalogue().groupId(),source.local,Purpose.ANCESTOR_METADATA,range.groupId(),split.sourceDirectory());
             var image=NativeRangeImage.writeMetadata(root.resolve("renewal-meta-"+transition),store,new NativeRangeImage.Limits(4<<20,32<<20,8));var cfg=store.configuration();byte[] registration=new byte[32];registration[0]=1;
             var initial=transition?new Request(request.transferId(),null,request.catalogue(),request.receiver(),Purpose.CURRENT_LEAF,range.groupId(),split.sourceDirectory()):request;
+            var selectedMeta=request.successor(new UUID(993,5));var supersedingScope=transition?new NativeRecoverySupersession.Scope(request.catalogue(),new ApplyPosition(1,20),split.header(),split.sourceDirectory(),range.groupId(),request.receiver(),OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(PREPARE,selectedMeta)),List.of(OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(PREPARE,initial)))):null;
             var lost=new java.util.concurrent.atomic.AtomicBoolean();var prepares=new AtomicInteger();var files=new RatisConfiguredRecoveryTest.Forwarding(){@Override public void write(Path path,byte[] body,int maximum)throws IOException{super.write(path,body,maximum);if(lost.getAndSet(false))throw new IOException("Lost forced renewal journal acknowledgement");}};
             Path path=Files.createDirectory(root.resolve("renewal-manager-"+transition));var resources=budget(64L<<20);
             var manager=new RatisConfiguredRecoveries(path,new byte[32],2,Map.of(POOL,2),resources,new RatisConfiguredRecoveries.Owner(){
@@ -116,7 +140,10 @@ class RatisConfiguredRecoveriesTest {
                 public RatisJournalAccess journal(UUID pool,UUID group,Path directory){return files;}
             },admission->new RatisConfiguredRecovery.Host(){
                 Prepared prepared;
-                public CompletableFuture<Prepared> prepare(Request value){prepares.incrementAndGet();prepared=new Prepared(value,value.metadataOnly()?image:groupImage,source.first,source.local,cfg,Map.of(),value.metadataOnly()?store.topologyFreeze():null);return CompletableFuture.completedFuture(prepared);}
+                public Request resolveCurrentAlias(RatisConfiguredRecovery.CurrentAlias reference)throws IOException {if(!initial.transferId().equals(reference.transferId()) || !Arrays.equals(reference.digest(),OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(PREPARE,initial))))throw new IOException("Foreign renewal alias");return initial;}
+                public CompletableFuture<byte[]> forceSupersession(NativeRecoverySupersession.Scope scope){assertEquals(supersedingScope,scope);return CompletableFuture.completedFuture(registration.clone());}
+                public CompletableFuture<RatisConfiguredRecovery.CleanupDisposition> cleanup(Request alias,ReplicaDescriptor owner,RatisConfiguredRecovery.CleanupAction action,NativeRecoverySupersession.Scope scope,byte[] fence){requireRequest(initial,alias);assertEquals(RatisConfiguredRecovery.CleanupAction.RELEASE,action);return CompletableFuture.completedFuture(RatisConfiguredRecovery.CleanupDisposition.RELEASED);}
+                public CompletableFuture<RatisConfiguredRecovery.Preparation> prepare(Request value,RatisConfiguredRecovery.CleanupWitness witness){prepares.incrementAndGet();prepared=new Prepared(value,value.metadataOnly()?image:groupImage,source.first,source.local,cfg,Map.of(),value.metadataOnly()?store.topologyFreeze():null);return CompletableFuture.completedFuture(new RatisConfiguredRecovery.RemotePrepared(prepared));}
                 public CompletableFuture<byte[]> register(Prepared value){return CompletableFuture.completedFuture(registration.clone());}
                 public CompletableFuture<Prepared> transfer(Request value){return CompletableFuture.completedFuture(prepared);}
                 public CompletableFuture<RatisRecoveryImageRpc.Evidence> probe(RatisRecoveryImageRpc.Request value){return CompletableFuture.completedFuture(new RatisRecoveryImageRpc.Evidence(value.digest(),TopologyChange.Owner.of(value.source().receiver()),(value.source().metadataOnly()?image:groupImage).position(),cfg,registration,true));}
@@ -126,8 +153,14 @@ class RatisConfiguredRecoveriesTest {
             });
             try {
                 manager.enqueue(initial).get(10,TimeUnit.SECONDS);if(transition){assertThrows(ExecutionException.class,()->manager.enqueue(request.successor(new UUID(993,5))).get(10,TimeUnit.SECONDS),"Unfinished CURRENT keeps its original purpose");assertEquals(0,prepares.get());}for(int steps=0;steps<16 && manager.phase(range.groupId())!=RatisConfiguredRecovery.Phase.DONE;steps++)step(manager);assertEquals(RatisConfiguredRecovery.Phase.DONE,manager.phase(range.groupId()));assertEquals(1,prepares.get());
-                lost.set(true);assertThrows(ExecutionException.class,()->manager.enqueue(request.successor(new UUID(993,4))).get(10,TimeUnit.SECONDS));assertNotNull(manager.failure());assertNull(manager.phase(range.groupId()),"The cached DONE must not hide a durably forced renewal");assertEquals(1,prepares.get());
-                step(manager);assertEquals(RatisConfiguredRecovery.Phase.REGISTER,manager.phase(range.groupId()));assertEquals(2,prepares.get());assertNull(manager.failure());
+                if(transition){
+                    var canonical=path.resolve(POOL.toString()).resolve(range.groupId().toString()).resolve("recovery");byte[] before=Files.readAllBytes(canonical);
+                    assertThrows(ExecutionException.class,()->manager.enqueue(selectedMeta).get(10,TimeUnit.SECONDS),"Even DONE CURRENT must retain evidence until explicit fence/source cleanup");assertArrayEquals(before,Files.readAllBytes(canonical));assertEquals(1,prepares.get());
+                    manager.discover(()->{var retained=manager.retainedOnIo(range.groupId(),bytes->{});assertEquals(RatisConfiguredRecovery.Phase.DONE,retained.phase());manager.reconcileOnIo(selectedMeta,supersedingScope,List.of(initial));return null;}).get(10,TimeUnit.SECONDS);
+                    for(int steps=0;steps<24 && manager.phase(range.groupId())!=RatisConfiguredRecovery.Phase.DONE;steps++)step(manager);assertEquals(RatisConfiguredRecovery.Phase.DONE,manager.phase(range.groupId()));assertEquals(2,prepares.get());
+                }
+                int completedPrepares=prepares.get();lost.set(true);assertThrows(ExecutionException.class,()->manager.enqueue(request.successor(new UUID(993,4))).get(10,TimeUnit.SECONDS));assertNotNull(manager.failure());assertNull(manager.phase(range.groupId()),"The cached DONE must not hide a durably forced renewal");assertEquals(completedPrepares,prepares.get());
+                step(manager);assertEquals(RatisConfiguredRecovery.Phase.REGISTER,manager.phase(range.groupId()));assertEquals(completedPrepares+1,prepares.get());assertNull(manager.failure());
             }finally{manager.close(Duration.ofSeconds(10));}
             assertEquals(new RatisNodeResourceBudget.Usage(0,0),resources.stats().protectedLane());
         }
@@ -147,7 +180,7 @@ class RatisConfiguredRecoveriesTest {
                 public UUID pool(Request request){requireRequest(prepared.get(request.sourceGroup()).request(),request);return POOL;}
                 public RatisJournalAccess journal(UUID pool,UUID group,Path directory){return RatisJournalAccess.standalone();}
             },admission->new RatisConfiguredRecovery.Host(){
-                public CompletableFuture<Prepared> prepare(Request request){var value=prepared.get(request.sourceGroup());try{admission.beforeReply(value.encodedSize());return CompletableFuture.completedFuture(value);}catch(IOException denied){return CompletableFuture.failedFuture(denied);}}
+                public CompletableFuture<RatisConfiguredRecovery.Preparation> prepare(Request request,RatisConfiguredRecovery.CleanupWitness witness){var value=prepared.get(request.sourceGroup());try{admission.beforeReply(value.encodedSize());return CompletableFuture.completedFuture(new RatisConfiguredRecovery.RemotePrepared(value));}catch(IOException denied){return CompletableFuture.failedFuture(denied);}}
                 public CompletableFuture<byte[]> register(Prepared value){registrations.get(value.request().sourceGroup()).incrementAndGet();return CompletableFuture.completedFuture(identity.clone());}
                 public CompletableFuture<Prepared> transfer(Request request){return CompletableFuture.completedFuture(prepared.get(request.sourceGroup()));}
                 public CompletableFuture<RatisRecoveryImageRpc.Evidence> probe(RatisRecoveryImageRpc.Request request){var value=prepared.get(request.source().sourceGroup());return CompletableFuture.completedFuture(new RatisRecoveryImageRpc.Evidence(request.digest(),TopologyChange.Owner.of(value.request().receiver()),value.image().position(),value.sourceCfg(),identity,true));}

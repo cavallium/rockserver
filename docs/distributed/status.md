@@ -32,8 +32,34 @@ This section and the remaining gates at the end describe the current branch.
   combines 174 adapter cases and 15 server eligibility cases in
   `automatic-supersession-final-regression.log` with the passing 24-case
   `automatic-supersession-final-repair.log`, reusing unchanged passing cases.
-  Genuine local META activation after fencing, its completion witness and full
-  independent endpoint/quorum acceptance remain pending.
+  Independent endpoint/quorum acceptance remains pending.
+- Genuine local META completion now validates the actual acknowledged receiver
+  fence, original pool seed/retirement/FREEZE and completed CURRENT image/prefix.
+  Its bounded snapshot exposes only STATE and RECEIPTS. The forced META file,
+  actual core reload and cached native activation precede eligibility publication;
+  a fresh GROUP HEAD and actual updater/native/full-CFG coverage precede LOCAL_DONE.
+  The same driver retains its exact source-cleanup witness through cold reopening
+  and META request renewal. Native-only CURRENT registrations also enter the graph
+  before selection; completed registered CURRENT is valid source publication
+  authority for its exact restored directory. No remote Prepared or registration
+  is synthesized, and the permanent fence continues to deny GROUP/USER access.
+  Cold inventory uses a read-only bounded FREEZE proof, without creating/revoking
+  candidates or retaining a copied CFG. Successful local settlement resumes the
+  committed dispatcher after native/Gate publication. Initial division loading is
+  serialized by the bounded proxy executor within unchanged log-reader budgets;
+  request, replication and apply executors remain separate.
+  Native validation passes 67 distinct cases in both Maven core executions in
+  `local-meta-native-regression17.log`. The seven-case coupled gate
+  `local-meta-dispatch-resume19.log` covers actual single-voter Raft LOCAL_DONE,
+  lost source PREPARE acknowledgement, source cleanup, two cold reopens and
+  equal-cut forged-hash refusal, plus local candidate cancellation/publication.
+  Broader coverage combines 106 distinct adapter cases in
+  `local-meta-final-adapter-regression20.log` with the passing two-case
+  `local-meta-source-pin-repair21.log`, reusing unchanged passing cases. The repair
+  replaces a stale retained-pin assertion with zero native pins plus retained
+  source leases and image quota after forced READY.
+  The initial image adoption and CAT transport remain controlled fixtures; this
+  is not independent endpoint/quorum or production-performance acceptance.
 - Redundant format-version words are removed from the current command, schema,
   directory, acceptance, session journals, native image and internal state rows.
   Java and Rust readers, command admission offsets and receipt budgets use the
@@ -2207,13 +2233,13 @@ An unresolved role fence must be installed before server construction: Ratis als
 initializes persisted DATA divisions. Preserve their real log floor while deferring
 GROUP import, replay, voting, export and incoming snapshot installation until CAT
 classification is durable. Ordinary MISSING alone permits snapshot installation.
-All-node cold restart additionally needs qualification of genuine local META
-sources so fenced sources do not all wait for another source. Explicit true-genesis
+Genuine local META qualification now covers the controlled single-voter cold path;
+independent multi-node cold restart remains a separate gate. Explicit true-genesis
 authority must remain distinct from a returning empty configured member.
 
-The automatic discovery driver must supersede unfinished CURRENT attempts after sealing, including
-terminal cleanup of their obsolete source captures without claiming GROUP install.
-Catch-up from a stale pre-relocation membership and leader-change source transfer
+The configured driver now supersedes unfinished CURRENT attempts after sealing and
+settles their source captures without claiming GROUP install. Catch-up from a stale
+pre-relocation membership and leader-change source transfer
 also remain open. FENCED import roots require genuine import provenance rather than
 ordinary-bootstrap permission.
 Canonical journal promises and runway accounting do not establish the complete

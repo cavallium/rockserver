@@ -20,7 +20,7 @@ class RatisConfiguredRecoverySupersessionTest {
         final RatisConfiguredRecoveryTest helper=new RatisConfiguredRecoveryTest();final RatisConfiguredRecoveryTest.Fixture base;
         final List<Request> aliases;final Request selected;final NativeRecoverySupersession.Scope scope;final Path journal;
         final List<String> calls=new ArrayList<>();final List<RatisConfiguredRecovery.CleanupAction> actions=new ArrayList<>();final Map<String,RatisConfiguredRecovery.CleanupDisposition> disposed=new LinkedHashMap<>();
-        final byte[] fence=new byte[32];boolean loseFence,loseCleanup;int fences,metadataPrepares;
+        final byte[] fence=new byte[32];boolean loseFence,loseCleanup,localMetadata,originalMetadata,registrationOrigin;RatisConfiguredRecovery.CleanupWitness observedWitness;int fences,metadataPrepares;
         Fixture(String name)throws Exception {
             helper.root=root.resolve(name);Files.createDirectories(helper.root);base=helper.new Fixture();journal=Files.createDirectory(helper.root.resolve("actor"));fence[0]=19;
             var a=base.initial;aliases=List.of(a,a.successor(id(2)),a.successor(id(3)));var directory=a.sourceDirectory();var parent=directory.ranges().getFirst();
@@ -31,11 +31,13 @@ class RatisConfiguredRecoverySupersessionTest {
         }
         RatisConfiguredRecovery open(RatisJournalAccess files)throws Exception{return new RatisConfiguredRecovery(journal,base.binding,Files.exists(journal.resolve("recovery"))?null:base.initial,this,base.io,files,RatisConfiguredRecoveryTest.metadata(()->{}),request->{if(!request.sourceGroup().equals(base.initial.sourceGroup()))throw new IOException("Foreign group");});}
         public Request resolveCurrentAlias(RatisConfiguredRecovery.CurrentAlias reference)throws IOException{return aliases.stream().filter(alias->alias.transferId().equals(reference.transferId()) && Arrays.equals(digest(alias),reference.digest())).findFirst().orElseThrow(()->new IOException("Missing immutable graph alias"));}
-        public CompletableFuture<Prepared> prepare(Request request) {
-            if(request.metadataOnly()){metadataPrepares++;assertEquals(aliases.size()*2,disposed.size());return CompletableFuture.failedFuture(new IOException("META dispatch reached after exact old cleanup"));}
+        public CompletableFuture<RatisConfiguredRecovery.Preparation> prepare(Request request,RatisConfiguredRecovery.CleanupWitness witness) {
+            if(request.metadataOnly()){metadataPrepares++;if(!originalMetadata)assertEquals(aliases.size()*2,disposed.size());observedWitness=witness;if(localMetadata)try{return CompletableFuture.completedFuture(new RatisConfiguredRecovery.LocalCompletion(localReceipt(request)));}catch(Exception failed){return CompletableFuture.failedFuture(failed);}return CompletableFuture.failedFuture(new IOException("META dispatch reached after exact old cleanup"));}
             for(int i=0;i<2;i++)if(request.transferId().equals(aliases.get(i).transferId()))try{return CompletableFuture.failedFuture(new AbandonedException(new Abandoned(request,aliases.get(i+1).transferId(),base.source.store.applied(),base.source.donor,OperatorUpload.sha256(base.source.store.configuration().data()))));}catch(Exception failed){return CompletableFuture.failedFuture(failed);}
-            return base.prepare(request);
+            return base.prepare(request,witness);
         }
+        RatisConfiguredRecovery.LocalMetadataCompletion localReceipt(Request request)throws Exception {var cut=base.source.store.applied();var cfg=base.source.store.configuration();var head=new RatisSourceHeadRpc.Head(new RatisSourceHeadRpc.Request(request,cut),new ApplyPosition(1,100),request.sourceDirectory(),base.source.donor,cut,cfg);return new RatisConfiguredRecovery.LocalMetadataCompletion(digest(request),cut,new byte[32],cut,cfg,head,registrationOrigin?RatisConfiguredRecovery.LocalMetadataOrigin.METADATA_REGISTRATION:RatisConfiguredRecovery.LocalMetadataOrigin.LOCAL_SEED,OperatorUpload.sha256(new byte[]{1}),OperatorUpload.sha256(new byte[]{2}));}
+        void finishCleanup(RatisConfiguredRecovery actor)throws Exception {actor.reconcile(selected,scope,aliases);for(int n=0;n<40 && actor.phase()!=RatisConfiguredRecovery.Phase.PREPARE;n++)RatisConfiguredRecoveryTest.step(actor);assertEquals(RatisConfiguredRecovery.Phase.PREPARE,actor.phase());}
         public CompletableFuture<byte[]> register(Prepared value){return base.register(value);}
         public CompletableFuture<Prepared> transfer(Request request){return base.transfer(request);}
         public CompletableFuture<RatisRecoveryImageRpc.Evidence> probe(RatisRecoveryImageRpc.Request request){return base.probe(request);}
@@ -60,7 +62,7 @@ class RatisConfiguredRecoverySupersessionTest {
             try(var actor=f.open(RatisJournalAccess.standalone())) {
                 assertEquals(RatisConfiguredRecovery.Phase.CLEANUP_OLD,actor.phase());RatisConfiguredRecoveryTest.step(actor);RatisConfiguredRecoveryTest.step(actor);assertEquals(f.calls.get(0),f.calls.get(3));assertEquals(List.of(RatisConfiguredRecovery.CleanupAction.RELEASE,RatisConfiguredRecovery.CleanupAction.OBSOLETE,RatisConfiguredRecovery.CleanupAction.RELEASE,RatisConfiguredRecovery.CleanupAction.OBSOLETE),f.actions.subList(0,4));
                 for(int i=0;i<40 && actor.phase()==RatisConfiguredRecovery.Phase.CLEANUP_OLD;i++)RatisConfiguredRecoveryTest.step(actor);assertEquals(RatisConfiguredRecovery.Phase.PREPARE,actor.phase());requireRequest(f.selected,actor.initial());assertEquals(6,f.disposed.size());assertEquals(0,f.metadataPrepares);
-                var fields=RatisSchemaClientJournal.read(f.journal.resolve("recovery"));assertFalse(fields.containsKey("supersessionScope"));assertFalse(fields.containsKey("prepared"));assertThrows(ExecutionException.class,()->RatisConfiguredRecoveryTest.step(actor));assertEquals(1,f.metadataPrepares);
+                var fields=RatisSchemaClientJournal.read(f.journal.resolve("recovery"));assertFalse(fields.containsKey("supersessionScope"));assertTrue(fields.containsKey("cleanupScope"));assertTrue(fields.containsKey("cleanupAliases"));assertTrue(fields.containsKey("cleanupDispositions"));assertFalse(fields.containsKey("prepared"));assertThrows(ExecutionException.class,()->RatisConfiguredRecoveryTest.step(actor));assertEquals(1,f.metadataPrepares);
             }
         }
     }
@@ -69,6 +71,43 @@ class RatisConfiguredRecoverySupersessionTest {
             var lose=new AtomicBoolean();var files=new RatisConfiguredRecoveryTest.Forwarding(){public void write(Path path,byte[] body,int maximum)throws IOException{if(!after && lose.getAndSet(false))throw new IOException("Lost before journal force");super.write(path,body,maximum);if(after && lose.getAndSet(false))throw new IOException("Lost after journal force");}};
             try(var actor=f.open(files)){f.reachFrozenCurrent(actor);lose.set(true);assertThrows(IOException.class,()->actor.reconcile(f.selected,f.scope,f.aliases));assertEquals(0,f.fences);assertEquals(RatisConfiguredRecovery.Phase.FENCE_RECEIVER,RatisConfiguredRecoveryTest.step(actor));assertEquals(0,f.fences);RatisConfiguredRecoveryTest.step(actor);lose.set(true);assertThrows(ExecutionException.class,()->RatisConfiguredRecoveryTest.step(actor));assertEquals(1,f.calls.size());RatisConfiguredRecoveryTest.step(actor);assertEquals(1,f.calls.size(),"Exact dirty action/cursor force must settle before another RPC");}
             try(var actor=f.open(files)){assertEquals(RatisConfiguredRecovery.Phase.CLEANUP_OLD,actor.phase());assertEquals(0,f.metadataPrepares);for(int i=0;i<40 && actor.phase()==RatisConfiguredRecovery.Phase.CLEANUP_OLD;i++)RatisConfiguredRecoveryTest.step(actor);assertEquals(6,f.disposed.size());}
+        }
+    }
+    @Test void completedCleanupWitnessSurvivesColdLocalCompletionAndMetadataUuidRenewal()throws Exception {
+        try(var f=new Fixture("local-cold")){
+            f.localMetadata=true;RatisConfiguredRecovery.CleanupWitness witness;byte[] localDigest;
+            try(var actor=f.open(RatisJournalAccess.standalone())){
+                f.reachFrozenCurrent(actor);f.finishCleanup(actor);var retained=actor.retainedRequests(bytes->{});witness=retained.witness();assertNotNull(witness);assertEquals(6,witness.dispositions().size());requireRequest(f.selected,witness.originalSelected());assertEquals(RatisConfiguredRecovery.Phase.PREPARE,retained.phase());
+                int registers=f.base.registers,releases=f.base.releases,completions=f.base.completions;assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,RatisConfiguredRecoveryTest.step(actor));assertSame(witness,f.observedWitness);
+                assertEquals(registers,f.base.registers);assertEquals(releases,f.base.releases);assertEquals(completions,f.base.completions);assertEquals(1,f.metadataPrepares);assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,RatisConfiguredRecoveryTest.step(actor));assertEquals(1,f.metadataPrepares);
+                var done=actor.retainedRequests(bytes->{});assertEquals(witness,done.witness());assertNotNull(done.localCompletion());localDigest=done.localCompletion().requestDigest();var fields=RatisSchemaClientJournal.read(f.journal.resolve("recovery"));assertTrue(fields.containsKey("localCompletion"));for(String key:List.of("prepared","registration","head","abandoned","selected"))assertFalse(fields.containsKey(key));
+            }
+            try(var actor=f.open(RatisJournalAccess.standalone())){
+                assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,actor.phase());var retained=actor.retainedRequests(bytes->{});assertEquals(witness,retained.witness());assertArrayEquals(localDigest,retained.localCompletion().requestDigest());assertEquals(1,f.metadataPrepares);
+                var renewed=f.selected.successor(id(80));actor.ensureSelected(renewed);assertEquals(RatisConfiguredRecovery.Phase.PREPARE,actor.phase());var selected=actor.retainedRequests(bytes->{});requireRequest(renewed,selected.selected());assertEquals(witness,selected.witness());assertNull(selected.localCompletion());
+                actor.reconcile(renewed,f.scope,f.aliases);assertEquals(witness,actor.retainedRequests(bytes->{}).witness());assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,RatisConfiguredRecoveryTest.step(actor));assertEquals(2,f.metadataPrepares);assertEquals(witness,f.observedWitness);assertArrayEquals(f.scope.selectedMetadataRequestDigest(),digest(f.observedWitness.originalSelected()));assertEquals(1,f.fences);
+            }
+            try(var actor=f.open(RatisJournalAccess.standalone())){assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,actor.phase());assertEquals(witness,actor.retainedRequests(bytes->{}).witness());assertEquals(2,f.metadataPrepares);}
+        }
+    }
+    @Test void localTerminalLostJournalAcknowledgementRetriesExactCandidateAndColdReceipt()throws Exception {
+        for(boolean after:List.of(false,true))try(var f=new Fixture("local-force-"+after)){
+            f.localMetadata=true;var lose=new AtomicBoolean();var files=new RatisConfiguredRecoveryTest.Forwarding(){public void write(Path path,byte[] body,int maximum)throws IOException{if(!after&&lose.getAndSet(false))throw new IOException("Lost local receipt beforeforce");super.write(path,body,maximum);if(after&&lose.getAndSet(false))throw new IOException("Lost local receipt force acknowledgement");}};
+            try(var actor=f.open(files)){
+                f.reachFrozenCurrent(actor);f.finishCleanup(actor);lose.set(true);assertThrows(ExecutionException.class,()->RatisConfiguredRecoveryTest.step(actor));assertEquals(1,f.metadataPrepares);
+                if(!after){assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,RatisConfiguredRecoveryTest.step(actor));assertEquals(1,f.metadataPrepares,"Dirty local receipt is forced before another Host call");}
+            }
+            try(var actor=f.open(files)){assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,actor.phase());assertEquals(1,f.metadataPrepares);assertNotNull(actor.retainedRequests(bytes->{}).localCompletion());assertNotNull(actor.retainedRequests(bytes->{}).witness());}
+        }
+    }
+    @Test void originalMetadataHostCanReturnLocalCompletionWithoutSupersessionOrRemotePorts()throws Exception {
+        try(var f=new Fixture("local-original")){
+            f.localMetadata=true;f.originalMetadata=true;f.registrationOrigin=true;
+            try(var actor=new RatisConfiguredRecovery(f.journal,f.base.binding,f.selected,f,f.base.io,RatisJournalAccess.standalone(),RatisConfiguredRecoveryTest.metadata(()->{}),request->requireRequest(f.selected,request))){
+                assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,RatisConfiguredRecoveryTest.step(actor));var retained=actor.retainedRequests(bytes->{});assertNull(retained.witness());assertNotNull(retained.localCompletion());assertEquals(0,f.fences);assertTrue(f.disposed.isEmpty());assertEquals(0,f.base.registers);assertEquals(0,f.base.releases);assertEquals(0,f.base.completions);
+                var good=retained.localCompletion();byte[] wrong=good.requestDigest();wrong[0]^=1;var bad=new RatisConfiguredRecovery.LocalMetadataCompletion(wrong,good.imageCut(),good.imageHash(),good.completedCut(),good.configuration(),good.head(),good.originKind(),good.originDigest(),good.freezeDigest());assertThrows(IllegalArgumentException.class,()->bad.require(f.selected));assertThrows(IllegalArgumentException.class,()->good.require(f.aliases.getFirst()));
+            }
+            try(var actor=f.open(RatisJournalAccess.standalone())){assertEquals(RatisConfiguredRecovery.Phase.LOCAL_DONE,actor.phase());var receipt=actor.retainedRequests(bytes->{}).localCompletion();assertEquals(RatisConfiguredRecovery.LocalMetadataOrigin.METADATA_REGISTRATION,receipt.originKind());assertArrayEquals(OperatorUpload.sha256(new byte[]{1}),receipt.originDigest());assertEquals(1,f.metadataPrepares);}
         }
     }
     @Test void managerReconcilesInsideOwnedDiscoveryWithoutNestedQueueAndRetainsOneSlot()throws Exception {

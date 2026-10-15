@@ -49,7 +49,7 @@ class RatisConfiguredRecoveryRuntimeTest {
                 node.start();graph.force(plan,requests);
                 var host=node.configuredRecoveryHost(bytes->{});
                 for(int retry=0;retry<2;retry++) {
-                    var failed=assertThrows(ExecutionException.class,()->host.prepare(request).get(10,TimeUnit.SECONDS));
+                    var failed=assertThrows(ExecutionException.class,()->host.prepare(request,null).get(10,TimeUnit.SECONDS));
                     var observed=assertInstanceOf(RatisTopologySourceSnapshotRpc.AbandonedException.class,failed.getCause()).receipt();
                     assertArrayEquals(RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,receipt),RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,observed));
                     RatisTopologySourceSnapshotRpc.requireRequest(receipt.successorRequest(),graph.snapshot().activeRequests().get(range.groupId()));
@@ -58,6 +58,33 @@ class RatisConfiguredRecoveryRuntimeTest {
             }
         }
     }
+    @Test void manualBornCurrentBeforeFirstGraphWaitsForActualAncestorMetadataBeforeSourceIo()throws Exception {
+        try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("manual-current-source"),false);var env=new RatisNodeRuntimeTest.Env(root.resolve("manual-current-receiver"),false,source.first.digest())) {
+            var split=source.split();var catalogue=source.plan.catalogue();var pool=RatisPoolFixtures.ID;var domain=new RatisNodePlan.Domain(split.sourceDirectory(),Map.of(source.first.columnIds().iterator().next(),"receiver-data"),Set.of());
+            var plan=new RatisNodePlan(source.plan.nodeId(),source.plan.nodeIncarnation(),List.of(domain),catalogue,List.of(),List.of(),Map.of(),4,List.of(RatisPoolFixtures.spec(pool,false)),Map.of(source.first.domainId(),pool),Map.of(catalogue.groupId(),pool));
+            var epochs=new RatisSessionEpochs(source.catalogue,source.first.clusterId(),source.first.databaseId(),catalogue.groupId(),catalogue.epoch(),catalogue.schemaDigest(),catalogue.sessionsColumn());
+            var receiver=new RatisNodeRuntimeTest.FakeServer();receiver.skipFirstNoop=true;var dataCalls=new java.util.concurrent.atomic.AtomicInteger();
+            try(var route=new RatisRoutedClient(split.sourceDirectory(),new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor range,UUID column,byte[] key){throw new AssertionError("No USER read");}public CommandResult command(RangeDescriptor range,DistributedCommand command){throw new AssertionError("No USER write");}});
+                var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),epochs,Map.of(source.first.domainId(),route),env.scheduler,env.timer,()->20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,receiver::create,List.of(source.first))) {
+                node.relocationTransport(range->{if(!range.groupId().equals(catalogue.groupId())){dataCalls.incrementAndGet();throw new AssertionError("CURRENT contacted a source before ancestor META readiness");}return client(source,range);},(range,owner)->{dataCalls.incrementAndGet();throw new AssertionError("No owner RPC before ancestor META readiness");});node.start();
+                var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class);assertNull(graph.snapshot());var child=split.targets().getFirst();
+                var request=new RatisTopologySourceSnapshotRpc.Request(new UUID(994,160),null,catalogue.groupId(),child.replicas().getFirst(),RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF,child.groupId(),split.targetDirectory());
+                node.recoverConfigured(request).get(15,TimeUnit.SECONDS);var manager=field(node,"configuredRecoveries",RatisConfiguredRecoveries.class);
+                var failure=assertThrows(ExecutionException.class,()->manager.step().get(15,TimeUnit.SECONDS));assertInstanceOf(IOException.class,failure.getCause());assertTrue(failure.getCause().getMessage().contains("Ancestor META"),failure::toString);
+                assertEquals(0,dataCalls.get());assertNotNull(graph.snapshot());RatisTopologySourceSnapshotRpc.requireRequest(request,graph.snapshot().activeRequests().get(child.groupId()));
+                assertEquals(RatisConfiguredRecovery.Phase.PREPARE,manager.phase(child.groupId()));assertFalse(receiver.machines.containsKey(RaftGroupId.valueOf(child.groupId())));assertTrue(node.nativePool(pool).currentRangeRecoveries().isEmpty());assertTrue(node.nativePool(pool).metadataRecoveries().isEmpty());
+            }
+        }
+    }
+    private static void awaitDone(RatisNodeRuntime node,RatisTransactionRecoveryService control,RatisConfiguredRecoveries manager,UUID group)throws Exception {
+        Throwable last=null;
+        for(int steps=0;steps<64 && node.configuredRecoveryPhase(group)!=RatisConfiguredRecovery.Phase.DONE;steps++) {
+            control.tick().get(15,TimeUnit.SECONDS);
+            try{manager.step().get(15,TimeUnit.SECONDS);}catch(ExecutionException waiting){last=waiting.getCause();}
+        }
+        assertEquals(RatisConfiguredRecovery.Phase.DONE,node.configuredRecoveryPhase(group),"Recovery did not settle: "+last);
+    }
+
     @Test void nodeOwnedRecoveryRecoversMetadataAndCurrentChildrenAndColdJournals()throws Exception {
         try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("source"),false);var env=new RatisNodeRuntimeTest.Env(root.resolve("receiver"),false,source.first.digest())) {
             var split=source.split();var catalogue=source.plan.catalogue();var pool=RatisPoolFixtures.ID;
@@ -90,7 +117,7 @@ class RatisConfiguredRecoveryRuntimeTest {
                                     var discovered=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class).snapshot();
                                     final var request=discovered==null?proposed:discovered.activeRequests().getOrDefault(proposed.sourceGroup(),proposed);
                                     if(round==0){node.recoverConfigured(request).get(15,TimeUnit.SECONDS);assertTrue(Files.isRegularFile(env.nodeRoot.resolve("configured-recovery").resolve(pool.toString()).resolve(request.sourceGroup().toString()).resolve("recovery")));assertEquals(RatisConfiguredRecovery.Phase.PREPARE,node.configuredRecoveryPhase(request.sourceGroup()));if(request.metadataOnly())assertThrows(ExecutionException.class,()->node.recoverConfigured(request.successor(new UUID(994,99))).get(15,TimeUnit.SECONDS),"Unfinished metadata capture keeps its original request identity");}
-                                    for(int steps=0;steps<64 && node.configuredRecoveryPhase(request.sourceGroup())!=RatisConfiguredRecovery.Phase.DONE;steps++){control.tick().get(15,TimeUnit.SECONDS);manager.step().get(15,TimeUnit.SECONDS);}
+                                    awaitDone(node,control,manager,request.sourceGroup());
                                     assertEquals(RatisConfiguredRecovery.Phase.DONE,node.configuredRecoveryPhase(request.sourceGroup()));assertNull(node.configuredRecoveryFailure());
                                     if(round==0 && request.metadataOnly()){
                                         var receiverOwner=field(node,"pools",Map.class).get(pool);var graph=field(receiverOwner,"recoveryMetadata",RatisNodeResourceBudget.Lease.class);long retained=graph.bytes();var metaMachine=receiver.machines.get(RaftGroupId.valueOf(request.sourceGroup()));var donor=source.server.machines.get(RaftGroupId.valueOf(request.sourceGroup()));long own=store(receiver,request.sourceGroup()).applied().index()+1;
@@ -98,7 +125,7 @@ class RatisConfiguredRecoveryRuntimeTest {
                                         var successor=request.successor(new UUID(994,4));node.recoverConfigured(successor).get(15,TimeUnit.SECONDS);assertEquals(RatisConfiguredRecovery.Phase.PREPARE,node.configuredRecoveryPhase(request.sourceGroup()));manager.step().get(15,TimeUnit.SECONDS);assertEquals(RatisConfiguredRecovery.Phase.REGISTER,node.configuredRecoveryPhase(request.sourceGroup()));
                                         var once=new java.util.concurrent.atomic.AtomicBoolean(true);node.nativePool(pool).metadataRecoveryForceObserver(after->{if(after && once.getAndSet(false))throw new org.rocksdb.RocksDBException("Lost forced META successor acknowledgement");});assertThrows(ExecutionException.class,()->manager.step().get(15,TimeUnit.SECONDS));var frozen=store(receiver,request.sourceGroup()).metadataRecoveryRegistration().catalogueCut();assertTrue(store(receiver,request.sourceGroup()).metadataRecoveryPending());assertFalse(store(receiver,request.sourceGroup()).admissionOpen());
                                         var ledger=epochs.read();assertEquals(CommandResult.Status.SUCCESS,epochs.execute(epochs.prepare(new OperationId(new UUID(994,70),0,0),ledger,ledger.advanceTime(ledger.logicalTimeMillis()+1))).status());node.nativePool(pool).metadataRecoveryForceObserver(after->{});
-                                        for(int steps=0;steps<64 && node.configuredRecoveryPhase(request.sourceGroup())!=RatisConfiguredRecovery.Phase.DONE;steps++){control.tick().get(15,TimeUnit.SECONDS);manager.step().get(15,TimeUnit.SECONDS);}
+                                        awaitDone(node,control,manager,request.sourceGroup());
                                         assertEquals(RatisConfiguredRecovery.Phase.DONE,node.configuredRecoveryPhase(request.sourceGroup()));var recovered=store(receiver,request.sourceGroup());assertEquals(successor.transferId(),recovered.metadataRecoveryRegistration().transferId());assertEquals(frozen,recovered.metadataRecoveryRegistration().catalogueCut(),"Unknown successor force retains its original CAT cut");assertFalse(recovered.metadataRecoveryPending());assertFalse(recovered.admissionOpen());assertEquals(own+1,recovered.applied().index());assertEquals(retained,graph.bytes(),"A settled successor replaces its graph credit instead of accumulating history");assertEquals(224L,field(receiverOwner,"recoveryExposureBytes",Long.class));
                                     }
                                 }

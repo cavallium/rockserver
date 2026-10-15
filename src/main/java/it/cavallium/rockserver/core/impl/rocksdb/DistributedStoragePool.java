@@ -466,6 +466,27 @@ public final class DistributedStoragePool implements AutoCloseable {
             store.configureSnapshotAdmission(snapshotAdmission);store.configureSchemaPreparationPool(this);store.validateTopologyActivationRecovery();store.configureRetiredTopologyDirectory(seed.definition().sourceDirectory());ranges.add(store);drainDeferredDrops();return store;
         } finally { nativeMutation.release(); }
     }
+    /** Proves original local retirement independently of a receiver fence or imported META rows. */
+    public ReplicatedRangeStore.LocalMetadataDiscovery prepareLocalMetadataDiscovery(ReplicatedRangeStore store,NativeRecoverySupersession expected,ApplyPosition minimumFloor)throws IOException,RocksDBException {
+        Objects.requireNonNull(store);Objects.requireNonNull(expected);nativeMutation.acquireUninterruptibly();try(var scope=NativeRangeImage.openMetadataAdmission(NativeRangeImage.IoAdmission.UNLIMITED);var metadata=scope.pass()) {
+            var seed=localMetadataSeed(store,expected,metadata);if(seed==null)return null;
+            return store.prepareLocalMetadataDiscovery(expected,seed,minimumFloor);
+        }finally{nativeMutation.release();}
+    }
+    /** Read-only cold inventory proof; never creates or revokes an activation candidate. */
+    public NativeTopologyFreeze qualifyLocalMetadataFreeze(ReplicatedRangeStore store,NativeRecoverySupersession expected)throws IOException,RocksDBException {
+        Objects.requireNonNull(store);Objects.requireNonNull(expected);nativeMutation.acquireUninterruptibly();
+        try(var scope=NativeRangeImage.openMetadataAdmission(NativeRangeImage.IoAdmission.UNLIMITED);var metadata=scope.pass()){
+            var seed=localMetadataSeed(store,expected,metadata);return seed==null?null:store.qualifyLocalMetadataFreeze(expected,seed);
+        }finally{nativeMutation.release();}
+    }
+    private NativeTopologySeed localMetadataSeed(ReplicatedRangeStore store,NativeRecoverySupersession expected,NativeRangeImage.MetadataPass metadata)throws IOException,RocksDBException {
+        synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}if(!ranges.contains(store) || !store.ownership().owner().groupId().equals(expected.groupId()))throw new IllegalArgumentException("Local META store is outside this pool/scope");
+        if(pendingTopologySeed!=null || pendingCurrentRecovery!=null || !pendingMetadataRecoveries.isEmpty() || !pendingRecoverySupersessions.isEmpty())throw new IllegalStateException("Uncertain ownership force prevents local META discovery");
+        var seed=topologyRetirements.get(expected.groupId());if(seed==null){if(loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(expected.groupId(),0x62),new byte[0])!=RocksDB.NOT_FOUND)throw new IllegalArgumentException("Local META retirement lost its retained seed");return null;}
+        metadata.reserve(Math.toIntExact(8192L+8L*(104L+seed.header().encodedSize())));requireTopologySeedRows(seed);if(!Arrays.equals(seed.header().encode(),expected.scope().header().encode()) || !seed.localReplica().equals(expected.receiver()))throw new IllegalArgumentException("Local META seed differs from selected consuming authority");
+        return seed;
+    }
     /** Releases only this parent's borrowed USER references after actual native users/pins drain. */
     public boolean detachRetiredUserHandles(ReplicatedRangeStore store) throws RocksDBException {
         Objects.requireNonNull(store);nativeMutation.acquireUninterruptibly();

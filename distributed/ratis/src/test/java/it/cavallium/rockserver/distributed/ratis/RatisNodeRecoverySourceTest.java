@@ -95,7 +95,8 @@ class RatisNodeRecoverySourceTest {
             assertEquals(leaf.groupId(),userPrepared.image().owner().groupId());assertEquals(parent.groupId(),metadataPrepared.image().owner().groupId());
             assertEquals(fixture.store(leaf.groupId()).applied(),userPrepared.image().position());assertEquals(source.applied(),metadataPrepared.image().position());
             assertArrayEquals(fixture.store(leaf.groupId()).configuration().data(),userPrepared.sourceCfg().data());assertArrayEquals(source.configuration().data(),metadataPrepared.sourceCfg().data());
-            assertNull(metadataPrepared.image().topologyOrigin());assertTrue(fixture.store(leaf.groupId()).activeSnapshotPins()>0);assertTrue(source.activeSnapshotPins()>0);
+            assertNull(metadataPrepared.image().topologyOrigin());assertEquals(0,fixture.store(leaf.groupId()).activeSnapshotPins());assertEquals(0,source.activeSnapshotPins());
+            assertEquals(beforeStats.leases()+2,sourceService.stats().leases());assertTrue(sourceService.stats().reservedImageBytes()>beforeStats.reservedImageBytes());
             var owners=field(fixture.node,"pools",Map.class);var owner=owners.get(fixture.fast);var artifacts=field(owner,"artifacts",RatisTopologySourceSnapshotArtifacts.class);
             var userSaved=artifacts.lookup(user);var metadataSaved=artifacts.lookup(metadata);var limits=field(artifacts,"imageLimits",NativeRangeImage.Limits.class);
             assertArrayEquals(userPrepared.image().sha256(),NativeRangeImage.inspect(userSaved.image(),limits).sha256());assertArrayEquals(metadataPrepared.image().sha256(),NativeRangeImage.inspectMetadata(metadataSaved.image(),limits).sha256());

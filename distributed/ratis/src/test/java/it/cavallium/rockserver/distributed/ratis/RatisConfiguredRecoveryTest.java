@@ -33,10 +33,10 @@ class RatisConfiguredRecoveryTest {
             images=new RatisTopologySourceSnapshotService(source,RatisTopologySourceSnapshotService.Limits.defaults(8L<<20),source.scheduler,source.transferAdmission());registration[0]=1;
         }
         RatisConfiguredRecovery open(Path path,RatisJournalAccess files)throws Exception {Files.createDirectories(path);return new RatisConfiguredRecovery(path,binding,initial,this,io,files,metadata(releasedMetadata::incrementAndGet),request->requireRequest(initial,request));}
-        public CompletableFuture<Prepared> prepare(Request request) {
+        public CompletableFuture<RatisConfiguredRecovery.Preparation> prepare(Request request,RatisConfiguredRecovery.CleanupWitness witness) {
             prepares++;lastPrepared=request;
             if(abandon){abandon=false;try{return CompletableFuture.failedFuture(new AbandonedException(new Abandoned(request,new UUID(992,3),source.store.applied(),source.donor,OperatorUpload.sha256(source.store.configuration().data()))));}catch(Exception failed){return CompletableFuture.failedFuture(failed);}}
-            return images.prepareAsync(request).thenApply(value->{prepared=value;return value;});
+            return images.prepareAsync(request).thenApply(value->{prepared=value;return new RatisConfiguredRecovery.RemotePrepared(value);});
         }
         public CompletableFuture<byte[]> register(Prepared value){registers++;return blockedRegistration!=null?blockedRegistration:CompletableFuture.completedFuture(registration.clone());}
         public CompletableFuture<Prepared> transfer(Request request){return images.transfer(request);}

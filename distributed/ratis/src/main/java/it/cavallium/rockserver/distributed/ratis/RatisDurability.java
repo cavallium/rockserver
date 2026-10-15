@@ -11,6 +11,9 @@ public final class RatisDurability {
     private RatisDurability() {}
     public static RaftProperties properties(Path logDirectory) {
         var properties = new RaftProperties();
+        // Cold division loading shares one bounded log-reader workspace across this node.
+        RaftServerConfigKeys.ThreadPool.setProxyCached(properties,false);
+        RaftServerConfigKeys.ThreadPool.setProxySize(properties,1);
         RaftServerConfigKeys.setStorageDir(properties, List.of(logDirectory.toFile()));
         RaftServerConfigKeys.Log.setUseMemory(properties, false);
         // Framing streams large legal entries through this small, lifetime-owned buffer.
