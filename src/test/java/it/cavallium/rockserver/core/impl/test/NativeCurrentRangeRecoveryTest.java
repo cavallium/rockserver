@@ -27,6 +27,23 @@ class NativeCurrentRangeRecoveryTest {
     NativeCurrentRangeRecovery registration(ReplicatedRangeStore source,RangeDirectory directory,NativeRangeImage.Manifest image,ReplicaDescriptor receiver,ReplicaDescriptor owner,String prefix)throws Exception {
         var cfg=source.configuration();return new NativeCurrentRangeRecovery(UUID.randomUUID(),helper.catalogue,new ApplyPosition(1,40),directory,source.installedSchema(),source.ownership().owner().groupId(),receiver,owner,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),names(source.installedSchema(),prefix),source.deterministicMergeColumns(),schemaRows(source));
     }
+    @Test void sessionControlsConfigureRegisteredCurrentReceiverWithoutOpeningUserAdmission()throws Exception {
+        Path imagePath=root.resolve("configured-current-image");
+        try(var source=helper.new Fixture(root.resolve("configured-current-source"),helper.first,"source-")){
+            source.child.apply(new ApplyPosition(1,2),source.write(8));var image=NativeRangeImage.write(imagePath,source.child,helper.limits);
+            var registration=registration(source.child,source.definition.targetDirectory(),image,helper.second,helper.first,"configured-current-");
+            try(var pool=helper.helper.pool(root.resolve("configured-current-receiver"))){
+                var receiver=pool.openCurrentRangeRecovery(registration);assertDoesNotThrow(receiver::enableSessionControls);assertDoesNotThrow(receiver::enableSessionControls);
+                assertNull(receiver.applied());assertFalse(receiver.admissionOpen());assertFalse(receiver.currentRangeRecoveryReady());assertFalse(receiver.currentRangeRecoveryImageInstalled());
+                assertThrows(IllegalStateException.class,receiver::activate);assertThrows(IllegalStateException.class,receiver::capture);assertThrows(IllegalStateException.class,receiver::captureForRecovery);
+                assertThrows(IllegalStateException.class,()->receiver.readCurrentPoint(helper.helper.outer.fixed,helper.helper.helper.key(1)));
+                assertThrows(IllegalStateException.class,()->receiver.apply(new ApplyPosition(1,3),source.write(9)));
+                assertThrows(IllegalStateException.class,()->receiver.applyCurrentRangeRecoveryTail(new ApplyPosition(1,3),source.write(9)));
+                receiver.installSnapshot(imagePath,helper.limits);assertDoesNotThrow(receiver::enableSessionControls);assertTrue(receiver.currentRangeRecoveryImageInstalled());assertFalse(receiver.currentRangeRecoveryReady());assertFalse(receiver.admissionOpen());assertThrows(IllegalStateException.class,receiver::capture);
+            }
+        }
+    }
+
     @Test void typedMetadataChargesActualBytesReusesInstallAndScanEnvelopeAndReleasesOnFailure()throws Exception {
         Path original=root.resolve("metadata-source-image"),exported=root.resolve("metadata-reexport");
         try(var source=helper.new Fixture(root.resolve("metadata-source"),helper.first,"source-")) {
@@ -66,6 +83,61 @@ class NativeCurrentRangeRecoveryTest {
             NativeRangeImage.inspectAdmitted(exported,helper.limits,gate);
             assertEquals(0,held.get());assertEquals(5,reservations.get());
         }
+    }
+
+    @Test void completedBornCurrentMemberRestoresOwnEvolvedCheckpointAcrossInterruptedColdRetry()throws Exception {
+        try(var source=helper.new Fixture(root.resolve("own-born-source"),helper.first,"source-")){
+            source.evolve();source.child.apply(new ApplyPosition(1,5),source.write(8));
+            ownCheckpointWorkflow(root.resolve("own-born"),source.child,source.child.schemaInstallation().definition().targetDirectory());
+        }
+    }
+    @Test void completedOrdinaryCurrentMemberRestoresOwnEvolvedCheckpointAcrossInterruptedColdRetry()throws Exception {
+        try(var pool=helper.helper.pool(root.resolve("own-ordinary-source"))){
+            var schema=helper.helper.outer.schema();var directory=helper.definition().sourceDirectory();var range=directory.ranges().getFirst();
+            var source=pool.openRange(new RangeOwnership.Owner(range.groupId(),range.rangeEpoch()),new RangeOwnership.Interval(schema.domainId(),schema.columnIds(),range.lowerInclusive(),range.upperExclusive()),schema.digest(),helper.names("source-"),Set.of());
+            source.enableLogicalSchema(schema);source.initializeConfiguration(new byte[]{1});source.applyNoop(new ApplyPosition(1,0));source.apply(new ApplyPosition(1,1),ownPut(source,8));
+            ownCheckpointWorkflow(root.resolve("own-ordinary"),source,directory);
+        }
+    }
+    DistributedCommand ownPut(ReplicatedRangeStore store,int value){return new DistributedCommand(store.ownership().owner().groupId(),store.ownership().owner().epoch(),store.schemaDigest(),new OperationId(UUID.randomUUID(),1,0),List.of(new Mutation(Mutation.Kind.PUT,helper.helper.outer.fixed,helper.helper.helper.key(1),helper.helper.helper.key(value))));}
+    SchemaChange.Definition ownSchemaChange(DistributedStoragePool pool,ReplicatedRangeStore store,RangeDirectory directory,long id)throws Exception {
+        var change=addColumn(directory,store.installedSchema(),id,"own-column-"+id);var aliases=new HashMap<>(pool.schemaPhysicalNames(store));aliases.put(new UUID(0,id),"own-alias-"+id);
+        long next=store.applied().index()+1;store.applySchemaFence(new ApplyPosition(1,next),change.header());var installed=pool.installSchema(store,new ApplyPosition(1,next+1),change,aliases,Set.of());store.applySchemaActivation(new ApplyPosition(1,next+2),installed.proof(),helper.catalogue,new ApplyPosition(1,90+id%10));return change;
+    }
+    byte[] currentState(ReplicatedRangeStore store,int tag)throws Exception {
+        byte[][] result={null};try(var pin=store.captureForRecovery()){pin.visitState((key,value)->{if(key.length==17 && (key[16]&255)==tag)result[0]=value;});}return Objects.requireNonNull(result[0]);
+    }
+    Path alteredImage(Path original,Path destination,byte[] before,byte[] after)throws Exception {
+        assertEquals(before.length,after.length);byte[] bytes=java.nio.file.Files.readAllBytes(original);int found=-1;
+        for(int offset=0;offset<=bytes.length-before.length;offset++)if(Arrays.equals(bytes,offset,offset+before.length,before,0,before.length)){assertEquals(-1,found,"Expected unique complete row encoding");found=offset;}
+        assertTrue(found>=0);System.arraycopy(after,0,bytes,found,after.length);byte[] checksum=java.security.MessageDigest.getInstance("SHA-256").digest(Arrays.copyOf(bytes,bytes.length-32));System.arraycopy(checksum,0,bytes,bytes.length-32,32);java.nio.file.Files.write(destination,bytes);return destination;
+    }
+    void ownCheckpointWorkflow(Path directory,ReplicatedRangeStore source,RangeDirectory published)throws Exception {
+        java.nio.file.Files.createDirectories(directory);var limits=new NativeRangeImage.Limits(4<<20,32<<20,8);
+        Path initial=directory.resolve("initial"),beforeSchema=directory.resolve("before-schema"),firstSchema=directory.resolve("first-schema"),checkpoint=directory.resolve("checkpoint"),conflicting=directory.resolve("conflicting-checkpoint"),receiverPath=directory.resolve("receiver");
+        var image=NativeRangeImage.write(initial,source,limits);var registration=registration(source,published,image,helper.second,helper.first,"own-current-");byte[] completion,baseline;NativeRangeImage.Manifest restored;
+        try(var pool=helper.helper.pool(receiverPath)){
+            var receiver=pool.openCurrentRangeRecovery(registration);assertArrayEquals(image.sha256(),receiver.validateCurrentRangeRecoveryImage(initial,limits).sha256());receiver.installSnapshot(initial,limits);
+            receiver.applyNoop(new ApplyPosition(1,receiver.applied().index()+1),new byte[]{2});receiver.completeCurrentRangeRecovery(registration,receiver.applied(),receiver.configuration());completion=currentState(receiver,0x73);baseline=currentState(receiver,0x74);
+            receiver.apply(new ApplyPosition(1,receiver.applied().index()+1),ownPut(receiver,9));receiver.applyNoop(new ApplyPosition(1,receiver.applied().index()+1),new byte[]{3});
+            NativeRangeImage.write(beforeSchema,receiver,limits);assertDoesNotThrow(()->receiver.validateCurrentRangeRecoveryImage(beforeSchema,limits));
+            try(var freshPool=helper.helper.pool(directory.resolve("fresh-incomplete"))){var fresh=freshPool.openCurrentRangeRecovery(registration);assertThrows(java.io.IOException.class,()->fresh.validateCurrentRangeRecoveryImage(beforeSchema,limits));assertThrows(java.io.IOException.class,()->fresh.installSnapshot(beforeSchema,limits));assertNull(fresh.applied());assertFalse(fresh.pendingInstallation());fresh.installSnapshot(initial,limits);assertFalse(fresh.currentRangeRecoveryReady());}
+            var first=ownSchemaChange(pool,receiver,published,26001);var saved=NativeRangeImage.write(firstSchema,receiver,limits);assertArrayEquals(saved.sha256(),receiver.validateCurrentRangeRecoveryImage(firstSchema,limits).sha256());
+            receiver.fence();receiver.installSnapshot(firstSchema,limits);assertTrue(receiver.currentRangeRecoveryReady());assertFalse(receiver.admissionOpen());receiver.activate();assertTrue(receiver.admissionOpen());assertArrayEquals(completion,currentState(receiver,0x73));assertArrayEquals(baseline,currentState(receiver,0x74));assertArrayEquals(helper.helper.helper.key(9),receiver.readCurrentPoint(helper.helper.outer.fixed,helper.helper.helper.key(1)));
+            ownSchemaChange(pool,receiver,first.targetDirectory(),26002);restored=NativeRangeImage.write(checkpoint,receiver,limits);assertDoesNotThrow(()->receiver.validateCurrentRangeRecoveryImage(initial,limits));assertDoesNotThrow(()->receiver.validateCurrentRangeRecoveryImage(firstSchema,limits));assertThrows(java.io.IOException.class,()->receiver.installSnapshot(firstSchema,limits));assertFalse(receiver.pendingInstallation());
+            byte[] changed=completion.clone();var cut=java.nio.ByteBuffer.wrap(changed);cut.putLong(changed.length-8,cut.getLong(changed.length-8)+1);Path wrongCompletion=alteredImage(checkpoint,directory.resolve("wrong-completion"),completion,changed);assertDoesNotThrow(()->NativeRangeImage.inspect(wrongCompletion,limits));assertThrows(java.io.IOException.class,()->receiver.validateCurrentRangeRecoveryImage(wrongCompletion,limits));
+            byte[] cfg=currentState(receiver,1),badCfg=cfg.clone();badCfg[badCfg.length-1]^=1;Path wrongConfiguration=alteredImage(checkpoint,directory.resolve("wrong-configuration"),cfg,badCfg);assertThrows(java.io.IOException.class,()->receiver.validateCurrentRangeRecoveryImage(wrongConfiguration,limits));
+            byte[] adopted=registration.encode(),badAdoption=adopted.clone();badAdoption[4]^=1;Path wrongBinding=alteredImage(checkpoint,directory.resolve("wrong-registration"),adopted,badAdoption);assertThrows(java.io.IOException.class,()->receiver.validateCurrentRangeRecoveryImage(wrongBinding,limits));
+            byte[] badBaseline=baseline.clone();badBaseline[badBaseline.length-1]^=1;Path wrongReceipt=alteredImage(checkpoint,directory.resolve("wrong-receipt"),baseline,badBaseline);assertThrows(java.io.IOException.class,()->receiver.validateCurrentRangeRecoveryImage(wrongReceipt,limits));
+            if(restored.topologyOrigin()!=null){byte[] origin=restored.topologyOrigin().encode(),badOrigin=origin.clone();badOrigin[badOrigin.length-1]^=1;Path wrongAnchor=alteredImage(checkpoint,directory.resolve("wrong-anchor"),origin,badOrigin);assertThrows(java.io.IOException.class,()->receiver.validateCurrentRangeRecoveryImage(wrongAnchor,limits));}
+            var row=new java.io.ByteArrayOutputStream();var out=new java.io.DataOutputStream(row);out.writeByte(NativeRangeImage.Section.USER.ordinal()+1);UUID column=helper.helper.outer.fixed;out.writeLong(column.getMostSignificantBits());out.writeLong(column.getLeastSignificantBits());byte[] key=helper.helper.helper.key(1),value=helper.helper.helper.key(9);out.writeInt(key.length);out.writeInt(value.length);out.write(key);out.write(value);byte[] before=row.toByteArray(),after=before.clone();after[after.length-1]^=1;alteredImage(checkpoint,conflicting,before,after);assertDoesNotThrow(()->NativeRangeImage.inspect(conflicting,limits));
+            receiver.fence();assertThrows(java.io.IOException.class,()->receiver.installSnapshot(checkpoint,limits,batch->{assertFalse(receiver.currentRangeRecoveryReady());throw new java.io.IOException("interrupt own checkpoint");}));assertTrue(receiver.pendingInstallation());assertFalse(receiver.currentRangeRecoveryReady());assertFalse(receiver.admissionOpen());assertNull(receiver.applied());
+        }
+        try(var pool=helper.helper.pool(receiverPath)){
+            var receiver=pool.openCurrentRangeRecovery(registration);assertTrue(receiver.pendingInstallation());assertFalse(receiver.currentRangeRecoveryReady());assertFalse(receiver.admissionOpen());assertNull(receiver.applied());assertThrows(IllegalStateException.class,receiver::activate);assertDoesNotThrow(()->receiver.validateCurrentRangeRecoveryImage(initial,limits));assertDoesNotThrow(()->receiver.validateCurrentRangeRecoveryImage(firstSchema,limits));
+            assertThrows(java.io.IOException.class,()->receiver.installSnapshot(beforeSchema,limits));assertTrue(receiver.pendingInstallation());assertTrue(assertThrows(java.io.IOException.class,()->receiver.installSnapshot(conflicting,limits)).getMessage().contains("exact original image retry"));receiver.installSnapshot(checkpoint,limits);assertEquals(restored.position(),receiver.applied());assertTrue(receiver.currentRangeRecoveryReady());receiver.activate();assertArrayEquals(completion,currentState(receiver,0x73));assertArrayEquals(baseline,currentState(receiver,0x74));assertEquals("own-alias-26002",pool.schemaPhysicalNames(receiver).get(new UUID(0,26002)));assertArrayEquals(helper.helper.helper.key(9),receiver.readCurrentPoint(helper.helper.outer.fixed,helper.helper.helper.key(1)));assertTrue(pool.topologySeeds().isEmpty());NativeRangeImage.write(directory.resolve("after-retry"),receiver,limits);
+        }
+        try(var pool=helper.helper.pool(receiverPath)){var receiver=pool.openCurrentRangeRecovery(registration);assertTrue(receiver.currentRangeRecoveryReady());assertTrue(receiver.admissionOpen());assertArrayEquals(completion,currentState(receiver,0x73));assertDoesNotThrow(()->receiver.validateCurrentRangeRecoveryImage(checkpoint,limits));}
     }
 
     @Test void absentBornCurrentMemberInstallsActualEvolvedImageReplaysOwnTailCompletesColdReopensAndReexports()throws Exception {
