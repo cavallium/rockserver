@@ -87,16 +87,67 @@ class StateMachineUpdater implements Runnable {
   private final RaftLogIndex snapshotIndex;
   private final AtomicReference<Long> stopIndex = new AtomicReference<>();
   private volatile State state = State.RUNNING;
+  private volatile RockserverRaftServers.CoveredPrefix coveredPrefix;
   private TermIndex observedReloadCut;
   private CompletableFuture<Void> observedReload;
 
   synchronized CompletableFuture<Void> observeLocalReload(TermIndex cut) throws IOException {
-    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null) {
+    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null || coveredPrefix != null) {
       throw new IOException("State machine updater is busy/stopping");
     }
     observedReloadCut = cut;
     observedReload = new CompletableFuture<>();
     return observedReload.copy();
+  }
+
+  synchronized void requireCoveredAvailable() throws IOException {
+    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null || coveredPrefix != null)
+      throw new IOException("Updater already owns work or is stopping");
+  }
+  synchronized void registerCoveredPrefix(RockserverRaftServers.CoveredPrefix permit) throws IOException {
+    requireCoveredAvailable(); coveredPrefix = permit;
+  }
+  private void retireCoveredPrefix(RockserverRaftServers.CoveredPrefix permit, Throwable failure) {
+    synchronized (this) { if (coveredPrefix != permit) return; coveredPrefix = null; }
+    if (failure != null) { permit.drained.completeExceptionally(failure); permit.retired.completeExceptionally(failure); }
+    else permit.retired.complete(null);
+  }
+  /** Fixed scalar quantum before ordinary readHead/native/CFG dispatch. */
+  private boolean consumeCoveredPrefix() throws IOException, InterruptedException {
+    var permit = coveredPrefix;
+    if (permit == null) return false;
+    if (permit.abortRequested) {
+      permit.gate.deferDiscovery();
+      synchronized (this) { if (coveredPrefix == permit) coveredPrefix = null; }
+      permit.drained.completeExceptionally(new IOException("Covered prefix aborted")); permit.retired.complete(null); return true;
+    }
+    if (permit.releaseRequested) {
+      if (!permit.drained.isDone() || !permit.published()) throw new IOException("Covered prefix release lacks exact published native owner");
+      retireCoveredPrefix(permit, null); return true;
+    }
+    if (permit.drained.isDone() && !permit.gate.discoveryPending() && permit.sameLocalOwner()) {
+      awaitForSignal.await(100, TimeUnit.MILLISECONDS); return true;
+    }
+    if (!permit.sameLocalOwner() || !permit.gate.discoveryPending() || permit.gate.revision() != permit.revision)
+      throw new IOException("Covered prefix recovery owner revoked");
+    if (!permit.started || appliedIndex.get() == permit.applied.getIndex()) {
+      awaitForSignal.await(100, TimeUnit.MILLISECONDS); return true;
+    }
+    for (int visited = 0; visited < 128 && appliedIndex.get() < permit.applied.getIndex(); visited++) {
+      if (stopIndex.get() != null || permit.abortRequested) break;
+      if (!permit.sameLocalOwner() || !permit.gate.discoveryPending() || permit.gate.revision() != permit.revision)
+        throw new IOException("Covered prefix recovery owner changed during quantum");
+      long next = appliedIndex.get() + 1;
+      var header = raftLog.getEntries(next, next + 1);
+      if (header == null || header.length != 1 || header[0].getIndex() != next
+          || header[0].getTerm() < permit.precedingTerm || next == permit.applied.getIndex() && header[0].getTerm() != permit.applied.getTerm())
+        throw new IOException("Covered prefix cached header changed");
+      permit.precedingTerm = header[0].getTerm();
+      if (appliedIndex.incrementAndGet(debugIndexChange) != next) throw new IOException("Covered cursor ownership changed");
+      notifyAppliedIndex(next);
+    }
+    if (appliedIndex.get() == permit.applied.getIndex()) permit.drained.complete(null);
+    return true;
   }
 
   boolean isStopRequested() { return stopIndex.get() != null; }
@@ -189,6 +240,9 @@ class StateMachineUpdater implements Runnable {
     } catch(Throwable t) {
       LOG.warn(name + ": Failed to close " + JavaUtils.getClassSimpleName(stateMachine.getClass())
           + " " + stateMachine, t);
+    } finally {
+      var covered = coveredPrefix;
+      if (covered != null) retireCoveredPrefix(covered, new IOException("Updater stopped during covered prefix ownership"));
     }
   }
 
@@ -229,9 +283,10 @@ class StateMachineUpdater implements Runnable {
     CompletableFuture<Void> applyLogFutures = CompletableFuture.completedFuture(null);
     for(; state != State.STOP; ) {
       try {
-        if (stopIndex.get() != null && (committedAdmission != null || !server.isInitialImageReady())) { stop(); break; }
+        if (stopIndex.get() != null && (committedAdmission != null || coveredPrefix != null || !server.isInitialImageReady())) { stop(); break; }
+        if (consumeCoveredPrefix()) continue;
         waitForCommit(applyLogFutures);
-        if (stopIndex.get() != null && (committedAdmission != null || !server.isInitialImageReady())) { stop(); break; }
+        if (stopIndex.get() != null && (committedAdmission != null || coveredPrefix != null || !server.isInitialImageReady())) { stop(); break; }
 
         if (state == State.RELOAD) {
           reload();
@@ -265,7 +320,7 @@ class StateMachineUpdater implements Runnable {
     // Thus it is possible to have applied > committed initially.
     final long applied = getLastAppliedIndex();
     for(; (applied >= raftLog.getLastCommittedIndex() || !server.isInitialImageReady())
-        && state == State.RUNNING && !shouldStop() && stopIndex.get() == null; ) {
+        && state == State.RUNNING && !shouldStop() && stopIndex.get() == null && coveredPrefix == null; ) {
       if (server.isInitialImageReady() && server.getSnapshotRequestHandler().shouldTriggerTakingSnapshot()) {
         takeSnapshot(applyLogFutures);
       }

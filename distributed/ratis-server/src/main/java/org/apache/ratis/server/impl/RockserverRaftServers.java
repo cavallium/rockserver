@@ -3,6 +3,10 @@ package org.apache.ratis.server.impl;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.Objects;
+import java.util.Optional;
+import org.apache.ratis.proto.RaftProtos.RaftConfigurationProto;
+import org.apache.ratis.proto.RaftProtos.LogEntryProto;
+import org.apache.ratis.server.raftlog.LogProtoUtils;
 import java.util.concurrent.CompletableFuture;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.raftlog.segmented.SegmentedRaftLog;
@@ -24,6 +28,132 @@ public final class RockserverRaftServers {
         if (seed!=null && !seed.getPeers().isEmpty() && seed.getPeer(id)==null) throw new IllegalArgumentException("Seed group does not contain this node");
         return initialize(new RaftServerProxy(id,registry,properties,parameters,null),server -> server.initGroups(seed,option));
     }
+    private static final long MAX_COVERED_HEADERS = 1L << 20;
+    /** One updater-owned recovery barrier; observers cannot cancel actual work or retire its owner. */
+    public static final class CoveredPrefix {
+        final RaftServerImpl server;
+        final StateMachine machine;
+        final StateMachineUpdater updater;
+        final RecoveryEligibilityStateMachine.Gate gate;
+        final long revision;
+        final TermIndex snapshot, applied, configurationCut;
+        final RaftConfigurationProto configuration;
+        final CompletableFuture<Void> drained = new CompletableFuture<>(), retired = new CompletableFuture<>();
+        volatile boolean started, releaseRequested, abortRequested;
+        long precedingTerm;
+        private CoveredPrefix(RaftServerImpl server, StateMachine machine, StateMachineUpdater updater,
+                RecoveryEligibilityStateMachine.Gate gate, long revision, TermIndex snapshot, TermIndex applied,
+                TermIndex configurationCut, RaftConfigurationProto configuration) {
+            this.server = server; this.machine = machine; this.updater = updater; this.gate = gate;
+            this.revision = revision; this.snapshot = snapshot; this.applied = applied;
+            this.configurationCut = configurationCut; this.configuration = configuration; precedingTerm = snapshot.getTerm();
+        }
+        public CompletableFuture<Void> start() { started = true; updater.notifyUpdater(); return drained(); }
+        public CompletableFuture<Void> drained() { return drained.copy(); }
+        /** Caller has durably published its exact native/Node role and settled discovery outside core monitors. */
+        public CompletableFuture<Void> release() {
+            releaseRequested = true; updater.notifyUpdater(); return retired.copy();
+        }
+        public CompletableFuture<Void> abort() { abortRequested = true; updater.notifyUpdater(); return retired.copy(); }
+        boolean sameLocalOwner() {
+            return server.getStateMachine() == machine && server.getInfo().isAlive()
+                && server.getInfo().getLifeCycleState() == LifeCycle.State.RUNNING
+                && machine.getLifeCycleState() == LifeCycle.State.RUNNING
+                && applied.equals(machine.getLastAppliedTermIndex()) && machine.getLatestSnapshot() != null
+                && snapshot.equals(machine.getLatestSnapshot().getTermIndex())
+                && server.getRaftLog().getSnapshotIndex() == snapshot.getIndex();
+        }
+        boolean published() {
+            var evidence = gate.snapshot();
+            return sameLocalOwner() && !gate.discoveryPending()
+                && evidence.mode() == RecoveryEligibilityStateMachine.Mode.RECOVERY
+                && applied.equals(evidence.nativeCut()) && snapshot.equals(evidence.snapshotCut())
+                && evidence.configurationTerm() == configurationCut.getTerm()
+                && evidence.configurationIndex() == configurationCut.getIndex()
+                && configuration.equals(evidence.configuration());
+        }
+    }
+
+    /** Missing retained coverage/commit proof selects the snapshot fallback before changing the updater. */
+    public static Optional<CoveredPrefix> coverLocalPrefix(RaftServer.Division division, StateMachine expected,
+            TermIndex nativeApplied, TermIndex nativeConfiguration, RaftConfigurationProto configuration) throws IOException {
+        Objects.requireNonNull(expected); Objects.requireNonNull(nativeApplied);
+        Objects.requireNonNull(nativeConfiguration); Objects.requireNonNull(configuration);
+        if (!(division instanceof RaftServerImpl server) || !(expected instanceof RecoveryEligibilityStateMachine recovery)
+                || !(server.getRaftLog() instanceof SegmentedRaftLog)) throw new IOException("Covered prefix requires actual recovery division/log");
+        final StateMachineUpdater updater; final TermIndex snapshot; final long revision;
+        synchronized (server) {
+            if (server.getStateMachine() != expected || !server.getInfo().isAlive()
+                    || server.getInfo().getLifeCycleState() != LifeCycle.State.RUNNING
+                    || expected.getLifeCycleState() != LifeCycle.State.RUNNING || !recovery.recoveryEligibilityGate().discoveryPending()
+                    || !nativeApplied.equals(expected.getLastAppliedTermIndex()) || expected.getLatestSnapshot() == null)
+                throw new IOException("Covered prefix lacks exact native/discovery owner");
+            snapshot = expected.getLatestSnapshot().getTermIndex();
+            if (snapshot.getTerm() < 1 || snapshot.getIndex() < 0 || nativeApplied.getIndex() <= snapshot.getIndex()
+                    || nativeApplied.getTerm() < snapshot.getTerm() || nativeApplied.getIndex() == Long.MAX_VALUE
+                    || nativeConfiguration.getIndex() < -1 || nativeConfiguration.getTerm() < 0
+                    || nativeConfiguration.getIndex() == -1 && nativeConfiguration.getTerm() != 0
+                    || nativeConfiguration.getIndex() > nativeApplied.getIndex() || nativeConfiguration.getTerm() > nativeApplied.getTerm()
+                    || configuration.getSerializedSize() > 1 << 20) throw new IOException("Invalid covered prefix geometry/configuration");
+            updater = server.getState().getStateMachineUpdater();
+            if (server.getRaftLog().getSnapshotIndex() != snapshot.getIndex())
+                throw new IOException("Covered prefix snapshot differs from actual log floor");
+            updater.requireCoveredAvailable();
+            long cursor = updater.getLastAppliedIndex();
+            if (cursor < snapshot.getIndex() || cursor > nativeApplied.getIndex())
+                throw new IOException("Covered updater cursor exceeds native/snapshot bounds");
+            if (cursor > snapshot.getIndex()) return Optional.empty();
+            revision = recovery.recoveryEligibilityGate().revision();
+        }
+        var log = server.getRaftLog();
+        if (nativeApplied.getIndex() - snapshot.getIndex() > MAX_COVERED_HEADERS
+                || log.getLastCommittedIndex() < nativeApplied.getIndex()
+                || log.getStartIndex() > snapshot.getIndex() + 1 || log.getNextIndex() <= nativeApplied.getIndex()) return Optional.empty();
+        long previousTerm = snapshot.getTerm(), lastConfiguration = -1;
+        for (long index = snapshot.getIndex() + 1; index <= nativeApplied.getIndex(); index++) {
+            if (index < log.getStartIndex() || index >= log.getNextIndex()) return Optional.empty();
+            final org.apache.ratis.server.raftlog.LogEntryHeader[] headers;
+            try { headers = log.getEntries(index, index + 1); }
+            catch (IndexOutOfBoundsException missing) {
+                if (index < log.getStartIndex() || index >= log.getNextIndex()) return Optional.empty();
+                throw new IOException("Cached covered header contradicts retained log bounds", missing);
+            }
+            if (headers == null) throw new IOException("Cached covered header array is null");
+            if (headers.length == 0) return Optional.empty();
+            if (headers[0] == null) throw new IOException("Cached covered header is null");
+            if (headers.length != 1 || headers[0].getIndex() != index || headers[0].getTerm() < previousTerm)
+                throw new IOException("Covered cached log prefix is contradictory");
+            previousTerm = headers[0].getTerm();
+            if (headers[0].getLogEntryBodyCase() == LogEntryProto.LogEntryBodyCase.CONFIGURATIONENTRY) lastConfiguration = index;
+        }
+        if (previousTerm != nativeApplied.getTerm()) throw new IOException("Native applied cut contradicts retained log term");
+        if (lastConfiguration >= 0 && lastConfiguration != nativeConfiguration.getIndex())
+            throw new IOException("Native configuration is not latest in covered log prefix");
+        var configurationEntry = nativeConfiguration.getIndex() < 0 ? null : log.get(nativeConfiguration.getIndex());
+        if (configurationEntry != null) {
+            if (!configurationEntry.hasConfigurationEntry() || configurationEntry.getTerm() != nativeConfiguration.getTerm()
+                    || !configurationEntry.getConfigurationEntry().equals(configuration)) throw new IOException("Native configuration contradicts retained full log configuration");
+        } else {
+            if (nativeConfiguration.getIndex() > snapshot.getIndex()) return Optional.empty();
+            var actual = server.getRaftConf();
+            boolean bootstrap = nativeConfiguration.getTerm() == 0 && nativeConfiguration.getIndex() == -1
+                && actual.getLogEntryIndex() == 0 && log.getTermIndex(0) == null;
+            if (actual.getLogEntryIndex() != nativeConfiguration.getIndex() && !bootstrap
+                    || !LogProtoUtils.toRaftConfigurationProtoBuilder(actual).build().equals(configuration)) return Optional.empty();
+            // A compacted non-bootstrap configuration has no retained term witness here.
+            if (nativeConfiguration.getIndex() >= 0) return Optional.empty();
+        }
+        synchronized (server) {
+            var permit = new CoveredPrefix(server, expected, updater, recovery.recoveryEligibilityGate(), revision,
+                snapshot, nativeApplied, nativeConfiguration, configuration);
+            if (!permit.sameLocalOwner() || !permit.gate.discoveryPending() || permit.gate.revision() != revision
+                    || log.getLastCommittedIndex() < nativeApplied.getIndex() || updater.getLastAppliedIndex() != snapshot.getIndex())
+                throw new IOException("Covered prefix owner changed during qualification");
+            updater.registerCoveredPrefix(permit);
+            return Optional.of(permit);
+        }
+    }
+
     /** Reload an already forced local checkpoint. Discovery settlement remains the caller's responsibility. */
     public static CompletableFuture<Void> reloadLocalCheckpoint(RaftServer.Division division,
             StateMachine expected, TermIndex cut) throws IOException {
