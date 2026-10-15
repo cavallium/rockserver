@@ -148,7 +148,15 @@ message KVBatch {
   repeated KV entries = 1;
 }
 
-message OpenTransactionRequest {int64 transactionLeaseTtlNanos = 1; RequestContext context = 2;}
+message TransactionScopeKeys { repeated bytes keys = 1; }
+message TransactionScopeSpan {
+  int64 columnId = 1;
+  bool point = 2;
+  TransactionScopeKeys lowerInclusive = 3;
+  TransactionScopeKeys upperExclusive = 4;
+}
+message TransactionOpenScope { repeated TransactionScopeSpan spans = 1; }
+message OpenTransactionRequest {int64 transactionLeaseTtlNanos = 1; RequestContext context = 2; TransactionOpenScope scope = 3;}
 message OpenTransactionResponse {int64 transactionId = 1;}
 
 message CloseTransactionRequest {int64 transactionId = 1; reserved 2; bool commit = 3; RequestContext context = 4;}

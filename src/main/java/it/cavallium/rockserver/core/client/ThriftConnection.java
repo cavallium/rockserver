@@ -322,10 +322,10 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	@Override
-	public long openTransaction(Duration transactionLeaseTtl) {
+	public long openTransaction(it.cavallium.rockserver.core.common.TransactionOpenScope scope, Duration transactionLeaseTtl) {
 		try {
 			return client.openTransaction(LeaseTtl.toNanos(transactionLeaseTtl, "transactionLeaseTtl"),
-					currentWireRequestContext());
+					currentWireRequestContext(), TransactionScopeWire.thrift(scope));
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -935,8 +935,8 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	// --- Async API ---
 
 	@Override
-	public CompletableFuture<Long> openTransactionAsync(Duration transactionLeaseTtl) {
-		return supplyAsyncContextual(() -> openTransaction(transactionLeaseTtl), executor);
+	public CompletableFuture<Long> openTransactionAsync(it.cavallium.rockserver.core.common.TransactionOpenScope scope, Duration transactionLeaseTtl) {
+		return supplyAsyncContextual(() -> openTransaction(scope, transactionLeaseTtl), executor);
 	}
 
 	@Override

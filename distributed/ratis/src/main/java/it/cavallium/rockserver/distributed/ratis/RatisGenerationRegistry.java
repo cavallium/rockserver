@@ -26,7 +26,7 @@ final class RatisGenerationRegistry implements AutoCloseable {
         try (var files=Files.newDirectoryStream(root)) {
             for (var folder:files) {
                 if (!Files.isDirectory(folder,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Unexpected connection generation entry");
-                var in=ByteBuffer.wrap(access.read(folder.resolve("binding"),8*1024*1024)); var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES)); var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES)); if (in.hasRemaining() || !folder.getFileName().toString().equals(key(schema))) throw new IOException("Invalid generation binding");
+                var in=ByteBuffer.wrap(access.read(folder.resolve("binding"),8*1024*1024)); var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES)); var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES)); if (in.hasRemaining() || !folder.getFileName().toString().equals(key(schema,directory))) throw new IOException("Invalid generation binding");
                 schema.requireMatches(directory);var data=data(schema.domainId());data.requireKnownSchema(schema);var qualified=data.directory(schema);
                 // Only this exclusively owned, forced generation binding restores historical placement.
                 // Its actors separately cross-check their immutable root bindings; no route is published or retargeted here.
@@ -37,11 +37,12 @@ final class RatisGenerationRegistry implements AutoCloseable {
         for(var domain:routed.keySet())current(domain);validateColumns();
         } catch (Throwable failure) { try { close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); } if (failure instanceof IOException io) throw io; throw new IOException("Generation inventory open failed",failure); }
     }
-    private static String key(DistributedSchema schema) { return HexFormat.of().formatHex(schema.digest()); }
+    static String key(DistributedSchema schema,RangeDirectory directory) { return key(schema.digest(),directory); }
+    private static String key(byte[] schemaDigest,RangeDirectory directory) { return HexFormat.of().formatHex(schemaDigest)+"-"+HexFormat.of().formatHex(directory.payloadDigest()); }
     private void add(DistributedSchema schema,RangeDirectory directory,Path folder,boolean create) throws IOException {
         if (generations.size()>=maximum) throw new IOException("Connection immutable generation capacity exhausted");
         if (create) {
-            capacity.admitBinding(schema);
+            capacity.admitBinding(schema,directory);
             byte[] a=DistributedSchemaCodec.encode(schema),b=RangeDirectoryCodec.encode(directory); var expected=ByteBuffer.allocate(8+a.length+b.length).putInt(a.length).put(a).putInt(b.length).put(b).array();
             if (Files.exists(folder,LinkOption.NOFOLLOW_LINKS)) { if (!Files.isDirectory(folder,LinkOption.NOFOLLOW_LINKS) || !Arrays.equals(expected,access.read(folder.resolve("binding"),8*1024*1024))) throw new IOException("Original generation binding is missing/changed"); }
             else { Files.createDirectory(folder); access.write(folder.resolve("binding"),expected,8*1024*1024); SessionJournalFiles.force(root); }
@@ -49,11 +50,36 @@ final class RatisGenerationRegistry implements AutoCloseable {
         capacity.forceBinding(folder);
         capacity.bound(schema);
         var owned=new Owned(schema,directory,Objects.requireNonNull(factory.create(schema,directory,folder,ids)));
-        synchronized(this) { generations.put(key(schema),owned); }
+        synchronized(this) { generations.put(key(schema,directory),owned); }
     }
     private RatisRoutedClient data(UUID domain)throws IOException {var data=routed.get(domain);if(data==null)throw new IOException("Generation belongs to an undeclared database domain");return data;}
+    record Scoped(Owned owner,TransactionScope scope) {}
+    Scoped scope(it.cavallium.rockserver.core.common.TransactionOpenScope declaration) throws IOException {
+        if (declaration==null) throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.TX_SCOPE_REQUIRED,"Distributed transactions require an explicit bounded scope");
+        var candidates=new ArrayList<DistributedSchema>(); var directories=new HashMap<UUID,RangeDirectory>();
+        // Read bindings without constructing generation/session owners for a rejected declaration.
+        for (var domain:routed.keySet()) {
+            var directory=data(domain).directory();Owned cached;
+            synchronized(this){cached=generations.get(key(directory.schemaDigest(),directory));}
+            var schema=cached==null ? schemas.read(directory.schemaDigest()) : cached.schema();
+            if (schema==null) throw new IOException("Activated immutable schema absent from catalogue");
+            data(domain).requireKnownSchema(schema);schema.requireMatches(directory);candidates.add(schema);directories.put(domain,directory);
+        }
+        requireUnique(candidates); DistributedSchema selected=null;
+        for (var span:declaration.spans()) {
+            DistributedSchema candidate=null;
+            for (var schema:candidates) if (schema.columns().stream().anyMatch(column -> column.apiId()==span.columnId())) {candidate=schema;break;}
+            if (candidate==null) throw new IllegalArgumentException("Unknown transaction scope column");
+            if (selected!=null && !selected.domainId().equals(candidate.domainId())) throw new IllegalArgumentException("Transaction scope cannot cross database domains");
+            selected=candidate;
+        }
+        var directory=directories.get(selected.domainId());var physical=RatisRocksDBAdapter.scope(selected,directory,declaration);
+        var key=key(selected,directory);Owned owner;synchronized(this){owner=generations.get(key);}
+        if(owner==null){add(selected,directory,root.resolve(key),true);validateColumns();synchronized(this){owner=generations.get(key);}}
+        return new Scoped(owner,physical);
+    }
     Owned current(UUID domain) throws IOException {
-        var data=data(domain);var directory=data.directory();var key=HexFormat.of().formatHex(directory.schemaDigest());Owned current;synchronized(this){current=generations.get(key);}if(current!=null)return current;
+        var data=data(domain);var directory=data.directory();var key=key(directory.schemaDigest(),directory);Owned current;synchronized(this){current=generations.get(key);}if(current!=null)return current;
         var schema=schemas.read(directory.schemaDigest());if(schema==null)throw new IOException("Activated immutable schema absent from catalogue");data.requireKnownSchema(schema);schema.requireMatches(directory);add(schema,directory,root.resolve(key),true);validateColumns();synchronized(this){return generations.get(key);}
     }
     List<Owned> current()throws IOException {var owners=new ArrayList<Owned>();for(var domain:routed.keySet())owners.add(current(domain));return List.copyOf(owners);}
@@ -64,7 +90,7 @@ final class RatisGenerationRegistry implements AutoCloseable {
     }
     private void validateColumns()throws IOException {
         var ids=new HashSet<Long>();var columns=new HashSet<UUID>();var names=new HashSet<String>();
-        for(var domain:routed.keySet()){var digest=HexFormat.of().formatHex(data(domain).directory().schemaDigest());var owner=generations.get(digest);if(owner==null)continue;for(var column:owner.schema.columns())if(!ids.add(column.apiId()) || !columns.add(column.columnId()) || !names.add(column.name()))throw new IOException("Database domains share a column UUID/API identity/name");}
+        for(var domain:routed.keySet()){var directory=data(domain).directory();var owner=generations.get(key(directory.schemaDigest(),directory));if(owner==null)continue;for(var column:owner.schema.columns())if(!ids.add(column.apiId()) || !columns.add(column.columnId()) || !names.add(column.name()))throw new IOException("Database domains share a column UUID/API identity/name");}
     }
     Owned transaction(long id) throws IOException { for (var generation:all()) if (generation.generation().adapter().ownsTransactionOrUpdate(id)) return generation; throw new IOException("Original transaction/update handle not owned by this connection"); }
     Owned iterator(long id) throws IOException { for (var generation:all()) if (generation.generation().adapter().ownsIterator(id)) return generation; throw new IOException("Original iterator handle not owned by this connection"); }
@@ -129,8 +155,8 @@ final class RatisGenerationRegistry implements AutoCloseable {
             if(hasTargetBinding(target) || phase.equals("CONFLICT") && conflictBeforeBegin(fields) || phase.equals("ABORTED") || phase.equals("DONE") && ByteBuffer.wrap(fields.get("aborted")).getLong()!=0) slots.remove(id);
             else slots.put(id,new Slot(slot.source,slot.directory,target.clone(),true));
         }
-        synchronized void admitBinding(DistributedSchema schema) throws IOException {
-            requireUsable(); if(hasTargetBinding(schema.digest())) return;
+        synchronized void admitBinding(DistributedSchema schema,RangeDirectory directory) throws IOException {
+            requireUsable(); if(Files.exists(bindings.resolve(key(schema,directory)).resolve("binding"),LinkOption.NOFOLLOW_LINKS)) return;
             boolean reserved=slots.values().stream().anyMatch(slot -> Arrays.equals(slot.target,schema.digest()));
             if(bindingCount()+slots.size()-(reserved ? 1 : 0)>=maximum) throw new IOException("Connection immutable generation capacity exhausted");
         }
@@ -144,11 +170,16 @@ final class RatisGenerationRegistry implements AutoCloseable {
         }
         private static byte[] target(Map<String,byte[]> fields) { var target=fields.get("targetSchema"); return target==null ? new byte[0] : DistributedSchemaCodec.decode(target).digest(); }
         private boolean hasTargetBinding(byte[] target) throws IOException {
-            if(target.length==0) return false; var path=bindings.resolve(HexFormat.of().formatHex(target)).resolve("binding");
-            if(!Files.exists(path,LinkOption.NOFOLLOW_LINKS)) return false;
-            try { var in=ByteBuffer.wrap(access.read(path,8*1024*1024)); var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES)); var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES)); schema.requireMatches(directory);
-                if(in.hasRemaining() || !Arrays.equals(schema.digest(),target)) throw new IOException("Reserved target binding changed"); forceBinding(path.getParent()); return true;
-            } catch(IllegalArgumentException invalid) { throw new IOException("Invalid reserved target binding",invalid); }
+            if(target.length==0 || !Files.exists(bindings)) return false;
+            try(var folders=Files.newDirectoryStream(bindings)) { for(var folder:folders) {
+                var path=folder.resolve("binding");
+                if(!Files.isDirectory(folder,LinkOption.NOFOLLOW_LINKS) || !Files.exists(path,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Invalid generation inventory");
+                try { var in=ByteBuffer.wrap(access.read(path,8*1024*1024)); var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES)); var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES)); schema.requireMatches(directory);
+                    if(in.hasRemaining() || !folder.getFileName().toString().equals(key(schema,directory))) throw new IOException("Reserved target binding changed");
+                    if(Arrays.equals(schema.digest(),target)) {forceBinding(folder);return true;}
+                } catch(IllegalArgumentException invalid) { throw new IOException("Invalid reserved target binding",invalid); }
+            } }
+            return false;
         }
         synchronized void forceBinding(Path folder) throws IOException {
             requireUsable();

@@ -195,7 +195,7 @@ class GrpcShutdownTest {
 		var client = newClient();
 		var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("tx-col",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
-		var txId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(5)));
+		var txId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(null,  java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(5)));
 		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId,
 				colId,
 				key(1),

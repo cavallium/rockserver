@@ -245,7 +245,7 @@ class RangePageContractTest {
 		var firstPages = new ArrayList<RangePage<KV>>();
 		try {
 			for (var api : transportApis) {
-				transactionIds.add(api.openTransaction(Duration.ofMillis(TIMEOUT_MS)));
+				transactionIds.add(api.openTransaction(null, Duration.ofMillis(TIMEOUT_MS)));
 			}
 			for (int index = 0; index < transportApis.size(); index++) {
 				var first = transportApis.get(index).getRangePage(transactionIds.get(index),

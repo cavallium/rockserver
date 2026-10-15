@@ -103,9 +103,15 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private static final class Tracking { final List<CompletableFuture<?>> actual=new ArrayList<>(); final List<Runnable> cancel=new ArrayList<>(); }
     private final ThreadLocal<Tracking> tracking=new ThreadLocal<>();
     OwnedDispatch dispatchOwned(RocksDBAPICommand<?,?,?> request,RequestContext context) {
+        return dispatchOwned(() -> api(context).requestAsync(request));
+    }
+    OwnedDispatch openOwned(TransactionScope scope,Duration ttl,RequestContext context) {
+        return dispatchOwned(() -> open(scope,ttl,new Deadline(context),Mode.EXPLICIT));
+    }
+    private OwnedDispatch dispatchOwned(Supplier<Object> action) {
         var tracker=new Tracking(); tracking.set(tracker);
         try {
-            Object observer=api(context).requestAsync(request);
+            Object observer=action.get();
             if (tracker.actual.isEmpty() && observer instanceof CompletableFuture<?> future) tracker.actual.add(future.handle((value,failure) -> null));
             var drained=CompletableFuture.allOf(tracker.actual.stream().map(future -> future.handle((value,failure) -> null)).toArray(CompletableFuture[]::new));
             return new OwnedDispatch(observer,drained,() -> tracker.cancel.forEach(Runnable::run));
@@ -138,7 +144,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private CompletableFuture<?> dispatch(RocksDBAPICommand<?,?,?> request,Deadline deadline) throws Exception {
         synchronized (this) { if (closing) throw new IOException("Adapter closing"); }
         if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange || request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch || request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch)throw explicitMutationRequired();
-        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.OpenTransaction open) return open(open.transactionLeaseTtl(),deadline);
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.OpenTransaction open) return open(open.scope(),open.transactionLeaseTtl(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction close) return close(close.transactionId(),close.commit(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate close) return closeFailedUpdate(close.updateId(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId column) return CompletableFuture.completedFuture(schema.column(column.name()).apiId());
@@ -247,21 +253,36 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             return iterators.streamOwned(transaction,column,low,high,reverse,() -> readResource(transaction,column,low,high,reverse,Duration.ofSeconds(60),deadline,true),deadline.remaining()).observer();
         });
     }
-    private CompletableFuture<Long> open(Duration ttl,Deadline deadline) { return open(ttl,deadline,Mode.EXPLICIT); }
-    CompletableFuture<Long> openAt(long id,Duration ttl,RequestContext context){if(id<=0)return CompletableFuture.failedFuture(new IllegalArgumentException("Invalid connection transaction identity"));return open(ttl,new Deadline(context),Mode.EXPLICIT,id);}
-    private CompletableFuture<Long> open(Duration ttl,Deadline deadline,Mode mode) {return open(ttl,deadline,mode,0);}
-    private CompletableFuture<Long> open(Duration ttl,Deadline deadline,Mode mode,long forcedId) {
+    private TransactionScope scope(TransactionOpenScope declaration) { return scope(schema,directory,declaration); }
+    static TransactionScope scope(DistributedSchema schema,RangeDirectory directory,TransactionOpenScope declaration) {
+        if (declaration==null) throw RocksDBException.of(TX_SCOPE_REQUIRED,"Distributed transactions require an explicit bounded scope");
+        var spans=new ArrayList<TransactionScope.Span>();
+        for (var span:declaration.spans()) {
+            var column=schema.column(span.columnId()).columnId();
+            spans.add(span.point() ? TransactionScope.Span.point(column,schema.encodeLogicalKey(column,span.lowerInclusive()).physicalKey())
+                    : TransactionScope.Span.range(column,RatisLogicalRangePages.bound(schema,column,span.lowerInclusive()),RatisLogicalRangePages.upperBound(schema,column,span.upperExclusive())));
+        }
+        var scope=new TransactionScope(spans); scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS); return scope;
+    }
+    private CompletableFuture<Long> open(TransactionOpenScope declaration,Duration ttl,Deadline deadline) {
+        try { return open(scope(declaration),ttl,deadline,Mode.EXPLICIT); }
+        catch (Throwable failure) { return CompletableFuture.failedFuture(failure); }
+    }
+    private CompletableFuture<Long> open(Duration ttl,Deadline deadline,Mode mode) {
+        return open(new TransactionScope(schema.columns().stream().map(column -> TransactionScope.Span.range(column.columnId(),null,null)).toList()),ttl,deadline,mode);
+    }
+    private CompletableFuture<Long> open(TransactionScope scope,Duration ttl,Deadline deadline,Mode mode) {
         try {
             if (Objects.requireNonNull(ttl).isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Transaction TTL must be whole milliseconds up to60seconds");
-            var scope=new TransactionScope(schema.columns().stream().map(column -> TransactionScope.Span.range(column.columnId(),null,null)).toList()); scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
+            scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
             final Entry entry;
             synchronized (this) { if (closing || entries.size()>=MAX_TRANSACTIONS) throw RocksDBException.of(SERVER_OVERLOADED,"Transaction ID capacity exhausted");
-                long id=forcedId==0?handleIds.getAsLong():forcedId; if (id<=0 || entries.containsKey(id)) throw new IllegalStateException("Shared handle allocator returned an invalid or reused ID"); entry=new Entry(id,mode); entries.put(entry.id,entry); }
+                long id=handleIds.getAsLong(); if (id<=0 || entries.containsKey(id)) throw new IllegalStateException("Shared handle allocator returned an invalid or reused ID"); entry=new Entry(id,mode); entries.put(entry.id,entry); }
             var view=new CompletableFuture<Long>();
             CompletableFuture<Allocation> allocation;
             try { allocation=Objects.requireNonNull(allocations.allocate(deadline.remaining())); }
             catch (Throwable failure) { synchronized (this) { entries.remove(entry.id,entry); } return CompletableFuture.failedFuture(failure); }
-            allocation.thenCompose(saved -> {
+            var acquired=allocation.thenCompose(saved -> {
                 try { entry.lease=transactions.open(saved.snapshot(),saved.commit(),saved.identity(),scope,ttl,deadline.remaining()); return entry.lease.completion(); }
                 catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
             }).whenComplete((ignored,failure) -> {
@@ -271,6 +292,8 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
                 if (view.isCancelled()) entry.orphan=true;
                 if (entry.orphan) orphanCleanup(entry);
             });
+            track(acquired);
+            var tracker=tracking.get(); if (tracker!=null) tracker.cancel.add(() -> view.cancel(false));
             return view;
         } catch (Throwable failure) { return CompletableFuture.failedFuture(failure); }
     }

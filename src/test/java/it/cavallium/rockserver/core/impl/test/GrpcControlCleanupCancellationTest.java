@@ -164,7 +164,7 @@ class GrpcControlCleanupCancellationTest {
 		long columnId = sync.createColumn("protected-cleanup",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 		sync.put(0, columnId, key(1), Buf.wrap(new byte[] {1}), RequestType.none());
-		long transactionId = sync.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
+		long transactionId = sync.openTransaction(null,  java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
 		long iteratorId = async.openIteratorAsync(0,
 				columnId,
 				new Keys(),
@@ -207,7 +207,7 @@ class GrpcControlCleanupCancellationTest {
 		var client = newClient();
 		var sync = client.getSyncApi(RequestContext.batch());
 		var async = client.getAsyncApi(RequestContext.batch());
-		long transactionId = sync.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
+		long transactionId = sync.openTransaction(null,  java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
 		var scheduler = embeddedConnection.getScheduler();
 		var ingestWriteExecutor = scheduler.executor(RequestContext.ingest(), OperationFamily.MUTATION);
 		var blockedWrite = blockLane(3, ingestWriteExecutor::execute);
@@ -234,7 +234,7 @@ class GrpcControlCleanupCancellationTest {
 		replaceServer(recordingBackend);
 		var client = newClient();
 		long transactionId = client.getSyncApi(RequestContext.batch())
-				.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
+				.openTransaction(null,  java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
 		var expiredCallerContext = RequestContext.batch(java.time.Duration.ofNanos(1));
 
 		assertTrue(client.getAsyncApi(expiredCallerContext)
@@ -446,7 +446,7 @@ class GrpcControlCleanupCancellationTest {
 	void cancelledRunningExplicitPointReadKeepsNativeOwnerUntilProtectedRollbackCanEnter() throws Exception {
 		long column = newForUpdateColumn();
 		var owner = embeddedConnection.getSyncApi(RequestContext.ingest());
-		long id = owner.openTransaction(Duration.ofMinutes(1));
+		long id = owner.openTransaction(null, Duration.ofMinutes(1));
 		var probe = TransactionCloseConcurrencyTest.replaceNativeTransaction(
 				embeddedConnection.getInternalDB(), id, Long.MAX_VALUE);
 		probe.blockMethod = "get";
@@ -520,7 +520,7 @@ class GrpcControlCleanupCancellationTest {
 	void cancelledRunningForUpdatePreservesExistingOwner(boolean explicitTransaction) throws Exception {
 		long column = newForUpdateColumn();
 		var owner = embeddedConnection.getSyncApi(RequestContext.ingest());
-		long id = explicitTransaction ? owner.openTransaction(Duration.ofMinutes(1))
+		long id = explicitTransaction ? owner.openTransaction(null, Duration.ofMinutes(1))
 				: owner.get(0, column, key(1), RequestType.forUpdate()).updateId();
 		var backend = new BlockingForUpdateConnection(embeddedConnection);
 		var cancelled = new CountDownLatch(1);

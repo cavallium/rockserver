@@ -23,7 +23,7 @@ class TransactionDeadlineOverflowTest {
 				"transaction-deadline-overflow", null)) {
 			EmbeddedDB internal = connection.getInternalDB();
 			var api = connection.getSyncApi(RequestContext.batch());
-			long transactionId = api.openTransaction( java.time.Duration.ofMillis(Long.MAX_VALUE));
+			long transactionId = api.openTransaction(null,  java.time.Duration.ofMillis(Long.MAX_VALUE));
 
 			assertEquals(1, internal.getOpenTransactionsCount());
 			assertEquals(1L, internal.getPendingOpsCount(),
@@ -50,7 +50,7 @@ class TransactionDeadlineOverflowTest {
 			var api = connection.getSyncApi(RequestContext.batch());
 
 			assertThrows(IllegalArgumentException.class,
-					() -> api.openTransaction(java.time.Duration.ofMillis(-1L)));
+					() -> api.openTransaction(null, java.time.Duration.ofMillis(-1L)));
 			assertEquals(0, internal.getOpenTransactionsCount());
 			assertEquals(0L, internal.getPendingOpsCount(),
 					"invalid timeout admission must not allocate or retain a native resource");

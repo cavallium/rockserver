@@ -176,8 +176,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	}
 
 	@Override
-	public long openTransaction(Duration transactionLeaseTtl) {
-		return db.openTransaction(LeaseTtl.toMillisCeil(transactionLeaseTtl, "transactionLeaseTtl"),
+	public long openTransaction(it.cavallium.rockserver.core.common.TransactionOpenScope scope, Duration transactionLeaseTtl) {
+		return db.openTransaction(scope, LeaseTtl.toMillisCeil(transactionLeaseTtl, "transactionLeaseTtl"),
 				currentRequestContext().profile());
 	}
 

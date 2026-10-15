@@ -60,15 +60,17 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
             while (closed<resources.size()) { try { resources.get(closed).close(); closed++; } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Generation resource close failed",failure); } }
         }
     }
-    public record DirectRecovery(byte[] schemaDigest,long schemaEpoch,RatisRocksDBDirect.RecoveryState state) {
-        public DirectRecovery { schemaDigest=schemaDigest.clone(); }
+    public record DirectRecovery(byte[] schemaDigest,byte[] directoryDigest,long schemaEpoch,RatisRocksDBDirect.RecoveryState state) {
+        public DirectRecovery { schemaDigest=schemaDigest.clone(); directoryDigest=directoryDigest.clone(); }
         @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
+        @Override public byte[] directoryDigest() { return directoryDigest.clone(); }
     }
     /** Bounds apply to one copied KVBatch's complete encoded group commands; chunks are independently atomic. */
     public record BatchLimits(int maximumInputItems,int maximumEncodedInputBytes,int maximumChunkItems,int maximumEncodedChunkBytes) {}
-    public record BatchRecovery(byte[] schemaDigest,long schemaEpoch,RatisRocksDBBatches.RecoveryState state,RatisRocksDBBatches.Progress progress) {
-        public BatchRecovery { schemaDigest=schemaDigest.clone(); }
+    public record BatchRecovery(byte[] schemaDigest,byte[] directoryDigest,long schemaEpoch,RatisRocksDBBatches.RecoveryState state,RatisRocksDBBatches.Progress progress) {
+        public BatchRecovery { schemaDigest=schemaDigest.clone(); directoryDigest=directoryDigest.clone(); }
         @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
+        @Override public byte[] directoryDigest() { return directoryDigest.clone(); }
     }
     public BatchLimits batchLimits() { return new BatchLimits(RatisRocksDBBatches.MAX_INPUT_ITEMS,RatisRocksDBBatches.MAX_INPUT_BYTES,RatisRocksDBBatches.MAX_CHUNK_ITEMS,RatisRocksDBBatches.MAX_CHUNK_BYTES); }
     public static GenerationFactory durableGenerationFactory(RatisRoutedClient routed,RWScheduler scheduler,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RatisSessionEpochs epochs,RatisCatalogue directories,RatisRoutedClient.SourceAckDirectoryReader acknowledgementDirectories,RatisRocksDBAdapter.AllocationSource allocations,SessionFactory sessions,List<AutoCloseable> generationOwned,RatisRequestBudget budget) {
@@ -84,7 +86,7 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
                 for(var actor:points.all())if(actor.owner().ownerId().equals(bulkSession.grant().sessionId()) && actor.owner().ownerEpoch()==bulkSession.grant().epoch())throw new IOException("Point and bulk sessions require distinct exclusively owned grants");
                 bulkSession.installReroutes(root.resolve("bulk-reroutes"),schema,epochs,routed,transactionHomes,scheduler,directories,acknowledgementDirectories,budget);
                 batches=new RatisRocksDBBatches(schema,directory,routed,bulkSession,scheduler,root.resolve("bulk"),RatisRocksDBBatches.SessionOwnership.OWNED,budget,bulkCredit); bulkSession=null;bulkCredit=null;budget.fulfilled(bulkPaths);
-                tx=RatisTransactionClient.journalOwned(schema,snapshotHomes,transactionHomes,routed,scheduler,RatisTransactionClient.Limits.defaults(),budget); snapshots=RatisSnapshotClient.journalOwned(schema,snapshotHomes,routed,scheduler,RatisSnapshotClient.Limits.defaults(),RatisSnapshotCaptureRequest.Mode.READ_ONLY,budget); ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations);
+                tx=RatisTransactionClient.journalOwned(schema,directory,snapshotHomes,transactionHomes,routed,scheduler,RatisTransactionClient.Limits.defaults(),budget); snapshots=RatisSnapshotClient.journalOwned(schema,directory,snapshotHomes,routed,scheduler,RatisSnapshotClient.Limits.defaults(),RatisSnapshotCaptureRequest.Mode.READ_ONLY,budget); ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations);
                 Path rangeRoot=root.resolve("range-delete");
                 rangeCredit=budget.owner(RemoteMutationToken.Kind.RANGE,4L*(DistributedSchemaCodec.encodedSize(schema)+RangeDirectoryCodec.encodedSize(directory)),RatisRequestBudget.files(rangeRoot.resolve("input"),rangeRoot.resolve("input.pending"),rangeRoot.resolve("atomic"),rangeRoot.resolve("atomic.pending")));
                 rangeDeletes=new RatisRangeDeleteClient(schema,directory,routed,transactionHomes,scheduler,allocations,rangeRoot,budget,rangeCredit);rangeCredit=null;var generation=new Generation(new RatisRocksDBAdapter(schema,directory,tx,allocations,direct,ranges,ids,batches).rangeDeletes(rangeDeletes),direct,ranges,tx,snapshots,generationResources(rangeDeletes,bulkOwner,transferred),batches);generation.points=points;return generation;
@@ -98,11 +100,6 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     private volatile Thread dataWorker;
     private final java.util.concurrent.locks.ReentrantLock closeOwner=new java.util.concurrent.locks.ReentrantLock();
     private boolean stopping,closed; private int dataOwners,dependencyClosed; private long nextId,idLimit;
-    private static final class LazyTransaction {
-        final long id,leaseDeadline;RatisGenerationRegistry.Owned owner;CompletableFuture<Void> ready;
-        LazyTransaction(long id,long leaseDeadline){this.id=id;this.leaseDeadline=leaseDeadline;}
-    }
-    private final Map<Long,LazyTransaction> transactions=new LinkedHashMap<>();
     /** All supplied transports/schedulers/allocators are borrowed unless listed in ownedDependencies. Factory generations are owned. */
     public RatisRocksDBConnection(URI uri,Path root,Map<UUID,RatisRoutedClient> routed,DomainPlacement placement,RWScheduler scheduler,RatisNodePlan.Catalogue binding,RaftClient catalogue,RatisSchemaReplicaClient replicas,RatisOperatorCatalogue operators,RatisSchemaClient.TrustedOperatorResolver resolver,GenerationFactory factory,Limits limits,List<AutoCloseable> ownedDependencies,RatisJournalAccess journalAccess) throws IOException {
         this.journalAccess=Objects.requireNonNull(journalAccess);
@@ -176,23 +173,10 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     private static long column(RocksDBAPICommand<?,?,?> request) {
         return switch(request){case Put<?> r->r.columnId();case PutMulti<?> r->r.columnId();case Delete<?> r->r.columnId();case DeleteMulti<?> r->r.columnId();case DeleteRange r->r.columnId();case Merge<?> r->r.columnId();case MergeMulti<?> r->r.columnId();case PutBatch r->r.columnId();case MergeBatch r->r.columnId();case Get<?> r->r.columnId();case ExistsMulti r->r.columnId();case OpenIterator r->r.columnId();case GetRangePage<?> r->r.columnId();case ReduceRange<?> r->r.columnId();case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> r->r.columnId();default->0;};
     }
-    private synchronized long openLazy(Duration ttl)throws IOException {
-        RatisSnapshotCaptureRequest.requireTtl(ttl,RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED);if(transactionCount()>=RatisRocksDBAdapter.MAX_TRANSACTIONS)throw new IOException("Database transaction handle capacity exhausted");long id=nextHandle();transactions.put(id,new LazyTransaction(id,clock.bindTimeoutNanos(ttl.toNanos())));return id;
-    }
-    private synchronized int transactionCount(){int count=0;for(var owner:generations.all())count+=owner.generation().adapter().stats().transactions();for(var tx:transactions.values())if(tx.owner==null)count++;return count;}
+    private synchronized int transactionCount(){int count=0;for(var owner:generations.all())count+=owner.generation().adapter().stats().transactions();return count;}
     private CompletableFuture<RatisGenerationRegistry.Owned> owner(RocksDBAPICommand<?,?,?> request,RequestContext context)throws IOException {
         long id=handle(request),column=column(request),iterator=iterator(request);
         if(iterator!=0)return CompletableFuture.completedFuture(generations.iterator(iterator));
-        LazyTransaction lazy;synchronized(this){lazy=transactions.get(id);}
-        if(lazy!=null){
-            final var transaction=lazy;var candidate=column==0?null:generations.column(column);final RatisGenerationRegistry.Owned selected;boolean bind=false;Duration ttl=null;
-            synchronized(this){
-                if(lazy.owner==null){if(candidate==null)throw new IOException("Transaction has no concrete domain");long remaining=clock.remainingMonotonicDeadlineNanos(lazy.leaseDeadline);if(remaining<1_000_000L)throw new IOException("Original lazy transaction lease expired");lazy.owner=candidate;lazy.ready=new CompletableFuture<>();ttl=Duration.ofMillis(remaining/1_000_000L);bind=true;}
-                selected=lazy.owner;if(candidate!=null && !candidate.schema().domainId().equals(selected.schema().domainId()) || column!=0 && selected.schema().columns().stream().noneMatch(c->c.apiId()==column))throw new IOException("A transaction cannot cross database domains or its frozen schema");
-            }
-            if(bind)try{selected.generation().adapter().openAt(id,ttl,context).whenComplete((ignored,failure)->{if(failure==null)transaction.ready.complete(null);else transaction.ready.completeExceptionally(unwrap(failure));});}catch(Throwable failure){lazy.ready.completeExceptionally(failure);}
-            return request instanceof CloseTransaction ? lazy.ready.handle((ignored,failure)->selected) : lazy.ready.thenApply(ignored->selected);
-        }
         if(id!=0){var selected=generations.transaction(id);if(column!=0 && selected.schema().columns().stream().noneMatch(c->c.apiId()==column))throw new IOException("Original handle cannot cross database domains");return CompletableFuture.completedFuture(selected);}
         if(column!=0)return CompletableFuture.completedFuture(generations.column(column));
         if(request instanceof GetColumnId named){var selected=generations.column(named.name());if(selected==null)throw new IOException("Unknown database column name");return CompletableFuture.completedFuture(selected);}
@@ -240,24 +224,22 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
             final java.util.concurrent.atomic.AtomicReference<RatisGenerationRegistry.Owned> selected=new java.util.concurrent.atomic.AtomicReference<>();
             try {
                 remaining(context,deadline); if (view.isCancelled()) throw new CancellationException("Connection observer cancelled before DATA dispatch");
-                if(original instanceof OpenTransaction open){actual=CompletableFuture.completedFuture(openLazy(open.transactionLeaseTtl()));}
-                else if(original instanceof CloseTransaction close && unbound(close.transactionId())){synchronized(this){transactions.remove(close.transactionId());}actual=CompletableFuture.completedFuture(true);}
-                else if(original instanceof RocksDBAPICommand.GetAllColumnDefinitions){var definitions=new LinkedHashMap<String,ColumnSchema>();for(var generation:generations.current())for(var binding:generation.schema().columns())if(definitions.putIfAbsent(binding.name(),binding.schema())!=null)throw new IOException("Ambiguous database column name");actual=CompletableFuture.completedFuture(Collections.unmodifiableMap(definitions));}
+                if(original instanceof RocksDBAPICommand.GetAllColumnDefinitions){var definitions=new LinkedHashMap<String,ColumnSchema>();for(var generation:generations.current())for(var binding:generation.schema().columns())if(definitions.putIfAbsent(binding.name(),binding.schema())!=null)throw new IOException("Ambiguous database column name");actual=CompletableFuture.completedFuture(Collections.unmodifiableMap(definitions));}
                 else {
-                    long handle=handle(original),iterator=iterator(original);if(handle==0 && iterator==0 && !original.isReadOnly())for(var generation:generations.all()){
+                    long handle=handle(original),iterator=iterator(original);if(handle==0 && iterator==0 && !original.isReadOnly() && !(original instanceof OpenTransaction))for(var generation:generations.all()){
                         if(generation.generation().direct()!=null && generation.generation().direct().recoveryState()!=RatisRocksDBDirect.RecoveryState.NONE)throw new IOException("Resolve the original generation's retained direct request before fresh mutation");
                         if(generation.generation().adapter().rangeDeletes()!=null && generation.generation().adapter().rangeDeletes().recoveryState()!=RatisRocksDBDirect.RecoveryState.NONE)throw new IOException("Resolve the original generation's retained range deletion before fresh mutation");
                         if(generation.generation().batches()!=null && generation.generation().batches().recoveryState()!=RatisRocksDBBatches.RecoveryState.NONE)throw new IOException("Resolve the original generation's retained batch request before fresh mutation");
                     }
                     var actualDrain=new CompletableFuture<Void>();drained=actualDrain;
-                    actual=owner(original,remaining(context,deadline)).thenCompose(owner->{selected.set(owner);try{remaining(context,deadline);if(view.isCancelled())throw new CancellationException("Connection observer cancelled before native dispatch");if(original instanceof Get<?> get && get.requestType().getRequestTypeId()==RequestType.RequestTypeId.FOR_UPDATE && transactionCount()>=RatisRocksDBAdapter.MAX_TRANSACTIONS)throw new IOException("Database transaction/update capacity exhausted");var dispatched=owner.generation().adapter().dispatchOwned(original,remaining(context,deadline));cancelDelegate.set(dispatched.cancelObserver());if(view.isCancelled())dispatched.cancelObserver().run();dispatched.drained().whenComplete((ignored,failure)->actualDrain.complete(null));Object delegated=dispatched.observer();return streamOwner!=null?CompletableFuture.completedFuture(delegated):((CompletableFuture<?>)delegated).thenApply(value->(Object)value);}catch(Throwable failure){actualDrain.complete(null);return CompletableFuture.failedFuture(failure);}});
-                    actual.whenComplete((value,failure)->{if(failure!=null && selected.get()==null)actualDrain.complete(null);if(original instanceof CloseTransaction close && selected.get()!=null && !selected.get().generation().adapter().ownsTransactionOrUpdate(close.transactionId()))synchronized(RatisRocksDBConnection.this){transactions.remove(close.transactionId());}});
+                    var declaration=original instanceof OpenTransaction open ? generations.scope(open.scope()) : null;
+                    actual=(declaration==null ? owner(original,remaining(context,deadline)) : CompletableFuture.completedFuture(declaration.owner())).thenCompose(owner->{selected.set(owner);try{remaining(context,deadline);if(view.isCancelled())throw new CancellationException("Connection observer cancelled before native dispatch");if((original instanceof OpenTransaction || original instanceof Get<?> get && get.requestType().getRequestTypeId()==RequestType.RequestTypeId.FOR_UPDATE) && transactionCount()>=RatisRocksDBAdapter.MAX_TRANSACTIONS)throw new IOException("Database transaction/update capacity exhausted");var dispatched=original instanceof OpenTransaction open ? owner.generation().adapter().openOwned(declaration.scope(),open.transactionLeaseTtl(),remaining(context,deadline)) : owner.generation().adapter().dispatchOwned(original,remaining(context,deadline));cancelDelegate.set(dispatched.cancelObserver());if(view.isCancelled())dispatched.cancelObserver().run();dispatched.drained().whenComplete((ignored,failure)->actualDrain.complete(null));Object delegated=dispatched.observer();return streamOwner!=null?CompletableFuture.completedFuture(delegated):((CompletableFuture<?>)delegated).thenApply(value->(Object)value);}catch(Throwable failure){actualDrain.complete(null);return CompletableFuture.failedFuture(failure);}});
+                    actual.whenComplete((value,failure)->{if(failure!=null && selected.get()==null)actualDrain.complete(null);});
                 }
             } catch (Throwable failure) { drained.complete(null);actual=CompletableFuture.failedFuture(failure); }
             record Acquired(Object value,Throwable failure) {}
             var cleanup=actual.handle((value,failure) -> new Acquired(value,failure)).thenCombine(view.delivered,(acquired,delivered) -> {
                 var value=acquired.value(); var failure=acquired.failure();
-                if(!delivered && failure==null && original instanceof OpenTransaction && value instanceof Long id)synchronized(RatisRocksDBConnection.this){transactions.remove(id);}
                 if (delivered || failure!=null || selected.get()==null) return CompletableFuture.<Void>completedFuture(null);
                 RocksDBAPICommand<?,?,?> release=null;
                 if (original instanceof OpenTransaction && value instanceof Long id) release=new CloseTransaction(id,false);
@@ -272,7 +254,6 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
         try { dataLane.execute(dispatch); } catch (RejectedExecutionException failure) { if (streamOwner!=null) streamOwner.selected(); else synchronized (this) { dataOwners--; } if (view.claimDelivery()) { view.delivered.complete(true); view.completeExceptionally(failure); } }
         return view;
     }
-    private synchronized boolean unbound(long id){var tx=transactions.get(id);return tx!=null && tx.owner==null;}
     private static <T> CompletableFuture<T> schemaObserver(CompletableFuture<RatisSchemaRequests.Result> original,java.util.function.Function<RatisSchemaRequests.Result,T> mapper) {
         var view=original.thenApply(mapper); view.whenComplete((value,failure) -> { if (view.isCancelled()) original.cancel(false); }); return view;
     }
@@ -301,12 +282,12 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     public CompletableFuture<Void> acknowledgeRemoteMutation(RemoteMutationToken token,byte[] resultDigest,RequestContext context) {byte[] frozen=resultDigest.clone();return diagnostic(context,remaining -> {var generation=originalMutationGeneration(token).generation();switch(token.kind()){case POINT -> generation.point(token).acknowledgeResult(token,frozen);case RANGE -> generation.adapter().rangeDeletes().acknowledgeResult(token,frozen);case BULK -> generation.batches().acknowledgeResult(token,frozen);}return CompletableFuture.completedFuture(null);});}
     public CompletableFuture<RatisRocksDBBatches.Progress> appendRemoteBatch(RemoteMutationToken token,long ordinal,KVBatch batch,byte[] inputDigest,RequestContext context) {byte[] frozen=inputDigest.clone();return diagnosticOwned(context,remaining -> {if(token.kind()!=RemoteMutationToken.Kind.BULK)throw new IOException("Expected bulk token");var actor=originalMutationGeneration(token).generation().batches();var observer=actor.append(token,ordinal,batch,frozen,remaining);return new OwnedDiagnostic<>(observer,actor.actualCompletion(observer),() -> observer.cancel(false));});}
     public CompletableFuture<RatisRocksDBBatches.Progress> finishRemoteInput(RemoteMutationToken token,RequestContext context) {return diagnosticOwned(context,remaining -> {if(token.kind()!=RemoteMutationToken.Kind.BULK)throw new IOException("Expected bulk token");var actor=originalMutationGeneration(token).generation().batches();var observer=actor.finishInput(token,remaining);return new OwnedDiagnostic<>(observer,actor.actualCompletion(observer),() -> observer.cancel(false));});}
-    public CompletableFuture<List<DirectRecovery>> rangeDeleteRecoveryStatus(RequestContext context){return diagnostic(context,remaining->{var states=new ArrayList<DirectRecovery>();for(var generation:generations.all()){var owner=generation.generation().adapter().rangeDeletes();if(owner!=null)states.add(new DirectRecovery(generation.schema().digest(),generation.schema().schemaEpoch(),owner.recoveryState()));}return CompletableFuture.completedFuture(List.copyOf(states));});}
-    public CompletableFuture<Void> resumeRangeDelete(byte[] schemaDigest,RequestContext context){byte[] frozen=schemaDigest.clone();return diagnosticOwned(context,remaining->{for(var generation:generations.all())if(Arrays.equals(generation.schema().digest(),frozen)){var owner=generation.generation().adapter().rangeDeletes();if(owner!=null){var result=owner.resume(remaining);return new OwnedDiagnostic<>(result.observer(),result.drained(),result.cancel());}}throw new IOException("Unknown original range deletion generation");});}
-    public CompletableFuture<List<DirectRecovery>> directRecoveryStatus(RequestContext context) { return diagnostic(context,remaining -> { var states=new ArrayList<DirectRecovery>(); for (var generation:generations.all()) if (generation.generation().direct()!=null) states.add(new DirectRecovery(generation.schema().digest(),generation.schema().schemaEpoch(),generation.generation().direct().recoveryState())); return CompletableFuture.completedFuture(List.copyOf(states)); }); }
-    public CompletableFuture<Object> resumeDirectRequest(byte[] schemaDigest,RequestContext context) { byte[] frozen=schemaDigest.clone(); return diagnostic(context,remaining -> { for (var generation:generations.all()) if (Arrays.equals(generation.schema().digest(),frozen) && generation.generation().direct()!=null) return generation.generation().direct().resumeRetained(remaining); return CompletableFuture.failedFuture(new IOException("Unknown original direct generation")); }); }
+    public CompletableFuture<List<DirectRecovery>> rangeDeleteRecoveryStatus(RequestContext context){return diagnostic(context,remaining->{var states=new ArrayList<DirectRecovery>();for(var generation:generations.all()){var owner=generation.generation().adapter().rangeDeletes();if(owner!=null)states.add(new DirectRecovery(generation.schema().digest(),generation.directory().payloadDigest(),generation.schema().schemaEpoch(),owner.recoveryState()));}return CompletableFuture.completedFuture(List.copyOf(states));});}
+    public CompletableFuture<Void> resumeRangeDelete(byte[] schemaDigest,byte[] directoryDigest,RequestContext context){byte[] frozen=schemaDigest.clone(),placement=directoryDigest.clone();return diagnosticOwned(context,remaining->{for(var generation:generations.all())if(Arrays.equals(generation.schema().digest(),frozen) && Arrays.equals(generation.directory().payloadDigest(),placement)){var owner=generation.generation().adapter().rangeDeletes();if(owner!=null){var result=owner.resume(remaining);return new OwnedDiagnostic<>(result.observer(),result.drained(),result.cancel());}}throw new IOException("Unknown original range deletion generation");});}
+    public CompletableFuture<List<DirectRecovery>> directRecoveryStatus(RequestContext context) { return diagnostic(context,remaining -> { var states=new ArrayList<DirectRecovery>(); for (var generation:generations.all()) if (generation.generation().direct()!=null) states.add(new DirectRecovery(generation.schema().digest(),generation.directory().payloadDigest(),generation.schema().schemaEpoch(),generation.generation().direct().recoveryState())); return CompletableFuture.completedFuture(List.copyOf(states)); }); }
+    public CompletableFuture<Object> resumeDirectRequest(byte[] schemaDigest,byte[] directoryDigest,RequestContext context) { byte[] frozen=schemaDigest.clone(),placement=directoryDigest.clone(); return diagnostic(context,remaining -> { for (var generation:generations.all()) if (Arrays.equals(generation.schema().digest(),frozen) && Arrays.equals(generation.directory().payloadDigest(),placement) && generation.generation().direct()!=null) return generation.generation().direct().resumeRetained(remaining); return CompletableFuture.failedFuture(new IOException("Unknown original direct generation")); }); }
     public CompletableFuture<List<BatchRecovery>> batchRecoveryStatus(RequestContext context) {
-        return diagnostic(context,remaining -> { var states=new ArrayList<BatchRecovery>(); for(var generation:generations.all()) if(generation.generation().batches()!=null) { var batches=generation.generation().batches(); states.add(new BatchRecovery(generation.schema().digest(),generation.schema().schemaEpoch(),batches.recoveryState(),batches.progress())); } return CompletableFuture.completedFuture(List.copyOf(states)); });
+        return diagnostic(context,remaining -> { var states=new ArrayList<BatchRecovery>(); for(var generation:generations.all()) if(generation.generation().batches()!=null) { var batches=generation.generation().batches(); states.add(new BatchRecovery(generation.schema().digest(),generation.directory().payloadDigest(),generation.schema().schemaEpoch(),batches.recoveryState(),batches.progress())); } return CompletableFuture.completedFuture(List.copyOf(states)); });
     }
     private record OwnedDiagnostic<T>(CompletableFuture<T> observer,CompletableFuture<Void> drained,Runnable cancelObserver) {}
     @FunctionalInterface private interface OwnedDiagnosticWork<T> { OwnedDiagnostic<T> run(RequestContext remaining) throws Exception; }
@@ -348,7 +329,7 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
         // Retry only already stopped stream cleanup; actual owners remain charged through its drain.
         for(var generation:generations.all()) generation.generation().adapter().retryStoppedFlowsCleanup();
         synchronized(this) { if(dataOwners!=0) throw new IOException("Connection DATA/refresh work active; ownership retained"); }
-        cdc.close(); schemas.close(); generations.close();synchronized(this){transactions.clear();}
+        cdc.close(); schemas.close(); generations.close();
         while (dependencyClosed<ownedDependencies.size()) { try { ownedDependencies.get(dependencyClosed).close(); dependencyClosed++; } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Owned dependency close failed",failure); } }
         dataLane.shutdown(); if(lock.isValid())lock.release(); ownership.close();rootOwnership.close(); synchronized (this) { closed=true; }
         } finally { closeOwner.unlock(); }

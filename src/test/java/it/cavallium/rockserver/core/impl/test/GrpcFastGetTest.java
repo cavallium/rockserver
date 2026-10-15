@@ -81,7 +81,7 @@ class GrpcFastGetTest {
 			long columnId = populate(embedded);
 			var embeddedApi = embedded.getSyncApi(
 					it.cavallium.rockserver.core.common.RequestContext.batch());
-			long rollbackTransaction = embeddedApi.openTransaction(java.time.Duration.ofMinutes(1L));
+			long rollbackTransaction = embeddedApi.openTransaction(null, java.time.Duration.ofMinutes(1L));
 			try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 				server.start();
 				try (var client = ClientHandle.forTcp("127.0.0.1", server.getPort())) {
@@ -190,7 +190,7 @@ class GrpcFastGetTest {
 		try (var embedded = openEmbedded("fallbacks")) {
 			long columnId = populate(embedded);
 			var api = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-			long transactionId = api.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
+			long transactionId = api.openTransaction(null,  java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
 			byte[] transactionValue = value(42, 513);
 			api.put(transactionId, columnId, keys(42), Buf.wrap(transactionValue), RequestType.none());
 			System.setProperty("rockserver.grpc.fast-get.strategy", "automatic");

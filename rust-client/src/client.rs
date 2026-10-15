@@ -1,7 +1,7 @@
 use crate::proto::rocks_db_service_client::RocksDbServiceClient;
 use crate::proto::*; // For request/response types
 use crate::types::*;
-use crate::types::{Column, ColumnSchema};
+use crate::types::{Column, ColumnSchema, TransactionOpenScope};
 use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter};
@@ -284,15 +284,17 @@ impl RockserverClient {
     // Transaction Management
     // ============================================================================================
 
-    /// Opens a new transaction with the specified timeout.
+    /// Captures a transaction snapshot eagerly for the declared logical scope.
     ///
     /// # Arguments
-    /// * `timeout_ms` - The transaction timeout in milliseconds.
+    /// * `scope` - Required for distributed storage; `None` captures the standalone database.
+    /// * `transaction_lease_ttl` - The transaction lease lifetime.
     ///
     /// # Returns
     /// The transaction ID.
-    pub async fn open_transaction(&self, transaction_lease_ttl: Duration) -> Result<i64> {
+    pub async fn open_transaction(&self, scope: Option<TransactionOpenScope>, transaction_lease_ttl: Duration) -> Result<i64> {
         let req = OpenTransactionRequest {
+            scope: scope.map(TryInto::try_into).transpose()?,
             transaction_lease_ttl_nanos: duration_nanos(transaction_lease_ttl)?,
             context: Some(self.context.clone()),
         };

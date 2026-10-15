@@ -24,7 +24,7 @@ class RatisGenerationRetryTest {
             };
             var limits=RatisRocksDBConnection.Limits.defaults();
             assertThrows(IOException.class,() -> new RatisRocksDBConnection(URI.create("ratis://controlled/retry"),f.connectionRoot,java.util.Map.of(f.direct.f.schema.domainId(),f.direct.routed),(name,shape)->f.direct.f.schema.domainId(),f.direct.f.scheduler,f.binding,f.direct.f.catalogue.client,replicas,null,null,factory,limits,List.of(), RatisJournalAccess.standalone()));
-            Path binding=f.connectionRoot.resolve("generations").resolve(HexFormat.of().formatHex(f.direct.f.schema.digest())).resolve("binding");
+            Path binding=f.connectionRoot.resolve("generations").resolve(RatisGenerationRegistry.key(f.direct.f.schema,f.direct.routed.directory())).resolve("binding");
             byte[] original=Files.readAllBytes(binding);
             try (var recovered=new RatisRocksDBConnection(URI.create("ratis://controlled/retry"),f.connectionRoot,java.util.Map.of(f.direct.f.schema.domainId(),f.direct.routed),(name,shape)->f.direct.f.schema.domainId(),f.direct.f.scheduler,f.binding,f.direct.f.catalogue.client,replicas,null,null,factory,limits,List.of(), RatisJournalAccess.standalone())) {
                 assertEquals(71,recovered.getSyncApi(RequestContext.batch()).getColumnId("atomic-0"));

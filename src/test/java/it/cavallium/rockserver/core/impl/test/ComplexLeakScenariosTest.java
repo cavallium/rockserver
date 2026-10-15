@@ -105,7 +105,7 @@ database: {
     void expired_tx_and_iterators_are_cleaned_up_without_waiting_scheduler() {
         var internal = db.getInternalDB();
         // Open a tx with tiny timeout so it expires immediately
-        long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(1));
+        long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(null,  java.time.Duration.ofMillis(1));
         // Open an iterator with tiny timeout
         var key = new Keys(new Buf[]{Buf.wrap(intKey(1))});
         long itId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIterator(txId, colId, key, null, false, java.time.Duration.ofMillis( 1));

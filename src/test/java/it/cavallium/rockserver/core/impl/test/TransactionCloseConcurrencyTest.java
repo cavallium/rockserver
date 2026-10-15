@@ -53,7 +53,7 @@ class TransactionCloseConcurrencyTest {
 	void duplicateCommitsSerializeAndBalanceTheTransactionOnce() throws Exception {
 		try (var db = new EmbeddedConnection(tempDir.resolve("duplicate-close"), "duplicate-close", null)) {
 			EmbeddedDB internal = db.getInternalDB();
-			long transactionId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(10_000));
+			long transactionId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(null,  java.time.Duration.ofMillis(10_000));
 			Object transactionMonitor = getTransactionMonitor(internal, transactionId);
 			assertEquals(1, internal.getOpenTransactionsCount());
 			assertEquals(1, internal.getPendingOpsCount());
@@ -369,7 +369,7 @@ class TransactionCloseConcurrencyTest {
 
 	private static long openTransaction(EmbeddedConnection connection, long column, boolean owned) {
 		return owned ? connection.getInternalDB().get(0, column, key(1), RequestType.forUpdate(), WorkloadProfile.INGEST).updateId()
-				: connection.getSyncApi(RequestContext.ingest()).openTransaction(java.time.Duration.ofMinutes(1));
+				: connection.getSyncApi(RequestContext.ingest()).openTransaction(null, java.time.Duration.ofMinutes(1));
 	}
 
 	private static Stream<Arguments> mutationAndFailure() {
@@ -402,7 +402,7 @@ class TransactionCloseConcurrencyTest {
 		var transactions = transactionMap(db);
 		var old = transactions.get(id);
 		var probe = new NativeProbe(old.val());
-		transactions.put(id, new Tx(probe.wrapped, old.isFromGetForUpdate(), expiry, old.objs(), old.workloadProfile()));
+		transactions.put(id, new Tx(probe.wrapped, old.isFromGetForUpdate(), expiry, old.objs(), old.workloadProfile(), old.scope()));
 		return probe;
 	}
 

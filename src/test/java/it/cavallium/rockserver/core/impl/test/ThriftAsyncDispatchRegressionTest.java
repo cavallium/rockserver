@@ -224,7 +224,7 @@ class ThriftAsyncDispatchRegressionTest {
 
 		assertEquals(expected, api.get(0, 1, key(1), RequestType.current()));
 		api.put(0, 1, key(1), expected, RequestType.none());
-		assertEquals(41L, api.openTransaction( java.time.Duration.ofMillis(10_000)));
+		assertEquals(41L, api.openTransaction(null,  java.time.Duration.ofMillis(10_000)));
 		assertEquals(3, connection.syncRequests.size());
 		assertEquals(0, connection.asyncRequests.size());
 
@@ -294,7 +294,7 @@ class ThriftAsyncDispatchRegressionTest {
 
 				var finite = it.cavallium.rockserver.core.common.RequestContext.batch(
 						java.time.Duration.ofSeconds(30));
-				long transactionId = client.getSyncApi(finite).openTransaction( java.time.Duration.ofMillis(10_000L));
+				long transactionId = client.getSyncApi(finite).openTransaction(null,  java.time.Duration.ofMillis(10_000L));
 				assertTrue(connection.lastApiContextDeadline.get() > 0L);
 				assertTrue(connection.lastApiContextDeadline.get() <= finite.timeoutNanos());
 				assertTrue(client.getSyncApi(expired).closeTransaction(transactionId, false));
@@ -398,7 +398,7 @@ class ThriftAsyncDispatchRegressionTest {
 				try {
 					assertTrue(connection.openIteratorRequested.await(5, SECONDS));
 					cancelled = opened.cancel(true);
-					var queued = api.openTransactionAsync( java.time.Duration.ofMillis(10_000));
+					var queued = api.openTransactionAsync(null,  java.time.Duration.ofMillis(10_000));
 					assertTrue(queued.cancel(true),
 							"a queued transport call must be removable before it acquires a socket");
 				} finally {

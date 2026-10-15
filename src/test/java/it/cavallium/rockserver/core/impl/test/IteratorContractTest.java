@@ -87,7 +87,7 @@ class IteratorContractTest {
 			api.put(0, columnId, key(10), value(10), RequestType.none());
 			api.put(0, columnId, key(20), value(20), RequestType.none());
 
-			long transactionId = api.openTransaction( java.time.Duration.ofMillis(30_000));
+			long transactionId = api.openTransaction(null,  java.time.Duration.ofMillis(30_000));
 			assertTrue(transactionId < 0, name + ", transaction IDs must be negative");
 			try {
 				api.put(transactionId, columnId, key(15), value(15), RequestType.none());

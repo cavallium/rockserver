@@ -153,7 +153,7 @@ class CdcRobustnessTest {
 		long ignored = createColumn("ignored");
 		long start = db.cdcCreate("configured", null, List.of(selected), false, java.util.OptionalLong.empty());
 
-		long ignoredTx = db.openTransaction( java.time.Duration.ofMillis(10_000));
+		long ignoredTx = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 		for (int i = 0; i < 7; i++) {
 			db.put(ignoredTx, ignored, key(i), Buf.wrap(new byte[0]), RequestType.none());
 		}
@@ -197,7 +197,7 @@ class CdcRobustnessTest {
 		long selected = createColumn("selected");
 		long ignored = createColumn("ignored");
 		long start = db.cdcCreate("duration", null, List.of(selected), false, java.util.OptionalLong.empty());
-		long tx = db.openTransaction( java.time.Duration.ofMillis(10_000));
+		long tx = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 		for (int i = 0; i < 6; i++) {
 			db.put(tx, ignored, key(i), Buf.wrap(new byte[] {1}), RequestType.none());
 		}
@@ -227,7 +227,7 @@ class CdcRobustnessTest {
 				""");
 		long selected = createColumn("selected");
 		long start = db.cdcCreate("mid-batch", null, List.of(selected), false, java.util.OptionalLong.empty());
-		long tx = db.openTransaction( java.time.Duration.ofMillis(10_000));
+		long tx = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 		for (int i = 0; i < 10; i++) {
 			db.put(tx, selected, key(i), Buf.wrap(new byte[] {(byte) i}), RequestType.none());
 		}
@@ -345,7 +345,7 @@ class CdcRobustnessTest {
 		long selected = createColumn("selected");
 		long ignored = createColumn("ignored");
 		long start = db.cdcCreate("age", null, List.of(selected), false, java.util.OptionalLong.empty());
-		long tx = db.openTransaction( java.time.Duration.ofMillis(10_000));
+		long tx = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 		for (int i = 0; i < 3; i++) {
 			db.put(tx, ignored, key(i), Buf.wrap(new byte[] {1}), RequestType.none());
 		}
@@ -386,7 +386,7 @@ class CdcRobustnessTest {
 		long selected = createColumn("selected");
 		long ignored = createColumn("ignored");
 		long start = db.cdcCreate("chat-progress", null, List.of(selected), false, java.util.OptionalLong.empty());
-		long tx = db.openTransaction( java.time.Duration.ofMillis(10_000));
+		long tx = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 		for (int i = 0; i < 5; i++) {
 			db.put(tx, ignored, key(i), Buf.wrap(new byte[] {1}), RequestType.none());
 		}

@@ -52,8 +52,8 @@ import org.jetbrains.annotations.Nullable;
 public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 
 	/** See: {@link OpenTransaction}. */
-	default long openTransaction(Duration transactionLeaseTtl) throws RocksDBException {
-		return requestSync(new OpenTransaction(transactionLeaseTtl));
+	default long openTransaction(TransactionOpenScope scope, Duration transactionLeaseTtl) throws RocksDBException {
+		return requestSync(new OpenTransaction(scope, transactionLeaseTtl));
 	}
 
 	/** See: {@link CloseTransaction}. */

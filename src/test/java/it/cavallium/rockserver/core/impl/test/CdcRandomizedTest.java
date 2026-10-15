@@ -135,7 +135,7 @@ class CdcRandomizedTest {
 	                                List<Mutation> expectedEvents,
 	                                Map<Integer, byte[]> expectedState,
 	                                long seed) {
-		long transactionId = db.openTransaction( java.time.Duration.ofMillis(5_000));
+		long transactionId = db.openTransaction(null,  java.time.Duration.ofMillis(5_000));
 		boolean closed = false;
 		try {
 			for (Mutation mutation : mutations) {

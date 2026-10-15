@@ -1171,6 +1171,7 @@ public class GrpcServer extends Server {
 		public Mono<OpenTransactionResponse> openTransaction(OpenTransactionRequest request) {
 			return executeSync(request.getContext(), OperationFamily.METADATA, contextualApi -> {
 				var txId = contextualApi.openTransaction(
+						request.hasScope() ? it.cavallium.rockserver.core.client.TransactionScopeWire.grpc(request.getScope()) : null,
 						java.time.Duration.ofNanos(request.getTransactionLeaseTtlNanos()));
 				return OpenTransactionResponse.newBuilder().setTransactionId(txId).build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("openTransaction", request));
@@ -4141,7 +4142,7 @@ public class GrpcServer extends Server {
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case CDC_SUBSCRIPTION_NOT_FOUND, TRANSACTION_NOT_FOUND -> Status.NOT_FOUND
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
-						case CDC_RESPONSE_TOO_LARGE -> Status.FAILED_PRECONDITION
+						case CDC_RESPONSE_TOO_LARGE, TX_SCOPE_REQUIRED -> Status.FAILED_PRECONDITION
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case READ_DEADLINE_EXCEEDED -> Status.DEADLINE_EXCEEDED
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);

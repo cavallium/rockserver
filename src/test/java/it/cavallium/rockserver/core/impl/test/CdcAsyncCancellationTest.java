@@ -270,7 +270,7 @@ class CdcAsyncCancellationTest {
 			long selected = createColumn(db, "selected");
 			long ignored = createColumn(db, "ignored");
 			long startSeq = db.cdcCreate("sub", null, List.of(selected), false, java.util.OptionalLong.empty());
-			long tx = db.openTransaction( java.time.Duration.ofMillis(10_000));
+			long tx = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 			for (int i = 0; i < 3; i++) {
 				db.put(tx, ignored, key(i), Buf.wrap(new byte[] {1}), RequestType.none());
 			}

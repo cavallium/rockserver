@@ -112,12 +112,12 @@ class RatisMergeFrontendTest {
         try (var x=new Fixture(root.resolve("transaction"))) {
             var api=x.adapter.api(RequestContext.batch()); var a=member(2,"alpha"); var b=member(2,"beta");
             callerWriteAndAcknowledge(x,76,a,value(1),RatisRocksDBDirect.WriteKind.PUT,RequestType.<Buf>none()); callerWriteAndAcknowledge(x,76,b,value(9),RatisRocksDBDirect.WriteKind.PUT,RequestType.<Buf>none());
-            long tx=await(api.openTransactionAsync(Duration.ofSeconds(30))); bytes(await(api.mergeAsync(tx,76,a,value(2),RequestType.<Buf>merged())),1,2);
+            long tx=await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(76), Duration.ofSeconds(30))); bytes(await(api.mergeAsync(tx,76,a,value(2),RequestType.<Buf>merged())),1,2);
             bytes(await(api.mergeAsync(tx,76,a,value(3),RequestType.<Buf>merged())),1,2,3); bytes(await(api.putAsync(tx,76,b,value(8),RequestType.<Buf>previous())),9);
             bytes(await(api.mergeAsync(tx,76,a,value(4),RequestType.<Buf>merged())),1,2,3,4); bytes(await(api.getAsync(tx,76,a,RequestType.<Buf>current())),1,2,3,4);
             var page=await(api.getRangePageAsync(tx,76,key(2),key(3),false,null,RequestType.<KV>allInRange(),RangeBudget.DEFAULT)); assertEquals(List.of(a,b),page.items().stream().map(KV::keys).toList()); bytes(page.items().getFirst().value(),1,2,3,4);
             bytes(await(api.getAsync(0,76,a,RequestType.<Buf>current())),1); assertTrue(await(api.closeTransactionAsync(tx,false))); bytes(await(api.getAsync(0,76,a,RequestType.<Buf>current())),1);
-            tx=await(api.openTransactionAsync(Duration.ofSeconds(30))); await(api.mergeAsync(tx,76,a,value(2),RequestType.<Buf>none())); bytes(await(api.mergeAsync(tx,76,a,value(3),RequestType.<Buf>merged())),1,2,3);
+            tx=await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(76), Duration.ofSeconds(30))); await(api.mergeAsync(tx,76,a,value(2),RequestType.<Buf>none())); bytes(await(api.mergeAsync(tx,76,a,value(3),RequestType.<Buf>merged())),1,2,3);
             bytes(await(api.putAsync(tx,76,b,value(8),RequestType.<Buf>previous())),9); bytes(await(api.mergeAsync(tx,76,a,value(4),RequestType.<Buf>merged())),1,2,3,4); assertTrue(await(api.closeTransactionAsync(tx,true)));
             bytes(await(api.getAsync(0,76,a,RequestType.<Buf>current())),1,2,3,4); bytes(await(api.getAsync(0,76,b,RequestType.<Buf>current())),8);
             var update=await(api.getAsync(0,76,a,RequestType.<Buf>forUpdate())); var invalid=assertThrows(ExecutionException.class,() -> await(api.mergeAsync(update.updateId(),76,a,value(5),RequestType.<Buf>none()))); assertInstanceOf(RocksDBException.class,invalid.getCause()); assertNull(await(api.closeFailedUpdateAsync(update.updateId())));

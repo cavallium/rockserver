@@ -16,7 +16,7 @@ class RatisRocksDBOwnershipTest {
         try (var f=new RatisAtomicClientTest.Fixture(root,true); var transactions=RatisRocksDBAdapterTest.client(f,f.data);
              var identities=RatisTransactionIdentities.create(Files.createDirectory(root.resolve("ids")),f.grant,2048,f.scheduler);
              var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,identities,null,null)) {
-            var api=adapter.api(RequestContext.batch()); long id=api.openTransactionAsync(Duration.ofSeconds(30)).get(10,TimeUnit.SECONDS);
+            var api=adapter.api(RequestContext.batch()); long id=api.openTransactionAsync(RatisRocksDBAdapterTest.scope(71,72,73,74), Duration.ofSeconds(30)).get(10,TimeUnit.SECONDS);
             api.putAsync(id,71,RatisAtomicClientTest.key(2),RatisAtomicClientTest.value(7),RequestType.<Buf>none()).get(5,TimeUnit.SECONDS);
             f.losePrepareGroup=f.groups.getLast(); assertThrows(ExecutionException.class,() -> api.closeTransactionAsync(id,true).get(10,TimeUnit.SECONDS));
             long reserved=identities.nextSequence(); int captures=f.captureRequests.get();
@@ -31,7 +31,7 @@ class RatisRocksDBOwnershipTest {
         try (var f=new RatisAtomicClientTest.Fixture(root,true); var transactions=RatisRocksDBAdapterTest.client(f,f.data)) {
             var allocations=new RatisRocksDBAdapterTest.Allocations(f);
             try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
-                var api=adapter.api(RequestContext.batch()); long id=api.openTransactionAsync(Duration.ofSeconds(30)).get(10,TimeUnit.SECONDS);
+                var api=adapter.api(RequestContext.batch()); long id=api.openTransactionAsync(RatisRocksDBAdapterTest.scope(71,72,73,74), Duration.ofSeconds(30)).get(10,TimeUnit.SECONDS);
                 var value=Buf.wrap(new byte[1100*1024]);
                 api.putAsync(id,71,RatisAtomicClientTest.key(2),value,RequestType.<Buf>none()).get(10,TimeUnit.SECONDS);
                 api.putAsync(id,71,RatisAtomicClientTest.key(200),value,RequestType.<Buf>none()).get(10,TimeUnit.SECONDS);

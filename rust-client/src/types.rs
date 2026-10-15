@@ -529,3 +529,60 @@ impl Default for CdcStreamOptions {
         }
     }
 }
+
+/// A bounded logical declaration for the transaction snapshot captured at open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionOpenScope {
+    pub spans: Vec<TransactionScopeSpan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransactionScopeSpan {
+    Point { column_id: i64, key: Vec<Vec<u8>> },
+    Range { column_id: i64, lower_inclusive: Option<Vec<Vec<u8>>>, upper_exclusive: Option<Vec<Vec<u8>>> },
+}
+
+impl TryFrom<TransactionOpenScope> for crate::proto::TransactionOpenScope {
+    type Error = tonic::Status;
+    fn try_from(scope: TransactionOpenScope) -> Result<Self, Self::Error> {
+        if scope.spans.is_empty() || scope.spans.len() > 256 {
+            return Err(tonic::Status::invalid_argument("Invalid transaction scope span count"));
+        }
+        let mut bytes: usize = 0;
+        let mut spans = Vec::with_capacity(scope.spans.len());
+        for span in scope.spans {
+            let (column_id, point, lower, upper) = match span {
+                TransactionScopeSpan::Point { column_id, key } => (column_id, true, Some(key), None),
+                TransactionScopeSpan::Range { column_id, lower_inclusive, upper_exclusive } => (column_id, false, lower_inclusive, upper_exclusive),
+            };
+            if column_id <= 0 { return Err(tonic::Status::invalid_argument("Invalid scope column ID")); }
+            for keys in [&lower, &upper].into_iter().flatten() {
+                if keys.len() > 256 { return Err(tonic::Status::invalid_argument("Too many scope key components")); }
+                for key in keys {
+                    bytes = bytes.checked_add(key.len()).ok_or_else(|| tonic::Status::invalid_argument("Scope byte budget exceeded"))?;
+                    if bytes > 2 * 1024 * 1024 { return Err(tonic::Status::invalid_argument("Scope byte budget exceeded")); }
+                }
+            }
+            spans.push(crate::proto::TransactionScopeSpan { column_id, point,
+                lower_inclusive: lower.map(|keys| crate::proto::TransactionScopeKeys { keys }),
+                upper_exclusive: upper.map(|keys| crate::proto::TransactionScopeKeys { keys }),
+            });
+        }
+        Ok(Self { spans })
+    }
+}
+
+#[cfg(test)]
+mod transaction_scope_tests {
+    use super::{TransactionOpenScope, TransactionScopeSpan};
+    #[test]
+    fn scope_preserves_empty_and_absent_bounds_and_checks_aggregate_budget() {
+        let scope = TransactionOpenScope { spans: vec![TransactionScopeSpan::Range { column_id: 71, lower_inclusive: Some(vec![]), upper_exclusive: None }] };
+        let wire: crate::proto::TransactionOpenScope = scope.try_into().unwrap();
+        assert!(wire.spans[0].lower_inclusive.is_some());
+        assert!(wire.spans[0].upper_exclusive.is_none());
+        assert!(crate::proto::TransactionOpenScope::try_from(TransactionOpenScope { spans: vec![] }).is_err());
+        let large = TransactionScopeSpan::Point { column_id: 71, key: vec![vec![0; 1024 * 1024 + 1]] };
+        assert!(crate::proto::TransactionOpenScope::try_from(TransactionOpenScope { spans: vec![large.clone(), large] }).is_err());
+    }
+}

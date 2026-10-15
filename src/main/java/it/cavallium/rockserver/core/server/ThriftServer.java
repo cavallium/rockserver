@@ -609,9 +609,10 @@ public class ThriftServer extends Server {
 
 		@Override
 		public long openTransaction(long transactionLeaseTtlNanos,
-				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
+				it.cavallium.rockserver.core.common.api.RequestContext context,
+				it.cavallium.rockserver.core.common.api.TransactionOpenScope scope) throws RocksDBThriftException {
 			try {
-				return api(context).openTransaction(java.time.Duration.ofNanos(transactionLeaseTtlNanos));
+				return api(context).openTransaction(it.cavallium.rockserver.core.client.TransactionScopeWire.thrift(scope), java.time.Duration.ofNanos(transactionLeaseTtlNanos));
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}

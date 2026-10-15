@@ -529,7 +529,7 @@ class WorkloadAdmissionTest {
 		var seek = profiles(LATENCY, ANALYTICAL, BATCH);
 		var batch = profiles(BATCH);
 		var commands = new ArrayList<CommandExpectation>();
-		commands.add(client("openTransaction", new RocksDBAPICommandSingle.OpenTransaction(Duration.ofSeconds(1)), all));
+		commands.add(client("openTransaction", new RocksDBAPICommandSingle.OpenTransaction(null, Duration.ofSeconds(1)), all));
 		commands.add(client("commitTransaction", new RocksDBAPICommandSingle.CloseTransaction(1, true), ingestOrBatch));
 		commands.add(protectedCommand("rollbackTransaction", new RocksDBAPICommandSingle.CloseTransaction(1, false), CONTROL));
 		commands.add(protectedCommand("closeFailedUpdate", new RocksDBAPICommandSingle.CloseFailedUpdate(1), CONTROL));

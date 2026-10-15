@@ -183,7 +183,7 @@ class RatisRocksDBRangeTest {
             };
             try (var data=new RatisRoutedClient(f.directory,transport); var transactions=client(f,data);
                  var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,null)) {
-                var api=adapter.api(CONTEXT); long tx=await(api.openTransactionAsync(TTL));
+                var api=adapter.api(CONTEXT); long tx=await(api.openTransactionAsync(scope(71,72,73,74), TTL));
                 CompletableFuture<FirstAndLast<KV>> first=api.reduceRangeAsync(tx,71,key(1),key(201),false,RequestType.<KV>firstAndLast()),second;
                 try { assertTrue(entered.await(5,TimeUnit.SECONDS)); second=api.reduceRangeAsync(tx,71,key(1),key(201),false,RequestType.<KV>firstAndLast()); }
                 finally { proceed.countDown(); }
@@ -216,7 +216,7 @@ class RatisRocksDBRangeTest {
             };
             try (var data=new RatisRoutedClient(f.directory,transport); var transactions=client(f,data);
                  var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,null)) {
-                var api=adapter.api(CONTEXT); long tx=await(api.openTransactionAsync(TTL));
+                var api=adapter.api(CONTEXT); long tx=await(api.openTransactionAsync(scope(71,72,73,74), TTL));
                 var first=new CompletableFuture<KV>(); var terminal=new CompletableFuture<Throwable>(); var rows=new AtomicInteger();
                 var subscriber=new reactor.core.publisher.BaseSubscriber<KV>() {
                     protected void hookOnSubscribe(org.reactivestreams.Subscription subscription) { request(1); }
@@ -241,7 +241,7 @@ class RatisRocksDBRangeTest {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("transaction"),true); var transactions=client(f,f.data); var snapshots=snapshots(f)) {
             seed(f,71,key(2),value(1),1900); seed(f,71,key(200),value(3),1901); var source=new RangeAllocations(f);
             try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,ranges)) {
-                var api=adapter.api(CONTEXT); long tx=await(api.openTransactionAsync(TTL)); await(api.putAsync(tx,71,key(2),value(7),RequestType.<Buf>none()));
+                var api=adapter.api(CONTEXT); long tx=await(api.openTransactionAsync(scope(71,72,73,74), TTL)); await(api.putAsync(tx,71,key(2),value(7),RequestType.<Buf>none()));
                 var page=await(api.getRangePageAsync(tx,71,key(1),key(201),false,null,RequestType.<KV>allInRange(),RangeBudget.DEFAULT)); bytes(7,page.items().getFirst().value());
                 long iterator=await(api.openIteratorAsync(tx,71,key(1),key(201),false,TTL)); assertEquals(List.of(7),numbers(await(api.subsequentAsync(iterator,0,1,RequestType.<Buf>multi()))));
                 await(api.putAsync(tx,71,key(200),value(8),RequestType.<Buf>none()));

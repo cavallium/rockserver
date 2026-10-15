@@ -270,7 +270,7 @@ class DatabaseStateMachineTest {
 			TreeMap<Long, Long> expected,
 			SplittableRandom random,
 			String context) {
-		long transactionId = api.openTransaction( java.time.Duration.ofMillis(30_000));
+		long transactionId = api.openTransaction(null,  java.time.Duration.ofMillis(30_000));
 		var transactionExpected = new TreeMap<>(expected);
 		var touchedKeys = new ArrayList<Long>();
 		boolean closed = false;

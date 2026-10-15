@@ -361,7 +361,7 @@ class EmbeddedRangeSchedulingTest {
 				}
 			});
 
-			long transactionId = api.openTransaction( java.time.Duration.ofMillis(10_000));
+			long transactionId = api.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 			java.util.List<Boolean> existence;
 			try {
 				existence = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())

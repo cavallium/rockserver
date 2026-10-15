@@ -208,7 +208,8 @@ enum RocksDBErrorType {
 	CDC_SUBSCRIPTION_CHANGED = 41,
 	CDC_SUBSCRIPTION_NOT_FOUND = 42,
 	SERVER_OVERLOADED = 43,
-	RANGE_ITEM_TOO_LARGE = 44
+	RANGE_ITEM_TOO_LARGE = 44,
+  TX_SCOPE_REQUIRED = 45
 }
 
 exception RocksDBThriftException {
@@ -251,7 +252,7 @@ struct ColumnTablePropertiesData {
 
 service RocksDB {
 
-   i64 openTransaction(1: required i64 transactionLeaseTtlNanos, 2: required RequestContext context) throws (1: RocksDBThriftException e),
+   i64 openTransaction(1: required i64 transactionLeaseTtlNanos, 2: required RequestContext context, 3: optional TransactionOpenScope scope) throws (1: RocksDBThriftException e),
 
    bool closeTransaction(1: required i64 transactionId, 2: required bool commit, 3: required RequestContext context) throws (1: RocksDBThriftException e),
 
@@ -375,3 +376,12 @@ service RocksDB {
    RangePage getRangePage(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 6: list<binary> resumeAfter, 7: required RangeRequestType requestType, 9: required RangeBudget budget, 10: required RequestContext context) throws (1: RocksDBThriftException e),
 
 }
+
+struct TransactionScopeKeys { 1: required list<binary> keys }
+struct TransactionScopeSpan {
+  1: required i64 columnId,
+  2: required bool point,
+  3: optional TransactionScopeKeys lowerInclusive,
+  4: optional TransactionScopeKeys upperExclusive
+}
+struct TransactionOpenScope { 1: required list<TransactionScopeSpan> spans }

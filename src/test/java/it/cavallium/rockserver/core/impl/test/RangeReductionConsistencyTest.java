@@ -55,7 +55,7 @@ class RangeReductionConsistencyTest {
 			api.flush();
 			assertCountMatchesRange(api, 0, columnId, null, null, 2, name + ", flushed baseline");
 
-			long transactionId = api.openTransaction( java.time.Duration.ofMillis(30_000));
+			long transactionId = api.openTransaction(null,  java.time.Duration.ofMillis(30_000));
 			assertTrue(transactionId < 0, name + ", transaction IDs must use the reserved negative range");
 			try {
 				api.put(transactionId, columnId, key3, toBufSimple(33), RequestType.none());
@@ -113,7 +113,7 @@ class RangeReductionConsistencyTest {
 			assertCountMatchesRange(api, 0, columnId, null, null, 2,
 					name + ", two colliding bucket entries");
 
-			long transactionId = api.openTransaction( java.time.Duration.ofMillis(30_000));
+			long transactionId = api.openTransaction(null,  java.time.Duration.ofMillis(30_000));
 			assertTrue(transactionId < 0, name + ", transaction IDs must use the reserved negative range");
 			try {
 				api.put(transactionId, columnId, key3, toBufSimple(33), RequestType.none());

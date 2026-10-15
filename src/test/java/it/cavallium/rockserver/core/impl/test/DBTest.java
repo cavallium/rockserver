@@ -378,7 +378,7 @@ database: {
 			Assertions.assertTrue(api.get(0, colId, key2, RequestType.exists()));
 
 			var rolledBackKey = getNotFoundKeyI(100);
-			long rollbackTransaction = api.openTransaction( java.time.Duration.ofMillis(5_000));
+			long rollbackTransaction = api.openTransaction(null,  java.time.Duration.ofMillis(5_000));
 			Assertions.assertTrue(api.putMulti(rollbackTransaction,
 					colId,
 					List.of(rolledBackKey),
@@ -390,7 +390,7 @@ database: {
 			Assertions.assertFalse(api.get(0, colId, rolledBackKey, RequestType.exists()));
 
 			var committedKey = getNotFoundKeyI(101);
-			long commitTransaction = api.openTransaction( java.time.Duration.ofMillis(5_000));
+			long commitTransaction = api.openTransaction(null,  java.time.Duration.ofMillis(5_000));
 			Assertions.assertTrue(api.putMulti(commitTransaction,
 					colId,
 					List.of(committedKey),

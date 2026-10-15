@@ -373,7 +373,7 @@ class CdcBugReproductionTest {
     @Test
     void testTransactionCDC() throws RocksDBException {
         // Start a transaction
-        long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
+        long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 
         // Add 5 items
         for(int i=0; i<5; i++) {
@@ -410,7 +410,7 @@ class CdcBugReproductionTest {
 
         // Create a batch with mixed ops: PUT, MERGE, PUT
         // We will use a transaction to create a mixed batch.
-        long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
+        long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 
         // Op 0: PUT Key 1
         db.put(txId, mixedColId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("V1".getBytes()), RequestType.none());
@@ -1100,7 +1100,7 @@ class CdcBugReproductionTest {
     @Test
     void testTransactionRollback() throws RocksDBException {
         // 1. Open transaction
-        long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
+        long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 
         // 2. Write data within transaction
         db.put(txId, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("Rollback".getBytes()), RequestType.none());
@@ -1162,7 +1162,7 @@ class CdcBugReproductionTest {
 
     @Test
     void testTransactionSavepoints() throws RocksDBException {
-        long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
+        long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 
         // 1. Write "A"
         db.put(txId, columnId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A".getBytes()), RequestType.none());

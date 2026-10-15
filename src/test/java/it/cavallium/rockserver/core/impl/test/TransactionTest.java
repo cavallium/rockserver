@@ -77,7 +77,7 @@ database: {
 	@Test
 	@Order(1)
 	void testMultiplePutsInOneTransaction() {
-		long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(10_000));
+		long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(null,  java.time.Duration.ofMillis(10_000));
 
 		var key1 = makeKey(1, 1, 1);
 		var value1 = toBufSimple(100);
@@ -107,7 +107,7 @@ database: {
 		var key = makeKey(3, 3, 3);
 		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colIdNoBuckets, key, toBufString("A"), RequestType.none());
 
-		long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(10_000));
+		long txId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction(null,  java.time.Duration.ofMillis(10_000));
 
 		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId, colIdNoBuckets, key, toBufString("B"), RequestType.none());
 		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(txId, colIdNoBuckets, key, toBufString("C"), RequestType.none());
@@ -179,8 +179,8 @@ database: {
 		if (present) {
 			api.put(0, column, guard, toBufSimple(0), RequestType.none());
 		}
-		long reader = api.openTransaction(java.time.Duration.ofSeconds(10));
-		long writer = api.openTransaction(java.time.Duration.ofSeconds(10));
+		long reader = api.openTransaction(null, java.time.Duration.ofSeconds(10));
+		long writer = api.openTransaction(null, java.time.Duration.ofSeconds(10));
 		try {
 			var fence = api.get(reader, column, guard, RequestType.forUpdate());
 			assertBufEquals(present ? toBufSimple(0) : null, fence.previous());
@@ -203,8 +203,8 @@ database: {
 		var tracked = makeKey(8, 8, 8);
 		var ordinary = makeKey(9, 9, 9);
 		var payload = makeKey(10, 10, 10);
-		long reader = api.openTransaction(java.time.Duration.ofSeconds(10));
-		long writer = api.openTransaction(java.time.Duration.ofSeconds(10));
+		long reader = api.openTransaction(null, java.time.Duration.ofSeconds(10));
+		long writer = api.openTransaction(null, java.time.Duration.ofSeconds(10));
 		try {
 			Assertions.assertNull(api.get(reader, colIdNoBuckets, tracked, RequestType.forUpdate()).previous());
 			Assertions.assertNull(api.get(reader, colIdNoBuckets, ordinary, RequestType.current()));

@@ -499,11 +499,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	@Override
-	public CompletableFuture<Long> openTransactionAsync(Duration transactionLeaseTtl) throws RocksDBException {
-		var request = OpenTransactionRequest.newBuilder()
+	public CompletableFuture<Long> openTransactionAsync(it.cavallium.rockserver.core.common.TransactionOpenScope scope, Duration transactionLeaseTtl) throws RocksDBException {
+		var builder = OpenTransactionRequest.newBuilder()
 				.setTransactionLeaseTtlNanos(LeaseTtl.toNanos(transactionLeaseTtl, "transactionLeaseTtl"))
-				.setContext(currentWireRequestContext())
-				.build();
+				.setContext(currentWireRequestContext());
+		if (scope != null) builder.setScope(TransactionScopeWire.grpc(scope));
+		var request = builder.build();
 		return toResponse(futureStubWithRequestDeadline().openTransaction(request), OpenTransactionResponse::getTransactionId);
 	}
 

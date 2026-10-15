@@ -165,7 +165,7 @@ class CdcPollErrorPropagationTest {
 					null,
 					null));
 			long startSeq = db.cdcCreate("sub", null, List.of(columnId), false, java.util.OptionalLong.empty());
-			long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
+			long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 			for (int i = 0; i < 4; i++) {
 				db.put(txId, columnId,
 						new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, (byte) i})}),

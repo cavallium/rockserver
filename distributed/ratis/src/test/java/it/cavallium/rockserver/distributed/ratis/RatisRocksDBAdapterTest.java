@@ -15,12 +15,15 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import static org.junit.jupiter.api.Assertions.*;
 
-/** Legacy explicit transactions over controlled dispatch and real native DATA/HOME state. */
+/** Explicit scoped transactions over controlled dispatch and real native DATA/HOME state. */
 class RatisRocksDBAdapterTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     static final RequestContext CONTEXT=RequestContext.batch();
     static final Duration TTL=Duration.ofSeconds(30);
     static Keys key(int n) { return RatisAtomicClientTest.key(n); }
+    static TransactionOpenScope scope(long... columns) {
+        return new TransactionOpenScope(Arrays.stream(columns).mapToObj(column -> TransactionOpenScope.Span.range(column,null,null)).toList());
+    }
     static Keys member(int n,String tail) { return RatisAtomicClientTest.member(n,tail); }
     static Buf value(int n) { return RatisAtomicClientTest.value(n); }
     static <T> T await(CompletableFuture<T> future) throws Exception { return future.get(10,TimeUnit.SECONDS); }
@@ -57,7 +60,7 @@ class RatisRocksDBAdapterTest {
             seed(f,73,key(2),Buf.wrap(new byte[0]),1902); seed(f,74,member(2,"alpha"),value(4),1903);
             var allocations=new Allocations(f);
             try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
-                var api=adapter.api(CONTEXT); long id=await(api.openTransactionAsync(TTL));
+                var api=adapter.api(CONTEXT); long id=await(api.openTransactionAsync(scope(71,72,73,74), TTL));
                 var update=await(api.getAsync(id,71,key(2),RequestType.<Buf>forUpdate())); assertEquals(id,update.updateId()); bytes(1,update.previous());
                 assertTrue(await(api.getAsync(id,73,key(2),RequestType.<Buf>exists()))); assertEquals(0,await(api.getAsync(id,73,key(2),RequestType.<Buf>current())).size());
                 bytes(1,await(api.putAsync(id,71,key(2),value(7),RequestType.<Buf>previous())));
@@ -98,12 +101,12 @@ class RatisRocksDBAdapterTest {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("retry"),true); var transactions=client(f,f.data)) {
             seed(f,71,key(2),value(1),1900); seed(f,71,key(200),value(3),1901); var allocations=new Allocations(f);
             try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
-                var api=adapter.api(CONTEXT); long rejected=await(api.openTransactionAsync(TTL));
+                var api=adapter.api(CONTEXT); long rejected=await(api.openTransactionAsync(scope(71,72,73,74), TTL));
                 await(api.putAsync(rejected,71,key(2),value(7),RequestType.<Buf>none())); seed(f,71,key(200),value(4),1902);
                 assertFalse(await(api.closeTransactionAsync(rejected,true))); int captures=f.captureRequests.get();
                 assertFalse(await(api.closeTransactionAsync(rejected,true))); assertEquals(1,allocations.count.get()); assertEquals(captures,f.captureRequests.get()); assertEquals(1,adapter.stats().transactions());
                 assertArrayEquals(new byte[]{1},f.get(71,key(2))); assertTrue(await(api.closeTransactionAsync(rejected,false))); assertTrue(await(api.closeTransactionAsync(rejected,false)));
-                long id=await(api.openTransactionAsync(TTL)); await(api.putAsync(id,72,key(2),value(9),RequestType.<Buf>none()));
+                long id=await(api.openTransactionAsync(scope(71,72,73,74), TTL)); await(api.putAsync(id,72,key(2),value(9),RequestType.<Buf>none()));
                 captures=f.captureRequests.get(); var original=allocations.issued.getLast(); f.losePrepareGroup=f.groups.getLast();
                 assertThrows(ExecutionException.class,() -> await(api.closeTransactionAsync(id,true)));
                 assertNotNull(f.stores.get(f.groups.getLast()).preparedParticipant(original.identity().commit().transaction()));
@@ -136,7 +139,7 @@ class RatisRocksDBAdapterTest {
             try (var data=new RatisRoutedClient(f.directory,transport); var transactions=client(f,data)) {
                 var allocations=new Allocations(f);
                 try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
-                    var api=adapter.api(CONTEXT); long id=await(api.openTransactionAsync(TTL)); byte[] rawKey={2},rawValue={7};
+                    var api=adapter.api(CONTEXT); long id=await(api.openTransactionAsync(scope(71,72,73,74), TTL)); byte[] rawKey={2},rawValue={7};
                     var keys=new ArrayList<>(List.of(new Keys(Buf.wrap(rawKey)))); var values=new ArrayList<>(List.of(Buf.wrap(rawValue)));
                     var write=api.putMultiAsync(id,71,keys,values,RequestType.<Buf>delta());
                     try {
@@ -162,4 +165,54 @@ class RatisRocksDBAdapterTest {
             }
         }
     }
+    @Test void openCapturesDeclaredPointsBeforeFirstReadAndConflictRetainsThatCut() throws Exception {
+        try (var f=new RatisAtomicClientTest.Fixture(root.resolve("eager-points"),true); var transactions=client(f,f.data)) {
+            seed(f,71,key(2),value(1),1900);seed(f,72,key(200),value(2),1901);
+            var allocations=new Allocations(f);
+            try(var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
+                var declaration=new TransactionOpenScope(List.of(TransactionOpenScope.Span.point(71,key(2)),TransactionOpenScope.Span.point(72,key(200))));
+                var api=adapter.api(CONTEXT);long id=await(api.openTransactionAsync(declaration,TTL));int captures=f.captureRequests.get();assertTrue(captures>0);
+                // No operation on the handle precedes these independently committed writes.
+                seed(f,71,key(2),value(3),1902);seed(f,72,key(200),value(4),1903);
+                bytes(1,await(api.getAsync(id,71,key(2),RequestType.<Buf>current())));bytes(2,await(api.getAsync(id,72,key(200),RequestType.<Buf>current())));
+                await(api.putAsync(id,72,key(200),value(9),RequestType.none()));
+                assertFalse(await(api.closeTransactionAsync(id,true)));assertFalse(await(api.closeTransactionAsync(id,true)));
+                assertEquals(1,adapter.stats().transactions());assertEquals(1,allocations.count.get());assertEquals(captures,f.captureRequests.get());
+                assertTrue(await(api.closeTransactionAsync(id,false)));assertArrayEquals(new byte[]{4},f.get(72,key(200)));
+            }
+        }
+    }
+    @Test void invalidDeclarationsAllocateNoHandleIdentityOrCapture() throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("scope-preflight"),true);var transactions=client(f,f.data)) {
+            var allocations=new Allocations(f);var ids=new AtomicInteger();
+            try(var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null,ids::incrementAndGet)) {
+                var api=adapter.api(CONTEXT);int captures=f.captureRequests.get();
+                error(RocksDBException.RocksDBErrorType.TX_SCOPE_REQUIRED,api.openTransactionAsync(null,TTL));
+                assertThrows(ExecutionException.class,()->await(api.openTransactionAsync(scope(999),TTL)));
+                var backward=new TransactionOpenScope(List.of(TransactionOpenScope.Span.range(71,key(3),key(2))));
+                assertThrows(ExecutionException.class,()->await(api.openTransactionAsync(backward,TTL)));
+                assertEquals(0,ids.get());assertEquals(0,allocations.count.get());assertEquals(0,adapter.stats().transactions());assertEquals(captures,f.captureRequests.get());
+                var ranges=new ArrayList<RangeDescriptor>();var original=f.directory.ranges().getFirst();
+                for(int n=0;n<65;n++)ranges.add(new RangeDescriptor(new UUID(300,n+1),new UUID(301,n+1),1,0,n==0?null:new byte[]{(byte)n},n==64?null:new byte[]{(byte)(n+1)},RangeDescriptor.TopologyState.ACTIVE,original.replicas()));
+                var directory=new RangeDirectory(f.schema.clusterId(),f.schema.databaseId(),f.schema.domainId(),f.schema.schemaEpoch(),f.schema.digest(),0,f.schema.columnIds(),1,ranges);
+                try(var bounded=new RatisRocksDBAdapter(f.schema,directory,transactions,allocations,null,null,ids::incrementAndGet)) {
+                    assertThrows(ExecutionException.class,()->await(bounded.api(CONTEXT).openTransactionAsync(scope(71),TTL)));
+                    assertEquals(0,ids.get());assertEquals(0,allocations.count.get());assertEquals(0,bounded.stats().transactions());assertEquals(captures,f.captureRequests.get());
+                }
+            }
+        }
+    }
+    @Test void leaderLossRejectsOriginalWritableCaptureWithoutRecapture() throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("scope-leader-loss"),true);var transactions=client(f,f.data)) {
+            var allocations=new Allocations(f);
+            try(var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
+                var api=adapter.api(CONTEXT);long id=await(api.openTransactionAsync(new TransactionOpenScope(List.of(TransactionOpenScope.Span.point(71,key(2)))),TTL));int captures=f.captureRequests.get();
+                f.machines.get(f.groups.getFirst()).notifyNotLeader(List.of());
+                assertThrows(ExecutionException.class,()->await(api.putAsync(id,71,key(2),value(9),RequestType.none())));
+                assertEquals(captures,f.captureRequests.get());assertEquals(1,allocations.count.get());assertNull(f.get(71,key(2)));
+                assertTrue(await(api.closeTransactionAsync(id,false)));
+            }
+        }
+    }
+
 }

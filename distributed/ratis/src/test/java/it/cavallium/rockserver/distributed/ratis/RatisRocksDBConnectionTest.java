@@ -72,7 +72,7 @@ class RatisRocksDBConnectionTest {
                 assertEquals(71,sync.createColumn("atomic-0",f.direct.f.schema.column(71).schema())); assertFalse(await(async.deleteColumnIfExistsAsync("never-created")));
                 point(connection,71,key(2),value(7),RequestType.RequestTypeId.NOTHING); assertArrayEquals(new byte[]{7},await(async.getAsync(0,71,key(2),RequestType.<Buf>current())).toByteArray());
                 originalToken=preparePoint(connection,71,key(2),value(9),RequestType.RequestTypeId.PREVIOUS);assertEquals(CommandResult.Status.SUCCESS,await(connection.getRemoteMutationApi().execute(originalToken,RequestContext.batch())).outcome());assertArrayEquals(new byte[]{7},savedPoint(connection,originalToken).toByteArray()); assertArrayEquals(new byte[]{9},sync.get(0,71,key(2),RequestType.<Buf>current()).toByteArray());
-                originalId=await(async.openTransactionAsync(Duration.ofSeconds(10))); assertTrue(await(async.closeTransactionAsync(originalId,false)));
+                originalId=await(async.openTransactionAsync(RatisRocksDBAdapterTest.scope(71,72,73,74), Duration.ofSeconds(10))); assertTrue(await(async.closeTransactionAsync(originalId,false)));
                 assertTrue(connection.pendingSchemaRequests().isEmpty());
             }
             try (var connection=f.open(8)) {
@@ -81,7 +81,7 @@ class RatisRocksDBConnectionTest {
                 assertEquals(RatisRocksDBDirect.RecoveryState.COMPLETE,retained.state());
                 var remote=connection.getRemoteMutationApi();var status=await(remote.resume(originalToken,RequestContext.batch()));var previous=savedPoint(connection,originalToken);await(remote.acknowledge(originalToken,status.resultDigest(),RequestContext.batch()));
                 assertArrayEquals(new byte[]{7},previous.toByteArray());
-                long next=await(connection.getAsyncApi(RequestContext.batch()).openTransactionAsync(Duration.ofSeconds(10))); assertTrue(next>originalId); assertTrue(await(connection.getAsyncApi(RequestContext.batch()).closeTransactionAsync(next,false)));
+                long next=await(connection.getAsyncApi(RequestContext.batch()).openTransactionAsync(RatisRocksDBAdapterTest.scope(71,72,73,74), Duration.ofSeconds(10))); assertTrue(next>originalId); assertTrue(await(connection.getAsyncApi(RequestContext.batch()).closeTransactionAsync(next,false)));
             }
         }
     }
@@ -98,7 +98,7 @@ class RatisRocksDBConnectionTest {
             capacity.checkpoint(sdk.resolve(id+".request"),fields,RatisSchemaClientJournal::write);
             assertEquals(1,java.nio.ByteBuffer.wrap(SessionJournalFiles.read(ledger,4096)).getInt());
             // Crash after binding force, before capacity.bound and before controller DONE.
-            var folder=Files.createDirectory(bindings.resolve(HexFormat.of().formatHex(target.digest()))); byte[] a=DistributedSchemaCodec.encode(target),b=RangeDirectoryCodec.encode(directory);
+            var folder=Files.createDirectory(bindings.resolve(RatisGenerationRegistry.key(target,directory))); byte[] a=DistributedSchemaCodec.encode(target),b=RangeDirectoryCodec.encode(directory);
             SessionJournalFiles.write(folder.resolve("binding"),java.nio.ByteBuffer.allocate(8+a.length+b.length).putInt(a.length).put(a).putInt(b.length).put(b).array(),8*1024*1024); SessionJournalFiles.force(bindings);
             var forced=new ArrayList<Path>(); var failRoot=new java.util.concurrent.atomic.AtomicBoolean(true);
             RatisGenerationRegistry.Capacity.BindingForce force=path -> { forced.add(path); if(path.equals(bindings) && failRoot.getAndSet(false)) throw new IOException("Uncertain generations directory force"); SessionJournalFiles.force(path); };
@@ -230,7 +230,7 @@ class RatisRocksDBConnectionTest {
             };
             try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/old-handles"),root.resolve("handle-connection"),java.util.Map.of(nativeSchema.initial.domainId(),nativeSchema.routed),(name,shape)->nativeSchema.initial.domainId(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,new RatisRocksDBConnection.Limits(2,64,8,128L*1024*1024,8),List.of(), pointBudget.shared)) {
                 var api=connection.getAsyncApi(RequestContext.batch()); point(connection,7,dataKey,value(1),RequestType.RequestTypeId.NOTHING);
-                long oldTransaction=await(api.openTransactionAsync(Duration.ofSeconds(10)));assertEquals(0,activePins.get());assertArrayEquals(new byte[]{1},await(api.getAsync(oldTransaction,7,dataKey,RequestType.<Buf>current())).toByteArray());assertEquals(1,activePins.get()); point(connection,7,dataKey,value(2),RequestType.RequestTypeId.NOTHING);
+                long oldTransaction=await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(7), Duration.ofSeconds(10)));assertEquals(1,activePins.get());assertArrayEquals(new byte[]{1},await(api.getAsync(oldTransaction,7,dataKey,RequestType.<Buf>current())).toByteArray());assertEquals(1,activePins.get()); point(connection,7,dataKey,value(2),RequestType.RequestTypeId.NOTHING);
                 long oldCursor=await(api.openIteratorAsync(0,7,dataKey,null,false,Duration.ofSeconds(10))); assertNotEquals(oldTransaction,oldCursor); assertEquals(2,activePins.get());
                 var failure=assertThrows(ExecutionException.class,() -> await(api.createColumnAsync("after-old-handles",RatisSchemaClientTest.shape()))); UUID token=assertInstanceOf(RatisSchemaRequestPendingException.class,failure.getCause()).requestId();
                 assertEquals(SchemaChange.Phase.FENCED,nativeSchema.admin.readHead(nativeSchema.initial.domainId()).status().phase()); assertEquals(1,nativeSchema.routed.directory().schemaEpoch());
@@ -239,7 +239,7 @@ class RatisRocksDBConnectionTest {
                 assertTrue(await(api.closeTransactionAsync(oldTransaction,false))); assertEquals(1,activePins.get());
                 var stillBlocked=assertThrows(ExecutionException.class,() -> await(connection.resumeSchemaRequest(token,RequestContext.batch()))); assertEquals(token,assertInstanceOf(RatisSchemaRequestPendingException.class,stillBlocked.getCause()).requestId());
                 await(api.closeIteratorAsync(oldCursor)); assertEquals(0,activePins.get()); assertTrue(await(connection.resumeSchemaRequest(token,RequestContext.batch())).changed()); assertEquals(2,nativeSchema.routed.directory().schemaEpoch());
-                long newTransaction=await(api.openTransactionAsync(Duration.ofSeconds(10))); long newCursor=await(api.openIteratorAsync(0,7,dataKey,null,false,Duration.ofSeconds(10))); assertTrue(newTransaction>Math.max(oldTransaction,oldCursor)); assertTrue(newCursor>newTransaction);
+                long newTransaction=await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(7), Duration.ofSeconds(10))); long newCursor=await(api.openIteratorAsync(0,7,dataKey,null,false,Duration.ofSeconds(10))); assertTrue(newTransaction>Math.max(oldTransaction,oldCursor)); assertTrue(newCursor>newTransaction);
                 assertArrayEquals(new byte[]{2},await(api.getAsync(newTransaction,7,dataKey,RequestType.<Buf>current())).toByteArray()); assertArrayEquals(new byte[]{2},await(api.subsequentAsync(newCursor,0,1,RequestType.<Buf>multi())).getFirst().toByteArray());
                 assertTrue(await(api.closeTransactionAsync(newTransaction,false))); await(api.closeIteratorAsync(newCursor)); assertEquals(0,activePins.get()); assertEquals(List.of(1L,2L),transactionSchemas); assertEquals(List.of(1L,2L),cursorSchemas);
             }

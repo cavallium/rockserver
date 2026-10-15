@@ -32,16 +32,20 @@ class RatisDatabaseConnectionTest {
             try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/database"),connectionRoot,routes,placement,homes.scheduler,binding,f.client,replicas,null,null,factory,RatisRocksDBConnection.Limits.defaults(),List.of(), pointBudget.shared)) {
                 var api=connection.getAsyncApi(RequestContext.batch());assertEquals(2,await(api.getAllColumnDefinitionsAsync()).size());assertEquals(71,await(api.getColumnIdAsync("logical-1")));assertEquals(72,await(api.getColumnIdAsync("logical-2")));
                 RatisRocksDBConnectionTest.point(connection,71,key(7),value(11),RequestType.RequestTypeId.NOTHING);RatisRocksDBConnectionTest.point(connection,72,key(7),value(12),RequestType.RequestTypeId.NOTHING);assertArrayEquals(new byte[]{11},await(api.getAsync(0,71,key(7),RequestType.<Buf>current())).toByteArray());assertArrayEquals(new byte[]{12},await(api.getAsync(0,72,key(7),RequestType.<Buf>current())).toByteArray());
-                long lazy=await(api.openTransactionAsync(Duration.ofSeconds(10)));assertEquals(4,issued.get());assertTrue(await(api.closeTransactionAsync(lazy,false)));assertEquals(4,issued.get());assertEquals(2,await(connection.directRecoveryStatus(RequestContext.batch())).size());
+                var missing=assertThrows(ExecutionException.class,()->await(api.openTransactionAsync(null, Duration.ofSeconds(10))));assertEquals(RocksDBException.RocksDBErrorType.TX_SCOPE_REQUIRED,assertInstanceOf(RocksDBException.class,missing.getCause()).getErrorUniqueId());assertEquals(4,issued.get());
+                int captures=homes.captureRequests.get();var cross=new TransactionOpenScope(List.of(TransactionOpenScope.Span.point(71,key(7)),TransactionOpenScope.Span.point(72,key(7))));
+                assertThrows(ExecutionException.class,()->await(api.openTransactionAsync(cross,Duration.ofSeconds(10))));
+                assertThrows(ExecutionException.class,()->await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(999),Duration.ofSeconds(10))));
+                assertEquals(4,issued.get());assertEquals(captures,homes.captureRequests.get());assertEquals(2,await(connection.directRecoveryStatus(RequestContext.batch())).size());
             }
             try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/database"),connectionRoot,routes,placement,homes.scheduler,binding,f.client,replicas,null,null,factory,RatisRocksDBConnection.Limits.defaults(),List.of(), pointBudget.shared)) {assertEquals(4,issued.get());var api=connection.getSyncApi(RequestContext.batch());assertArrayEquals(new byte[]{11},api.get(0,71,key(7),RequestType.<Buf>current()).toByteArray());assertArrayEquals(new byte[]{12},api.get(0,72,key(7),RequestType.<Buf>current()).toByteArray());}
             assertEquals(4,windows.size());assertThrows(IOException.class,()->new RatisRocksDBConnection(URI.create("ratis://controlled/incomplete"),root.resolve("incomplete"),Map.of(f.data.getFirst().domain,f.data.getFirst().routed),placement,homes.scheduler,binding,f.client,replicas,null,null,factory,RatisRocksDBConnection.Limits.defaults(),List.of(), pointBudget.shared));
         }
     }
-    @Test void fourColumnsShareOneLazyNativeTransactionAndUnknownCommitRetainsOriginalCaptures()throws Exception {
+    @Test void fourColumnsShareOneEagerNativeTransactionAndUnknownCommitRetainsOriginalCaptures()throws Exception {
         var helper=new RatisRocksDBConnectionTest();helper.root=root;
         try(var f=helper.new Fixture();var connection=f.open(8)) {
-            var nativeState=f.direct.f;var api=connection.getAsyncApi(RequestContext.batch());int before=nativeState.captureRequests.get();long transaction=await(api.openTransactionAsync(Duration.ofSeconds(10)));assertEquals(before,nativeState.captureRequests.get());
+            var nativeState=f.direct.f;var api=connection.getAsyncApi(RequestContext.batch());int before=nativeState.captureRequests.get();long transaction=await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(71,72,73,74), Duration.ofSeconds(10)));assertTrue(nativeState.captureRequests.get()>before);
             var keys=new ArrayList<Keys>();for(int n=0;n<4;n++)keys.add(n==3?new Keys(Buf.wrap(new byte[]{2}),Buf.wrap(new byte[]{7})):key(2));
             for(int n=0;n<4;n++)await(api.putAsync(transaction,71+n,keys.get(n),value(20+n),RequestType.none()));int captured=nativeState.captureRequests.get();assertTrue(captured>before);
             nativeState.beforeHomeRead=()->{throw new UncheckedIOException(new IOException("Retain exact commit until HOME proof is available"));};assertThrows(ExecutionException.class,()->await(api.closeTransactionAsync(transaction,true)));nativeState.beforeHomeRead=null;

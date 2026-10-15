@@ -193,7 +193,7 @@ class WorkloadResourceBindingTest {
 			var batch = embedded.getSyncApi(RequestContext.batch());
 			long columnId = batch.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-			long transactionId = latency.openTransaction(Duration.ofMillis(1));
+			long transactionId = latency.openTransaction(null, Duration.ofMillis(1));
 			long iteratorId = latency.openIterator(0, columnId, null, null, false, Duration.ofMillis(1));
 			Thread.sleep(20);
 
@@ -207,7 +207,7 @@ class WorkloadResourceBindingTest {
 			assertRocksFailure(() -> latency.get(transactionId, columnId, key(1), RequestType.current()));
 			assertRocksFailure(() -> latency.seekTo(iteratorId, key(1)));
 
-			latency.openTransaction(Duration.ofSeconds(30));
+			latency.openTransaction(null, Duration.ofSeconds(30));
 			latency.openIterator(0, columnId, null, null, false, Duration.ofSeconds(30));
 		} finally {
 			// closeTesting asserts that shutdown leaves no transactions, iterators, or
@@ -381,7 +381,7 @@ class WorkloadResourceBindingTest {
 
 		long openTransaction(long timeoutMs) {
 			var leaseTtl = Duration.ofMillis(timeoutMs);
-			return asyncMode ? async.openTransactionAsync(leaseTtl).join() : sync.openTransaction(leaseTtl);
+			return asyncMode ? async.openTransactionAsync(null, leaseTtl).join() : sync.openTransaction(null, leaseTtl);
 		}
 
 		boolean closeTransaction(long transactionId, boolean commit) {

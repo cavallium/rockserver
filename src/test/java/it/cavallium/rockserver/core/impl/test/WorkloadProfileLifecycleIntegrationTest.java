@@ -90,7 +90,7 @@ class WorkloadProfileLifecycleIntegrationTest {
 					false,
 					RequestType.entriesCount()));
 
-			long transactionId = batch.openTransaction( java.time.Duration.ofMillis(5_000));
+			long transactionId = batch.openTransaction(null,  java.time.Duration.ofMillis(5_000));
 			batch.closeTransaction(transactionId, false);
 			long iteratorId = batch.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 5_000));
 			batch.closeIterator(iteratorId);

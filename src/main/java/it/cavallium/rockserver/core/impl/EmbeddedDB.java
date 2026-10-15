@@ -2452,25 +2452,101 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	@Override
-	public long openTransaction(Duration transactionLeaseTtl) {
-		return openTransaction(LeaseTtl.toMillisCeil(transactionLeaseTtl, "transactionLeaseTtl"),
+	public long openTransaction(TransactionOpenScope scope, Duration transactionLeaseTtl) {
+		return openTransaction(scope, LeaseTtl.toMillisCeil(transactionLeaseTtl, "transactionLeaseTtl"),
 				WorkloadProfile.BATCH);
 	}
 
-	public long openTransaction(long timeoutMs, WorkloadProfile workloadProfile) {
+	public long openTransaction(TransactionOpenScope scope, long timeoutMs, WorkloadProfile workloadProfile) {
 		var start = System.nanoTime();
 		actionLogger.logAction("OpenTransaction", start, null, null, null, null, null, timeoutMs, null);
 		ops.beginOp();
 		try {
-			return allocateTransactionInternal(openTransactionInternal(timeoutMs,
-					false,
-					workloadProfile,
-					true));
+			var physicalScope = validateTransactionScope(scope);
+			return allocateTransactionInternal(openTransactionInternal(timeoutMs, false, workloadProfile, true, physicalScope));
 		} finally {
 			ops.endOp();
 			var end = System.nanoTime();
 			openTransactionTimer.record(end - start, TimeUnit.NANOSECONDS);
 		}
+	}
+
+	private List<Tx.ScopeSpan> validateTransactionScope(@Nullable TransactionOpenScope scope) {
+		if (scope == null) return null;
+		var spans = new ArrayList<Tx.ScopeSpan>(scope.spans().size());
+		for (var span : scope.spans()) {
+			try (var use = acquireColumnUse(span.columnId())) {
+				var col = use.column();
+				byte[] lower;
+				byte[] upper;
+				if (span.point()) {
+					lower = col.calculateKey(span.lowerInclusive().keys()).toByteArray();
+					upper = lower.clone();
+					int index = upper.length - 1;
+					while (index >= 0 && upper[index] == (byte) 0xff) upper[index--] = 0;
+					if (index < 0) upper = null;
+					else upper[index]++;
+				} else {
+					lower = transactionScopeBound(col, span.lowerInclusive(), false);
+					upper = transactionScopeBound(col, span.upperExclusive(), true);
+					if (lower != null && upper != null && Tx.compareBounds(lower, upper) >= 0)
+						throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Invalid transaction scope range");
+				}
+				spans.add(new Tx.ScopeSpan(col.cfh(), lower, upper));
+			}
+		}
+		spans.sort((left, right) -> {
+			if (left.lower() == null) return right.lower() == null ? 0 : -1;
+			if (right.lower() == null) return 1;
+			return Tx.compareBounds(left.lower(), right.lower());
+		});
+		return List.copyOf(spans);
+	}
+
+	private static byte[] transactionScopeBound(ColumnInstance col, @Nullable Keys keys, boolean upper) {
+		if (keys == null || keys.keys().length == 0) return null;
+		var parts = keys.keys();
+		var schema = col.schema();
+		if (parts.length < schema.keysCount() && parts.length <= schema.fixedLengthKeysCount()) {
+			int bytes = 0;
+			for (int i = 0; i < parts.length; i++) {
+				if (parts[i].size() != schema.key(i))
+					throw RocksDBException.of(RocksDBErrorType.KEY_LENGTH_MISMATCH, "Invalid transaction scope prefix component width");
+				bytes = Math.addExact(bytes, parts[i].size());
+			}
+			var prefix = new byte[bytes];
+			int offset = 0;
+			for (var part : parts) {
+				var bytesPart = part.toByteArray();
+				System.arraycopy(bytesPart, 0, prefix, offset, bytesPart.length);
+				offset += bytesPart.length;
+			}
+			return prefix;
+		}
+		var physical = col.calculateKey(parts).toByteArray();
+		if (!upper || !col.hasBuckets()) return physical;
+		// A logical upper endpoint can share its hash with included members. The
+		// declaration must authorize the entire physical bucket, never cut it.
+		int index = physical.length - 1;
+		while (index >= 0 && physical[index] == (byte) 0xff) index--;
+		if (index < 0) return null;
+		var successor = Arrays.copyOf(physical, index + 1);
+		successor[index]++;
+		return successor;
+	}
+
+	private static byte[] transactionRangeBound(ColumnInstance col, @Nullable Keys keys) {
+		return keys == null || keys.keys().length == 0 ? null : col.calculateKey(keys.keys()).toByteArray();
+	}
+
+	private static void useTransactionSnapshot(Tx tx, ReadOptions options) {
+		var snapshot = tx.val().getSnapshot();
+		if (snapshot != null) options.setSnapshot(snapshot);
+	}
+
+	private static void requireTransactionPoints(@Nullable Tx tx, ColumnInstance col, List<Keys> keys) {
+		if (tx != null && tx.scope() != null)
+			for (var key : keys) tx.requirePoint(col.cfh(), col.calculateKey(key.keys()).toByteArray());
 	}
 
 	private long allocateTransactionInternal(Tx tx) {
@@ -2494,6 +2570,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean isFromGetForUpdate,
 			WorkloadProfile workloadProfile,
 			boolean captureSnapshot) {
+		return openTransactionInternal(timeoutMs, isFromGetForUpdate, workloadProfile, captureSnapshot, null);
+	}
+
+	private Tx openTransactionInternal(long timeoutMs, boolean isFromGetForUpdate,
+			WorkloadProfile workloadProfile, boolean captureSnapshot, @Nullable List<Tx.ScopeSpan> scope) {
 		Objects.requireNonNull(workloadProfile, "workloadProfile");
 		if (timeoutMs < 0L) {
 			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
@@ -2516,7 +2597,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					isFromGetForUpdate,
 					expirationTimestamp,
 					rocksObjects,
-					workloadProfile);
+					workloadProfile, scope);
 			transaction = null;
 			try {
 				retainResourceLease();
@@ -3167,6 +3248,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Tx tx;
 			if (transactionOrUpdateId != 0) {
 				tx = getTransaction(transactionOrUpdateId, true);
+				requireTransactionPoints(tx, col, List.of(keys));
 			} else {
 				tx = null;
 			}
@@ -3209,6 +3291,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Tx tx;
 			if (transactionOrUpdateId != 0) {
 				tx = getTransaction(transactionOrUpdateId, true);
+				requireTransactionPoints(tx, col, List.of(keys));
 			} else {
 				tx = null;
 			}
@@ -3251,6 +3334,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Tx tx;
 			if (transactionOrUpdateId != 0) {
 				tx = getTransaction(transactionOrUpdateId, true);
+				requireTransactionPoints(tx, col, List.of(keys));
 			} else {
 				tx = null;
 			}
@@ -3302,6 +3386,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Tx tx;
 			if (transactionOrUpdateId != 0) {
 				tx = getTransaction(transactionOrUpdateId, true);
+				requireTransactionPoints(tx, col, keysList);
 			} else {
 				tx = null;
 			}
@@ -3593,6 +3678,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Tx tx;
 			if (transactionOrUpdateId != 0) {
 				tx = getTransaction(transactionOrUpdateId, true);
+				requireTransactionPoints(tx, col, keysList);
 			} else {
 				tx = null;
 			}
@@ -3818,6 +3904,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Tx tx;
 			if (transactionOrUpdateId != 0) {
 				tx = getTransaction(transactionOrUpdateId, true);
+				requireTransactionPoints(tx, col, keysList);
 			} else {
 				tx = null;
 			}
@@ -4609,6 +4696,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 						try (var readOptions = newReadOptions(null)) {
+							if (newTx instanceof Tx readTx) useTransactionSnapshot(readTx, readOptions);
 							var previousRawBucketByteArray
 									= ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 							didGetForUpdateInternally = true;
@@ -4624,6 +4712,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						if (RequestType.requiresGettingPreviousValue(callback)) {
 							assert newTx instanceof Tx;
 							try (var readOptions = newReadOptions(null)) {
+								if (newTx instanceof Tx readTx) useTransactionSnapshot(readTx, readOptions);
 								byte[] previousValueByteArray
 										= ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 								didGetForUpdateInternally = true;
@@ -4635,6 +4724,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							// todo: in the future this should be replaced with just keyExists
 							assert newTx instanceof Tx;
 							try (var readOptions = newReadOptions(null)) {
+								if (newTx instanceof Tx readTx) useTransactionSnapshot(readTx, readOptions);
 								byte[] previousValueByteArray = ((Tx) newTx)
 										.val()
 										.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
@@ -4771,6 +4861,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 						try (var readOptions = newReadOptions(null)) {
+							if (newTx instanceof Tx readTx) useTransactionSnapshot(readTx, readOptions);
 							var previousRawBucketByteArray = ((Tx) newTx)
 									.val()
 									.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
@@ -4787,6 +4878,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						if (RequestType.requiresGettingPreviousValue(callback)) {
 							assert newTx instanceof Tx;
 							try (var readOptions = newReadOptions(null)) {
+								if (newTx instanceof Tx readTx) useTransactionSnapshot(readTx, readOptions);
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx)
 										.val()
@@ -4800,6 +4892,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							// todo: in the future this should be replaced with just keyExists
 							assert newTx instanceof Tx;
 							try (var readOptions = newReadOptions(null)) {
+								if (newTx instanceof Tx readTx) useTransactionSnapshot(readTx, readOptions);
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx)
 										.val()
@@ -4931,6 +5024,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 						try (var readOptions = newReadOptions(null)) {
+							if (newTx instanceof Tx readTx) useTransactionSnapshot(readTx, readOptions);
 							var previousRawBucketByteArray = ((Tx) newTx)
 									.val()
 									.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
@@ -5189,6 +5283,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Tx prevTx = transactionOrUpdateId != 0
 					? getTransaction(transactionOrUpdateId, true, workloadProfile)
 					: null;
+			requireTransactionPoints(prevTx, col, List.of(keys));
 			Tx tx;
 			long updateId;
 			if (requestType instanceof RequestType.RequestForUpdate<?>) {
@@ -5834,6 +5929,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "keys contains null");
 				}
 			}
+			requireTransactionPoints(tx, col, keys);
 			if (keys.isEmpty()) {
 				this.snapshot = null;
 				this.readOptions = null;
@@ -5845,7 +5941,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Snapshot createdSnapshot = null;
 			ReadOptions createdReadOptions = null;
 			try {
-				if (chunk.nextOffset() < keys.size()) {
+				if (tx == null && chunk.nextOffset() < keys.size()) {
 					createdSnapshot = db.get().getSnapshot();
 					var snapshotObserver = existsMultiSnapshotObserver;
 					if (snapshotObserver != null) {
@@ -5855,6 +5951,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				createdReadOptions = newReadOptions("exists-multi-read-options");
 				createdReadOptions.setDeadline(deadlineMicros);
 				createdReadOptions.setFillCache(false);
+				if (tx != null) useTransactionSnapshot(tx, createdReadOptions);
 				if (createdSnapshot != null) {
 					createdReadOptions.setSnapshot(createdSnapshot);
 				}
@@ -6220,7 +6317,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 				if (transactionId != 0L) {
 					//noinspection resource
-					it = getTransaction(transactionId, false, workloadProfile).val().getIterator(ro, col.cfh());
+					var tx = getTransaction(transactionId, false, workloadProfile);
+					tx.requireRange(col.cfh(), transactionRangeBound(col, startKeysInclusive), transactionRangeBound(col, endKeysExclusive));
+					useTransactionSnapshot(tx, ro);
+					it = tx.val().getIterator(ro, col.cfh());
 				} else {
 					it = db.get().newIterator(col.cfh(), ro);
 				}
@@ -6827,7 +6927,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					RocksIterator it;
 					if (transactionId != 0L) {
 						//noinspection resource
-						it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
+						var tx = getTransaction(transactionId, false);
+						tx.requireRange(col.cfh(), transactionRangeBound(col, startKeysInclusive), transactionRangeBound(col, endKeysExclusive));
+						useTransactionSnapshot(tx, ro);
+						it = tx.val().getIterator(ro, col.cfh());
 					} else {
 						it = db.get().newIterator(col.cfh(), ro);
 					}
@@ -8460,7 +8563,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				createdReadOptions = newRangeReadOptions(deadlineMicros, fillCache, createdStartKeySlice,
 						createdEndKeySlice);
 				if (transactionId != 0L) {
-					var transactionSnapshot = getTransaction(transactionId, false).val().getSnapshot();
+					var tx = getTransaction(transactionId, false);
+					tx.requireRange(col.cfh(), startKey == null ? null : startKey.toByteArray(), endKey == null ? null : endKey.toByteArray());
+					var transactionSnapshot = tx.val().getSnapshot();
 					if (transactionSnapshot != null) {
 						createdReadOptions.setSnapshot(transactionSnapshot);
 					}
@@ -10296,6 +10401,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		if (tx != null) {
 			byte[] previousRawBucketByteArray;
 			byte[] calculatedKeyArray = calculatedKey.toByteArray();
+			tx.requirePoint(col.cfh(), calculatedKeyArray);
+			useTransactionSnapshot(tx, readOptions);
 			if (forUpdate || tx.isFromGetForUpdate()) {
 				previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 			} else {

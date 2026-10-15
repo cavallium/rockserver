@@ -69,7 +69,7 @@ class CdcGhostAndSkipTest {
     private int writeFilteredWalPage() throws RocksDBException {
         int written = 0;
         for (int batch = 0; batch < FILTERED_WAL_BATCHES_PER_PHYSICAL_PAGE; batch++) {
-            long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
+            long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
             for (int i = 0; i < FILTERED_WAL_BATCH_SIZE; i++) {
                 int key = batch * FILTERED_WAL_BATCH_SIZE + i;
                 db.put(txId,
@@ -86,7 +86,7 @@ class CdcGhostAndSkipTest {
 
     private int writeFilteredWalPagesThenMatchingEvent() throws RocksDBException {
         int written = writeFilteredWalPage();
-        long matchingTx = db.openTransaction( java.time.Duration.ofMillis(10_000));
+        long matchingTx = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
         db.put(matchingTx,
                 colA,
                 new Keys(new Buf[]{Buf.wrap(intToBytes(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE))}),
@@ -124,7 +124,7 @@ class CdcGhostAndSkipTest {
         for (int page = 0; page < filteredPages; page++) {
             filteredMutations += writeFilteredWalPage();
         }
-        long matchingTx = db.openTransaction( java.time.Duration.ofMillis(10_000));
+        long matchingTx = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
         db.put(matchingTx,
                 colA,
                 new Keys(new Buf[]{Buf.wrap(intToBytes(filteredMutations))}),
@@ -182,7 +182,7 @@ class CdcGhostAndSkipTest {
         var appended = new AtomicBoolean();
         db.setCdcPollTailCapturedObserverForTesting(() -> {
             if (appended.compareAndSet(false, true)) {
-                long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
+                long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
                 db.put(txId,
                         colA,
                         new Keys(new Buf[]{Buf.wrap(intToBytes(FILTERED_MUTATIONS_PER_PHYSICAL_PAGE))}),
@@ -222,7 +222,7 @@ class CdcGhostAndSkipTest {
         final int transactionSize = 512;
         int written = 0;
         for (int first = 0; first < events; first += transactionSize) {
-            long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
+            long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
             int end = Math.min(events, first + transactionSize);
             for (int i = first; i < end; i++) {
                 db.put(txId,
@@ -274,7 +274,7 @@ class CdcGhostAndSkipTest {
         var value = Buf.wrap(new byte[valueBytes]);
         int written = 0;
         for (int first = 0; first < events; first += eventsPerTransaction) {
-            long txId = db.openTransaction( java.time.Duration.ofMillis(10_000));
+            long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10_000));
             int end = Math.min(events, first + eventsPerTransaction);
             for (int i = first; i < end; i++) {
                 db.put(txId,
@@ -325,7 +325,7 @@ class CdcGhostAndSkipTest {
         // OR rely on the fact that EmbeddedDB doesn't easily expose mixed-column atomic writes in one call
         // EXCEPT via Transactions.
 
-        long txId = db.openTransaction( java.time.Duration.ofMillis(10000));
+        long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10000));
         db.put(txId, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A1".getBytes()), RequestType.none());
         db.put(txId, colB, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("B1".getBytes()), RequestType.none());
         db.put(txId, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("A2".getBytes()), RequestType.none());
@@ -349,7 +349,7 @@ class CdcGhostAndSkipTest {
         db.cdcCreate(subA, null, List.of(colA), false, java.util.OptionalLong.empty());
 
         // Write mixed batch: [Put A1, Put B1, Put A2]
-        long txId = db.openTransaction( java.time.Duration.ofMillis(10000));
+        long txId = db.openTransaction(null,  java.time.Duration.ofMillis(10000));
         db.put(txId, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A1".getBytes()), RequestType.none());
         db.put(txId, colB, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("B1".getBytes()), RequestType.none());
         db.put(txId, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("A2".getBytes()), RequestType.none());
@@ -375,7 +375,7 @@ class CdcGhostAndSkipTest {
         db.cdcCreate(subA, null, List.of(colA), false, java.util.OptionalLong.empty());
 
         // 1. Write Data (Using Transaction for consistency)
-        long tx1 = db.openTransaction( java.time.Duration.ofMillis(10000));
+        long tx1 = db.openTransaction(null,  java.time.Duration.ofMillis(10000));
         db.put(tx1, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("Data1".getBytes()), RequestType.none());
         db.closeTransaction(tx1, true);
 
@@ -385,12 +385,12 @@ class CdcGhostAndSkipTest {
         long seqAfterA1 = b1.nextSeq();
 
         // 2. Write Put B1 (Batch 2) - This batch is filtered out for subA
-        long tx2 = db.openTransaction( java.time.Duration.ofMillis(10000));
+        long tx2 = db.openTransaction(null,  java.time.Duration.ofMillis(10000));
         db.put(tx2, colB, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("B1".getBytes()), RequestType.none());
         db.closeTransaction(tx2, true);
 
         // 3. Write Put A2 (Batch 3)
-        long tx3 = db.openTransaction( java.time.Duration.ofMillis(10000));
+        long tx3 = db.openTransaction(null,  java.time.Duration.ofMillis(10000));
         db.put(tx3, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("A2".getBytes()), RequestType.none());
         db.closeTransaction(tx3, true);
 
@@ -408,7 +408,7 @@ class CdcGhostAndSkipTest {
         db.cdcCreate(sub, null, List.of(colA), false, java.util.OptionalLong.empty());
 
         // Write 3 items
-        long tx = db.openTransaction( java.time.Duration.ofMillis(10000));
+        long tx = db.openTransaction(null,  java.time.Duration.ofMillis(10000));
         for(int i=0; i<3; i++) {
             db.put(tx, colA, new Keys(new Buf[]{Buf.wrap(intToBytes(i))}), Buf.wrap(("V"+i).getBytes()), RequestType.none());
         }

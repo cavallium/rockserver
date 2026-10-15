@@ -48,13 +48,19 @@ public final class RatisSnapshotClient implements AutoCloseable {
         this(schema,homes,data,scheduler,limits,RatisSnapshotCaptureRequest.Mode.READ_ONLY);
     }
     RatisSnapshotClient(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode) {
-        this(schema,homes,data,scheduler,limits,mode,RatisJournalAccess.standalone());
+        this(schema,data.directory(schema),homes,data,scheduler,limits,mode,RatisJournalAccess.standalone());
     }
-    static RatisSnapshotClient journalOwned(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access){return new RatisSnapshotClient(schema,homes,data,scheduler,limits,mode,access);}
-    private RatisSnapshotClient(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access) {
+    static RatisSnapshotClient journalOwned(DistributedSchema schema,RangeDirectory directory,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access){return new RatisSnapshotClient(schema,directory,homes,data,scheduler,limits,mode,access);}
+    private RatisSnapshotClient(DistributedSchema schema,RangeDirectory directory,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access) {
         journalAccess=Objects.requireNonNull(access);
         this.mode=Objects.requireNonNull(mode); this.schema=Objects.requireNonNull(schema); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); this.scheduler=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits);
-        data.requireKnownSchema(schema); directory=data.directory(schema); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
+        this.directory=qualifiedDirectory(schema,directory,data); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
+    }
+    static RangeDirectory qualifiedDirectory(DistributedSchema schema,RangeDirectory directory,RatisRoutedClient data) {
+        schema.requireMatches(Objects.requireNonNull(directory));var qualified=data.directory(schema);
+        if(directory.generation()>qualified.generation() || directory.generation()==qualified.generation() && !Arrays.equals(directory.payloadDigest(),qualified.payloadDigest()))
+            throw new IllegalArgumentException("Frozen snapshot placement is not qualified by current schema authority");
+        return directory;
     }
     RatisSnapshotCaptureRequest.Mode captureMode() { return mode; }
     public byte[] identityDigest() {

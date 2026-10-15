@@ -73,7 +73,7 @@ class CdcConsistencyTest {
     @Test
     void testTransactionVisibility() throws Exception {
         // 1. Transaction Commit
-        long txId1 = db.openTransaction( java.time.Duration.ofMillis(5000));
+        long txId1 = db.openTransaction(null,  java.time.Duration.ofMillis(5000));
         db.put(txId1, defaultColId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("Committed".getBytes()), RequestType.none());
 
         // Should not see it yet
@@ -89,7 +89,7 @@ class CdcConsistencyTest {
         long nextSeq = batch.nextSeq();
 
         // 2. Transaction Rollback
-        long txId2 = db.openTransaction( java.time.Duration.ofMillis(5000));
+        long txId2 = db.openTransaction(null,  java.time.Duration.ofMillis(5000));
         db.put(txId2, defaultColId, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("RolledBack".getBytes()), RequestType.none());
 
         // Should not see it
@@ -146,7 +146,7 @@ class CdcConsistencyTest {
         db.cdcCreate(sub2, null, List.of(defaultColId, col2), false, java.util.OptionalLong.empty());
 
         // Manually create a WriteBatch with mixed CFs using Transaction
-        long txId = db.openTransaction( java.time.Duration.ofMillis(5000));
+        long txId = db.openTransaction(null,  java.time.Duration.ofMillis(5000));
         db.put(txId, defaultColId, new Keys(new Buf[]{Buf.wrap(intToBytes(1))}), Buf.wrap("A".getBytes()), RequestType.none());
         db.put(txId, col2, new Keys(new Buf[]{Buf.wrap(intToBytes(2))}), Buf.wrap("B".getBytes()), RequestType.none());
         db.put(txId, defaultColId, new Keys(new Buf[]{Buf.wrap(intToBytes(3))}), Buf.wrap("C".getBytes()), RequestType.none());

@@ -28,7 +28,7 @@ class RatisLogicalExportMigrationTest {
     @FunctionalInterface interface BeforeCommit {void run()throws Exception;}
     static Buf fence(long epoch,UUID owner){return Buf.wrap(ByteBuffer.allocate(24).putLong(epoch).putLong(owner.getMostSignificantBits()).putLong(owner.getLeastSignificantBits()).array());}
     static Applied migrate(RocksDBAsyncAPI api,ExportJobs.Chunk chunk,List<KV> rows,Buf expectedFence,Keys checkpoint,BeforeCommit competing)throws Exception {
-        long transaction=await(api.openTransactionAsync(Duration.ofSeconds(30)));boolean closed=false;
+        long transaction=await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(71,72,73,74), Duration.ofSeconds(30)));boolean closed=false;
         try {
             var guard=await(api.getAsync(transaction,71,key(1),RequestType.<Buf>forUpdate()));assertEquals(transaction,guard.updateId());assertArrayEquals(expectedFence.toByteArray(),guard.previous().toByteArray(),"Migration epoch/owner must match the trusted lease");
             byte[] exact=ExportWire.id(chunk.id()).toByteArray();var saved=await(api.getAsync(transaction,73,checkpoint,RequestType.<Buf>current()));
@@ -37,6 +37,14 @@ class RatisLogicalExportMigrationTest {
             await(api.putAsync(transaction,73,checkpoint,Buf.wrap(exact),RequestType.<Buf>none()));competing.run();
             if(await(api.closeTransactionAsync(transaction,true))){closed=true;return Applied.COMMITTED;}
             assertTrue(await(api.closeTransactionAsync(transaction,false)));closed=true;return Applied.CONFLICT;
+        }finally{if(!closed)await(api.closeTransactionAsync(transaction,false));}
+    }
+    static void put(RocksDBAsyncAPI api,long column,Keys key,Buf value)throws Exception {
+        var scope=new TransactionOpenScope(List.of(TransactionOpenScope.Span.point(column,key)));
+        long transaction=await(api.openTransactionAsync(scope,Duration.ofSeconds(30)));boolean closed=false;
+        try {
+            await(api.putAsync(transaction,column,key,value,RequestType.none()));
+            assertTrue(await(api.closeTransactionAsync(transaction,true)));closed=true;
         }finally{if(!closed)await(api.closeTransactionAsync(transaction,false));}
     }
     static List<KV> decode(Path file,ExportJobs.Chunk chunk,DistributedSchema immutableSchema)throws Exception {

@@ -55,7 +55,7 @@ class ExistsMultiTest {
 			assertEquals(expected, api.existsMultiAsync(0, fixedColumn, query).join());
 			assertEquals(List.of(), api.existsMulti(0, fixedColumn, List.of()));
 
-			long transactionId = api.openTransaction( java.time.Duration.ofMillis(10_000));
+			long transactionId = api.openTransaction(null,  java.time.Duration.ofMillis(10_000));
 			try {
 				api.delete(transactionId, fixedColumn, key1, RequestType.none());
 				api.put(transactionId, fixedColumn, key2, value(2), RequestType.none());

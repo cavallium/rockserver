@@ -63,8 +63,8 @@ import reactor.util.retry.Retry;
 public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 
 	/** See: {@link OpenTransaction}. */
-	default CompletableFuture<Long> openTransactionAsync(Duration transactionLeaseTtl) throws RocksDBException {
-		return requestAsync(new OpenTransaction(transactionLeaseTtl));
+	default CompletableFuture<Long> openTransactionAsync(TransactionOpenScope scope, Duration transactionLeaseTtl) throws RocksDBException {
+		return requestAsync(new OpenTransaction(scope, transactionLeaseTtl));
 	}
 
 	/** See: {@link CloseTransaction}. */

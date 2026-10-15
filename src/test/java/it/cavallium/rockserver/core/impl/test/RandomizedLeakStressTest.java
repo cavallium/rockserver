@@ -206,7 +206,7 @@ public class RandomizedLeakStressTest {
 	}
 
 	private void doTxCommit(Random random) {
-		long transactionId = syncApi.openTransaction( java.time.Duration.ofMillis(5_000));
+		long transactionId = syncApi.openTransaction(null,  java.time.Duration.ofMillis(5_000));
 		boolean closed = false;
 		try {
 			syncApi.put(transactionId,
@@ -224,7 +224,7 @@ public class RandomizedLeakStressTest {
 	}
 
 	private void doTxRollback(Random random) {
-		long transactionId = syncApi.openTransaction( java.time.Duration.ofMillis(5_000));
+		long transactionId = syncApi.openTransaction(null,  java.time.Duration.ofMillis(5_000));
 		boolean closed = false;
 		try {
 			syncApi.put(transactionId,
@@ -386,7 +386,7 @@ public class RandomizedLeakStressTest {
 	}
 
 	private void openExpiringTxAndIteratorThenCleanup() {
-		long transactionId = syncApi.openTransaction( java.time.Duration.ofMillis(10));
+		long transactionId = syncApi.openTransaction(null,  java.time.Duration.ofMillis(10));
 		try {
 			syncApi.openIterator(transactionId, colId, key(1), null, false, java.time.Duration.ofMillis( 10));
 		} catch (RocksDBException expired) {

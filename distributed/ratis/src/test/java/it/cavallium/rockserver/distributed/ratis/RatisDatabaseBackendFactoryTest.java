@@ -93,8 +93,8 @@ class RatisDatabaseBackendFactoryTest {
                     RatisConnectionBatchesTest.acknowledge(remote,token,await(remote.finishInput(token,RequestContext.batch())));
                     assertArrayEquals(new byte[]{(byte)(20+n)},await(api.getAsync(0,column,key(8),RequestType.<Buf>current())).toByteArray());
                 }
-                long transaction=await(api.openTransactionAsync(Duration.ofSeconds(10)));assertTrue(await(api.closeTransactionAsync(transaction,false)));
-                assertEquals(before+6,fixture.nativeDomains.catalogue.epochs.read().nextEpoch(),"Each used domain owns two POINT grants and one BULK grant; an untouched lazy transaction allocates none");
+                var missing=assertThrows(ExecutionException.class,()->await(api.openTransactionAsync(null, Duration.ofSeconds(10))));assertEquals(RocksDBException.RocksDBErrorType.TX_SCOPE_REQUIRED,assertInstanceOf(RocksDBException.class,missing.getCause()).getErrorUniqueId());
+                assertEquals(before+6,fixture.nativeDomains.catalogue.epochs.read().nextEpoch(),"Each used domain owns two POINT grants and one BULK grant; a missing scope allocates none");
                 var grants=fixture.nativeDomains.catalogue.epochs.read().grants();assertEquals(6,grants.size());assertEquals(6,grants.stream().map(SessionEpochLedger.Grant::sessionId).distinct().count());
                 var transactionHome=fixture.homes.stream().filter(h->h.placement.role()==RatisNodePlan.Role.TRANSACTION_HOME).findFirst().orElseThrow();assertEquals(6,transactionHome.bindings.size());
                 var snapshotHome=fixture.homes.stream().filter(h->h.placement.role()==RatisNodePlan.Role.SNAPSHOT_HOME).findFirst().orElseThrow();assertTrue(snapshotHome.bindings.isEmpty(),"No snapshot grant is issued until a transaction actually captures or stages data");
@@ -159,7 +159,7 @@ class RatisDatabaseBackendFactoryTest {
             try(var factory=fixture.factory(owned)){
                 var connection=factory.open(URI.create("ratis://controlled/transaction-backend"));var api=connection.getAsyncApi(RequestContext.batch());assertEquals(5,await(api.getAllColumnDefinitionsAsync()).size());
                 RatisRocksDBConnectionTest.point(connection,75,key(7),value(55),RequestType.RequestTypeId.NOTHING);int captures=f.captureRequests.get();
-                firstTransaction=await(api.openTransactionAsync(Duration.ofSeconds(30)));assertEquals(captures,f.captureRequests.get());
+                firstTransaction=await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(71,72,73,74), Duration.ofSeconds(30)));assertTrue(f.captureRequests.get()>captures);
                 await(api.putAsync(firstTransaction,71,key(2),value(41),RequestType.none()));await(api.putAsync(firstTransaction,72,key(200),value(42),RequestType.none()));
                 assertTrue(f.captureRequests.get()>captures,"Factory durable allocation must drive real native captures");assertArrayEquals(new byte[]{41},await(api.getAsync(firstTransaction,71,key(2),RequestType.<Buf>current())).toByteArray());
                 assertNull(await(api.getAsync(0,71,key(2),RequestType.<Buf>current())),"Uncommitted cross-column state remains private");
@@ -170,7 +170,7 @@ class RatisDatabaseBackendFactoryTest {
             assertEquals(2,fixture.ownedHomeCloses.get());int captures=f.captureRequests.get();
             try(var factory=fixture.factory(owned)){
                 var connection=factory.open(URI.create("ratis://controlled/transaction-backend"));var api=connection.getAsyncApi(RequestContext.batch());assertArrayEquals(new byte[]{41},await(api.getAsync(0,71,key(2),RequestType.<Buf>current())).toByteArray());assertArrayEquals(new byte[]{42},await(api.getAsync(0,72,key(200),RequestType.<Buf>current())).toByteArray());assertArrayEquals(new byte[]{55},await(api.getAsync(0,75,key(7),RequestType.<Buf>current())).toByteArray());
-                long transaction=await(api.openTransactionAsync(Duration.ofSeconds(30)));assertTrue(transaction>firstTransaction);await(api.putAsync(transaction,71,key(3),value(99),RequestType.none()));assertTrue(f.captureRequests.get()>captures);assertTrue(await(api.closeTransactionAsync(transaction,false)));assertNull(await(api.getAsync(0,71,key(3),RequestType.<Buf>current())));assertEquals(issued,f.catalogue.epochs.read().nextEpoch());
+                long transaction=await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(71,72,73,74), Duration.ofSeconds(30)));assertTrue(transaction>firstTransaction);await(api.putAsync(transaction,71,key(3),value(99),RequestType.none()));assertTrue(f.captureRequests.get()>captures);assertTrue(await(api.closeTransactionAsync(transaction,false)));assertNull(await(api.getAsync(0,71,key(3),RequestType.<Buf>current())));assertEquals(issued,f.catalogue.epochs.read().nextEpoch());
                 for(var store:f.stores.values())assertEquals(0,store.activeSnapshotPins());
             }
             assertEquals(4,fixture.ownedHomeCloses.get());assertArrayEquals(new byte[]{41},f.get(71,key(2)));assertArrayEquals(new byte[]{55},fixture.extra.read(fixture.extraColumn,new byte[]{7}));

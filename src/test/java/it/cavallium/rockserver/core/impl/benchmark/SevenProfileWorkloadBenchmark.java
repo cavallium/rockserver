@@ -320,7 +320,7 @@ public final class SevenProfileWorkloadBenchmark {
 			futures.add(workers.submit(() -> runWorker(control, pressure,
 					new WorkloadKey(WorkloadProfile.CONTROL, OperationFamily.CONTROL),
 					new Pacer(options.controlRate(), options.controlWorkers(), workerIndex), () -> {
-						long transactionId = batch.openTransaction( java.time.Duration.ofMillis(60_000L));
+						long transactionId = batch.openTransaction(null,  java.time.Duration.ofMillis(60_000L));
 						if (!batch.closeTransaction(transactionId, false)) {
 							throw new IllegalStateException("CONTROL rollback did not close its transaction");
 						}

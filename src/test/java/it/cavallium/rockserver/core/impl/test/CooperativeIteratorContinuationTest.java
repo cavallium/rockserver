@@ -131,7 +131,7 @@ class CooperativeIteratorContinuationTest {
 				sync.closeIterator(bucketedIterator);
 			}
 
-			long transactionId = sync.openTransaction( java.time.Duration.ofMillis(30_000L));
+			long transactionId = sync.openTransaction(null,  java.time.Duration.ofMillis(30_000L));
 			try {
 				long transactionIterator = sync.openIterator(
 						transactionId, fixedColumn, new Keys(), null, false, java.time.Duration.ofMillis( 30_000L));

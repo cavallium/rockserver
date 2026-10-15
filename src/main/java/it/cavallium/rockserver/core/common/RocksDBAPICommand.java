@@ -219,21 +219,23 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * <p>
 		 * Returns the transaction id
 		 *
+		 * @param scope immutable logical access declaration; null captures the standalone database
+		 *              and is rejected with TX_SCOPE_REQUIRED by distributed storage
 		 * @param transactionLeaseTtl lifetime of the transaction lease
 		 */
-		record OpenTransaction(Duration transactionLeaseTtl) implements RocksDBAPICommandSingle<Long> {
+		record OpenTransaction(TransactionOpenScope scope, Duration transactionLeaseTtl) implements RocksDBAPICommandSingle<Long> {
 			public OpenTransaction {
 				validateLeaseTtl(transactionLeaseTtl, "transactionLeaseTtl");
 			}
 
 			@Override
 			public Long handleSync(RocksDBSyncAPI api) {
-				return api.openTransaction(transactionLeaseTtl);
+				return api.openTransaction(scope, transactionLeaseTtl);
 			}
 
 			@Override
 			public CompletableFuture<Long> handleAsync(RocksDBAsyncAPI api) {
-				return api.openTransactionAsync(transactionLeaseTtl);
+				return api.openTransactionAsync(scope, transactionLeaseTtl);
 			}
 
 			@Override

@@ -16,6 +16,32 @@ does not establish complete distributed API parity or production acceptance.
 Earlier checkpoints below retain the limitations known at their validation time.
 This section and the remaining gates at the end describe the current branch.
 
+- The current Java/gRPC/Thrift/Rust transaction open now carries an immutable,
+  bounded logical scope; no TTL-only compatibility overload remains. Distributed
+  opens reject missing scope before allocating a handle, grant or capture, and
+  eagerly capture the declared columns/groups. Standalone null-scope opens retain
+  their eager database snapshot; explicit scopes enforce points, fixed prefixes,
+  ranges and whole collision buckets before access effects. Native transactional
+  reads now actually select the captured snapshot in ReadOptions. Socket tests
+  cover open, an external write before the first read, the original cut, typed
+  out-of-scope refusal, rollback, reopen and commit over both gRPC and Thrift.
+  Immutable connection generations and recovery identities bind both schema and
+  exact directory digests, preserving old handles across same-schema placement
+  changes while new opens capture the current directory. Cross-domain scopes
+  remain an explicit implementation gap; domains are placement units within one
+  database, not a relaxation of the required cross-column atomicity contract.
+  `scoped-prefix-native57.log` passes 43 core cases in each execution.
+  `scoped-recovery-combined58.log` passes 128 core cases in each execution,
+  28 server cases and 16 gRPC lifecycle cases. Packaging succeeds separately in
+  `scoped-package-local-cache59.log`; all four current jars contain no removed
+  LazyTransaction implementation. Rust passes 85 cases in
+  `scoped-current-rust49.log` and all workspace targets compile in
+  `scoped-rust-workspace53.log`. The actual export migration now uses owned scoped
+  transactions for its fence writes; all six workflow cases pass in
+  `scoped-export-owned-fence55.log`. The final combined adapter gate
+  `scoped-recovery-coupled60.log` passes 27 cases, including the same three-process
+  cold recovery/leader loss/return workflow in 57.66 seconds, exact placement
+  generation recovery and export fence/data/checkpoint atomicity.
 - Three independent Runtime JVMs now pass a complete production-loopback gRPC
   workflow with real native pools and retained Raft roots: original genesis and
   grant binding, writes, three unfinished CURRENT source preparations, actual
