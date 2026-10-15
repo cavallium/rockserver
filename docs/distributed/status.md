@@ -16,6 +16,22 @@ does not establish complete distributed API parity or production acceptance.
 Earlier checkpoints below retain the limitations known at their validation time.
 This section and the remaining gates at the end describe the current branch.
 
+- Three independent Runtime JVMs now pass a complete production-loopback gRPC
+  workflow with real native pools and retained Raft roots: original genesis and
+  grant binding, writes, three unfinished CURRENT source preparations, actual
+  topology split, forced receiver fencing, hard-stop of the entire cohort,
+  concurrent cold META completion and descendant recovery, exact original receipt
+  replay, new descendant writes, actual leader loss, two-voter writes and the
+  stopped voter's cold return and updater catch-up. The exact fence and local-seed
+  digests survive; all three cleanup dispositions are OBSOLETE, with zero native
+  pins/source leases and no retired USER access. Each node retains four groups
+  under the existing budgets. `runtime-quorum-catalogue-appender-cause43.log`
+  passes this workflow in 67.62 seconds. Recovery phase timers are caller-driven;
+  Raft timers, transport, catalogue and native work are real. This is one-host
+  correctness evidence, with separate failure domains and representative resource/
+  performance acceptance still pending. Earlier runs also exposed sticky leader
+  routing of proof reads; the passing run does not resolve that remaining defect.
+
 - Configured CURRENT recovery now durably selects META in the same driver journal,
   fences the actual receiver, and settles every retained request alias at every
   original source voter before META PREPARE. Fresh graph discovery adopts forced
