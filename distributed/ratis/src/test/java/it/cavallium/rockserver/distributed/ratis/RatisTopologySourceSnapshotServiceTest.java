@@ -60,7 +60,7 @@ class RatisTopologySourceSnapshotServiceTest {
                 public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireReceiverInstalled(lease);}
                 public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.released(lease);}
                 public boolean isReleased(Request request)throws Exception{return fixture.isReleased(request);}
-                public InstallSnapshotReplyProto send(InstallSnapshotRequestProto request)throws IOException{return fixture.send(request);}
+                public InstallSnapshotReplyProto send(RatisTopologySourceSnapshotRpc.Request scope,InstallSnapshotRequestProto request)throws IOException{return fixture.send(scope,request);}
             };
             try(var service=new RatisTopologySourceSnapshotService(host,new RatisTopologySourceSnapshotService.Limits(1,8L<<20,8L<<20,RatisTopologySourceSnapshotService.MAX_METADATA_BYTES),fixture.scheduler,fixture.transferAdmission());var executor=Executors.newSingleThreadExecutor()){
                 service.prepare(next);long imageCharge=service.stats().reservedImageBytes(),metadataCharge=service.stats().metadataBytes();var actual=executor.submit(()->service.prepare(old));assertTrue(entered.await(5,TimeUnit.SECONDS));assertEquals(imageCharge,service.stats().reservedImageBytes());assertTrue(service.stats().metadataBytes()>metadataCharge);assertEquals(1,service.stats().active());assertThrows(IOException.class,()->service.prepare(old));unblock.countDown();var failure=assertThrows(ExecutionException.class,()->actual.get(5,TimeUnit.SECONDS));assertInstanceOf(AbandonedException.class,failure.getCause());assertEquals(terminal,((AbandonedException)failure.getCause()).receipt());assertEquals(imageCharge,service.stats().reservedImageBytes());assertEquals(metadataCharge,service.stats().metadataBytes());assertEquals(1,fixture.captures.get());assertThrows(AbandonedException.class,()->service.prepare(old));assertEquals(1,fixture.captures.get());
@@ -114,7 +114,7 @@ class RatisTopologySourceSnapshotServiceTest {
                 public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireReceiverInstalled(lease);}
                 public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.released(lease);}
                 public boolean isReleased(Request request)throws Exception{return fixture.isReleased(request);}
-                public InstallSnapshotReplyProto send(InstallSnapshotRequestProto request)throws IOException{return fixture.send(request);}
+                public InstallSnapshotReplyProto send(RatisTopologySourceSnapshotRpc.Request scope,InstallSnapshotRequestProto request)throws IOException{return fixture.send(scope,request);}
             };
             var limits=new RatisTopologySourceSnapshotService.Limits(4,8*1024*1024,32*1024*1024,3L*MAX_REPLY_BYTES);
             try(var service=new RatisTopologySourceSnapshotService(host,limits,fixture.scheduler,fixture.transferAdmission())){

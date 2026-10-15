@@ -1644,8 +1644,22 @@ topology publications and rejects unqualified route/directory advancement
 (`node-service-remote-placement-gate.log`). Remote owner admission is controlled;
 this is not remote quorum evidence. Another 36 standalone/command-codec cases
 pass against the integrated core and qualified private JNI artifact
-(`integrated-standalone-codec-gate.log`). The combined import/schema/backup and
-cold-service workflow remains in progress.
+(`integrated-standalone-codec-gate.log`). The same-service two-pool workflow now
+passes actual split, nonempty SST import, operator upload/CREATE and non-idempotent
+MERGE, shared native backup/cohorts, pin drainage, and cold reopen using the original
+manifest and node identity. The copied COMPLETE archive independently contains
+key `9` with value `[11,33]`; the retained grant, request bytes and epoch ledger
+survive exact retry without a second merge effect. Cold recovery also exposed and
+fixed a DATA-only startup return that skipped native topology route restoration.
+Evidence: `two-pool-backup-cold-native-routing-fixed-gate.log` and
+`current-leaf-runtime-source-and-backup-gate2.log`. Catalogue/HOME transports and
+Ratis divisions are controlled; this does not establish network/quorum acceptance.
+The qualified Debug JNI now retains its C API as a direct CMake JNI source, so
+actual configured FFM operators load and execute. Source `47806cf` and reconstructed
+source `1ea9c5b` have the same tree; wrapper `54d0f2c` retains one consolidated
+current delta. Required C symbols and bundled-library identity are verified, and
+all twelve replica-service cases plus the full workflow pass. The production
+Debian/GCC12 build remains unproven.
 A controlled native split now passes full connection close/reopen with the latest
 activated directory, exact old/new token lookup, another native write and no extra
 historical grants. The original forced generation binding is preserved; known
@@ -1720,9 +1734,34 @@ quota enforcement including the reservation marker
 (`topology-anchor-marker-quota-gate.log`). The extended 17-case gate also proves
 exact pending reservation promotion/deduplication after cold quota validation;
 partial/conflicting markers and over-quota inventories remain untouched
-(`topology-reservation-pending-recovery-gate.log`). This does not yet
-implement historical obligation discovery, transport, quorum retirement or physical
-parent reclamation.
+(`topology-reservation-pending-recovery-gate.log`). These whole-USER frozen anchors
+remain temporary correctness scaffolding, not the efficient final topology path.
+
+The native replacement now recovers a qualified CURRENT leaf from its own GROUP
+image and own tail, and sealed ancestors from separate metadata-only images/tails.
+Receiver registration grants neither USER readiness nor voting eligibility. Native
+checks cover missing historical seeds, receipt/ACK/credit/CDC retention, interrupted
+install and cold retry, schema catch-up, later schema/topology changes, and two-hop
+re-export with different physical aliases. Provenance uses a fixed first-installation
+digest rather than duplicating schema history. Eleven focused current-leaf cases
+pass in `native-current-compact-final-current-gate.log`; the wider native/schema/
+learner selections and metadata gates are recorded in the same output directory.
+The integrated core selection passes 31 cases, including ten standalone async and
+five command-codec cases (`current-leaf-runtime-source-backup-standalone-integrated-gate.log`).
+Runtime source capture now qualifies actual current placement or immutable ancestor
+publication, live Division/configuration and each source's own native cut. The
+exact receiver image probe remains separate from authoritative outcome readiness.
+Source capture/cold-artifact checks pass in
+`current-native-source-host-publication-final-gate.log`; receiver/protocol/source
+regressions and the full two-pool workflow are in
+`current-leaf-runtime-source-and-backup-gate2.log`.
+
+Initial-image adapter reload, voting/apply/append eligibility, durable metadata-DAG
+obligation discovery, asynchronous configured-member catch-up, quorum retirement,
+source quiescence and physical parent reclamation remain unfinished. In particular,
+Raft commitment alone must not report an absent native image as installed, replay
+historical USER state, or let a registered empty member vote. Existing all-owner
+retirement guards stay in place until that complete path is proven.
 
 - Reconcile the complete two-pool dynamic/import/schema/backup matrix and cold
   artifact quotas against the architecture. Controlled restore quota/unknown-force,

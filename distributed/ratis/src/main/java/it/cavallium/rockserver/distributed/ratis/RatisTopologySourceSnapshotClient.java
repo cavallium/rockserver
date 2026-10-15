@@ -14,6 +14,13 @@ public final class RatisTopologySourceSnapshotClient {
     public Prepared prepare(Request request)throws IOException{return prepared(PREPARE,request);}
     public Prepared transfer(Request request)throws IOException{return prepared(TRANSFER,request);}
     public void release(Request request)throws IOException{byte[] input=request(RELEASE,request),reply=call(input,request,MAX_REQUEST_BYTES).getMessage().getContent().toByteArray();if(!Arrays.equals(input,reply))throw new IOException("Source release acknowledgement changed exact request");}
+    public RatisRecoveryImageRpc.Evidence imageInstalled(RatisRecoveryImageRpc.Request request)throws IOException {
+        if(!client.getGroupId().equals(RaftGroupId.valueOf(request.source().sourceGroup())))throw new IOException("Image probe client belongs to another group");
+        var receiver=RaftPeerId.valueOf(request.source().receiver().peerId());
+        var reply=RatisRoutedClient.rpc(()->client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(RatisRecoveryImageRpc.request(request))),0,receiver));
+        if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !client.getGroupId().equals(reply.getRaftGroupId()) || !receiver.equals(reply.getServerId()) || reply.getMessage().getContent().size()>RatisRecoveryImageRpc.MAX_REPLY_BYTES)throw new IOException("Image probe did not reach exact receiver",reply==null?null:reply.getException());
+        try{return RatisRecoveryImageRpc.reply(reply.getMessage().getContent().toByteArray(),request);}catch(IllegalArgumentException malformed){throw new IOException("Malformed recovery image receipt",malformed);}
+    }
     private Prepared prepared(int kind,Request request)throws IOException{
         var reply=call(request(kind,request),request,MAX_REPLY_BYTES);
         try{var result=RatisTopologySourceSnapshotRpc.reply(reply.getMessage().getContent().toByteArray(),kind,request);if(!RaftPeerId.valueOf(result.sourceOwner().peerId()).equals(reply.getServerId()))throw new IOException("Source image reply crossed actual source owner");return result;}catch(AbandonedException abandoned){if(!RaftPeerId.valueOf(abandoned.receipt().sourceOwner().peerId()).equals(reply.getServerId()))throw new IOException("Abandoned source reply crossed actual owner",abandoned);throw abandoned;}catch(IllegalArgumentException malformed){throw new IOException("Malformed source snapshot reply",malformed);}

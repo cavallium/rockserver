@@ -79,7 +79,7 @@ final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSna
     @Override public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception {proofs.incrementAndGet();assertEquals(0,imageDescriptors(),"File reader closes before native qualification");if(!installed || !Arrays.equals(MessageDigest.getInstance("SHA-256").digest(received.toByteArray()),lease.prepared().image().sha256()))throw new IOException("Receiver has not qualified the exact installed image");}
     @Override public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request){releaseLookups.incrementAndGet();return false;}
     @Override public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{durableReleases.incrementAndGet();if(failRelease)throw new IOException("controlled durable release failure");}
-    @Override public InstallSnapshotReplyProto send(InstallSnapshotRequestProto request)throws IOException {
+    @Override public InstallSnapshotReplyProto send(RatisTopologySourceSnapshotRpc.Request scope,InstallSnapshotRequestProto request)throws IOException {
         int call=calls.incrementAndGet();if(entered!=null){entered.countDown();try{if(!unblock.await(5,TimeUnit.SECONDS))throw new IOException("controlled chunk wait expired");}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}}
         if(failFirst && call==1)throw new IOException("controlled RPC failure");
         if(unknownReply)return InstallSnapshotReplyProto.getDefaultInstance();

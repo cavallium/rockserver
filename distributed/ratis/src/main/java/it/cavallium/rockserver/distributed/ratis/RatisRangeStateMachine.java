@@ -798,15 +798,86 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     void drainSourceCapture(java.util.UUID transfer)throws Exception{var pin=failedSourceCapturePins.get(transfer);if(pin!=null){pin.close();failedSourceCapturePins.remove(transfer,pin);}}
     private void closeSourceCapture(java.util.UUID transfer,ReplicatedRangeStore.SnapshotPin pin)throws Exception{try{pin.close();failedSourceCapturePins.remove(transfer,pin);}catch(Exception failed){failedSourceCapturePins.put(transfer,pin);throw failed;}}
     Path sourceSnapshotDirectory(){return snapshots.getSnapshotFile(0,0).toPath().getParent();}
-    RatisTopologySourceSnapshotService.Lease captureSourceSnapshot(RatisTopologySourceSnapshotRpc.Request request,TopologyChange.Definition definition,DistributedSchema fallback,RatisTopologySourceSnapshotArtifacts artifacts,NativeRangeImage.IoAdmission imageAdmission)throws Exception{
-        imageAdmission.beforeBytes(1);request.header().requireDefinition(definition);var evidence=relocationEvidence(new RatisRelocationOwnerRpc.Request(definition,null,RatisRelocationOwnerRpc.Expected.SOURCE,null,null));var division=getServer().getNow(null).getDivision(getGroupId());var saved=artifacts.lookupAdmitted(request,imageAdmission);ReplicatedRangeStore.SnapshotPin pin=store.captureForRecovery();boolean returned=false;
-        try{
-            if(saved!=null){var prepared=saved.prepared();if(!RatisRelocationOwnerRpc.covers(evidence.completedCut(),prepared.image().position()) || !prepared.sourceOwner().replicaId().equals(evidence.owner().replicaId()))throw new IOException("Cold source image lacks its original actual owner/prefix");var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,saved.snapshot(),()->closeSourceCapture(request.transferId(),pin));returned=true;return lease;}
-            var position=pin.position();if(position==null || position.term()<1)throw new IOException("Source image lacks committed native prefix");var rows=new java.util.HashMap<String,byte[]>();pin.visitState((key,value)->{if(it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerSchema.row(key))rows.put(java.util.HexFormat.of().formatHex(key),value.clone());});
-            var schema=fallback;for(var row:rows.entrySet()){byte[] key=java.util.HexFormat.of().parseHex(row.getKey());if(key.length==17 && key[16]==0x28)schema=it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation.decode(row.getValue()).definition().targetSchema();}if(schema==null)throw new IOException("Source logical schema is not qualified");schema.requireMatches(definition.sourceDirectory());if(!java.util.Arrays.equals(schema.digest(),pin.schemaDigest()))throw new IOException("Source schema is not from the exported native cut");var owner=definition.parents().getFirst().replicas().stream().filter(r->r.replicaId().equals(evidence.owner().replicaId())).findFirst().orElseThrow();
-            artifacts.capture(request,definition,pin,schema,owner);
-            var file=artifacts.originalImagePath(request,position);NativeRangeImage.Manifest image;if(!Files.exists(file))image=NativeRangeImage.writeAdmitted(file,pin,pin.interval(),limits,imageAdmission);else image=NativeRangeImage.inspectAdmitted(file,limits,imageAdmission);if(!position.equals(image.position()))throw new IOException("Published source snapshot cut changed");var md5=org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(file,imageAdmission));var snapshot=new SingleFileSnapshotInfo(new FileInfo(file,md5),TermIndex.valueOf(position.term(),position.index()));var prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,image,schema,owner,pin.configuration(),rows);var retained=artifacts.retainAdmitted(prepared,snapshot,imageAdmission);var after=relocationEvidence(new RatisRelocationOwnerRpc.Request(definition,null,RatisRelocationOwnerRpc.Expected.SOURCE,null,null));if(!RatisRelocationOwnerRpc.covers(after.completedCut(),position))throw new IOException("Source lost completed image owner");var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,retained.snapshot(),()->closeSourceCapture(request.transferId(),pin));returned=true;return lease;
+    record SourceSnapshotEvidence(ReplicaDescriptor owner,ApplyPosition completedCut,ReplicatedRangeStore.Configuration configuration) {}
+    SourceSnapshotEvidence sourceSnapshotEvidence(RatisTopologySourceSnapshotRpc.Request request,TopologyChange.Definition definition,RangeDirectory qualifiedDirectory)throws Exception {
+        java.util.Objects.requireNonNull(qualifiedDirectory);
+        if(request.relocation()) {
+            if(definition==null)throw new IOException("Relocation export requires immutable definition");
+            request.header().requireDefinition(definition);
+            if(!java.util.Arrays.equals(qualifiedDirectory.payloadDigest(),definition.sourceDirectory().payloadDigest()))throw new IOException("Relocation export directory differs");
+            var evidence=relocationEvidence(new RatisRelocationOwnerRpc.Request(definition,null,RatisRelocationOwnerRpc.Expected.SOURCE,null,null));
+            var owner=definition.parents().getFirst().replicas().stream().filter(replica->replica.replicaId().equals(evidence.owner().replicaId())).findFirst().orElseThrow();
+            return new SourceSnapshotEvidence(owner,evidence.completedCut(),evidence.configuration());
+        }
+        requireDataRole();requireHealthy();
+        if(definition!=null || request.sourceDirectory()==null || !java.util.Arrays.equals(request.sourceDirectory().payloadDigest(),qualifiedDirectory.payloadDigest()) || topologyLocalReplica==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Recovery export lacks exact qualified source directory");
+        var expected=request.range();var local=expected.replicas().stream().filter(replica->sameReplicaIdentity(replica,topologyLocalReplica)).findFirst().orElseThrow(()->new IOException("Recovery export has no configured local source"));
+        if(!request.sourceOwner(local) || !request.sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Recovery export crossed actual source group/owner");
+        var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(local.peerId()))throw new IOException("Recovery export server identity differs");
+        var division=server.getDivision(getGroupId());var info=division.getInfo();long term=info.getCurrentTerm();
+        if(division.getStateMachine()!=this || !info.isAlive() || info.getLifeCycleState()!=LifeCycle.State.RUNNING || term<1 || !info.isLeader() || !info.isLeaderReady())throw new IOException("Recovery export requires actual live ready leader");
+        long generation=admissionGeneration.get();final long stamp;synchronized(admissions){if(schemaConfigurationPending)throw new IOException("Recovery export configuration apply pending");stamp=schemaConfigurationStamp;}
+        var cut=store.applied();var cfg=store.configuration();var ownership=store.ownership();
+        if(cut==null || cut.term()!=term || cfg==null || cfg.term()>cut.term() || cfg.index()>cut.index() || cfg.index()==cut.index() && cfg.term()!=cut.term() || ownership.owner().epoch()!=expected.rangeEpoch()
+                || !ownership.interval().equals(new it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.Interval(qualifiedDirectory.domainId(),qualifiedDirectory.columns(),expected.lowerInclusive(),expected.upperExclusive())) || !java.util.Arrays.equals(store.schemaDigest(),qualifiedDirectory.schemaDigest())
+                || store.pendingInstallation() || store.importPending() || store.topologyBirthPending() || store.topologyRecoveryOnly() || store.metadataRecoveryPending())throw new IOException("Recovery export native geometry/schema/completed prefix differs");
+        if(request.metadataOnly()) {
+            var freeze=store.topologyFreeze();if(freeze==null || !java.util.Arrays.equals(freeze.header().encode(),request.header().encode()))throw new IOException("Metadata export lacks original sealed source");
+            freeze.requireParent(expected.groupId(),expected.rangeEpoch(),qualifiedDirectory.domainId(),qualifiedDirectory.schemaDigest(),expected.lowerInclusive(),expected.upperExclusive());freeze.requireCut(cut);
+            var metadata=store.metadataOutcomeState();if(!java.util.Objects.equals(metadata.applied(),cut))throw new IOException("Metadata export is not ready at native cut");
+        } else if(store.topologyRetired() || store.topologyFreeze()!=null || !store.admissionOpen())throw new IOException("Current leaf export lacks active USER authority");
+        requireSchemaMembership(expected,cfg.data());var actual=division.getRaftConf();requireActualMembership(actual,expected);
+        if(actual.getLogEntryIndex()!=cfg.index() && !(cfg.term()==0 && cfg.index()==-1 && actual.getLogEntryIndex()<=0))throw new IOException("Recovery export actual/native configuration positions differ");
+        synchronized(admissions){if(generation!=admissionGeneration.get() || schemaConfigurationPending || stamp!=schemaConfigurationStamp || getLifeCycleState()!=LifeCycle.State.RUNNING || info.getCurrentTerm()!=term || !java.util.Objects.equals(cut,store.applied()))throw new IOException("Recovery export owner/configuration changed during proof");}
+        return new SourceSnapshotEvidence(local,cut,cfg);
+    }
+    RatisTopologySourceSnapshotService.Lease captureSourceSnapshot(RatisTopologySourceSnapshotRpc.Request request,TopologyChange.Definition definition,RangeDirectory qualifiedDirectory,DistributedSchema qualifiedSchema,RatisTopologySourceSnapshotArtifacts artifacts,NativeRangeImage.IoAdmission imageAdmission)throws Exception{
+        imageAdmission.beforeBytes(1);qualifiedSchema.requireMatches(qualifiedDirectory);
+        var evidence=sourceSnapshotEvidence(request,definition,qualifiedDirectory);var division=getServer().getNow(null).getDivision(getGroupId());var saved=artifacts.lookupAdmitted(request,imageAdmission);
+        ReplicatedRangeStore.SnapshotPin pin=request.metadataOnly()?store.captureMetadataForRecovery():request.relocation()?store.captureForRecovery():store.capture();boolean returned=false;
+        try {
+            if(saved!=null){var prepared=saved.prepared();var after=sourceSnapshotEvidence(request,definition,qualifiedDirectory);if(!RatisRelocationOwnerRpc.covers(after.completedCut(),prepared.image().position()) || !prepared.sourceOwner().equals(after.owner()) || !after.owner().equals(evidence.owner()))throw new IOException("Cold source image lacks its original actual owner/prefix");var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,saved.snapshot(),()->closeSourceCapture(request.transferId(),pin));returned=true;return lease;}
+            var position=pin.position();if(position==null || position.term()<1 || !java.util.Arrays.equals(qualifiedSchema.digest(),pin.schemaDigest()))throw new IOException("Source image lacks qualified committed schema/prefix");
+            var rows=new java.util.HashMap<String,byte[]>();pin.visitState((key,value)->{if(it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerSchema.row(key))rows.put(java.util.HexFormat.of().formatHex(key),value.clone());});
+            if(request.relocation())artifacts.capture(request,definition,pin,qualifiedSchema,evidence.owner());else artifacts.capture(request,pin,qualifiedSchema,evidence.owner());
+            var file=artifacts.originalImagePath(request,position);NativeRangeImage.Manifest image;
+            if(!Files.exists(file))image=request.metadataOnly()?NativeRangeImage.writeMetadataAdmitted(file,pin,pin.interval(),limits,imageAdmission):NativeRangeImage.writeAdmitted(file,pin,pin.interval(),limits,imageAdmission);
+            else image=request.metadataOnly()?NativeRangeImage.visitMetadataAdmitted(file,limits,(section,column,key,value)->{},imageAdmission):NativeRangeImage.inspectAdmitted(file,limits,imageAdmission);
+            if(!position.equals(image.position()))throw new IOException("Published source snapshot cut changed");
+            var md5=org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(file,imageAdmission));var snapshot=new SingleFileSnapshotInfo(new FileInfo(file,md5),TermIndex.valueOf(position.term(),position.index()));
+            var prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,image,qualifiedSchema,evidence.owner(),pin.configuration(),rows);var retained=artifacts.retainAdmitted(prepared,snapshot,imageAdmission);
+            var after=sourceSnapshotEvidence(request,definition,qualifiedDirectory);if(!after.owner().equals(evidence.owner()) || !RatisRelocationOwnerRpc.covers(after.completedCut(),position))throw new IOException("Source lost completed image owner");
+            var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,retained.snapshot(),()->closeSourceCapture(request.transferId(),pin));returned=true;return lease;
         }finally{if(!returned)closeSourceCapture(request.transferId(),pin);}
+    }
+    RatisRecoveryImageRpc.Evidence recoveryImageEvidence(RatisRecoveryImageRpc.Request request)throws Exception {
+        requireDataRole();requireHealthy();var scope=request.source();
+        if(topologyLocalReplica==null || !sameReplicaIdentity(scope.receiver(),topologyLocalReplica) || !scope.sourceGroup().equals(store.ownership().owner().groupId()) || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Image receipt does not address actual local recovery owner");
+        var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(scope.receiver().peerId()))throw new IOException("Image receipt server identity differs");
+        var division=server.getDivision(getGroupId());var info=division.getInfo();
+        if(division.getStateMachine()!=this || !info.isAlive() || info.getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Image receipt requires initialized actual local division");
+        long generation=admissionGeneration.get();final long stamp;synchronized(admissions){if(schemaConfigurationPending)throw new IOException("Image receipt configuration apply pending");stamp=schemaConfigurationStamp;}
+        byte[] registrationDigest=null;boolean installed=false;
+        if(scope.metadataOnly()) {
+            var registration=store.metadataRecoveryRegistration();
+            if(registration!=null) {
+                if(!registration.transferId().equals(scope.transferId()) || !registration.catalogue().equals(scope.catalogue()) || !registration.receiver().equals(scope.receiver()) || !java.util.Arrays.equals(registration.sourceDirectory().payloadDigest(),scope.sourceDirectory().payloadDigest())
+                        || !java.util.Arrays.equals(registration.freeze().header().encode(),scope.header().encode()) || !registration.imageCut().equals(request.imageCut()) || !java.util.Arrays.equals(registration.imageHash(),request.imageHash()))throw new IOException("Metadata image receipt changed original registration");
+                registrationDigest=registration.digest();installed=store.metadataRecoveryImageInstalled();
+            }
+        } else {
+            var registration=store.currentRangeRecoveryRegistration();
+            if(registration!=null) {
+                if(!registration.transferId().equals(scope.transferId()) || !registration.catalogue().equals(scope.catalogue()) || !registration.receiver().equals(scope.receiver()) || !registration.groupId().equals(scope.sourceGroup()) || !java.util.Arrays.equals(registration.directory().payloadDigest(),scope.sourceDirectory().payloadDigest())
+                        || !java.util.Arrays.equals(registration.schema().digest(),scope.schemaDigest()) || !registration.imageCut().equals(request.imageCut()) || !java.util.Arrays.equals(registration.imageHash(),request.imageHash()))throw new IOException("Current leaf image receipt changed original registration");
+                registrationDigest=registration.digest();installed=store.currentRangeRecoveryImageInstalled();
+            }
+        }
+        installed=installed && !store.pendingInstallation();var cut=installed?store.applied():null;var cfg=installed?store.configuration():null;
+        if(cut==null || cfg==null){if(installed)throw new IOException("Completed image receipt has no native cut/configuration");cut=null;cfg=null;}
+        if(installed){requireSchemaMembership(scope.range(),cfg.data());var actual=division.getRaftConf();requireActualMembership(actual,scope.range());if(actual.getLogEntryIndex()!=cfg.index() && !(cfg.term()==0 && cfg.index()==-1 && actual.getLogEntryIndex()<=0))throw new IOException("Image receipt actual/native configuration differs");}
+        synchronized(admissions){if(generation!=admissionGeneration.get() || schemaConfigurationPending || stamp!=schemaConfigurationStamp || !java.util.Objects.equals(cut,store.applied()) && cut!=null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Image receipt local owner changed during proof");}
+        var result=new RatisRecoveryImageRpc.Evidence(request.digest(),TopologyChange.Owner.of(scope.receiver()),cut,cfg,registrationDigest,installed);result.require(request);return result;
     }
     @FunctionalInterface interface LearnerInstaller {it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration install(RatisTopologyJoinAuthority.Request request)throws IOException;}
     @FunctionalInterface interface LearnerRecoveryInstaller {RatisTopologySourceSnapshotRpc.Prepared prepare(RatisTopologySourceSnapshotRpc.Request request)throws Exception;}
@@ -4501,7 +4572,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
                 return query(request);
             }
-            if(ScopedTransactionRpc.schemaReplica(kind) || kind==ScopedTransactionRpc.TOPOLOGY_OWNER || kind==ScopedTransactionRpc.TOPOLOGY_SEED || kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner-local requests have no requested index override");return query(request);}
+            if(kind==RatisRecoveryImageRpc.KIND || ScopedTransactionRpc.schemaReplica(kind) || kind==ScopedTransactionRpc.TOPOLOGY_OWNER || kind==ScopedTransactionRpc.TOPOLOGY_SEED || kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner-local requests have no requested index override");return query(request);}
             if (kind>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
             synchronized (gate) {
                 requireHealthy();
@@ -4642,7 +4713,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(kind==RatisTopologyLearnerRecoveryRpc.KIND){if(topologyImageQueries==null || learnerRecoveryInstaller==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Learner recovery dispatcher unavailable");return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologyLearnerRecoveryRpc.MAX_REPLY_BYTES,false,owned->{try{return Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerRecoveryRpc.reply(learnerRecoveryInstaller.prepare(RatisTopologyLearnerRecoveryRpc.decode(owned)))));}catch(RatisTopologySourceSnapshotRpc.AbandonedException terminal){return Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerRecoveryRpc.reply(terminal.receipt())));}});}
             if(kind==RatisTopologyLearnerJoinRpc.KIND){if(topologyImageQueries==null || learnerInstaller==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Node learner bootstrap unavailable");return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologyLearnerJoinRpc.MAX_REPLY_BYTES,false,owned->{var join=RatisTopologyLearnerJoinRpc.decode(owned);var registration=learnerInstaller.install(join);return Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerJoinRpc.reply(join,registration)));});}
             if(RatisTopologySourceSnapshotRpc.kind(kind)){
-                requireDataRole();if(!freshBarrier || sourceSnapshots==null || topologyImageQueries==null)throw new IOException("Source snapshot dispatcher unavailable");var sourceRequest=RatisTopologySourceSnapshotRpc.request(encoded);if(!sourceRequest.header().parents().getFirst().groupId().equals(store.ownership().owner().groupId()))throw new IOException("Source snapshot crossed group");
+                requireDataRole();if(!freshBarrier || sourceSnapshots==null || topologyImageQueries==null)throw new IOException("Source snapshot dispatcher unavailable");var sourceRequest=RatisTopologySourceSnapshotRpc.request(encoded);if(!sourceRequest.sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Source snapshot crossed group");
                 if(kind==RatisTopologySourceSnapshotRpc.PREPARE)return sourceSnapshots.prepareAsync(sourceRequest).handle((prepared,failed)->{
                     Throwable problem=failed;while(problem instanceof java.util.concurrent.CompletionException && problem.getCause()!=null)problem=problem.getCause();
                     if(problem instanceof RatisTopologySourceSnapshotRpc.AbandonedException terminal)return Message.valueOf(ByteString.copyFrom(RatisTopologySourceSnapshotRpc.reply(kind,terminal.receipt())));
@@ -4653,9 +4724,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     if(problem instanceof RatisTopologySourceSnapshotRpc.AbandonedException terminal)return Message.valueOf(ByteString.copyFrom(RatisTopologySourceSnapshotRpc.reply(kind,terminal.receipt())));
                     if(problem!=null)throw new java.util.concurrent.CompletionException(problem);return Message.valueOf(ByteString.copyFrom(RatisTopologySourceSnapshotRpc.reply(kind,prepared)));
                 });
-                return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologySourceSnapshotRpc.MAX_REPLY_BYTES,false,owned->{sourceSnapshots.release(RatisTopologySourceSnapshotRpc.request(owned));return Message.valueOf(ByteString.copyFrom(owned));});
+                return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologySourceSnapshotRpc.maximumPreparedBytes(sourceRequest),false,owned->{sourceSnapshots.release(RatisTopologySourceSnapshotRpc.request(owned));return Message.valueOf(ByteString.copyFrom(owned));});
             }
             if(RatisRelocationAdmissionRpc.kind(kind)){if(role!=RatisNodePlan.Role.DATA || proofQueries==null)throw new IOException("Relocation dispatcher unavailable");var record=RatisRelocationAdmissionRpc.decode(encoded);if(kind==RatisRelocationAdmissionRpc.CANCEL){synchronized(admissions){if(relocationHold!=null && relocationHold.record.equals(record) && !relocationHold.submitted)releaseRelocation(relocationHold);}return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(encoded)));}if(!freshBarrier)throw new IOException("Relocation preparation needs fresh leader barrier");return proofQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.MAX_BYTES,false,owned->{prepareRelocation(RatisRelocationAdmissionRpc.decode(owned));return Message.valueOf(ByteString.copyFrom(owned));});}
+            if(kind==RatisRecoveryImageRpc.KIND){
+                requireDataRole();if(proofQueries==null)throw new IOException("Recovery image receipt dispatcher unavailable");var probe=RatisRecoveryImageRpc.decode(encoded);if(!probe.source().sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Recovery receipt crossed native group");
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,256L+4L*encoded.length+4L*RatisRecoveryImageRpc.MAX_REPLY_BYTES,false,owned->Message.valueOf(ByteString.copyFrom(RatisRecoveryImageRpc.reply(recoveryImageEvidence(RatisRecoveryImageRpc.decode(owned))))));
+            }
             if(kind==RatisRelocationOwnerRpc.KIND){
                 if(role!=RatisNodePlan.Role.DATA || relocationOwnerQueries==null || relocationAuthority==null)throw new IOException("Relocation owner dispatcher is not configured");var ownerRequest=RatisRelocationOwnerRpc.decode(encoded);if(!freshBarrier && ownerRequest.replica()==null && (ownerRequest.expected()==RatisRelocationOwnerRpc.Expected.SOURCE || ownerRequest.expected()==RatisRelocationOwnerRpc.Expected.TARGET))throw new IOException("Relocation leader proof requires fresh barrier");return relocationOwnerQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.RELOCATION_OWNER_BYTES,false,owned->Message.valueOf(ByteString.copyFrom(RatisRelocationOwnerRpc.reply(relocationEvidence(RatisRelocationOwnerRpc.decode(owned))))));
             }
@@ -4772,6 +4847,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private RatisNodeResourceBudget.Lease readConstructionLease(int kind,ByteBuffer request) throws IOException {
         long responseBytes;
         switch (kind) {
+            case RatisRecoveryImageRpc.KIND -> {return reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,256L+4L*request.remaining()+4L*RatisRecoveryImageRpc.MAX_REPLY_BYTES,1);}
             case ScopedTransactionRpc.POINT, ScopedTransactionRpc.GET, ScopedTransactionRpc.SNAPSHOT_GET ->
                     responseBytes=4L*DistributedCommandCodec.MAX_ENCODED_BYTES;
             case ScopedTransactionRpc.PAGE, ScopedTransactionRpc.SNAPSHOT_PAGE -> {

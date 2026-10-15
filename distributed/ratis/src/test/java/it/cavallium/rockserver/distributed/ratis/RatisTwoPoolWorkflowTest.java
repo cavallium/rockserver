@@ -24,5 +24,18 @@ class RatisTwoPoolWorkflowTest {
             assertArrayEquals(new byte[]{11},fixture.store(split.targets().getFirst().groupId()).readCurrentPoint(fixture.first.columnIds().iterator().next(),new byte[]{7}));fixture.service.verifyCatalogue();
         }
     }
+    @Test void sameServiceSplitImportSchemaOperatorAndNativeMergeShareTheTwoPools()throws Exception {
+        try(var fixture=new RatisTwoPoolWorkflowFixture(root,true)){
+            fixture.split();fixture.importArchivePool();var merged=fixture.createOperatorAndMerge();
+            assertEquals(fixture.appendOperator,fixture.store(merged.last().groupId()).installedSchema().column(merged.api()).operator());
+            assertArrayEquals(new byte[]{11,33},fixture.store(merged.last().groupId()).readCurrentPoint(merged.column(),new byte[]{9}));
+            assertEquals(merged.grant().sessionId(),merged.last().operationId().sessionId());assertEquals(merged.grant().epoch(),merged.last().operationId().epoch());fixture.service.verifyCatalogue();
+        }
+    }
+    @Test void sameServiceTwoPoolWorkflowCopiesCompleteBackupDrainsPinsAndColdReopensOriginalIdentity()throws Exception {
+        try(var fixture=new RatisTwoPoolWorkflowFixture(root,true)){
+            fixture.split();fixture.importArchivePool();var merged=fixture.createOperatorAndMerge();var backup=fixture.backupBothPools();fixture.coldReopen(merged,backup);
+        }
+    }
 
 }

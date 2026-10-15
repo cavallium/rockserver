@@ -139,7 +139,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                     public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireReceiverInstalled(lease);}
                     public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.released(lease);helper.released(lease.prepared().request());}
                     public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return helper.isReleased(request);}
-                    public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request)throws IOException{return fixture.send(request);}
+                    public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(RatisTopologySourceSnapshotRpc.Request scope,org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request)throws IOException{return fixture.send(scope,request);}
                 };
                 try(var service=new RatisTopologySourceSnapshotService(host,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){service.prepare(request);service.close();assertEquals(1,fixture.pinCloses.get());assertEquals(0,fixture.durableReleases.get());}
             }
@@ -162,7 +162,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                     public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireReceiverInstalled(lease);}
                     public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.released(lease);helper.released(lease.prepared().request());}
                     public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return helper.isReleased(request);}
-                    public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request)throws IOException{return fixture.send(request);}
+                    public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(RatisTopologySourceSnapshotRpc.Request scope,org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request)throws IOException{return fixture.send(scope,request);}
                 };
                 try(var service=new RatisTopologySourceSnapshotService(host,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){service.prepare(request);service.transfer(request).get(5,TimeUnit.SECONDS);service.release(request);}
             }
@@ -175,7 +175,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                     public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot create a new installation proof");}
                     public void released(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot create a receipt");}
                     public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return helper.isReleased(request);}
-                    public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request){throw new AssertionError("Cold release cannot send chunks");}
+                    public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(RatisTopologySourceSnapshotRpc.Request scope,org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request){throw new AssertionError("Cold release cannot send chunks");}
                 };
                 try(var service=new RatisTopologySourceSnapshotService(replayOnly,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
                     var changed=new RatisTopologySourceSnapshotRpc.Request(request.transferId(),request.header(),new UUID(0,99),request.receiver(),request.purpose());

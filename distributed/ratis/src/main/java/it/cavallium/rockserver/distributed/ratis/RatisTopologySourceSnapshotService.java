@@ -44,7 +44,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         void requireReceiverInstalled(Lease lease)throws Exception;
         void released(Lease lease)throws Exception;
         boolean isReleased(Request request)throws Exception;
-        InstallSnapshotReplyProto send(InstallSnapshotRequestProto request)throws IOException;
+        InstallSnapshotReplyProto send(Request scope,InstallSnapshotRequestProto request)throws IOException;
     }
     /** Minimum policy capacity for the bounded relocation request class; each task charges transferBytes(request). */
     public static final long TRANSFER_BYTES=256+4L*(MAX_REQUEST_BYTES-RatisCatalogue.MAX_DIRECTORY_BYTES+MAX_OWNER_BYTES+177)+4L*(CHUNK_BYTES+MAX_REQUEST_BYTES-RatisCatalogue.MAX_DIRECTORY_BYTES+MAX_REPLY_BYTES-RatisCatalogue.MAX_DIRECTORY_BYTES);
@@ -164,7 +164,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                 if(chunks==null)chunks=RockserverSnapshotRequests.openSource(entry.lease.source(),RaftPeerId.valueOf(request.receiver().peerId()),request.transferId().toString(),entry.lease.snapshot(),CHUNK_BYTES);
                 if(!chunks.hasNext())throw new IOException("Snapshot producer did not yield a final receiver response");
                 if(!host.chunkReady(request,CHUNK_BYTES)){rateWakeup.schedule(this::resumeRate,10,TimeUnit.MILLISECONDS);return RWScheduler.CooperativeResult.PARK;}
-                var chunk=chunks.next();var reply=host.send(chunk);requireReply(chunk,reply);host.requireOwner(entry.lease);
+                var chunk=chunks.next();var reply=host.send(request,chunk);requireReply(chunk,reply);host.requireOwner(entry.lease);
                 synchronized(RatisTopologySourceSnapshotService.this){requireOpen();}
                 if(reply.getResult()!=InstallSnapshotResult.ALREADY_INSTALLED && !chunk.getSnapshotChunk().getDone())return RWScheduler.CooperativeResult.YIELD;
                 closeReader();
