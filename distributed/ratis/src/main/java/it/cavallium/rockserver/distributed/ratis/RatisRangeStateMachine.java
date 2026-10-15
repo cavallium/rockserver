@@ -389,7 +389,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private volatile boolean recoveryReplacement=true;
     @Override public org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate recoveryEligibilityGate(){return recoveryEligibility;}
     /** Caller must revoke outside division/native/apply locks before starting a live replacement. */
-    void prepareRecoveryReplacement(){recoveryEligibility.publish(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing());}
+    void prepareRecoveryReplacement(){recoveryReplacement=true;recoveryEligibility.publish(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing());}
     /** Native reads finish before the immutable Gate assignment; no division callback runs under Gate. */
     void refreshRecoveryEligibility()throws IOException {
         long revision=recoveryEligibility.revision(),generation=admissionGeneration.get();
@@ -2195,7 +2195,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         if (discovered != null) {
             Path image = discovered.getFile().getPath();
-            var manifest = validateImage(image, discovered.getTermIndex());
+            var manifest = validateImage(image, discovered.getTermIndex(),null,installing?SnapshotImageUse.INSTALLATION:SnapshotImageUse.RETAINED_INVENTORY);
             force(image);
             Path md5 = MD5FileUtil.getDigestFileForFile(image.toFile()).toPath();
             if (Files.exists(md5)) force(md5);
@@ -2240,7 +2240,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return role==RatisNodePlan.Role.DATA && (store.metadataRecoveryRegistration()!=null || store.topologyRetired() && store.topologyFreeze()!=null);
     }
     private NativeRangeImage.Manifest validateImage(Path image,TermIndex position)throws IOException{return validateImage(image,position,null);}
-    private NativeRangeImage.Manifest validateImage(Path image,TermIndex position,ReplicatedRangeStore.SnapshotPin pin)throws IOException {
+    private enum SnapshotImageUse { INSTALLATION, RETAINED_INVENTORY }
+    private NativeRangeImage.Manifest validateImage(Path image,TermIndex position,ReplicatedRangeStore.SnapshotPin pin)throws IOException {return validateImage(image,position,pin,SnapshotImageUse.INSTALLATION);}
+    private NativeRangeImage.Manifest validateImage(Path image,TermIndex position,ReplicatedRangeStore.SnapshotPin pin,SnapshotImageUse use)throws IOException {
         try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
         final ReplicatedRangeStore.Configuration[] cutConfiguration = {null};
         final NativeTopologyFreeze[] cutFreeze={null};
@@ -2273,7 +2275,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(freeze==null || !freeze.equals(cutFreeze[0]))throw new IOException("Metadata snapshot changed qualified original source FREEZE");
             if(registration!=null) {
                 var server=getServer().getNow(null);if(topologyLocalReplica==null || !sameReplicaIdentity(registration.receiver(),topologyLocalReplica) || server==null || !server.getId().toString().equals(registration.receiver().peerId()))throw new IOException("META snapshot receiver identity differs");
-                try{var qualified=pin==null?store.validateMetadataRecoveryImage(image,limits):pin.validateMetadataRecoveryImage(image,limits);if(!qualified.position().equals(manifest.position()) || !Arrays.equals(qualified.sha256(),manifest.sha256()))throw new IOException("META image changed during native qualification");}
+                // A newer forced registration can coexist with the previous Raft snapshot until
+                // its image arrives. Inventory preserves that covered log floor; installation still
+                // requires the new exact permission and eligibility remains MISSING.
+                var nativeCut=store.applied();boolean retainedFloor=use==SnapshotImageUse.RETAINED_INVENTORY && store.metadataRecoveryPending() && !store.pendingInstallation()
+                        && manifest.position().index()<registration.imageCut().index() && nativeCut!=null && RatisRelocationOwnerRpc.covers(nativeCut,manifest.position());
+                if(!retainedFloor)try{var qualified=pin==null?store.validateMetadataRecoveryImage(image,limits):pin.validateMetadataRecoveryImage(image,limits);if(!qualified.position().equals(manifest.position()) || !Arrays.equals(qualified.sha256(),manifest.sha256()))throw new IOException("META image changed during native qualification");}
                 catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify META image provenance",invalid);}
             }
         } else if(current!=null) {
@@ -2425,6 +2432,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return new Image(file, position, validateImage(file, position));
     }
 
+    private Image retainedImage(Path file)throws IOException {
+        var position=SimpleStateMachineStorage.getTermIndexFromSnapshotFile(file.toFile());
+        return new Image(file,position,validateImage(file,position,null,SnapshotImageUse.RETAINED_INVENTORY));
+    }
+
     private void syncImage(Image image) throws IOException {
         force(image.file());
         var md5 = MD5FileUtil.computeMd5ForFile(image.file().toFile());
@@ -2437,10 +2449,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         Files.createDirectories(recoveryDir);
         Path target = recoveryDir.resolve(image.file().getFileName());
         if (!Files.exists(target)) Files.createLink(target, image.file());
-        else if (!Arrays.equals(image(target).manifest().sha256(), image.manifest().sha256())) {
+        else if (!Arrays.equals(retainedImage(target).manifest().sha256(), image.manifest().sha256())) {
             throw new IOException("Conflicting snapshot recovery image at " + image.position());
         }
-        syncImage(image(target));
+        syncImage(retainedImage(target));
         force(recoveryDir);
         force(raftRoot);
     }
@@ -2453,7 +2465,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (!SimpleStateMachineStorage.SNAPSHOT_REGEX.matcher(file.getFileName().toString()).matches()) continue;
                 // A sidecar is written only after the last chunk. Partial transfers remain inert.
                 if (staging && !Files.exists(MD5FileUtil.getDigestFileForFile(file.toFile()).toPath())) continue;
-                try { result.add(image(file)); }
+                try { result.add(staging?image(file):retainedImage(file)); }
                 catch (IOException | RuntimeException invalid) {
                     if (!staging) throw new IOException("Invalid durable snapshot " + file, invalid);
                 }
@@ -2508,7 +2520,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (latest != null) {
                 Path target = published.resolve(latest.file().getFileName());
                 if (!Files.exists(target)) Files.createLink(target, latest.file());
-                syncImage(image(target));
+                syncImage(retainedImage(target));
             }
             force(published);
             force(raftRoot);

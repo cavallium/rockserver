@@ -91,6 +91,30 @@ class RatisRecoverySnapshotLifecycleTest {
             var target=pool.openMetadataRecovery(registration);try(var adapter=new Adapter(target,pool,registration.sourceDirectory(),registration.receiver(),raft,true)){assertTrue(target.metadataRecoveryPending());assertTrue(target.metadataRecoveryImageInstalled());assertFalse(target.admissionOpen());assertThrows(IllegalStateException.class,target::metadataOutcomeState);assertEquals(registration.imageCut().index(),adapter.machine.getLatestSnapshot().getIndex());}
         }
     }
+    @Test void newerMetadataPermissionRetainsOldRaftFloorWhileMissingAndAcceptsExactNewImage()throws Exception {
+        var helper=new RatisSourceOutcomeTest();Path receiver=root.resolve("successor-metadata-receiver"),raft=root.resolve("successor-metadata-raft");
+        try(var fixture=helper.new Fixture(root.resolve("successor-metadata-source"),false)) {
+            var source=fixture.home.source;Path initial=root.resolve("successor-initial.image");var first=NativeRangeImage.writeMetadata(initial,source.store,limits);var cfg=source.store.configuration();
+            var original=new NativeMetadataRecoveryRegistration(new UUID(0,9710),source.catalogue,new ApplyPosition(1,1),source.directory,source.freeze,source.local,source.local,cfg.term(),cfg.index(),cfg.data(),first.position(),first.sha256(),Set.of());
+            try(var pool=new RatisTopologyRecoveryAnchorTest().pool(receiver)) {
+                var target=pool.openMetadataRecovery(original);target.enableSessionControls();
+                try(var adapter=new Adapter(target,pool,source.directory,source.local,raft,false)){adapter.install(initial,first);target.completeMetadataRecovery(original,first.position(),cfg);assertFalse(target.metadataRecoveryPending());}
+            }
+            fixture.applyControl(source.clock(998,20));Path next=root.resolve("successor-later.image");var later=NativeRangeImage.writeMetadata(next,source.store,limits);var nextCfg=source.store.configuration();assertTrue(later.position().index()>first.position().index());
+            var successor=new NativeMetadataRecoveryRegistration(new UUID(0,9711),source.catalogue,new ApplyPosition(1,2),source.directory,source.freeze,source.local,source.local,nextCfg.term(),nextCfg.index(),nextCfg.data(),later.position(),later.sha256(),Set.of());
+            try(var pool=new RatisTopologyRecoveryAnchorTest().pool(receiver)) {
+                var target=pool.openMetadataRecovery(successor);assertTrue(target.metadataRecoveryPending());assertEquals(first.position(),target.applied());assertFalse(target.metadataRecoveryImageInstalled());
+                for(int attempt=0;attempt<2;attempt++)try(var adapter=new Adapter(target,pool,source.directory,source.local,raft,true)) {
+                    assertEquals(first.position().index(),adapter.machine.getLatestSnapshot().getIndex());assertEquals(first.position().index(),adapter.machine.getLastAppliedTermIndex().getIndex());assertEquals(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.MISSING,adapter.machine.recoveryEligibilityGate().snapshot().mode());
+                    assertThrows(IOException.class,()->target.validateMetadataRecoveryImage(initial,limits));assertThrows(IllegalStateException.class,target::metadataOutcomeState);assertFalse(target.admissionOpen());
+                    if(attempt==1){adapter.install(next,later);assertEquals(later.position(),target.applied());assertTrue(target.metadataRecoveryImageInstalled());assertTrue(target.metadataRecoveryPending());assertEquals(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.RECOVERY,adapter.machine.recoveryEligibilityGate().snapshot().mode());}
+                }
+            }
+            try(var pool=new RatisTopologyRecoveryAnchorTest().pool(receiver)) {
+                var target=pool.openMetadataRecovery(successor);try(var adapter=new Adapter(target,pool,source.directory,source.local,raft,true)){assertEquals(later.position(),target.applied());assertTrue(target.metadataRecoveryImageInstalled());assertTrue(target.metadataRecoveryPending());assertEquals(later.position().index(),adapter.machine.getLatestSnapshot().getIndex());assertFalse(target.admissionOpen());}
+            }
+        }
+    }
     @Test void completedMetadataOwnerPublishesOwnSnapshotWithOnePinAndColdReopens()throws Exception {
         var helper=new RatisSourceOutcomeTest();NativeMetadataRecoveryRegistration registration;long cut;Path receiver=root.resolve("ready-metadata-receiver"),raft=root.resolve("ready-metadata-raft");
         try(var f=helper.new Fixture(root.resolve("ready-metadata-source"),false)) {
@@ -114,7 +138,7 @@ class RatisRecoverySnapshotLifecycleTest {
         var helper=new RatisSourceOutcomeTest();try(var f=helper.new Fixture(root.resolve("retired-source"),false)) {
             var source=f.home.source;assertTrue(source.store.topologyRetired());assertEquals(-1,f.machine.takeSnapshot());f.applyControl(source.clock(995,20));long cut=source.store.applied().index();assertTrue(cut>source.freeze.position().index());assertEquals(cut,f.machine.takeSnapshot());
             var file=f.machine.getLatestSnapshot().getFiles().getFirst().getPath();assertEquals(cut,NativeRangeImage.inspectMetadata(file,limits).position().index());assertThrows(IOException.class,()->NativeRangeImage.inspect(file,limits));
-            f.machine.prepareRecoveryReplacement();f.machine.pause();assertNull(f.machine.getLatestSnapshot());f.machine.reinitialize();assertTrue(source.store.topologyRetired());assertFalse(source.store.admissionOpen());assertEquals(cut,f.machine.getLatestSnapshot().getIndex());assertEquals(cut,source.store.applied().index());
+            f.machine.prepareRecoveryReplacement();f.machine.refreshRecoveryEligibility();assertEquals(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.MISSING,f.machine.recoveryEligibilityGate().snapshot().mode(),"A native NORMAL refresh cannot undo replacement revocation");f.machine.pause();assertNull(f.machine.getLatestSnapshot());f.machine.reinitialize();assertTrue(source.store.topologyRetired());assertFalse(source.store.admissionOpen());assertEquals(cut,f.machine.getLatestSnapshot().getIndex());assertEquals(cut,source.store.applied().index());
         }
     }
 }
