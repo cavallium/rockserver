@@ -22,6 +22,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Semaphore;
+import org.rocksdb.RocksDB;
 import java.util.concurrent.TimeUnit;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.rocksdb.ColumnFamilyDescriptor;
@@ -95,8 +96,67 @@ public final class DistributedStoragePool implements AutoCloseable {
     private static final byte[] METADATA_RECOVERIES_KEY="METADATA-RECOVERIES".getBytes(StandardCharsets.US_ASCII);
     private volatile Map<UUID,NativeMetadataRecoveryRegistration> metadataRecoveries=Map.of();
     private final Map<UUID,NativeMetadataRecoveryRegistration> pendingMetadataRecoveries=new HashMap<>();
+    private volatile Map<UUID,NativeRecoverySupersession> recoverySupersessions=Map.of();
+    private final Map<UUID,NativeRecoverySupersession> pendingRecoverySupersessions=new HashMap<>();
+    private volatile TopologySeedForceObserver recoverySupersessionForceObserver=after->{};
+    public void recoverySupersessionForceObserver(TopologySeedForceObserver observer){recoverySupersessionForceObserver=Objects.requireNonNull(observer);}
+    public List<NativeRecoverySupersession> recoverySupersessions(){return List.copyOf(recoverySupersessions.values());}
+    private void recoverRecoverySupersessions() {
+        try {
+            var found=new HashMap<UUID,NativeRecoverySupersession>();var db=loaded.db().get();var state=handles.get(STATE_COLUMN);long bytes=0;
+            for(var history:ownershipHistory){var group=history.owner().groupId();var key=groupSchemaKey(group,0x75);int size=db.get(state,key,new byte[0]);if(size==RocksDB.NOT_FOUND)continue;
+                if(size<1 || size>NativeRecoverySupersession.MAX_BYTES || (bytes+=size)>MAX_TOPOLOGY_SEED_BYTES)throw new IOException("Supersession inventory exceeds bound");
+                var value=NativeRecoverySupersession.decode(db.get(state,key));var range=value.range();
+                if(!group.equals(value.groupId()) || history.owner().epoch()!=range.rangeEpoch() || !history.interval().domainId().equals(value.sourceDirectory().domainId()) || !Arrays.equals(history.interval().lowerInclusive(),range.lowerInclusive()) || !Arrays.equals(history.interval().upperExclusive(),range.upperExclusive()) || found.put(group,value)!=null)throw new IOException("Supersession lost permanent ownership history");
+                var current=currentRecoveries.get(group);if(current!=null){value.requireCurrent(current);if(!Arrays.equals(current.digest(),value.captured().currentRegistrationDigest()))throw new IOException("Supersession changed retained CURRENT registration");}
+                var metadata=metadataRecoveries.get(group);if(metadata!=null)value.requireMetadataScope(metadata);
+                ownership.recoverMetadata(history.owner(),new RangeOwnership.Interval(value.sourceDirectory().domainId(),value.sourceDirectory().columns(),range.lowerInclusive(),range.upperExclusive()));
+            }recoverySupersessions=Map.copyOf(found);
+        }catch(IOException|RocksDBException|IllegalArgumentException failure){throw new IllegalStateException("Cannot recover receiver supersessions",failure);}
+    }
+    /** Trusted fresh CAT consumption qualification; this force grants only permanent rejection of obsolete GROUP work. */
+    public ReplicatedRangeStore forceRecoverySupersession(NativeRecoverySupersession.Scope scope)throws IOException,RocksDBException {
+        Objects.requireNonNull(scope);nativeMutation.acquireUninterruptibly();try(var metadataScope=NativeRangeImage.openMetadataAdmission(NativeRangeImage.IoAdmission.UNLIMITED);var metadata=metadataScope.pass()) {
+            synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}
+            metadata.reserve(Math.toIntExact(8192L+4L*(RangeDirectoryCodec.encodedSize(scope.sourceDirectory())+TopologyChange.MAX_HEADER_BYTES)));
+            UUID group=scope.groupId();var range=scope.range();var owner=new RangeOwnership.Owner(group,range.rangeEpoch());var interval=new RangeOwnership.Interval(scope.sourceDirectory().domainId(),scope.sourceDirectory().columns(),range.lowerInclusive(),range.upperExclusive());
+            if(pendingCurrentRecovery!=null || pendingTopologySeed!=null || pendingLearnerHistory!=null || !pendingMetadataRecoveries.isEmpty())throw new IllegalStateException("Unknown original ownership force requires exact settlement");
+            var retained=pendingRecoverySupersessions.get(group);if(retained==null)retained=recoverySupersessions.get(group);
+            if(!pendingRecoverySupersessions.isEmpty() && (!pendingRecoverySupersessions.containsKey(group) || pendingRecoverySupersessions.size()!=1))throw new IllegalStateException("Unknown supersession force requires exact original retry");
+            if(retained!=null && !retained.scope().equals(scope))throw new IllegalArgumentException("Supersession requires exact original scope");
+            ReplicatedRangeStore existing=null;for(var store:ranges)if(store.ownership().owner().groupId().equals(group)){existing=store;break;}
+            if(existing==null && currentRecoveries.containsKey(group) && retained==null)throw new IllegalStateException("Open original CURRENT owner before supersession");
+            if(retained==null && loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(group,0x75),new byte[0])!=RocksDB.NOT_FOUND)throw new IllegalStateException("Supersession lost its qualified pool history");
+            var history=pendingRecoverySupersessions.containsKey(group)?ownershipHistory:proposedOwnershipHistory(owner,interval);long historySize=8;for(var entry:history)historySize+=52L+16L*entry.interval().columns().size()+(entry.interval().lowerInclusive()==null?0:entry.interval().lowerInclusive().length)+(entry.interval().upperExclusive()==null?0:entry.interval().upperExclusive().length);metadata.reserve(Math.toIntExact(4096L+4L*historySize));byte[] historyBytes=encodeOwnershipHistory(history);ownership.validateMetadataRecovery(owner,interval);
+            ReplicatedRangeStore.SupersessionForce force=new ReplicatedRangeStore.SupersessionForce(){
+                public void reserve(NativeRecoverySupersession value){long bytes=value.encodedSize();for(var other:recoverySupersessions.values())if(!other.groupId().equals(group))bytes=Math.addExact(bytes,other.encodedSize());if(bytes>MAX_TOPOLOGY_SEED_BYTES)throw new IllegalStateException("Supersession metadata capacity exhausted");}
+                public void force(NativeRecoverySupersession value)throws RocksDBException{
+                pendingRecoverySupersessions.put(group,value);ownershipHistory=history;ownershipHistoryDurable=false;recoverySupersessionForceObserver.boundary(false);
+                try(var batch=new org.rocksdb.WriteBatch();var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)){batch.put(handles.get(STATE_COLUMN),OWNERSHIP_HISTORY_KEY,historyBytes);batch.put(handles.get(STATE_COLUMN),groupSchemaKey(group,0x75),value.encode());loaded.db().get().write(options,batch);}recoverySupersessionForceObserver.boundary(true);}
+            };
+            NativeRecoverySupersession value;
+            if(existing==null){
+                if(retained==null){
+                    metadata.reserve(4096+8*65536);var db=loaded.db().get();var state=handles.get(STATE_COLUMN);
+                    if(db.get(state,groupSchemaKey(group,0x72),new byte[0])!=RocksDB.NOT_FOUND)throw new IllegalStateException("Open original CURRENT before supersession");
+                    byte[] marker=readFixedGroupState(db,state,group,0,16),pending=readFixedGroupState(db,state,group,0x7f,48),receipt=readFixedGroupState(db,state,group,0x74,48);
+                    if(receipt!=null)throw new IllegalArgumentException("CURRENT image receipt lost its registration");
+                    int cfgSize=db.get(state,groupSchemaKey(group,1),new byte[0]);if(cfgSize>65556)throw new IllegalArgumentException("Supersession CFG exceeds bound");var cfg=cfgSize==RocksDB.NOT_FOUND?null:ReplicatedRangeStore.Configuration.decode(db.get(state,groupSchemaKey(group,1)));
+                    var cut=marker==null?null:new ApplyPosition(ByteBuffer.wrap(marker).getLong(),ByteBuffer.wrap(marker).getLong(8));
+                    retained=new NativeRecoverySupersession(scope,new NativeRecoverySupersession.CapturedState(null,null,null,receipt,pending,cut,cfg==null?null:new NativeRecoverySupersession.ConfigurationReference(cfg.term(),cfg.index(),RangeImportAdmission.sha256(cfg.data()))));
+                }
+                force.reserve(retained);force.force(retained);value=retained;ownership.recoverMetadata(owner,interval);
+                existing=new ReplicatedRangeStore(loaded.db().get(),ownership,owner,scope.sourceDirectory().schemaDigest(),Map.of(),handles.get(STATE_COLUMN),handles.get(RECEIPTS_COLUMN),metadataRecoveries.containsKey(group)?metadataRecoveries.get(group).mergeColumns():Set.of(),true,metadataRecoveries.get(group));
+                existing.configureSnapshotAdmission(snapshotAdmission);existing.configureSchemaPreparationPool(this);existing.configureRetiredTopologyDirectory(scope.sourceDirectory());ranges.add(existing);existing.acknowledgeRecoverySupersession(value);
+            }else value=existing.forceRecoverySupersession(scope,retained,force);
+            var next=new HashMap<>(recoverySupersessions);next.put(group,value);recoverySupersessions=Map.copyOf(next);pendingRecoverySupersessions.remove(group);ownershipHistoryDurable=true;return existing;
+        }finally{nativeMutation.release();}
+    }
+    private static byte[] readFixedGroupState(RocksDB db,ColumnFamilyHandle state,UUID group,int tag,int length)throws RocksDBException {
+        var key=tag==0?ByteBuffer.allocate(16).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).array():groupSchemaKey(group,tag);int size=db.get(state,key,new byte[0]);if(size==RocksDB.NOT_FOUND)return null;if(size!=length)throw new IllegalArgumentException("Invalid captured native state");return db.get(state,key);
+    }
     /** Under nativeMutation: an uncertain role force must not free intervals for new USER ownership. */
-    private void requireMetadataRoleSettled(){if(!pendingMetadataRecoveries.isEmpty())throw new IllegalStateException("Unknown metadata role force requires exact original retry");}
+    private void requireMetadataRoleSettled(){if(!pendingMetadataRecoveries.isEmpty() || !pendingRecoverySupersessions.isEmpty())throw new IllegalStateException("Unknown metadata role force requires exact original retry");}
     private volatile TopologySeedForceObserver metadataRecoveryForceObserver=after->{};
     public void metadataRecoveryForceObserver(TopologySeedForceObserver observer){metadataRecoveryForceObserver=Objects.requireNonNull(observer);}
     public List<NativeMetadataRecoveryRegistration> metadataRecoveries(){return List.copyOf(metadataRecoveries.values());}
@@ -120,6 +180,8 @@ public final class DistributedStoragePool implements AutoCloseable {
     public ReplicatedRangeStore openMetadataRecovery(NativeMetadataRecoveryRegistration registration)throws RocksDBException {
         Objects.requireNonNull(registration);nativeMutation.acquireUninterruptibly();try {
             synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}
+            if(!pendingRecoverySupersessions.isEmpty())throw new IllegalStateException("Unknown supersession force requires exact original retry");
+            var supersession=recoverySupersessions.get(registration.groupId());if(supersession!=null){if(registration.equals(metadataRecoveries.get(registration.groupId())))supersession.requireMetadataScope(registration);else supersession.requireMetadata(registration);}
             if(pendingTopologySeed!=null || pendingLearnerHistory!=null)throw new IllegalStateException("Unknown topology ownership force requires exact original retry");
             UUID group=registration.groupId();if(pendingCurrentRecovery!=null)throw new IllegalStateException("Unknown CURRENT registration requires exact original retry");var predecessor=currentRecoveries.get(group);if(predecessor!=null)registration.requireTransitionOf(predecessor);var pending=pendingMetadataRecoveries.get(group);if(pending!=null && !pending.equals(registration))throw new IllegalStateException("Unknown metadata registration force requires original retry");
             if(!pendingMetadataRecoveries.isEmpty() && (pending==null || pendingMetadataRecoveries.size()!=1))throw new IllegalStateException("Unknown global metadata registry force requires original retry");
@@ -130,7 +192,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             if(!registration.equals(previous) || pending!=null) {
                 var next=new HashMap<>(metadataRecoveries);next.putAll(pendingMetadataRecoveries);next.put(group,registration);var remainingCurrent=new HashMap<>(currentRecoveries);remainingCurrent.remove(group);byte[] registry;try{registry=encodeMetadataRecoveries(next,remainingCurrent);}catch(IOException failure){throw new IllegalStateException("Metadata registration capacity unavailable",failure);}var published=Map.copyOf(next);var publishedCurrent=Map.copyOf(remainingCurrent);byte[] pointer=registration.digest();
                 boolean publishedRegistration=Arrays.equals(pointer,loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(group,0x6f))) && Arrays.equals(registry,loaded.db().get().get(handles.get(STATE_COLUMN),METADATA_RECOVERIES_KEY));
-                ReplicatedRangeStore.MetadataRecoveryForce force=()->{pendingMetadataRecoveries.put(group,registration);metadataRecoveryForceObserver.boundary(false);try(var batch=new org.rocksdb.WriteBatch();var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)){batch.put(handles.get(STATE_COLUMN),METADATA_RECOVERIES_KEY,registry);batch.put(handles.get(STATE_COLUMN),groupSchemaKey(group,0x6f),pointer);if(!publishedRegistration)for(int tag:List.of(0x6d,0x6e,0x70,0x71))batch.delete(handles.get(STATE_COLUMN),groupSchemaKey(group,tag));if(predecessor!=null){for(int tag:List.of(0x72,0x73,0x74))batch.delete(handles.get(STATE_COLUMN),groupSchemaKey(group,tag));if(!publishedRegistration)batch.delete(handles.get(STATE_COLUMN),groupSchemaKey(group,0x7f));}loaded.db().get().write(options,batch);}metadataRecoveryForceObserver.boundary(true);};
+                ReplicatedRangeStore.MetadataRecoveryForce force=()->{pendingMetadataRecoveries.put(group,registration);metadataRecoveryForceObserver.boundary(false);try(var batch=new org.rocksdb.WriteBatch();var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)){batch.put(handles.get(STATE_COLUMN),METADATA_RECOVERIES_KEY,registry);batch.put(handles.get(STATE_COLUMN),groupSchemaKey(group,0x6f),pointer);if(!publishedRegistration)for(int tag:List.of(0x6d,0x6e,0x70,0x71))batch.delete(handles.get(STATE_COLUMN),groupSchemaKey(group,tag));if(predecessor!=null){for(int tag:List.of(0x72,0x73,0x74))batch.delete(handles.get(STATE_COLUMN),groupSchemaKey(group,tag));if(!publishedRegistration)batch.delete(handles.get(STATE_COLUMN),groupSchemaKey(group,0x7f));}else if(supersession!=null && previous==null && !publishedRegistration)batch.delete(handles.get(STATE_COLUMN),groupSchemaKey(group,0x7f));loaded.db().get().write(options,batch);}metadataRecoveryForceObserver.boundary(true);};
                 if(existing==null){force.force();ownership.recoverMetadata(owner,interval);}else existing.prepareMetadataRecovery(registration,predecessor,force);
                 metadataRecoveries=published;currentRecoveries=publishedCurrent;pendingMetadataRecoveries.remove(group);
             }
@@ -157,6 +219,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         Objects.requireNonNull(registration);UUID group=registration.groupId();var owner=new RangeOwnership.Owner(group,registration.range().rangeEpoch());var interval=currentInterval(registration);
         nativeMutation.acquireUninterruptibly();try {
             synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}
+            if(recoverySupersessions.containsKey(group) || pendingRecoverySupersessions.containsKey(group))throw new IllegalStateException("Superseded GROUP registration is permanently closed");
             if(pendingTopologySeed!=null || pendingLearnerHistory!=null || !newImportReservations.isEmpty() || !pendingMetadataRecoveries.isEmpty())throw new IllegalStateException("Unknown ownership force requires original retry");
             if(pendingCurrentRecovery!=null && !pendingCurrentRecovery.equals(registration))throw new IllegalArgumentException("Unknown CURRENT force requires exact retry");
             var saved=currentRecoveries.get(group);if(saved!=null && !saved.equals(registration))throw new IllegalArgumentException("Current recovery changed original registration");
@@ -920,7 +983,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                 handles.put(new String(descriptor.getName(), StandardCharsets.US_ASCII), handle));
         recoverBirths();
         recoverOwnershipHistory();
-        recoverCapacityClaims(); recoverTopologySeeds();recoverTopologyLearners();recoverMetadataRecoveries();recoverCurrentRangeRecoveries();
+        recoverCapacityClaims(); recoverTopologySeeds();recoverTopologyLearners();recoverMetadataRecoveries();recoverCurrentRangeRecoveries();recoverRecoverySupersessions();
     }
 
     public static void stageOperator(Path poolPath,DistributedSchema.Operator operator,
@@ -1040,6 +1103,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             for(var record:ownershipHistory){var group=record.owner().groupId();boolean retired=topologyRetirements.containsKey(group) || metadataRecoveries.containsKey(group);boolean pending=topologyBirths.containsKey(group)&&db.get(state,groupSchemaKey(group,0x63))==null || topologyLearners.containsKey(group)&&db.get(state,groupSchemaKey(group,0x68))==null || currentRecoveries.containsKey(group)&&db.get(state,groupSchemaKey(group,0x73))==null;
                 byte[] key=groupSchemaKey(group,0x40);int size=db.get(state,key,new byte[0]);if(size!=org.rocksdb.RocksDB.NOT_FOUND){if(size>NativeSstImportManifest.MAX_BYTES)throw new IllegalStateException("Import metadata inventory exceeds bound");var manifest=NativeSstImportManifest.decode(db.get(state,key));if(!manifest.groupId().equals(group) || ownershipHistory.stream().noneMatch(original->original.owner().groupId().equals(group) && manifest.rangeEpoch()==original.owner().epoch() && manifest.domainId().equals(original.interval().domainId()) && original.interval().columns().containsAll(manifest.physicalNames().keySet()) && Arrays.equals(manifest.lowerInclusive(),original.interval().lowerInclusive()) && Arrays.equals(manifest.upperExclusive(),original.interval().upperExclusive())))throw new IllegalStateException("Import metadata inventory changed ownership");pending|=db.get(state,groupSchemaKey(group,0x43))==null;}
                 var metadata=metadataRecoveries.get(group);if(metadata!=null)pending|=!metadataRecoveryCompleted(db,state,metadata);
+                retired|=recoverySupersessions.containsKey(group) || pendingRecoverySupersessions.containsKey(group);pending|=pendingRecoverySupersessions.containsKey(group) || recoverySupersessions.containsKey(group) && (metadata==null || !metadataRecoveryCompleted(db,state,metadata));
                 result.add(new RetainedMetadataOwner(record.owner(),record.interval(),retired,pending));
             }
             var historical=new HashSet<UUID>();for(var owner:result)historical.add(owner.owner().groupId());
@@ -1237,7 +1301,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                 if (closing) throw new IllegalStateException("Pool is closing");
             }
         requireMetadataRoleSettled();
-        if(metadataRecoveries.containsKey(owner.groupId()))throw new IllegalStateException("Registered source metadata cannot reopen as a USER owner");
+        if(metadataRecoveries.containsKey(owner.groupId()) || recoverySupersessions.containsKey(owner.groupId()) || loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(owner.groupId(),0x75),new byte[0])!=RocksDB.NOT_FOUND)throw new IllegalStateException("Registered source metadata cannot reopen as a USER owner");
             if(pendingCurrentRecovery!=null)throw new IllegalStateException("Unknown CURRENT registration requires exact retry");
             if(pendingTopologySeed!=null) throw new IllegalStateException("Unknown topology seed completion requires exact retry");
             if(pendingLearnerHistory!=null)throw new IllegalStateException("Unknown learner history requires exact original retry");

@@ -281,7 +281,7 @@ public final class NativeRangeImage {
         boolean[] originWritten={false};
         pin.visitState((key,value) -> {
             if(metadata && metadataLocalPointer(key))return;
-            if(key.length==17 && key[16]>=0x6d && key[16]<=0x71)return; // Recovery fences are local receiver authority, never transferable image state.
+            if(key.length==17 && (key[16]>=0x6d && key[16]<=0x71 || key[16]==0x75))return; // Recovery fences are local receiver authority, never transferable image state.
             if(Arrays.equals(key,originKey)) throw new IOException("Image-only topology origin cannot be persisted as native state");
             if(originBytes!=null && !originWritten[0] && Arrays.compareUnsigned(key,originKey)>0) { append.accept(Section.STATE,null,originKey,originBytes); originWritten[0]=true; }
             append.accept(Section.STATE,null,key,value);
@@ -295,7 +295,7 @@ public final class NativeRangeImage {
         return tracker;
     }
     /** Receiver-local ownership rows omitted from the portable metadata projection of a GROUP image. */
-    public static boolean metadataLocalPointer(byte[] key){if(key.length<17)return false;int tag=key[16]&255;return key.length==17 && (tag>=0x61 && tag<=0x64 || tag>=0x67 && tag<=0x74) || key.length==33 && tag==0x68;}
+    public static boolean metadataLocalPointer(byte[] key){if(key.length<17)return false;int tag=key[16]&255;return key.length==17 && (tag>=0x61 && tag<=0x64 || tag>=0x67 && tag<=0x75) || key.length==33 && tag==0x68;}
 
     public static Manifest inspectAdmitted(Path image,Limits limits,IoAdmission admission)throws IOException{return visit(image,limits,(section,column,key,value)->{},true,null,null,Objects.requireNonNull(admission));}
 
@@ -400,6 +400,7 @@ public final class NativeRangeImage {
                 input.readFully(key);
                 if(rowBytes>rowByteLimit(header,section,key,limits))throw new IOException("Image row exceeds byte limit");
                 if(section==Section.STATE && key.length>16 && key[16]==0x67 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration.MAX_BYTES))throw new IOException("Learner registration exceeds bound");
+                if(section==Section.STATE && key.length>16 && key[16]==0x75)throw new IOException("Image contains foreign receiver supersession authority");
                 if(section==Section.STATE && key.length>16 && key[16]==0x72 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery.MAX_BYTES))throw new IOException("CURRENT registration exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x73 && (key.length!=17 || valueLength>65620))throw new IOException("CURRENT completion exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x74 && (key.length!=17 || valueLength!=48))throw new IOException("CURRENT image receipt exceeds bound");
@@ -673,6 +674,7 @@ public final class NativeRangeImage {
         }
 
         void accept(Section section, UUID column, byte[] key, byte[] value) throws IOException {
+            if(section==Section.STATE && key.length>16 && key[16]==0x75)throw new IOException("Image contains foreign receiver supersession authority");
             if(header.metadata() && (section==Section.USER || section==Section.STATE && metadataLocalPointer(key)))throw new IOException("Metadata image contains USER data or foreign local ownership authority");
             if(header.metadata() && section==Section.STATE && key.length==17 && key[16]==1) {
                 try {var configuration=ReplicatedRangeStore.Configuration.decode(value);var cut=header.position();if(configuration.term()>cut.term() || configuration.index()>cut.index() || configuration.index()==cut.index() && configuration.term()!=cut.term())throw new IllegalArgumentException("Configuration exceeds metadata cut");metadataConfiguration=true;}
