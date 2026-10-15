@@ -82,6 +82,8 @@ public class RecoveryEligibilityTest {
     final List<Long> applied = new CopyOnWriteArrayList<>();
     final CountDownLatch appliedConfiguration = new CountDownLatch(1), reloaded = new CountDownLatch(1);
     volatile CountDownLatch eligibilityEntered, eligibilityContinue;
+    volatile CountDownLatch reloadEntered, reloadContinue;
+    volatile boolean failReload;
     final AtomicInteger controlledEligibilityReads = new AtomicInteger();
     @Override public TermIndex getLastAppliedTermIndex() {
       var entered = eligibilityEntered; var proceed = eligibilityContinue;
@@ -113,6 +115,12 @@ public class RecoveryEligibilityTest {
       getLifeCycle().transition(LifeCycle.State.PAUSING); getLifeCycle().transition(LifeCycle.State.PAUSED);
     }
     public void reinitialize() throws IOException {
+      if (reloadEntered != null) {
+        reloadEntered.countDown();
+        try { if (!reloadContinue.await(5, TimeUnit.SECONDS)) throw new IOException("Reload fixture timed out"); }
+        catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new IOException(failure); }
+      }
+      if (failReload) throw new IOException("Controlled checkpoint reload failure");
       snapshot = storage.loadLatestSnapshot();
       if (snapshot == null || !Arrays.equals(Files.readAllBytes(snapshot.getFiles().getFirst().getPath()), new byte[]{11, 22, 33})) {
         throw new IOException("Missing actual installed test image");
@@ -136,11 +144,12 @@ public class RecoveryEligibilityTest {
     @Override public void notifyTermIndexUpdated(long term, long index) {
       if (!nativeImage) { throw new AssertionError("Historical apply before actual image at " + index); }
       applied.add(index); super.notifyTermIndexUpdated(term, index); publish();
+      if (index == configurationIndex) appliedConfiguration.countDown();
     }
     @Override public void notifyConfigurationChanged(long term, long index, RaftConfigurationProto proto) {
       if (!nativeImage) { throw new AssertionError("Historical configuration before actual image"); }
       configurationTerm = term; configurationIndex = index; configuration = proto;
-      applied.add(index); updateLastAppliedTermIndex(term, index); publish(); appliedConfiguration.countDown();
+      updateLastAppliedTermIndex(term, index); publish();
     }
   }
 
@@ -377,6 +386,160 @@ public class RecoveryEligibilityTest {
     gate.publish(RecoveryEligibilityStateMachine.Evidence.missing());
     gate.publish(RecoveryEligibilityStateMachine.Evidence.normal());
     assertThrows(IllegalStateException.class, fresh::requireCurrent);
+  }
+
+  @Test void localCheckpointReloadObservesActualUpdaterAndKeepsDiscoveryClosed() throws Exception {
+    var path = root.resolve("local-reload");
+    var originalConfiguration = RaftConfigurationProto.newBuilder()
+        .addAllPeers(PEERS.stream().map(RaftPeer::getRaftPeerProto).toList()).build();
+    var newerConfiguration = originalConfiguration.toBuilder().addListeners(RaftPeer.newBuilder()
+        .setId("observer").setAddress("observer:0").setStartupRole(RaftPeerRole.LISTENER).build().getRaftPeerProto()).build();
+    var newerEntry = LogEntryProto.newBuilder().setTerm(1).setIndex(6).setConfigurationEntry(newerConfiguration).build();
+    try (var seed = new Fixture(path, new Machine())) {
+      seed.server.changeToFollowerAndPersistMetadata(1, false, "durable local reload tail").join();
+      var entries = new ArrayList<LogEntryProto>();
+      for (int n = 0; n < 5; n++) entries.add(LogEntryProto.newBuilder().setTerm(1).setIndex(n)
+          .setMetadataEntry(MetadataProto.newBuilder()).build());
+      entries.add(LogEntryProto.newBuilder().setTerm(1).setIndex(5).setConfigurationEntry(originalConfiguration).build());
+      entries.add(newerEntry);
+      entries.add(LogEntryProto.newBuilder().setTerm(1).setIndex(7)
+          .setMetadataEntry(MetadataProto.newBuilder().setCommitIndex(6)).build());
+      append(seed.server, entries);
+    }
+    var machine = new Machine(); machine.gate.deferDiscovery();
+    machine.configurationTerm = 1; machine.configurationIndex = 5; machine.configuration = originalConfiguration;
+    try (var fixture = new Fixture(path, machine)) {
+      assertEquals(6, fixture.server.getRaftConf().getLogEntryIndex());
+      var baseline = TermIndex.valueOf(1, 2);
+      machine.snapshotFile(baseline); machine.nativeImage = true;
+      machine.snapshotFile(IMAGE); machine.pause();
+      machine.reloadEntered = new CountDownLatch(1); machine.reloadContinue = new CountDownLatch(1);
+      assertThrows(IOException.class, () -> RockserverRaftServers.reloadLocalCheckpoint(
+          fixture.server, machine, baseline));
+      assertThrows(IOException.class, () -> RockserverRaftServers.reloadLocalCheckpoint(
+          fixture.server, new Machine(), IMAGE));
+      assertTrue(fixture.server.getState().getStateMachineUpdater().getLastAppliedIndex() < IMAGE.getIndex());
+      var observer = RockserverRaftServers.reloadLocalCheckpoint(fixture.server, machine, IMAGE);
+      var actualReload = fixture.server.getState().getStateMachineUpdater().localReloadCompletion();
+      var failedLog = CompletableFuture.<Long>failedFuture(new IOException("Controlled original log failure"));
+      var failedAfterDrain = RockserverRaftServers.awaitLocalReload(actualReload, failedLog);
+      try {
+        assertTrue(machine.reloadEntered.await(5, TimeUnit.SECONDS));
+        assertFalse(observer.isDone()); assertFalse(failedAfterDrain.isDone());
+        assertThrows(IOException.class, () -> RockserverRaftServers.reloadLocalCheckpoint(fixture.server, machine, IMAGE));
+        assertFalse(fixture.vote(false).getServerReply().getSuccess());
+        assertFalse(fixture.server.isInitialImageReady()); assertTrue(machine.applied.isEmpty());
+        assertThrows(IOException.class, () -> fixture.server.installSnapshot(
+            fixture.snapshot(TermIndex.valueOf(1, 6), 0, 0, new byte[]{11,22,33}, true)));
+        observer.cancel(false);
+      } finally { machine.reloadContinue.countDown(); }
+      assertTrue(machine.reloaded.await(5, TimeUnit.SECONDS));
+      // The canceled observer cannot release the actual updater/log operation.
+      var log = (org.apache.ratis.server.raftlog.segmented.SegmentedRaftLog)fixture.server.getRaftLog();
+      log.snapshotInstallationCompletion(IMAGE.getIndex()).get(5, TimeUnit.SECONDS);
+      actualReload.get(5, TimeUnit.SECONDS);
+      assertThrows(ExecutionException.class, () -> failedAfterDrain.get(5, TimeUnit.SECONDS));
+      assertEquals(IMAGE.getIndex(), fixture.server.getState().getStateMachineUpdater().getLastAppliedIndex());
+      assertEquals(LifeCycle.State.RUNNING, machine.getLifeCycleState());
+      assertTrue(machine.gate.discoveryPending()); assertFalse(fixture.server.isInitialImageReady());
+      assertFalse(fixture.vote(true).getServerReply().getSuccess()); assertTrue(machine.applied.isEmpty());
+      assertTrue(machine.gate.settleDiscovery(machine.gate.revision(), RecoveryEligibilityStateMachine.Evidence.recovered(
+          IMAGE, IMAGE, IMAGE, machine.configurationTerm, machine.configurationIndex, machine.configuration)));
+      assertTrue(fixture.server.isInitialImageReady());
+      fixture.server.getState().getStateMachineUpdater().notifyUpdater();
+      assertTrue(machine.appliedConfiguration.await(5, TimeUnit.SECONDS));
+      assertEquals(List.of(6L), machine.applied);
+      assertEquals(newerEntry, fixture.server.getRaftLog().get(6));
+      assertEquals(6, fixture.server.getRaftConf().getLogEntryIndex());
+      assertTrue(fixture.server.isVotingEligible());
+    }
+  }
+
+  @Test void localCheckpointContradictingKnownLogTermRejectsBeforeRegistration() throws Exception {
+    var machine = new Machine(); machine.gate.deferDiscovery();
+    try (var fixture = new Fixture(root.resolve("local-reload-wrong-term"), machine)) {
+      var entries = new ArrayList<LogEntryProto>();
+      for (int n = 0; n <= IMAGE.getIndex(); n++) entries.add(LogEntryProto.newBuilder()
+          .setTerm(2).setIndex(n).setMetadataEntry(MetadataProto.newBuilder()).build());
+      append(fixture.server, entries);
+      machine.snapshotFile(IMAGE); machine.nativeImage = true; machine.pause();
+      var updater = fixture.server.getState().getStateMachineUpdater();
+      long applied = updater.getLastAppliedIndex(), floor = fixture.server.getRaftLog().getSnapshotIndex();
+      assertEquals(TermIndex.valueOf(2, IMAGE.getIndex()), fixture.server.getRaftLog().getTermIndex(IMAGE.getIndex()));
+      assertThrows(IOException.class, () -> RockserverRaftServers.reloadLocalCheckpoint(fixture.server, machine, IMAGE));
+      assertThrows(IOException.class, updater::localReloadCompletion);
+      assertEquals(applied, updater.getLastAppliedIndex()); assertEquals(floor, fixture.server.getRaftLog().getSnapshotIndex());
+      assertEquals(entries.getLast(), fixture.server.getRaftLog().get(IMAGE.getIndex()));
+      assertEquals(1, machine.reloaded.getCount()); assertTrue(machine.gate.discoveryPending());
+    }
+  }
+
+  @Test void localCheckpointBelowRetainedLogFloorRejectsBeforeRegistration() throws Exception {
+    var machine = new Machine(); machine.gate.deferDiscovery();
+    try (var fixture = new Fixture(root.resolve("local-reload-old-floor"), machine)) {
+      var floor = TermIndex.valueOf(1, 8);
+      machine.snapshotFile(floor); machine.nativeImage = true;
+      fixture.server.getRaftLog().onSnapshotInstalled(floor.getIndex()).get(5, TimeUnit.SECONDS);
+      machine.snapshotFile(IMAGE); machine.pause();
+      var updater = fixture.server.getState().getStateMachineUpdater();
+      long originalApplied = updater.getLastAppliedIndex();
+      assertEquals(floor.getIndex(), fixture.server.getRaftLog().getSnapshotIndex());
+      assertThrows(IOException.class, () -> RockserverRaftServers.reloadLocalCheckpoint(fixture.server, machine, IMAGE));
+      assertThrows(IOException.class, updater::localReloadCompletion);
+      assertEquals(originalApplied, updater.getLastAppliedIndex());
+      assertEquals(1, machine.reloaded.getCount()); assertEquals(LifeCycle.State.PAUSED, machine.getLifeCycleState());
+      assertEquals(floor.getIndex(), fixture.server.getRaftLog().getSnapshotIndex());
+      assertTrue(machine.gate.discoveryPending());
+    }
+  }
+
+  @Test void localCheckpointReloadStopWaitsForActualBlockedReinitialize() throws Exception {
+    var machine = new Machine(); machine.gate.deferDiscovery();
+    try (var fixture = new Fixture(root.resolve("local-reload-stop"), machine);
+         var workers = Executors.newVirtualThreadPerTaskExecutor()) {
+      machine.snapshotFile(IMAGE); machine.nativeImage = true; machine.pause();
+      machine.reloadEntered = new CountDownLatch(1); machine.reloadContinue = new CountDownLatch(1);
+      var observer = RockserverRaftServers.reloadLocalCheckpoint(fixture.server, machine, IMAGE);
+      assertTrue(machine.reloadEntered.await(5, TimeUnit.SECONDS));
+      var actualUpdater = fixture.server.getState().getStateMachineUpdater();
+      var actualReload = actualUpdater.localReloadCompletion();
+      var callbackUnlocked = actualReload.handle((ignored, failure) -> {
+        assertFalse(Thread.holdsLock(actualUpdater), "Reload stop callback entered under updater monitor"); return null;
+      });
+      var close = workers.submit(() -> fixture.server.close());
+      try {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        var updater = fixture.server.getState().getStateMachineUpdater();
+        while (!updater.isStopRequested() && System.nanoTime() < deadline) TimeUnit.MILLISECONDS.sleep(1);
+        assertTrue(updater.isStopRequested());
+        assertFalse(close.isDone()); assertFalse(observer.isDone()); assertFalse(actualReload.isDone());
+        var cancelled = observer.copy(); cancelled.cancel(false);
+        assertFalse(observer.isDone());
+      } finally { machine.reloadContinue.countDown(); }
+      assertThrows(ExecutionException.class, () -> observer.get(5, TimeUnit.SECONDS));
+      close.get(5, TimeUnit.SECONDS); callbackUnlocked.get(5, TimeUnit.SECONDS);
+      assertTrue(machine.gate.discoveryPending());
+    }
+  }
+
+  @Test void localCheckpointReloadFailureSettlesObserverAndKeepsFence() throws Exception {
+    var machine = new Machine(); machine.gate.deferDiscovery();
+    try (var fixture = new Fixture(root.resolve("local-reload-failed"), machine)) {
+      machine.snapshotFile(IMAGE); machine.nativeImage = true; machine.pause(); machine.failReload = true;
+      machine.reloadEntered = new CountDownLatch(1); machine.reloadContinue = new CountDownLatch(1);
+      var reload = RockserverRaftServers.reloadLocalCheckpoint(fixture.server, machine, IMAGE);
+      CompletableFuture<?> callbackUnlocked;
+      try {
+        assertTrue(machine.reloadEntered.await(5, TimeUnit.SECONDS));
+        var updater = fixture.server.getState().getStateMachineUpdater();
+        callbackUnlocked = updater.localReloadCompletion().handle((ignored, failure) -> {
+          assertFalse(Thread.holdsLock(updater), "Reload failure callback entered under updater monitor"); return null;
+        });
+      } finally { machine.reloadContinue.countDown(); }
+      assertThrows(ExecutionException.class, () -> reload.get(5, TimeUnit.SECONDS));
+      callbackUnlocked.get(5, TimeUnit.SECONDS);
+      assertTrue(machine.gate.discoveryPending()); assertFalse(fixture.server.isVotingEligible());
+    }
   }
 
   @Test void discoveryFenceSurvivesOrdinaryPublicationAndRejectsChunksUntilExplicitSettlement() throws Exception {

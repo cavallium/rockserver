@@ -363,11 +363,18 @@ class SegmentedRaftLogWorker {
   private Task addIOTask(Task task) {
     return addIOTask(task,boundedResources ? claimTask(task.getSerializedSize()) : null);
   }
+  static void trackActualTask(Task task, LogResourceStateMachine.Lease standalone) {
+    // Track the derived cleanup stage, not sibling raw-future callbacks whose ordering is unspecified.
+    var returned = standalone == null ? task.actualReturned()
+        : task.actualReturned().whenComplete((value, error) -> standalone.close());
+    LogResourceScope.track(returned);
+    LogResourceScope.track(task.getFuture());
+  }
+
   private Task addIOTask(Task task,LogResourceStateMachine.Lease standalone) {
     LOG.debug("{} adds IO task {}", name, task);
+    trackActualTask(task, standalone);
     if(boundedResources) {
-      LogResourceScope.track(task.actualReturned()); LogResourceScope.track(task.getFuture());
-      if(standalone!=null)task.actualReturned().whenComplete((value,error)->standalone.close());
       if(!queue.offer(task)) { var failure=new RaftLogIOException("Reserved nonblocking Raft IO queue insertion failed"); task.failed(failure); task.returned(); throw new java.io.UncheckedIOException(failure); }
       task.startTimerOnEnqueue(raftLogMetrics.getEnqueuedTimer()); return task;
     }
@@ -377,6 +384,8 @@ class SegmentedRaftLogWorker {
             "the worker thread is not alive");
       }
     } catch (Exception e) {
+      try { task.failed(new RaftLogIOException("Raft IO queue insertion failed", e)); }
+      finally { task.returned(); }
       if (e instanceof InterruptedException && !running) {
         LOG.info("Got InterruptedException when adding task " + task
             + ". The SegmentedRaftLogWorker already stopped.");
@@ -385,6 +394,7 @@ class SegmentedRaftLogWorker {
         LOG.error("Failed to add IO task {}", task, e);
         Optional.ofNullable(server).ifPresent(RaftServer.Division::close);
       }
+      return task;
     }
     task.startTimerOnEnqueue(raftLogMetrics.getEnqueuedTimer());
     return task;

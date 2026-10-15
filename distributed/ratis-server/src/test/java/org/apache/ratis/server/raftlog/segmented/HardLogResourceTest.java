@@ -95,6 +95,49 @@ class HardLogResourceTest {
     try {var observer=opened.log().appendEntry(entry(0,ByteString.copyFromUtf8("held")));observer.cancel(false);assertTrue(policy.intake>0);assertTrue(policy.headers>0);flush.complete(null);long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);while(policy.intake!=0 && System.nanoTime()<deadline)Thread.onSpinWait();assertEquals(0,policy.intake);assertTrue(policy.headers>0);}
     finally {flush.complete(null);opened.close();}assertEquals(0,policy.headers);assertEquals(0,policy.bytes);
   }
+  static SegmentedRaftLog.Task controlledTask() {
+    return new SegmentedRaftLog.Task() {
+      void execute() { }
+      long getEndIndex() { return 7; }
+    };
+  }
+  @Test void installationFailureWaitsForActualReturnAndDerivedCreditRelease() throws Exception {
+    var task = controlledTask(); var failure = new IOException("Controlled task failure before finally");
+    var closing = new CountDownLatch(1); var release = new CountDownLatch(1); var credits = new AtomicInteger(1);
+    var observer = SegmentedRaftLog.installAndDrain(() -> {
+      SegmentedRaftLogWorker.trackActualTask(task, () -> {
+        closing.countDown();
+        try { if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("Credit release barrier timed out"); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+        credits.decrementAndGet();
+      });
+      return task.getFuture();
+    });
+    task.failed(failure); assertFalse(observer.isDone()); assertEquals(1, credits.get());
+    try (var worker = Executors.newVirtualThreadPerTaskExecutor()) {
+      var returned = worker.submit(task::returned);
+      try {
+        assertTrue(closing.await(5, TimeUnit.SECONDS)); assertFalse(observer.isDone()); assertEquals(1, credits.get());
+        var canceled = observer.copy(); canceled.cancel(false); assertFalse(observer.isDone());
+      } finally { release.countDown(); }
+      returned.get(5, TimeUnit.SECONDS);
+    }
+    var terminal = assertThrows(ExecutionException.class, () -> observer.get(5, TimeUnit.SECONDS));
+    assertSame(failure, terminal.getCause()); assertEquals(0, credits.get());
+  }
+  @Test void laterInstallationDispatchFailureWaitsForEarlierTaskReturn() throws Exception {
+    var task = controlledTask(); var failure = new IllegalStateException("Later purge dispatch failed");
+    var credits = new AtomicInteger(1);
+    var observer = SegmentedRaftLog.installAndDrain(() -> {
+      SegmentedRaftLogWorker.trackActualTask(task, credits::decrementAndGet);
+      task.done();
+      throw failure;
+    });
+    assertFalse(observer.isDone()); assertEquals(1, credits.get());
+    task.returned();
+    var terminal = assertThrows(ExecutionException.class, () -> observer.get(5, TimeUnit.SECONDS));
+    assertSame(failure, terminal.getCause()); assertEquals(0, credits.get());
+  }
   @Test void supportedOversizedEntryOwnsItsActualPayloadAcrossEvictionAndColdLoad() throws Exception {
     // The declared cap covers the complete LogEntryProto, including its twelve-byte envelope.
     var bytes=new byte[Math.toIntExact(MAX_ENTRY_BYTES)-12];bytes[0]=1;bytes[bytes.length-1]=2;var payload=ByteString.copyFrom(bytes);assertEquals(MAX_ENTRY_BYTES,entry(0,payload).getSerializedSize());var policy=new Policy(WRITE_BUFFER_BYTES+(80L<<20),8,64);Path path=root.resolve("oversized");

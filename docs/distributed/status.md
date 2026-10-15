@@ -2123,6 +2123,23 @@ RPC handlers and producer reader cleanup. The downstream gate passes 37 cases in
 CURRENT-to-META and metadata-transition workflows. Both are controlled no-socket
 checks; they do not establish complete startup classification.
 
+The core now exposes an owned local-checkpoint reload observation for an exact
+paused SM on its actual running division with discovery still fenced. It rejects
+a cut below the retained log floor or contradicting a known log term. Completion
+joins real updater reinitialization/index publication with the original log
+installation, including actual task return and credit release after failure or
+partial dispatch. Cancellation affects only the observer; ownership clears before
+terminal publication. It preserves a newer committed configuration for genuine
+own-tail replay and leaves role settlement to the caller. No direct log-floor
+setter or fabricated configuration entry is used.
+
+`local-checkpoint-reload-drained-core-gate.log` passes 35 cases across five core
+classes, including blocked reload, observer cancellation, stop/failure ordering,
+unlocked callbacks, contradictory cuts, newer CFG replay and delayed log-task
+return/credit cleanup. The SM classification permit, genuine local META checkpoint
+producer and Node bootstrap call remain unfinished; this core helper alone does
+not qualify an all-cold META cohort.
+
 NEW DATA state machines can now inventory genuine GROUP snapshot floors while
 discovery remains fenced. Canonical and retained recovery/group-floor directories
 share an eight-unique-floor limit and sixteen entries per fixed root, with path

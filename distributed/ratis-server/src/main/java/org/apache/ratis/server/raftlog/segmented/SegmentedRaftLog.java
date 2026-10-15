@@ -575,8 +575,43 @@ public final class SegmentedRaftLog extends RaftLogBase {
     return storage.getMetadataFile().getMetadata();
   }
 
+  private long observedSnapshotCut = -1;
+  private CompletableFuture<Long> observedSnapshotCompletion;
+
+  /** Observe the actual original installation; cancellation never cancels log IO. */
+  public synchronized CompletableFuture<Long> snapshotInstallationCompletion(long cut) throws IOException {
+    if (observedSnapshotCompletion == null || observedSnapshotCut != cut) {
+      throw new IOException("No original log snapshot installation for expected cut");
+    }
+    return observedSnapshotCompletion.copy();
+  }
+
   @Override
   public CompletableFuture<Long> onSnapshotInstalled(long lastSnapshotIndex) {
+    final CompletableFuture<Long> completion = new CompletableFuture<>();
+    synchronized (this) {
+      observedSnapshotCut = lastSnapshotIndex;
+      observedSnapshotCompletion = completion;
+    }
+    var actual = installAndDrain(() -> installSnapshot(lastSnapshotIndex));
+    actual.whenComplete((value, failure) -> {
+      if (failure == null) completion.complete(value); else completion.completeExceptionally(failure);
+    });
+    return completion.copy();
+  }
+
+  /** Retain every dispatched task through its actual return, even if a later dispatch throws. */
+  static CompletableFuture<Long> installAndDrain(java.util.function.Supplier<CompletableFuture<Long>> install) {
+    try (var scope = LogResourceScope.enter(LogResourceScope.currentResident())) {
+      CompletableFuture<Long> result;
+      try { result = install.get(); }
+      catch (Throwable failure) { result = CompletableFuture.failedFuture(failure); }
+      final var outcome = result;
+      return scope.actualDrain().thenCompose(ignored -> outcome);
+    }
+  }
+
+  private CompletableFuture<Long> installSnapshot(long lastSnapshotIndex) {
     updateSnapshotIndex(lastSnapshotIndex);
     fileLogWorker.syncWithSnapshot(lastSnapshotIndex);
     // TODO purge normal/tmp/corrupt snapshot files
@@ -608,6 +643,10 @@ public final class SegmentedRaftLog extends RaftLogBase {
     }
     cacheEviction.close();
     fileLogWorker.close();
+    CompletableFuture<Long> stoppedInstallation;
+    synchronized (this) { stoppedInstallation = observedSnapshotCompletion; }
+    if (stoppedInstallation != null) stoppedInstallation.completeExceptionally(
+        new IOException("Log stopped during snapshot installation"));
     try(AutoCloseableLock writeLock = writeLock()) { cache.close(); }
     metadataResources.close(); if(sharedPreallocation!=null) { sharedPreallocation.actualFinished(); sharedPreallocation=null; }
     storage.close();

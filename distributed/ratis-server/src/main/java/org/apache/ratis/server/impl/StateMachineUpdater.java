@@ -87,6 +87,41 @@ class StateMachineUpdater implements Runnable {
   private final RaftLogIndex snapshotIndex;
   private final AtomicReference<Long> stopIndex = new AtomicReference<>();
   private volatile State state = State.RUNNING;
+  private TermIndex observedReloadCut;
+  private CompletableFuture<Void> observedReload;
+
+  synchronized CompletableFuture<Void> observeLocalReload(TermIndex cut) throws IOException {
+    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null) {
+      throw new IOException("State machine updater is busy/stopping");
+    }
+    observedReloadCut = cut;
+    observedReload = new CompletableFuture<>();
+    return observedReload.copy();
+  }
+
+  boolean isStopRequested() { return stopIndex.get() != null; }
+
+  synchronized CompletableFuture<Void> localReloadCompletion() throws IOException {
+    if (observedReload == null) throw new IOException("No actual local reload");
+    return observedReload.copy();
+  }
+
+  void finishLocalReload(Throwable failure) {
+    final CompletableFuture<Void> completed;
+    synchronized (this) {
+      completed = observedReload;
+      observedReload = null;
+      observedReloadCut = null;
+    }
+    if (completed != null && failure != null) completed.completeExceptionally(failure);
+  }
+
+  private void failLocalReload(Throwable failure) {
+    final CompletableFuture<Void> completed;
+    synchronized (this) { completed = observedReload; }
+    if (completed != null) completed.completeExceptionally(failure);
+  }
+
 
   private final SnapshotRetentionPolicy snapshotRetentionPolicy;
 
@@ -143,6 +178,7 @@ class StateMachineUpdater implements Runnable {
 
   private void stop() {
     state = State.STOP;
+    failLocalReload(new IOException("State machine updater stopped during local reload"));
     try {
       LOG.info("{}: closing {}, lastApplied={}", name,
           JavaUtils.getClassSimpleName(stateMachine.getClass()), stateMachine.getLastAppliedTermIndex());
@@ -215,6 +251,7 @@ class StateMachineUpdater implements Runnable {
           LOG.info("{} was interrupted.  Exiting ...", this);
         } else {
           state = State.EXCEPTION;
+          failLocalReload(t);
           LOG.error(this + " caught a Throwable.", t);
           server.close();
         }
@@ -251,6 +288,21 @@ class StateMachineUpdater implements Runnable {
     appliedIndex.setUnconditionally(i, infoIndexChange);
     notifyAppliedIndex(i);
     state = State.RUNNING;
+    CompletableFuture<Void> completed;
+    synchronized (this) {
+      if (observedReload != null && (stopIndex.get() != null
+          || !(stateMachine instanceof RecoveryEligibilityStateMachine recovery)
+          || !recovery.recoveryEligibilityGate().discoveryPending()
+          || !snapshot.getTermIndex().equals(observedReloadCut)
+          || !observedReloadCut.equals(stateMachine.getLastAppliedTermIndex())
+          || stateMachine.getLifeCycleState() != LifeCycle.State.RUNNING
+          || appliedIndex.get() != observedReloadCut.getIndex()
+          || snapshotIndex.get() != observedReloadCut.getIndex())) {
+        throw new IOException("Local checkpoint reload changed its expected cut/lifecycle");
+      }
+      completed = observedReload;
+    }
+    if (completed != null) completed.complete(null);
   }
 
   /** Defer snapshot publication instead of parking the sole native continuation pump. */
@@ -469,7 +521,7 @@ class StateMachineUpdater implements Runnable {
     this.isRemoving = true;
   }
 
-  private long getLastAppliedIndex() {
+  long getLastAppliedIndex() {
     return appliedIndex.get();
   }
 
