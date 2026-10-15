@@ -410,6 +410,21 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }catch(Exception failure){recoveryEligibility.publish(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing());throw new IOException("Cannot qualify native/Ratis recovery baseline",failure);}
         if(!recoveryReplacement && generation==admissionGeneration.get() && getLifeCycleState()==LifeCycle.State.RUNNING)recoveryEligibility.publishIfCurrent(revision,evidence);
     }
+    void requireRecoveryRegistrationDrained()throws IOException {
+        synchronized(gate){if(storageFailure!=null || nativeApply!=null || !deferred.isEmpty() || !pendingNoops.isEmpty() || !configurations.isEmpty())throw new IOException("Original committed native work must drain before recovery registration");}
+    }
+    /** Resume the existing division after a forced META registration, without claiming image installation. */
+    void resumeRecoveryRegistration()throws IOException {
+        try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
+            synchronized(gate){
+                if(getLifeCycleState()!=LifeCycle.State.PAUSED || !recoveryReplacement || store.metadataRecoveryRegistration()==null || store.pendingInstallation())throw new IOException("META registration resume lacks paused replacement ownership");
+                requireRecoveryRegistrationDrained();
+                try{getLifeCycle().transition(LifeCycle.State.STARTING);recover(false);activateRecoveredOwner();getLifeCycle().transition(LifeCycle.State.RUNNING);if(committedGroup!=null)committedGroup.resume();}
+                catch(Exception failed){throw failRecovery(failed);}
+            }
+            recoveryReplacement=false;refreshRecoveryEligibility();
+        }
+    }
     private void refreshRecoveryAfterNativeCompletion()throws IOException {
         if(store.currentRangeRecoveryRegistration()!=null || store.metadataRecoveryRegistration()!=null)refreshRecoveryEligibility();
     }
@@ -2157,6 +2172,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     @Override public SimpleStateMachineStorage getStateMachineStorage() { return snapshots; }
+    boolean hasRetainedSnapshot(){return durableSnapshot!=null;}
     @Override public SnapshotInfo getLatestSnapshot() { return recoveryReplacement?null:durableSnapshot; }
 
     @Override public void initialize(RaftServer server, RaftGroupId groupId, RaftStorage storage) throws IOException {
@@ -2278,8 +2294,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 // A newer forced registration can coexist with the previous Raft snapshot until
                 // its image arrives. Inventory preserves that covered log floor; installation still
                 // requires the new exact permission and eligibility remains MISSING.
-                var nativeCut=store.applied();boolean retainedFloor=use==SnapshotImageUse.RETAINED_INVENTORY && store.metadataRecoveryPending() && !store.pendingInstallation()
-                        && manifest.position().index()<registration.imageCut().index() && nativeCut!=null && RatisRelocationOwnerRpc.covers(nativeCut,manifest.position());
+                var nativeCut=store.applied();boolean retainedFloor=use==SnapshotImageUse.RETAINED_INVENTORY && !store.pendingInstallation()
+                        && manifest.position().index()<registration.imageCut().index() && RatisRelocationOwnerRpc.covers(registration.imageCut(),manifest.position()) && nativeCut!=null && RatisRelocationOwnerRpc.covers(nativeCut,manifest.position());
                 if(!retainedFloor)try{var qualified=pin==null?store.validateMetadataRecoveryImage(image,limits):pin.validateMetadataRecoveryImage(image,limits);if(!qualified.position().equals(manifest.position()) || !Arrays.equals(qualified.sha256(),manifest.sha256()))throw new IOException("META image changed during native qualification");}
                 catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify META image provenance",invalid);}
             }
@@ -2373,6 +2389,31 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         synchronized (gate) { requireHealthy();requireUserReplica(); return store.readCurrentPoint(column,key); }
     }
 
+    /** Atomically refuses staged native work before pausing a normal owner for META registration. */
+    void pauseRecoveryRegistration(ApplyPosition imageCut)throws IOException {
+        if(getLifeCycleState()==LifeCycle.State.PAUSED){requireRecoveryRegistrationDrained();return;}
+        requireRecoveryRegistrationDrained();
+        prepareRecoveryReplacement();admissionGeneration.incrementAndGet();invalidateProposalCandidates();
+        try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
+            try{synchronized(gate){
+                requireRecoveryRegistrationDrained();
+                if(getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Recovery registration source is not running");
+                var actual=store.applied();if(store.pendingInstallation() || store.activeSnapshotPins()!=0 || actual!=null && !RatisRelocationOwnerRpc.covers(imageCut,actual))throw new IOException("Recovery registration image does not cover the drained native prefix");
+                getLifeCycle().transition(LifeCycle.State.PAUSING);store.fence();getLifeCycle().transition(LifeCycle.State.PAUSED);
+            }}catch(IOException refused){
+                // No pause or native registration happened. Restore ordinary eligibility outside
+                // the apply monitor so the original committed work can finish before a retry.
+                if(getLifeCycleState()==LifeCycle.State.RUNNING && store.metadataRecoveryRegistration()==null){recoveryReplacement=false;try{refreshRecoveryEligibility();}catch(IOException refresh){refused.addSuppressed(refresh);}}
+                throw refused;
+            }
+            try{drainPausedNativeState();}
+            catch(Exception failed){synchronized(gate){storageFailure=failed;store.fence();}failDeferred(failed);throw new IOException("Recovery registration pause failed",failed);}
+        }
+    }
+    private void drainPausedNativeState()throws Exception {
+        if(committedGroup!=null)committedGroup.wakeup();capturedSnapshots.invalidate();awaitNativeReaders(java.time.Duration.ofSeconds(10));preserveInstallationImages();
+    }
+
     @Override public void pause() {
         recoveryReplacement=true;
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates();
@@ -2383,10 +2424,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 getLifeCycle().transition(LifeCycle.State.PAUSED);
                 if(committedGroup!=null && nativeApply!=null){nativeApply.suspended=true;nativeApply.stageReady=false;}
             }
-            if(committedGroup!=null)committedGroup.wakeup();
-            capturedSnapshots.invalidate();
-            awaitNativeReaders(java.time.Duration.ofSeconds(10));
-            preserveInstallationImages();
+            drainPausedNativeState();
         } catch (Exception failure) {
             synchronized (gate) { storageFailure = failure; store.fence(); }
             failDeferred(failure);

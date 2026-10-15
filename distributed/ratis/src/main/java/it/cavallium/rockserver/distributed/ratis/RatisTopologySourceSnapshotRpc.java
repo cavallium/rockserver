@@ -48,9 +48,10 @@ public final class RatisTopologySourceSnapshotRpc {
         public boolean sourceOwner(ReplicaDescriptor value){return value.role()==ReplicaDescriptor.Role.VOTER && (sourceDirectory==null?header.parents().getFirst().owner(value.replicaId()).equals(TopologyChange.Owner.of(value)):range().replicas().contains(value));}
         public Request successor(UUID id){return new Request(id,header,catalogue,receiver,purpose,sourceGroup,sourceDirectory);}
     }
-    public record Prepared(Request request,NativeRangeImage.Manifest image,DistributedSchema schema,ReplicaDescriptor sourceOwner,
-                           ReplicatedRangeStore.Configuration sourceCfg,Map<String,byte[]> schemaRows,NativeTopologyFreeze metadataFreeze) {
-        public Prepared {
+    public static final class Prepared {
+        private final Request request;private final NativeRangeImage.Manifest image;private final DistributedSchema schema;private final ReplicaDescriptor sourceOwner;
+        private final ReplicatedRangeStore.Configuration sourceCfg;private final Map<String,byte[]> schemaRows;private final NativeTopologyFreeze metadataFreeze;private final int encodedSize;
+        public Prepared(Request request,NativeRangeImage.Manifest image,DistributedSchema schema,ReplicaDescriptor sourceOwner,ReplicatedRangeStore.Configuration sourceCfg,Map<String,byte[]> schemaRows,NativeTopologyFreeze metadataFreeze) {
             Objects.requireNonNull(request);Objects.requireNonNull(image);Objects.requireNonNull(schema);Objects.requireNonNull(sourceOwner);Objects.requireNonNull(sourceCfg);
             if(!image.owner().groupId().equals(request.sourceGroup()) || image.owner().epoch()!=request.rangeEpoch() || image.position().term()<1 || image.bytes()<1
                     || !image.interval().domainId().equals(request.domainId()) || !image.interval().columns().equals(schema.columnIds())
@@ -66,8 +67,22 @@ public final class RatisTopologySourceSnapshotRpc {
             bound(image.interval().lowerInclusive());bound(image.interval().upperExclusive());owner(sourceOwner);
             schemaRows=NativeTopologyLearnerSchema.copy(Objects.requireNonNull(schemaRows));
             for(var key:schemaRows.keySet())if(!key.equals(HexFormat.of().formatHex(HexFormat.of().parseHex(key))))throw new IllegalArgumentException("Noncanonical schema row key");
+            this.request=request;this.image=image;this.schema=schema;this.sourceOwner=sourceOwner;this.sourceCfg=sourceCfg;this.schemaRows=schemaRows;this.metadataFreeze=metadataFreeze;
+            // Capture/decode construction already owns metadata admission. Cache lengths here so a
+            // receiver can reserve its exact construction workspace without copying any payload.
+            byte[] lower=image.interval().lowerInclusive(),upper=image.interval().upperExclusive();var origin=image.topologyOrigin();
+            long manifest=156L+16L*(image.interval().columns().size()+image.deterministicMergeColumns().size())+(lower==null?0:lower.length)+(upper==null?0:upper.length)+(origin==null?0:78L+origin.seed().encodedSize()+237L+headerBytes(origin.activation().header()));
+            long size=45L+encodedRequestBytes(request)+manifest+DistributedSchemaCodec.encodedSize(schema)+57L+sourceOwner.peerId().length()+sourceOwner.address().length()+sourceCfg.data().length+(metadataFreeze==null?0:104L+headerBytes(metadataFreeze.header()));
+            for(var row:schemaRows.entrySet())size+=8L+row.getKey().length()/2+row.getValue().length;
+            encodedSize=Math.toIntExact(size);if(encodedSize>MAX_REPLY_BYTES)throw new IllegalArgumentException("Prepared source reply exceeds byte bound");
         }
-        @Override public Map<String,byte[]> schemaRows(){return NativeTopologyLearnerSchema.copy(schemaRows);}
+        public Request request(){return request;}public NativeRangeImage.Manifest image(){return image;}public DistributedSchema schema(){return schema;}public ReplicaDescriptor sourceOwner(){return sourceOwner;}public ReplicatedRangeStore.Configuration sourceCfg(){return sourceCfg;}public NativeTopologyFreeze metadataFreeze(){return metadataFreeze;}
+        public Map<String,byte[]> schemaRows(){return NativeTopologyLearnerSchema.copy(schemaRows);}
+        /** Exact PREPARE/TRANSFER reply length; constant-time and allocation-free. */
+        public int encodedSize(){return encodedSize;}
+        @Override public boolean equals(Object other){return other instanceof Prepared p && request.equals(p.request) && image.equals(p.image) && schema.equals(p.schema) && sourceOwner.equals(p.sourceOwner) && sourceCfg.equals(p.sourceCfg) && schemaRows.equals(p.schemaRows) && Objects.equals(metadataFreeze,p.metadataFreeze);}
+        @Override public int hashCode(){int result=request.hashCode();result=31*result+image.hashCode();result=31*result+schema.hashCode();result=31*result+sourceOwner.hashCode();result=31*result+sourceCfg.hashCode();result=31*result+schemaRows.hashCode();return 31*result+Objects.hashCode(metadataFreeze);}
+        @Override public String toString(){return "Prepared[request="+request+", image="+image+", schema="+schema+", sourceOwner="+sourceOwner+", sourceCfg="+sourceCfg+", schemaRows="+schemaRows+", metadataFreeze="+metadataFreeze+"]";}
     }
     static boolean metadataFreezeKey(UUID group,byte[] key){return key.length==17 && key[16]==0x60 && uuid(ByteBuffer.wrap(key)).equals(group);}
     static void requireMetadataFreeze(Request request,NativeTopologyFreeze freeze,ApplyPosition cut,byte[] lower,byte[] upper){
@@ -83,11 +98,11 @@ public final class RatisTopologySourceSnapshotRpc {
         private final Abandoned receipt;public AbandonedException(Abandoned receipt){super("Source transfer was durably abandoned; retry its acknowledged successor");this.receipt=Objects.requireNonNull(receipt);}public Abandoned receipt(){return receipt;}
     }
     static int encodedRequestBytes(Request request) {
-        long header=0;
-        if(request.header()!=null){header=229;for(var participant:request.header().parents())header+=52L+49L*participant.owners().size();for(var participant:request.header().targets())header+=52L+49L*participant.owners().size();}
+        long header=request.header()==null?0:headerBytes(request.header());
         long directory=request.sourceDirectory()==null?0:RangeDirectoryCodec.encodedSize(request.sourceDirectory());
         return Math.toIntExact(ScopedTransactionRpc.HEADER_BYTES+61L+header+directory+57L+request.receiver().peerId().length()+request.receiver().address().length());
     }
+    private static long headerBytes(TopologyChange.Header header){long size=229;for(var participant:header.parents())size+=52L+49L*participant.owners().size();for(var participant:header.targets())size+=52L+49L*participant.owners().size();return size;}
     /** The directory/header in this request is already fixed; reserve only its actual bytes. */
     static int maximumPreparedBytes(Request request){return Math.addExact(MAX_REPLY_BYTES-MAX_REQUEST_BYTES-(request.metadataOnly()?0:NativeTopologyFreeze.MAX_BYTES),encodedRequestBytes(request));}
     static int maximumPublicationBytes(Request request){return Math.addExact(encodedRequestBytes(request),MAX_OWNER_BYTES+181+(request.metadataOnly()?NativeTopologyFreeze.MAX_BYTES:0));}
@@ -109,7 +124,7 @@ public final class RatisTopologySourceSnapshotRpc {
         if(in.hasRemaining())throw new IllegalArgumentException("Trailing source snapshot reply");var result=new Prepared(request,image,schema,source,configuration,rows,metadataFreeze);if(!Arrays.equals(reply(kind,result),bytes))throw new IllegalArgumentException("Noncanonical source snapshot reply");return result;
     }
     public static void requireRequest(Request expected,Request actual){if(!Arrays.equals(body(expected),body(actual)))throw new IllegalArgumentException("Source transfer identity/input changed");}
-    static int preparedBytes(Prepared prepared){return preparedBody(prepared).length+1+ScopedTransactionRpc.HEADER_BYTES;}
+    static int preparedBytes(Prepared prepared){return prepared.encodedSize();}
     private static byte[] body(Request request){return bytes(out->{out.writeByte(request.purpose().ordinal());uuid(out,request.transferId());uuid(out,request.catalogue());blob(out,request.header()==null?new byte[0]:request.header().encode());uuid(out,request.sourceGroup());blob(out,request.sourceDirectory()==null?new byte[0]:RangeDirectoryCodec.encode(request.sourceDirectory()));blob(out,owner(request.receiver()));},MAX_REQUEST_BYTES);}
     private static Request readRequest(ByteBuffer in){if(in.remaining()<65)throw new IllegalArgumentException("Truncated source transfer request");int purpose=in.get()&255;if(purpose>=Purpose.values().length)throw new IllegalArgumentException("Unknown source transfer purpose");UUID transfer=uuid(in),catalogue=uuid(in);byte[] header=blob(in,TopologyChange.MAX_HEADER_BYTES);var group=uuid(in);byte[] directory=blob(in,RatisCatalogue.MAX_DIRECTORY_BYTES);var receiver=owner(blob(in,MAX_OWNER_BYTES));var result=new Request(transfer,header.length==0?null:TopologyChange.Header.decode(header),catalogue,receiver,Purpose.values()[purpose],group,directory.length==0?null:RangeDirectoryCodec.decode(directory));if(in.hasRemaining())throw new IllegalArgumentException("Trailing transfer request");return result;}
     private static byte[] preparedBody(Prepared prepared){return bytes(out->{blob(out,body(prepared.request()));blob(out,manifest(prepared.image()));blob(out,DistributedSchemaCodec.encode(prepared.schema()));blob(out,owner(prepared.sourceOwner()));out.writeLong(prepared.sourceCfg().term());out.writeLong(prepared.sourceCfg().index());blob(out,prepared.sourceCfg().data());blob(out,prepared.metadataFreeze()==null?new byte[0]:prepared.metadataFreeze().encode());var rows=prepared.schemaRows();out.writeInt(rows.size());for(var row:rows.entrySet()){blob(out,HexFormat.of().parseHex(row.getKey()));blob(out,row.getValue());}},MAX_REPLY_BYTES);}

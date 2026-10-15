@@ -16,11 +16,23 @@ class RatisTopologySourceSnapshotRpcTest {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
             var request=fixture.request(50);assertEquals(request(PREPARE,request).length,encodedRequestBytes(request));var prepared=service.prepare(request);
             for(int kind:new int[]{PREPARE,TRANSFER,RELEASE})assertArrayEquals(request(kind,request),request(kind,request(request(kind,request))));
-            var bytes=reply(PREPARE,prepared);var decoded=reply(bytes,PREPARE,request);
+            var bytes=reply(PREPARE,prepared);assertEquals(bytes.length,prepared.encodedSize());assertEquals(bytes.length,preparedBytes(prepared));var decoded=reply(bytes,PREPARE,request);assertEquals(bytes.length,decoded.encodedSize());
             assertArrayEquals(bytes,reply(PREPARE,decoded));assertArrayEquals(prepared.image().sha256(),decoded.image().sha256());assertArrayEquals(prepared.sourceCfg().data(),decoded.sourceCfg().data());assertTrue(decoded.schemaRows().isEmpty());
             assertFalse(new String(bytes,java.nio.charset.StandardCharsets.ISO_8859_1).contains(root.toString()));
             assertThrows(IllegalArgumentException.class,()->reply(bytes,TRANSFER,request));assertThrows(IllegalArgumentException.class,()->reply(bytes,PREPARE,fixture.request(51)));
             assertThrows(IllegalArgumentException.class,()->reply(Arrays.copyOf(bytes,bytes.length-1),PREPARE,request));
+        }
+    }
+    @Test void measuredCurrentWithBirthAndSchemaHistoryAndMetadataFreezeMatchExactWireBytes()throws Exception {
+        try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("sizes"),false)){
+            var split=source.split();source.createColumn(source.first.domainId(),"μήκος");var current=source.routes.get(source.first.domainId()).directory();var leaf=current.ranges().getFirst();var parent=split.parents().getFirst();var helper=new RatisNodeRecoverySourceTest();
+            var user=new Request(new UUID(94,3),null,source.plan.catalogue().groupId(),leaf.replicas().getFirst(),Purpose.CURRENT_LEAF,leaf.groupId(),current);
+            var metadata=new Request(new UUID(94,4),split.header(),source.plan.catalogue().groupId(),parent.replicas().getFirst(),Purpose.ANCESTOR_METADATA,parent.groupId(),split.sourceDirectory());
+            for(var request:List.of(user,metadata)){
+                var prepared=helper.prepare(source,request);if(request.metadataOnly())assertNotNull(prepared.metadataFreeze());else{assertNotNull(prepared.image().topologyOrigin());assertFalse(prepared.schemaRows().isEmpty());}
+                for(int kind:new int[]{PREPARE,TRANSFER}){var encoded=reply(kind,prepared);assertEquals(encoded.length,prepared.encodedSize());var decoded=reply(encoded,kind,request);assertEquals(encoded.length,decoded.encodedSize());assertArrayEquals(encoded,reply(kind,decoded));}
+                assertTrue(prepared.encodedSize()<maximumPreparedBytes(request));
+            }
         }
     }
     @Test void malformedRequestLengthsAndKindsAreRejectedBeforeHostWork()throws Exception {
@@ -41,7 +53,7 @@ class RatisTopologySourceSnapshotRpcTest {
             assertEquals(Purpose.RECOVERY,request(request(PREPARE,recovery)).purpose());
             assertArrayEquals(RatisTopologyLearnerRecoveryRpc.request(recovery),RatisTopologyLearnerRecoveryRpc.request(RatisTopologyLearnerRecoveryRpc.decode(RatisTopologyLearnerRecoveryRpc.request(recovery))));
             var prepared=new Prepared(recovery,initial.image(),initial.schema(),initial.sourceOwner(),initial.sourceCfg(),initial.schemaRows(),initial.metadataFreeze());
-            var encoded=RatisTopologyLearnerRecoveryRpc.reply(prepared);assertArrayEquals(encoded,RatisTopologyLearnerRecoveryRpc.reply(RatisTopologyLearnerRecoveryRpc.reply(encoded,recovery)));
+            assertEquals(reply(PREPARE,prepared).length,prepared.encodedSize());var encoded=RatisTopologyLearnerRecoveryRpc.reply(prepared);assertArrayEquals(encoded,RatisTopologyLearnerRecoveryRpc.reply(RatisTopologyLearnerRecoveryRpc.reply(encoded,recovery)));
             assertThrows(IllegalArgumentException.class,()->new Request(recovery.transferId(),definition.header(),recovery.catalogue(),voter,Purpose.BOOTSTRAP));
             assertThrows(IllegalArgumentException.class,()->RatisTopologyLearnerRecoveryRpc.request(initial.request()));
             assertThrows(IllegalArgumentException.class,()->RatisTopologyLearnerRecoveryRpc.reply(encoded,fixture.request(51)));

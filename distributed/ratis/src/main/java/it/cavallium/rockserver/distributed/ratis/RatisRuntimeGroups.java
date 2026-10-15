@@ -60,13 +60,17 @@ final class RatisRuntimeGroups {
             }
         }catch(java.io.IOException invalid){throw new IllegalArgumentException("Invalid native recovery configuration",invalid);}
     }
-    synchronized void register(NativeCurrentRangeRecovery registration){
+    synchronized void preflight(NativeCurrentRangeRecovery registration){
         var directory=registration.directory();var descriptor=registration.range();recoveryIdentity(registration.catalogue(),directory,registration.receiver(),descriptor,registration.sourceConfiguration());
         var old=groups.get(registration.groupId());
         if(old!=null){if(old.current()!=null && old.current().equals(registration))return;if(old.role()!=RatisNodePlan.Role.DATA || old.current()!=null || old.metadata()!=null || old.seed()!=null || old.learner()!=null || old.retired() || !old.descriptor().equals(descriptor))throw new IllegalArgumentException("CURRENT recovery conflicts with an existing local registration");}
-        requireCapacity(List.of(registration.groupId()));groups.put(registration.groupId(),new Entry(group(descriptor),RatisNodePlan.Role.DATA,directory,descriptor,null,null,null,registration,null,false));dataGroups=snapshotDataGroups();
+        requireCapacity(List.of(registration.groupId()));
     }
-    synchronized void register(NativeMetadataRecoveryRegistration registration){
+    synchronized void register(NativeCurrentRangeRecovery registration){
+        var existing=groups.get(registration.groupId());if(existing!=null && registration.equals(existing.current()))return;
+        preflight(registration);var directory=registration.directory();var descriptor=registration.range();groups.put(registration.groupId(),new Entry(group(descriptor),RatisNodePlan.Role.DATA,directory,descriptor,null,null,null,registration,null,false));dataGroups=snapshotDataGroups();
+    }
+    synchronized void preflight(NativeMetadataRecoveryRegistration registration){
         var directory=registration.sourceDirectory();var descriptor=registration.range();recoveryIdentity(registration.catalogue(),directory,registration.receiver(),descriptor,registration.sourceConfiguration());
         var old=groups.get(registration.groupId());
         if(old!=null){
@@ -74,7 +78,11 @@ final class RatisRuntimeGroups {
             if(old.role()!=RatisNodePlan.Role.DATA || old.current()!=null || old.learner()!=null || old.descriptor().rangeEpoch()!=descriptor.rangeEpoch() || !old.descriptor().rangeId().equals(descriptor.rangeId())
                     || !Arrays.equals(old.descriptor().lowerInclusive(),descriptor.lowerInclusive()) || !Arrays.equals(old.descriptor().upperExclusive(),descriptor.upperExclusive()) || !old.directory().domainId().equals(directory.domainId()))throw new IllegalArgumentException("META recovery conflicts with an existing local registration");
         }
-        requireCapacity(List.of(registration.groupId()));groups.put(registration.groupId(),new Entry(group(descriptor),RatisNodePlan.Role.DATA,directory,descriptor,old==null?null:old.seed(),null,old==null?null:old.relocation(),null,registration,true));dataGroups=snapshotDataGroups();
+        requireCapacity(List.of(registration.groupId()));
+    }
+    synchronized void register(NativeMetadataRecoveryRegistration registration){
+        var existing=groups.get(registration.groupId());if(existing!=null && registration.equals(existing.metadata()))return;
+        preflight(registration);var directory=registration.sourceDirectory();var descriptor=registration.range();var old=groups.get(registration.groupId());groups.put(registration.groupId(),new Entry(group(descriptor),RatisNodePlan.Role.DATA,directory,descriptor,old==null?null:old.seed(),null,old==null?null:old.relocation(),null,registration,true));dataGroups=snapshotDataGroups();
     }
     synchronized void relocation(RatisTopologyRelocationRecord record){var definition=record.definition();var id=definition.parents().getFirst().groupId();var old=require(id);if(old.role()!=RatisNodePlan.Role.DATA || old.retired() || !definition.header().clusterId().equals(plan.clusterId()) || !definition.header().databaseId().equals(plan.databaseId()) || !definition.header().domainId().equals(old.directory().domainId()))throw new IllegalArgumentException("Relocation changed registered namespace/role");var directory=record.action()==RatisTopologyRelocationRecord.Action.COMPLETE?definition.targetDirectory():definition.sourceDirectory();if(old.directory().generation()>directory.generation())return;var descriptor=record.action()==RatisTopologyRelocationRecord.Action.COMPLETE?definition.targets().getFirst():definition.parents().getFirst();if(old.descriptor().rangeEpoch()!=descriptor.rangeEpoch() || !old.descriptor().rangeId().equals(descriptor.rangeId()))throw new IllegalArgumentException("Relocation changed registered lineage");groups.put(id,new Entry(group(descriptor),old.role(),directory,descriptor,old.seed(),old.learner(),record,old.current(),old.metadata(),old.retired()));}
     synchronized RaftGroup reconcileRelocationConfiguration(UUID id,byte[] nativeConfiguration)throws java.io.IOException{

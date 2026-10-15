@@ -107,11 +107,11 @@ class RatisRecoverySnapshotLifecycleTest {
                 for(int attempt=0;attempt<2;attempt++)try(var adapter=new Adapter(target,pool,source.directory,source.local,raft,true)) {
                     assertEquals(first.position().index(),adapter.machine.getLatestSnapshot().getIndex());assertEquals(first.position().index(),adapter.machine.getLastAppliedTermIndex().getIndex());assertEquals(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.MISSING,adapter.machine.recoveryEligibilityGate().snapshot().mode());
                     assertThrows(IOException.class,()->target.validateMetadataRecoveryImage(initial,limits));assertThrows(IllegalStateException.class,target::metadataOutcomeState);assertFalse(target.admissionOpen());
-                    if(attempt==1){adapter.install(next,later);assertEquals(later.position(),target.applied());assertTrue(target.metadataRecoveryImageInstalled());assertTrue(target.metadataRecoveryPending());assertEquals(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.RECOVERY,adapter.machine.recoveryEligibilityGate().snapshot().mode());}
+                    if(attempt==1){adapter.install(next,later);assertEquals(later.position(),target.applied());assertTrue(target.metadataRecoveryImageInstalled());assertTrue(target.metadataRecoveryPending());assertEquals(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.RECOVERY,adapter.machine.recoveryEligibilityGate().snapshot().mode());target.completeMetadataRecovery(successor,later.position(),nextCfg);adapter.machine.refreshRecoveryEligibility();assertFalse(target.metadataRecoveryPending());}
                 }
             }
             try(var pool=new RatisTopologyRecoveryAnchorTest().pool(receiver)) {
-                var target=pool.openMetadataRecovery(successor);try(var adapter=new Adapter(target,pool,source.directory,source.local,raft,true)){assertEquals(later.position(),target.applied());assertTrue(target.metadataRecoveryImageInstalled());assertTrue(target.metadataRecoveryPending());assertEquals(later.position().index(),adapter.machine.getLatestSnapshot().getIndex());assertFalse(target.admissionOpen());}
+                var target=pool.openMetadataRecovery(successor);try(var adapter=new Adapter(target,pool,source.directory,source.local,raft,true)){assertEquals(later.position(),target.applied());assertTrue(target.metadataRecoveryImageInstalled());assertFalse(target.metadataRecoveryPending());assertEquals(later.position().index(),adapter.machine.getLatestSnapshot().getIndex());assertFalse(target.admissionOpen());}
             }
         }
     }
@@ -132,6 +132,12 @@ class RatisRecoverySnapshotLifecycleTest {
         try(var pool=new RatisTopologyRecoveryAnchorTest().pool(receiver)) {
             pool.configureSnapshotAdmission(new PoolSnapshotAdmission.Limits(1,8L<<30,java.time.Duration.ofSeconds(60),0));var target=pool.openMetadataRecovery(registration);target.enableSessionControls();
             try(var adapter=new Adapter(target,pool,registration.sourceDirectory(),registration.receiver(),raft,true)){assertFalse(target.metadataRecoveryPending());assertFalse(target.admissionOpen());assertEquals(cut,target.metadataOutcomeState().applied().index());assertEquals(cut,adapter.machine.getLatestSnapshot().getIndex());assertEquals(20,target.metadataOutcomeState().sessionAuthority().logicalTimeMillis());assertEquals(0,pool.snapshotAdmissionStats().pins());}
+        }
+    }
+    @Test void newerCommittedPrefixRefusesRegistrationPauseWithoutClosingOriginalOwner()throws Exception {
+        var helper=new RatisSourceOutcomeTest();try(var fixture=helper.new Fixture(root.resolve("registration-cut-race"),false)) {
+            var source=fixture.home.source;var captured=source.store.applied();fixture.applyControl(source.clock(999,20));assertTrue(source.store.applied().index()>captured.index());
+            assertThrows(IOException.class,()->fixture.machine.pauseRecoveryRegistration(captured));assertEquals(org.apache.ratis.util.LifeCycle.State.RUNNING,fixture.machine.getLifeCycleState());assertEquals(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.NORMAL,fixture.machine.recoveryEligibilityGate().snapshot().mode());assertNull(source.store.metadataRecoveryRegistration());
         }
     }
     @Test void originalRetiredSourceSnapshotsOnlyMetadataAtNewActualOwnCutAndReinitializes()throws Exception {

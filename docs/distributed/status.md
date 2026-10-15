@@ -1881,6 +1881,47 @@ READY and release cleanly (`metadata-freeze-cold-capturing-gate.log`, three case
 This is controlled native/adapter evidence, not complete node actor integration or
 remote quorum acceptance.
 
+A pending newer META image no longer invalidates an older covered META Raft
+snapshot during cold inventory. Its original FREEZE, semantic image, native-covered
+cut, geometry/configuration and checksum remain validated; it supplies only the old
+log floor. It cannot install under the new permission, and the member stays MISSING
+until the exact new image is durably installed. Replacement revocation now latches
+before publishing MISSING, preventing a concurrent native NORMAL refresh from
+reopening eligibility. Five lifecycle cases and seven eligibility cases pass
+(`metadata-successor-adapter-first-gate.log`) on the hash-matched adapter patch in
+the isolated validation checkout.
+
+Runtime now registers trusted source PREPARE results as configured CURRENT or
+META owners under fresh CAT/birth/source-head qualification. It reserves measured
+construction workspace, the retained registration graph, durable exposure and
+group/pool claims before native force. Exact unknown-force retries retain the
+original recipe and CAT cut; later catalogue progress cannot rebase them. Existing
+quiescent META-source divisions pause atomically and resume at their actual prefix
+without claiming an installed image; all services and registration-bound exposure
+are in place before a new division is added. Both kinds remain MISSING/no-USER
+until actual image/tail/completion evidence exists. The fresh head proves authority
+and progress; the trusted PREPARE transport supplies the image identity, whose
+bytes/hash are checked during native installation.
+
+The 24-case final gate passes (`runtime-recovery-registration-sized-quiescent-gate.log`):
+actual Runtime source/receiver pools, META then absent born CURRENT, forced-native
+lost reply followed by CAT progress and exact retry, rejected group addition,
+changed-image/namespace refusal, native cold inventory, snapshot/eligibility
+lifecycle, and measured Prepared framing. Tiny META registration succeeds with
+only 32 MiB protected workspace free. Busy work and a newly advanced native cut
+refuse registration without leaving the original owner paused or closing its gate.
+The existing 46 Runtime/seed/learner/two-pool workflows also pass
+(`runtime-registration-existing-workflows-gate.log`). Cached Prepared sizing is
+wire-exact and avoids payload copies at Runtime admission; 36 source-service,
+publication, artifact and metadata-replay consumer cases pass
+(`recovery-prepared-size-source-consumers-gate.log`).
+
+CURRENT-to-META conversion, META registration successors, and conversion of an
+existing source with a retained GROUP snapshot still need dedicated Runtime
+transitions; first-time META conversion conservatively refuses any retained
+snapshot before native force. The journaled asynchronous configured-member driver,
+DAG obligation retention and leader-change source transfer remain unfinished.
+
 Durable metadata-DAG
 obligation discovery, asynchronous configured-member catch-up, quorum retirement,
 source quiescence and physical parent reclamation remain unfinished. In particular,
