@@ -61,7 +61,7 @@ class NativeMetadataRecoveryTest {
     @Test void interruptedMetadataInstallReopensFencedAndRetriesExactOriginalImage()throws Exception {
         Path image=root.resolve("metadata"),path=root.resolve("receiver");NativeMetadataRecoveryRegistration registration;TopologyChange.Definition definition;DistributedCommand original;byte[] result;
         try(var source=nativeTest.new Fixture(root.resolve("source"))) {original=source.write(source.parent,0,9);result=source.parent.apply(new ApplyPosition(1,1),original);source.freeze();source.seed();definition=source.definition;registration=registration(source,NativeRangeImage.writeMetadata(image,source.parent,nativeTest.limits));}
-        try(var pool=helper.pool(path)) {var target=pool.openMetadataRecovery(registration);configure(target,definition);assertThrows(IOException.class,()->target.installMetadataSnapshot(image,nativeTest.limits,batches->{throw new IOException("Lost install completion");}));assertTrue(target.pendingInstallation());assertThrows(IllegalStateException.class,()->outcome(target,definition,original.operationId(),original.receiptDigest()));}
+        try(var pool=helper.pool(path)) {var target=pool.openMetadataRecovery(registration);configure(target,definition);target.installMetadataSnapshot(image,nativeTest.limits);target.completeMetadataRecovery(registration,registration.imageCut(),target.configuration());assertFalse(target.metadataRecoveryPending());assertThrows(IOException.class,()->target.installMetadataSnapshot(image,nativeTest.limits,batches->{throw new IOException("Lost install completion");}));assertTrue(target.pendingInstallation());assertTrue(target.metadataRecoveryPending());assertThrows(IllegalStateException.class,target::metadataOutcomeState);assertThrows(IllegalStateException.class,()->outcome(target,definition,original.operationId(),original.receiptDigest()));}
         try(var pool=helper.pool(path)) {var target=pool.openMetadataRecovery(registration);configure(target,definition);assertTrue(target.pendingInstallation());assertTrue(target.metadataRecoveryPending());target.installMetadataSnapshot(image,nativeTest.limits);assertFalse(target.pendingInstallation());target.completeMetadataRecovery(registration,registration.imageCut(),target.configuration());assertArrayEquals(result,outcome(target,definition,original.operationId(),original.receiptDigest()).result());}
     }
     @Test void uncertainRegistrationRequiresExactRetryAndColdRegistryDoesNotInventReadiness()throws Exception {
@@ -97,6 +97,20 @@ class NativeMetadataRecoveryTest {
             assertEquals(source.parent.sourceOutcomePublication(request,result),target.sourceOutcomePublication(request,result));assertEquals(NativeSourceOutcomePublication.Outcome.RETAINED,publication.outcome());
         }
         try(var pool=helper.pool(path)) {var target=pool.openMetadataRecovery(next);target.configureSourceOutcomeCapacity(4,352);assertFalse(target.metadataRecoveryPending());assertTrue(target.sourceOutcomeCredits().isEmpty());assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(target.operationResult(request.original().operationId(),request.original().receiptDigest())).status());}
+    }
+
+    @Test void committedCreditAndPublicationTailReplayDoesNotOpenFreshAuthority()throws Exception {
+        var promises=new NativeSourceOutcomePublicationTest();Path image=root.resolve("metadata");
+        try(var source=nativeTest.new Fixture(root.resolve("source"));var home=promises.home.new Fixture(root.resolve("home"));var pool=helper.pool(root.resolve("receiver"))) {
+            source.freeze();source.seed();var registration=registration(source,NativeRangeImage.writeMetadata(image,source.parent,nativeTest.limits));
+            source.parent.configureSourceOutcomeCapacity(4,352);var request=promises.reserve(source,home,1,1);var credit=source.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);byte[] result=promises.success();var publication=source.parent.publishSourceOutcome(new ApplyPosition(1,3),request,result);
+            var target=pool.openMetadataRecovery(registration);configure(target,source.definition);target.installMetadataSnapshot(image,nativeTest.limits);target.configureSourceOutcomeCapacity(4,352);
+            assertNull(target.readCommittedSourceOutcome(request).credit());assertEquals(credit,target.applySourceOutcomeCredit(new ApplyPosition(1,2),request));assertEquals(credit,target.applySourceOutcomeCredit(new ApplyPosition(1,2),request));
+            assertEquals(credit,target.readCommittedSourceOutcome(request).credit());assertThrows(IllegalStateException.class,()->target.estimateSourceOutcomeCredit(request));
+            assertEquals(publication,target.publishSourceOutcome(new ApplyPosition(1,3),request,result));var replay=target.readCommittedSourceOutcome(request);assertNull(replay.credit());assertEquals(publication.publication(),replay.publication());assertArrayEquals(result,replay.result());
+            assertThrows(IllegalStateException.class,()->target.sourceOutcomePublication(request,result));assertThrows(IllegalStateException.class,()->target.operationResult(request.original().operationId(),request.original().receiptDigest()));
+            target.completeMetadataRecovery(registration,new ApplyPosition(1,3),target.configuration());assertArrayEquals(result,target.operationResult(request.original().operationId(),request.original().receiptDigest()));
+        }
     }
 
 }

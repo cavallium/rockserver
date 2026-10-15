@@ -896,6 +896,7 @@ public final class ReplicatedRangeStore {
             if (ownership.get(owner).state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
         }
         recoverTopologyOwnership();
+        if(metadataRecoveryReady && !metadataImageInstalledUnderLane())throw new IllegalStateException("Ready metadata recovery lost its installed source image");
         if(retiredMetadataOnly && (!topologyRetired() || pendingInstallation!=null && metadataRecoveryRegistration==null))throw new IllegalArgumentException("Metadata-only owner lacks completed retirement/recovery authority");
         if(pendingInstallation==null && (metadataRecoveryRegistration==null || metadataImageInstalledUnderLane())) {
             recoverSchemaMetadata();
@@ -1105,7 +1106,7 @@ public final class ReplicatedRangeStore {
     public boolean topologyRetired() { return topologyRetirement!=null || metadataRecoveryRegistration!=null; }
     public NativeMetadataRecoveryRegistration metadataRecoveryRegistration(){return metadataRecoveryRegistration;}
     public boolean metadataRecoveryPending(){return metadataRecoveryRegistration!=null && !metadataRecoveryReady;}
-    private void requireMetadataRecoveryReady(){if(metadataRecoveryPending())throw new IllegalStateException("Source metadata recovery has not qualified its current completed prefix");}
+    private void requireMetadataRecoveryReady(){var registration=metadataRecoveryRegistration;if(registration!=null && (!metadataRecoveryReady || pendingInstallation!=null || applied==null || !NativeMetadataRecoveryRegistration.covers(applied,registration.imageCut())))throw new IllegalStateException("Source metadata recovery has not qualified its current completed prefix");}
     private static byte[] metadataImageReceipt(NativeMetadataRecoveryRegistration registration){return ByteBuffer.allocate(48).putLong(registration.imageCut().term()).putLong(registration.imageCut().index()).put(registration.imageHash()).array();}
     private boolean metadataImageInstalledUnderLane()throws RocksDBException {
         var registration=metadataRecoveryRegistration;return registration!=null && pendingInstallation==null && applied!=null && NativeMetadataRecoveryRegistration.covers(applied,registration.imageCut())
@@ -3997,6 +3998,7 @@ public final class ReplicatedRangeStore {
                 // Publish recovery authority before the first destructive interval change.
                 try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
                     batch.put(state, installingKey, pendingInstallation);
+                    if(metadata && metadataRecoveryRegistration!=null){metadataRecoveryReady=false;batch.delete(state,topologyOwnershipKey(0x70));}
                     if(learnerSchemaPreparation!=null){for(var row:localSchemaRows.entrySet())batch.put(state,HexFormat.of().parseHex(row.getKey()),row.getValue());}
                     batch.delete(state, markerKey);
                     db.write(options, batch);
