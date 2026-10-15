@@ -46,7 +46,8 @@ class RatisNodeGenesisObservationTest {
             catalogue=(RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args)->switch(method.getName()){case "getGroupId"->RaftGroupId.valueOf(binding.groupId());case "io"->io;case "close"->null;default->throw new AssertionError(method);});
         }
         RatisNodeRuntime open(RatisNodeRuntime.Startup startup)throws Exception {
-            var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,routes,env.scheduler,env.timer,()->20L,env.settings(),startup,new RatisNodeRuntimeTest.FakeServer()::create);
+            var server=new RatisNodeRuntimeTest.FakeServer();server.skipFirstNoop=true;
+            var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,routes,env.scheduler,env.timer,()->20L,env.settings(),startup,server::create);
             node.relocationTransport(range->{assertEquals(plan.catalogue().groupId(),range.groupId());return catalogue;},(range,owner)->{throw new AssertionError("Genesis observation grants no DATA source call");});node.start();return node;
         }
         RatisNodeIdentity saved()throws IOException{return RatisNodeIdentity.decode(SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),RatisNodeIdentity.MAX_BYTES),plan,env.settings().resources().nativeExtents());}

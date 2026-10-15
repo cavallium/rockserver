@@ -26,6 +26,20 @@ public final class RatisRelocationDataClient implements AutoCloseable {
             public RatisRecoveryLineageRpc.Reply birth(RatisRecoveryLineageRpc.Request request,RatisConfiguredRecoveryDiscovery.ReplyAdmission charge)throws IOException{return source.birth(request,charge);}
         },admission);}finally{leave();}
     }
+    /** Same bounded fresh CAT route as graph discovery, without requiring directories to exist yet. */
+    boolean discoverGenesis(RatisNodePlan plan,RatisConfiguredRecoveryDiscovery.Admission admission,ViewObserver observer)throws IOException {
+        if(!cluster.equals(plan.clusterId()) || !database.equals(plan.databaseId()) || !catalogue.equals(plan.catalogue().groupId()))throw new IOException("Genesis transport changed configured catalogue");
+        var binding=plan.catalogue();var route=new RangeDescriptor(binding.groupId(),binding.groupId(),binding.epoch(),0,null,null,RangeDescriptor.TopologyState.ACTIVE,binding.replicas());boolean complete=true;
+        enter();try(var lease=clients.acquire(route)) {
+            var source=new RatisCatalogue(lease.client(),cluster,database,catalogue,binding.epoch(),binding.schemaDigest(),binding.directoryColumn()).recoveryDiscoverySource();
+            for(var domain:plan.domains()) {
+                var request=new RatisCatalogueViewRpc.Request(cluster,database,catalogue,binding.directoryColumn(),domain.domainId());var charged=new boolean[1];
+                var view=source.view(request,bytes->{if(charged[0])throw new IOException("Duplicate genesis reply admission");charged[0]=true;admission.beforeReply(0,bytes);});if(!charged[0])throw new IOException("Genesis reply omitted admission");
+                observer.observed(view);complete&=view.directory()!=null;
+            }
+            return complete;
+        }finally{leave();}
+    }
     private void require(TopologyChange.Definition definition)throws IOException{if(definition.kind()!=TopologyChange.Kind.RELOCATE || !cluster.equals(definition.header().clusterId()) || !database.equals(definition.header().databaseId()))throw new IOException("Relocation namespace differs");}
     public RatisRelocationOwnerRpc.Evidence read(RatisRelocationOwnerRpc.Request request)throws IOException{
         require(request.definition());var descriptor=request.expected()==RatisRelocationOwnerRpc.Expected.SOURCE?request.definition().parents().getFirst():request.definition().targets().getFirst();var peer=request.replica()==null?null:descriptor.replicas().stream().filter(r->r.replicaId().equals(request.replica())).findFirst().orElseThrow();enter();try(var lease=peer==null?clients.acquire(descriptor):clients.acquireOwner(descriptor,peer)){byte[] bytes=RatisRelocationOwnerRpc.request(request);var reply=RatisRoutedClient.rpc(()->peer==null?lease.client().io().sendReadOnly(message(bytes)):lease.client().io().sendStaleRead(message(bytes),0,RaftPeerId.valueOf(peer.peerId())));byte[] output=content(reply,descriptor.groupId(),RatisRelocationOwnerRpc.MAX_REPLY_BYTES);try{var evidence=RatisRelocationOwnerRpc.decodeReply(output,request);var owner=(request.expected()==RatisRelocationOwnerRpc.Expected.SOURCE?request.definition().parents().getFirst():descriptor).replicas().stream().filter(r->r.replicaId().equals(evidence.owner().replicaId())).findFirst().orElseThrow();if(!RaftPeerId.valueOf(owner.peerId()).equals(reply.getServerId()))throw new IOException("Relocation owner reply crossed actual peer");return evidence;}catch(IllegalArgumentException invalid){throw new IOException("Invalid actual relocation evidence",invalid);}}finally{leave();}

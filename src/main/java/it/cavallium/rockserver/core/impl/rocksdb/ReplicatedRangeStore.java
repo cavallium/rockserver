@@ -4,6 +4,8 @@ import it.cavallium.rockserver.core.common.distributed.BucketMergeOperand;
 import it.cavallium.rockserver.core.common.distributed.DatabaseDomainRoster;
 import it.cavallium.rockserver.core.common.distributed.CatalogueHistory;
 import it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec;
+import it.cavallium.rockserver.core.common.distributed.RangeDirectory;
+import it.cavallium.rockserver.core.common.distributed.RangeDescriptor;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
@@ -984,6 +986,22 @@ public final class ReplicatedRangeStore {
     /** Adapter startup inventory keeps native foreground work closed independently of Raft eligibility. */
     public void deferDiscovery() {
         synchronized(discoveryPublication){discoveryPending=true;discoveryActivation=null;}fence();
+    }
+    /** Original creation metadata only; this grants neither USER access nor image installation. */
+    public RangeStateView genesisState(RangeDirectory directory,RangeDescriptor range)throws RocksDBException {
+        Objects.requireNonNull(directory);Objects.requireNonNull(range);
+        return readSchemaMetadata(()->{
+            if(!discoveryPending || closing || directory.generation()!=0 || range.configurationVersion()!=0 || range.topologyState()!=RangeDescriptor.TopologyState.ACTIVE
+                    || currentRangeRecovery!=null || metadataRecoveryRegistration!=null || topologyLearner!=null || learnerImagePermission!=null || relocationCompletion!=null
+                    || topologyBirth!=null || topologyActivation!=null || topologyRetirement!=null || topologyRecoveryFence!=null || topologyPreparation!=null
+                    || importBirth!=null || importIntent!=null || importReceipt!=null || importActivation!=null || pendingInstallation!=null || db.get(state,installingKey)!=null
+                    || activeTopologyFreeze!=null || retiredMetadataOnly || activeSchemaFence!=null || activeSchemaInstallation!=null)throw new IllegalStateException("No original fenced genesis owner");
+            var current=ownership.get(owner).state();if(current!=RangeOwnership.State.FENCED && current!=RangeOwnership.State.ACTIVE)throw new IllegalStateException("Genesis owner is not fenced/active");
+            var view=metadataOutcomeStateUnderLane();view.requireMatches(directory,range);
+            if(view.minimumSessionEpoch()!=0 || view.sessionAuthority()!=null)throw new IllegalStateException("Published session state cannot regain genesis authority");
+            var cfg=configurationUnderAdmission();if(cfg!=null && (applied==null?cfg.term()!=0 || cfg.index()!=-1:cfg.index()>applied.index() || cfg.term()>applied.term() || cfg.index()==applied.index() && cfg.term()!=applied.term()))throw new IllegalStateException("Genesis configuration exceeds actual native prefix");
+            return view;
+        });
     }
     /** Heavy activation/control reconstruction runs while the independent foreground fence remains closed. */
     public DiscoveryActivation prepareCurrentDiscoveryActivation(boolean sessions,RangeMutationHistory.Limits history) {

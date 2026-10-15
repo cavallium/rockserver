@@ -319,13 +319,13 @@ class StateMachineUpdater implements Runnable {
     // It will be updated only after the leader contacts other peers.
     // Thus it is possible to have applied > committed initially.
     final long applied = getLastAppliedIndex();
-    for(; (applied >= raftLog.getLastCommittedIndex() || !server.isInitialImageReady())
+    for(; (applied >= raftLog.getLastCommittedIndex() || !server.isStateMachineProgressReady())
         && state == State.RUNNING && !shouldStop() && stopIndex.get() == null && coveredPrefix == null; ) {
       if (server.isInitialImageReady() && server.getSnapshotRequestHandler().shouldTriggerTakingSnapshot()) {
         takeSnapshot(applyLogFutures);
       }
       if (awaitForSignal.await(100, TimeUnit.MILLISECONDS)
-          && (state != State.RUNNING || server.isInitialImageReady())) {
+          && (state != State.RUNNING || server.isStateMachineProgressReady())) {
         return;
       }
     }
@@ -414,11 +414,22 @@ class StateMachineUpdater implements Runnable {
     }
   }
 
-  private CompletableFuture<Void> applyLog(CompletableFuture<Void> applyLogFutures) throws RaftLogIOException {
+  private CompletableFuture<Void> applyLog(CompletableFuture<Void> applyLogFutures) throws RaftLogIOException, InterruptedException {
     final long committed = raftLog.getLastCommittedIndex();
     for(long applied; (applied = getLastAppliedIndex()) < committed && state == State.RUNNING
-        && server.isInitialImageReady() && !shouldStop(); ) {
+        && server.isStateMachineProgressReady() && !shouldStop(); ) {
       final long nextIndex = applied + 1;
+      if (server.isGenesisMetadataOnly()) {
+        final var headers = raftLog.getEntries(nextIndex, nextIndex + 1);
+        if (headers == null || headers.length != 1 || headers[0] == null || headers[0].getIndex() != nextIndex)
+          throw new RaftLogIOException("Creation metadata header is missing or contradictory");
+        final var body = headers[0].getLogEntryBodyCase();
+        if (body != LogEntryProto.LogEntryBodyCase.CONFIGURATIONENTRY && body != LogEntryProto.LogEntryBodyCase.METADATAENTRY) {
+          // No USER body hydration, admission or application while creation authority is restricted.
+          awaitForSignal.await(100, TimeUnit.MILLISECONDS);
+          return applyLogFutures;
+        }
+      }
       LogEntryProto next;
       CommittedApplyStateMachine.ApplyPermit permit = null;
       CommittedApplyStateMachine.Descriptor descriptor = null;

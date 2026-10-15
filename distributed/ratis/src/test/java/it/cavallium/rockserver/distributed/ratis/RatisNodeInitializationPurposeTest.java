@@ -47,13 +47,14 @@ class RatisNodeInitializationPurposeTest {
                 assertThrows(IOException.class,()->open(env,plan,route,RatisNodeRuntime.Startup.AUTHORIZED_GENESIS,failed));
                 assertThrows(IOException.class,()->open(env,plan,route,RatisNodeRuntime.Startup.RECOVER,new RatisNodeRuntimeTest.FakeServer()::create));
                 for(var purpose:List.of(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,RatisNodeRuntime.Startup.AUTHORIZED_RESTORE_TARGET))assertThrows(IOException.class,()->open(env,plan,route,purpose,new RatisNodeRuntimeTest.FakeServer()::create));
-                try(var node=open(env,plan,route,RatisNodeRuntime.Startup.AUTHORIZED_GENESIS,new RatisNodeRuntimeTest.FakeServer()::create)){node.start();}
+                try(var node=open(env,plan,route,RatisNodeRuntime.Startup.AUTHORIZED_GENESIS,genesisServer())){node.start();}
                 byte[] exposed=Files.readAllBytes(env.nodeRoot.resolve("node.identity"));
-                try(var node=open(env,plan,route,RatisNodeRuntime.Startup.RECOVER,new RatisNodeRuntimeTest.FakeServer()::create)){node.start();}
+                try(var node=open(env,plan,route,RatisNodeRuntime.Startup.RECOVER,genesisServer())){node.start();}
                 assertArrayEquals(exposed,Files.readAllBytes(env.nodeRoot.resolve("node.identity")));
             }
         }
     }
+    private static RatisNodeRuntime.ServerFactory genesisServer(){var server=new RatisNodeRuntimeTest.FakeServer();server.skipFirstNoop=true;return server::create;}
     private static RatisNodeRuntime open(RatisNodeRuntimeTest.Env env,RatisNodePlan plan,RatisRoutedClient route,RatisNodeRuntime.Startup startup,RatisNodeRuntime.ServerFactory factory)throws IOException {
         return RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,Map.of(route.directory().domainId(),route),env.scheduler,env.timer,()->20L,env.settings(),startup,factory);
     }

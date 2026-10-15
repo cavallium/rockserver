@@ -659,7 +659,7 @@ class RaftServerImpl implements RaftServer.Division,
   private boolean votingEligibleUnderGate() {
     if (recoveryEligibility == null) { return true; }
     final RecoveryEligibilityStateMachine.Evidence e = recoveryEligibility.snapshot();
-    if (e.mode() == RecoveryEligibilityStateMachine.Mode.NORMAL) { return true; }
+    if (e.mode() == RecoveryEligibilityStateMachine.Mode.NORMAL || e.mode() == RecoveryEligibilityStateMachine.Mode.GENESIS) { return true; }
     if (e.mode() != RecoveryEligibilityStateMachine.Mode.RECOVERY) { return false; }
     if (!initialImageReady(e) || state.getCurrentTerm() < e.nativeCut().getTerm()) { return false; }
     final RaftConfigurationImpl conf = getRaftConf();
@@ -674,7 +674,7 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   private boolean initialImageReady(RecoveryEligibilityStateMachine.Evidence e) {
-    if (e.mode() == RecoveryEligibilityStateMachine.Mode.NORMAL) { return true; }
+    if (e.mode() == RecoveryEligibilityStateMachine.Mode.NORMAL || e.mode() == RecoveryEligibilityStateMachine.Mode.GENESIS) { return true; }
     if (e.mode() != RecoveryEligibilityStateMachine.Mode.RECOVERY
         || stateMachine.getLifeCycleState() != State.RUNNING) { return false; }
     final SnapshotInfo snapshot = stateMachine.getLatestSnapshot();
@@ -687,6 +687,18 @@ class RaftServerImpl implements RaftServer.Division,
   /** Cached advisory baseline read; the updater must not wait for the division monitor during pause/reload. */
   boolean isInitialImageReady() {
     return recoveryEligibility == null || initialImageReady(recoveryEligibility.snapshot());
+  }
+
+  /** Creation inventory may drain genuine committed metadata without regaining votes or append authority. */
+  boolean isStateMachineProgressReady() {
+    return isInitialImageReady() || recoveryEligibility != null
+        && recoveryEligibility.snapshot().mode() == RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED;
+  }
+
+  boolean isGenesisMetadataOnly() {
+    if (recoveryEligibility == null) { return false; }
+    final var mode = recoveryEligibility.snapshot().mode();
+    return mode == RecoveryEligibilityStateMachine.Mode.GENESIS || mode == RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED;
   }
 
   RecoveryEligibilityStateMachine.Gate getRecoveryEligibilityGate() { return recoveryEligibility; }
@@ -1486,6 +1498,7 @@ class RaftServerImpl implements RaftServer.Division,
    * Handle a raft configuration change request from client.
    */
   public CompletableFuture<RaftClientReply> setConfigurationAsync(SetConfigurationRequest request) throws IOException {
+    if (isGenesisMetadataOnly()) { throw new IOException("Original creation authority cannot reconfigure the cohort"); }
     LOG.info("{}: receive setConfiguration {}", getMemberId(), request);
     assertLifeCycleState(LifeCycle.States.RUNNING);
     assertGroup(getMemberId(), request);
@@ -1503,6 +1516,10 @@ class RaftServerImpl implements RaftServer.Division,
         return reply;
       }
 
+      synchronized (votingLock()) {
+        if (recoveryEligibility != null && (recoveryEligibility.discoveryPending() || isGenesisMetadataOnly()))
+          throw new IOException("Recovery discovery cannot admit cohort reconfiguration");
+      }
       final RaftConfigurationImpl current = getRaftConf();
       final LeaderStateImpl leaderState = role.getLeaderStateNonNull();
       // make sure there is no other raft reconfiguration in progress

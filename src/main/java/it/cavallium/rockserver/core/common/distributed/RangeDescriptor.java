@@ -41,6 +41,8 @@ public record RangeDescriptor(UUID rangeId, UUID groupId, long rangeEpoch, long 
         replicas = replicas.stream().sorted(Comparator.comparing(ReplicaDescriptor::replicaId, RangeDirectoryCodec.UUID_ORDER)).toList();
     }
 
+    /** Immutable boundary geometry for admission without cloning the keys. */
+    public int boundsBytes() { return (lowerInclusive==null?0:lowerInclusive.length)+(upperExclusive==null?0:upperExclusive.length); }
     @Override public byte[] lowerInclusive() { return lowerInclusive == null ? null : lowerInclusive.clone(); }
     @Override public byte[] upperExclusive() { return upperExclusive == null ? null : upperExclusive.clone(); }
     @Override public boolean equals(Object other) {

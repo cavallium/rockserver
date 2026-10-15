@@ -119,8 +119,8 @@ class SnapshotInstallationHandler {
 
   private void requireDiscoverySettled() throws IOException {
     final RecoveryEligibilityStateMachine.Gate gate = server.getRecoveryEligibilityGate();
-    if (gate != null && gate.discoveryPending()) {
-      throw new IOException("DATA recovery role discovery is pending");
+    if (gate != null && (gate.discoveryPending() || (gate.snapshot().mode() == RecoveryEligibilityStateMachine.Mode.GENESIS || gate.snapshot().mode() == RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED))) {
+      throw new IOException("DATA recovery role does not permit snapshot installation");
     }
   }
 

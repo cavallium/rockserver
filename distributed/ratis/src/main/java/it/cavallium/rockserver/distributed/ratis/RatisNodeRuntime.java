@@ -624,12 +624,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.importPreflightQueries(importPreflightQueries);machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,importDefinition),epochs.importAuthority(),ownReplica(descriptor));
                     }
                 }
+                if(groups.require(id).role()==RatisNodePlan.Role.DATA && nodeIdentity.purpose()==RatisNodeIdentity.Purpose.GENESIS)machine.deferRecoveryDiscovery();
                 machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);
                 machine.nodeResources(resources,owner.spec.id());machine.logResources(logBudget(group.getGroupId().getUuid(),owner.spec.id()));machine.diskRunway(diskRunway,owner.spec.id());machine.committedApply(committedDispatcher,owner.spec.id(),MAX_COMMITTED_ENTRY_BYTES);machines.put(group.getGroupId(),machine);
             }
             for (var entry:machines.entrySet()) if (groups.require(entry.getKey().getUuid()).role()==RatisNodePlan.Role.DATA)
                 if(groups.require(entry.getKey().getUuid()).metadata()==null)for (var schema:entry.getValue().schemaRoutingHistory()) observeSchemaActivation(schema.definition(),schema.proof());
-            for(var entry:groups.entries())if(entry.current()!=null && !entry.retired()){var store=stores.get(entry.current().groupId());if(store.currentRangeRecoveryReady()){if(!entry.current().equals(store.currentRangeRecoveryRegistration()) || !store.admissionOpen())throw new IOException("Recovered CURRENT readiness differs from original registration");var routed=data(entry.directory().domainId());if(routed.directory().generation()<=entry.directory().generation())routed.refresh(entry.directory());}}
+            for(var entry:groups.entries())if(entry.current()!=null && !entry.retired()){var store=stores.get(entry.current().groupId());if(store.currentRangeRecoveryReady()){if(!entry.current().equals(store.currentRangeRecoveryRegistration()) || !store.admissionOpen() && !machines.get(RaftGroupId.valueOf(entry.current().groupId())).recoveryEligibilityGate().discoveryPending())throw new IOException("Recovered CURRENT readiness differs from original registration");var routed=data(entry.directory().domainId());if(routed.directory().generation()<=entry.directory().generation())routed.refresh(entry.directory());}}
             freezeStartupDirectories();
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
         exportSources=new RatisExportSourceService(root.resolve("exports"),settings.exports().sources(),settings.exports().io(),
@@ -1173,13 +1174,21 @@ public final class RatisNodeRuntime implements AutoCloseable {
         return configuredRecoveries.discover(()->{
             synchronized(this){if(!started || starting || installing || closing || closeRequested || closed || recoveryAttempt!=null || seedAttempt!=null || learnerAttempt!=null)throw new IOException("Discovery bootstrap owner unavailable");installing=true;}
             try {
-                recoveryGraph.retryPending();
+                recoveryGraph.retryPending();forcePendingGenesisIdentity();
+                if(needsGenesisObservation())try(var workspace=resources.reserve(metadataClaims.graphPool(),RatisNodeResourceBudget.Kind.PROTECTED,4096,1)) {
+                    boolean complete=relocationClients.discoverGenesis(plan,(retained,incoming)->workspace.growTo(Math.max(workspace.bytes(),4096L+16L*incoming)),this::observeGenesisDiscovery);
+                    if(!complete)return null;
+                }
                 var frozen=freezeFreshRecoveryGraph();
                 settleLocalNoneDiscovery(frozen);
                 for(var obligation:frozen.plan().localObligations()) {
                     var machine=machines.get(RaftGroupId.valueOf(obligation.range().groupId()));
-                    if(machine==null || !machine.recoveryEligibilityGate().discoveryPending())continue;
+                    if(machine==null || !machine.recoveryEligibilityGate().discoveryPending() && !machine.genesisActive())continue;
                     requireLocalRecoveryGraphOwner(frozen,obligation,machine);
+                    if(machine.genesisActive()) {
+                        if(obligation.purpose()!=RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF || nodeIdentity.genesisOpen(obligation.sourceDirectory().domainId()) || genesisIdentityForcePending)throw new IOException("Genesis completion lacks forced published CURRENT authority");
+                        if(!machine.completeGenesis(obligation.sourceDirectory(),this::publishLocalDiscovery))throw new IOException("Genesis metadata prefix has not reached its actual updater");continue;
+                    }
                     if(obligation.purpose()==RatisTopologySourceSnapshotRpc.Purpose.ANCESTOR_METADATA) {
                         var consuming=frozen.plan().definitions().stream().filter(definition->Arrays.equals(definition.digest(),obligation.header().definitionDigest())).findFirst().orElseThrow(()->new IOException("Local META consuming definition absent"));
                         var candidate=machine.prepareLocalMetadataDiscovery(frozen.plan().catalogueCut(),consuming);
@@ -1228,7 +1237,19 @@ public final class RatisNodeRuntime implements AutoCloseable {
         var domain=view.request().domain();if(!nodeIdentity.genesisDomains().contains(domain))throw new IOException("Fresh CAT observation crossed original genesis scope");
         var issued=new HashSet<UUID>();if(view.directory()!=null)issued.add(domain);
         if(view.roster()!=null)for(var original:nodeIdentity.genesisDomains())if(view.roster().domainIds().contains(original))issued.add(original);
+        for(var original:issued)for(var range:plan.directory(original).ranges()){var machine=machines.get(RaftGroupId.valueOf(range.groupId()));if(machine!=null)machine.suspendGenesis();}
         var closed=nodeIdentity.closeGenesis(issued);if(closed!=nodeIdentity){nodeIdentity=closed;genesisIdentityForcePending=true;forcePendingGenesisIdentity();}
+    }
+    private boolean needsGenesisObservation(){return nodeIdentity.purpose()==RatisNodeIdentity.Purpose.GENESIS && (nodeIdentity.genesisDomains().stream().anyMatch(nodeIdentity::genesisOpen) || machines.values().stream().anyMatch(RatisRangeStateMachine::genesisActive));}
+    private void observeGenesisDiscovery(RatisCatalogueViewRpc.View view)throws IOException {
+        observeGenesisIssuance(view);var domain=view.request().domain();
+        if(view.directory()!=null || nodeIdentity.purpose()!=RatisNodeIdentity.Purpose.GENESIS || !nodeIdentity.genesisOpen(domain) || genesisIdentityForcePending)return;
+        var directory=plan.directory(domain);
+        for(var range:directory.ranges()) {
+            var machine=machines.get(RaftGroupId.valueOf(range.groupId()));if(machine==null || machine.genesisActive())continue;
+            nodeIdentity.requireGenesisScope(directory,range,ownReplica(range));
+            if(!machine.authorizeGenesis(directory,this::publishLocalDiscovery))throw new IOException("Original genesis metadata prefix is not qualified yet");
+        }
     }
     private void forcePendingGenesisIdentity()throws IOException {
         if(!genesisIdentityForcePending)return;
@@ -1294,11 +1315,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
             public void fulfilled(Reservation reservation)throws IOException{require(reservation.path(),reservation.maximum(),false);}
         };
     }
-    private boolean hasDeferredRecovery(){return machines.values().stream().anyMatch(machine->machine.recoveryEligibilityGate().discoveryPending());}
+    private boolean needsRecoveryDiscovery(){return needsGenesisObservation() || machines.values().stream().anyMatch(machine->machine.recoveryEligibilityGate().discoveryPending());}
     private void configuredRecoveryCycle() {
         if(!configuredRecoveries.idle())return;
         final boolean discover;
-        synchronized(this){if(!started || starting || installing || closeRequested || closing || closed || !configuredRecoveries.idle())return;discover=hasDeferredRecovery() && (configuredRecoveries.size()==0 || configuredDiscoveryNext);configuredDiscoveryNext=!discover;}
+        synchronized(this){if(!started || starting || installing || closeRequested || closing || closed || !configuredRecoveries.idle())return;discover=needsRecoveryDiscovery() && (configuredRecoveries.size()==0 || configuredDiscoveryNext);configuredDiscoveryNext=!discover;}
         if(discover)bootstrapDeferredRecovery();else configuredRecoveries.cycle();
     }
     private CompletableFuture<Void> startConfiguredRecoveryService(){
@@ -1473,7 +1494,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (participantRecoveryService!=null) participantRecoveryService.start(timer,recoverySettings.period());
             if (retirementService!=null) retirementService.start(timer,Duration.ofSeconds(1));
             synchronized (this) { started=true; }
-            if(configuredRecoveries.size()!=0 || hasDeferredRecovery())startConfiguredRecoveryService().join();
+            if(configuredRecoveries.size()!=0 || needsRecoveryDiscovery())startConfiguredRecoveryService().join();
         } catch (IOException | RuntimeException | Error failure) {
             synchronized (this) { closeRequested=true; }
             for (var machine:machines.values()) machine.beginShutdown();

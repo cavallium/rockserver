@@ -74,6 +74,104 @@ public final class RockserverRaftServers {
         }
     }
 
+    /** Actual updater progress; Division.Info may report the native-backed SM cut ahead of this cursor. */
+    public static boolean hasAppliedPrefix(RaftServer.Division division,StateMachine expected,TermIndex cut) {
+        return division instanceof RaftServerImpl server && server.getStateMachine()==expected
+            && server.getState().getStateMachineUpdater().getLastAppliedIndex()>=cut.getIndex();
+    }
+
+    /** Read-only cold original-creation proof. Missing proof leaves discovery fenced. */
+    public static boolean hasGenesisPrefix(RaftServer.Division division, StateMachine expected,
+            TermIndex nativeApplied, TermIndex nativeConfiguration, RaftConfigurationProto originalConfiguration) throws IOException {
+        Objects.requireNonNull(expected); Objects.requireNonNull(nativeConfiguration); Objects.requireNonNull(originalConfiguration);
+        if (!(division instanceof RaftServerImpl server) || !(expected instanceof RecoveryEligibilityStateMachine recovery)
+                || !(server.getRaftLog() instanceof SegmentedRaftLog)) throw new IOException("GENESIS requires actual recovery division/log");
+        final TermIndex applied = nativeApplied == null ? TermIndex.valueOf(0, -1) : nativeApplied;
+        final TermIndex snapshot; final StateMachineUpdater updater; final long revision, cursor, next, start, actualConfigurationIndex;
+        synchronized (server) {
+            if (server.getStateMachine() != expected || !server.getInfo().isAlive()
+                    || server.getInfo().getLifeCycleState() != LifeCycle.State.RUNNING
+                    || expected.getLifeCycleState() != LifeCycle.State.RUNNING || !recovery.recoveryEligibilityGate().discoveryPending()
+                    || !applied.equals(expected.getLastAppliedTermIndex())) throw new IOException("GENESIS lacks exact native/discovery owner");
+            snapshot = expected.getLatestSnapshot() == null ? TermIndex.valueOf(0, -1) : expected.getLatestSnapshot().getTermIndex();
+            if (applied.getIndex() < -1 || applied.getIndex() == Long.MAX_VALUE || applied.getTerm() < 0
+                    || applied.getIndex() == -1 && applied.getTerm() != 0 || applied.getIndex() >= 0 && applied.getTerm() < 1
+                    || snapshot.getIndex() < -1 || snapshot.getTerm() < 0 || snapshot.getIndex() == -1 && snapshot.getTerm() != 0
+                    || snapshot.getIndex() >= 0 && snapshot.getTerm() < 1
+                    || nativeConfiguration.getIndex() < -1 || nativeConfiguration.getTerm() < 0
+                    || nativeConfiguration.getIndex() == -1 && nativeConfiguration.getTerm() != 0
+                    || nativeConfiguration.getIndex() > applied.getIndex() || nativeConfiguration.getTerm() > applied.getTerm()
+                    || originalConfiguration.getSerializedSize() > 1 << 20) throw new IOException("Invalid GENESIS native/configuration prefix");
+            if (applied.getIndex() < snapshot.getIndex()) return false;
+            if (applied.getTerm() < snapshot.getTerm() || applied.getIndex() == snapshot.getIndex() && applied.getTerm() != snapshot.getTerm())
+                throw new IOException("GENESIS native cut contradicts retained GROUP cut");
+            if (server.getRaftLog().getSnapshotIndex() != snapshot.getIndex()) return false;
+            updater = server.getState().getStateMachineUpdater(); updater.requireCoveredAvailable();
+            cursor = updater.getLastAppliedIndex();
+            if (cursor < snapshot.getIndex() || cursor > applied.getIndex()) throw new IOException("GENESIS updater exceeds actual prefix");
+            if(server.getRole().getLeaderState().map(LeaderStateImpl::inStagingState).orElse(false))return false;
+            var actualConfiguration = server.getRaftConf(); actualConfigurationIndex = actualConfiguration.getLogEntryIndex();
+            if (!LogProtoUtils.toRaftConfigurationProtoBuilder(actualConfiguration).build().equals(originalConfiguration))
+                throw new IOException("GENESIS original configuration differs from actual membership");
+            revision = recovery.recoveryEligibilityGate().revision();
+            next = server.getRaftLog().getNextIndex(); start = server.getRaftLog().getStartIndex();
+        }
+        var log = server.getRaftLog();
+        if (next - snapshot.getIndex() - 1 > MAX_COVERED_HEADERS
+                || next <= applied.getIndex() || next > snapshot.getIndex() + 1 && start > snapshot.getIndex() + 1) return false;
+        long previousTerm = snapshot.getTerm(), lastNativeConfiguration = -1, lastRetainedConfiguration = -1;
+        boolean nativeCovered = applied.equals(snapshot);
+        for (long index = snapshot.getIndex() + 1; index < next; index++) {
+            if (index < log.getStartIndex() || index >= log.getNextIndex()) return false;
+            final org.apache.ratis.server.raftlog.LogEntryHeader[] headers;
+            try { headers = log.getEntries(index, index + 1); }
+            catch (IndexOutOfBoundsException missing) {
+                if (index < log.getStartIndex() || index >= log.getNextIndex()) return false;
+                throw new IOException("GENESIS cached headers contradict retained bounds", missing);
+            }
+            if (headers == null || headers.length > 0 && headers[0] == null) throw new IOException("Null GENESIS cached header");
+            if (headers.length == 0) return false;
+            var header = headers[0];
+            if (headers.length != 1 || header.getIndex() != index || header.getTerm() < previousTerm)
+                throw new IOException("GENESIS cached prefix is contradictory");
+            previousTerm = header.getTerm();
+            if (header.getLogEntryBodyCase() == LogEntryProto.LogEntryBodyCase.STATEMACHINELOGENTRY) return false;
+            if (header.getLogEntryBodyCase() == LogEntryProto.LogEntryBodyCase.CONFIGURATIONENTRY) {
+                lastRetainedConfiguration = index;
+                if (index <= applied.getIndex()) lastNativeConfiguration = index;
+            } else if (header.getLogEntryBodyCase() != LogEntryProto.LogEntryBodyCase.METADATAENTRY)
+                throw new IOException("Unexpected GENESIS log body");
+            if (index == applied.getIndex()) {
+                if (header.getTerm() != applied.getTerm()) throw new IOException("GENESIS native term contradicts retained log");
+                nativeCovered = true;
+            }
+        }
+        if (!nativeCovered) return false;
+        if (lastNativeConfiguration >= 0 && lastNativeConfiguration != nativeConfiguration.getIndex())
+            throw new IOException("GENESIS native CFG is not latest through native A");
+        if (nativeConfiguration.getIndex() >= 0) {
+            var entry = log.get(nativeConfiguration.getIndex());
+            if (entry == null) return false;
+            if (!entry.hasConfigurationEntry() || entry.getTerm() != nativeConfiguration.getTerm()
+                    || !entry.getConfigurationEntry().equals(originalConfiguration)) throw new IOException("GENESIS native CFG contradicts retained full entry");
+        } else if (actualConfigurationIndex != 0 && actualConfigurationIndex != lastRetainedConfiguration) {
+            return false;
+        }
+        synchronized (server) {
+            updater.requireCoveredAvailable();
+            return server.getStateMachine() == expected && server.getInfo().isAlive()
+                && server.getInfo().getLifeCycleState() == LifeCycle.State.RUNNING && expected.getLifeCycleState() == LifeCycle.State.RUNNING
+                && !server.getRole().getLeaderState().map(LeaderStateImpl::inStagingState).orElse(false)
+                && recovery.recoveryEligibilityGate().discoveryPending() && recovery.recoveryEligibilityGate().revision() == revision
+                && applied.equals(expected.getLastAppliedTermIndex())
+                && snapshot.equals(expected.getLatestSnapshot() == null ? TermIndex.valueOf(0, -1) : expected.getLatestSnapshot().getTermIndex())
+                && cursor == updater.getLastAppliedIndex() && log.getSnapshotIndex() == snapshot.getIndex()
+                && log.getStartIndex() == start && log.getNextIndex() == next
+                && server.getRaftConf().getLogEntryIndex() == actualConfigurationIndex
+                && LogProtoUtils.toRaftConfigurationProtoBuilder(server.getRaftConf()).build().equals(originalConfiguration);
+        }
+    }
+
     /** Missing retained coverage/commit proof selects the snapshot fallback before changing the updater. */
     public static Optional<CoveredPrefix> coverLocalPrefix(RaftServer.Division division, StateMachine expected,
             TermIndex nativeApplied, TermIndex nativeConfiguration, RaftConfigurationProto configuration) throws IOException {

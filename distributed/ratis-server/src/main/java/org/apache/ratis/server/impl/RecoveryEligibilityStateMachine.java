@@ -7,7 +7,7 @@ import org.apache.ratis.statemachine.StateMachine;
 
 /** Optional durable native recovery baseline for voting, independent of final USER readiness. */
 public interface RecoveryEligibilityStateMachine extends StateMachine {
-  enum Mode { NORMAL, MISSING, RECOVERY }
+  enum Mode { NORMAL, MISSING, RECOVERY, GENESIS, GENESIS_SUSPENDED }
 
   /** All fields describe already completed native effects and an already durably published Ratis snapshot. */
   record Evidence(Mode mode, TermIndex imageCut, TermIndex nativeCut, TermIndex snapshotCut,
@@ -25,11 +25,15 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
             || configurationIndex == nativeCut.getIndex() && configurationTerm != nativeCut.getTerm()) {
           throw new IllegalArgumentException("Recovery evidence exceeds its actual native prefix");
         }
-      } else if (imageCut != null || nativeCut != null || snapshotCut != null || configuration != null) {
+      } else if (imageCut != null || nativeCut != null || snapshotCut != null || configuration != null
+          || (mode == Mode.GENESIS || mode == Mode.GENESIS_SUSPENDED) && (configurationTerm != 0 || configurationIndex != -1)) {
         throw new IllegalArgumentException("Non-recovery mode cannot carry a baseline");
       }
     }
     public static Evidence normal() { return new Evidence(Mode.NORMAL, null, null, null, 0, -1, null); }
+    /** Explicit original creation authority, with no installed image/native/configuration baseline. */
+    public static Evidence genesis() { return new Evidence(Mode.GENESIS, null, null, null, 0, -1, null); }
+    public static Evidence suspendedGenesis() { return new Evidence(Mode.GENESIS_SUSPENDED, null, null, null, 0, -1, null); }
     public static Evidence missing() { return new Evidence(Mode.MISSING, null, null, null, 0, -1, null); }
     public static Evidence recovered(TermIndex imageCut, TermIndex nativeCut, TermIndex snapshotCut,
         long configurationTerm, long configurationIndex, RaftConfigurationProto configuration) {
@@ -50,7 +54,9 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
    * Core post-pause invalidation may publish in division-to-Gate order after native locks are released.
    * Publication never enters a division lock or runs callbacks/IO. Core eligibility reads use cached
    * metadata only; core holds division-to-Gate across vote/self-vote grant and Raft metadata fsync.
-   * That required Raft vote-file force is the only file IO admitted under Gate. User SM role
+   * That required Raft vote-file force is the only file IO admitted under Gate.
+   * Adapter settlement may publish an already prepared native activation token under Gate;
+   * this changes cached foreground eligibility only and must not acquire the native apply lane. User SM role
    * callbacks, native IO and apply-lane acquisition remain outside Gate.
    */
   final class Gate {
@@ -78,7 +84,7 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
       private SnapshotPermit(Gate owner, long generation) { this.owner = owner; this.generation = generation; }
       public void requireCurrent() {
         final Publication current = owner.publication;
-        if (current.discoveryPending() || current.evidence().mode() == Mode.MISSING || current.revocationGeneration() != generation) {
+        if (current.discoveryPending() || (current.evidence().mode() == Mode.MISSING || current.evidence().mode() == Mode.GENESIS || current.evidence().mode() == Mode.GENESIS_SUSPENDED) || current.revocationGeneration() != generation) {
           throw new IllegalStateException("Snapshot source eligibility was revoked");
         }
       }
@@ -89,7 +95,7 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
     }
     public SnapshotPermit snapshotPermit() {
       final Publication current = publication;
-      if (current.discoveryPending() || current.evidence().mode() == Mode.MISSING) {
+      if (current.discoveryPending() || (current.evidence().mode() == Mode.MISSING || current.evidence().mode() == Mode.GENESIS || current.evidence().mode() == Mode.GENESIS_SUSPENDED)) {
         throw new IllegalStateException("Missing native recovery state cannot produce a snapshot");
       }
       return new SnapshotPermit(this, current.revocationGeneration());
@@ -101,7 +107,7 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
     public long revision() { return publication.revision(); }
     public synchronized void publish(Evidence next) {
       Objects.requireNonNull(next);
-      final long generation = next.mode() == Mode.MISSING
+      final long generation = (next.mode() == Mode.MISSING || next.mode() == Mode.GENESIS || next.mode() == Mode.GENESIS_SUSPENDED)
           ? Math.incrementExact(publication.revocationGeneration()) : publication.revocationGeneration();
       publication = new Publication(Math.incrementExact(publication.revision()), generation,
           publication.discoveryPending(), next);
