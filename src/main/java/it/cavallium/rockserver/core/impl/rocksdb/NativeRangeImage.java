@@ -183,6 +183,20 @@ public final class NativeRangeImage {
     public static Manifest writeMetadataAdmitted(Path destination,ReplicatedRangeStore.SnapshotPin pin,RangeOwnership.Interval interval,Limits limits,IoAdmission admission)throws IOException,RocksDBException {
         return writeAdmitted(destination,pin,interval,limits,admission,true);
     }
+    /** Exact current-format length from a stable metadata pin; never visits USER columns. */
+    public static long metadataEncodedBytes(ReplicatedRangeStore.SnapshotPin pin,Limits limits)throws IOException,RocksDBException {
+        Objects.requireNonNull(pin);Objects.requireNonNull(limits);
+        if(!pin.metadataOnly() || pin.position()==null || pin.topologyImageOrigin()!=null)throw new IllegalArgumentException("Metadata sizing requires a completed metadata-only pin");
+        try(var scope=openMetadataAdmission(IoAdmission.UNLIMITED);var pass=scope.pass()) {
+            pass.reserve(pin.imageMetadataBytes(limits));
+            var header=new Header(new RangeOwnership.Owner(pin.groupId(),pin.rangeEpoch()),pin.interval(),pin.schemaDigest(),pin.position(),Set.copyOf(pin.deterministicMergeColumns()),true);validateHeader(header,limits);
+            var counted=new BoundedOutput(OutputStream.nullOutputStream(),limits.maxImageBytes());var output=new DataOutputStream(counted);writeHeader(output,header);var tracker=new Rows(header,limits);
+            RowVisitor append=(section,column,key,value)->{tracker.accept(section,column,key,value);output.writeByte(section.ordinal()+1);output.writeInt(key.length);output.writeInt(value.length);output.write(key);output.write(value);};
+            pin.visitState((key,value)->{if(!metadataLocalPointer(key))append.accept(Section.STATE,null,key,value);});
+            pin.visitReceipts((key,value)->append.accept(Section.RECEIPTS,null,key,value));tracker.finish();
+            output.writeByte(0);output.writeLong(tracker.count);output.write(new byte[32]);output.flush();return counted.count;
+        }
+    }
     private static Manifest writeAdmitted(Path destination,ReplicatedRangeStore.SnapshotPin pin,RangeOwnership.Interval interval,Limits limits,IoAdmission admission,boolean metadata)throws IOException,RocksDBException {
         Objects.requireNonNull(admission).beforeBytes(1);
         Objects.requireNonNull(pin, "pin");

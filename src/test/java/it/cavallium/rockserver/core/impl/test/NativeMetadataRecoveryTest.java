@@ -16,6 +16,18 @@ class NativeMetadataRecoveryTest {
     @TempDir(factory=DiskTestDirectory.class) Path root;
     final NativeTopologyCdcTest nativeTest=new NativeTopologyCdcTest();
     final NativeTopologySeedTest helper=nativeTest.helper;
+    @Test void metadataSizingMatchesExactPublishedFrameFromTheSamePin()throws Exception {
+        try(var source=nativeTest.new Fixture(root.resolve("sizing-source"))) {
+            source.parent.apply(new ApplyPosition(1,1),source.write(source.parent,0,9));source.freeze();source.seed();
+            try(var pin=source.parent.captureMetadataForRecovery()) {
+                long bytes=NativeRangeImage.metadataEncodedBytes(pin,nativeTest.limits);Path image=root.resolve("sized-meta");
+                var manifest=NativeRangeImage.writeMetadataAdmitted(image,pin,pin.interval(),nativeTest.limits,NativeRangeImage.IoAdmission.UNLIMITED);
+                assertEquals(bytes,manifest.bytes());assertEquals(bytes,java.nio.file.Files.size(image));assertEquals(pin.position(),manifest.position());
+                NativeRangeImage.visitMetadata(image,nativeTest.limits,(section,column,key,value)->assertNotEquals(NativeRangeImage.Section.USER,section));
+            }
+            try(var pin=source.child.captureForRecovery()){assertThrows(IllegalArgumentException.class,()->NativeRangeImage.metadataEncodedBytes(pin,nativeTest.limits));}
+        }
+    }
     NativeMetadataRecoveryRegistration registration(NativeTopologyCdcTest.Fixture source,NativeRangeImage.Manifest image) throws Exception {
         var cfg=source.parent.configuration();
         return new NativeMetadataRecoveryRegistration(new UUID(0,1100),nativeTest.catalogue,new ApplyPosition(1,20),source.definition.sourceDirectory(),source.freeze,helper.topology.replica,helper.topology.replica,cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of(),null);
