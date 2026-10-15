@@ -15,7 +15,7 @@ class RatisMetadataClaimsTest {
     @Test void dataRecoverySlotSharesNodeAndPoolPromisesAndSurvivesReopen()throws Exception {
         assertEquals((64L<<20)+4096,RatisMetadataClaims.CONFIGURED_RECOVERY_BYTES);
         var retained=claim(GROUP);assertTrue(retained.bytes()>RatisMetadataClaims.CONFIGURED_RECOVERY_BYTES);
-        long poolRequired=RatisMetadataClaims.POOL_BYTES+retained.bytes(),nodeRequired=RatisMetadataClaims.JOURNAL_BYTES+poolRequired;
+        long poolRequired=RatisMetadataClaims.POOL_BYTES+RatisMetadataClaims.RECOVERY_GRAPH_BYTES+retained.bytes(),nodeRequired=RatisMetadataClaims.JOURNAL_BYTES+poolRequired;
         var nodePath=root.resolve("recovery-node-limit");var nodeDenied=new RatisMetadataClaims(nodePath,nodeRequired-1,Map.of(POOL,poolRequired));
         assertThrows(IOException.class,()->nodeDenied.reserve(List.of(retained)));assertFalse(Files.exists(nodePath));
         var poolPath=root.resolve("recovery-pool-limit");var poolDenied=new RatisMetadataClaims(poolPath,nodeRequired,Map.of(POOL,poolRequired-1));
@@ -24,8 +24,15 @@ class RatisMetadataClaimsTest {
         var cold=new RatisMetadataClaims(path,nodeRequired,Map.of(POOL,poolRequired));cold.reserve(List.of(retained));
         assertEquals(nodeRequired,cold.bytes());assertEquals(poolRequired,cold.bytes(POOL));assertEquals(1,cold.groups());
     }
+    @Test void graphPromiseCountsOnceOnNodeAndItsDeterministicPoolBeforeAnyGroup()throws Exception {
+        UUID other=new UUID(9910,9);long base=RatisMetadataClaims.POOL_BYTES,graph=RatisMetadataClaims.RECOVERY_GRAPH_BYTES,total=RatisMetadataClaims.JOURNAL_BYTES+2*base+graph;
+        var path=root.resolve("graph-promises");var claims=new RatisMetadataClaims(path,total,Map.of(other,base,POOL,base+graph));
+        assertEquals(POOL,claims.graphPool());assertEquals(base+graph,claims.bytes(POOL));assertEquals(base,claims.bytes(other));assertEquals(total,claims.bytes());assertEquals(0,claims.groups());
+        assertThrows(IOException.class,()->new RatisMetadataClaims(root.resolve("graph-node-denied"),total-1,Map.of(POOL,base+graph,other,base)));
+        assertThrows(IOException.class,()->new RatisMetadataClaims(root.resolve("graph-pool-denied"),total,Map.of(POOL,base+graph-1,other,base)));assertFalse(Files.exists(path));
+    }
     @Test void unknownForceRetryAndColdRetainedGroupsDoNotDuplicateOrRefundClaims()throws Exception {
-        var path=root.resolve("claims");var fail=new AtomicBoolean(true);var retained=claim(GROUP);long ceiling=RatisMetadataClaims.JOURNAL_BYTES+RatisMetadataClaims.POOL_BYTES+retained.bytes();
+        var path=root.resolve("claims");var fail=new AtomicBoolean(true);var retained=claim(GROUP);long ceiling=RatisMetadataClaims.JOURNAL_BYTES+RatisMetadataClaims.POOL_BYTES+RatisMetadataClaims.RECOVERY_GRAPH_BYTES+retained.bytes();
         var budget=new RatisMetadataClaims(path,ceiling,Map.of(POOL,ceiling),(file,bytes)->{SessionJournalFiles.write(file,bytes,8<<20);if(fail.getAndSet(false))throw new IOException("Unknown force reply");});
         assertThrows(IOException.class,()->budget.reserve(List.of(retained)));assertTrue(Files.exists(path));budget.reserve(List.of(retained));assertEquals(1,budget.groups());assertEquals(ceiling,budget.bytes());
         var reopened=new RatisMetadataClaims(path,ceiling,Map.of(POOL,ceiling));assertEquals(1,reopened.groups());assertThrows(IOException.class,()->reopened.reserve(List.of(claim(new UUID(9910,3)))));assertEquals(ceiling,reopened.bytes());assertThrows(IOException.class,()->new RatisMetadataClaims(path,ceiling-1,Map.of(POOL,ceiling)));assertTrue(Files.exists(path));
@@ -50,7 +57,7 @@ class RatisMetadataClaimsTest {
     }
     @Test void aggregateRoleClaimsRejectBeforeNativeOpenAndRemainAcrossActualColdRuntime()throws Exception {
         try(var env=new RatisNodeRuntimeTest.Env(root)){
-            var base=env.settings();long required=RatisMetadataClaims.JOURNAL_BYTES+RatisMetadataClaims.POOL_BYTES;for(var group:env.plan.localGroups())required+=RatisMetadataClaims.claim(RatisPoolFixtures.ID,group.getGroupId().getUuid(),env.plan.role(group.getGroupId().getUuid()),base.retention(),RatisPoolFixtures.pools().getFirst().replicas()).bytes();
+            var base=env.settings();long required=RatisMetadataClaims.JOURNAL_BYTES+RatisMetadataClaims.POOL_BYTES+RatisMetadataClaims.RECOVERY_GRAPH_BYTES;for(var group:env.plan.localGroups())required+=RatisMetadataClaims.claim(RatisPoolFixtures.ID,group.getGroupId().getUuid(),env.plan.role(group.getGroupId().getUuid()),base.retention(),RatisPoolFixtures.pools().getFirst().replicas()).bytes();
             var resources=base.resources();var denied=new RatisNodeRuntime.Settings(base.images(),base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),base.exports(),new RatisNodeRuntime.ResourceLimits(resources.node(),resources.pool(),resources.maximumSourceImageDiskBytes(),required-1,resources.maximumOperatorCacheBytes(),resources.maximumNativeCacheBytes(),RatisCommittedApplyDispatcher.Policy.defaults(),RatisDiskRunway.Policy.defaults(),RatisMigrationController.Policy.defaults(),resources.nativeExtents()));var unopened=new RatisNodeRuntimeTest.FakeServer();
             assertThrows(IOException.class,()->RatisNodeRuntime.open(env.plan,env.nodeRoot,it.cavallium.rockserver.core.config.ConfigParser.parseDefault(),env.catalogue.epochs,Map.of(env.routed.directory().domainId(),env.routed),env.scheduler,env.timer,()->20L,denied,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,unopened::create));assertNull(unopened.machines);assertFalse(Files.exists(RatisPoolFixtures.pools().getFirst().nativePath(env.nodeRoot).resolve("CURRENT")));
             try(var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new RatisNodeRuntimeTest.FakeServer())){node.start();}

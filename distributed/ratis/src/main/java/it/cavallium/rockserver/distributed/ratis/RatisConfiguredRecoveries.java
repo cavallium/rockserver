@@ -89,6 +89,14 @@ final class RatisConfiguredRecoveries {
         int count=0;try(var entries=Files.newDirectoryStream(directory)){for(var file:entries){String name=file.getFileName().toString();if(++count>3 || !Set.of("recovery","recovery.pending","recovery.lock").contains(name) || !Files.isRegularFile(file,LinkOption.NOFOLLOW_LINKS))throw new IOException("Foreign configured recovery file");long size=Files.size(file),limit=name.equals("recovery.lock")?4096:RatisSchemaClientJournal.MAX_BYTES;if(size>limit)throw new IOException("Configured recovery file exceeds bound");}}
     }
 
+    /** One graph/discovery operation shares the actual IO owner with recovery steps and stop. */
+    CompletableFuture<Void> discover(java.util.concurrent.Callable<Void> action) {
+        Objects.requireNonNull(action);final CompletableFuture<Void> pending;
+        synchronized(this){if(stopping)return CompletableFuture.failedFuture(new IOException("Configured recoveries stopped"));if(actual!=null)return CompletableFuture.failedFuture(new RejectedExecutionException("Configured recovery operation already active"));actual=pending=new CompletableFuture<>();enqueued=null;waiters=1;}
+        try{io.execute(()->{try{if(isStopping())throw new CancellationException("Discovery stopped before dispatch");closeActive();action.call();finish(pending,null);}catch(Throwable failure){finish(pending,failure);}});}catch(RuntimeException failure){finish(pending,failure);}
+        return pending.copy();
+    }
+
     /** The returned observation acknowledges the forced initial journal, independently of host work. */
     CompletableFuture<Void> enqueue(Request request) {
         Objects.requireNonNull(request);final CompletableFuture<Void> pending;final Metadata metadata;final UUID pool;

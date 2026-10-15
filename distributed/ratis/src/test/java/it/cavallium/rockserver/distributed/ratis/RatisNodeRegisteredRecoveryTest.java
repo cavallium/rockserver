@@ -84,7 +84,7 @@ class RatisNodeRegisteredRecoveryTest {
     }
     @Test void exactAdditionalExposureDebtRejectsBeforeRaftAndRetainsNativeRegistrationsForRetry()throws Exception {
         try(var fixture=new Fixture(false)){
-            fixture.force(false,false);var original=fixture.settings();var policy=original.resources();var spec=fixture.plan.pools().get(fixture.pool);long baseline=RatisMetadataClaims.JOURNAL_BYTES+RatisMetadataClaims.POOL_BYTES;
+            fixture.force(false,false);var original=fixture.settings();var policy=original.resources();var spec=fixture.plan.pools().get(fixture.pool);long baseline=RatisMetadataClaims.JOURNAL_BYTES+RatisMetadataClaims.POOL_BYTES+RatisMetadataClaims.RECOVERY_GRAPH_BYTES;
             for(var group:List.of(fixture.metadata.groupId(),fixture.children.get(0).groupId(),fixture.children.get(1).groupId()))baseline=Math.addExact(baseline,RatisMetadataClaims.claim(fixture.pool,group,RatisNodePlan.Role.DATA,original.retention(),spec.replicas()).bytes());
             long exposure=Math.multiplyExact(224L,fixture.children.size()+1);var bounded=new RatisNodeRuntime.ResourceLimits(policy.node(),policy.pool(),policy.maximumSourceImageDiskBytes(),Math.addExact(baseline,exposure)-1,policy.maximumOperatorCacheBytes(),policy.maximumNativeCacheBytes(),policy.committedApply(),policy.diskRunway(),policy.migration(),policy.nativeExtents());
             var settings=new RatisNodeRuntime.Settings(original.images(),original.retention(),original.clockPeriod(),original.propagationVisits(),original.maxPropagationRanges(),original.shutdownTimeout(),original.exports(),bounded);var deniedServer=new RatisNodeRuntimeTest.FakeServer();

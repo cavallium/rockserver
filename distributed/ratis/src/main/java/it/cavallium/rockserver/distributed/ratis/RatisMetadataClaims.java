@@ -11,6 +11,8 @@ import java.util.*;
 /** Forced canonical metadata and promise ceilings. These are not filesystem or LSM-space reservations. */
 final class RatisMetadataClaims {
     static final long POOL_BYTES=(144L<<20)+185;
+    /** One node graph, its atomic replacement and lock metadata, charged to one deterministic pool. */
+    static final long RECOVERY_GRAPH_BYTES=2L*RatisConfiguredRecoveryGraph.MAX_BYTES+4096;
     /** One forced recovery state, its atomic replacement, and bounded lock/path metadata per DATA group. */
     static final long CONFIGURED_RECOVERY_BYTES=2L*RatisSchemaClientJournal.MAX_BYTES+4096;
     private static final int MAX_CLAIMS=DistributedStoragePool.MAX_RETAINED_METADATA_OWNERS*RatisNodeResourceBudget.MAX_POOLS,RECORD_BYTES=73,MAX_BYTES=40+MAX_CLAIMS*RECORD_BYTES;
@@ -21,23 +23,25 @@ final class RatisMetadataClaims {
         boolean same(Claim other){return pool.equals(other.pool)&&group.equals(other.group)&&role==other.role&&bytes==other.bytes&&Arrays.equals(policy,other.policy);}
     }
     @FunctionalInterface interface Writer {void write(Path path,byte[] bytes)throws IOException;}
-    private final Path path;private final long nodeLimit;private final Map<UUID,Long> poolLimits;private final Writer writer;private Map<UUID,Claim> claims;
+    private final Path path;private final long nodeLimit;private final Map<UUID,Long> poolLimits;private final UUID graphPool;private final Writer writer;private Map<UUID,Claim> claims;
     RatisMetadataClaims(Path path,long nodeLimit,Map<UUID,Long> pools)throws IOException{this(path,nodeLimit,pools,(file,bytes)->SessionJournalFiles.write(file,bytes,MAX_BYTES));}
     RatisMetadataClaims(Path path,long nodeLimit,Map<UUID,Long> pools,Writer writer)throws IOException {
-        this.path=path;this.nodeLimit=nodeLimit;poolLimits=Map.copyOf(pools);this.writer=writer;recoverPending();claims=load();validate(claims);forceExisting();
+        this.path=path;this.nodeLimit=nodeLimit;poolLimits=Map.copyOf(pools);graphPool=poolLimits.keySet().stream().min(RangeDirectoryCodec.UUID_ORDER).orElseThrow(()->new IOException("Recovery graph has no declared pool"));this.writer=writer;recoverPending();claims=load();validate(claims);forceExisting();
     }
     synchronized void reserve(Collection<Claim> requested)throws IOException {
         var current=load();validate(current);forceExisting();var next=new HashMap<>(current);
         for(var claim:requested){var previous=next.putIfAbsent(claim.group(),claim);if(previous!=null&&!previous.same(claim))throw new IOException("Retained metadata claim changed pool/role/effective policy");}
         validate(next);if(next.equals(current)&&Files.exists(path)){claims=current;return;}writer.write(path,encode(next));claims=Map.copyOf(next);
     }
+    UUID graphPool(){return graphPool;}
+    private long poolBase(UUID pool){return POOL_BYTES+(graphPool.equals(pool)?RECOVERY_GRAPH_BYTES:0);}
     synchronized long bytes(){return total(claims);}
     synchronized int groups(){return claims.size();}
     synchronized boolean contains(UUID group){return claims.containsKey(group);}
-    synchronized long bytes(UUID pool){if(!poolLimits.containsKey(pool))throw new IllegalArgumentException("Undeclared metadata pool");long total=POOL_BYTES;for(var claim:claims.values())if(claim.pool().equals(pool))total=Math.addExact(total,claim.bytes());return total;}
-    private long total(Map<UUID,Claim> values){long total=JOURNAL_BYTES+Math.multiplyExact(POOL_BYTES,poolLimits.size());for(var claim:values.values())total=Math.addExact(total,claim.bytes());return total;}
+    synchronized long bytes(UUID pool){if(!poolLimits.containsKey(pool))throw new IllegalArgumentException("Undeclared metadata pool");long total=poolBase(pool);for(var claim:claims.values())if(claim.pool().equals(pool))total=Math.addExact(total,claim.bytes());return total;}
+    private long total(Map<UUID,Claim> values){long total=JOURNAL_BYTES+Math.multiplyExact(POOL_BYTES,poolLimits.size())+RECOVERY_GRAPH_BYTES;for(var claim:values.values())total=Math.addExact(total,claim.bytes());return total;}
     private void validate(Map<UUID,Claim> values)throws IOException {
-        if(values.size()>MAX_CLAIMS || total(values)>nodeLimit)throw new IOException("Node durable metadata ceiling exhausted");var sums=new HashMap<UUID,Long>();for(var id:poolLimits.keySet())sums.put(id,POOL_BYTES);
+        if(values.size()>MAX_CLAIMS || total(values)>nodeLimit)throw new IOException("Node durable metadata ceiling exhausted");var sums=new HashMap<UUID,Long>();for(var id:poolLimits.keySet())sums.put(id,poolBase(id));
         for(var claim:values.values()){if(!sums.containsKey(claim.pool()))throw new IOException("Retained metadata claim belongs to an undeclared pool");sums.compute(claim.pool(),(id,bytes)->Math.addExact(bytes,claim.bytes()));}for(var entry:sums.entrySet())if(entry.getValue()>poolLimits.get(entry.getKey()))throw new IOException("Physical pool durable metadata ceiling exhausted");
     }
     private Map<UUID,Claim> load()throws IOException{if(!Files.exists(path,LinkOption.NOFOLLOW_LINKS))return Map.of();if(!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Invalid owned metadata claims file");return decode(SessionJournalFiles.read(path,MAX_BYTES));}

@@ -2054,7 +2054,27 @@ split/merge resolution through the production client adapter, nonlocal roots,
 cohort changes, two-domain cut ordering, FENCED-import provenance refusal, byte/count
 limits and existing lineage/source consumers. This establishes planning only.
 
-Automatic Runtime discovery and durable graph/attempt ownership remain unfinished.
+Runtime now owns a canonical durable discovery graph with frozen request UUIDs,
+retained immutable definitions and a common CAT cut. Its compact directory table
+has a 64 MiB frame ceiling; the node and one deterministic pool prepay 128 MiB
+plus 4 KiB for main/pending files and lock metadata. Protected heap admission
+covers retained state, discovery workspace and uncertain write overlap. Discovery
+shares the recovery manager's actual IO owner, so observer cancellation does not
+release native pools, transport or credit while a CAT read is still running.
+Lost write acknowledgements retry the exact candidate without fresh CAT reads or
+new request identities. Cold loading validates canonical bytes before forcing
+the main file and parent; valid pending files promote without another body copy.
+The graph is loaded before server construction and grants no dispatch authority.
+
+The final graph gate passes 100 distinct cases across 15 classes in
+`configured-graph-final-regression-gate.log`: 85 adapter cases and 15 standalone
+codec/async cases (the latter also pass the second core execution). Coverage
+includes genuine CAT split discovery, lost-ACK settlement after CAT clock progress,
+cold reopen, real shared-budget pending promotion, quota denial, retained request
+identity, cancellation and blocked-read shutdown. This is controlled filesystem
+and injected-transport evidence, not power-loss or real-quorum acceptance.
+
+Automatic Runtime discovery and graph-driven dispatch remain unfinished.
 An unresolved role fence must be installed before server construction: Ratis also
 initializes persisted DATA divisions. Preserve their real log floor while deferring
 GROUP import, replay, voting, export and incoming snapshot installation until CAT
@@ -2071,8 +2091,8 @@ ordinary-bootstrap permission.
 Canonical journal promises and runway accounting do not establish the complete
 physical allocation envelope.
 
-Durable metadata-DAG
-obligation discovery, DAG-driven configured-member catch-up, quorum retirement,
+Automatic metadata-DAG
+obligation reconciliation, DAG-driven configured-member catch-up, quorum retirement,
 source quiescence and physical parent reclamation remain unfinished. In particular,
 Raft commitment alone must not report an absent native image as installed, replay
 historical USER state, or let a registered empty member vote. Existing all-owner
