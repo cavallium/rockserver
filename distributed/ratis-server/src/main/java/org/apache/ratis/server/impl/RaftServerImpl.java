@@ -228,6 +228,7 @@ class RaftServerImpl implements RaftServer.Division,
 
   private final RaftServerProxy proxy;
   private final StateMachine stateMachine;
+  private final RecoveryEligibilityStateMachine.Gate recoveryEligibility;
   private final Info info =  new Info();
 
   private final DivisionProperties divisionProperties;
@@ -273,6 +274,8 @@ class RaftServerImpl implements RaftServer.Division,
     LOG.info("{}: new RaftServerImpl for {} with {}", id, group, stateMachine);
     this.lifeCycle = new LifeCycle(id);
     this.stateMachine = stateMachine;
+    this.recoveryEligibility = stateMachine instanceof RecoveryEligibilityStateMachine
+        ? Objects.requireNonNull(((RecoveryEligibilityStateMachine) stateMachine).recoveryEligibilityGate()) : null;
     this.role = new RoleInfo(id);
 
     final RaftProperties properties = proxy.getProperties();
@@ -651,7 +654,80 @@ class RaftServerImpl implements RaftServer.Division,
     return future;
   }
 
+  private Object votingLock() { return recoveryEligibility == null ? this : recoveryEligibility; }
+
+  private boolean votingEligibleUnderGate() {
+    if (recoveryEligibility == null) { return true; }
+    final RecoveryEligibilityStateMachine.Evidence e = recoveryEligibility.snapshot();
+    if (e.mode() == RecoveryEligibilityStateMachine.Mode.NORMAL) { return true; }
+    if (e.mode() != RecoveryEligibilityStateMachine.Mode.RECOVERY) { return false; }
+    if (!initialImageReady(e) || state.getCurrentTerm() < e.nativeCut().getTerm()) { return false; }
+    final RaftConfigurationImpl conf = getRaftConf();
+    if (conf == null || conf.getPeer(getId(), RaftPeerRole.FOLLOWER) == null
+        || !LogProtoUtils.toRaftConfigurationProtoBuilder(conf).build().equals(e.configuration())) { return false; }
+    final long configurationIndex = conf.getLogEntryIndex();
+    final boolean bootstrap = e.configurationTerm() == 0 && e.configurationIndex() == -1
+        && configurationIndex == 0 && getRaftLog().getTermIndex(0) == null;
+    if (configurationIndex != e.configurationIndex() && !bootstrap) { return false; }
+    final TermIndex retained = e.configurationIndex() < 0 ? null : getRaftLog().getTermIndex(e.configurationIndex());
+    return retained == null || retained.getTerm() == e.configurationTerm();
+  }
+
+  private boolean initialImageReady(RecoveryEligibilityStateMachine.Evidence e) {
+    if (e.mode() == RecoveryEligibilityStateMachine.Mode.NORMAL) { return true; }
+    if (e.mode() != RecoveryEligibilityStateMachine.Mode.RECOVERY
+        || stateMachine.getLifeCycleState() != State.RUNNING) { return false; }
+    final SnapshotInfo snapshot = stateMachine.getLatestSnapshot();
+    return snapshot != null && e.snapshotCut().equals(snapshot.getTermIndex())
+        && RecoveryEligibilityStateMachine.Evidence.covers(e.snapshotCut(), e.imageCut())
+        && RecoveryEligibilityStateMachine.Evidence.covers(stateMachine.getLastAppliedTermIndex(), e.nativeCut())
+        && getRaftLog().getSnapshotIndex() == e.snapshotCut().getIndex();
+  }
+
+  /** Cached advisory baseline read; the updater must not wait for the division monitor during pause/reload. */
+  boolean isInitialImageReady() {
+    return recoveryEligibility == null || initialImageReady(recoveryEligibility.snapshot());
+  }
+
+  RecoveryEligibilityStateMachine.Gate getRecoveryEligibilityGate() { return recoveryEligibility; }
+
+  void revokeRecoveryEligibility() {
+    if (recoveryEligibility != null) { recoveryEligibility.publish(RecoveryEligibilityStateMachine.Evidence.missing()); }
+  }
+
+  synchronized boolean isVotingEligible() {
+    synchronized (votingLock()) { return votingEligibleUnderGate(); }
+  }
+
+  synchronized boolean isCandidateForElection() {
+    if (!getInfo().isCandidate()) { return false; }
+    synchronized (votingLock()) {
+      if (votingEligibleUnderGate()) { return true; }
+      changeToFollower(state.getCurrentTerm(), false, false, "recovery voting baseline revoked", new AtomicBoolean());
+      return false;
+    }
+  }
+
+  synchronized LeaderElection.ConfAndTerm initEligibleElection(Phase phase) throws IOException {
+    synchronized (votingLock()) {
+      if (!votingEligibleUnderGate()) {
+        if (getInfo().isCandidate()) {
+          changeToFollower(state.getCurrentTerm(), false, false, "recovery voting baseline revoked", new AtomicBoolean());
+        }
+        throw new IOException("Recovery baseline is not eligible for self-vote");
+      }
+      return state.initElection(phase);
+    }
+  }
+
   synchronized void changeToLeader() {
+    synchronized (votingLock()) {
+    if (!votingEligibleUnderGate()) {
+      if (getInfo().isCandidate()) {
+        changeToFollower(state.getCurrentTerm(), false, false, "recovery voting baseline revoked", new AtomicBoolean());
+      }
+      return;
+    }
     Preconditions.assertTrue(getInfo().isCandidate());
     role.shutdownLeaderElection();
     setRole(RaftPeerRole.LEADER, "changeToLeader");
@@ -660,6 +736,7 @@ class RaftServerImpl implements RaftServer.Division,
 
     // start sending AppendEntries RPC to followers
     leader.start();
+    }
   }
 
   @Override
@@ -722,7 +799,9 @@ class RaftServerImpl implements RaftServer.Division,
     return role.buildRoleInfoProto(this);
   }
 
-  synchronized void changeToCandidate(boolean forceStartLeaderElection) {
+  synchronized boolean changeToCandidate(boolean forceStartLeaderElection) {
+    synchronized (votingLock()) {
+    if (!votingEligibleUnderGate()) { return false; }
     Preconditions.assertTrue(getInfo().isFollower());
     role.shutdownFollowerState();
     setRole(RaftPeerRole.CANDIDATE, "changeToCandidate");
@@ -731,6 +810,8 @@ class RaftServerImpl implements RaftServer.Division,
     }
     // start election
     role.startLeaderElection(this, forceStartLeaderElection);
+    return true;
+    }
   }
 
   @Override
@@ -1528,6 +1609,11 @@ class RaftServerImpl implements RaftServer.Division,
       // Check life cycle state again to avoid the PAUSING/PAUSED state.
       assertLifeCycleState(LifeCycle.States.RUNNING);
 
+      synchronized (votingLock()) {
+      if (!votingEligibleUnderGate()) {
+        return toRequestVoteReplyProto(candidateId, getMemberId(), false,
+            state.getCurrentTerm(), false, state.getLastEntry(), callId);
+      }
       final VoteContext context = new VoteContext(this, phase, candidateId);
       final RaftPeer candidate = context.recognizeCandidate(candidateTerm);
       final boolean voteGranted = context.decideVote(candidate, candidateLastEntry);
@@ -1552,6 +1638,7 @@ class RaftServerImpl implements RaftServer.Division,
       if (LOG.isInfoEnabled()) {
         LOG.info("{} replies to {} vote request: {}. Peer's state: {}",
             getMemberId(), phase, toRequestVoteReplyString(reply), state);
+      }
       }
     }
     if (future != null) {
@@ -1688,6 +1775,11 @@ class RaftServerImpl implements RaftServer.Division,
             leaderId, getMemberId(), currentTerm, followerCommit, state.getNextIndex(),
             AppendResult.NOT_LEADER, callId, RaftLog.INVALID_LOG_INDEX, isHeartbeat));
       }
+      if (!isInitialImageReady()) {
+        return CompletableFuture.completedFuture(toAppendEntriesReplyProto(
+            leaderId, getMemberId(), currentTerm, followerCommit, RaftLog.LEAST_VALID_LOG_INDEX,
+            AppendResult.INCONSISTENCY, callId, RaftLog.INVALID_LOG_INDEX, isHeartbeat));
+      }
       try {
         future = changeToFollowerAndPersistMetadata(leaderTerm, true, Op.APPEND_ENTRIES);
         LogResourceScope.track(future);
@@ -1816,6 +1908,7 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   boolean pause() {
+    revokeRecoveryEligibility(); // Join admitted votes before entering any division/native pause locks.
     // TODO: should pause() be limited on only working for a follower?
 
     // Now the state of lifeCycle should be PAUSING, which will prevent future other operations.
@@ -1826,7 +1919,8 @@ class RaftServerImpl implements RaftServer.Division,
         return false;
       }
       // TODO: any other operations that needs to be paused?
-      stateMachine.pause();
+      try { stateMachine.pause(); }
+      finally { revokeRecoveryEligibility(); } // Invalidate refreshes even when native pause fails.
       lifeCycle.compareAndTransition(State.PAUSING, State.PAUSED);
     }
     return true;
@@ -1872,6 +1966,8 @@ class RaftServerImpl implements RaftServer.Division,
     synchronized (this) {
       // Check life cycle state again to avoid the PAUSING/PAUSED state.
       assertLifeCycleState(LifeCycle.States.STARTING_OR_RUNNING);
+      synchronized (votingLock()) {
+      if (!votingEligibleUnderGate()) { return toStartLeaderElectionReplyProto(leaderId, getMemberId(), false); }
       final boolean recognized = state.recognizeLeader("startLeaderElection", leaderId, leaderLastEntry.getTerm());
       if (!recognized) {
         return toStartLeaderElectionReplyProto(leaderId, getMemberId(), false);
@@ -1889,8 +1985,8 @@ class RaftServerImpl implements RaftServer.Division,
         return toStartLeaderElectionReplyProto(leaderId, getMemberId(), false);
       }
 
-      changeToCandidate(true);
-      return toStartLeaderElectionReplyProto(leaderId, getMemberId(), true);
+      return toStartLeaderElectionReplyProto(leaderId, getMemberId(), changeToCandidate(true));
+      }
     }
   }
 
