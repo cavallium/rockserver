@@ -77,6 +77,8 @@ class RatisConfiguredRecoveryTest {
         try(var fixture=new Fixture()) {
             fixture.abandon=true;var path=root.resolve("attempt");try(var recovery=fixture.open(path,RatisJournalAccess.standalone())){assertEquals(RatisConfiguredRecovery.Phase.PREPARE,step(recovery));assertEquals(0,fixture.source.captures.get());}
             try(var cold=fixture.open(path,RatisJournalAccess.standalone())){assertEquals(RatisConfiguredRecovery.Phase.REGISTER,step(cold));assertEquals(new UUID(992,3),fixture.lastPrepared.transferId());fixture.notCaughtUp=true;while(cold.phase()!=RatisConfiguredRecovery.Phase.DONE)step(cold);assertEquals(2,fixture.heads);}
+            var reused=new Request(fixture.lastPrepared.transferId(),fixture.source.definition.header(),fixture.initial.catalogue(),fixture.initial.receiver(),Purpose.ANCESTOR_METADATA,fixture.initial.sourceGroup(),fixture.initial.sourceDirectory());byte[] settled=Files.readAllBytes(path.resolve("recovery"));
+            assertThrows(IllegalArgumentException.class,()->new RatisConfiguredRecovery(path,fixture.binding,reused,fixture,fixture.io,RatisJournalAccess.standalone(),metadata(()->{}),request->{}));assertArrayEquals(settled,Files.readAllBytes(path.resolve("recovery")),"A released effective capture identity cannot replace DONE");
             byte[] wrong=fixture.binding.clone();wrong[0]=1;assertThrows(IOException.class,()->new RatisConfiguredRecovery(path,wrong,fixture.initial,fixture,fixture.io,RatisJournalAccess.standalone(),metadata(()->{}),request->{}));assertEquals(1,fixture.source.captures.get());
         }
     }

@@ -71,27 +71,29 @@ class RatisConfiguredRecoveriesTest {
         }
     }
     @Test void lostRenewalJournalAcknowledgementInvalidatesCachedDoneAndResumesWithoutAnotherEnqueue()throws Exception {
-        try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("renewal-source"),false)) {
+        for(boolean transition:List.of(false,true))try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("renewal-source-"+transition),false)) {
+            var groupImage=NativeRangeImage.write(root.resolve("renewal-group-"+transition),source.store(source.firstDirectory.ranges().getFirst().groupId()),new NativeRangeImage.Limits(4<<20,32<<20,8));
             var split=source.split();var range=split.parents().getFirst();var store=source.store(range.groupId());
             var request=new Request(new UUID(993,3),split.header(),source.plan.catalogue().groupId(),source.local,Purpose.ANCESTOR_METADATA,range.groupId(),split.sourceDirectory());
-            var image=NativeRangeImage.writeMetadata(root.resolve("renewal-meta"),store,new NativeRangeImage.Limits(4<<20,32<<20,8));var cfg=store.configuration();byte[] registration=new byte[32];registration[0]=1;
+            var image=NativeRangeImage.writeMetadata(root.resolve("renewal-meta-"+transition),store,new NativeRangeImage.Limits(4<<20,32<<20,8));var cfg=store.configuration();byte[] registration=new byte[32];registration[0]=1;
+            var initial=transition?new Request(request.transferId(),null,request.catalogue(),request.receiver(),Purpose.CURRENT_LEAF,range.groupId(),split.sourceDirectory()):request;
             var lost=new java.util.concurrent.atomic.AtomicBoolean();var prepares=new AtomicInteger();var files=new RatisConfiguredRecoveryTest.Forwarding(){@Override public void write(Path path,byte[] body,int maximum)throws IOException{super.write(path,body,maximum);if(lost.getAndSet(false))throw new IOException("Lost forced renewal journal acknowledgement");}};
-            Path path=Files.createDirectory(root.resolve("renewal-manager"));var resources=budget(64L<<20);
+            Path path=Files.createDirectory(root.resolve("renewal-manager-"+transition));var resources=budget(64L<<20);
             var manager=new RatisConfiguredRecoveries(path,new byte[32],2,Map.of(POOL,2),resources,new RatisConfiguredRecoveries.Owner(){
-                public UUID pool(Request value){requireRequest(request.successor(value.transferId()),value);return POOL;}
+                public UUID pool(Request value){requireRequest((value.metadataOnly()?request:initial).successor(value.transferId()),value);return POOL;}
                 public RatisJournalAccess journal(UUID pool,UUID group,Path directory){return files;}
             },admission->new RatisConfiguredRecovery.Host(){
                 Prepared prepared;
-                public CompletableFuture<Prepared> prepare(Request value){prepares.incrementAndGet();prepared=new Prepared(value,image,source.first,source.local,cfg,Map.of(),store.topologyFreeze());return CompletableFuture.completedFuture(prepared);}
+                public CompletableFuture<Prepared> prepare(Request value){prepares.incrementAndGet();prepared=new Prepared(value,value.metadataOnly()?image:groupImage,source.first,source.local,cfg,Map.of(),value.metadataOnly()?store.topologyFreeze():null);return CompletableFuture.completedFuture(prepared);}
                 public CompletableFuture<byte[]> register(Prepared value){return CompletableFuture.completedFuture(registration.clone());}
                 public CompletableFuture<Prepared> transfer(Request value){return CompletableFuture.completedFuture(prepared);}
-                public CompletableFuture<RatisRecoveryImageRpc.Evidence> probe(RatisRecoveryImageRpc.Request value){return CompletableFuture.completedFuture(new RatisRecoveryImageRpc.Evidence(value.digest(),TopologyChange.Owner.of(value.source().receiver()),image.position(),cfg,registration,true));}
-                public CompletableFuture<RatisSourceHeadRpc.Head> head(RatisSourceHeadRpc.Request value){return CompletableFuture.completedFuture(new RatisSourceHeadRpc.Head(value,new ApplyPosition(1,20),split.sourceDirectory(),source.local,image.position(),cfg));}
+                public CompletableFuture<RatisRecoveryImageRpc.Evidence> probe(RatisRecoveryImageRpc.Request value){return CompletableFuture.completedFuture(new RatisRecoveryImageRpc.Evidence(value.digest(),TopologyChange.Owner.of(value.source().receiver()),(value.source().metadataOnly()?image:groupImage).position(),cfg,registration,true));}
+                public CompletableFuture<RatisSourceHeadRpc.Head> head(RatisSourceHeadRpc.Request value){return CompletableFuture.completedFuture(new RatisSourceHeadRpc.Head(value,new ApplyPosition(1,20),split.sourceDirectory(),source.local,(value.source().metadataOnly()?image:groupImage).position(),cfg));}
                 public CompletableFuture<Boolean> complete(Prepared value,RatisSourceHeadRpc.Head head){return CompletableFuture.completedFuture(true);}
                 public CompletableFuture<Void> release(Prepared value){return CompletableFuture.completedFuture(null);}
             });
             try {
-                manager.enqueue(request).get(10,TimeUnit.SECONDS);for(int steps=0;steps<16 && manager.phase(range.groupId())!=RatisConfiguredRecovery.Phase.DONE;steps++)step(manager);assertEquals(RatisConfiguredRecovery.Phase.DONE,manager.phase(range.groupId()));assertEquals(1,prepares.get());
+                manager.enqueue(initial).get(10,TimeUnit.SECONDS);if(transition){assertThrows(ExecutionException.class,()->manager.enqueue(request.successor(new UUID(993,5))).get(10,TimeUnit.SECONDS),"Unfinished CURRENT keeps its original purpose");assertEquals(0,prepares.get());}for(int steps=0;steps<16 && manager.phase(range.groupId())!=RatisConfiguredRecovery.Phase.DONE;steps++)step(manager);assertEquals(RatisConfiguredRecovery.Phase.DONE,manager.phase(range.groupId()));assertEquals(1,prepares.get());
                 lost.set(true);assertThrows(ExecutionException.class,()->manager.enqueue(request.successor(new UUID(993,4))).get(10,TimeUnit.SECONDS));assertNotNull(manager.failure());assertNull(manager.phase(range.groupId()),"The cached DONE must not hide a durably forced renewal");assertEquals(1,prepares.get());
                 step(manager);assertEquals(RatisConfiguredRecovery.Phase.REGISTER,manager.phase(range.groupId()));assertEquals(2,prepares.get());assertNull(manager.failure());
             }finally{manager.close(Duration.ofSeconds(10));}

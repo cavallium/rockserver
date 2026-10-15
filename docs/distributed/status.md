@@ -2012,10 +2012,38 @@ gate. Both cold defects were reproduced before repair. Earlier fixture failures
 were repaired by fencing the initial native install and providing the bounded
 native apply dispatcher.
 
-These remain controlled Raft wire delivery and log-floor fixtures. Automatic
-CAT/DAG obligation discovery, CURRENT-to-META conversion, DAG obligation retention
-and leader-change source transfer remain unfinished. Canonical journal promises
-and runway accounting do not establish the complete physical allocation envelope.
+A completed CURRENT recovery can now become META after its range seals. The
+existing native registration force atomically publishes META authority and removes
+CURRENT registration/image/completion rows. It preserves permanent ownership,
+shared CF bindings and descendant USER data. Uncertain attempts detach USER access
+before force; exact retry retains the predecessor and re-syncs without resetting
+later META image/tail/completion progress. Immediate cold reopen proves either the
+old CURRENT authority or the new pending META authority, never mixed receipts.
+Immutable group/range/epoch/bounds and receiver identity stay fixed while source
+schema, configuration and receiver role may progress under fresh authority.
+
+The node replaces the old graph credit once and reuses its exposure identity.
+A DONE CURRENT journal may start the fresh META attempt; unfinished attempts stay
+fixed. Renewal rejects both the initial UUID and an effective UUID reached after
+abandonment, before rewriting the journal. Source fixtures now complete actual
+receiver-image qualification and durable RELEASE before further captures; the
+initial integration failure exposed retained test captures exceeding admission.
+
+Validation passes 115 distinct cases across 16 classes in
+`current-to-meta-final-regression-gate.log`, including native force boundaries,
+standalone async/codecs, existing startup/seed/source consumers, and a real
+CURRENT image/own-tail/completion followed by another split, META conversion,
+unknown force retry, cold pending reopen, descendant recovery and cold readiness.
+The separate `current-to-meta-native-current-regression.log` passes the unchanged
+16 native CURRENT cases in both core executions. Logs are in the task-owned native
+output directory; delivery and Ratis log floors remain controlled fixtures.
+
+Automatic CAT/DAG discovery and durable obligation retention remain unfinished.
+Discovery must fence obsolete roles before Raft replay or new PREPARE work and
+safely supersede unfinished CURRENT attempts after sealing. Catch-up from a stale
+pre-relocation membership and leader-change source transfer also remain open.
+Canonical journal promises and runway accounting do not establish the complete
+physical allocation envelope.
 
 Durable metadata-DAG
 obligation discovery, DAG-driven configured-member catch-up, quorum retirement,

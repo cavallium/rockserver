@@ -506,6 +506,7 @@ public final class ReplicatedRangeStore {
     private volatile NativeCurrentRangeRecovery currentRangeRecovery;
     private volatile boolean currentRangeRecoveryReady;
     private byte[] pendingCurrentCompletion;
+    private NativeCurrentRangeRecovery metadataCurrentPredecessor;
     private byte[] pendingMetadataCompletion;
     @FunctionalInterface public interface CurrentRecoveryForceObserver {void boundary(boolean afterPersistence)throws RocksDBException;}
     private volatile CurrentRecoveryForceObserver currentRecoveryCompletionForceObserver=after->{};
@@ -1139,13 +1140,21 @@ public final class ReplicatedRangeStore {
     }
     @FunctionalInterface interface MetadataRecoveryForce {void force()throws RocksDBException;}
     /** Pool mutation ownership supplies the one durable registry/registration force before local publication. */
-    void prepareMetadataRecovery(NativeMetadataRecoveryRegistration registration,MetadataRecoveryForce force)throws RocksDBException {
+    void prepareMetadataRecovery(NativeMetadataRecoveryRegistration registration,NativeCurrentRangeRecovery predecessor,MetadataRecoveryForce force)throws RocksDBException {
         Objects.requireNonNull(registration);Objects.requireNonNull(force);requireSnapshotReleaseHealthy();
         if(!nativeLifecycle.writeLock().tryLock())throw new IllegalStateException("Actual original native users have not drained");
         applyLane.lock();try {
             if(closing || snapshotPins.get()!=0)throw new IllegalStateException("Actual original native snapshots have not drained");
             var previous=metadataRecoveryRegistration;if(previous!=null)registration.requireSuccessorOf(previous);
-            if(retiredMetadataOnly && registration.equals(previous) && Arrays.equals(registration.digest(),db.get(state,topologyOwnershipKey(0x6f)))){force.force();return;}
+            if(retiredMetadataOnly && registration.equals(previous) && Arrays.equals(registration.digest(),db.get(state,topologyOwnershipKey(0x6f)))){force.force();metadataCurrentPredecessor=null;return;}
+            if(predecessor!=null){
+                registration.requireTransitionOf(predecessor);if(pendingInstallation!=null || pendingCurrentCompletion!=null)throw new IllegalStateException("Unsettled CURRENT image/completion cannot change native role");
+                if(currentRangeRecovery!=null){if(!predecessor.equals(currentRangeRecovery) || !currentRangeRecoveryReady || !currentImageInstalledUnderLane())throw new IllegalStateException("META transition requires genuinely completed CURRENT image");}
+                else if(!predecessor.equals(metadataCurrentPredecessor) || !registration.equals(previous))throw new IllegalStateException("META transition lost its original completed CURRENT predecessor");
+                byte[] recipe=db.get(state,topologyOwnershipKey(0x72));if(recipe==null || !Arrays.equals(recipe,predecessor.encode()) || !Arrays.equals(db.get(state,topologyOwnershipKey(0x74)),ByteBuffer.allocate(48).putLong(predecessor.imageCut().term()).putLong(predecessor.imageCut().index()).put(predecessor.imageHash()).array()))throw new IllegalStateException("META transition lost actual CURRENT registration/image receipt");
+                NativeCurrentRangeRecovery.requireCompletion(predecessor,db.get(state,topologyOwnershipKey(0x73)),applied);
+                if(activeTopologyFreeze!=null && !activeTopologyFreeze.equals(registration.freeze()))throw new IllegalArgumentException("META transition changed the actual sealed source FREEZE");
+            }
             if(pendingInstallation!=null && !registration.equals(previous))throw new IllegalStateException("Uncertain metadata install requires original image retry");
             if(applied!=null && !NativeMetadataRecoveryRegistration.covers(registration.imageCut(),applied))throw new IllegalArgumentException("Metadata image regresses completed native prefix");
             var descriptor=registration.range();var target=new RangeOwnership.Interval(registration.sourceDirectory().domainId(),registration.sourceDirectory().columns(),descriptor.lowerInclusive(),descriptor.upperExclusive());
@@ -1153,8 +1162,10 @@ public final class ReplicatedRangeStore {
             ownership.validateMetadataRecovery(owner,target);byte[] digest=registration.sourceDirectory().schemaDigest();
             // Fence first. A failed/unknown force must never reopen the previous USER owner.
             metadataRecoveryRegistration=registration;metadataRecoveryReady=false;pendingMetadataCompletion=null;
-            force.force();ownership.recoverMetadata(owner,target);interval=target;schemaDigest=digest;columns=Map.of();deterministicMergeColumns=registration.mergeColumns();topologyRecoveryFence=null;
+            if(predecessor!=null){metadataCurrentPredecessor=predecessor;currentRangeRecovery=null;currentRangeRecoveryReady=false;pendingCurrentCompletion=null;}
+            ownership.recoverMetadata(owner,target);interval=target;schemaDigest=digest;columns=Map.of();deterministicMergeColumns=registration.mergeColumns();topologyRecoveryFence=null;
             retiredMetadataOnly=true;installedGeneration=null;logicalSchema=null;retiredRoutingPrefix=registration.sourceDirectory().routingPrefixBytes();
+            force.force();metadataCurrentPredecessor=null;
         }finally{applyLane.unlock();nativeLifecycle.writeLock().unlock();}
     }
     /** Fresh source-group quorum/configuration qualification is supplied by the trusted adapter. */
