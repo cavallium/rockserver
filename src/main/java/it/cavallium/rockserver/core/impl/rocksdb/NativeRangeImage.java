@@ -40,7 +40,7 @@ public final class NativeRangeImage {
         return first != 0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(), b.getLeastSignificantBits());
     };
 
-    /** maxRowBytes bounds key+value bytes together, including image-only provenance, and each interval bound. */
+    /** maxRowBytes bounds ordinary key+value rows and interval bounds. Recovery registrations use their canonical metadata bounds. */
     public record Limits(int maxRowBytes, long maxImageBytes, int maxColumns) {
         public Limits {
             if (maxRowBytes <= 0 || maxImageBytes <= 0 || maxColumns <= 0) {
@@ -317,12 +317,14 @@ public final class NativeRangeImage {
                 int keyLength = input.readInt();
                 int valueLength = input.readInt();
                 long rowBytes = (long) keyLength + valueLength;
-                if (keyLength < 0 || valueLength < 0 || rowBytes > limits.maxRowBytes()
-                        || rowBytes > counted.remaining() - 41) {
+                if (keyLength < 0 || keyLength > limits.maxRowBytes() || valueLength < 0
+                        || rowBytes > counted.remaining() - 41
+                        || rowBytes > limits.maxRowBytes() && (section!=Section.STATE || keyLength!=17)) {
                     throw new IOException("Invalid image row lengths");
                 }
                 byte[] key = new byte[keyLength];
                 input.readFully(key);
+                if(rowBytes>rowByteLimit(header,section,key,limits))throw new IOException("Image row exceeds byte limit");
                 if(section==Section.STATE && key.length>16 && key[16]==0x72 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery.MAX_BYTES))throw new IOException("CURRENT registration exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x73 && (key.length!=17 || valueLength>65620))throw new IOException("CURRENT completion exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x74 && (key.length!=17 || valueLength!=48))throw new IOException("CURRENT image receipt exceeds bound");
@@ -480,6 +482,22 @@ public final class NativeRangeImage {
         }
     }
 
+    private static long rowByteLimit(Header header,Section section,byte[] key,Limits limits) {
+        if(!header.metadata() && section==Section.STATE && key.length==17) {
+            var group=ByteBuffer.wrap(key);
+            if(group.getLong()==header.owner().groupId().getMostSignificantBits() && group.getLong()==header.owner().groupId().getLeastSignificantBits()) {
+                long bound=switch(key[16]) {
+                    case 0x67 -> it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration.MAX_BYTES;
+                    case 0x6a -> it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerImagePermission.MAX_BYTES;
+                    case 0x72 -> it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery.MAX_BYTES;
+                    default -> 0;
+                };
+                if(bound>0)return Math.min(limits.maxImageBytes(),Math.max(limits.maxRowBytes(),17+bound));
+            }
+        }
+        return limits.maxRowBytes();
+    }
+
     private static final class Rows {
         private boolean metadataConfiguration;
         private final Header header;
@@ -558,7 +576,7 @@ public final class NativeRangeImage {
                 try {var configuration=ReplicatedRangeStore.Configuration.decode(value);var cut=header.position();if(configuration.term()>cut.term() || configuration.index()>cut.index() || configuration.index()==cut.index() && configuration.term()!=cut.term())throw new IllegalArgumentException("Configuration exceeds metadata cut");metadataConfiguration=true;}
                 catch(IllegalArgumentException invalid){throw new IOException("Invalid sealed source configuration",invalid);}
             }
-            if ((long) key.length + value.length > limits.maxRowBytes()) throw new IOException("Image row exceeds byte limit");
+            if ((long) key.length + value.length > rowByteLimit(header,section,key,limits)) throw new IOException("Image row exceeds byte limit");
             if (section == Section.USER) {
                 if (column == null || !header.interval().columns().contains(column)) throw new IOException("Unknown image user column");
                 if ((lower != null && Arrays.compareUnsigned(key, lower) < 0)

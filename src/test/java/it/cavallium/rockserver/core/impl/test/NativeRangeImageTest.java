@@ -331,6 +331,27 @@ class NativeRangeImageTest {
         }
     }
 
+    @Test void recoveryMetadataDoesNotRelaxOrdinaryOrForeignRows()throws Exception {
+        byte[] header;
+        try(var pool=new Pool(directory.resolve("recovery-row-bounds"))){pool.store.applyNoop(new ApplyPosition(1,0));Path valid=directory.resolve("recovery-header.image");try(var pin=pool.store.capture()){NativeRangeImage.write(valid,pin,interval(),LIMITS);}byte[] bytes=Files.readAllBytes(valid);header=Arrays.copyOf(bytes,headerEnd(bytes));}
+        for(int variant=0;variant<5;variant++) {
+            boolean user=variant==0;int keyLength=variant==2?18:17;UUID group=variant==1?OTHER:GROUP;
+            int length=variant==4?NativeCurrentRangeRecovery.MAX_BYTES+1:4096;
+            byte tag=variant==3?(byte)0x66:(byte)0x72;
+            Path invalid=directory.resolve("invalid-recovery-row-"+variant+".image");
+            try(var channel=java.nio.channels.FileChannel.open(invalid,StandardOpenOption.CREATE_NEW,StandardOpenOption.WRITE)) {
+                channel.write(ByteBuffer.wrap(header));var row=ByteBuffer.allocate(9+(user?16:0)+keyLength).put((byte)((user?Section.USER:Section.STATE).ordinal()+1));
+                if(user)row.putLong(A.getMostSignificantBits()).putLong(A.getLeastSignificantBits());
+                row.putInt(keyLength).putInt(length).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).put(tag);if(keyLength==18)row.put((byte)0);row.flip();channel.write(row);channel.position(channel.position()+length);channel.write(ByteBuffer.allocate(41));
+            }
+            var delivered=new java.util.concurrent.atomic.AtomicInteger();var read=new java.util.concurrent.atomic.AtomicLong();
+            assertThrows(IOException.class,()->NativeRangeImage.visitMetadataAdmitted(invalid,new Limits(1024,128L<<20,4),(section,column,key,value)->delivered.incrementAndGet(),read::addAndGet));
+            assertEquals(0,delivered.get());assertTrue(read.get()<=8192,"Rejected before reading oversized value");
+            read.set(0);
+            assertThrows(IOException.class,()->NativeRangeImage.inspectAdmitted(invalid,new Limits(1024,128L<<20,4),read::addAndGet));assertTrue(read.get()<=8192,"Rejected before reading oversized value");
+        }
+    }
+
     private int headerEnd(byte[] image) {
         var input = ByteBuffer.wrap(image);
         input.position(92);

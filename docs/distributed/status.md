@@ -1756,6 +1756,16 @@ Source capture/cold-artifact checks pass in
 regressions and the full two-pool workflow are in
 `current-leaf-runtime-source-and-backup-gate2.log`.
 
+Recovery registrations with legal retained schema history can exceed the ordinary
+row ceiling. GROUP images now apply canonical metadata limits only to exact
+own-group registration/permission keys; USER rows and total image limits stay
+unchanged. A forty-change history passes interrupted install, cold retry and
+successive re-export/install, and malformed/foreign/ordinary oversized rows are
+rejected before value allocation. All 28 current/metadata/image cases pass in both
+configured executions (`current-typed-registration-image-gate.log`). Row-aware heap
+admission for retained decoded metadata and nested image passes is still in progress;
+this gate does not prove the final resource envelope.
+
 Initial-image adapter reload, voting/apply/append eligibility, durable metadata-DAG
 obligation discovery, asynchronous configured-member catch-up, quorum retirement,
 source quiescence and physical parent reclamation remain unfinished. In particular,
