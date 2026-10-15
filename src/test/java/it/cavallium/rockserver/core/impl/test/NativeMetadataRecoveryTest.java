@@ -72,6 +72,7 @@ class NativeMetadataRecoveryTest {
             registration=registration(source,NativeRangeImage.writeMetadata(initial,source.parent,nativeTest.limits));
         }
         try(var pool=helper.pool(receiver)) {
+            pool.configureSnapshotAdmission(new PoolSnapshotAdmission.Limits(1,8L<<30,java.time.Duration.ofSeconds(60),0));
             var child=helper.open(pool,definition.targets().getFirst());child.initializeConfiguration(new byte[]{1});child.applyNoop(new ApplyPosition(3,0));child.apply(new ApplyPosition(3,1),helper.put(child.ownership().owner().groupId(),0,1,7));
             var target=pool.openMetadataRecovery(registration);configure(target,definition);target.installMetadataSnapshot(initial,nativeTest.limits);target.completeMetadataRecovery(registration,registration.imageCut(),target.configuration());
             target.applyNoop(new ApplyPosition(1,3),new byte[]{2});var first=NativeRangeImage.writeMetadata(earlier,target,nativeTest.limits);
@@ -90,6 +91,7 @@ class NativeMetadataRecoveryTest {
             assertArrayEquals(helper.helper.key(7),child.readCurrentPoint(helper.outer.fixed,helper.helper.key(1)));
         }
         try(var pool=helper.pool(receiver)) {
+            pool.configureSnapshotAdmission(new PoolSnapshotAdmission.Limits(1,8L<<30,java.time.Duration.ofSeconds(60),0));
             var target=pool.openMetadataRecovery(registration);configure(target,definition);assertTrue(target.pendingInstallation());assertTrue(target.metadataRecoveryPending());assertNull(target.applied());assertThrows(IllegalStateException.class,target::metadataOutcomeState);
             var cfg=new ArrayList<byte[]>();NativeRangeImage.visitMetadata(latest,nativeTest.limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==1)cfg.add(value.clone());});assertEquals(1,cfg.size());byte[] changedCfg=cfg.getFirst().clone();changedCfg[changedCfg.length-1]^=1;
             Path changed=replaceMetadataBytes(latest,root.resolve("changed-pending-meta"),cfg.getFirst(),changedCfg);assertThrows(IOException.class,()->target.installMetadataSnapshot(changed,nativeTest.limits));
