@@ -28,7 +28,7 @@ class RatisSourceObsoleteServiceClientTest {
         var left=new RangeDescriptor(id(100),id(101),1,range.configurationVersion(),null,new byte[]{64},RangeDescriptor.TopologyState.ACTIVE,range.replicas());var right=new RangeDescriptor(id(102),id(103),1,range.configurationVersion(),new byte[]{64},null,RangeDescriptor.TopologyState.ACTIVE,range.replicas());
         var target=new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),directory.schemaDigest(),directory.generation()+1,directory.columns(),directory.routingPrefixBytes(),List.of(left,right));var consuming=new TopologyChange.Definition(id(104),directory,target);
         byte[] originalDigest=OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,original));
-        var scope=new NativeRecoverySupersession.Scope(original.catalogue(),new ApplyPosition(1,20),consuming.header(),directory,f.group,f.receiver,new byte[32],originalDigest,originalDigest);
+        var scope=new NativeRecoverySupersession.Scope(original.catalogue(),new ApplyPosition(1,20),consuming.header(),directory,f.group,f.receiver,new byte[32],List.of(originalDigest));
         return new RatisRecoveryObsoleteRpc.Request(original,scope,new byte[32]);
     }
     private static final class Host implements InvocationHandler {

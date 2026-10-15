@@ -91,16 +91,22 @@ final class RatisRuntimeGroups {
         preflight(registration);var directory=registration.sourceDirectory();var descriptor=registration.range();var old=groups.get(registration.groupId());groups.put(registration.groupId(),new Entry(group(descriptor),RatisNodePlan.Role.DATA,directory,descriptor,old==null?null:old.seed(),null,old==null?null:old.relocation(),old==null || old.supersession()==null?null:old.current(),registration,old==null?null:old.supersession(),true));dataGroups=snapshotDataGroups();
     }
     synchronized void preflight(NativeRecoverySupersession value){
-        Objects.requireNonNull(value);var scope=value.scope();var descriptor=value.range();
-        recoveryIdentity(scope.catalogue(),value.sourceDirectory(),value.receiver(),descriptor);
+        Objects.requireNonNull(value);var scope=value.scope();preflightSupersession(scope);
         var old=groups.get(value.groupId());
         if(old!=null){
-            if(old.role()!=RatisNodePlan.Role.DATA || old.learner()!=null || !sameRangeIdentity(old.descriptor(),descriptor) || !old.directory().domainId().equals(value.sourceDirectory().domainId()))throw new IllegalArgumentException("Supersession conflicts with existing runtime ownership");
             if(old.supersession()!=null && !old.supersession().equals(value))throw new IllegalArgumentException("Supersession requires exact original scope and captured facts");
-            if(old.current()!=null)scope.requireCurrent(old.current());
             if(old.metadata()!=null)value.requireMetadataScope(old.metadata());
         }
-        requireCapacity(List.of(value.groupId()));
+    }
+    synchronized void preflightSupersession(NativeRecoverySupersession.Scope scope){
+        Objects.requireNonNull(scope);var descriptor=scope.range();recoveryIdentity(scope.catalogue(),scope.sourceDirectory(),scope.receiver(),descriptor);
+        var old=groups.get(scope.groupId());
+        if(old!=null){
+            if(old.role()!=RatisNodePlan.Role.DATA || old.learner()!=null || !sameRangeIdentity(old.descriptor(),descriptor) || !old.directory().domainId().equals(scope.sourceDirectory().domainId()))throw new IllegalArgumentException("Supersession conflicts with existing runtime ownership");
+            if(old.supersession()!=null && !old.supersession().scope().equals(scope))throw new IllegalArgumentException("Supersession requires exact original scope");
+            if(old.current()!=null)scope.requireCurrent(old.current());
+        }
+        requireCapacity(List.of(scope.groupId()));
     }
     synchronized void register(NativeRecoverySupersession value){
         preflight(value);var old=groups.get(value.groupId());if(old!=null && value.equals(old.supersession()))return;

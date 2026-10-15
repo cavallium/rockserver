@@ -16,7 +16,7 @@ class RatisRecoverySupersessionRpcTest {
     RangeDescriptor range(int range,int group,byte[] lower,byte[] upper){return new RangeDescriptor(id(range),id(group),1,0,lower,upper,RangeDescriptor.TopologyState.ACTIVE,List.of(receiver));}
     RangeDirectory directory(long generation,List<RangeDescriptor> ranges){return new RangeDirectory(schema.clusterId(),schema.databaseId(),schema.domainId(),1,schema.digest(),generation,Set.of(),0,ranges);}
     NativeRecoverySupersession value(int marker){
-        var scope=new NativeRecoverySupersession.Scope(id(14),new ApplyPosition(1,20),split.header(),directory,parent.groupId(),receiver,new byte[32],new byte[32],new byte[32]);
+        var scope=new NativeRecoverySupersession.Scope(id(14),new ApplyPosition(1,20),split.header(),directory,parent.groupId(),receiver,new byte[32],List.of(new byte[32]));
         return new NativeRecoverySupersession(scope,new NativeRecoverySupersession.CapturedState(null,null,null,null,null,marker==0?null:new ApplyPosition(1,marker),null));
     }
     @Test void fixedCanonicalRequestAndAckBindExactNativeFenceAndActualOwner(){

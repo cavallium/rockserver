@@ -33,7 +33,7 @@ class RatisNodeSupersessionBootstrapTest {
             var helper=new RatisDiscoveryInventoryTest();helper.root=root;
             assertThrows(IOException.class,()->helper.new Adapter(store,pool,directory,source.local,root.resolve("unfenced-warm-inventory"),image,prepared.image().position(),(machine,floor)->{}));
             var consuming=source.split();var digest=OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,request));
-            var scope=new NativeRecoverySupersession.Scope(c.groupId(),catalogue.readView(directory.domainId()).cut(),consuming.header(),directory,range.groupId(),source.local,new byte[32],digest,digest);
+            var scope=new NativeRecoverySupersession.Scope(c.groupId(),catalogue.readView(directory.domainId()).cut(),consuming.header(),directory,range.groupId(),source.local,new byte[32],List.of(digest));
             pool.forceRecoverySupersession(scope);assertNull(store.recoverySupersession().captured().pendingIntent());assertEquals(prepared.image().position(),store.recoverySupersession().captured().marker());
             try(var adapter=helper.new Adapter(store,pool,directory,source.local,root.resolve("fenced-warm-inventory"),image,prepared.image().position(),(machine,floor)->{})) {
                 assertEquals(prepared.image().position().index(),adapter.machine.getLatestSnapshot().getIndex());assertEquals(-1,adapter.machine.getLastAppliedTermIndex().getIndex());assertNull(store.applied());assertTrue(store.pendingInstallation());assertNull(store.pendingInstallationCut());assertTrue(adapter.machine.recoveryEligibilityGate().discoveryPending());assertFalse(store.currentRangeRecoveryReady());assertFalse(store.admissionOpen());assertNull(store.metadataRecoveryRegistration());
@@ -79,7 +79,7 @@ class RatisNodeSupersessionBootstrapTest {
                     var consuming=source.split();var cut=new RatisCatalogue(source.catalogue,directory.clusterId(),directory.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn()).readView(directory.domainId()).cut();
                     var selected=new RatisTopologySourceSnapshotRpc.Request(new UUID(12920,11),consuming.header(),c.groupId(),local,RatisTopologySourceSnapshotRpc.Purpose.ANCESTOR_METADATA,group,directory);
                     var oldDigest=OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,original));
-                    var scope=new NativeRecoverySupersession.Scope(c.groupId(),cut,consuming.header(),directory,group,local,OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,selected)),oldDigest,oldDigest);
+                    var scope=new NativeRecoverySupersession.Scope(c.groupId(),cut,consuming.header(),directory,group,local,OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,selected)),List.of(oldDigest));
                     var store=node.nativePool(poolId).forceRecoverySupersession(scope);assertEquals(actual,store.applied());if(!publishedCurrent)assertNull(store.configuration());expected=RatisRecoverySupersessionRpc.Request.of(store.acknowledgedRecoverySupersession());
                 }
                 assertEquals(publishedCurrent,Files.exists(env.nodeRoot.resolve("raft").resolve(group.toString()).resolve("current/raft-meta")));

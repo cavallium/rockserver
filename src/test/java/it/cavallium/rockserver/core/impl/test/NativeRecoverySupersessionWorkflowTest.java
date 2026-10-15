@@ -34,7 +34,7 @@ class NativeRecoverySupersessionWorkflowTest {
                 source.parent.apply(new ApplyPosition(1,1),source.write(source.parent,0,9));
                 var image=NativeRangeImage.write(groupImage,source.parent,nativeTest.limits);var cfg=source.parent.configuration();
                 current=new NativeCurrentRangeRecovery(new UUID(0,22001),nativeTest.catalogue,new ApplyPosition(1,10),source.definition.sourceDirectory(),helper.outer.schema(),source.parent.ownership().owner().groupId(),helper.topology.replica,helper.topology.replica,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),currentHelper.names(helper.outer.schema(),"supersession-"),Set.of(),currentHelper.schemaRows(source.parent));
-                scope=new NativeRecoverySupersession.Scope(current.catalogue(),new ApplyPosition(1,20),source.definition.header(),source.definition.sourceDirectory(),current.groupId(),current.receiver(),hash(1),hash(2),hash(3));
+                scope=new NativeRecoverySupersession.Scope(current.catalogue(),new ApplyPosition(1,20),source.definition.header(),source.definition.sourceDirectory(),current.groupId(),current.receiver(),hash(1),List.of(hash(2),hash(3)));
                 pool=helper.pool(receiver);if(open){target=pool.openCurrentRangeRecovery(current);metadataTest.configure(target,source.definition);}
             }catch(Exception|Error failed){try{if(pool!=null)pool.close();}catch(Exception|Error close){failed.addSuppressed(close);}try{source.close();}catch(Exception|Error close){failed.addSuppressed(close);}throw failed;}
         }
@@ -89,8 +89,8 @@ class NativeRecoverySupersessionWorkflowTest {
             f.completeCurrent();var before=originalRows(f);var cfg=f.target.configuration();var applied=f.target.applied();
             var calls=new java.util.concurrent.atomic.AtomicInteger();f.pool.recoverySupersessionForceObserver(after->calls.incrementAndGet());
             for(var invalid:List.of(
-                    new NativeRecoverySupersession.Scope(UUID.randomUUID(),f.scope.catalogueCut(),f.scope.header(),f.scope.sourceDirectory(),f.scope.groupId(),f.scope.receiver(),hash(1),hash(2),hash(3)),
-                    new NativeRecoverySupersession.Scope(f.scope.catalogue(),new ApplyPosition(1,9),f.scope.header(),f.scope.sourceDirectory(),f.scope.groupId(),f.scope.receiver(),hash(1),hash(2),hash(3)))) {
+                    new NativeRecoverySupersession.Scope(UUID.randomUUID(),f.scope.catalogueCut(),f.scope.header(),f.scope.sourceDirectory(),f.scope.groupId(),f.scope.receiver(),hash(1),List.of(hash(2),hash(3))),
+                    new NativeRecoverySupersession.Scope(f.scope.catalogue(),new ApplyPosition(1,9),f.scope.header(),f.scope.sourceDirectory(),f.scope.groupId(),f.scope.receiver(),hash(1),List.of(hash(2),hash(3))))) {
                 assertThrows(IllegalArgumentException.class,()->f.pool.forceRecoverySupersession(invalid));
                 assertEquals(0,calls.get());assertNull(f.target.recoverySupersession());assertNull(row(f.pool,f.current.groupId(),0x75));
                 assertTrue(f.pool.recoverySupersessions().isEmpty());assertFalse(f.target.userHandlesDetached());assertTrue(f.target.currentRangeRecoveryReady());
@@ -119,7 +119,7 @@ class NativeRecoverySupersessionWorkflowTest {
             f.partialCurrent();var before=originalRows(f);var once=new java.util.concurrent.atomic.AtomicBoolean(true);
             f.pool.recoverySupersessionForceObserver(after->{if(!after && once.getAndSet(false))throw new RocksDBException("Lost before supersession force");});
             assertThrows(RocksDBException.class,()->f.pool.forceRecoverySupersession(f.scope));assertFalse(once.get());fenced(f,false);assertNull(row(f.pool,f.current.groupId(),0x75));assertTrue(f.pool.recoverySupersessions().isEmpty());unchangedRows(f,before);
-            var retained=f.target.recoverySupersession();var changed=new NativeRecoverySupersession.Scope(f.scope.catalogue(),f.scope.catalogueCut(),f.scope.header(),f.scope.sourceDirectory(),f.scope.groupId(),f.scope.receiver(),hash(8),f.scope.originalCurrentRequestDigest(),f.scope.effectiveCurrentRequestDigest());
+            var retained=f.target.recoverySupersession();var changed=new NativeRecoverySupersession.Scope(f.scope.catalogue(),f.scope.catalogueCut(),f.scope.header(),f.scope.sourceDirectory(),f.scope.groupId(),f.scope.receiver(),hash(8),f.scope.currentRequestDigests());
             assertThrows(IllegalArgumentException.class,()->f.pool.forceRecoverySupersession(changed));assertEquals(retained,f.target.recoverySupersession());
             f.pool.recoverySupersessionForceObserver(after->{});assertSame(f.target,f.pool.forceRecoverySupersession(f.scope));assertEquals(retained,f.target.acknowledgedRecoverySupersession());unchangedRows(f,before);f.installMetadata(true);
         }
@@ -151,7 +151,7 @@ class NativeRecoverySupersessionWorkflowTest {
             f.target.installMetadataSnapshot(f.metaImage,nativeTest.limits);f.target.completeMetadataRecovery(registration,f.target.applied(),f.target.configuration());
             var tail=new ApplyPosition(1,f.target.applied().index()+1);f.target.applyNoop(tail,new byte[]{2});
             assertTrue(tail.index()>registration.imageCut().index());var cfg=f.target.configuration();assertEquals(tail.index(),cfg.index());
-            var scope=new NativeRecoverySupersession.Scope(f.scope.catalogue(),new ApplyPosition(1,30),f.scope.header(),f.scope.sourceDirectory(),f.scope.groupId(),f.scope.receiver(),hash(1),hash(2),hash(3));
+            var scope=new NativeRecoverySupersession.Scope(f.scope.catalogue(),new ApplyPosition(1,30),f.scope.header(),f.scope.sourceDirectory(),f.scope.groupId(),f.scope.receiver(),hash(1),List.of(hash(2),hash(3)));
             assertSame(f.target,f.pool.forceRecoverySupersession(scope));var saved=f.target.acknowledgedRecoverySupersession();assertNotNull(saved);
             assertEquals(tail,saved.captured().marker());assertEquals(tail.index(),saved.captured().configuration().index());
             saved.requireMetadataScope(registration);assertThrows(IllegalArgumentException.class,()->saved.requireMetadata(registration));

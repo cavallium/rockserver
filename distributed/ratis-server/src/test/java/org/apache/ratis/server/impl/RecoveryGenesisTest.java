@@ -253,14 +253,14 @@ class RecoveryGenesisTest {
     var machine = new BlockedGenesisMachine();
     try (var fixture = open("drain-boundary", machine, true)) {
       genesis(machine); appendGenesisMetadata(fixture);
-      RockserverRaftServers.GenesisDrain hold;
+      RockserverRaftServers.DiscoveryDrain hold;
       try {
         assertTrue(machine.entered.await(5, TimeUnit.SECONDS));
         machine.gate.publish(RecoveryEligibilityStateMachine.Evidence.suspendedGenesis());
-        hold = RockserverRaftServers.holdGenesis(fixture.server, machine);
+        hold = RockserverRaftServers.holdDiscovery(fixture.server,machine,RockserverRaftServers.DiscoveryRole.GENESIS);
         assertThrows(IOException.class, hold::requireHeld); assertFalse(hold.drained().isDone());
         var canceled = hold.drained(); canceled.cancel(false); assertFalse(hold.drained().isDone());
-        assertThrows(IOException.class, () -> RockserverRaftServers.holdGenesis(fixture.server, machine));
+        assertThrows(IOException.class, () -> RockserverRaftServers.holdDiscovery(fixture.server,machine,RockserverRaftServers.DiscoveryRole.GENESIS));
       } finally { machine.proceed.countDown(); }
       hold.drained().get(5, TimeUnit.SECONDS); hold.requireHeld();
       assertEquals(List.of(0L), machine.applied); assertEquals(0, fixture.server.getState().getStateMachineUpdater().getLastAppliedIndex());
@@ -279,7 +279,7 @@ class RecoveryGenesisTest {
     var machine = new GenesisMachine();
     try (var fixture = open("drain-release-unfenced", machine, true)) {
       assertTrue(machine.gate.settleDiscovery(machine.gate.revision(), RecoveryEligibilityStateMachine.Evidence.suspendedGenesis()));
-      var hold = RockserverRaftServers.holdGenesis(fixture.server, machine);
+      var hold = RockserverRaftServers.holdDiscovery(fixture.server,machine,RockserverRaftServers.DiscoveryRole.GENESIS);
       hold.drained().get(5, TimeUnit.SECONDS); hold.requireHeld();
       assertFalse(machine.gate.discoveryPending());
       assertThrows(ExecutionException.class, () -> hold.release().get(5, TimeUnit.SECONDS));
@@ -295,10 +295,10 @@ class RecoveryGenesisTest {
       var machine = new BlockedGenesisMachine(); machine.failCallback = failure;
       try (var fixture = open("drain-abort-" + failure, machine, true)) {
         genesis(machine); appendGenesisMetadata(fixture);
-        CompletableFuture<Void> retired; RockserverRaftServers.GenesisDrain hold;
+        CompletableFuture<Void> retired; RockserverRaftServers.DiscoveryDrain hold;
         try {
           assertTrue(machine.entered.await(5, TimeUnit.SECONDS)); machine.gate.publish(RecoveryEligibilityStateMachine.Evidence.suspendedGenesis());
-          hold = RockserverRaftServers.holdGenesis(fixture.server, machine);
+          hold = RockserverRaftServers.holdDiscovery(fixture.server,machine,RockserverRaftServers.DiscoveryRole.GENESIS);
           retired = failure ? hold.release() : hold.abort();
           assertFalse(retired.isDone()); assertFalse(hold.drained().isDone());
         } finally { machine.proceed.countDown(); }
@@ -313,10 +313,10 @@ class RecoveryGenesisTest {
     var machine = new BlockedGenesisMachine();
     try (var fixture = open("drain-revoked", machine, true)) {
       genesis(machine); appendGenesisMetadata(fixture);
-      RockserverRaftServers.GenesisDrain hold;
+      RockserverRaftServers.DiscoveryDrain hold;
       try {
         assertTrue(machine.entered.await(5, TimeUnit.SECONDS)); machine.gate.publish(RecoveryEligibilityStateMachine.Evidence.suspendedGenesis());
-        hold = RockserverRaftServers.holdGenesis(fixture.server, machine); machine.gate.deferDiscovery();
+        hold = RockserverRaftServers.holdDiscovery(fixture.server,machine,RockserverRaftServers.DiscoveryRole.GENESIS); machine.gate.deferDiscovery();
         assertFalse(hold.drained().isDone());
       } finally { machine.proceed.countDown(); }
       assertThrows(ExecutionException.class, () -> hold.drained().get(5, TimeUnit.SECONDS));
@@ -330,7 +330,7 @@ class RecoveryGenesisTest {
       genesis(machine); appendGenesisMetadata(fixture);
       try {
         assertTrue(machine.entered.await(5, TimeUnit.SECONDS)); machine.gate.publish(RecoveryEligibilityStateMachine.Evidence.suspendedGenesis());
-        var hold = RockserverRaftServers.holdGenesis(fixture.server, machine);
+        var hold = RockserverRaftServers.holdDiscovery(fixture.server,machine,RockserverRaftServers.DiscoveryRole.GENESIS);
         var closing = closer.submit(fixture.server::close);
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         var updater = fixture.server.getState().getStateMachineUpdater();

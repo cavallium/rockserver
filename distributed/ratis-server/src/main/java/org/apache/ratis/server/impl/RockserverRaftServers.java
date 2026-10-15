@@ -74,52 +74,39 @@ public final class RockserverRaftServers {
         }
     }
 
-    /** Actual metadata-dispatch quiescence for retiring one warm GENESIS role. */
-    public static final class GenesisDrain {
-        final RaftServerImpl server;
-        final StateMachine machine;
-        final StateMachineUpdater updater;
-        final RecoveryEligibilityStateMachine.Gate gate;
-        final long revision;
-        final CompletableFuture<Void> drained = new CompletableFuture<>(), retired = new CompletableFuture<>();
-        volatile boolean releaseRequested, abortRequested;
-        private GenesisDrain(RaftServerImpl server, StateMachine machine, StateMachineUpdater updater,
-                RecoveryEligibilityStateMachine.Gate gate, long revision) {
-            this.server = server; this.machine = machine; this.updater = updater; this.gate = gate; this.revision = revision;
+    public enum DiscoveryRole { GENESIS, CURRENT }
+    /** Stops new selection and joins actual selected callbacks before binding publication evidence. */
+    public static final class DiscoveryDrain {
+        final RaftServerImpl server;final StateMachine machine;final StateMachineUpdater updater;
+        final RecoveryEligibilityStateMachine.Gate gate;final DiscoveryRole role;final boolean initiallyPending;
+        final long generation,initialRevision;volatile long revision=-1;
+        final CompletableFuture<Void> drained=new CompletableFuture<>(),retired=new CompletableFuture<>();
+        volatile boolean releaseRequested,abortRequested;
+        private DiscoveryDrain(RaftServerImpl server,StateMachine machine,StateMachineUpdater updater,RecoveryEligibilityStateMachine.Gate gate,DiscoveryRole role) {
+            this.server=server;this.machine=machine;this.updater=updater;this.gate=gate;this.role=role;initiallyPending=gate.discoveryPending();generation=gate.revocationGeneration();initialRevision=gate.revision();
         }
-        public CompletableFuture<Void> drained() { return drained.copy(); }
-        public CompletableFuture<Void> release() { releaseRequested = true; updater.notifyUpdater(); return retired.copy(); }
-        public CompletableFuture<Void> abort() { abortRequested = true; updater.notifyUpdater(); return retired.copy(); }
+        public CompletableFuture<Void> drained(){return drained.copy();}
+        public long revision()throws IOException{requireHeld();return revision;}
+        public CompletableFuture<Void> release(){releaseRequested=true;updater.notifyUpdater();return retired.copy();}
+        public CompletableFuture<Void> abort(){abortRequested=true;updater.notifyUpdater();return retired.copy();}
         /** Cached only: safe under the caller's Node -> SM -> eligibility publication guards. */
-        public void requireHeld() throws IOException {
-            if (!drained.isDone() || drained.isCompletedExceptionally() || retired.isDone()
-                    || !updater.holdsGenesisDrain(this) || !sameOwner() || gate.discoveryPending()
-                    || gate.revision() != revision || gate.snapshot().mode() != RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED)
-                throw new IOException("GENESIS updater hold is absent, stale or not drained");
+        public void requireHeld()throws IOException {
+            if(!drained.isDone() || drained.isCompletedExceptionally() || retired.isDone() || !updater.holdsDiscoveryDrain(this) || !sameOwner() || !eligible() || gate.revocationGeneration()!=generation || gate.revision()!=revision)throw new IOException("Discovery updater hold is absent, stale or not drained");
         }
-        boolean sameOwner() {
-            return server.getStateMachine() == machine && server.getInfo().isAlive()
-                && server.getInfo().getLifeCycleState() == LifeCycle.State.RUNNING
-                && machine.getLifeCycleState() == LifeCycle.State.RUNNING;
-        }
+        boolean eligible(){var mode=gate.snapshot().mode();return role==DiscoveryRole.GENESIS?!gate.discoveryPending() && mode==RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED:gate.discoveryPending()==initiallyPending && mode!=RecoveryEligibilityStateMachine.Mode.GENESIS && mode!=RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED;}
+        boolean sameOwner(){return server.getStateMachine()==machine && server.getInfo().isAlive() && server.getInfo().getLifeCycleState()==LifeCycle.State.RUNNING && machine.getLifeCycleState()==LifeCycle.State.RUNNING;}
     }
-    public static GenesisDrain holdGenesis(RaftServer.Division division, StateMachine expected) throws IOException {
-        Objects.requireNonNull(expected);
-        if (!(division instanceof RaftServerImpl server) || !(expected instanceof RecoveryEligibilityStateMachine recovery))
-            throw new IOException("GENESIS hold requires actual recovery division");
-        final GenesisDrain drain;
-        synchronized (server) {
-            var gate = recovery.recoveryEligibilityGate();
-            if (server.getStateMachine() != expected || !server.getInfo().isAlive()
-                    || server.getInfo().getLifeCycleState() != LifeCycle.State.RUNNING
-                    || expected.getLifeCycleState() != LifeCycle.State.RUNNING || gate.discoveryPending()
-                    || gate.snapshot().mode() != RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED)
-                throw new IOException("GENESIS hold requires exact suspended creation owner");
-            var updater = server.getState().getStateMachineUpdater();
-            drain = new GenesisDrain(server, expected, updater, gate, gate.revision());
-            updater.registerGenesisDrain(drain);
+    public static DiscoveryDrain holdDiscovery(RaftServer.Division division,StateMachine expected,DiscoveryRole role)throws IOException {
+        Objects.requireNonNull(expected);Objects.requireNonNull(role);
+        if(!(division instanceof RaftServerImpl server) || !(expected instanceof RecoveryEligibilityStateMachine recovery))throw new IOException("Discovery hold requires actual recovery division");
+        final DiscoveryDrain drain;
+        synchronized(server) {
+            var gate=recovery.recoveryEligibilityGate();var updater=server.getState().getStateMachineUpdater();
+            drain=new DiscoveryDrain(server,expected,updater,gate,role);
+            if(!drain.sameOwner() || !drain.eligible())throw new IOException("Discovery hold requires exact role/owner");
+            updater.registerDiscoveryDrain(drain);
         }
-        drain.updater.notifyUpdater(); return drain;
+        drain.updater.notifyUpdater();return drain;
     }
 
     /** Actual updater progress; Division.Info may report the native-backed SM cut ahead of this cursor. */

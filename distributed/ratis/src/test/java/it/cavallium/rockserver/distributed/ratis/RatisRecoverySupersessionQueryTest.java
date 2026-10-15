@@ -24,7 +24,7 @@ class RatisRecoverySupersessionQueryTest {
         var children=new ArrayList<RangeDescriptor>();for(int n=0;n<2;n++){var id=new UUID(12900,10+n);children.add(new RangeDescriptor(id,id,1,0,n==0?null:new byte[]{(byte)128},n==0?new byte[]{(byte)128}:null,RangeDescriptor.TopologyState.ACTIVE,List.of(local)));}
         var next=new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),directory.schemaDigest(),2,directory.columns(),directory.routingPrefixBytes(),children);
         var definition=new TopologyChange.Definition(new UUID(12900,20),directory,next);var catalogue=new UUID(12900,21);
-        var scope=new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),directory,group,local,new byte[32],new byte[32],new byte[32]);
+        var scope=new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),directory,group,local,new byte[32],List.of(new byte[32]));
         var remote=new ReplicaDescriptor(new UUID(12900,30),new UUID(12900,31),new UUID(12900,32),"catalogue","127.0.0.1:4520",ReplicaDescriptor.Role.VOTER);
         var cat=new RatisNodePlan.Catalogue(catalogue,1,new byte[32],new UUID(12900,33),new UUID(12900,34),List.of(remote));
         var domain=new RatisNodePlan.Domain(directory,Map.of(schema.columnIds().iterator().next(),"data"),Set.of());

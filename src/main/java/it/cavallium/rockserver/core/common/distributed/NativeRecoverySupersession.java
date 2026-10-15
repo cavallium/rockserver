@@ -6,16 +6,20 @@ import java.util.*;
 
 /** Durable receiver fence for replacing obsolete CURRENT authority; never evidence of image readiness. */
 public final class NativeRecoverySupersession {
-    public static final int MAX_SCOPE_BYTES=RangeDirectoryCodec.MAX_ENCODED_BYTES+TopologyChange.MAX_HEADER_BYTES+192;
+    public static final int MAX_CURRENT_REQUEST_DIGESTS=2048;
+    public static final int MAX_SCOPE_BYTES=RangeDirectoryCodec.MAX_ENCODED_BYTES+TopologyChange.MAX_HEADER_BYTES+112+32*MAX_CURRENT_REQUEST_DIGESTS;
     public static final int MAX_BYTES=MAX_SCOPE_BYTES+304;
     private static final int MAGIC=0x4e525350,SCOPE_MAGIC=0x4e525353;
 
     public record Scope(UUID catalogue,ApplyPosition catalogueCut,TopologyChange.Header header,RangeDirectory sourceDirectory,
                         UUID groupId,ReplicaDescriptor receiver,byte[] selectedMetadataRequestDigest,
-                        byte[] originalCurrentRequestDigest,byte[] effectiveCurrentRequestDigest) {
+                        List<byte[]> currentRequestDigests) {
         public Scope {
             Objects.requireNonNull(catalogue);positive(catalogueCut);Objects.requireNonNull(header);Objects.requireNonNull(sourceDirectory);Objects.requireNonNull(groupId);Objects.requireNonNull(receiver);
-            selectedMetadataRequestDigest=exact(selectedMetadataRequestDigest,32);originalCurrentRequestDigest=exact(originalCurrentRequestDigest,32);effectiveCurrentRequestDigest=exact(effectiveCurrentRequestDigest,32);
+            selectedMetadataRequestDigest=exact(selectedMetadataRequestDigest,32);
+            if(currentRequestDigests==null || currentRequestDigests.isEmpty() || currentRequestDigests.size()>MAX_CURRENT_REQUEST_DIGESTS)throw new IllegalArgumentException("Invalid CURRENT request identity count");
+            var identities=new ArrayList<byte[]>(currentRequestDigests.size());for(var digest:currentRequestDigests)identities.add(exact(digest,32));identities.sort(Arrays::compareUnsigned);
+            for(int n=1;n<identities.size();n++)if(Arrays.equals(identities.get(n-1),identities.get(n)))throw new IllegalArgumentException("Duplicate CURRENT request identity");currentRequestDigests=List.copyOf(identities);
             var range=find(sourceDirectory,groupId);
             if(header.kind()==TopologyChange.Kind.RELOCATE || !header.clusterId().equals(sourceDirectory.clusterId()) || !header.databaseId().equals(sourceDirectory.databaseId())
                     || !header.domainId().equals(sourceDirectory.domainId()) || header.schemaEpoch()!=sourceDirectory.schemaEpoch() || header.sourceGeneration()!=sourceDirectory.generation()
@@ -24,8 +28,8 @@ public final class NativeRecoverySupersession {
                 throw new IllegalArgumentException("Supersession differs from original frozen source scope");
         }
         @Override public byte[] selectedMetadataRequestDigest(){return selectedMetadataRequestDigest.clone();}
-        @Override public byte[] originalCurrentRequestDigest(){return originalCurrentRequestDigest.clone();}
-        @Override public byte[] effectiveCurrentRequestDigest(){return effectiveCurrentRequestDigest.clone();}
+        @Override public List<byte[]> currentRequestDigests(){return currentRequestDigests.stream().map(value->value.clone()).toList();}
+        public boolean authorizesCurrentRequestDigest(byte[] digest){return digest!=null && digest.length==32 && Collections.binarySearch(currentRequestDigests,digest,Arrays::compareUnsigned)>=0;}
         public RangeDescriptor range(){return find(sourceDirectory,groupId);}
         /** Validates the original CURRENT owner before any irreversible local fence. */
         public void requireCurrent(NativeCurrentRangeRecovery current){
@@ -38,10 +42,10 @@ public final class NativeRecoverySupersession {
                     || !NativeMetadataRecoveryRegistration.covers(catalogueCut,current.catalogueCut()) || sourceDirectory.generation()<directory.generation())
                 throw new IllegalArgumentException("Supersession changed or regressed original CURRENT ownership/authority");
         }
-        public int encodedSize(){return Math.toIntExact(Math.addExact(172L,Math.addExact(header.encodedSize(),RangeDirectoryCodec.encodedSize(sourceDirectory))));}
-        public byte[] encode(){return write(out->{out.writeInt(SCOPE_MAGIC);uuid(out,catalogue);cut(out,catalogueCut);blob(out,header.encode());blob(out,RangeDirectoryCodec.encode(sourceDirectory));uuid(out,groupId);uuid(out,receiver.replicaId());out.write(selectedMetadataRequestDigest);out.write(originalCurrentRequestDigest);out.write(effectiveCurrentRequestDigest);},MAX_SCOPE_BYTES);}
+        public int encodedSize(){return Math.toIntExact(Math.addExact(112L+32L*currentRequestDigests.size(),Math.addExact(header.encodedSize(),RangeDirectoryCodec.encodedSize(sourceDirectory))));}
+        public byte[] encode(){return write(out->{out.writeInt(SCOPE_MAGIC);uuid(out,catalogue);cut(out,catalogueCut);blob(out,header.encode());blob(out,RangeDirectoryCodec.encode(sourceDirectory));uuid(out,groupId);uuid(out,receiver.replicaId());out.write(selectedMetadataRequestDigest);out.writeInt(currentRequestDigests.size());for(var digest:currentRequestDigests)out.write(digest);},MAX_SCOPE_BYTES);}
         public byte[] digest(){return RangeImportAdmission.sha256(encode());}
-        public static Scope decode(byte[] bytes){bounded(bytes,MAX_SCOPE_BYTES);try{var in=input(bytes,SCOPE_MAGIC);var catalogue=uuid(in);var cat=cut(in);var header=TopologyChange.Header.decode(blob(in,TopologyChange.MAX_HEADER_BYTES));var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES));var group=uuid(in);var replica=uuid(in);var receiver=find(directory,group).replicas().stream().filter(r->r.replicaId().equals(replica)).findFirst().orElseThrow();var result=new Scope(catalogue,cat,header,directory,group,receiver,in.readNBytes(32),in.readNBytes(32),in.readNBytes(32));canonical(in,bytes,result.encode());return result;}catch(IOException|NoSuchElementException bad){throw new IllegalArgumentException("Invalid supersession scope",bad);}}
+        public static Scope decode(byte[] bytes){bounded(bytes,MAX_SCOPE_BYTES);try{var in=input(bytes,SCOPE_MAGIC);var catalogue=uuid(in);var cat=cut(in);var header=TopologyChange.Header.decode(blob(in,TopologyChange.MAX_HEADER_BYTES));var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES));var group=uuid(in);var replica=uuid(in);var receiver=find(directory,group).replicas().stream().filter(r->r.replicaId().equals(replica)).findFirst().orElseThrow();byte[] selected=in.readNBytes(32);int count=in.readInt();if(count<1 || count>MAX_CURRENT_REQUEST_DIGESTS || count*32L>in.available())throw new IOException("Invalid CURRENT identity count");var identities=new ArrayList<byte[]>(count);byte[] previous=null;for(int n=0;n<count;n++){byte[] digest=in.readNBytes(32);if(previous!=null&&Arrays.compareUnsigned(previous,digest)>=0)throw new IOException("Noncanonical CURRENT identities");identities.add(digest);previous=digest;}var result=new Scope(catalogue,cat,header,directory,group,receiver,selected,identities);canonical(in,bytes,result.encode());return result;}catch(IOException|NoSuchElementException bad){throw new IllegalArgumentException("Invalid supersession scope",bad);}}
         @Override public boolean equals(Object other){return other instanceof Scope scope && Arrays.equals(encode(),scope.encode());}
         @Override public int hashCode(){return Arrays.hashCode(encode());}
     }

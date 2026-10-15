@@ -16,7 +16,7 @@ public final class RatisRecoveryObsoleteRpc {
             if(fenceDigest==null || fenceDigest.length!=32)throw new IllegalArgumentException("Invalid receiver fence digest");fenceDigest=fenceDigest.clone();
             if(original.purpose()!=RatisTopologySourceSnapshotRpc.Purpose.CURRENT_LEAF)throw new IllegalArgumentException("Only CURRENT captures may become obsolete");
             var hash=OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,original));var old=original.range();var range=scope.range();var a=original.receiver();var b=scope.receiver();
-            if(!Arrays.equals(hash,scope.originalCurrentRequestDigest()) && !Arrays.equals(hash,scope.effectiveCurrentRequestDigest()))throw new IllegalArgumentException("Obsolete request is outside original/effective CURRENT identities");
+            if(!scope.authorizesCurrentRequestDigest(hash))throw new IllegalArgumentException("Obsolete request is outside frozen CURRENT identity set");
             if(!original.clusterId().equals(scope.sourceDirectory().clusterId()) || !original.databaseId().equals(scope.sourceDirectory().databaseId()) || !original.catalogue().equals(scope.catalogue()) || !original.domainId().equals(scope.sourceDirectory().domainId())
                     || !original.sourceGroup().equals(scope.groupId()) || !old.rangeId().equals(range.rangeId()) || old.rangeEpoch()!=range.rangeEpoch() || !Arrays.equals(old.lowerInclusive(),range.lowerInclusive()) || !Arrays.equals(old.upperExclusive(),range.upperExclusive())
                     || !a.nodeId().equals(b.nodeId()) || !a.nodeIncarnation().equals(b.nodeIncarnation()) || !a.replicaId().equals(b.replicaId()) || !a.peerId().equals(b.peerId()) || !a.address().equals(b.address())

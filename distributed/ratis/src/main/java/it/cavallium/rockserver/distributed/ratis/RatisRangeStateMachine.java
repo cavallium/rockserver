@@ -11,6 +11,7 @@ import it.cavallium.rockserver.core.common.distributed.OperatorUpload;
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze;
 import it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery;
+import it.cavallium.rockserver.core.common.distributed.NativeRecoverySupersession;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyActivation;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologySeed;
 import it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor;
@@ -411,10 +412,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     || recoveryEligibility.snapshot().mode()!=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED)throw new IOException("Genesis abandonment lacks suspended native ownership");
             genesisAbandoning=true;
         }
-        org.apache.ratis.server.impl.RockserverRaftServers.GenesisDrain hold=null;boolean published=false;Throwable failure=null;
+        org.apache.ratis.server.impl.RockserverRaftServers.DiscoveryDrain hold=null;boolean published=false;Throwable failure=null;
         try {
             var server=getServer().getNow(null);if(server==null)throw new IOException("Genesis abandonment lacks actual division");
-            hold=org.apache.ratis.server.impl.RockserverRaftServers.holdGenesis(server.getDivision(getGroupId()),this);var actual=hold;
+            hold=org.apache.ratis.server.impl.RockserverRaftServers.holdDiscovery(server.getDivision(getGroupId()),this,org.apache.ratis.server.impl.RockserverRaftServers.DiscoveryRole.GENESIS);var actual=hold;
             awaitUpdaterWork(actual.drained());
             publisher.publish(()->{synchronized(gate){
                 if(genesisDirectory!=original || !genesisAbandoning || recoveryReplacement || getLifeCycleState()!=LifeCycle.State.RUNNING
@@ -619,6 +620,52 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     @FunctionalInterface interface LocalDiscoveryPublication {void publish()throws IOException;}
     @FunctionalInterface interface LocalDiscoverySettlement {void publish(LocalDiscoveryPublication publication)throws IOException;}
+    void acknowledgeRecoverySupersession(NativeRecoverySupersession value)throws IOException {
+        synchronized(gate){
+            if(!value.equals(store.acknowledgedRecoverySupersession()) || !recoveryEligibility.discoveryPending()
+                    || !localDiscoveryIdle() || topologyLocalReplica==null || !sameReplicaIdentity(value.receiver(),topologyLocalReplica))
+                throw new IOException("Supersession publication lost its exact fenced receiver");
+            recoveryReplacement=true;topologyLocalReplica=value.receiver();
+        }
+    }
+    /** Node IO owns the immutable replacement scope and its prepaid durable force. */
+    void supersedeCurrentDiscovery(NativeRecoverySupersession.Scope scope,LocalDiscoverySettlement publisher,
+                                  LocalDiscoveryPublication force,java.time.Duration timeout)throws IOException {
+        Objects.requireNonNull(scope);Objects.requireNonNull(publisher);Objects.requireNonNull(force);
+        awaitUpdaterWork(abandonLocalDiscovery());
+        synchronized(gate){
+            if(role!=RatisNodePlan.Role.DATA || getLifeCycleState()!=LifeCycle.State.RUNNING || storageFailure!=null
+                    || !localDiscoveryIdle() || genesisActive() || store.metadataRecoveryRegistration()!=null
+                    || !getGroupId().getUuid().equals(scope.groupId()) || !store.ownership().owner().groupId().equals(scope.groupId()))
+                throw new IOException("Supersession requires its original live CURRENT inventory owner");
+            var current=store.currentRangeRecoveryRegistration();if(current!=null)scope.requireCurrent(current);
+            localDiscoveryAbandoning=true;
+        }
+        org.apache.ratis.server.impl.RockserverRaftServers.DiscoveryDrain hold=null;Throwable failure=null;boolean drained=false;
+        try {
+            var server=getServer().getNow(null);if(server==null)throw new IOException("Supersession lacks actual division");
+            hold=org.apache.ratis.server.impl.RockserverRaftServers.holdDiscovery(server.getDivision(getGroupId()),this,org.apache.ratis.server.impl.RockserverRaftServers.DiscoveryRole.CURRENT);var actual=hold;
+            awaitUpdaterWork(actual.drained());drained=true;
+            publisher.publish(()->{synchronized(gate){
+                if(!localDiscoveryAbandoning || getLifeCycleState()!=LifeCycle.State.RUNNING || storageFailure!=null || schemaConfigurationPending)
+                    throw new IOException("Supersession lost its drained native owner");
+                requireRecoveryRegistrationDrained();
+                synchronized(recoveryEligibility){actual.requireHeld();recoveryReplacement=true;recoveryEligibility.deferDiscovery();}
+            }});
+            admissionGeneration.incrementAndGet();invalidateProposalCandidates();store.deferDiscovery();
+            capturedSnapshots.invalidate();awaitNativeReaders(timeout);requireRecoveryRegistrationDrained();
+            // The updater stays held through force; native IO never runs under Node/SM/Gate guards.
+            force.publish();
+        }catch(IOException|RuntimeException|Error problem){failure=problem;throw problem;}
+        catch(Exception problem){failure=problem;throw new IOException("Supersession native readers did not drain",problem);}
+        finally {
+            synchronized(gate){recoveryReplacement=true;synchronized(recoveryEligibility){if(!recoveryEligibility.discoveryPending())recoveryEligibility.deferDiscovery();}}
+            try{store.deferDiscovery();}
+            finally{try{if(hold!=null)awaitUpdaterWork(drained?hold.release():hold.abort());}
+            catch(IOException|RuntimeException cleanup){if(failure!=null)failure.addSuppressed(cleanup);else throw cleanup;}
+            finally{synchronized(gate){localDiscoveryAbandoning=false;}}}
+        }
+    }
     boolean settleLocalMetadataDiscovery(LocalMetadataCandidate candidate,LocalDiscoverySettlement publicationOwner)throws IOException {
         Objects.requireNonNull(publicationOwner);
         if(candidate==null || candidate.permit==null || candidate.permit.owner!=this)throw new IOException("Foreign local META candidate");var permit=candidate.permit;if(permit.settled)return true;

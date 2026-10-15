@@ -25,7 +25,7 @@ class RatisRuntimeGroupsTest {
     NativeCurrentRangeRecovery current(){return new NativeCurrentRangeRecovery(id(20),catalogue.groupId(),new ApplyPosition(1,10),directory,schema,parent.groupId(),local,local,new ApplyPosition(1,2),new byte[32],0,-1,configuration(),null,Map.of(),Set.of(),Map.of());}
     NativeTopologyFreeze freeze(){return new NativeTopologyFreeze(definition.header(),parent.groupId(),new ApplyPosition(1,3),NativeTopologyFreeze.boundsDigest(null,null),new byte[32]);}
     NativeRecoverySupersession fence(NativeCurrentRangeRecovery current,long marker,long catCut){
-        var scope=new NativeRecoverySupersession.Scope(catalogue.groupId(),new ApplyPosition(1,catCut),definition.header(),directory,parent.groupId(),local,new byte[32],new byte[32],new byte[32]);
+        var scope=new NativeRecoverySupersession.Scope(catalogue.groupId(),new ApplyPosition(1,catCut),definition.header(),directory,parent.groupId(),local,new byte[32],List.of(new byte[32]));
         return new NativeRecoverySupersession(scope,new NativeRecoverySupersession.CapturedState(current==null?null:current.digest(),current==null?null:current.imageCut(),current==null?null:current.imageHash(),null,null,marker==0?null:new ApplyPosition(1,marker),null));
     }
     NativeMetadataRecoveryRegistration metadata(UUID transfer,long image,long catCut,NativeCurrentRangeRecovery current){return new NativeMetadataRecoveryRegistration(transfer,catalogue.groupId(),new ApplyPosition(1,catCut),directory,freeze(),local,local,0,-1,configuration(),new ApplyPosition(1,image),new byte[32],Set.of(),current==null?null:NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current));}
@@ -35,7 +35,7 @@ class RatisRuntimeGroupsTest {
         var entry=groups.require(parent.groupId());assertEquals(value,entry.supersession());assertTrue(entry.retired());assertEquals(RatisNodePlan.Role.DATA,entry.role());assertNull(entry.current());assertNull(entry.metadata());assertNull(entry.seed());assertEquals(directory,entry.directory());
         assertThrows(IllegalArgumentException.class,()->groups.register(current()));
         assertThrows(IllegalArgumentException.class,()->groups.register(fence(null,1,20)));assertEquals(value,groups.require(parent.groupId()).supersession());
-        var old=value.scope();var foreign=new NativeRecoverySupersession.Scope(id(900),old.catalogueCut(),old.header(),old.sourceDirectory(),old.groupId(),old.receiver(),old.selectedMetadataRequestDigest(),old.originalCurrentRequestDigest(),old.effectiveCurrentRequestDigest());
+        var old=value.scope();var foreign=new NativeRecoverySupersession.Scope(id(900),old.catalogueCut(),old.header(),old.sourceDirectory(),old.groupId(),old.receiver(),old.selectedMetadataRequestDigest(),old.currentRequestDigests());
         assertThrows(IllegalArgumentException.class,()->new RatisRuntimeGroups(plan).register(new NativeRecoverySupersession(foreign,value.captured())));
     }
     @Test void coldCurrentThenFenceThenSeedPreservesAllOriginalProvenanceAndRejectsCurrentRetry(){
@@ -63,7 +63,7 @@ class RatisRuntimeGroupsTest {
     }
     @Test void nativeFenceCanMaterializeAnAbsentRuntimeGroupWithinConfiguredCapacity(){
         var extra=range(40,41,null,null);var source=directory(1,List.of(extra));var targets=directory(2,List.of(range(42,43,null,new byte[]{(byte)128}),range(44,45,new byte[]{(byte)128},null)));var split=new TopologyChange.Definition(id(46),source,targets);
-        var scope=new NativeRecoverySupersession.Scope(catalogue.groupId(),new ApplyPosition(1,20),split.header(),source,extra.groupId(),local,new byte[32],new byte[32],new byte[32]);
+        var scope=new NativeRecoverySupersession.Scope(catalogue.groupId(),new ApplyPosition(1,20),split.header(),source,extra.groupId(),local,new byte[32],List.of(new byte[32]));
         var value=new NativeRecoverySupersession(scope,new NativeRecoverySupersession.CapturedState(null,null,null,null,null,null,null));
         var groups=new RatisRuntimeGroups(plan);assertThrows(IllegalArgumentException.class,()->groups.require(extra.groupId()));groups.register(value);
         assertEquals(value,groups.require(extra.groupId()).supersession());assertEquals(2,groups.raftGroups().size());assertTrue(groups.dataGroups().contains(extra.groupId()));assertNull(groups.require(extra.groupId()).metadata());

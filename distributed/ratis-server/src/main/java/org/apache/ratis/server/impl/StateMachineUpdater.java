@@ -88,12 +88,14 @@ class StateMachineUpdater implements Runnable {
   private final AtomicReference<Long> stopIndex = new AtomicReference<>();
   private volatile State state = State.RUNNING;
   private volatile RockserverRaftServers.CoveredPrefix coveredPrefix;
-  private volatile RockserverRaftServers.GenesisDrain genesisDrain;
+  private volatile RockserverRaftServers.DiscoveryDrain discoveryDrain;
+  private CompletableFuture<Void> selectedApplications=CompletableFuture.completedFuture(null);
+  private Throwable discoveryFailure;
   private TermIndex observedReloadCut;
   private CompletableFuture<Void> observedReload;
 
   synchronized CompletableFuture<Void> observeLocalReload(TermIndex cut) throws IOException {
-    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null || coveredPrefix != null || genesisDrain != null) {
+    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null || coveredPrefix != null || discoveryDrain != null) {
       throw new IOException("State machine updater is busy/stopping");
     }
     observedReloadCut = cut;
@@ -102,45 +104,43 @@ class StateMachineUpdater implements Runnable {
   }
 
   synchronized void requireCoveredAvailable() throws IOException {
-    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null || coveredPrefix != null || genesisDrain != null)
+    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null || coveredPrefix != null || discoveryDrain != null)
       throw new IOException("Updater already owns work or is stopping");
   }
   synchronized void registerCoveredPrefix(RockserverRaftServers.CoveredPrefix permit) throws IOException {
     requireCoveredAvailable(); coveredPrefix = permit;
   }
-  synchronized void registerGenesisDrain(RockserverRaftServers.GenesisDrain drain) throws IOException {
-    requireCoveredAvailable(); genesisDrain = drain;
+  synchronized void registerDiscoveryDrain(RockserverRaftServers.DiscoveryDrain drain) throws IOException {
+    requireCoveredAvailable(); discoveryDrain = drain;
   }
-  boolean holdsGenesisDrain(RockserverRaftServers.GenesisDrain drain) { return genesisDrain == drain; }
-  private void retireGenesisDrain(RockserverRaftServers.GenesisDrain drain, Throwable failure) {
-    synchronized (this) { if (genesisDrain != drain) return; genesisDrain = null; }
-    if (failure != null) { drain.drained.completeExceptionally(failure); drain.retired.completeExceptionally(failure); }
+  boolean holdsDiscoveryDrain(RockserverRaftServers.DiscoveryDrain drain) { return discoveryDrain == drain; }
+  private void retireDiscoveryDrain(RockserverRaftServers.DiscoveryDrain drain, Throwable failure) {
+    synchronized (this) { if (discoveryDrain != drain) return; discoveryDrain = null; }
+    if (failure != null) { drain.gate.deferDiscovery(); drain.drained.completeExceptionally(failure); drain.retired.completeExceptionally(failure); }
     else drain.retired.complete(null);
   }
-  /** Runs only at a boundary after the previously selected read/apply/native callback returned. */
-  private boolean consumeGenesisDrain() throws InterruptedException {
-    var drain = genesisDrain;
-    if (drain == null) return false;
-    if (drain.abortRequested) {
-      drain.gate.deferDiscovery();
-      drain.drained.completeExceptionally(new IOException("GENESIS updater hold aborted"));
-      retireGenesisDrain(drain, null); return true;
+  /** The sole updater keeps pumping selected native continuations; it never parks on their future. */
+  private boolean consumeDiscoveryDrain() throws IOException,InterruptedException {
+    var drain=discoveryDrain;if(drain==null)return false;
+    if(committedAdmission!=null)committedAdmission.pump();
+    if(!selectedApplications.isDone()){awaitForSignal.await(100,TimeUnit.MILLISECONDS);return true;}
+    if(discoveryFailure!=null){var failure=discoveryFailure;discoveryFailure=null;retireDiscoveryDrain(drain,failure);state=State.EXCEPTION;failLocalReload(failure);server.close();return true;}
+    if(selectedApplications.isCompletedExceptionally()) {
+      drain.gate.deferDiscovery();retireDiscoveryDrain(drain,new IOException("Selected application/callback failed during discovery drain"));return true;
     }
-    if (drain.releaseRequested) {
-      if (!drain.drained.isDone() || drain.drained.isCompletedExceptionally() || !drain.gate.discoveryPending()) {
-        drain.gate.deferDiscovery(); retireGenesisDrain(drain, new IOException("GENESIS hold release lacks actual drain or sticky discovery fence"));
-      } else retireGenesisDrain(drain, null);
-      return true;
+    if(stopIndex.get()!=null){drain.gate.deferDiscovery();stop();return true;}
+    if(drain.abortRequested){drain.gate.deferDiscovery();drain.drained.completeExceptionally(new IOException("Discovery updater hold aborted"));retireDiscoveryDrain(drain,null);return true;}
+    if(drain.releaseRequested) {
+      if(!drain.drained.isDone() || drain.drained.isCompletedExceptionally() || !drain.gate.discoveryPending()){drain.gate.deferDiscovery();retireDiscoveryDrain(drain,new IOException("Discovery release lacks actual drain or sticky fence"));}
+      else retireDiscoveryDrain(drain,null);return true;
     }
-    if (!drain.drained.isDone()) {
-      if (!drain.sameOwner() || drain.gate.discoveryPending() || drain.gate.revision() != drain.revision
-          || drain.gate.snapshot().mode() != RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED) {
-        drain.gate.deferDiscovery(); retireGenesisDrain(drain, new IOException("GENESIS owner revoked before updater drain")); return true;
-      }
+    if(!drain.drained.isDone()) {
+      boolean valid;
+      synchronized(drain.gate){valid=drain.sameOwner() && drain.eligible() && drain.gate.revocationGeneration()==drain.generation && (drain.role!=RockserverRaftServers.DiscoveryRole.GENESIS || drain.gate.revision()==drain.initialRevision);if(valid)drain.revision=drain.gate.revision();}
+      if(!valid){drain.gate.deferDiscovery();retireDiscoveryDrain(drain,new IOException("Discovery owner revoked before updater drain"));return true;}
       drain.drained.complete(null);
     }
-    // Once acknowledged, keep the barrier through the caller's marker/defer publication gap.
-    awaitForSignal.await(100, TimeUnit.MILLISECONDS); return true;
+    awaitForSignal.await(100,TimeUnit.MILLISECONDS);return true;
   }
 
   private void retireCoveredPrefix(RockserverRaftServers.CoveredPrefix permit, Throwable failure) {
@@ -279,8 +279,8 @@ class StateMachineUpdater implements Runnable {
     } finally {
       var covered = coveredPrefix;
       if (covered != null) retireCoveredPrefix(covered, new IOException("Updater stopped during covered prefix ownership"));
-      var creation = genesisDrain;
-      if (creation != null) retireGenesisDrain(creation, new IOException("Updater stopped during GENESIS hold"));
+      var creation = discoveryDrain;
+      if (creation != null) retireDiscoveryDrain(creation, new IOException("Updater stopped during Discovery hold"));
     }
   }
 
@@ -321,11 +321,12 @@ class StateMachineUpdater implements Runnable {
     CompletableFuture<Void> applyLogFutures = CompletableFuture.completedFuture(null);
     for(; state != State.STOP; ) {
       try {
-        if (stopIndex.get() != null && (committedAdmission != null || coveredPrefix != null || genesisDrain != null || !server.isInitialImageReady())) { stop(); break; }
-        if (consumeGenesisDrain()) continue;
+        if (consumeDiscoveryDrain()) continue;
+        if (discoveryDrain==null && stopIndex.get() != null && (committedAdmission != null || coveredPrefix != null || !server.isInitialImageReady())) { stop(); break; }
         if (consumeCoveredPrefix()) continue;
         waitForCommit(applyLogFutures);
-        if (stopIndex.get() != null && (committedAdmission != null || coveredPrefix != null || genesisDrain != null || !server.isInitialImageReady())) { stop(); break; }
+        if(discoveryDrain!=null)continue;
+        if (discoveryDrain==null && stopIndex.get() != null && (committedAdmission != null || coveredPrefix != null || !server.isInitialImageReady())) { stop(); break; }
 
         if (state == State.RELOAD) {
           reload();
@@ -335,11 +336,12 @@ class StateMachineUpdater implements Runnable {
         if (committedAdmission != null) committedAdmission.pump();
         checkAndTakeSnapshot(applyLogFutures);
 
-        if (shouldStop()) {
+        if (discoveryDrain==null && shouldStop()) {
           if (committedAdmission == null) applyLogFutures.get();
           stop();
         }
       } catch (Throwable t) {
+        if(discoveryDrain!=null && !selectedApplications.isDone()) {discoveryFailure=t;discoveryDrain.gate.deferDiscovery();continue;}
         if (t instanceof InterruptedException && state == State.STOP) {
           Thread.currentThread().interrupt();
           LOG.info("{} was interrupted.  Exiting ...", this);
@@ -359,7 +361,7 @@ class StateMachineUpdater implements Runnable {
     // Thus it is possible to have applied > committed initially.
     final long applied = getLastAppliedIndex();
     for(; (applied >= raftLog.getLastCommittedIndex() || !server.isStateMachineProgressReady())
-        && state == State.RUNNING && !shouldStop() && stopIndex.get() == null && coveredPrefix == null && genesisDrain == null; ) {
+        && state == State.RUNNING && !shouldStop() && stopIndex.get() == null && coveredPrefix == null && discoveryDrain == null; ) {
       if (server.isInitialImageReady() && server.getSnapshotRequestHandler().shouldTriggerTakingSnapshot()) {
         takeSnapshot(applyLogFutures);
       }
@@ -456,8 +458,10 @@ class StateMachineUpdater implements Runnable {
   private CompletableFuture<Void> applyLog(CompletableFuture<Void> applyLogFutures) throws RaftLogIOException, InterruptedException {
     final long committed = raftLog.getLastCommittedIndex();
     for(long applied; (applied = getLastAppliedIndex()) < committed && state == State.RUNNING
-        && server.isStateMachineProgressReady() && !shouldStop() && genesisDrain == null; ) {
+        && server.isStateMachineProgressReady() && !shouldStop() && discoveryDrain == null; ) {
       final long nextIndex = applied + 1;
+      // This is the selection linearization point shared with hold registration. No IO under it.
+      synchronized(this){if(discoveryDrain!=null)return applyLogFutures;}
       if (server.isGenesisMetadataOnly()) {
         final var headers = raftLog.getEntries(nextIndex, nextIndex + 1);
         if (headers == null || headers.length != 1 || headers[0] == null || headers[0].getIndex() != nextIndex)
@@ -522,12 +526,12 @@ class StateMachineUpdater implements Runnable {
         final long incremented = appliedIndex.incrementAndGet(debugIndexChange);
         Preconditions.assertTrue(incremented == nextIndex);
         if (f != null) {
-          CompletableFuture<Message> exceptionHandledFuture = f.exceptionally(ex -> {
-            LOG.error("Exception while {}: applying txn index={}", this, nextIndex, ex);
-            return null;
+          var delivered=f.thenAccept(m -> notifyAppliedIndex(incremented));
+          selectedApplications=CompletableFuture.allOf(selectedApplications,delivered);
+          var exceptionHandledFuture=delivered.exceptionally(ex -> {
+            LOG.error("Exception while {}: applying txn index={}",this,nextIndex,ex);return null;
           });
-          applyLogFutures = applyLogFutures.thenCombine(exceptionHandledFuture, (v, message) -> null);
-          f.thenAccept(m -> notifyAppliedIndex(incremented));
+          applyLogFutures=applyLogFutures.thenCombine(exceptionHandledFuture,(v,message)->null);
         } else {
           notifyAppliedIndex(incremented);
         }
@@ -543,7 +547,7 @@ class StateMachineUpdater implements Runnable {
   private void checkAndTakeSnapshot(CompletableFuture<?> futures)
       throws ExecutionException, InterruptedException {
     // check if need to trigger a snapshot
-    if (shouldTakeSnapshot()) {
+    if (discoveryDrain==null && shouldTakeSnapshot()) {
       takeSnapshot(futures);
     }
   }

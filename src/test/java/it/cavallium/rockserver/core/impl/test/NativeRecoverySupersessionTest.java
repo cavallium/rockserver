@@ -14,7 +14,7 @@ class NativeRecoverySupersessionTest {
     final UUID group=definition.parents().getFirst().groupId(),catalogue=new UUID(0,21702);
     byte[] digest(int value){var result=new byte[32];Arrays.fill(result,(byte)value);return result;}
     byte[] receipt(long index,int hash){return ByteBuffer.allocate(48).putLong(1).putLong(index).put(digest(hash)).array();}
-    NativeRecoverySupersession.Scope scope(){return new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),directory,group,helper.replica,digest(1),digest(2),digest(3));}
+    NativeRecoverySupersession.Scope scope(){return new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),directory,group,helper.replica,digest(1),List.of(digest(2),digest(3)));}
     NativeRecoverySupersession.CapturedState captured(){return new NativeRecoverySupersession.CapturedState(digest(4),new ApplyPosition(1,3),digest(5),receipt(7,6),receipt(8,7),new ApplyPosition(1,9),new NativeRecoverySupersession.ConfigurationReference(1,4,RangeImportAdmission.sha256(new byte[]{9})));}
     NativeMetadataRecoveryRegistration metadata(UUID transfer,ApplyPosition image,byte[] config,NativeMetadataRecoveryRegistration.CurrentPredecessor predecessor){
         var freeze=new NativeTopologyFreeze(definition.header(),group,new ApplyPosition(1,10),NativeTopologyFreeze.boundsDigest(null,null),digest(8));
@@ -52,6 +52,34 @@ class NativeRecoverySupersessionTest {
         assertThrows(IllegalArgumentException.class,()->scope().requireCurrent(current(r,catalogue,new ApplyPosition(1,10),1,range.rangeEpoch(),new UUID(0,701))));
         assertDoesNotThrow(()->scope().requireCurrent(current(r,catalogue,scope().catalogueCut(),directory.generation(),range.rangeEpoch(),range.rangeId())));
     }
+    @Test void threeCurrentAliasesAreOneCanonicalImmutableColdFenceIdentity(){
+        byte[] first=digest(255),second=digest(128),third=digest(0);var input=new ArrayList<>(List.of(first,third,second));var original=scope();
+        var aliases=new NativeRecoverySupersession.Scope(original.catalogue(),original.catalogueCut(),original.header(),original.sourceDirectory(),original.groupId(),original.receiver(),original.selectedMetadataRequestDigest(),input);
+        assertEquals(aliases.encodedSize(),aliases.encode().length);var ordered=aliases.currentRequestDigests();assertArrayEquals(digest(0),ordered.get(0));assertArrayEquals(digest(128),ordered.get(1));assertArrayEquals(digest(255),ordered.get(2));
+        first[0]=1;input.clear();ordered.getFirst()[0]=1;
+        var value=new NativeRecoverySupersession(aliases,new NativeRecoverySupersession.CapturedState(null,null,null,null,null,null,null));var cold=NativeRecoverySupersession.decode(value.encode());
+        assertArrayEquals(value.digest(),cold.digest());assertArrayEquals(value.scopeDigest(),cold.scopeDigest());
+        for(int id:new int[]{0,128,255})assertTrue(cold.scope().authorizesCurrentRequestDigest(digest(id)));
+        assertFalse(cold.scope().authorizesCurrentRequestDigest(digest(127)));assertFalse(cold.scope().authorizesCurrentRequestDigest(new byte[31]));assertFalse(cold.scope().authorizesCurrentRequestDigest(null));
+        assertThrows(UnsupportedOperationException.class,()->cold.scope().currentRequestDigests().clear());
+        var changed=new NativeRecoverySupersession.Scope(original.catalogue(),original.catalogueCut(),original.header(),original.sourceDirectory(),original.groupId(),original.receiver(),original.selectedMetadataRequestDigest(),List.of(digest(0),digest(128)));
+        assertFalse(Arrays.equals(aliases.digest(),changed.digest()));
+    }
+    @Test void aliasCountDuplicatesAndNoncanonicalWireOrderAreRejected(){
+        var base=scope();
+        assertThrows(IllegalArgumentException.class,()->new NativeRecoverySupersession.Scope(base.catalogue(),base.catalogueCut(),base.header(),base.sourceDirectory(),base.groupId(),base.receiver(),base.selectedMetadataRequestDigest(),List.of()));
+        assertThrows(IllegalArgumentException.class,()->new NativeRecoverySupersession.Scope(base.catalogue(),base.catalogueCut(),base.header(),base.sourceDirectory(),base.groupId(),base.receiver(),base.selectedMetadataRequestDigest(),List.of(digest(2),digest(2))));
+        assertThrows(IllegalArgumentException.class,()->new NativeRecoverySupersession.Scope(base.catalogue(),base.catalogueCut(),base.header(),base.sourceDirectory(),base.groupId(),base.receiver(),base.selectedMetadataRequestDigest(),Collections.nCopies(NativeRecoverySupersession.MAX_CURRENT_REQUEST_DIGESTS+1,digest(2))));
+        var maximum=new ArrayList<byte[]>();for(int n=0;n<NativeRecoverySupersession.MAX_CURRENT_REQUEST_DIGESTS;n++)maximum.add(java.nio.ByteBuffer.allocate(32).putInt(n).array());
+        var bounded=new NativeRecoverySupersession.Scope(base.catalogue(),base.catalogueCut(),base.header(),base.sourceDirectory(),base.groupId(),base.receiver(),base.selectedMetadataRequestDigest(),maximum);
+        assertEquals(NativeRecoverySupersession.MAX_CURRENT_REQUEST_DIGESTS,NativeRecoverySupersession.Scope.decode(bounded.encode()).currentRequestDigests().size());assertEquals(bounded.encodedSize(),bounded.encode().length);assertTrue(bounded.encodedSize()<=NativeRecoverySupersession.MAX_SCOPE_BYTES);
+        var encoded=base.encode();int start=encoded.length-64;
+        var reversed=encoded.clone();System.arraycopy(encoded,start+32,reversed,start,32);System.arraycopy(encoded,start,reversed,start+32,32);
+        assertThrows(IllegalArgumentException.class,()->NativeRecoverySupersession.Scope.decode(reversed));
+        var duplicate=encoded.clone();System.arraycopy(encoded,start,duplicate,start+32,32);assertThrows(IllegalArgumentException.class,()->NativeRecoverySupersession.Scope.decode(duplicate));
+        var zero=encoded.clone();java.nio.ByteBuffer.wrap(zero).putInt(start-4,0);assertThrows(IllegalArgumentException.class,()->NativeRecoverySupersession.Scope.decode(zero));
+        var oversized=encoded.clone();java.nio.ByteBuffer.wrap(oversized).putInt(start-4,NativeRecoverySupersession.MAX_CURRENT_REQUEST_DIGESTS+1);assertThrows(IllegalArgumentException.class,()->NativeRecoverySupersession.Scope.decode(oversized));
+    }
     @Test void canonicalRoundTripIsBoundedDefensiveAndRetainsIndependentFacts(){
         var scope=scope();var value=new NativeRecoverySupersession(scope,captured());
         assertEquals(scope.encode().length,scope.encodedSize());assertEquals(scope.header().encode().length,scope.header().encodedSize());assertEquals(scope,NativeRecoverySupersession.Scope.decode(scope.encode()));
@@ -61,7 +89,7 @@ class NativeRecoverySupersessionTest {
         byte[] encoded=value.encode(),hash=value.digest(),current=value.captured().currentRegistrationDigest(),intent=value.captured().pendingIntent();
         encoded[0]^=1;hash[0]^=1;current[0]^=1;intent[0]^=1;
         assertEquals(value,NativeRecoverySupersession.decode(value.encode()));assertArrayEquals(digest(4),value.captured().currentRegistrationDigest());assertArrayEquals(receipt(8,7),value.captured().pendingIntent());
-        byte[] selected=digest(1);var copied=new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),directory,group,helper.replica,selected,digest(2),digest(3));selected[0]^=1;
+        byte[] selected=digest(1);var copied=new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),directory,group,helper.replica,selected,List.of(digest(2),digest(3)));selected[0]^=1;
         assertEquals(scope,copied);copied.selectedMetadataRequestDigest()[0]^=1;assertEquals(scope,copied);
     }
     @Test void rejectsMalformedTrailingUnknownAndUncoupledFields(){
@@ -78,9 +106,9 @@ class NativeRecoverySupersessionTest {
     }
     @Test void exactOriginalScopeRejectsForeignReceiverDirectoryAndParent(){
         var foreign=new ReplicaDescriptor(new UUID(0,999),helper.replica.nodeIncarnation(),helper.replica.replicaId(),helper.replica.peerId(),helper.replica.address(),helper.replica.role());
-        assertThrows(IllegalArgumentException.class,()->new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),directory,group,foreign,digest(1),digest(2),digest(3)));
-        assertThrows(IllegalArgumentException.class,()->new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),definition.targetDirectory(),group,helper.replica,digest(1),digest(2),digest(3)));
-        assertThrows(IllegalArgumentException.class,()->new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),directory,new UUID(0,998),helper.replica,digest(1),digest(2),digest(3)));
+        assertThrows(IllegalArgumentException.class,()->new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),directory,group,foreign,digest(1),List.of(digest(2),digest(3))));
+        assertThrows(IllegalArgumentException.class,()->new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),definition.targetDirectory(),group,helper.replica,digest(1),List.of(digest(2),digest(3))));
+        assertThrows(IllegalArgumentException.class,()->new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,20),definition.header(),directory,new UUID(0,998),helper.replica,digest(1),List.of(digest(2),digest(3))));
     }
     @Test void metadataRequiresImmutableAuthorityAndCapturedFloorsButNotSelectedRequestUuid(){
         var value=new NativeRecoverySupersession(scope(),captured());
@@ -92,11 +120,11 @@ class NativeRecoverySupersessionTest {
         assertThrows(IllegalArgumentException.class,()->value.requireMetadata(metadata(new UUID(0,32),new ApplyPosition(1,12),new byte[]{9},changed)));
         var high=new NativeRecoverySupersession(scope(),new NativeRecoverySupersession.CapturedState(null,null,null,null,receipt(13,1),null,null));
         assertThrows(IllegalArgumentException.class,()->high.requireMetadata(metadata(new UUID(0,32),new ApplyPosition(1,12),new byte[]{9},null)));
-        var foreignScope=new NativeRecoverySupersession.Scope(new UUID(0,400),scope().catalogueCut(),definition.header(),directory,group,helper.replica,digest(1),digest(2),digest(3));
+        var foreignScope=new NativeRecoverySupersession.Scope(new UUID(0,400),scope().catalogueCut(),definition.header(),directory,group,helper.replica,digest(1),List.of(digest(2),digest(3)));
         assertThrows(IllegalArgumentException.class,()->new NativeRecoverySupersession(foreignScope,captured()).requireMetadata(metadata(new UUID(0,32),new ApplyPosition(1,12),new byte[]{9},previous())));
     }
     @Test void retainedMetadataScopeDoesNotDemandOriginalImageCoverLaterNativeTailOrCatalogueCut(){
-        var scope=new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,30),definition.header(),directory,group,helper.replica,digest(1),digest(2),digest(3));
+        var scope=new NativeRecoverySupersession.Scope(catalogue,new ApplyPosition(1,30),definition.header(),directory,group,helper.replica,digest(1),List.of(digest(2),digest(3)));
         var captured=new NativeRecoverySupersession.CapturedState(digest(4),new ApplyPosition(1,3),digest(5),null,null,new ApplyPosition(1,15),new NativeRecoverySupersession.ConfigurationReference(1,15,digest(8)));
         var value=new NativeRecoverySupersession(scope,captured);var retained=metadata(new UUID(0,70),new ApplyPosition(1,12),new byte[]{9},previous());
         value.requireMetadataScope(retained);

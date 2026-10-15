@@ -105,6 +105,7 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
       return current.discoveryPending() ? Evidence.missing() : current.evidence();
     }
     public long revision() { return publication.revision(); }
+    public long revocationGeneration() { return publication.revocationGeneration(); }
     public synchronized void publish(Evidence next) {
       Objects.requireNonNull(next);
       final long generation = (next.mode() == Mode.MISSING || next.mode() == Mode.GENESIS || next.mode() == Mode.GENESIS_SUSPENDED)

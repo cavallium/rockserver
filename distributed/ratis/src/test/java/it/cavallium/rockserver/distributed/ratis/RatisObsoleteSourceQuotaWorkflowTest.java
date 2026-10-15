@@ -34,7 +34,7 @@ class RatisObsoleteSourceQuotaWorkflowTest {
                 var consuming=source.split();var meta=new RatisTopologySourceSnapshotRpc.Request(new UUID(13100,3),consuming.header(),original.catalogue(),source.local,RatisTopologySourceSnapshotRpc.Purpose.ANCESTOR_METADATA,range.groupId(),directory);
                 assertThrows(java.util.concurrent.ExecutionException.class,()->service.prepareAsync(meta).get(5,TimeUnit.SECONDS));
                 var cut=new RatisCatalogue(source.catalogue,directory.clusterId(),directory.databaseId(),original.catalogue(),source.plan.catalogue().epoch(),source.plan.catalogue().schemaDigest(),source.plan.catalogue().directoryColumn()).readView(directory.domainId()).cut();
-                var scope=new NativeRecoverySupersession.Scope(original.catalogue(),cut,consuming.header(),directory,range.groupId(),source.local,hash(meta),hash(original),hash(unknown));
+                var scope=new NativeRecoverySupersession.Scope(original.catalogue(),cut,consuming.header(),directory,range.groupId(),source.local,hash(meta),List.of(hash(original),hash(unknown)));
                 try(var receiver=new Receiver(source,scope)) {
                     var transportField=RatisNodeRuntime.class.getDeclaredField("relocationClients");transportField.setAccessible(true);var oldTransport=(RatisRelocationDataClient)transportField.get(source.node);
                     try(var transport=new RatisRelocationDataClient(directory.clusterId(),directory.databaseId(),original.catalogue(),r->{throw new AssertionError("Fence proof is owner directed");},(r,peer)->receiver.client())) {
