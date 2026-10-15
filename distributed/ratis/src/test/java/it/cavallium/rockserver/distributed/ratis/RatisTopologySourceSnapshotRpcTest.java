@@ -14,7 +14,7 @@ class RatisTopologySourceSnapshotRpcTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     @Test void canonicalImageMetadataRoundtripNeverCarriesAHostPath()throws Exception {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
-            var request=fixture.request(50);var prepared=service.prepare(request);
+            var request=fixture.request(50);assertEquals(request(PREPARE,request).length,encodedRequestBytes(request));var prepared=service.prepare(request);
             for(int kind:new int[]{PREPARE,TRANSFER,RELEASE})assertArrayEquals(request(kind,request),request(kind,request(request(kind,request))));
             var bytes=reply(PREPARE,prepared);var decoded=reply(bytes,PREPARE,request);
             assertArrayEquals(bytes,reply(PREPARE,decoded));assertArrayEquals(prepared.image().sha256(),decoded.image().sha256());assertArrayEquals(prepared.sourceCfg().data(),decoded.sourceCfg().data());assertTrue(decoded.schemaRows().isEmpty());
@@ -52,7 +52,7 @@ class RatisTopologySourceSnapshotRpcTest {
 
     @Test void actualBootstrapSourceConfigurationRoundtripsWithoutInventingACommittedIndex()throws Exception {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root,true);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
-            var request=fixture.request(50);var prepared=service.prepare(request);assertEquals(0,fixture.store.configuration().term());assertEquals(-1,fixture.store.configuration().index());
+            var request=fixture.request(50);assertEquals(request(PREPARE,request).length,encodedRequestBytes(request));var prepared=service.prepare(request);assertEquals(0,fixture.store.configuration().term());assertEquals(-1,fixture.store.configuration().index());
             var decoded=reply(reply(PREPARE,prepared),PREPARE,request);assertEquals(0,decoded.sourceCfg().term());assertEquals(-1,decoded.sourceCfg().index());assertTrue(decoded.image().position().term()>0);
             assertSame(prepared,service.transfer(request).get(5,TimeUnit.SECONDS));service.release(request);
             byte[] data=prepared.sourceCfg().data();

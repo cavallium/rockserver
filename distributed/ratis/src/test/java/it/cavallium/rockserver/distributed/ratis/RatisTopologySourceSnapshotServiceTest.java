@@ -144,7 +144,7 @@ class RatisTopologySourceSnapshotServiceTest {
     }
 
     @Test void coldReleaseMetadataQuotaRejectsBeforeHostLookup()throws Exception {
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,new RatisTopologySourceSnapshotService.Limits(4,8*1024*1024,32*1024*1024,3L*MAX_REPLY_BYTES),fixture.scheduler,fixture.transferAdmission())){
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,new RatisTopologySourceSnapshotService.Limits(4,8*1024*1024,32*1024*1024,3L*maximumPreparedBytes(fixture.request(50))),fixture.scheduler,fixture.transferAdmission())){
             assertThrows(IOException.class,()->service.release(fixture.request(50)));assertEquals(0,fixture.releaseLookups.get());assertEquals(0,fixture.captures.get());assertEquals(0,service.stats().active());assertEquals(0,service.stats().metadataBytes());
         }
     }
@@ -160,9 +160,9 @@ class RatisTopologySourceSnapshotServiceTest {
             var request=fixture.request(50);var original=service.prepare(request);fixture.scheduler.setStoragePressure(true);fixture.entered=new CountDownLatch(1);fixture.unblock=new CountDownLatch(1);
             var observer=service.transfer(request);assertTrue(fixture.entered.await(5,TimeUnit.SECONDS));
             try {
-                assertTrue(fixture.scheduler.isStoragePressure());assertEquals(RatisTopologySourceSnapshotService.TRANSFER_BYTES,fixture.graph.stats().ordinary().bytes());assertTrue(fixture.imageDescriptors()>0);assertTrue(observer.cancel(false));
+                assertTrue(fixture.scheduler.isStoragePressure());assertEquals(RatisTopologySourceSnapshotService.transferBytes(request),fixture.graph.stats().ordinary().bytes());assertTrue(fixture.imageDescriptors()>0);assertTrue(observer.cancel(false));
                 service.release(settled);assertEquals(1,fixture.durableReleases.get());assertEquals(1,fixture.pinCloses.get());assertEquals(1,service.stats().active());
-                var stop=service.stop();assertFalse(stop.isDone());assertEquals(RatisTopologySourceSnapshotService.TRANSFER_BYTES,fixture.graph.stats().ordinary().bytes());assertEquals(original.image().bytes(),java.nio.file.Files.size(fixture.image));
+                var stop=service.stop();assertFalse(stop.isDone());assertEquals(RatisTopologySourceSnapshotService.transferBytes(request),fixture.graph.stats().ordinary().bytes());assertEquals(original.image().bytes(),java.nio.file.Files.size(fixture.image));
                 fixture.unblock.countDown();stop.get(5,TimeUnit.SECONDS);assertEquals(0,fixture.graph.stats().ordinary().bytes());assertEquals(0,fixture.imageDescriptors());assertEquals(2,fixture.pinCloses.get());assertEquals(0,service.stats().leases());
             } finally {fixture.unblock.countDown();service.stop().get(5,TimeUnit.SECONDS);}
         }
@@ -201,7 +201,7 @@ class RatisTopologySourceSnapshotServiceTest {
             }
             var stop=service.stop();
             try {
-                assertFalse(stop.isDone());fixture.unblock.countDown();assertThrows(ExecutionException.class,()->observer.get(5,TimeUnit.SECONDS));assertFalse(stop.isDone());assertEquals(1,closeCalls.get());assertEquals(RatisTopologySourceSnapshotService.TRANSFER_BYTES,fixture.graph.stats().ordinary().bytes());assertTrue(fixture.imageDescriptors()>0);assertEquals(0,fixture.pinCloses.get());
+                assertFalse(stop.isDone());fixture.unblock.countDown();assertThrows(ExecutionException.class,()->observer.get(5,TimeUnit.SECONDS));assertFalse(stop.isDone());assertEquals(1,closeCalls.get());assertEquals(RatisTopologySourceSnapshotService.transferBytes(request),fixture.graph.stats().ordinary().bytes());assertTrue(fixture.imageDescriptors()>0);assertEquals(0,fixture.pinCloses.get());
                 service.stop().get(5,TimeUnit.SECONDS);stop.get(5,TimeUnit.SECONDS);assertEquals(2,closeCalls.get());assertEquals(0,fixture.graph.stats().ordinary().bytes());assertEquals(0,fixture.imageDescriptors());assertEquals(1,fixture.pinCloses.get());assertEquals(0,fixture.durableReleases.get());
             } finally {fixture.unblock.countDown();service.stop().get(5,TimeUnit.SECONDS);}
         }

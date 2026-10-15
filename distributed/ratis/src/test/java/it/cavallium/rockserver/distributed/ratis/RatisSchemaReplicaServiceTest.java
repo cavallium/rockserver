@@ -102,7 +102,7 @@ class RatisSchemaReplicaServiceTest {
         }
         Request request(int kind) { return new Request(kind,target,kind<=ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE ? upload : null,-1,null); }
         Request chunk(int index) { int start=index*OperatorUpload.CHUNK_BYTES; return new Request(ScopedTransactionRpc.SCHEMA_ARTIFACT_CHUNK,target,upload,index,Arrays.copyOfRange(jar,start,Math.min(jar.length,start+OperatorUpload.CHUNK_BYTES))); }
-        CompletableFuture<org.apache.ratis.protocol.Message> submit(Request request) { return machine.query(Message.valueOf(ByteString.copyFrom(request.encode()))); }
+        CompletableFuture<org.apache.ratis.protocol.Message> submit(Request request) { return machine.queryStale(Message.valueOf(ByteString.copyFrom(request.encode())),0); }
         Reply call(Request request) throws Exception { return decodeReply(submit(request).get(10,TimeUnit.SECONDS).getContent().toByteArray(),request); }
         void restart() throws Exception { service.stop().get(10,TimeUnit.SECONDS); machine.close(); machine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); start(); }
         void upload() throws Exception { call(request(ScopedTransactionRpc.SCHEMA_ARTIFACT_BEGIN)); for (int i=0;i<upload.chunks().size();i++) call(chunk(i)); assertTrue(call(request(ScopedTransactionRpc.SCHEMA_ARTIFACT_FINISH)).artifactReady()); }

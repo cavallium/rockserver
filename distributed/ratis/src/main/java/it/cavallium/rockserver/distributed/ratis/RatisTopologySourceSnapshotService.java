@@ -19,10 +19,10 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     public static final int CHUNK_BYTES=1024*1024,MAX_LEASES=4,MAX_RELEASED=1024;
     public static final long MAX_METADATA_BYTES=128L*1024*1024;
     // CRC reader copies, expected sidecar bytes and bounded sidecar comparison during cleanup.
-    private static final long RELEASE_LOOKUP_BYTES=4L*MAX_REPLY_BYTES;
-    private static final long PUBLICATION_LOOKUP_BYTES=4L*(MAX_REQUEST_BYTES+MAX_OWNER_BYTES+177);
+    private static long releaseLookupBytes(Request request){return 4L*maximumPreparedBytes(request);}
+    private static long publicationLookupBytes(Request request){return 4L*maximumPublicationBytes(request);}
     public record Limits(int maximumLeases,long maximumImageBytes,long maximumReservedImageBytes,long maximumMetadataBytes) {
-        public Limits {if(maximumLeases<1 || maximumLeases>MAX_LEASES || maximumImageBytes<1 || maximumReservedImageBytes<maximumImageBytes || maximumMetadataBytes<3L*MAX_REPLY_BYTES || maximumMetadataBytes>MAX_METADATA_BYTES)throw new IllegalArgumentException("Invalid source snapshot limits");}
+        public Limits {if(maximumLeases<1 || maximumLeases>MAX_LEASES || maximumImageBytes<1 || maximumReservedImageBytes<maximumImageBytes || maximumMetadataBytes<1 || maximumMetadataBytes>MAX_METADATA_BYTES)throw new IllegalArgumentException("Invalid source snapshot limits");}
         public static Limits defaults(long maximumImageBytes){return new Limits(MAX_LEASES,maximumImageBytes,Math.multiplyExact(MAX_LEASES,maximumImageBytes),MAX_METADATA_BYTES);}
     }
     public record Lease(Prepared prepared,RaftServer.Division source,SnapshotInfo snapshot,AutoCloseable retained) implements AutoCloseable {
@@ -46,7 +46,9 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         boolean isReleased(Request request)throws Exception;
         InstallSnapshotReplyProto send(InstallSnapshotRequestProto request)throws IOException;
     }
-    public static final long TRANSFER_BYTES=256+PUBLICATION_LOOKUP_BYTES+4L*(CHUNK_BYTES+MAX_REQUEST_BYTES+MAX_REPLY_BYTES);
+    /** Minimum policy capacity for the bounded relocation request class; each task charges transferBytes(request). */
+    public static final long TRANSFER_BYTES=256+4L*(MAX_REQUEST_BYTES-RatisCatalogue.MAX_DIRECTORY_BYTES+MAX_OWNER_BYTES+177)+4L*(CHUNK_BYTES+MAX_REQUEST_BYTES-RatisCatalogue.MAX_DIRECTORY_BYTES+MAX_REPLY_BYTES-RatisCatalogue.MAX_DIRECTORY_BYTES);
+    static long transferBytes(Request request){return 256+publicationLookupBytes(request)+4L*(CHUNK_BYTES+encodedRequestBytes(request)+maximumPreparedBytes(request));}
     @FunctionalInterface public interface ResourceAdmission {RatisProofQueryService.ResourceLease reserve(Request request,long bytes)throws IOException;}
     public record Stats(int leases,int active,long reservedImageBytes,long metadataBytes,int released) {}
     private static final class Entry {
@@ -63,9 +65,9 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     /** The actual image write/inspect/hash runs in bounded BATCH work, outside the proof/control worker. */
     public CompletableFuture<Prepared> prepareAsync(Request request){
         final Preparation task;final RatisProofQueryService.ResourceLease resource;
-        try{resource=Objects.requireNonNull(admission.reserve(request,TRANSFER_BYTES));}catch(Exception failure){return CompletableFuture.failedFuture(failure);}
+        try{resource=Objects.requireNonNull(admission.reserve(request,transferBytes(request)));}catch(Exception failure){return CompletableFuture.failedFuture(failure);}
         synchronized(this){if(stopping || preparations.size()>=MAX_LEASES){resource.close();return CompletableFuture.failedFuture(new IOException("Source image build admission exhausted"));}task=new Preparation(request,resource);preparations.add(task);}
-        try{task.handle=executor.executeCooperatively(task,TRANSFER_BYTES);boolean stop;synchronized(this){stop=stopping;}if(stop)task.handle.cancel();}catch(RuntimeException rejected){task.reject(rejected);}
+        try{task.handle=executor.executeCooperatively(task,transferBytes(request));boolean stop;synchronized(this){stop=stopping;}if(stop)task.handle.cancel();}catch(RuntimeException rejected){task.reject(rejected);}
         return task.result.copy();
     }
     /** A bounded native owner waits off the scheduler worker; each IO quantum still enters the BATCH lane. */
@@ -109,7 +111,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             requireOpen();requireNotReleased(request);if(releaseLookups.contains(request.transferId()))throw new IOException("Durable release lookup still owns this transfer");entry=entries.get(request.transferId());
             if(entry!=null){requireSame(entry,request);if(entry.unusable)throw new IOException("Failed source preparation requires cleanup drainage");if(entry.busy)throw new IOException("Source transfer owner is active");entry.busy=true;active++;capture=entry.lease==null;}
             else {
-                long charge=PUBLICATION_LOOKUP_BYTES;
+                long charge=publicationLookupBytes(request);
                 if(active>=MAX_LEASES || entries.size()>=limits.maximumLeases()+MAX_LEASES || released.size()>=MAX_RELEASED || charge>limits.maximumMetadataBytes()-metadataBytes)throw new IOException("Source publication lookup admission exhausted");
                 entry=new Entry(request,0,charge);entries.put(request.transferId(),entry);metadataBytes+=charge;active++;capture=true;
             }
@@ -118,7 +120,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         try {
             if(capture){
                 var terminal=host.abandoned(request);if(terminal!=null)throw new AbandonedException(terminal);
-                synchronized(this){if(entry.imageCharge==0){long charge=3L*MAX_REPLY_BYTES;long captures=entries.values().stream().filter(value->value.imageCharge!=0).count();if(captures>=limits.maximumLeases() || limits.maximumImageBytes()>limits.maximumReservedImageBytes()-imageBytes || charge-entry.metadataCharge>limits.maximumMetadataBytes()-metadataBytes)throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Source snapshot admission exhausted");requireOpen();entry.imageCharge=limits.maximumImageBytes();imageBytes+=entry.imageCharge;metadataBytes+=charge-entry.metadataCharge;entry.metadataCharge=charge;}}
+                synchronized(this){if(entry.imageCharge==0){long charge=3L*maximumPreparedBytes(request);long captures=entries.values().stream().filter(value->value.imageCharge!=0).count();if(captures>=limits.maximumLeases() || limits.maximumImageBytes()>limits.maximumReservedImageBytes()-imageBytes || charge-entry.metadataCharge>limits.maximumMetadataBytes()-metadataBytes)throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Source snapshot admission exhausted");requireOpen();entry.imageCharge=limits.maximumImageBytes();imageBytes+=entry.imageCharge;metadataBytes+=charge-entry.metadataCharge;entry.metadataCharge=charge;}}
                 Lease candidate=null;
                 try {candidate=Objects.requireNonNull(host.capture(request,imageAdmission));requireRequest(request,candidate.prepared().request());
                     if(candidate.prepared().image().bytes()>limits.maximumImageBytes())throw new IOException("Captured source image exceeds reserved quota");
@@ -137,12 +139,12 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     public CompletableFuture<Prepared> transfer(Request request) {
         RatisProofQueryService.ResourceLease resource=null;Transfer task=null;
         try {
-            Objects.requireNonNull(request);resource=Objects.requireNonNull(admission.reserve(request,TRANSFER_BYTES));
+            Objects.requireNonNull(request);resource=Objects.requireNonNull(admission.reserve(request,transferBytes(request)));
             synchronized(this){requireOpen();requireNotReleased(request);var entry=entries.get(request.transferId());if(entry!=null){requireSame(entry,request);if(entry.busy)throw new IOException("Source transfer owner is active");}
-                if(active>=MAX_LEASES || PUBLICATION_LOOKUP_BYTES>limits.maximumMetadataBytes()-metadataBytes || !releaseLookups.add(request.transferId()))throw new IOException("Source transfer lookup admission exhausted");
-                active++;metadataBytes+=PUBLICATION_LOOKUP_BYTES;task=new Transfer(request,resource);transfers.add(task);resource=null;
+                if(active>=MAX_LEASES || publicationLookupBytes(request)>limits.maximumMetadataBytes()-metadataBytes || !releaseLookups.add(request.transferId()))throw new IOException("Source transfer lookup admission exhausted");
+                active++;metadataBytes+=publicationLookupBytes(request);task=new Transfer(request,resource);transfers.add(task);resource=null;
             }
-            try{var handle=executor.executeCooperatively(task,TRANSFER_BYTES);task.handle=handle;boolean stop;synchronized(this){stop=stopping;}if(stop)handle.cancel();}catch(RuntimeException rejected){task.reject(rejected);}
+            try{var handle=executor.executeCooperatively(task,transferBytes(request));task.handle=handle;boolean stop;synchronized(this){stop=stopping;}if(stop)handle.cancel();}catch(RuntimeException rejected){task.reject(rejected);}
             return task.result.copy();
         }catch(Exception failed){if(resource!=null)resource.close();return CompletableFuture.failedFuture(failed);}
     }
@@ -155,7 +157,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                 synchronized(RatisTopologySourceSnapshotService.this){requireOpen();}
                 if(context.terminationRequested())throw context.terminationFailure();
                 if(lookup){var abandoned=host.abandoned(request);if(abandoned!=null)throw new AbandonedException(abandoned);
-                    synchronized(RatisTopologySourceSnapshotService.this){entry=entries.get(request.transferId());if(entry==null || entry.lease==null || entry.unusable)throw new IOException("Prepare the exact source image first");requireSame(entry,request);if(entry.busy)throw new IOException("Source transfer owner is active");entry.busy=true;releaseLookups.remove(request.transferId());metadataBytes-=PUBLICATION_LOOKUP_BYTES;lookup=false;}
+                    synchronized(RatisTopologySourceSnapshotService.this){entry=entries.get(request.transferId());if(entry==null || entry.lease==null || entry.unusable)throw new IOException("Prepare the exact source image first");requireSame(entry,request);if(entry.busy)throw new IOException("Source transfer owner is active");entry.busy=true;releaseLookups.remove(request.transferId());metadataBytes-=publicationLookupBytes(request);lookup=false;}
                 }
                 if(entry.installed)return RWScheduler.CooperativeResult.COMPLETE;
                 host.requireOwner(entry.lease);
@@ -179,7 +181,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             catch(IOException unknown){synchronized(RatisTopologySourceSnapshotService.this){if(entry!=null)entry.unusable=true;settling=false;}result.completeExceptionally(unknown);return;}
             IOException problem=failure==null?null:io("Source transfer outcome unresolved; exact lease retained",failure);
             try {
-                if(lookup){synchronized(RatisTopologySourceSnapshotService.this){releaseLookups.remove(request.transferId());metadataBytes-=PUBLICATION_LOOKUP_BYTES;active--;lookup=false;RatisTopologySourceSnapshotService.this.notifyAll();}}
+                if(lookup){synchronized(RatisTopologySourceSnapshotService.this){releaseLookups.remove(request.transferId());metadataBytes-=publicationLookupBytes(request);active--;lookup=false;RatisTopologySourceSnapshotService.this.notifyAll();}}
                 else finish(entry,problem);
             }catch(IOException cleanup){if(problem==null)problem=cleanup;else problem.addSuppressed(cleanup);}
             synchronized(RatisTopologySourceSnapshotService.this){settled=true;}
@@ -193,7 +195,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             byte[] prior=released.get(request.transferId());if(prior!=null){requireReleased(request,prior);return;}
             entry=entries.get(request.transferId());
             if(entry!=null){requireSame(entry,request);if(entry.busy || !entry.installed)throw new IOException("Source snapshot has no settled receiver installation");entry.busy=true;active++;}
-            else {requireOpen();if(active>=MAX_LEASES || released.size()>=MAX_RELEASED || RELEASE_LOOKUP_BYTES>limits.maximumMetadataBytes()-metadataBytes || !releaseLookups.add(request.transferId()))throw new IOException("Durable release lookup capacity/ownership unavailable");active++;metadataBytes+=RELEASE_LOOKUP_BYTES;}
+            else {requireOpen();if(active>=MAX_LEASES || released.size()>=MAX_RELEASED || releaseLookupBytes(request)>limits.maximumMetadataBytes()-metadataBytes || !releaseLookups.add(request.transferId()))throw new IOException("Durable release lookup capacity/ownership unavailable");active++;metadataBytes+=releaseLookupBytes(request);}
         }
         if(entry!=null){retire(entry,true);return;}
         try {
@@ -201,7 +203,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             if(!host.isReleased(request))throw new IOException("Unknown source snapshot lease/release receipt");
             synchronized(this){released.put(request.transferId(),digest(request));}
         }catch(Exception failure){throw io("Durable source release retry failed",failure);}
-        finally{synchronized(this){releaseLookups.remove(request.transferId());active--;metadataBytes-=RELEASE_LOOKUP_BYTES;notifyAll();}checkStopped();}
+        finally{synchronized(this){releaseLookups.remove(request.transferId());active--;metadataBytes-=releaseLookupBytes(request);notifyAll();}checkStopped();}
     }
     private void finish(Entry entry,IOException failure)throws IOException {
         boolean close;

@@ -19,7 +19,7 @@ public final class RatisTopologySourceSnapshotClient {
         try{var result=RatisTopologySourceSnapshotRpc.reply(reply.getMessage().getContent().toByteArray(),kind,request);if(!RaftPeerId.valueOf(result.sourceOwner().peerId()).equals(reply.getServerId()))throw new IOException("Source image reply crossed actual source owner");return result;}catch(AbandonedException abandoned){if(!RaftPeerId.valueOf(abandoned.receipt().sourceOwner().peerId()).equals(reply.getServerId()))throw new IOException("Abandoned source reply crossed actual owner",abandoned);throw abandoned;}catch(IllegalArgumentException malformed){throw new IOException("Malformed source snapshot reply",malformed);}
     }
     private RaftClientReply call(byte[] input,Request request,int maximum)throws IOException{
-        UUID group=request.header().parents().getFirst().groupId();if(!client.getGroupId().equals(RaftGroupId.valueOf(group)))throw new IOException("Source snapshot client belongs to another group");
+        UUID group=request.sourceGroup();if(!client.getGroupId().equals(RaftGroupId.valueOf(group)))throw new IOException("Source snapshot client belongs to another group");
         var reply=RatisRoutedClient.rpc(()->client.io().sendReadOnly(Message.valueOf(ByteString.copyFrom(input))));
         if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !client.getGroupId().equals(reply.getRaftGroupId()) || reply.getMessage().getContent().size()>maximum)throw new IOException("Source snapshot action failed; exact request remains recoverable",reply==null?null:reply.getException());
         return reply;
