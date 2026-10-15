@@ -33,6 +33,10 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
             schemas=input.schema()==null ? null : new RatisSchemaCatalogue(client,p.clusterId(),p.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());}
         @Override public void close()throws IOException {if(propagation!=null)propagation.close();if(genesis!=null)genesis.close();if(publication!=null)publication.close();}
     }
+    private enum Publication { NOT_STARTED, PUBLISHING, PUBLISHED }
+    private static final int IDENTITY_BYTES=65;
+    private final Path identity;
+    private Publication publication=Publication.NOT_STARTED;
     private record RangeWork(DomainWork domain,RangeDescriptor range) {}
     private record State(Phase phase,SessionAuthority target,BitSet checked,int cursor,int domain) {}
     private final List<DomainWork> domains;private final List<RangeWork> ranges;private final LongSupplier time;private final byte[] scope;
@@ -70,20 +74,28 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
         beforeRoster=expectedRoster; afterRoster=expectedRoster==null ? DatabaseDomainRoster.initial(directory.clusterId(),directory.databaseId(),domainIds) : expectedRoster.add(domainIds);
         RatisDatabaseDomainRoster.requireNamespace(afterRoster,directory.clusterId(),directory.databaseId()); rosters=new RatisDatabaseDomainRoster(client,directory.clusterId(),directory.databaseId(),c);
         domains=List.copyOf(work);ranges=List.copyOf(allRanges);requireCachedScope();scope=binding(inputs,existingLedger,initialTime,beforeRoster,afterRoster);
-        Path path=root.toAbsolutePath();if(!Files.isDirectory(path))throw new IOException("Bootstrap root is absent");
+        Path path=root.toAbsolutePath();if(!Files.isDirectory(path))throw new IOException("Bootstrap root is absent");identity=path.resolve("bootstrap.identity");
         var epochs=new RatisSessionEpochs(client,directory.clusterId(),directory.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
         lockChannel=FileChannel.open(path.resolve("bootstrap.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);FileLock acquired=null;
         try {
             try{acquired=lockChannel.tryLock();}catch(OverlappingFileLockException owned){throw new IOException("Bootstrap root already owned",owned);}if(acquired==null)throw new IOException("Bootstrap root already owned");lock=acquired;
-            var identity=path.resolve("bootstrap.identity");if(Files.exists(identity)){if(!Arrays.equals(scope,SessionJournalFiles.read(identity,64)))throw new IOException("Frozen bootstrap domains changed");}else SessionJournalFiles.write(identity,scope,64);
+            if(Files.exists(identity,LinkOption.NOFOLLOW_LINKS)) {
+                if(!Files.isRegularFile(identity,LinkOption.NOFOLLOW_LINKS))throw new IOException("Invalid bootstrap identity owner");
+                byte[] saved=SessionJournalFiles.read(identity,IDENTITY_BYTES);if(saved.length!=33 || !Arrays.equals(scope,Arrays.copyOf(saved,32)) || (saved[32]&255)>=Publication.values().length)throw new IOException("Frozen bootstrap domains/publication state changed");
+                publication=Publication.values()[saved[32]&255];SessionJournalFiles.force(identity);SessionJournalFiles.force(path);
+            }else SessionJournalFiles.write(identity,identity(Publication.NOT_STARTED),IDENTITY_BYTES);
             var parent=Files.createDirectories(path.resolve("domains"));SessionJournalFiles.force(parent);SessionJournalFiles.force(path);
             var ledger=existingLedger==null ? SessionEpochLedger.initial(directory.clusterId(),directory.databaseId(),initialTime) : existingLedger;
-            for(int i=0;i<domains.size();i++){var domain=domains.get(i);var input=domain.input;var journals=Files.createDirectories(parent.resolve(input.directory().domainId().toString()));SessionJournalFiles.force(journals);SessionJournalFiles.force(parent);
+            for(int i=0;i<domains.size();i++){var domain=domains.get(i);var input=domain.input;var journals=parent.resolve(input.directory().domainId().toString());
+                if(publication!=Publication.NOT_STARTED && (!Files.isRegularFile(journals.resolve("genesis.bin"),LinkOption.NOFOLLOW_LINKS) || input.schema()!=null && !Files.isRegularFile(journals.resolve("schema.bin"),LinkOption.NOFOLLOW_LINKS)))throw new IOException("Started bootstrap publication lost its original domain intent");
+                Files.createDirectories(journals);SessionJournalFiles.force(journals);SessionJournalFiles.force(parent);
                 if(input.schema()!=null)domain.publication=new RatisSchemaPublication(journals.resolve("schema.bin"),client,input.plan(),input.schema(),input.allocationWitness(),Map.of(),Map.of(),Map.of());
                 domain.genesis=new RatisCatalogueGenesis(journals.resolve("genesis.bin"),client,input.plan(),input.directory().domainId(),initialTime,i==0 && existingLedger==null ? null : ledger,i==0 ? beforeRoster : afterRoster,afterRoster);
                 var clocks=Files.createDirectories(journals.resolve("ranges"));SessionJournalFiles.force(clocks);SessionJournalFiles.force(journals);domain.propagation=new RatisSessionPropagation(clocks,epochs,input.routed(),maxRanges);
             }
             clock=new RatisCatalogueClock(path.resolve("clock.bin"),epochs);
+            if(publication==Publication.PUBLISHING)state=new State(Phase.GENESIS,null,new BitSet(),0,0);
+            if(publication==Publication.PUBLISHED && domains.stream().anyMatch(domain->domain.genesis.completedResult()==null || domain.genesis.completedResult().status()!=CommandResult.Status.SUCCESS))throw new IOException("Published bootstrap lost its original domain outcomes");
         }catch(IOException|RuntimeException|Error failure){for(var domain:domains)try{domain.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}try{if(clock!=null)clock.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}try{if(acquired!=null)acquired.release();}catch(IOException cleanup){failure.addSuppressed(cleanup);}try{lockChannel.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}throw failure;}
     }
     private static boolean sameHomes(RatisNodePlan first,RatisNodePlan next){
@@ -107,13 +119,18 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
                 case PREFLIGHT,VERIFY -> {int visits=0,work=0;while(visits++<ranges.size() && work<budget){int next=cursor;cursor=(cursor+1)%ranges.size();if(checked.get(next))continue;work++;var entry=ranges.get(next);try{var view=entry.domain.input.routed().stateView(entry.range.groupId());view.requireMatches(entry.domain.input.directory(),entry.range);if(view.applied()==null || view.applied().term()==0)throw new IllegalStateException("Current-term native apply is absent");if(phase==Phase.VERIFY)view.requireServing(target);checked.set(next);}catch(IOException|IllegalStateException|IllegalArgumentException failure){var message=String.valueOf(failure.getMessage());failures.put(entry.range.groupId(),message.substring(0,Math.min(512,message.length())));}}
                     if(checked.cardinality()==ranges.size()){if(phase==Phase.PREFLIGHT){phase=domains.stream().anyMatch(d->d.publication!=null) ? Phase.SCHEMA : Phase.GENESIS;index=0;}else{requirePublishedScope();phase=Phase.READY;}}}
                 case SCHEMA -> {while(index<domains.size() && domains.get(index).publication==null)index++;var domain=domains.get(index);var outcome=domain.publication.execute();if(outcome.status()==CommandResult.Status.SUCCESS || outcome.status()==CommandResult.Status.CONFLICT){requirePublishedSchema(domain);index++;while(index<domains.size() && domains.get(index).publication==null)index++;if(index==domains.size()){phase=Phase.GENESIS;index=0;}}else phase=Phase.EXPIRED;}
-                case GENESIS -> {var domain=domains.get(index);requirePublishedSchema(domain);var outcome=domain.genesis.execute();if(outcome.status()==CommandResult.Status.SUCCESS){if(++index==domains.size()){phase=Phase.CLOCK;index=0;}}else phase=outcome.status()==CommandResult.Status.CONFLICT ? Phase.CONFLICT : Phase.EXPIRED;}
+                case GENESIS -> {forcePublication(Publication.PUBLISHING);var domain=domains.get(index);requirePublishedSchema(domain);var outcome=domain.genesis.execute();if(outcome.status()==CommandResult.Status.SUCCESS){if(++index==domains.size()){forcePublication(Publication.PUBLISHED);phase=Phase.CLOCK;index=0;}}else phase=outcome.status()==CommandResult.Status.CONFLICT ? Phase.CONFLICT : Phase.EXPIRED;}
                 case CLOCK -> {var tick=clock.advance(time.getAsLong());if(tick.outcome()==RatisCatalogueClock.Outcome.OBSERVED || tick.outcome()==RatisCatalogueClock.Outcome.APPLIED){target=tick.authority();phase=Phase.PROPAGATE;index=0;}}
                 case PROPAGATE -> {var propagation=domains.get(index).propagation;var prior=propagation.progress();if(prior.target()==null || prior.complete() && !propagation.covers(target))propagation.begin();failures.putAll(propagation.step(budget).failures());index=(index+1)%domains.size();boolean complete=true;for(var domain:domains)if(!domain.propagation.covers(target)){complete=false;break;}if(complete){phase=Phase.VERIFY;checked.clear();cursor=0;index=0;}}
                 default -> throw new IllegalStateException("Unexpected bootstrap phase");
             }
             requireCachedScope();var next=new State(phase,target,checked,cursor,index);synchronized(this){state=next;}return progress(next,failures);
         }finally{synchronized(this){busy=false;}}
+    }
+    private byte[] identity(Publication value){return java.nio.ByteBuffer.allocate(33).put(scope).put((byte)value.ordinal()).array();}
+    private void forcePublication(Publication next)throws IOException {
+        if(publication==next || publication==Publication.PUBLISHED)return;
+        SessionJournalFiles.write(identity,identity(next),IDENTITY_BYTES);publication=next;
     }
     private void requireCachedScope()throws IOException {for(var domain:domains)if(!Arrays.equals(domain.scope,domain.input.routed().directory().payloadDigest()))throw new IOException("Bootstrap routed directory changed; frozen intent cannot be rebased");}
     private void requirePublishedScope()throws IOException {var view=rosters.readComplete();if(!view.roster().equals(afterRoster))throw new IOException("Published database roster differs from frozen bootstrap scope");for(var domain:domains){var current=RatisRoutedClient.rpc(()->domain.catalogue.read(domain.input.directory().domainId()));if(current==null || !Arrays.equals(domain.scope,current.payloadDigest()))throw new IOException("Published directory differs from frozen bootstrap scope");requirePublishedSchema(domain);}}

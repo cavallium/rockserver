@@ -65,8 +65,8 @@ class RatisNodeFrozenCurrentBootstrapTest {
             if(kind==RatisCatalogueViewRpc.KIND) {
                 views.incrementAndGet();var request=RatisCatalogueViewRpc.request(query);assertEquals(binding.groupId(),request.catalogue());assertEquals(binding.directoryColumn(),request.column());
                 var key=ByteBuffer.allocate(16).putLong(request.domain().getMostSignificantBits()).putLong(request.domain().getLeastSignificantBits()).array();
-                var read=store.readSchemaAuthorityPoints(List.of(new ReplicatedRangeStore.PhysicalPoint(binding.directoryColumn(),key)),new int[]{RatisCatalogue.MAX_DIRECTORY_BYTES});
-                wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(request,read.position(),RangeDirectoryCodec.decode(read.values().getFirst())));
+                var read=store.readSchemaAuthorityPoints(List.of(new ReplicatedRangeStore.PhysicalPoint(binding.directoryColumn(),key),new ReplicatedRangeStore.PhysicalPoint(binding.directoryColumn(),RatisDatabaseDomainRoster.key(request.database()))),new int[]{RatisCatalogue.MAX_DIRECTORY_BYTES,DatabaseDomainRoster.MAX_BYTES});
+                wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(request,read.position(),RangeDirectoryCodec.decode(read.values().getFirst()),read.values().get(1)==null?null:DatabaseDomainRoster.decode(read.values().get(1))));
             } else if(kind==RatisRecoveryLineageRpc.KIND) {
                 births.incrementAndGet();var request=RatisRecoveryLineageRpc.request(query);assertEquals(binding.groupId(),request.catalogue());assertEquals(binding.directoryColumn(),request.column());
                 var lookup=resolver.lookup(new RatisRecoveryLineage.Request(request.domain(),request.range(),request.group(),request.epoch()),request.minimumCatalogueCut());

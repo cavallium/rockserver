@@ -25,7 +25,7 @@ class RatisConfiguredRecoveryDiscoveryTest {
         WireSource(RangeDirectory current,TopologyChange.Definition... definitions){this.current=current;for(var d:definitions)for(var r:d.targets())births.put(r.groupId(),d);}
         public RatisCatalogueViewRpc.View view(RatisCatalogueViewRpc.Request request,RatisConfiguredRecoveryDiscovery.ReplyAdmission admission)throws IOException {
             views++;var directory=changeLast && views>1 ? new RangeDirectory(current.clusterId(),current.databaseId(),current.domainId(),current.schemaEpoch(),current.schemaDigest(),current.generation()+1,current.columns(),current.routingPrefixBytes(),current.ranges()) : current;
-            byte[] wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(request,new ApplyPosition(1,index++),directory));if(!omitAdmission)admission.beforeReply(wire.length);return RatisCatalogueViewRpc.reply(wire,request);
+            byte[] wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(request,new ApplyPosition(1,index++),directory,null));if(!omitAdmission)admission.beforeReply(wire.length);return RatisCatalogueViewRpc.reply(wire,request);
         }
         public RatisRecoveryLineageRpc.Reply birth(RatisRecoveryLineageRpc.Request request,RatisConfiguredRecoveryDiscovery.ReplyAdmission admission)throws IOException {
             birthReads++;byte[] wire=RatisRecoveryLineageRpc.reply(new RatisRecoveryLineageRpc.Reply(request,new ApplyPosition(1,index++),births.get(request.group())));if(!omitAdmission)admission.beforeReply(wire.length);return RatisRecoveryLineageRpc.reply(wire,request);
@@ -106,7 +106,7 @@ class RatisConfiguredRecoveryDiscoveryTest {
         var source=new RatisConfiguredRecoveryDiscovery.Source() {
             public RatisCatalogueViewRpc.View view(RatisCatalogueViewRpc.Request request,RatisConfiguredRecoveryDiscovery.ReplyAdmission admission)throws IOException {
                 var directory=live.get(request.domain());long position=index[0]++;int count=viewCounts.merge(request.domain(),1,Integer::sum);
-                byte[] wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(request,new ApplyPosition(1,position),directory));admission.beforeReply(wire.length);
+                byte[] wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(request,new ApplyPosition(1,position),directory,null));admission.beforeReply(wire.length);
                 if(count==2) {
                     if(request.domain().equals(DOMAIN)) {
                         firstFinal[0]=position;
@@ -148,7 +148,7 @@ class RatisConfiguredRecoveryDiscoveryTest {
                     int kind=ScopedTransactionRpc.kind(query,RatisRecoveryLineageRpc.REQUEST_BYTES);
                     if(kind==RatisCatalogueViewRpc.KIND) {
                         var request=RatisCatalogueViewRpc.request(query);byte[] key=java.nio.ByteBuffer.allocate(16).putLong(request.domain().getMostSignificantBits()).putLong(request.domain().getLeastSignificantBits()).array();
-                        var directory=RangeDirectoryCodec.decode(store.readCurrentPoint(binding.directoryColumn(),key));wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(request,store.applied(),directory));
+                        var read=store.readSchemaAuthorityPoints(List.of(new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.PhysicalPoint(binding.directoryColumn(),key),new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.PhysicalPoint(binding.directoryColumn(),RatisDatabaseDomainRoster.key(request.database()))),new int[]{RatisCatalogue.MAX_DIRECTORY_BYTES,DatabaseDomainRoster.MAX_BYTES});var directory=RangeDirectoryCodec.decode(read.values().getFirst());var roster=read.values().get(1);wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(request,read.position(),directory,roster==null?null:DatabaseDomainRoster.decode(roster)));
                     } else {
                         assertEquals(RatisRecoveryLineageRpc.KIND,kind);var request=RatisRecoveryLineageRpc.request(query);var lookup=resolver.lookup(new RatisRecoveryLineage.Request(request.domain(),request.range(),request.group(),request.epoch()),request.minimumCatalogueCut());wire=RatisRecoveryLineageRpc.reply(new RatisRecoveryLineageRpc.Reply(request,lookup.catalogueCut(),lookup.birth()==null?null:lookup.birth().definition()));
                     }

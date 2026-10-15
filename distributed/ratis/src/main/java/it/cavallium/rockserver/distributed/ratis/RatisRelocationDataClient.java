@@ -17,10 +17,14 @@ public final class RatisRelocationDataClient implements AutoCloseable {
     public RatisRelocationDataClient(UUID cluster,UUID database,UUID catalogue){this(cluster,database,catalogue,r->connected(r,null),RatisRelocationDataClient::connected);}
     RatisRelocationDataClient(UUID cluster,UUID database,UUID catalogue,RatisClientPool.Factory leaders,RatisClientPool.OwnerFactory owners){this.cluster=Objects.requireNonNull(cluster);this.database=Objects.requireNonNull(database);this.catalogue=Objects.requireNonNull(catalogue);clients=new RatisClientPool(16,leaders,owners);}
     private synchronized void enter()throws IOException{if(closing || active>=16)throw new IOException("Relocation transport unavailable");active++;}private synchronized void leave(){active--;notifyAll();}
-    RatisConfiguredRecoveryDiscovery.Plan discover(RatisNodePlan plan,RatisConfiguredRecoveryDiscovery.Admission admission)throws IOException {
+    @FunctionalInterface interface ViewObserver {void observed(RatisCatalogueViewRpc.View view)throws IOException;}
+    RatisConfiguredRecoveryDiscovery.Plan discover(RatisNodePlan plan,RatisConfiguredRecoveryDiscovery.Admission admission,ViewObserver observer)throws IOException {
         if(!cluster.equals(plan.clusterId()) || !database.equals(plan.databaseId()) || !catalogue.equals(plan.catalogue().groupId()))throw new IOException("Discovery transport changed configured catalogue");
         var binding=plan.catalogue();var route=new RangeDescriptor(binding.groupId(),binding.groupId(),binding.epoch(),0,null,null,RangeDescriptor.TopologyState.ACTIVE,binding.replicas());
-        enter();try(var lease=clients.acquire(route)){var source=new RatisCatalogue(lease.client(),cluster,database,catalogue,binding.epoch(),binding.schemaDigest(),binding.directoryColumn()).recoveryDiscoverySource();return RatisConfiguredRecoveryDiscovery.discover(plan,source,admission);}finally{leave();}
+        enter();try(var lease=clients.acquire(route)){var source=new RatisCatalogue(lease.client(),cluster,database,catalogue,binding.epoch(),binding.schemaDigest(),binding.directoryColumn()).recoveryDiscoverySource();return RatisConfiguredRecoveryDiscovery.discover(plan,new RatisConfiguredRecoveryDiscovery.Source(){
+            public RatisCatalogueViewRpc.View view(RatisCatalogueViewRpc.Request request,RatisConfiguredRecoveryDiscovery.ReplyAdmission charge)throws IOException{var view=source.view(request,charge);observer.observed(view);return view;}
+            public RatisRecoveryLineageRpc.Reply birth(RatisRecoveryLineageRpc.Request request,RatisConfiguredRecoveryDiscovery.ReplyAdmission charge)throws IOException{return source.birth(request,charge);}
+        },admission);}finally{leave();}
     }
     private void require(TopologyChange.Definition definition)throws IOException{if(definition.kind()!=TopologyChange.Kind.RELOCATE || !cluster.equals(definition.header().clusterId()) || !database.equals(definition.header().databaseId()))throw new IOException("Relocation namespace differs");}
     public RatisRelocationOwnerRpc.Evidence read(RatisRelocationOwnerRpc.Request request)throws IOException{

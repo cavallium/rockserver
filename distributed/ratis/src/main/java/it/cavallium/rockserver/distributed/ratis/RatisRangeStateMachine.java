@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest;
 import it.cavallium.rockserver.core.common.distributed.RangeImportAdmission;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.DatabaseDomainRoster;
 import it.cavallium.rockserver.core.common.distributed.TopologyChange;
 import it.cavallium.rockserver.core.common.distributed.OperatorUpload;
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
@@ -5387,9 +5388,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE || schemaColumn==null || schemaAuthorityQueries==null)throw new IOException("Catalogue view requires fresh catalogue dispatcher");checkCatalogueOwner();long generation=admissionGeneration.get();var leader=leadership();
                 return schemaAuthorityQueries.submit(store.ownership().owner().groupId(),encoded,4L*RatisCatalogueViewRpc.MAX_REPLY_BYTES,false,owned->{
                     var query=RatisCatalogueViewRpc.request(owned);if(!query.cluster().equals(schemaCluster) || !query.database().equals(schemaDatabase) || !query.catalogue().equals(store.ownership().owner().groupId()) || !query.column().equals(schemaColumn))throw new IOException("Catalogue view crossed namespace");
-                    checkCatalogueOwner();var point=new ReplicatedRangeStore.PhysicalPoint(schemaColumn,ByteBuffer.allocate(16).putLong(query.domain().getMostSignificantBits()).putLong(query.domain().getLeastSignificantBits()).array());var read=store.readSchemaAuthorityPoints(List.of(point),new int[]{RatisCatalogue.MAX_DIRECTORY_BYTES});var bytes=read.values().getFirst();var directory=bytes==null?null:RangeDirectoryCodec.decode(bytes);
+                    checkCatalogueOwner();var point=new ReplicatedRangeStore.PhysicalPoint(schemaColumn,ByteBuffer.allocate(16).putLong(query.domain().getMostSignificantBits()).putLong(query.domain().getLeastSignificantBits()).array());var rosterPoint=new ReplicatedRangeStore.PhysicalPoint(schemaColumn,RatisDatabaseDomainRoster.key(query.database()));var read=store.readSchemaAuthorityPoints(List.of(point,rosterPoint),new int[]{RatisCatalogue.MAX_DIRECTORY_BYTES,DatabaseDomainRoster.MAX_BYTES});var bytes=read.values().getFirst();var directory=bytes==null?null:RangeDirectoryCodec.decode(bytes);var rosterBytes=read.values().get(1);var roster=rosterBytes==null?null:DatabaseDomainRoster.decode(rosterBytes);
                     checkCatalogueOwner();synchronized(admissions){if(generation!=admissionGeneration.get() || schemaConfigurationPending || leadership().term()!=leader.term() || read.position().term()!=leader.term() || !read.position().equals(store.applied()))throw new IOException("Catalogue view lost completed barrier owner");}
-                    return Message.valueOf(ByteString.copyFrom(RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(query,read.position(),directory))));
+                    return Message.valueOf(ByteString.copyFrom(RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(query,read.position(),directory,roster))));
                 });
             }
             if(RatisTopologySourceSnapshotRpc.kind(kind)){

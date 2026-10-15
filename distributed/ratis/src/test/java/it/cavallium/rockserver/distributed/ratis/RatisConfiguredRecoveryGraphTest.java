@@ -23,7 +23,7 @@ class RatisConfiguredRecoveryGraphTest {
     RatisConfiguredRecoveryDiscovery.Plan discover(RatisNodePlan node,RangeDirectory current,long index,TopologyChange.Definition... definitions)throws IOException {
         var births=new HashMap<UUID,TopologyChange.Definition>();for(var d:definitions)for(var r:d.targets())births.put(r.groupId(),d);var cut=new ApplyPosition(1,index);
         return RatisConfiguredRecoveryDiscovery.discover(node,new RatisConfiguredRecoveryDiscovery.Source(){
-            public RatisCatalogueViewRpc.View view(RatisCatalogueViewRpc.Request r,RatisConfiguredRecoveryDiscovery.ReplyAdmission admission)throws IOException{var wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(r,cut,current));admission.beforeReply(wire.length);return RatisCatalogueViewRpc.reply(wire,r);}
+            public RatisCatalogueViewRpc.View view(RatisCatalogueViewRpc.Request r,RatisConfiguredRecoveryDiscovery.ReplyAdmission admission)throws IOException{var wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(r,cut,current,null));admission.beforeReply(wire.length);return RatisCatalogueViewRpc.reply(wire,r);}
             public RatisRecoveryLineageRpc.Reply birth(RatisRecoveryLineageRpc.Request r,RatisConfiguredRecoveryDiscovery.ReplyAdmission admission)throws IOException{var wire=RatisRecoveryLineageRpc.reply(new RatisRecoveryLineageRpc.Reply(r,cut,births.get(r.group())));admission.beforeReply(wire.length);return RatisRecoveryLineageRpc.reply(wire,r);}
         },(retained,incoming)->{});
     }

@@ -79,7 +79,7 @@ class RatisNodeNoneBootstrapTest {
             var cut=new ApplyPosition(1,10);var binding=env.plan.catalogue();
             var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args)->{
                 assertEquals("sendReadOnly",method.getName());byte[] query=((Message)args[0]).getContent().toByteArray();byte[] wire=switch(ScopedTransactionRpc.kind(query,ScopedTransactionRpc.MAX_REQUEST_BYTES)){
-                    case RatisCatalogueViewRpc.KIND->RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(RatisCatalogueViewRpc.request(query),cut,directory));
+                    case RatisCatalogueViewRpc.KIND->RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(RatisCatalogueViewRpc.request(query),cut,directory,null));
                     case RatisRecoveryLineageRpc.KIND->RatisRecoveryLineageRpc.reply(new RatisRecoveryLineageRpc.Reply(RatisRecoveryLineageRpc.request(query),cut,null));
                     default->throw new AssertionError("Unexpected inert CAT query");
                 };
@@ -126,7 +126,7 @@ class RatisNodeNoneBootstrapTest {
             byte[] query=((Message)args[0]).getContent().toByteArray();var reply=source.catalogue.io().sendReadOnly((Message)args[0]);
             if(ScopedTransactionRpc.kind(query,ScopedTransactionRpc.MAX_REQUEST_BYTES)!=RatisCatalogueViewRpc.KIND)return reply;
             var request=RatisCatalogueViewRpc.request(query);if(!request.domain().equals(source.first.domainId()))return reply;calls.incrementAndGet();
-            var current=RatisCatalogueViewRpc.reply(reply.getMessage().getContent().toByteArray(),request);byte[] wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(request,current.cut(),selected.get()));
+            var current=RatisCatalogueViewRpc.reply(reply.getMessage().getContent().toByteArray(),request);byte[] wire=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(request,current.cut(),selected.get(),current.roster()));
             return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf("controlled-membership")).setGroupId(RaftGroupId.valueOf(binding.groupId())).setCallId(1).setSuccess(true).setMessage(Message.valueOf(ByteString.copyFrom(wire))).build();
         });
         return (RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args)->switch(method.getName()){

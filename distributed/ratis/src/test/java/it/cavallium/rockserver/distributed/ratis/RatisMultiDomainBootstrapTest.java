@@ -29,13 +29,14 @@ class RatisMultiDomainBootstrapTest {
         final RatisSessionEpochsTest.Fixture catalogue;
         final UUID node=new UUID(820,1),incarnation=new UUID(820,2);
         final List<Data> data=new ArrayList<>();final List<DistributedCommand> catalogueCommands=new ArrayList<>();
-        final RaftClient client;boolean loseSecondSchema;int lostSecondSchema;
+        final RaftClient client;boolean loseSecondSchema,loseFirstGenesis;int lostSecondSchema,lostFirstGenesis;
         Fixture()throws Exception {
             catalogue=outer.new Fixture(root.resolve("native"));var actual=catalogue.client;var actualIo=actual.io();
             var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args)->{
                 if(method.getName().equals("send")){
                     var command=DistributedCommandCodec.decode(((Message)args[0]).getContent().toByteArray());catalogueCommands.add(command);
                     Object reply=invoke(method,actualIo,args);
+                    if(loseFirstGenesis && command.mutations().stream().anyMatch(m->m.columnId().equals(outer.directoryColumn) && Arrays.equals(m.key(),java.nio.ByteBuffer.allocate(16).putLong(data.getFirst().domain.getMostSignificantBits()).putLong(data.getFirst().domain.getLeastSignificantBits()).array()))){loseFirstGenesis=false;lostFirstGenesis++;throw new IOException("Lost applied first-domain genesis reply");}
                     if(loseSecondSchema && command.mutations().stream().anyMatch(m->m.key().length==33 && m.key()[0]==0x53 && Arrays.equals(Arrays.copyOfRange(m.key(),1,33),data.get(1).schema.digest()))){loseSecondSchema=false;lostSecondSchema++;throw new IOException("Lost applied second-domain schema reply");}
                     return reply;
                 }return invoke(method,actualIo,args);
@@ -98,6 +99,46 @@ class RatisMultiDomainBootstrapTest {
             var first=f.catalogueCommands.stream().filter(c->c.mutations().stream().anyMatch(m->m.key().length==33 && m.key()[0]==0x53 && Arrays.equals(Arrays.copyOfRange(m.key(),1,33),f.data.get(1).schema.digest()))).findFirst().orElseThrow();byte[] exact=DistributedCommandCodec.encode(first);var operation=first.operationId();
             try(var boot=f.bootstrap(path,null,2)){assertEquals(RatisDatabaseBootstrap.Phase.PREFLIGHT,boot.progress().phase());f.ready(boot);}
             var retries=f.catalogueCommands.stream().filter(c->c.operationId().equals(operation)).toList();assertTrue(retries.size()>=2);for(var retry:retries)assertArrayEquals(exact,DistributedCommandCodec.encode(retry));assertEquals(20,f.catalogue.epochs.read().logicalTimeMillis());for(var d:f.data)assertArrayEquals(d.directory.payloadDigest(),f.directories().read(d.domain).payloadDigest());
+        }
+    }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void partialGenesisReopensWithoutDataPreflightAndKeepsOriginalUnknownCommand(boolean lostReply)throws Exception {
+        try(var f=new Fixture()) {
+            Path path=Files.createDirectory(root.resolve("partial-publication"));f.loseFirstGenesis=lostReply;
+            try(var boot=f.bootstrap(path,null,2)) {
+                for(int n=0;n<10 && boot.progress().phase()!=RatisDatabaseBootstrap.Phase.GENESIS;n++)boot.step(1);
+                assertEquals(RatisDatabaseBootstrap.Phase.GENESIS,boot.progress().phase());
+                if(lostReply)assertThrows(IOException.class,()->boot.step(1));else assertEquals(RatisDatabaseBootstrap.Phase.GENESIS,boot.step(1).phase());
+            }
+            var first=f.data.getFirst();var second=f.data.get(1);assertNotNull(f.directories().read(first.domain));assertNull(f.directories().read(second.domain));
+            var roster=new RatisDatabaseDomainRoster(f.client,f.outer.cluster,f.outer.database,first.plan.catalogue()).read();assertEquals(Set.of(first.domain,second.domain),Set.copyOf(roster.domainIds()));
+            var command=f.catalogueCommands.stream().filter(c->c.mutations().stream().anyMatch(m->m.columnId().equals(f.outer.directoryColumn) && Arrays.equals(m.key(),java.nio.ByteBuffer.allocate(16).putLong(first.domain.getMostSignificantBits()).putLong(first.domain.getLeastSignificantBits()).array()))).findFirst().orElseThrow();byte[] original=DistributedCommandCodec.encode(command);
+            int reads=f.data.stream().mapToInt(d->d.stateReads).sum();var cuts=f.data.stream().map(d->d.store.applied()).toList();f.data.forEach(d->d.unavailable=true);
+            try(var boot=f.bootstrap(path,null,2)) {
+                assertEquals(RatisDatabaseBootstrap.Phase.GENESIS,boot.progress().phase(),"Issued domains must finish frozen publication while DATA remains fenced");
+                for(int n=0;n<3 && boot.progress().phase()==RatisDatabaseBootstrap.Phase.GENESIS;n++)boot.step(1);
+                assertEquals(RatisDatabaseBootstrap.Phase.CLOCK,boot.progress().phase());assertNotNull(f.directories().read(second.domain));assertEquals(reads,f.data.stream().mapToInt(d->d.stateReads).sum());assertEquals(cuts,f.data.stream().map(d->d.store.applied()).toList());
+                assertEquals(RatisDatabaseBootstrap.Phase.PROPAGATE,boot.step(1).phase());assertFalse(boot.step(2).failures().isEmpty());assertNotEquals(RatisDatabaseBootstrap.Phase.READY,boot.progress().phase());
+                f.data.forEach(d->d.unavailable=false);f.ready(boot);f.writesWithOneIssuedGrant();
+            }
+            var attempts=f.catalogueCommands.stream().filter(c->c.operationId().equals(command.operationId())).toList();assertEquals(lostReply?2:1,attempts.size());for(var attempt:attempts)assertArrayEquals(original,DistributedCommandCodec.encode(attempt));assertEquals(lostReply?1:0,f.lostFirstGenesis);
+        }
+    }
+    @Test void startedPublicationRefusesLostDomainIntentInsteadOfCreatingAnotherCommand()throws Exception {
+        try(var f=new Fixture()) {
+            Path path=Files.createDirectory(root.resolve("missing-published-intent"));
+            try(var boot=f.bootstrap(path,null,2)){for(int n=0;n<10 && boot.progress().phase()!=RatisDatabaseBootstrap.Phase.GENESIS;n++)boot.step(1);boot.step(1);}
+            var file=path.resolve("domains").resolve(f.data.get(1).domain.toString()).resolve("genesis.bin");byte[] identity=Files.readAllBytes(path.resolve("bootstrap.identity"));int commands=f.catalogueCommands.size();Files.delete(file);
+            assertThrows(IOException.class,()->f.bootstrap(path,null,2));assertFalse(Files.exists(file));assertArrayEquals(identity,Files.readAllBytes(path.resolve("bootstrap.identity")));assertEquals(commands,f.catalogueCommands.size());
+        }
+    }
+    @Test void currentBootstrapIdentityRejectsMalformedOrUnprovenPublicationPhase()throws Exception {
+        try(var f=new Fixture()) {
+            Path path=Files.createDirectory(root.resolve("publication-identity"));try(var boot=f.bootstrap(path,null,2)){assertEquals(RatisDatabaseBootstrap.Phase.PREFLIGHT,boot.progress().phase());}
+            var file=path.resolve("bootstrap.identity");byte[] original=SessionJournalFiles.read(file,65);assertEquals(33,original.length);
+            var malformed=new ArrayList<byte[]>();malformed.add(Arrays.copyOf(original,32));byte[] unknown=original.clone();unknown[32]=(byte)255;malformed.add(unknown);byte[] foreign=original.clone();foreign[0]^=1;malformed.add(foreign);byte[] unproven=original.clone();unproven[32]=2;malformed.add(unproven);
+            for(var body:malformed){SessionJournalFiles.write(file,body,65);assertThrows(IOException.class,()->f.bootstrap(path,null,2));assertArrayEquals(body,SessionJournalFiles.read(file,65));assertEquals(0,f.catalogue.next.get());}
+            SessionJournalFiles.write(file,original,65);try(var boot=f.bootstrap(path,null,2)){f.ready(boot);}
         }
     }
     @Test void unavailableSecondDomainCannotBecomeReadyWhileFirstDomainAdvances()throws Exception {availability(1);}

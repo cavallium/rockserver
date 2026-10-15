@@ -41,9 +41,10 @@ final class RatisNodeIdentity {
         return next==phase?this:new RatisNodeIdentity(next,planDigest,nativePolicy,purpose,scopes,local);
     }
     /** Caller forces this replacement before relying on observed CAT issuance/publication. */
-    RatisNodeIdentity closeGenesis(UUID domain) {
-        var scope=scopes.get(Objects.requireNonNull(domain));if(scope==null)throw new IllegalArgumentException("No original genesis scope for domain");if(scope.closed())return this;
-        var next=new TreeMap<>(scopes);next.put(domain,new Scope(scope.digest(),true));return new RatisNodeIdentity(phase,planDigest,nativePolicy,purpose,next,local);
+    RatisNodeIdentity closeGenesis(Collection<UUID> domains) {
+        Objects.requireNonNull(domains);if(domains.size()>RatisNodePlan.MAX_DOMAINS)throw new IllegalArgumentException("Genesis closure exceeds original scope bound");TreeMap<UUID,Scope> next=null;
+        for(var domain:domains){var scope=scopes.get(Objects.requireNonNull(domain));if(scope==null)throw new IllegalArgumentException("No original genesis scope for domain");if(!scope.closed()){if(next==null)next=new TreeMap<>(scopes);next.put(domain,new Scope(scope.digest(),true));}}
+        return next==null?this:new RatisNodeIdentity(phase,planDigest,nativePolicy,purpose,next,local);
     }
     /** Also requires the caller's fresh add-only roster and absent-directory proof before creation. */
     void requireGenesisScope(RangeDirectory directory,RangeDescriptor range,ReplicaDescriptor replica) {

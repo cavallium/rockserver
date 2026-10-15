@@ -29,7 +29,7 @@ class RatisNodeIdentityTest {
             var identity=RatisNodeIdentity.create(plan,POLICY,purpose);assertEquals(0,identity.phase());assertFalse(identity.genesisOpen(id(20)));assertTrue(identity.genesisDomains().isEmpty());
             var exposed=identity.withPhase(1).withPhase(2);var decoded=RatisNodeIdentity.decode(exposed.encode(),plan,POLICY);
             assertEquals(purpose,decoded.purpose());assertEquals(2,decoded.phase());assertEquals(decoded.encodedSize(),decoded.encode().length);assertArrayEquals(exposed.encode(),decoded.encode());
-            assertThrows(IllegalArgumentException.class,()->decoded.withPhase(1));assertThrows(IllegalArgumentException.class,()->decoded.closeGenesis(id(20)));
+            assertThrows(IllegalArgumentException.class,()->decoded.withPhase(1));assertThrows(IllegalArgumentException.class,()->decoded.closeGenesis(List.of(id(20))));
         }
     }
     @Test void genesisBindsExactZeroGenerationAndLocalCohortDespiteNormalizedPlanDigest() {
@@ -43,8 +43,8 @@ class RatisNodeIdentityTest {
     }
     @Test void forcedPerDomainClosureSurvivesColdReadAndPreservesExposureAndOtherScope()throws Exception {
         var plan=plan(0,0,2);var identity=RatisNodeIdentity.create(plan,POLICY,RatisNodeIdentity.Purpose.GENESIS).withPhase(2);var path=root.resolve("node.identity");
-        SessionJournalFiles.write(path,identity.encode(),RatisNodeIdentity.MAX_BYTES);var closed=identity.closeGenesis(id(20));SessionJournalFiles.write(path,closed.encode(),RatisNodeIdentity.MAX_BYTES);
-        var cold=RatisNodeIdentity.decode(SessionJournalFiles.read(path,RatisNodeIdentity.MAX_BYTES),plan,POLICY);assertEquals(2,cold.phase());assertEquals(RatisNodeIdentity.Purpose.GENESIS,cold.purpose());assertFalse(cold.genesisOpen(id(20)));assertTrue(cold.genesisOpen(id(21)));assertSame(cold,cold.closeGenesis(id(20)));
+        SessionJournalFiles.write(path,identity.encode(),RatisNodeIdentity.MAX_BYTES);var closed=identity.closeGenesis(List.of(id(20)));SessionJournalFiles.write(path,closed.encode(),RatisNodeIdentity.MAX_BYTES);
+        var cold=RatisNodeIdentity.decode(SessionJournalFiles.read(path,RatisNodeIdentity.MAX_BYTES),plan,POLICY);assertEquals(2,cold.phase());assertEquals(RatisNodeIdentity.Purpose.GENESIS,cold.purpose());assertFalse(cold.genesisOpen(id(20)));assertTrue(cold.genesisOpen(id(21)));assertSame(cold,cold.closeGenesis(List.of(id(20))));
         var first=plan.directory(id(20));assertThrows(IllegalArgumentException.class,()->cold.requireGenesisScope(first,first.ranges().getFirst(),local()));
         var second=plan.directory(id(21));cold.requireGenesisScope(second,second.ranges().getFirst(),local());assertEquals(Set.of(id(20),id(21)),cold.genesisDomains());assertThrows(UnsupportedOperationException.class,()->cold.genesisDomains().clear());
     }

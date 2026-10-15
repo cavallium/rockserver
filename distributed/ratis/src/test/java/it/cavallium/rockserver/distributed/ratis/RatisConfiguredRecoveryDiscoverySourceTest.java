@@ -25,7 +25,7 @@ class RatisConfiguredRecoveryDiscoverySourceTest {
     }
     @Test void admitsExactWireLengthsAndPreservesScopeForBothReplies()throws Exception {
         var f=new Fixture();var lengths=new ArrayList<Integer>();
-        byte[] view=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(f.view,new ApplyPosition(1,3),null));f.reply(view);assertEquals(new ApplyPosition(1,3),f.source.view(f.view,lengths::add).cut());
+        byte[] view=RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(f.view,new ApplyPosition(1,3),null,null));f.reply(view);assertEquals(new ApplyPosition(1,3),f.source.view(f.view,lengths::add).cut());
         byte[] birth=RatisRecoveryLineageRpc.reply(new RatisRecoveryLineageRpc.Reply(f.birth,new ApplyPosition(1,4),null));f.reply(birth);assertNull(f.source.birth(f.birth,lengths::add).birth());
         assertEquals(List.of(view.length,birth.length),lengths);verify(f.io,times(2)).sendReadOnly(any(Message.class));
     }
