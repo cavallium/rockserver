@@ -2883,8 +2883,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         force(raftRoot);
         var a=store.applied();var cfg=store.configuration();boolean installing=store.pendingInstallation();var pending=installing?store.pendingInstallationCut():null;
-        if(installing && pending==null)throw new IOException("Pending native inventory lacks its genuine installation cut");
         var reference=installing?pending:a;
+        if(installing && pending==null) {
+            var value=store.acknowledgedRecoverySupersession();
+            var completed=value==null || value.captured().pendingIntent()!=null?null:store.completedCurrentInstallationReference();
+            var captured=value==null?null:value.captured().configuration();
+            if(completed==null || !completed.cut().equals(value.captured().marker()) || captured==null || captured.term()!=completed.configuration().term() || captured.index()!=completed.configuration().index() || !Arrays.equals(captured.digest(),OperatorUpload.sha256(completed.configuration().data())))throw new IOException("Pending native inventory lacks its genuine installation cut");
+            // Acknowledged rejection preserves this factual completed-force reference only.
+            // Cached A/pending and readiness remain unchanged after the lost install acknowledgement.
+            reference=completed.cut();
+        }
         if(reference==null) {
             var registration=store.metadataRecoveryRegistration();
             if(registration!=null && registration.currentPredecessor()!=null && store.metadataRecoveryPending()
@@ -2906,6 +2914,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private DiscoveryImage validateDiscoveryImage(Path image,TermIndex position)throws IOException {
         var kind=NativeRangeImage.kind(image,snapshotMetadataAdmission);
+        if(kind==NativeRangeImage.Kind.GROUP && store.recoverySupersession()!=null && store.metadataRecoveryRegistration()==null && store.currentRangeRecoveryRegistration()!=null)return validateSupersededDiscoveryImage(image,position);
         if(kind==NativeRangeImage.Kind.GROUP && !metadataSnapshotOwner())return new DiscoveryImage(validateImage(image,position,null,SnapshotImageUse.DISCOVERY_INVENTORY),kind,null,null);
         try {
             var registration=store.metadataRecoveryRegistration();var freeze=registration==null?store.topologyFreeze():registration.freeze();
@@ -2950,6 +2959,20 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var saved=MD5FileUtil.readStoredMd5ForFile(image.toFile());if(saved!=null && !saved.equals(org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(image,snapshotMetadataAdmission))))throw new IOException("META inventory MD5 mismatch");
             return new DiscoveryImage(manifest,kind,projection.digest(),cfg[0]);
         }catch(org.rocksdb.RocksDBException|IllegalArgumentException invalid){throw new IOException("META inventory qualification failed",invalid);}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
+    }
+
+    private DiscoveryImage validateSupersededDiscoveryImage(Path image,TermIndex position)throws IOException {
+        try {
+            var value=store.acknowledgedRecoverySupersession();var server=getServer().getNow(null);
+            if(value==null || role!=RatisNodePlan.Role.DATA || !recoveryEligibility.discoveryPending() || topologyLocalReplica==null || server==null || !server.getId().toString().equals(topologyLocalReplica.peerId()) || !sameReplicaIdentity(value.receiver(),topologyLocalReplica))throw new IOException("Superseded GROUP inventory lacks exact forced local receiver");
+            var qualified=store.validateSupersededGroupFloorInventory(image,limits);var cfg=new ReplicatedRangeStore.Configuration[1];
+            var manifest=NativeRangeImage.visitAdmitted(image,limits,(section,column,key,bytes)->{if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==1)cfg[0]=ReplicatedRangeStore.Configuration.decode(bytes);},snapshotMetadataAdmission);
+            if(!Arrays.equals(qualified.sha256(),manifest.sha256()) || manifest.position().term()!=position.getTerm() || manifest.position().index()!=position.getIndex())throw new IOException("Superseded GROUP floor changed native qualification or filename");
+            if(cfg[0]==null || cfg[0].index()>manifest.position().index() || cfg[0].term()>manifest.position().term() || cfg[0].index()==manifest.position().index() && cfg[0].term()!=manifest.position().term())throw new IOException("Superseded GROUP inventory lacks configuration at its floor");
+            validateConfiguration(cfg[0].data());
+            var saved=MD5FileUtil.readStoredMd5ForFile(image.toFile());if(saved!=null && !saved.equals(org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(image,snapshotMetadataAdmission))))throw new IOException("Superseded GROUP inventory MD5 mismatch");
+            return new DiscoveryImage(manifest,NativeRangeImage.Kind.GROUP,null,cfg[0]);
+        }catch(org.rocksdb.RocksDBException|IllegalArgumentException invalid){throw new IOException("Superseded GROUP inventory qualification failed",invalid);}
     }
 
     private static void validateConfiguration(byte[] bytes) throws IOException {
@@ -5435,7 +5458,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     @Override public boolean isRecoveryOwnerQuery(Message request) {
-        if(request==null || request.getContent().size()!=RatisRecoverySupersessionRpc.REQUEST_BYTES)return false;
+        if(role!=RatisNodePlan.Role.DATA || store.acknowledgedRecoverySupersession()==null || request==null || request.getContent().size()!=RatisRecoverySupersessionRpc.REQUEST_BYTES)return false;
         try{return ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisRecoverySupersessionRpc.REQUEST_BYTES)==RatisRecoverySupersessionRpc.KIND;}
         catch(IllegalArgumentException invalid){return false;}
     }
@@ -5443,6 +5466,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
         try {
             if(genesisActive())throw new IOException("Genesis requires a fresh STATE barrier");
+            if(role==RatisNodePlan.Role.DATA && recoveryEligibility.discoveryPending()) {
+                if(isRecoveryOwnerQuery(request))return queryRecoverySupersession(request,minIndex);
+                requireDiscoverySettled();
+            }
             int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);
             if(kind==RatisRecoverySupersessionRpc.KIND)return queryRecoverySupersession(request,minIndex);
             requireDiscoverySettled();

@@ -178,6 +178,40 @@ class NativeRecoverySupersessionWorkflowTest {
         }
     }
     static byte[] stateKey(UUID group,int tag){return ByteBuffer.allocate(17).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).put((byte)tag).array();}
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void capturedInitialGroupFloorSurvivesColdSupersessionWithoutImageOrReadiness(boolean partial)throws Exception {
+        try(var f=new Fixture("initial-floor-"+partial,true)) {
+            if(partial)f.partialCurrent();f.pool.forceRecoverySupersession(f.scope);var saved=f.target.recoverySupersession();f.reopen();f.target=f.pool.forceRecoverySupersession(f.scope);
+            assertNull(f.target.installedSchema());assertNull(f.target.schemaInstallation());var before=originalRows(f);
+            var floor=f.target.validateSupersededGroupFloorInventory(f.groupImage,nativeTest.limits);assertEquals(f.current.imageCut(),floor.position());assertArrayEquals(f.current.imageHash(),floor.sha256());
+            unchangedRows(f,before);assertEquals(saved,f.target.recoverySupersession());assertNull(f.target.installedSchema());assertNull(f.target.schemaInstallation());assertNull(f.target.applied());assertFalse(f.target.currentRangeRecoveryReady());assertTrue(f.target.userHandlesDetached());assertFalse(f.target.admissionOpen());
+            assertThrows(IllegalStateException.class,f.target::captureForRecovery);assertThrows(IOException.class,()->f.target.installSnapshot(f.groupImage,nativeTest.limits));
+            var corrupt=root.resolve("initial-corrupt-"+partial);byte[] bytes=java.nio.file.Files.readAllBytes(f.groupImage);bytes[bytes.length-1]^=1;java.nio.file.Files.write(corrupt,bytes);assertThrows(IOException.class,()->f.target.validateSupersededGroupFloorInventory(corrupt,nativeTest.limits));unchangedRows(f,before);
+        }
+    }
+    @Test void coldOwnGroupFloorsUseMatchingSchemaAtTheirCutWithoutPublishingCaches()throws Exception {
+        try(var f=new Fixture("own-floor-schema",true)) {
+            var limits=new NativeRangeImage.Limits(nativeTest.limits.maxRowBytes(),nativeTest.limits.maxImageBytes(),8);
+            f.completeCurrent();f.target.apply(new ApplyPosition(1,2),currentHelper.ownPut(f.target,8));Path beforeSchema=root.resolve("own-before-schema");var old=NativeRangeImage.write(beforeSchema,f.target,limits);
+            currentHelper.ownSchemaChange(f.pool,f.target,f.current.directory(),27901);Path evolved=root.resolve("own-evolved-schema");var latest=NativeRangeImage.write(evolved,f.target,limits);assertNotEquals(HexFormat.of().formatHex(old.schemaDigest()),HexFormat.of().formatHex(latest.schemaDigest()));
+            f.pool.forceRecoverySupersession(f.scope);var saved=f.target.recoverySupersession();f.reopen();f.target=f.pool.forceRecoverySupersession(f.scope);assertNull(f.target.installedSchema());assertNull(f.target.schemaInstallation());var before=originalRows(f);
+            assertArrayEquals(old.sha256(),f.target.validateSupersededGroupFloorInventory(beforeSchema,limits).sha256());assertArrayEquals(latest.sha256(),f.target.validateSupersededGroupFloorInventory(evolved,limits).sha256());
+            assertNull(f.target.installedSchema());assertNull(f.target.schemaInstallation());assertEquals(saved.captured().marker(),f.target.applied());assertFalse(f.target.currentRangeRecoveryReady());assertFalse(f.target.admissionOpen());assertTrue(f.target.userHandlesDetached());unchangedRows(f,before);
+            assertThrows(IllegalStateException.class,()->f.target.applyNoop(new ApplyPosition(1,30)));assertThrows(IOException.class,()->f.target.installSnapshot(evolved,limits));
+        }
+    }
+    @Test void ownGroupAtInterruptedInstallCutRequiresCapturedExactHash()throws Exception {
+        try(var f=new Fixture("own-pending-floor",true)) {
+            f.completeCurrent();f.target.apply(new ApplyPosition(1,2),currentHelper.ownPut(f.target,8));Path pending=root.resolve("own-pending");var manifest=NativeRangeImage.write(pending,f.target,nativeTest.limits);Path changed=root.resolve("own-pending-changed");f.target.apply(new ApplyPosition(1,3),currentHelper.ownPut(f.target,9));NativeRangeImage.write(changed,f.target,nativeTest.limits);
+            // Return through the genuine completed own image before interrupting an exact reinstall.
+            f.target.fence();f.target.installSnapshot(changed,nativeTest.limits);assertThrows(IOException.class,()->f.target.installSnapshot(changed,nativeTest.limits,batch->{throw new IOException("Interrupted exact own floor import");}));
+            assertTrue(f.target.pendingInstallation());f.pool.forceRecoverySupersession(f.scope);f.reopen();f.target=f.pool.forceRecoverySupersession(f.scope);var before=originalRows(f);
+            assertArrayEquals(NativeRangeImage.inspect(changed,nativeTest.limits).sha256(),f.target.validateSupersededGroupFloorInventory(changed,nativeTest.limits).sha256());assertArrayEquals(manifest.sha256(),f.target.validateSupersededGroupFloorInventory(pending,nativeTest.limits).sha256());
+            Path corrupt=root.resolve("own-pending-wrong-hash");var column=helper.outer.fixed;byte[] key=helper.helper.key(1),value=helper.helper.key(9);byte[] row=ByteBuffer.allocate(25+key.length+value.length).put((byte)(NativeRangeImage.Section.USER.ordinal()+1)).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).putInt(key.length).putInt(value.length).put(key).put(value).array();byte[] other=row.clone();other[other.length-1]^=1;currentHelper.alteredImage(changed,corrupt,row,other);
+            assertDoesNotThrow(()->NativeRangeImage.inspect(corrupt,nativeTest.limits));assertTrue(assertThrows(IOException.class,()->f.target.validateSupersededGroupFloorInventory(corrupt,nativeTest.limits)).getMessage().contains("pending image identity"));
+            assertNull(f.target.installedSchema());assertFalse(f.target.currentRangeRecoveryReady());assertFalse(f.target.admissionOpen());unchangedRows(f,before);
+        }
+    }
     @Test void actualSnapshotPinAndInstallerMustDrainBeforeFence()throws Exception {
         try(var f=new Fixture("drain",true);var workers=Executors.newVirtualThreadPerTaskExecutor()) {
             f.completeCurrent();try(var pin=f.target.captureForRecovery()){assertThrows(IllegalStateException.class,()->f.pool.forceRecoverySupersession(f.scope));assertNull(f.target.recoverySupersession());assertTrue(f.pool.recoverySupersessions().isEmpty());}

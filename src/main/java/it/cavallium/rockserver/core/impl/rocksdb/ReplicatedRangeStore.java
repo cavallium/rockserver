@@ -4269,6 +4269,34 @@ public final class ReplicatedRangeStore {
             finally{applyLane.unlock();}
         } finally{leaveNative();}
     }
+    /** Inventory evidence only for the permanently fenced CURRENT predecessor. Never restores USER or publishes schema caches. */
+    public NativeRangeImage.Manifest validateSupersededGroupFloorInventory(Path image,NativeRangeImage.Limits limits)throws IOException,RocksDBException {
+        enterNative();
+        try(var scope=NativeRangeImage.openMetadataAdmission(NativeRangeImage.IoAdmission.UNLIMITED);var metadata=scope.pass()) {
+            applyLane.lock();
+            try {
+                var supersession=recoverySupersession;var registration=currentRangeRecovery;
+                if(supersession==null || registration==null || metadataRecoveryRegistration!=null)throw new IOException("GROUP inventory lacks superseded CURRENT authority");
+                metadata.reserve(Math.addExact(imageMetadataBytes(null,limits,true),supersession.encodedSize()));
+                if(db.get(state,topologyOwnershipKey(0x75),new byte[0])!=supersession.encodedSize() || !Arrays.equals(supersession.encode(),db.get(state,topologyOwnershipKey(0x75))) || !Arrays.equals(registration.encode(),db.get(state,topologyOwnershipKey(0x72))))throw new IOException("Superseded GROUP inventory lost its exact forced local rows");
+                supersession.requireCurrent(registration);var captured=supersession.captured();
+                if(!Arrays.equals(registration.digest(),captured.currentRegistrationDigest()) || !registration.imageCut().equals(captured.registeredImageCut()) || !Arrays.equals(registration.imageHash(),captured.registeredImageHash()))throw new IOException("Superseded GROUP inventory changed captured CURRENT image identity");
+                byte[] completion=db.get(state,topologyOwnershipKey(0x73));if(completion!=null)NativeCurrentRangeRecovery.requireCompletion(registration,completion,topologyRecoveryCut());
+                var qualified=qualifyCurrentRangeRecoveryImage(image,limits,null,false,registration,completion,true);var actual=qualified.manifest();
+                boolean initial=actual.position().equals(captured.registeredImageCut()) && Arrays.equals(actual.sha256(),captured.registeredImageHash());
+                if(!initial) {
+                    byte[] receipt=db.get(state,topologyOwnershipKey(0x74));byte[] expected=ByteBuffer.allocate(48).putLong(registration.imageCut().term()).putLong(registration.imageCut().index()).put(registration.imageHash()).array();
+                    if(completion==null || !Arrays.equals(receipt,expected) || !Arrays.equals(receipt,captured.localImageReceipt()))throw new IOException("Superseded own GROUP floor lacks captured local completion/image receipt");
+                    var pending=captured.pendingIntent();var p=snapshotInstallationCut(pending);var ceiling=p==null?captured.marker():p;
+                    if(ceiling==null || !NativeMetadataRecoveryRegistration.covers(ceiling,actual.position()) || p!=null && p.index()==actual.position().index() && !Arrays.equals(pending,ByteBuffer.allocate(48).putLong(actual.position().term()).putLong(actual.position().index()).put(actual.sha256()).array()))throw new IOException("Superseded own GROUP floor exceeds captured marker/pending image identity");
+                }
+                var cfg=captured.configuration();var candidate=qualified.configuration();
+                if(cfg!=null && cfg.index()==candidate.index() && (cfg.term()!=candidate.term() || !Arrays.equals(cfg.digest(),RangeImportAdmission.sha256(candidate.data()))))throw new IOException("Superseded GROUP floor changed captured configuration identity");
+                return actual;
+            }catch(IllegalArgumentException invalid){throw new IOException("Invalid superseded GROUP inventory authority",invalid);}
+            finally{applyLane.unlock();}
+        }finally{leaveNative();}
+    }
     /** Reference CFG of the exact durable interrupted CURRENT image, without completing or installing it. */
     public Configuration validatePendingCurrentRangeRecoveryConfiguration(Path image,NativeRangeImage.Limits limits)throws IOException,RocksDBException {
         enterNative();
@@ -4299,7 +4327,7 @@ public final class ReplicatedRangeStore {
                 if(adoption[0]==null || adoption[1]==null || adoption[2]==null)throw new IOException("GROUP checkpoint lacks CURRENT adoption evidence");
                 var previous=NativeCurrentRangeRecovery.decode(adoption[0]);registration.requireTransitionOf(previous);
                 NativeCurrentRangeRecovery.requireCompletion(previous,adoption[1],actual.position());
-                return qualifyCurrentRangeRecoveryImage(image,limits,actual,false,previous,adoption[1]).manifest();
+                return qualifyCurrentRangeRecoveryImage(image,limits,actual,false,previous,adoption[1],false).manifest();
             }catch(IllegalArgumentException invalid){throw new IOException("Invalid META GROUP inventory authority",invalid);}
             finally{applyLane.unlock();}
         }finally{leaveNative();}
@@ -4314,11 +4342,11 @@ public final class ReplicatedRangeStore {
             // Read this before scanning the candidate. The importer never writes this receiver-local receipt.
             byte[] trustedCompletion=db.get(state,topologyOwnershipKey(0x73));
             if(trustedCompletion!=null)NativeCurrentRangeRecovery.requireCompletion(registration,trustedCompletion,topologyRecoveryCut());
-            return qualifyCurrentRangeRecoveryImage(image,limits,expected,installing,registration,trustedCompletion);
+            return qualifyCurrentRangeRecoveryImage(image,limits,expected,installing,registration,trustedCompletion,false);
         }catch(IllegalArgumentException invalid){throw new IOException("Invalid CURRENT recovery image authority",invalid);}
     }
     private CurrentImageQualification qualifyCurrentRangeRecoveryImage(Path image,NativeRangeImage.Limits limits,
-            NativeRangeImage.Manifest expected,boolean installing,NativeCurrentRangeRecovery registration,byte[] trustedCompletion)throws IOException,RocksDBException {
+            NativeRangeImage.Manifest expected,boolean installing,NativeCurrentRangeRecovery registration,byte[] trustedCompletion,boolean inventoryOnly)throws IOException,RocksDBException {
         try {
         var rows=new HashMap<String,byte[]>();long[] rowBytes={0};
         byte[][] adoption=new byte[3][];Configuration[] configuration={null};
@@ -4332,9 +4360,12 @@ public final class ReplicatedRangeStore {
             }
         });
         if(expected!=null && !Arrays.equals(expected.sha256(),actual.sha256()))throw new IOException("CURRENT image changed during qualification");
-        boolean currentSchema=actual.owner().equals(owner) && actual.interval().equals(interval)
-                && Arrays.equals(actual.schemaDigest(),schemaDigest) && actual.deterministicMergeColumns().equals(deterministicMergeColumns);
-        if(!currentSchema && (installing || !qualifiedHistoricalImage(actual)))throw new IOException("CURRENT image differs from retained native schema/coverage");
+        if(inventoryOnly)validateCurrentInventorySchema(actual,registration,rows);
+        else {
+            boolean currentSchema=actual.owner().equals(owner) && actual.interval().equals(interval)
+                    && Arrays.equals(actual.schemaDigest(),schemaDigest) && actual.deterministicMergeColumns().equals(deterministicMergeColumns);
+            if(!currentSchema && (installing || !qualifiedHistoricalImage(actual)))throw new IOException("CURRENT image differs from retained native schema/coverage");
+        }
         var cfg=configuration[0];
         if(cfg==null || cfg.index()>actual.position().index() || cfg.term()>actual.position().term()
                 || cfg.index()==actual.position().index() && cfg.term()!=actual.position().term())throw new IOException("CURRENT image configuration exceeds its cut");
@@ -4382,6 +4413,23 @@ public final class ReplicatedRangeStore {
         }
         return new CurrentImageQualification(actual,activation,localRows,trustedCompletion,cfg);
         } catch(IllegalArgumentException invalid){throw new IOException("Invalid CURRENT recovery image authority",invalid);}
+    }
+    /** Computes schema-at-S from bounded immutable rows, independently of detached live handles/caches. */
+    private void validateCurrentInventorySchema(NativeRangeImage.Manifest image,NativeCurrentRangeRecovery registration,Map<String,byte[]> rows) {
+        NativeSchemaInstallation current=null;NativeSchemaActivationProof activation=null;NativeSchemaFence pending=null;
+        var history=new ArrayList<NativeSchemaInstallation>();var activations=new HashMap<UUID,NativeSchemaActivationProof>();
+        for(var row:rows.entrySet()) {
+            byte[] key=HexFormat.of().parseHex(row.getKey());int tag=key[16]&255;
+            if(tag==0x27 && key.length==17)pending=NativeSchemaFence.decode(row.getValue());
+            else if(tag==0x28 && key.length==17)current=NativeSchemaInstallation.decode(row.getValue());
+            else if(tag==0x2c && key.length==17)activation=NativeSchemaActivationProof.decode(row.getValue());
+            else if(tag==0x2a && key.length==33){var record=NativeSchemaInstallation.decode(row.getValue());record.requireRange(groupId,rangeEpoch,interval.domainId(),interval.lowerInclusive(),interval.upperExclusive());if(history.size()>=64 || !Arrays.equals(key,schemaHistoryKey(record.definition().changeId())))throw new IllegalArgumentException("Invalid inventory schema INSTALL identity/count");history.add(record);}
+            else if(tag==0x2b && key.length==33){var proof=NativeSchemaActivationProof.decode(row.getValue());var change=proof.installation().fence().changeId();if(activations.size()>=64 || !Arrays.equals(key,schemaChangeKey(tag,change)) || activations.put(change,proof)!=null)throw new IllegalArgumentException("Invalid inventory schema ACTIVATE identity/count");}
+            else throw new IllegalArgumentException("Invalid inventory schema row identity");
+        }
+        NativeSchemaInstallation.validateLifecycle(current,history,activation,activations,pending,image.position());
+        var schema=current==null?registration.schema():current.definition().targetSchema();var merges=current==null?registration.mergeColumns():current.targetMerges();var range=registration.range();
+        if(!image.owner().equals(owner) || !schema.clusterId().equals(registration.schema().clusterId()) || !schema.databaseId().equals(registration.schema().databaseId()) || !image.interval().domainId().equals(schema.domainId()) || !image.interval().columns().equals(schema.columnIds()) || !Arrays.equals(image.interval().lowerInclusive(),range.lowerInclusive()) || !Arrays.equals(image.interval().upperExclusive(),range.upperExclusive()) || !Arrays.equals(image.schemaDigest(),schema.digest()) || !image.deterministicMergeColumns().equals(merges))throw new IllegalArgumentException("Superseded GROUP floor differs from its schema-at-cut/geometry");
     }
     private static boolean sameSchemaRows(Map<String,byte[]> first,Map<String,byte[]> second) {
         if(!first.keySet().equals(second.keySet()))return false;
