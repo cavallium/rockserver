@@ -5477,7 +5477,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
                 return query(request);
             }
-            if(kind==RatisTopologySourceSnapshotRpc.RELEASE || kind==RatisRecoveryImageRpc.KIND || ScopedTransactionRpc.schemaReplica(kind) || kind==ScopedTransactionRpc.TOPOLOGY_OWNER || kind==ScopedTransactionRpc.TOPOLOGY_SEED || kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner-local requests have no requested index override");return query(request);}
+            if(kind==RatisRecoveryObsoleteRpc.KIND || kind==RatisTopologySourceSnapshotRpc.RELEASE || kind==RatisRecoveryImageRpc.KIND || ScopedTransactionRpc.schemaReplica(kind) || kind==ScopedTransactionRpc.TOPOLOGY_OWNER || kind==ScopedTransactionRpc.TOPOLOGY_SEED || kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner-local requests have no requested index override");return query(request);}
             if (kind>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
             synchronized (gate) {
                 requireHealthy();
@@ -5664,6 +5664,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     return Message.valueOf(ByteString.copyFrom(RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(query,read.position(),directory,roster))));
                 });
             }
+            if(kind==RatisRecoveryObsoleteRpc.KIND) {
+                requireDataRole();if(sourceSnapshots==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Obsolete source dispatcher unavailable");
+                var obsolete=RatisRecoveryObsoleteRpc.decode(encoded);if(!obsolete.original().sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Obsolete source request crossed group");
+                return sourceSnapshots.obsolete(obsolete).thenApply(reply->Message.valueOf(ByteString.copyFrom(reply)));
+            }
             if(RatisTopologySourceSnapshotRpc.kind(kind)){
                 requireDataRole();if((kind!=RatisTopologySourceSnapshotRpc.RELEASE && !freshBarrier) || sourceSnapshots==null || topologyImageQueries==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Source snapshot dispatcher unavailable");var sourceRequest=RatisTopologySourceSnapshotRpc.request(encoded);if(!sourceRequest.sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Source snapshot crossed group");
                 if(kind==RatisTopologySourceSnapshotRpc.PREPARE)return sourceSnapshots.prepareAsync(sourceRequest).handle((prepared,failed)->{
@@ -5799,6 +5804,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private RatisNodeResourceBudget.Lease readConstructionLease(int kind,ByteBuffer request) throws IOException {
         long responseBytes;
         switch (kind) {
+            case RatisRecoveryObsoleteRpc.KIND -> {return reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,4096L+16L*request.remaining()+4L*RatisRecoveryObsoleteRpc.MAX_REPLY_BYTES,1);}
             case RatisRecoveryImageRpc.KIND -> {return reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,256L+4L*request.remaining()+4L*RatisRecoveryImageRpc.MAX_REPLY_BYTES,1);}
             case ScopedTransactionRpc.POINT, ScopedTransactionRpc.GET, ScopedTransactionRpc.SNAPSHOT_GET ->
                     responseBytes=4L*DistributedCommandCodec.MAX_ENCODED_BYTES;

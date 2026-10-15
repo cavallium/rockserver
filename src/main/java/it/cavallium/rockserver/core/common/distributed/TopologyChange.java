@@ -131,9 +131,9 @@ public final class TopologyChange {
         public List<Participant> targets() { return targets; }
         public Participant participant(Stage stage,UUID group) { return (stage==Stage.FREEZE ? parents : targets).stream().filter(p->p.groupId().equals(group)).findFirst().orElseThrow(()->new IllegalArgumentException("Unknown topology stage participant")); }
         public void requireDefinition(Definition definition) { if(!Arrays.equals(encode(),definition.header().encode())) throw new IllegalArgumentException("Topology header differs from immutable definition"); }
+        public int encodedSize() {int size=229;for(var p:parents)size+=52+49*p.owners().size();for(var p:targets)size+=52+49*p.owners().size();if(size>MAX_HEADER_BYTES)throw new IllegalArgumentException("Topology header exceeds bound");return size;}
         public byte[] encode() {
-            int size=229; for(var p:parents) size+=52+49*p.owners().size(); for(var p:targets) size+=52+49*p.owners().size(); if(size>MAX_HEADER_BYTES) throw new IllegalArgumentException("Topology header exceeds bound");
-            var out=ByteBuffer.allocate(size).putInt(HEADER_MAGIC); uuid(out,intent); uuid(out,cluster); uuid(out,database); uuid(out,domain); out.put((byte)kind.ordinal()).putLong(schemaEpoch).putLong(sourceGeneration).putLong(targetGeneration).put(schemaDigest).put(definitionDigest).put(sourceDigest).put(targetDigest); participants(out,parents); participants(out,targets); return out.array();
+            var out=ByteBuffer.allocate(encodedSize()).putInt(HEADER_MAGIC); uuid(out,intent); uuid(out,cluster); uuid(out,database); uuid(out,domain); out.put((byte)kind.ordinal()).putLong(schemaEpoch).putLong(sourceGeneration).putLong(targetGeneration).put(schemaDigest).put(definitionDigest).put(sourceDigest).put(targetDigest); participants(out,parents); participants(out,targets); return out.array();
         }
         public static Header decode(byte[] bytes) {
             var in=input(bytes,MAX_HEADER_BYTES,229,HEADER_MAGIC); UUID intent=uuid(in),cluster=uuid(in),database=uuid(in),domain=uuid(in); var kind=tag(Kind.values(),in.get()); long epoch=in.getLong(),source=in.getLong(),target=in.getLong();

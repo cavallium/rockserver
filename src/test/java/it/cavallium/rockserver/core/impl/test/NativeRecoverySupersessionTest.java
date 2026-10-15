@@ -54,7 +54,7 @@ class NativeRecoverySupersessionTest {
     }
     @Test void canonicalRoundTripIsBoundedDefensiveAndRetainsIndependentFacts(){
         var scope=scope();var value=new NativeRecoverySupersession(scope,captured());
-        assertEquals(scope,NativeRecoverySupersession.Scope.decode(scope.encode()));
+        assertEquals(scope.encode().length,scope.encodedSize());assertEquals(scope.header().encode().length,scope.header().encodedSize());assertEquals(scope,NativeRecoverySupersession.Scope.decode(scope.encode()));
         assertEquals(value,NativeRecoverySupersession.decode(value.encode()));
         assertEquals(value.encodedSize(),value.encode().length);assertTrue(value.encodedSize()<=NativeRecoverySupersession.MAX_BYTES);
         assertArrayEquals(RangeImportAdmission.sha256(value.encode()),value.digest());

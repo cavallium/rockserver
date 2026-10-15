@@ -28,6 +28,13 @@ public final class RatisTopologySourceSnapshotClient {
         if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !client.getGroupId().equals(reply.getRaftGroupId()) || !peer.equals(reply.getServerId()) || reply.getMessage().getContent().size()>MAX_REQUEST_BYTES)throw new IOException("Source release did not acknowledge exact request at its original owner",reply==null?null:reply.getException());
         admission.beforeReply(reply.getMessage().getContent().size());if(!Arrays.equals(input,reply.getMessage().getContent().toByteArray()))throw new IOException("Source release changed exact request acknowledgement");
     }
+    public void obsolete(RatisRecoveryObsoleteRpc.Request request,it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor sourceOwner)throws IOException {
+        var original=request.original();if(!original.sourceOwner(sourceOwner) || !client.getGroupId().equals(RaftGroupId.valueOf(original.sourceGroup())))throw new IOException("Obsolete source owner/group differs from immutable CURRENT capture");
+        var peer=RaftPeerId.valueOf(sourceOwner.peerId());byte[] input=RatisRecoveryObsoleteRpc.request(request);
+        var reply=RatisRoutedClient.rpc(()->client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(input)),0,peer));
+        if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !client.getGroupId().equals(reply.getRaftGroupId()) || !peer.equals(reply.getServerId()) || reply.getMessage().getContent().size()!=RatisRecoveryObsoleteRpc.MAX_REPLY_BYTES)throw new IOException("Obsolete source did not acknowledge exact request at original owner",reply==null?null:reply.getException());
+        admission.beforeReply(reply.getMessage().getContent().size());try{RatisRecoveryObsoleteRpc.reply(reply.getMessage().getContent().toByteArray(),request);}catch(IllegalArgumentException invalid){throw new IOException("Malformed obsolete source acknowledgement",invalid);}
+    }
     public RatisRecoveryImageRpc.Evidence imageInstalled(RatisRecoveryImageRpc.Request request)throws IOException {
         if(!client.getGroupId().equals(RaftGroupId.valueOf(request.source().sourceGroup())))throw new IOException("Image probe client belongs to another group");
         var receiver=RaftPeerId.valueOf(request.source().receiver().peerId());

@@ -104,7 +104,7 @@ public final class RatisTopologySourceSnapshotRpc {
     }
     private static long headerBytes(TopologyChange.Header header){long size=229;for(var participant:header.parents())size+=52L+49L*participant.owners().size();for(var participant:header.targets())size+=52L+49L*participant.owners().size();return size;}
     /** The directory/header in this request is already fixed; reserve only its actual bytes. */
-    static int maximumPreparedBytes(Request request){return Math.addExact(MAX_REPLY_BYTES-MAX_REQUEST_BYTES-(request.metadataOnly()?0:NativeTopologyFreeze.MAX_BYTES),encodedRequestBytes(request));}
+    static int maximumPreparedBytes(Request request){return Math.addExact(MAX_REPLY_BYTES-MAX_REQUEST_BYTES-(request.metadataOnly()?NativeTopologyImageOrigin.MAX_BYTES:NativeTopologyFreeze.MAX_BYTES),encodedRequestBytes(request));}
     static int maximumPublicationBytes(Request request){return Math.addExact(encodedRequestBytes(request),MAX_OWNER_BYTES+181+(request.metadataOnly()?NativeTopologyFreeze.MAX_BYTES:0));}
     public static byte[] reply(int kind,Abandoned abandoned){if(kind!=PREPARE && kind!=TRANSFER)throw new IllegalArgumentException("Expected source publication reply");return ScopedTransactionRpc.frame(kind,bytes(out->{out.writeByte(2);blob(out,body(abandoned.original()));uuid(out,abandoned.successorId());out.writeLong(abandoned.cut().term());out.writeLong(abandoned.cut().index());blob(out,owner(abandoned.sourceOwner()));out.write(abandoned.configurationDigest());},MAX_REPLY_BYTES));}
     public static byte[] request(int kind,Request request){if(!kind(kind))throw new IllegalArgumentException("Unknown source snapshot action");return ScopedTransactionRpc.frame(kind,body(request));}

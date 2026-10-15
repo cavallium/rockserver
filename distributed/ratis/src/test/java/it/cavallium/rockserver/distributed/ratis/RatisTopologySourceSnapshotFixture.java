@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.*;
 final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSnapshotService.Host,AutoCloseable {
     final it.cavallium.rockserver.core.impl.RWScheduler scheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(4,1,1,16,16,"source-snapshot-fixture");
     final RatisNodeResourceBudget graph=new RatisNodeResourceBudget(new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(256L<<20,16),new RatisNodeResourceBudget.Lane(256L<<20,16)),Map.of(new UUID(0,100),new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(256L<<20,16),new RatisNodeResourceBudget.Lane(256L<<20,16))));
-    RatisTopologySourceSnapshotService.ResourceAdmission transferAdmission(){return (request,bytes)->{var lease=graph.reserve(new UUID(0,100),RatisNodeResourceBudget.Kind.ORDINARY,bytes,1);return lease::close;};}
+    RatisTopologySourceSnapshotService.ResourceAdmission transferAdmission(){return (request,bytes,control)->{var lease=graph.reserve(new UUID(0,100),control?RatisNodeResourceBudget.Kind.PROTECTED:RatisNodeResourceBudget.Kind.ORDINARY,bytes,1);return lease::close;};}
     static UUID id(int n){return new UUID(0,n);}
     final UUID group=id(4),column=id(5);
     final ReplicaDescriptor donor=new ReplicaDescriptor(id(10),id(11),id(12),"donor","127.0.0.1:7001",ReplicaDescriptor.Role.VOTER);

@@ -126,7 +126,7 @@ class RatisTopologySourceColdQuotaTest {
                 assertThrows(java.util.concurrent.ExecutionException.class,()->owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.fresh));
                 assertEquals(managed,files(owner.machine.sourceSnapshotDirectory()),"Cold quota rejection precedes writing a new native image");assertEquals(originalImages,f.imageFiles());assertEquals(cut,owner.store.applied());assertEquals(0,owner.store.activeSnapshotPins());
                 Path artifacts=f.env.nodeRoot.resolve("topology-source-artifacts").resolve(f.env.plan.poolId(f.parent.groupId()).toString());assertTrue(files(artifacts).stream().noneMatch(name->name.startsWith(f.fresh.transferId().toString())));
-                assertArrayEquals(original,owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request));assertEquals(originalImages,f.imageFiles());assertEquals(1,owner.store.activeSnapshotPins());
+                assertArrayEquals(original,owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request));assertEquals(originalImages,f.imageFiles());assertEquals(0,owner.store.activeSnapshotPins(),"Cold replay owns immutable files, without a new native snapshot");
             }
         }
     }
@@ -198,7 +198,7 @@ class RatisTopologySourceColdQuotaTest {
                 owner.machine.notifyTermIndexUpdated(1,owner.store.applied().index()+1);
                 assertArrayEquals(abandonedReply,owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request));
                 assertArrayEquals(successorReply,owner.action(RatisTopologySourceSnapshotRpc.PREPARE,successor),"B retains its own fixed READY cut across a later cold prefix");
-                assertEquals(2,f.imageFiles().size());assertEquals(1,owner.store.activeSnapshotPins());
+                assertEquals(2,f.imageFiles().size());assertEquals(0,owner.store.activeSnapshotPins(),"Cold successor replay retains its exact immutable image");
             }
         }
     }

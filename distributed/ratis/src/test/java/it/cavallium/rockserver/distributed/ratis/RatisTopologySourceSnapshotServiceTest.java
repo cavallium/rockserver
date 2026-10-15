@@ -22,7 +22,7 @@ class RatisTopologySourceSnapshotServiceTest {
                 if(method.getName().equals("chunkReady") && args[0].equals(bootstrap)){denied.countDown();return allow.get();}
                 try{return method.invoke(fixture,args);}catch(java.lang.reflect.InvocationTargetException failed){throw failed.getCause();}
             });
-            RatisTopologySourceSnapshotService.ResourceAdmission admission=(request,bytes)->request.purpose()==Purpose.RECOVERY?controller.reserveRecovery(new java.util.UUID(0,100),bytes):fixture.transferAdmission().reserve(request,bytes);
+            RatisTopologySourceSnapshotService.ResourceAdmission admission=(request,bytes,control)->control?fixture.transferAdmission().reserve(request,bytes,true):request.purpose()==Purpose.RECOVERY?controller.reserveRecovery(new java.util.UUID(0,100),bytes):fixture.transferAdmission().reserve(request,bytes,false);
             try(var service=new RatisTopologySourceSnapshotService(host,limits(),scheduler,admission)){
                 var waiting=service.prepareAsync(bootstrap);assertTrue(denied.await(5,TimeUnit.SECONDS));
                 try(var saturated=fixture.graph.reserve(new java.util.UUID(0,100),RatisNodeResourceBudget.Kind.ORDINARY,(256L<<20)-fixture.graph.stats().ordinary().bytes(),1)){
