@@ -193,9 +193,9 @@ class StateMachineUpdater implements Runnable {
     CompletableFuture<Void> applyLogFutures = CompletableFuture.completedFuture(null);
     for(; state != State.STOP; ) {
       try {
-        if (committedAdmission != null && stopIndex.get() != null) { stop(); break; }
+        if (stopIndex.get() != null && (committedAdmission != null || !server.isInitialImageReady())) { stop(); break; }
         waitForCommit(applyLogFutures);
-        if (committedAdmission != null && stopIndex.get() != null) { stop(); break; }
+        if (stopIndex.get() != null && (committedAdmission != null || !server.isInitialImageReady())) { stop(); break; }
 
         if (state == State.RELOAD) {
           reload();
@@ -227,11 +227,13 @@ class StateMachineUpdater implements Runnable {
     // It will be updated only after the leader contacts other peers.
     // Thus it is possible to have applied > committed initially.
     final long applied = getLastAppliedIndex();
-    for(; applied >= raftLog.getLastCommittedIndex() && state == State.RUNNING && !shouldStop(); ) {
-      if (server.getSnapshotRequestHandler().shouldTriggerTakingSnapshot()) {
+    for(; (applied >= raftLog.getLastCommittedIndex() || !server.isInitialImageReady())
+        && state == State.RUNNING && !shouldStop() && stopIndex.get() == null; ) {
+      if (server.isInitialImageReady() && server.getSnapshotRequestHandler().shouldTriggerTakingSnapshot()) {
         takeSnapshot(applyLogFutures);
       }
-      if (awaitForSignal.await(100, TimeUnit.MILLISECONDS)) {
+      if (awaitForSignal.await(100, TimeUnit.MILLISECONDS)
+          && (state != State.RUNNING || server.isInitialImageReady())) {
         return;
       }
     }
@@ -307,7 +309,8 @@ class StateMachineUpdater implements Runnable {
 
   private CompletableFuture<Void> applyLog(CompletableFuture<Void> applyLogFutures) throws RaftLogIOException {
     final long committed = raftLog.getLastCommittedIndex();
-    for(long applied; (applied = getLastAppliedIndex()) < committed && state == State.RUNNING && !shouldStop(); ) {
+    for(long applied; (applied = getLastAppliedIndex()) < committed && state == State.RUNNING
+        && server.isInitialImageReady() && !shouldStop(); ) {
       final long nextIndex = applied + 1;
       LogEntryProto next;
       CommittedApplyStateMachine.ApplyPermit permit = null;

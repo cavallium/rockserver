@@ -344,9 +344,11 @@ class SegmentedRaftLogWorker {
    */
   void syncWithSnapshot(long lastSnapshotIndex) {
     Task abandoned; while((abandoned=queue.poll())!=null) { if(abandoned==WAKE_UP_TASK)continue; abandoned.failed(new IOException("Raft IO task superseded by snapshot")); abandoned.returned(); }
-    lastWrittenIndex = lastSnapshotIndex;
-    flushIndex.setUnconditionally(lastSnapshotIndex, infoIndexChange);
-    safeCacheEvictIndex.setUnconditionally(lastSnapshotIndex, infoIndexChange);
+    // An initial native image may cover only a prefix of an already durable committed tail.
+    // Preserve the proven flush floor; a commit index alone is not durability evidence.
+    lastWrittenIndex = Math.max(lastSnapshotIndex, flushIndex.get());
+    flushIndex.setUnconditionally(lastWrittenIndex, infoIndexChange);
+    safeCacheEvictIndex.setUnconditionally(Math.max(lastSnapshotIndex, safeCacheEvictIndex.get()), infoIndexChange);
     pendingFlushNum = 0;
   }
 
