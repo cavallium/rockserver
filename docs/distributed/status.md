@@ -77,6 +77,14 @@ This section and the remaining gates at the end describe the current branch.
   recovery discovery. Public cross-domain transaction orchestration is still an
   explicit implementation gate; native authority support does not establish that
   frontend capability or production performance.
+- Unqualified common physical CF estimates, table/SST metadata and maintenance now
+  return typed NOT_IMPLEMENTED before generation lookup in both connection and
+  adapter dispatch. Physical observations and maintenance retain the qualified
+  ReplicaPhysicalAPI route; logical counts are not fabricated from shared CF or
+  replica totals. `qualified-physical-dispatch82.log` passes four direct/local and
+  actual gRPC/Thrift client cases with no DATA dispatch, capture or grant issuance;
+  existing unqualified Thrift SST methods refuse in the client. Ordinary reads
+  remain usable after refusal. Standalone physical contracts are unchanged.
 - Three independent Runtime JVMs now pass a complete production-loopback gRPC
   workflow with real native pools and retained Raft roots: original genesis and
   grant binding, writes, three unfinished CURRENT source preparations, actual

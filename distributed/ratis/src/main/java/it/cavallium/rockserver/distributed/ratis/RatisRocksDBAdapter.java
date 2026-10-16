@@ -141,8 +141,18 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         };
     }
     public synchronized Stats stats() { return new Stats(entries.size(),(int)entries.values().stream().filter(entry -> entry.acquiring).count()); }
+    static void rejectUnqualifiedPhysical(RocksDBAPICommand<?,?,?> request) {
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.EstimateNumKeys
+                || request instanceof RocksDBAPICommand.GetTableProperties
+                || request instanceof RocksDBAPICommand.GetSstMetadata
+                || request instanceof RocksDBAPICommand.Flush
+                || request instanceof RocksDBAPICommand.Compact
+                || request instanceof RocksDBAPICommand.CompactFiles)
+            throw RocksDBException.of(NOT_IMPLEMENTED,"Physical RocksDB statistics and maintenance require a qualified ReplicaPhysicalAPI replica/pool target");
+    }
     private CompletableFuture<?> dispatch(RocksDBAPICommand<?,?,?> request,Deadline deadline) throws Exception {
         synchronized (this) { if (closing) throw new IOException("Adapter closing"); }
+        rejectUnqualifiedPhysical(request);
         if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange || request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch || request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch)throw explicitMutationRequired();
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.OpenTransaction open) return open(open.scope(),open.transactionLeaseTtl(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction close) return close(close.transactionId(),close.commit(),deadline);

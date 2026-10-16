@@ -263,6 +263,8 @@ Live atomic SST ingestion needs a crash-recoverable publication boundary with th
 
 `*_NO_WAL` modes cannot request acknowledged nondurable distributed data; reject them explicitly in distributed mode. `SST_INGEST_BEHIND` and merge-ingest-behind have no implicit distributed translation. Physical compaction remains local replica maintenance with local tokens; it never determines logical transaction order.
 
+Unqualified common `estimateNumKeys`, table properties, SST metadata, flush, compact and compact-files requests return `NOT_IMPLEMENTED` in distributed mode before generation lookup. Their standalone contracts describe physical CF buckets/files or local maintenance, so replica/range summation cannot substitute logical counts. Use the qualified `ReplicaPhysicalAPI` with explicit node/incarnation/process/pool/session/CF identity for physical observations and maintenance. Logical counts use the declared snapshot and range-count operation. Standalone physical operations retain their existing contracts.
+
 ### CDC
 
 Distributed CDC is derived from committed canonical commands/finalized effects, not the local RocksDB WAL. A cursor is `(range lineage, log index, mutation ordinal)`; a subscription covering several ranges has a vector/checkpoint map. There is per-range order and explicit transaction ID/decision metadata, not an invented global scalar order. Consumers needing transaction-atomic output buffer a bounded transaction envelope or use a committed-transaction subscription. Normal CDC never emits prepared-but-aborted plans.
