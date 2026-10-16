@@ -10,7 +10,8 @@ package it.cavallium.rockserver.core.common.api;
 public enum ThriftMutationKind implements org.apache.thrift.TEnum {
   POINT(0),
   RANGE(1),
-  BULK(2);
+  BULK(2),
+  ATOMIC(3);
 
   private final int value;
 
@@ -39,6 +40,8 @@ public enum ThriftMutationKind implements org.apache.thrift.TEnum {
         return RANGE;
       case 2:
         return BULK;
+      case 3:
+        return ATOMIC;
       default:
         return null;
     }

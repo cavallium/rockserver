@@ -17,7 +17,7 @@ class RatisRemoteMutationApiTest {
     final RatisRocksDBConnection connection=mock(RatisRocksDBConnection.class);
     final RWScheduler scheduler=mock(RWScheduler.class);
     final RatisRemoteMutationApi api=new RatisRemoteMutationApi(connection,scheduler);
-    final RemoteMutationToken token=new RemoteMutationToken(new UUID(1,1),new UUID(2,2),new UUID(3,3),new UUID(4,4),new UUID(5,5),1,0,RemoteMutationToken.Kind.POINT,new byte[32],new byte[32],new byte[32]);
+    final RemoteMutationToken token=new RemoteMutationToken(new UUID(1,1),new UUID(2,2),new UUID(4,4),new UUID(5,5),1,0,RemoteMutationToken.Kind.POINT,List.of(new DomainBinding(new UUID(3,3),0,new byte[32],0,new byte[32])),new byte[32]);
     RemoteMutationStatus terminal(CommandResult.Status outcome,int count){return new RemoteMutationStatus(token,RemoteMutationStatus.State.TERMINAL,1,0,count,outcome,new byte[32]);}
     void unlimited(){when(scheduler.resolveMonotonicDeadline(any())).thenReturn(Long.MAX_VALUE);}
     @Test void cancellationForwardsToCurrentObserverWithoutStartingStatusOrAcknowledging() {
@@ -39,7 +39,7 @@ class RatisRemoteMutationApiTest {
         var page=api.results(token,0,1,1024,RequestContext.batch()).get();assertSame(status,page.status());assertEquals(0,page.offset());assertEquals(1,page.nextOffset());assertTrue(page.hasMore());var saved=page.rows().getFirst();row[0]^=1;assertArrayEquals(saved,page.rows().getFirst());var exposed=page.rows().getFirst();exposed[0]^=1;assertArrayEquals(saved,page.rows().getFirst());
     }
     @Test void prepareEntersConnectionAdmissionSynchronouslyWithBorrowedLogicalInput() throws Exception {
-        var keys=List.of(new Keys(Buf.wrap(new byte[]{2})));var values=List.of(Buf.wrap(new byte[]{9}));var expected=new RemoteMutationOwner(token.clusterId(),token.databaseId(),token.domainId(),token.ownerId(),token.ownerEpoch(),0,token.kind(),token.schemaDigest(),token.directoryDigest());
+        var keys=List.of(new Keys(Buf.wrap(new byte[]{2})));var values=List.of(Buf.wrap(new byte[]{9}));var expected=new RemoteMutationOwner(token.clusterId(),token.databaseId(),token.ownerId(),token.ownerEpoch(),0,token.kind(),token.domains());
         when(connection.preparePointMutation(eq(expected),eq(token.requestId()),eq(0L),eq(71L),same(keys),same(values),eq(RatisRocksDBDirect.WriteKind.PUT),eq(RequestType.RequestTypeId.NOTHING),eq(false),any())).thenReturn(CompletableFuture.completedFuture(token));
         assertSame(token,api.preparePoint(expected,token.requestId(),0,71,keys,values,Mutation.Kind.PUT,RequestType.RequestTypeId.NOTHING,false,RequestContext.batch()).get());
     }

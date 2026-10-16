@@ -9,7 +9,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class RatisRequestBudgetTest {
     @TempDir Path root;
     @Test void kindsShareRequestAndRamCapsAndDynamicTransferDoesNotCreateCredit()throws Exception {
-        var limits=new RemoteMutationOwnerLimits(1,1,1,1,1,64L<<20,16L<<20,8,16L<<20,8L<<20,1);
+        var limits=new RemoteMutationOwnerLimits(1,1,1,1,0,1,64L<<20,16L<<20,8,16L<<20,8L<<20,1);
         try(var budget=new RatisRequestBudget(limits);var point=budget.owner(RemoteMutationToken.Kind.POINT,0,0);var bulk=budget.owner(RemoteMutationToken.Kind.BULK,0,0);var range=budget.owner(RemoteMutationToken.Kind.RANGE,0,0)){
             assertThrows(RuntimeException.class,()->budget.owner(RemoteMutationToken.Kind.BULK,0,0));assertThrows(IllegalStateException.class,()->range.opened(1,false));range.opened(0,false);point.opened(0,false);bulk.opened(0,false);
             try(var request=budget.request(RemoteMutationToken.Kind.BULK,1024);var work=budget.work(2048)){
@@ -44,7 +44,7 @@ class RatisRequestBudgetTest {
         }
     }
     @Test void diskAndPathBoundsRejectBeforeReplacementOrRegistryGrowth()throws Exception {
-        var limits=new RemoteMutationOwnerLimits(1,1,1,1,2,64L<<20,16L<<20,1,16L<<20,8L<<20,1);
+        var limits=new RemoteMutationOwnerLimits(1,1,1,1,0,2,64L<<20,16L<<20,1,16L<<20,8L<<20,1);
         try(var budget=new RatisRequestBudget(limits)){
             var file=root.resolve("owned");Files.write(file,new byte[1024]);try(var disk=budget.disk(file,16<<20)){assertThrows(RuntimeException.class,()->disk.prepareReplacement(16L<<20));assertEquals(1024,budget.chargedDiskBytes());assertEquals(1024,Files.size(file));assertFalse(Files.exists(root.resolve("owned.pending")));}
             long memory=budget.chargedBytes();assertThrows(RuntimeException.class,()->budget.disk(root.resolve("another"),1024));assertEquals(memory,budget.chargedBytes());

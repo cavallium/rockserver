@@ -11,6 +11,10 @@ public class RocksDBRemoteMutations {
 
   public interface Iface {
 
+    public java.util.List<ThriftMutationOwner> atomicOwners(java.util.List<java.lang.Long> columns, it.cavallium.rockserver.core.common.api.RequestContext context) throws it.cavallium.rockserver.core.common.api.RocksDBThriftException, org.apache.thrift.TException;
+
+    public java.nio.ByteBuffer prepareAtomic(ThriftMutationOwner owner, java.nio.ByteBuffer requestId, long requestSequence, java.util.List<ThriftAtomicMutation> mutations, java.util.List<ThriftAtomicPredicate> predicates, long ttlMillis, it.cavallium.rockserver.core.common.api.RequestContext context) throws it.cavallium.rockserver.core.common.api.RocksDBThriftException, org.apache.thrift.TException;
+
     public java.util.List<ThriftMutationOwner> owners(long column, it.cavallium.rockserver.core.common.api.RequestContext context) throws it.cavallium.rockserver.core.common.api.RocksDBThriftException, org.apache.thrift.TException;
 
     public java.nio.ByteBuffer preparePoint(ThriftMutationOwner owner, java.nio.ByteBuffer requestId, long requestSequence, long column, java.util.List<ThriftMutationEntry> entries, boolean valuesPresent, ThriftPointMutationKind kind, ThriftMutationCallback callback, boolean multi, it.cavallium.rockserver.core.common.api.RequestContext context) throws it.cavallium.rockserver.core.common.api.RocksDBThriftException, org.apache.thrift.TException;
@@ -36,6 +40,10 @@ public class RocksDBRemoteMutations {
   }
 
   public interface AsyncIface {
+
+    public void atomicOwners(java.util.List<java.lang.Long> columns, it.cavallium.rockserver.core.common.api.RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<ThriftMutationOwner>> resultHandler) throws org.apache.thrift.TException;
+
+    public void prepareAtomic(ThriftMutationOwner owner, java.nio.ByteBuffer requestId, long requestSequence, java.util.List<ThriftAtomicMutation> mutations, java.util.List<ThriftAtomicPredicate> predicates, long ttlMillis, it.cavallium.rockserver.core.common.api.RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.nio.ByteBuffer> resultHandler) throws org.apache.thrift.TException;
 
     public void owners(long column, it.cavallium.rockserver.core.common.api.RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<ThriftMutationOwner>> resultHandler) throws org.apache.thrift.TException;
 
@@ -81,6 +89,67 @@ public class RocksDBRemoteMutations {
 
     public Client(org.apache.thrift.protocol.TProtocol iprot, org.apache.thrift.protocol.TProtocol oprot) {
       super(iprot, oprot);
+    }
+
+    @Override
+    public java.util.List<ThriftMutationOwner> atomicOwners(java.util.List<java.lang.Long> columns, it.cavallium.rockserver.core.common.api.RequestContext context) throws it.cavallium.rockserver.core.common.api.RocksDBThriftException, org.apache.thrift.TException
+    {
+      send_atomicOwners(columns, context);
+      return recv_atomicOwners();
+    }
+
+    public void send_atomicOwners(java.util.List<java.lang.Long> columns, it.cavallium.rockserver.core.common.api.RequestContext context) throws org.apache.thrift.TException
+    {
+      atomicOwners_args args = new atomicOwners_args();
+      args.setColumns(columns);
+      args.setContext(context);
+      sendBase("atomicOwners", args);
+    }
+
+    public java.util.List<ThriftMutationOwner> recv_atomicOwners() throws it.cavallium.rockserver.core.common.api.RocksDBThriftException, org.apache.thrift.TException
+    {
+      atomicOwners_result result = new atomicOwners_result();
+      receiveBase(result, "atomicOwners");
+      if (result.isSetSuccess()) {
+        return result.success;
+      }
+      if (result.e != null) {
+        throw result.e;
+      }
+      throw new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.MISSING_RESULT, "atomicOwners failed: unknown result");
+    }
+
+    @Override
+    public java.nio.ByteBuffer prepareAtomic(ThriftMutationOwner owner, java.nio.ByteBuffer requestId, long requestSequence, java.util.List<ThriftAtomicMutation> mutations, java.util.List<ThriftAtomicPredicate> predicates, long ttlMillis, it.cavallium.rockserver.core.common.api.RequestContext context) throws it.cavallium.rockserver.core.common.api.RocksDBThriftException, org.apache.thrift.TException
+    {
+      send_prepareAtomic(owner, requestId, requestSequence, mutations, predicates, ttlMillis, context);
+      return recv_prepareAtomic();
+    }
+
+    public void send_prepareAtomic(ThriftMutationOwner owner, java.nio.ByteBuffer requestId, long requestSequence, java.util.List<ThriftAtomicMutation> mutations, java.util.List<ThriftAtomicPredicate> predicates, long ttlMillis, it.cavallium.rockserver.core.common.api.RequestContext context) throws org.apache.thrift.TException
+    {
+      prepareAtomic_args args = new prepareAtomic_args();
+      args.setOwner(owner);
+      args.setRequestId(requestId);
+      args.setRequestSequence(requestSequence);
+      args.setMutations(mutations);
+      args.setPredicates(predicates);
+      args.setTtlMillis(ttlMillis);
+      args.setContext(context);
+      sendBase("prepareAtomic", args);
+    }
+
+    public java.nio.ByteBuffer recv_prepareAtomic() throws it.cavallium.rockserver.core.common.api.RocksDBThriftException, org.apache.thrift.TException
+    {
+      prepareAtomic_result result = new prepareAtomic_result();
+      receiveBase(result, "prepareAtomic");
+      if (result.isSetSuccess()) {
+        return result.success;
+      }
+      if (result.e != null) {
+        throw result.e;
+      }
+      throw new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.MISSING_RESULT, "prepareAtomic failed: unknown result");
     }
 
     @Override
@@ -432,6 +501,97 @@ public class RocksDBRemoteMutations {
 
     public AsyncClient(org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.async.TAsyncClientManager clientManager, org.apache.thrift.transport.TNonblockingTransport transport) {
       super(protocolFactory, clientManager, transport);
+    }
+
+    @Override
+    public void atomicOwners(java.util.List<java.lang.Long> columns, it.cavallium.rockserver.core.common.api.RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<ThriftMutationOwner>> resultHandler) throws org.apache.thrift.TException {
+      checkReady();
+      atomicOwners_call method_call = new atomicOwners_call(columns, context, resultHandler, this, ___protocolFactory, ___transport);
+      this.___currentMethod = method_call;
+      ___manager.call(method_call);
+    }
+
+    public static class atomicOwners_call extends org.apache.thrift.async.TAsyncMethodCall<java.util.List<ThriftMutationOwner>> {
+      private java.util.List<java.lang.Long> columns;
+      private it.cavallium.rockserver.core.common.api.RequestContext context;
+      public atomicOwners_call(java.util.List<java.lang.Long> columns, it.cavallium.rockserver.core.common.api.RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<ThriftMutationOwner>> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
+        this.columns = columns;
+        this.context = context;
+      }
+
+      @Override
+      public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("atomicOwners", org.apache.thrift.protocol.TMessageType.CALL, 0));
+        atomicOwners_args args = new atomicOwners_args();
+        args.setColumns(columns);
+        args.setContext(context);
+        args.write(prot);
+        prot.writeMessageEnd();
+      }
+
+      @Override
+      public java.util.List<ThriftMutationOwner> getResult() throws it.cavallium.rockserver.core.common.api.RocksDBThriftException, org.apache.thrift.TException {
+        if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
+          throw new java.lang.IllegalStateException("Method call not finished!");
+        }
+        org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
+        org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        return (new Client(prot)).recv_atomicOwners();
+      }
+    }
+
+    @Override
+    public void prepareAtomic(ThriftMutationOwner owner, java.nio.ByteBuffer requestId, long requestSequence, java.util.List<ThriftAtomicMutation> mutations, java.util.List<ThriftAtomicPredicate> predicates, long ttlMillis, it.cavallium.rockserver.core.common.api.RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.nio.ByteBuffer> resultHandler) throws org.apache.thrift.TException {
+      checkReady();
+      prepareAtomic_call method_call = new prepareAtomic_call(owner, requestId, requestSequence, mutations, predicates, ttlMillis, context, resultHandler, this, ___protocolFactory, ___transport);
+      this.___currentMethod = method_call;
+      ___manager.call(method_call);
+    }
+
+    public static class prepareAtomic_call extends org.apache.thrift.async.TAsyncMethodCall<java.nio.ByteBuffer> {
+      private ThriftMutationOwner owner;
+      private java.nio.ByteBuffer requestId;
+      private long requestSequence;
+      private java.util.List<ThriftAtomicMutation> mutations;
+      private java.util.List<ThriftAtomicPredicate> predicates;
+      private long ttlMillis;
+      private it.cavallium.rockserver.core.common.api.RequestContext context;
+      public prepareAtomic_call(ThriftMutationOwner owner, java.nio.ByteBuffer requestId, long requestSequence, java.util.List<ThriftAtomicMutation> mutations, java.util.List<ThriftAtomicPredicate> predicates, long ttlMillis, it.cavallium.rockserver.core.common.api.RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.nio.ByteBuffer> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
+        this.owner = owner;
+        this.requestId = requestId;
+        this.requestSequence = requestSequence;
+        this.mutations = mutations;
+        this.predicates = predicates;
+        this.ttlMillis = ttlMillis;
+        this.context = context;
+      }
+
+      @Override
+      public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("prepareAtomic", org.apache.thrift.protocol.TMessageType.CALL, 0));
+        prepareAtomic_args args = new prepareAtomic_args();
+        args.setOwner(owner);
+        args.setRequestId(requestId);
+        args.setRequestSequence(requestSequence);
+        args.setMutations(mutations);
+        args.setPredicates(predicates);
+        args.setTtlMillis(ttlMillis);
+        args.setContext(context);
+        args.write(prot);
+        prot.writeMessageEnd();
+      }
+
+      @Override
+      public java.nio.ByteBuffer getResult() throws it.cavallium.rockserver.core.common.api.RocksDBThriftException, org.apache.thrift.TException {
+        if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
+          throw new java.lang.IllegalStateException("Method call not finished!");
+        }
+        org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
+        org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        return (new Client(prot)).recv_prepareAtomic();
+      }
     }
 
     @Override
@@ -937,6 +1097,8 @@ public class RocksDBRemoteMutations {
     }
 
     private static <I extends Iface> java.util.Map<java.lang.String, org.apache.thrift.ProcessFunction<I, ? extends org.apache.thrift.TBase, ? extends org.apache.thrift.TBase>> getProcessMap(java.util.Map<java.lang.String, org.apache.thrift.ProcessFunction<I, ? extends  org.apache.thrift.TBase, ? extends org.apache.thrift.TBase>> processMap) {
+      processMap.put("atomicOwners", new atomicOwners());
+      processMap.put("prepareAtomic", new prepareAtomic());
       processMap.put("owners", new owners());
       processMap.put("preparePoint", new preparePoint());
       processMap.put("prepareRange", new prepareRange());
@@ -949,6 +1111,80 @@ public class RocksDBRemoteMutations {
       processMap.put("appendBatch", new appendBatch());
       processMap.put("finishInput", new finishInput());
       return processMap;
+    }
+
+    public static class atomicOwners<I extends Iface> extends org.apache.thrift.ProcessFunction<I, atomicOwners_args, atomicOwners_result> {
+      public atomicOwners() {
+        super("atomicOwners");
+      }
+
+      @Override
+      public atomicOwners_args getEmptyArgsInstance() {
+        return new atomicOwners_args();
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      protected boolean rethrowUnhandledExceptions() {
+        return false;
+      }
+
+      @Override
+      public atomicOwners_result getEmptyResultInstance() {
+        return new atomicOwners_result();
+      }
+
+      @Override
+      public atomicOwners_result getResult(I iface, atomicOwners_args args) throws org.apache.thrift.TException {
+        atomicOwners_result result = getEmptyResultInstance();
+        try {
+          result.success = iface.atomicOwners(args.columns, args.context);
+        } catch (it.cavallium.rockserver.core.common.api.RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
+      }
+    }
+
+    public static class prepareAtomic<I extends Iface> extends org.apache.thrift.ProcessFunction<I, prepareAtomic_args, prepareAtomic_result> {
+      public prepareAtomic() {
+        super("prepareAtomic");
+      }
+
+      @Override
+      public prepareAtomic_args getEmptyArgsInstance() {
+        return new prepareAtomic_args();
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      protected boolean rethrowUnhandledExceptions() {
+        return false;
+      }
+
+      @Override
+      public prepareAtomic_result getEmptyResultInstance() {
+        return new prepareAtomic_result();
+      }
+
+      @Override
+      public prepareAtomic_result getResult(I iface, prepareAtomic_args args) throws org.apache.thrift.TException {
+        prepareAtomic_result result = getEmptyResultInstance();
+        try {
+          result.success = iface.prepareAtomic(args.owner, args.requestId, args.requestSequence, args.mutations, args.predicates, args.ttlMillis, args.context);
+        } catch (it.cavallium.rockserver.core.common.api.RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
+      }
     }
 
     public static class owners<I extends Iface> extends org.apache.thrift.ProcessFunction<I, owners_args, owners_result> {
@@ -1371,6 +1607,8 @@ public class RocksDBRemoteMutations {
     }
 
     private static <I extends AsyncIface> java.util.Map<java.lang.String,  org.apache.thrift.AsyncProcessFunction<I, ? extends  org.apache.thrift.TBase, ?, ? extends org.apache.thrift.TBase>> getProcessMap(java.util.Map<java.lang.String,  org.apache.thrift.AsyncProcessFunction<I, ? extends  org.apache.thrift.TBase, ?, ? extends org.apache.thrift.TBase>> processMap) {
+      processMap.put("atomicOwners", new atomicOwners());
+      processMap.put("prepareAtomic", new prepareAtomic());
       processMap.put("owners", new owners());
       processMap.put("preparePoint", new preparePoint());
       processMap.put("prepareRange", new prepareRange());
@@ -1383,6 +1621,158 @@ public class RocksDBRemoteMutations {
       processMap.put("appendBatch", new appendBatch());
       processMap.put("finishInput", new finishInput());
       return processMap;
+    }
+
+    public static class atomicOwners<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, atomicOwners_args, java.util.List<ThriftMutationOwner>, atomicOwners_result> {
+      public atomicOwners() {
+        super("atomicOwners");
+      }
+
+      @Override
+      public atomicOwners_result getEmptyResultInstance() {
+        return new atomicOwners_result();
+      }
+
+      @Override
+      public atomicOwners_args getEmptyArgsInstance() {
+        return new atomicOwners_args();
+      }
+
+      @Override
+      public org.apache.thrift.async.AsyncMethodCallback<java.util.List<ThriftMutationOwner>> getResultHandler(final org.apache.thrift.server.AbstractNonblockingServer.AsyncFrameBuffer fb, final int seqid) {
+        final org.apache.thrift.AsyncProcessFunction fcall = this;
+        return new org.apache.thrift.async.AsyncMethodCallback<java.util.List<ThriftMutationOwner>>() {
+          @Override
+          public void onComplete(java.util.List<ThriftMutationOwner> o) {
+            atomicOwners_result result = new atomicOwners_result();
+            result.success = o;
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
+          }
+          @Override
+          public void onError(java.lang.Exception e) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            atomicOwners_result result = new atomicOwners_result();
+            if (e instanceof it.cavallium.rockserver.core.common.api.RocksDBThriftException) {
+              result.e = (it.cavallium.rockserver.core.common.api.RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
+              _LOGGER.error("TTransportException inside handler", e);
+              fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
+            } else {
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
+            }
+          }
+        };
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      public void start(I iface, atomicOwners_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<ThriftMutationOwner>> resultHandler) throws org.apache.thrift.TException {
+        iface.atomicOwners(args.columns, args.context,resultHandler);
+      }
+    }
+
+    public static class prepareAtomic<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, prepareAtomic_args, java.nio.ByteBuffer, prepareAtomic_result> {
+      public prepareAtomic() {
+        super("prepareAtomic");
+      }
+
+      @Override
+      public prepareAtomic_result getEmptyResultInstance() {
+        return new prepareAtomic_result();
+      }
+
+      @Override
+      public prepareAtomic_args getEmptyArgsInstance() {
+        return new prepareAtomic_args();
+      }
+
+      @Override
+      public org.apache.thrift.async.AsyncMethodCallback<java.nio.ByteBuffer> getResultHandler(final org.apache.thrift.server.AbstractNonblockingServer.AsyncFrameBuffer fb, final int seqid) {
+        final org.apache.thrift.AsyncProcessFunction fcall = this;
+        return new org.apache.thrift.async.AsyncMethodCallback<java.nio.ByteBuffer>() {
+          @Override
+          public void onComplete(java.nio.ByteBuffer o) {
+            prepareAtomic_result result = new prepareAtomic_result();
+            result.success = o;
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
+          }
+          @Override
+          public void onError(java.lang.Exception e) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            prepareAtomic_result result = new prepareAtomic_result();
+            if (e instanceof it.cavallium.rockserver.core.common.api.RocksDBThriftException) {
+              result.e = (it.cavallium.rockserver.core.common.api.RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
+              _LOGGER.error("TTransportException inside handler", e);
+              fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
+            } else {
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
+            }
+          }
+        };
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      public void start(I iface, prepareAtomic_args args, org.apache.thrift.async.AsyncMethodCallback<java.nio.ByteBuffer> resultHandler) throws org.apache.thrift.TException {
+        iface.prepareAtomic(args.owner, args.requestId, args.requestSequence, args.mutations, args.predicates, args.ttlMillis, args.context,resultHandler);
+      }
     }
 
     public static class owners<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, owners_args, java.util.List<ThriftMutationOwner>, owners_result> {
@@ -2221,6 +2611,2671 @@ public class RocksDBRemoteMutations {
       }
     }
 
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class atomicOwners_args implements org.apache.thrift.TBase<atomicOwners_args, atomicOwners_args._Fields>, java.io.Serializable, Cloneable, Comparable<atomicOwners_args>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("atomicOwners_args");
+
+    private static final org.apache.thrift.protocol.TField COLUMNS_FIELD_DESC = new org.apache.thrift.protocol.TField("columns", org.apache.thrift.protocol.TType.LIST, (short)82);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)100);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new atomicOwners_argsStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new atomicOwners_argsTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable java.util.List<java.lang.Long> columns; // required
+    public @org.apache.thrift.annotation.Nullable it.cavallium.rockserver.core.common.api.RequestContext context; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      COLUMNS((short)82, "columns"),
+      CONTEXT((short)100, "context");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 82: // COLUMNS
+            return COLUMNS;
+          case 100: // CONTEXT
+            return CONTEXT;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.COLUMNS, new org.apache.thrift.meta_data.FieldMetaData("columns", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
+              new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64))));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, it.cavallium.rockserver.core.common.api.RequestContext.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(atomicOwners_args.class, metaDataMap);
+    }
+
+    public atomicOwners_args() {
+    }
+
+    public atomicOwners_args(
+      java.util.List<java.lang.Long> columns,
+      it.cavallium.rockserver.core.common.api.RequestContext context)
+    {
+      this();
+      this.columns = columns;
+      this.context = context;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public atomicOwners_args(atomicOwners_args other) {
+      if (other.isSetColumns()) {
+        java.util.List<java.lang.Long> __this__columns = new java.util.ArrayList<java.lang.Long>(other.columns);
+        this.columns = __this__columns;
+      }
+      if (other.isSetContext()) {
+        this.context = new it.cavallium.rockserver.core.common.api.RequestContext(other.context);
+      }
+    }
+
+    @Override
+    public atomicOwners_args deepCopy() {
+      return new atomicOwners_args(this);
+    }
+
+    @Override
+    public void clear() {
+      this.columns = null;
+      this.context = null;
+    }
+
+    public int getColumnsSize() {
+      return (this.columns == null) ? 0 : this.columns.size();
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.util.Iterator<java.lang.Long> getColumnsIterator() {
+      return (this.columns == null) ? null : this.columns.iterator();
+    }
+
+    public void addToColumns(long elem) {
+      if (this.columns == null) {
+        this.columns = new java.util.ArrayList<java.lang.Long>();
+      }
+      this.columns.add(elem);
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.util.List<java.lang.Long> getColumns() {
+      return this.columns;
+    }
+
+    public atomicOwners_args setColumns(@org.apache.thrift.annotation.Nullable java.util.List<java.lang.Long> columns) {
+      this.columns = columns;
+      return this;
+    }
+
+    public void unsetColumns() {
+      this.columns = null;
+    }
+
+    /** Returns true if field columns is set (has been assigned a value) and false otherwise */
+    public boolean isSetColumns() {
+      return this.columns != null;
+    }
+
+    public void setColumnsIsSet(boolean value) {
+      if (!value) {
+        this.columns = null;
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public it.cavallium.rockserver.core.common.api.RequestContext getContext() {
+      return this.context;
+    }
+
+    public atomicOwners_args setContext(@org.apache.thrift.annotation.Nullable it.cavallium.rockserver.core.common.api.RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case COLUMNS:
+        if (value == null) {
+          unsetColumns();
+        } else {
+          setColumns((java.util.List<java.lang.Long>)value);
+        }
+        break;
+
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((it.cavallium.rockserver.core.common.api.RequestContext)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case COLUMNS:
+        return getColumns();
+
+      case CONTEXT:
+        return getContext();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case COLUMNS:
+        return isSetColumns();
+      case CONTEXT:
+        return isSetContext();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof atomicOwners_args)
+        return this.equals((atomicOwners_args)that);
+      return false;
+    }
+
+    public boolean equals(atomicOwners_args that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_columns = true && this.isSetColumns();
+      boolean that_present_columns = true && that.isSetColumns();
+      if (this_present_columns || that_present_columns) {
+        if (!(this_present_columns && that_present_columns))
+          return false;
+        if (!this.columns.equals(that.columns))
+          return false;
+      }
+
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetColumns()) ? 131071 : 524287);
+      if (isSetColumns())
+        hashCode = hashCode * 8191 + columns.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(atomicOwners_args other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetColumns(), other.isSetColumns());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetColumns()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.columns, other.columns);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    @Override
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+    }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("atomicOwners_args(");
+      boolean first = true;
+
+      sb.append("columns:");
+      if (this.columns == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.columns);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      if (columns == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'columns' was not present! Struct: " + toString());
+      }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
+      // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class atomicOwners_argsStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public atomicOwners_argsStandardScheme getScheme() {
+        return new atomicOwners_argsStandardScheme();
+      }
+    }
+
+    private static class atomicOwners_argsStandardScheme extends org.apache.thrift.scheme.StandardScheme<atomicOwners_args> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, atomicOwners_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 82: // COLUMNS
+              if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
+                {
+                  org.apache.thrift.protocol.TList _list40 = iprot.readListBegin();
+                  struct.columns = new java.util.ArrayList<java.lang.Long>(_list40.size);
+                  long _elem41;
+                  for (int _i42 = 0; _i42 < _list40.size; ++_i42)
+                  {
+                    _elem41 = iprot.readI64();
+                    struct.columns.add(_elem41);
+                  }
+                  iprot.readListEnd();
+                }
+                struct.setColumnsIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 100: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new it.cavallium.rockserver.core.common.api.RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, atomicOwners_args struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.columns != null) {
+          oprot.writeFieldBegin(COLUMNS_FIELD_DESC);
+          {
+            oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.I64, struct.columns.size()));
+            for (long _iter43 : struct.columns)
+            {
+              oprot.writeI64(_iter43);
+            }
+            oprot.writeListEnd();
+          }
+          oprot.writeFieldEnd();
+        }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class atomicOwners_argsTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public atomicOwners_argsTupleScheme getScheme() {
+        return new atomicOwners_argsTupleScheme();
+      }
+    }
+
+    private static class atomicOwners_argsTupleScheme extends org.apache.thrift.scheme.TupleScheme<atomicOwners_args> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, atomicOwners_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        {
+          oprot.writeI32(struct.columns.size());
+          for (long _iter44 : struct.columns)
+          {
+            oprot.writeI64(_iter44);
+          }
+        }
+        struct.context.write(oprot);
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, atomicOwners_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        {
+          org.apache.thrift.protocol.TList _list45 = iprot.readListBegin(org.apache.thrift.protocol.TType.I64);
+          struct.columns = new java.util.ArrayList<java.lang.Long>(_list45.size);
+          long _elem46;
+          for (int _i47 = 0; _i47 < _list45.size; ++_i47)
+          {
+            _elem46 = iprot.readI64();
+            struct.columns.add(_elem46);
+          }
+        }
+        struct.setColumnsIsSet(true);
+        struct.context = new it.cavallium.rockserver.core.common.api.RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class atomicOwners_result implements org.apache.thrift.TBase<atomicOwners_result, atomicOwners_result._Fields>, java.io.Serializable, Cloneable, Comparable<atomicOwners_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("atomicOwners_result");
+
+    private static final org.apache.thrift.protocol.TField SUCCESS_FIELD_DESC = new org.apache.thrift.protocol.TField("success", org.apache.thrift.protocol.TType.LIST, (short)0);
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new atomicOwners_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new atomicOwners_resultTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable java.util.List<ThriftMutationOwner> success; // required
+    public @org.apache.thrift.annotation.Nullable it.cavallium.rockserver.core.common.api.RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      SUCCESS((short)0, "success"),
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 0: // SUCCESS
+            return SUCCESS;
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.SUCCESS, new org.apache.thrift.meta_data.FieldMetaData("success", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
+              new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, ThriftMutationOwner.class))));
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, it.cavallium.rockserver.core.common.api.RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(atomicOwners_result.class, metaDataMap);
+    }
+
+    public atomicOwners_result() {
+    }
+
+    public atomicOwners_result(
+      java.util.List<ThriftMutationOwner> success,
+      it.cavallium.rockserver.core.common.api.RocksDBThriftException e)
+    {
+      this();
+      this.success = success;
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public atomicOwners_result(atomicOwners_result other) {
+      if (other.isSetSuccess()) {
+        java.util.List<ThriftMutationOwner> __this__success = new java.util.ArrayList<ThriftMutationOwner>(other.success.size());
+        for (ThriftMutationOwner other_element : other.success) {
+          __this__success.add(new ThriftMutationOwner(other_element));
+        }
+        this.success = __this__success;
+      }
+      if (other.isSetE()) {
+        this.e = new it.cavallium.rockserver.core.common.api.RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public atomicOwners_result deepCopy() {
+      return new atomicOwners_result(this);
+    }
+
+    @Override
+    public void clear() {
+      this.success = null;
+      this.e = null;
+    }
+
+    public int getSuccessSize() {
+      return (this.success == null) ? 0 : this.success.size();
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.util.Iterator<ThriftMutationOwner> getSuccessIterator() {
+      return (this.success == null) ? null : this.success.iterator();
+    }
+
+    public void addToSuccess(ThriftMutationOwner elem) {
+      if (this.success == null) {
+        this.success = new java.util.ArrayList<ThriftMutationOwner>();
+      }
+      this.success.add(elem);
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.util.List<ThriftMutationOwner> getSuccess() {
+      return this.success;
+    }
+
+    public atomicOwners_result setSuccess(@org.apache.thrift.annotation.Nullable java.util.List<ThriftMutationOwner> success) {
+      this.success = success;
+      return this;
+    }
+
+    public void unsetSuccess() {
+      this.success = null;
+    }
+
+    /** Returns true if field success is set (has been assigned a value) and false otherwise */
+    public boolean isSetSuccess() {
+      return this.success != null;
+    }
+
+    public void setSuccessIsSet(boolean value) {
+      if (!value) {
+        this.success = null;
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public it.cavallium.rockserver.core.common.api.RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public atomicOwners_result setE(@org.apache.thrift.annotation.Nullable it.cavallium.rockserver.core.common.api.RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case SUCCESS:
+        if (value == null) {
+          unsetSuccess();
+        } else {
+          setSuccess((java.util.List<ThriftMutationOwner>)value);
+        }
+        break;
+
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((it.cavallium.rockserver.core.common.api.RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case SUCCESS:
+        return getSuccess();
+
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case SUCCESS:
+        return isSetSuccess();
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof atomicOwners_result)
+        return this.equals((atomicOwners_result)that);
+      return false;
+    }
+
+    public boolean equals(atomicOwners_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_success = true && this.isSetSuccess();
+      boolean that_present_success = true && that.isSetSuccess();
+      if (this_present_success || that_present_success) {
+        if (!(this_present_success && that_present_success))
+          return false;
+        if (!this.success.equals(that.success))
+          return false;
+      }
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetSuccess()) ? 131071 : 524287);
+      if (isSetSuccess())
+        hashCode = hashCode * 8191 + success.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(atomicOwners_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetSuccess(), other.isSetSuccess());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetSuccess()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.success, other.success);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("atomicOwners_result(");
+      boolean first = true;
+
+      sb.append("success:");
+      if (this.success == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.success);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class atomicOwners_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public atomicOwners_resultStandardScheme getScheme() {
+        return new atomicOwners_resultStandardScheme();
+      }
+    }
+
+    private static class atomicOwners_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<atomicOwners_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, atomicOwners_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 0: // SUCCESS
+              if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
+                {
+                  org.apache.thrift.protocol.TList _list48 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<ThriftMutationOwner>(_list48.size);
+                  @org.apache.thrift.annotation.Nullable ThriftMutationOwner _elem49;
+                  for (int _i50 = 0; _i50 < _list48.size; ++_i50)
+                  {
+                    _elem49 = new ThriftMutationOwner();
+                    _elem49.read(iprot);
+                    struct.success.add(_elem49);
+                  }
+                  iprot.readListEnd();
+                }
+                struct.setSuccessIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new it.cavallium.rockserver.core.common.api.RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, atomicOwners_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.success != null) {
+          oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+          {
+            oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.success.size()));
+            for (ThriftMutationOwner _iter51 : struct.success)
+            {
+              _iter51.write(oprot);
+            }
+            oprot.writeListEnd();
+          }
+          oprot.writeFieldEnd();
+        }
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class atomicOwners_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public atomicOwners_resultTupleScheme getScheme() {
+        return new atomicOwners_resultTupleScheme();
+      }
+    }
+
+    private static class atomicOwners_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<atomicOwners_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, atomicOwners_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetSuccess()) {
+          optionals.set(0);
+        }
+        if (struct.isSetE()) {
+          optionals.set(1);
+        }
+        oprot.writeBitSet(optionals, 2);
+        if (struct.isSetSuccess()) {
+          {
+            oprot.writeI32(struct.success.size());
+            for (ThriftMutationOwner _iter52 : struct.success)
+            {
+              _iter52.write(oprot);
+            }
+          }
+        }
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, atomicOwners_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(2);
+        if (incoming.get(0)) {
+          {
+            org.apache.thrift.protocol.TList _list53 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+            struct.success = new java.util.ArrayList<ThriftMutationOwner>(_list53.size);
+            @org.apache.thrift.annotation.Nullable ThriftMutationOwner _elem54;
+            for (int _i55 = 0; _i55 < _list53.size; ++_i55)
+            {
+              _elem54 = new ThriftMutationOwner();
+              _elem54.read(iprot);
+              struct.success.add(_elem54);
+            }
+          }
+          struct.setSuccessIsSet(true);
+        }
+        if (incoming.get(1)) {
+          struct.e = new it.cavallium.rockserver.core.common.api.RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class prepareAtomic_args implements org.apache.thrift.TBase<prepareAtomic_args, prepareAtomic_args._Fields>, java.io.Serializable, Cloneable, Comparable<prepareAtomic_args>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("prepareAtomic_args");
+
+    private static final org.apache.thrift.protocol.TField OWNER_FIELD_DESC = new org.apache.thrift.protocol.TField("owner", org.apache.thrift.protocol.TType.STRUCT, (short)30);
+    private static final org.apache.thrift.protocol.TField REQUEST_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("requestId", org.apache.thrift.protocol.TType.STRING, (short)5);
+    private static final org.apache.thrift.protocol.TField REQUEST_SEQUENCE_FIELD_DESC = new org.apache.thrift.protocol.TField("requestSequence", org.apache.thrift.protocol.TType.I64, (short)31);
+    private static final org.apache.thrift.protocol.TField MUTATIONS_FIELD_DESC = new org.apache.thrift.protocol.TField("mutations", org.apache.thrift.protocol.TType.LIST, (short)80);
+    private static final org.apache.thrift.protocol.TField PREDICATES_FIELD_DESC = new org.apache.thrift.protocol.TField("predicates", org.apache.thrift.protocol.TType.LIST, (short)81);
+    private static final org.apache.thrift.protocol.TField TTL_MILLIS_FIELD_DESC = new org.apache.thrift.protocol.TField("ttlMillis", org.apache.thrift.protocol.TType.I64, (short)84);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)100);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new prepareAtomic_argsStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new prepareAtomic_argsTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable ThriftMutationOwner owner; // required
+    public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer requestId; // required
+    public long requestSequence; // required
+    public @org.apache.thrift.annotation.Nullable java.util.List<ThriftAtomicMutation> mutations; // required
+    public @org.apache.thrift.annotation.Nullable java.util.List<ThriftAtomicPredicate> predicates; // required
+    public long ttlMillis; // required
+    public @org.apache.thrift.annotation.Nullable it.cavallium.rockserver.core.common.api.RequestContext context; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      OWNER((short)30, "owner"),
+      REQUEST_ID((short)5, "requestId"),
+      REQUEST_SEQUENCE((short)31, "requestSequence"),
+      MUTATIONS((short)80, "mutations"),
+      PREDICATES((short)81, "predicates"),
+      TTL_MILLIS((short)84, "ttlMillis"),
+      CONTEXT((short)100, "context");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 30: // OWNER
+            return OWNER;
+          case 5: // REQUEST_ID
+            return REQUEST_ID;
+          case 31: // REQUEST_SEQUENCE
+            return REQUEST_SEQUENCE;
+          case 80: // MUTATIONS
+            return MUTATIONS;
+          case 81: // PREDICATES
+            return PREDICATES;
+          case 84: // TTL_MILLIS
+            return TTL_MILLIS;
+          case 100: // CONTEXT
+            return CONTEXT;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    private static final int __REQUESTSEQUENCE_ISSET_ID = 0;
+    private static final int __TTLMILLIS_ISSET_ID = 1;
+    private byte __isset_bitfield = 0;
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.OWNER, new org.apache.thrift.meta_data.FieldMetaData("owner", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, ThriftMutationOwner.class)));
+      tmpMap.put(_Fields.REQUEST_ID, new org.apache.thrift.meta_data.FieldMetaData("requestId", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.REQUEST_SEQUENCE, new org.apache.thrift.meta_data.FieldMetaData("requestSequence", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.MUTATIONS, new org.apache.thrift.meta_data.FieldMetaData("mutations", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
+              new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, ThriftAtomicMutation.class))));
+      tmpMap.put(_Fields.PREDICATES, new org.apache.thrift.meta_data.FieldMetaData("predicates", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
+              new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, ThriftAtomicPredicate.class))));
+      tmpMap.put(_Fields.TTL_MILLIS, new org.apache.thrift.meta_data.FieldMetaData("ttlMillis", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, it.cavallium.rockserver.core.common.api.RequestContext.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(prepareAtomic_args.class, metaDataMap);
+    }
+
+    public prepareAtomic_args() {
+    }
+
+    public prepareAtomic_args(
+      ThriftMutationOwner owner,
+      java.nio.ByteBuffer requestId,
+      long requestSequence,
+      java.util.List<ThriftAtomicMutation> mutations,
+      java.util.List<ThriftAtomicPredicate> predicates,
+      long ttlMillis,
+      it.cavallium.rockserver.core.common.api.RequestContext context)
+    {
+      this();
+      this.owner = owner;
+      this.requestId = org.apache.thrift.TBaseHelper.copyBinary(requestId);
+      this.requestSequence = requestSequence;
+      setRequestSequenceIsSet(true);
+      this.mutations = mutations;
+      this.predicates = predicates;
+      this.ttlMillis = ttlMillis;
+      setTtlMillisIsSet(true);
+      this.context = context;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public prepareAtomic_args(prepareAtomic_args other) {
+      __isset_bitfield = other.__isset_bitfield;
+      if (other.isSetOwner()) {
+        this.owner = new ThriftMutationOwner(other.owner);
+      }
+      if (other.isSetRequestId()) {
+        this.requestId = org.apache.thrift.TBaseHelper.copyBinary(other.requestId);
+      }
+      this.requestSequence = other.requestSequence;
+      if (other.isSetMutations()) {
+        java.util.List<ThriftAtomicMutation> __this__mutations = new java.util.ArrayList<ThriftAtomicMutation>(other.mutations.size());
+        for (ThriftAtomicMutation other_element : other.mutations) {
+          __this__mutations.add(new ThriftAtomicMutation(other_element));
+        }
+        this.mutations = __this__mutations;
+      }
+      if (other.isSetPredicates()) {
+        java.util.List<ThriftAtomicPredicate> __this__predicates = new java.util.ArrayList<ThriftAtomicPredicate>(other.predicates.size());
+        for (ThriftAtomicPredicate other_element : other.predicates) {
+          __this__predicates.add(new ThriftAtomicPredicate(other_element));
+        }
+        this.predicates = __this__predicates;
+      }
+      this.ttlMillis = other.ttlMillis;
+      if (other.isSetContext()) {
+        this.context = new it.cavallium.rockserver.core.common.api.RequestContext(other.context);
+      }
+    }
+
+    @Override
+    public prepareAtomic_args deepCopy() {
+      return new prepareAtomic_args(this);
+    }
+
+    @Override
+    public void clear() {
+      this.owner = null;
+      this.requestId = null;
+      setRequestSequenceIsSet(false);
+      this.requestSequence = 0;
+      this.mutations = null;
+      this.predicates = null;
+      setTtlMillisIsSet(false);
+      this.ttlMillis = 0;
+      this.context = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public ThriftMutationOwner getOwner() {
+      return this.owner;
+    }
+
+    public prepareAtomic_args setOwner(@org.apache.thrift.annotation.Nullable ThriftMutationOwner owner) {
+      this.owner = owner;
+      return this;
+    }
+
+    public void unsetOwner() {
+      this.owner = null;
+    }
+
+    /** Returns true if field owner is set (has been assigned a value) and false otherwise */
+    public boolean isSetOwner() {
+      return this.owner != null;
+    }
+
+    public void setOwnerIsSet(boolean value) {
+      if (!value) {
+        this.owner = null;
+      }
+    }
+
+    public byte[] getRequestId() {
+      setRequestId(org.apache.thrift.TBaseHelper.rightSize(requestId));
+      return requestId == null ? null : requestId.array();
+    }
+
+    public java.nio.ByteBuffer bufferForRequestId() {
+      return org.apache.thrift.TBaseHelper.copyBinary(requestId);
+    }
+
+    public prepareAtomic_args setRequestId(byte[] requestId) {
+      this.requestId = requestId == null ? (java.nio.ByteBuffer)null     : java.nio.ByteBuffer.wrap(requestId.clone());
+      return this;
+    }
+
+    public prepareAtomic_args setRequestId(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer requestId) {
+      this.requestId = org.apache.thrift.TBaseHelper.copyBinary(requestId);
+      return this;
+    }
+
+    public void unsetRequestId() {
+      this.requestId = null;
+    }
+
+    /** Returns true if field requestId is set (has been assigned a value) and false otherwise */
+    public boolean isSetRequestId() {
+      return this.requestId != null;
+    }
+
+    public void setRequestIdIsSet(boolean value) {
+      if (!value) {
+        this.requestId = null;
+      }
+    }
+
+    public long getRequestSequence() {
+      return this.requestSequence;
+    }
+
+    public prepareAtomic_args setRequestSequence(long requestSequence) {
+      this.requestSequence = requestSequence;
+      setRequestSequenceIsSet(true);
+      return this;
+    }
+
+    public void unsetRequestSequence() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __REQUESTSEQUENCE_ISSET_ID);
+    }
+
+    /** Returns true if field requestSequence is set (has been assigned a value) and false otherwise */
+    public boolean isSetRequestSequence() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __REQUESTSEQUENCE_ISSET_ID);
+    }
+
+    public void setRequestSequenceIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __REQUESTSEQUENCE_ISSET_ID, value);
+    }
+
+    public int getMutationsSize() {
+      return (this.mutations == null) ? 0 : this.mutations.size();
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.util.Iterator<ThriftAtomicMutation> getMutationsIterator() {
+      return (this.mutations == null) ? null : this.mutations.iterator();
+    }
+
+    public void addToMutations(ThriftAtomicMutation elem) {
+      if (this.mutations == null) {
+        this.mutations = new java.util.ArrayList<ThriftAtomicMutation>();
+      }
+      this.mutations.add(elem);
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.util.List<ThriftAtomicMutation> getMutations() {
+      return this.mutations;
+    }
+
+    public prepareAtomic_args setMutations(@org.apache.thrift.annotation.Nullable java.util.List<ThriftAtomicMutation> mutations) {
+      this.mutations = mutations;
+      return this;
+    }
+
+    public void unsetMutations() {
+      this.mutations = null;
+    }
+
+    /** Returns true if field mutations is set (has been assigned a value) and false otherwise */
+    public boolean isSetMutations() {
+      return this.mutations != null;
+    }
+
+    public void setMutationsIsSet(boolean value) {
+      if (!value) {
+        this.mutations = null;
+      }
+    }
+
+    public int getPredicatesSize() {
+      return (this.predicates == null) ? 0 : this.predicates.size();
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.util.Iterator<ThriftAtomicPredicate> getPredicatesIterator() {
+      return (this.predicates == null) ? null : this.predicates.iterator();
+    }
+
+    public void addToPredicates(ThriftAtomicPredicate elem) {
+      if (this.predicates == null) {
+        this.predicates = new java.util.ArrayList<ThriftAtomicPredicate>();
+      }
+      this.predicates.add(elem);
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.util.List<ThriftAtomicPredicate> getPredicates() {
+      return this.predicates;
+    }
+
+    public prepareAtomic_args setPredicates(@org.apache.thrift.annotation.Nullable java.util.List<ThriftAtomicPredicate> predicates) {
+      this.predicates = predicates;
+      return this;
+    }
+
+    public void unsetPredicates() {
+      this.predicates = null;
+    }
+
+    /** Returns true if field predicates is set (has been assigned a value) and false otherwise */
+    public boolean isSetPredicates() {
+      return this.predicates != null;
+    }
+
+    public void setPredicatesIsSet(boolean value) {
+      if (!value) {
+        this.predicates = null;
+      }
+    }
+
+    public long getTtlMillis() {
+      return this.ttlMillis;
+    }
+
+    public prepareAtomic_args setTtlMillis(long ttlMillis) {
+      this.ttlMillis = ttlMillis;
+      setTtlMillisIsSet(true);
+      return this;
+    }
+
+    public void unsetTtlMillis() {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __TTLMILLIS_ISSET_ID);
+    }
+
+    /** Returns true if field ttlMillis is set (has been assigned a value) and false otherwise */
+    public boolean isSetTtlMillis() {
+      return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __TTLMILLIS_ISSET_ID);
+    }
+
+    public void setTtlMillisIsSet(boolean value) {
+      __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __TTLMILLIS_ISSET_ID, value);
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public it.cavallium.rockserver.core.common.api.RequestContext getContext() {
+      return this.context;
+    }
+
+    public prepareAtomic_args setContext(@org.apache.thrift.annotation.Nullable it.cavallium.rockserver.core.common.api.RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case OWNER:
+        if (value == null) {
+          unsetOwner();
+        } else {
+          setOwner((ThriftMutationOwner)value);
+        }
+        break;
+
+      case REQUEST_ID:
+        if (value == null) {
+          unsetRequestId();
+        } else {
+          if (value instanceof byte[]) {
+            setRequestId((byte[])value);
+          } else {
+            setRequestId((java.nio.ByteBuffer)value);
+          }
+        }
+        break;
+
+      case REQUEST_SEQUENCE:
+        if (value == null) {
+          unsetRequestSequence();
+        } else {
+          setRequestSequence((java.lang.Long)value);
+        }
+        break;
+
+      case MUTATIONS:
+        if (value == null) {
+          unsetMutations();
+        } else {
+          setMutations((java.util.List<ThriftAtomicMutation>)value);
+        }
+        break;
+
+      case PREDICATES:
+        if (value == null) {
+          unsetPredicates();
+        } else {
+          setPredicates((java.util.List<ThriftAtomicPredicate>)value);
+        }
+        break;
+
+      case TTL_MILLIS:
+        if (value == null) {
+          unsetTtlMillis();
+        } else {
+          setTtlMillis((java.lang.Long)value);
+        }
+        break;
+
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((it.cavallium.rockserver.core.common.api.RequestContext)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case OWNER:
+        return getOwner();
+
+      case REQUEST_ID:
+        return getRequestId();
+
+      case REQUEST_SEQUENCE:
+        return getRequestSequence();
+
+      case MUTATIONS:
+        return getMutations();
+
+      case PREDICATES:
+        return getPredicates();
+
+      case TTL_MILLIS:
+        return getTtlMillis();
+
+      case CONTEXT:
+        return getContext();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case OWNER:
+        return isSetOwner();
+      case REQUEST_ID:
+        return isSetRequestId();
+      case REQUEST_SEQUENCE:
+        return isSetRequestSequence();
+      case MUTATIONS:
+        return isSetMutations();
+      case PREDICATES:
+        return isSetPredicates();
+      case TTL_MILLIS:
+        return isSetTtlMillis();
+      case CONTEXT:
+        return isSetContext();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof prepareAtomic_args)
+        return this.equals((prepareAtomic_args)that);
+      return false;
+    }
+
+    public boolean equals(prepareAtomic_args that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_owner = true && this.isSetOwner();
+      boolean that_present_owner = true && that.isSetOwner();
+      if (this_present_owner || that_present_owner) {
+        if (!(this_present_owner && that_present_owner))
+          return false;
+        if (!this.owner.equals(that.owner))
+          return false;
+      }
+
+      boolean this_present_requestId = true && this.isSetRequestId();
+      boolean that_present_requestId = true && that.isSetRequestId();
+      if (this_present_requestId || that_present_requestId) {
+        if (!(this_present_requestId && that_present_requestId))
+          return false;
+        if (!this.requestId.equals(that.requestId))
+          return false;
+      }
+
+      boolean this_present_requestSequence = true;
+      boolean that_present_requestSequence = true;
+      if (this_present_requestSequence || that_present_requestSequence) {
+        if (!(this_present_requestSequence && that_present_requestSequence))
+          return false;
+        if (this.requestSequence != that.requestSequence)
+          return false;
+      }
+
+      boolean this_present_mutations = true && this.isSetMutations();
+      boolean that_present_mutations = true && that.isSetMutations();
+      if (this_present_mutations || that_present_mutations) {
+        if (!(this_present_mutations && that_present_mutations))
+          return false;
+        if (!this.mutations.equals(that.mutations))
+          return false;
+      }
+
+      boolean this_present_predicates = true && this.isSetPredicates();
+      boolean that_present_predicates = true && that.isSetPredicates();
+      if (this_present_predicates || that_present_predicates) {
+        if (!(this_present_predicates && that_present_predicates))
+          return false;
+        if (!this.predicates.equals(that.predicates))
+          return false;
+      }
+
+      boolean this_present_ttlMillis = true;
+      boolean that_present_ttlMillis = true;
+      if (this_present_ttlMillis || that_present_ttlMillis) {
+        if (!(this_present_ttlMillis && that_present_ttlMillis))
+          return false;
+        if (this.ttlMillis != that.ttlMillis)
+          return false;
+      }
+
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetOwner()) ? 131071 : 524287);
+      if (isSetOwner())
+        hashCode = hashCode * 8191 + owner.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetRequestId()) ? 131071 : 524287);
+      if (isSetRequestId())
+        hashCode = hashCode * 8191 + requestId.hashCode();
+
+      hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(requestSequence);
+
+      hashCode = hashCode * 8191 + ((isSetMutations()) ? 131071 : 524287);
+      if (isSetMutations())
+        hashCode = hashCode * 8191 + mutations.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetPredicates()) ? 131071 : 524287);
+      if (isSetPredicates())
+        hashCode = hashCode * 8191 + predicates.hashCode();
+
+      hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(ttlMillis);
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(prepareAtomic_args other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetOwner(), other.isSetOwner());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetOwner()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.owner, other.owner);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetRequestId(), other.isSetRequestId());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetRequestId()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.requestId, other.requestId);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetRequestSequence(), other.isSetRequestSequence());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetRequestSequence()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.requestSequence, other.requestSequence);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetMutations(), other.isSetMutations());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetMutations()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.mutations, other.mutations);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetPredicates(), other.isSetPredicates());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetPredicates()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.predicates, other.predicates);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetTtlMillis(), other.isSetTtlMillis());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetTtlMillis()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.ttlMillis, other.ttlMillis);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    @Override
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+    }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("prepareAtomic_args(");
+      boolean first = true;
+
+      sb.append("owner:");
+      if (this.owner == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.owner);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("requestId:");
+      if (this.requestId == null) {
+        sb.append("null");
+      } else {
+        org.apache.thrift.TBaseHelper.toString(this.requestId, sb);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("requestSequence:");
+      sb.append(this.requestSequence);
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("mutations:");
+      if (this.mutations == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.mutations);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("predicates:");
+      if (this.predicates == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.predicates);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("ttlMillis:");
+      sb.append(this.ttlMillis);
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      if (owner == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'owner' was not present! Struct: " + toString());
+      }
+      if (requestId == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'requestId' was not present! Struct: " + toString());
+      }
+      // alas, we cannot check 'requestSequence' because it's a primitive and you chose the non-beans generator.
+      if (mutations == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'mutations' was not present! Struct: " + toString());
+      }
+      if (predicates == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'predicates' was not present! Struct: " + toString());
+      }
+      // alas, we cannot check 'ttlMillis' because it's a primitive and you chose the non-beans generator.
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
+      // check for sub-struct validity
+      if (owner != null) {
+        owner.validate();
+      }
+      if (context != null) {
+        context.validate();
+      }
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        // it doesn't seem like you should have to do this, but java serialization is wacky, and doesn't call the default constructor.
+        __isset_bitfield = 0;
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class prepareAtomic_argsStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public prepareAtomic_argsStandardScheme getScheme() {
+        return new prepareAtomic_argsStandardScheme();
+      }
+    }
+
+    private static class prepareAtomic_argsStandardScheme extends org.apache.thrift.scheme.StandardScheme<prepareAtomic_args> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, prepareAtomic_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 30: // OWNER
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.owner = new ThriftMutationOwner();
+                struct.owner.read(iprot);
+                struct.setOwnerIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 5: // REQUEST_ID
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+                struct.requestId = iprot.readBinary();
+                struct.setRequestIdIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 31: // REQUEST_SEQUENCE
+              if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
+                struct.requestSequence = iprot.readI64();
+                struct.setRequestSequenceIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 80: // MUTATIONS
+              if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
+                {
+                  org.apache.thrift.protocol.TList _list56 = iprot.readListBegin();
+                  struct.mutations = new java.util.ArrayList<ThriftAtomicMutation>(_list56.size);
+                  @org.apache.thrift.annotation.Nullable ThriftAtomicMutation _elem57;
+                  for (int _i58 = 0; _i58 < _list56.size; ++_i58)
+                  {
+                    _elem57 = new ThriftAtomicMutation();
+                    _elem57.read(iprot);
+                    struct.mutations.add(_elem57);
+                  }
+                  iprot.readListEnd();
+                }
+                struct.setMutationsIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 81: // PREDICATES
+              if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
+                {
+                  org.apache.thrift.protocol.TList _list59 = iprot.readListBegin();
+                  struct.predicates = new java.util.ArrayList<ThriftAtomicPredicate>(_list59.size);
+                  @org.apache.thrift.annotation.Nullable ThriftAtomicPredicate _elem60;
+                  for (int _i61 = 0; _i61 < _list59.size; ++_i61)
+                  {
+                    _elem60 = new ThriftAtomicPredicate();
+                    _elem60.read(iprot);
+                    struct.predicates.add(_elem60);
+                  }
+                  iprot.readListEnd();
+                }
+                struct.setPredicatesIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 84: // TTL_MILLIS
+              if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
+                struct.ttlMillis = iprot.readI64();
+                struct.setTtlMillisIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 100: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new it.cavallium.rockserver.core.common.api.RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        if (!struct.isSetRequestSequence()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'requestSequence' was not found in serialized data! Struct: " + toString());
+        }
+        if (!struct.isSetTtlMillis()) {
+          throw new org.apache.thrift.protocol.TProtocolException("Required field 'ttlMillis' was not found in serialized data! Struct: " + toString());
+        }
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, prepareAtomic_args struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.requestId != null) {
+          oprot.writeFieldBegin(REQUEST_ID_FIELD_DESC);
+          oprot.writeBinary(struct.requestId);
+          oprot.writeFieldEnd();
+        }
+        if (struct.owner != null) {
+          oprot.writeFieldBegin(OWNER_FIELD_DESC);
+          struct.owner.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldBegin(REQUEST_SEQUENCE_FIELD_DESC);
+        oprot.writeI64(struct.requestSequence);
+        oprot.writeFieldEnd();
+        if (struct.mutations != null) {
+          oprot.writeFieldBegin(MUTATIONS_FIELD_DESC);
+          {
+            oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.mutations.size()));
+            for (ThriftAtomicMutation _iter62 : struct.mutations)
+            {
+              _iter62.write(oprot);
+            }
+            oprot.writeListEnd();
+          }
+          oprot.writeFieldEnd();
+        }
+        if (struct.predicates != null) {
+          oprot.writeFieldBegin(PREDICATES_FIELD_DESC);
+          {
+            oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.predicates.size()));
+            for (ThriftAtomicPredicate _iter63 : struct.predicates)
+            {
+              _iter63.write(oprot);
+            }
+            oprot.writeListEnd();
+          }
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldBegin(TTL_MILLIS_FIELD_DESC);
+        oprot.writeI64(struct.ttlMillis);
+        oprot.writeFieldEnd();
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class prepareAtomic_argsTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public prepareAtomic_argsTupleScheme getScheme() {
+        return new prepareAtomic_argsTupleScheme();
+      }
+    }
+
+    private static class prepareAtomic_argsTupleScheme extends org.apache.thrift.scheme.TupleScheme<prepareAtomic_args> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, prepareAtomic_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.owner.write(oprot);
+        oprot.writeBinary(struct.requestId);
+        oprot.writeI64(struct.requestSequence);
+        {
+          oprot.writeI32(struct.mutations.size());
+          for (ThriftAtomicMutation _iter64 : struct.mutations)
+          {
+            _iter64.write(oprot);
+          }
+        }
+        {
+          oprot.writeI32(struct.predicates.size());
+          for (ThriftAtomicPredicate _iter65 : struct.predicates)
+          {
+            _iter65.write(oprot);
+          }
+        }
+        oprot.writeI64(struct.ttlMillis);
+        struct.context.write(oprot);
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, prepareAtomic_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.owner = new ThriftMutationOwner();
+        struct.owner.read(iprot);
+        struct.setOwnerIsSet(true);
+        struct.requestId = iprot.readBinary();
+        struct.setRequestIdIsSet(true);
+        struct.requestSequence = iprot.readI64();
+        struct.setRequestSequenceIsSet(true);
+        {
+          org.apache.thrift.protocol.TList _list66 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+          struct.mutations = new java.util.ArrayList<ThriftAtomicMutation>(_list66.size);
+          @org.apache.thrift.annotation.Nullable ThriftAtomicMutation _elem67;
+          for (int _i68 = 0; _i68 < _list66.size; ++_i68)
+          {
+            _elem67 = new ThriftAtomicMutation();
+            _elem67.read(iprot);
+            struct.mutations.add(_elem67);
+          }
+        }
+        struct.setMutationsIsSet(true);
+        {
+          org.apache.thrift.protocol.TList _list69 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+          struct.predicates = new java.util.ArrayList<ThriftAtomicPredicate>(_list69.size);
+          @org.apache.thrift.annotation.Nullable ThriftAtomicPredicate _elem70;
+          for (int _i71 = 0; _i71 < _list69.size; ++_i71)
+          {
+            _elem70 = new ThriftAtomicPredicate();
+            _elem70.read(iprot);
+            struct.predicates.add(_elem70);
+          }
+        }
+        struct.setPredicatesIsSet(true);
+        struct.ttlMillis = iprot.readI64();
+        struct.setTtlMillisIsSet(true);
+        struct.context = new it.cavallium.rockserver.core.common.api.RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class prepareAtomic_result implements org.apache.thrift.TBase<prepareAtomic_result, prepareAtomic_result._Fields>, java.io.Serializable, Cloneable, Comparable<prepareAtomic_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("prepareAtomic_result");
+
+    private static final org.apache.thrift.protocol.TField SUCCESS_FIELD_DESC = new org.apache.thrift.protocol.TField("success", org.apache.thrift.protocol.TType.STRING, (short)0);
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new prepareAtomic_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new prepareAtomic_resultTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer success; // required
+    public @org.apache.thrift.annotation.Nullable it.cavallium.rockserver.core.common.api.RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      SUCCESS((short)0, "success"),
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 0: // SUCCESS
+            return SUCCESS;
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.SUCCESS, new org.apache.thrift.meta_data.FieldMetaData("success", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, it.cavallium.rockserver.core.common.api.RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(prepareAtomic_result.class, metaDataMap);
+    }
+
+    public prepareAtomic_result() {
+    }
+
+    public prepareAtomic_result(
+      java.nio.ByteBuffer success,
+      it.cavallium.rockserver.core.common.api.RocksDBThriftException e)
+    {
+      this();
+      this.success = org.apache.thrift.TBaseHelper.copyBinary(success);
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public prepareAtomic_result(prepareAtomic_result other) {
+      if (other.isSetSuccess()) {
+        this.success = org.apache.thrift.TBaseHelper.copyBinary(other.success);
+      }
+      if (other.isSetE()) {
+        this.e = new it.cavallium.rockserver.core.common.api.RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public prepareAtomic_result deepCopy() {
+      return new prepareAtomic_result(this);
+    }
+
+    @Override
+    public void clear() {
+      this.success = null;
+      this.e = null;
+    }
+
+    public byte[] getSuccess() {
+      setSuccess(org.apache.thrift.TBaseHelper.rightSize(success));
+      return success == null ? null : success.array();
+    }
+
+    public java.nio.ByteBuffer bufferForSuccess() {
+      return org.apache.thrift.TBaseHelper.copyBinary(success);
+    }
+
+    public prepareAtomic_result setSuccess(byte[] success) {
+      this.success = success == null ? (java.nio.ByteBuffer)null     : java.nio.ByteBuffer.wrap(success.clone());
+      return this;
+    }
+
+    public prepareAtomic_result setSuccess(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer success) {
+      this.success = org.apache.thrift.TBaseHelper.copyBinary(success);
+      return this;
+    }
+
+    public void unsetSuccess() {
+      this.success = null;
+    }
+
+    /** Returns true if field success is set (has been assigned a value) and false otherwise */
+    public boolean isSetSuccess() {
+      return this.success != null;
+    }
+
+    public void setSuccessIsSet(boolean value) {
+      if (!value) {
+        this.success = null;
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public it.cavallium.rockserver.core.common.api.RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public prepareAtomic_result setE(@org.apache.thrift.annotation.Nullable it.cavallium.rockserver.core.common.api.RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case SUCCESS:
+        if (value == null) {
+          unsetSuccess();
+        } else {
+          if (value instanceof byte[]) {
+            setSuccess((byte[])value);
+          } else {
+            setSuccess((java.nio.ByteBuffer)value);
+          }
+        }
+        break;
+
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((it.cavallium.rockserver.core.common.api.RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case SUCCESS:
+        return getSuccess();
+
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case SUCCESS:
+        return isSetSuccess();
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof prepareAtomic_result)
+        return this.equals((prepareAtomic_result)that);
+      return false;
+    }
+
+    public boolean equals(prepareAtomic_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_success = true && this.isSetSuccess();
+      boolean that_present_success = true && that.isSetSuccess();
+      if (this_present_success || that_present_success) {
+        if (!(this_present_success && that_present_success))
+          return false;
+        if (!this.success.equals(that.success))
+          return false;
+      }
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetSuccess()) ? 131071 : 524287);
+      if (isSetSuccess())
+        hashCode = hashCode * 8191 + success.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(prepareAtomic_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetSuccess(), other.isSetSuccess());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetSuccess()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.success, other.success);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("prepareAtomic_result(");
+      boolean first = true;
+
+      sb.append("success:");
+      if (this.success == null) {
+        sb.append("null");
+      } else {
+        org.apache.thrift.TBaseHelper.toString(this.success, sb);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class prepareAtomic_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public prepareAtomic_resultStandardScheme getScheme() {
+        return new prepareAtomic_resultStandardScheme();
+      }
+    }
+
+    private static class prepareAtomic_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<prepareAtomic_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, prepareAtomic_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 0: // SUCCESS
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+                struct.success = iprot.readBinary();
+                struct.setSuccessIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new it.cavallium.rockserver.core.common.api.RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, prepareAtomic_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.success != null) {
+          oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+          oprot.writeBinary(struct.success);
+          oprot.writeFieldEnd();
+        }
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class prepareAtomic_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public prepareAtomic_resultTupleScheme getScheme() {
+        return new prepareAtomic_resultTupleScheme();
+      }
+    }
+
+    private static class prepareAtomic_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<prepareAtomic_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, prepareAtomic_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetSuccess()) {
+          optionals.set(0);
+        }
+        if (struct.isSetE()) {
+          optionals.set(1);
+        }
+        oprot.writeBitSet(optionals, 2);
+        if (struct.isSetSuccess()) {
+          oprot.writeBinary(struct.success);
+        }
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, prepareAtomic_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(2);
+        if (incoming.get(0)) {
+          struct.success = iprot.readBinary();
+          struct.setSuccessIsSet(true);
+        }
+        if (incoming.get(1)) {
+          struct.e = new it.cavallium.rockserver.core.common.api.RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
   }
 
   @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
@@ -3108,14 +6163,14 @@ public class RocksDBRemoteMutations {
             case 0: // SUCCESS
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list16 = iprot.readListBegin();
-                  struct.success = new java.util.ArrayList<ThriftMutationOwner>(_list16.size);
-                  @org.apache.thrift.annotation.Nullable ThriftMutationOwner _elem17;
-                  for (int _i18 = 0; _i18 < _list16.size; ++_i18)
+                  org.apache.thrift.protocol.TList _list72 = iprot.readListBegin();
+                  struct.success = new java.util.ArrayList<ThriftMutationOwner>(_list72.size);
+                  @org.apache.thrift.annotation.Nullable ThriftMutationOwner _elem73;
+                  for (int _i74 = 0; _i74 < _list72.size; ++_i74)
                   {
-                    _elem17 = new ThriftMutationOwner();
-                    _elem17.read(iprot);
-                    struct.success.add(_elem17);
+                    _elem73 = new ThriftMutationOwner();
+                    _elem73.read(iprot);
+                    struct.success.add(_elem73);
                   }
                   iprot.readListEnd();
                 }
@@ -3153,9 +6208,9 @@ public class RocksDBRemoteMutations {
           oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.success.size()));
-            for (ThriftMutationOwner _iter19 : struct.success)
+            for (ThriftMutationOwner _iter75 : struct.success)
             {
-              _iter19.write(oprot);
+              _iter75.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -3195,9 +6250,9 @@ public class RocksDBRemoteMutations {
         if (struct.isSetSuccess()) {
           {
             oprot.writeI32(struct.success.size());
-            for (ThriftMutationOwner _iter20 : struct.success)
+            for (ThriftMutationOwner _iter76 : struct.success)
             {
-              _iter20.write(oprot);
+              _iter76.write(oprot);
             }
           }
         }
@@ -3212,14 +6267,14 @@ public class RocksDBRemoteMutations {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list21 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-            struct.success = new java.util.ArrayList<ThriftMutationOwner>(_list21.size);
-            @org.apache.thrift.annotation.Nullable ThriftMutationOwner _elem22;
-            for (int _i23 = 0; _i23 < _list21.size; ++_i23)
+            org.apache.thrift.protocol.TList _list77 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+            struct.success = new java.util.ArrayList<ThriftMutationOwner>(_list77.size);
+            @org.apache.thrift.annotation.Nullable ThriftMutationOwner _elem78;
+            for (int _i79 = 0; _i79 < _list77.size; ++_i79)
             {
-              _elem22 = new ThriftMutationOwner();
-              _elem22.read(iprot);
-              struct.success.add(_elem22);
+              _elem78 = new ThriftMutationOwner();
+              _elem78.read(iprot);
+              struct.success.add(_elem78);
             }
           }
           struct.setSuccessIsSet(true);
@@ -4387,14 +7442,14 @@ public class RocksDBRemoteMutations {
             case 42: // ENTRIES
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list24 = iprot.readListBegin();
-                  struct.entries = new java.util.ArrayList<ThriftMutationEntry>(_list24.size);
-                  @org.apache.thrift.annotation.Nullable ThriftMutationEntry _elem25;
-                  for (int _i26 = 0; _i26 < _list24.size; ++_i26)
+                  org.apache.thrift.protocol.TList _list80 = iprot.readListBegin();
+                  struct.entries = new java.util.ArrayList<ThriftMutationEntry>(_list80.size);
+                  @org.apache.thrift.annotation.Nullable ThriftMutationEntry _elem81;
+                  for (int _i82 = 0; _i82 < _list80.size; ++_i82)
                   {
-                    _elem25 = new ThriftMutationEntry();
-                    _elem25.read(iprot);
-                    struct.entries.add(_elem25);
+                    _elem81 = new ThriftMutationEntry();
+                    _elem81.read(iprot);
+                    struct.entries.add(_elem81);
                   }
                   iprot.readListEnd();
                 }
@@ -4492,9 +7547,9 @@ public class RocksDBRemoteMutations {
           oprot.writeFieldBegin(ENTRIES_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.entries.size()));
-            for (ThriftMutationEntry _iter27 : struct.entries)
+            for (ThriftMutationEntry _iter83 : struct.entries)
             {
-              _iter27.write(oprot);
+              _iter83.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -4545,9 +7600,9 @@ public class RocksDBRemoteMutations {
         oprot.writeI64(struct.column);
         {
           oprot.writeI32(struct.entries.size());
-          for (ThriftMutationEntry _iter28 : struct.entries)
+          for (ThriftMutationEntry _iter84 : struct.entries)
           {
-            _iter28.write(oprot);
+            _iter84.write(oprot);
           }
         }
         oprot.writeBool(struct.valuesPresent);
@@ -4570,14 +7625,14 @@ public class RocksDBRemoteMutations {
         struct.column = iprot.readI64();
         struct.setColumnIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list29 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-          struct.entries = new java.util.ArrayList<ThriftMutationEntry>(_list29.size);
-          @org.apache.thrift.annotation.Nullable ThriftMutationEntry _elem30;
-          for (int _i31 = 0; _i31 < _list29.size; ++_i31)
+          org.apache.thrift.protocol.TList _list85 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+          struct.entries = new java.util.ArrayList<ThriftMutationEntry>(_list85.size);
+          @org.apache.thrift.annotation.Nullable ThriftMutationEntry _elem86;
+          for (int _i87 = 0; _i87 < _list85.size; ++_i87)
           {
-            _elem30 = new ThriftMutationEntry();
-            _elem30.read(iprot);
-            struct.entries.add(_elem30);
+            _elem86 = new ThriftMutationEntry();
+            _elem86.read(iprot);
+            struct.entries.add(_elem86);
           }
         }
         struct.setEntriesIsSet(true);
@@ -5988,13 +9043,13 @@ public class RocksDBRemoteMutations {
             case 51: // LOWER
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list32 = iprot.readListBegin();
-                  struct.lower = new java.util.ArrayList<java.nio.ByteBuffer>(_list32.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem33;
-                  for (int _i34 = 0; _i34 < _list32.size; ++_i34)
+                  org.apache.thrift.protocol.TList _list88 = iprot.readListBegin();
+                  struct.lower = new java.util.ArrayList<java.nio.ByteBuffer>(_list88.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem89;
+                  for (int _i90 = 0; _i90 < _list88.size; ++_i90)
                   {
-                    _elem33 = iprot.readBinary();
-                    struct.lower.add(_elem33);
+                    _elem89 = iprot.readBinary();
+                    struct.lower.add(_elem89);
                   }
                   iprot.readListEnd();
                 }
@@ -6006,13 +9061,13 @@ public class RocksDBRemoteMutations {
             case 52: // UPPER
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list35 = iprot.readListBegin();
-                  struct.upper = new java.util.ArrayList<java.nio.ByteBuffer>(_list35.size);
-                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem36;
-                  for (int _i37 = 0; _i37 < _list35.size; ++_i37)
+                  org.apache.thrift.protocol.TList _list91 = iprot.readListBegin();
+                  struct.upper = new java.util.ArrayList<java.nio.ByteBuffer>(_list91.size);
+                  @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem92;
+                  for (int _i93 = 0; _i93 < _list91.size; ++_i93)
                   {
-                    _elem36 = iprot.readBinary();
-                    struct.upper.add(_elem36);
+                    _elem92 = iprot.readBinary();
+                    struct.upper.add(_elem92);
                   }
                   iprot.readListEnd();
                 }
@@ -6072,9 +9127,9 @@ public class RocksDBRemoteMutations {
           oprot.writeFieldBegin(LOWER_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.lower.size()));
-            for (java.nio.ByteBuffer _iter38 : struct.lower)
+            for (java.nio.ByteBuffer _iter94 : struct.lower)
             {
-              oprot.writeBinary(_iter38);
+              oprot.writeBinary(_iter94);
             }
             oprot.writeListEnd();
           }
@@ -6084,9 +9139,9 @@ public class RocksDBRemoteMutations {
           oprot.writeFieldBegin(UPPER_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.upper.size()));
-            for (java.nio.ByteBuffer _iter39 : struct.upper)
+            for (java.nio.ByteBuffer _iter95 : struct.upper)
             {
-              oprot.writeBinary(_iter39);
+              oprot.writeBinary(_iter95);
             }
             oprot.writeListEnd();
           }
@@ -6131,18 +9186,18 @@ public class RocksDBRemoteMutations {
         if (struct.isSetLower()) {
           {
             oprot.writeI32(struct.lower.size());
-            for (java.nio.ByteBuffer _iter40 : struct.lower)
+            for (java.nio.ByteBuffer _iter96 : struct.lower)
             {
-              oprot.writeBinary(_iter40);
+              oprot.writeBinary(_iter96);
             }
           }
         }
         if (struct.isSetUpper()) {
           {
             oprot.writeI32(struct.upper.size());
-            for (java.nio.ByteBuffer _iter41 : struct.upper)
+            for (java.nio.ByteBuffer _iter97 : struct.upper)
             {
-              oprot.writeBinary(_iter41);
+              oprot.writeBinary(_iter97);
             }
           }
         }
@@ -6166,26 +9221,26 @@ public class RocksDBRemoteMutations {
         java.util.BitSet incoming = iprot.readBitSet(2);
         if (incoming.get(0)) {
           {
-            org.apache.thrift.protocol.TList _list42 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.lower = new java.util.ArrayList<java.nio.ByteBuffer>(_list42.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem43;
-            for (int _i44 = 0; _i44 < _list42.size; ++_i44)
+            org.apache.thrift.protocol.TList _list98 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.lower = new java.util.ArrayList<java.nio.ByteBuffer>(_list98.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem99;
+            for (int _i100 = 0; _i100 < _list98.size; ++_i100)
             {
-              _elem43 = iprot.readBinary();
-              struct.lower.add(_elem43);
+              _elem99 = iprot.readBinary();
+              struct.lower.add(_elem99);
             }
           }
           struct.setLowerIsSet(true);
         }
         if (incoming.get(1)) {
           {
-            org.apache.thrift.protocol.TList _list45 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-            struct.upper = new java.util.ArrayList<java.nio.ByteBuffer>(_list45.size);
-            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem46;
-            for (int _i47 = 0; _i47 < _list45.size; ++_i47)
+            org.apache.thrift.protocol.TList _list101 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+            struct.upper = new java.util.ArrayList<java.nio.ByteBuffer>(_list101.size);
+            @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem102;
+            for (int _i103 = 0; _i103 < _list101.size; ++_i103)
             {
-              _elem46 = iprot.readBinary();
-              struct.upper.add(_elem46);
+              _elem102 = iprot.readBinary();
+              struct.upper.add(_elem102);
             }
           }
           struct.setUpperIsSet(true);
@@ -14089,14 +17144,14 @@ public class RocksDBRemoteMutations {
             case 42: // ENTRIES
               if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
                 {
-                  org.apache.thrift.protocol.TList _list48 = iprot.readListBegin();
-                  struct.entries = new java.util.ArrayList<ThriftMutationEntry>(_list48.size);
-                  @org.apache.thrift.annotation.Nullable ThriftMutationEntry _elem49;
-                  for (int _i50 = 0; _i50 < _list48.size; ++_i50)
+                  org.apache.thrift.protocol.TList _list104 = iprot.readListBegin();
+                  struct.entries = new java.util.ArrayList<ThriftMutationEntry>(_list104.size);
+                  @org.apache.thrift.annotation.Nullable ThriftMutationEntry _elem105;
+                  for (int _i106 = 0; _i106 < _list104.size; ++_i106)
                   {
-                    _elem49 = new ThriftMutationEntry();
-                    _elem49.read(iprot);
-                    struct.entries.add(_elem49);
+                    _elem105 = new ThriftMutationEntry();
+                    _elem105.read(iprot);
+                    struct.entries.add(_elem105);
                   }
                   iprot.readListEnd();
                 }
@@ -14155,9 +17210,9 @@ public class RocksDBRemoteMutations {
           oprot.writeFieldBegin(ENTRIES_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.entries.size()));
-            for (ThriftMutationEntry _iter51 : struct.entries)
+            for (ThriftMutationEntry _iter107 : struct.entries)
             {
-              _iter51.write(oprot);
+              _iter107.write(oprot);
             }
             oprot.writeListEnd();
           }
@@ -14193,9 +17248,9 @@ public class RocksDBRemoteMutations {
         oprot.writeI64(struct.ordinal);
         {
           oprot.writeI32(struct.entries.size());
-          for (ThriftMutationEntry _iter52 : struct.entries)
+          for (ThriftMutationEntry _iter108 : struct.entries)
           {
-            _iter52.write(oprot);
+            _iter108.write(oprot);
           }
         }
         oprot.writeBinary(struct.inputDigest);
@@ -14210,14 +17265,14 @@ public class RocksDBRemoteMutations {
         struct.ordinal = iprot.readI64();
         struct.setOrdinalIsSet(true);
         {
-          org.apache.thrift.protocol.TList _list53 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-          struct.entries = new java.util.ArrayList<ThriftMutationEntry>(_list53.size);
-          @org.apache.thrift.annotation.Nullable ThriftMutationEntry _elem54;
-          for (int _i55 = 0; _i55 < _list53.size; ++_i55)
+          org.apache.thrift.protocol.TList _list109 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+          struct.entries = new java.util.ArrayList<ThriftMutationEntry>(_list109.size);
+          @org.apache.thrift.annotation.Nullable ThriftMutationEntry _elem110;
+          for (int _i111 = 0; _i111 < _list109.size; ++_i111)
           {
-            _elem54 = new ThriftMutationEntry();
-            _elem54.read(iprot);
-            struct.entries.add(_elem54);
+            _elem110 = new ThriftMutationEntry();
+            _elem110.read(iprot);
+            struct.entries.add(_elem110);
           }
         }
         struct.setEntriesIsSet(true);

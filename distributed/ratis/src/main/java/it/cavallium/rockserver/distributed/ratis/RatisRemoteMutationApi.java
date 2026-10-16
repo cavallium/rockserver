@@ -16,6 +16,8 @@ public final class RatisRemoteMutationApi implements RemoteMutationAsyncAPI {
     private final RatisRocksDBConnection connection;
     private final RWScheduler scheduler;
     RatisRemoteMutationApi(RatisRocksDBConnection connection,RWScheduler scheduler){this.connection=Objects.requireNonNull(connection);this.scheduler=Objects.requireNonNull(scheduler);}
+    @Override public CompletableFuture<List<RemoteMutationOwner>> atomicOwners(List<Long> columns,RequestContext context){return connection.atomicMutationOwners(columns,context);}
+    @Override public CompletableFuture<RemoteMutationToken> prepareAtomic(RemoteMutationOwner owner,UUID id,long sequence,List<AtomicMutation> mutations,List<AtomicPredicate> predicates,long ttlMillis,RequestContext context){return connection.prepareAtomicMutation(owner,id,sequence,mutations,predicates,ttlMillis,context);}
     @Override public CompletableFuture<List<RemoteMutationOwner>> owners(long column,RequestContext context){return connection.remoteMutationOwners(column,context);}
     @Override public CompletableFuture<RemoteMutationToken> preparePoint(RemoteMutationOwner owner,UUID id,long sequence,long column,List<Keys> keys,List<Buf> values,Mutation.Kind kind,RequestType.RequestTypeId callback,boolean multi,RequestContext context){
         try {

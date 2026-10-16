@@ -75,6 +75,12 @@ final class RatisGenerationRegistry implements AutoCloseable {
         var bindings=new RatisTransactionBindings(new ArrayList<>(selected.values()));var physical=bindings.scope(declaration);var key=key(bindings);Owned owner;synchronized(this){owner=generations.get(key);}if(owner==null){add(bindings,root.resolve(key),true);validateColumns();synchronized(this){owner=generations.get(key);}}
         return new Scoped(owner,physical);
     }
+    Owned atomicColumns(List<Long> columns)throws IOException {
+        if(columns.isEmpty() || columns.size()>256)throw new IllegalArgumentException("Invalid atomic selected column count");
+        var selected=new LinkedHashMap<UUID,RatisTransactionBindings.Domain>();
+        var current=current();for(long column:columns){var owner=current.stream().filter(value->value.bindings().columns().stream().anyMatch(c->c.apiId()==column)).findFirst().orElseThrow(()->new IllegalArgumentException("Unknown atomic API column"));for(var domain:owner.bindings().domains())selected.putIfAbsent(domain.directory().domainId(),domain);}
+        var bindings=new RatisTransactionBindings(new ArrayList<>(selected.values()));var key=key(bindings);Owned owner;synchronized(this){owner=generations.get(key);}if(owner==null){add(bindings,root.resolve(key),true);synchronized(this){owner=generations.get(key);}}return owner;
+    }
     Owned current(UUID domain) throws IOException {
         var data=data(domain);var directory=data.directory();var key=key(directory.schemaDigest(),directory);Owned current;synchronized(this){current=generations.get(key);}if(current!=null)return current;
         var schema=schemas.read(directory.schemaDigest());if(schema==null)throw new IOException("Activated immutable schema absent from catalogue");data.requireKnownSchema(schema);schema.requireMatches(directory);add(RatisTransactionBindings.of(schema,directory,data),root.resolve(key),true);validateColumns();synchronized(this){return generations.get(key);}

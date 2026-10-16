@@ -65,7 +65,7 @@ class RatisPointPipelineTest {
         }
     }
     @Test void sharedEnvelopeRejectsBeforeCopyAndRetainedOwnerConstruction()throws Exception {
-        var limits=new RemoteMutationOwnerLimits(2,2,0,0,2,32L<<20,512L<<20,512,16L<<20,8L<<20,1);
+        var limits=new RemoteMutationOwnerLimits(2,2,0,0,0,2,32L<<20,512L<<20,512,16L<<20,8L<<20,1);
         try(var budget=new RatisRequestBudget(limits);var first=budget.owner(RemoteMutationToken.Kind.POINT,1024,0);var second=budget.owner(RemoteMutationToken.Kind.POINT,1024,0)) {
             first.opened(0,false);second.opened(0,false);long used=budget.chargedBytes();assertThrows(RocksDBException.class,()->budget.owner(RemoteMutationToken.Kind.POINT,1024,0));assertThrows(RocksDBException.class,()->budget.request(RemoteMutationToken.Kind.POINT,new RatisRequestBudget.Geometry(2L<<20,2L<<20,2L<<20,2L<<20,2L<<20,1).bytes()));assertEquals(used,budget.chargedBytes());assertEquals(0,budget.retainedRequests());
         }

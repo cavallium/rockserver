@@ -25,8 +25,8 @@ class RemoteMutationThriftContractTest {
     private static final RequestContext CONTEXT=RequestContext.batch();
     private static final UUID REQUEST=new UUID(711,9);
     private static final long COLUMN=7,SEQUENCE=11;
-    private static RemoteMutationOwner owner(RemoteMutationToken.Kind kind){return new RemoteMutationOwner(new UUID(711,1),new UUID(711,2),new UUID(711,3),new UUID(711,4+kind.ordinal()),2,SEQUENCE,kind,new byte[32],new byte[32]);}
-    private static RemoteMutationToken token(RemoteMutationOwner owner,UUID id,long sequence,byte[] input){return new RemoteMutationToken(owner.clusterId(),owner.databaseId(),owner.domainId(),owner.ownerId(),id,owner.ownerEpoch(),sequence,owner.kind(),owner.schemaDigest(),owner.directoryDigest(),input);}
+    private static RemoteMutationOwner owner(RemoteMutationToken.Kind kind){return new RemoteMutationOwner(new UUID(711,1),new UUID(711,2),new UUID(711,4+kind.ordinal()),2,SEQUENCE,kind,List.of(new DomainBinding(new UUID(711,3),4,new byte[32],6,new byte[32])));}
+    private static RemoteMutationToken token(RemoteMutationOwner owner,UUID id,long sequence,byte[] input){return new RemoteMutationToken(owner.clusterId(),owner.databaseId(),owner.ownerId(),id,owner.ownerEpoch(),sequence,owner.kind(),owner.domains(),input);}
     private static it.cavallium.rockserver.core.common.api.RequestContext context(){return new it.cavallium.rockserver.core.common.api.RequestContext(WorkloadProfile.BATCH,RequestContext.NO_TIMEOUT);}
     private static RemoteMutationAsyncAPI backend(InvocationHandler handler){return (RemoteMutationAsyncAPI)Proxy.newProxyInstance(RemoteMutationAsyncAPI.class.getClassLoader(),new Class<?>[]{RemoteMutationAsyncAPI.class},handler);}
     private static RocksDBRemoteMutations.Iface binary(RemoteMutationThriftService service,AtomicBoolean loseExecute){
@@ -110,12 +110,12 @@ class RemoteMutationThriftContractTest {
         assertThrows(RocksDBThriftException.class,()->service.finishInput(ThriftRemoteMutationWire.token(token),context()));
         var malformedOwner=ThriftRemoteMutationWire.owner(owner(RemoteMutationToken.Kind.BULK));malformedOwner.unsetOwnerEpoch();
         assertThrows(RocksDBThriftException.class,()->service.prepareBulk(malformedOwner,ThriftRemoteMutationWire.uuid(REQUEST),SEQUENCE,COLUMN,false,context()));
-        var invalidDigest=ThriftRemoteMutationWire.owner(owner(RemoteMutationToken.Kind.BULK)).setSchemaDigest(new byte[33]);
+        var invalidDigest=ThriftRemoteMutationWire.owner(owner(RemoteMutationToken.Kind.BULK));invalidDigest.domains.getFirst().setSchemaDigest(new byte[33]);
         assertThrows(RocksDBThriftException.class,()->service.prepareBulk(invalidDigest,ThriftRemoteMutationWire.uuid(REQUEST),SEQUENCE,COLUMN,false,context()));
         var bounds=List.of(ByteBuffer.wrap(new byte[TransactionScope.MAX_BOUND_BYTES]));
         assertThrows(RocksDBThriftException.class,()->service.prepareRange(ThriftRemoteMutationWire.owner(owner(RemoteMutationToken.Kind.RANGE)),ThriftRemoteMutationWire.uuid(REQUEST),SEQUENCE,COLUMN,bounds,List.of(ByteBuffer.wrap(new byte[1])),context()));
         assertEquals(0,calls.get());
-        var bytes=new TMemoryBuffer(32);var protocol=new TBinaryProtocol(bytes);protocol.writeFieldBegin(new TField("token",TType.STRING,(short)20));protocol.writeI32(194);
+        var bytes=new TMemoryBuffer(32);var protocol=new TBinaryProtocol(bytes);protocol.writeFieldBegin(new TField("token",TType.STRING,(short)20));protocol.writeI32(RemoteMutationToken.MAX_BYTES+1);
         assertThrows(TProtocolException.class,()->new RocksDBRemoteMutations.status_args().read(ThriftRemoteMutationWire.boundedProtocol(new TBinaryProtocol(bytes),true)));
         var listBytes=new TMemoryBuffer(32);protocol=new TBinaryProtocol(listBytes);protocol.writeFieldBegin(new TField("entries",TType.LIST,(short)42));protocol.writeListBegin(new TList(TType.STRUCT,4097));
         var input=ThriftRemoteMutationWire.boundedProtocol(new TBinaryProtocol(listBytes),true);input.readFieldBegin();assertThrows(TProtocolException.class,input::readListBegin);

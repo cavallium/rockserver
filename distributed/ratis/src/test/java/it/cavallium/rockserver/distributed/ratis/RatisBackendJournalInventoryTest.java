@@ -51,7 +51,7 @@ class RatisBackendJournalInventoryTest {
 
     @Test void ownedExportMetadataPreflightsBeforeChunkAndColdAckRefundsOnlyForcedSidecarRemoval()throws Exception {
         Path artifacts=Files.createDirectories(root.resolve("exports/job")),path=artifacts.resolve("child");var helper=new RatisExportJournalTest();helper.root=artifacts;var directory=helper.directory(1);var definition=helper.definition(directory);var captures=helper.tokens(definition.fence());
-        var limits=new RemoteMutationOwnerLimits(1,2,1,1,4,128L<<20,16L<<20,128,16L<<20,8L<<20,1);Path artifact;
+        var limits=new RemoteMutationOwnerLimits(1,2,1,1,0,4,128L<<20,16L<<20,128,16L<<20,8L<<20,1);Path artifact;
         try(var budget=new RatisRequestBudget(limits);var lease=budget.backendRoot(root);var journal=RatisExportJournal.createOwned(path,definition,budget)){
             journal.bindSource(helper.capturedSource(directory,definition.fence(),captures));Path competing=root.resolve("retained-history");Files.write(competing,new byte[0]);long promise=(16L<<20)-budget.chargedDiskBytes()-(4L<<20);budget.reserve(new RatisJournalAccess.Reservation(competing,16<<20,promise));long disk=budget.chargedDiskBytes(),bytes=Files.size(path);
             assertThrows(RuntimeException.class,()->journal.freezeChunk(directory.ranges().getFirst().groupId()));assertEquals(disk,budget.chargedDiskBytes());assertEquals(bytes,Files.size(path));assertNull(journal.snapshot().pending());

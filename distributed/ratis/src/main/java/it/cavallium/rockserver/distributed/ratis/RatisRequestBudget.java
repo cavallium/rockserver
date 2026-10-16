@@ -12,7 +12,7 @@ import static it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorT
 /** Credits precede owner construction and input copies, and outlive observers until actual ownership drains. */
 final class RatisRequestBudget implements AutoCloseable,RatisJournalAccess {
     record Geometry(long inputBytes,long resultBytes,long maximumItemBytes,long maximumResultBytes,long logicalBytes,int items) {
-        long bytes(){long journal=56+RemoteMutationToken.BYTES+36+32+8L*items+inputBytes+resultBytes;return Math.addExact(64L*1024+logicalBytes,Math.addExact(4*journal,4*(maximumItemBytes+maximumResultBytes)));}
+        long bytes(){long journal=56+RemoteMutationToken.MAX_BYTES+36+32+8L*items+inputBytes+resultBytes;return Math.addExact(64L*1024+logicalBytes,Math.addExact(4*journal,4*(maximumItemBytes+maximumResultBytes)));}
     }
     private final RemoteMutationOwnerLimits limits;private final ThreadPoolExecutor recovery;
     private long bytes,diskBytes,pathBytes;private int owners,requests,works,diskOwners,recoveryOwners;private boolean closed;
@@ -21,8 +21,8 @@ final class RatisRequestBudget implements AutoCloseable,RatisJournalAccess {
     private RatisBackendRootOwnership backendRoot;
     RatisRequestBudget(RemoteMutationOwnerLimits limits){this.limits=Objects.requireNonNull(limits);recovery=new ThreadPoolExecutor(limits.recoveryWorkers(),limits.recoveryWorkers(),0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(limits.maximumRequests()),Thread.ofPlatform().daemon(true).name("ratis-request-recovery-",0).factory(),new ThreadPoolExecutor.AbortPolicy());}
     RemoteMutationOwnerLimits limits(){return limits;}
-    private static void kind(RemoteMutationToken.Kind kind){if(kind!=RemoteMutationToken.Kind.POINT && kind!=RemoteMutationToken.Kind.BULK && kind!=RemoteMutationToken.Kind.RANGE)throw new IllegalArgumentException("Unsupported shared owner kind");}
-    private int maximumOwners(RemoteMutationToken.Kind kind){return switch(kind){case POINT->limits.maximumPointOwners();case BULK->limits.maximumBulkOwners();case RANGE->limits.maximumRangeOwners();default->throw new IllegalArgumentException("Unsupported owner kind");};}
+    private static void kind(RemoteMutationToken.Kind kind){if(kind!=RemoteMutationToken.Kind.POINT && kind!=RemoteMutationToken.Kind.BULK && kind!=RemoteMutationToken.Kind.RANGE && kind!=RemoteMutationToken.Kind.ATOMIC)throw new IllegalArgumentException("Unsupported shared owner kind");}
+    private int maximumOwners(RemoteMutationToken.Kind kind){return switch(kind){case POINT->limits.maximumPointOwners();case BULK->limits.maximumBulkOwners();case RANGE->limits.maximumRangeOwners();case ATOMIC->limits.maximumAtomicOwners();default->throw new IllegalArgumentException("Unsupported owner kind");};}
     private void capacity(long amount){if(closed || amount<0 || amount>limits.maximumBytes()-limits.recoveryBytes()-limits.renewalBytes()-bytes)throw RocksDBException.of(SERVER_OVERLOADED,"Shared remote owner byte envelope exhausted");}
     synchronized Owner owner(RemoteMutationToken.Kind kind,long directoryBytes,long openingBytes){
         kind(kind);if(directoryBytes<0 || openingBytes<0)throw new IllegalArgumentException("Negative owner geometry");long base=Math.addExact(256L<<10,directoryBytes),opening=Math.addExact(base,Math.multiplyExact(4,openingBytes));

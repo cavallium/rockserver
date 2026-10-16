@@ -4974,17 +4974,22 @@ public final class ReplicatedRangeStore {
         private final long accountedBytes;
         private boolean closed;
         private ScopedStaging(ScopedHistoryPin parent,DistributedCommand command) throws RocksDBException {
-            this.parent=parent; this.command=command; this.visibility=new RangeOverlay(command);
+            this.parent=parent; this.command=command;var evaluatedVisibility=new RangeOverlay(command);
             var pin=parent.snapshot.pin; pin.acquireUse();
             WriteBatchWithIndex building=null; boolean success=false;
             try {
                 building=new WriteBatchWithIndex(true);
                 building.setMaxBytes(MAX_BUCKET_PLAN_BYTES+3L*DistributedCommandCodec.MAX_ENCODED_BYTES);
                 try (var options=new ReadOptions().setSnapshot(pin.snapshot)) {
-                    var evaluation=evaluatePoints(command,building,options,visibility);
-                    if (evaluation.result().status()!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Transaction staging rejected: "+evaluation.result().status());
-                    for (var entry:evaluation.buckets().entrySet()) building.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
+                    var evaluation=evaluatePoints(command,building,options,evaluatedVisibility);
                     result=evaluation.result();
+                    if(result.status()==CommandResult.Status.SUCCESS){
+                        for(var entry:evaluation.buckets().entrySet())building.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
+                        visibility=evaluatedVisibility;
+                    }else {
+                        // A deterministic no-effect result must expose neither partial point writes nor range elision.
+                        building.clear();visibility=new RangeOverlay(command);
+                    }
                     // Original operands, raw indexed effects, materialized buckets, result and bounded entry overhead.
                     long bytes=(visibility.enabled ? 5L : 2L)*DistributedCommandCodec.encodedSize(command)+result.encode().length+4096L+128L*(command.mutations().size()+command.predicates().size());
                     for (var bucket:evaluation.buckets().values()) bytes+=bucket.encodedSize();

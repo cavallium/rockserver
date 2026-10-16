@@ -79,7 +79,7 @@ class NativeScopedStagingTest {
             enable(f);
             try (var pin=f.store.captureTracked(range(outer.fixed))) {
                 var bad=new DistributedCommand(outer.group,1,f.schema.digest(),new OperationId(outer.session,1,0),List.of(put(outer.fixed,1,1)),List.of(new KeyPredicate(outer.fixed,key(1),key(99))));
-                assertThrows(IllegalStateException.class,() -> pin.stage(bad)); assertEquals(1,f.store.activeSnapshotPins());
+                try(var rejected=pin.stage(bad)){assertEquals(CommandResult.Status.CONFLICT,rejected.result().status());assertEquals(0,rejected.result().valueCount());assertNull(rejected.get(outer.fixed,key(1)));assertThrows(IllegalStateException.class,()->f.store.planScopedCommit(pin,bad,0,new UUID(0,9)));}assertEquals(1,f.store.activeSnapshotPins());
                 assertThrows(IllegalArgumentException.class,() -> pin.stage(command(f,1,put(outer.fixed,11,1))));
                 try (var first=pin.stage(command(f,2,put(outer.fixed,1,1))); var next=pin.stage(command(f,2,put(outer.fixed,1,1),put(outer.fixed,2,2)))) {
                     assertNull(first.get(outer.fixed,key(2))); assertArrayEquals(key(2),next.get(outer.fixed,key(2)));
@@ -98,7 +98,7 @@ class NativeScopedStagingTest {
             try (var pin=f.store.captureTracked(range(outer.fixed))) {
                 var tooLarge=command(f,1,new Mutation(Mutation.Kind.PUT,outer.fixed,key(1),value,Mutation.ReturnMode.PREVIOUS),
                         new Mutation(Mutation.Kind.DELETE,outer.fixed,key(1),null,Mutation.ReturnMode.PREVIOUS));
-                assertThrows(IllegalStateException.class,() -> pin.stage(tooLarge));
+                try(var rejected=pin.stage(tooLarge)){assertEquals(CommandResult.Status.RESULT_TOO_LARGE,rejected.result().status());assertArrayEquals(value,rejected.get(outer.fixed,key(1)));assertEquals(0,rejected.result().valueCount());}
                 assertThrows(IllegalArgumentException.class,() -> pin.stage(command(f,2,new Mutation(Mutation.Kind.PUT,outer.fixed,new byte[]{1,2},key(1)))));
                 assertEquals(1,f.store.activeSnapshotPins()); assertEquals(new ApplyPosition(1,1),f.store.applied());
                 try (var stage=pin.stage(command(f,3,put(outer.fixed,2,2)))) { assertArrayEquals(value,stage.get(outer.fixed,key(1))); }

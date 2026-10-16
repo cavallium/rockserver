@@ -58,7 +58,7 @@ final class RatisDirectRequestJournal implements AutoCloseable {
     private void persist() throws IOException { try { access.write(path,encode(),MAX_BYTES); } catch (IOException | RuntimeException failure) { fenced=true; if (failure instanceof IOException io) throw io; throw new IOException("Direct journal failed; reopen it",failure); } }
     private byte[] encode() throws IOException {
         if (request==null) throw new IOException("Direct request absent"); validate(request);
-        long size=56L+RemoteMutationToken.BYTES+(request.pending==null ? 0 : 36);
+        long size=56L+RemoteMutationToken.MIN_BYTES+(request.pending==null ? 0 : 36);
         for (var item:request.items) size+=4L+DistributedCommandCodec.encodedSize(item);
         for (var result:request.results) size+=4L+result.encode().length;
         if (size+32>MAX_BYTES) throw new IOException("Direct request journal exceeds bound");
@@ -79,7 +79,7 @@ final class RatisDirectRequestJournal implements AutoCloseable {
             int kind=in.getInt(); if (kind<0 || kind>=RequestType.RequestTypeId.values().length) throw new IOException("Invalid direct callback"); boolean multi=flag(in); int count=in.getInt(); if (count<1 || count>256 || count*4L>in.remaining()) throw new IOException("Invalid direct item count");
             var items=new ArrayList<DistributedCommand>(); for (int n=0;n<count;n++) items.add(DistributedCommandCodec.decode(blob(in,DistributedCommandCodec.MAX_ENCODED_BYTES)));
             var result=new Request(RatisRocksDBDirect.WriteKind.values()[effect],RequestType.RequestTypeId.values()[kind],multi,items); count=in.getInt(); if (count<0 || count>items.size()) throw new IOException("Invalid direct progress"); for (int n=0;n<count;n++) result.results.add(CommandResult.decode(blob(in,CommandResult.MAX_BYTES)));
-            result.overflow=flag(in); if (flag(in)) { result.pendingIndex=in.getInt(); result.pending=new OperationId(new UUID(in.getLong(),in.getLong()),in.getLong(),in.getLong()); } if (flag(in)) result.unsubmittedStatus=CommandResult.Status.STALE_SCHEMA; byte[] token=new byte[RemoteMutationToken.BYTES]; in.get(token); result.token=RemoteMutationToken.decode(token); if (in.hasRemaining()) throw new IOException("Trailing direct journal bytes"); validate(result); return result;
+            result.overflow=flag(in); if (flag(in)) { result.pendingIndex=in.getInt(); result.pending=new OperationId(new UUID(in.getLong(),in.getLong()),in.getLong(),in.getLong()); } if (flag(in)) result.unsubmittedStatus=CommandResult.Status.STALE_SCHEMA; byte[] token=new byte[RemoteMutationToken.MIN_BYTES]; in.get(token); result.token=RemoteMutationToken.decode(token); if (in.hasRemaining()) throw new IOException("Trailing direct journal bytes"); validate(result); return result;
         } catch (RuntimeException invalid) { throw new IOException("Invalid direct journal",invalid); }
     }
     private static void validate(Request request) throws IOException {

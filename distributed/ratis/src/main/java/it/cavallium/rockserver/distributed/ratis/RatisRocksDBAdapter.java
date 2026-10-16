@@ -450,7 +450,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
                 try { plan=RatisTransactionPlan.captured(schema.directories(),entry.lease.identity().commit().business(),logical.mutations(),logical.predicates(),entry.lease.snapshot()); }
                 catch (IOException unavailable) { throw new CompletionException(unavailable); }
                 var ordered=new HashMap<Integer,byte[]>();
-                for (var part:plan.partitions()) { var result=results.get(part.route().groupId()); if (result==null || result.valueCount()!=part.resultPositions().size()) throw new CompletionException(new IOException("Stage result mapping changed")); for (int n=0;n<result.valueCount();n++) ordered.put(part.resultPositions().get(n),result.value(n)); }
+                for (var part:plan.partitions()) { var result=results.get(part.route().groupId()); if (result==null || result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=part.resultPositions().size()) throw new CompletionException(new IOException("Stage result mapping changed")); for (int n=0;n<result.valueCount();n++) ordered.put(part.resultPositions().get(n),result.value(n)); }
                 var returned=new ArrayList<Object>();
                 for (int n=0;n<pending.keys.size();n++) {
                     byte[] raw=returns ? ordered.get(pending.firstResult+n) : null; Buf previous=raw==null ? null : Buf.wrap(raw); Buf current=pending.kind==RatisRocksDBDirect.WriteKind.DELETE ? null : shape.schema().hasValue() ? pending.values.get(n) : Buf.wrap(new byte[0]);

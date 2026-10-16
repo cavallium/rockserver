@@ -46,6 +46,16 @@ public final class RatisTransactionClient implements AutoCloseable {
         if (Files.exists(capture,LinkOption.NOFOLLOW_LINKS) || Files.exists(commit,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Mutable transaction journals must be new; reopen only an exact durable commit");
         var snapshot=snapshots.open(capture,identity.snapshot(),scope,ttl,context); var lease=new Lease(snapshot,commit,identity); leases.put(capture,lease); return lease;
     }
+    /** Exact durable outer owner definition, forced before the first snapshot RPC. */
+    SnapshotFence frozenDefinition(Identity identity,TransactionScope scope){return snapshots.plan(identity.snapshot(),scope).fence();}
+    synchronized Lease openFrozen(Path snapshotPath,Path commitPath,Identity identity,SnapshotFence fence,Duration ttl,RequestContext context,RatisSnapshotClient.PublicationObserver publication)throws IOException {
+        requireOpen();data.require(fence.domains());
+        if(!fence.fenceId().equals(identity.snapshot().fence()) || !fence.operation().equals(identity.snapshot().business()))throw new IOException("Frozen transaction snapshot identity differs");
+        Path capture=snapshotPath.toAbsolutePath().normalize(),commit=commitPath.toAbsolutePath().normalize();
+        if(capture.equals(commit) || owned(capture) || owned(commit))throw new IOException("Frozen transaction journal already owned");
+        var snapshot=snapshots.openWritableFrozen(capture,fence,ttl,context,publication);
+        var lease=new Lease(snapshot,commit,identity);leases.put(capture,lease);return lease;
+    }
     /** Recover an exact already-published commit; ephemeral staged prefixes have no reopen API. */
     public synchronized RatisAtomicClient.Operation reopenCommit(Path path,RequestContext context) throws IOException {
         requireOpen(); Path commit=Objects.requireNonNull(path).toAbsolutePath().normalize();
@@ -119,6 +129,9 @@ public final class RatisTransactionClient implements AutoCloseable {
                 return snapshot.stagePrefix(plan,context);
             } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
         }
+        /** Freeze immutable acceptance before the outer owner publishes its child journal. */
+        synchronized RatisTransactionPlan.Accepted freezeAcceptance()throws IOException {requireLease();requireOpen();if(operation!=null)throw new IOException("Commit already published");return snapshot.preparedPrefix(identity.commit());}
+        synchronized void finishAcceptedOwnership(){snapshot.finishCommitOwnership();commitFinished=true;}
         public synchronized RatisAtomicClient.Operation commit(RequestContext context) throws IOException {
             requireLease(); requireOpen(); if (operation!=null) return operation;
             var accepted=snapshot.preparedPrefix(identity.commit());

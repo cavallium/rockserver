@@ -59,6 +59,10 @@ class RatisAtomicClientTest {
         final Map<UUID,RaftGroup> raftGroups=new HashMap<>();
         final List<RaftStorage> storages=new ArrayList<>();
         final AtomicInteger opens=new AtomicInteger(),captureCloses=new AtomicInteger(),submissions=new AtomicInteger(),rpcs=new AtomicInteger(),captureRequests=new AtomicInteger();
+        record CaptureIdentity(UUID group,UUID owner,UUID snapshot) {}
+        record CaptureAttempt(CaptureIdentity identity,RatisSnapshotCaptureRequest request,byte[] bytes){CaptureAttempt{bytes=bytes.clone();}@Override public byte[] bytes(){return bytes.clone();}}
+        final List<CaptureAttempt> captureAttempts=new CopyOnWriteArrayList<>();
+        final Map<CaptureIdentity,RatisSnapshotCaptureRequest.Result> captureResults=new ConcurrentHashMap<>();
         volatile Runnable beforeAuthorize,beforeHomeRead,beforeHomeCommand,beforeSnapshotCapture,beforeSnapshotRead,beforeSnapshotRelease,beforePromotion;
         volatile UUID losePrepareGroup,loseCaptureGroup;
         volatile TransactionStatus allowedReservation;
@@ -200,11 +204,20 @@ class RatisAtomicClientTest {
                 }
                 public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
                     rpcs.incrementAndGet(); int kind=ScopedTransactionRpc.kind(request,Math.max(ScopedTransactionRpc.MAX_REQUEST_BYTES,RatisSnapshotCohortRpc.MAX_REQUEST_BYTES));
-                    if (kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) { captureRequests.incrementAndGet(); if (beforeSnapshotCapture!=null) beforeSnapshotCapture.run(); }
+                    CaptureAttempt attempt=null;
+                    if(kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE){
+                        var capture=RatisSnapshotCaptureRequest.decode(ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES).body());attempt=new CaptureAttempt(new CaptureIdentity(route.groupId(),capture.owner(),capture.snapshotId()),capture,request);captureAttempts.add(attempt);
+                        captureRequests.incrementAndGet();if(beforeSnapshotCapture!=null)beforeSnapshotCapture.run();
+                    }
                     if (kind==ScopedTransactionRpc.SNAPSHOT_RELEASE && beforeSnapshotRelease!=null) beforeSnapshotRelease.run();
                     if ((kind==ScopedTransactionRpc.SNAPSHOT_GET || kind==ScopedTransactionRpc.SNAPSHOT_PAGE) && beforeSnapshotRead!=null) beforeSnapshotRead.run();
                     if(owner!=null)assertEquals(route.replicas().getFirst(),owner);var machine=machines.get(route.groupId());var message=Message.valueOf(ByteString.copyFrom(request));
-                    return (owner==null ? machine.queryLinearizable(message) : machine.queryStale(message,0)).thenApply(reply->{if(kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE && route.groupId().equals(loseCaptureGroup)){loseCaptureGroup=null;throw new java.util.concurrent.CompletionException(new IOException("Lost native capture reply"));}return reply.getContent().toByteArray();});
+                    var original=attempt;
+                    return (owner==null ? machine.queryLinearizable(message) : machine.queryStale(message,0)).thenApply(reply->{
+                        byte[] bytes=reply.getContent().toByteArray();
+                        if(original!=null)try{var captured=original.request().resultBinding(ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REPLY_BYTES).body());var previous=captureResults.putIfAbsent(original.identity(),captured);if(previous!=null)assertEquals(previous,captured,"Capture retry changed its original native token/handle");}catch(IOException failure){throw new CompletionException(failure);}
+                        if(kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE && route.groupId().equals(loseCaptureGroup)){loseCaptureGroup=null;throw new CompletionException(new IOException("Lost native capture reply"));}return bytes;
+                    });
                 }
                 public RangeStateView stateView(RangeDescriptor route) throws IOException { return RangeStateView.decode(ScopedTransactionRpc.parse(transaction(route,ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]),true),ScopedTransactionRpc.MAX_REPLY_BYTES).body()); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException {

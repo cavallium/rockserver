@@ -1032,7 +1032,7 @@ public final class RatisRoutedClient implements AutoCloseable {
             byte[] encoded=reset?new byte[0]:DistributedCommandCodec.encode(prefix),digest=reset?OperatorUpload.sha256(encoded):prefix.payloadDigest();var body=ByteBuffer.allocate(60+encoded.length);ScopedTransactionRpc.writeHandle(body,handle);ScopedTransactionRpc.putBlob(body,encoded);
             byte[] reply=call(ScopedTransactionRpc.STAGE,body.array());
             if(reply.length<32 || !Arrays.equals(digest,Arrays.copyOf(reply,32)))throw new IOException("Staging reply differs from requested prefix");
-            try{var result=CommandResult.decode(Arrays.copyOfRange(reply,32,reply.length));long returns=mutations.stream().filter(m->m.returnMode()!=Mutation.ReturnMode.NONE).count();if(result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=returns)throw new IOException("Staging reply differs from requested result plan");return result;}
+            try{var result=CommandResult.decode(Arrays.copyOfRange(reply,32,reply.length));long returns=mutations.stream().filter(m->m.returnMode()!=Mutation.ReturnMode.NONE).count();if(result.status()==CommandResult.Status.SUCCESS && result.valueCount()!=returns || result.status()!=CommandResult.Status.SUCCESS && result.valueCount()!=0)throw new IOException("Staging reply differs from requested result plan");return result;}
             catch(IllegalArgumentException malformed){throw new IOException("Invalid staging reply",malformed);}
         }
         public CommandResult stage(List<Mutation> mutations) throws IOException { return stage(mutations,List.of()); }

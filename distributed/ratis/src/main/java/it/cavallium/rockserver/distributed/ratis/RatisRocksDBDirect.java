@@ -50,7 +50,7 @@ public final class RatisRocksDBDirect implements AutoCloseable {
     synchronized void activateSelected(){if(historical)throw new IllegalStateException("Historical owner cannot reactivate");renewing=false;}
 
     public RemoteMutationOwner owner() throws IOException {return authority(receipts.nextSequence());}
-    private RemoteMutationOwner authority(long nextSequence) {var grant=session.grant();return new RemoteMutationOwner(schema.clusterId(),schema.databaseId(),schema.domainId(),grant.sessionId(),grant.epoch(),nextSequence,RemoteMutationToken.Kind.POINT,schema.digest(),directory.payloadDigest());}
+    private RemoteMutationOwner authority(long nextSequence) {var grant=session.grant();return new RemoteMutationOwner(schema.clusterId(),schema.databaseId(),grant.sessionId(),grant.epoch(),nextSequence,RemoteMutationToken.Kind.POINT,List.of(DomainBinding.of(directory)));}
     public CompletableFuture<Object> get(long column,Keys keys,RequestType.RequestTypeId type,RequestContext context) {
         try {
             if (type!=RequestType.RequestTypeId.CURRENT && type!=RequestType.RequestTypeId.EXISTS && type!=RequestType.RequestTypeId.NOTHING) throw unsupported();
@@ -69,7 +69,7 @@ public final class RatisRocksDBDirect implements AutoCloseable {
         try { task=reserve(context,OperationFamily.MUTATION,true); } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
         try {
             var geometry=RatisRequestBudget.geometry(schema,column,keys,values,kind,type,multi);persistence.lock();try{journal.request();if(requestCredit==null)requestCredit=budget.request(RemoteMutationToken.Kind.POINT,geometry.bytes());}finally{persistence.unlock();}
-            var token=new RemoteMutationToken(schema.clusterId(),schema.databaseId(),schema.domainId(),expectedOwner.ownerId(),requestId,expectedOwner.ownerEpoch(),requestSequence,RemoteMutationToken.Kind.POINT,schema.digest(),directory.payloadDigest(),RemoteMutationInputs.point(column,kind.ordinal(),type,multi,keys,values));persistence.lock();try{receipts.requireNew(token);}finally{persistence.unlock();}
+            var token=new RemoteMutationToken(schema.clusterId(),schema.databaseId(),expectedOwner.ownerId(),requestId,expectedOwner.ownerEpoch(),requestSequence,RemoteMutationToken.Kind.POINT,List.of(DomainBinding.of(directory)),RemoteMutationInputs.point(column,kind.ordinal(),type,multi,keys,values));persistence.lock();try{receipts.requireNew(token);}finally{persistence.unlock();}
             if(!owner().sameAuthority(expectedOwner))throw new IOException("Point owner differs from installed durable session"); Objects.requireNonNull(kind);
             if (kind==WriteKind.MERGE ? type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.MERGED
                     : !(type==RequestType.RequestTypeId.NOTHING || type==RequestType.RequestTypeId.PREVIOUS || type==RequestType.RequestTypeId.PREVIOUS_PRESENCE || kind==WriteKind.PUT && (type==RequestType.RequestTypeId.ENSURE || type==RequestType.RequestTypeId.DELTA || type==RequestType.RequestTypeId.CHANGED))) throw unsupported();

@@ -1,7 +1,7 @@
 include "rocksdb.thrift"
 namespace java it.cavallium.rockserver.core.common.api
 
-enum ThriftMutationKind { POINT = 0, RANGE = 1, BULK = 2 }
+enum ThriftMutationKind { POINT = 0, RANGE = 1, BULK = 2, ATOMIC = 3 }
 enum ThriftPointMutationKind { PUT = 0, DELETE = 1, MERGE = 2 }
 enum ThriftMutationCallback {
  NOTHING = 0, PREVIOUS = 1, CURRENT = 2, FOR_UPDATE = 3, EXISTS = 4, DELTA = 5,
@@ -10,11 +10,21 @@ enum ThriftMutationCallback {
 }
 enum ThriftMutationState { PREPARED = 0, PENDING = 1, TERMINAL = 2, ACKNOWLEDGED = 3, EXPIRED = 4, OWNER_UNAVAILABLE = 5, UNAVAILABLE = 6 }
 enum ThriftMutationOutcome { SUCCESS = 0, RESULT_TOO_LARGE = 1, CONFLICT = 2, SESSION_EXPIRED = 3, STALE_SCHEMA = 4 }
-struct ThriftMutationOwner {
- 1: required binary clusterId, 2: required binary databaseId, 3: required binary domainId, 4: required binary ownerId,
- 6: required ThriftMutationKind kind, 7: required i64 ownerEpoch, 8: required i64 nextRequestSequence,
- 10: required binary schemaDigest, 11: required binary directoryDigest
+enum ThriftAtomicReturnMode { NONE = 0, PREVIOUS = 1, CURRENT = 2 }
+struct ThriftMutationDomainBinding {
+ 3: required binary domainId, 13: required i64 directoryGeneration, 11: required binary directoryDigest,
+ 14: required i64 schemaEpoch, 10: required binary schemaDigest
 }
+struct ThriftMutationOwner {
+ 1: required binary clusterId, 2: required binary databaseId, 4: required binary ownerId,
+ 6: required ThriftMutationKind kind, 7: required i64 ownerEpoch, 8: required i64 nextRequestSequence,
+ 12: required list<ThriftMutationDomainBinding> domains
+}
+struct ThriftAtomicMutation {
+ 32: required i64 column, 40: required list<binary> keys, 44: required ThriftPointMutationKind kind,
+ 41: optional binary value, 83: required ThriftAtomicReturnMode returns
+}
+struct ThriftAtomicPredicate {32: required i64 column, 40: required list<binary> keys, 41: optional binary expected}
 struct ThriftMutationEntry { 40: required list<binary> keys, 41: optional binary value }
 struct ThriftMutationObservation {
  20: required binary token, 60: required ThriftMutationState state, 61: required i64 appliedMutations,
@@ -26,6 +36,10 @@ struct ThriftMutationPage {
  45: required list<binary> rows, 73: required bool hasMore
 }
 service RocksDBRemoteMutations {
+ list<ThriftMutationOwner> atomicOwners(82: required list<i64> columns, 100: required rocksdb.RequestContext context) throws (1: rocksdb.RocksDBThriftException e),
+ binary prepareAtomic(30: required ThriftMutationOwner owner, 5: required binary requestId, 31: required i64 requestSequence,
+   80: required list<ThriftAtomicMutation> mutations, 81: required list<ThriftAtomicPredicate> predicates,
+   84: required i64 ttlMillis, 100: required rocksdb.RequestContext context) throws (1: rocksdb.RocksDBThriftException e),
  list<ThriftMutationOwner> owners(32: required i64 column, 100: required rocksdb.RequestContext context) throws (1: rocksdb.RocksDBThriftException e),
  binary preparePoint(30: required ThriftMutationOwner owner, 5: required binary requestId, 31: required i64 requestSequence,
    32: required i64 column, 42: required list<ThriftMutationEntry> entries, 43: required bool valuesPresent,

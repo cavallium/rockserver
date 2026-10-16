@@ -221,6 +221,7 @@ final class RatisScopedTransactions implements AutoCloseable {
             if (entry.stagedCommand!=null && !samePlan(entry.stagedCommand,command)) {
                 success=true; throw new IllegalArgumentException("Commit differs from the staged mutation/predicate prefix");
             }
+            if(entry.staging!=null && entry.staging.result().status()!=CommandResult.Status.SUCCESS)throw new IllegalArgumentException("Rejected staged prefix cannot become an accepted plan");
             releaseStaging(entry);
             synchronized (this) {
                 if (DistributedCommandCodec.MAX_ENCODED_BYTES>limits.planBytes()-planBytes) throw new IOException("Transaction retained-plan admission exhausted");
@@ -238,6 +239,7 @@ final class RatisScopedTransactions implements AutoCloseable {
         var entry=beginParticipant(handle); boolean preserve=true;
         try {
             if (entry.plan!=null) throw new IllegalArgumentException("Ordinary plan already owns this handle");
+            if(entry.staging!=null && entry.staging.result().status()!=CommandResult.Status.SUCCESS)throw new IllegalArgumentException("Rejected staged prefix cannot authorize a participant");
             var audit=accepted.acceptance();
             // In 2PC the original ACK is an eligibility header, not a child receipt-deletion
             // request. Native PREPARE accounts the frozen family; COMMIT leaves child floors alone.
@@ -299,7 +301,7 @@ final class RatisScopedTransactions implements AutoCloseable {
     private Entry begin(ScopedTransactionRpc.Handle handle,boolean permitPlan) throws Exception {
         machine.checkTransactionOwner(); expire();
         synchronized (this) {
-            var entry=handles.get(handle.id()); if (entry==null || closed) throw new IOException("Transaction expired or leader changed");
+            var entry=handles.get(handle.id()); if (entry==null || closed) throw new RatisPreparationUnavailableException("Original transaction expired or leader changed");
             requireHandle(entry,handle); ensureLive(entry);
             if (entry.busy) throw new IOException("Transaction operation is already running");
             if (!permitPlan && (entry.plan!=null || entry.participant!=null)) throw new IOException("Transaction plan is already frozen");
@@ -312,9 +314,9 @@ final class RatisScopedTransactions implements AutoCloseable {
                 && (entry.pin==null || entry.pin.position().term()==machine.transactionTerm())
                 && (entry.plan!=null || entry.participant!=null || entry.planning || entry.pin==null || entry.pin.status()==RangeMutationHistory.Status.ACTIVE);
     }
-    private void ensureLive(Entry entry) throws IOException { if (!live(entry)) throw new IOException("Transaction expired or leader changed"); }
+    private void ensureLive(Entry entry) throws IOException { if (!live(entry)) throw new RatisPreparationUnavailableException("Original transaction expired or leader changed"); }
     private void requireHandle(Entry entry,ScopedTransactionRpc.Handle handle) throws IOException {
-        if (!owner.equals(handle.owner()) || !Objects.equals(entry.handle,handle)) throw new IOException("Transaction handle ownership changed");
+        if (!owner.equals(handle.owner()) || !Objects.equals(entry.handle,handle)) throw new RatisPreparationUnavailableException("Original transaction handle ownership changed");
     }
     private void retire(Entry entry) { entry.closed=true; entries.remove(entry.id,entry); handles.remove(entry.leaseId,entry); retired.add(entry); }
     private void finish(Entry entry,boolean retire) throws Exception {

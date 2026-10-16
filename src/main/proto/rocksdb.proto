@@ -537,11 +537,25 @@ message ColumnTablePropertiesResponse {
   map<string, int64> compressions = 29;
 }
 
-// Explicit durable caller-owned mutations. Tokens are the canonical 193-byte encoding.
+// Caller-owned mutation authority and canonical self-delimited vector token (117 + 96*N bytes).
+message RemoteMutationDomainBinding {
+  bytes domainId = 1; int64 directoryGeneration = 2; bytes directoryDigest = 3;
+  int64 schemaEpoch = 4; bytes schemaDigest = 5;
+}
 message RemoteMutationAuthority {
-  bytes clusterId = 1; bytes databaseId = 2; bytes domainId = 3; bytes ownerId = 4;
-  int64 ownerEpoch = 5; int64 nextRequestSequence = 6; string kind = 7;
-  bytes schemaDigest = 8; bytes directoryDigest = 9;
+  bytes clusterId = 1; bytes databaseId = 2; bytes ownerId = 3;
+  int64 ownerEpoch = 4; int64 nextRequestSequence = 5; string kind = 6;
+  repeated RemoteMutationDomainBinding domains = 7;
+}
+message RemoteMutationAtomicOwnersRequest { repeated int64 columns = 1; RequestContext context = 2; }
+message RemoteMutationAtomicWrite {
+  int64 column = 1; KeyTuple key = 2; string kind = 3; optional bytes value = 4; string returns = 5;
+}
+message RemoteMutationAtomicPredicate { int64 column = 1; KeyTuple key = 2; optional bytes expected = 3; }
+message RemoteMutationPrepareAtomicRequest {
+  RemoteMutationAuthority owner = 1; bytes requestId = 2; int64 requestSequence = 3;
+  repeated RemoteMutationAtomicWrite mutations = 4; repeated RemoteMutationAtomicPredicate predicates = 5;
+  int64 ttlMillis = 6; RequestContext context = 7;
 }
 message RemoteMutationOwnersRequest { int64 column = 1; RequestContext context = 2; }
 message RemoteMutationOwnersResponse { repeated RemoteMutationAuthority owners = 1; }
@@ -578,6 +592,8 @@ message RemoteMutationAppendRequest {
   bytes inputDigest = 4; RequestContext context = 5;
 }
 service RemoteMutationService {
+  rpc atomicOwners(RemoteMutationAtomicOwnersRequest) returns (RemoteMutationOwnersResponse);
+  rpc prepareAtomic(RemoteMutationPrepareAtomicRequest) returns (RemoteMutationTokenResponse);
   rpc owners(RemoteMutationOwnersRequest) returns (RemoteMutationOwnersResponse);
   rpc preparePoint(RemoteMutationPreparePointRequest) returns (RemoteMutationTokenResponse);
   rpc prepareRange(RemoteMutationPrepareRangeRequest) returns (RemoteMutationTokenResponse);

@@ -72,6 +72,17 @@ public final class RatisSnapshotClient implements AutoCloseable {
         if (mode!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IOException("Mutable frontend cannot reopen its prefix");
         long deadline=scheduler.resolveMonotonicDeadline(context); var lease=admit(path,null,null,RatisDurableSnapshot.MAX_BYTES,expected); lease.beginAcquire(context,deadline); return lease;
     }
+    @FunctionalInterface interface PublicationObserver {void published()throws IOException;}
+    /** The durable outer owner acknowledges initial journal publication before any acquisition RPC. */
+    Lease openWritableFrozen(Path path,SnapshotFence expected,Duration ttl,RequestContext context,PublicationObserver publication) throws IOException {
+        if(mode!=RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED)throw new IOException("Writable capture mode required");
+        Objects.requireNonNull(expected);Objects.requireNonNull(publication);validateTtl(ttl);var plan=RatisSnapshotPlan.frozen(data.directories(),expected);
+        var home=homes.route(expected.fenceId());if(!home.groupId().equals(expected.homeGroup()) || home.rangeEpoch()!=expected.homeEpoch())throw new IOException("Frozen writable HOME placement changed");
+        boolean reopen=Files.exists(path,LinkOption.NOFOLLOW_LINKS);long bytes=reopen?RatisDurableSnapshot.MAX_BYTES:64*1024L+3L*expected.encode().length+128*1024L*plan.routes().size();
+        if(!reopen)for(var route:plan.routes())bytes+=2L*SessionWindowJournal.routeSize(route);
+        if(bytes>RatisDurableSnapshot.MAX_BYTES)throw new IOException("Snapshot retained metadata exceeds journal capacity");
+        var lease=admit(path,reopen?null:plan,reopen?null:ttl,bytes,expected);lease.publicationObserver=publication;lease.beginAcquire(context,scheduler.resolveMonotonicDeadline(context));return lease;
+    }
     /** Plan only against cached placement; performs no journal I/O, allocation or RPC. */
     public RatisSnapshotPlan plan(Identity identity,TransactionScope scope) {
         Objects.requireNonNull(identity); Objects.requireNonNull(scope);
@@ -117,7 +128,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
     static long checkedResultBytes(long total,CommandResult result) throws IOException {
         if (total<8 || total>CommandResult.MAX_BYTES) throw new IllegalArgumentException("Invalid aggregate staged-result accounting");
         long next=total+Objects.requireNonNull(result).encode().length-8;
-        if (next>CommandResult.MAX_BYTES) throw new IOException("Aggregate staged result exceeds transaction result budget; prefix remains uncertain");
+        if (next>CommandResult.MAX_BYTES) throw new RatisStagedResultTooLargeException();
         return next;
     }
     private enum Kind { ACQUIRE, RELEASE, STAGE, GET, PAGE }
@@ -125,7 +136,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
     public final class Lease implements AutoCloseable {
         private final Path path; private final long bytes;
         private RatisSnapshotPlan plan; private Duration ttl;
-        private final SnapshotFence expectedFence;
+        private final SnapshotFence expectedFence;private PublicationObserver publicationObserver;
         private volatile RatisDurableSnapshot journal;
         private record ReadBinding(TransactionScope scope,List<RatisLogicalSnapshotPages.Owner> owners,RatisLogicalSnapshotPages.OwnerReader reader,Map<UUID,RatisRoutedClient.ScopedTransaction> captures) {}
         private volatile ReadBinding binding;
@@ -252,7 +263,8 @@ public final class RatisSnapshotClient implements AutoCloseable {
         }
         private Void acquire(Task<Void> task) throws Exception {
             task.check(); if (journal==null) initialize();
-            try (var coordinator=new RatisSnapshotCoordinator(journal,homes,data,this::nextHome,UUID::randomUUID,ttl)) {
+            if(publicationObserver!=null){publicationObserver.published();publicationObserver=null;}
+            task.check();try (var coordinator=new RatisSnapshotCoordinator(journal,homes,data,this::nextHome,UUID::randomUUID,ttl)) {
                 for (int n=0;n<1024;n++) {
                     task.check(); if (coordinator.step().complete()) {
                         var saved=journal.snapshot(); if (saved.observedHome()==null || saved.observedHome().phase()!=SnapshotFenceStatus.Phase.COMPLETE) throw new RatisSnapshotLostException("Snapshot acquisition aborted or expired");

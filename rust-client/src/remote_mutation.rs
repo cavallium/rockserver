@@ -2,7 +2,7 @@
 //! prepare. Dropping a call cancels observation only: query the same identity after ambiguity.
 //! No method retries, selects a sequence, replays a source, or acknowledges automatically.
 use crate::{
-    client::{await_bound_call, DeadlineInterceptor},
+    client::{await_bound_call, BoundDeadline, DeadlineInterceptor},
     proto, RequestContext, RockserverClient,
 };
 use prost::Message;
@@ -28,6 +28,7 @@ pub enum RemoteMutationKind {
     Point,
     Range,
     Bulk,
+    Atomic,
 }
 impl RemoteMutationKind {
     fn name(self) -> &'static str {
@@ -35,6 +36,7 @@ impl RemoteMutationKind {
             Self::Point => "POINT",
             Self::Range => "RANGE",
             Self::Bulk => "BULK",
+            Self::Atomic => "ATOMIC",
         }
     }
     fn parse(value: &str) -> Result<Self> {
@@ -42,55 +44,105 @@ impl RemoteMutationKind {
             "POINT" => Ok(Self::Point),
             "RANGE" => Ok(Self::Range),
             "BULK" => Ok(Self::Bulk),
+            "ATOMIC" => Ok(Self::Atomic),
             _ => Err(malformed("unknown mutation kind")),
         }
+    }
+}
+/// Original directory and schema authority for one domain, ordered by unsigned UUID bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteMutationDomainBinding {
+    pub domain_id: [u8; 16],
+    pub directory_generation: i64,
+    pub directory_digest: [u8; 32],
+    pub schema_epoch: i64,
+    pub schema_digest: [u8; 32],
+}
+fn bindings_valid(domains: &[RemoteMutationDomainBinding], kind: RemoteMutationKind) -> bool {
+    (1..=64).contains(&domains.len())
+        && (kind == RemoteMutationKind::Atomic || domains.len() == 1)
+        && domains
+            .iter()
+            .all(|d| d.directory_generation >= 0 && d.schema_epoch >= 0)
+        && domains
+            .windows(2)
+            .all(|pair| pair[0].domain_id < pair[1].domain_id)
+}
+impl RemoteMutationDomainBinding {
+    fn wire(&self) -> proto::RemoteMutationDomainBinding {
+        proto::RemoteMutationDomainBinding {
+            domain_id: self.domain_id.to_vec(),
+            directory_generation: self.directory_generation,
+            directory_digest: self.directory_digest.to_vec(),
+            schema_epoch: self.schema_epoch,
+            schema_digest: self.schema_digest.to_vec(),
+        }
+    }
+    fn decode(w: proto::RemoteMutationDomainBinding) -> Result<Self> {
+        Ok(Self {
+            domain_id: array(&w.domain_id)?,
+            directory_generation: w.directory_generation,
+            directory_digest: array(&w.directory_digest)?,
+            schema_epoch: w.schema_epoch,
+            schema_digest: array(&w.schema_digest)?,
+        })
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteMutationOwner {
     pub cluster_id: [u8; 16],
     pub database_id: [u8; 16],
-    pub domain_id: [u8; 16],
     pub owner_id: [u8; 16],
     pub owner_epoch: i64,
     /// Advisory only. Persist an explicitly selected sequence before preparing.
     pub next_request_sequence: i64,
     pub kind: RemoteMutationKind,
-    pub schema_digest: [u8; 32],
-    pub directory_digest: [u8; 32],
+    pub domains: Vec<RemoteMutationDomainBinding>,
 }
 impl RemoteMutationOwner {
     fn wire(&self) -> Result<proto::RemoteMutationAuthority> {
-        if self.owner_epoch < 0 || self.next_request_sequence < 0 {
-            return Err(invalid("negative owner epoch/sequence"));
+        if self.owner_epoch < 0
+            || self.next_request_sequence < 0
+            || !bindings_valid(&self.domains, self.kind)
+        {
+            return Err(invalid("invalid owner authority/domain vector"));
         }
         Ok(proto::RemoteMutationAuthority {
             cluster_id: self.cluster_id.to_vec(),
             database_id: self.database_id.to_vec(),
-            domain_id: self.domain_id.to_vec(),
             owner_id: self.owner_id.to_vec(),
             owner_epoch: self.owner_epoch,
             next_request_sequence: self.next_request_sequence,
             kind: self.kind.name().into(),
-            schema_digest: self.schema_digest.to_vec(),
-            directory_digest: self.directory_digest.to_vec(),
+            domains: self
+                .domains
+                .iter()
+                .map(RemoteMutationDomainBinding::wire)
+                .collect(),
         })
     }
     fn decode(w: proto::RemoteMutationAuthority) -> Result<Self> {
-        if w.owner_epoch < 0 || w.next_request_sequence < 0 {
-            return Err(malformed("negative owner epoch/sequence"));
+        if w.owner_epoch < 0 || w.next_request_sequence < 0 || !(1..=64).contains(&w.domains.len())
+        {
+            return Err(malformed("invalid owner authority/domain count"));
         }
-        Ok(Self {
+        let owner = Self {
             cluster_id: array(&w.cluster_id)?,
             database_id: array(&w.database_id)?,
-            domain_id: array(&w.domain_id)?,
             owner_id: array(&w.owner_id)?,
             owner_epoch: w.owner_epoch,
             next_request_sequence: w.next_request_sequence,
             kind: RemoteMutationKind::parse(&w.kind)?,
-            schema_digest: array(&w.schema_digest)?,
-            directory_digest: array(&w.directory_digest)?,
-        })
+            domains: w
+                .domains
+                .into_iter()
+                .map(RemoteMutationDomainBinding::decode)
+                .collect::<Result<_>>()?,
+        };
+        if !bindings_valid(&owner.domains, owner.kind) {
+            return Err(malformed("noncanonical owner domain authority"));
+        }
+        Ok(owner)
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,30 +151,53 @@ pub struct RemoteMutationIdentity {
     pub request_sequence: i64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RemoteMutationToken([u8; 193]);
+pub struct RemoteMutationToken(Vec<u8>);
 impl RemoteMutationToken {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let bytes: [u8; 193] = array(bytes)?;
-        if i64::from_be_bytes(array(&bytes[80..88])?) < 0
-            || i64::from_be_bytes(array(&bytes[88..96])?) < 0
-            || bytes[96] > 2
-        {
-            return Err(malformed("invalid mutation token"));
+        if !(213..=6261).contains(&bytes.len()) {
+            return Err(malformed("invalid mutation token size"));
         }
-        Ok(Self(bytes))
-    }
-    pub fn encode(&self) -> [u8; 193] {
-        self.0
-    }
-    pub fn kind(&self) -> RemoteMutationKind {
-        match self.0[96] {
+        let kind = match bytes[80] {
             0 => RemoteMutationKind::Point,
             1 => RemoteMutationKind::Range,
-            _ => RemoteMutationKind::Bulk,
+            2 => RemoteMutationKind::Bulk,
+            3 => RemoteMutationKind::Atomic,
+            _ => return Err(malformed("unknown mutation token kind")),
+        };
+        let count = i32::from_be_bytes(array(&bytes[81..85])?);
+        if !(1..=64).contains(&count)
+            || bytes.len() != 117 + 96 * count as usize
+            || kind != RemoteMutationKind::Atomic && count != 1
+            || i64::from_be_bytes(array(&bytes[64..72])?) < 0
+            || i64::from_be_bytes(array(&bytes[72..80])?) < 0
+        {
+            return Err(malformed("invalid mutation token identity/domain count"));
+        }
+        let mut previous: Option<&[u8]> = None;
+        for binding in bytes[85..bytes.len() - 32].chunks_exact(96) {
+            if previous.is_some_and(|id| id >= &binding[..16])
+                || i64::from_be_bytes(array(&binding[16..24])?) < 0
+                || i64::from_be_bytes(array(&binding[56..64])?) < 0
+            {
+                return Err(malformed("noncanonical token domain authority"));
+            }
+            previous = Some(&binding[..16]);
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        self.0.clone()
+    }
+    pub fn kind(&self) -> RemoteMutationKind {
+        match self.0[80] {
+            0 => RemoteMutationKind::Point,
+            1 => RemoteMutationKind::Range,
+            2 => RemoteMutationKind::Bulk,
+            _ => RemoteMutationKind::Atomic,
         }
     }
     pub fn input_digest(&self) -> [u8; 32] {
-        self.0[161..193].try_into().unwrap()
+        self.0[self.0.len() - 32..].try_into().unwrap()
     }
     fn expected(
         owner: &RemoteMutationOwner,
@@ -133,11 +208,10 @@ impl RemoteMutationToken {
         if id.request_sequence < 0 {
             return Err(invalid("negative request sequence"));
         }
-        let mut bytes = Vec::with_capacity(193);
+        let mut bytes = Vec::with_capacity(117 + 96 * owner.domains.len());
         for uuid in [
             &owner.cluster_id,
             &owner.database_id,
-            &owner.domain_id,
             &owner.owner_id,
             &id.request_id,
         ] {
@@ -146,8 +220,14 @@ impl RemoteMutationToken {
         bytes.extend_from_slice(&owner.owner_epoch.to_be_bytes());
         bytes.extend_from_slice(&id.request_sequence.to_be_bytes());
         bytes.push(owner.kind as u8);
-        bytes.extend_from_slice(&owner.schema_digest);
-        bytes.extend_from_slice(&owner.directory_digest);
+        bytes.extend_from_slice(&(owner.domains.len() as i32).to_be_bytes());
+        for domain in &owner.domains {
+            bytes.extend_from_slice(&domain.domain_id);
+            bytes.extend_from_slice(&domain.directory_generation.to_be_bytes());
+            bytes.extend_from_slice(&domain.directory_digest);
+            bytes.extend_from_slice(&domain.schema_epoch.to_be_bytes());
+            bytes.extend_from_slice(&domain.schema_digest);
+        }
         bytes.extend_from_slice(&digest);
         Self::decode(&bytes)
     }
@@ -517,6 +597,155 @@ pub fn remote_mutation_batch_digest(
     Ok(h.finalize().into())
 }
 
+/// Ordered atomic write. PUT may carry null for a key-only column; MERGE requires a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtomicMutation {
+    pub column: i64,
+    pub key: Vec<Vec<u8>>,
+    pub kind: AtomicMutationKind,
+    pub value: Option<Vec<u8>>,
+    pub returns: AtomicReturnMode,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicMutationKind {
+    Put,
+    Delete,
+    Merge,
+}
+impl AtomicMutationKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+            Self::Merge => "MERGE",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicReturnMode {
+    None,
+    Previous,
+    Current,
+}
+impl AtomicReturnMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Previous => "PREVIOUS",
+            Self::Current => "CURRENT",
+        }
+    }
+}
+/// Equality against the original capture: null is absent; empty is present empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtomicPredicate {
+    pub column: i64,
+    pub key: Vec<Vec<u8>>,
+    pub expected: Option<Vec<u8>>,
+}
+fn atomic_key_size(key: &[Vec<u8>]) -> Result<usize> {
+    if key.len() > 256 {
+        return Err(invalid("too many atomic key components"));
+    }
+    key.iter().try_fold(4usize, |size, part| {
+        size.checked_add(4)
+            .and_then(|n| n.checked_add(part.len()))
+            .filter(|&n| n <= MAX_BYTES)
+            .ok_or_else(|| invalid("atomic key exceeds byte bound"))
+    })
+}
+/// Exact canonical input bytes, checked before copying values or constructing wire entries.
+pub fn remote_mutation_atomic_size(
+    mutations: &[AtomicMutation],
+    predicates: &[AtomicPredicate],
+    ttl_millis: i64,
+) -> Result<usize> {
+    if !(1..=60000).contains(&ttl_millis)
+        || mutations.len() > 256
+        || predicates.len() > 256
+        || !(1..=256).contains(&(mutations.len() + predicates.len()))
+    {
+        return Err(invalid("invalid atomic count or lifetime"));
+    }
+    let mut bytes = 17usize;
+    for mutation in mutations {
+        if mutation.kind == AtomicMutationKind::Delete && mutation.value.is_some()
+            || mutation.kind == AtomicMutationKind::Merge && mutation.value.is_none()
+        {
+            return Err(invalid("invalid atomic mutation value"));
+        }
+        bytes = bytes
+            .checked_add(14 + atomic_key_size(&mutation.key)?)
+            .and_then(|n| n.checked_add(mutation.value.as_ref().map_or(0, Vec::len)))
+            .filter(|&n| n <= MAX_BYTES)
+            .ok_or_else(|| invalid("atomic input exceeds byte bound"))?;
+    }
+    for predicate in predicates {
+        bytes = bytes
+            .checked_add(12 + atomic_key_size(&predicate.key)?)
+            .and_then(|n| n.checked_add(predicate.expected.as_ref().map_or(0, Vec::len)))
+            .filter(|&n| n <= MAX_BYTES)
+            .ok_or_else(|| invalid("atomic input exceeds byte bound"))?;
+    }
+    Ok(bytes)
+}
+fn digest_nullable(h: &mut Sha256, value: Option<&[u8]>) -> Result<()> {
+    if let Some(value) = value {
+        length(h, value.len())?;
+        h.update(value);
+    } else {
+        h.update((-1i32).to_be_bytes());
+    }
+    Ok(())
+}
+/// Current Java RemoteMutationInputs.atomic digest. Ordered mutations/returns are preserved.
+pub fn remote_mutation_atomic_digest(
+    mutations: &[AtomicMutation],
+    predicates: &[AtomicPredicate],
+    ttl_millis: i64,
+) -> Result<[u8; 32]> {
+    remote_mutation_atomic_size(mutations, predicates, ttl_millis)?;
+    let mut h = Sha256::new();
+    h.update([4]);
+    h.update(ttl_millis.to_be_bytes());
+    length(&mut h, mutations.len())?;
+    for mutation in mutations {
+        h.update(mutation.column.to_be_bytes());
+        digest_key(&mut h, Some(&mutation.key))?;
+        h.update([mutation.kind as u8]);
+        digest_nullable(&mut h, mutation.value.as_deref())?;
+        h.update([mutation.returns as u8]);
+    }
+    length(&mut h, predicates.len())?;
+    for predicate in predicates {
+        h.update(predicate.column.to_be_bytes());
+        digest_key(&mut h, Some(&predicate.key))?;
+        digest_nullable(&mut h, predicate.expected.as_deref())?;
+    }
+    Ok(h.finalize().into())
+}
+/// Bind subsequent phases to the original call deadline, including readiness-queue time.
+fn atomic_request_at<T: Message>(
+    message: T,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<tonic::Request<T>> {
+    if message.encoded_len() > MAX_FRAME {
+        return Err(invalid("mutation request exceeds frame bound"));
+    }
+    let mut request = tonic::Request::new(message);
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(tonic::Status::deadline_exceeded(
+                "atomic call original deadline expired",
+            ));
+        }
+        request.set_timeout(remaining);
+        request.extensions_mut().insert(BoundDeadline(deadline));
+    }
+    Ok(request)
+}
+
 #[derive(Clone, Debug)]
 pub struct RemoteMutationClient {
     base: RockserverClient,
@@ -582,6 +811,124 @@ impl RemoteMutationClient {
             .into_iter()
             .map(RemoteMutationOwner::decode)
             .collect()
+    }
+    /// Discover durable atomic owners for an explicitly supplied set of logical columns.
+    pub async fn atomic_owners(&self, columns: &[i64]) -> Result<Vec<RemoteMutationOwner>> {
+        if columns.is_empty() || columns.len() > 256 {
+            return Err(invalid("invalid atomic owner column count"));
+        }
+        let w = rpc!(
+            self,
+            atomic_owners,
+            proto::RemoteMutationAtomicOwnersRequest {
+                columns: columns.to_vec(),
+                context: Some(self.base.context.clone())
+            }
+        );
+        bounded_reply(&w)?;
+        if w.owners.len() > 4096 {
+            return Err(malformed("too many atomic owners"));
+        }
+        w.owners
+            .into_iter()
+            .map(|wire| {
+                let owner = RemoteMutationOwner::decode(wire)?;
+                if owner.kind != RemoteMutationKind::Atomic {
+                    return Err(malformed("not an atomic owner"));
+                }
+                Ok(owner)
+            })
+            .collect()
+    }
+    /// Persist the selected owner, caller UUID and sequence before prepare. No identity is generated.
+    pub async fn prepare_atomic(
+        &self,
+        owner: &RemoteMutationOwner,
+        id: RemoteMutationIdentity,
+        mutations: &[AtomicMutation],
+        predicates: &[AtomicPredicate],
+        ttl_millis: i64,
+    ) -> Result<RemoteMutationToken> {
+        let deadline = self.base.contextual_request(())?.deadline;
+        self.prepare_atomic_at(owner, id, mutations, predicates, ttl_millis, deadline)
+            .await
+    }
+    async fn prepare_atomic_at(
+        &self,
+        owner: &RemoteMutationOwner,
+        id: RemoteMutationIdentity,
+        mutations: &[AtomicMutation],
+        predicates: &[AtomicPredicate],
+        ttl_millis: i64,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<RemoteMutationToken> {
+        if owner.kind != RemoteMutationKind::Atomic {
+            return Err(invalid("not an atomic owner"));
+        }
+        let digest = remote_mutation_atomic_digest(mutations, predicates, ttl_millis)?;
+        let expected = RemoteMutationToken::expected(owner, id, digest)?;
+        let message = proto::RemoteMutationPrepareAtomicRequest {
+            owner: Some(owner.wire()?),
+            request_id: id.request_id.to_vec(),
+            request_sequence: id.request_sequence,
+            mutations: mutations
+                .iter()
+                .map(|m| proto::RemoteMutationAtomicWrite {
+                    column: m.column,
+                    key: Some(proto::KeyTuple {
+                        keys: m.key.clone(),
+                    }),
+                    kind: m.kind.name().into(),
+                    value: m.value.clone(),
+                    returns: m.returns.name().into(),
+                })
+                .collect(),
+            predicates: predicates
+                .iter()
+                .map(|p| proto::RemoteMutationAtomicPredicate {
+                    column: p.column,
+                    key: Some(proto::KeyTuple {
+                        keys: p.key.clone(),
+                    }),
+                    expected: p.expected.clone(),
+                })
+                .collect(),
+            ttl_millis,
+            context: Some(self.base.context.clone()),
+        };
+        let request = atomic_request_at(message, deadline)?;
+        let mut client = self.client.clone();
+        let reply = await_bound_call(deadline, client.prepare_atomic(request))
+            .await?
+            .into_inner();
+        RemoteMutationToken::prepared(reply, expected)
+    }
+    /// Idempotently prepare the caller's original identity and execute its validated token.
+    /// Both RPCs share one original deadline. Ambiguous completion never acknowledges or retries.
+    pub async fn execute_atomic(
+        &self,
+        owner: &RemoteMutationOwner,
+        id: RemoteMutationIdentity,
+        mutations: &[AtomicMutation],
+        predicates: &[AtomicPredicate],
+        ttl_millis: i64,
+    ) -> Result<RemoteMutationObservation> {
+        let deadline = self.base.contextual_request(())?.deadline;
+        let token = self
+            .prepare_atomic_at(owner, id, mutations, predicates, ttl_millis, deadline)
+            .await?;
+        let request = atomic_request_at(
+            proto::RemoteMutationTokenRequest {
+                token: token.encode(),
+                context: Some(self.base.context.clone()),
+            },
+            deadline,
+        )?;
+        let mut client = self.client.clone();
+        let reply = await_bound_call(deadline, client.execute(request))
+            .await?
+            .into_inner();
+        RemoteMutationObservation::decode(reply, &token)
     }
     /// Caller must persist owner and identity before calling. The returned token is fully validated.
     pub async fn prepare_point(
@@ -791,13 +1138,17 @@ mod tests {
         RemoteMutationOwner {
             cluster_id: [1; 16],
             database_id: [2; 16],
-            domain_id: [3; 16],
             owner_id: [4; 16],
             owner_epoch: 9,
             next_request_sequence: 999,
             kind: RemoteMutationKind::Point,
-            schema_digest: [6; 32],
-            directory_digest: [7; 32],
+            domains: vec![RemoteMutationDomainBinding {
+                domain_id: [3; 16],
+                directory_generation: 10,
+                directory_digest: [7; 32],
+                schema_epoch: 11,
+                schema_digest: [6; 32],
+            }],
         }
     }
     fn token() -> RemoteMutationToken {
@@ -835,27 +1186,87 @@ mod tests {
     fn current_token_encoding_and_crossed_identity() {
         let t = token();
         let encoded = t.encode();
-        assert_eq!(encoded.len(), 193);
-        assert_eq!(&encoded[80..88], &9_i64.to_be_bytes());
-        assert_eq!(&encoded[88..96], &12_i64.to_be_bytes());
-        assert_eq!(encoded[96], 0);
+        assert_eq!(encoded.len(), 213);
+        assert_eq!(&encoded[64..72], &9i64.to_be_bytes());
+        assert_eq!(&encoded[72..80], &12i64.to_be_bytes());
+        assert_eq!(encoded[80], 0);
+        assert_eq!(&encoded[81..85], &1i32.to_be_bytes());
+        assert_eq!(&encoded[85..101], &[3; 16]);
+        assert_eq!(&encoded[101..109], &10i64.to_be_bytes());
+        assert_eq!(&encoded[141..149], &11i64.to_be_bytes());
         assert_eq!(RemoteMutationToken::decode(&encoded).unwrap(), t);
-        let mut crossed = encoded;
-        crossed[0] ^= 1;
-        assert!(RemoteMutationToken::prepared(
-            proto::RemoteMutationTokenResponse {
-                token: crossed.to_vec()
-            },
-            t.clone()
-        )
-        .is_err());
-        crossed = encoded;
-        crossed[96] = 3;
-        assert!(RemoteMutationToken::decode(&crossed).is_err());
-        assert!(RemoteMutationToken::decode(&encoded[..192]).is_err());
+        for offset in [0, 32, 48, 64, 72, 85, 101, 109, 141, 149, 212] {
+            let mut crossed = encoded.clone();
+            crossed[offset] ^= 1;
+            assert!(RemoteMutationToken::prepared(
+                proto::RemoteMutationTokenResponse { token: crossed },
+                t.clone()
+            )
+            .is_err());
+        }
+        let mut bad = encoded.clone();
+        bad[80] = 4;
+        assert!(RemoteMutationToken::decode(&bad).is_err());
+        assert!(RemoteMutationToken::decode(&encoded[..212]).is_err());
+        let mut bad = encoded.clone();
+        bad.push(0);
+        assert!(RemoteMutationToken::decode(&bad).is_err());
         let mut w = observation("PREPARED");
         w.token[160] ^= 1;
         assert!(RemoteMutationObservation::decode(w, &t).is_err());
+    }
+    #[test]
+    fn vector_tokens_require_unsigned_sorted_unique_real_authority() {
+        let mut owner = owner();
+        owner.kind = RemoteMutationKind::Atomic;
+        let mut second = owner.domains[0].clone();
+        second.domain_id = [128; 16];
+        second.directory_generation = 12;
+        second.schema_epoch = 13;
+        owner.domains.push(second.clone());
+        let id = RemoteMutationIdentity {
+            request_id: [5; 16],
+            request_sequence: 12,
+        };
+        let t = RemoteMutationToken::expected(&owner, id, [8; 32]).unwrap();
+        assert_eq!(t.encode().len(), 309);
+        assert_eq!(t.kind(), RemoteMutationKind::Atomic);
+        let mut bytes = t.encode();
+        let first = bytes[85..181].to_vec();
+        let second_bytes = bytes[181..277].to_vec();
+        bytes[85..181].copy_from_slice(&second_bytes);
+        bytes[181..277].copy_from_slice(&first);
+        assert!(RemoteMutationToken::decode(&bytes).is_err());
+        let mut bytes = t.encode();
+        bytes[181..197].copy_from_slice(&first[..16]);
+        assert!(RemoteMutationToken::decode(&bytes).is_err());
+        let mut bytes = t.encode();
+        bytes[80] = 0;
+        assert!(RemoteMutationToken::decode(&bytes).is_err());
+        for count in [0i32, 65] {
+            let mut bytes = t.encode();
+            bytes[81..85].copy_from_slice(&count.to_be_bytes());
+            assert!(RemoteMutationToken::decode(&bytes).is_err());
+        }
+        owner.domains[0].directory_generation = -1;
+        assert!(RemoteMutationToken::expected(&owner, id, [8; 32]).is_err());
+        owner.domains[0].directory_generation = 10;
+        owner.domains[0].schema_epoch = -1;
+        assert!(RemoteMutationToken::expected(&owner, id, [8; 32]).is_err());
+        owner.domains.clear();
+        assert!(RemoteMutationToken::expected(&owner, id, [8; 32]).is_err());
+        owner.domains = (0u8..64)
+            .map(|v| {
+                let mut b = second.clone();
+                b.domain_id = [v; 16];
+                b
+            })
+            .collect();
+        let max = RemoteMutationToken::expected(&owner, id, [8; 32]).unwrap();
+        assert_eq!(max.encode().len(), 6261);
+        assert!(RemoteMutationToken::decode(&max.encode()).is_ok());
+        owner.domains.push(second);
+        assert!(RemoteMutationToken::expected(&owner, id, [8; 32]).is_err());
     }
     #[test]
     fn command_result_nullable_values_and_failure_are_explicit() {
@@ -945,6 +1356,119 @@ mod tests {
             remote_mutation_batch_digest(7, false, &rows).unwrap()
         );
     }
+    #[test]
+    fn atomic_canonical_digest_preserves_null_empty_order_and_returns() {
+        let first = AtomicMutation {
+            column: 7,
+            key: vec![b"a".to_vec()],
+            kind: AtomicMutationKind::Put,
+            value: None,
+            returns: AtomicReturnMode::Previous,
+        };
+        let predicate = AtomicPredicate {
+            column: 8,
+            key: vec![b"b".to_vec()],
+            expected: Some(vec![]),
+        };
+        assert_eq!(
+            remote_mutation_atomic_size(&[first.clone()], &[predicate.clone()], 1000).unwrap(),
+            61
+        );
+        let digest =
+            remote_mutation_atomic_digest(&[first.clone()], &[predicate.clone()], 1000).unwrap();
+        assert_eq!(
+            digest
+                .iter()
+                .map(|v| format!("{v:02x}"))
+                .collect::<String>(),
+            "e50fb358257f477e3e6ffe6652f00f029b35d9c4c4815232fc6d3732d03b2630"
+        );
+        let mut empty = first.clone();
+        empty.value = Some(vec![]);
+        assert_ne!(
+            digest,
+            remote_mutation_atomic_digest(&[empty.clone()], &[predicate.clone()], 1000).unwrap()
+        );
+        let mut absent = predicate.clone();
+        absent.expected = None;
+        assert_ne!(
+            digest,
+            remote_mutation_atomic_digest(&[first.clone()], &[absent], 1000).unwrap()
+        );
+        assert_ne!(
+            remote_mutation_atomic_digest(&[first.clone(), empty.clone()], &[], 1000).unwrap(),
+            remote_mutation_atomic_digest(&[empty, first.clone()], &[], 1000).unwrap()
+        );
+        let mut current = first.clone();
+        current.returns = AtomicReturnMode::Current;
+        assert_ne!(
+            digest,
+            remote_mutation_atomic_digest(&[current], &[predicate.clone()], 1000).unwrap()
+        );
+        assert!(remote_mutation_atomic_digest(&[], &[predicate], 1000).is_ok());
+        assert!(remote_mutation_atomic_digest(&[], &[], 1000).is_err());
+        assert!(remote_mutation_atomic_digest(&[first.clone()], &[], 0).is_err());
+        assert!(remote_mutation_atomic_digest(&[first.clone()], &[], 60001).is_err());
+        assert!(remote_mutation_atomic_digest(&vec![first; 257], &[], 1000).is_err());
+    }
+    #[test]
+    fn atomic_preflight_uses_exact_canonical_byte_limit_and_value_rules() {
+        let mut large = AtomicMutation {
+            column: 7,
+            key: vec![],
+            kind: AtomicMutationKind::Put,
+            value: Some(vec![0; MAX_BYTES - 35]),
+            returns: AtomicReturnMode::None,
+        };
+        assert_eq!(
+            remote_mutation_atomic_size(std::slice::from_ref(&large), &[], 1).unwrap(),
+            MAX_BYTES
+        );
+        large.value.as_mut().unwrap().push(0);
+        assert!(remote_mutation_atomic_size(std::slice::from_ref(&large), &[], 1).is_err());
+        large.value = None;
+        large.kind = AtomicMutationKind::Merge;
+        assert!(remote_mutation_atomic_size(std::slice::from_ref(&large), &[], 1).is_err());
+        large.kind = AtomicMutationKind::Delete;
+        large.value = Some(vec![]);
+        assert!(remote_mutation_atomic_size(std::slice::from_ref(&large), &[], 1).is_err());
+        large.value = None;
+        large.key = vec![vec![]; 257];
+        assert!(remote_mutation_atomic_size(&[large], &[], 1).is_err());
+    }
+    #[tokio::test]
+    async fn atomic_convenience_phases_bind_the_same_original_deadline() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let prepare = atomic_request_at(
+            proto::RemoteMutationPrepareAtomicRequest::default(),
+            Some(deadline),
+        )
+        .unwrap();
+        tokio::task::yield_now().await;
+        let execute =
+            atomic_request_at(proto::RemoteMutationTokenRequest::default(), Some(deadline))
+                .unwrap();
+        assert_eq!(
+            prepare.extensions().get::<BoundDeadline>().unwrap().0,
+            deadline
+        );
+        assert_eq!(
+            execute.extensions().get::<BoundDeadline>().unwrap().0,
+            deadline
+        );
+        assert!(atomic_request_at(
+            proto::RemoteMutationTokenRequest::default(),
+            Some(tokio::time::Instant::now() - std::time::Duration::from_millis(1))
+        )
+        .is_err());
+        assert!(
+            atomic_request_at(proto::RemoteMutationTokenRequest::default(), None)
+                .unwrap()
+                .metadata()
+                .get("grpc-timeout")
+                .is_none()
+        );
+    }
     // Compiled API workflow fixture; never run and never opens a socket.
     #[allow(dead_code)]
     async fn explicit_public_workflow(
@@ -957,6 +1481,25 @@ mod tests {
             .remote_mutations()?
             .with_context(RequestContext::batch());
         let _ = client.owners(7).await?;
+        let _ = client.atomic_owners(&[7, 8]).await?;
+        let mutations = [AtomicMutation {
+            column: 7,
+            key: vec![vec![1]],
+            kind: AtomicMutationKind::Put,
+            value: None,
+            returns: AtomicReturnMode::Previous,
+        }];
+        let predicates = [AtomicPredicate {
+            column: 8,
+            key: vec![vec![2]],
+            expected: Some(vec![]),
+        }];
+        let _ = client
+            .prepare_atomic(owner, id, &mutations, &predicates, 1000)
+            .await?;
+        let _ = client
+            .execute_atomic(owner, id, &mutations, &predicates, 1000)
+            .await?;
         let point = client
             .prepare_point(
                 owner,

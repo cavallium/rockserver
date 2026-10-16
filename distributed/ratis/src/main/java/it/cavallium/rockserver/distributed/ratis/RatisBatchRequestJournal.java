@@ -73,7 +73,7 @@ final class RatisBatchRequestJournal implements AutoCloseable {
     private void requireOpen() throws IOException { if(closed || fenced) throw new IOException("Batch journal unavailable; reopen exact retained input"); }
     long encodedSize()throws IOException{return encodedSize(request);}
     static long encodedSize(Request r)throws IOException {
-        validate(r);long bytes=4+32+16+1+4+RangeDirectoryCodec.encodedSize(r.directory)+32+1+4+4+1+(r.pending==null?0:32)+1+(r.result==null?0:12)+1+(r.failure==null?0:12)+RemoteMutationToken.BYTES+8+4+40L*r.inputDigests.size();
+        validate(r);long bytes=4+32+16+1+4+RangeDirectoryCodec.encodedSize(r.directory)+32+1+4+4+1+(r.pending==null?0:32)+1+(r.result==null?0:12)+1+(r.failure==null?0:12)+RemoteMutationToken.MIN_BYTES+8+4+40L*r.inputDigests.size();
         for(var chunk:r.chunks)bytes=Math.addExact(bytes,4L+DistributedCommandCodec.encodedSize(chunk));if(bytes+32>MAX_BYTES)throw new IOException("Batch journal exceeds bound");return bytes;
     }
     Closeable workspace(RatisRequestBudget.Lease credit){if(workspace.get()!=null)throw new IllegalStateException("Nested bulk encoding owner");workspace.set(credit);return workspace::remove;}
@@ -108,7 +108,7 @@ final class RatisBatchRequestJournal implements AutoCloseable {
             if(count<0 || count>RatisRocksDBBatches.MAX_INPUT_ITEMS || 4L*count>in.available()) throw new IOException("Invalid retained batch chunk count"); var chunks=new ArrayList<DistributedCommand>(count);
             for(int i=0;i<count;i++) chunks.add(DistributedCommandCodec.decode(blob(in,RatisRocksDBBatches.MAX_CHUNK_BYTES))); result.chunks=List.copyOf(chunks);
             if(in.readBoolean()) result.pending=new OperationId(uuid(in),in.readLong(),in.readLong()); if(in.readBoolean()) result.result=CommandResult.decode(blob(in,CommandResult.MAX_BYTES)); if(in.readBoolean()) result.failure=CommandResult.decode(blob(in,CommandResult.MAX_BYTES));
-            result.token=RemoteMutationToken.decode(in.readNBytes(RemoteMutationToken.BYTES)); result.column=in.readLong(); int receipts=in.readInt(); if(receipts<0 || receipts>COMPLETED_WINDOW+1)throw new IOException("Invalid copied ordinal receipts"); for(int n=0;n<receipts;n++) { long ordinal=in.readLong();byte[] digest=in.readNBytes(32);if(ordinal!=result.retiredInputThrough+1+n || digest.length!=32 || result.inputDigests.put(ordinal,digest)!=null)throw new IOException("Invalid ordinal receipt"); } if(in.available()!=0) throw new IOException("Trailing batch journal input"); validate(result); return result;
+            result.token=RemoteMutationToken.decode(in.readNBytes(RemoteMutationToken.MIN_BYTES)); result.column=in.readLong(); int receipts=in.readInt(); if(receipts<0 || receipts>COMPLETED_WINDOW+1)throw new IOException("Invalid copied ordinal receipts"); for(int n=0;n<receipts;n++) { long ordinal=in.readLong();byte[] digest=in.readNBytes(32);if(ordinal!=result.retiredInputThrough+1+n || digest.length!=32 || result.inputDigests.put(ordinal,digest)!=null)throw new IOException("Invalid ordinal receipt"); } if(in.available()!=0) throw new IOException("Trailing batch journal input"); validate(result); return result;
         } catch(RuntimeException invalid) { throw new IOException("Invalid batch journal",invalid); }
     }
     private static void validate(Request request) throws IOException {

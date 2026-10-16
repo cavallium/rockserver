@@ -12,20 +12,17 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
 
   private static final org.apache.thrift.protocol.TField CLUSTER_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("clusterId", org.apache.thrift.protocol.TType.STRING, (short)1);
   private static final org.apache.thrift.protocol.TField DATABASE_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("databaseId", org.apache.thrift.protocol.TType.STRING, (short)2);
-  private static final org.apache.thrift.protocol.TField DOMAIN_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("domainId", org.apache.thrift.protocol.TType.STRING, (short)3);
   private static final org.apache.thrift.protocol.TField OWNER_ID_FIELD_DESC = new org.apache.thrift.protocol.TField("ownerId", org.apache.thrift.protocol.TType.STRING, (short)4);
   private static final org.apache.thrift.protocol.TField KIND_FIELD_DESC = new org.apache.thrift.protocol.TField("kind", org.apache.thrift.protocol.TType.I32, (short)6);
   private static final org.apache.thrift.protocol.TField OWNER_EPOCH_FIELD_DESC = new org.apache.thrift.protocol.TField("ownerEpoch", org.apache.thrift.protocol.TType.I64, (short)7);
   private static final org.apache.thrift.protocol.TField NEXT_REQUEST_SEQUENCE_FIELD_DESC = new org.apache.thrift.protocol.TField("nextRequestSequence", org.apache.thrift.protocol.TType.I64, (short)8);
-  private static final org.apache.thrift.protocol.TField SCHEMA_DIGEST_FIELD_DESC = new org.apache.thrift.protocol.TField("schemaDigest", org.apache.thrift.protocol.TType.STRING, (short)10);
-  private static final org.apache.thrift.protocol.TField DIRECTORY_DIGEST_FIELD_DESC = new org.apache.thrift.protocol.TField("directoryDigest", org.apache.thrift.protocol.TType.STRING, (short)11);
+  private static final org.apache.thrift.protocol.TField DOMAINS_FIELD_DESC = new org.apache.thrift.protocol.TField("domains", org.apache.thrift.protocol.TType.LIST, (short)12);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new ThriftMutationOwnerStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new ThriftMutationOwnerTupleSchemeFactory();
 
   public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer clusterId; // required
   public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer databaseId; // required
-  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer domainId; // required
   public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer ownerId; // required
   /**
    *
@@ -34,14 +31,12 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
   public @org.apache.thrift.annotation.Nullable ThriftMutationKind kind; // required
   public long ownerEpoch; // required
   public long nextRequestSequence; // required
-  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer schemaDigest; // required
-  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer directoryDigest; // required
+  public @org.apache.thrift.annotation.Nullable java.util.List<ThriftMutationDomainBinding> domains; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
     CLUSTER_ID((short)1, "clusterId"),
     DATABASE_ID((short)2, "databaseId"),
-    DOMAIN_ID((short)3, "domainId"),
     OWNER_ID((short)4, "ownerId"),
     /**
      *
@@ -50,8 +45,7 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     KIND((short)6, "kind"),
     OWNER_EPOCH((short)7, "ownerEpoch"),
     NEXT_REQUEST_SEQUENCE((short)8, "nextRequestSequence"),
-    SCHEMA_DIGEST((short)10, "schemaDigest"),
-    DIRECTORY_DIGEST((short)11, "directoryDigest");
+    DOMAINS((short)12, "domains");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -71,8 +65,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
           return CLUSTER_ID;
         case 2: // DATABASE_ID
           return DATABASE_ID;
-        case 3: // DOMAIN_ID
-          return DOMAIN_ID;
         case 4: // OWNER_ID
           return OWNER_ID;
         case 6: // KIND
@@ -81,10 +73,8 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
           return OWNER_EPOCH;
         case 8: // NEXT_REQUEST_SEQUENCE
           return NEXT_REQUEST_SEQUENCE;
-        case 10: // SCHEMA_DIGEST
-          return SCHEMA_DIGEST;
-        case 11: // DIRECTORY_DIGEST
-          return DIRECTORY_DIGEST;
+        case 12: // DOMAINS
+          return DOMAINS;
         default:
           return null;
       }
@@ -138,8 +128,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
     tmpMap.put(_Fields.DATABASE_ID, new org.apache.thrift.meta_data.FieldMetaData("databaseId", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
-    tmpMap.put(_Fields.DOMAIN_ID, new org.apache.thrift.meta_data.FieldMetaData("domainId", org.apache.thrift.TFieldRequirementType.REQUIRED,
-        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
     tmpMap.put(_Fields.OWNER_ID, new org.apache.thrift.meta_data.FieldMetaData("ownerId", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
     tmpMap.put(_Fields.KIND, new org.apache.thrift.meta_data.FieldMetaData("kind", org.apache.thrift.TFieldRequirementType.REQUIRED,
@@ -148,10 +136,9 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     tmpMap.put(_Fields.NEXT_REQUEST_SEQUENCE, new org.apache.thrift.meta_data.FieldMetaData("nextRequestSequence", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
-    tmpMap.put(_Fields.SCHEMA_DIGEST, new org.apache.thrift.meta_data.FieldMetaData("schemaDigest", org.apache.thrift.TFieldRequirementType.REQUIRED,
-        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
-    tmpMap.put(_Fields.DIRECTORY_DIGEST, new org.apache.thrift.meta_data.FieldMetaData("directoryDigest", org.apache.thrift.TFieldRequirementType.REQUIRED,
-        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
+    tmpMap.put(_Fields.DOMAINS, new org.apache.thrift.meta_data.FieldMetaData("domains", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
+            new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, ThriftMutationDomainBinding.class))));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(ThriftMutationOwner.class, metaDataMap);
   }
@@ -162,26 +149,22 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
   public ThriftMutationOwner(
     java.nio.ByteBuffer clusterId,
     java.nio.ByteBuffer databaseId,
-    java.nio.ByteBuffer domainId,
     java.nio.ByteBuffer ownerId,
     ThriftMutationKind kind,
     long ownerEpoch,
     long nextRequestSequence,
-    java.nio.ByteBuffer schemaDigest,
-    java.nio.ByteBuffer directoryDigest)
+    java.util.List<ThriftMutationDomainBinding> domains)
   {
     this();
     this.clusterId = org.apache.thrift.TBaseHelper.copyBinary(clusterId);
     this.databaseId = org.apache.thrift.TBaseHelper.copyBinary(databaseId);
-    this.domainId = org.apache.thrift.TBaseHelper.copyBinary(domainId);
     this.ownerId = org.apache.thrift.TBaseHelper.copyBinary(ownerId);
     this.kind = kind;
     this.ownerEpoch = ownerEpoch;
     setOwnerEpochIsSet(true);
     this.nextRequestSequence = nextRequestSequence;
     setNextRequestSequenceIsSet(true);
-    this.schemaDigest = org.apache.thrift.TBaseHelper.copyBinary(schemaDigest);
-    this.directoryDigest = org.apache.thrift.TBaseHelper.copyBinary(directoryDigest);
+    this.domains = domains;
   }
 
   /**
@@ -195,9 +178,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     if (other.isSetDatabaseId()) {
       this.databaseId = org.apache.thrift.TBaseHelper.copyBinary(other.databaseId);
     }
-    if (other.isSetDomainId()) {
-      this.domainId = org.apache.thrift.TBaseHelper.copyBinary(other.domainId);
-    }
     if (other.isSetOwnerId()) {
       this.ownerId = org.apache.thrift.TBaseHelper.copyBinary(other.ownerId);
     }
@@ -206,11 +186,12 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     }
     this.ownerEpoch = other.ownerEpoch;
     this.nextRequestSequence = other.nextRequestSequence;
-    if (other.isSetSchemaDigest()) {
-      this.schemaDigest = org.apache.thrift.TBaseHelper.copyBinary(other.schemaDigest);
-    }
-    if (other.isSetDirectoryDigest()) {
-      this.directoryDigest = org.apache.thrift.TBaseHelper.copyBinary(other.directoryDigest);
+    if (other.isSetDomains()) {
+      java.util.List<ThriftMutationDomainBinding> __this__domains = new java.util.ArrayList<ThriftMutationDomainBinding>(other.domains.size());
+      for (ThriftMutationDomainBinding other_element : other.domains) {
+        __this__domains.add(new ThriftMutationDomainBinding(other_element));
+      }
+      this.domains = __this__domains;
     }
   }
 
@@ -223,15 +204,13 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
   public void clear() {
     this.clusterId = null;
     this.databaseId = null;
-    this.domainId = null;
     this.ownerId = null;
     this.kind = null;
     setOwnerEpochIsSet(false);
     this.ownerEpoch = 0;
     setNextRequestSequenceIsSet(false);
     this.nextRequestSequence = 0;
-    this.schemaDigest = null;
-    this.directoryDigest = null;
+    this.domains = null;
   }
 
   public byte[] getClusterId() {
@@ -299,40 +278,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
   public void setDatabaseIdIsSet(boolean value) {
     if (!value) {
       this.databaseId = null;
-    }
-  }
-
-  public byte[] getDomainId() {
-    setDomainId(org.apache.thrift.TBaseHelper.rightSize(domainId));
-    return domainId == null ? null : domainId.array();
-  }
-
-  public java.nio.ByteBuffer bufferForDomainId() {
-    return org.apache.thrift.TBaseHelper.copyBinary(domainId);
-  }
-
-  public ThriftMutationOwner setDomainId(byte[] domainId) {
-    this.domainId = domainId == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(domainId.clone());
-    return this;
-  }
-
-  public ThriftMutationOwner setDomainId(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer domainId) {
-    this.domainId = org.apache.thrift.TBaseHelper.copyBinary(domainId);
-    return this;
-  }
-
-  public void unsetDomainId() {
-    this.domainId = null;
-  }
-
-  /** Returns true if field domainId is set (has been assigned a value) and false otherwise */
-  public boolean isSetDomainId() {
-    return this.domainId != null;
-  }
-
-  public void setDomainIdIsSet(boolean value) {
-    if (!value) {
-      this.domainId = null;
     }
   }
 
@@ -449,71 +394,44 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __NEXTREQUESTSEQUENCE_ISSET_ID, value);
   }
 
-  public byte[] getSchemaDigest() {
-    setSchemaDigest(org.apache.thrift.TBaseHelper.rightSize(schemaDigest));
-    return schemaDigest == null ? null : schemaDigest.array();
+  public int getDomainsSize() {
+    return (this.domains == null) ? 0 : this.domains.size();
   }
 
-  public java.nio.ByteBuffer bufferForSchemaDigest() {
-    return org.apache.thrift.TBaseHelper.copyBinary(schemaDigest);
+  @org.apache.thrift.annotation.Nullable
+  public java.util.Iterator<ThriftMutationDomainBinding> getDomainsIterator() {
+    return (this.domains == null) ? null : this.domains.iterator();
   }
 
-  public ThriftMutationOwner setSchemaDigest(byte[] schemaDigest) {
-    this.schemaDigest = schemaDigest == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(schemaDigest.clone());
-    return this;
-  }
-
-  public ThriftMutationOwner setSchemaDigest(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer schemaDigest) {
-    this.schemaDigest = org.apache.thrift.TBaseHelper.copyBinary(schemaDigest);
-    return this;
-  }
-
-  public void unsetSchemaDigest() {
-    this.schemaDigest = null;
-  }
-
-  /** Returns true if field schemaDigest is set (has been assigned a value) and false otherwise */
-  public boolean isSetSchemaDigest() {
-    return this.schemaDigest != null;
-  }
-
-  public void setSchemaDigestIsSet(boolean value) {
-    if (!value) {
-      this.schemaDigest = null;
+  public void addToDomains(ThriftMutationDomainBinding elem) {
+    if (this.domains == null) {
+      this.domains = new java.util.ArrayList<ThriftMutationDomainBinding>();
     }
+    this.domains.add(elem);
   }
 
-  public byte[] getDirectoryDigest() {
-    setDirectoryDigest(org.apache.thrift.TBaseHelper.rightSize(directoryDigest));
-    return directoryDigest == null ? null : directoryDigest.array();
+  @org.apache.thrift.annotation.Nullable
+  public java.util.List<ThriftMutationDomainBinding> getDomains() {
+    return this.domains;
   }
 
-  public java.nio.ByteBuffer bufferForDirectoryDigest() {
-    return org.apache.thrift.TBaseHelper.copyBinary(directoryDigest);
-  }
-
-  public ThriftMutationOwner setDirectoryDigest(byte[] directoryDigest) {
-    this.directoryDigest = directoryDigest == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(directoryDigest.clone());
+  public ThriftMutationOwner setDomains(@org.apache.thrift.annotation.Nullable java.util.List<ThriftMutationDomainBinding> domains) {
+    this.domains = domains;
     return this;
   }
 
-  public ThriftMutationOwner setDirectoryDigest(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer directoryDigest) {
-    this.directoryDigest = org.apache.thrift.TBaseHelper.copyBinary(directoryDigest);
-    return this;
+  public void unsetDomains() {
+    this.domains = null;
   }
 
-  public void unsetDirectoryDigest() {
-    this.directoryDigest = null;
+  /** Returns true if field domains is set (has been assigned a value) and false otherwise */
+  public boolean isSetDomains() {
+    return this.domains != null;
   }
 
-  /** Returns true if field directoryDigest is set (has been assigned a value) and false otherwise */
-  public boolean isSetDirectoryDigest() {
-    return this.directoryDigest != null;
-  }
-
-  public void setDirectoryDigestIsSet(boolean value) {
+  public void setDomainsIsSet(boolean value) {
     if (!value) {
-      this.directoryDigest = null;
+      this.domains = null;
     }
   }
 
@@ -540,18 +458,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
           setDatabaseId((byte[])value);
         } else {
           setDatabaseId((java.nio.ByteBuffer)value);
-        }
-      }
-      break;
-
-    case DOMAIN_ID:
-      if (value == null) {
-        unsetDomainId();
-      } else {
-        if (value instanceof byte[]) {
-          setDomainId((byte[])value);
-        } else {
-          setDomainId((java.nio.ByteBuffer)value);
         }
       }
       break;
@@ -592,27 +498,11 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
       }
       break;
 
-    case SCHEMA_DIGEST:
+    case DOMAINS:
       if (value == null) {
-        unsetSchemaDigest();
+        unsetDomains();
       } else {
-        if (value instanceof byte[]) {
-          setSchemaDigest((byte[])value);
-        } else {
-          setSchemaDigest((java.nio.ByteBuffer)value);
-        }
-      }
-      break;
-
-    case DIRECTORY_DIGEST:
-      if (value == null) {
-        unsetDirectoryDigest();
-      } else {
-        if (value instanceof byte[]) {
-          setDirectoryDigest((byte[])value);
-        } else {
-          setDirectoryDigest((java.nio.ByteBuffer)value);
-        }
+        setDomains((java.util.List<ThriftMutationDomainBinding>)value);
       }
       break;
 
@@ -629,9 +519,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     case DATABASE_ID:
       return getDatabaseId();
 
-    case DOMAIN_ID:
-      return getDomainId();
-
     case OWNER_ID:
       return getOwnerId();
 
@@ -644,11 +531,8 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     case NEXT_REQUEST_SEQUENCE:
       return getNextRequestSequence();
 
-    case SCHEMA_DIGEST:
-      return getSchemaDigest();
-
-    case DIRECTORY_DIGEST:
-      return getDirectoryDigest();
+    case DOMAINS:
+      return getDomains();
 
     }
     throw new java.lang.IllegalStateException();
@@ -666,8 +550,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
       return isSetClusterId();
     case DATABASE_ID:
       return isSetDatabaseId();
-    case DOMAIN_ID:
-      return isSetDomainId();
     case OWNER_ID:
       return isSetOwnerId();
     case KIND:
@@ -676,10 +558,8 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
       return isSetOwnerEpoch();
     case NEXT_REQUEST_SEQUENCE:
       return isSetNextRequestSequence();
-    case SCHEMA_DIGEST:
-      return isSetSchemaDigest();
-    case DIRECTORY_DIGEST:
-      return isSetDirectoryDigest();
+    case DOMAINS:
+      return isSetDomains();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -712,15 +592,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
       if (!(this_present_databaseId && that_present_databaseId))
         return false;
       if (!this.databaseId.equals(that.databaseId))
-        return false;
-    }
-
-    boolean this_present_domainId = true && this.isSetDomainId();
-    boolean that_present_domainId = true && that.isSetDomainId();
-    if (this_present_domainId || that_present_domainId) {
-      if (!(this_present_domainId && that_present_domainId))
-        return false;
-      if (!this.domainId.equals(that.domainId))
         return false;
     }
 
@@ -760,21 +631,12 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
         return false;
     }
 
-    boolean this_present_schemaDigest = true && this.isSetSchemaDigest();
-    boolean that_present_schemaDigest = true && that.isSetSchemaDigest();
-    if (this_present_schemaDigest || that_present_schemaDigest) {
-      if (!(this_present_schemaDigest && that_present_schemaDigest))
+    boolean this_present_domains = true && this.isSetDomains();
+    boolean that_present_domains = true && that.isSetDomains();
+    if (this_present_domains || that_present_domains) {
+      if (!(this_present_domains && that_present_domains))
         return false;
-      if (!this.schemaDigest.equals(that.schemaDigest))
-        return false;
-    }
-
-    boolean this_present_directoryDigest = true && this.isSetDirectoryDigest();
-    boolean that_present_directoryDigest = true && that.isSetDirectoryDigest();
-    if (this_present_directoryDigest || that_present_directoryDigest) {
-      if (!(this_present_directoryDigest && that_present_directoryDigest))
-        return false;
-      if (!this.directoryDigest.equals(that.directoryDigest))
+      if (!this.domains.equals(that.domains))
         return false;
     }
 
@@ -793,10 +655,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     if (isSetDatabaseId())
       hashCode = hashCode * 8191 + databaseId.hashCode();
 
-    hashCode = hashCode * 8191 + ((isSetDomainId()) ? 131071 : 524287);
-    if (isSetDomainId())
-      hashCode = hashCode * 8191 + domainId.hashCode();
-
     hashCode = hashCode * 8191 + ((isSetOwnerId()) ? 131071 : 524287);
     if (isSetOwnerId())
       hashCode = hashCode * 8191 + ownerId.hashCode();
@@ -809,13 +667,9 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
 
     hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(nextRequestSequence);
 
-    hashCode = hashCode * 8191 + ((isSetSchemaDigest()) ? 131071 : 524287);
-    if (isSetSchemaDigest())
-      hashCode = hashCode * 8191 + schemaDigest.hashCode();
-
-    hashCode = hashCode * 8191 + ((isSetDirectoryDigest()) ? 131071 : 524287);
-    if (isSetDirectoryDigest())
-      hashCode = hashCode * 8191 + directoryDigest.hashCode();
+    hashCode = hashCode * 8191 + ((isSetDomains()) ? 131071 : 524287);
+    if (isSetDomains())
+      hashCode = hashCode * 8191 + domains.hashCode();
 
     return hashCode;
   }
@@ -844,16 +698,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     }
     if (isSetDatabaseId()) {
       lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.databaseId, other.databaseId);
-      if (lastComparison != 0) {
-        return lastComparison;
-      }
-    }
-    lastComparison = java.lang.Boolean.compare(isSetDomainId(), other.isSetDomainId());
-    if (lastComparison != 0) {
-      return lastComparison;
-    }
-    if (isSetDomainId()) {
-      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.domainId, other.domainId);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -898,22 +742,12 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
         return lastComparison;
       }
     }
-    lastComparison = java.lang.Boolean.compare(isSetSchemaDigest(), other.isSetSchemaDigest());
+    lastComparison = java.lang.Boolean.compare(isSetDomains(), other.isSetDomains());
     if (lastComparison != 0) {
       return lastComparison;
     }
-    if (isSetSchemaDigest()) {
-      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.schemaDigest, other.schemaDigest);
-      if (lastComparison != 0) {
-        return lastComparison;
-      }
-    }
-    lastComparison = java.lang.Boolean.compare(isSetDirectoryDigest(), other.isSetDirectoryDigest());
-    if (lastComparison != 0) {
-      return lastComparison;
-    }
-    if (isSetDirectoryDigest()) {
-      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.directoryDigest, other.directoryDigest);
+    if (isSetDomains()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.domains, other.domains);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -958,14 +792,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     }
     first = false;
     if (!first) sb.append(", ");
-    sb.append("domainId:");
-    if (this.domainId == null) {
-      sb.append("null");
-    } else {
-      org.apache.thrift.TBaseHelper.toString(this.domainId, sb);
-    }
-    first = false;
-    if (!first) sb.append(", ");
     sb.append("ownerId:");
     if (this.ownerId == null) {
       sb.append("null");
@@ -990,19 +816,11 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     sb.append(this.nextRequestSequence);
     first = false;
     if (!first) sb.append(", ");
-    sb.append("schemaDigest:");
-    if (this.schemaDigest == null) {
+    sb.append("domains:");
+    if (this.domains == null) {
       sb.append("null");
     } else {
-      org.apache.thrift.TBaseHelper.toString(this.schemaDigest, sb);
-    }
-    first = false;
-    if (!first) sb.append(", ");
-    sb.append("directoryDigest:");
-    if (this.directoryDigest == null) {
-      sb.append("null");
-    } else {
-      org.apache.thrift.TBaseHelper.toString(this.directoryDigest, sb);
+      sb.append(this.domains);
     }
     first = false;
     sb.append(")");
@@ -1017,9 +835,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     if (databaseId == null) {
       throw new org.apache.thrift.protocol.TProtocolException("Required field 'databaseId' was not present! Struct: " + toString());
     }
-    if (domainId == null) {
-      throw new org.apache.thrift.protocol.TProtocolException("Required field 'domainId' was not present! Struct: " + toString());
-    }
     if (ownerId == null) {
       throw new org.apache.thrift.protocol.TProtocolException("Required field 'ownerId' was not present! Struct: " + toString());
     }
@@ -1028,11 +843,8 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
     }
     // alas, we cannot check 'ownerEpoch' because it's a primitive and you chose the non-beans generator.
     // alas, we cannot check 'nextRequestSequence' because it's a primitive and you chose the non-beans generator.
-    if (schemaDigest == null) {
-      throw new org.apache.thrift.protocol.TProtocolException("Required field 'schemaDigest' was not present! Struct: " + toString());
-    }
-    if (directoryDigest == null) {
-      throw new org.apache.thrift.protocol.TProtocolException("Required field 'directoryDigest' was not present! Struct: " + toString());
+    if (domains == null) {
+      throw new org.apache.thrift.protocol.TProtocolException("Required field 'domains' was not present! Struct: " + toString());
     }
     // check for sub-struct validity
   }
@@ -1091,14 +903,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
-          case 3: // DOMAIN_ID
-            if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
-              struct.domainId = iprot.readBinary();
-              struct.setDomainIdIsSet(true);
-            } else {
-              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
-            }
-            break;
           case 4: // OWNER_ID
             if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
               struct.ownerId = iprot.readBinary();
@@ -1131,18 +935,21 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
-          case 10: // SCHEMA_DIGEST
-            if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
-              struct.schemaDigest = iprot.readBinary();
-              struct.setSchemaDigestIsSet(true);
-            } else {
-              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
-            }
-            break;
-          case 11: // DIRECTORY_DIGEST
-            if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
-              struct.directoryDigest = iprot.readBinary();
-              struct.setDirectoryDigestIsSet(true);
+          case 12: // DOMAINS
+            if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
+              {
+                org.apache.thrift.protocol.TList _list0 = iprot.readListBegin();
+                struct.domains = new java.util.ArrayList<ThriftMutationDomainBinding>(_list0.size);
+                @org.apache.thrift.annotation.Nullable ThriftMutationDomainBinding _elem1;
+                for (int _i2 = 0; _i2 < _list0.size; ++_i2)
+                {
+                  _elem1 = new ThriftMutationDomainBinding();
+                  _elem1.read(iprot);
+                  struct.domains.add(_elem1);
+                }
+                iprot.readListEnd();
+              }
+              struct.setDomainsIsSet(true);
             } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
@@ -1179,11 +986,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
         oprot.writeBinary(struct.databaseId);
         oprot.writeFieldEnd();
       }
-      if (struct.domainId != null) {
-        oprot.writeFieldBegin(DOMAIN_ID_FIELD_DESC);
-        oprot.writeBinary(struct.domainId);
-        oprot.writeFieldEnd();
-      }
       if (struct.ownerId != null) {
         oprot.writeFieldBegin(OWNER_ID_FIELD_DESC);
         oprot.writeBinary(struct.ownerId);
@@ -1200,14 +1002,16 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
       oprot.writeFieldBegin(NEXT_REQUEST_SEQUENCE_FIELD_DESC);
       oprot.writeI64(struct.nextRequestSequence);
       oprot.writeFieldEnd();
-      if (struct.schemaDigest != null) {
-        oprot.writeFieldBegin(SCHEMA_DIGEST_FIELD_DESC);
-        oprot.writeBinary(struct.schemaDigest);
-        oprot.writeFieldEnd();
-      }
-      if (struct.directoryDigest != null) {
-        oprot.writeFieldBegin(DIRECTORY_DIGEST_FIELD_DESC);
-        oprot.writeBinary(struct.directoryDigest);
+      if (struct.domains != null) {
+        oprot.writeFieldBegin(DOMAINS_FIELD_DESC);
+        {
+          oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.domains.size()));
+          for (ThriftMutationDomainBinding _iter3 : struct.domains)
+          {
+            _iter3.write(oprot);
+          }
+          oprot.writeListEnd();
+        }
         oprot.writeFieldEnd();
       }
       oprot.writeFieldStop();
@@ -1230,13 +1034,17 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       oprot.writeBinary(struct.clusterId);
       oprot.writeBinary(struct.databaseId);
-      oprot.writeBinary(struct.domainId);
       oprot.writeBinary(struct.ownerId);
       oprot.writeI32(struct.kind.getValue());
       oprot.writeI64(struct.ownerEpoch);
       oprot.writeI64(struct.nextRequestSequence);
-      oprot.writeBinary(struct.schemaDigest);
-      oprot.writeBinary(struct.directoryDigest);
+      {
+        oprot.writeI32(struct.domains.size());
+        for (ThriftMutationDomainBinding _iter4 : struct.domains)
+        {
+          _iter4.write(oprot);
+        }
+      }
     }
 
     @Override
@@ -1246,8 +1054,6 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
       struct.setClusterIdIsSet(true);
       struct.databaseId = iprot.readBinary();
       struct.setDatabaseIdIsSet(true);
-      struct.domainId = iprot.readBinary();
-      struct.setDomainIdIsSet(true);
       struct.ownerId = iprot.readBinary();
       struct.setOwnerIdIsSet(true);
       struct.kind = it.cavallium.rockserver.core.common.api.ThriftMutationKind.findByValue(iprot.readI32());
@@ -1256,10 +1062,18 @@ public class ThriftMutationOwner implements org.apache.thrift.TBase<ThriftMutati
       struct.setOwnerEpochIsSet(true);
       struct.nextRequestSequence = iprot.readI64();
       struct.setNextRequestSequenceIsSet(true);
-      struct.schemaDigest = iprot.readBinary();
-      struct.setSchemaDigestIsSet(true);
-      struct.directoryDigest = iprot.readBinary();
-      struct.setDirectoryDigestIsSet(true);
+      {
+        org.apache.thrift.protocol.TList _list5 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+        struct.domains = new java.util.ArrayList<ThriftMutationDomainBinding>(_list5.size);
+        @org.apache.thrift.annotation.Nullable ThriftMutationDomainBinding _elem6;
+        for (int _i7 = 0; _i7 < _list5.size; ++_i7)
+        {
+          _elem6 = new ThriftMutationDomainBinding();
+          _elem6.read(iprot);
+          struct.domains.add(_elem6);
+        }
+      }
+      struct.setDomainsIsSet(true);
     }
   }
 

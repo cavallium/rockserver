@@ -95,8 +95,7 @@ This section and the remaining gates at the end describe the current branch.
   `cross-domain-clients-coupled98.log` and all 64 cases in repaired classes from
   `cross-domain-clients-repair100.log`; the saved per-class manifest identifies
   source and report hashes. These controlled transports do not prove independent
-  endpoint/quorum or performance acceptance. The public
-  durable `executeAtomic(mutations, predicates)` owner remains a separate gap.
+  endpoint/quorum or performance acceptance.
 - Retained schema inventory, status, resume and abort are available through Java,
   gRPC, Thrift and Rust using the original UUID/controller. Ordinary schema calls
   still create new requests. Initial UUIDs and terminal results, including conflict,
@@ -110,6 +109,23 @@ This section and the remaining gates at the end describe the current branch.
   rejection, UPLOAD pause/resume and cancellation during native installation.
   Rust's full workspace passes 105 cases in `schema-lifecycle-rust-workspace92.log`;
   later bridge-only fixes leave that Rust/protobuf contract unchanged.
+- Public durable atomic mutations accept caller-retained owner/request/sequence
+  identity, ordered PUT/DELETE/MERGE operations, original-image predicates and
+  ordered saved returns. Owners and tokens carry the current canonical domain
+  vector. Java gRPC/Thrift and Rust expose discovery, prepare and execution through
+  the same retained lifecycle. The owner forces original input/fence/captures and
+  child acceptance, saves its result before child consumption, and retains it until
+  explicit acknowledgement. False predicates produce a retained zero-effect
+  conflict; cancelled observers preserve actual owned work. `atomic-fixture113.log`
+  passes 19 native adapter cases on JDK 25, including eight public-owner cases,
+  cross-domain cold recovery and shared backup/two-pool workflows. The unchanged
+  fault cases passed six cases in gate105; real gRPC/Thrift transport passed four
+  cases in gate102. The full offline Rust workspace passes in
+  `atomic-rust-workspace117.log`. Resource efficiency remains unfinished: replace
+  fixed maximum-size future disk promises with conservative derived geometry and
+  account retained per-participant wire buffers before concurrency/performance
+  acceptance. These results do not establish independent failure-domain or
+  production performance acceptance.
 - Unqualified common physical CF estimates, table/SST metadata and maintenance now
   return typed NOT_IMPLEMENTED before generation lookup in both connection and
   adapter dispatch. Physical observations and maintenance retain the qualified
