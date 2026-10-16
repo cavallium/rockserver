@@ -42,6 +42,35 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
                 Thread.ofPlatform().daemon(true).name(name,0).factory(),new ThreadPoolExecutor.AbortPolicy());
     }
     private final Map<Key,Task> tasks=new HashMap<>();
+    private static final long GROUP_FENCE_BYTES=128;
+    private static final class GroupFence {
+        final ResourceLease lease;final CompletableFuture<Void> drained=new CompletableFuture<>();
+        final List<Publication> publications=new ArrayList<>();int waiters;
+        GroupFence(ResourceLease lease){this.lease=lease;}
+    }
+    private final Map<UUID,GroupFence> groupFences=new HashMap<>();
+    /** Permanent in-process group ingress fence; actual running/queued actions retain their owners.
+     * The durable source terminal recipe must reestablish it before serving on cold open. */
+    public CompletableFuture<Void> fenceGroup(UUID group){
+        final GroupFence fence;final List<Task> pending;final CompletableFuture<Void> view;
+        synchronized(this){
+            var existing=groupFences.get(Objects.requireNonNull(group));
+            if(existing==null){
+                if(stopping || groupFences.size()>=RatisNodePlan.MAX_LOCAL_GROUPS)return CompletableFuture.failedFuture(new RejectedExecutionException("Proof group fence capacity/stopping"));
+                final ResourceLease resource;try{resource=Objects.requireNonNull(resourceAdmission.reserve(group,GROUP_FENCE_BYTES));}catch(IOException|RuntimeException failure){return CompletableFuture.failedFuture(failure);}
+                fence=new GroupFence(resource);groupFences.put(group,fence);pending=tasks.values().stream().filter(task->task.key.group().equals(group)).toList();
+            }else{fence=existing;pending=null;}
+            if(!fence.drained.isDone() && fence.waiters>=MAX_WAITERS)return CompletableFuture.failedFuture(new RejectedExecutionException("Proof group drain waiter capacity"));
+            if(!fence.drained.isDone())fence.waiters++;view=fence.drained.copy();
+        }
+        if(pending!=null)CompletableFuture.allOf(pending.stream().map(task->task.drained).toArray(CompletableFuture[]::new)).whenComplete((ignored,failure)->{
+            final List<Publication> publications;synchronized(this){publications=List.copyOf(fence.publications);fence.publications.clear();}
+            fence.drained.complete(null);for(var publication:publications)publish(publication);
+        });
+        return view;
+    }
+    private int retainedPublications;
+    private boolean stopTasksDrained;
     private long bytes;
     private boolean stopping;
     private CompletableFuture<Void> actualStop;
@@ -58,7 +87,7 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
         catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
         final Task task;
         synchronized (this) {
-            if (stopping) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof queries are stopping"));
+            if (stopping || groupFences.containsKey(group)) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof queries are stopping"));
             var existing=tasks.get(key);
             if (existing!=null) {
                 if (weight>existing.weight) return CompletableFuture.failedFuture(new RejectedExecutionException("Coalesced proof query exceeds original ownership estimate"));
@@ -66,7 +95,7 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
                 if (existing.waiters>=MAX_WAITERS) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query waiter capacity exhausted"));
                 existing.waiters++; return existing.result.copy();
             }
-            if (tasks.size()>=maximumJobs || weight>maximumBytes-bytes) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query capacity exhausted"));
+            if (tasks.size()+retainedPublications>=maximumJobs || weight>maximumBytes-bytes) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query capacity exhausted"));
             final ResourceLease resource;
             try {resource=Objects.requireNonNull(resourceAdmission.reserve(group,weight));}
             catch(IOException|RuntimeException rejected){return CompletableFuture.failedFuture(rejected);}
@@ -91,7 +120,7 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
             else { if (!actualStop.isDone()) drainViews++; view=actualStop.copy(); }
         }
         if (pending!=null) {
-            CompletableFuture.allOf(pending.stream().map(task -> task.drained).toArray(CompletableFuture[]::new)).whenComplete((ignored,failure) -> actualStop.complete(null));
+            CompletableFuture.allOf(pending.stream().map(task -> task.drained).toArray(CompletableFuture[]::new)).whenComplete((ignored,failure) -> {synchronized(this){stopTasksDrained=true;}completeStopIfDrained();});
             for (var task:pending) if (executor.remove(task)) task.reject(new RejectedExecutionException("Proof query stopped before execution"));
             executor.shutdown();
             final List<Publication> publications;
@@ -100,18 +129,32 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
         }
         return view;
     }
-    public synchronized Stats stats() { return new Stats(tasks.size(),bytes,executor.getPoolSize()); }
+    /** Stop joins actual actions, not arbitrary synchronous observer callbacks. Publication
+     * owners remain separately charged until transfer, even after this acknowledgement. */
+    private void completeStopIfDrained(){
+        final CompletableFuture<Void> completion;
+        synchronized(this){if(!stopping || !stopTasksDrained)return;for(var fence:groupFences.values())fence.lease.close();groupFences.clear();completion=actualStop;}
+        completion.complete(null);
+    }
+    public synchronized Stats stats() { return new Stats(tasks.size()+retainedPublications,bytes,executor.getPoolSize()); }
     private void finish(Task task,Message message,Throwable failure) {
         var publication=new Publication(task,message,failure); final boolean defer;
         synchronized (this) {
             if (tasks.get(task.key)!=task) return;
-            task.resource.close();tasks.remove(task.key);bytes-=task.weight;
-            defer=sweeping; if (defer) deferred.add(publication);
+            tasks.remove(task.key);
+            var fence=groupFences.get(task.key.group());
+            defer=sweeping || fence!=null && !fence.drained.isDone();
+            // Deferred result bodies remain service-owned even after their native task retires.
+            // Its distinct drained future must still complete, or the group barrier self-deadlocks.
+            if(defer){task.retainedPublication=true;retainedPublications++;}else{task.resource.close();bytes-=task.weight;}
+            if(sweeping)deferred.add(publication);else if(defer)fence.publications.add(publication);
         }
         task.drained.complete(null);
         if (!defer) publish(publication);
     }
-    private static void publish(Publication publication) {
+    private void publish(Publication publication) {
+        synchronized(this){var task=publication.task();if(task.retainedPublication){task.retainedPublication=false;retainedPublications--;bytes-=task.weight;task.resource.close();}}
+        completeStopIfDrained();
         if (publication.failure()==null) publication.task().result.complete(publication.message());
         else publication.task().result.completeExceptionally(publication.failure());
     }
@@ -121,7 +164,7 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
         RatisRangeStateMachine.ProofQueryAction action;
         final long weight;
         final ResourceLease resource;
-        int waiters=1;
+        int waiters=1;boolean retainedPublication;
         final CompletableFuture<Message> result=new CompletableFuture<>();
         final CompletableFuture<Void> drained=new CompletableFuture<>();
         final AtomicInteger phase=new AtomicInteger();

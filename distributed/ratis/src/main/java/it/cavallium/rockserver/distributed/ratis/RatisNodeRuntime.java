@@ -745,7 +745,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         try{
             var entry=groups.require(group);var store=stores.get(group);var machine=machines.get(RaftGroupId.valueOf(group));var division=server.getDivision(RaftGroupId.valueOf(group));
             if(entry.role()!=RatisNodePlan.Role.DATA || store==null || machine==null || division.getStateMachine()!=machine || !division.getInfo().isLeaderReady() || !store.topologyRetired())throw new IOException("Source CLOSE requires actual local retired leader");
-            var cut=store.applied();if(cut==null || cut.index()<division.getRaftLog().getLastCommittedIndex() || !org.apache.ratis.server.impl.RockserverRaftServers.hasAppliedPrefix(division,machine,org.apache.ratis.server.protocol.TermIndex.valueOf(cut.term(),cut.index())))throw new IOException("Source CLOSE waits for actual committed/updater/native prefix");
+            var cut=store.applied();if(cut==null || cut.index()<division.getRaftLog().getLastCommittedIndex() || !org.apache.ratis.server.impl.RockserverRaftServers.hasAppliedPrefix(division,machine,org.apache.ratis.server.protocol.TermIndex.valueOf(cut.term(),cut.index())))throw new IOException("Source CLOSE waits for actual committed/updater/native prefix: native="+cut+", committed="+division.getRaftLog().getLastCommittedIndex()+", updaterCoversNative="+(cut!=null && org.apache.ratis.server.impl.RockserverRaftServers.hasAppliedPrefix(division,machine,org.apache.ratis.server.protocol.TermIndex.valueOf(cut.term(),cut.index()))));
             var saved=store.sourceClosingAttempt();final RatisSourceClosingRecord record;
             if(saved!=null)record=new RatisSourceClosingRecord(saved.request());
             else{

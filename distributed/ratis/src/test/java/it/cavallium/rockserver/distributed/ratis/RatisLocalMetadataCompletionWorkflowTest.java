@@ -35,10 +35,15 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySourceSnaps
 class RatisLocalMetadataCompletionWorkflowTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     private long operation;
+    private boolean exerciseSourceClosing;
     private final AtomicLong calls=new AtomicLong();
     private final AtomicReference<RaftServer> actual=new AtomicReference<>();
     private final AtomicBoolean self=new AtomicBoolean(),losePrepare=new AtomicBoolean(true);
     private final AtomicInteger metaPrepares=new AtomicInteger(),obsoleteCalls=new AtomicInteger();
+
+    @Test void actualElectedRuntimeClosesRetiredSourceAndPreservesItsOriginalReceiptAcrossColdReopen()throws Exception{
+        exerciseSourceClosing=true;completedCurrentSourceCleansItsOldImageThenFinishesLocalMetaAndColdReopensTwice(Interruption.NONE);
+    }
 
     enum Interruption { NONE, CHECKPOINT_RETRY, CHECKPOINT_COLD, RELOAD_CANCEL_CLOSE }
     @ParameterizedTest @EnumSource(Interruption.class)
@@ -133,11 +138,33 @@ class RatisLocalMetadataCompletionWorkflowTest {
                     var selected=RatisTopologySourceSnapshotRpc.request(terminal.get("request"));var key=new TopologyChange.Key(group,selected.receiver().replicaId());var target=new RatisRecoveryObligationRpc.Target(c.groupId(),consuming.header(),key);
                     var localProof=RatisRecoveryObligationRpc.reply(requireSuccess(submit(actual.get(),group,RatisRecoveryObligationRpc.request(target),false,true)).getMessage().getContent().toByteArray(),target);assertEquals(RatisTopologyRecoveryObligations.ProofKind.LOCAL_METADATA,localProof.kind());assertArrayEquals(OperatorUpload.sha256(terminal.get("localCompletion")),localProof.proofDigest());assertEquals(selected.transferId(),localProof.transferId());
                     if(interruption==Interruption.NONE){var wrongKind=new RatisTopologyRecoveryObligations.Completion(localProof.transferId(),RatisTopologyRecoveryObligations.ProofKind.METADATA_REGISTRATION,localProof.requestDigest(),localProof.proofDigest(),localProof.completedCut());var rejection=assertThrows(UndeclaredThrowableException.class,()->topology.acknowledgeRecovery(topology.readRecovery(consuming.intentId()),key,wrongKind));var failed=assertInstanceOf(ExecutionException.class,rejection.getUndeclaredThrowable());assertEquals("Recovery ACK differs from original native completion",assertInstanceOf(IOException.class,failed.getCause()).getMessage());assertFalse(topology.readRecovery(consuming.intentId()).completions().containsKey(key));donor.loseRecoveryAck=true;var currentNode=node;assertThrows(ExecutionException.class,()->currentNode.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS));assertFalse(donor.loseRecoveryAck);assertEquals(localProof,topology.readRecovery(consuming.intentId()).completions().get(key));}
+                    NativeSourceClosing sourceClosed=null;
+                    if(exerciseSourceClosing){
+                        var published=authority.read(consuming.header(),TopologyChange.Stage.ACTIVATE);
+                        for(var child:consuming.targets()){
+                            var activation=RatisTopologyActivationRecord.of(published,child.groupId());
+                            requireSuccess(submit(actual.get(),child.groupId(),RatisTopologyActivationRpc.prepareRequest(activation),false));
+                            var receipt=NativeTopologyActivation.decode(requireSuccess(submit(actual.get(),child.groupId(),activation.encode(),true)).getMessage().getContent().toByteArray());
+                            command(donor,topology,topology.prepareProof(op(),consuming,topology.readHead(directory.domainId()),receipt.proof()));
+                        }
+                        var schemaHead=new RatisSchemaAdministration(donor.catalogue,directory.clusterId(),directory.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn()).readHead(directory.domainId());
+                        var importHead=new RatisRangeImportCatalogue(donor.catalogue,directory.clusterId(),directory.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn()).readHead(directory.domainId());
+                        command(donor,topology,topology.prepareRetirement(op(),consuming,topology.readHead(directory.domainId()),schemaHead,importHead));
+                        assertEquals(TopologyChange.Phase.RETIRED,topology.readHead(directory.domainId()).phase());
+                        var activeSource=(RatisRangeStateMachine)actual.get().getDivision(id).getStateMachine();var activeStore=field(activeSource,"store",ReplicatedRangeStore.class);awaitSourceClosingPrefix(actual.get(),id,activeStore);
+                        sourceClosed=node.closeTopologySource(group).get(20,TimeUnit.SECONDS);assertEquals(sourceClosed,activeStore.sourceClosing());awaitSourceClosingPrefix(actual.get(),id,activeStore);
+                        assertEquals(sourceClosed,node.closeTopologySource(group).get(20,TimeUnit.SECONDS),"Exact retry retains the original committed CLOSE cut and request");
+                    }
                     byte[] witness=terminal.get("cleanupScope");node.close();node=null;
                     for(int reopen=0;reopen<2;reopen++) {
                         node=open(donor,plan,nodeRoot,epochs,route,RatisNodeRuntime.Startup.RECOVER,this::electedServer);
                         var currentNode=node;bootstrap(currentNode);assertLocal(currentNode,group,consuming);assertEquals(localProof,topology.readRecovery(consuming.intentId()).completions().get(key));assertEquals("LOCAL_DONE",phase(journal));assertArrayEquals(witness,RatisSchemaClientJournal.read(journal).get("cleanupScope"));
-                        currentNode.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS);assertLocal(currentNode,group,consuming);assertEquals(0,metaPrepares.get());node.close();node=null;
+                        currentNode.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS);assertLocal(currentNode,group,consuming);assertEquals(0,metaPrepares.get());
+                        if(sourceClosed!=null){
+                            var sourceMachine=(RatisRangeStateMachine)actual.get().getDivision(id).getStateMachine();var sourceStore=field(sourceMachine,"store",ReplicatedRangeStore.class);assertEquals(sourceClosed,sourceStore.sourceClosing());awaitSourceClosingPrefix(actual.get(),id,sourceStore);assertEquals(sourceClosed,currentNode.closeTopologySource(group).get(20,TimeUnit.SECONDS));
+                            var childMachine=(RatisRangeStateMachine)actual.get().getDivision(RaftGroupId.valueOf(consuming.targets().getFirst().groupId())).getStateMachine();var childStore=field(childMachine,"store",ReplicatedRangeStore.class);awaitLeader(actual.get(),childMachine.getGroupId(),childStore);assertArrayEquals(new byte[]{11},childStore.readCurrentPoint(donor.first.columnIds().iterator().next(),new byte[]{7}));
+                        }
+                        node.close();node=null;
                     }
                 }catch(Exception|Error failure){primary=failure;throw failure;}
                 finally{
@@ -297,6 +324,11 @@ class RatisLocalMetadataCompletionWorkflowTest {
         fail("Expected parent "+phase+", actual="+phase(journal)+", failure="+last);
     }
     private static void bootstrap(RatisNodeRuntime node)throws Exception{Throwable last=null;for(int n=0;n<8;n++)try{node.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS);return;}catch(ExecutionException waitingForActualLeader){last=waitingForActualLeader;Thread.sleep(100);}throw new AssertionError("Cold local META did not settle",last);}
+    private static void awaitSourceClosingPrefix(RaftServer server,RaftGroupId group,ReplicatedRangeStore store)throws Exception{
+        awaitLeader(server,group,store);
+        try{await(()->{var division=server.getDivision(group);var a=store.applied();return a!=null && a.index()>=division.getRaftLog().getLastCommittedIndex() && RockserverRaftServers.hasAppliedPrefix(division,division.getStateMachine(),TermIndex.valueOf(a.term(),a.index()));},"Actual source native/updater covers committed frontier");}
+        catch(AssertionError failure){var division=server.getDivision(group);throw new AssertionError("Source A="+store.applied()+", committed="+division.getRaftLog().getLastCommittedIndex()+", SM="+division.getStateMachine().getLastAppliedTermIndex()+", nativeCFG="+store.configuration()+", coreCFG="+division.getRaftConf(),failure);}
+    }
     private static void awaitLeader(RaftServer server,RaftGroupId group,ReplicatedRangeStore store)throws Exception {
         try{await(()->{var info=server.getDivision(group).getInfo();var a=store.applied();return info.isLeader() && info.isLeaderReady() && a!=null && a.term()==info.getCurrentTerm() && RockserverRaftServers.hasAppliedPrefix(server.getDivision(group),(RatisRangeStateMachine)server.getDivision(group).getStateMachine(),TermIndex.valueOf(a.term(),a.index()));},"Actual single-voter leader/native prefix");}
         catch(AssertionError failure){var division=server.getDivision(group);var sm=(RatisRangeStateMachine)division.getStateMachine();throw new AssertionError("Leader="+division.getInfo().isLeader()+", ready="+division.getInfo().isLeaderReady()+", term="+division.getInfo().getCurrentTerm()+", A="+store.applied()+", updater="+sm.getLastAppliedTermIndex()+", gate="+sm.recoveryEligibilityGate().snapshot()+", pending="+sm.recoveryEligibilityGate().discoveryPending()+", health="+sm.getLifeCycleState()+", conf="+division.getRaftConf(),failure);}

@@ -16,6 +16,34 @@ class RatisProofQueryServiceTest {
         UUID pool=new UUID(0,1);var lane=new RatisNodeResourceBudget.Lane(RatisNodeResourceBudget.MAX_BYTES,RatisNodeResourceBudget.MAX_OWNERS);var limits=new RatisNodeResourceBudget.Limits(lane,lane);var budget=new RatisNodeResourceBudget(limits,Map.of(pool,limits));
         return (group,bytes)->{var lease=budget.reserve(pool,RatisNodeResourceBudget.Kind.ORDINARY,bytes,1);return lease::close;};
     }
+    @Test void groupFenceJoinsActualOwnersWithoutStoppingOtherGroupsOrPublishingEarly()throws Exception{
+        var retained=new AtomicInteger();var service=new RatisProofQueryService((id,bytes)->{retained.incrementAndGet();return retained::decrementAndGet;});
+        var entered=new CountDownLatch(2);var release=new CountDownLatch(1);var other=UUID.randomUUID();
+        try{
+            var first=service.submit(group,new byte[]{1},1,false,owned->{entered.countDown();if(!release.await(5,TimeUnit.SECONDS))throw new IOException("Fixture timeout");return Message.EMPTY;});
+            var second=service.submit(group,new byte[]{2},1,false,owned->{entered.countDown();if(!release.await(5,TimeUnit.SECONDS))throw new IOException("Fixture timeout");return Message.EMPTY;});
+            assertTrue(entered.await(5,TimeUnit.SECONDS));var drain=service.fenceGroup(group);assertFalse(drain.isDone());assertTrue(drain.cancel(false));assertEquals(3,retained.get(),"Both actual work owners and the permanent group fence remain paid");
+            assertThrows(ExecutionException.class,()->service.submit(group,new byte[]{3},1,false,owned->{throw new AssertionError("Fenced group ran");}).get(5,TimeUnit.SECONDS));
+            assertEquals(Message.EMPTY,service.submit(other,new byte[]{4},1,false,owned->Message.EMPTY).get(5,TimeUnit.SECONDS));
+            var callback=first.thenRun(()->{try{service.fenceGroup(group).get(5,TimeUnit.SECONDS);}catch(Exception failure){throw new CompletionException(failure);}});
+            var actual=service.fenceGroup(group);assertFalse(actual.isDone());release.countDown();actual.get(5,TimeUnit.SECONDS);callback.get(5,TimeUnit.SECONDS);second.get(5,TimeUnit.SECONDS);
+            assertEquals(1,retained.get(),"Terminal ingress fence lives until actual service stop");assertEquals(0,service.stats().jobs());
+            service.stop().get(5,TimeUnit.SECONDS);assertEquals(0,retained.get());
+        }finally{release.countDown();service.stop().get(5,TimeUnit.SECONDS);}
+    }
+    @Test void deferredLargeResultKeepsItsByteAndOwnerAdmissionUntilPublication()throws Exception{
+        var service=new RatisProofQueryService(admission());var entered=new CountDownLatch(2);var finishFirst=new CountDownLatch(1);var finishLast=new CountDownLatch(1);
+        long half=RatisProofQueryService.MAX_BYTES/2;var tasksField=RatisProofQueryService.class.getDeclaredField("tasks");tasksField.setAccessible(true);
+        try{
+            var first=service.submit(group,new byte[]{11},half,false,owned->{entered.countDown();if(!finishFirst.await(5,TimeUnit.SECONDS))throw new IOException("Fixture timeout");return Message.valueOf(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(new byte[Math.toIntExact(half)]));});
+            var last=service.submit(group,new byte[]{12},half,false,owned->{entered.countDown();if(!finishLast.await(5,TimeUnit.SECONDS))throw new IOException("Fixture timeout");return Message.EMPTY;});
+            assertTrue(entered.await(5,TimeUnit.SECONDS));var drained=service.fenceGroup(group);finishFirst.countDown();
+            long end=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);boolean firstRetired=false;while(System.nanoTime()<end){synchronized(service){firstRetired=((Map<?,?>)tasksField.get(service)).size()==1;}if(firstRetired)break;Thread.sleep(1);}assertTrue(firstRetired,"First actual action must retire while the last still owns native work");
+            assertFalse(first.isDone());assertFalse(drained.isDone());assertEquals(2,service.stats().jobs());assertEquals(RatisProofQueryService.MAX_BYTES,service.stats().bytes());
+            assertThrows(ExecutionException.class,()->service.submit(UUID.randomUUID(),new byte[]{13},1,false,owned->{throw new AssertionError("Deferred result admission was reused");}).get(5,TimeUnit.SECONDS));
+            finishLast.countDown();drained.get(5,TimeUnit.SECONDS);assertEquals(half,first.get(5,TimeUnit.SECONDS).getContent().size());last.get(5,TimeUnit.SECONDS);assertEquals(0,service.stats().bytes());assertEquals(0,service.stats().jobs());
+        }finally{finishFirst.countDown();finishLast.countDown();service.stop().get(5,TimeUnit.SECONDS);}
+    }
     @Test void cancelledViewsCoalesceAndStopRetainsRunningActionAndInputUntilReturn() throws Exception {
         var service=new RatisProofQueryService(admission()); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var calls=new AtomicInteger(); byte[] input={1,2,3};
         try {
@@ -90,6 +118,25 @@ class RatisProofQueryServiceTest {
             }
             service.stop().get(5,TimeUnit.SECONDS); for (var callback:callbacks) callback.get(5,TimeUnit.SECONDS); assertEquals(0,service.stats().jobs()); assertEquals(0,service.stats().bytes());
         } finally { release.countDown(); service.stop().get(5,TimeUnit.SECONDS); }
+    }
+    @Test void actualStopDoesNotWaitForCallbacksButRetainsUnpublishedBodyOwnership()throws Exception{
+        var retained=new AtomicInteger();var service=new RatisProofQueryService((id,bytes)->{retained.incrementAndGet();return retained::decrementAndGet;});
+        var workersEntered=new CountDownLatch(4);var releaseWorkers=new CountDownLatch(1);var callbackEntered=new CountDownLatch(1);var releaseCallback=new CountDownLatch(1);
+        var field=RatisProofQueryService.class.getDeclaredField("executor");field.setAccessible(true);var executor=(ThreadPoolExecutor)field.get(service);
+        try(var stopWorker=Executors.newVirtualThreadPerTaskExecutor()){
+            for(int n=0;n<4;n++)executor.execute(()->{workersEntered.countDown();try{releaseWorkers.await();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();}});
+            assertTrue(workersEntered.await(5,TimeUnit.SECONDS));
+            var first=service.submit(group,new byte[]{21},1024,false,owned->{throw new AssertionError("Queued action ran");});
+            var second=service.submit(group,new byte[]{22},2048,false,owned->{throw new AssertionError("Queued action ran");});
+            // Follow the service's actual pending iteration order, not UUID/hash-map luck.
+            var tasksField=RatisProofQueryService.class.getDeclaredField("tasks");tasksField.setAccessible(true);final int firstInput;
+            synchronized(service){var task=((Map<?,?>)tasksField.get(service)).values().iterator().next();var inputField=task.getClass().getDeclaredField("input");inputField.setAccessible(true);firstInput=((byte[])inputField.get(task))[0];}
+            var blocked=firstInput==21?first:second;var unpublished=firstInput==21?second:first;long unpublishedBytes=firstInput==21?2048:1024;
+            var callback=blocked.handle((value,failure)->{callbackEntered.countDown();try{service.stop().get(5,TimeUnit.SECONDS);if(!releaseCallback.await(5,TimeUnit.SECONDS))throw new AssertionError("Callback timeout");}catch(Exception problem){throw new CompletionException(problem);}return null;});
+            var stopCall=stopWorker.submit((Callable<CompletableFuture<Void>>)service::stop);assertTrue(callbackEntered.await(5,TimeUnit.SECONDS));
+            service.stop().get(5,TimeUnit.SECONDS);assertFalse(unpublished.isDone());assertEquals(unpublishedBytes,service.stats().bytes());assertEquals(1,retained.get(),"Unpublished second result remains owned after actual task stop");
+            releaseCallback.countDown();callback.get(5,TimeUnit.SECONDS);stopCall.get(5,TimeUnit.SECONDS).get(5,TimeUnit.SECONDS);assertThrows(ExecutionException.class,()->unpublished.get(5,TimeUnit.SECONDS));assertEquals(0,retained.get());assertEquals(0,service.stats().bytes());
+        }finally{releaseCallback.countDown();releaseWorkers.countDown();service.stop().get(5,TimeUnit.SECONDS);}
     }
     @Test void actualEncodedBytesReserveBeforeDispatchAndFailuresPermitRetry() throws Exception {
         var service=new RatisProofQueryService(admission()); var entered=new CountDownLatch(1); var release=new CountDownLatch(1);
