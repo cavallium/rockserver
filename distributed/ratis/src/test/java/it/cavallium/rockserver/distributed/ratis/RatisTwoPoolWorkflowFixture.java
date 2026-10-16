@@ -138,6 +138,14 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
     private RaftClientReply reply(byte[] bytes){return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf("catalogue")).setGroupId(RaftGroupId.valueOf(plan.catalogue().groupId())).setCallId(1).setSuccess(true).setMessage(Message.valueOf(ByteString.copyFrom(bytes))).build();}
     private RatisRangeStateMachine machine(UUID group){var remote=remoteHomes.get(group);return remote!=null?remote:server.machines.get(RaftGroupId.valueOf(group));}
     ReplicatedRangeStore store(UUID group)throws Exception{return field(machine(group),"store",ReplicatedRangeStore.class);}
+    /** Deliver an actual committed configuration callback before interoperating with a real Raft receiver. */
+    void commitCurrentConfiguration(UUID group)throws Exception {
+        var machine=machine(group);var store=store(group);var current=store.configuration();var actual=org.apache.ratis.server.raftlog.LogProtoUtils.toRaftConfigurationProtoBuilder(server.division(RaftGroupId.valueOf(group)).getRaftConf()).build();assertArrayEquals(current.data(),actual.toByteArray());
+        long term=server.term,index=store.applied().index()+1;machine.notifyConfigurationChanged(term,index,actual);machine.notifyTermIndexUpdated(term,index);
+        long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);while((store.configuration().index()!=index || machine.getLastAppliedTermIndex().getIndex()<index) && System.nanoTime()<deadline)Thread.sleep(1);
+        assertEquals(term,store.configuration().term());assertEquals(index,store.configuration().index());assertArrayEquals(actual.toByteArray(),store.configuration().data());assertEquals(new ApplyPosition(term,index),store.applied());assertEquals(index,machine.getLastAppliedTermIndex().getIndex());
+    }
+
     private <T> CompletableFuture<T> async(Callable<T> action){try{return CompletableFuture.supplyAsync(()->{try{return action.call();}catch(Exception failure){throw new CompletionException(failure);}},calls);}catch(RuntimeException rejected){return CompletableFuture.failedFuture(rejected);}}
     Message apply(UUID group,byte[] bytes)throws Exception {
         // A real Raft division assigns log indexes in one serial lane, before committed apply.

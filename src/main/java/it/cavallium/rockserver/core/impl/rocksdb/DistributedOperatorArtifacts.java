@@ -226,7 +226,17 @@ public final class DistributedOperatorArtifacts {
             if(needed!=null && !needed.contains(names.get(column.columnId()))) continue;
             var expected=column.operator()==null ? null : descriptor(column.operator(),new DeterministicContract(column.operator().deterministicContract(),column.operator().deterministicContractVersion(),true));
             var actual=bindings.get(names.get(column.columnId()));
-            if(actual==null || !actual.column().equals(column.columnId()) || !Objects.equals(actual.operator(),expected) || !Objects.equals(actual.bucket(),bucketShape(column))) throw new IOException("Native schema differs from trusted operator tuple");
+            if(actual==null || !actual.column().equals(column.columnId()) || !Objects.equals(actual.operator(),expected) || !Objects.equals(actual.bucket(),bucketShape(column))) {
+                var retainedAlias=bindings.entrySet().stream().filter(entry->entry.getValue().column().equals(column.columnId())).map(Map.Entry::getKey).findFirst().orElse(null);
+                throw new IOException("Native schema differs from trusted operator tuple: column="+column.columnId()+", alias="+names.get(column.columnId())+", retainedAlias="+retainedAlias+", bindingPresent="+(actual!=null)+", columnMatches="+(actual!=null && actual.column().equals(column.columnId()))+", operatorMatches="+(actual!=null && Objects.equals(actual.operator(),expected))+", bucketMatches="+(actual!=null && Objects.equals(actual.bucket(),bucketShape(column))));
+            }
+        }
+    }
+    /** Historical META aliases are donor evidence; qualify semantics without granting CF ownership. */
+    void requireMetadataSchemaBindings(DistributedSchema schema)throws IOException {
+        for(var column:schema.columns()){
+            var expected=column.operator()==null?null:require(column.operator());
+            for(var binding:bindings.values())if(binding.column().equals(column.columnId()) && (!Objects.equals(binding.operator(),expected) || !Objects.equals(binding.bucket(),bucketShape(column))))throw new IOException("Metadata schema differs from qualified local operator/bucket tuple: "+column.columnId());
         }
     }
     private static byte[] encodedBindings(Map<String,Binding> bindings,byte[] bootstrap) throws IOException {

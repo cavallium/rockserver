@@ -30,6 +30,7 @@ class NativeSchemaCapacityTest {
         store.enableLogicalSchema(store.installedSchema()==null ? original : store.installedSchema()); return store;
     }
     RocksDBLoader.LoadedDb loaded(DistributedStoragePool pool) throws Exception { var field=DistributedStoragePool.class.getDeclaredField("loaded"); field.setAccessible(true); return (RocksDBLoader.LoadedDb)field.get(pool); }
+    byte[] capacityBytes(DistributedStoragePool pool)throws Exception {var db=loaded(pool);var state=db.db().getStartupColumns().entrySet().stream().filter(entry->Arrays.equals(entry.getKey().getName(),DistributedStoragePool.STATE_COLUMN.getBytes())).findFirst().orElseThrow().getValue();return db.db().get().get(state,"SCHEMA-CAPACITY".getBytes());}
     DistributedStoragePool qualified(Path path,DistributedSchema original,Map<UUID,String> plain) { return DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(original),Map.of(),plain); }
     SchemaChange.Definition change(DistributedSchema source,DistributedSchema target,UUID group) {
         var directory=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),source.schemaEpoch(),source.digest(),0,source.columnIds(),source.routingPrefixBytes(),List.of(fixture.descriptor(group,null,null)));
@@ -60,10 +61,12 @@ class NativeSchemaCapacityTest {
         }
         try(var pool=fixture.open(path)) {
             var store=range(pool,fixture.group,source,Map.of()); assertEquals(proof,pool.lookupSchemaCapacity(store,change.header())); assertNull(store.schemaFence());
+            int reservedBytes=capacityBytes(pool).length;
             pool.applySchemaFence(store,new ApplyPosition(2,2),change.header(),proof);
             var fenced=pool.lookupSchemaCapacityStatus(store,change,"future",false); assertEquals(DistributedStoragePool.SchemaCapacityState.FENCED,fenced.state()); assertTrue(fenced.forcedDurable()); assertFalse(fenced.ready()); assertEquals(proof,pool.requireSchemaFenceCapacity(store,change.header()));
             assertThrows(IllegalStateException.class,() -> pool.releaseSchemaCapacity(store,proof,abort(change)));
             var installed=pool.installSchema(store,new ApplyPosition(2,3),change,Map.of(fixture.column,"future"),Set.of());
+            assertEquals(reservedBytes,capacityBytes(pool).length,"Original INSTALL proof storage must already be reserved before FENCE/INSTALL");
             pool.releaseSchemaCapacity(store,proof,SchemaCapacityRelease.completed(installed.proof()));
             UUID catalogue=UUID.randomUUID(); store.applySchemaActivation(new ApplyPosition(2,4),installed.proof(),catalogue,new ApplyPosition(2,1));
             var consumed=pool.lookupSchemaCapacityStatus(store,change,"future",false); assertEquals(proof,consumed.reservation()); assertEquals(DistributedStoragePool.SchemaCapacityState.CONSUMED,consumed.state()); assertTrue(consumed.forcedDurable()); assertFalse(consumed.ready()); assertThrows(IllegalStateException.class,() -> pool.requireSchemaFenceCapacity(store,change.header()));
@@ -80,6 +83,19 @@ class NativeSchemaCapacityTest {
             var status=pool.lookupSchemaCapacityStatus(store,change,"future",false); assertEquals(proof,status.reservation()); assertEquals(DistributedStoragePool.SchemaCapacityState.RETIRED,status.state()); assertTrue(status.forcedDurable()); assertFalse(status.ready()); assertThrows(IllegalStateException.class,() -> pool.requireSchemaFenceCapacity(store,change.header()));
             assertThrows(IllegalArgumentException.class,() -> pool.lookupSchemaCapacityStatus(store,change,"changed",false));
         }
+    }
+    @Test void consumedCapacityCannotColdAdoptADifferentInstallCoordinate()throws Exception {
+        var source=empty(fixture.domain,0);var target=populated(source,fixture.column);var change=change(source,target,fixture.group);var path=root.resolve("changed-consumed-proof");
+        try(var pool=fixture.open(path)){
+            var store=range(pool,fixture.group,source,Map.of());store.applyNoop(new ApplyPosition(1,0));var proof=pool.reserveSchemaCapacity(store,change,Map.of(fixture.column,"future"),Set.of());pool.applySchemaFence(store,new ApplyPosition(1,1),change.header(),proof);
+            var installed=pool.installSchema(store,new ApplyPosition(1,2),change,Map.of(fixture.column,"future"),Set.of());
+            var corrupt=new NativeSchemaInstallation(change,installed.fence(),new ApplyPosition(1,3),installed.sourceNames(),installed.targetNames(),installed.sourceMerges(),installed.targetMerges());
+            var db=loaded(pool);var state=db.db().getStartupColumns().entrySet().stream().filter(entry->Arrays.equals(entry.getKey().getName(),DistributedStoragePool.STATE_COLUMN.getBytes())).findFirst().orElseThrow().getValue();
+            byte[] key=java.nio.ByteBuffer.allocate(33).putLong(fixture.group.getMostSignificantBits()).putLong(fixture.group.getLeastSignificantBits()).put((byte)0x2a).putLong(change.changeId().getMostSignificantBits()).putLong(change.changeId().getLeastSignificantBits()).array();
+            byte[] current=java.nio.ByteBuffer.allocate(17).putLong(fixture.group.getMostSignificantBits()).putLong(fixture.group.getLeastSignificantBits()).put((byte)0x28).array();
+            try(var options=new org.rocksdb.WriteOptions().setSync(true)){db.db().get().put(state,options,key,corrupt.encode());db.db().get().put(state,options,current,corrupt.encode());}
+        }
+        var failure=assertThrows(IllegalStateException.class,()->fixture.open(path));assertInstanceOf(IOException.class,failure.getCause());assertTrue(failure.getCause().getMessage().contains("original INSTALL proof changed"));
     }
     @Test void lastPermanentPoolSlotIsSharedAcrossGroupsAndBlocksConcurrentOtherDomainsUntilAuthoritativeAbort() throws Exception {
         var source=empty(fixture.domain,0); var path=root.resolve("last-pool-slot"); var permanent=new HashMap<UUID,String>();

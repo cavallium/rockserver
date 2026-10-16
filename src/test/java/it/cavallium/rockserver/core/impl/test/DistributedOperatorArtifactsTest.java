@@ -46,11 +46,20 @@ class DistributedOperatorArtifactsTest {
         var cache=cache(path); var names=Map.of(column.columnId(),"bucket");
         invoke(cache,"qualifyBootstrap",new Class<?>[]{Collection.class,Map.class,Map.class,boolean.class},List.of(bucket),names,Map.of(),true);
         var reopened=cache(path);
+        // META preserves donor aliases. Its schema still needs the exact trusted
+        // operator/bucket tuple, while local USER bindings retain exact aliases.
+        invoke(reopened,"requireMetadataSchemaBindings",new Class<?>[]{DistributedSchema.class},bucket);
+        assertThrows(java.io.IOException.class,()->invoke(reopened,"requireSchemaBindings",new Class<?>[]{DistributedSchema.class,Map.class},bucket,Map.of(column.columnId(),"donor-bucket")));
         try(var callback=(it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator)invoke(reopened,"resolve",new Class<?>[]{String.class},"bucket")) { assertInstanceOf(it.cavallium.rockserver.core.impl.rocksdb.DistributedBucketMergeOperator.class,callback); }
         assertThrows(java.io.IOException.class,() -> invoke(reopened,"requireSchemaBindings",new Class<?>[]{DistributedSchema.class,Map.class},fixed,names));
         var wrongShape=it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(it.cavallium.rockserver.core.common.ColumnHashType.XXHASH8),true,operator.name(),operator.version(),operator.className());
         var changed=new DistributedSchema(bucket.clusterId(),bucket.databaseId(),bucket.domainId(),bucket.schemaEpoch(),0,List.of(new DistributedSchema.Column(column.apiId(),column.columnId(),column.name(),wrongShape,operator)));
         assertThrows(java.io.IOException.class,() -> invoke(reopened,"requireSchemaBindings",new Class<?>[]{DistributedSchema.class,Map.class},changed,names));
+        assertThrows(java.io.IOException.class,()->invoke(reopened,"requireMetadataSchemaBindings",new Class<?>[]{DistributedSchema.class},changed));
+        assertThrows(java.io.IOException.class,()->invoke(reopened,"requireMetadataSchemaBindings",new Class<?>[]{DistributedSchema.class},fixed));
+        byte[] wrongHash=operator.artifactSha256();wrongHash[0]^=1;var wrongOperator=new DistributedSchema.Operator(operator.name(),operator.version(),operator.className(),wrongHash,operator.valueCodecVersion(),operator.operandCodecVersion(),operator.deterministicContract(),operator.deterministicContractVersion());
+        var wrongArtifact=new DistributedSchema(bucket.clusterId(),bucket.databaseId(),bucket.domainId(),bucket.schemaEpoch(),0,List.of(new DistributedSchema.Column(column.apiId(),column.columnId(),column.name(),shape,wrongOperator)));
+        assertThrows(java.io.IOException.class,()->invoke(reopened,"requireMetadataSchemaBindings",new Class<?>[]{DistributedSchema.class},wrongArtifact));
         assertThrows(RuntimeException.class,() -> it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool.open(path,it.cavallium.rockserver.core.config.ConfigParser.parseDefault(),org.slf4j.LoggerFactory.getLogger(getClass()),List.of(changed),names,Map.of()));
         assertFalse(Files.exists(path.resolve("CURRENT")),"Wrong shape must be rejected before writable native open");
     }

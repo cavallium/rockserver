@@ -10,9 +10,13 @@ import java.util.*;
 final class SchemaCapacityClaims {
     static final int MAX_CHANGES=64,MAX_BYTES=16*1024*1024;
     enum State { ACTIVE, FENCED, CONSUMED, ABORTED, RETIRED }
-    record Group(NativeSchemaCapacityReservation proof,State state) { boolean outstanding() { return state==State.ACTIVE || state==State.FENCED; } }
+    record Group(NativeSchemaCapacityReservation proof,State state,NativeSchemaInstallProof installation) {
+        Group { Objects.requireNonNull(proof);Objects.requireNonNull(state);if((state==State.CONSUMED || state==State.RETIRED)!=(installation!=null))throw new IllegalArgumentException("Capacity state differs from original INSTALL evidence");if(installation!=null && !installation.fence().participant().equals(proof.participant()))throw new IllegalArgumentException("Capacity INSTALL participant changed"); }
+        boolean outstanding() { return state==State.ACTIVE || state==State.FENCED; }
+    }
     record Claim(SchemaChange.Definition definition,Map<UUID,String> sourceNames,Map<UUID,String> targetNames,Set<UUID> sourceMerges,Set<UUID> targetMerges,Map<UUID,Group> groups) {
-        Claim { sourceNames=Map.copyOf(sourceNames); targetNames=Map.copyOf(targetNames); sourceMerges=Set.copyOf(sourceMerges); targetMerges=Set.copyOf(targetMerges); groups=Map.copyOf(groups); }
+        Claim { sourceNames=Map.copyOf(sourceNames); targetNames=Map.copyOf(targetNames); sourceMerges=Set.copyOf(sourceMerges); targetMerges=Set.copyOf(targetMerges); groups=Map.copyOf(groups);for(var entry:groups.entrySet()){var group=entry.getValue();if(!entry.getKey().equals(group.proof().participant().groupId()))throw new IllegalArgumentException("Capacity group identity changed");group.proof().requireDefinition(definition);if(group.installation()!=null)group.installation().requireHeader(definition.header());} }
+        NativeSchemaInstallation installedRecord(UUID group){var original=Objects.requireNonNull(groups.get(group).installation(),"Capacity lacks original INSTALL");return new NativeSchemaInstallation(definition,original.fence(),original.position(),sourceNames,targetNames,sourceMerges,targetMerges);}
         boolean outstanding() { return groups.values().stream().anyMatch(Group::outstanding); }
         byte[] bindingDigest() { return digest(bindingBytes(sourceNames,targetNames,sourceMerges,targetMerges)); }
         int installBytes() { int size=Math.toIntExact(36L+NativeSchemaFence.BYTES+definition.encode().length+namesSize(sourceNames)+namesSize(targetNames)); if(size>NativeSchemaInstallation.MAX_BYTES) throw new IllegalArgumentException("Reserved INSTALL metadata exceeds budget"); return size; }
@@ -28,7 +32,7 @@ final class SchemaCapacityClaims {
             for(var id:claims.keySet().stream().sorted().toList()) {
                 var claim=claims.get(id); blob(out,claim.definition.encode()); names(out,claim.sourceNames,claim.sourceMerges); names(out,claim.targetNames,claim.targetMerges);
                 out.writeInt(claim.groups.size());
-                for(var group:claim.groups.keySet().stream().sorted().toList()) { var value=claim.groups.get(group); out.write(value.proof.encode()); out.writeByte(value.state.ordinal()+1); }
+                for(var group:claim.groups.keySet().stream().sorted().toList()) { var value=claim.groups.get(group); out.write(value.proof.encode()); out.writeByte(value.state.ordinal()+1);out.writeBoolean(value.installation()!=null);out.write(value.installation()==null?new byte[NativeSchemaInstallProof.BYTES]:value.installation().encode()); }
             }
             out.flush(); if(bytes.size()>MAX_BYTES) throw new IllegalStateException("Schema capacity evidence byte budget exhausted"); return bytes.toByteArray();
         } catch(IOException impossible) { throw new AssertionError(impossible); }
@@ -46,7 +50,9 @@ final class SchemaCapacityClaims {
                 for(int g=0;g<groups;g++) {
                     var proof=NativeSchemaCapacityReservation.decode(in.readNBytes(NativeSchemaCapacityReservation.BYTES)); proof.requireDefinition(definition); proof.requireBinding(claim.bindingDigest());
                     if(proof.historyBytes()!=claim.historyBytes()) throw new IOException("Capacity charge changed"); int state=in.readUnsignedByte(); if(state<1 || state>State.values().length) throw new IOException("Invalid capacity state");
-                    if(members.put(proof.participant().groupId(),new Group(proof,State.values()[state-1]))!=null) throw new IOException("Duplicate capacity participant");
+                    int present=in.readUnsignedByte();if(present>1)throw new IOException("Invalid capacity INSTALL presence");byte[] installed=in.readNBytes(NativeSchemaInstallProof.BYTES);if(installed.length!=NativeSchemaInstallProof.BYTES || present==0 && !Arrays.equals(installed,new byte[NativeSchemaInstallProof.BYTES]))throw new IOException("Invalid reserved capacity INSTALL slot");
+                    var original=present==0?null:NativeSchemaInstallProof.decode(installed);
+                    if(members.put(proof.participant().groupId(),new Group(proof,State.values()[state-1],original))!=null) throw new IOException("Duplicate capacity participant");
                 }
                 claim=new Claim(definition,source.names,target.names,source.merges,target.merges,members); if(claims.put(definition.changeId(),claim)!=null) throw new IOException("Duplicate capacity change");
             }

@@ -13,6 +13,7 @@ import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Collection;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -51,6 +52,7 @@ public final class DistributedStoragePool implements AutoCloseable {
     private final Object admission = new Object();
     private final Map<String, ColumnFamilyHandle> handles = new HashMap<>();
     private final Map<UUID, Binding> bindings = new HashMap<>();
+    private final List<DistributedSchema> bootstrapSchemas;
     private final List<ColumnFamilyHandle> newHandles = new ArrayList<>();
     private final List<ReplicatedRangeStore> ranges = new ArrayList<>();
     private final Set<UUID> deferredDrops=new HashSet<>();
@@ -168,18 +170,34 @@ public final class DistributedStoragePool implements AutoCloseable {
         for(var group:records.keySet().stream().sorted(RangeDirectoryCodec.UUID_ORDER).toList()){byte[] value=records.get(group).encode();out.writeInt(value.length);out.write(value);}
         out.flush();return bytes.toByteArray();
     }
+    /** Shared bounded registry/pointer qualification; a pointer alone grants no role. */
+    private static Map<UUID,NativeMetadataRecoveryRegistration> readMetadataRecoveries(RocksDB db,ColumnFamilyHandle state)throws IOException,RocksDBException {
+        int size=db.get(state,METADATA_RECOVERIES_KEY,new byte[0]);if(size==RocksDB.NOT_FOUND)return Map.of();if(size>MAX_TOPOLOGY_SEED_BYTES)throw new IOException("Metadata registry exceeds bound");
+        var in=new DataInputStream(new ByteArrayInputStream(db.get(state,METADATA_RECOVERIES_KEY)));if(in.readInt()!=0x4d445253)throw new IOException("Invalid metadata registry");int count=in.readInt();if(count<0 || count>MAX_TOPOLOGY_SEEDS)throw new IOException("Invalid metadata registry count");
+        var found=new HashMap<UUID,NativeMetadataRecoveryRegistration>();UUID previous=null;
+        for(int n=0;n<count;n++){
+            int length=in.readInt();if(length<1 || length>NativeMetadataRecoveryRegistration.MAX_BYTES || length>in.available())throw new IOException("Invalid metadata registration length");var registration=NativeMetadataRecoveryRegistration.decode(in.readNBytes(length));
+            if(previous!=null && RangeDirectoryCodec.UUID_ORDER.compare(previous,registration.groupId())>=0)throw new IOException("Noncanonical metadata registry order");previous=registration.groupId();found.put(registration.groupId(),registration);
+            if(!Arrays.equals(registration.digest(),readFixedGroupState(db,state,registration.groupId(),0x6f,32)))throw new IOException("Metadata registration lost its exact local pointer");
+        }
+        if(in.available()!=0)throw new IOException("Trailing metadata registry bytes");return Map.copyOf(found);
+    }
     private void recoverMetadataRecoveries() {
-        try{var db=loaded.db().get();var state=handles.get(STATE_COLUMN);int size=db.get(state,METADATA_RECOVERIES_KEY,new byte[0]);if(size==org.rocksdb.RocksDB.NOT_FOUND)return;if(size>MAX_TOPOLOGY_SEED_BYTES)throw new IOException("Metadata registry exceeds bound");byte[] bytes=db.get(state,METADATA_RECOVERIES_KEY);var in=new DataInputStream(new ByteArrayInputStream(bytes));if(in.readInt()!=0x4d445253)throw new IOException("Invalid metadata registry");int count=in.readInt();if(count<0 || count>MAX_TOPOLOGY_SEEDS)throw new IOException("Invalid metadata registry count");var found=new HashMap<UUID,NativeMetadataRecoveryRegistration>();
-            for(int n=0;n<count;n++){int length=in.readInt();if(length<1 || length>NativeMetadataRecoveryRegistration.MAX_BYTES || length>in.available())throw new IOException("Invalid metadata registration length");var registration=NativeMetadataRecoveryRegistration.decode(in.readNBytes(length));if(found.put(registration.groupId(),registration)!=null)throw new IOException("Duplicate metadata registration");byte[] key=groupSchemaKey(registration.groupId(),0x6f);if(db.get(state,key,new byte[0])!=32 || !Arrays.equals(registration.digest(),db.get(state,key)))throw new IOException("Metadata registration lost its exact local pointer");}
-            if(in.available()!=0 || !Arrays.equals(bytes,encodeMetadataRecoveries(found,currentRecoveries)))throw new IOException("Noncanonical metadata registry");
+        try{var db=loaded.db().get();var state=handles.get(STATE_COLUMN);var found=readMetadataRecoveries(db,state);
+            if(!found.isEmpty() && !Arrays.equals(db.get(state,METADATA_RECOVERIES_KEY),encodeMetadataRecoveries(found,currentRecoveries)))throw new IOException("Noncanonical metadata registry");
             for(var registration:found.values()){var range=registration.range();ownership.recoverMetadata(new RangeOwnership.Owner(range.groupId(),range.rangeEpoch()),new RangeOwnership.Interval(registration.sourceDirectory().domainId(),registration.sourceDirectory().columns(),range.lowerInclusive(),range.upperExclusive()));}
-            metadataRecoveries=Map.copyOf(found);
+            metadataRecoveries=found;
         }catch(IOException|RocksDBException|IllegalArgumentException failure){throw new IllegalStateException("Cannot recover original metadata registrations",failure);}
+    }
+    private static void requireMetadataPoolNamespace(Collection<DistributedSchema> trusted,RangeDirectory directory){
+        if(trusted.isEmpty())throw new IllegalArgumentException("Metadata qualification requires a trusted pool namespace");
+        for(var schema:trusted)if(!schema.clusterId().equals(directory.clusterId()) || !schema.databaseId().equals(directory.databaseId()))throw new IllegalArgumentException("Metadata registration differs from qualified pool cluster/database");
     }
     /** Opens a non-USER source owner even when this receiver never executed the historical local seed. */
     public ReplicatedRangeStore openMetadataRecovery(NativeMetadataRecoveryRegistration registration)throws RocksDBException {
         Objects.requireNonNull(registration);nativeMutation.acquireUninterruptibly();try {
             synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}
+            if(!bootstrapSchemas.isEmpty() || artifacts.qualified())requireMetadataPoolNamespace(bootstrapSchemas,registration.sourceDirectory());
             if(!pendingRecoverySupersessions.isEmpty())throw new IllegalStateException("Unknown supersession force requires exact original retry");
             var supersession=recoverySupersessions.get(registration.groupId());if(supersession!=null){if(registration.equals(metadataRecoveries.get(registration.groupId())))supersession.requireMetadataScope(registration);else supersession.requireMetadata(registration);}
             if(pendingTopologySeed!=null || pendingLearnerHistory!=null)throw new IllegalStateException("Unknown topology ownership force requires exact original retry");
@@ -621,7 +639,7 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
     /** Reads forced metadata, including WAL, without installing user callbacks or enabling native writes. */
     private static void preflightNativeBindings(Path path,DatabaseConfig config,DistributedOperatorArtifacts artifacts,
-            org.rocksdb.NativeExtentEnv env, Logger logger) throws IOException,RocksDBException {
+            Collection<DistributedSchema> bootstrapSchemas,org.rocksdb.NativeExtentEnv env, Logger logger) throws IOException,RocksDBException {
         org.rocksdb.RocksDB.loadLibrary();
         List<byte[]> names; try(var listing=new org.rocksdb.Options()) {
             if (env != null) listing.setEnv(env);
@@ -643,6 +661,8 @@ public final class DistributedStoragePool implements AutoCloseable {
                 try {
                     ColumnFamilyHandle state=null; for(var handle:nativeHandles) if(Arrays.equals(handle.getName(),STATE_COLUMN.getBytes(StandardCharsets.US_ASCII))) state=handle;
                     if(state==null) throw new IOException("Read-only native STATE missing");
+                    var metadataRegistrations=readMetadataRecoveries(db,state);
+                    if(artifacts.qualified())for(var registration:metadataRegistrations.values())requireMetadataPoolNamespace(bootstrapSchemas,registration.sourceDirectory());
                     var births=new HashMap<UUID,Binding>();
                     var buffer=new byte[Math.max(SchemaCapacityClaims.MAX_BYTES,Math.max(MAX_BINDING_BYTES,NativeSchemaInstallation.MAX_BYTES))];
                     int birthLength=db.get(state,BIRTHS_KEY,buffer);
@@ -671,8 +691,24 @@ public final class DistributedStoragePool implements AutoCloseable {
                                             || record.definition().targetSchema().columns().stream().anyMatch(column -> column.operator()!=null);
                                     if(neededOperator) throw new IOException("Operator-bearing native schema lacks trusted cache");
                                 } else {
-                                    artifacts.requireSchemaBindings(record.definition().sourceSchema(),record.sourceNames(),live);
-                                    artifacts.requireSchemaBindings(record.definition().targetSchema(),record.targetNames());
+                                    try {
+                                        var groupId=new UUID(ByteBuffer.wrap(group).getLong(),ByteBuffer.wrap(group).getLong(8));var metadata=metadataRegistrations.get(groupId);
+                                        if(metadata==null){
+                                            artifacts.requireSchemaBindings(record.definition().sourceSchema(),record.sourceNames(),live);
+                                            artifacts.requireSchemaBindings(record.definition().targetSchema(),record.targetNames());
+                                        }else{
+                                            // META retains the donor's immutable evidence, including aliases.
+                                            // These names never select local USER handles or install operators.
+                                            var range=metadata.range();record.requireRange(groupId,range.rangeEpoch(),metadata.sourceDirectory().domainId(),range.lowerInclusive(),range.upperExclusive());record.requireCut(metadata.imageCut());
+                                            for(var schema:List.of(record.definition().sourceSchema(),record.definition().targetSchema())){
+                                                if(!schema.clusterId().equals(metadata.sourceDirectory().clusterId()) || !schema.databaseId().equals(metadata.sourceDirectory().databaseId()) || !schema.domainId().equals(metadata.sourceDirectory().domainId()))throw new IOException("Metadata schema namespace differs from original registration");
+                                                var columns=new HashMap<UUID,DistributedSchema.Column>();for(var column:schema.columns())columns.put(column.columnId(),column);
+                                                for(var known:bootstrapSchemas)requireCurrentRecoveryColumns(schema,columns,known);
+                                                artifacts.requireMetadataSchemaBindings(schema);
+                                            }
+                                            if(tag==0x28 && !Arrays.equals(record.definition().targetSchema().digest(),metadata.sourceDirectory().schemaDigest()))throw new IOException("Metadata current schema differs from original frozen directory");
+                                        }
+                                    } catch(IOException invalid) {throw new IOException("Native schema binding qualification failed: group="+new UUID(ByteBuffer.wrap(group).getLong(),ByteBuffer.wrap(group).getLong(8))+", tag="+tag+", change="+record.definition().changeId(),invalid);}
                                     for(var column:record.definition().targetSchema().columns()) if(column.operator()!=null) artifacts.require(column.operator());
                                 }
                             }
@@ -730,11 +766,19 @@ public final class DistributedStoragePool implements AutoCloseable {
         try {
             byte[] bytes=loaded.db().get().get(handles.get(STATE_COLUMN),CAPACITY_KEY); if(bytes==null) return;
             capacityClaims=SchemaCapacityClaims.decode(bytes); validateBirthCapacity(bindings,capacityClaims); artifacts.validateCapacity(capacityClaims.values(),plainBirths(bindings));
+            var metadata=readMetadataRecoveries(loaded.db().get(),handles.get(STATE_COLUMN));
             for(var claim:capacityClaims.values()) for(var entry:claim.groups().entrySet()) if(entry.getValue().state()==SchemaCapacityClaims.State.CONSUMED || entry.getValue().state()==SchemaCapacityClaims.State.RETIRED) {
                 byte[] key=ByteBuffer.allocate(33).putLong(entry.getKey().getMostSignificantBits()).putLong(entry.getKey().getLeastSignificantBits()).put((byte)0x2a).putLong(claim.definition().changeId().getMostSignificantBits()).putLong(claim.definition().changeId().getLeastSignificantBits()).array();
                 var installed=loaded.db().get().get(handles.get(STATE_COLUMN),key); if(installed==null) throw new IOException("Consumed capacity lacks original INSTALL");
                 var record=NativeSchemaInstallation.decode(installed); record.requireDefinition(claim.definition());
-                claim.requireSame(new SchemaCapacityClaims.Claim(record.definition(),record.sourceNames(),record.targetNames(),record.sourceMerges(),record.targetMerges(),Map.of()));
+                var original=claim.installedRecord(entry.getKey());
+                if(!record.proof().equals(original.proof()))throw new IOException("Consumed capacity original INSTALL proof changed");
+                if(metadata.containsKey(entry.getKey())){
+                    // The forced local claim retains original aliases and genuine INSTALL
+                    // evidence independently of subsequently imported donor META history.
+                    if(!record.sourceMerges().equals(original.sourceMerges()) || !record.targetMerges().equals(original.targetMerges()))throw new IOException("META INSTALL changed original capacity operator projection");
+                    if(artifacts.qualified()){artifacts.requireSchemaBindings(original.definition().sourceSchema(),original.sourceNames());artifacts.requireSchemaBindings(original.definition().targetSchema(),original.targetNames());}
+                }else claim.requireSame(new SchemaCapacityClaims.Claim(record.definition(),record.sourceNames(),record.targetNames(),record.sourceMerges(),record.targetMerges(),Map.of()));
             }
         } catch(IOException|RocksDBException failure) { throw new IllegalStateException("Cannot recover schema capacity admissions",failure); }
     }
@@ -807,7 +851,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                 validateCapacityOptions(candidate);
                 var proof=new NativeSchemaCapacityReservation(definition.header(),group,candidate.bindingDigest(),candidate.historyBytes());
                 var next=new HashMap<>(capacityClaims); var claim=previous==null ? candidate : previous;
-                next.put(definition.changeId(),claim.group(group,new SchemaCapacityClaims.Group(proof,SchemaCapacityClaims.State.ACTIVE)));
+                next.put(definition.changeId(),claim.group(group,new SchemaCapacityClaims.Group(proof,SchemaCapacityClaims.State.ACTIVE,null)));
                 SchemaCapacityClaims.encode(next); validateBirthCapacity(bindings,next);
                 try { artifacts.validateCapacity(next.values(),plainBirths(bindings)); } catch(IOException failure) { throw new IllegalStateException("Schema operator capacity qualification failed",failure); }
                 forceCapacityClaims(next); return proof;
@@ -938,7 +982,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                 var retained=store.lookupSchemaFence(header);
                 if(retained!=null) { if(member.state()==SchemaCapacityClaims.State.ABORTED) throw new IllegalStateException("Retained FENCE contradicts aborted admission"); retained.requireAdmissionDigest(admissionDigest); return store.applySchemaFence(position,header,admissionDigest); }
                 requireCapacityFence(member.proof().participant().groupId(),header);
-                if(member.state()==SchemaCapacityClaims.State.ACTIVE) { var next=new HashMap<>(capacityClaims); next.put(header.changeId(),claim.group(member.proof().participant().groupId(),new SchemaCapacityClaims.Group(member.proof(),SchemaCapacityClaims.State.FENCED))); forceCapacityClaims(next); }
+                if(member.state()==SchemaCapacityClaims.State.ACTIVE) { var next=new HashMap<>(capacityClaims); next.put(header.changeId(),claim.group(member.proof().participant().groupId(),new SchemaCapacityClaims.Group(member.proof(),SchemaCapacityClaims.State.FENCED,null))); forceCapacityClaims(next); }
                 return store.applySchemaFence(position,header,admissionDigest);
             });
         } finally { nativeMutation.release(); }
@@ -960,7 +1004,9 @@ public final class DistributedStoragePool implements AutoCloseable {
                     if(authority.kind()==SchemaCapacityRelease.Kind.INSTALLED) { authority.installation().requireHeader(claim.definition().header()); if(!proof.equals(authority.installation())) throw new IllegalArgumentException("Completion proof changed"); terminal=SchemaCapacityClaims.State.CONSUMED; }
                     else { reservation.requireHeader(authority.status().header()); if(!Objects.equals(authority.status().installed().get(group),proof.position())) throw new IllegalArgumentException("Retirement differs from original INSTALL"); terminal=SchemaCapacityClaims.State.RETIRED; }
                 }
-                var next=new HashMap<>(capacityClaims); next.put(reservation.changeId(),claim.group(group,new SchemaCapacityClaims.Group(member.proof(),terminal))); forceCapacityClaims(next); return null;
+                var original=terminal==SchemaCapacityClaims.State.ABORTED?null:store.lookupSchemaInstallation(claim.definition().header());
+                if(member.installation()!=null && !member.installation().equals(original))throw new IllegalArgumentException("Original capacity INSTALL proof changed");
+                var next=new HashMap<>(capacityClaims); next.put(reservation.changeId(),claim.group(group,new SchemaCapacityClaims.Group(member.proof(),terminal,original))); forceCapacityClaims(next); return null;
             });
         } finally { nativeMutation.release(); }
     }
@@ -970,7 +1016,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         var actual=new SchemaCapacityClaims.Claim(record.definition(),record.sourceNames(),record.targetNames(),record.sourceMerges(),record.targetMerges(),Map.of()); claim.requireSame(actual);
         UUID group=store.ownership().owner().groupId(); var member=claim.groups().get(group);
         if(member==null || !member.outstanding()) throw new IllegalStateException("INSTALL lacks outstanding original capacity admission");
-        var next=new HashMap<>(capacityClaims); next.put(record.definition().changeId(),claim.group(group,new SchemaCapacityClaims.Group(member.proof(),SchemaCapacityClaims.State.CONSUMED)));
+        var next=new HashMap<>(capacityClaims); next.put(record.definition().changeId(),claim.group(group,new SchemaCapacityClaims.Group(member.proof(),SchemaCapacityClaims.State.CONSUMED,record.proof())));
         var immutable=Map.copyOf(next); byte[] bytes=SchemaCapacityClaims.encode(next);
         return new CapacityTransfer() {
             public void append(org.rocksdb.WriteBatch batch) throws RocksDBException { batch.put(handles.get(STATE_COLUMN),CAPACITY_KEY,bytes); }
@@ -995,9 +1041,9 @@ public final class DistributedStoragePool implements AutoCloseable {
         output.flush(); if(bytes.size()>MAX_BINDING_BYTES)throw new IllegalStateException("Native CF birth byte budget exhausted"); return bytes.toByteArray();
     }
 
-    private DistributedStoragePool(RocksDBLoader.LoadedDb loaded, GlobalDatabaseConfig globalConfig, Logger logger, DistributedOperatorArtifacts artifacts) {
+    private DistributedStoragePool(RocksDBLoader.LoadedDb loaded, GlobalDatabaseConfig globalConfig, Logger logger, DistributedOperatorArtifacts artifacts,java.util.Collection<DistributedSchema> bootstrapSchemas) {
         this.loaded = loaded;
-        this.artifacts=artifacts;
+        this.artifacts=artifacts;this.bootstrapSchemas=List.copyOf(bootstrapSchemas);
         this.globalConfig = globalConfig;
         this.logger = logger;
         loaded.db().getStartupColumns().forEach((descriptor, handle) ->
@@ -1048,11 +1094,11 @@ public final class DistributedStoragePool implements AutoCloseable {
                 artifacts.qualifyBootstrap(List.copyOf(bootstrapSchemas),Objects.requireNonNull(bootstrapPhysicalColumns),Objects.requireNonNull(nonDATAPlainBindings),true);
             }
             if(bootstrapSchemas!=null && Files.exists(persistentPath.resolve("CURRENT"))) artifacts.qualifyBootstrap(List.copyOf(bootstrapSchemas),Objects.requireNonNull(bootstrapPhysicalColumns),Objects.requireNonNull(nonDATAPlainBindings),false);
-            if(Files.exists(persistentPath.resolve("CURRENT"))) preflightNativeBindings(persistentPath,config,artifacts,env,logger);
+            if(Files.exists(persistentPath.resolve("CURRENT"))) preflightNativeBindings(persistentPath,config,artifacts,bootstrapSchemas==null?List.of():bootstrapSchemas,env,logger);
         } catch(IOException|RocksDBException failure) { throw new IllegalStateException("Cannot qualify native operator bindings",failure); }
         RocksDBLoader.OperatorResolver resolver=artifacts.qualified() ? name -> RESERVED_COLUMNS.contains(name) ? null : artifacts.resolve(name) : null;
         var nativeLoaded=RocksDBLoader.load(persistentPath,config,logger,null,null,INTERNAL_COLUMNS,resolver,INVENTORY_LIMITS,env);
-        try { return new DistributedStoragePool(nativeLoaded,globalConfig,logger,artifacts); }
+        try { return new DistributedStoragePool(nativeLoaded,globalConfig,logger,artifacts,bootstrapSchemas==null?List.of():bootstrapSchemas); }
         catch(RuntimeException|Error failure) {
             try { nativeLoaded.db().close(); } catch(Exception cleanup) { failure.addSuppressed(cleanup); }
             if(!nativeLoaded.db().get().isOwningHandle()) try { nativeLoaded.refs().close(); } catch(RuntimeException cleanup) { failure.addSuppressed(cleanup); }
@@ -1549,6 +1595,31 @@ public final class DistributedStoragePool implements AutoCloseable {
 
     public void activateImport(ReplicatedRangeStore store,NativeRangeSstImport.Activation authority) throws RocksDBException {
         nativeMutation.acquireUninterruptibly(); try { synchronized(admission) { if(closing || !ranges.contains(store))throw new IllegalStateException("Import store not owned"); } store.activateImportUnderPool(authority); } finally { nativeMutation.release(); }
+    }
+
+    /** Select receiver aliases without replacing permanent logical-column/operator births. */
+    public Map<UUID,String> currentRecoveryPhysicalNames(DistributedSchema schema,Map<UUID,String> absentNames)throws IOException {
+        Objects.requireNonNull(schema);Objects.requireNonNull(absentNames);var columns=schema.columnIds();if(!columns.equals(absentNames.keySet()))throw new IllegalArgumentException("CURRENT physical fallback coverage differs from schema");
+        nativeMutation.acquireUninterruptibly();try {
+            synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}
+            var wanted=new HashMap<UUID,DistributedSchema.Column>();for(var column:schema.columns())wanted.put(column.columnId(),column);
+            for(var known:bootstrapSchemas)requireCurrentRecoveryColumns(schema,wanted,known);
+            for(var registered:currentRecoveries.values())requireCurrentRecoveryColumns(schema,wanted,registered.schema());
+            for(var range:ranges){var known=range.installedSchema();requireCurrentRecoveryColumns(schema,wanted,known);if(known==null && bootstrapSchemas.isEmpty() && !schemaOrigins.containsKey(schema.domainId()) && range.ownership().interval().domainId().equals(schema.domainId()) && range.ownership().interval().columns().equals(columns) && !Arrays.equals(range.schemaDigest(),schema.digest()))throw new IllegalArgumentException("CURRENT schema differs from retained unqualified native owner");}
+            for(var origin:schemaOrigins.values()){requireCurrentRecoveryColumns(schema,wanted,origin.sourceSchema());requireCurrentRecoveryColumns(schema,wanted,origin.targetSchema());}
+            for(var column:columns){var removed=deletionOrigins.get(column);if(removed!=null)requireCurrentRecoveryColumns(schema,wanted,removed.sourceSchema());}
+            for(var history:ownershipHistory)if(!history.interval().domainId().equals(schema.domainId()))for(var column:history.interval().columns())if(columns.contains(column) && bindings.containsKey(column))throw new IllegalArgumentException("CURRENT logical column belongs to another native domain");
+            var selected=new HashMap<UUID,String>();var retained=new HashSet<String>();var aliases=new HashSet<String>();
+            for(var column:schema.columns()) {var binding=bindings.get(column.columnId());
+                if(binding!=null){if(binding.mergeAdmitted()!=(column.operator()!=null))throw new IllegalArgumentException("CURRENT operator conflicts with permanent logical binding");retained.add(binding.name());}
+                String name=binding==null?Objects.requireNonNull(absentNames.get(column.columnId())):binding.name();if(RESERVED_COLUMNS.contains(name) || !aliases.add(name) || bindings.entrySet().stream().anyMatch(other->!other.getKey().equals(column.columnId()) && other.getValue().name().equals(name)))throw new IllegalArgumentException("CURRENT receiver alias is reserved, duplicate, or belongs to another logical column");selected.put(column.columnId(),name);
+            }
+            if(artifacts.qualified())artifacts.requireSchemaBindings(schema,selected,retained);
+            return Map.copyOf(selected);
+        }finally{nativeMutation.release();}
+    }
+    private static void requireCurrentRecoveryColumns(DistributedSchema schema,Map<UUID,DistributedSchema.Column> wanted,DistributedSchema known){
+        if(known!=null)for(var column:known.columns())if(wanted.containsKey(column.columnId()) && (!known.clusterId().equals(schema.clusterId()) || !known.databaseId().equals(schema.databaseId()) || !known.domainId().equals(schema.domainId()) || known.routingPrefixBytes()!=schema.routingPrefixBytes() || !wanted.get(column.columnId()).equals(column)))throw new IllegalArgumentException("CURRENT column namespace/shape/operator differs from retained native schema");
     }
 
     public Map<UUID,String> schemaPhysicalNames(ReplicatedRangeStore store) {

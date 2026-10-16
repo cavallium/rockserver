@@ -38,6 +38,29 @@ class NativeMetadataRecoveryTest {
     void configure(ReplicatedRangeStore target,TopologyChange.Definition definition)throws Exception {
         target.enableSessionControls();target.enableCdc(definition.parents().getFirst().rangeId());
     }
+    @Test void disjointHistoricalColumnsCannotEnterAForeignQualifiedPoolNamespaceBeforeRoleForce()throws Exception {
+        Path image=root.resolve("namespace-metadata");NativeMetadataRecoveryRegistration registration;
+        try(var source=nativeTest.new Fixture(root.resolve("namespace-source"))){
+            source.freeze();source.seed();registration=registration(source,NativeRangeImage.writeMetadata(image,source.parent,nativeTest.limits));
+        }
+        var original=helper.outer.schema();var localColumn=new UUID(0,9591);var shape=original.columns().getFirst().schema();
+        for(int foreign=0;foreign<3;foreign++){
+            var schema=new DistributedSchema(foreign==0?new UUID(0,9592):original.clusterId(),foreign==1?new UUID(0,9593):original.databaseId(),new UUID(0,9594),1,0,List.of(new DistributedSchema.Column(9591,localColumn,"unrelated-local-column",shape,null)));
+            var path=root.resolve("namespace-receiver-"+foreign);var names=Map.of(localColumn,"unrelated-local-data");
+            try(var pool=DistributedStoragePool.open(path,it.cavallium.rockserver.core.config.ConfigParser.parseDefault(),org.slf4j.LoggerFactory.getLogger(getClass()),List.of(schema),names,Map.of())){
+                var forces=new java.util.concurrent.atomic.AtomicInteger();pool.metadataRecoveryForceObserver(after->forces.incrementAndGet());
+                if(foreign<2){
+                    var rejected=assertThrows(IllegalArgumentException.class,()->pool.openMetadataRecovery(registration));assertTrue(rejected.getMessage().contains("qualified pool cluster/database"));assertEquals(0,forces.get());assertTrue(pool.metadataRecoveries().isEmpty());assertFalse(pool.persistedRangeGroups(8).contains(registration.groupId()));
+                }else{
+                    var metadata=pool.openMetadataRecovery(registration);assertTrue(metadata.userHandlesDetached());assertFalse(metadata.admissionOpen());assertTrue(forces.get()>0);
+                }
+            }
+            if(foreign==2){
+                var unanchored=assertThrows(IllegalArgumentException.class,()->DistributedStoragePool.open(path,it.cavallium.rockserver.core.config.ConfigParser.parseDefault(),org.slf4j.LoggerFactory.getLogger(getClass())));assertTrue(unanchored.getMessage().contains("trusted pool namespace"));
+                try(var pool=DistributedStoragePool.open(path,it.cavallium.rockserver.core.config.ConfigParser.parseDefault(),org.slf4j.LoggerFactory.getLogger(getClass()),List.of(schema),names,Map.of())){assertEquals(List.of(registration),pool.metadataRecoveries());assertTrue(pool.openMetadataRecovery(registration).userHandlesDetached());}
+            }
+        }
+    }
     @Test void sourceSchemaActivatedBeforeRetirementRecoversAsMetadataWithoutUserHandlesOrHistoricalSeed()throws Exception {
         Path initial=root.resolve("evolved-source-meta"),checkpoint=root.resolve("evolved-own-meta"),receiver=root.resolve("evolved-meta-receiver");
         var limits=new NativeRangeImage.Limits(4<<20,32<<20,8);var base=helper.outer.schema();UUID added=new UUID(0,9501);
