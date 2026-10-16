@@ -74,63 +74,103 @@ class RatisTopologyRecoveryAnchorTest {
                     RatisSchemaClientJournal.write(pending,fields);byte[] conflict=Files.readAllBytes(pending);
                     assertThrows(IOException.class,()->anchors.capture(f.definition,source,freeze,f.local,authority.cut()));assertArrayEquals(before,Files.readAllBytes(original));assertArrayEquals(conflict,Files.readAllBytes(pending));
                     byte[] partial={1,2,3};Files.write(pending,partial,StandardOpenOption.TRUNCATE_EXISTING);assertThrows(IOException.class,()->anchors.capture(f.definition,source,freeze,f.local,authority.cut()));assertArrayEquals(partial,Files.readAllBytes(pending));assertArrayEquals(before,Files.readAllBytes(original));
-                    Files.move(original,root.resolve("known-"+name+"-backup"));assertThrows(IOException.class,()->anchors.capture(f.definition,source,freeze,f.local,authority.cut()));assertArrayEquals(partial,Files.readAllBytes(pending));assertFalse(Files.exists(original));assertArrayEquals(saved.image().sha256(),NativeRangeImage.inspect(saved.file(),limits).sha256());
+                    Files.move(original,root.resolve("known-"+name+"-backup"));assertThrows(IOException.class,()->anchors.capture(f.definition,source,freeze,f.local,authority.cut()));assertArrayEquals(partial,Files.readAllBytes(pending));assertFalse(Files.exists(original));assertArrayEquals(saved.image().sha256(),NativeRangeImage.inspectMetadata(saved.file(),limits).sha256());
                 }
             }
         }
     }
-    @Test void frozenGroupAnchorSurvivesSplitMergeAndColdReplayNeverServesIntermediateChildren()throws Exception {
+    @Test void completedMetadataImageForceCanRetryExactAfterLostObservationAndRejectGroupReplacement()throws Exception {
+        helper.root=root;try(var f=helper.new Fixture(root.resolve("force-source"),false,false)){
+            var journal=Files.createDirectory(root.resolve("force-journal"));try(var driver=f.controller(journal)){helper.until(driver,driver.prepare(f.definition),journal,RatisTopologyController.Phase.SEED);}
+            var source=f.store(f.definition.parents().getFirst().groupId());var freeze=source.topologyFreeze();var authority=f.authority(f.definition.header(),TopologyChange.Stage.SEED);Path owned=Files.createDirectory(root.resolve("force-artifacts"));
+            var failed=new java.util.concurrent.atomic.AtomicBoolean();var held=new java.util.concurrent.atomic.AtomicInteger();var ioCalls=new java.util.concurrent.atomic.AtomicInteger();
+            var admission=new NativeRangeImage.IoAdmission(){
+                public void beforeBytes(int bytes)throws IOException{ioCalls.incrementAndGet();try(var directories=Files.newDirectoryStream(owned,"*.recovery")){for(var directory:directories)if(Files.exists(directory.resolve("image")) && failed.compareAndSet(false,true))throw new IOException("Lost forced metadata image observation");}}
+                public AutoCloseable reserveMetadata(int bytes){held.addAndGet(bytes);return ()->held.addAndGet(-bytes);}
+            };
+            Path image;byte[] hash;ApplyPosition cut;
+            try(var ledger=new RatisTopologySourceSnapshotArtifacts(owned,limits,4*limits.maxImageBytes(),8L*RatisTopologyRecoveryAnchors.MAX_METADATA_BYTES,2,admission)){
+                var anchors=new RatisTopologyRecoveryAnchors(ledger,limits);var failure=assertThrows(IOException.class,()->anchors.capture(f.definition,source,freeze,f.local,authority.cut()));assertEquals("Lost forced metadata image observation",failure.getMessage());assertTrue(failed.get(),"Failure must occur after the actual forced image is visible");assertEquals(0,held.get(),"Typed metadata workspace must retire on failure (this fixture may need none)");assertTrue(ioCalls.get()>0,"Actual image bytes pass through admission");
+                try(var directories=Files.newDirectoryStream(owned,"*.recovery")){image=directories.iterator().next().resolve("image");}
+                var actual=NativeRangeImage.inspectMetadata(image,limits);hash=actual.sha256();cut=actual.position();assertFalse(Files.exists(image.resolveSibling("anchor")));
+                source.applyNoop(new ApplyPosition(cut.term(),cut.index()+1));var saved=anchors.capture(f.definition,source,freeze,f.local,authority.cut());assertEquals(cut,saved.image().position());assertArrayEquals(hash,saved.image().sha256());assertEquals(0,held.get());
+                var foreign=new ReplicaDescriptor(f.local.nodeId(),f.local.nodeIncarnation(),f.local.replicaId(),f.local.peerId(),f.local.address(),ReplicaDescriptor.Role.LISTENER);assertThrows(IOException.class,()->anchors.read(freeze,foreign));
+                var original=Files.readAllBytes(image.resolveSibling("capture"));var fields=new HashMap<>(RatisSchemaClientJournal.read(image.resolveSibling("capture")));var cfg=fields.get("configuration").clone();cfg[cfg.length-1]^=1;fields.put("configuration",cfg);RatisSchemaClientJournal.write(image.resolveSibling("capture.pending"),fields);assertThrows(IOException.class,()->anchors.read(freeze,f.local));assertArrayEquals(original,Files.readAllBytes(image.resolveSibling("capture")));Files.delete(image.resolveSibling("capture.pending"));
+                Path group=root.resolve("wrong-group-kind");try(var pin=source.captureForRecovery()){NativeRangeImage.write(group,pin,pin.interval(),limits);}byte[] groupHash=NativeRangeImage.inspect(group,limits).sha256();Files.copy(group,image,StandardCopyOption.REPLACE_EXISTING);
+                assertThrows(IOException.class,()->anchors.read(freeze,f.local));assertArrayEquals(groupHash,NativeRangeImage.inspect(image,limits).sha256());assertEquals(0,held.get());
+            }
+        }
+    }
+    @Test void frozenMetadataAncestorsAndCurrentLeafGroupSurviveSplitMergeAndColdRecovery()throws Exception {
         helper.root=root;
         try(var f=helper.new Fixture(root.resolve("source"),false,false)) {
             var schema=RatisTopologyControllerTest.logicalSchema();var split=f.definition;var source=split.parents().getFirst();
-            var original=new DistributedCommand(source.groupId(),source.rangeEpoch(),schema.digest(),new OperationId(RatisTopologyControllerTest.id(91),0,0),List.of(new Mutation(Mutation.Kind.PUT,RatisTopologyControllerTest.COLUMN,new byte[]{1},new byte[]{42})));
-            byte[] result=f.store(source.groupId()).operationResult(original.operationId(),original.receiptDigest());
             Path journal=Files.createDirectory(root.resolve("journal"));
             try(var driver=f.controller(journal)){helper.until(driver,driver.prepare(split),journal,RatisTopologyController.Phase.RETIRED);}
-            var anchor=f.node.topologyRecoveryAnchor(source.groupId());
-            assertTrue(Files.isRegularFile(anchor.file()));assertTrue(anchor.image().position().index()>=anchor.freeze().position().index());
-            var firstSeed=f.node.nativePool(f.node.poolId(source.groupId())).topologySeed(split.intentId());
+            var anchor=f.node.topologyRecoveryAnchor(source.groupId());assertMetadata(anchor);
+            var firstSeed=f.node.nativePool(f.node.poolId(source.groupId())).topologySeed(split.intentId());assertNotNull(firstSeed);
+            for(var child:split.targets())assertNotNull(firstSeed.birth(child.groupId()));
             var merged=new RangeDescriptor(RatisTopologyControllerTest.id(201),RatisTopologyControllerTest.id(202),1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(f.local));
             var sourceDirectory=split.targetDirectory();var target=new RangeDirectory(sourceDirectory.clusterId(),sourceDirectory.databaseId(),sourceDirectory.domainId(),sourceDirectory.schemaEpoch(),sourceDirectory.schemaDigest(),sourceDirectory.generation()+1,sourceDirectory.columns(),sourceDirectory.routingPrefixBytes(),List.of(merged));
             var merge=new TopologyChange.Definition(RatisTopologyControllerTest.id(203),sourceDirectory,target);f.definition=merge;
             try(var driver=f.controller(journal)){helper.until(driver,driver.prepare(merge),journal,RatisTopologyController.Phase.RETIRED);}
-            var secondSeed=f.node.nativePool(f.node.poolId(merged.groupId())).topologySeed(merge.intentId());
-            var mergeAnchors=new ArrayList<RatisTopologyRecoveryAnchors.Saved>();for(var parent:merge.parents())mergeAnchors.add(f.node.topologyRecoveryAnchor(parent.groupId()));
-            assertArrayEquals(anchor.image().sha256(),NativeRangeImage.inspect(anchor.file(),limits).sha256());
-            // A receiver absent during both source transitions starts with only the retained frozen GROUP image.
+            assertNotNull(f.node.nativePool(f.node.poolId(merged.groupId())).topologySeed(merge.intentId()));
+            for(var parent:merge.parents())assertMetadata(f.node.topologyRecoveryAnchor(parent.groupId()));
+            assertArrayEquals(anchor.image().sha256(),NativeRangeImage.inspectMetadata(anchor.file(),limits).sha256());
+            var leaf=f.store(merged.groupId());assertArrayEquals(new byte[]{42},leaf.readCurrentPoint(RatisTopologyControllerTest.COLUMN,new byte[]{1}));
+            Path groupFile=root.resolve("current-leaf-group");NativeRangeImage.Manifest group;var rows=new TreeMap<String,byte[]>();
+            try(var pin=leaf.captureForRecovery()){group=NativeRangeImage.write(groupFile,pin,pin.interval(),limits);pin.visitState((key,value)->{if(NativeTopologyLearnerSchema.row(key))rows.put(HexFormat.of().formatHex(key),value);});}
+            var cfg=leaf.configuration();var current=merge.targetDirectory();var authority=f.authority(merge.header(),TopologyChange.Stage.ACTIVATE);
+            var registration=new NativeCurrentRangeRecovery(UUID.randomUUID(),f.plan.catalogue().groupId(),authority.cut(),current,schema,merged.groupId(),f.local,f.local,group.position(),group.sha256(),cfg.term(),cfg.index(),cfg.data(),group.topologyOrigin(),Map.of(RatisTopologyControllerTest.COLUMN,"receiver-current"),group.deterministicMergeColumns(),rows);
+            var ancestor=new NativeMetadataRecoveryRegistration(UUID.randomUUID(),f.plan.catalogue().groupId(),anchor.catalogueCut(),split.sourceDirectory(),anchor.freeze(),f.local,f.local,anchor.configuration().term(),anchor.configuration().index(),anchor.configuration().data(),anchor.image().position(),anchor.image().sha256(),anchor.image().deterministicMergeColumns(),null);
             Path receiver=root.resolve("receiver");
-            try(var cold=pool(receiver)) {
-                var parent=cold.openTopologyRecoveryRange(anchor.fence(),anchor.image().interval(),schema.digest(),firstSeed.physicalNames(),firstSeed.mergeColumns());
-                assertTrue(parent.topologyRecoveryOnly());assertEquals(RangeOwnership.State.FENCED,parent.ownership().state());
-                parent.installSnapshot(anchor.file(),limits);assertTrue(parent.topologyRecoveryOnly());assertEquals(RangeOwnership.State.FENCED,parent.ownership().state());
-                assertArrayEquals(result,parent.operationResult(original.operationId(),original.receiptDigest()));
-                var seeded=cold.seedTopologyRecovery(split,firstSeed.authority(),List.of(parent),f.local,anchor.fence());
-                for(var range:split.targets()) {
-                    var child=cold.reopenTopologyRange(seeded.birth(range.groupId()),schema);child.initializeConfiguration(f.store(range.groupId()).configuration().data());activation(child,f.store(range.groupId()).topologyActivation(),split);
-                    assertTrue(child.topologyRecoveryOnly());assertFalse(child.admissionOpen());
-                    assertThrows(IllegalStateException.class,()->child.validate(new DistributedCommand(range.groupId(),range.rangeEpoch(),schema.digest(),new OperationId(RatisTopologyControllerTest.id(204),0,0),List.of(new Mutation(Mutation.Kind.PUT,RatisTopologyControllerTest.COLUMN,new byte[]{1},new byte[]{77})))));
-                    assertThrows(IllegalStateException.class,()->child.captureReadable(new TransactionScope(List.of(TransactionScope.Span.range(RatisTopologyControllerTest.COLUMN,range.lowerInclusive(),range.upperExclusive())))));
-                    assertThrows(IllegalStateException.class,()->NativeRangeImage.write(root.resolve("forbidden-"+range.groupId()),child,limits));
-                }
+            try(var cold=pool(receiver)){
+                var metadata=cold.openMetadataRecovery(ancestor);metadata.installMetadataSnapshot(anchor.file(),limits);metadata.completeMetadataRecovery(ancestor,anchor.image().position(),anchor.configuration());
+                assertEquals(ancestor,metadata.metadataRecoveryRegistration());assertTrue(metadata.metadataRecoveryRegistrationForced(ancestor));assertFalse(metadata.metadataRecoveryPending());assertFalse(metadata.admissionOpen());assertThrows(IllegalStateException.class,()->metadata.readCurrentPoint(RatisTopologyControllerTest.COLUMN,new byte[]{1}));
+                var active=cold.openCurrentRangeRecovery(registration);assertThrows(IOException.class,()->active.installSnapshot(anchor.file(),limits));assertFalse(active.currentRangeRecoveryImageInstalled());
+                active.installSnapshot(groupFile,limits);assertFalse(active.admissionOpen());active.completeCurrentRangeRecovery(registration,group.position(),cfg);assertTrue(active.admissionOpen());assertArrayEquals(new byte[]{42},active.readCurrentPoint(RatisTopologyControllerTest.COLUMN,new byte[]{1}));
             }
-            try(var cold=pool(receiver)) {
-                var parents=new ArrayList<ReplicatedRangeStore>();
-                for(var range:merge.parents()) {
-                    var child=cold.reopenTopologyRange(firstSeed.birth(range.groupId()),schema);assertTrue(child.topologyRecoveryOnly());assertFalse(child.admissionOpen());
-                    var freeze=f.store(range.groupId()).topologyFreeze();child.applyTopologyFreeze(freeze.position(),merge,freeze.admissionDigest());parents.add(child);
-                }
-                byte[] hashes=new byte[64];for(int i=0;i<mergeAnchors.size();i++)System.arraycopy(mergeAnchors.get(i).image().sha256(),0,hashes,i*32,32);
-                var fence=new NativeTopologyRecoveryFence(merge.header(),merge.parents().getFirst().groupId(),TopologyChange.Owner.of(f.local),mergeAnchors.getFirst().fence().catalogueCut(),RangeImportAdmission.sha256(hashes));
-                var seeded=cold.seedTopologyRecovery(merge,secondSeed.authority(),parents,f.local,fence);var leaf=cold.reopenTopologyRange(seeded.birth(merged.groupId()),schema);leaf.initializeConfiguration(f.store(merged.groupId()).configuration().data());activation(leaf,f.store(merged.groupId()).topologyActivation(),merge);
-                assertTrue(leaf.topologyRecoveryOnly());assertFalse(leaf.admissionOpen());
-                var write=new DistributedCommand(merged.groupId(),merged.rangeEpoch(),schema.digest(),new OperationId(RatisTopologyControllerTest.id(205),0,0),List.of(new Mutation(Mutation.Kind.PUT,RatisTopologyControllerTest.COLUMN,new byte[]{1},new byte[]{77})));
-                leaf.apply(new ApplyPosition(1,leaf.applied().index()+1),write); // Trusted committed tail remains executable.
-                var current=f.authority(merge.header(),TopologyChange.Stage.ACTIVATE);assertEquals(TopologyChange.Phase.RETIRED,current.state().phase());
-                var localFence=leaf.topologyRecoveryFence();assertThrows(IllegalArgumentException.class,()->leaf.completeTopologyRecovery(localFence,split,leaf.applied(),leaf.configuration()));
-                leaf.completeTopologyRecovery(localFence,current.definition(),leaf.applied(),leaf.configuration());assertTrue(leaf.admissionOpen());assertArrayEquals(new byte[]{77},leaf.readCurrentPoint(RatisTopologyControllerTest.COLUMN,new byte[]{1}));
-                leaf.completeTopologyRecovery(localFence,current.definition(),leaf.applied(),leaf.configuration());
+            try(var cold=pool(receiver)){
+                var metadata=cold.openMetadataRecovery(ancestor);assertEquals(ancestor,metadata.metadataRecoveryRegistration());assertTrue(metadata.metadataRecoveryRegistrationForced(ancestor));assertFalse(metadata.metadataRecoveryPending());assertFalse(metadata.admissionOpen());
+                var active=cold.openCurrentRangeRecovery(registration);assertTrue(active.currentRangeRecoveryReady());assertArrayEquals(new byte[]{42},active.readCurrentPoint(RatisTopologyControllerTest.COLUMN,new byte[]{1}));
             }
-            try(var cold=pool(receiver)){var leaf=cold.reopenTopologyRange(secondSeed.birth(merged.groupId()),schema);assertFalse(leaf.topologyRecoveryOnly());assertTrue(leaf.admissionOpen());assertArrayEquals(new byte[]{77},leaf.readCurrentPoint(RatisTopologyControllerTest.COLUMN,new byte[]{1}));}
+        }
+    }
+    private void assertMetadata(RatisTopologyRecoveryAnchors.Saved saved)throws Exception {
+        assertEquals(NativeRangeImage.Kind.METADATA,NativeRangeImage.kind(saved.file(),NativeRangeImage.IoAdmission.UNLIMITED));
+        var users=new java.util.concurrent.atomic.AtomicInteger();var actual=NativeRangeImage.visitMetadata(saved.file(),limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.USER)users.incrementAndGet();});
+        assertEquals(0,users.get());assertArrayEquals(saved.image().sha256(),actual.sha256());assertThrows(IOException.class,()->NativeRangeImage.inspect(saved.file(),limits));
+        saved.freeze().requireParent(actual.owner().groupId(),actual.owner().epoch(),actual.interval().domainId(),actual.schemaDigest(),actual.interval().lowerInclusive(),actual.interval().upperExclusive());
+    }
+    @Test void metadataPinNeverVisitsUserAndLargeUserVolumeDoesNotConsumeAnchorBudget()throws Exception {
+        helper.root=root;try(var f=helper.new Fixture(root.resolve("large-source"),false,false)){
+            var parent=f.definition.parents().getFirst();var store=f.store(parent.groupId());byte[] value=new byte[256*1024];Arrays.fill(value,(byte)7);
+            var write=new DistributedCommand(parent.groupId(),parent.rangeEpoch(),f.definition.header().schemaDigest(),new OperationId(RatisTopologyControllerTest.id(300),0,0),List.of(new Mutation(Mutation.Kind.PUT,RatisTopologyControllerTest.COLUMN,new byte[]{2},value)));
+            long index=store.applied().index()+1;assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,index),write)).status());f.server.machines.get(org.apache.ratis.protocol.RaftGroupId.valueOf(parent.groupId())).notifyTermIndexUpdated(1,index);
+            // Advance genuine CAT authority and replay its exact controls. The normal CDC age
+            // policy retires the old large event, and minimumEpoch retires its epoch-zero receipt.
+            // USER bytes remain; no retained metadata row is deleted by the fixture.
+            store.enableSessionControls();var epochs=f.env.catalogue.epochs;var sessionLedger=epochs.read();assertNotNull(sessionLedger);long time=sessionLedger.logicalTimeMillis()+1;
+            for(int tick=0;tick<2;tick++){
+                var next=sessionLedger.advanceTime(time+tick*24L*60*60*1000);assertEquals(CommandResult.Status.SUCCESS,epochs.execute(epochs.prepare(f.env.outer.operation(700+tick),sessionLedger,next)).status());sessionLedger=next;
+                var control=epochs.prepareAuthorityAdvance(f.definition.sourceDirectory(),parent.groupId(),new OperationId(RatisTopologyControllerTest.id(301),sessionLedger.minimumEpoch(),tick),-1);
+                epochs.sessionControlAdmission(f.definition.sourceDirectory(),parent.groupId()).accept(control);
+                long nextIndex=store.applied().index()+1;assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,nextIndex),control)).status());f.server.machines.get(org.apache.ratis.protocol.RaftGroupId.valueOf(parent.groupId())).notifyTermIndexUpdated(1,nextIndex);
+            }
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(store.operationResult(write.operationId(),write.receiptDigest())).status());
+            var lineage=new DistributedCdcCheckpoint.Lineage(parent.rangeId(),parent.groupId(),parent.rangeEpoch());var retained=store.pollCdc(lineage,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,index)),8,1024*1024);assertTrue(retained.records().isEmpty());
+            assertArrayEquals(value,store.readCurrentPoint(RatisTopologyControllerTest.COLUMN,new byte[]{2}));
+            var journal=Files.createDirectory(root.resolve("large-journal"));try(var driver=f.controller(journal)){helper.until(driver,driver.prepare(f.definition),journal,RatisTopologyController.Phase.SEED);}
+            var bounded=new NativeRangeImage.Limits(limits.maxRowBytes(),64*1024,limits.maxColumns());
+            try(var pin=store.captureMetadataForRecovery()){
+                assertThrows(IllegalArgumentException.class,()->pin.visitColumn(RatisTopologyControllerTest.COLUMN,null,null,(key,bytes)->fail("Metadata pin cannot create a USER iterator")));
+                var image=NativeRangeImage.writeMetadataAdmitted(root.resolve("same-metadata-pin"),pin,pin.interval(),bounded,NativeRangeImage.IoAdmission.UNLIMITED);assertTrue(image.bytes()<value.length);
+            }
+            var owned=Files.createDirectory(root.resolve("large-artifacts"));try(var ledger=new RatisTopologySourceSnapshotArtifacts(owned,bounded,4*bounded.maxImageBytes(),8L*RatisTopologyRecoveryAnchors.MAX_METADATA_BYTES,2)){
+                var authority=f.authority(f.definition.header(),TopologyChange.Stage.SEED);var saved=new RatisTopologyRecoveryAnchors(ledger,bounded).capture(f.definition,store,store.topologyFreeze(),f.local,authority.cut());assertTrue(saved.image().bytes()<bounded.maxImageBytes());assertMetadata(saved);assertEquals(2*bounded.maxImageBytes(),ledger.reservedImageBytes());
+            }
+            try(var driver=f.controller(journal)){helper.until(driver,driver.reopen(f.definition.intentId()),journal,RatisTopologyController.Phase.RETIRED);}
+            var child=f.definition.targets().stream().filter(range->range.lowerInclusive()==null).findFirst().orElseThrow();assertArrayEquals(value,f.store(child.groupId()).readCurrentPoint(RatisTopologyControllerTest.COLUMN,new byte[]{2}));
         }
     }
 }

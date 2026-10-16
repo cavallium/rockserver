@@ -1935,19 +1935,18 @@ unavailable listener recovery before retirement
 lineage-safe catch-up, physical parent cleanup and its recovery barriers remain
 unfinished.
 
-The recovery prerequisite now retains an exact frozen parent GROUP image before
-native SEED retirement, sharing the existing source artifact quotas. A durable
-receiver-local fence prevents historical sources and intermediate children from
-serving while committed replay proceeds through split and merge to a qualified
-current leaf. Image installation and cold reopen preserve that fence. Fourteen
-controlled anchor/artifact cases pass, including original pending-sidecar recovery,
-conflicting/partial sidecar refusal, scratch-growth refusal and aggregate metadata
-quota enforcement including the reservation marker
-(`topology-anchor-marker-quota-gate.log`). The extended 17-case gate also proves
-exact pending reservation promotion/deduplication after cold quota validation;
-partial/conflicting markers and over-quota inventories remain untouched
-(`topology-reservation-pending-recovery-gate.log`). These whole-USER frozen anchors
-remain temporary correctness scaffolding, not the efficient final topology path.
+Before native SEED retirement, the source retains an exact frozen parent META
+image, with the original FREEZE, owner, catalogue cut, configuration and checksum.
+Capture uses a metadata-only native pin; USER iteration is refused. Image and
+replacement reservations use the bounded metadata ceiling rather than the GROUP
+image ceiling. Ancestor anchors provide no historical USER or voting authority.
+Seven native cases pass (`metadata-anchors114.log`, JDK 25), covering split/merge,
+current-leaf GROUP recovery and cold reopen, pending-sidecar refusal, scratch and
+quota admission, exact retry after lost image observation, and owner/configuration/
+image-kind substitution. A 256 KiB USER value survives normal receipt/CDC retirement,
+a 64 KiB metadata capture, and actual split SEED. Metadata history remains subject
+to its own admitted bound; these checks do not establish constant cost for
+arbitrarily large retained history or source quiescence and physical reclamation.
 
 The native replacement now recovers a qualified CURRENT leaf from its own GROUP
 image and own tail, and sealed ancestors from separate metadata-only images/tails.
