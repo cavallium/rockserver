@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
 import java.io.*;
+import it.cavallium.rockserver.core.common.distributed.*;
 import java.nio.file.*;
 import java.security.MessageDigest;
 import java.util.concurrent.*;
@@ -13,6 +14,51 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySourceSnaps
 class RatisTopologySourceSnapshotServiceTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     RatisTopologySourceSnapshotService.Limits limits(){return RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024);}
+    @Test void actualStopAcknowledgementPreventsEveryFreshServiceResourceAdmission()throws Exception{
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root)){
+            var admissions=new java.util.concurrent.atomic.AtomicInteger();
+            RatisTopologySourceSnapshotService.ResourceAdmission admission=(request,bytes,control)->{admissions.incrementAndGet();return fixture.transferAdmission().reserve(request,bytes,control);};
+            try(var service=new RatisTopologySourceSnapshotService(fixture,limits(),fixture.scheduler,admission)){
+                var request=fixture.request(50);service.sealGroup(request);assertEquals(1,admissions.get());service.stop().get(5,TimeUnit.SECONDS);assertEquals(0,fixture.graph.stats().protectedLane().owners());
+                assertThrows(IOException.class,()->service.head(new RatisSourceHeadRpc.Request(request,fixture.store.applied())));
+                assertThrows(ExecutionException.class,()->service.prepareAsync(request).get(5,TimeUnit.SECONDS));assertThrows(IOException.class,()->service.prepare(request));
+                assertThrows(ExecutionException.class,()->service.transfer(request).get(5,TimeUnit.SECONDS));assertThrows(IOException.class,()->service.release(request));assertThrows(IOException.class,()->service.sealGroup(request));
+                var directory=fixture.definition.targetDirectory();var range=directory.ranges().getFirst();var current=new Request(new java.util.UUID(0,88),null,request.catalogue(),fixture.receiver,Purpose.CURRENT_LEAF,fixture.group,directory);
+                var left=new RangeDescriptor(new java.util.UUID(0,89),new java.util.UUID(0,90),1,range.configurationVersion(),null,new byte[]{64},RangeDescriptor.TopologyState.ACTIVE,range.replicas());
+                var right=new RangeDescriptor(new java.util.UUID(0,91),new java.util.UUID(0,92),1,range.configurationVersion(),new byte[]{64},null,RangeDescriptor.TopologyState.ACTIVE,range.replicas());
+                var after=new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),directory.schemaDigest(),directory.generation()+1,directory.columns(),directory.routingPrefixBytes(),java.util.List.of(left,right));
+                var consuming=new TopologyChange.Definition(new java.util.UUID(0,93),directory,after);
+                var scope=new NativeRecoverySupersession.Scope(current.catalogue(),new ApplyPosition(1,20),consuming.header(),directory,fixture.group,fixture.receiver,new byte[32],java.util.List.of(OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(PREPARE,current))));
+                var obsolete=new RatisRecoveryObsoleteRpc.Request(current,scope,new byte[32]);assertThrows(ExecutionException.class,()->service.obsolete(obsolete).get(5,TimeUnit.SECONDS));
+                assertEquals(1,admissions.get(),"No fresh resource lease may be allocated after actual stop ACK, including after terminal map cleanup");assertEquals(0,fixture.graph.stats().ordinary().owners());assertEquals(0,fixture.graph.stats().protectedLane().owners());assertEquals(0,service.stats().leases());
+            }
+        }
+    }
+    @Test void terminalGroupRefusesRetainedImageDebtThenFencesActualServiceIngress()throws Exception{
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,limits(),fixture.scheduler,fixture.transferAdmission())){
+            var request=fixture.request(50);service.prepare(request);assertEquals(1,fixture.store.activeSnapshotPins());
+            var charged=service.stats();assertThrows(IOException.class,()->service.sealGroup(request));assertEquals(charged,service.stats());assertEquals(0,fixture.pinCloses.get(),"Terminal qualification cannot abandon a retained receiver/image owner");
+            service.transfer(request).get(5,TimeUnit.SECONDS);service.release(request);assertEquals(0,fixture.store.activeSnapshotPins());
+            var terminal=service.sealGroup(request);terminal.requireHeld();assertSame(terminal,service.sealGroup(request));assertEquals(1,fixture.graph.stats().protectedLane().owners());
+            assertThrows(IOException.class,()->service.prepare(request));assertThrows(ExecutionException.class,()->service.prepareAsync(fixture.request(51)).get(5,TimeUnit.SECONDS));assertThrows(ExecutionException.class,()->service.transfer(request).get(5,TimeUnit.SECONDS));assertThrows(IOException.class,()->service.release(request));
+            assertThrows(IOException.class,()->service.head(new RatisSourceHeadRpc.Request(request,fixture.store.applied())));terminal.requireHeld();
+            service.stop().get(5,TimeUnit.SECONDS);assertEquals(0,fixture.graph.stats().protectedLane().owners());assertThrows(IOException.class,terminal::requireHeld);
+        }
+    }
+    @Test void terminalGroupCannotOutrunActualHeadOrWholeServiceStop()throws Exception{
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var worker=Executors.newVirtualThreadPerTaskExecutor()){
+            var request=fixture.request(50);var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+            var host=(RatisTopologySourceSnapshotService.Host)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{RatisTopologySourceSnapshotService.Host.class},(proxy,method,args)->{
+                if(method.getName().equals("head")){entered.countDown();if(!release.await(5,TimeUnit.SECONDS))throw new IOException("Fixture timeout");throw new IOException("Controlled actual HEAD failure");}
+                try{return method.invoke(fixture,args);}catch(java.lang.reflect.InvocationTargetException failed){throw failed.getCause();}
+            });
+            try(var service=new RatisTopologySourceSnapshotService(host,limits(),fixture.scheduler,fixture.transferAdmission())){
+                var actual=CompletableFuture.runAsync(()->{try{service.head(new RatisSourceHeadRpc.Request(request,fixture.store.applied()));throw new AssertionError("Expected HEAD failure");}catch(IOException expected){}catch(Exception failure){throw new CompletionException(failure);}},worker);
+                assertTrue(entered.await(5,TimeUnit.SECONDS));assertTrue(actual.copy().cancel(false));assertThrows(IOException.class,()->service.sealGroup(request));var stopped=service.stop();assertFalse(stopped.isDone());assertEquals(1,fixture.graph.stats().protectedLane().owners());
+                release.countDown();actual.get(5,TimeUnit.SECONDS);stopped.get(5,TimeUnit.SECONDS);assertEquals(0,fixture.graph.stats().protectedLane().owners());
+            }finally{release.countDown();}
+        }
+    }
     @Test void oneBatchWorkerMakesRecoveryProgressWhileBootstrapHasNoRateCredits()throws Exception {
         var scheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(1,1,1,16,16,"one-source-build-worker");
         try(var fixture=new RatisTopologySourceSnapshotFixture(root)){

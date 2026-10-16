@@ -68,15 +68,42 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     private final Set<Preparation> preparations=new LinkedHashSet<>();
     private final Set<Transfer> transfers=new LinkedHashSet<>();private final CompletableFuture<Void> stopped=new CompletableFuture<>();
     private final Map<UUID,Entry> entries=new LinkedHashMap<>();private final Map<UUID,byte[]> released=new HashMap<>();private final Set<UUID> releaseLookups=new HashSet<>();
+    private static final int TERMINAL_GROUP_BYTES=128;
+    private final Map<UUID,Integer> groupOwners=new HashMap<>();
+    private final Map<UUID,TerminalGroup> terminalGroups=new HashMap<>();
+    /** Joins actual service owners without abandoning any retained image or unknown cleanup.
+     * Native/CAT terminal proof and cold reestablishment are the caller's separate obligations. */
+    public final class TerminalGroup {
+        private final UUID group;private final RatisProofQueryService.ResourceLease resource;
+        private TerminalGroup(UUID group,RatisProofQueryService.ResourceLease resource){this.group=group;this.resource=resource;}
+        public void requireHeld()throws IOException{synchronized(RatisTopologySourceSnapshotService.this){if(terminalGroups.get(group)!=this || groupOwners.containsKey(group) || hasGroupDebt(group))throw new IOException("Source service terminal ownership changed or retains actual work");}}
+    }
+    public TerminalGroup sealGroup(Request scope)throws IOException{
+        Objects.requireNonNull(scope);synchronized(this){
+            requireOpen();var group=scope.sourceGroup();var existing=terminalGroups.get(group);if(existing!=null){existing.requireHeld();return existing;}
+            if(groupOwners.containsKey(group) || hasGroupDebt(group))throw new IOException("Source service retains image/capture/transfer/cleanup ownership");
+            if(terminalGroups.size()>=RatisNodePlan.MAX_LOCAL_GROUPS || TERMINAL_GROUP_BYTES>limits.maximumMetadataBytes()-metadataBytes)throw new IOException("Source terminal service gate capacity exhausted");
+            var resource=Objects.requireNonNull(admission.reserve(scope,TERMINAL_GROUP_BYTES,true));var terminal=new TerminalGroup(group,resource);terminalGroups.put(group,terminal);metadataBytes+=TERMINAL_GROUP_BYTES;return terminal;
+        }
+    }
+    private boolean hasGroupDebt(UUID group){return entries.values().stream().anyMatch(entry->entry.request.sourceGroup().equals(group)) || preparations.stream().anyMatch(build->build.request.sourceGroup().equals(group)) || transfers.stream().anyMatch(transfer->transfer.request.sourceGroup().equals(group)) || obsoletePending.values().stream().anyMatch(owner->owner.request.original().sourceGroup().equals(group));}
+    private RatisProofQueryService.ResourceLease reserve(Request request,long bytes,boolean control)throws IOException{
+        synchronized(this){
+            requireOpen();
+            if(terminalGroups.containsKey(request.sourceGroup()))throw new IOException("Source group is terminally sealed");
+            var resource=Objects.requireNonNull(admission.reserve(request,bytes,control));var group=request.sourceGroup();groupOwners.merge(group,1,Math::addExact);
+            return new RatisProofQueryService.ResourceLease(){boolean released;public void close(){synchronized(RatisTopologySourceSnapshotService.this){if(released)return;resource.close();released=true;int remaining=groupOwners.get(group)-1;if(remaining==0)groupOwners.remove(group);else groupOwners.put(group,remaining);}checkStopped();}};
+        }
+    }
     private static final int OBSOLETE_TERMINAL_BYTES=128;
     private final Map<UUID,ObsoleteOwner> obsoletePending=new HashMap<>();private final Map<UUID,byte[]> obsoleteTerminals=new HashMap<>();
     // At most MAX_LEASES transient controls, separately admitted by their protected graph leases.
-    private long imageBytes,metadataBytes,obsoleteControlBytes;private int active;private boolean stopping;
+    private long imageBytes,metadataBytes,obsoleteControlBytes;private int active;private boolean stopping,stopPublicationScheduled;
     public RatisTopologySourceSnapshotService(Host host,Limits limits,RWScheduler scheduler,ResourceAdmission admission){this.host=Objects.requireNonNull(host);this.limits=Objects.requireNonNull(limits);this.admission=Objects.requireNonNull(admission);executor=Objects.requireNonNull(scheduler).executor(RequestContext.batch(),OperationFamily.FULL_SCAN_AGGREGATE);}
     /** The actual image write/inspect/hash runs in bounded BATCH work, outside the proof/control worker. */
     public CompletableFuture<Prepared> prepareAsync(Request request){
         final Preparation task;final RatisProofQueryService.ResourceLease resource;
-        try{resource=Objects.requireNonNull(admission.reserve(request,transferBytes(request),false));}catch(Exception failure){return CompletableFuture.failedFuture(failure);}
+        try{resource=Objects.requireNonNull(reserve(request,transferBytes(request),false));}catch(Exception failure){return CompletableFuture.failedFuture(failure);}
         synchronized(this){if(stopping || preparations.size()>=MAX_LEASES || request.purpose()==Purpose.CURRENT_LEAF && !hasTerminalSlot(request.transferId()) || qualifiedObsolete(request.transferId()) || obsoleteTerminals.containsKey(request.transferId())){resource.close();return CompletableFuture.failedFuture(new IOException("Source image build admission exhausted"));}task=new Preparation(request,resource);preparations.add(task);}
         try{task.handle=executor.executeCooperatively(task,transferBytes(request));boolean stop;synchronized(this){stop=stopping || qualifiedObsolete(request.transferId());}if(stop)task.handle.cancel();}catch(RuntimeException rejected){task.reject(rejected);}
         return task.result.copy();
@@ -115,7 +142,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             try{Thread.sleep(10);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Source image admission interrupted",interrupted);}
         }
     }
-    public RatisSourceHeadRpc.Head head(RatisSourceHeadRpc.Request request)throws Exception{synchronized(this){if(stopping)throw new IOException("Source service stopped");}return host.head(request);}
+    public RatisSourceHeadRpc.Head head(RatisSourceHeadRpc.Request request)throws Exception{try(var owner=reserve(request.source(),TERMINAL_GROUP_BYTES,true)){synchronized(this){requireOpen();}return host.head(request);}}
     Prepared prepare(Request request)throws IOException {return prepareOwned(request,bytes->awaitImageBytes(request,bytes));}
     private Prepared prepareOwned(Request request,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission imageAdmission)throws IOException {
         Objects.requireNonNull(request);Entry entry;boolean capture;
@@ -151,7 +178,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     public CompletableFuture<Prepared> transfer(Request request) {
         RatisProofQueryService.ResourceLease resource=null;Transfer task=null;
         try {
-            Objects.requireNonNull(request);resource=Objects.requireNonNull(admission.reserve(request,transferBytes(request),false));
+            Objects.requireNonNull(request);resource=Objects.requireNonNull(reserve(request,transferBytes(request),false));
             synchronized(this){requireOpen();requireNotReleased(request);var entry=entries.get(request.transferId());if(entry!=null){requireSame(entry,request);if(entry.busy)throw new IOException("Source transfer owner is active");}
                 if(active>=MAX_LEASES || publicationLookupBytes(request)>limits.maximumMetadataBytes()-metadataBytes || !releaseLookups.add(request.transferId()))throw new IOException("Source transfer lookup admission exhausted");
                 active++;metadataBytes+=publicationLookupBytes(request);task=new Transfer(request,resource);transfers.add(task);resource=null;
@@ -207,7 +234,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         try {
             byte[] identity;
             synchronized(this){var retained=obsoletePending.get(original.transferId());if(retained!=null && retained.busy)throw new IOException("Actual obsolete cleanup is active");identity=retained==null?null:request.digest();}
-            if(identity==null){resource=Objects.requireNonNull(admission.reserve(original,weight,true));identity=request.digest();}
+            if(identity==null){resource=Objects.requireNonNull(reserve(original,weight,true));identity=request.digest();}
             synchronized(this) {
                 var terminal=obsoleteTerminals.get(original.transferId());if(terminal!=null){if(!Arrays.equals(terminal,identity))throw new IOException("Obsolete transfer changed exact terminal request");if(resource!=null)resource.close();return CompletableFuture.completedFuture(ScopedTransactionRpc.frame(RatisRecoveryObsoleteRpc.KIND,identity));}
                 if(released.containsKey(original.transferId()))throw new IOException("Installed RELEASE cannot become OBSOLETE");
@@ -299,7 +326,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         return identities.contains(id) || identities.size()<MAX_RELEASED;
     }
     public void release(Request request)throws IOException {
-        try(var resource=admission.reserve(request,releaseLookupBytes(request),true)){releaseOwned(request);}
+        try(var resource=reserve(request,releaseLookupBytes(request),true)){releaseOwned(request);}
     }
     private void releaseOwned(Request request)throws IOException {
         Entry entry;
@@ -340,7 +367,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         for(var request:pendingObsolete)obsolete(request);
         checkStopped();return stopped.copy();
     }
-    private void checkStopped(){boolean complete;synchronized(this){complete=stopping && active==0 && entries.isEmpty() && transfers.isEmpty() && preparations.isEmpty() && obsoletePending.isEmpty();if(complete){metadataBytes-=OBSOLETE_TERMINAL_BYTES*(long)obsoleteTerminals.size();obsoleteTerminals.clear();}}if(complete){rateWakeup.shutdown();stopped.complete(null);}}
+    private void checkStopped(){boolean complete;synchronized(this){complete=!stopPublicationScheduled && stopping && active==0 && groupOwners.isEmpty() && entries.isEmpty() && transfers.isEmpty() && preparations.isEmpty() && obsoletePending.isEmpty();if(complete){stopPublicationScheduled=true;metadataBytes-=OBSOLETE_TERMINAL_BYTES*(long)obsoleteTerminals.size();obsoleteTerminals.clear();for(var terminal:terminalGroups.values())terminal.resource.close();metadataBytes-=TERMINAL_GROUP_BYTES*(long)terminalGroups.size();terminalGroups.clear();}}if(complete){Runnable publish=()->{rateWakeup.shutdown();stopped.complete(null);};if(Thread.holdsLock(this))rateWakeup.execute(publish);else publish.run();}}
     @Override public void close()throws IOException{var completion=stop();if(!completion.isDone())throw new IOException("Source snapshot stop waits for actual capture/transfer/cleanup drainage");try{completion.join();}catch(CompletionException failed){throw new IOException("Source stop did not settle",failed.getCause());}}
     static void requireReply(InstallSnapshotRequestProto request,InstallSnapshotReplyProto reply)throws IOException {
         var expected=request.getServerRequest();
@@ -349,7 +376,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                 || !reply.getServerReply().getRaftGroupId().equals(expected.getRaftGroupId()) || reply.getResult()!=InstallSnapshotResult.SUCCESS && reply.getResult()!=InstallSnapshotResult.ALREADY_INSTALLED)throw new IOException("Unknown, stale or crossed snapshot receiver reply");
     }
     private void requireOpen()throws IOException{if(stopping)throw new IOException("Source snapshot owner is stopping");}
-    private void requireNotReleased(Request request)throws IOException{if(qualifiedObsolete(request.transferId()) || obsoleteTerminals.containsKey(request.transferId()))throw new IOException("Source capture is permanently obsolete or awaits exact obsolete cleanup");var prior=released.get(request.transferId());if(prior!=null){requireReleased(request,prior);throw new IOException("Source snapshot already released");}}
+    private void requireNotReleased(Request request)throws IOException{if(terminalGroups.containsKey(request.sourceGroup()))throw new IOException("Source group is terminally sealed");if(qualifiedObsolete(request.transferId()) || obsoleteTerminals.containsKey(request.transferId()))throw new IOException("Source capture is permanently obsolete or awaits exact obsolete cleanup");var prior=released.get(request.transferId());if(prior!=null){requireReleased(request,prior);throw new IOException("Source snapshot already released");}}
     private static void requireSame(Entry entry,Request request)throws IOException{try{requireRequest(entry.request,request);}catch(IllegalArgumentException changed){throw new IOException("Transfer ID already owns different input",changed);}}
     private static void requireReleased(Request request,byte[] expected)throws IOException{if(!Arrays.equals(expected,digest(request)))throw new IOException("Released transfer input changed");}
     private static byte[] digest(Request request){try{return java.security.MessageDigest.getInstance("SHA-256").digest(RatisTopologySourceSnapshotRpc.request(RELEASE,request));}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}}
