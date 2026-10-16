@@ -21,6 +21,9 @@ public final class RatisSnapshotFences {
     void requireDirectoryBinding(RangeDirectory expected) {
         if (!Arrays.equals(routed.directory().payloadDigest(),expected.payloadDigest())) throw new IllegalArgumentException("Home reader differs from declared placement");
     }
+    long futureRouteBytes()throws IOException {
+        long maximum=0;for(var route:routed.directory().ranges())maximum=Math.max(maximum,2*RatisDurableSnapshot.futureRoute(route));return maximum;
+    }
     byte[] identityDigest() {
         var bytes=ByteBuffer.allocate(48).put(routed.sessionIdentityDigest()).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).array();
         try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }

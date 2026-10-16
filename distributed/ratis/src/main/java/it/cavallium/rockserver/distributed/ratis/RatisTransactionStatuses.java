@@ -24,6 +24,9 @@ public final class RatisTransactionStatuses {
         if (!Arrays.equals(routed.directory().payloadDigest(),expected.payloadDigest())) throw new IllegalArgumentException("Home reader differs from declared placement");
     }
     long directoryBytes(){return RangeDirectoryCodec.encodedSize(routed.directory());}
+    long futureRouteBytes()throws IOException {
+        long maximum=0;for(var route:routed.directory().ranges())maximum=Math.max(maximum,2*RatisDurableSnapshot.futureRoute(route));return maximum;
+    }
     byte[] identityDigest() {
         var bytes=ByteBuffer.allocate(48).put(routed.sessionIdentityDigest()).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).array();
         try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
@@ -54,6 +57,7 @@ public final class RatisTransactionStatuses {
             if(maintenance.execute().status()!=CommandResult.Status.SUCCESS)throw new IOException("HOME binding did not apply");
         }
     }
+    RangeDescriptor route(UUID transaction){return routed.directory().route(column,key(transaction));}
     public RegistrationRead readRegistration(UUID transaction) throws IOException {
         var read=routed.readWithRoute(column,key(transaction)); byte[] bytes=read.value();
         if (bytes==null) return new RegistrationRead(null,read.descriptor());

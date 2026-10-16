@@ -121,11 +121,18 @@ This section and the remaining gates at the end describe the current branch.
   cross-domain cold recovery and shared backup/two-pool workflows. The unchanged
   fault cases passed six cases in gate105; real gRPC/Thrift transport passed four
   cases in gate102. The full offline Rust workspace passes in
-  `atomic-rust-workspace117.log`. Resource efficiency remains unfinished: replace
-  fixed maximum-size future disk promises with conservative derived geometry and
-  account retained per-participant wire buffers before concurrency/performance
-  acceptance. These results do not establish independent failure-domain or
-  production performance acceptance.
+  `atomic-rust-workspace117.log`. Request disk and RAM reservations now derive from
+  the immutable input, scopes, participants, return bounds, routes and current
+  encoder sizes. Main/pending replacement, checksum and retained graph/workspace
+  overlap remain charged; capture requests share the immutable fence instead of
+  retaining one complete encoded copy per participant. The four native cases in
+  `atomic-derived-geometry138.log` pass, including two concurrent native owners
+  under one unchanged budget (charged disk below 2 MiB, charged request RAM below
+  32 MiB), refusal before third allocation, cancellation without replacement,
+  qualified cold sidecar promotion with all remaining disk already promised, and
+  stable zero-effect RESULT_TOO_LARGE for an oversized participant acceptance.
+  Representative concurrency, latency/throughput, independent failure domains and
+  production hardware/resource acceptance remain unfinished.
 - Unqualified common physical CF estimates, table/SST metadata and maintenance now
   return typed NOT_IMPLEMENTED before generation lookup in both connection and
   adapter dispatch. Physical observations and maintenance retain the qualified

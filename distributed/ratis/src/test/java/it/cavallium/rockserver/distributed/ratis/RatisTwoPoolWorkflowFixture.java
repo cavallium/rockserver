@@ -63,8 +63,9 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
 
     RatisTwoPoolWorkflowFixture(Path root,boolean pendingImport)throws Exception {this(root,pendingImport,List.of());}
     RatisTwoPoolWorkflowFixture(Path root,boolean pendingImport,List<ReplicaDescriptor> additionalFirstReplicas)throws Exception {this(root,pendingImport,additionalFirstReplicas,false);}
-    RatisTwoPoolWorkflowFixture(Path root,boolean pendingImport,List<ReplicaDescriptor> additionalFirstReplicas,boolean heterogeneousTransactions)throws Exception {
-        this.root=root;operatorJar=RatisSchemaClientWorkflowTest.jar();appendOperator=new DistributedSchema.Operator("append",0,RatisSchemaClientWorkflowTest.AppendOperator.class.getName(),OperatorUpload.sha256(operatorJar),1,1,"append-contract",1);schemaReplicas=new RatisSchemaReplicaClient(4,this::schemaOwnerClient);importSource=root.resolve("original-import.sst");Files.createDirectories(root);var initialSchema=new RatisNodeServiceTest().schema();first=heterogeneousTransactions?new DistributedSchema(initialSchema.clusterId(),initialSchema.databaseId(),initialSchema.domainId(),initialSchema.schemaEpoch(),1,initialSchema.columns()):initialSchema;env=new Environment(root);
+    RatisTwoPoolWorkflowFixture(Path root,boolean pendingImport,List<ReplicaDescriptor> additionalFirstReplicas,boolean heterogeneousTransactions)throws Exception {this(root,pendingImport,additionalFirstReplicas,heterogeneousTransactions,1);}
+    RatisTwoPoolWorkflowFixture(Path root,boolean pendingImport,List<ReplicaDescriptor> additionalFirstReplicas,boolean heterogeneousTransactions,int mutationWorkers)throws Exception {
+        this.root=root;operatorJar=RatisSchemaClientWorkflowTest.jar();appendOperator=new DistributedSchema.Operator("append",0,RatisSchemaClientWorkflowTest.AppendOperator.class.getName(),OperatorUpload.sha256(operatorJar),1,1,"append-contract",1);schemaReplicas=new RatisSchemaReplicaClient(4,this::schemaOwnerClient);importSource=root.resolve("original-import.sst");Files.createDirectories(root);var initialSchema=new RatisNodeServiceTest().schema();first=heterogeneousTransactions?new DistributedSchema(initialSchema.clusterId(),initialSchema.databaseId(),initialSchema.domainId(),initialSchema.schemaEpoch(),1,initialSchema.columns()):initialSchema;env=new Environment(root,mutationWorkers);
         try {
         local=new ReplicaDescriptor(new UUID(9,1),new UUID(9,2),new UUID(9,3),"node9","127.0.0.1:4512",ReplicaDescriptor.Role.VOTER);
         second=new DistributedSchema(first.clusterId(),first.databaseId(),new UUID(960,3),1,0,List.of(new DistributedSchema.Column(72,new UUID(960,4),"archive",ColumnSchema.of(IntArrayList.of(heterogeneousTransactions?2:1),new ObjectArrayList<>(),true),null)));
@@ -136,14 +137,18 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
     ReplicatedRangeStore store(UUID group)throws Exception{return field(machine(group),"store",ReplicatedRangeStore.class);}
     private <T> CompletableFuture<T> async(Callable<T> action){try{return CompletableFuture.supplyAsync(()->{try{return action.call();}catch(Exception failure){throw new CompletionException(failure);}},calls);}catch(RuntimeException rejected){return CompletableFuture.failedFuture(rejected);}}
     Message apply(UUID group,byte[] bytes)throws Exception {
-        var machine=machine(group);var transaction=machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(group)).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(Message.valueOf(ByteString.copyFrom(bytes))).build());assertNull(transaction.getException());machine.preAppendTransaction(transaction);transaction.initLogEntry(1,store(group).applied().index()+1);
-        return committedApply(machine,transaction);
+        // A real Raft division assigns log indexes in one serial lane, before committed apply.
+        return updater.submit(()->{
+            var machine=machine(group);var transaction=machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(group)).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(Message.valueOf(ByteString.copyFrom(bytes))).build());assertNull(transaction.getException());machine.preAppendTransaction(transaction);transaction.initLogEntry(1,store(group).applied().index()+1);
+            return committedApplyInline(machine,transaction);
+        }).get(10,TimeUnit.SECONDS);
     }
     private Message committedApply(RatisRangeStateMachine machine,TransactionContext transaction)throws Exception {
-        return updater.submit(()->{
-            var admission=machine.committedApplyAdmission();org.apache.ratis.server.impl.CommittedApplyStateMachine.Descriptor descriptor;long index=transaction.getLogEntry().getIndex();try(var read=admission.awaitRead(index)){descriptor=admission.describe(transaction.getLogEntry());}var permit=admission.awaitDispatch(descriptor);admission.offer(descriptor,permit);CompletableFuture<Message> result;
-            try{result=machine.applyTransaction(transaction);}finally{admission.withdraw(descriptor,permit);if(!permit.claimed())permit.close();}try(var read=admission.awaitRead(index+1)){}return result.get(5,TimeUnit.SECONDS);
-        }).get(10,TimeUnit.SECONDS);
+        return updater.submit(()->committedApplyInline(machine,transaction)).get(10,TimeUnit.SECONDS);
+    }
+    private Message committedApplyInline(RatisRangeStateMachine machine,TransactionContext transaction)throws Exception {
+        var admission=machine.committedApplyAdmission();org.apache.ratis.server.impl.CommittedApplyStateMachine.Descriptor descriptor;long index=transaction.getLogEntry().getIndex();try(var read=admission.awaitRead(index)){descriptor=admission.describe(transaction.getLogEntry());}var permit=admission.awaitDispatch(descriptor);admission.offer(descriptor,permit);CompletableFuture<Message> result;
+        try{result=machine.applyTransaction(transaction);}finally{admission.withdraw(descriptor,permit);if(!permit.claimed())permit.close();}try(var read=admission.awaitRead(index+1)){}return result.get(5,TimeUnit.SECONDS);
     }
 
     private void topologyCommand(RatisTopologyCatalogue topology,DistributedCommand command)throws Exception {
@@ -335,16 +340,16 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
         }
     }
     void reopenTransactionDataPools()throws Exception {
-        service.close();service=null;env.scheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(1,1,1,4,1,"two-pool-cold-workflow");env.timer=new RatisNodeRuntimeTest.ManualTimer();server=new RatisNodeRuntimeTest.FakeServer();routes.clear();routes.put(first.domainId(),routed(firstDirectory));routes.put(second.domainId(),routed(secondDirectory));
+        service.close();service=null;env.scheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(1,env.mutationWorkers,1,4,1,"two-pool-cold-workflow");env.timer=new RatisNodeRuntimeTest.ManualTimer();server=new RatisNodeRuntimeTest.FakeServer();routes.clear();routes.put(first.domainId(),routed(firstDirectory));routes.put(second.domainId(),routed(secondDirectory));
         var resources=new RatisNodeService.Resources(catalogue,routes,env.scheduler,env.timer);service=RatisNodeService.recover(manifest,env.nodeRoot,ConfigParser.parseDefault(),resources,server::create,this::admitOperator,this::homeClient);node=field(service,"node",RatisNodeRuntime.class);service.start();field(node,"poolPressure",RatisPoolPressureService.class).refresh().get(10,TimeUnit.SECONDS);service.verifyCatalogue();assertSharedNodeResources();
     }
     it.cavallium.rockserver.core.impl.RWScheduler transactionScheduler(){return env.scheduler;}
     UUID transactionProcess()throws Exception{return field(node,"snapshotProcessIncarnation",UUID.class);}
     RatisTransactionBindings transactionBindings(){return new RatisTransactionBindings(List.of(new RatisTransactionBindings.Domain(first,routes.get(first.domainId()).directory(),routes.get(first.domainId())),new RatisTransactionBindings.Domain(second,routes.get(second.domainId()).directory(),routes.get(second.domainId()))));}
     RatisRoutedClient transactionHome(RatisNodePlan.Role role){return homeClient(plan.home(role).directory());}
-    RatisBackendAllocations transactionAllocator(Path path,RatisTransactionBindings bindings,RatisRoutedClient snapshot,RatisRoutedClient transaction)throws IOException {
+    RatisBackendAllocations transactionAllocator(Path path,RatisTransactionBindings bindings,RatisRoutedClient snapshot,RatisRoutedClient transaction,RatisJournalAccess access)throws IOException {
         var clients=new ArrayList<RatisRoutedClient>();bindings.domains().forEach(domain->clients.add(domain.client()));clients.add(snapshot);clients.add(transaction);var targets=new ArrayList<RatisBackendSessions.Target>();for(var client:List.of(snapshot,transaction)){var directory=client.directory();for(var range:directory.ranges())targets.add(new RatisBackendSessions.Target(client,range.groupId(),directory));}
-        var authority=plan.catalogue();var epochs=new RatisSessionEpochs(catalogue,first.clusterId(),first.databaseId(),authority.groupId(),authority.epoch(),authority.schemaDigest(),authority.sessionsColumn());return new RatisBackendAllocations(path,epochs,env.scheduler,60000,8,clients,targets,RatisJournalAccess.standalone());
+        var authority=plan.catalogue();var epochs=new RatisSessionEpochs(catalogue,first.clusterId(),first.databaseId(),authority.groupId(),authority.epoch(),authority.schemaDigest(),authority.sessionsColumn());return new RatisBackendAllocations(path,epochs,env.scheduler,60000,8,clients,targets,access);
     }
     void coldReopen(SchemaMerge merged,Backup backup)throws Exception {
         var originalBinding=plan.catalogue();var originalEpochs=new RatisSessionEpochs(catalogue,first.clusterId(),first.databaseId(),originalBinding.groupId(),originalBinding.epoch(),originalBinding.schemaDigest(),originalBinding.sessionsColumn());byte[] originalLedger=originalEpochs.read().encode();
@@ -397,10 +402,10 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
     private static final class Environment implements AutoCloseable {
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest();
         final RatisSessionEpochsTest.Fixture catalogue;
-        it.cavallium.rockserver.core.impl.RWScheduler scheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(1,1,1,4,1,"two-pool-workflow");
+        it.cavallium.rockserver.core.impl.RWScheduler scheduler;final int mutationWorkers;
         RatisNodeRuntimeTest.ManualTimer timer=new RatisNodeRuntimeTest.ManualTimer();
         final Path nodeRoot;boolean resourcesTransferred;
-        Environment(Path root)throws Exception{catalogue=outer.new Fixture(root.resolve("catalogue"));nodeRoot=Files.createDirectory(root.resolve("node"));}
+        Environment(Path root,int mutationWorkers)throws Exception{this.mutationWorkers=mutationWorkers;scheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(1,mutationWorkers,1,4,1,"two-pool-workflow");catalogue=outer.new Fixture(root.resolve("catalogue"));nodeRoot=Files.createDirectory(root.resolve("node"));}
         RatisNodeRuntime.Settings settings(){return new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4<<20,16<<20,4),RatisRangeStateMachine.RetentionLimits.defaults(),java.time.Duration.ofSeconds(1),1,8,java.time.Duration.ofSeconds(5),RatisNodeRuntime.ExportResources.defaults(),RatisNodeRuntime.ResourceLimits.defaults());}
         public void close()throws Exception{if(resourcesTransferred)catalogue.pool.close();else{scheduler.disposeGracefully().block(java.time.Duration.ofSeconds(5));catalogue.close();}}
     }

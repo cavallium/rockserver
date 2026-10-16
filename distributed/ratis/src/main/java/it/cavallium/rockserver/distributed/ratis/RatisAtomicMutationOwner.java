@@ -19,7 +19,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
     private enum Phase { PREPARED, ALLOCATING, ALLOCATED, CAPTURING, STAGING, ACCEPTED, PUBLISHING, RESULT, REJECTING, DONE }
     private static final class Job {
         RemoteMutationToken token;List<AtomicMutation> mutations;List<AtomicPredicate> predicates;long ttlMillis,expires;
-        Phase phase=Phase.PREPARED;boolean snapshotPublished;RatisTransactionClient.Identity identity;SnapshotFence fence;
+        Phase phase=Phase.PREPARED;boolean snapshotPublished;long snapshotHomeBytes,transactionHomeBytes;RatisTransactionClient.Identity identity;SnapshotFence fence;
         RatisTransactionPlan.Accepted accepted;CommandResult result;boolean acknowledged;
     }
     private final RatisTransactionBindings data;
@@ -33,7 +33,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
     private final Path root,input,snapshot,child;
     private final FileChannel channel;private final FileLock lock;
     private final UUID ownerId;private final RatisRemoteMutationReceipts receipts;
-    private RatisRequestBudget.Lease requestCredit;
+    private RatisRequestBudget.Lease requestCredit;private RatisRequestBudget.Workspace workspace;
     private RatisTransactionClient.Lease lease;private RatisTransactionClient.Cleanup cleanup;
     private RatisAtomicClient.Operation operation;
     private Job job;private boolean active,closed,fenced;
@@ -54,10 +54,12 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
             receipts=new RatisRemoteMutationReceipts(this.root.resolve("released"),authority(0),used,budget);
             ownerCredit.requireOpening(RatisRequestBudget.files(input,pending(input),snapshot,pending(snapshot),child,pending(child)));recoverInput();receipts.validateJournal(job==null?null:job.token);if(job!=null)job.acknowledged=receipts.retired(job.token);
             if(job==null && (present(snapshot)||present(pending(snapshot))||present(child)||present(pending(child))))throw new IOException("Atomic child graph lost original input");
-            requestCredit=job!=null && job.acknowledged?ownerCredit.openedWorkspace(retained(job)):ownerCredit.opened(job==null?0:retained(job),job!=null);
+            var geometry=job==null?null:geometry(job);
+            requestCredit=job!=null && job.acknowledged?ownerCredit.openedWorkspace(geometry.retained()):ownerCredit.opened(job==null?0:geometry.retained(),job!=null);
+            if(job!=null){ownerCredit.retainTo(ownerCredit.base+receipts.retainedBytesAfterNext(job.token));workspace=budget.workspace(geometry.workspace());requestCredit.prepaid(workspace);budget.preflight(journalGraph(geometry));}
             transactions=RatisTransactionClient.journalOwned(data,snapshotHomes,homes,scheduler,RatisTransactionClient.Limits.defaults(),budget);
             atomic=new RatisAtomicClient(data,homes,scheduler,RatisAtomicClient.Limits.defaults(),budget,()->requestCredit);
-        }catch(Throwable failure){if(requestCredit!=null)requestCredit.close();ownerCredit.close();if(acquired!=null)acquired.release();if(opened!=null)opened.close();if(failure instanceof IOException io)throw io;throw new IOException("Atomic owner open failed",failure);}
+        }catch(Throwable failure){if(workspace!=null)workspace.close();if(requestCredit!=null)requestCredit.close();ownerCredit.close();if(acquired!=null)acquired.release();if(opened!=null)opened.close();if(failure instanceof IOException io)throw io;throw new IOException("Atomic owner open failed",failure);}
     }
     private RemoteMutationOwner authority(long sequence){return new RemoteMutationOwner(data.clusterId(),data.databaseId(),ownerId,0,sequence,RemoteMutationToken.Kind.ATOMIC,data.authority());}
     synchronized RemoteMutationOwner owner()throws IOException{requireOpen();return authority(receipts.nextSequence());}
@@ -66,24 +68,54 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
         long inputBytes=RemoteMutationInputs.atomicSize(mutations,predicates,ttlMillis);
         var token=new RemoteMutationToken(data.clusterId(),data.databaseId(),ownerId,requestId,0,sequence,RemoteMutationToken.Kind.ATOMIC,data.authority(),RemoteMutationInputs.atomic(mutations,predicates,ttlMillis));
         receipts.requireNew(token);if(job!=null && !job.acknowledged){if(!job.token.equals(token))throw new IOException("Atomic original input differs");return token;}
-        var declaration=scope(mutations,predicates);data.preflight(declaration);var routes=data.participants(declaration);
-        // Charge input, saved results, immutable acceptance and future encoding before allocating identities.
-        long retained=256*1024L+8*inputBytes+8L*CommandResult.MAX_BYTES+128*1024L*routes.size();
-        var credit=budget.request(RemoteMutationToken.Kind.ATOMIC,retained);
-        try {
-            retire();var paths=journalGraph();budget.preflight(paths);requestCredit=credit;
+        try(var planning=budget.work(128*1024+8*inputBytes)){
             var candidate=new Job();candidate.token=token;candidate.mutations=mutations.stream().map(m->new AtomicMutation(m.column(),copy(m.key()),m.kind(),copy(m.value()),m.returns())).toList();candidate.predicates=predicates.stream().map(p->new AtomicPredicate(p.column(),copy(p.key()),copy(p.expected()))).toList();candidate.ttlMillis=ttlMillis;candidate.expires=Math.addExact(System.currentTimeMillis(),ttlMillis);
-            // Schema/key/operator validation is pure and precedes the first allocation/capture.
-            physical(candidate);job=candidate;persist();receipts.bind(token);return token;
-        }catch(Throwable failure){if(requestCredit!=credit || job==null){credit.close();if(requestCredit==credit)requestCredit=null;}if(job==null)try{budget.fulfilled(journalGraph());}catch(IOException cleanup){failure.addSuppressed(cleanup);}if(failure instanceof IOException io)throw io;throw failure;}
+            candidate.snapshotHomeBytes=snapshotHomes.futureRouteBytes();candidate.transactionHomeBytes=homes.futureRouteBytes();
+            var geometry=geometry(candidate);retire();
+            RatisRequestBudget.Lease credit=null;RatisRequestBudget.Workspace working=null;boolean promised=false;
+            try {
+                ownerCredit.retainTo(ownerCredit.base+receipts.retainedBytesAfterNext(token));
+                credit=budget.request(RemoteMutationToken.Kind.ATOMIC,geometry.retained());working=budget.workspace(geometry.workspace());credit.prepaid(working);
+                budget.preflight(journalGraph(geometry));promised=true;requestCredit=credit;workspace=working;job=candidate;persist();receipts.bind(token);return token;
+            }catch(Throwable failure){
+                if(job!=candidate){if(working!=null)working.close();if(credit!=null)credit.close();if(promised)try{budget.fulfilled(journalGraph(geometry));}catch(IOException cleanup){failure.addSuppressed(cleanup);}}
+                if(failure instanceof IOException io)throw io;throw failure;
+            }
+        }
     }
-    private List<RatisJournalAccess.Reservation> journalGraph(){return List.of(
-        new RatisJournalAccess.Reservation(input,MAX_BYTES,2L*MAX_BYTES),
-        new RatisJournalAccess.Reservation(root.resolve("released"),2*1024*1024,4L*1024*1024),
-        new RatisJournalAccess.Reservation(snapshot,RatisDurableSnapshot.MAX_BYTES,2L*RatisDurableSnapshot.MAX_BYTES),
+    private record Geometry(long outer,long snapshot,long child,long receipt,long retained,long workspace){}
+    /** All inputs are immutable actual logical/physical geometry; no provisional operation or authority is fabricated. */
+    private Geometry geometry(Job saved)throws IOException {
+        long input=RemoteMutationInputs.atomicSize(saved.mutations,saved.predicates,saved.ttlMillis);var scope=scope(saved.mutations,saved.predicates);data.preflight(scope);var routes=data.participants(scope);var physical=physical(saved);
+        long body=0;for(var mutation:physical.mutations())body+=mutation.encodedSize();for(var predicate:physical.predicates())body+=predicate.encodedSize();
+        long spans=0,components=0;for(var span:scope.spans())spans+=25L+span.lowerInclusive().length;for(var mutation:saved.mutations)components+=mutation.key().keys().length;for(var predicate:saved.predicates)components+=predicate.key().keys().length;
+        long result=8;int returns=0;
+        for(var mutation:saved.mutations)if(mutation.returns()!=Mutation.ReturnMode.NONE){
+            returns++;var shape=data.column(mutation.column()).schema();long value;
+            if(!shape.hasValue() || mutation.kind()==Mutation.Kind.DELETE && mutation.returns()==Mutation.ReturnMode.CURRENT)value=0;
+            else if(mutation.returns()==Mutation.ReturnMode.CURRENT && mutation.kind()==Mutation.Kind.PUT)value=mutation.value()==null?0:mutation.value().size();
+            else value=CommandResult.MAX_BYTES;
+            result=Math.min(CommandResult.MAX_BYTES,result+4+value);
+        }
+        long definition=RatisSnapshotPlan.definitionBytes(data.directories(),scope),status=TransactionStatus.HEADER_BYTES+DomainBinding.BYTES*(long)data.domains().size()+TransactionStatus.PARTICIPANT_BYTES*(long)routes.size();
+        long accepted=165L*routes.size()+body+spans+result-8;
+        long outer=243L+saved.token.encodedSize()+input+definition+status+accepted+40L*routes.size()+4L*returns+result;
+        long snapshot=RatisDurableSnapshot.futureBytes(definition,routes,saved.snapshotHomeBytes),child=RatisDurableTransaction.futureBytes(status,accepted,returns,routes,saved.transactionHomeBytes),receipt=receipts.futureBytes(saved.token);
+        if(outer>MAX_BYTES || receipt>2L*1024*1024)throw new IOException("Atomic future outer/receipt journal exceeds bound");
+        long routeBytes=0;for(var route:routes)routeBytes+=SessionWindowJournal.routeSize(route);
+        long retained=65536+3*input+2*body+2*spans+2*accepted+3*result+status+4*routeBytes+256L*(saved.mutations.size()+saved.predicates.size())+128*components+4096L*routes.size()+256L*data.domains().size();
+        retained=Math.max(retained,RatisAtomicClient.retainedGeometry(child));
+        // Outer/snapshot/receipt byte-stream encoding, plus nested main+sidecar child qualification/reopen.
+        long work=128*1024+Math.max(Math.max(6*outer,6*snapshot),Math.max(12*child,Math.max(6*receipt,5*(definition+57)+2*result+2*(body+105L*routes.size()))));
+        return new Geometry(outer,snapshot,child,receipt,retained,work);
+    }
+    private List<RatisJournalAccess.Reservation> journalGraph(Geometry geometry){return List.of(
+        new RatisJournalAccess.Reservation(input,Math.toIntExact(geometry.outer()),2*geometry.outer()),
+        new RatisJournalAccess.Reservation(root.resolve("released"),Math.toIntExact(geometry.receipt()),2*geometry.receipt()),
+        new RatisJournalAccess.Reservation(snapshot,Math.toIntExact(geometry.snapshot()),2*geometry.snapshot()),
         new RatisJournalAccess.Reservation(snapshot.resolveSibling("snapshot.lock"),32,0),
         new RatisJournalAccess.Reservation(snapshot.resolveSibling("snapshot.pending.lock"),32,0),
-        new RatisJournalAccess.Reservation(child,RatisDurableTransaction.MAX_BYTES,2L*RatisDurableTransaction.MAX_BYTES),
+        new RatisJournalAccess.Reservation(child,Math.toIntExact(geometry.child()),2*geometry.child()),
         new RatisJournalAccess.Reservation(child.resolveSibling("commit.lock"),32,0),
         new RatisJournalAccess.Reservation(child.resolveSibling("commit.pending.lock"),32,0));}
     private void requireOpen()throws IOException{if(closed || fenced)throw new IOException("Atomic owner closed or original force unresolved");}
@@ -101,7 +133,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
         if(saved.phase!=Phase.DONE || offset==1 || saved.result.encodedSize()>maximumBytes)return List.of();return List.of(saved.result.encode());
     }
     synchronized void acknowledge(RemoteMutationToken token,byte[] digest)throws IOException {
-        requireOpen();if(active)throw new IOException("Atomic actual work active");var retired=receipts.find(token);if(retired!=null){if(!Arrays.equals(retired.resultDigest(),digest))throw new IOException("Atomic acknowledged digest changed");return;}
+        requireOpen();if(active)throw new IOException("Atomic actual work active");var retired=receipts.find(token);if(retired!=null){if(!Arrays.equals(retired.resultDigest(),digest))throw new IOException("Atomic acknowledged digest changed");if(job!=null && job.acknowledged && job.token.equals(token))retire();return;}
         var saved=exact(token);if(saved.phase!=Phase.DONE || !Arrays.equals(RemoteMutationToken.digest(saved.result.encode()),digest))throw new IOException("Atomic ACK differs from forced terminal result");
         receipts.acknowledge(new RemoteMutationStatus(token,RemoteMutationStatus.State.ACKNOWLEDGED,saved.result.status()==CommandResult.Status.SUCCESS?saved.mutations.size():0,0,0,saved.result.status(),digest));saved.acknowledged=true;retire();
     }
@@ -130,7 +162,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
         }).thenCompose(ignored->{var acquired=lease.completion();return acquired.isCompletedExceptionally()?lease.resume(remaining(context,deadline)):acquired;}).thenCompose(ignored->work(context,deadline,()->{job.phase=Phase.STAGING;persist();return null;}))
           .thenCompose(ignored->lease.stage(changes(job),conditions(job),remaining(context,deadline)))
           .thenCompose(results->{
-              var rejected=results.entrySet().stream().sorted(Map.Entry.comparingByKey(RangeDirectoryCodec.UUID_ORDER)).map(Map.Entry::getValue).filter(result->result.status()!=CommandResult.Status.SUCCESS).findFirst();
+              var rejected=results.entrySet().stream().sorted(Comparator.<Map.Entry<UUID,CommandResult>>comparingInt(entry->entry.getValue().status()==CommandResult.Status.CONFLICT?0:1).thenComparing(Map.Entry::getKey,RangeDirectoryCodec.UUID_ORDER)).map(Map.Entry::getValue).filter(result->result.status()!=CommandResult.Status.SUCCESS).findFirst();
               if(rejected.isPresent())return rejectOutcome(rejected.get().status());
               return work(context,deadline,()->{job.accepted=lease.freezeAcceptance();job.phase=Phase.ACCEPTED;persist();return null;}).thenCompose(ignored->publish(context,deadline));
           });
@@ -149,7 +181,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
         return work(context,deadline,()->{
             if(operation==null && job.accepted!=null){recoverChildFile(child,RatisDurableTransaction.MAX_BYTES);if(!present(child))throw new IOException("Forced atomic result lost its exact child journal");validateAtomicFile(child);operation=atomic.reopen(child,remaining(context,deadline));}return null;
         }).thenCompose(ignored->{if(operation==null)return CompletableFuture.completedFuture(null);return operation.resume(remaining(context,deadline)).thenCompose(result->{if(!Arrays.equals(job.result.encode(),result.encode()))return CompletableFuture.failedFuture(new IOException("Original atomic child result changed"));return operation.consume(remaining(context,deadline));});})
-          .thenCompose(ignored->work(context,deadline,()->{if(operation!=null){operation.close();operation=null;}if(lease!=null && job.accepted!=null)lease.finishAcceptedOwnership();if(lease==null && cleanup==null && present(snapshot))cleanup=transactions.reopenForRelease(snapshot,remaining(context,deadline));return null;}))
+          .thenCompose(ignored->work(context,deadline,()->{if(operation!=null){operation.close();operation=null;}if(lease!=null && job.accepted!=null)lease.finishAcceptedOwnership();if(lease==null && cleanup==null){recoverChildFile(snapshot,RatisDurableSnapshot.MAX_BYTES);if(job.snapshotPublished && !present(snapshot))throw new IOException("Original atomic snapshot journal is missing; capture cleanup remains pending");if(present(snapshot))cleanup=transactions.reopenForRelease(snapshot,remaining(context,deadline));}return null;}))
           .thenCompose(ignored->lease!=null?lease.release(remaining(context,deadline)):cleanup!=null?cleanup.resume(remaining(context,deadline)):CompletableFuture.completedFuture(null))
           .thenCompose(ignored->work(context,deadline,()->{if(lease!=null){lease.close();lease=null;}if(cleanup!=null){cleanup.close();cleanup=null;}job.phase=Phase.DONE;persist();return null;}));
     }
@@ -180,12 +212,11 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
     private static Path pending(Path path){return path.resolveSibling(path.getFileName()+".pending");}
     private static boolean present(Path path){return Files.exists(path,LinkOption.NOFOLLOW_LINKS);}
     private static Throwable unwrap(Throwable failure){while((failure instanceof CompletionException || failure instanceof ExecutionException)&&failure.getCause()!=null)failure=failure.getCause();return failure;}
-    private long retained(Job saved){return 256*1024L+8*RemoteMutationInputs.atomicSize(saved.mutations,saved.predicates,saved.ttlMillis)+8L*CommandResult.MAX_BYTES+128*1024L*data.participants(scope(saved.mutations,saved.predicates)).size();}
     private void persist()throws IOException {
         try{budget.write(input,encode(job),MAX_BYTES);}catch(IOException|RuntimeException failure){fenced=true;throw failure;}
     }
     private byte[] encode(Job saved)throws IOException {
-        var bytes=new ByteArrayOutputStream();var out=new DataOutputStream(bytes);out.writeInt(0x52414d4f);blob(out,saved.token.encode());out.writeLong(saved.ttlMillis);out.writeLong(saved.expires);out.writeByte(saved.phase.ordinal());out.writeBoolean(saved.snapshotPublished);
+        var bytes=new ByteArrayOutputStream();var out=new DataOutputStream(bytes);out.writeInt(0x52414d4f);blob(out,saved.token.encode());out.writeLong(saved.ttlMillis);out.writeLong(saved.expires);out.writeByte(saved.phase.ordinal());out.writeBoolean(saved.snapshotPublished);out.writeLong(saved.snapshotHomeBytes);out.writeLong(saved.transactionHomeBytes);
         out.writeInt(saved.mutations.size());for(var m:saved.mutations){out.writeLong(m.column());key(out,m.key());out.writeByte(m.kind().ordinal());value(out,m.value());out.writeByte(m.returns().ordinal());}
         out.writeInt(saved.predicates.size());for(var p:saved.predicates){out.writeLong(p.column());key(out,p.key());value(out,p.expected());}
         out.writeBoolean(saved.identity!=null);if(saved.identity!=null){uuid(out,saved.identity.snapshot().fence());operation(out,saved.identity.snapshot().business());operation(out,saved.identity.snapshot().firstControl());uuid(out,saved.identity.commit().transaction());operation(out,saved.identity.commit().business());operation(out,saved.identity.commit().firstControl());}
@@ -196,7 +227,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
         try(var in=new DataInputStream(new ByteArrayInputStream(bytes))){
             if(in.readInt()!=0x52414d4f)throw new IOException("Invalid atomic owner journal");var saved=new Job();saved.token=RemoteMutationToken.decode(blob(in,RemoteMutationToken.MAX_BYTES));
             var authority=new RemoteMutationOwner(saved.token.clusterId(),saved.token.databaseId(),saved.token.ownerId(),saved.token.ownerEpoch(),saved.token.requestSequence(),saved.token.kind(),saved.token.domains());if(!authority(0).sameAuthority(authority))throw new IOException("Atomic original vector/owner changed");
-            saved.ttlMillis=in.readLong();saved.expires=in.readLong();int phase=in.readUnsignedByte();if(phase>=Phase.values().length)throw new IOException("Invalid atomic phase");saved.phase=Phase.values()[phase];saved.snapshotPublished=flag(in);
+            saved.ttlMillis=in.readLong();saved.expires=in.readLong();int phase=in.readUnsignedByte();if(phase>=Phase.values().length)throw new IOException("Invalid atomic phase");saved.phase=Phase.values()[phase];saved.snapshotPublished=flag(in);saved.snapshotHomeBytes=in.readLong();saved.transactionHomeBytes=in.readLong();if(saved.snapshotHomeBytes<snapshotHomes.futureRouteBytes() || saved.transactionHomeBytes<homes.futureRouteBytes() || saved.snapshotHomeBytes>4L*RangeDirectoryCodec.MAX_ENCODED_BYTES || saved.transactionHomeBytes>4L*RangeDirectoryCodec.MAX_ENCODED_BYTES)throw new IOException("Atomic sealed HOME geometry is understated or exceeds bounds");
             int count=count(in,256);var mutations=new ArrayList<AtomicMutation>(count);long inputBytes=0;
             for(int n=0;n<count;n++){long column=in.readLong();var key=key(in);int kind=in.readUnsignedByte();var value=value(in);int returns=in.readUnsignedByte();if(kind>Mutation.Kind.MERGE.ordinal() || returns>=Mutation.ReturnMode.values().length)throw new IOException("Invalid atomic input kind");mutations.add(new AtomicMutation(column,key,Mutation.Kind.values()[kind],value,Mutation.ReturnMode.values()[returns]));inputBytes=RemoteMutationInputs.atomicSize(mutations,List.of(),saved.ttlMillis);}
             count=count(in,256-mutations.size());var predicates=new ArrayList<AtomicPredicate>(count);for(int n=0;n<count;n++){predicates.add(new AtomicPredicate(in.readLong(),key(in),value(in)));inputBytes=RemoteMutationInputs.atomicSize(mutations,predicates,saved.ttlMillis);}
@@ -240,7 +271,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
     }
     private void recoverInput()throws IOException {
         Job main=present(input)?decode(budget.read(input,MAX_BYTES)):null;
-        if(present(pending(input))){var side=decode(budget.read(pending(input),MAX_BYTES));if(main!=null && (!side.token.equals(main.token) || side.expires!=main.expires || main.snapshotPublished && !side.snapshotPublished || side.phase.ordinal()<main.phase.ordinal() || main.identity!=null && !main.identity.equals(side.identity) || main.fence!=null && !main.fence.equals(side.fence) || main.result!=null && (side.result==null || !Arrays.equals(main.result.encode(),side.result.encode())) || main.accepted!=null && !sameAccepted(main.accepted,side.accepted)))throw new IOException("Atomic input sidecar changed original identity or regressed");main=side;forceRecovered(input,encode(main),MAX_BYTES);}
+        if(present(pending(input))){var side=decode(budget.read(pending(input),MAX_BYTES));if(main!=null && (!side.token.equals(main.token) || side.expires!=main.expires || side.snapshotHomeBytes!=main.snapshotHomeBytes || side.transactionHomeBytes!=main.transactionHomeBytes || main.snapshotPublished && !side.snapshotPublished || side.phase.ordinal()<main.phase.ordinal() || main.identity!=null && !main.identity.equals(side.identity) || main.fence!=null && !main.fence.equals(side.fence) || main.result!=null && (side.result==null || !Arrays.equals(main.result.encode(),side.result.encode())) || main.accepted!=null && !sameAccepted(main.accepted,side.accepted)))throw new IOException("Atomic input sidecar changed original identity or regressed");main=side;forceRecovered(input,encode(main),MAX_BYTES);}
         job=main;
     }
     private static boolean sameAccepted(RatisTransactionPlan.Accepted expected,RatisTransactionPlan.Accepted actual){
@@ -254,7 +285,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
     /** Qualification is synchronous and precedes reopen, whose asynchronous task may immediately contact HOME. */
     private void validateAtomicFile(Path path)throws IOException {
         if(job.accepted==null || job.identity==null)throw new IOException("Atomic child lacks forced outer acceptance/identity");
-        try(var workspace=budget.work(65536+4*RatisRequestBudget.files(path));var journal=RatisDurableTransaction.reopen(path,homes,data)){
+        try(var encoding=workspace.borrow(65536+4*RatisRequestBudget.files(path));var journal=RatisDurableTransaction.reopen(path,homes,data)){
             var saved=journal.snapshot();var accepted=new RatisTransactionPlan.Accepted(saved.initial(),saved.participants().stream().map(RatisDurableTransaction.ParticipantProgress::intent).toList());
             if(!sameAccepted(job.accepted,accepted) || !saved.initial().transactionId().equals(job.identity.commit().transaction()) || !saved.initial().operation().equals(job.identity.commit().business()))throw new IOException("Atomic child changed original public token definition/accepted intents");
         }
@@ -262,7 +293,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
     private void recoverChildFile(Path path,int maximum)throws IOException {
         if(!present(pending(path)))return;
         budget.register(pending(path).resolveSibling(pending(path).getFileName()+".lock"),32);
-        try(var workspace=budget.work(65536+4*RatisRequestBudget.files(path,pending(path)))){
+        try(var encoding=workspace.borrow(65536+4*RatisRequestBudget.files(path,pending(path)))){
             if(path.equals(snapshot)){
                 RatisDurableSnapshot.Snapshot side;
                 try(var retained=RatisDurableSnapshot.reopen(pending(path),snapshotHomes,data)){side=retained.snapshot();if(!side.initial().fence().equals(job.fence))throw new IOException("Snapshot sidecar changed original forced fence");}
@@ -282,7 +313,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
         for(var old:main.participants()){
             var next=side.participant(old.route().groupId());
             if(!old.route().equals(next.route()) || old.installFrozen() && !next.installFrozen() || old.releaseFrozen() && !next.releaseFrozen() || old.captureLost() && !next.captureLost() || old.captureReleased() && !next.captureReleased() || old.captureReleaseLost() && !next.captureReleaseLost()
-                    || old.capture()!=null && (next.capture()==null || !Arrays.equals(old.capture().bytes(),next.capture().bytes()))
+                    || old.capture()!=null && (next.capture()==null || !old.capture().sameRequest(next.capture()))
                     || old.captureToken()!=null && !old.captureToken().equals(next.captureToken()) || old.certifiedHandle()!=null && !old.certifiedHandle().equals(next.certifiedHandle())
                     || old.installReceipt()!=null && !old.installReceipt().equals(next.installReceipt()) || old.releaseReceipt()!=null && !old.releaseReceipt().equals(next.releaseReceipt()))throw new IOException("Snapshot sidecar changed original capture or regressed cleanup");
         }
@@ -291,7 +322,7 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
     private void retire()throws IOException {
         if(job==null)return;if(!job.acknowledged || job.phase!=Phase.DONE)throw new IOException("Original atomic result not acknowledged");
         for(var path:List.of(snapshot,child,input)){if(present(pending(path)))throw new IOException("Original atomic child publication unresolved");if(present(path))budget.remove(path,budget.read(path,RatisDurableTransaction.MAX_BYTES),RatisDurableTransaction.MAX_BYTES,SessionJournalFiles.FILESYSTEM);}
-        if(requestCredit!=null){requestCredit.close();requestCredit=null;}budget.fulfilled(journalGraph());job=null;
+        budget.fulfilled(journalGraph(geometry(job)));if(workspace!=null){workspace.close();workspace=null;}if(requestCredit!=null){requestCredit.close();requestCredit=null;}job=null;
     }
     private static int count(DataInputStream in,int maximum)throws IOException{int count=in.readInt();if(count<0 || count>maximum || count>in.available()/4)throw new IOException("Atomic journal count exceeds bound");return count;}
     private static boolean flag(DataInputStream in)throws IOException{int value=in.readUnsignedByte();if(value>1)throw new IOException("Invalid atomic boolean");return value==1;}
@@ -311,6 +342,6 @@ final class RatisAtomicMutationOwner implements AutoCloseable {
     @Override public void close()throws IOException {
         synchronized(this){if(closed)return;if(active)throw new IOException("Atomic actual work active; ownership retained");}
         if(fenced){persist();fenced=false;}if(operation!=null)operation.close();if(lease!=null){if(job!=null && job.accepted!=null)lease.finishAcceptedOwnership();lease.close();}if(cleanup!=null)cleanup.close();atomic.close();transactions.close();
-        lock.release();channel.close();if(requestCredit!=null)requestCredit.close();ownerCredit.close();synchronized(this){closed=true;}
+        lock.release();channel.close();if(workspace!=null)workspace.close();if(requestCredit!=null)requestCredit.close();ownerCredit.close();synchronized(this){closed=true;}
     }
 }

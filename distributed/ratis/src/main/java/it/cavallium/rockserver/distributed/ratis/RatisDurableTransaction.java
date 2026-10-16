@@ -78,12 +78,15 @@ public final class RatisDurableTransaction implements AutoCloseable {
     private RatisRequestBudget budget;
     private RatisRequestBudget.Lease retainedCredit;
     private RatisRequestBudget.Disk disk;
-    static long futureBytes(List<Intent> intents) throws IOException {
-        long size=2L*RangeDirectoryCodec.MAX_ENCODED_BYTES+4L*TransactionStatus.MAX_BYTES+HomeFenceProof.MAX_BYTES+65536L;
-        for(var intent:intents)size+=DistributedCommandCodec.encodedSize(intent.acceptedBusiness())+SessionWindowJournal.routeSize(intent.route())
-                +2L*ParticipantFinalization.MAX_BYTES+TransactionStatus.MAX_BYTES+2L*ParticipantFenceProof.MAX_BYTES+529;
-        if(size+32>MAX_BYTES)throw new IOException("Transaction future persistence capacity unavailable");
-        return size+32;
+    /** Checksum-inclusive current journal bound; status images retain the exact declared vector/participants. */
+    static long futureBytes(long statusBytes,long acceptedBytes,int returns,List<RangeDescriptor> routes,long homeRouteBytes)throws IOException {
+        long size=585+5*statusBytes+homeRouteBytes+acceptedBytes+4L*returns;
+        for(var route:routes)size=Math.addExact(size,SessionWindowJournal.routeSize(route)+398+4*statusBytes);
+        if(size>MAX_BYTES)throw new IOException("Transaction future persistence capacity unavailable");return size;
+    }
+    static long futureBytes(TransactionStatus initial,List<Intent> intents,RangeDescriptor home)throws IOException {
+        long accepted=0;int returns=0;for(var intent:intents){accepted+=DistributedCommandCodec.encodedSize(intent.acceptedBusiness());returns+=intent.resultPositions().size();}
+        return futureBytes(statusSize(initial),accepted,returns,intents.stream().map(Intent::route).toList(),SessionWindowJournal.routeSize(home)+RatisDurableSnapshot.futureRoute(home));
     }
     static RatisDurableTransaction createAccounted(Path path,RatisTransactionStatuses homes,RatisTransactionBindings data,TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents,RatisOperationRerouteAdmissionRpc.Evidence evidence,RatisRequestBudget budget,RatisRequestBudget.Lease retained)throws IOException {
         // Evidence counting traverses immutable directories/commands; even their defensive copies
@@ -97,7 +100,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
                 workspace.growTo(Math.max(workspace.amount,6*bound));
                 evidenceBytes=evidence.encode().length;
             }
-            retained.growTo(Math.max(retained.amount,RatisAtomicClient.retainedGeometry(futureBytes(intents)+evidenceBytes)));
+            retained.growTo(Math.max(retained.amount,RatisAtomicClient.retainedGeometry(futureBytes(initial,intents,registration.descriptor())+evidenceBytes)));
             return create(path,homes,data,initial,registration,intents,evidence,budget,retained,RatisJournalAccess.standalone());
         }
     }
@@ -174,9 +177,9 @@ public final class RatisDurableTransaction implements AutoCloseable {
             if(budget!=null)disk=budget.disk(path,MAX_BYTES);
             if (!create) {
                 long input=RatisRequestBudget.files(path,path.resolveSibling(path.getFileName()+".pending"));
-                try(var workspace=budget==null?null:budget.work(Math.addExact(65536,4*input))) {
+                try(var workspace=budget==null?null:budget.work(retainedCredit,Math.addExact(65536,4*input))) {
                     byte[] body=budget==null?journalAccess.read(path,MAX_BYTES):SessionJournalFiles.read(path,MAX_BYTES); decode(body); capacity();
-                    if(retainedCredit!=null)retainedCredit.growTo(Math.max(retainedCredit.amount,RatisAtomicClient.retainedGeometry(futureBytes(entries.values().stream().map(e->e.intent).toList()))));
+                    if(retainedCredit!=null)retainedCredit.growTo(Math.max(retainedCredit.amount,RatisAtomicClient.retainedGeometry(futureBytes(initial,entries.values().stream().map(e->e.intent).toList(),homeRoute))));
                     if (!Arrays.equals(body,encode())) throw new IOException("Noncanonical transaction journal");
                     SessionJournalFiles.force(path); SessionJournalFiles.force(path.getParent());
                 }
@@ -520,10 +523,10 @@ public final class RatisDurableTransaction implements AutoCloseable {
     public void reclaimRetired() throws IOException { reclaimRetired(SessionJournalFiles.FILESYSTEM); }
     void reclaimRetired(SessionJournalFiles.Removal io) throws IOException {
         final byte[] body;
-        RatisRequestBudget.Lease workspace=null;
+        RatisRequestBudget.Work workspace=null;
         synchronized (this) {
             requireOpen(); if (!reclaimable()) throw new IOException("Reclamation requires an idle consumed transaction and saved HOME retirement proof");
-            if(budget!=null)workspace=budget.work(Math.addExact(65536,3*encodedSize()));
+            if(budget!=null)workspace=budget.work(retainedCredit,Math.addExact(65536,3*encodedSize()));
             try{body=encode();active=true;}catch(Throwable failure){if(workspace!=null)workspace.close();throw failure;}
         }
         try {
@@ -538,8 +541,8 @@ public final class RatisDurableTransaction implements AutoCloseable {
     private void requireOpen() throws IOException { if (reclaimed) throw new IOException("Transaction journal reclaimed"); if (closed || fenced || !lock.isValid()) throw new IOException("Transaction journal closed/fenced; reopen it"); }
     private void idle() throws IOException { requireOpen(); if (homeRetirementProof!=null) throw new RatisHomeRetiredException(homeRetirementProof); if (active) throw new IOException("Transaction journal RPC already active"); }
     private void persist() throws IOException {
-        try (var workspace=budget==null?null:budget.work(Math.addExact(65536,3*encodedSize()))) {
-            long size=encodedSize();if(disk!=null)disk.prepareReplacement(size+32);
+        try (var workspace=budget==null?null:budget.work(retainedCredit,Math.addExact(65536,3*encodedSize()))) {
+            long size=encodedSize();if(disk!=null)disk.prepareOwnedReplacement(size+32);
             if(disk==null)journalAccess.write(path,encode(),MAX_BYTES);else{SessionJournalFiles.write(path,encode(),MAX_BYTES);disk.forcedReconcile();}
         }
         catch (IOException | RuntimeException failure) { fenced=true; if (failure instanceof IOException io) throw io; throw new IOException("Transaction journal persistence failed; reopen it",failure); }

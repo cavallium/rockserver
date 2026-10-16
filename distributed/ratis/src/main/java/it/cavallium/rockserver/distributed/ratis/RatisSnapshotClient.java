@@ -380,7 +380,12 @@ public final class RatisSnapshotClient implements AutoCloseable {
             for (var part:prefix.partitions()) {
                 var group=part.route().groupId(); var capture=binding.captures().get(group);
                 var result=stagedResults.get(group);
-                accepted.put(group,part.command().readCertification() ? part.command() : capture.participantIntent(part.command(),Objects.requireNonNull(result,"Missing settled stage result")));
+                if(!part.command().readCertification()){
+                    Objects.requireNonNull(result,"Missing settled stage result");if(result.status()!=CommandResult.Status.SUCCESS)throw new IOException("Rejected staged prefix cannot be accepted");
+                    long bytes=DistributedCommandCodec.encodedSize(part.command())+4L+TransactionAcceptance.encodedSize(part.scope(),result.encodedSize());
+                    if(bytes>DistributedCommandCodec.MAX_ENCODED_BYTES)throw new RatisStagedResultTooLargeException();
+                }
+                accepted.put(group,part.command().readCertification() ? part.command() : capture.participantIntent(part.command(),result));
                 prepares.put(group,new OperationId(identity.firstControl().sessionId(),identity.firstControl().epoch(),identity.firstControl().sequence()+n));
                 finalizes.put(group,new OperationId(identity.firstControl().sessionId(),identity.firstControl().epoch(),identity.firstControl().sequence()+64+n++));
             }

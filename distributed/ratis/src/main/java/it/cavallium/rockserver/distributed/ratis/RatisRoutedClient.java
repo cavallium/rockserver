@@ -349,11 +349,12 @@ public final class RatisRoutedClient implements AutoCloseable {
     }
 
     public static final class PreparedSnapshotCapture {
-        private final SnapshotTarget target; private final RatisSnapshotCaptureRequest request; private final byte[] bytes;
-        private PreparedSnapshotCapture(SnapshotTarget target,RatisSnapshotCaptureRequest request) { this.target=target; this.request=request; bytes=ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_CAPTURE,request.encode()); }
+        private final SnapshotTarget target; private final RatisSnapshotCaptureRequest request;
+        private PreparedSnapshotCapture(SnapshotTarget target,RatisSnapshotCaptureRequest request) { this.target=target; this.request=request; }
         public SnapshotTarget target() { return target; }
         public RatisSnapshotCaptureRequest request() { return request; }
-        public byte[] bytes() { return bytes.clone(); }
+        public byte[] bytes() { return ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_CAPTURE,request.encode()); }
+        boolean sameRequest(PreparedSnapshotCapture other){return other!=null && target.descriptor().equals(other.target.descriptor()) && target.replica().equals(other.target.replica()) && request.equals(other.request); }
     }
     public PreparedSnapshotCapture prepareSnapshotCapture(SnapshotTarget target,UUID snapshotId,java.time.Duration ttl) {
         if(snapshotCleanup!=null)throw new IllegalStateException("Frozen snapshot cleanup view cannot create captures");
@@ -386,14 +387,14 @@ public final class RatisRoutedClient implements AutoCloseable {
     }
     CompletableFuture<RatisSnapshotCaptureRequest.Result> executeCaptureAsync(PreparedSnapshotCapture operation){
         Objects.requireNonNull(operation);requireIdentity(operation.target.source);
-        return snapshotAsync(()->transport.snapshot(operation.target.descriptor,operation.target.replica,operation.bytes).thenApply(bytes->{try{
+        return snapshotAsync(()->transport.snapshot(operation.target.descriptor,operation.target.replica,operation.bytes()).thenApply(bytes->{try{
             var response=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REPLY_BYTES);if(response.kind()!=ScopedTransactionRpc.SNAPSHOT_CAPTURE)throw new IllegalArgumentException("Capture reply opcode changed");return operation.request.resultBinding(response.body());
         }catch(IllegalArgumentException malformed){throw new CompletionException(new IOException("Invalid capture reply",malformed));}
         catch(IOException failure){throw new CompletionException(failure);}}));
     }
     private RatisSnapshotCaptureRequest.Result executeCapture(PreparedSnapshotCapture operation) throws IOException {
         Objects.requireNonNull(operation); requireIdentity(operation.target.source);
-        try{return awaitSnapshot(snapshotAsync(()->transport.snapshot(operation.target.descriptor,operation.target.replica,operation.bytes).thenApply(bytes->{var response=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REPLY_BYTES);if(response.kind()!=ScopedTransactionRpc.SNAPSHOT_CAPTURE)throw new IllegalArgumentException("Capture reply opcode changed");try{return operation.request.resultBinding(response.body());}catch(IOException lost){throw new CompletionException(lost);}})));}catch(IllegalArgumentException invalid){throw new IOException("Invalid capture reply",invalid);}
+        try{return awaitSnapshot(snapshotAsync(()->transport.snapshot(operation.target.descriptor,operation.target.replica,operation.bytes()).thenApply(bytes->{var response=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REPLY_BYTES);if(response.kind()!=ScopedTransactionRpc.SNAPSHOT_CAPTURE)throw new IllegalArgumentException("Capture reply opcode changed");try{return operation.request.resultBinding(response.body());}catch(IOException lost){throw new CompletionException(lost);}})));}catch(IllegalArgumentException invalid){throw new IOException("Invalid capture reply",invalid);}
     }
 
     public static final class PreparedSnapshotOperation {
@@ -939,7 +940,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     private final class SnapshotCleanupTransport implements Transport {
         final RangeDirectory frozen;final SnapshotFence fence;private final java.util.Map<UUID,PreparedSnapshotCapture> captures=new java.util.HashMap<>();private boolean released;
         SnapshotCleanupTransport(RangeDirectory frozen,SnapshotFence fence){this.frozen=frozen;this.fence=fence;}
-        synchronized void restore(PreparedSnapshotCapture original)throws IOException{route(original.target.descriptor);if(!fence.equals(original.request.fence()) || original.request.mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY)throw denied();var previous=captures.putIfAbsent(original.target.descriptor.groupId(),original);if(previous!=null&&!Arrays.equals(previous.bytes,original.bytes))throw denied();}
+        synchronized void restore(PreparedSnapshotCapture original)throws IOException{route(original.target.descriptor);if(!fence.equals(original.request.fence()) || original.request.mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY)throw denied();var previous=captures.putIfAbsent(original.target.descriptor.groupId(),original);if(previous!=null&&!previous.sameRequest(original))throw denied();}
         private IOException denied(){return new IOException("Frozen snapshot cleanup view cannot create captures or perform USER work");}
         private void route(RangeDescriptor route)throws IOException{if(frozen.ranges().stream().noneMatch(route::equals) || fence.participants().stream().noneMatch(p->p.groupId().equals(route.groupId())))throw denied();}
         private void record(RangeDescriptor route,byte[] bytes,boolean release)throws IOException{route(route);var record=RatisSnapshotRecord.decode(bytes);if(!fence.equals(record.fence()) || !route.groupId().equals(record.participantGroup()) || release&&!record.isRelease())throw denied();}
@@ -961,7 +962,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{transactionRequest(route,bytes);return transport.transaction(route,bytes,fresh);}
         public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{transactionRequest(route,bytes);return transport.transactionAsync(route,bytes,fresh);}
         public CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] bytes)throws IOException{route(route);var packet=ScopedTransactionRpc.parse(bytes,RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);switch(packet.kind()){
-            case ScopedTransactionRpc.SNAPSHOT_CAPTURE -> {PreparedSnapshotCapture original;synchronized(this){original=captures.get(route.groupId());}if(original==null || !original.target.replica.equals(owner) || !Arrays.equals(original.bytes,bytes))throw denied();}
+            case ScopedTransactionRpc.SNAPSHOT_CAPTURE -> {PreparedSnapshotCapture original;synchronized(this){original=captures.get(route.groupId());}if(original==null || !original.target.replica.equals(owner) || !Arrays.equals(original.bytes(),bytes))throw denied();}
             case ScopedTransactionRpc.SNAPSHOT_RELEASE -> {var input=ByteBuffer.wrap(packet.body());if(!ScopedTransactionRpc.snapshotBinding(input).equals(ScopedTransactionRpc.SnapshotBinding.of(fence)))throw denied();var token=ScopedTransactionRpc.snapshotToken(input);PreparedSnapshotCapture original;synchronized(this){original=captures.get(route.groupId());}if(original==null || !original.target.replica.equals(owner) || !original.request.snapshotId().equals(token.snapshotId()) || !original.request.owner().equals(token.ownerIncarnation()))throw denied();}
             case ScopedTransactionRpc.EXPORT_RELEASE -> {var request=RatisExportSourceRpc.ReleaseRequest.decode(packet.body());PreparedSnapshotCapture original;synchronized(this){original=captures.get(route.groupId());}if(!fence.equals(request.definition().fence()) || !route.groupId().equals(request.definition().group()) || original==null || !original.target.replica.equals(owner) || !original.request.snapshotId().equals(request.definition().capture().snapshotId()) || !original.request.owner().equals(request.definition().capture().ownerIncarnation()))throw denied();}
             case RatisSnapshotCohortRpc.STATE,RatisSnapshotCohortRpc.CANCEL -> {}

@@ -110,20 +110,19 @@ public final class RatisAtomicClient implements AutoCloseable {
                 || !initial.clusterId().equals(data.clusterId()) || !initial.databaseId().equals(data.databaseId()) || !initial.domains().equals(data.authority())
                 || !Arrays.equals(initial.planDigest(),RatisDurableTransaction.planDigest(accepted.intents())) || accepted.intents().size()!=initial.participants().size()) throw new IllegalArgumentException("Accepted projection differs from reserved atomic identity/schema");
         var ordered=accepted.intents().stream().sorted(Comparator.comparing(i -> i.route().groupId(),RangeDirectoryCodec.UUID_ORDER)).toList();
-        var groups=new HashSet<UUID>(); long bytes=64*1024L+2*1024*1024L; int n=0;
+        var groups=new HashSet<UUID>(); int n=0;
         for (var intent:ordered) {
             if (!groups.add(intent.route().groupId()) || intent.captureId()==null || !intent.acceptedBusiness().operationId().equals(identity.business())
                     || !intent.prepareControl().equals(identity.control(n)) || !intent.finalizeControl().equals(identity.control(64+n++))) throw new IllegalArgumentException("Accepted projection changed its original handles or control block");
             var participant=initial.participants().stream().filter(p -> p.groupId().equals(intent.route().groupId())).findFirst().orElseThrow();
             if (!participant.rangeId().equals(intent.route().rangeId()) || participant.rangeEpoch()!=intent.route().rangeEpoch() || !Arrays.equals(participant.planDigest(),intent.acceptedBusiness().payloadDigest())) throw new IllegalArgumentException("Accepted participant differs from HOME definition");
             data.restoreTransaction(intent); // Pure binding validation; this never issues OPEN or reads latest data.
-            bytes+=2L*DistributedCommandCodec.encodedSize(intent.acceptedBusiness())+2L*SessionWindowJournal.routeSize(intent.route())+64*1024L;
         }
-        if (bytes>RatisDurableTransaction.MAX_BYTES) throw new IOException("Accepted projection exceeds retained journal capacity");
         RatisDurableTransaction.validateResultPlan(accepted.intents());
         var expected=initial.origin()==null ? null : TransactionStatus.reserve(initial.origin(),initial.domains().getFirst());
         if(expected!=null && (!initial.origin().firstControl().equals(identity.firstControl()) || !Arrays.equals(initial.origin().targetDirectoryDigest(),singletonDirectoryDigest())))throw new IllegalArgumentException("Accepted reserved projection changed target/control binding");
         var registration=homes.prepare(identity.control(128),expected,initial);
+        long bytes=RatisDurableTransaction.futureBytes(initial,accepted.intents(),registration.descriptor());
         var operation=admit(path,identity,null,null,bytes,accepted,registration); operation.beginExecution(context,deadline); return operation;
     }
     Operation executePlan(Path journal,Identity identity,RatisTransactionPlan plan,Duration ttl,RequestContext context,long deadline) throws IOException {
@@ -159,7 +158,7 @@ public final class RatisAtomicClient implements AutoCloseable {
         if (operations.size()>=limits.operations() || budget==null && bytes>limits.bytes()-chargedBytes) throw new IOException("Atomic operation/byte capacity exhausted");
         var credit=budget==null ? null : Objects.requireNonNull(retainedCredit.get());
         if(credit!=null) {
-            if(identity==null)bytes=Math.max(256L*1024,RatisRequestBudget.files(path,path.resolveSibling(path.getFileName()+".pending")));
+            if(identity==null)bytes=Math.max(1,RatisRequestBudget.files(path));
             credit.growTo(Math.max(credit.amount,retainedGeometry(bytes)));
         }
         var operation=new Operation(path,identity,plan,ttl,bytes,credit); operation.initialization=accepted; operation.registration=registration;

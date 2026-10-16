@@ -26,9 +26,10 @@ public final class RatisSnapshotPlan {
         for(var span:scope.spans()){var directory=column(directories,span.columnId());var ranges=span.isPoint()?List.of(directory.route(span.columnId(),span.lowerInclusive())):directory.intersect(span.columnId(),span.lowerInclusive(),span.upperExclusive(),false);for(var range:ranges){selected.putIfAbsent(range.groupId(),range);if(selected.size()>SnapshotFence.MAX_PARTICIPANTS)throw new IllegalArgumentException("Aggregate transaction participant budget exceeded");}}
         return List.copyOf(selected.values());
     }
-    private record Projection(List<RangeDescriptor> routes,Map<UUID,List<TransactionScope.Span>> scopes,List<DomainBinding> authority) {}
+    private record Projection(List<RangeDescriptor> routes,Map<UUID,List<TransactionScope.Span>> scopes,List<DomainBinding> authority,long bytes) {}
     /** Exact clipped wire envelope validation, without allocating a transaction or any operation identity. */
     public static void preflight(List<RangeDirectory> directories,TransactionScope scope){project(directories,scope);}
+    static long definitionBytes(List<RangeDirectory> directories,TransactionScope scope){return project(directories,scope).bytes();}
     private static Projection project(List<RangeDirectory> directories,TransactionScope scope){
         var routes=participants(directories,scope);var used=new HashSet<UUID>();for(var route:routes)used.add(group(directories,route.groupId()).domainId());
         var authority=DomainBinding.canonical(directories.stream().filter(directory->used.contains(directory.domainId())).map(DomainBinding::of).toList());
@@ -45,7 +46,7 @@ public final class RatisSnapshotPlan {
                 spans.add(span.isPoint()?TransactionScope.Span.point(span.columnId(),lower):TransactionScope.Span.range(span.columnId(),lower,upper));
             }
         }
-        return new Projection(routes,Map.copyOf(scopes),authority);
+        return new Projection(routes,Map.copyOf(scopes),authority,bytes);
     }
     public static RatisSnapshotPlan create(List<RangeDirectory> directories,TransactionScope scope,UUID fenceId,OperationId business,UUID homeGroup,long homeEpoch,OperationId firstControl) {
         Objects.requireNonNull(scope);Objects.requireNonNull(fenceId);Objects.requireNonNull(business);Objects.requireNonNull(homeGroup);Objects.requireNonNull(firstControl);

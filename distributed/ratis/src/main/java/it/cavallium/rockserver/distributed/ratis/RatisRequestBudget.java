@@ -35,18 +35,38 @@ final class RatisRequestBudget implements AutoCloseable,RatisJournalAccess {
         Lease opened(long retainedBytes,boolean retained){synchronized(RatisRequestBudget.this){if(released || opened || retainedBytes<0 || !retained && retainedBytes!=0)throw new IllegalStateException("Owner opening credit unavailable");if(retained && requests>=limits.maximumRequests())throw RocksDBException.of(SERVER_OVERLOADED,"Shared retained request count exhausted");long replacement=Math.addExact(base,retainedBytes),delta=replacement-charged;if(delta>0)capacity(delta);bytes+=delta;charged=base;opened=true;if(retained){requests++;requestCounts.merge(kind,1,Integer::sum);return new Lease(kind,retainedBytes,true);}return null;}}
         /** ACKed cold state needs cleanup workspace, not a new retained public request or a second opening reservation. */
         Lease openedWorkspace(long minimum){synchronized(RatisRequestBudget.this){if(released || opened || minimum<0)throw new IllegalStateException("Owner opening credit unavailable");long amount=Math.max(minimum,charged-base),delta=Math.addExact(base,amount)-charged;if(delta>0)capacity(delta);bytes+=delta;charged=base;opened=true;works++;return new Lease(null,amount,false);}}
+        void retainTo(long target){synchronized(RatisRequestBudget.this){if(released || !opened || target<0)throw new IllegalStateException("Owner metadata unavailable");if(target>charged){capacity(target-charged);bytes+=target-charged;charged=target;}}}
         @Override public void close(){synchronized(RatisRequestBudget.this){if(released)return;released=true;owners--;ownerCounts.merge(kind,-1,Integer::sum);bytes-=charged;}}
     }
     synchronized Lease request(RemoteMutationToken.Kind kind,long amount){kind(kind);if(requests>=limits.maximumRequests())throw RocksDBException.of(SERVER_OVERLOADED,"Shared remote request count exhausted");capacity(amount);requests++;requestCounts.merge(kind,1,Integer::sum);bytes+=amount;return new Lease(kind,amount,true);}
     synchronized Lease work(long amount){capacity(amount);works++;bytes+=amount;return new Lease(null,amount,false);}
-    final class Lease implements AutoCloseable {
-        volatile long amount;final RemoteMutationToken.Kind kind;final boolean request;private boolean released;
+    interface Work extends AutoCloseable {@Override void close();}
+    final class Lease implements Work {
+        volatile long amount;final RemoteMutationToken.Kind kind;final boolean request;private boolean released;private Workspace prepaid;
         private final RatisRequestBudget budget=RatisRequestBudget.this;
         Lease(RemoteMutationToken.Kind kind,long amount,boolean request){this.kind=kind;this.amount=amount;this.request=request;}
+        void prepaid(Workspace workspace){synchronized(RatisRequestBudget.this){if(released || prepaid!=null)throw new IllegalStateException("Request workspace already bound");prepaid=Objects.requireNonNull(workspace);}}
         void growTo(long target){synchronized(RatisRequestBudget.this){if(released || target<amount)throw new IllegalStateException("Invalid credit growth");capacity(target-amount);bytes+=target-amount;amount=target;}}
         void shrinkTo(long target){synchronized(RatisRequestBudget.this){if(released || target<0 || target>amount)throw new IllegalStateException("Invalid credit shrink");bytes-=amount-target;amount=target;}}
         void transferTo(Lease target,long transferred){synchronized(RatisRequestBudget.this){if(target==this || target.budget!=budget || released || target.released || transferred<0 || transferred>amount)throw new IllegalStateException("Invalid credit transfer");long replacement=Math.addExact(target.amount,transferred);amount-=transferred;target.amount=replacement;}}
         @Override public void close(){synchronized(RatisRequestBudget.this){if(released)return;released=true;bytes-=amount;amount=0;if(request){requests--;requestCounts.merge(kind,-1,Integer::sum);}else works--;}}
+    }
+    Work work(Lease retained,long amount){return retained!=null && retained.prepaid!=null?retained.prepaid.borrow(amount):work(amount);}
+    /** A single admitted future workspace, lent to actual encoders without charging the same bytes again. */
+    Workspace workspace(long amount){return new Workspace(work(amount));}
+    final class Workspace implements AutoCloseable {
+        private final Lease credit;private int borrowed;private boolean released;
+        Workspace(Lease credit){this.credit=credit;}
+        final class Use implements Work {
+            private final Lease memory;private boolean returned;
+            Use(Lease memory){this.memory=memory;}
+            @Override public void close(){synchronized(Workspace.this){if(returned)return;memory.transferTo(credit,memory.amount);memory.close();returned=true;borrowed--;}}
+        }
+        synchronized Use borrow(long amount){
+            if(released || amount<0 || amount>credit.amount)throw RocksDBException.of(SERVER_OVERLOADED,"Admitted journal workspace exceeded");
+            var memory=work(0);try{credit.transferTo(memory,amount);borrowed++;return new Use(memory);}catch(RuntimeException failure){memory.close();throw failure;}
+        }
+        @Override public synchronized void close(){if(released)return;if(borrowed!=0)throw new IllegalStateException("Actual journal work still owns prepaid workspace");credit.close();released=true;}
     }
     <T> CompletableFuture<T> recover(Callable<T> work){var result=new CompletableFuture<T>();try{recovery.execute(()->{try{result.complete(work.call());}catch(Throwable failure){result.completeExceptionally(failure);}});}catch(RuntimeException failure){result.completeExceptionally(failure);}return result;}
     RecoveryCredit recoveryCredit(){synchronized(this){if(closed || recoveryOwners>=limits.recoveryWorkers())throw RocksDBException.of(SERVER_OVERLOADED,"Shared recovery owners exhausted");recoveryOwners++;return new RecoveryCredit();}}
@@ -63,7 +83,8 @@ final class RatisRequestBudget implements AutoCloseable,RatisJournalAccess {
         void prepareReplacement(long encodedBytes){synchronized(RatisRequestBudget.this){if(!owned || encodedBytes<32 || encodedBytes>maximum)throw new IllegalStateException("Invalid journal replacement geometry");long peak=Math.addExact(amount,encodedBytes);diskCapacity(peak-amount);diskBytes+=peak-amount;amount=peak;}}
         void forcedReconcile()throws IOException{long actual=inventory();synchronized(RatisRequestBudget.this){if(!owned)throw new IllegalStateException("Journal disk ownership released");actual=Math.max(actual,reservedPeak);if(actual>amount){diskCapacity(actual-amount);diskBytes+=actual-amount;}else diskBytes-=amount-actual;amount=actual;}}
         void reservePeak(long peak){synchronized(RatisRequestBudget.this){if(!owned || peak<0)throw new IllegalStateException("Invalid journal promise");if(peak>amount){diskCapacity(peak-amount);diskBytes+=peak-amount;amount=peak;}reservedPeak=Math.max(reservedPeak,peak);}}
-        void prepareOwnedReplacement(long encodedBytes)throws IOException {long actual=inventory();synchronized(RatisRequestBudget.this){if(!owned || encodedBytes<32 || encodedBytes>maximum)throw new IOException("Invalid journal replacement geometry");long peak=Math.max(amount,Math.addExact(actual,encodedBytes));diskCapacity(peak-amount);diskBytes+=peak-amount;amount=peak;}}
+        /** Caller owns the journal lock and has qualified any old sidecar before replacing that same pending path. */
+        void prepareOwnedReplacement(long encodedBytes)throws IOException {long main=file(path,maximum),side=file(pending,maximum);synchronized(RatisRequestBudget.this){if(!owned || encodedBytes<32 || encodedBytes>maximum)throw new IOException("Invalid journal replacement geometry");long peak=Math.max(amount,Math.addExact(main,Math.max(side,encodedBytes)));diskCapacity(peak-amount);diskBytes+=peak-amount;amount=peak;}}
         void releasePromise()throws IOException {SessionJournalFiles.force(path.getParent());if(Files.exists(path,LinkOption.NOFOLLOW_LINKS))SessionJournalFiles.force(path);long actual=inventory();synchronized(RatisRequestBudget.this){if(!owned)throw new IllegalStateException("Journal ownership released");if(actual>amount){diskCapacity(actual-amount);diskBytes+=actual-amount;}else diskBytes-=amount-actual;amount=actual;reservedPeak=0;}}
         long debt(){synchronized(RatisRequestBudget.this){return amount;}}
         @Override public void close(){synchronized(RatisRequestBudget.this){if(!owned)return;owned=false;diskOwners--;}}
@@ -74,7 +95,7 @@ final class RatisRequestBudget implements AutoCloseable,RatisJournalAccess {
         // Two UnixPath objects retain UTF-8 arrays, cached UTF-16 strings and component-offset arrays.
         // Include object/array/map headers and the longer pending suffix before registry retention.
         long actual=Math.addExact(file(path,maximum),file(path.resolveSibling(path.getFileName()+".pending"),maximum));long metadata=Math.addExact(2048L,Math.multiplyExact(32L,Math.addExact(text.length(),8L)));
-        synchronized(this){if(closed)throw new IOException("Shared journal budget closed");var existing=journals.get(path);if(existing!=null){if(existing.owned)throw new IOException("Journal already owned");if(actual>existing.amount){diskCapacity(actual-existing.amount);diskBytes+=actual-existing.amount;existing.amount=actual;}existing.maximum=maximum;existing.owned=true;diskOwners++;return existing;}
+        synchronized(this){if(closed)throw new IOException("Shared journal budget closed");var existing=journals.get(path);if(existing!=null){if(existing.owned)throw new IOException("Journal already owned");if(actual>existing.amount){diskCapacity(actual-existing.amount);diskBytes+=actual-existing.amount;existing.amount=actual;}if(existing.reservedPeak==0)existing.maximum=maximum;existing.owned=true;diskOwners++;return existing;}
             if(journals.size()>=limits.maximumJournalPaths())throw RocksDBException.of(SERVER_OVERLOADED,"Shared journal path registry exhausted");capacity(metadata);diskCapacity(actual);var created=new Disk(path,maximum,actual);created.owned=true;journals.put(path,created);bytes+=metadata;pathBytes+=metadata;diskBytes+=actual;diskOwners++;return created;}
     }
     @Override public synchronized RatisJournalAccess.RootLease backendRoot(Path input)throws IOException {if(closed)throw new IOException("Shared backend capability closed");Path root=input.toAbsolutePath().normalize();if(backendRoot==null || backendRoot.released())backendRoot=new RatisBackendRootOwnership(root,this);return backendRoot.retain(root);}

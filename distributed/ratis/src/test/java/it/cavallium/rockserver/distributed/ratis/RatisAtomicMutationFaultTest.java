@@ -57,8 +57,11 @@ class RatisAtomicMutationFaultTest {
             doAnswer(invocation->{Path file=invocation.getArgument(0);if(file.equals(path.resolve("snapshot")) && failDelete.getAndSet(false))throw new IOException("Lost cleanup after forced public ACK");return invocation.callRealMethod();}).when(budget).remove(any(Path.class),any(byte[].class),anyInt(),any(SessionJournalFiles.Removal.class));
             try(var actor=singleton(f,allocations,path,budget)){
                 var original=prepare(actor,2);await(actor.execute(original,CONTEXT).observer());var digest=actor.status(original).resultDigest();assertThrows(IOException.class,()->actor.acknowledge(original,digest));assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,actor.status(original).state());
-                var next=prepare(actor,200);assertEquals(1,next.requestSequence());assertEquals(1,allocations.count.get());assertTrue(budget.chargedDiskBytes()>300L*1024*1024);
-                assertThrows(RuntimeException.class,()->budget.preflight(List.of(new RatisJournalAccess.Reservation(root.resolve("competing"),128*1024*1024,256L*1024*1024))));assertEquals(RemoteMutationStatus.State.PREPARED,actor.status(next).state());
+                var next=prepare(actor,200);assertEquals(1,next.requestSequence());assertEquals(1,allocations.count.get());
+                long actual;try(var files=Files.walk(path)){actual=files.filter(Files::isRegularFile).mapToLong(file->{try{return Files.size(file);}catch(IOException failure){throw new UncheckedIOException(failure);}}).sum();}
+                long promised=budget.chargedDiskBytes();assertTrue(promised>actual+65536,"Prepared request must retain its future main+pending promise");
+                long competing=budget.limits().maximumDiskBytes()-actual-8192;assertTrue(actual+competing<budget.limits().maximumDiskBytes());assertTrue(promised+competing>budget.limits().maximumDiskBytes());
+                assertThrows(RuntimeException.class,()->budget.preflight(List.of(new RatisJournalAccess.Reservation(root.resolve("competing"),Math.toIntExact((competing+1)/2),competing))));assertEquals(RemoteMutationStatus.State.PREPARED,actor.status(next).state());
             }
         }
     }

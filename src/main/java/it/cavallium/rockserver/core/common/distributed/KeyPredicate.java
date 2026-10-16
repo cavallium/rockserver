@@ -37,7 +37,7 @@ public final class KeyPredicate {
     public byte[] expectedValue() { return expectedValue == null ? null : expectedValue.clone(); }
     public boolean bucket() { return bucket; }
     public List<byte[]> memberKeys() { return Mutation.copyMembers(memberKeys); }
-    int encodedSize() { return 25 + key.length + (expectedValue == null ? 0 : expectedValue.length) + (bucket ? Mutation.memberBytes(memberKeys) : 0); }
+    public int encodedSize() { return 25 + key.length + (expectedValue == null ? 0 : expectedValue.length) + (bucket ? Mutation.memberBytes(memberKeys) : 0); }
 
     @Override public boolean equals(Object other) {
         return other instanceof KeyPredicate predicate && columnId.equals(predicate.columnId)

@@ -22,6 +22,14 @@ final class RatisRemoteMutationReceipts {
             }catch(RuntimeException malformed){throw new IOException("Invalid retirement floor",malformed);}
         } else {if(used)throw new IOException("Used mutation owner lost its retirement floor");persist();}
     }
+    /** Checksum-inclusive next bind/ACK image; one request can add at most one retained receipt. */
+    synchronized long futureBytes(RemoteMutationToken token)throws IOException {
+        requireOpen();requireAuthority(token);long bytes=token.encodedSize();int count=receipts.size();
+        return 77+Math.max(bytes+count*(bytes+49),Math.min(MAXIMUM,count+1)*(bytes+49));
+    }
+    synchronized long retainedBytesAfterNext(RemoteMutationToken token)throws IOException {
+        return 4096+4*futureBytes(token)+1024L*Math.min(MAXIMUM,receipts.size()+1);
+    }
     private byte[] binding(){return RemoteMutationToken.digest(new RemoteMutationToken(authority.clusterId(),authority.databaseId(),authority.ownerId(),authority.ownerId(),authority.ownerEpoch(),0,authority.kind(),authority.domains(),new byte[32]).encode());}
     private void requireOpen() throws IOException {if(fenced)throw new IOException("Retirement force uncertain; reopen original owner");}
     private void requireAuthority(RemoteMutationToken token) throws IOException {var descriptor=new RemoteMutationOwner(token.clusterId(),token.databaseId(),token.ownerId(),token.ownerEpoch(),0,token.kind(),token.domains());if(!authority.sameAuthority(descriptor))throw new IOException("Mutation owner authority changed");}

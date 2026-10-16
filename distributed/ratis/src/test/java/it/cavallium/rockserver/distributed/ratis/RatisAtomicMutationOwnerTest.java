@@ -78,7 +78,7 @@ class RatisAtomicMutationOwnerTest {
             var snapshotPlacement=f.plan.home(RatisNodePlan.Role.SNAPSHOT_HOME);var transactionPlacement=f.plan.home(RatisNodePlan.Role.TRANSACTION_HOME);
             try(var snapshotRoute=f.transactionHome(RatisNodePlan.Role.SNAPSHOT_HOME);var transactionRoute=f.transactionHome(RatisNodePlan.Role.TRANSACTION_HOME);var budget=new RatisRequestBudget(RemoteMutationOwnerLimits.defaults())){
                 var bindings=f.transactionBindings();var snapshots=new RatisSnapshotFences(snapshotRoute,snapshotPlacement.column());var homes=new RatisTransactionStatuses(transactionRoute,transactionPlacement.column());
-                try(var allocator=f.transactionAllocator(allocatorRoot,bindings,snapshotRoute,transactionRoute);var owner=new RatisAtomicMutationOwner(bindings,snapshots,homes,f.transactionScheduler(),allocator,ownerRoot,budget)){
+                try(var allocator=f.transactionAllocator(allocatorRoot,bindings,snapshotRoute,transactionRoute,RatisJournalAccess.standalone());var owner=new RatisAtomicMutationOwner(bindings,snapshots,homes,f.transactionScheduler(),allocator,ownerRoot,budget)){
                     var authority=owner.owner();token=owner.prepare(authority,UUID.randomUUID(),authority.nextRequestSequence(),List.of(put(72,secondKey(),61,Mutation.ReturnMode.PREVIOUS),put(71,firstKey(),62,Mutation.ReturnMode.PREVIOUS)),List.of(),30000);
                     f.loseCommitReply=true;assertThrows(ExecutionException.class,()->await(owner.execute(token,CONTEXT).observer()));original=captures(f);assertEquals(2,original.size());
                 }
@@ -86,7 +86,7 @@ class RatisAtomicMutationOwnerTest {
             long epochs=f.transactionEpoch();f.reopenTransactionDataPools();
             try(var snapshotRoute=f.transactionHome(RatisNodePlan.Role.SNAPSHOT_HOME);var transactionRoute=f.transactionHome(RatisNodePlan.Role.TRANSACTION_HOME);var budget=new RatisRequestBudget(RemoteMutationOwnerLimits.defaults())){
                 var bindings=f.transactionBindings();var snapshots=new RatisSnapshotFences(snapshotRoute,snapshotPlacement.column());var homes=new RatisTransactionStatuses(transactionRoute,transactionPlacement.column());
-                try(var allocator=f.transactionAllocator(allocatorRoot,bindings,snapshotRoute,transactionRoute);var owner=new RatisAtomicMutationOwner(bindings,snapshots,homes,f.transactionScheduler(),allocator,ownerRoot,budget)){
+                try(var allocator=f.transactionAllocator(allocatorRoot,bindings,snapshotRoute,transactionRoute,RatisJournalAccess.standalone());var owner=new RatisAtomicMutationOwner(bindings,snapshots,homes,f.transactionScheduler(),allocator,ownerRoot,budget)){
                     await(owner.execute(token,CONTEXT).observer());var status=owner.status(token);assertEquals(CommandResult.Status.SUCCESS,status.outcome());var saved=CommandResult.decode(owner.resultPage(token,0,1,CommandResult.MAX_BYTES).getFirst());assertArrayEquals(new byte[]{22},saved.value(0));assertArrayEquals(new byte[]{11},saved.value(1));assertEquals(original,captures(f));assertEquals(epochs,f.transactionEpoch());owner.acknowledge(token,status.resultDigest());
                 }
             }
@@ -134,7 +134,7 @@ class RatisAtomicMutationOwnerTest {
             Path ownerRoot=root.resolve("overflow-owner"),allocatorRoot=root.resolve("overflow-allocator");var snapshotPlacement=f.plan.home(RatisNodePlan.Role.SNAPSHOT_HOME);var transactionPlacement=f.plan.home(RatisNodePlan.Role.TRANSACTION_HOME);
             try(var snapshotRoute=f.transactionHome(RatisNodePlan.Role.SNAPSHOT_HOME);var transactionRoute=f.transactionHome(RatisNodePlan.Role.TRANSACTION_HOME);var budget=new RatisRequestBudget(RemoteMutationOwnerLimits.defaults())){
                 var bindings=f.transactionBindings();var snapshots=new RatisSnapshotFences(snapshotRoute,snapshotPlacement.column());var homes=new RatisTransactionStatuses(transactionRoute,transactionPlacement.column());
-                try(var allocator=f.transactionAllocator(allocatorRoot,bindings,snapshotRoute,transactionRoute)){
+                try(var allocator=f.transactionAllocator(allocatorRoot,bindings,snapshotRoute,transactionRoute,RatisJournalAccess.standalone())){
                     RemoteMutationToken token;Map<RatisTwoPoolWorkflowFixture.CaptureIdentity,RatisSnapshotCaptureRequest.Result> original;
                     try(var owner=new RatisAtomicMutationOwner(bindings,snapshots,homes,f.transactionScheduler(),allocator,ownerRoot,budget)){
                         var authority=owner.owner();token=owner.prepare(authority,UUID.randomUUID(),0,List.of(put(71,firstKey(),81,Mutation.ReturnMode.PREVIOUS),put(72,secondKey(),82,Mutation.ReturnMode.PREVIOUS)),List.of(),30000);await(owner.execute(token,CONTEXT).observer());assertEquals(CommandResult.Status.RESULT_TOO_LARGE,owner.status(token).outcome());assertEquals(0,owner.status(token).appliedMutations());assertFalse(java.nio.file.Files.exists(ownerRoot.resolve("commit")));original=captures(f);

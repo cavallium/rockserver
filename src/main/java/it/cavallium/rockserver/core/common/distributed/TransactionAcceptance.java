@@ -19,13 +19,13 @@ public record TransactionAcceptance(ApplyPosition snapshot,long leaderGeneration
         if (snapshot==null || snapshot.term()<1 || leaderGeneration<0 || ownerIncarnation==null || scope==null || result==null) {
             throw new IllegalArgumentException("Invalid transaction acceptance audit");
         }
-        if (size(scope,result.length)>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Transaction acceptance exceeds command budget");
+        if (encodedSize(scope,result.length)>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Transaction acceptance exceeds command budget");
         var decoded=CommandResult.decode(result);
         if (decoded.status()!=CommandResult.Status.SUCCESS || !Arrays.equals(result,decoded.encode())) throw new IllegalArgumentException("Acceptance requires a canonical SUCCESS result");
         scope=new TransactionScope(ordered(scope)); result=result.clone();
     }
     @Override public byte[] result() { return result.clone(); }
-    int encodedSize() { return (int)size(scope,result.length); }
+    int encodedSize() { return (int)encodedSize(scope,result.length); }
     void encode(ByteBuffer output) {
         output.putLong(snapshot.term()).putLong(snapshot.index()).putLong(leaderGeneration);
         uuid(output,ownerIncarnation); var spans=ordered(scope); output.putInt(spans.size());
@@ -87,7 +87,9 @@ public record TransactionAcceptance(ApplyPosition snapshot,long leaderGeneration
         for (var span:scope.spans()) hash=31*hash+Objects.hash(span.columnId(),span.isPoint(),Arrays.hashCode(span.lowerInclusive()),Arrays.hashCode(span.upperExclusive()));
         return hash;
     }
-    private static long size(TransactionScope scope,int result) {
+    /** Exact audit bytes without constructing any provisional snapshot/owner identity. */
+    public static long encodedSize(TransactionScope scope,int result) {
+        Objects.requireNonNull(scope);if(result<8 || result>CommandResult.MAX_BYTES)throw new IllegalArgumentException("Invalid accepted result byte bound");
         long size=FIXED_BYTES+(long)result;
         for (var span:scope.spans()) { byte[] lower=span.lowerInclusive(), upper=span.upperExclusive(); size+=25L+(lower==null ? 0 : lower.length)+(upper==null ? 0 : upper.length); }
         return size;

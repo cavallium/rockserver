@@ -579,7 +579,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
                 || next.topologyState()!=RangeDescriptor.TopologyState.ACTIVE) throw new IllegalArgumentException("Frozen range incarnation/bounds changed");
     }
     private static boolean sameCommand(RatisRoutedClient.PreparedCommand a,RatisRoutedClient.PreparedCommand b) { return a.descriptor().equals(b.descriptor()) && Arrays.equals(DistributedCommandCodec.encode(a.command()),DistributedCommandCodec.encode(b.command())); }
-    private static boolean sameCapture(RatisRoutedClient.PreparedSnapshotCapture a,RatisRoutedClient.PreparedSnapshotCapture b) { return a.target().descriptor().equals(b.target().descriptor()) && a.target().replica().equals(b.target().replica()) && Arrays.equals(a.bytes(),b.bytes()); }
+    private static boolean sameCapture(RatisRoutedClient.PreparedSnapshotCapture a,RatisRoutedClient.PreparedSnapshotCapture b) { return a.sameRequest(b); }
     private static SnapshotFenceStatus expected(RatisRoutedClient.PreparedCommand request) { byte[] value=request.command().predicates().getFirst().expectedValue(); return value==null ? null : SnapshotFenceStatus.decode(value); }
     private static SnapshotFenceStatus next(RatisRoutedClient.PreparedCommand request) { return SnapshotFenceStatus.decode(request.command().mutations().getFirst().value()); }
     private Entry entry(UUID group) { var entry=entries.get(group); if (entry==null) throw new IllegalArgumentException("Unregistered snapshot group"); return entry; }
@@ -600,6 +600,12 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         if (active) throw new IOException("Snapshot RPC active; file ownership retained");
         if (closed && !channel.isOpen()) return; closed=true; try { if (lock.isValid()) lock.release(); } finally { channel.close(); }
     }
+    /** Checksum-inclusive maximum of the compact current journal, including refreshed capture/HOME routes. */
+    static long futureBytes(long definitionBytes,List<RangeDescriptor> routes,long homeRouteBytes)throws IOException {
+        long size=270+definitionBytes+homeRouteBytes;
+        for(var route:routes)size=Math.addExact(size,SessionWindowJournal.routeSize(route)+futureRoute(route)+498);
+        if(size>MAX_BYTES)throw new IOException("Snapshot future persistence capacity unavailable");return size;
+    }
     private void capacity() throws IOException {
         if (entries.size()!=initial.fence().participants().size() || entries.isEmpty() || entries.size()>SnapshotFence.MAX_PARTICIPANTS) throw new IOException("Incomplete snapshot route set");
         requireControl(lastHome); requireLineage(homeRoute,pending.descriptor()); homes.restore(pending.command(),pending.descriptor());
@@ -610,10 +616,9 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             routes+=SessionWindowJournal.routeSize(entry.route)+futureRoute(entry.route);
         }
         if (routes>MAX_ROUTES) throw new IOException("Snapshot frozen/future routes exceed aggregate budget");
-        long reserve=initial.fence().encode().length+routes+65536L+entries.size()*(1024L+ScopedTransactionRpc.HANDLE_BYTES+1);
-        if (reserve+32>MAX_BYTES) throw new IOException("Snapshot future persistence capacity unavailable");
+        futureBytes(initial.fence().encode().length,entries.values().stream().map(entry->entry.route).toList(),SessionWindowJournal.routeSize(homeRoute)+futureRoute(homeRoute));
     }
-    private static long futureRoute(RangeDescriptor route) { return 60L+(route.lowerInclusive()==null ? 0 : route.lowerInclusive().length)+(route.upperExclusive()==null ? 0 : route.upperExclusive().length)+RangeDirectoryCodec.MAX_REPLICAS*(57L+128+256); }
+    static long futureRoute(RangeDescriptor route) { return 60L+(route.lowerInclusive()==null ? 0 : route.lowerInclusive().length)+(route.upperExclusive()==null ? 0 : route.upperExclusive().length)+RangeDirectoryCodec.MAX_REPLICAS*(57L+128+256); }
     private void validateScope(RangeDescriptor route) {
         var directory=data.directoryForGroup(route.groupId()); int prefix=directory.routingPrefixBytes(); var participant=initial.fence().participant(route.groupId());
         byte[] routeLower=route.lowerInclusive(),routeUpper=route.upperExclusive();
