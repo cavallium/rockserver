@@ -112,7 +112,7 @@ class RatisRocksDBConnectionTest {
     }
     @Test void cancelledStreamReleaseFailureCanRetryThroughConnectionCloseWithoutLosingOwnership() throws Exception {
         try(var f=new Fixture()) {
-            var snapshots=mock(RatisSnapshotClient.class); var lease=mock(RatisSnapshotClient.Lease.class); f.suppliedSnapshots=snapshots;
+            var snapshots=mock(RatisSnapshotClient.class); when(snapshots.bindings()).thenReturn(RatisTransactionBindings.of(f.direct.f.schema,f.direct.f.directory,f.direct.f.data)); var lease=mock(RatisSnapshotClient.Lease.class); f.suppliedSnapshots=snapshots;
             var reading=new CompletableFuture<RangePage<KV>>(); var releasing=new CompletableFuture<Void>(); var requested=new CountDownLatch(1); var releaseStarted=new CountDownLatch(1); var calls=new AtomicInteger(); var closes=new AtomicInteger();
             when(lease.completion()).thenReturn(CompletableFuture.completedFuture(null));
             when(lease.page(anyLong(),any(),any(),anyBoolean(),any(),any(),any())).thenAnswer(call -> { requested.countDown(); return reading; });
@@ -208,6 +208,7 @@ class RatisRocksDBConnectionTest {
                 }),List.of(),pointBudget.shared).create(generationBindings,path,ids);
                 try {
                     var transactions=mock(RatisTransactionClient.class); var snapshots=mock(RatisSnapshotClient.class);
+                    when(transactions.bindings()).thenReturn(generationBindings);when(snapshots.bindings()).thenReturn(generationBindings);
                     when(transactions.open(any(),any(),any(),any(),any(),any())).thenAnswer(call -> {
                         assertArrayEquals(schema.digest(),nativeSchema.peers.getFirst().store.schemaDigest()); transactionSchemas.add(schema.schemaEpoch());
                         var pin=nativeSchema.peers.getFirst().store.capture(); activePins.incrementAndGet(); var closed=new java.util.concurrent.atomic.AtomicBoolean(); var lease=mock(RatisTransactionClient.Lease.class);
@@ -224,7 +225,7 @@ class RatisRocksDBConnectionTest {
                         Runnable release=() -> { if(closed.compareAndSet(false,true)) { pin.close(); activePins.decrementAndGet(); } };
                         when(lease.release(any())).thenAnswer(releasing -> { release.run(); return CompletableFuture.completedFuture(null); }); doAnswer(close -> { release.run(); return null; }).when(lease).close(); return lease;
                     });
-                    var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(schema,directory,(transactions).bindings().domain((schema).domainId()).client()),transactions,allocations,base.direct(),ranges,ids);
+                    var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(generationBindings,transactions,allocations,base.direct(),ranges,ids);
                     return new RatisRocksDBConnection.Generation(adapter,base.direct(),ranges,transactions,snapshots,List.of(base));
                 } catch(Throwable failure) { try { base.close(); } catch(Throwable cleanup) { failure.addSuppressed(cleanup); } if(failure instanceof IOException io) throw io; throw new IOException(failure); }
             };

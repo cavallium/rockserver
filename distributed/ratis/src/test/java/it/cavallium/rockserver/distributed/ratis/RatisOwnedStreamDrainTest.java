@@ -66,7 +66,9 @@ class RatisOwnedStreamDrainTest {
     void adapter(boolean failedAcquisition) throws Exception {
         var schema=RatisRocksDBIteratorLifecycleTest.schema(); var replica=new ReplicaDescriptor(new UUID(1,1),new UUID(1,2),new UUID(1,3),"fixture","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER);
         var directory=new RangeDirectory(schema.clusterId(),schema.databaseId(),schema.domainId(),schema.schemaEpoch(),schema.digest(),0,schema.columnIds(),schema.routingPrefixBytes(),List.of(new RangeDescriptor(new UUID(2,1),new UUID(2,2),1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica))));
-        var snapshots=mock(RatisSnapshotClient.class); var lease=mock(RatisSnapshotClient.Lease.class); var acquiring=new CompletableFuture<Void>(); var reading=new CompletableFuture<RangePage<KV>>(); var releasing=new CompletableFuture<Void>(); var closes=new AtomicInteger();
+        var routed=new RatisRoutedClient(directory,mock(RatisRoutedClient.Transport.class));
+        var bindings=RatisTransactionBindings.of(schema,directory,routed);
+        var snapshots=mock(RatisSnapshotClient.class); when(snapshots.bindings()).thenReturn(bindings); var lease=mock(RatisSnapshotClient.Lease.class); var acquiring=new CompletableFuture<Void>(); var reading=new CompletableFuture<RangePage<KV>>(); var releasing=new CompletableFuture<Void>(); var closes=new AtomicInteger();
         when(lease.completion()).thenReturn(acquiring);
         when(lease.page(anyLong(),any(),any(),anyBoolean(),any(),any(),any())).thenReturn(reading);
         when(lease.release(any())).thenReturn(releasing); doAnswer(call -> { closes.incrementAndGet(); return null; }).when(lease).close();
@@ -75,7 +77,7 @@ class RatisOwnedStreamDrainTest {
         var identity=new RatisTransactionClient.Identity(new RatisSnapshotClient.Identity(new UUID(3,2),new OperationId(session,1,0),new OperationId(session,1,1)),new RatisAtomicClient.Identity(new UUID(3,3),new OperationId(session,1,513),new OperationId(session,1,514)));
         RatisRocksDBAdapter.AllocationSource allocations=(context,dataTargets)-> CompletableFuture.completedFuture(new RatisRocksDBAdapter.Allocation(Path.of("snapshot"),Path.of("commit"),identity));
         var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations);
-        var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(schema,directory,(mock(RatisTransactionClient.class)).bindings().domain((schema).domainId()).client()),mock(RatisTransactionClient.class),allocations,null,ranges);
+        var adapter=new RatisRocksDBAdapter(bindings,mock(RatisTransactionClient.class),allocations,null,ranges);
         var request=new RocksDBAPICommand.RocksDBAPICommandStream.GetRange<KV>(0,71,key(1),key(3),false,RequestType.<KV>allInRange());
         var dispatched=adapter.dispatchOwned(request,CONTEXT); assertFalse(dispatched.drained().isDone());
         @SuppressWarnings("unchecked") var stream=(Flux<KV>)dispatched.observer(); var observer=new RatisRocksDBIteratorLifecycleTest.Observer(); stream.subscribe(observer);
@@ -87,7 +89,7 @@ class RatisOwnedStreamDrainTest {
             }
             assertFalse(dispatched.drained().isDone()); assertEquals(1,ranges.stats()); assertEquals(0,closes.get());
             releasing.complete(null); await(dispatched.drained()); assertEquals(0,ranges.stats()); assertEquals(1,closes.get());
-        } finally { acquiring.complete(null); reading.complete(new RangePage<>(List.of(),null,false)); releasing.complete(null); dispatched.cancelObserver().run(); adapter.close(); ranges.close(); }
+        } finally { acquiring.complete(null); reading.complete(new RangePage<>(List.of(),null,false)); releasing.complete(null); dispatched.cancelObserver().run(); adapter.close(); ranges.close(); routed.close(); }
     }
     @Test void failedFinitePageAcquisitionRetainsActualOwnerUntilCleanupRetry() throws Exception { finite(0); }
     @Test void failedFirstAndLastAcquisitionRetainsActualOwnerUntilCleanupRetry() throws Exception { finite(1); }
@@ -95,12 +97,14 @@ class RatisOwnedStreamDrainTest {
     void finite(int operation) throws Exception {
         var schema=RatisRocksDBIteratorLifecycleTest.schema(); var replica=new ReplicaDescriptor(new UUID(4,1),new UUID(4,2),new UUID(4,3),"fixture","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER);
         var directory=new RangeDirectory(schema.clusterId(),schema.databaseId(),schema.domainId(),schema.schemaEpoch(),schema.digest(),0,schema.columnIds(),schema.routingPrefixBytes(),List.of(new RangeDescriptor(new UUID(5,1),new UUID(5,2),1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica))));
-        var snapshots=mock(RatisSnapshotClient.class); var lease=mock(RatisSnapshotClient.Lease.class); var acquiring=new CompletableFuture<Void>(); var releasing=new CompletableFuture<Void>(); var closes=new AtomicInteger();
+        var routed=new RatisRoutedClient(directory,mock(RatisRoutedClient.Transport.class));
+        var bindings=RatisTransactionBindings.of(schema,directory,routed);
+        var snapshots=mock(RatisSnapshotClient.class); when(snapshots.bindings()).thenReturn(bindings); var lease=mock(RatisSnapshotClient.Lease.class); var acquiring=new CompletableFuture<Void>(); var releasing=new CompletableFuture<Void>(); var closes=new AtomicInteger();
         when(lease.completion()).thenReturn(acquiring); when(lease.release(any())).thenReturn(CompletableFuture.failedFuture(new IOException("Unknown first release")),releasing);
         doAnswer(call -> { closes.incrementAndGet(); return null; }).when(lease).close(); when(snapshots.open(any(),any(),any(),any(),any())).thenReturn(lease);
         UUID session=new UUID(6,1); var identity=new RatisTransactionClient.Identity(new RatisSnapshotClient.Identity(new UUID(6,2),new OperationId(session,1,0),new OperationId(session,1,1)),new RatisAtomicClient.Identity(new UUID(6,3),new OperationId(session,1,513),new OperationId(session,1,514)));
         RatisRocksDBAdapter.AllocationSource allocations=(context,dataTargets)-> CompletableFuture.completedFuture(new RatisRocksDBAdapter.Allocation(Path.of("finite-snapshot"),Path.of("finite-commit"),identity));
-        var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(schema,directory,(mock(RatisTransactionClient.class)).bindings().domain((schema).domainId()).client()),mock(RatisTransactionClient.class),allocations,null,ranges);
+        var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(bindings,mock(RatisTransactionClient.class),allocations,null,ranges);
         RocksDBAPICommand<?,?,?> request=switch (operation) {
             case 0 -> new RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<KV>(0,71,key(1),key(3),false,null,RequestType.<KV>allInRange(),RangeBudget.DEFAULT);
             case 1 -> new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<FirstAndLast<KV>>(0,71,key(1),key(3),false,RequestType.<KV>firstAndLast());
@@ -114,7 +118,7 @@ class RatisOwnedStreamDrainTest {
             assertFalse(dispatched.drained().isDone()); assertEquals(1,ranges.stats()); assertEquals(0,closes.get());
             var retry=adapter.retryStoppedFlowsCleanup(); assertFalse(retry.isDone()); verify(lease,atLeast(2)).release(any());
             releasing.complete(null); await(retry); await(dispatched.drained()); assertEquals(0,ranges.stats()); assertEquals(1,closes.get());
-        } finally { acquiring.complete(null); releasing.complete(null); adapter.retryStoppedFlowsCleanup(); dispatched.cancelObserver().run(); adapter.close(); ranges.close(); }
+        } finally { acquiring.complete(null); releasing.complete(null); adapter.retryStoppedFlowsCleanup(); dispatched.cancelObserver().run(); adapter.close(); ranges.close(); routed.close(); }
     }
 
 }

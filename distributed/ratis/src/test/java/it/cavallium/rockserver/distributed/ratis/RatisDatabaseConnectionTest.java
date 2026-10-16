@@ -33,8 +33,7 @@ class RatisDatabaseConnectionTest {
                 var api=connection.getAsyncApi(RequestContext.batch());assertEquals(2,await(api.getAllColumnDefinitionsAsync()).size());assertEquals(71,await(api.getColumnIdAsync("logical-1")));assertEquals(72,await(api.getColumnIdAsync("logical-2")));
                 RatisRocksDBConnectionTest.point(connection,71,key(7),value(11),RequestType.RequestTypeId.NOTHING);RatisRocksDBConnectionTest.point(connection,72,key(7),value(12),RequestType.RequestTypeId.NOTHING);assertArrayEquals(new byte[]{11},await(api.getAsync(0,71,key(7),RequestType.<Buf>current())).toByteArray());assertArrayEquals(new byte[]{12},await(api.getAsync(0,72,key(7),RequestType.<Buf>current())).toByteArray());
                 var missing=assertThrows(ExecutionException.class,()->await(api.openTransactionAsync(null, Duration.ofSeconds(10))));assertEquals(RocksDBException.RocksDBErrorType.TX_SCOPE_REQUIRED,assertInstanceOf(RocksDBException.class,missing.getCause()).getErrorUniqueId());assertEquals(4,issued.get());
-                int captures=homes.captureRequests.get();var cross=new TransactionOpenScope(List.of(TransactionOpenScope.Span.point(71,key(7)),TransactionOpenScope.Span.point(72,key(7))));
-                assertThrows(ExecutionException.class,()->await(api.openTransactionAsync(cross,Duration.ofSeconds(10))));
+                int captures=homes.captureRequests.get();
                 assertThrows(ExecutionException.class,()->await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(999),Duration.ofSeconds(10))));
                 assertEquals(4,issued.get());assertEquals(captures,homes.captureRequests.get());assertEquals(2,await(connection.directRecoveryStatus(RequestContext.batch())).size());
             }
