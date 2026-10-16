@@ -46,6 +46,19 @@ final class RatisConfiguredRecovery implements AutoCloseable {
         void require(Request request){if(!request.metadataOnly() || !Arrays.equals(requestDigest, RatisConfiguredRecovery.requestDigest(request)))throw new IllegalArgumentException("Local completion changed selected META");requireSameMetadata(head.request().source(),request);if(!head.request().source().transferId().equals(request.transferId()))throw new IllegalArgumentException("Local completion HEAD changed request identity");}
         int encodedSize(){return Math.toIntExact(185L+configuration.data().length+RatisSourceHeadRpc.encodedReplyBytes(head));}
     }
+    /** Exact existing LOCAL_DONE journal evidence, distinct from a native registration receipt. */
+    record LocalMetadataProof(Request request,LocalMetadataCompletion completion,byte[] digest){
+        LocalMetadataProof {completion.require(request);digest=exactDigest(digest);}
+        @Override public byte[] digest(){return digest.clone();}
+    }
+    static LocalMetadataProof localMetadataProof(Map<String,byte[]> fields,byte[] expectedBinding,UUID group)throws IOException {
+        try {
+            if(!Arrays.equals(expectedBinding,fields.get("binding")) || !Arrays.equals("LOCAL_DONE".getBytes(StandardCharsets.US_ASCII),fields.get("phase")))throw new IllegalArgumentException("Journal is not a bound LOCAL_DONE publication");
+            var request=request(fields.get("request"));if(!request.metadataOnly() || !request.sourceGroup().equals(group))throw new IllegalArgumentException("Local journal crossed selected META group");
+            byte[] encoded=Objects.requireNonNull(fields.get("localCompletion"));var completion=decodeLocal(encoded,request);if(!Arrays.equals(encoded,encodeLocal(completion)))throw new IllegalArgumentException("Noncanonical local completion proof");
+            return new LocalMetadataProof(request,completion,OperatorUpload.sha256(encoded));
+        }catch(RuntimeException invalid){throw new IOException("Invalid forced local META journal proof",invalid);}
+    }
     interface Host {
         /** Borrow an immutable graph request; no remote IO, mutation or unadmitted payload copies. */
         default Request resolveCurrentAlias(CurrentAlias reference)throws IOException{throw new IOException("Retained CURRENT graph alias unavailable");}
@@ -270,7 +283,7 @@ final class RatisConfiguredRecovery implements AutoCloseable {
     private static int aliasBytes(List<CurrentAlias> aliases){return Math.toIntExact(4L+48L*aliases.size());}
     private static byte[] encodeAliases(List<CurrentAlias> aliases){var out=java.nio.ByteBuffer.allocate(aliasBytes(aliases)).putInt(aliases.size());for(var alias:aliases)out.putLong(alias.transferId().getMostSignificantBits()).putLong(alias.transferId().getLeastSignificantBits()).put(alias.digest());return out.array();}
     private static List<CurrentAlias> decodeAliases(byte[] bytes){if(bytes==null || bytes.length<4 || bytes.length>4+48*NativeRecoverySupersession.MAX_CURRENT_REQUEST_DIGESTS)throw new IllegalArgumentException("Invalid aliases framing");var in=java.nio.ByteBuffer.wrap(bytes);int count=in.getInt();if(count<1 || count>NativeRecoverySupersession.MAX_CURRENT_REQUEST_DIGESTS || count*48L!=in.remaining())throw new IllegalArgumentException("Invalid alias count");var aliases=new ArrayList<CurrentAlias>();for(int i=0;i<count;i++){var transfer=new UUID(in.getLong(),in.getLong());byte[] digest=new byte[32];in.get(digest);aliases.add(new CurrentAlias(transfer,digest));}return List.copyOf(aliases);}
-    private static byte[] requestDigest(Request request){return OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(PREPARE,request));}
+    static byte[] requestDigest(Request request){return OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.request(PREPARE,request));}
     private static void validateSupersession(State state) {
         boolean superseding=state.phase()==Phase.FENCE_RECEIVER || state.phase()==Phase.CLEANUP_OLD;var recipe=state.supersession();if(superseding!=(recipe!=null))throw new IllegalArgumentException("Supersession phase lost recipe");if(recipe==null)return;
         if(recipe.previous()==Phase.FENCE_RECEIVER || recipe.previous()==Phase.CLEANUP_OLD || !recipe.selected().metadataOnly() || recipe.aliases().isEmpty() || recipe.aliases().size()>NativeRecoverySupersession.MAX_CURRENT_REQUEST_DIGESTS || state.initial().purpose()!=Purpose.CURRENT_LEAF || recipe.references().size()!=recipe.aliases().size())throw new IllegalArgumentException("Invalid supersession purpose/history");

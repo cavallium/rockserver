@@ -82,7 +82,11 @@ class RatisConfiguredRecoveryRuntimeTest {
             control.tick().get(15,TimeUnit.SECONDS);
             try{manager.step().get(15,TimeUnit.SECONDS);}catch(ExecutionException waiting){last=waiting.getCause();}
         }
-        assertEquals(RatisConfiguredRecovery.Phase.DONE,node.configuredRecoveryPhase(group),"Recovery did not settle: "+last);
+        if(node.configuredRecoveryPhase(group)!=RatisConfiguredRecovery.Phase.DONE){
+            var store=(ReplicatedRangeStore)field(node,"stores",Map.class).get(group);var configuration=store==null?null:store.configuration();
+            String nativeState=store==null?"absent":"cut="+store.applied()+", CURRENT-ready="+store.currentRangeRecoveryReady()+", META-pending="+store.metadataRecoveryPending()+", CFG="+(configuration==null?"absent":configuration.term()+"/"+configuration.index()+"/"+HexFormat.of().formatHex(OperatorUpload.sha256(configuration.data())));
+            throw new AssertionError("Recovery did not settle for "+group+": phase="+node.configuredRecoveryPhase(group)+", native "+nativeState,last);
+        }
     }
 
     @Test void nodeOwnedRecoveryRecoversMetadataAndCurrentChildrenAndColdJournals()throws Exception {
@@ -97,6 +101,7 @@ class RatisConfiguredRecoveryRuntimeTest {
                     var receiver=new RatisNodeRuntimeTest.FakeServer();receiver.skipFirstNoop=true;
                     try(var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),epochs,Map.of(source.first.domainId(),route),env.scheduler,env.timer,()->20L,env.settings(),round==0?RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT:RatisNodeRuntime.Startup.RECOVER,receiver::create,List.of(source.first))) {
                         node.relocationTransport(range->client(source,range),(range,owner)->client(source,range));node.start();
+                        source.recoveryOwner=target->{try{var machine=receiver.machines.get(RaftGroupId.valueOf(target.key().groupId()));var response=machine.queryStale(Message.valueOf(ByteString.copyFrom(RatisRecoveryObligationRpc.request(target))),0).get(10,TimeUnit.SECONDS);return RatisRecoveryObligationRpc.reply(response.getContent().toByteArray(),target);}catch(Exception failed){throw new IOException("Actual receiver completion proof failed",failed);}};
                         var owners=field(source.node,"pools",Map.class);var owner=owners.get(source.fast);var prior=field(owner,"sources",RatisTopologySourceSnapshotService.class);var host=field(prior,"host",RatisTopologySourceSnapshotService.Host.class);var bytes=new ByteArrayOutputStream();var preparedSources=new java.util.concurrent.ConcurrentHashMap<UUID,RatisTopologySourceSnapshotRpc.Prepared>();
                         var delivery=(RatisTopologySourceSnapshotService.Host)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{RatisTopologySourceSnapshotService.Host.class},(proxy,method,args)->{
                             if(method.getName().equals("send")){
@@ -135,11 +140,113 @@ class RatisConfiguredRecoveryRuntimeTest {
                         for(var child:split.targets()){var recovered=store(receiver,child.groupId());assertTrue(recovered.currentRangeRecoveryReady());assertTrue(recovered.admissionOpen());assertArrayEquals(source.store(child.groupId()).topologyBirth().encode(),recovered.topologyBirth().encode());assertArrayEquals(source.store(child.groupId()).topologyActivation().encode(),recovered.topologyActivation().encode());}
                         assertArrayEquals(new byte[]{11},store(receiver,split.targets().getFirst().groupId()).readCurrentPoint(source.first.columnIds().iterator().next(),new byte[]{7}));assertEquals(0,source.store(split.parents().getFirst().groupId()).activeSnapshotPins());
                         assertArrayEquals(new byte[]{22},source.store(source.secondDirectory.ranges().getFirst().groupId()).readCurrentPoint(source.second.columnIds().iterator().next(),new byte[]{7}));
+                        var topology=epochs.topologyCatalogue(catalogue.directoryColumn());
+                        if(round==0){source.loseRecoveryAck=true;assertThrows(ExecutionException.class,()->node.bootstrapDeferredRecovery().get(15,TimeUnit.SECONDS));assertFalse(source.loseRecoveryAck,"The actual catalogue ACK committed before its reply was lost");assertFalse(topology.readRecovery(split.intentId()).completions().isEmpty());}
+                        else {node.bootstrapDeferredRecovery().get(15,TimeUnit.SECONDS);var acknowledged=topology.readRecovery(split.intentId());assertEquals(3,acknowledged.completions().size());for(var obligation:field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class).snapshot().plan().localObligations()){var key=new TopologyChange.Key(obligation.range().groupId(),obligation.localReplica().replicaId());assertEquals(RatisRecoveryObligationRpc.local(store(receiver,obligation.range().groupId())).completion(),acknowledged.completions().get(key));}assertEquals(TopologyChange.Phase.RETIRED,topology.readIntent(split.intentId()).phase());}
+
                     }
                 }
             }finally{route.close();}
         }
     }
+
+    @Test void absentConfiguredOwnerRecoversRetiredSplitMergeDagAndNonIdempotentReceiptsAutomatically()throws Exception {
+        var absent=new ReplicaDescriptor(new UUID(995,1),new UUID(995,2),new UUID(995,3),"receiver995","127.0.0.1:4597",ReplicaDescriptor.Role.LISTENER);
+        try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("dag-source"),false,List.of(absent));var env=new RatisNodeRuntimeTest.Env(root.resolve("dag-receiver"),false,source.first.digest())){
+            var initial=source.firstDirectory;var originalRange=initial.ranges().getFirst();var binding=source.plan.catalogue();var pool=RatisPoolFixtures.ID;
+            // This node has a genuine local HOME but no local DATA image at initial startup.
+            // The remote-only bootstrap geometry is the same incoming-node witness used by
+            // the existing registration/reconciliation workflows; fresh CAT supplies membership.
+            var remoteRange=new RangeDescriptor(originalRange.rangeId(),originalRange.groupId(),originalRange.rangeEpoch(),originalRange.configurationVersion(),originalRange.lowerInclusive(),originalRange.upperExclusive(),originalRange.topologyState(),List.of(source.local));
+            var bootstrap=new RangeDirectory(initial.clusterId(),initial.databaseId(),initial.domainId(),initial.schemaEpoch(),initial.schemaDigest(),0,initial.columns(),initial.routingPrefixBytes(),List.of(remoteRange));
+            var domain=new RatisNodePlan.Domain(bootstrap,Map.of(source.first.columnIds().iterator().next(),"receiver-data"),Set.of());
+            var homeId=new UUID(995,10);var homeColumn=new UUID(995,11);var homeReplica=new ReplicaDescriptor(absent.nodeId(),absent.nodeIncarnation(),new UUID(995,12),absent.peerId(),absent.address(),ReplicaDescriptor.Role.VOTER);
+            var homeRange=new RangeDescriptor(homeId,homeId,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(homeReplica));var homeDirectory=new RangeDirectory(initial.clusterId(),initial.databaseId(),homeId,1,new byte[32],0,Set.of(homeColumn),0,List.of(homeRange));var home=new RatisNodePlan.Home(RatisNodePlan.Role.TRANSACTION_HOME,homeDirectory,homeColumn,"recovery-home");
+            var plan=new RatisNodePlan(absent.nodeId(),absent.nodeIncarnation(),List.of(domain),binding,List.of(home),List.of(),Map.of(),8,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(domain)),RatisPoolFixtures.groups(binding,List.of(home)));
+            var epochs=new RatisSessionEpochs(source.catalogue,initial.clusterId(),initial.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.sessionsColumn());
+            var receiver=new java.util.concurrent.atomic.AtomicReference<RatisNodeRuntimeTest.FakeServer>();var requests=new java.util.concurrent.CopyOnWriteArrayList<RatisTopologySourceSnapshotRpc.Request>();
+            var owner=field(source.node,"pools",Map.class).get(source.fast);var prior=field(owner,"sources",RatisTopologySourceSnapshotService.class);var host=field(prior,"host",RatisTopologySourceSnapshotService.Host.class);var bytes=new ByteArrayOutputStream();
+            var delivery=(RatisTopologySourceSnapshotService.Host)Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{RatisTopologySourceSnapshotService.Host.class},(proxy,method,args)->{
+                if(method.getName().equals("send")){var scope=(RatisTopologySourceSnapshotRpc.Request)args[0];var chunk=(InstallSnapshotRequestProto)args[1];if(chunk.getSnapshotChunk().getRequestIndex()==0)bytes.reset();for(var file:chunk.getSnapshotChunk().getFileChunksList())file.getData().writeTo(bytes);if(chunk.getSnapshotChunk().getDone()){var machine=receiver.get().machines.get(RaftGroupId.valueOf(scope.sourceGroup()));var cut=chunk.getSnapshotChunk().getTermIndex();install(machine,bytes.toByteArray(),cut.getTerm(),cut.getIndex());when(receiver.get().division(machine.getGroupId()).getRaftLog().getSnapshotIndex()).thenReturn(cut.getIndex());}var rpc=chunk.getServerRequest();return InstallSnapshotReplyProto.newBuilder().setServerReply(RaftRpcReplyProto.newBuilder().setRequestorId(rpc.getRequestorId()).setReplyId(rpc.getReplyId()).setRaftGroupId(rpc.getRaftGroupId()).setSuccess(true)).setTerm(chunk.getLeaderTerm()).setRequestIndex(chunk.getSnapshotChunk().getRequestIndex()).setResult(InstallSnapshotResult.SUCCESS).build();}
+                if(method.getName().equals("requireReceiverInstalled")){var prepared=((RatisTopologySourceSnapshotService.Lease)args[0]).prepared();var request=new RatisRecoveryImageRpc.Request(prepared.request(),prepared.image().position(),prepared.image().sha256());var evidence=receiver.get().machines.get(RaftGroupId.valueOf(prepared.request().sourceGroup())).recoveryImageEvidence(request);evidence.require(request);assertTrue(evidence.imageInstalled());return null;}
+                try{return method.invoke(host,args);}catch(InvocationTargetException failed){throw failed.getCause();}
+            });
+            var sourceField=RatisRangeStateMachine.class.getDeclaredField("sourceSnapshots");sourceField.setAccessible(true);var originals=new HashMap<RatisRangeStateMachine,Object>();
+            var limits=field(prior,"limits",RatisTopologySourceSnapshotService.Limits.class);var admission=field(prior,"admission",RatisTopologySourceSnapshotService.ResourceAdmission.class);
+            var originalSourceTransport=field(source.node,"relocationClients",RatisRelocationDataClient.class);
+            try(var sourceTransport=new RatisRelocationDataClient(initial.clusterId(),initial.databaseId(),binding.groupId(),r->client(source,r),(r,o)->o.nodeId().equals(absent.nodeId())?receiverClient(receiver.get(),r):client(source,r));var route=new RatisRoutedClient(bootstrap,new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor r,UUID c,byte[] k){throw new AssertionError("No external USER transport");}public CommandResult command(RangeDescriptor r,DistributedCommand c){throw new AssertionError("No external USER transport");}});var transport=new RatisTopologySourceSnapshotService(delivery,limits,source.scheduler(),admission)){
+                field(source.node,"relocationClients",sourceTransport);
+                source.recoveryOwner=target->{try{var result=receiver.get().machines.get(RaftGroupId.valueOf(target.key().groupId())).queryStale(Message.valueOf(ByteString.copyFrom(RatisRecoveryObligationRpc.request(target))),0).get(10,TimeUnit.SECONDS);return RatisRecoveryObligationRpc.reply(result.getContent().toByteArray(),target);}catch(Exception failure){throw new IOException(failure);}};
+                var policy=new RatisNodeRuntime.SchemaReplicaConfig(RatisSchemaReplicaService.Limits.defaults(),operator->{if(!source.appendOperator.equals(operator))throw new IOException("Unexpected operator tuple");return new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("append-contract",1,true);});
+                RatisTwoPoolWorkflowFixture.SchemaMerge provisioned;TopologyChange.Definition split,merge;DistributedCommand childWrite;byte[] originalReceipt,childReceipt;
+                try{
+                    for(var machine:source.server.machines.values()){originals.put(machine,sourceField.get(machine));sourceField.set(machine,transport);}
+                    var available=new RatisNodeRuntimeTest.FakeServer();available.skipFirstNoop=true;receiver.set(available);
+                    // Provision while this exact configured owner is online. All schema ARTIFACT,
+                    // CAPACITY and follower apply paths use its actual native adapter.
+                    try(var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),epochs,Map.of(initial.domainId(),route),env.scheduler,env.timer,()->20L,source.manifest.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,available::create,List.of(source.first),null,null,RatisRoutedClient::connect,policy)){
+                        node.relocationTransport(r->recordingClient(source,r,requests),(r,o)->recordingClient(source,r,requests));node.start();field(node,"poolPressure",RatisPoolPressureService.class).refresh().get(10,TimeUnit.SECONDS);
+                        node.bootstrapDeferredRecovery().get(15,TimeUnit.SECONDS);var manager=field(node,"configuredRecoveries",RatisConfiguredRecoveries.class);var control=field(node,"configuredRecoveryService",RatisTransactionRecoveryService.class);
+                        assertFalse(available.machines.containsKey(RaftGroupId.valueOf(originalRange.groupId())),"An empty incoming DATA owner has no initialized voting division");assertNotNull(node.configuredRecoveryPhase(originalRange.groupId()),"Fresh CAT must dispatch recovery for its genuinely absent native group");
+                        awaitDone(node,control,manager,originalRange.groupId());assertTrue(store(available,originalRange.groupId()).currentRangeRecoveryReady());
+                        source.schemaPeer=available;try{provisioned=source.createOperatorAndMerge(initial.domainId());}finally{source.schemaPeer=null;}
+                        assertArrayEquals(new byte[]{11,33},store(available,originalRange.groupId()).readCurrentPoint(provisioned.column(),new byte[]{9}));
+                        originalReceipt=source.store(originalRange.groupId()).operationResult(provisioned.last().operationId(),provisioned.last().receiptDigest());assertNotNull(originalReceipt);
+                    }
+                    requests.clear();split=source.split();var topology=epochs.topologyCatalogue(binding.directoryColumn());
+                    assertEquals(TopologyChange.Phase.RETIRED,topology.readIntent(split.intentId()).phase());assertTrue(topology.readIntent(split.intentId()).activated().keySet().stream().noneMatch(k->k.replicaId().equals(absent.replicaId())));
+                    assertTrue(topology.readRecovery(split.intentId()).owners().contains(new TopologyChange.Key(split.targets().getFirst().groupId(),absent.replicaId())));
+                    var child=split.targets().getFirst();var childRoute=source.routes.get(initial.domainId());field(source.node,"poolPressure",RatisPoolPressureService.class).refresh().get(10,TimeUnit.SECONDS);
+                    // A fresh born group owns a new replicated session authority. Bind through
+                    // the normal issued-grant protocol before its first non-idempotent write.
+                    try(var session=RatisBackendSessions.window(source.root.resolve("child-window"),childRoute,epochs,60000,new RatisSessionClient.Limits(4,1L<<20,1L<<20),List.of(new RatisBackendSessions.Target(childRoute,child.groupId(),split.targetDirectory())),RatisJournalAccess.standalone())){
+                        var pending=session.prepare(List.of(new Mutation(Mutation.Kind.MERGE,provisioned.column(),new byte[]{9},new byte[]{55})));childWrite=pending.command();childReceipt=session.execute(pending).encode();assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(childReceipt).status());
+                    }
+                    assertArrayEquals(new byte[]{11,33,55},source.store(child.groupId()).readCurrentPoint(provisioned.column(),new byte[]{9}));
+                    assertArrayEquals(childReceipt,source.apply(child.groupId(),DistributedCommandCodec.encode(childWrite)).getContent().toByteArray());assertArrayEquals(new byte[]{11,33,55},source.store(child.groupId()).readCurrentPoint(provisioned.column(),new byte[]{9}));
+                    merge=source.merge(split);assertEquals(TopologyChange.Phase.RETIRED,topology.readIntent(merge.intentId()).phase());
+                    for(var machine:source.server.machines.values())if(!originals.containsKey(machine)){originals.put(machine,sourceField.get(machine));sourceField.set(machine,transport);}
+                    var leaf=merge.targets().getFirst();Map<TopologyChange.Key,RatisTopologyRecoveryObligations.Completion> lostReceipts=null;
+                    for(int round=0;round<2;round++){
+                        var restarted=new RatisNodeRuntimeTest.FakeServer();restarted.skipFirstNoop=true;receiver.set(restarted);
+                        try(var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),epochs,Map.of(initial.domainId(),route),env.scheduler,env.timer,()->20L,source.manifest.settings(),RatisNodeRuntime.Startup.RECOVER,restarted::create,List.of(source.first),null,null,RatisRoutedClient::connect,policy)){
+                            node.relocationTransport(r->recordingClient(source,r,requests),(r,o)->recordingClient(source,r,requests));node.start();field(node,"poolPressure",RatisPoolPressureService.class).refresh().get(10,TimeUnit.SECONDS);
+                            node.bootstrapDeferredRecovery().get(15,TimeUnit.SECONDS);var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class).snapshot();assertEquals(4,graph.plan().localObligations().size());assertEquals(2,graph.plan().definitions().size());assertEquals(3,graph.plan().localObligations().stream().filter(o->o.purpose()==RatisTopologySourceSnapshotRpc.Purpose.ANCESTOR_METADATA).count());
+                            var manager=field(node,"configuredRecoveries",RatisConfiguredRecoveries.class);var control=field(node,"configuredRecoveryService",RatisTransactionRecoveryService.class);
+                            for(var obligation:graph.plan().localObligations())awaitAutomatic(node,control,manager,obligation.range().groupId());
+                            assertTrue(store(restarted,leaf.groupId()).currentRangeRecoveryReady());assertArrayEquals(new byte[]{11,33,55},store(restarted,leaf.groupId()).readCurrentPoint(provisioned.column(),new byte[]{9}));
+                            for(var definition:List.of(split,merge))for(var ancestor:definition.parents()){
+                                var recovered=store(restarted,ancestor.groupId());assertTrue(recovered.userHandlesDetached());assertFalse(recovered.admissionOpen());assertFalse(field(restarted.machines.get(RaftGroupId.valueOf(ancestor.groupId())),"currentDataVoter",Boolean.class));
+                                var lineage=new DistributedCdcCheckpoint.Lineage(ancestor.rangeId(),ancestor.groupId(),ancestor.rangeEpoch());var expected=source.store(ancestor.groupId()).pollRetiredCdc(lineage,DistributedCdcCheckpoint.Cursor.beginning(),256,1<<20);var actual=recovered.pollRetiredCdc(lineage,DistributedCdcCheckpoint.Cursor.beginning(),256,1<<20);assertEquals(expected.cut(),actual.cut());assertEquals(expected.records().size(),actual.records().size());for(int i=0;i<actual.records().size();i++)assertArrayEquals(expected.records().get(i).encode(),actual.records().get(i).encode());
+                            }
+                            assertArrayEquals(originalReceipt,store(restarted,originalRange.groupId()).operationResult(provisioned.last().operationId(),provisioned.last().receiptDigest()));assertArrayEquals(childReceipt,store(restarted,childWrite.groupId()).operationResult(childWrite.operationId(),childWrite.receiptDigest()));
+                            assertTrue(requests.stream().allMatch(r->r.metadataOnly() || r.sourceGroup().equals(leaf.groupId())),"Historical parents never request USER replay after absence");
+                            if(round==0){source.loseRecoveryAck=true;assertThrows(ExecutionException.class,()->node.bootstrapDeferredRecovery().get(15,TimeUnit.SECONDS));assertFalse(source.loseRecoveryAck);lostReceipts=topology.readRecovery(split.intentId()).completions();assertFalse(lostReceipts.isEmpty());}
+                            else{node.bootstrapDeferredRecovery().get(15,TimeUnit.SECONDS);for(var entry:lostReceipts.entrySet())assertEquals(entry.getValue(),topology.readRecovery(split.intentId()).completions().get(entry.getKey()));assertEquals(merge.intentId(),topology.readHead(initial.domainId()).header().intentId());}
+                        }
+                    }
+                }finally{source.schemaPeer=null;field(source.node,"relocationClients",originalSourceTransport);for(var entry:originals.entrySet())sourceField.set(entry.getKey(),entry.getValue());}
+            }
+        }
+    }
+    private static RaftClient receiverClient(RatisNodeRuntimeTest.FakeServer receiver,RangeDescriptor range){
+        var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args)->{
+            var machine=receiver.machines.get(RaftGroupId.valueOf(range.groupId()));var request=(Message)args[0];var result=switch(method.getName()){case "sendReadOnly"->machine.queryLinearizable(request);case "sendStaleRead"->machine.queryStale(request,(long)args[1]);default->throw new AssertionError(method);};return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(receiver.plan.peerId())).setGroupId(RaftGroupId.valueOf(range.groupId())).setCallId(1).setSuccess(true).setMessage(result.get(15,TimeUnit.SECONDS)).build();
+        });return (RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args)->switch(method.getName()){case "io"->io;case "getGroupId"->RaftGroupId.valueOf(range.groupId());case "close"->null;default->throw new AssertionError(method);});
+    }
+    private static RaftClient recordingClient(RatisTwoPoolWorkflowFixture source,RangeDescriptor range,List<RatisTopologySourceSnapshotRpc.Request> requests){
+        var delegate=client(source,range);var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args)->{
+            if(args!=null && args.length>0 && args[0] instanceof Message message){byte[] encoded=message.getContent().toByteArray();if(ScopedTransactionRpc.kind(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES)==RatisTopologySourceSnapshotRpc.PREPARE)requests.add(RatisTopologySourceSnapshotRpc.request(encoded));}
+            try{return method.invoke(delegate.io(),args);}catch(InvocationTargetException failure){throw failure.getCause();}
+        });return (RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args)->switch(method.getName()){case "io"->io;case "getGroupId"->delegate.getGroupId();case "close"->null;default->throw new AssertionError(method);});
+    }
+    private static void awaitAutomatic(RatisNodeRuntime node,RatisTransactionRecoveryService control,RatisConfiguredRecoveries manager,UUID group)throws Exception {
+        Throwable last=null;for(int steps=0;steps<128;steps++){
+            var phase=node.configuredRecoveryPhase(group);if(phase==RatisConfiguredRecovery.Phase.DONE || phase==RatisConfiguredRecovery.Phase.LOCAL_DONE)return;
+            try{manager.step().get(15,TimeUnit.SECONDS);}catch(ExecutionException waiting){last=waiting.getCause();}
+        }throw new AssertionError("Automatic DAG recovery did not settle for "+group,last);
+    }
+
     @Test void initialZeroDelayControlTickCannotDisplaceTheFirstAcceptedRequest()throws Exception {
         try(var env=new RatisNodeRuntimeTest.Env(root.resolve("initial-tick"),false)) {
             var armed=new java.util.concurrent.atomic.AtomicBoolean();var reference=new java.util.concurrent.atomic.AtomicReference<RatisNodeRuntime>();

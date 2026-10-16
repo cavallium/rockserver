@@ -517,6 +517,34 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private volatile LocalMetadataCandidate localMetadataCandidate;private volatile boolean localMetadataPreparing,localMetadataStopped;
     private volatile ApplyPosition localMetadataBaseline,localMetadataCompletedCut;
     private volatile byte[] localMetadataImageHash;
+    @FunctionalInterface interface LocalMetadataProofReader {RatisConfiguredRecovery.LocalMetadataProof read(RatisTopologySourceSnapshotClient.ReplyAdmission admission)throws IOException;}
+    private LocalMetadataProofReader localMetadataProofReader;
+    void localMetadataProofReader(LocalMetadataProofReader reader){requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || localMetadataProofReader!=null)throw new IllegalStateException("Local META proof reader is fixed before initialization");localMetadataProofReader=Objects.requireNonNull(reader);}
+    RatisRecoveryObligationRpc.Local localMetadataObligationProof(RatisTopologySourceSnapshotClient.ReplyAdmission admission)throws Exception {
+        if(localMetadataProofReader==null || !localMetadataCompletionReady())return null;
+        var proof=localMetadataProofReader.read(admission);if(proof==null)return null;requireLocalMetadataObligationProof(proof);
+        return RatisRecoveryObligationRpc.local(proof,store.topologyFreeze());
+    }
+    /** Historical forced journal evidence must still have its genuine native origin and real updater. */
+    void requireLocalMetadataObligationProof(RatisConfiguredRecovery.LocalMetadataProof proof)throws IOException {
+        var request=proof.request();var completion=proof.completion();completion.require(request);requireMetadataDiscoveryReady(request.header());requireRecoveryRegistrationDrained();
+        try {
+            if(!localMetadataCompletionReady() || topologyStorage==null || topologyLocalReplica==null || !request.receiver().equals(topologyLocalReplica) || !getGroupId().getUuid().equals(request.sourceGroup()))throw new IOException("Local META proof lost its actual selected receiver");
+            var cut=store.applied();var configuration=store.configuration();var freeze=store.topologyFreeze();
+            if(store.ownership().owner().epoch()!=request.rangeEpoch() || !Arrays.equals(store.schemaDigest(),request.schemaDigest()) || !store.ownership().interval().equals(new RangeOwnership.Interval(request.domainId(),request.sourceDirectory().columns(),request.range().lowerInclusive(),request.range().upperExclusive())))throw new IOException("Local META proof changed native schema/geometry");
+            if(freeze==null || !Arrays.equals(freeze.header().encode(),request.header().encode()) || !Arrays.equals(freeze.digest(),completion.freezeDigest()) || !Arrays.equals(request.sourceDirectory().payloadDigest(),request.header().sourceDirectoryDigest()))throw new IOException("Local META proof lost original consuming FREEZE/source");freeze.requireParent(request.sourceGroup(),request.rangeEpoch(),request.domainId(),request.schemaDigest(),request.range().lowerInclusive(),request.range().upperExclusive());freeze.requireCut(completion.completedCut());
+            if(!RatisRelocationOwnerRpc.covers(cut,completion.completedCut()) || !RatisRelocationOwnerRpc.covers(localMetadataBaseline,completion.imageCut()) || localMetadataBaseline.equals(completion.imageCut()) && !Arrays.equals(localMetadataImageHash,completion.imageHash()) || configuration==null || configuration.term()<completion.configuration().term() || configuration.index()<completion.configuration().index() || configuration.index()==completion.configuration().index() && !sameConfiguration(configuration,completion.configuration()))throw new IOException("Local META proof native image/cut/configuration regressed");
+            var registration=store.metadataRecoveryRegistration();
+            if(completion.originKind()==RatisConfiguredRecovery.LocalMetadataOrigin.METADATA_REGISTRATION){if(registration==null || !Arrays.equals(registration.digest(),completion.originDigest()) || !registration.freeze().equals(freeze) || !store.metadataRecoveryRegistrationForced(registration) || store.metadataRecoveryPending() || !store.metadataRecoveryImageInstalled())throw new IOException("Local META proof lost registered native origin");}
+            else{var seed=topologyStorage.topologySeed(request.header().intentId());if(seed==null || !seed.localReplica().equals(topologyLocalReplica) || !Arrays.equals(seed.digest(),completion.originDigest()) || !Arrays.equals(seed.header().encode(),request.header().encode()) || !freeze.equals(seed.parentFreezes().get(request.sourceGroup())))throw new IOException("Local META proof lost original native seed");}
+            var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(topologyLocalReplica.peerId()))throw new IOException("Local META proof lost actual server");var division=server.getDivision(getGroupId());
+            if(division.getStateMachine()!=this || !division.getInfo().isAlive() || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING || !org.apache.ratis.server.impl.RockserverRaftServers.hasAppliedPrefix(division,this,TermIndex.valueOf(completion.completedCut().term(),completion.completedCut().index())))throw new IOException("Local META proof lacks its actual completed updater prefix");
+            var actual=division.getRaftConf();requireActualMembership(actual,request.range());boolean bootstrap=configuration.term()==0 && configuration.index()==-1 && actual.getLogEntryIndex()==0 && division.getRaftLog().getTermIndex(0)==null;
+            if(!org.apache.ratis.server.raftlog.LogProtoUtils.toRaftConfigurationProtoBuilder(actual).build().equals(RaftConfigurationProto.parseFrom(configuration.data())) || actual.getLogEntryIndex()!=configuration.index() && !bootstrap)throw new IOException("Local META proof actual/native configurations differ");
+            if(!Objects.equals(cut,store.applied()) || !sameConfiguration(configuration,store.configuration()) || !localMetadataCompletionReady())throw new IOException("Local META proof native owner changed during qualification");
+        }catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify local META obligation proof",invalid);}
+    }
+
     /** A driver completion flag alone is not a durable local ancestor baseline. */
     void requireMetadataDiscoveryReady(TopologyChange.Header header)throws IOException {
         requireHealthy();
@@ -5640,7 +5668,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
                 return query(request);
             }
-            if(kind==RatisRecoveryObsoleteRpc.KIND || kind==RatisTopologySourceSnapshotRpc.RELEASE || kind==RatisRecoveryImageRpc.KIND || ScopedTransactionRpc.schemaReplica(kind) || kind==ScopedTransactionRpc.TOPOLOGY_OWNER || kind==ScopedTransactionRpc.TOPOLOGY_SEED || kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner-local requests have no requested index override");return query(request);}
+            if(kind==RatisRecoveryObligationRpc.KIND || kind==RatisRecoveryObsoleteRpc.KIND || kind==RatisTopologySourceSnapshotRpc.RELEASE || kind==RatisRecoveryImageRpc.KIND || ScopedTransactionRpc.schemaReplica(kind) || kind==ScopedTransactionRpc.TOPOLOGY_OWNER || kind==ScopedTransactionRpc.TOPOLOGY_SEED || kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner-local requests have no requested index override");return query(request);}
             if (kind>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
             synchronized (gate) {
                 requireHealthy();
@@ -5816,6 +5844,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(kind==ScopedTransactionRpc.TOPOLOGY_SEED) {
                 requireDataRole();if(proofQueries==null || topologySeedInstaller==null)throw new IOException("Topology SEED actual owner installer is not configured");var requested=RatisTopologySeedRpc.decodeRequest(encoded);if(!requested.anchorGroup().equals(store.ownership().owner().groupId()))throw new IOException("Topology SEED crossed parent group");
                 return proofQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.MAX_BYTES,false,owned->{ var seedRequest=RatisTopologySeedRpc.decodeRequest(owned);var target=new RatisTopologyOwnerRpc.Target(seedRequest.definition(),TopologyChange.Stage.FREEZE,seedRequest.catalogue(),seedRequest.anchorGroup(),seedRequest.replica());topologyOwnerEvidence(target);var seed=topologySeedInstaller.install(seedRequest);seedRequest.requireSeed(seed);topologyOwnerEvidence(target);return Message.valueOf(ByteString.copyFrom(RatisTopologySeedRpc.reply(new RatisTopologySeedRpc.Reply(seedRequest,seed)))); });
+            }
+            if(kind==RatisRecoveryObligationRpc.KIND){
+                requireDataRole();if(proofQueries==null)throw new IOException("Recovery completion proof dispatcher is not configured");var target=RatisRecoveryObligationRpc.request(encoded);
+                if(!target.key().groupId().equals(store.ownership().owner().groupId()))throw new IOException("Recovery completion proof crossed native group");
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.MAX_BYTES,false,owned->{requireHealthy();var requested=RatisRecoveryObligationRpc.request(owned);var local=getServer().getNow(null);if(local==null || topologyLocalReplica==null || getLifeCycleState()!=LifeCycle.State.RUNNING || !local.getId().toString().equals(topologyLocalReplica.peerId()))throw new IOException("Recovery completion proof changed actual receiver");var division=local.getDivision(getGroupId());if(division.getStateMachine()!=this || !division.getInfo().isAlive() || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Recovery completion proof lost actual division owner");try(var metadata=reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,4096,1)){var nativeProof=RatisRecoveryObligationRpc.local(store);var localProof=nativeProof!=null && nativeProof.request().metadataOnly()?null:localMetadataObligationProof(bytes->metadata.growTo(Math.max(metadata.bytes(),4096L+16L*bytes)));return Message.valueOf(ByteString.copyFrom(RatisRecoveryObligationRpc.reply(requested,RatisRecoveryObligationRpc.evidence(store,requested,topologyLocalReplica,localProof==null?nativeProof:localProof))));}});
             }
             if(kind==ScopedTransactionRpc.TOPOLOGY_OWNER) {
                 requireDataRole();if(proofQueries==null)throw new IOException("Topology owner proof dispatcher is not configured");var target=RatisTopologyOwnerRpc.decodeRequest(encoded);if(!target.group().equals(store.ownership().owner().groupId()))throw new IOException("Topology proof crossed native group");
@@ -6018,6 +6051,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private RatisNodeResourceBudget.Lease readConstructionLease(int kind,ByteBuffer request) throws IOException {
         long responseBytes;
         switch (kind) {
+            case RatisRecoveryObligationRpc.KIND -> {return reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,RatisRecoveryObligationRpc.proofBytes(store)+4L*request.remaining(),1);}
             case RatisRecoveryObsoleteRpc.KIND -> {return reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,4096L+16L*request.remaining()+4L*RatisRecoveryObsoleteRpc.MAX_REPLY_BYTES,1);}
             case RatisRecoveryImageRpc.KIND -> {return reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,256L+4L*request.remaining()+4L*RatisRecoveryImageRpc.MAX_REPLY_BYTES,1);}
             case ScopedTransactionRpc.POINT, ScopedTransactionRpc.GET, ScopedTransactionRpc.SNAPSHOT_GET ->

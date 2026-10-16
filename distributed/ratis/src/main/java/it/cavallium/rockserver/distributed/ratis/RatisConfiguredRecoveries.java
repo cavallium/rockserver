@@ -31,7 +31,7 @@ final class RatisConfiguredRecoveries {
     }
     private static final class Slot {
         final UUID pool,group;final Path directory;final RatisJournalAccess files;final int index;
-        RatisConfiguredRecovery.Phase phase;
+        RatisConfiguredRecovery.Phase phase;long publication;
         Slot(UUID pool,UUID group,Path directory,RatisJournalAccess files,int index){this.pool=pool;this.group=group;this.directory=directory;this.files=files;this.index=index;}
     }
     private final class Metadata implements RatisConfiguredRecovery.Metadata {
@@ -93,6 +93,17 @@ final class RatisConfiguredRecoveries {
         int count=0;try(var entries=Files.newDirectoryStream(directory)){for(var file:entries){String name=file.getFileName().toString();if(++count>3 || !Set.of("recovery","recovery.pending","recovery.lock").contains(name) || !Files.isRegularFile(file,LinkOption.NOFOLLOW_LINKS))throw new IOException("Foreign configured recovery file");long size=Files.size(file),limit=name.equals("recovery.lock")?4096:RatisSchemaClientJournal.MAX_BYTES;if(size>limit)throw new IOException("Configured recovery file exceeds bound");}}
     }
 
+    private synchronized void publishPhase(Slot slot,RatisConfiguredRecovery.Phase phase){slot.publication=Math.incrementExact(slot.publication);slot.phase=phase;}
+    /** Read-only proof lane: no actor opening, forcing, manager-IO wait or retained body cache. */
+    RatisConfiguredRecovery.LocalMetadataProof localMetadataProof(UUID group,RatisTopologySourceSnapshotClient.ReplyAdmission admission)throws IOException {
+        Objects.requireNonNull(admission);
+        final Slot slot;final long publication;
+        synchronized(this){slot=groups.get(group);if(stopping || slot==null || slot.phase!=RatisConfiguredRecovery.Phase.LOCAL_DONE)return null;publication=slot.publication;}
+        validateFiles(slot.directory);var file=slot.directory.resolve("recovery");long bytes=Files.size(file);if(bytes>RatisSchemaClientJournal.MAX_BYTES)throw new IOException("Local completion journal exceeds bound");admission.beforeReply(Math.toIntExact(bytes));
+        var proof=RatisConfiguredRecovery.localMetadataProof(RatisSchemaClientJournal.readOwned(file,slot.files),binding,group);
+        synchronized(this){if(stopping || slot.phase!=RatisConfiguredRecovery.Phase.LOCAL_DONE || slot.publication!=publication)throw new IOException("Local completion journal publication changed during proof");}
+        return proof;
+    }
     /** One graph/discovery operation shares the actual IO owner with recovery steps and stop. */
     CompletableFuture<Void> discover(java.util.concurrent.Callable<Void> action) {
         Objects.requireNonNull(action);final CompletableFuture<Void> pending;
@@ -113,7 +124,7 @@ final class RatisConfiguredRecoveries {
         try {
             validateFiles(slot.directory);
             try(var driver=new RatisConfiguredRecovery(slot.directory,binding,null,hosts.create(metadata),io,slot.files,metadata,initial->{if(!initial.sourceGroup().equals(slot.group) || !owner.pool(initial).equals(slot.pool))throw new IOException("Retained recovery escaped its pool/group");})) {
-                synchronized(this){slot.phase=driver.phase();}
+                publishPhase(slot,driver.phase());
                 return driver.retainedRequests(admission);
             }
         }finally{metadata.close();}
@@ -129,7 +140,7 @@ final class RatisConfiguredRecoveries {
         Slot slot;synchronized(this){slot=groups.get(selected.sourceGroup());}if(slot!=null && !slot.pool.equals(pool))throw new IOException("Selected recovery changed retained pool");
         if(slot==null)slot=addSlot(pool,selected.sourceGroup(),root.resolve(pool.toString()).resolve(selected.sourceGroup().toString()));
         if(!Files.exists(slot.directory,LinkOption.NOFOLLOW_LINKS)){Files.createDirectory(slot.directory);SessionJournalFiles.force(slot.directory.getParent());}
-        var metadata=new Metadata(pool);boolean opened=false;try{open(slot,Files.exists(slot.directory.resolve("recovery"),LinkOption.NOFOLLOW_LINKS)?null:selected,metadata);opened=true;synchronized(this){slot.phase=null;}active.ensureSelected(selected);synchronized(this){slot.phase=active.phase();}}finally{if(opened)closeActive();else metadata.close();}
+        var metadata=new Metadata(pool);boolean opened=false;try{open(slot,Files.exists(slot.directory.resolve("recovery"),LinkOption.NOFOLLOW_LINKS)?null:selected,metadata);opened=true;publishPhase(slot,null);active.ensureSelected(selected);publishPhase(slot,active.phase());}finally{if(opened)closeActive();else metadata.close();}
     }
     /** Borrow the already-serialized discovery IO owner; never enqueue or wait on this same executor. */
     void reconcileOnIo(Request selected,NativeRecoverySupersession.Scope scope,List<Request> aliases)throws IOException {
@@ -144,7 +155,7 @@ final class RatisConfiguredRecoveries {
         var metadata=new Metadata(pool);boolean opened=false;
         try {
             var original=Files.exists(slot.directory.resolve("recovery"),LinkOption.NOFOLLOW_LINKS)?null:aliases.getFirst();open(slot,original,metadata);opened=true;
-            synchronized(this){slot.phase=null;}active.reconcile(selected,scope,aliases);synchronized(this){slot.phase=active.phase();}
+            publishPhase(slot,null);active.reconcile(selected,scope,aliases);publishPhase(slot,active.phase());
         }finally{if(opened)closeActive();else metadata.close();}
     }
     /** The returned observation acknowledges the forced initial journal, independently of host work. */
@@ -189,7 +200,7 @@ final class RatisConfiguredRecoveries {
             var driver=active;var slot=activeSlot;
             driver.step().whenComplete((phase,failure)->post(()->{
                 try {
-                    synchronized(this){slot.phase=driver.phase();}visits++;
+                    publishPhase(slot,driver.phase());visits++;
                     if(failure!=null || RatisConfiguredRecovery.terminal(phase) || visits>=STEPS_PER_VISIT){cursor=(slot.index+1)%slots.size();if(!isStopping())closeActive();}
                     finish(pending,unwrap(failure));
                 }catch(Throwable failed){finish(pending,failed);}
@@ -199,10 +210,10 @@ final class RatisConfiguredRecoveries {
     private Slot select(){for(int checked=0;checked<slots.size();checked++){var slot=slots.get(cursor);if(!RatisConfiguredRecovery.terminal(slot.phase))return slot;cursor=(cursor+1)%slots.size();}return null;}
     private void open(Slot slot,Request request,Metadata metadata)throws IOException {
         try {
-            synchronized(this){slot.phase=null;} // A lost constructor-force ACK must be rediscovered, even after cached DONE.
+            publishPhase(slot,null); // A lost constructor-force ACK must be rediscovered, even after cached DONE.
             validateFiles(slot.directory);
             var driver=new RatisConfiguredRecovery(slot.directory,binding,request,hosts.create(metadata),io,slot.files,metadata,initial->{if(!initial.sourceGroup().equals(slot.group) || !owner.pool(initial).equals(slot.pool))throw new IOException("Configured recovery journal escaped its pool/group");});
-            active=driver;activeSlot=slot;visits=0;synchronized(this){slot.phase=driver.phase();}
+            active=driver;activeSlot=slot;visits=0;publishPhase(slot,driver.phase());
         }catch(IOException|RuntimeException|Error failure){metadata.close();throw failure;}
     }
     private void closeActive()throws IOException {if(active==null)return;var previous=active;active=null;activeSlot=null;visits=0;previous.close();}

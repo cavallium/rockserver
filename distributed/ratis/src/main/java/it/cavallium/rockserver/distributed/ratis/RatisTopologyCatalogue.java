@@ -13,7 +13,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 public final class RatisTopologyCatalogue {
     public static final int MAX_INTENTS=128;
     public static final long MAX_BYTES=64L*1024*1024;
-    private static final byte STATE=(byte)0x82,HEAD=(byte)0x83,DEFINITION=(byte)0x84,IDENTITY=(byte)0x85,CAPACITY=(byte)0x86;
+    private static final byte STATE=(byte)0x82,HEAD=(byte)0x83,DEFINITION=(byte)0x84,IDENTITY=(byte)0x85,CAPACITY=(byte)0x86,RECOVERY=(byte)0x88,RECOVERY_COMPLETIONS=(byte)0x89;
     @FunctionalInterface public interface ImmutableReader { byte[] read(byte[] key); }
     /** Trusted transport validates the actual addressed owner, stable configuration and current Raft term. */
     @FunctionalInterface public interface OwnerProofReader { QualifiedOwner read(TopologyChange.Definition definition,TopologyChange.Proof expected) throws IOException; }
@@ -26,7 +26,7 @@ public final class RatisTopologyCatalogue {
         public Capacity { if(count<0 || count>MAX_INTENTS || bytes<0 || bytes>MAX_BYTES || (count==0)!=(bytes==0)) throw new IllegalArgumentException("Invalid topology capacity"); }
         public byte[] encode() { return ByteBuffer.allocate(12).putInt(count).putLong(bytes).array(); }
         public static Capacity decode(byte[] bytes) { if(bytes==null) return new Capacity(0,0); if(bytes.length!=12) throw new IllegalArgumentException("Invalid topology capacity length"); var in=ByteBuffer.wrap(bytes); return new Capacity(in.getInt(),in.getLong()); }
-        Capacity reserve(int definitionBytes) { return new Capacity(Math.incrementExact(count),Math.addExact(bytes,definitionBytes+33L+17+32+2L*(17+TopologyChange.MAX_STATUS_BYTES))); }
+        Capacity reserve(int definitionBytes) { return new Capacity(Math.incrementExact(count),Math.addExact(bytes,definitionBytes+33L+17+32+2L*(17+TopologyChange.MAX_STATUS_BYTES)+2L*17+TopologyChange.MAX_HEADER_BYTES+12L+RatisTopologyRecoveryObligations.MAX_BYTES)); }
     }
     private final RaftClient client;
     private final UUID cluster,database,group,column;
@@ -51,15 +51,15 @@ public final class RatisTopologyCatalogue {
     }
     public DistributedCommand prepareDefinition(OperationId operation,TopologyChange.Definition definition,Capacity expected) {
         requireDefinition(definition,cluster,database,definition.digest()); byte[] bytes=definition.encode(); var next=(expected==null ? new Capacity(0,0) : expected).reserve(bytes.length);
-        return checked(operation,List.of(put(definitionKey(definition.digest()),bytes),put(identityKey(definition.header().intentId()),definition.digest()),put(capacityKey(),next.encode())),
-                List.of(predicate(definitionKey(definition.digest()),null),predicate(identityKey(definition.header().intentId()),null),predicate(capacityKey(),expected==null ? null : expected.encode())));
+        return checked(operation,List.of(put(definitionKey(definition.digest()),bytes),put(identityKey(definition.header().intentId()),definition.digest()),put(capacityKey(),next.encode()),put(recoveryKey(definition.intentId()),RatisTopologyRecoveryObligations.reserve(definition.header()).encode()),put(recoveryCompletionsKey(definition.intentId()),RatisTopologyRecoveryObligations.reserve(definition.header()).encode())),
+                List.of(predicate(definitionKey(definition.digest()),null),predicate(identityKey(definition.header().intentId()),null),predicate(capacityKey(),expected==null ? null : expected.encode()),predicate(recoveryKey(definition.intentId()),null),predicate(recoveryCompletionsKey(definition.intentId()),null)));
     }
     public DistributedCommand prepareBegin(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expectedHead,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead) {
         requireDefinition(definition,cluster,database,definition.digest()); if(expectedHead!=null && !expectedHead.terminal()) throw new IllegalArgumentException("Topology domain already owns an active intent");
         var state=TopologyChange.State.begin(definition.header()); byte[] bytes=state.encode(); UUID id=state.header().intentId(),domain=state.header().domainId();
         return checked(operation,List.of(put(stateKey(id),bytes),put(headKey(domain),bytes)),List.of(predicate(stateKey(id),null),predicate(headKey(domain),expectedHead==null ? null : expectedHead.encode()),
                 predicate(domainKey(domain),RangeDirectoryCodec.encode(definition.sourceDirectory())),predicate(identityKey(id),definition.digest()),
-                predicate(RatisSchemaAdministration.headKey(domain),schemaHead==null ? null : schemaHead.encode()),predicate(RatisRangeImportCatalogue.headKey(domain),importHead==null ? null : importHead.encode())));
+                predicate(RatisSchemaAdministration.headKey(domain),schemaHead==null ? null : schemaHead.encode()),predicate(RatisRangeImportCatalogue.headKey(domain),importHead==null ? null : importHead.encode()),predicate(recoveryKey(id),RatisTopologyRecoveryObligations.reserve(definition.header()).encode())));
     }
     public DistributedCommand prepareAbort(OperationId operation,TopologyChange.State expected) {
         var next=expected.abort(); byte[] bytes=next.encode();
@@ -74,7 +74,7 @@ public final class RatisTopologyCatalogue {
         return checked(operation,List.of(put(stateKey(header.intentId()),bytes),put(headKey(header.domainId()),bytes)),
                 List.of(predicate(stateKey(header.intentId()),expected.encode()),predicate(headKey(header.domainId()),expected.encode()),
                         predicate(domainKey(header.domainId()),RangeDirectoryCodec.encode(definition.sourceDirectory())),predicate(identityKey(header.intentId()),definition.digest()),
-                        predicate(RatisSchemaAdministration.headKey(header.domainId()),schemaHead==null ? null : schemaHead.encode()),predicate(RatisRangeImportCatalogue.headKey(header.domainId()),importHead==null ? null : importHead.encode())));
+                        predicate(RatisSchemaAdministration.headKey(header.domainId()),schemaHead==null ? null : schemaHead.encode()),predicate(RatisRangeImportCatalogue.headKey(header.domainId()),importHead==null ? null : importHead.encode()),predicate(recoveryKey(header.intentId()),RatisTopologyRecoveryObligations.reserve(header).encode())));
     }
     public DistributedCommand prepareJoining(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead){expected.requireDefinition(definition);return prepareProgress(operation,definition,expected,expected.beginJoining(),schemaHead,importHead,false);}
     public DistributedCommand prepareReconfigured(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,TopologyChange.RelocationProof proof,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead){expected.requireDefinition(definition);return prepareProgress(operation,definition,expected,expected.reconfigured(proof),schemaHead,importHead,false);}
@@ -107,10 +107,8 @@ public final class RatisTopologyCatalogue {
     }
     private static void requireRetirementCoverage(TopologyChange.State state) {
         if(state.phase()!=TopologyChange.Phase.ACTIVE) throw new IllegalArgumentException("Topology retirement requires exact ACTIVE intent");
-        for(var target:state.header().targets()) for(var owner:target.owners()) {
-            var key=new TopologyChange.Key(target.groupId(),owner.replicaId());
-            if(!state.seeded().containsKey(key) || !state.activated().containsKey(key)) throw new IllegalArgumentException("Topology retirement waits for every configured target owner");
-        }
+        // Missing configured owners remain durable recovery obligations. Fresh native
+        // ACTIVATE quorums are checked by admitExecution, never inferred from this ledger.
     }
     private DistributedCommand prepareProgress(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,TopologyChange.State next,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead,boolean publication) {
         var header=next.header(); byte[] bytes=next.encode();
@@ -119,10 +117,30 @@ public final class RatisTopologyCatalogue {
         if(publication) writes.add(put(domainKey(header.domainId()),RangeDirectoryCodec.encode(definition.targetDirectory())));
         return checked(operation,writes,List.of(predicate(stateKey(header.intentId()),expected.encode()),predicate(headKey(header.domainId()),expected.encode()),
                 predicate(domainKey(header.domainId()),RangeDirectoryCodec.encode(directory)),predicate(identityKey(header.intentId()),definition.digest()),
-                predicate(RatisSchemaAdministration.headKey(header.domainId()),schemaHead==null ? null : schemaHead.encode()),predicate(RatisRangeImportCatalogue.headKey(header.domainId()),importHead==null ? null : importHead.encode())));
+                predicate(RatisSchemaAdministration.headKey(header.domainId()),schemaHead==null ? null : schemaHead.encode()),predicate(RatisRangeImportCatalogue.headKey(header.domainId()),importHead==null ? null : importHead.encode()),predicate(recoveryKey(header.intentId()),RatisTopologyRecoveryObligations.reserve(header).encode())));
+    }
+    public static boolean recoveryCompletion(DistributedCommand command){return isCommand(command) && command.mutations().size()==1 && command.mutations().getFirst().key().length==17 && command.mutations().getFirst().key()[0]==RECOVERY_COMPLETIONS;}
+    public DistributedCommand prepareRecoveryCompletion(OperationId operation,RatisTopologyRecoveryObligations expected,TopologyChange.Key key,RatisTopologyRecoveryObligations.Completion completion){
+        var next=expected.complete(key,completion);if(Arrays.equals(next.encode(),expected.encode()))throw new IllegalArgumentException("Recovery obligation already acknowledged");
+        return checked(operation,List.of(put(recoveryCompletionsKey(expected.header().intentId()),next.encode())),List.of(predicate(recoveryCompletionsKey(expected.header().intentId()),expected.encode()),predicate(identityKey(expected.header().intentId()),expected.header().definitionDigest()),predicate(recoveryKey(expected.header().intentId()),RatisTopologyRecoveryObligations.reserve(expected.header()).encode())));
+    }
+    static TopologyChange.Key completionKey(DistributedCommand command){var previous=RatisTopologyRecoveryObligations.decode(command.predicates().getFirst().expectedValue());var next=RatisTopologyRecoveryObligations.decode(command.mutations().getFirst().value());return next.completions().keySet().stream().filter(key->!previous.completions().containsKey(key)).findFirst().orElseThrow();}
+    @FunctionalInterface interface RecoveryOwnerReader {RatisTopologyRecoveryObligations.Completion read(RatisRecoveryObligationRpc.Target target)throws IOException;}
+    static void admitRecoveryCompletion(DistributedCommand command,UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column,ImmutableReader reader,RecoveryOwnerReader owners)throws IOException {
+        validator(cluster,database,group,epoch,schema,column,reader).accept(command);if(!recoveryCompletion(command) || owners==null)throw new IOException("Recovery completion owner admission absent");requireCurrentWitnesses(command,reader);
+        var next=RatisTopologyRecoveryObligations.decode(command.mutations().getFirst().value());var key=completionKey(command);var actual=owners.read(new RatisRecoveryObligationRpc.Target(group,next.header(),key));if(!next.completions().get(key).equals(actual))throw new IOException("Recovery ACK differs from original native completion");requireCurrentWitnesses(command,reader);
+    }
+    /** Retry identity derives from the original obligation, receipt and CAS predecessor, never current HEAD. */
+    boolean acknowledgeRecovery(RatisTopologyRecoveryObligations expected,TopologyChange.Key key,RatisTopologyRecoveryObligations.Completion completion)throws IOException {
+        if(expected.completions().containsKey(key))return true;
+        byte[] identity=OperatorUpload.sha256(ByteBuffer.allocate(32+32+97).put(expected.header().definitionDigest()).put(OperatorUpload.sha256(expected.encode())).put(RatisTopologyRecoveryObligations.encodeCompletion(completion)).array());
+        var id=ByteBuffer.wrap(identity);var command=prepareRecoveryCompletion(new OperationId(new UUID(id.getLong(),id.getLong()),0,0),expected,key,completion);
+        var prepared=client.io().sendReadOnly(message(RatisTopologyExecutionRpc.prepareRequest(command)));try{RatisTopologyExecutionRpc.requireEcho(content(prepared,RatisTopologyExecutionRpc.MAX_BYTES),RatisTopologyExecutionRpc.PREPARE,command);}catch(IllegalArgumentException invalid){throw new IOException("Recovery obligation preparation changed command",invalid);}
+        return execute(command).status()==CommandResult.Status.SUCCESS;
     }
     public static boolean requiresOwnerAdmission(DistributedCommand command) {
-        if(!isCommand(command) || command.mutations().size()<2 || command.predicates().size()!=6 || command.predicates().getFirst().expectedValue()==null) return false;
+        if(recoveryCompletion(command))return true;
+        if(!isCommand(command) || command.mutations().size()<2 || command.predicates().size()!=7 || command.predicates().getFirst().expectedValue()==null) return false;
         var previous=TopologyChange.State.decode(command.predicates().getFirst().expectedValue());
         var next=TopologyChange.State.decode(command.mutations().getFirst().value());
         return previous.phase()!=TopologyChange.Phase.PREPARED || next.phase()!=TopologyChange.Phase.FENCING && next.phase()!=TopologyChange.Phase.JOINING;
@@ -186,20 +204,27 @@ public final class RatisTopologyCatalogue {
     private DistributedCommand checked(OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates) { var command=new DistributedCommand(group,epoch,schema,operation,mutations,predicates); validator.accept(command); DistributedCommandCodec.encode(command); return command; }
     private Mutation put(byte[] key,byte[] value) { return new Mutation(Mutation.Kind.PUT,column,key,value); }
     private KeyPredicate predicate(byte[] key,byte[] value) { return new KeyPredicate(column,key,value); }
-    public static boolean isCommand(DistributedCommand command) { return command.mutations().stream().anyMatch(m->{ byte[] key=m.key(); return key.length==33 && key[0]==DEFINITION || key.length==17 && (key[0]==STATE || key[0]==HEAD || key[0]==IDENTITY) || key.length==1 && key[0]==CAPACITY; }); }
+    public static boolean isCommand(DistributedCommand command) { return command.mutations().stream().anyMatch(m->{ byte[] key=m.key(); return key.length==33 && key[0]==DEFINITION || key.length==17 && (key[0]==STATE || key[0]==HEAD || key[0]==IDENTITY || key[0]==RECOVERY || key[0]==RECOVERY_COMPLETIONS) || key.length==1 && key[0]==CAPACITY; }); }
     public static Consumer<DistributedCommand> validator(UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column,ImmutableReader reader) {
         byte[] digest=schema.clone(); return command->{
             if(command.kind()!=DistributedCommand.Kind.DATA || command.hasBucketData() || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1 || !command.groupId().equals(group) || command.rangeEpoch()!=epoch || !Arrays.equals(command.schemaDigest(),digest)) throw new IllegalArgumentException("Invalid topology catalogue envelope");
             for(var mutation:command.mutations()) if(mutation.kind()!=Mutation.Kind.PUT || mutation.returnMode()!=Mutation.ReturnMode.NONE || !mutation.columnId().equals(column)) throw new IllegalArgumentException("Invalid topology write");
-            if(command.mutations().size()==3 && command.predicates().size()==3) {
+            if(recoveryCompletion(command)){
+                if(command.predicates().size()!=3)throw new IllegalArgumentException("Invalid recovery ACK shape");var previous=RatisTopologyRecoveryObligations.decode(command.predicates().getFirst().expectedValue());var next=RatisTopologyRecoveryObligations.decode(command.mutations().getFirst().value());next.requireHeader(previous.header());requireNamespace(next.header(),cluster,database);
+                mutation(command.mutations().getFirst(),recoveryCompletionsKey(next.header().intentId()));guard(command.predicates().getFirst(),column,recoveryCompletionsKey(next.header().intentId()));guard(command.predicates().get(1),column,identityKey(next.header().intentId()));
+                guard(command.predicates().get(2),column,recoveryKey(next.header().intentId()));if(!Arrays.equals(command.predicates().get(2).expectedValue(),RatisTopologyRecoveryObligations.reserve(next.header()).encode()))throw new IllegalArgumentException("Recovery ACK lacks original immutable reservation");
+                if(!Arrays.equals(command.predicates().get(1).expectedValue(),next.header().definitionDigest()) || next.completions().size()!=previous.completions().size()+1)throw new IllegalArgumentException("Recovery ACK changed original reservation/identity");
+                for(var entry:previous.completions().entrySet())if(!entry.getValue().equals(next.completions().get(entry.getKey())))throw new IllegalArgumentException("Recovery ACK discarded original receipt");return;
+            }
+            if(command.mutations().size()==5 && command.predicates().size()==5) {
                 var definition=TopologyChange.Definition.decode(command.mutations().getFirst().value()); requireDefinition(definition,cluster,database,definition.digest());
-                byte[][] keys={definitionKey(definition.digest()),identityKey(definition.header().intentId()),capacityKey()};
-                for(int i=0;i<3;i++) { mutation(command.mutations().get(i),keys[i]); guard(command.predicates().get(i),column,keys[i]); }
-                if(command.predicates().get(0).expectedValue()!=null || command.predicates().get(1).expectedValue()!=null || !Arrays.equals(command.mutations().get(1).value(),definition.digest())
+                byte[][] keys={definitionKey(definition.digest()),identityKey(definition.header().intentId()),capacityKey(),recoveryKey(definition.intentId()),recoveryCompletionsKey(definition.intentId())};
+                for(int i=0;i<5;i++) { mutation(command.mutations().get(i),keys[i]); guard(command.predicates().get(i),column,keys[i]); }
+                if(command.predicates().get(4).expectedValue()!=null || !Arrays.equals(command.mutations().get(4).value(),command.mutations().get(3).value()) || command.predicates().get(3).expectedValue()!=null || !Arrays.equals(command.mutations().get(3).value(),RatisTopologyRecoveryObligations.reserve(definition.header()).encode()) || command.predicates().get(0).expectedValue()!=null || command.predicates().get(1).expectedValue()!=null || !Arrays.equals(command.mutations().get(1).value(),definition.digest())
                         || !Capacity.decode(command.mutations().get(2).value()).equals(Capacity.decode(command.predicates().get(2).expectedValue()).reserve(definition.encode().length))) throw new IllegalArgumentException("Topology definition identity/capacity differs");
                 return;
             }
-            if((command.mutations().size()!=2 && command.mutations().size()!=3) || command.predicates().size()!=2 && command.predicates().size()!=6) throw new IllegalArgumentException("Invalid topology intent shape");
+            if((command.mutations().size()!=2 && command.mutations().size()!=3) || command.predicates().size()!=2 && command.predicates().size()!=7) throw new IllegalArgumentException("Invalid topology intent shape");
             var next=TopologyChange.State.decode(command.mutations().getFirst().value()); var header=next.header(); requireNamespace(header,cluster,database);
             mutation(command.mutations().get(0),stateKey(header.intentId())); mutation(command.mutations().get(1),headKey(header.domainId()));
             if(!Arrays.equals(command.mutations().get(0).value(),command.mutations().get(1).value())) throw new IllegalArgumentException("Topology head/state differ");
@@ -247,6 +272,8 @@ public final class RatisTopologyCatalogue {
             guard(command.predicates().get(2),column,domainKey(header.domainId())); if(!Arrays.equals(command.predicates().get(2).expectedValue(),RangeDirectoryCodec.encode(directory))) throw new IllegalArgumentException("Topology stage directory differs");
             if(command.mutations().size()==3) { mutation(command.mutations().get(2),domainKey(header.domainId())); if(!Arrays.equals(command.mutations().get(2).value(),RangeDirectoryCodec.encode(definition.targetDirectory()))) throw new IllegalArgumentException("Topology publication target directory differs"); }
             guard(command.predicates().get(3),column,identityKey(header.intentId())); if(!Arrays.equals(command.predicates().get(3).expectedValue(),header.definitionDigest())) throw new IllegalArgumentException("Topology definition identity is not committed");
+            guard(command.predicates().get(6),column,recoveryKey(header.intentId()));
+            if(!Arrays.equals(command.predicates().get(6).expectedValue(),RatisTopologyRecoveryObligations.reserve(header).encode()))throw new IllegalArgumentException("Topology stage lacks exact immutable recovery reservation");
             RatisSchemaAdministration.requireTopologyGuard(command.predicates().get(4),directory); RatisRangeImportCatalogue.requireTopologyGuard(command.predicates().get(5),directory);
             if(!command.predicates().get(4).columnId().equals(column) || !command.predicates().get(5).columnId().equals(column)) throw new IllegalArgumentException("Topology administrative guard column differs");
         };
@@ -267,6 +294,9 @@ public final class RatisTopologyCatalogue {
             if(!state.terminal() || !state.header().domainId().equals(directory.domainId())) throw new IllegalArgumentException("Active/foreign topology prevents other administration");
         }
     }
+    public static byte[] recoveryKey(UUID id) { return idKey(RECOVERY,id); }
+    public static byte[] recoveryCompletionsKey(UUID id) { return idKey(RECOVERY_COMPLETIONS,id); }
+    public RatisTopologyRecoveryObligations readRecovery(UUID id)throws IOException {byte[] bytes=read(recoveryCompletionsKey(id),RatisTopologyRecoveryObligations.MAX_BYTES);return bytes==null?null:RatisTopologyRecoveryObligations.decode(bytes);}
     public static byte[] stateKey(UUID id) { return idKey(STATE,id); }
     public static byte[] statePrefix() { return new byte[]{STATE}; }
     public static byte[] headKey(UUID id) { return idKey(HEAD,id); }

@@ -98,7 +98,7 @@ class RatisTopologyCatalogueTest {
             var expected=catalogue.readHead(source.domainId()); var parent=definition.header().parents().getFirst(); var replica=parent.owners().getFirst();
             var proof=TopologyChange.Proof.of(TopologyChange.Stage.FREEZE,definition.header(),parent.groupId(),replica.replicaId(),new ApplyPosition(1,1),new byte[32],definition.header().sourceDirectoryDigest());
             var valid=catalogue.prepareProof(f.operation(4),definition,expected,proof,null,null); assertTrue(RatisTopologyCatalogue.requiresOwnerAdmission(valid)); assertDoesNotThrow(()->f.pure.accept(valid));
-            for(int index:new int[]{2,3,4,5}) {
+            for(int index:new int[]{2,3,4,5,6}) {
                 var predicates=new ArrayList<>(valid.predicates()); var original=predicates.get(index);
                 predicates.set(index,new KeyPredicate(f.outer.directoryColumn,new byte[]{42},original.expectedValue()));
                 var malformed=new DistributedCommand(f.outer.catalogue,1,new byte[32],f.operation(5+index),valid.mutations(),predicates);

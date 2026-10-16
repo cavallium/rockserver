@@ -31,6 +31,15 @@ public final class RatisTopologyOwnerClient implements AutoCloseable {
             try{return RatisTopologyOwnerRpc.decodeReply(reply.getMessage().getContent().toByteArray(),target);}catch(IllegalArgumentException invalid){throw new IOException("Invalid topology owner evidence",invalid);}
         }finally{end();}
     }
+    RatisTopologyRecoveryObligations.Completion recoveryCompletion(TopologyChange.Definition definition,RatisRecoveryObligationRpc.Target target)throws IOException {
+        requireNamespace(definition);target.header().requireDefinition(definition);if(!catalogue.equals(target.catalogue()))throw new IOException("Recovery obligation catalogue differs");
+        var range=java.util.stream.Stream.concat(definition.parents().stream(),definition.targets().stream()).filter(r->r.groupId().equals(target.key().groupId())).findFirst().orElseThrow();var owner=range.replicas().stream().filter(r->r.replicaId().equals(target.key().replicaId())).findFirst().orElseThrow();
+        begin();try(var lease=clients.acquireOwner(range,owner)){
+            var reply=RatisRoutedClient.rpc(()->lease.client().io().sendStaleRead(Message.valueOf(ByteString.copyFrom(RatisRecoveryObligationRpc.request(target))),0,RaftPeerId.valueOf(owner.peerId())));
+            if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !RaftGroupId.valueOf(range.groupId()).equals(reply.getRaftGroupId()) || !RaftPeerId.valueOf(owner.peerId()).equals(reply.getServerId()) || reply.getMessage().getContent().size()>RatisRecoveryObligationRpc.MAX_BYTES+ScopedTransactionRpc.HEADER_BYTES+97)throw new IOException("Recovery completion proof crossed addressed owner/group",reply==null?null:reply.getException());
+            try{return RatisRecoveryObligationRpc.reply(reply.getMessage().getContent().toByteArray(),target);}catch(IllegalArgumentException invalid){throw new IOException("Invalid native recovery completion evidence",invalid);}
+        }finally{end();}
+    }
     /** Borrowed catalogue authority client remains owned by the caller. */
     public RatisTopologyController.DataPlane dataPlane(RatisTopologyAuthority.Client authority){
         Objects.requireNonNull(authority);return new RatisTopologyController.DataPlane(){

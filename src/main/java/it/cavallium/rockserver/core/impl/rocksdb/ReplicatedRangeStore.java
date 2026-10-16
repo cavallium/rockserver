@@ -1427,6 +1427,18 @@ public final class ReplicatedRangeStore {
             return true;
         });
     }
+    /** Original durable completion receipt; no fresh HEAD is needed to acknowledge it. */
+    public byte[] recoveryCompletionReceipt() throws RocksDBException {
+        return readSchemaMetadata(()->{
+            boolean metadata=metadataRecoveryRegistration!=null;
+            if(pendingInstallation!=null || (metadata?!metadataRecoveryReady:currentRangeRecovery==null || !currentRangeRecoveryReady))return null;
+            byte[] receipt=db.get(state,topologyOwnershipKey(metadata?0x70:0x73));
+            if(metadata)requireMetadataCompletion(metadataRecoveryRegistration,receipt,applied);
+            else NativeCurrentRangeRecovery.requireCompletion(currentRangeRecovery,receipt,applied);
+            if(!(metadata?metadataImageInstalledUnderLane():currentImageInstalledUnderLane()))throw new IllegalStateException("Completed recovery lost its registered image");
+            return receipt;
+        });
+    }
     private static byte[] recoveryCompletion(byte[] registration,ApplyPosition required,Configuration configuration,ApplyPosition completed){byte[] cfg=configuration.data();return ByteBuffer.allocate(84+cfg.length).put(registration).putLong(required.term()).putLong(required.index()).putLong(configuration.term()).putLong(configuration.index()).putInt(cfg.length).put(cfg).putLong(completed==null?0:completed.term()).putLong(completed==null?-1:completed.index()).array();}
     private static boolean sameCompletionRecipe(byte[] first,byte[] second){return first.length>=85 && second.length>=85 && first.length==second.length && Arrays.equals(first,0,first.length-16,second,0,second.length-16);}
     static void requireMetadataCompletion(NativeMetadataRecoveryRegistration registration,byte[] receipt,ApplyPosition cut){

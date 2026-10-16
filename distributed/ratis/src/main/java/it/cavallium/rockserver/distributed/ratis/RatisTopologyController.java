@@ -126,7 +126,7 @@ public final class RatisTopologyController implements AutoCloseable {
                 else { value(h,"cursor",cursor+1); collect(h,TopologyChange.Stage.ACTIVATE,"actProofCursor",Phase.ACTIVATE_PROOFS); }
             }
             case ACTIVE -> {
-                if(pending(h)==0) { freeze(h,catalogue.prepareRetirement(next(h),d,state,schema(h),imported(h)),Phase.RETIRED); execute(h); }
+                if(state.phase()==TopologyChange.Phase.ACTIVE) { freeze(h,catalogue.prepareRetirement(next(h),d,state,schema(h),imported(h)),Phase.RETIRED); execute(h); }
                 else if(cursor%3==0) { seedNode(h); value(h,"cursor",cursor+1); save(h); }
                 else if(cursor%3==1) { value(h,"cursor",cursor+1); collect(h,TopologyChange.Stage.SEED,"seedProofCursor",Phase.ACTIVE); }
                 else { value(h,"cursor",cursor+1); collect(h,TopologyChange.Stage.ACTIVATE,"actProofCursor",Phase.ACTIVE); }

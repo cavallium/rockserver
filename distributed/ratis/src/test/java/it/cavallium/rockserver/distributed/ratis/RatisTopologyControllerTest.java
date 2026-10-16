@@ -95,7 +95,7 @@ class RatisTopologyControllerTest {
                 throw failure;
             }
         }
-        String action(DistributedCommand command) { if(command.mutations().isEmpty()) return "ACK"; if(command.predicates().size()==3) return "DEFINITION"; if(command.predicates().getFirst().expectedValue()==null) return "BEGIN"; var old=TopologyChange.State.decode(command.predicates().getFirst().expectedValue()); if(old.phase()==TopologyChange.Phase.PREPARED) return "FENCING"; if(command.mutations().size()==3) return "PUBLISH"; if(TopologyChange.State.decode(command.mutations().getFirst().value()).phase()==TopologyChange.Phase.RETIRED) return "RETIRE"; return RatisTopologyCatalogue.executionProof(command).stage().name(); }
+        String action(DistributedCommand command) { if(command.mutations().isEmpty()) return "ACK"; if(command.predicates().size()==5) return "DEFINITION"; if(command.predicates().getFirst().expectedValue()==null) return "BEGIN"; var old=TopologyChange.State.decode(command.predicates().getFirst().expectedValue()); if(old.phase()==TopologyChange.Phase.PREPARED) return "FENCING"; if(command.mutations().size()==3) return "PUBLISH"; if(TopologyChange.State.decode(command.mutations().getFirst().value()).phase()==TopologyChange.Phase.RETIRED) return "RETIRE"; return RatisTopologyCatalogue.executionProof(command).stage().name(); }
         void bindReaders() throws Exception { for(var machine:server.machines==null ? List.<RatisRangeStateMachine>of() : server.machines.values()) RatisTopologySeedRuntimeTest.field(machine,"topologyAuthority",(RatisRangeStateMachine.TopologyAuthorityReader)this::authority); }
         ReplicatedRangeStore store(UUID group) throws Exception { return RatisTopologySeedRuntimeTest.field(server.machines.get(RaftGroupId.valueOf(group)),"store",ReplicatedRangeStore.class); }
         RaftClientReply reply(UUID group,byte[] bytes) { return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(group)).setCallId(1).setSuccess(true).setMessage(message(bytes)).build(); }
@@ -182,13 +182,13 @@ class RatisTopologyControllerTest {
     @Test void executableLocalSplitAndMergeUseActualOwnerArtifactsThroughActivationAndBusinessData() throws Exception {
         for(boolean merge:List.of(false,true)) try(var f=new Fixture(root.resolve("workflow-"+merge),merge,true)) {
             Path journal=Files.createDirectory(root.resolve("journal-"+merge)); try(var controller=f.controller(journal)) {
-                var handle=controller.prepare(f.definition); until(controller,handle,journal,RatisTopologyController.Phase.ACTIVE); var progress=controller.advance(handle,6); assertEquals(TopologyChange.Phase.ACTIVE,progress.state().phase()); assertTrue(progress.retirementBlocked()); assertTrue(progress.pendingOwners()>0,"Unready configured listener is not synthesized from the local voter");
+                var handle=controller.prepare(f.definition); until(controller,handle,journal,RatisTopologyController.Phase.ACTIVE); var progress=controller.advance(handle,6); assertEquals(TopologyChange.Phase.RETIRED,progress.state().phase()); assertFalse(progress.retirementBlocked()); assertTrue(progress.pendingOwners()>0,"Unready configured listener is not synthesized from the local voter");
                 var current=new RatisCatalogue(f.client,f.definition.sourceDirectory().clusterId(),f.definition.sourceDirectory().databaseId(),f.plan.catalogue().groupId(),1,new byte[32],f.plan.catalogue().directoryColumn()).read(f.definition.header().domainId()); assertArrayEquals(f.definition.targetDirectory().payloadDigest(),current.payloadDigest());
                 for(var child:f.definition.targets()) { var store=f.store(child.groupId()); assertFalse(store.topologyBirthPending()); assertTrue(store.admissionOpen()); }
                 var first=f.definition.targets().getFirst(); var store=f.store(first.groupId()); assertArrayEquals(new byte[]{42},store.readCurrentPoint(COLUMN,new byte[]{1})); if(merge) assertArrayEquals(new byte[]{43},store.readCurrentPoint(COLUMN,new byte[]{(byte)200}));
                 var put=new DistributedCommand(first.groupId(),first.rangeEpoch(),f.definition.header().schemaDigest(),new OperationId(id(99),0,0),List.of(new Mutation(Mutation.Kind.PUT,COLUMN,new byte[]{1},new byte[]{77}))); assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,store.applied().index()+1),put)).status()); assertArrayEquals(new byte[]{77},store.readCurrentPoint(COLUMN,new byte[]{1}));
             }
-            try(var reopened=f.controller(journal)) { var handle=reopened.reopen(f.definition.intentId()); assertEquals(TopologyChange.Phase.ACTIVE,reopened.advance(handle,3).state().phase()); }
+            try(var reopened=f.controller(journal)) { var handle=reopened.reopen(f.definition.intentId()); assertEquals(TopologyChange.Phase.RETIRED,reopened.advance(handle,3).state().phase()); }
         }
     }
     @Test void sameCatalogueSplitRetirementThenMergeRetainsReadonlyPinOriginalReceiptAndHistory() throws Exception {
@@ -200,21 +200,13 @@ class RatisTopologyControllerTest {
             try(var pin=parent.captureReadable(new TransactionScope(List.of(TransactionScope.Span.point(COLUMN,new byte[]{1}))))) {
                 try(var controller=f.controller(journal)) {
                     var handle=controller.prepare(split); until(controller,handle,journal,RatisTopologyController.Phase.ACTIVE);
-                    var blocked=controller.advance(handle,12); assertTrue(blocked.retirementBlocked()); assertTrue(blocked.pendingOwners()>0);
-                    assertThrows(IllegalArgumentException.class,()->f.catalogue.prepareRetirement(new OperationId(id(34),0,0),split,handle.state(),null,null));
-                    var active=handle.state(); var column=f.plan.catalogue().directoryColumn(); var header=active.header();
-                    var bypass=new DistributedCommand(f.plan.catalogue().groupId(),1,new byte[32],new OperationId(id(35),0,0),List.of(new Mutation(Mutation.Kind.PUT,column,RatisTopologyCatalogue.stateKey(header.intentId()),active.retire().encode()),new Mutation(Mutation.Kind.PUT,column,RatisTopologyCatalogue.headKey(header.domainId()),active.retire().encode())),List.of(
-                            new KeyPredicate(column,RatisTopologyCatalogue.stateKey(header.intentId()),active.encode()),new KeyPredicate(column,RatisTopologyCatalogue.headKey(header.domainId()),active.encode()),
-                            new KeyPredicate(column,ByteBuffer.allocate(16).putLong(header.domainId().getMostSignificantBits()).putLong(header.domainId().getLeastSignificantBits()).array(),RangeDirectoryCodec.encode(split.targetDirectory())),
-                            new KeyPredicate(column,RatisTopologyCatalogue.identityKey(header.intentId()),split.digest()),new KeyPredicate(column,RatisSchemaAdministration.headKey(header.domainId()),null),new KeyPredicate(column,RatisRangeImportCatalogue.headKey(header.domainId()),null)));
+                    var active=handle.state();var reservation=f.catalogue.readRecovery(split.intentId());assertNotNull(reservation);reservation.requireHeader(split.header());
+                    for(var participant:split.header().targets())for(var owner:participant.owners())assertTrue(reservation.owners().contains(new TopologyChange.Key(participant.groupId(),owner.replicaId())));
+                    assertTrue(active.header().targets().stream().mapToInt(target->target.owners().size()).sum()>active.activated().size(),"Absent configured owner remains explicitly reserved");
+                    var retire=f.catalogue.prepareRetirement(new OperationId(id(34),0,0),split,active,null,null);var predicates=new ArrayList<>(retire.predicates());predicates.removeLast();
+                    var bypass=new DistributedCommand(retire.groupId(),retire.rangeEpoch(),retire.schemaDigest(),new OperationId(id(35),0,0),retire.mutations(),predicates);
                     assertThrows(IllegalArgumentException.class,()->f.catalogue.execute(bypass));
-                    f.minorityAvailable=true;
-                    RatisTopologyController.Progress recovered=blocked;
-                    for(int i=0;i<200 && recovered.pendingOwners()!=0;i++) recovered=controller.advance(handle,1);
-                    assertEquals(0,recovered.pendingOwners(),()->"Listener recovery did not finish: "+f.minorityFailure);
-                    until(controller,handle,journal,RatisTopologyController.Phase.ACTIVE);
-                    assertEquals(TopologyChange.Phase.ACTIVE,handle.state().phase());
-                    f.loseCatalogue.add("RETIRE"); assertThrows(IOException.class,()->controller.advance(handle,1));
+                    f.loseCatalogue.add("RETIRE");assertThrows(IOException.class,()->controller.advance(handle,1));
                     assertEquals(TopologyChange.Phase.RETIRED,f.catalogue.readIntent(split.intentId()).phase());
                 }
                 try(var controller=f.controller(journal)) {

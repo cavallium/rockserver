@@ -100,7 +100,7 @@ class RatisLocalMetadataCompletionWorkflowTest {
                     assertTrue(store.topologyRetired());assertNotNull(node.nativePool(RatisPoolFixtures.ID).topologySeed(consuming.intentId()));assertNotNull(store.currentRangeRecoveryRegistration());assertTrue(store.currentRangeRecoveryReady());
                     node.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS);var slot=field(manager,"groups",Map.class).get(group);var journal=field(slot,"directory",Path.class).resolve("recovery");
                     assertEquals("FENCE_RECEIVER",phase(journal));stepUntil(manager,journal,"CLEANUP_OLD");assertNotNull(store.acknowledgedRecoverySupersession());assertEquals(0,metaPrepares.get());
-                    stepUntil(manager,journal,"PREPARE");assertTrue(obsoleteCalls.get()>0);assertEquals(0,sources.stats().leases());assertEquals(0,store.activeSnapshotPins());assertTrue(RatisSchemaClientJournal.read(journal).containsKey("cleanupScope"));
+                    stepUntil(manager,journal,"PREPARE");assertNull(manager.localMetadataProof(group,bytes->{throw new AssertionError("Unfinished journal cannot publish completion proof");}));assertTrue(obsoleteCalls.get()>0);assertEquals(0,sources.stats().leases());assertEquals(0,store.activeSnapshotPins());assertTrue(RatisSchemaClientJournal.read(journal).containsKey("cleanupScope"));
                     byte[] interruptedHash=null;ApplyPosition interruptedCut=null;
                     if(interruption!=Interruption.NONE){
                         interruptedCut=store.applied();var target=machine.getStateMachineStorage().getSnapshotFile(interruptedCut.term(),interruptedCut.index()).toPath();var retained=field(machine,"recoveryDir",Path.class).resolve(target.getFileName());assertFalse(Files.exists(retained));
@@ -128,11 +128,15 @@ class RatisLocalMetadataCompletionWorkflowTest {
                     stepUntil(manager,journal,"LOCAL_DONE");assertEquals(0,metaPrepares.get(),"Local seed must not dispatch a remote META PREPARE");assertLocal(node,group,consuming);
                     var terminal=RatisSchemaClientJournal.read(journal);assertFalse(terminal.containsKey("prepared"));assertFalse(terminal.containsKey("registration"));assertTrue(terminal.containsKey("localCompletion"));
                     if(probe!=null){assertEquals(0,probe.held.get());var receipt=localReceipt(terminal);assertEquals(interruptedCut,receipt.imageCut());assertArrayEquals(interruptedHash,receipt.imageHash());}
-                    requireExactLocalReceiptHash((RatisRangeStateMachine)actual.get().getDivision(id).getStateMachine(),terminal);
+                    var completedMachine=(RatisRangeStateMachine)actual.get().getDivision(id).getStateMachine();requireExactLocalReceiptHash(completedMachine,terminal);
+                    if(interruption==Interruption.NONE){var publishedManager=manager;assertThrows(IOException.class,()->publishedManager.localMetadataProof(group,bytes->{try{publishedManager.discover(()->{publishedManager.retainedOnIo(group,size->{});return null;}).get(20,TimeUnit.SECONDS);}catch(Exception failed){throw new IOException(failed);}}));}
+                    var selected=RatisTopologySourceSnapshotRpc.request(terminal.get("request"));var key=new TopologyChange.Key(group,selected.receiver().replicaId());var target=new RatisRecoveryObligationRpc.Target(c.groupId(),consuming.header(),key);
+                    var localProof=RatisRecoveryObligationRpc.reply(requireSuccess(submit(actual.get(),group,RatisRecoveryObligationRpc.request(target),false,true)).getMessage().getContent().toByteArray(),target);assertEquals(RatisTopologyRecoveryObligations.ProofKind.LOCAL_METADATA,localProof.kind());assertArrayEquals(OperatorUpload.sha256(terminal.get("localCompletion")),localProof.proofDigest());assertEquals(selected.transferId(),localProof.transferId());
+                    if(interruption==Interruption.NONE){var wrongKind=new RatisTopologyRecoveryObligations.Completion(localProof.transferId(),RatisTopologyRecoveryObligations.ProofKind.METADATA_REGISTRATION,localProof.requestDigest(),localProof.proofDigest(),localProof.completedCut());var rejection=assertThrows(UndeclaredThrowableException.class,()->topology.acknowledgeRecovery(topology.readRecovery(consuming.intentId()),key,wrongKind));var failed=assertInstanceOf(ExecutionException.class,rejection.getUndeclaredThrowable());assertEquals("Recovery ACK differs from original native completion",assertInstanceOf(IOException.class,failed.getCause()).getMessage());assertFalse(topology.readRecovery(consuming.intentId()).completions().containsKey(key));donor.loseRecoveryAck=true;var currentNode=node;assertThrows(ExecutionException.class,()->currentNode.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS));assertFalse(donor.loseRecoveryAck);assertEquals(localProof,topology.readRecovery(consuming.intentId()).completions().get(key));}
                     byte[] witness=terminal.get("cleanupScope");node.close();node=null;
                     for(int reopen=0;reopen<2;reopen++) {
                         node=open(donor,plan,nodeRoot,epochs,route,RatisNodeRuntime.Startup.RECOVER,this::electedServer);
-                        var currentNode=node;bootstrap(currentNode);assertLocal(currentNode,group,consuming);assertEquals("LOCAL_DONE",phase(journal));assertArrayEquals(witness,RatisSchemaClientJournal.read(journal).get("cleanupScope"));
+                        var currentNode=node;bootstrap(currentNode);assertLocal(currentNode,group,consuming);assertEquals(localProof,topology.readRecovery(consuming.intentId()).completions().get(key));assertEquals("LOCAL_DONE",phase(journal));assertArrayEquals(witness,RatisSchemaClientJournal.read(journal).get("cleanupScope"));
                         currentNode.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS);assertLocal(currentNode,group,consuming);assertEquals(0,metaPrepares.get());node.close();node=null;
                     }
                 }catch(Exception|Error failure){primary=failure;throw failure;}
@@ -237,6 +241,7 @@ class RatisLocalMetadataCompletionWorkflowTest {
 
     private RatisNodeRuntime open(RatisTwoPoolWorkflowFixture donor,RatisNodePlan plan,Path root,RatisSessionEpochs epochs,RatisRoutedClient route,RatisNodeRuntime.Startup startup,RatisNodeRuntime.ServerFactory factory)throws Exception {
         var borrowed=donor.service.restoreResources();var node=RatisNodeRuntime.open(plan,root,ConfigParser.parseDefault(),epochs,Map.of(donor.first.domainId(),route),borrowed.scheduler,borrowed.timer,()->20L,donor.manifest.settings(),startup,factory,List.of(donor.first));
+        donor.recoveryOwner=target->{try{var reply=submit(actual.get(),target.key().groupId(),RatisRecoveryObligationRpc.request(target),false,true);return RatisRecoveryObligationRpc.reply(reply.getMessage().getContent().toByteArray(),target);}catch(Exception failed){throw new IOException("Actual local META owner proof failed",failed);}};
         try{node.relocationTransport(range->client(donor,range),(range,peer)->client(donor,range));node.start();field(node,"poolPressure",RatisPoolPressureService.class).refresh().get(10,TimeUnit.SECONDS);return node;}catch(Throwable failure){try{node.close();}catch(Throwable cleanup){failure.addSuppressed(cleanup);}throw failure;}
     }
     private RaftServer electedServer(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines)throws IOException {
@@ -285,6 +290,7 @@ class RatisLocalMetadataCompletionWorkflowTest {
         var forged=(RatisConfiguredRecovery.LocalMetadataCompletion)decode.invoke(null,corrupt,selected);
         var refused=assertThrows(IOException.class,()->machine.confirmLocalMetadataCompletion(selected,receipt.head(),forged));
         assertEquals("Cold local META checkpoint changed its exact equal-cut hash",refused.getMessage());
+        assertThrows(IOException.class,()->machine.requireLocalMetadataObligationProof(new RatisConfiguredRecovery.LocalMetadataProof(selected,forged,OperatorUpload.sha256(corrupt))));
     }
     private static void stepUntil(RatisConfiguredRecoveries manager,Path journal,String phase)throws Exception {
         Throwable last=null;for(int n=0;n<48;n++){if(phase.equals(phase(journal)))return;try{manager.step().get(20,TimeUnit.SECONDS);}catch(ExecutionException pending){last=pending;}}
