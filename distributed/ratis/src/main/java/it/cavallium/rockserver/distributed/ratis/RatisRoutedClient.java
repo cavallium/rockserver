@@ -1448,6 +1448,14 @@ public final class RatisRoutedClient implements AutoCloseable {
     public RatisHomeSourceClosingRpc.ClosedReservation closedReservation(HomeIdentity identity)throws IOException {
         var descriptor=directory.ranges().stream().filter(r->r.groupId().equals(identity.groupId())).findFirst().orElseThrow(()->new IllegalArgumentException("HOME closing group absent"));if(!identity.definition().reserved())throw new IllegalArgumentException("CLOSED lookup requires original RESERVED");beginCall();try{byte[] bytes=transport.transaction(descriptor,RatisHomeSourceClosingRpc.lookup(identity),true);if(bytes.length==0)return null;var value=RatisHomeSourceClosingRpc.ClosedReservation.decode(bytes);value.requireIdentity(identity);return value;}catch(IllegalArgumentException invalid){throw new IOException("Invalid CLOSED reservation proof",invalid);}finally{endCall();}
     }
+    /** Caller pays the bounded request/reply/decoder workspace before any transport copies. */
+    public RatisHomeSourceReferencesRpc.Reply homeSourceReferences(RatisHomeSourceReferencesRpc.Request request,RatisSourceReferenceClosure.Admission admission)throws IOException{
+        var home=directory.ranges().stream().filter(range->range.groupId().equals(request.closing().request().home())).findFirst().orElseThrow(()->new IllegalArgumentException("HOME reference group absent"));
+        if(home.rangeEpoch()!=request.closing().request().homeEpoch() || !Arrays.equals(directory.schemaDigest(),request.closing().request().schema()))throw new IllegalArgumentException("HOME reference route/schema changed");
+        try(var workspace=admission.reserve(RatisHomeSourceReferencesRpc.WORKSPACE_BYTES)){
+            beginCall();try{byte[] response=transport.transaction(home,RatisHomeSourceReferencesRpc.request(request),true);return RatisHomeSourceReferencesRpc.reply(response,request);}catch(IllegalArgumentException invalid){throw new IOException("Invalid HOME reference proof",invalid);}finally{endCall();}
+        }
+    }
     public NativeHomeSourceClosing closeHomeSource(RangeDescriptor home,NativeHomeSourceClosing.Request request)throws IOException {
         if(!home.groupId().equals(request.home()) || home.rangeEpoch()!=request.homeEpoch())throw new IllegalArgumentException("HOME closing route changed");
         beginCall();try{
@@ -1707,10 +1715,11 @@ public final class RatisRoutedClient implements AutoCloseable {
                 catch (IllegalArgumentException invalid) { throw new IOException("Invalid command reply", invalid); }
             } });
         }
+        private static int transactionReplyLimit(byte[] request){return request.length>=ScopedTransactionRpc.HEADER_BYTES && ByteBuffer.wrap(request).getInt()==ScopedTransactionRpc.MAGIC && ByteBuffer.wrap(request).getInt(4)==RatisHomeSourceReferencesRpc.KIND?RatisHomeSourceReferencesRpc.MAX_REPLY_BYTES:ScopedTransactionRpc.MAX_REPLY_BYTES;}
         @Override public byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean freshBarrier) throws IOException {
             return rpc(() -> { try (var lease=clients.acquire(descriptor)) {
                 var message=Message.valueOf(ByteString.copyFrom(request));
-                return content(freshBarrier ? lease.client().io().sendReadOnly(message) : lease.client().io().sendReadOnlyNonLinearizable(message),ScopedTransactionRpc.MAX_REPLY_BYTES);
+                return content(freshBarrier ? lease.client().io().sendReadOnly(message) : lease.client().io().sendReadOnlyNonLinearizable(message),transactionReplyLimit(request));
             } });
         }
 
@@ -1750,7 +1759,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         }
         @Override public CompletableFuture<byte[]> transactionAsync(RangeDescriptor descriptor,byte[] request,boolean freshBarrier) {
             var message=Message.valueOf(ByteString.copyFrom(request));
-            return callAsync(descriptor,ScopedTransactionRpc.MAX_REPLY_BYTES,client->freshBarrier?client.async().sendReadOnly(message):client.async().sendReadOnlyNonLinearizable(message));
+            return callAsync(descriptor,transactionReplyLimit(request),client->freshBarrier?client.async().sendReadOnly(message):client.async().sendReadOnlyNonLinearizable(message));
         }
         @Override public CompletableFuture<byte[]> participantAsync(RangeDescriptor descriptor,byte[] record) {
             var message=Message.valueOf(ByteString.copyFrom(record));

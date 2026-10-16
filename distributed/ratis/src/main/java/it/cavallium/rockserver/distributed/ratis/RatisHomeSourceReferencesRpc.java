@@ -1,0 +1,39 @@
+package it.cavallium.rockserver.distributed.ratis;
+
+import it.cavallium.rockserver.core.common.distributed.*;
+import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
+import java.nio.ByteBuffer;
+import java.util.*;
+
+/** Fresh bounded inventory under an exact forced HOME fence; a page is never a closure certificate. */
+public final class RatisHomeSourceReferencesRpc {
+    public static final int KIND=129,MAX_ROW_BYTES=2*1024*1024;
+    public static final int MAX_REQUEST_BYTES=ScopedTransactionRpc.HEADER_BYTES+22+NativeHomeSourceClosing.MAX_BYTES;
+    public static final int MAX_REPLY_BYTES=ScopedTransactionRpc.HEADER_BYTES+91+65536+MAX_ROW_BYTES;
+    public static final long WORKSPACE_BYTES=8L*(MAX_REQUEST_BYTES+MAX_REPLY_BYTES);
+    private RatisHomeSourceReferencesRpc(){}
+    public record Request(NativeHomeSourceClosing closing,byte[] after,int scans){
+        public Request{Objects.requireNonNull(closing);if(after!=null && after.length!=16 || scans<1 || scans>16)throw new IllegalArgumentException("Invalid HOME reference cursor/scan bound");after=after==null?null:after.clone();}
+        @Override public byte[] after(){return after==null?null:after.clone();}
+        public byte[] digest(){return OperatorUpload.sha256(body(this));}
+    }
+    public record Reply(Request request,ReplicatedRangeStore.HomeSourceReferencePage page,ReplicatedRangeStore.Configuration configuration){
+        public Reply{
+            Objects.requireNonNull(request);Objects.requireNonNull(page);Objects.requireNonNull(configuration);request.closing().requireCut(page.position());
+            if(configuration.term()>page.position().term() || configuration.index()>page.position().index() || configuration.index()==page.position().index() && configuration.term()!=page.position().term() || configuration.data().length>65536)throw new IllegalArgumentException("HOME scan configuration exceeds actual cut");
+            try{var cfg=org.apache.ratis.proto.RaftProtos.RaftConfigurationProto.parseFrom(configuration.data());if(cfg.getPeersCount()==0 || cfg.getOldPeersCount()!=0 || cfg.getOldListenersCount()!=0)throw new IllegalArgumentException("HOME scan requires a nonempty stable voter cohort");var ids=new HashSet<String>();for(var peer:cfg.getPeersList())if(!ids.add(peer.getId().toStringUtf8()))throw new IllegalArgumentException("Duplicate HOME scan voter");for(var peer:cfg.getListenersList())if(!ids.add(peer.getId().toStringUtf8()))throw new IllegalArgumentException("Duplicate HOME scan listener");}catch(org.apache.ratis.thirdparty.com.google.protobuf.InvalidProtocolBufferException malformed){throw new IllegalArgumentException("Invalid HOME scan configuration",malformed);}
+            var next=page.next();if(next!=null && next.length!=16 || page.more() && next==null || request.after()!=null && next!=null && Arrays.compareUnsigned(next,request.after())<=0)throw new IllegalArgumentException("HOME scan cursor did not progress");
+            var closing=request.closing().request();boolean reference=false;
+            if(page.transaction()!=null){var status=page.transaction();reference=status.origin()!=null && closing.references(status.origin());for(var p:status.participants())reference|=closing.references(p.domainId(),p.rangeId(),p.groupId(),p.rangeEpoch());if(status.consumed() || !reference || !Arrays.equals(next,uuid(status.transactionId())))throw new IllegalArgumentException("HOME transaction page changed reference/identity");}
+            if(page.snapshot()!=null){var status=page.snapshot();for(var p:status.fence().participants())reference|=closing.references(p.domainId(),p.rangeId(),p.groupId(),p.rangeEpoch());if(status.consumed() || !reference || !Arrays.equals(next,uuid(status.fence().fenceId())))throw new IllegalArgumentException("HOME snapshot page changed reference/identity");}
+        }
+    }
+    static byte[] body(Request request){var closing=request.closing().encode();var after=request.after();return ByteBuffer.allocate(6+closing.length+(after==null?0:16)).putInt(closing.length).put(closing).put((byte)(after==null?0:1)).put(after==null?new byte[0]:after).put((byte)request.scans()).array();}
+    public static byte[] request(Request request){return ScopedTransactionRpc.frame(KIND,body(request));}
+    public static Request request(byte[] bytes){var packet=ScopedTransactionRpc.parse(bytes,MAX_REQUEST_BYTES);if(packet.kind()!=KIND)throw new IllegalArgumentException("Wrong HOME reference action");try{var b=ByteBuffer.wrap(packet.body());int n=b.getInt();if(n<1 || n>NativeHomeSourceClosing.MAX_BYTES || n>b.remaining()-2)throw new IllegalArgumentException("Invalid HOME fence length");byte[] closing=new byte[n];b.get(closing);int present=b.get()&255;if(present>1 || b.remaining()!=(present==0?1:17))throw new IllegalArgumentException("Invalid HOME reference framing");byte[] after=present==0?null:new byte[16];if(after!=null)b.get(after);return new Request(NativeHomeSourceClosing.decode(closing),after,b.get()&255);}catch(java.nio.BufferUnderflowException malformed){throw new IllegalArgumentException("Truncated HOME reference request",malformed);}}
+    static byte[] replyBody(Reply reply){var p=reply.page();byte[] cfg=reply.configuration().data(),next=p.next(),value=p.transaction()!=null?p.transaction().encode():p.snapshot()!=null?p.snapshot().encode():new byte[0];if(value.length>MAX_ROW_BYTES)throw new IllegalArgumentException("HOME reference row exceeds native scan bound");return ByteBuffer.allocate(75+cfg.length+(next==null?0:16)+value.length).put(reply.request().digest()).putLong(p.position().term()).putLong(p.position().index()).putLong(reply.configuration().term()).putLong(reply.configuration().index()).putInt(cfg.length).put(cfg).put((byte)(next==null?0:1)).put(next==null?new byte[0]:next).put((byte)(p.more()?1:0)).put((byte)(p.transaction()!=null?1:p.snapshot()!=null?2:0)).putInt(value.length).put(value).array();}
+    public static byte[] reply(Reply reply){return ScopedTransactionRpc.frame(KIND,replyBody(reply));}
+    public static Reply reply(byte[] bytes,Request expected){var packet=ScopedTransactionRpc.parse(bytes,MAX_REPLY_BYTES);if(packet.kind()!=KIND)throw new IllegalArgumentException("Wrong HOME reference reply");return replyBody(packet.body(),expected);}
+    static Reply replyBody(byte[] bytes,Request expected){if(bytes.length<75 || bytes.length>MAX_REPLY_BYTES-ScopedTransactionRpc.HEADER_BYTES)throw new IllegalArgumentException("Invalid HOME reference reply bound");try{var b=ByteBuffer.wrap(bytes);byte[] digest=new byte[32];b.get(digest);if(!Arrays.equals(digest,expected.digest()))throw new IllegalArgumentException("HOME reference request echo changed");var cut=new ApplyPosition(b.getLong(),b.getLong());long term=b.getLong(),index=b.getLong();int n=b.getInt();if(n<1 || n>65536 || n>b.remaining()-7)throw new IllegalArgumentException("Invalid HOME reference CFG");byte[] cfg=new byte[n];b.get(cfg);int present=b.get()&255;if(present>1)throw new IllegalArgumentException("Invalid HOME reference cursor flag");byte[] next=present==0?null:new byte[16];if(next!=null)b.get(next);int more=b.get()&255,kind=b.get()&255;int length=b.getInt();if(more>1 || kind>2 || length!=b.remaining() || length>MAX_ROW_BYTES || (kind==0)!=(length==0))throw new IllegalArgumentException("Invalid HOME reference result framing");byte[] row=new byte[length];b.get(row);var page=new ReplicatedRangeStore.HomeSourceReferencePage(cut,next,more!=0,kind==1?TransactionStatus.decode(row):null,kind==2?SnapshotFenceStatus.decode(row):null);return new Reply(expected,page,new ReplicatedRangeStore.Configuration(term,index,cfg));}catch(java.nio.BufferUnderflowException malformed){throw new IllegalArgumentException("Truncated HOME reference reply",malformed);}}
+    private static byte[] uuid(UUID id){return ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();}
+}

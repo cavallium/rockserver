@@ -63,7 +63,13 @@ class RatisLocalMetadataCompletionWorkflowTest {
             var plan=new RatisNodePlan(donor.local.nodeId(),donor.local.nodeIncarnation(),List.of(domain),c,List.of(home),List.of(),Map.of(),8,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(domain)),RatisPoolFixtures.groups(c,List.of(home)));
             var nodeRoot=Files.createDirectory(root.resolve("node"));SessionJournalFiles.force(nodeRoot);SessionJournalFiles.force(root);
             var epochs=new RatisSessionEpochs(donor.catalogue,directory.clusterId(),directory.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
-            try(var route=new RatisRoutedClient(bootstrap,new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor r,UUID column,byte[] key){throw new AssertionError("No routed USER read");}public CommandResult command(RangeDescriptor r,DistributedCommand command){throw new AssertionError("No routed USER write");}})) {
+            try(var route=new RatisRoutedClient(bootstrap,new RatisRoutedClient.Transport(){
+                public byte[] read(RangeDescriptor r,UUID column,byte[] key){throw new AssertionError("No routed USER read");}public CommandResult command(RangeDescriptor r,DistributedCommand command){throw new AssertionError("No routed USER write");}
+                public byte[] transaction(RangeDescriptor r,byte[] request,boolean fresh)throws IOException{
+                    assertTrue(fresh);assertEquals(RatisHomeSourceClosingRpc.SOURCE_STATE,ScopedTransactionRpc.kind(request,RatisHomeSourceClosingRpc.MAX_BYTES));
+                    try{return requireSuccess(submit(actual.get(),r.groupId(),request,false)).getMessage().getContent().toByteArray();}catch(Exception failure){throw new IOException("Actual original source CLOSE proof failed",failure);}
+                }
+            })) {
                 // Initial adoption uses controlled division delivery, real native image/receipts,
                 // and the actual SM GROUP writer. Every transition below uses the real cold Core.
                 var initial=new RatisNodeRuntimeTest.FakeServer();initial.skipFirstNoop=true;
@@ -154,6 +160,16 @@ class RatisLocalMetadataCompletionWorkflowTest {
                         var activeSource=(RatisRangeStateMachine)actual.get().getDivision(id).getStateMachine();var activeStore=field(activeSource,"store",ReplicatedRangeStore.class);awaitSourceClosingPrefix(actual.get(),id,activeStore);
                         sourceClosed=node.closeTopologySource(group).get(20,TimeUnit.SECONDS);assertEquals(sourceClosed,activeStore.sourceClosing());awaitSourceClosingPrefix(actual.get(),id,activeStore);
                         assertEquals(sourceClosed,node.closeTopologySource(group).get(20,TimeUnit.SECONDS),"Exact retry retains the original committed CLOSE cut and request");
+                        var homeGroupId=RaftGroupId.valueOf(homeId);var actualHome=(RatisRangeStateMachine)actual.get().getDivision(homeGroupId).getStateMachine();var homeStore=field(actualHome,"store",ReplicatedRangeStore.class);awaitSourceClosingPrefix(actual.get(),homeGroupId,homeStore);
+                        var homeClosing=node.closeHomeSource(homeId,sourceClosed).get(20,TimeUnit.SECONDS);awaitSourceClosingPrefix(actual.get(),homeGroupId,homeStore);
+                        try(var references=new RatisRoutedClient(homeDirectory,new RatisRoutedClient.Transport(){
+                            public byte[] read(RangeDescriptor range,UUID column,byte[] key){throw new AssertionError("No raw HOME read");}public CommandResult command(RangeDescriptor range,DistributedCommand command){throw new AssertionError("No new HOME command");}
+                            public byte[] transaction(RangeDescriptor range,byte[] request,boolean fresh)throws IOException{try{assertTrue(fresh);return requireSuccess(submit(actual.get(),range.groupId(),request,false)).getMessage().getContent().toByteArray();}catch(Exception failure){throw new IOException("Actual fresh HOME scan failed",failure);}}
+                        })){
+                            @SuppressWarnings("unchecked") var clients=(Map<RatisNodePlan.Role,RatisRoutedClient>)field(node,"homeClients",Map.class);var savedClient=clients.put(home.role(),references);
+                            try(var qualified=node.qualifySourceHomeReferences(sourceClosed,List.of(homeClosing))){assertEquals(1,qualified.witnesses().size());assertEquals(homeId,qualified.witnesses().getFirst().home());assertEquals(32,qualified.digest().length);assertEquals(sourceClosed,qualified.source());}
+                            finally{clients.put(home.role(),savedClient);}
+                        }
                     }
                     byte[] witness=terminal.get("cleanupScope");node.close();node=null;
                     for(int reopen=0;reopen<2;reopen++) {

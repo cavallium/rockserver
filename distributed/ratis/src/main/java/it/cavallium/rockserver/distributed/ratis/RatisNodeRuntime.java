@@ -779,6 +779,19 @@ public final class RatisNodeRuntime implements AutoCloseable {
     public ReplicatedRangeStore.HomeSourceReferencePage homeSourceReferences(it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing closing,byte[] after,int scans)throws Exception {
         beginSeedLifecycle(true);try{var group=closing.request().home();var entry=groups.require(group);var store=stores.get(group);if((entry.role()!=RatisNodePlan.Role.TRANSACTION_HOME && entry.role()!=RatisNodePlan.Role.SNAPSHOT_HOME) || store==null)throw new IOException("Source references require actual configured HOME");return store.homeSourceReferences(closing,after,scans);}finally{endSeedLifecycle();}
     }
+    /** Observational exhaustive HOME qualification. Accepted references must be genuinely
+     * consumed before this succeeds; the returned paid evidence is not a deletion permit. */
+    public RatisSourceReferenceClosure.Qualification qualifySourceHomeReferences(it.cavallium.rockserver.core.common.distributed.NativeSourceClosing closing,Collection<it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing> receipts)throws IOException{
+        beginSeedLifecycle(true);
+        try{
+            var group=closing.request().group();var store=stores.get(group);var entry=groups.require(group);
+            if(entry.role()!=RatisNodePlan.Role.DATA || store==null || store.sourceClosing()==null || !store.sourceClosing().equals(closing))throw new IOException("HOME reference qualification changed local forced source CLOSE");
+            var owner=owner(group);
+            return RatisSourceReferenceClosure.scan(closing,plan.homes(),receipts,(request,admission)->{
+                var configured=plan.homes().stream().filter(home->home.directory().ranges().stream().anyMatch(range->range.groupId().equals(request.closing().request().home()))).findFirst().orElseThrow(()->new IOException("HOME reference group is not configured"));var client=homeClients.get(configured.role());if(client==null)throw new IOException("HOME reference client unavailable");return client.homeSourceReferences(request,admission);
+            },bytes->{var lease=resources.reserve(owner.spec.id(),RatisNodeResourceBudget.Kind.PROTECTED,bytes,1);return lease::close;});
+        }finally{endSeedLifecycle();}
+    }
     /** Exact deterministic protected identity survives a lost abort ACK; CLOSED is never published on the source. */
     public it.cavallium.rockserver.core.common.distributed.HomeRecoveryReceipt abortClosedHomeReservation(it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing closing,it.cavallium.rockserver.core.common.distributed.TransactionStatus reserved)throws Exception {
         beginSeedLifecycle(true);try{
