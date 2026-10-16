@@ -42,6 +42,18 @@ This section and the remaining gates at the end describe the current branch.
   `scoped-recovery-coupled60.log` passes 27 cases, including the same three-process
   cold recovery/leader loss/return workflow in 57.66 seconds, exact placement
   generation recovery and export fence/data/checkpoint atomicity.
+- Native session-owner binding plans now freeze a canonical namespace/selected-
+  group vector rather than a distinguished DATA directory and three-namespace
+  limit. The existing aggregate encoding and target ceilings remain unchanged;
+  metadata admission charges only the selected groups before encoding or grant
+  issuance. Cold restore preserves exact directories and targets after current
+  routing advances. Long-lived POINT/BULK owners explicitly bind all configured
+  groups; scoped callers select exact DATA/HOME targets. No prior-format reader
+  remains. `session-domain-bindings62.log` passes 22 cases, including four native
+  namespaces, lost binding reply/exact grant recovery, unselected DATA groups
+  receiving no binding, renewal, pipeline and factory ownership. Thirty further
+  batch/connection/reroute/topology cases pass in `session-domain-consumers63.log`.
+  This is a prerequisite for cross-domain transactions, not frontend acceptance.
 - Three independent Runtime JVMs now pass a complete production-loopback gRPC
   workflow with real native pools and retained Raft roots: original genesis and
   grant binding, writes, three unfinished CURRENT source preparations, actual

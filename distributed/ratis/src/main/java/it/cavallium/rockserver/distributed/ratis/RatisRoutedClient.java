@@ -1194,7 +1194,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     private final Map<String,OwnerDirectory> ownerDirectories=new HashMap<>();
     /** Trusted forced owner-root restoration only; never changes current routing or accepts a caller-selected schema. */
     synchronized OwnerDirectoryLease retainOwnerDirectory(RatisSessionBindingPlan plan){
-        requireOpen();var frozen=plan.directory();requireIdentity(frozen);var digest=java.util.HexFormat.of().formatHex(frozen.payloadDigest());var retained=ownerDirectories.get(digest);
+        requireOpen();var frozen=plan.directory(identity.domainId());requireIdentity(frozen);var digest=java.util.HexFormat.of().formatHex(frozen.payloadDigest());var retained=ownerDirectories.get(digest);
         if(retained==null){if(ownerDirectories.size()>=64)throw new IllegalStateException("Retained owner directory capacity exhausted");retained=new OwnerDirectory(frozen);ownerDirectories.put(digest,retained);}retained.owners=Math.addExact(retained.owners,1);var owner=retained;
         return new OwnerDirectoryLease(){boolean released;public void close(){synchronized(RatisRoutedClient.this){if(released)return;released=true;if(--owner.owners==0)ownerDirectories.remove(digest,owner);}}};
     }

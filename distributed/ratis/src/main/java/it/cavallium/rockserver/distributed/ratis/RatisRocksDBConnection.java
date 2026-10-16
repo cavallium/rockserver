@@ -33,8 +33,9 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     /** Return a generation-owned session with an exclusive installed grant. */
     @FunctionalInterface public interface SessionOpening {RatisDurableSessionClient open(Path root,DistributedSchema schema,RatisSessionBindingPlan plan)throws IOException;}
     public record SessionFactory(List<RatisRoutedClient> routes,SessionOpening opener) {
-        public SessionFactory{routes=List.copyOf(routes);Objects.requireNonNull(opener);if(routes.isEmpty() || routes.size()>3)throw new IllegalArgumentException("Invalid owner binding route count");}
-        RatisSessionBindingPlan.Input bindings(RangeDirectory directory){return RatisSessionBindingPlan.borrow(directory,routes);}
+        public SessionFactory{routes=List.copyOf(routes);Objects.requireNonNull(opener);if(routes.isEmpty() || routes.size()>RatisSessionBindingPlan.MAX_NAMESPACES)throw new IllegalArgumentException("Invalid owner binding route count");}
+        RatisSessionBindingPlan.Input allBindings(RangeDirectory directory){return RatisSessionBindingPlan.all(directory,routes);}
+        RatisSessionBindingPlan.Input bindings(List<RatisSessionBindingPlan.Selection> selections){return RatisSessionBindingPlan.borrow(selections,routes);}
         RatisSessionBindingPlan restore(byte[] bytes)throws IOException{return RatisSessionBindingPlan.restore(bytes,routes);}
         RatisDurableSessionClient open(Path root,DistributedSchema schema,RatisSessionBindingPlan plan)throws IOException{return opener.open(root,schema,plan);}
     }
@@ -79,7 +80,7 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
             RatisPointOwnerManager points=null; RatisDurableSessionClient bulkSession=null,bulkOwner=null; RatisRocksDBBatches batches=null; RatisTransactionClient tx=null; RatisSnapshotClient snapshots=null; RatisRocksDBRanges ranges=null; RatisRocksDBDirect direct=null;RatisRangeDeleteClient rangeDeletes=null;RatisRequestBudget.Owner bulkCredit=null,rangeCredit=null;
             try {
                 points=new RatisPointOwnerManager(schema,directory,routed,scheduler,root.resolve("points"),budget,sessions,epochs,directories,acknowledgementDirectories,transactionHomes); direct=points.reader();
-                var bulkBindings=sessions.bindings(directory);Path bulkInput=root.resolve("bulk"),bulkWindow=root.resolve("bulk-session/window.bin");
+                var bulkBindings=sessions.allBindings(directory);Path bulkInput=root.resolve("bulk"),bulkWindow=root.resolve("bulk-session/window.bin");
                 bulkCredit=budget.owner(RemoteMutationToken.Kind.BULK,4*DistributedSchemaCodec.encodedSize(schema)+bulkBindings.reservation(),RatisRequestBudget.files(bulkInput,bulkInput.resolveSibling("bulk.pending"),bulkInput.resolveSibling("bulk.released"),bulkInput.resolveSibling("bulk.released.pending"),bulkWindow,bulkWindow.resolveSibling("window.bin.pending")));
                 var bulkPaths=List.of(new RatisJournalAccess.Reservation(root.resolve("bulk"),RatisBatchRequestJournal.MAX_BYTES,0),new RatisJournalAccess.Reservation(root.resolve("bulk.lock"),32,0),new RatisJournalAccess.Reservation(root.resolve("bulk.released"),128*1024,364),new RatisJournalAccess.Reservation(root.resolve("bulk-reroutes/coordinator.lock"),32,0));budget.preflight(bulkPaths);
                 bulkSession=sessions.open(Files.createDirectories(root.resolve("bulk-session")),schema,bulkBindings.freeze());bulkOwner=bulkSession;

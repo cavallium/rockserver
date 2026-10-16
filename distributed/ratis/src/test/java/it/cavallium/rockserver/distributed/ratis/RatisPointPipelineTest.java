@@ -26,7 +26,7 @@ class RatisPointPipelineTest {
             })) {
                 Throwable problem=null;try {
                 var controls=new AtomicLong();UUID issuer=UUID.randomUUID();
-                RatisRocksDBConnection.SessionFactory sessions=new RatisRocksDBConnection.SessionFactory(List.of(routed),(path,schema,bindings)->{var directory=bindings.directory();
+                RatisRocksDBConnection.SessionFactory sessions=new RatisRocksDBConnection.SessionFactory(List.of(routed),(path,schema,bindings)->{var directory=bindings.directory(schema.domainId());
                     Path window=path.resolve("window.bin");if(Files.exists(window))return RatisDurableSessionClient.reopen(window,routed);
                     var before=f.catalogue.epochs.read();var next=before.issue(UUID.randomUUID(),1000);var grant=next.grants().getLast();
                     assertEquals(CommandResult.Status.SUCCESS,f.catalogue.epochs.execute(f.catalogue.epochs.prepare(new OperationId(issuer,0,controls.getAndIncrement()),before,next)).status());

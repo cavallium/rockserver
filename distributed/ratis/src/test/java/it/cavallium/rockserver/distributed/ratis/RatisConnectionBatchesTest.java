@@ -50,7 +50,7 @@ class RatisConnectionBatchesTest {
                     if(data && lose.getAndSet(false)) throw new IOException("Lost applied common batch reply"); return result;
                 }
             });
-            factory=RatisRocksDBConnection.durableGenerationFactory(routed,f.scheduler,f.snapshots,f.homes,f.catalogue.epochs,f.catalogue.epochs.catalogue(f.outer.directoryColumn),header->f.catalogue.epochs.topologyCatalogue(f.outer.directoryColumn).readDefinition(header.definitionDigest()).sourceDirectory(),new RatisRocksDBAdapterTest.Allocations(f),new RatisRocksDBConnection.SessionFactory(List.of(routed),(path,schema,bindings)-> {var directory=bindings.directory();
+            factory=RatisRocksDBConnection.durableGenerationFactory(routed,f.scheduler,f.snapshots,f.homes,f.catalogue.epochs,f.catalogue.epochs.catalogue(f.outer.directoryColumn),header->f.catalogue.epochs.topologyCatalogue(f.outer.directoryColumn).readDefinition(header.definitionDigest()).sourceDirectory(),new RatisRocksDBAdapterTest.Allocations(f),new RatisRocksDBConnection.SessionFactory(List.of(routed),(path,schema,bindings)-> {var directory=bindings.directory(schema.domainId());
                 Path window=path.resolve("window.bin"); if(Files.exists(window)) return RatisDurableSessionClient.reopen(window,routed);
                 var previous=f.catalogue.epochs.read(); var next=previous.issue(UUID.randomUUID(),1000); var grant=next.grants().getLast();
                 assertEquals(CommandResult.Status.SUCCESS,f.catalogue.epochs.execute(f.catalogue.epochs.prepare(f.outer.operation(sequence.getAndIncrement()),previous,next)).status());
