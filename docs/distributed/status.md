@@ -54,6 +54,29 @@ This section and the remaining gates at the end describe the current branch.
   receiving no binding, renewal, pipeline and factory ownership. Thirty further
   batch/connection/reroute/topology cases pass in `session-domain-consumers63.log`.
   This is a prerequisite for cross-domain transactions, not frontend acceptance.
+- Snapshot fences and transaction decisions now register one canonical vector of
+  domain/schema/directory bindings and explicitly qualify each participant's domain.
+  Native prepare, rejection, finalization, retained images and snapshot gates select
+  their local binding while preserving the complete global registration. One global
+  fence/decision and the aggregate 64-participant bound remain intact. Origin-bearing
+  reservations and promotions retain exactly one original target binding; ordinary
+  cross-domain registrations carry no reroute origin. The current codecs replace
+  their previous singular layouts directly, including Java/Rust CDC metadata.
+  `domain-vector-native70.log` passes 93 core cases in both executions, including
+  actual two-domain JNI prepare/finalize, native image/cold recovery and complete
+  global snapshot-gate lifecycle. Rust passes 87 cases in `domain-vector-rust66.log`.
+  Durable transaction journal sizing includes every domain binding before encoding;
+  the adapter, journal, backup, recovery and cleanup selection covers 126 cases in
+  `domain-vector-durable74.log` plus the focused repaired gate
+  `domain-vector-durable75.log`, reusing unchanged passing cases.
+  The final coupled `domain-vector-combined76.log` passes 17 core cases twice and
+  204 of 205 adapter cases, including real three-process recovery in 58.05 seconds.
+  Its sole failure was an obsolete timer-count fixture; all five HOME role cases
+  pass in `domain-vector-runtime78.log`, and all 33 Runtime lifecycle cases plus
+  packaging pass in `domain-vector-runtime79.log` after accounting for continuous
+  recovery discovery. Public cross-domain transaction orchestration is still an
+  explicit implementation gate; native authority support does not establish that
+  frontend capability or production performance.
 - Three independent Runtime JVMs now pass a complete production-loopback gRPC
   workflow with real native pools and retained Raft roots: original genesis and
   grant binding, writes, three unfinished CURRENT source preparations, actual
