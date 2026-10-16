@@ -265,7 +265,13 @@ public final class LogSegment {
       final LogSegment loaded=segment; final boolean cache=keepCache || startEnd.isOpen();
       int actual=readSegmentFile(file,startEnd,maxOpSize,CorruptionPolicy.get(storage,RaftStorage::getLogCorruptionPolicy),metrics,entry->{ loaded.append(cache,entry,Op.LOAD_SEGMENT_FILE,true); if(consumer!=null)consumer.accept(entry); });
       if(actual!=count)throw new IOException("Cold log inventory changed while loading");
-      if(actual==0) { segment.clear(); return null; }
+      if(actual==0) {
+        segment.clear();
+        // A validated empty open segment has no cached owner. Leaving its inode behind
+        // makes the next genuine StartLogSegment at this same index collide on cold open.
+        FileUtils.deleteFile(file);
+        return null;
+      }
       segment.assertSegment(startEnd.getStartIndex(),actual,false,segment.getEndIndex()); return segment;
     } catch(IOException|RuntimeException|Error failure) { if(segment!=null)segment.clear(); throw failure; }
   }

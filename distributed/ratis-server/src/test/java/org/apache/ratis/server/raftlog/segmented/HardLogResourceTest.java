@@ -76,6 +76,26 @@ class HardLogResourceTest {
   }
   static LogEntryProto entry(long index,ByteString payload) { return LogEntryProto.newBuilder().setTerm(1).setIndex(index).setStateMachineLogEntry(StateMachineLogEntryProto.newBuilder().setLogData(payload)).build(); }
   static void waitAppend(List<CompletableFuture<Long>> writes)throws Exception { CompletableFuture.allOf(writes.toArray(CompletableFuture[]::new)).get(10,TimeUnit.SECONDS); }
+  @Test void coldValidatedEmptyOpenSegmentIsRemovedBeforeSameIndexAppendAndOwnersDrain()throws Exception{
+    var initial=new Policy(WRITE_BUFFER_BYTES+8192,8,16);var path=root.resolve("empty-open");final Path empty;
+    try(var opened=open(path,new Machine(initial,null),false)){
+      empty=opened.storage().getStorageDir().getCurrentDir().toPath().resolve("log_inprogress_0");
+      // Real current-format writer, interrupted after opening/flushing its header and
+      // before any entry: no synthetic log entry, commit, snapshot or native marker.
+      try(var writer=new SegmentedRaftLogOutputStream(empty.toFile(),false,1L<<20,4096,java.nio.ByteBuffer.allocate(64*1024))){writer.flush();}
+      assertTrue(java.nio.file.Files.exists(empty));
+    }
+    assertEquals(0,initial.bytes);assertEquals(0,initial.segments);assertEquals(0,initial.intake);
+    var recovered=new Policy(WRITE_BUFFER_BYTES+8192,8,16);
+    try(var opened=open(path,new Machine(recovered,null),true)){
+      assertFalse(java.nio.file.Files.exists(empty),"Parsed zero-entry inode must not collide with the next StartLogSegment");
+      waitAppend(opened.log().append(List.of(entry(0,ByteString.copyFromUtf8("first-real-row")))));
+      assertEquals("first-real-row",opened.log().get(0).getStateMachineLogEntry().getLogData().toStringUtf8());
+    }
+    assertEquals(0,recovered.bytes);assertEquals(0,recovered.headers);assertEquals(0,recovered.segments);assertEquals(0,recovered.intake);
+    var reopened=new Policy(WRITE_BUFFER_BYTES+8192,8,16);try(var opened=open(path,new Machine(reopened,null),true)){assertEquals("first-real-row",opened.log().get(0).getStateMachineLogEntry().getLogData().toStringUtf8());}
+    assertEquals(0,reopened.bytes);assertEquals(0,reopened.headers);assertEquals(0,reopened.segments);
+  }
   @Test void realLogHeadersRemainAfterEvictionMetadataUsesPrepaidAllowanceAndReopenRestoresBytes() throws Exception {
     var policy=new Policy(WRITE_BUFFER_BYTES+8192,4,16);Path path=root.resolve("workflow");
     try(var opened=open(path,new Machine(policy,null),false)) {
