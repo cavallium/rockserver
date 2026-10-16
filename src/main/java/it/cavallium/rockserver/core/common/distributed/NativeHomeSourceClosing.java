@@ -27,6 +27,10 @@ public record NativeHomeSourceClosing(Request request, ApplyPosition position) {
         @Override public int hashCode(){return Arrays.hashCode(digest());}
     }
     public NativeHomeSourceClosing{Objects.requireNonNull(request);Objects.requireNonNull(position);if(position.term()<1 || position.index()<1 || position.index()<=request.configurationIndex() || position.term()<request.configurationTerm())throw new IllegalArgumentException("HOME closing does not follow actual configuration");}
+    /** Original protected no-effect identity, shared by local controller and recovered frontend. */
+    public OperationId abortOperation(TransactionStatus reserved){
+        if(!reserved.reserved() || !request.references(reserved.origin()))throw new IllegalArgumentException("Closed abort changed original reservation");byte[] original=reserved.encode();byte[] digest=hash(ByteBuffer.allocate(36+original.length).putInt(0x48434142).put(request.digest()).put(original).array());var key=ByteBuffer.wrap(digest);return new OperationId(new UUID(key.getLong(),key.getLong()),0,0);
+    }
     public void requireCut(ApplyPosition cut){if(cut==null || cut.index()<position.index() || cut.term()<position.term() || cut.index()==position.index() && cut.term()!=position.term())throw new IllegalArgumentException("HOME closing exceeds actual HOME prefix");}
     public byte[] encode(){byte[] body=request.encode();return ByteBuffer.allocate(24+body.length).putInt(MAGIC).putInt(body.length).put(body).putLong(position.term()).putLong(position.index()).array();}
     public static NativeHomeSourceClosing decode(byte[] bytes){try{if(bytes.length<24 || bytes.length>MAX_BYTES)throw new IllegalArgumentException("Invalid HOME closing length");var b=ByteBuffer.wrap(bytes);if(b.getInt()!=MAGIC || b.getInt()!=bytes.length-24)throw new IllegalArgumentException("Invalid HOME closing record");byte[] body=new byte[bytes.length-24];b.get(body);return new NativeHomeSourceClosing(Request.decode(body),new ApplyPosition(b.getLong(),b.getLong()));}catch(java.nio.BufferUnderflowException malformed){throw new IllegalArgumentException("Truncated HOME closing",malformed);}}

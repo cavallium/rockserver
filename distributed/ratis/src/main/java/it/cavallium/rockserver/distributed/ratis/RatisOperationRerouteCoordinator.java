@@ -12,7 +12,7 @@ import java.util.*;
 
 /** Session-owned reroute work on an already admitted mutation worker. Transports and scheduler are borrowed. */
 final class RatisOperationRerouteCoordinator implements AutoCloseable {
-    private static final int MAGIC=0x52524353,MAX_STATE_BYTES=155+HomeFenceProof.MAX_BYTES+NativeSourceOutcomeCredit.Request.MAX_BYTES+RatisSourceOutcomeRecord.MAX_BYTES+CommandResult.MAX_BYTES;
+    private static final int MAGIC=0x52524353,MAX_STATE_BYTES=163+HomeFenceProof.MAX_BYTES+NativeSourceOutcomeCredit.Request.MAX_BYTES+RatisSourceOutcomeRecord.MAX_BYTES+CommandResult.MAX_BYTES+RatisHomeSourceClosingRpc.ClosedReservation.MAX_BYTES+HomeRecovery.MAX_BYTES;
     static final int MAX_RETAINED_JOBS=4;
     static final long JOB_DISK_RESERVATION=2L*(RatisOperationRerouteJournal.MAX_BYTES+RatisDurableTransaction.MAX_BYTES+MAX_STATE_BYTES+RatisRerouteReclamation.MAX_BYTES+2L*SessionEpochLedger.MAX_BYTES+4096+(2L*TransactionStatus.MAX_PARTICIPANTS+2)*(RangeDirectoryCodec.MAX_ENCODED_BYTES+16384L));
     static final long MAX_DISK_RESERVATION=MAX_RETAINED_JOBS*JOB_DISK_RESERVATION;
@@ -52,6 +52,7 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
         if(!operation.sessionId().equals(business.sessionId()) || operation.epoch()!=business.epoch())throw new IOException("Reroute changed original session grant");
         return root.resolve(Long.toString(operation.sequence()));
     }
+    synchronized boolean hasSelected(OperationId original)throws IOException {if(closed)throw new IOException("Reroute coordinator closed");return Files.exists(operationPath(original).resolve("input.bin"),LinkOption.NOFOLLOW_LINKS);}
     CommandResult executeOwned(RatisRoutedClient.PreparedCommand original,RequestContext context,RatisAtomicClient.InlineCheck check,RatisRequestBudget budget)throws IOException {
         try(var credit=budget.recoveryCredit()){credit.require(16L*1024*1024);return execute(original,context,check,credit);}
     }
@@ -82,13 +83,23 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
         var original=input.originalCommand();var operation=original.operationId();
         if(!operationPath(operation).equals(job.directory))throw new IOException("Selected input crossed original operation directory");
         if(job.request!=null && (input.origin()==null || !job.request.origin().equals(input.origin()) || !Arrays.equals(DistributedCommandCodec.encode(job.request.original()),DistributedCommandCodec.encode(original)) || !Arrays.equals(job.request.targetDirectory().payloadDigest(),input.targetDirectory().payloadDigest()) || !Arrays.equals(job.request.freeze().encode(),input.absence().freeze().encode())))throw new IOException("Reroute state changed immutable selected input");
-        if((job.credited || job.published) && job.request==null || job.published && job.result==null || job.done && (!job.published || !job.sourceAcknowledged) || job.sourceAcknowledged && job.ack==null)throw new IOException("Inconsistent selected reroute lifecycle");
+        if((job.credited || job.published || job.closedProof!=null) && job.request==null || job.published && job.result==null || job.done && !(job.published && job.sourceAcknowledged || job.closedWithoutPublication()) || job.sourceAcknowledged && job.ack==null)throw new IOException("Inconsistent selected reroute lifecycle");
         if(job.ack!=null && (!job.ack.sessionId().equals(operation.sessionId()) || job.ack.epoch()!=operation.epoch() || job.ack.sequence()<=operation.sequence()))throw new IOException("Source ACK changed original grant or sequence");
         if(job.publication!=null && (job.request==null || !job.request.equals(job.publication.request()) || job.published && !Arrays.equals(job.result.encode(),job.publication.result())))throw new IOException("Published state changed original request or business result");
+        if(job.closedProof!=null){
+            if(job.credited || job.published || job.sourceAcknowledged || job.ack!=null || job.publication!=null)throw new IOException("Closed HOME evidence cannot fabricate source publication/ACK");
+            try{job.closedProof.requireIdentity(job.request.home());job.closedProof.closing().request().source().requireFreeze(job.request.freeze());}catch(IllegalArgumentException changed){throw new IOException("Closed HOME evidence crossed original source",changed);}
+            if(job.closedAbort!=null){var r=job.closedAbort;if(r.action()!=HomeRecovery.Action.ABORT || !r.before().equals(job.request.home().definition()) || !r.next().equals(r.before().abortReservation(TransactionStatus.NoEffectOutcome.SOURCE_CLOSED)) || !r.operation().equals(job.closedProof.closing().abortOperation(r.before())))throw new IOException("Closed abort changed original protected identity");}
+            if(!job.closedWithoutPublication() && job.result!=null)throw new IOException("Pending closed proof has no returned result");
+            if(job.closedWithoutPublication() && (job.result==null || !Arrays.equals(job.result.encode(),job.closedProof.terminal().recovery().next().terminalBusinessResult().encode())))throw new IOException("Closed result changed actual HOME outcome");
+            if(Files.exists(input.atomicPath()) && !RatisAtomicRejection.isRejection(input.atomicPath()))throw new IOException("Accepted atomic work cannot become a no-credit closed result");
+        }else if(job.closedAbort!=null)throw new IOException("Closed abort lost exact HOME fence");
+
     }
     private CommandResult resolve(Job job,RatisOperationRerouteJournal input,RequestContext context,RatisAtomicClient.InlineCheck check)throws IOException {
         requireSelected(job,input);
-        if(job.published)return job.result;
+        if(job.published || job.closedWithoutPublication())return job.result;
+        if(job.closedProof!=null || selectClosed(job,input,check))return finishClosed(job,input,check);
         check.check();preflight(job,input,epochs.read());Path issuing=job.directory.resolve("issuer.bin");
         try(var issuer=Files.exists(issuing) ? RatisGrantIssuer.reopenOwned(issuing,epochs,access) : RatisGrantIssuer.createOwned(issuing,epochs,Math.addExact(epochs.read().logicalTimeMillis(),SessionEpochLedger.MAX_LIFETIME_MILLIS),access)) {
             issuer.beforeIssue(next->preflight(job,input,next));
@@ -109,7 +120,9 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
                 if(current.status().phase()==TransactionStatus.Phase.PREPARING)throw new IOException("Promoted HOME has no original accepted journal; recapture is forbidden");
                 if(job.request==null){job.request=new NativeSourceOutcomeCredit.Request(input.originalCommand(),input.origin(),input.targetDirectory(),input.absence().freeze(),homes.identity(reserved,current.descriptor()));job.persist();}
                 if(current.status().reserved() && !job.credited) {
-                    var record=new RatisSourceOutcomeRecord(RatisSourceOutcomeRecord.Kind.CREDIT,job.request,null);check.check();var credit=routed.appendSourceOutcome(input.sourceDirectory(),record,List.of());if(credit.outcome()==NativeSourceOutcomePublication.Outcome.CLOSED)throw new IOException("Source is closing; retain original recovery identity for lineage resolution");job.credited=credit.outcome()==NativeSourceOutcomePublication.Outcome.RETAINED;job.persist();
+                    var record=new RatisSourceOutcomeRecord(RatisSourceOutcomeRecord.Kind.CREDIT,job.request,null);check.check();final RatisSourceOutcomeRpc.Applied credit;
+                    try{credit=routed.appendSourceOutcome(input.sourceDirectory(),record,List.of());}catch(IOException unknown){try{if(selectClosed(job,input,check))return finishClosed(job,input,check);}catch(IOException closedFailure){closedFailure.addSuppressed(unknown);throw closedFailure;}throw unknown;}
+                    if(credit.outcome()==NativeSourceOutcomePublication.Outcome.CLOSED){if(selectClosed(job,input,check))return finishClosed(job,input,check);throw new IOException("Source closing lacks exact HOME reference fence");}job.credited=credit.outcome()==NativeSourceOutcomePublication.Outcome.RETAINED;job.persist();
                 }
                 if(input.originalCommand().kind()==DistributedCommand.Kind.COMMIT_ACCEPTED || !job.credited)abort(job,reserved,check);
             }
@@ -131,13 +144,29 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
             check.check();var publication=routed.appendSourceOutcome(input.sourceDirectory(),job.publication,intents);if(publication.outcome()==NativeSourceOutcomePublication.Outcome.CLOSED)throw new IOException("Source is closing; original HOME result needs terminal lineage resolution");job.result=CommandResult.decode(job.publication.result());job.published=true;job.persist();return job.result;
         }
     }
+    private boolean selectClosed(Job job,RatisOperationRerouteJournal input,RatisAtomicClient.InlineCheck check)throws IOException {
+        if(job.closedProof!=null)return true;if(job.request==null || job.credited || job.published || job.publication!=null)return false;
+        if(Files.exists(input.atomicPath()) && !RatisAtomicRejection.isRejection(input.atomicPath()))return false;
+        check.check();var proof=homes.closedReservation(job.request.home());if(proof==null)return false;
+        proof.requireIdentity(job.request.home());proof.closing().request().source().requireFreeze(job.request.freeze());job.closedProof=proof;
+        if(proof.terminal()!=null)job.result=proof.terminal().recovery().next().terminalBusinessResult();job.persist();requireSelected(job,input);return true;
+    }
+    private CommandResult finishClosed(Job job,RatisOperationRerouteJournal input,RatisAtomicClient.InlineCheck check)throws IOException {
+        requireSelected(job,input);if(job.closedWithoutPublication())return job.result;var reserved=job.request.home().definition();
+        if(job.closedAbort==null){var operation=job.closedProof.closing().abortOperation(reserved);job.closedAbort=homes.prepareClosedReservationAbort(operation,reserved).recovery();job.persist();}
+        var restored=homes.prepareClosedReservationAbort(job.closedAbort.operation(),reserved);if(!restored.recovery().equals(job.closedAbort))throw new IOException("Closed abort retargeted original HOME");
+        check.check();var receipt=homes.executeRecovery(restored);
+        if(receipt.result().status()==CommandResult.Status.SUCCESS){job.closedProof=new RatisHomeSourceClosingRpc.ClosedReservation(job.closedProof.closing(),receipt.position(),receipt);}
+        else{check.check();var actual=homes.closedReservation(job.request.home());if(actual==null || actual.terminal()==null)throw new IOException("Closed abort lost original terminal HOME evidence");job.closedProof=actual;}
+        job.result=job.closedProof.terminal().recovery().next().terminalBusinessResult();job.persist();requireSelected(job,input);return job.result;
+    }
     private void preflight(Job job,RatisOperationRerouteJournal input,SessionEpochLedger ledger)throws IOException {
         if(ledger==null)throw new IOException("Reroute issuance authority absent");var target=input.targetDirectory();var command=input.originalCommand();
         var plan=command.acceptance()==null?RatisTransactionPlan.fromOriginal(target,command):null;var routes=plan==null?command.acceptance().scope().participants(target,TransactionStatus.MAX_PARTICIPANTS):plan.partitions().stream().map(p->p.route()).toList();
         long commandBytes=DistributedCommandCodec.encodedSize(command),directoryBytes=RangeDirectoryCodec.encodedSize(target),sourceBytes=RangeDirectoryCodec.encodedSize(input.sourceDirectory());
         long resultBytes=command.kind()==DistributedCommand.Kind.COMMIT_ACCEPTED || command.mutations().stream().allMatch(m->m.returnMode()==Mutation.ReturnMode.NONE)?8:CommandResult.MAX_BYTES;
         long requestBytes=24+commandBytes+OperationRerouteOrigin.MAX_BYTES+directoryBytes+input.absence().freeze().encode().length+HomeIdentity.MAX_BYTES;
-        long stateBytes=Math.min(MAX_STATE_BYTES,256+HomeFenceProof.MAX_BYTES+2*requestBytes+3*resultBytes);
+        long stateBytes=Math.min(MAX_STATE_BYTES,256+HomeFenceProof.MAX_BYTES+2*requestBytes+3*resultBytes+RatisHomeSourceClosingRpc.ClosedReservation.MAX_BYTES+HomeRecovery.MAX_BYTES);
         long evidence=20+commandBytes+sourceBytes+directoryBytes+RatisTopologyOperationOutcomeRpc.reply(input.absence()).length;
         long partitionBytes=plan==null?0:plan.partitions().stream().mapToLong(p->DistributedCommandCodec.encodedSize(p.command())).sum();long atomicBytes=2*directoryBytes+4L*TransactionStatus.MAX_BYTES+HomeFenceProof.MAX_BYTES+65536+evidence+4*resultBytes+2*partitionBytes;
         for(var route:routes)atomicBytes+=SessionWindowJournal.routeSize(route)+2L*ParticipantFinalization.MAX_BYTES+TransactionStatus.MAX_BYTES+2L*ParticipantFenceProof.MAX_BYTES+529;
@@ -194,8 +223,8 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
             for(var directory:directories) {
                 long sequence=Long.parseLong(directory.getFileName().toString());if(sequence>acknowledged || !Files.exists(directory.resolve("input.bin")))continue;
                 try(var job=new Job(directory);var input=RatisOperationRerouteJournal.reopenOwned(directory.resolve("input.bin"),binding,access)) {
-                    requireSelected(job,input);if(!job.published)continue;check.check();if(!job.done) {
-                    if(!job.sourceAcknowledged) {
+                    requireSelected(job,input);if(!job.published && !job.closedWithoutPublication())continue;check.check();if(!job.done) {
+                    if(!job.closedWithoutPublication() && !job.sourceAcknowledged) {
                         var pending=window.pending().stream().filter(p->job.ack!=null && p.command().operationId().equals(job.ack)).findFirst().orElse(null);
                         if(pending==null && job.ack!=null && window.acknowledgedThrough()>=job.ack.sequence())job.sourceAcknowledged=true;
                         else {
@@ -218,6 +247,7 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
                         if(!rejected && job.credited && input.originalCommand().kind()==DistributedCommand.Kind.DATA)throw new IOException("Accepted reroute lost its atomic journal; reserved identity cannot prove promoted retirement");
                         var status=homes.read(input.origin().transactionId());
                         if(status==null){var proof=homes.fence(job.request.home());if(proof==null)throw new IOException("Missing no-effect HOME has no original retirement proof");job.homeFence=proof;job.persist();}
+                        if(job.closedWithoutPublication() && status!=null && (!job.closedProof.terminal().recovery().next().sameDefinition(status) || status.noEffectOutcome()!=job.closedProof.terminal().recovery().next().noEffectOutcome()))throw new IOException("Closed HOME cleanup changed original terminal result");
                         if(status!=null && !status.consumed()) {
                             if(!status.terminal() || !status.participants().isEmpty())throw new IOException("Accepted HOME lost its original atomic journal; cleanup cannot reconstruct captures");
                             if(job.consume==null){job.consume=new OperationId(UUID.randomUUID(),0,0);job.persist();}check.check();
@@ -236,14 +266,15 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
     synchronized boolean quiescent()throws IOException{return !closed && active==0 && !retainedWork && reclamation.jobs(MAX_RETAINED_JOBS).isEmpty() && !reclamation.hasMarkers();}
     @Override public synchronized void close()throws IOException {if(active!=0)throw new IOException("Reroute work is still active");if(closed)return;ownershipLock.release();ownership.close();closed=true;}
     private final class Job implements AutoCloseable {
-        final Path directory,state;final FileChannel channel;final FileLock lock;NativeSourceOutcomeCredit.Request request;RatisSourceOutcomeRecord publication;CommandResult result;OperationId abort,ack,consume;HomeFenceProof homeFence;boolean credited,published,sourceAcknowledged,done;
+        final Path directory,state;final FileChannel channel;final FileLock lock;NativeSourceOutcomeCredit.Request request;RatisSourceOutcomeRecord publication;CommandResult result;OperationId abort,ack,consume;HomeFenceProof homeFence;RatisHomeSourceClosingRpc.ClosedReservation closedProof;HomeRecovery closedAbort;boolean credited,published,sourceAcknowledged,done;
+        boolean closedWithoutPublication(){return closedProof!=null && closedProof.terminal()!=null;}
         Job(Path directory)throws IOException {
             this.directory=directory;state=directory.resolve("state.bin");access.register(state,MAX_STATE_BYTES);access.register(directory.resolve("owner.lock"),32);channel=FileChannel.open(directory.resolve("owner.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);FileLock acquired=null;
             try{try{acquired=channel.tryLock();}catch(OverlappingFileLockException busy){throw new IOException("Original reroute work already owned",busy);}if(acquired==null)throw new IOException("Original reroute work already owned");lock=acquired;if(Files.exists(state))decode(access.read(state,MAX_STATE_BYTES));}
             catch(IOException|RuntimeException failure){if(acquired!=null)acquired.release();channel.close();throw failure;}
         }
-        void persist()throws IOException {byte[] req=request==null ? new byte[0] : request.encode(),pub=publication==null ? new byte[0] : publication.encode(),outcome=result==null ? new byte[0] : result.encode();var out=ByteBuffer.allocate(4+32+3*4+req.length+pub.length+outcome.length+2+1+(abort==null?0:32)+1+(ack==null?0:32)+1+(consume==null?0:32)+2+4+(homeFence==null?0:homeFence.encode().length)).putInt(MAGIC).put(binding);for(var bytes:List.of(req,pub,outcome))out.putInt(bytes.length).put(bytes);out.put((byte)(credited?1:0)).put((byte)(published?1:0)).put((byte)(abort==null?0:1));if(abort!=null)out.putLong(abort.sessionId().getMostSignificantBits()).putLong(abort.sessionId().getLeastSignificantBits()).putLong(abort.epoch()).putLong(abort.sequence());out.put((byte)(ack==null?0:1));if(ack!=null)out.putLong(ack.sessionId().getMostSignificantBits()).putLong(ack.sessionId().getLeastSignificantBits()).putLong(ack.epoch()).putLong(ack.sequence());out.put((byte)(consume==null?0:1));if(consume!=null)out.putLong(consume.sessionId().getMostSignificantBits()).putLong(consume.sessionId().getLeastSignificantBits()).putLong(consume.epoch()).putLong(consume.sequence());out.put((byte)(sourceAcknowledged?1:0)).put((byte)(done?1:0));byte[] fence=homeFence==null ? new byte[0] : homeFence.encode();out.putInt(fence.length).put(fence);access.write(state,out.array(),MAX_STATE_BYTES);}
-        void decode(byte[] bytes)throws IOException {try{var in=ByteBuffer.wrap(bytes);byte[] bound=new byte[32];if(in.getInt()!=MAGIC)throw new IOException("Invalid reroute state");in.get(bound);if(!Arrays.equals(binding,bound))throw new IOException("Reroute state binding changed");byte[] req=blob(in,NativeSourceOutcomeCredit.Request.MAX_BYTES),pub=blob(in,RatisSourceOutcomeRecord.MAX_BYTES),outcome=blob(in,CommandResult.MAX_BYTES);request=req.length==0?null:NativeSourceOutcomeCredit.Request.decode(req);publication=pub.length==0?null:RatisSourceOutcomeRecord.decode(pub);result=outcome.length==0?null:CommandResult.decode(outcome);credited=flag(in);published=flag(in);if(flag(in))abort=new OperationId(new UUID(in.getLong(),in.getLong()),in.getLong(),in.getLong());if(flag(in))ack=new OperationId(new UUID(in.getLong(),in.getLong()),in.getLong(),in.getLong());if(flag(in))consume=new OperationId(new UUID(in.getLong(),in.getLong()),in.getLong(),in.getLong());if(consume!=null && (consume.epoch()!=0 || consume.sequence()!=0))throw new IOException("Invalid protected consumption identity");sourceAcknowledged=flag(in);done=flag(in);byte[] fence=blob(in,HomeFenceProof.MAX_BYTES);homeFence=fence.length==0?null:HomeFenceProof.decode(fence);if(homeFence!=null && (request==null || !homeFence.identity().equals(request.home())))throw new IOException("Cleanup retirement proof crossed original HOME");if(in.hasRemaining() || published && result==null || publication!=null && (request==null || !request.equals(publication.request())))throw new IOException("Inconsistent reroute state");}catch(RuntimeException malformed){throw new IOException("Invalid reroute state",malformed);}}
+        void persist()throws IOException {byte[] req=request==null ? new byte[0] : request.encode(),pub=publication==null ? new byte[0] : publication.encode(),outcome=result==null ? new byte[0] : result.encode(),closing=closedProof==null?new byte[0]:closedProof.encode(),closed=closedAbort==null?new byte[0]:closedAbort.encode();var out=ByteBuffer.allocate(4+32+5*4+req.length+pub.length+outcome.length+closing.length+closed.length+2+1+(abort==null?0:32)+1+(ack==null?0:32)+1+(consume==null?0:32)+2+4+(homeFence==null?0:homeFence.encode().length)).putInt(MAGIC).put(binding);for(var bytes:List.of(req,pub,outcome,closing,closed))out.putInt(bytes.length).put(bytes);out.put((byte)(credited?1:0)).put((byte)(published?1:0)).put((byte)(abort==null?0:1));if(abort!=null)out.putLong(abort.sessionId().getMostSignificantBits()).putLong(abort.sessionId().getLeastSignificantBits()).putLong(abort.epoch()).putLong(abort.sequence());out.put((byte)(ack==null?0:1));if(ack!=null)out.putLong(ack.sessionId().getMostSignificantBits()).putLong(ack.sessionId().getLeastSignificantBits()).putLong(ack.epoch()).putLong(ack.sequence());out.put((byte)(consume==null?0:1));if(consume!=null)out.putLong(consume.sessionId().getMostSignificantBits()).putLong(consume.sessionId().getLeastSignificantBits()).putLong(consume.epoch()).putLong(consume.sequence());out.put((byte)(sourceAcknowledged?1:0)).put((byte)(done?1:0));byte[] fence=homeFence==null ? new byte[0] : homeFence.encode();out.putInt(fence.length).put(fence);access.write(state,out.array(),MAX_STATE_BYTES);}
+        void decode(byte[] bytes)throws IOException {try{var in=ByteBuffer.wrap(bytes);byte[] bound=new byte[32];if(in.getInt()!=MAGIC)throw new IOException("Invalid reroute state");in.get(bound);if(!Arrays.equals(binding,bound))throw new IOException("Reroute state binding changed");byte[] req=blob(in,NativeSourceOutcomeCredit.Request.MAX_BYTES),pub=blob(in,RatisSourceOutcomeRecord.MAX_BYTES),outcome=blob(in,CommandResult.MAX_BYTES),closing=blob(in,RatisHomeSourceClosingRpc.ClosedReservation.MAX_BYTES),closed=blob(in,HomeRecovery.MAX_BYTES);closedProof=closing.length==0?null:RatisHomeSourceClosingRpc.ClosedReservation.decode(closing);closedAbort=closed.length==0?null:HomeRecovery.decode(closed);request=req.length==0?null:NativeSourceOutcomeCredit.Request.decode(req);publication=pub.length==0?null:RatisSourceOutcomeRecord.decode(pub);result=outcome.length==0?null:CommandResult.decode(outcome);credited=flag(in);published=flag(in);if(flag(in))abort=new OperationId(new UUID(in.getLong(),in.getLong()),in.getLong(),in.getLong());if(flag(in))ack=new OperationId(new UUID(in.getLong(),in.getLong()),in.getLong(),in.getLong());if(flag(in))consume=new OperationId(new UUID(in.getLong(),in.getLong()),in.getLong(),in.getLong());if(consume!=null && (consume.epoch()!=0 || consume.sequence()!=0))throw new IOException("Invalid protected consumption identity");sourceAcknowledged=flag(in);done=flag(in);byte[] fence=blob(in,HomeFenceProof.MAX_BYTES);homeFence=fence.length==0?null:HomeFenceProof.decode(fence);if(homeFence!=null && (request==null || !homeFence.identity().equals(request.home())))throw new IOException("Cleanup retirement proof crossed original HOME");if(in.hasRemaining() || published && result==null || publication!=null && (request==null || !request.equals(publication.request())))throw new IOException("Inconsistent reroute state");}catch(RuntimeException malformed){throw new IOException("Invalid reroute state",malformed);}}
         @Override public void close()throws IOException {try{lock.release();}finally{channel.close();}}
     }
     private static byte[] blob(ByteBuffer in,int maximum){int size=in.getInt();if(size<0 || size>maximum || size>in.remaining())throw new IllegalArgumentException("Invalid reroute state blob");byte[] bytes=new byte[size];in.get(bytes);return bytes;}

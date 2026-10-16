@@ -2592,13 +2592,13 @@ public final class ReplicatedRangeStore {
         if (matching && !sameHomeReservationDefinition(row,identity.definition())) throw new IllegalArgumentException("Retained HOME definition changed");
         return new HomeState(row,credit,matching);
     }
-    /** Exact local terminal evidence survives source unavailability; it grants no new abort or publication authority. */
-    public HomeRecoveryReceipt sourceClosedHomeRecoveryReceipt(HomeIdentity identity)throws RocksDBException {
+    /** Exact retained no-effect terminal receipt; caller separately qualifies any source closure authority. */
+    public HomeRecoveryReceipt homeReservationAbortReceipt(HomeIdentity identity)throws RocksDBException {
         Objects.requireNonNull(identity);enterNative();applyLane.lock();try{
             requireActive();if(!identity.definition().reserved())throw new IllegalArgumentException("CLOSED receipt requires original RESERVED identity");var current=readHomeState(identity,null,applied);var row=current.row();
-            if(!current.matching() || row==null || row.phase()!=TransactionStatus.Phase.ABORT || !row.participants().isEmpty() || row.noEffectOutcome()!=TransactionStatus.NoEffectOutcome.SOURCE_CLOSED)return null;
+            if(!current.matching() || row==null || row.phase()!=TransactionStatus.Phase.ABORT || !row.participants().isEmpty() || row.noEffectOutcome()==TransactionStatus.NoEffectOutcome.NONE)return null;
             for(var receipt:homeRecoveries.values()){
-                var recovery=receipt.recovery();if(receipt.result().status()!=CommandResult.Status.SUCCESS || recovery.action()!=HomeRecovery.Action.ABORT || recovery.next().noEffectOutcome()!=TransactionStatus.NoEffectOutcome.SOURCE_CLOSED || !recovery.before().equals(identity.definition()))continue;
+                var recovery=receipt.recovery();if(receipt.result().status()!=CommandResult.Status.SUCCESS || recovery.action()!=HomeRecovery.Action.ABORT || recovery.next().noEffectOutcome()==TransactionStatus.NoEffectOutcome.NONE || !recovery.before().equals(identity.definition()))continue;
                 requireHomeRecovery(recovery);receipt.requireCut(applied);if(!homeIdentity(recovery).equals(identity))throw new IllegalArgumentException("CLOSED receipt changed original HOME identity");requireHomeRecoverySuccessor(receipt,row);return receipt;
             }return null;
         }finally{applyLane.unlock();leaveNative();}

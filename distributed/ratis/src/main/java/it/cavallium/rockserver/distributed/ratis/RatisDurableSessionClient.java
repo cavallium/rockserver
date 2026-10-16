@@ -150,7 +150,10 @@ public final class RatisDurableSessionClient implements AutoCloseable {
         lane.lock();try{requireOpen();owned(pending);if(pending.awaitingAcceptance)throw new IllegalStateException("Durable intent has not been accepted");if(pending.result!=null)return CompletableFuture.completedFuture(pending.result);if(pending.executing)throw new IOException("This durable operation is already executing");pending.executing=true;active++;}catch(Exception failure){return CompletableFuture.failedFuture(failure);}finally{lane.unlock();}
         var result=new CompletableFuture<CommandResult>();CompletableFuture<Void> recovery;
         if(reroutes==null || !recoveryPending)recovery=CompletableFuture.completedFuture(null);else recovery=budget.recover(() -> {recoverReroutesOwned(context,check,true,budget);return null;});
-        recovery.thenCompose(ignored -> client.executeAsync(pending.pending)).handle((value,failure) -> {
+        recovery.thenCompose(ignored -> {
+            try{if(reroutes!=null && reroutes.hasSelected(pending.command.operationId()))return budget.recover(() -> client.execute(pending.pending,original -> reroutes.executeOwned(original,context,check,budget)));return client.executeAsync(pending.pending);}
+            catch(Throwable failure){return CompletableFuture.<CommandResult>failedFuture(failure);}
+        }).handle((value,failure) -> {
             Throwable cause=unwrap(failure);if(cause instanceof RatisRoutedClient.OriginalOperationAbsent && reroutes!=null)return budget.recover(() -> client.execute(pending.pending,original -> reroutes.executeOwned(original,context,check,budget)));
             return cause==null?CompletableFuture.completedFuture(value):CompletableFuture.<CommandResult>failedFuture(cause);
         }).thenCompose(stage -> stage).whenComplete((value,failure) -> {

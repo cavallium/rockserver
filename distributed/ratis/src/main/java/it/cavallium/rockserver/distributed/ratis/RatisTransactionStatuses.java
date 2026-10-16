@@ -109,6 +109,9 @@ public final class RatisTransactionStatuses {
         if (proof!=null) recovery.requireOutcome(proof);
         return routed.restoreHomeRecovery(recovery,command.descriptor());
     }
+    public RatisHomeSourceClosingRpc.ClosedReservation closedReservation(HomeIdentity identity)throws IOException {
+        if(!identity.columnId().equals(column) || !identity.definition().clusterId().equals(cluster) || !identity.definition().databaseId().equals(database))throw new IllegalArgumentException("CLOSED reservation changed configured HOME namespace");return routed.closedReservation(identity);
+    }
     public boolean sourceClosedWithoutCredit(TransactionStatus reserved)throws IOException {
         if(!reserved.reserved())throw new IllegalArgumentException("CLOSED no-effect proof requires original reservation");var route=routed.directory().route(column,key(reserved.transactionId()));return routed.closedReservation(identity(reserved,route))!=null;
     }
