@@ -1874,17 +1874,16 @@ ordinary frontend defaults do not expose node-wide maintenance. Twelve Java and
 six Rust controlled contract cases pass (`physical-wire-and-exact-bulk-third-gate.log`,
 `rust-physical-first-gate.log`, `9f2eb22`). These are no-socket checks, not independent
 endpoint or operator-listener authentication acceptance. The current qualified JNI
-is installed only in the task's private Maven repository. Wrapper `5d0277c`
-reconstructs source `157838f56566ce4e80e9e8036ab4799f85f049d8` from the immutable
-upstream lock and one final-tree delta. Its tree
-`e92737804f00836db4630ce23f0b1fa9baa717a1` exactly matches checkpoint `5dc7215`.
-The unchanged first seventeen patches and refreshed final delta replay cleanly.
-The source checker passes after removing a JNI namespace directive and escaping
-an equivalent test character. The fresh Debug/GCC16/ABI1/JDK25 artifact passes
-39 JNI and 34 filesystem cases; eight metadata and 57 completion/recovery cases
-passed before those two source-only fixes, with the core implementation unchanged.
-The packaged library matches the built library and embeds the reconstructed
-source commit. Evidence: `qualified-artifact.json` and `qualified-*-gate.log` in
+is installed only in the task's private Maven repository. The current wrapper
+`54d0f2c` reconstructs source `1ea9c5b7fc0386cd5750ae4552693470a471e4d4`, tree
+`ba97d03366c2ec1181ba1cf162313deb3aabe93e`, from the immutable upstream lock and
+one final-tree delta. The Debug/GCC16/ABI1/JDK25 artifact passes 39 JNI and 34
+filesystem cases; eight metadata and 57 completion/recovery cases also pass.
+A current provenance check confirms the private JAR SHA-256
+`365f8673643585d6b1280aa0880f0d569ef432d52758e4ea54a9fb54067f239c`, the embedded
+source commit and all three required C API exports. The packaged library matches
+the built library. Evidence: `qualified-artifact.json`,
+`artifact-probe-qualified.log` and `qualified-*-gate.log` in
 `/home/cavallium/.codex/manual-worktrees/rockserver/bounded-native-wrapper-output`.
 The production Debian/GCC12 recipe build remains unproven.
 
