@@ -63,6 +63,8 @@ class RatisAggregateExportColdCleanupTest {
             for(var name:List.of("exportDelivery","exportAllocations","replicas","transactions","snapshots")) {
                 var member=RatisDatabaseBackendFactory.class.getDeclaredField(name);member.setAccessible(true);var owner=member.get(factory);if(owner!=null)((AutoCloseable)owner).close();
             }
+            field(factory,"pointBudget",RatisRequestBudget.class).close();
+            field(factory,"rootOwnership",RatisJournalAccess.RootLease.class).close();
             backend=null;factory=null;
         }
         void openRuntime(boolean recover)throws Exception {

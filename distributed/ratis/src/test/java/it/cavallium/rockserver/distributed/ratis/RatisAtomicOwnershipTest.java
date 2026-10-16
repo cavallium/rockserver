@@ -71,12 +71,21 @@ class RatisAtomicOwnershipTest {
     @Test void unavailableOriginalCaptureAfterCloseAbortsWithoutReplacementCutsOrEffects() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root)) {
             f.beforeAuthorize=() -> { throw new IllegalStateException("Authorization response unavailable"); }; Path path=root.resolve("unavailable.bin");
-            try (var client=f.client(); var operation=client.executeAtomic(path,f.identity(0),RatisAtomicClientTest.changes(),RatisAtomicClientTest.absentIdentity(),RatisAtomicClientTest.TTL,RequestContext.batch())) { assertThrows(ExecutionException.class,() -> operation.completion().get(10,TimeUnit.SECONDS)); }
+            List<RatisDurableTransaction.Intent> original;
+            try (var client=f.client(); var operation=client.executeAtomic(path,f.identity(0),RatisAtomicClientTest.changes(),RatisAtomicClientTest.absentIdentity(),RatisAtomicClientTest.TTL,RequestContext.batch())) {
+                assertThrows(ExecutionException.class,() -> operation.completion().get(10,TimeUnit.SECONDS));
+                original=operation.snapshot().participants().stream().map(RatisDurableTransaction.ParticipantProgress::intent).toList();
+            }
+            // Closing the facade retains journal-owned captures; lose the actual original handles.
+            var bindings=RatisTransactionBindings.of(f.schema,f.directory,f.data);
+            for(var intent:original)bindings.restoreTransaction(intent).close();
+            assertEquals(original.size(),f.captureCloses.get());
             int opens=f.opens.get(); f.beforeAuthorize=null;
             try (var client=f.client(); var resumed=client.reopen(path,RequestContext.batch())) {
                 assertEquals(CommandResult.Status.CONFLICT,resumed.completion().get(10,TimeUnit.SECONDS).status()); assertEquals(TransactionStatus.Phase.ABORT,resumed.snapshot().observedHome().phase());
                 assertEquals(opens,f.opens.get()); assertNull(f.get(71,RatisAtomicClientTest.key(2))); assertNull(f.get(72,RatisAtomicClientTest.key(200)));
                 assertFalse(resumed.snapshot().observedHome().consumed());
+                assertEquals(original.stream().map(RatisDurableTransaction.Intent::captureId).toList(),resumed.snapshot().participants().stream().map(p -> p.intent().captureId()).toList());
             }
         }
     }
