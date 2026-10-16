@@ -2460,3 +2460,14 @@ retirement guards stay in place until that complete path is proven.
 
 Standalone remains supported. This branch has not been pushed, published, merged
 or deployed.
+
+Committed source CLOSE now durably stops fresh source CREDIT and authoritative
+ABSENT admission while preserving accepted credit settlement and exact retries.
+The closing record survives portable META images, force-acknowledgement loss and
+cold reopening. CLOSED is an internal applied refusal, never publication evidence.
+`source-closing-first140.log` passes 32 distinct native/adapter cases;
+`source-closing-lifecycle142.log` passes 17, including submitted old-term hold
+reconciliation only after a newer completed native term, and admission-lock
+invalidation with actual proof drainage. Terminal Raft retirement ownership, CAT
+tombstones and closed-source routing/discovery, compacted native seed witnesses,
+and physical STATE/RECEIPTS/Raft reclamation remain unfinished.

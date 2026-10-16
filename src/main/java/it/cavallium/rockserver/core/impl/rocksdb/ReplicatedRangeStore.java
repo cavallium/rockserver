@@ -205,8 +205,40 @@ public final class ReplicatedRangeStore {
             requireTopologyMetadataOwner();var freeze=activeTopologyFreeze;var header=freeze.header();var parent=header.participant(TopologyChange.Stage.FREEZE,groupId);
             if(!cluster.equals(header.clusterId()) || !database.equals(header.databaseId()) || !domain.equals(header.domainId()) || !lineage.rangeId().equals(parent.rangeId()) || !lineage.groupId().equals(groupId) || lineage.rangeEpoch()!=rangeEpoch || parent.rangeEpoch()!=rangeEpoch)throw new IllegalArgumentException("Topology operation outcome namespace/parent lineage differs");
             var credit=sourceOutcomeCredits.get(operation);if(credit!=null && !Arrays.equals(credit.request().original().receiptDigest(),digest))throw new IllegalArgumentException("Source original credit digest changed");
-            return new TopologyOperationOutcome(applied,freeze,configurationUnderAdmission(),credit,operationResultUnderAdmission(operation,digest));
+            var result=operationResultUnderAdmission(operation,digest);if(sourceClosingAdmission() && credit==null && result==null)throw new SourceClosing();return new TopologyOperationOutcome(applied,freeze,configurationUnderAdmission(),credit,result);
         } finally { applyLane.unlock();leaveNative(); }
+    }
+    private volatile it.cavallium.rockserver.core.common.distributed.NativeSourceClosing sourceClosing,pendingSourceClosing;
+    @FunctionalInterface public interface SourceClosingForceObserver {void at(boolean persisted)throws RocksDBException;}
+    private volatile SourceClosingForceObserver sourceClosingForceObserver=persisted->{};
+    public void sourceClosingForceObserver(SourceClosingForceObserver observer){sourceClosingForceObserver=Objects.requireNonNull(observer);}
+    public it.cavallium.rockserver.core.common.distributed.NativeSourceClosing sourceClosing(){return sourceClosing;}
+    public it.cavallium.rockserver.core.common.distributed.NativeSourceClosing sourceClosingAttempt(){return sourceClosing!=null?sourceClosing:pendingSourceClosing;}
+    public boolean sourceClosingAdmission(){return sourceClosing!=null || pendingSourceClosing!=null;}
+    public static final class SourceClosing extends IllegalStateException {public SourceClosing(){super("Source is closing; fresh CREDIT/ABSENT authority is unavailable");}}
+    private byte[] sourceClosingKey(){return topologyOwnershipKey(0x76);}
+    /** Trusted committed source record. It closes admission but deliberately keeps every accepted debt. */
+    public it.cavallium.rockserver.core.common.distributed.NativeSourceClosing applySourceClosing(ApplyPosition position,it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.Request request)throws RocksDBException {
+        Objects.requireNonNull(position);Objects.requireNonNull(request);enterNative();applyLane.lock();try{
+            requireTopologyMetadataOwner(false);if(!topologyRetired() || !request.group().equals(groupId) || !Arrays.equals(request.header().encode(),activeTopologyFreeze.header().encode()))throw new IllegalArgumentException("Source CLOSE differs from durable consuming topology");
+            var prior=sourceClosing!=null?sourceClosing:pendingSourceClosing;
+            if(prior!=null){if(!prior.request().equals(request))throw new IllegalArgumentException("Unknown source CLOSE requires exact original retry");}
+            else {var cfg=configurationUnderAdmission();if(cfg==null || cfg.term()!=request.configurationTerm() || cfg.index()!=request.configurationIndex() || !Arrays.equals(cfg.data(),request.configuration()))throw new IllegalArgumentException("Source CLOSE changed actual native configuration");requireNext(position);activeTopologyFreeze.requireCut(position);prior=new it.cavallium.rockserver.core.common.distributed.NativeSourceClosing(request,position);prior.requireFreeze(activeTopologyFreeze);pendingSourceClosing=prior;}
+            // An exact replay can use a later own log index; its original closing identity never moves.
+            if(sourceClosing!=null){advanceCompletedMarker(position);return sourceClosing;}
+            prior.requireCut(position);if(applied!=null && position.index()<=applied.index())throw new IllegalArgumentException("Source CLOSE retry regressed native prefix");
+            sourceClosingForceObserver.at(false);
+            try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)){
+                batch.put(state,sourceClosingKey(),prior.encode());batch.put(state,markerKey,encodePosition(position));batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position));db.write(options,batch);
+            }
+            sourceClosing=prior;pendingSourceClosing=null;applied=position;sourceClosingForceObserver.at(true);return prior;
+        }finally{applyLane.unlock();leaveNative();}
+    }
+    private void recoverSourceClosing(ApplyPosition cut)throws RocksDBException {
+        byte[] bytes=db.get(state,sourceClosingKey());if(bytes==null){sourceClosing=null;pendingSourceClosing=null;return;}
+        var recovered=it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.decode(bytes);recovered.requireCut(cut);
+        if(activeTopologyFreeze==null || !recovered.request().group().equals(groupId) || !Arrays.equals(recovered.request().header().encode(),activeTopologyFreeze.header().encode()))throw new IllegalStateException("Source CLOSE lost original retirement/FREEZE");
+        recovered.requireFreeze(activeTopologyFreeze);sourceClosing=recovered;pendingSourceClosing=null;
     }
     private volatile Map<OperationId,NativeSourceOutcomeCredit> sourceOutcomeCredits=Map.of();
     private volatile Map<OperationId,NativeSourceOutcomePublication> sourceOutcomePublications=Map.of();
@@ -265,6 +297,7 @@ public final class ReplicatedRangeStore {
             requireSourceOutcomeRequest(request,ready);ensureReceiptUsage();var id=request.original().operationId();var total=readUsage(usageKey).plus(sourceOutcomePromises(null));var usage=new ReceiptUsage(applied,total.count(),total.bytes());
             var saved=sourceOutcomeCredits.get(id);if(saved!=null) { if(!saved.request().equals(request))throw new IllegalArgumentException("Source credit original input changed");return new SourceOutcomeCreditEstimate(usage,true,sourceOperationFenced(id),0,0,0,sourceOutcomeMetadataBytes()); }
             var published=sourceOutcomePublications.get(id);if(published!=null) { if(!Arrays.equals(published.requestDigest(),request.digest()))throw new IllegalArgumentException("Source publication original input changed");return new SourceOutcomeCreditEstimate(usage,true,sourceOperationFenced(id),0,0,0,sourceOutcomeMetadataBytes()); }
+            if(sourceClosingAdmission())throw new SourceClosing();
             if(sourceOperationFenced(id))return new SourceOutcomeCreditEstimate(usage,false,true,0,0,0,sourceOutcomeMetadataBytes());
             if(operationResultUnderAdmission(id,request.original().receiptDigest())!=null)throw new IllegalStateException("Source original operation already has an ordinary outcome");
             if(sessionAckEpochs==null)validateSessionMetadata(null);
@@ -277,7 +310,7 @@ public final class ReplicatedRangeStore {
     /** Trusted committed reservation after HOME RESERVED; fresh HOME/source authority is adapter-owned. */
     public NativeSourceOutcomeCredit applySourceOutcomeCredit(ApplyPosition position,NativeSourceOutcomeCredit.Request request) throws RocksDBException {
         enterNative();applyLane.lock();try {
-            var estimate=estimateSourceOutcomeCredit(request,false);var id=request.original().operationId();var existing=sourceOutcomeCredits.get(id);if(existing!=null) { advanceCompletedMarker(position);return existing; }
+            requireSourceOutcomeRequest(request,false);var id=request.original().operationId();if(sourceClosingAdmission() && !sourceOutcomeCredits.containsKey(id) && !sourceOutcomePublications.containsKey(id)){advanceCompletedMarker(position);return null;}var estimate=estimateSourceOutcomeCredit(request,false);var existing=sourceOutcomeCredits.get(id);if(existing!=null) { advanceCompletedMarker(position);return existing; }
             var publication=sourceOutcomePublications.get(id);if(publication!=null) { advanceCompletedMarker(position);return new NativeSourceOutcomeCredit(request,publication.creditPosition()); }
             if(estimate.fenced()) { advanceCompletedMarker(position);return null; }
             requireNext(position);var credit=new NativeSourceOutcomeCredit(request,position);var next=new HashMap<>(sourceOutcomeCredits);next.put(id,credit);
@@ -296,7 +329,7 @@ public final class ReplicatedRangeStore {
         enterNative();applyLane.lock();try {
             requireSourceOutcomeRequest(request,false);ensureReceiptUsage();var id=request.original().operationId();boolean fenced=sourceOperationFenced(id);var saved=sourceOutcomePublications.get(id);
             if(saved!=null) { saved.requireRequest(request,stable);saved.requireCut(applied);advanceCompletedMarker(position);return new SourceOutcomePublicationResult(fenced?NativeSourceOutcomePublication.Outcome.FENCED:saved.outcome(),saved); }
-            var credit=sourceOutcomeCredits.get(id);if(credit==null) { if(fenced) { advanceCompletedMarker(position);return new SourceOutcomePublicationResult(NativeSourceOutcomePublication.Outcome.FENCED,null); }throw new IllegalStateException("Source publication has no durable exact receipt credit"); }
+            var credit=sourceOutcomeCredits.get(id);if(credit==null) { if(sourceClosingAdmission()){advanceCompletedMarker(position);return new SourceOutcomePublicationResult(NativeSourceOutcomePublication.Outcome.CLOSED,null);} if(fenced) { advanceCompletedMarker(position);return new SourceOutcomePublicationResult(NativeSourceOutcomePublication.Outcome.FENCED,null); }throw new IllegalStateException("Source publication has no durable exact receipt credit"); }
             if(!credit.request().equals(request))throw new IllegalArgumentException("Source publication changed credited input");requireNext(position);
             byte[] old=operationResultUnderAdmission(id,request.original().receiptDigest());if(!fenced && old!=null && !Arrays.equals(old,stable))throw new IllegalArgumentException("Source original outcome already differs");
             var outcome=fenced?NativeSourceOutcomePublication.Outcome.FENCED:NativeSourceOutcomePublication.Outcome.RETAINED;var publication=new NativeSourceOutcomePublication(groupId,id,request.digest(),sourceOutcomeHash(stable),credit.position(),position,outcome);
@@ -931,7 +964,7 @@ public final class ReplicatedRangeStore {
             recoverImportMetadata();
             ensureReceiptUsage();
             validateReceiptUsage(applied);
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);recoverSourceOutcomes(applied);
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);recoverSourceOutcomes(applied);recoverSourceClosing(applied);
         }
     }
 
@@ -1080,7 +1113,7 @@ public final class ReplicatedRangeStore {
                 if(!manifest.owner().equals(owner) || !manifest.interval().equals(interval) || !Arrays.equals(manifest.schemaDigest(),schemaDigest) || !manifest.position().equals(prefix.cut()) || !manifest.deterministicMergeColumns().equals(deterministicMergeColumns) || !sameConfiguration(prefix.configuration(),cfg[0]) || !seed.parentFreezes().get(groupId).equals(freeze[0]))throw new IOException("Local META checkpoint differs from its selected native prefix");
                 byte[] actual;try(var pin=capture()){actual=metadataRowsDigest(pin,prefix.cut());}if(!java.security.MessageDigest.isEqual(projection.digest(),actual))throw new IOException("Local META checkpoint changed portable native metadata");
                 recoverSchemaMetadata();recoverRelocationCompletions();recoverImportMetadata();ensureReceiptUsage();validateReceiptUsage(applied);
-                homeRecoveries=loadHomeRecoveries();homeRecoveryCredits=loadHomeCredits(applied);validateHomeCreditCapacity();abortedIndex=loadAbortedIndex();committedIndex=loadCommittedIndex();rejectedIndex=loadRejectedIndex();snapshotGates=loadSnapshotGates();preparedIndex=loadPreparedIndex();validateAbortedIndex();validateCommittedIndex();validateRejectedIndex();validateSnapshotGates();validateHomeRecoveries();activeSchemaFence=loadSchemaFence(applied);activeTopologyFreeze=loadTopologyFreeze(applied);recoverSourceOutcomes(applied);configureSourceOutcomeCapacity(sourceOutcomeCount,sourceOutcomeBytes);if(sessions)sessionControlsEnabled=true;
+                homeRecoveries=loadHomeRecoveries();homeRecoveryCredits=loadHomeCredits(applied);validateHomeCreditCapacity();abortedIndex=loadAbortedIndex();committedIndex=loadCommittedIndex();rejectedIndex=loadRejectedIndex();snapshotGates=loadSnapshotGates();preparedIndex=loadPreparedIndex();validateAbortedIndex();validateCommittedIndex();validateRejectedIndex();validateSnapshotGates();validateHomeRecoveries();activeSchemaFence=loadSchemaFence(applied);activeTopologyFreeze=loadTopologyFreeze(applied);recoverSourceOutcomes(applied);recoverSourceClosing(applied);configureSourceOutcomeCapacity(sourceOutcomeCount,sourceOutcomeBytes);if(sessions)sessionControlsEnabled=true;
                 var range=supersession.scope().range();var lineage=new it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage(range.rangeId(),groupId,rangeEpoch);if(cdc==null)cdc=new NativeRangeCdc(databaseOwner,state,lineage);else if(!cdc.lineage().equals(lineage))throw new IllegalArgumentException("Local META CDC lineage changed");cdc.recover(applied,cdcAuthorityTime());requireCurrent();
                 synchronized(discoveryPublication){return localMetadataPublication=new LocalMetadataActivation(this,manifest);}
             }finally{applyLane.unlock();}}finally{nativeLifecycle.writeLock().unlock();}
@@ -1169,7 +1202,7 @@ public final class ReplicatedRangeStore {
             if(recoverySupersession!=null || currentRangeRecovery!=null && !currentRangeRecoveryReady || topologyRetired() || topologyBirthPending()) throw new IllegalStateException("Topology owner requires qualified future activation");
             if (pendingInstallation != null || importPending()) throw new IllegalStateException("Installation remains incomplete or unpublished");
             try { validateTopologyActivationRecovery(); recoverSchemaMetadata(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover schema generation",failure); }
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);try { recoverSourceOutcomes(applied); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover source outcome promises",failure); } validateSnapshotHomeUsersUnchecked();
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);try { recoverSourceOutcomes(applied);recoverSourceClosing(applied); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover source outcome promises",failure); } validateSnapshotHomeUsersUnchecked();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -4273,6 +4306,8 @@ public final class ReplicatedRangeStore {
 
     private int imageMetadataBytes(ReadOptions options,NativeRangeImage.Limits limits,boolean registrations)throws RocksDBException,IOException {
         int total=0;
+        int closingBytes=options==null?db.get(state,sourceClosingKey(),new byte[0]):db.get(state,options,sourceClosingKey(),new byte[0]);
+        if(closingBytes!=RocksDB.NOT_FOUND){if(closingBytes<0 || closingBytes>it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.MAX_BYTES || closingBytes+17L>limits.maxImageBytes())throw new IOException("Source closing exceeds image metadata bound");total=closingBytes;}
         int[] tags={0x67,0x6a,0x72};
         int[] bounds={NativeTopologyLearnerRegistration.MAX_BYTES,NativeTopologyLearnerImagePermission.MAX_BYTES,NativeCurrentRangeRecovery.MAX_BYTES};
         if(registrations)for(int i=0;i<tags.length;i++) {
@@ -4593,6 +4628,11 @@ public final class ReplicatedRangeStore {
             // Own-tail schema changes share this lane; measure and hold their exact graph before normalization.
             if(targetMetadata!=null)targetMetadata.reserve(imageMetadataBytes(null,limits,!metadata));
             if(metadata && applied!=null && !NativeMetadataRecoveryRegistration.covers(expected.position(),applied))throw new IOException("Metadata snapshot regresses actual completed source prefix");
+            if(pendingSourceClosing!=null)throw new IOException("Unknown CLOSE force must settle before image replacement");
+            if(sourceClosing!=null){
+                var closingRow=new byte[1][];NativeRangeImage.visitKind(image,limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE && Arrays.equals(key,sourceClosingKey()))closingRow[0]=value;},metadata);
+                if(!Arrays.equals(sourceClosing.encode(),closingRow[0]))throw new IOException("Snapshot cannot erase/change committed source closing authority");
+            }
             final MetadataImageQualification metadataImage=metadata && metadataRecoveryRegistration!=null?qualifyMetadataRecoveryImage(image,limits,expected,true,null):null;
             if(pendingLearnerImagePermission!=null)throw new IllegalStateException("Unknown later image force requires exact permission retry");
             final NativeTopologyLearnerImagePermission permission=topologyLearner!=null && learnerImagePermission!=null && expected.position().equals(learnerImagePermission.imageCut()) && Arrays.equals(expected.sha256(),learnerImagePermission.imageHash()) ? learnerImagePermission : null;
@@ -4696,7 +4736,7 @@ public final class ReplicatedRangeStore {
                     recoverSchemaMetadata(expected.position());
                     if(cdc!=null) cdc.recover(expected.position(),cdcAuthorityTime());
                     validateReceiptUsage(expected.position());
-                    activeSchemaFence=loadSchemaFence(expected.position()); activeTopologyFreeze=loadTopologyFreeze(expected.position(),false);recoverSourceOutcomes(expected.position());
+                    activeSchemaFence=loadSchemaFence(expected.position()); activeTopologyFreeze=loadTopologyFreeze(expected.position(),false);recoverSourceOutcomes(expected.position());recoverSourceClosing(expected.position());
                     homeRecoveries=loadHomeRecoveries(expected.position()); homeRecoveryCredits=loadHomeCredits(expected.position()); validateHomeCreditCapacity();
                     // Flush every prior CF mutation before publishing the final applied marker.
                     db.flushWal(true);

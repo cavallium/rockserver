@@ -109,7 +109,7 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
                 if(current.status().phase()==TransactionStatus.Phase.PREPARING)throw new IOException("Promoted HOME has no original accepted journal; recapture is forbidden");
                 if(job.request==null){job.request=new NativeSourceOutcomeCredit.Request(input.originalCommand(),input.origin(),input.targetDirectory(),input.absence().freeze(),homes.identity(reserved,current.descriptor()));job.persist();}
                 if(current.status().reserved() && !job.credited) {
-                    var record=new RatisSourceOutcomeRecord(RatisSourceOutcomeRecord.Kind.CREDIT,job.request,null);check.check();var credit=routed.appendSourceOutcome(input.sourceDirectory(),record,List.of());job.credited=credit.outcome()==NativeSourceOutcomePublication.Outcome.RETAINED;job.persist();
+                    var record=new RatisSourceOutcomeRecord(RatisSourceOutcomeRecord.Kind.CREDIT,job.request,null);check.check();var credit=routed.appendSourceOutcome(input.sourceDirectory(),record,List.of());if(credit.outcome()==NativeSourceOutcomePublication.Outcome.CLOSED)throw new IOException("Source is closing; retain original recovery identity for lineage resolution");job.credited=credit.outcome()==NativeSourceOutcomePublication.Outcome.RETAINED;job.persist();
                 }
                 if(input.originalCommand().kind()==DistributedCommand.Kind.COMMIT_ACCEPTED || !job.credited)abort(job,reserved,check);
             }
@@ -128,7 +128,7 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
                 if(prepared.fenced()){job.result=actual;job.published=true;job.persist();return actual;}
                 job.publication=prepared.record();if(!Arrays.equals(actual.encode(),job.publication.result()))throw new IOException("Source publication disagrees with actual HOME/participant outcome");job.persist();
             }
-            check.check();routed.appendSourceOutcome(input.sourceDirectory(),job.publication,intents);job.result=CommandResult.decode(job.publication.result());job.published=true;job.persist();return job.result;
+            check.check();var publication=routed.appendSourceOutcome(input.sourceDirectory(),job.publication,intents);if(publication.outcome()==NativeSourceOutcomePublication.Outcome.CLOSED)throw new IOException("Source is closing; original HOME result needs terminal lineage resolution");job.result=CommandResult.decode(job.publication.result());job.published=true;job.persist();return job.result;
         }
     }
     private void preflight(Job job,RatisOperationRerouteJournal input,SessionEpochLedger ledger)throws IOException {

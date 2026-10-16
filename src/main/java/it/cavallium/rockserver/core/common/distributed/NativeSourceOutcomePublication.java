@@ -5,9 +5,9 @@ import java.util.*;
 
 /** Compact terminal publication proof; original receipt fences remain authoritative. */
 public record NativeSourceOutcomePublication(UUID group,OperationId operation,byte[] requestDigest,byte[] resultDigest,ApplyPosition creditPosition,ApplyPosition position,Outcome outcome) {
-    public enum Outcome { RETAINED,FENCED }
+    public enum Outcome { RETAINED,FENCED,CLOSED }
     public static final int BYTES=149;
-    public NativeSourceOutcomePublication { Objects.requireNonNull(group);Objects.requireNonNull(operation);Objects.requireNonNull(creditPosition);Objects.requireNonNull(position);Objects.requireNonNull(outcome);if(requestDigest==null || requestDigest.length!=32 || resultDigest==null || resultDigest.length!=32 || creditPosition.term()<1 || creditPosition.index()<0 || position.term()<creditPosition.term() || position.index()<=creditPosition.index())throw new IllegalArgumentException("Invalid source publication proof");requestDigest=requestDigest.clone();resultDigest=resultDigest.clone(); }
+    public NativeSourceOutcomePublication { Objects.requireNonNull(group);Objects.requireNonNull(operation);Objects.requireNonNull(creditPosition);Objects.requireNonNull(position);Objects.requireNonNull(outcome);if(outcome==Outcome.CLOSED || requestDigest==null || requestDigest.length!=32 || resultDigest==null || resultDigest.length!=32 || creditPosition.term()<1 || creditPosition.index()<0 || position.term()<creditPosition.term() || position.index()<=creditPosition.index())throw new IllegalArgumentException("Invalid source publication proof");requestDigest=requestDigest.clone();resultDigest=resultDigest.clone(); }
     @Override public byte[] requestDigest() { return requestDigest.clone(); }
     @Override public byte[] resultDigest() { return resultDigest.clone(); }
     public void requireRequest(NativeSourceOutcomeCredit.Request request,byte[] result) { if(!group.equals(request.original().groupId()) || !operation.equals(request.original().operationId()) || !Arrays.equals(requestDigest,request.digest()) || !Arrays.equals(resultDigest,NativeSourceOutcomeCredit.hash(result)))throw new IllegalArgumentException("Source publication identity/result changed"); }
