@@ -74,6 +74,62 @@ public final class RockserverRaftServers {
         }
     }
 
+    /** Cached Raft frontier only; the adapter must independently bind the native marker/full CFG. */
+    public record SourceFrontier(TermIndex cut,long configurationIndex,RaftConfigurationProto configuration){
+        public SourceFrontier{Objects.requireNonNull(cut);Objects.requireNonNull(configuration);if(cut.getTerm()<1 || cut.getIndex()<0 || configurationIndex<0 || configurationIndex>cut.getIndex())throw new IllegalArgumentException("Invalid final source frontier");}
+    }
+    /** Adapter contract for work whose actual lifetime can outlive a timed-out Raft reply.
+     * Invoked after sealed ingress and selected applies drain, outside core monitors. It must
+     * fence group-specific external admission and join actual query, snapshot and native work.
+     * The call must return promptly; its future must acknowledge actual retirement, never an
+     * observer timeout/cancellation. Catch-up retry does not reopen ordinary source admission.
+     */
+    public interface SourceRetirementStateMachine extends StateMachine {
+        CompletableFuture<Void> drainSourceRetirement();
+    }
+    /** Terminal division owner. Observation cancellation does not release admission or actual work. */
+    public static final class SourceRetirement {
+        final RaftServerImpl server;final StateMachine machine;final StateMachineUpdater updater;final RecoveryEligibilityStateMachine.Gate gate;
+        volatile CompletableFuture<Void> protocolsDrained=new CompletableFuture<>();
+        volatile CompletableFuture<SourceFrontier> drained=new CompletableFuture<>();
+        volatile CompletableFuture<Void> roleStopped, nativeDrained, resumeRequested;volatile SourceFrontier frontier,expected;volatile boolean sealRequested,stopRequested,receiptIssued;volatile long sealGeneration=-1;
+        private volatile boolean closed;
+        private final java.util.concurrent.atomic.AtomicBoolean closeOwner=new java.util.concurrent.atomic.AtomicBoolean();
+        private SourceRetirement(RaftServerImpl server,StateMachine machine,RecoveryEligibilityStateMachine.Gate gate){this.server=server;this.machine=machine;this.gate=gate;updater=server.getState().getStateMachineUpdater();}
+        /** Observation only: replication/catch-up remains usable until every cohort owner agrees. */
+        public SourceFrontier observe()throws IOException{return server.observeSourceFrontier(this);}
+        public CompletableFuture<SourceFrontier> sealAt(SourceFrontier agreed)throws IOException{server.sealSourceRetirement(this,Objects.requireNonNull(agreed));return drained();}
+        public CompletableFuture<SourceFrontier> drained(){return drained.copy();}
+        /** Explicit pre-publication retry, never observer cancellation. Native closing stays permanent. */
+        public CompletableFuture<Void> resumeCatchup()throws IOException{return server.requestSourceCatchup(this);}
+        /** Must precede the first native/CAT terminal-receipt force attempt, including an unknown outcome. */
+        public void issuingTerminalReceipt(SourceFrontier expected)throws IOException{synchronized(server){requireHeld();if(resumeRequested!=null || !frontier.equals(expected))throw new IOException("Source terminal receipt changed agreed frontier");receiptIssued=true;}}
+
+        /** No callbacks or native IO; terminal admissions prevent this proof from being widened later. */
+        public void requireHeld()throws IOException{
+            var f=frontier;
+            synchronized(server){if(closed || server.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING || server.getSourceRetirement()!=this || server.getStateMachine()!=machine || !gate.sourceRetirementPending() || gate.revocationGeneration()!=sealGeneration || !server.sourceProtocolsDrained(this) || f==null || !drained.isDone() || drained.isCompletedExceptionally() || roleStopped==null || !roleStopped.isDone() || roleStopped.isCompletedExceptionally() || nativeDrained==null || !nativeDrained.isDone() || nativeDrained.isCompletedExceptionally() || server.getRaftLog().getLastCommittedIndex()!=f.cut().getIndex() || server.getRaftConf().getLogEntryIndex()!=f.configurationIndex() || !LogProtoUtils.toRaftConfigurationProtoBuilder(server.getRaftConf()).build().equals(f.configuration()) || !updater.sourceRetirementReady(this))throw new IOException("Source retirement has not joined its exact committed/native continuation frontier");}
+        }
+        /** Caller owns the actual blocking action outside Node/division/native monitors. */
+        public void closeChecked()throws IOException{
+            if(closed)return;if(!closeOwner.compareAndSet(false,true))throw new IOException("Actual source close remains owned");
+            try{
+                if(!stopRequested)requireHeld();else if(server.getSourceRetirement()!=this || frontier==null || !drained.isDone() || drained.isCompletedExceptionally())throw new IOException("Source close retry changed original owner/frontier");
+                if(!receiptIssued)throw new IOException("Source physical close has no issued terminal-receipt owner");stopRequested=true;updater.notifyUpdater();
+                updater.stopAndJoin();updater.requireSourceStopped();
+                // ServerState.close catches/logs these failures. Terminal removal needs checked acknowledgements.
+                server.getRaftLog().close();server.getState().getStorage().close();server.close();updater.requireSourceStopped();closed=true;
+            }catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Source close interrupted; ownership/deletion debt retained",interrupted);}
+            finally{if(!closed)closeOwner.set(false);}
+        }
+        public boolean closed(){return closed;}
+    }
+    public static SourceRetirement beginSourceRetirement(RaftServer.Division division,StateMachine expected)throws IOException{
+        if(!(division instanceof RaftServerImpl server) || server.getStateMachine()!=expected || !(expected instanceof RecoveryEligibilityStateMachine recovery) || !(expected instanceof SourceRetirementStateMachine))throw new IOException("Source retirement requires actual pinned division/SM owner");
+        synchronized(server){var prior=server.getSourceRetirement();if(prior!=null){if(prior.machine!=expected)throw new IOException("Source retirement owner changed");return prior;}}
+        var owner=new SourceRetirement(server,expected,recovery.recoveryEligibilityGate());server.beginSourceRetirement(owner);return owner;
+    }
+
     public enum DiscoveryRole { GENESIS, CURRENT }
     /** Stops new selection and joins actual selected callbacks before binding publication evidence. */
     public static final class DiscoveryDrain {

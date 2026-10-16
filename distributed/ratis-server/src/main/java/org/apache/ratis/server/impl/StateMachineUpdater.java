@@ -89,13 +89,45 @@ class StateMachineUpdater implements Runnable {
   private volatile State state = State.RUNNING;
   private volatile RockserverRaftServers.CoveredPrefix coveredPrefix;
   private volatile RockserverRaftServers.DiscoveryDrain discoveryDrain;
+  private volatile RockserverRaftServers.SourceRetirement sourceRetirement;
+  private volatile Throwable sourceStopFailure;
   private CompletableFuture<Void> selectedApplications=CompletableFuture.completedFuture(null);
   private Throwable discoveryFailure;
   private TermIndex observedReloadCut;
   private CompletableFuture<Void> observedReload;
 
+  synchronized void registerSourceRetirement(RockserverRaftServers.SourceRetirement owner)throws IOException{requireCoveredAvailable();sourceRetirement=owner;}
+  boolean sourceRetirementReady(RockserverRaftServers.SourceRetirement owner){return sourceRetirement==owner && state==State.RUNNING && owner.frontier!=null && getLastAppliedIndex()==owner.frontier.cut().getIndex() && owner.frontier.cut().equals(stateMachine.getLastAppliedTermIndex()) && owner.gate.revocationGeneration()==owner.sealGeneration && selectedApplications.isDone() && !selectedApplications.isCompletedExceptionally() && owner.nativeDrained!=null && owner.nativeDrained.isDone() && !owner.nativeDrained.isCompletedExceptionally();}
+  void requireSourceStopped()throws IOException{if(state!=State.STOP || updater.isAlive() || sourceStopFailure!=null)throw new IOException("Actual source updater/SM stop did not complete",sourceStopFailure);}
+  private boolean consumeSourceRetirement()throws IOException,InterruptedException{
+    var owner=sourceRetirement;if(owner==null)return false;
+    if(committedAdmission!=null)committedAdmission.pump();
+    if(owner.stopRequested){if(!selectedApplications.isDone()){awaitForSignal.await(100,TimeUnit.MILLISECONDS);return true;}if(owner.receiptIssued && !sourceRetirementReady(owner))throw new IOException("Issued source stop lost its actual drain");stop();return true;}
+    if(owner.resumeRequested!=null){
+      // Resume only after actual role/native callbacks retire; cancellation never drops their debt.
+      if(owner.roleStopped!=null && !owner.roleStopped.isDone() || owner.nativeDrained!=null && !owner.nativeDrained.isDone()){awaitForSignal.await(100,TimeUnit.MILLISECONDS);return true;}
+      if(owner.roleStopped!=null && owner.roleStopped.isCompletedExceptionally() || owner.nativeDrained!=null && owner.nativeDrained.isCompletedExceptionally())throw new IOException("Failed source drain cannot resume catch-up");
+      server.resumeSourceCatchup(owner);return true;
+    }
+    if(owner.drained.isCompletedExceptionally()){awaitForSignal.await(100,TimeUnit.MILLISECONDS);return true;}
+    if(!owner.sealRequested)return false;
+    if(!owner.protocolsDrained.isDone()){if(getLastAppliedIndex()>=raftLog.getLastCommittedIndex()){awaitForSignal.await(100,TimeUnit.MILLISECONDS);return true;}return false;}
+    if(owner.roleStopped==null)owner.roleStopped=server.stopSourceRole(owner);
+    if(!owner.roleStopped.isDone()){if(getLastAppliedIndex()>=raftLog.getLastCommittedIndex()){awaitForSignal.await(100,TimeUnit.MILLISECONDS);return true;}return false;}
+    if(owner.roleStopped.isCompletedExceptionally()){try{owner.roleStopped.join();}catch(java.util.concurrent.CompletionException failure){throw new IOException("Source role did not retire",failure.getCause());}}
+    if(owner.frontier==null)server.freezeSourceFrontier(owner);
+    if(getLastAppliedIndex()<owner.frontier.cut().getIndex())return false;
+    if(!selectedApplications.isDone()){awaitForSignal.await(100,TimeUnit.MILLISECONDS);return true;}
+    if(selectedApplications.isCompletedExceptionally())throw new IOException("Source selected/native callbacks did not settle");
+    if(owner.nativeDrained==null)owner.nativeDrained=java.util.Objects.requireNonNull(((RockserverRaftServers.SourceRetirementStateMachine)stateMachine).drainSourceRetirement(),"Actual source native drain");
+    if(!owner.nativeDrained.isDone()){awaitForSignal.await(100,TimeUnit.MILLISECONDS);return true;}
+    if(owner.nativeDrained.isCompletedExceptionally()){try{owner.nativeDrained.join();}catch(java.util.concurrent.CompletionException failure){throw new IOException("Source adapter actual work did not retire",failure.getCause());}}
+    if(!sourceRetirementReady(owner))throw new IOException("Source updater/native marker or generation differs from final frontier");
+    owner.drained.complete(owner.frontier);awaitForSignal.await(100,TimeUnit.MILLISECONDS);return true;
+  }
+
   synchronized CompletableFuture<Void> observeLocalReload(TermIndex cut) throws IOException {
-    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null || coveredPrefix != null || discoveryDrain != null) {
+    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null || coveredPrefix != null || discoveryDrain != null || sourceRetirement != null) {
       throw new IOException("State machine updater is busy/stopping");
     }
     observedReloadCut = cut;
@@ -104,7 +136,7 @@ class StateMachineUpdater implements Runnable {
   }
 
   synchronized void requireCoveredAvailable() throws IOException {
-    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null || coveredPrefix != null || discoveryDrain != null)
+    if (state != State.RUNNING || stopIndex.get() != null || observedReload != null || coveredPrefix != null || discoveryDrain != null || sourceRetirement != null)
       throw new IOException("Updater already owns work or is stopping");
   }
   synchronized void registerCoveredPrefix(RockserverRaftServers.CoveredPrefix permit) throws IOException {
@@ -274,9 +306,11 @@ class StateMachineUpdater implements Runnable {
         stateMachineMetrics.get().unregister();
       }
     } catch(Throwable t) {
+      sourceStopFailure=t;
       LOG.warn(name + ": Failed to close " + JavaUtils.getClassSimpleName(stateMachine.getClass())
           + " " + stateMachine, t);
     } finally {
+      var source=sourceRetirement;if(source!=null){var failure=new IOException("Updater stopped before terminal source drain",sourceStopFailure);if(!source.drained.isDone())source.drained.completeExceptionally(failure);if(source.resumeRequested!=null)source.resumeRequested.completeExceptionally(failure);}
       var covered = coveredPrefix;
       if (covered != null) retireCoveredPrefix(covered, new IOException("Updater stopped during covered prefix ownership"));
       var creation = discoveryDrain;
@@ -321,6 +355,7 @@ class StateMachineUpdater implements Runnable {
     CompletableFuture<Void> applyLogFutures = CompletableFuture.completedFuture(null);
     for(; state != State.STOP; ) {
       try {
+        if (consumeSourceRetirement()) continue;
         if (consumeDiscoveryDrain()) continue;
         if (discoveryDrain==null && stopIndex.get() != null && (committedAdmission != null || coveredPrefix != null || !server.isInitialImageReady())) { stop(); break; }
         if (consumeCoveredPrefix()) continue;
@@ -341,6 +376,7 @@ class StateMachineUpdater implements Runnable {
           stop();
         }
       } catch (Throwable t) {
+        if(sourceRetirement!=null){sourceRetirement.drained.completeExceptionally(t);if(sourceRetirement.resumeRequested!=null)sourceRetirement.resumeRequested.completeExceptionally(t);sourceStopFailure=t;if(stopIndex.get()!=null){stop();break;}continue;}
         if(discoveryDrain!=null && !selectedApplications.isDone()) {discoveryFailure=t;discoveryDrain.gate.deferDiscovery();continue;}
         if (t instanceof InterruptedException && state == State.STOP) {
           Thread.currentThread().interrupt();
@@ -361,7 +397,7 @@ class StateMachineUpdater implements Runnable {
     // Thus it is possible to have applied > committed initially.
     final long applied = getLastAppliedIndex();
     for(; (applied >= raftLog.getLastCommittedIndex() || !server.isStateMachineProgressReady())
-        && state == State.RUNNING && !shouldStop() && stopIndex.get() == null && coveredPrefix == null && discoveryDrain == null; ) {
+        && state == State.RUNNING && !shouldStop() && stopIndex.get() == null && coveredPrefix == null && discoveryDrain == null && (sourceRetirement == null || !sourceRetirement.sealRequested); ) {
       if (server.isInitialImageReady() && server.getSnapshotRequestHandler().shouldTriggerTakingSnapshot()) {
         takeSnapshot(applyLogFutures);
       }
@@ -461,7 +497,7 @@ class StateMachineUpdater implements Runnable {
         && server.isStateMachineProgressReady() && !shouldStop() && discoveryDrain == null; ) {
       final long nextIndex = applied + 1;
       // This is the selection linearization point shared with hold registration. No IO under it.
-      synchronized(this){if(discoveryDrain!=null)return applyLogFutures;}
+      synchronized(this){if(discoveryDrain!=null || sourceRetirement!=null && sourceRetirement.frontier!=null && nextIndex>sourceRetirement.frontier.cut().getIndex())return applyLogFutures;}
       if (server.isGenesisMetadataOnly()) {
         final var headers = raftLog.getEntries(nextIndex, nextIndex + 1);
         if (headers == null || headers.length != 1 || headers[0] == null || headers[0].getIndex() != nextIndex)
@@ -547,7 +583,7 @@ class StateMachineUpdater implements Runnable {
   private void checkAndTakeSnapshot(CompletableFuture<?> futures)
       throws ExecutionException, InterruptedException {
     // check if need to trigger a snapshot
-    if (discoveryDrain==null && shouldTakeSnapshot()) {
+    if (sourceRetirement==null && discoveryDrain==null && shouldTakeSnapshot()) {
       takeSnapshot(futures);
     }
   }

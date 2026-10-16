@@ -229,6 +229,58 @@ class RaftServerImpl implements RaftServer.Division,
   private final RaftServerProxy proxy;
   private final StateMachine stateMachine;
   private final RecoveryEligibilityStateMachine.Gate recoveryEligibility;
+  private volatile RockserverRaftServers.SourceRetirement sourceRetirement;
+  private int sourceProtocolOwners;
+  RockserverRaftServers.SourceRetirement getSourceRetirement(){return sourceRetirement;}
+  private final class SourceProtocolOwner implements AutoCloseable {
+    private boolean closed;
+    public void close(){CompletableFuture<Void> drained=null;synchronized(RaftServerImpl.this){if(closed)return;closed=true;if(--sourceProtocolOwners==0 && sourceRetirement!=null && sourceRetirement.sealRequested)drained=sourceRetirement.protocolsDrained;}if(drained!=null)drained.complete(null);}
+  }
+  private SourceProtocolOwner admitSourceProtocol(boolean replication)throws IOException{synchronized(this){if(sourceRetirement!=null && (!replication || sourceRetirement.sealRequested))throw new ServerNotReadyException(getMemberId()+": source retirement owns admission");sourceProtocolOwners=Math.incrementExact(sourceProtocolOwners);return new SourceProtocolOwner();}}
+  private <T> CompletableFuture<T> sourceProtocol(boolean replication,CheckedSupplier<CompletableFuture<T>,IOException> call)throws IOException{
+    if(recoveryEligibility==null)return call.get();var owner=admitSourceProtocol(replication);try{var observed=new CompletableFuture<T>();call.get().whenComplete((value,failure)->{owner.close();if(failure==null)observed.complete(value);else observed.completeExceptionally(failure);});return observed;}catch(IOException|RuntimeException|Error failure){owner.close();throw failure;}
+  }
+  void beginSourceRetirement(RockserverRaftServers.SourceRetirement owner)throws IOException{
+    synchronized(this){if(sourceRetirement!=null)throw new IOException("Source retirement already owns division");assertLifeCycleState(LifeCycle.States.RUNNING);if(getStateMachine()!=owner.machine || recoveryEligibility==null || !isInitialImageReady())throw new IOException("Source retirement lacks initialized native division");state.getStateMachineUpdater().registerSourceRetirement(owner);sourceRetirement=owner;}
+    state.getStateMachineUpdater().notifyUpdater();
+  }
+  boolean sourceProtocolsDrained(RockserverRaftServers.SourceRetirement owner){synchronized(this){return sourceRetirement==owner && sourceProtocolOwners==0;}}
+  CompletableFuture<Void> stopSourceRole(RockserverRaftServers.SourceRetirement owner)throws IOException{
+    synchronized(this){if(sourceRetirement!=owner || sourceProtocolOwners!=0)throw new IOException("Source protocol owners remain active");setRole(RaftPeerRole.FOLLOWER,"source retirement");state.setLeader(null,"source retirement");return CompletableFuture.allOf(role.shutdownLeaderState(true),role.shutdownLeaderElection(),role.shutdownFollowerState());}
+  }
+  RockserverRaftServers.SourceFrontier observeSourceFrontier(RockserverRaftServers.SourceRetirement owner)throws IOException{
+    synchronized(this){if(sourceRetirement!=owner || sourceProtocolOwners!=0 || snapshotInstallationHandler.getInProgressInstallSnapshotIndex()!=RaftLog.INVALID_LOG_INDEX || stateMachine.getLifeCycleState()!=State.RUNNING || !isStateMachineProgressReady())throw new IOException("Source snapshot/protocol/native baseline work remains owned");
+      if(!getRaftConf().isStable())throw new IOException("Source cohort transition is unresolved");long committed=state.getLog().getLastCommittedIndex();var cut=state.getLog().getTermIndex(committed);if(cut==null && stateMachine.getLatestSnapshot()!=null && stateMachine.getLatestSnapshot().getIndex()==committed)cut=stateMachine.getLatestSnapshot().getTermIndex();
+      if(cut==null || getRaftConf().getLogEntryIndex()>committed)throw new IOException("Source final log/configuration frontier is not proven");return new RockserverRaftServers.SourceFrontier(cut,getRaftConf().getLogEntryIndex(),LogProtoUtils.toRaftConfigurationProtoBuilder(getRaftConf()).build());
+    }
+  }
+  void sealSourceRetirement(RockserverRaftServers.SourceRetirement owner,RockserverRaftServers.SourceFrontier expected)throws IOException{
+    final boolean drained;
+    synchronized(this){if(sourceRetirement!=owner || owner.sealRequested)throw new IOException("Source seal already owned or owner changed");var current=observeSourceFrontier(owner);if(!current.equals(expected))throw new IOException("Source cohort frontier changed before seal");owner.expected=expected;owner.sealRequested=true;recoveryEligibility.beginSourceRetirement();owner.sealGeneration=recoveryEligibility.revocationGeneration();drained=sourceProtocolOwners==0;}
+    if(drained)owner.protocolsDrained.complete(null);state.getStateMachineUpdater().notifyUpdater();
+  }
+  CompletableFuture<Void> requestSourceCatchup(RockserverRaftServers.SourceRetirement owner)throws IOException{
+    final CompletableFuture<Void> actual;
+    synchronized(this){
+      if(sourceRetirement!=owner || !owner.sealRequested || owner.receiptIssued || owner.stopRequested)throw new IOException("Source terminal receipt prevents catch-up resume");
+      if(owner.resumeRequested==null)owner.resumeRequested=new CompletableFuture<>();actual=owner.resumeRequested;
+    }
+    state.getStateMachineUpdater().notifyUpdater();return actual.copy();
+  }
+  /** Sole updater transition: no older consume turn can observe a reset/new seal's fields. */
+  void resumeSourceCatchup(RockserverRaftServers.SourceRetirement owner)throws IOException{
+    final CompletableFuture<Void> resumed;final CompletableFuture<RockserverRaftServers.SourceFrontier> previous;
+    synchronized(this){
+      if(sourceRetirement!=owner || !owner.sealRequested || owner.receiptIssued || owner.stopRequested || owner.resumeRequested==null || stateMachine.getLifeCycleState()!=State.RUNNING)throw new IOException("Source terminal receipt/actual work prevents catch-up resume");
+      resumed=owner.resumeRequested;
+      previous=owner.drained;owner.drained=new CompletableFuture<>();owner.protocolsDrained=new CompletableFuture<>();owner.expected=null;owner.frontier=null;owner.sealGeneration=-1;owner.roleStopped=null;owner.nativeDrained=null;owner.sealRequested=false;owner.resumeRequested=null;recoveryEligibility.resumeSourceCatchup();if(!role.getFollowerState().isPresent())role.startFollowerState(this,"source cohort catch-up");
+    }
+    previous.completeExceptionally(new IOException("Pre-receipt source seal resumed for cohort catch-up"));resumed.complete(null);
+  }
+  void freezeSourceFrontier(RockserverRaftServers.SourceRetirement owner)throws IOException{
+    synchronized(this){var observed=observeSourceFrontier(owner);if(!observed.equals(owner.expected))throw new IOException("Source frontier changed during actual protocol/role drain");owner.frontier=observed;}
+  }
+
   private final Info info =  new Info();
 
   private final DivisionProperties divisionProperties;
@@ -538,6 +590,7 @@ class RaftServerImpl implements RaftServer.Division,
 
   @Override
   public void close() {
+    var retiring=sourceRetirement;if(retiring!=null){retiring.stopRequested=true;state.getStateMachineUpdater().notifyUpdater();}
     lifeCycle.checkStateAndClose(() -> {
       LOG.info("{}: shutdown", getMemberId());
       try {
@@ -657,6 +710,7 @@ class RaftServerImpl implements RaftServer.Division,
   private Object votingLock() { return recoveryEligibility == null ? this : recoveryEligibility; }
 
   private boolean votingEligibleUnderGate() {
+    if (sourceRetirement != null && sourceRetirement.sealRequested) { return false; }
     if (recoveryEligibility == null) { return true; }
     final RecoveryEligibilityStateMachine.Evidence e = recoveryEligibility.snapshot();
     if (e.mode() == RecoveryEligibilityStateMachine.Mode.NORMAL || e.mode() == RecoveryEligibilityStateMachine.Mode.GENESIS) { return true; }
@@ -691,6 +745,7 @@ class RaftServerImpl implements RaftServer.Division,
 
   /** Creation inventory may drain genuine committed metadata without regaining votes or append authority. */
   boolean isStateMachineProgressReady() {
+    if(sourceRetirement!=null)return recoveryEligibility!=null && stateMachine.getLifeCycleState()==State.RUNNING && initialImageReady(recoveryEligibility.retirementDrainEvidence());
     return isInitialImageReady() || recoveryEligibility != null
         && recoveryEligibility.snapshot().mode() == RecoveryEligibilityStateMachine.Mode.GENESIS_SUSPENDED;
   }
@@ -1080,8 +1135,9 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   @Override
-  public CompletableFuture<RaftClientReply> submitClientRequestAsync(
-      RaftClientRequest request) throws IOException {
+  public CompletableFuture<RaftClientReply> submitClientRequestAsync(RaftClientRequest request) throws IOException {return sourceProtocol(false,()->submitClientRequestAsyncOwned(request));}
+
+  private CompletableFuture<RaftClientReply> submitClientRequestAsyncOwned(RaftClientRequest request) throws IOException {
     return TraceServer.traceAsyncMethod(
         () -> submitClientRequestAsyncInternal(request),
         request, getMemberId().toString(), SpanNames.SUBMIT_CLIENT_REQUEST_ASYNC);
@@ -1509,7 +1565,9 @@ class RaftServerImpl implements RaftServer.Division,
   /**
    * Handle a raft configuration change request from client.
    */
-  public CompletableFuture<RaftClientReply> setConfigurationAsync(SetConfigurationRequest request) throws IOException {
+  public CompletableFuture<RaftClientReply> setConfigurationAsync(SetConfigurationRequest request) throws IOException {return sourceProtocol(false,()->setConfigurationAsyncOwned(request));}
+
+  private CompletableFuture<RaftClientReply> setConfigurationAsyncOwned(SetConfigurationRequest request) throws IOException {
     if (isGenesisMetadataOnly()) { throw new IOException("Original creation authority cannot reconfigure the cohort"); }
     LOG.info("{}: receive setConfiguration {}", getMemberId(), request);
     assertLifeCycleState(LifeCycle.States.RUNNING);
@@ -1692,8 +1750,9 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   @Override
-  public CompletableFuture<AppendEntriesReplyProto> appendEntriesAsync(AppendEntriesRequestProto r)
-      throws IOException {
+  public CompletableFuture<AppendEntriesReplyProto> appendEntriesAsync(AppendEntriesRequestProto r) throws IOException {return sourceProtocol(true,()->appendEntriesAsyncOwned(r));}
+
+  private CompletableFuture<AppendEntriesReplyProto> appendEntriesAsyncOwned(AppendEntriesRequestProto r) throws IOException {
     final RaftRpcRequestProto request = r.getServerRequest();
     final TermIndex previous = r.hasPreviousLog()? TermIndex.valueOf(r.getPreviousLog()) : null;
     try {
@@ -1728,7 +1787,9 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   @Override
-  public CompletableFuture<ReadIndexReplyProto> readIndexAsync(ReadIndexRequestProto request) throws IOException {
+  public CompletableFuture<ReadIndexReplyProto> readIndexAsync(ReadIndexRequestProto request) throws IOException {return sourceProtocol(false,()->readIndexAsyncOwned(request));}
+
+  private CompletableFuture<ReadIndexReplyProto> readIndexAsyncOwned(ReadIndexRequestProto request) throws IOException {
     assertLifeCycleState(LifeCycle.States.RUNNING);
 
     final RaftPeerId peerId = RaftPeerId.valueOf(request.getServerRequest().getRequestorId());
@@ -1938,7 +1999,8 @@ class RaftServerImpl implements RaftServer.Division,
 
   @Override
   public InstallSnapshotReplyProto installSnapshot(InstallSnapshotRequestProto request) throws IOException {
-    return snapshotInstallationHandler.installSnapshot(request);
+    if(recoveryEligibility==null)return snapshotInstallationHandler.installSnapshot(request);
+    try(var owner=admitSourceProtocol(true)){return snapshotInstallationHandler.installSnapshot(request);}
   }
 
   boolean pause() {

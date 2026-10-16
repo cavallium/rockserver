@@ -62,12 +62,20 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
   final class Gate {
     private record Publication(long revision, long revocationGeneration, boolean discoveryPending, Evidence evidence) { }
     record Revocation(long revision, Evidence previous) { }
+    private volatile boolean sourceRetirementPending;
     private volatile Publication publication = new Publication(0, 0, false, Evidence.missing());
     /** Install before constructing the division; ordinary recovery publications cannot clear this fence. */
     public synchronized void deferDiscovery() {
       publication = new Publication(Math.incrementExact(publication.revision()),
           Math.incrementExact(publication.revocationGeneration()), true, Evidence.missing());
     }
+    /** After a terminal receipt is issued, its native/CAT recipe owns every retry/restart. */
+    synchronized void beginSourceRetirement() {sourceRetirementPending=true;publication=new Publication(Math.incrementExact(publication.revision()),Math.incrementExact(publication.revocationGeneration()),publication.discoveryPending(),publication.evidence());}
+    /** Only a pre-receipt retirement owner may resume cohort catch-up; every old export stays revoked. */
+    synchronized void resumeSourceCatchup(){if(!sourceRetirementPending)throw new IllegalStateException("Source seal is not active");sourceRetirementPending=false;publication=new Publication(Math.incrementExact(publication.revision()),Math.incrementExact(publication.revocationGeneration()),publication.discoveryPending(),publication.evidence());}
+    public boolean sourceRetirementPending(){return sourceRetirementPending;}
+    // The sole updater can finish admitted native work while voting/export remain revoked.
+    Evidence retirementDrainEvidence(){return publication.evidence();}
     public boolean discoveryPending() { return publication.discoveryPending(); }
     /** Caller has forced the selected graph/role and qualified this completed native baseline. */
     public synchronized boolean settleDiscovery(long expectedRevision, Evidence qualified) {
@@ -84,7 +92,7 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
       private SnapshotPermit(Gate owner, long generation) { this.owner = owner; this.generation = generation; }
       public void requireCurrent() {
         final Publication current = owner.publication;
-        if (current.discoveryPending() || (current.evidence().mode() == Mode.MISSING || current.evidence().mode() == Mode.GENESIS || current.evidence().mode() == Mode.GENESIS_SUSPENDED) || current.revocationGeneration() != generation) {
+        if (owner.sourceRetirementPending || current.discoveryPending() || (current.evidence().mode() == Mode.MISSING || current.evidence().mode() == Mode.GENESIS || current.evidence().mode() == Mode.GENESIS_SUSPENDED) || current.revocationGeneration() != generation) {
           throw new IllegalStateException("Snapshot source eligibility was revoked");
         }
       }
@@ -95,14 +103,14 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
     }
     public SnapshotPermit snapshotPermit() {
       final Publication current = publication;
-      if (current.discoveryPending() || (current.evidence().mode() == Mode.MISSING || current.evidence().mode() == Mode.GENESIS || current.evidence().mode() == Mode.GENESIS_SUSPENDED)) {
+      if (sourceRetirementPending || current.discoveryPending() || (current.evidence().mode() == Mode.MISSING || current.evidence().mode() == Mode.GENESIS || current.evidence().mode() == Mode.GENESIS_SUSPENDED)) {
         throw new IllegalStateException("Missing native recovery state cannot produce a snapshot");
       }
       return new SnapshotPermit(this, current.revocationGeneration());
     }
     public Evidence snapshot() {
       final Publication current = publication;
-      return current.discoveryPending() ? Evidence.missing() : current.evidence();
+      return sourceRetirementPending || current.discoveryPending() ? Evidence.missing() : current.evidence();
     }
     public long revision() { return publication.revision(); }
     public long revocationGeneration() { return publication.revocationGeneration(); }
