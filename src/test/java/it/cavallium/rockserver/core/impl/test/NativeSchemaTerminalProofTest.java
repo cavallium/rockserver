@@ -28,9 +28,8 @@ class NativeSchemaTerminalProofTest {
                 var scope=new TransactionScope(List.of(TransactionScope.Span.point(helper.column,new byte[]{1})));
                 DistributedCommand accepted;
                 try (var pin=store.captureTracked(scope)) { accepted=store.planScopedCommit(pin,business,0,UUID.randomUUID()); }
-                var participant=new TransactionStatus.Participant(helper.group,helper.group,1,source.digest(),PreparedParticipant.Preparation.planDigest(accepted),null,false);
-                var initial=TransactionStatus.begin(source.clusterId(),source.databaseId(),source.domainId(),UUID.randomUUID(),business.operationId(),
-                        source.schemaEpoch(),source.digest(),change.sourceDirectory().payloadDigest(),List.of(participant));
+                var participant=new TransactionStatus.Participant(source.domainId(), helper.group, helper.group, 1, source.digest(), PreparedParticipant.Preparation.planDigest(accepted), null, false);
+                var initial=TransactionStatus.begin(source.clusterId(), source.databaseId(), UUID.randomUUID(), business.operationId(), List.of(DomainBinding.of(change.sourceDirectory())), change.sourceDirectory().payloadDigest(), List.of(participant));
                 preparation=new PreparedParticipant.Preparation(UUID.randomUUID(),1,new OperationId(UUID.randomUUID(),1,0),initial,accepted);
                 vote=store.applyPrepared(new ApplyPosition(1,1),preparation);
                 var decision=initial.prepared(helper.group,participant.planDigest(),vote.position()).decide(phase);

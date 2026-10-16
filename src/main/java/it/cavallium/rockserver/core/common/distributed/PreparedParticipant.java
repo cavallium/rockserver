@@ -35,7 +35,8 @@ public record PreparedParticipant(Preparation preparation,ApplyPosition position
             if ((long)64+registration.encode().length+DistributedCommandCodec.encodedSize(business)>MAX_BYTES) throw new IllegalArgumentException("Prepared plan exceeds byte budget");
         }
         public UUID homeGroup() { return homeGroup; } public long homeEpoch() { return homeEpoch; } public OperationId operation() { return operation; }
-        public TransactionStatus registration() { return registration; } public DistributedCommand business() { return business; }
+        public TransactionStatus registration() { return registration; }
+        public DomainBinding domainBinding(){return registration.participantDomain(business.groupId());} public DistributedCommand business() { return business; }
         public UUID transactionId() { return registration.transactionId(); } public TransactionScope scope() { return business.acceptance().scope(); }
         public boolean ownsOperation(OperationId id) { return operation.equals(id) || business.operationId().equals(id); }
         public boolean sharesOperation(Preparation other) { return ownsOperation(other.operation) || ownsOperation(other.business.operationId()); }

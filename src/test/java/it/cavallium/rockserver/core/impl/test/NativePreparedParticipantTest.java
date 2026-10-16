@@ -19,8 +19,8 @@ class NativePreparedParticipantTest {
     PreparedParticipant.Preparation preparation(NativeBucketApplyTest.Fixture f,DistributedCommand base,TransactionScope scope,long n) throws Exception {
         DistributedCommand accepted;
         try (var pin=f.store.captureTracked(scope)) { accepted=f.store.planScopedCommit(pin,base,0,new UUID(0,99)); }
-        var participant=new TransactionStatus.Participant(outer.group,outer.group,1,f.schema.digest(),PreparedParticipant.Preparation.planDigest(accepted),null,false);
-        var registration=TransactionStatus.begin(outer.cluster,outer.database,outer.domain,new UUID(0,n),base.operationId(),1,f.schema.digest(),new byte[32],List.of(participant));
+        var participant=new TransactionStatus.Participant(outer.domain, outer.group, outer.group, 1, f.schema.digest(), PreparedParticipant.Preparation.planDigest(accepted), null, false);
+        var registration=TransactionStatus.begin(outer.cluster, outer.database, new UUID(0,n), base.operationId(), List.of(new DomainBinding(outer.domain, 0, new byte[32], 1, f.schema.digest())), new byte[32], List.of(participant));
         return new PreparedParticipant.Preparation(new UUID(0,100),1,new OperationId(new UUID(0,101),1,n),registration,accepted);
     }
     @Test void completeScopeLocksAbsenceReadsAndRangesWithoutInstallingBusinessEffects() throws Exception {

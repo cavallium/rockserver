@@ -22,7 +22,7 @@ class RatisSnapshotCohortClientTest {
         var helper=new RatisSnapshotCohortServiceTest();helper.root=root;
         try(var f=helper.new Fixture("cohort-client")) {
             var ranges=new ArrayList<RangeDescriptor>();for(int n=0;n<2;n++){var store=f.nativeState.stores.get(n);var group=store.ownership().owner().groupId();var member=f.member(group,null,false);ranges.add(new RangeDescriptor(group,group,1,0,store.ownership().interval().lowerInclusive(),store.ownership().interval().upperExclusive(),RangeDescriptor.TopologyState.ACTIVE,List.of(member.replica())));}
-            var fence=f.nativeState.fence;var directory=new RangeDirectory(fence.clusterId(),fence.databaseId(),fence.domainId(),1,new byte[32],0,Set.of(f.nativeState.column),0,ranges);
+            var fence=f.nativeState.fence;var directory=new RangeDirectory(fence.clusterId(),fence.databaseId(),fence.domains().getFirst().domainId(),1,new byte[32],0,Set.of(f.nativeState.column),0,ranges);
             var lose=new AtomicBoolean(true);var calls=new ArrayList<byte[]>();var discovery=new AtomicInteger();
             var transport=new RatisRoutedClient.Transport(){
                 public byte[] read(RangeDescriptor r,UUID c,byte[] k){throw new AssertionError("No latest read");}

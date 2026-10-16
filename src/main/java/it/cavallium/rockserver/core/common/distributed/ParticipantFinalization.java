@@ -23,6 +23,7 @@ public final class ParticipantFinalization {
     public UUID participantGroup() { return participantGroup; }
     public OperationId operation() { return operation; }
     public TransactionStatus decision() { return decision; }
+    public DomainBinding domainBinding(){return decision.participantDomain(participantGroup);}
     public UUID transactionId() { return decision.transactionId(); }
     public TransactionStatus.Participant participant() { return decision.participants().stream().filter(p -> p.groupId().equals(participantGroup)).findFirst().orElseThrow(() -> new IllegalArgumentException("Unregistered finalization participant")); }
     /** An ABORT without a recorded vote may fence a prepare which was applied but not reported to the home. */

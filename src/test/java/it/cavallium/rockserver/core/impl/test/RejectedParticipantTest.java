@@ -31,8 +31,8 @@ class RejectedParticipantTest {
         byte[] changed=p.digest(); changed[0]^=1;
         var wrongDigest=new RejectedParticipant(helper.group,helper.home,1,p.operation(),p.registration(),changed,position);
         assertThrows(IllegalArgumentException.class,() -> wrongDigest.requirePreparation(p));
-        var initial=p.registration(); var other=new TransactionStatus.Participant(new UUID(0,92),new UUID(0,92),1,new byte[32],new byte[32],null,false);
-        var registration=TransactionStatus.begin(initial.clusterId(),initial.databaseId(),initial.domainId(),initial.transactionId(),initial.operation(),initial.schemaEpoch(),initial.schemaDigest(),initial.planDigest(),List.of(initial.participants().getFirst(),other));
+        var initial=p.registration(); var other=new TransactionStatus.Participant(initial.domains().getFirst().domainId(), new UUID(0,92), new UUID(0,92), 1, new byte[32], new byte[32], null, false);
+        var registration=TransactionStatus.begin(initial.clusterId(), initial.databaseId(), initial.transactionId(), initial.operation(), List.of(new DomainBinding(initial.domains().getFirst().domainId(), 0, new byte[32], initial.domains().getFirst().schemaEpoch(), initial.domains().getFirst().schemaDigest())), initial.planDigest(), List.of(initial.participants().getFirst(),other));
         var first=new PreparedParticipant.Preparation(helper.home,1,p.operation(),registration,p.business());
         var advanced=new PreparedParticipant.Preparation(helper.home,1,p.operation(),registration.prepared(other.groupId(),other.planDigest(),new ApplyPosition(1,1)),p.business());
         assertTrue(first.registration().sameDefinition(advanced.registration()));

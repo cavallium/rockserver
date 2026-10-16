@@ -43,7 +43,7 @@ class NativeHomeStatusCapacityTest {
             helper.apply(f,++index,DistributedCommand.advanceSessionEpochFloor(helper.group,1,new byte[32],new OperationId(helper.admin,3,0),2));
             var fixture=new NativeHomeRetirementTest();var retirement=new HomeRetirement(fixture.identity(first),first.decide(TransactionStatus.Phase.ABORT).finalized(helper.participant).consume(),List.of(fixture.dataFence(first,2)));
             f.store.applyHomeRetirement(new ApplyPosition(1,++index),retirement);assertEquals(1023,f.store.homeStatusCapacity().rows());
-            var replacement=TransactionStatus.begin(first.clusterId(),first.databaseId(),first.domainId(),new UUID(0,50000),new OperationId(helper.user,3,1),1,new byte[32],new byte[32],first.participants());
+            var replacement=TransactionStatus.begin(first.clusterId(), first.databaseId(), new UUID(0,50000), new OperationId(helper.user,3,1), first.domains(), new byte[32], first.participants());
             assertEquals(CommandResult.Status.SUCCESS,helper.apply(f,++index,helper.cas(new OperationId(helper.user,3,2),null,replacement)).status());assertEquals(1024,f.store.homeStatusCapacity().rows());
         }
         try(var f=helper.new Fixture(root.resolve("image-target"))){configure(f);f.store.fence();f.store.installSnapshot(image,helper.limits);f.store.activate();assertEquals(1024,f.store.homeStatusCapacity().rows());assertEquals(consumed,TransactionStatus.decode(f.store.readCurrentPoint(helper.column,helper.key(pending))));}
@@ -55,8 +55,8 @@ class NativeHomeStatusCapacityTest {
     }
     SnapshotFence largeFence(int id,long epoch) {
         byte[] key=new byte[900_000];
-        return new SnapshotFence(new UUID(0,20),new UUID(0,21),new UUID(0,22),new UUID(0,10000+id),helper.group,1,new OperationId(new UUID(0,23),epoch,id),1,1,new byte[32],List.of(
-            new SnapshotFence.Participant(new UUID(0,31),helper.participant,1,new byte[32],new OperationId(new UUID(0,32),epoch,2L*id),new OperationId(new UUID(0,32),epoch,2L*id+1),new TransactionScope(List.of(TransactionScope.Span.point(new UUID(0,33),key))))));
+        return new SnapshotFence(new UUID(0,20), new UUID(0,21), new UUID(0,10000+id), helper.group, 1, new OperationId(new UUID(0,23),epoch,id), List.of(new DomainBinding(new UUID(0,22), 1, new byte[32], 1, new byte[32])), List.of(
+            new SnapshotFence.Participant(new UUID(0,22), new UUID(0,31), helper.participant, 1, new byte[32], new OperationId(new UUID(0,32),epoch,2L*id), new OperationId(new UUID(0,32),epoch,2L*id+1), new TransactionScope(List.of(TransactionScope.Span.point(new UUID(0,33),key))))));
     }
     @Test void snapshotBytePromisesIncludeCaptureGrowthAndConsumedRowsUntilRetirement() throws Exception {
         var snapshotHelper=new NativeSnapshotHomeRetirementTest();var path=root.resolve("snapshots");var image=root.resolve("snapshot.image");int index=0;SnapshotFence last=null;int rows=0;long reserved;

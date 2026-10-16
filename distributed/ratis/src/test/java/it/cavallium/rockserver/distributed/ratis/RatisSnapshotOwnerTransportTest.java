@@ -55,7 +55,7 @@ class RatisSnapshotOwnerTransportTest {
                 assertThrows(RatisSnapshotLostException.class,() -> client.snapshotPage(target,secondToken,f.data.f.column,new byte[]{1},new byte[]{4},false,null,1,1024));
                 assertThrows(RatisSnapshotLostException.class,() -> client.releaseSnapshot(target,secondToken));
                 assertArrayEquals(new byte[]{9},client.snapshotGet(secondTarget,secondToken,f.data.f.column,new byte[]{2}));
-                var changedFence=new SnapshotFence(f.fence.clusterId(),f.fence.databaseId(),f.fence.domainId(),f.fence.fenceId(),f.fence.homeGroup(),f.fence.homeEpoch(),f.fence.operation(),1,f.fence.schemaEpoch(),f.fence.schemaDigest(),f.fence.participants());
+                var changedFence=new SnapshotFence(f.fence.clusterId(), f.fence.databaseId(), f.fence.fenceId(), f.fence.homeGroup(), f.fence.homeEpoch(), f.fence.operation(), List.of(new DomainBinding(f.fence.domains().getFirst().domainId(), 1, new byte[32], f.fence.domains().getFirst().schemaEpoch(), f.fence.domains().getFirst().schemaDigest())), f.fence.participants());
                 var changedTarget=client.restoreSnapshotTarget(changedFence,route,owner,target.incarnation());
                 assertThrows(RatisSnapshotLostException.class,() -> client.snapshotGet(changedTarget,token,f.data.f.column,new byte[]{2}));
                 client.releaseSnapshot(secondTarget,secondToken);

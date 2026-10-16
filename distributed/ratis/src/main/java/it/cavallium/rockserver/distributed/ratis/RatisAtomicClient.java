@@ -108,8 +108,8 @@ public final class RatisAtomicClient implements AutoCloseable {
         byte[] retained=RatisDurableTransaction.validateReservationEvidence(reservation,evidence);
         var origin=reservation.origin();
         if(!reservation.reserved() || origin==null || !reservation.transactionId().equals(identity.transaction()) || !reservation.operation().equals(identity.business()) || !origin.firstControl().equals(identity.firstControl())
-                || !reservation.clusterId().equals(schema.clusterId()) || !reservation.databaseId().equals(schema.databaseId()) || !reservation.domainId().equals(schema.domainId())
-                || reservation.schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(reservation.schemaDigest(),schema.digest()) || !Arrays.equals(origin.targetDirectoryDigest(),directory.payloadDigest())
+                || !reservation.clusterId().equals(schema.clusterId()) || !reservation.databaseId().equals(schema.databaseId()) || !reservation.domains().equals(List.of(DomainBinding.of(directory)))
+                || reservation.domain(schema.domainId()).schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(reservation.domain(schema.domainId()).schemaDigest(),schema.digest()) || !Arrays.equals(origin.targetDirectoryDigest(),directory.payloadDigest())
                 || !Arrays.equals(origin.planDigest(),rawPlanDigest(plan)) || origin.targetParticipantCount()!=plan.partitions().size())throw new IllegalArgumentException("Reserved atomic origin differs from frozen target plan/identities");
         if(!identity.business().equals(plan.operation()) || !Arrays.equals(directory.payloadDigest(),plan.directory().payloadDigest()) || ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis())))throw new IllegalArgumentException("Reserved atomic plan/TTL changed");
         long bytes=estimate(plan)+3L*retained.length;if(bytes>RatisDurableTransaction.MAX_BYTES)throw new IOException("Reserved evidence future persistence exceeds journal budget");
@@ -120,8 +120,8 @@ public final class RatisAtomicClient implements AutoCloseable {
         long deadline=scheduler.resolveMonotonicDeadline(context); Objects.requireNonNull(identity); Objects.requireNonNull(accepted);
         var initial=accepted.initial(); initial.requireInitial();
         if (!initial.transactionId().equals(identity.transaction()) || !initial.operation().equals(identity.business())
-                || !initial.clusterId().equals(schema.clusterId()) || !initial.databaseId().equals(schema.databaseId()) || !initial.domainId().equals(schema.domainId())
-                || initial.schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(initial.schemaDigest(),schema.digest())
+                || !initial.clusterId().equals(schema.clusterId()) || !initial.databaseId().equals(schema.databaseId()) || initial.domains().size()!=1 || !initial.domains().getFirst().domainId().equals(schema.domainId())
+                || initial.domain(schema.domainId()).schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(initial.domain(schema.domainId()).schemaDigest(),schema.digest())
                 || !Arrays.equals(initial.planDigest(),RatisDurableTransaction.planDigest(accepted.intents())) || accepted.intents().size()!=initial.participants().size()) throw new IllegalArgumentException("Accepted projection differs from reserved atomic identity/schema");
         var ordered=accepted.intents().stream().sorted(Comparator.comparing(i -> i.route().groupId())).toList();
         var groups=new HashSet<UUID>(); long bytes=64*1024L+2*1024*1024L; int n=0;
@@ -135,7 +135,7 @@ public final class RatisAtomicClient implements AutoCloseable {
         }
         if (bytes>RatisDurableTransaction.MAX_BYTES) throw new IOException("Accepted projection exceeds retained journal capacity");
         RatisDurableTransaction.validateResultPlan(accepted.intents());
-        var expected=initial.origin()==null ? null : TransactionStatus.reserve(initial.origin(),initial.schemaEpoch(),initial.schemaDigest());
+        var expected=initial.origin()==null ? null : TransactionStatus.reserve(initial.origin(),initial.domains().getFirst());
         if(expected!=null && (!initial.origin().firstControl().equals(identity.firstControl()) || !Arrays.equals(initial.origin().targetDirectoryDigest(),directory.payloadDigest())))throw new IllegalArgumentException("Accepted reserved projection changed target/control binding");
         var registration=homes.prepare(identity.control(128),expected,initial);
         var operation=admit(path,identity,null,null,bytes,accepted,registration); operation.beginExecution(context,deadline); return operation;

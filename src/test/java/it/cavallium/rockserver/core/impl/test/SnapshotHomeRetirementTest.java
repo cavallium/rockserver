@@ -10,10 +10,8 @@ class SnapshotHomeRetirementTest {
     final UUID home=new UUID(0,1),column=new UUID(0,2),left=new UUID(0,3),right=new UUID(-1,4);
     SnapshotFence fence(long sequence) {
         var scope=new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1})));
-        return new SnapshotFence(new UUID(0,5),new UUID(0,6),new UUID(0,7),new UUID(0,8),home,1,
-                new OperationId(new UUID(0,9),1,sequence),0,1,new byte[32],
-                List.of(new SnapshotFence.Participant(right,right,1,new byte[32],new OperationId(new UUID(0,10),1,2),new OperationId(new UUID(0,10),1,3),scope),
-                        new SnapshotFence.Participant(left,left,1,new byte[32],new OperationId(new UUID(0,10),1,0),new OperationId(new UUID(0,10),1,1),scope)));
+        return new SnapshotFence(new UUID(0,5), new UUID(0,6), new UUID(0,8), home, 1, new OperationId(new UUID(0,9),1,sequence), List.of(new DomainBinding(new UUID(0,7), 0, new byte[32], 1, new byte[32])), List.of(new SnapshotFence.Participant(new UUID(0,7), right, right, 1, new byte[32], new OperationId(new UUID(0,10),1,2), new OperationId(new UUID(0,10),1,3), scope),
+                        new SnapshotFence.Participant(new UUID(0,7), left, left, 1, new byte[32], new OperationId(new UUID(0,10),1,0), new OperationId(new UUID(0,10),1,1), scope)));
     }
     SnapshotHomeIdentity identity(SnapshotFence fence) { return new SnapshotHomeIdentity(home,1,new byte[32],column,fence); }
     SnapshotFenceStatus consumed(SnapshotFence fence) {

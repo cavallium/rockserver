@@ -48,9 +48,8 @@ public final class RatisTransactionPlan {
         var home=snapshot.observedHome(); var fence=snapshot.initial().fence();
         if (snapshot.captureMode()!=RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED || snapshot.releaseRequested()
                 || home==null || home.phase()!=SnapshotFenceStatus.Phase.COMPLETE || !home.fence().equals(fence)
-                || directory.generation()!=fence.directoryGeneration() || directory.schemaEpoch()!=fence.schemaEpoch()
                 || !directory.clusterId().equals(fence.clusterId()) || !directory.databaseId().equals(fence.databaseId())
-                || !directory.domainId().equals(fence.domainId()) || !Arrays.equals(directory.schemaDigest(),fence.schemaDigest())) throw new IllegalArgumentException("Transaction requires a complete original writable snapshot projection");
+                || fence.domains().size()!=1 || !DomainBinding.of(directory).equals(fence.domain(directory.domainId()))) throw new IllegalArgumentException("Transaction requires a complete original writable snapshot projection");
         var captures=new HashMap<UUID,CapturedCut>();
         if (snapshot.participants().size()!=fence.participants().size()) throw new IllegalArgumentException("Incomplete original read projection");
         for (var progress:snapshot.participants()) {
@@ -156,9 +155,9 @@ public final class RatisTransactionPlan {
             }
             if (!partition.scope().spans().stream().allMatch(span -> span.isPoint() ? plan.acceptance().scope().contains(span.columnId(),span.lowerInclusive()) : plan.acceptance().scope().containsRange(span.columnId(),span.lowerInclusive(),span.upperExclusive()))) throw new IllegalArgumentException("Accepted snapshot omitted transaction inputs");
             intents.add(new RatisDurableTransaction.Intent(route,plan,prepares.get(route.groupId()),finalizes.get(route.groupId()),partition.resultPositions(),captureIds.get(route.groupId())));
-            participants.add(new TransactionStatus.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),directory.schemaDigest(),plan.payloadDigest(),null,false));
+            participants.add(new TransactionStatus.Participant(directory.domainId(), route.rangeId(), route.groupId(), route.rangeEpoch(), directory.schemaDigest(), plan.payloadDigest(), null, false));
         }
-        var initial=TransactionStatus.begin(directory.clusterId(),directory.databaseId(),directory.domainId(),transaction,operation,directory.schemaEpoch(),directory.schemaDigest(),RatisDurableTransaction.planDigest(intents),participants);
+        var initial=TransactionStatus.begin(directory.clusterId(), directory.databaseId(), transaction, operation, List.of(DomainBinding.of(directory)), RatisDurableTransaction.planDigest(intents), participants);
         return new Accepted(initial,intents);
     }
 }

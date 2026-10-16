@@ -16,7 +16,7 @@ class RatisSnapshotPlanTest {
     @Test void completePhysicalScopeClipsAcrossColumnsAndUnsignedGroupOrderAndReconstructsUnion() {
         var directory=directory(2,0,RangeDescriptor.TopologyState.ACTIVE);
         var scope=new TransactionScope(List.of(TransactionScope.Span.range(column,null,null),TransactionScope.Span.range(column,new byte[]{0},new byte[]{2}),TransactionScope.Span.point(other,new byte[]{(byte)255})));
-        var plan=plan(directory,scope); assertEquals(2,plan.routes().size()); assertSame(scope,plan.scope()); assertEquals(directory.generation(),plan.fence().directoryGeneration()); assertEquals(directory.schemaEpoch(),plan.fence().schemaEpoch());
+        var plan=plan(directory,scope); assertEquals(2,plan.routes().size()); assertSame(scope,plan.scope()); assertEquals(directory.generation(),plan.fence().domains().getFirst().directoryGeneration()); assertEquals(directory.schemaEpoch(),plan.fence().domains().getFirst().schemaEpoch());
         var first=plan.fence().participants().getFirst(); assertEquals(new UUID(0,200),first.groupId()); assertEquals(1,first.installOperation().sequence()); assertEquals(65,first.releaseOperation().sequence());
         assertArrayEquals(new byte[]{1},first.scope().spans().getFirst().upperExclusive());
         var second=plan.fence().participants().getLast(); assertEquals(Long.MIN_VALUE,second.groupId().getMostSignificantBits()); assertEquals(2,second.installOperation().sequence()); assertEquals(66,second.releaseOperation().sequence()); assertTrue(second.scope().contains(other,new byte[]{(byte)255}));
@@ -57,10 +57,7 @@ class RatisSnapshotPlanTest {
         assertEquals(original.routes(),frozen.routes());
         assertEquals(2,frozen.scope().spans().size());
         var fence=original.fence(); var p=fence.participants().getFirst();
-        var changed=new SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),fence.fenceId(),
-                fence.homeGroup(),fence.homeEpoch(),fence.operation(),fence.directoryGeneration(),fence.schemaEpoch(),fence.schemaDigest(),
-                List.of(new SnapshotFence.Participant(p.rangeId(),p.groupId(),p.rangeEpoch(),p.schemaDigest(),p.installOperation(),
-                        new OperationId(p.releaseOperation().sessionId(),p.releaseOperation().epoch(),p.releaseOperation().sequence()+1),p.scope())));
+        var changed=new SnapshotFence(fence.clusterId(), fence.databaseId(), fence.fenceId(), fence.homeGroup(), fence.homeEpoch(), fence.operation(), fence.domains(), List.of(new SnapshotFence.Participant(p.domainId(), p.rangeId(), p.groupId(), p.rangeEpoch(), p.schemaDigest(), p.installOperation(), new OperationId(p.releaseOperation().sessionId(),p.releaseOperation().epoch(),p.releaseOperation().sequence()+1), p.scope())));
         assertThrows(IllegalArgumentException.class,() -> RatisSnapshotPlan.frozen(directory,changed));
         var newer=new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),
                 directory.schemaDigest(),directory.generation()+1,directory.columns(),directory.routingPrefixBytes(),directory.ranges());

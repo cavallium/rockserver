@@ -33,6 +33,6 @@ class SnapshotGateRetirementTest {
         var retained=SnapshotGateResult.retained(SnapshotGate.install(fence,helper.helper.a,helper.aReady)); assertFalse(retained.retired()); assertNull(retained.retirement());
         assertThrows(IllegalArgumentException.class,() -> new SnapshotGateResult(null,null)); assertThrows(IllegalArgumentException.class,() -> new SnapshotGateResult(retained.gate(),proof));
         assertThrows(IllegalArgumentException.class,() -> helper.ready().capture(helper.helper.a,helper.capture(1,new ApplyPosition(2,2))));
-        assertThrows(IllegalArgumentException.class,() -> new SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),fence.fenceId(),fence.homeGroup(),fence.homeEpoch(),fence.participant(helper.helper.a).installOperation(),fence.directoryGeneration(),fence.schemaEpoch(),fence.schemaDigest(),fence.participants()));
+        assertThrows(IllegalArgumentException.class,() -> new SnapshotFence(fence.clusterId(), fence.databaseId(), fence.fenceId(), fence.homeGroup(), fence.homeEpoch(), fence.participant(helper.helper.a).installOperation(), fence.domains(), fence.participants()));
     }
 }

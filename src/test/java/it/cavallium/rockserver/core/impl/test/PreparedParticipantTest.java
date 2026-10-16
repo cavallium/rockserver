@@ -10,7 +10,7 @@ class PreparedParticipantTest {
     final UUID group=new UUID(0,1),column=new UUID(0,2),home=new UUID(0,3),transaction=new UUID(0,4);
     final OperationId businessId=new OperationId(new UUID(0,5),1,0),prepareId=new OperationId(new UUID(0,6),1,0);
     DistributedCommand base() { return new DistributedCommand(group,1,new byte[32],businessId,List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{1},new byte[]{2},Mutation.ReturnMode.PREVIOUS))); }
-    TransactionStatus registration(byte[] digest) { return TransactionStatus.begin(new UUID(0,7),new UUID(0,8),new UUID(0,9),transaction,businessId,1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(group,group,1,new byte[32],digest,null,false))); }
+    TransactionStatus registration(byte[] digest) { return TransactionStatus.begin(new UUID(0,7), new UUID(0,8), transaction, businessId, List.of(new DomainBinding(new UUID(0,9), 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(new UUID(0,9), group, group, 1, new byte[32], digest, null, false))); }
     DistributedCommand accepted() {
         var scope=new TransactionScope(List.of(TransactionScope.Span.range(column,new byte[]{0},new byte[]{3})));
         return DistributedCommand.acceptedTransaction(base(),new TransactionAcceptance(new ApplyPosition(1,0),2,new UUID(0,10),scope,new CommandResult(CommandResult.Status.SUCCESS,Collections.singletonList(null)).encode()));

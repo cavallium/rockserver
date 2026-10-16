@@ -74,7 +74,7 @@ class RatisHomeReservationTest {
             for(var grant:source.ledger.get().grants())apply(DistributedCommand.sessionControl(groupId,1,new byte[32],new OperationId(controlSession,2,400+grant.epoch()),RangeSessionControl.bind(source.ledger.get(),grant,4096),-1));
             original=new DistributedCommand(source.groupId,1,source.schema.digest(),new OperationId(source.session,1,1),List.of(new Mutation(Mutation.Kind.PUT,source.column,new byte[]{10},new byte[]{7}),new Mutation(Mutation.Kind.PUT,source.column,new byte[]{(byte)200},new byte[]{8})));
             origin=new OperationRerouteOrigin(source.cluster,source.database,source.domain,new DistributedCdcCheckpoint.Lineage(source.rangeId,source.groupId,1),original.operationId(),original.receiptDigest(),OperatorUpload.sha256(source.freeze.encode()),source.store.applied(),source.target.payloadDigest(),RatisOperationRerouteAdmissionRpc.normalizedDigest(original,source.target),RatisOperationRerouteAdmissionRpc.targetParticipantCount(original,source.target),new OperationId(controlSession,2,0));
-            reserved=TransactionStatus.reserve(origin,source.schema.schemaEpoch(),source.schema.digest());reservation=command(origin.firstControl(),null,reserved);
+            reserved=TransactionStatus.reserve(origin, DomainBinding.of(source.target));reservation=command(origin.firstControl(),null,reserved);
         }
         byte[] cataloguePoint(byte[] key)throws IOException{try{return nativeCatalogue.readCurrentPoint(catalogueColumn,key);}catch(org.rocksdb.RocksDBException failure){throw new IOException(failure);}}
         RatisTopologyOperationOutcomeRpc.Reply sourceOutcome(DistributedCommand command)throws IOException{sourceReads.incrementAndGet();var request=new RatisTopologyOperationOutcomeRpc.Request(source.cluster,source.database,source.domain,new DistributedCdcCheckpoint.Lineage(source.rangeId,source.groupId,1),command.operationId(),command.receiptDigest());try{return RatisTopologyOperationOutcomeRpc.decodeReply(source.machine.queryLinearizable(message(RatisTopologyOperationOutcomeRpc.request(request))).get(5,TimeUnit.SECONDS).getContent().toByteArray(),request);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}catch(ExecutionException|TimeoutException failure){throw new IOException(failure);}}
@@ -111,7 +111,7 @@ class RatisHomeReservationTest {
     }
     ReservedEvidence reserveOriginal(Fixture f,DistributedCommand original)throws Exception {
         var origin=new OperationRerouteOrigin(f.source.cluster,f.source.database,f.source.domain,new DistributedCdcCheckpoint.Lineage(f.source.rangeId,f.source.groupId,1),original.operationId(),original.receiptDigest(),OperatorUpload.sha256(f.source.freeze.encode()),f.source.store.applied(),f.source.target.payloadDigest(),RatisOperationRerouteAdmissionRpc.normalizedDigest(original,f.source.target),RatisOperationRerouteAdmissionRpc.targetParticipantCount(original,f.source.target),f.origin.firstControl());
-        var reserved=TransactionStatus.reserve(origin,f.source.schema.schemaEpoch(),f.source.schema.digest());var command=f.command(origin.firstControl(),null,reserved);
+        var reserved=TransactionStatus.reserve(origin, DomainBinding.of(f.source.target));var command=f.command(origin.firstControl(),null,reserved);
         var evidence=new RatisOperationRerouteAdmissionRpc.Evidence(original,f.source.directory,f.source.target,f.sourceOutcome(original),List.of());prepareEvidence(f,command,evidence);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.apply(command)).status());assertEquals(reserved,f.read());return new ReservedEvidence(reserved,evidence);
     }
     void prepareEvidence(Fixture f,DistributedCommand command,RatisOperationRerouteAdmissionRpc.Evidence evidence)throws Exception {
@@ -127,7 +127,7 @@ class RatisHomeReservationTest {
         return plan.accept(base.status().transactionId(),accepted,prepares,finalizes,captures);
     }
     TransactionStatus initialFromIntents(Fixture f,ReservedEvidence base,List<RatisDurableTransaction.Intent> intents){
-        var participants=intents.stream().map(i->new TransactionStatus.Participant(i.route().rangeId(),i.route().groupId(),i.route().rangeEpoch(),f.source.schema.digest(),i.acceptedBusiness().payloadDigest(),null,false)).toList();return TransactionStatus.begin(f.source.cluster,f.source.database,f.source.domain,base.status().transactionId(),base.status().operation(),base.status().schemaEpoch(),base.status().schemaDigest(),RatisDurableTransaction.planDigest(intents),participants);
+        var participants=intents.stream().map(i->new TransactionStatus.Participant(f.source.domain, i.route().rangeId(), i.route().groupId(), i.route().rangeEpoch(), f.source.schema.digest(), i.acceptedBusiness().payloadDigest(), null, false)).toList();return TransactionStatus.begin(f.source.cluster, f.source.database, base.status().transactionId(), base.status().operation(), base.status().domains(), RatisDurableTransaction.planDigest(intents), participants);
     }
     RatisOperationRerouteAdmissionRpc.Evidence promotionEvidence(ReservedEvidence base,List<RatisDurableTransaction.Intent> intents){var e=base.evidence();return new RatisOperationRerouteAdmissionRpc.Evidence(e.original(),e.sourceDirectory(),e.targetDirectory(),e.absence(),intents);}
     void rejectPromotion(Fixture f,ReservedEvidence base,List<RatisDurableTransaction.Intent> intents)throws Exception {
@@ -203,8 +203,8 @@ class RatisHomeReservationTest {
         try(var f=new Fixture(root.resolve("closed"),false)){assertThrows(ExecutionException.class,()->f.prepare(f.reservation).get(5,TimeUnit.SECONDS));assertNotNull(f.propose(f.reservation).getException());}
         try(var f=new Fixture(root.resolve("promotion"),true)){
             f.prepare(f.reservation).get(5,TimeUnit.SECONDS);f.apply(f.reservation);var participants=new ArrayList<TransactionStatus.Participant>();
-            for(var target:f.source.definition.targets())participants.add(new TransactionStatus.Participant(target.rangeId(),target.groupId(),target.rangeEpoch(),f.source.schema.digest(),new byte[32],null,false));
-            var accepted=TransactionStatus.begin(f.origin.clusterId(),f.origin.databaseId(),f.origin.domainId(),f.origin.transactionId(),f.origin.operation(),f.reserved.schemaEpoch(),f.reserved.schemaDigest(),new byte[32],participants);
+            for(var target:f.source.definition.targets())participants.add(new TransactionStatus.Participant(f.source.domain, target.rangeId(), target.groupId(), target.rangeEpoch(), f.source.schema.digest(), new byte[32], null, false));
+            var accepted=TransactionStatus.begin(f.origin.clusterId(), f.origin.databaseId(), f.origin.transactionId(), f.origin.operation(), f.reserved.domains(), new byte[32], participants);
             var promotion=f.command(new OperationId(f.origin.firstControl().sessionId(),f.origin.firstControl().epoch(),128),f.reserved,f.reserved.promote(accepted));
             assertThrows(ExecutionException.class,()->f.prepare(promotion).get(5,TimeUnit.SECONDS));assertNotNull(f.propose(promotion).getException());assertEquals(f.reserved,f.read());
         }

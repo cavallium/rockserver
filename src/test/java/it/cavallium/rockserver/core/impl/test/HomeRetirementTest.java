@@ -9,9 +9,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class HomeRetirementTest {
     final UUID home=new UUID(0,1),column=new UUID(0,2),left=new UUID(0,3),right=new UUID(0,4),transaction=new UUID(0,5);
     TransactionStatus initial(long sequence) {
-        return TransactionStatus.begin(new UUID(0,6),new UUID(0,7),new UUID(0,8),transaction,new OperationId(new UUID(0,9),1,sequence),
-                1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(right,right,1,new byte[32],new byte[32],null,false),
-                        new TransactionStatus.Participant(left,left,1,new byte[32],new byte[32],null,false)));
+        return TransactionStatus.begin(new UUID(0,6), new UUID(0,7), transaction, new OperationId(new UUID(0,9),1,sequence), List.of(new DomainBinding(new UUID(0,8), 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(new UUID(0,8), right, right, 1, new byte[32], new byte[32], null, false),
+                        new TransactionStatus.Participant(new UUID(0,8), left, left, 1, new byte[32], new byte[32], null, false)));
     }
     TransactionStatus consumed() {
         return initial(0).prepared(left,new byte[32],new ApplyPosition(1,3)).prepared(right,new byte[32],new ApplyPosition(2,4))

@@ -237,7 +237,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
             if (candidate.mode()!=mode) throw new IOException("Snapshot journal capture mode differs from client");
             var saved=candidate.snapshot(); var fence=saved.initial().fence();
             if (expectedFence!=null && !expectedFence.equals(fence)) throw new IOException("Original source journal differs from frozen expected fence");
-            if (!fence.clusterId().equals(schema.clusterId()) || !fence.databaseId().equals(schema.databaseId()) || !fence.domainId().equals(schema.domainId()) || fence.schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(fence.schemaDigest(),schema.digest())) throw new IOException("Snapshot journal schema differs from this client");
+            if (!fence.clusterId().equals(schema.clusterId()) || !fence.databaseId().equals(schema.databaseId()) || fence.domains().size()!=1 || !fence.domains().getFirst().domainId().equals(schema.domainId()) || fence.domain(schema.domainId()).schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(fence.domain(schema.domainId()).schemaDigest(),schema.digest())) throw new IOException("Snapshot journal schema differs from this client");
             var first=fence.participants().stream().map(SnapshotFence.Participant::installOperation).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow(); new Identity(fence.fenceId(),fence.operation(),first);
             int n=0; for (var p:fence.participants()) {
                 OperationId install=new OperationId(first.sessionId(),first.epoch(),first.sequence()+n), release=new OperationId(first.sessionId(),first.epoch(),first.sequence()+64+n++);

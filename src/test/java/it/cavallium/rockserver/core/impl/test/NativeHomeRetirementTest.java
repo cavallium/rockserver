@@ -18,7 +18,7 @@ class NativeHomeRetirementTest {
     ParticipantFenceProof dataFence(TransactionStatus status,long floor) { return new ParticipantFenceProof(new ParticipantIdentity(helper.group,1,helper.participant,status),floor,new ApplyPosition(2,20)); }
     TransactionStatus replacement(TransactionStatus before) {
         byte[] plan=new byte[32]; plan[0]=1;
-        return TransactionStatus.begin(before.clusterId(),before.databaseId(),before.domainId(),before.transactionId(),new OperationId(new UUID(0,900),2,0),before.schemaEpoch(),before.schemaDigest(),plan,before.asInitial().participants());
+        return TransactionStatus.begin(before.clusterId(), before.databaseId(), before.transactionId(), new OperationId(new UUID(0,900),2,0), before.domains(), plan, before.asInitial().participants());
     }
     record Finished(TransactionStatus initial,TransactionStatus consumed,HomeRecovery recovery,HomeRecoveryReceipt receipt,HomeRetirement retirement,int index,DistributedCommand registration) {}
     Finished finish(NativeHomeRecoveryTest.Fixture f,boolean commit) throws Exception {
@@ -96,7 +96,7 @@ class NativeHomeRetirementTest {
             assertTrue(f.store.applyHomeRecovery(new ApplyPosition(1,5),request).retired()); f.store.applyHomeRetirement(new ApplyPosition(1,6),retirement); assertTrue(f.store.applyHomeRecovery(new ApplyPosition(1,1),request).retired());
             assertEquals(CommandResult.Status.SESSION_EXPIRED,helper.apply(f,7,helper.cas(new OperationId(helper.user,3,1),null,old)).status());
             try (var pin=f.store.capture()) { assertEquals(next,TransactionStatus.decode(pin.get(helper.column,helper.key(old)))); }
-            var changed=TransactionStatus.begin(next.clusterId(),next.databaseId(),next.domainId(),next.transactionId(),next.operation(),next.schemaEpoch(),next.schemaDigest(),new byte[32],next.participants());
+            var changed=TransactionStatus.begin(next.clusterId(), next.databaseId(), next.transactionId(), next.operation(), next.domains(), new byte[32], next.participants());
             assertThrows(IllegalArgumentException.class,() -> f.store.homeFence(identity(changed)));
             helper.apply(f,8,DistributedCommand.advanceSessionEpochFloor(helper.group,1,new byte[32],new OperationId(helper.admin,3,1),3)); assertNull(f.store.homeFence(identity(next))); assertEquals(3,f.store.homeRecoveryCapacity().reservedCount());
             var abort=helper.abort(next,1); assertFalse(f.store.applyHomeRecovery(new ApplyPosition(1,9),abort).retired()); assertEquals(2,f.store.homeRecoveryCapacity().reservedCount());

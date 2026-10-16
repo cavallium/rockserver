@@ -16,12 +16,9 @@ class SnapshotProofAllocationTest {
         var participants=new ArrayList<SnapshotFence.Participant>();
         for (int i=0;i<8;i++) {
             var group=new UUID(0,10+i); var key=new byte[8192]; Arrays.fill(key,(byte)i);
-            participants.add(new SnapshotFence.Participant(group,group,1,new byte[32],
-                    new OperationId(group,1,1),new OperationId(group,1,2),
-                    new TransactionScope(List.of(TransactionScope.Span.point(new UUID(0,30),key)))));
+            participants.add(new SnapshotFence.Participant(new UUID(0,3), group, group, 1, new byte[32], new OperationId(group,1,1), new OperationId(group,1,2), new TransactionScope(List.of(TransactionScope.Span.point(new UUID(0,30),key)))));
         }
-        return new SnapshotFence(new UUID(0,1),new UUID(0,2),new UUID(0,3),new UUID(0,4),
-                new UUID(0,5),1,new OperationId(new UUID(0,4),1,0),2,3,new byte[32],participants);
+        return new SnapshotFence(new UUID(0,1), new UUID(0,2), new UUID(0,4), new UUID(0,5), 1, new OperationId(new UUID(0,4),1,0), List.of(new DomainBinding(new UUID(0,3), 2, new byte[32], 3, new byte[32])), participants);
     }
 
     private SnapshotFenceStatus terminal(SnapshotFence fence) {

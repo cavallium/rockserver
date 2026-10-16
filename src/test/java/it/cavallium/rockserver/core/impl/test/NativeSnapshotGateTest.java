@@ -16,8 +16,7 @@ class NativeSnapshotGateTest {
     final NativeRangeImage.Limits limits=new NativeRangeImage.Limits(4*1024*1024,32*1024*1024,4);
     byte[] key(int n) { return helper.key(n); }
     SnapshotFence fence(NativeBucketApplyTest.Fixture f,int id,int point) {
-        return new SnapshotFence(outer.cluster,outer.database,outer.domain,new UUID(0,500+id),new UUID(0,400),1,new OperationId(new UUID(0,500+id),1,0),7,1,f.schema.digest(),
-                List.of(new SnapshotFence.Participant(outer.group,outer.group,1,f.schema.digest(),new OperationId(new UUID(0,401),1,id*2L),new OperationId(new UUID(0,401),1,id*2L+1),helper.point(outer.fixed,point))));
+        return new SnapshotFence(outer.cluster, outer.database, new UUID(0,500+id), new UUID(0,400), 1, new OperationId(new UUID(0,500+id),1,0), List.of(new DomainBinding(outer.domain, 7, new byte[32], 1, f.schema.digest())), List.of(new SnapshotFence.Participant(outer.domain, outer.group, outer.group, 1, f.schema.digest(), new OperationId(new UUID(0,401),1,id*2L), new OperationId(new UUID(0,401),1,id*2L+1), helper.point(outer.fixed,point))));
     }
     SnapshotFenceStatus completed(SnapshotFence fence,ApplyPosition installed,ApplyPosition captured) {
         return SnapshotFenceStatus.begin(fence).ready(outer.group,installed).capture(outer.group,new SnapshotFenceStatus.Capture(new UUID(0,600),new UUID(0,601),captured)).complete();
@@ -124,8 +123,7 @@ class NativeSnapshotGateTest {
         }
         try (var f=outer.new Fixture(root.resolve("replacement-target"),true)) {
             helper.enable(f); var base=fence(f,1,2); var participant=base.participant(outer.group);
-            var old=new SnapshotFence(base.clusterId(),base.databaseId(),base.domainId(),base.fenceId(),base.homeGroup(),base.homeEpoch(),base.operation(),base.directoryGeneration(),base.schemaEpoch(),base.schemaDigest(),
-                    List.of(new SnapshotFence.Participant(participant.rangeId(),participant.groupId(),participant.rangeEpoch(),participant.schemaDigest(),preparation.operation(),participant.releaseOperation(),participant.scope())));
+            var old=new SnapshotFence(base.clusterId(), base.databaseId(), base.fenceId(), base.homeGroup(), base.homeEpoch(), base.operation(), base.domains(), List.of(new SnapshotFence.Participant(participant.domainId(), participant.rangeId(), participant.groupId(), participant.rangeEpoch(), participant.schemaDigest(), preparation.operation(), participant.releaseOperation(), participant.scope())));
             f.store.applyGateInstall(new ApplyPosition(1,1),old).gate(); f.store.fence(); f.store.installSnapshot(image,limits); f.store.activate();
             assertEquals(0,f.store.gateCapacity().count()); assertNull(f.store.snapshotGate(old.fenceId()));
             assertEquals(ParticipantVote.prepared(new ApplyPosition(1,1)),f.store.recoveredPreparationVote(preparation));

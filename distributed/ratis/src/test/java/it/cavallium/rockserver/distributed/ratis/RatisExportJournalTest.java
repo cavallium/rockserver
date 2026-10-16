@@ -93,7 +93,7 @@ class RatisExportJournalTest {
                 List.of(TransactionScope.Span.range(column,null,new byte[]{4}),TransactionScope.Span.range(column,new byte[]{3},null)),
                 List.of(TransactionScope.Span.range(column,null,new byte[]{4}),TransactionScope.Span.range(column,new byte[]{5},null)),
                 List.of(TransactionScope.Span.range(column,null,null),TransactionScope.Span.range(column,new byte[]{4},null)))) {
-            var changed=new SnapshotFence(old.clusterId(),old.databaseId(),old.domainId(),old.fenceId(),old.homeGroup(),old.homeEpoch(),old.operation(),old.directoryGeneration(),old.schemaEpoch(),old.schemaDigest(),List.of(new SnapshotFence.Participant(local.rangeId(),local.groupId(),local.rangeEpoch(),local.schemaDigest(),local.installOperation(),local.releaseOperation(),new TransactionScope(spans))));
+            var changed=new SnapshotFence(old.clusterId(), old.databaseId(), old.fenceId(), old.homeGroup(), old.homeEpoch(), old.operation(), old.domains(), List.of(new SnapshotFence.Participant(local.domainId(), local.rangeId(), local.groupId(), local.rangeEpoch(), local.schemaDigest(), local.installOperation(), local.releaseOperation(), new TransactionScope(spans))));
             if (Arrays.equals(spans.getFirst().upperExclusive(),spans.getLast().lowerInclusive())) assertDoesNotThrow(() -> new RatisExportJournal.Definition(job,changed,List.of(column),root.resolve("source"),new byte[32],RatisExportJournal.Limits.defaults(),java.time.Duration.ofSeconds(30)));
             else assertThrows(IllegalArgumentException.class,() -> new RatisExportJournal.Definition(job,changed,List.of(column),root.resolve("source"),new byte[32],RatisExportJournal.Limits.defaults(),java.time.Duration.ofSeconds(30)));
         }
@@ -197,9 +197,9 @@ class RatisExportJournalTest {
         for (int n=0;n<original.participants().size();n++) {
             var p=original.participants().get(n);
             var scope=n==0 ? new TransactionScope(List.of(TransactionScope.Span.range(column,null,new byte[]{4}),TransactionScope.Span.range(column,new byte[]{4},new byte[]{(byte)128}),TransactionScope.Span.range(second,null,new byte[]{(byte)128}))) : new TransactionScope(List.of(TransactionScope.Span.range(unselected,new byte[]{(byte)128},null)));
-            participants.add(new SnapshotFence.Participant(p.rangeId(),p.groupId(),p.rangeEpoch(),p.schemaDigest(),p.installOperation(),p.releaseOperation(),scope));
+            participants.add(new SnapshotFence.Participant(p.domainId(), p.rangeId(), p.groupId(), p.rangeEpoch(), p.schemaDigest(), p.installOperation(), p.releaseOperation(), scope));
         }
-        var fence=new SnapshotFence(original.clusterId(),original.databaseId(),original.domainId(),original.fenceId(),original.homeGroup(),original.homeEpoch(),original.operation(),original.directoryGeneration(),original.schemaEpoch(),original.schemaDigest(),participants);
+        var fence=new SnapshotFence(original.clusterId(), original.databaseId(), original.fenceId(), original.homeGroup(), original.homeEpoch(), original.operation(), original.domains(), participants);
         var selection=new ArrayList<>(List.of(second,column)); var definition=new RatisExportJournal.Definition(job,fence,selection,root.resolve("multi-source"),new byte[32],RatisExportJournal.Limits.defaults(),java.time.Duration.ofSeconds(30)); selection.clear();
         assertEquals(List.of(column,second),definition.columns()); assertThrows(UnsupportedOperationException.class,() -> definition.columns().clear());
         var group=participants.getFirst().groupId(); var skipped=participants.getLast().groupId();

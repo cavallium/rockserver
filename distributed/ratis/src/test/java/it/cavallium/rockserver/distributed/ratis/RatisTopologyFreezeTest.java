@@ -135,8 +135,8 @@ class RatisTopologyFreezeTest {
     @Test void protectedPreparedFinalizationDrainsBeforeFreezeCanAppend() throws Exception {
         try(var f=new Fixture(root)) {
             DistributedCommand accepted; try(var pin=f.store.captureTracked(f.point())) { accepted=f.store.planScopedCommit(pin,f.put(0,9),0,id(99)); }
-            var participant=new TransactionStatus.Participant(id(8),f.groupId,1,f.schema.digest(),PreparedParticipant.Preparation.planDigest(accepted),null,false);
-            var registration=TransactionStatus.begin(id(1),id(2),id(3),id(101),accepted.operationId(),1,f.schema.digest(),f.directory.payloadDigest(),List.of(participant));
+            var participant=new TransactionStatus.Participant(id(3), id(8), f.groupId, 1, f.schema.digest(), PreparedParticipant.Preparation.planDigest(accepted), null, false);
+            var registration=TransactionStatus.begin(id(1), id(2), id(101), accepted.operationId(), List.of(new DomainBinding(id(3), 0, new byte[32], 1, f.schema.digest())), f.directory.payloadDigest(), List.of(participant));
             var preparation=new PreparedParticipant.Preparation(id(100),1,new OperationId(id(102),1,0),registration,accepted);
             f.replay(RatisParticipantRecord.encode(preparation),1,1).get(5,TimeUnit.SECONDS); assertFalse(f.prepare().ready()); assertNotNull(f.propose(f.record.encode()).getException());
             var decision=registration.prepared(f.groupId,participant.planDigest(),new ApplyPosition(1,1)).decide(TransactionStatus.Phase.COMMIT);

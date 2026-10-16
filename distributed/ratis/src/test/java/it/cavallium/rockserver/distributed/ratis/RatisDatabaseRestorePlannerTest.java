@@ -63,8 +63,8 @@ class RatisDatabaseRestorePlannerTest {
             var schema=new DistributedSchema(f.cluster,f.database,domain,0,0,List.of(new DistributedSchema.Column(api,column,"other",f.schema.column(f.column).schema(),null)));
             var original=f.directory.ranges().getFirst();var range=new RangeDescriptor(variant==0?original.rangeId():UUID.randomUUID(),UUID.randomUUID(),1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(f.owner));
             var directory=new RangeDirectory(f.cluster,f.database,domain,0,schema.digest(),0,Set.of(column),0,List.of(range));
-            var participant=new SnapshotFence.Participant(range.rangeId(),range.groupId(),1,schema.digest(),new OperationId(UUID.randomUUID(),1,0),new OperationId(UUID.randomUUID(),1,0),new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))));
-            var fence=new SnapshotFence(f.cluster,f.database,domain,UUID.randomUUID(),UUID.randomUUID(),1,new OperationId(UUID.randomUUID(),1,0),0,0,schema.digest(),List.of(participant));
+            var participant=new SnapshotFence.Participant(domain, range.rangeId(), range.groupId(), 1, schema.digest(), new OperationId(UUID.randomUUID(),1,0), new OperationId(UUID.randomUUID(),1,0), new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))));
+            var fence=new SnapshotFence(f.cluster, f.database, UUID.randomUUID(), UUID.randomUUID(), 1, new OperationId(UUID.randomUUID(),1,0), List.of(new DomainBinding(domain, 0, new byte[32], 0, schema.digest())), List.of(participant));
             var second=new DatabaseBackupDefinition.Domain(directory,schema,List.of(fence));
             assertThrows(IllegalArgumentException.class,()->new DatabaseBackupDefinition(UUID.randomUUID(),new DatabaseDomainRoster(f.cluster,f.database,0,List.of(f.domain,domain)),List.of(f.definition.domains().getFirst(),second),new DatabaseBackupDefinition.Limits(2,2,2,1024,1024*1024)));
         }

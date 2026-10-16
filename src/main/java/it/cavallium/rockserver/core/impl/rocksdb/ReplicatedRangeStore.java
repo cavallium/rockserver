@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
+import it.cavallium.rockserver.core.common.distributed.DomainBinding;
 import it.cavallium.rockserver.core.common.distributed.BucketMergeOperand;
 import it.cavallium.rockserver.core.common.distributed.DatabaseDomainRoster;
 import it.cavallium.rockserver.core.common.distributed.CatalogueHistory;
@@ -539,6 +540,11 @@ public final class ReplicatedRangeStore {
     public NativeSchemaInstallation schemaInstallation() { return activeSchemaInstallation; }
     private static String schemaIdentity(byte[] digest) { return java.util.HexFormat.of().formatHex(digest); }
     private boolean knownSchema(byte[] digest) { return Arrays.equals(schemaDigest,digest) || schemaHistory.containsKey(schemaIdentity(digest)); }
+    private void requireParticipantDomain(DomainBinding binding,byte[] digest) {
+        if(!binding.domainId().equals(interval.domainId()) || !Arrays.equals(binding.schemaDigest(),digest))throw new IllegalArgumentException("Participant domain/schema binding differs from native owner");
+        var schema=Arrays.equals(schemaDigest,digest)?logicalSchema:schemaHistory.get(schemaIdentity(digest));
+        if(schema!=null && binding.schemaEpoch()!=schema.schemaEpoch())throw new IllegalArgumentException("Participant schema epoch differs from native schema");
+    }
     private byte[] schemaStateKey(int tag) { return ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array(); }
     private byte[] schemaHistoryKey(UUID change) { return schemaChangeKey(0x2a,change); }
     byte[] schemaCapacityInstalledRow(UUID change) throws RocksDBException { return db.get(state,schemaHistoryKey(change)); }
@@ -2434,7 +2440,7 @@ public final class ReplicatedRangeStore {
         var reserved=left.reserved() ? left : right.reserved() ? right : null;var installed=reserved==left ? right : left;
         if(reserved==null || installed.origin()==null || !Objects.equals(reserved.origin(),installed.origin()) || installed.participants().isEmpty())return false;
         var initial=installed.asInitial();
-        try { return reserved.promote(TransactionStatus.begin(initial.clusterId(),initial.databaseId(),initial.domainId(),initial.transactionId(),initial.operation(),initial.schemaEpoch(),initial.schemaDigest(),initial.planDigest(),initial.participants())).sameDefinition(installed); }
+        try { return reserved.promote(TransactionStatus.begin(initial.clusterId(),initial.databaseId(),initial.transactionId(),initial.operation(),initial.domains(),initial.planDigest(),initial.participants())).sameDefinition(installed); }
         catch(IllegalArgumentException different) { return false; }
     }
     private static boolean sameHomeReservationIdentity(HomeIdentity left,HomeIdentity right) {
@@ -2608,9 +2614,9 @@ public final class ReplicatedRangeStore {
 
     private record ParticipantAnchor(UUID home,long epoch,UUID group,TransactionStatus definition) {}
     private void requireParticipantDefinition(UUID participantGroup,TransactionStatus definition,ReadOptions options) throws RocksDBException {
-        var participant=definition.participants().stream().filter(p -> p.groupId().equals(participantGroup)).findFirst().orElseThrow(() -> new IllegalArgumentException("Unregistered participant identity"));
+        var participant=definition.participant(participantGroup);requireParticipantDomain(definition.domain(participant.domainId()),participant.schemaDigest());
         if (!participantGroup.equals(groupId) || participant.rangeEpoch()!=rangeEpoch || !knownSchema(participant.schemaDigest())
-                || !definition.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Participant identity differs from native owner/schema");
+                || !participant.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Participant identity differs from native owner/schema");
         if (logicalSchema!=null && (!logicalSchema.clusterId().equals(definition.clusterId()) || !logicalSchema.databaseId().equals(definition.databaseId()))) throw new IllegalArgumentException("Participant identity database differs from schema");
         var authority=sessionAuthority(options);
         if (authority!=null && (!authority.clusterId().equals(definition.clusterId()) || !authority.databaseId().equals(definition.databaseId()))) throw new IllegalArgumentException("Participant identity database differs from native session authority");
@@ -2882,8 +2888,8 @@ public final class ReplicatedRangeStore {
     private byte[] snapshotGateKey(UUID fence) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x24).putLong(fence.getMostSignificantBits()).putLong(fence.getLeastSignificantBits()).array(); }
     private void requireSnapshotFence(SnapshotFence fence) { requireSnapshotFence(fence,false); }
     private void requireSnapshotFence(SnapshotFence fence,boolean terminal) {
-        var participant=fence.participant(groupId);
-        if (participant.rangeEpoch()!=rangeEpoch || !knownSchema(participant.schemaDigest()) || !fence.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Snapshot fence differs from range");
+        var participant=fence.participant(groupId);requireParticipantDomain(fence.domain(participant.domainId()),participant.schemaDigest());
+        if (participant.rangeEpoch()!=rangeEpoch || !knownSchema(participant.schemaDigest()) || !participant.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Snapshot fence differs from range");
         if (logicalSchema!=null && (!fence.clusterId().equals(logicalSchema.clusterId()) || !fence.databaseId().equals(logicalSchema.databaseId()))) throw new IllegalArgumentException("Snapshot fence database differs from schema");
         if(Arrays.equals(participant.schemaDigest(),schemaDigest)) validateSnapshotScope(participant.scope());
         else {
@@ -3159,7 +3165,7 @@ public final class ReplicatedRangeStore {
         owned.acquireUse();
         try(var options=new ReadOptions().setSnapshot(owned.snapshot)) {
             var participant=fence.participant(groupId);var coverage=owned.capturedInterval;var scope=participant.scope();
-            if(participant.rangeEpoch()!=rangeEpoch || !Arrays.equals(participant.schemaDigest(),owned.capturedSchemaDigest) || !Arrays.equals(fence.schemaDigest(),owned.capturedSchemaDigest) || !fence.domainId().equals(coverage.domainId()) || scope.spans().size()!=owned.capturedColumns.size() || owned.capturedColumns.stream().anyMatch(column->scope.spans().stream().noneMatch(span->span.columnId().equals(column) && !span.isPoint() && Arrays.equals(span.lowerInclusive(),coverage.lowerInclusive()) && Arrays.equals(span.upperExclusive(),coverage.upperExclusive()))))throw new IllegalArgumentException("Scoped cohort fence changed captured schema/epoch/full interval");
+            if(participant.rangeEpoch()!=rangeEpoch || !Arrays.equals(participant.schemaDigest(),owned.capturedSchemaDigest) || !Arrays.equals(fence.participantDomain(groupId).schemaDigest(),owned.capturedSchemaDigest) || !participant.domainId().equals(coverage.domainId()) || scope.spans().size()!=owned.capturedColumns.size() || owned.capturedColumns.stream().anyMatch(column->scope.spans().stream().noneMatch(span->span.columnId().equals(column) && !span.isPoint() && Arrays.equals(span.lowerInclusive(),coverage.lowerInclusive()) && Arrays.equals(span.upperExclusive(),coverage.upperExclusive()))))throw new IllegalArgumentException("Scoped cohort fence changed captured schema/epoch/full interval");
             byte[] marker=db.get(state,options,markerKey);if(!Objects.equals(marker==null ? null : decodePosition(marker),owned.position))throw new IllegalStateException("Scoped cohort marker differs from its original cut");
             byte[] encoded=db.get(state,options,snapshotGateKey(fence.fenceId()));if(encoded==null)throw new IllegalArgumentException("Cohort cut has no requested native gate");var gate=SnapshotGate.decode(encoded);gate.requireCompletedCut(owned.position);
             if(!gate.active() || !gate.participantGroup().equals(groupId) || !gate.fence().equals(fence))throw new IllegalArgumentException("Cohort cut lacks exact active captured gate");
@@ -3188,9 +3194,9 @@ public final class ReplicatedRangeStore {
     }
     private void requireRejected(RejectedParticipant record) {
         requireHomeRecoveryFree(record.operation()); requireHomeRecoveryFree(record.registration().operation());
-        var participant=record.registration().participants().stream().filter(p -> p.groupId().equals(record.participantGroup())).findFirst().orElseThrow();
+        var participant=record.registration().participant(record.participantGroup());requireParticipantDomain(record.registration().domain(participant.domainId()),participant.schemaDigest());
         if (!record.participantGroup().equals(groupId) || participant.rangeEpoch()!=rangeEpoch || !knownSchema(participant.schemaDigest())
-                || !record.registration().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Rejected preparation differs from range");
+                || !participant.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Rejected preparation differs from range");
         if (logicalSchema!=null && (!logicalSchema.clusterId().equals(record.registration().clusterId()) || !logicalSchema.databaseId().equals(record.registration().databaseId()))) throw new IllegalArgumentException("Rejected preparation database differs from schema");
     }
     private Map<UUID,RejectedParticipant> loadRejectedIndex() {
@@ -3275,9 +3281,9 @@ public final class ReplicatedRangeStore {
     private void requireAbort(AbortedParticipant record) { requireFinalization(record.finalization()); }
     private void requireFinalization(ParticipantFinalization decision) {
         requireHomeRecoveryFree(decision.operation()); requireHomeRecoveryFree(decision.decision().operation());
-        var participant=decision.participant();
+        var participant=decision.participant();requireParticipantDomain(decision.domainBinding(),participant.schemaDigest());
         if (!decision.participantGroup().equals(owner.groupId()) || participant.rangeEpoch()!=owner.epoch() || !knownSchema(participant.schemaDigest())
-                || !decision.decision().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Finalization differs from range");
+                || !participant.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Finalization differs from range");
         if (logicalSchema!=null && (!logicalSchema.clusterId().equals(decision.decision().clusterId()) || !logicalSchema.databaseId().equals(decision.decision().databaseId()))) throw new IllegalArgumentException("Finalization database differs from schema");
     }
     private Map<UUID,AbortedParticipant> loadAbortedIndex() {
@@ -3369,7 +3375,7 @@ public final class ReplicatedRangeStore {
             if(!isFinalized(preparation.transactionId())) throw new IllegalArgumentException("Unresolved preparation from historical schema");
             validateSnapshotScope(preparation.scope(),schemaHistory.get(schemaIdentity(business.schemaDigest())).columnIds());
         }
-        if (!preparation.registration().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Prepared domain differs from range");
+        requireParticipantDomain(preparation.domainBinding(),business.schemaDigest());
         if (logicalSchema!=null && (!logicalSchema.clusterId().equals(preparation.registration().clusterId()) || !logicalSchema.databaseId().equals(preparation.registration().databaseId()))) throw new IllegalArgumentException("Prepared database differs from schema");
     }
     private PreparedIndex addPrepared(PreparedIndex index,PreparedParticipant value) {

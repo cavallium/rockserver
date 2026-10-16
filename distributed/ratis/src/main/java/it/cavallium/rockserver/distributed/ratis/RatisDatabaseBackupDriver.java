@@ -162,8 +162,8 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
         long ordinal=export.snapshot().chunks().stream().filter(c->c.group().equals(chunk.group()) && c.column().equals(chunk.column()) && c.ordinal()<chunk.ordinal()).count();
         var old=journal.snapshot().chunks().stream().filter(c->c.groupId().equals(chunk.group()) && c.columnId().equals(chunk.column()) && c.ordinal()==ordinal).findFirst();if(old.isPresent())return false;
         UUID id=asset(binding.exportDefinition().jobId()+"/"+chunk.group()+"/"+chunk.ordinal());
-        var source=new NativeRangeSstExport.Manifest(chunk.group(),chunk.rangeEpoch(),chunk.column(),binding.exportDefinition().fence().schemaDigest(),chunk.cut(),chunk.lowerInclusive(),chunk.upperExclusive(),chunk.rows(),chunk.payloadBytes(),chunk.fileBytes(),chunk.rows()==0?new byte[0]:chunk.sha256(),chunk.file());
-        try{var copied=archive.copy(binding.exportDefinition().fence().domainId(),ordinal,id,source);journal.copied(copied);return true;}catch(org.rocksdb.RocksDBException failure){throw new IOException("Copied archive qualification failed",failure);}
+        var source=new NativeRangeSstExport.Manifest(chunk.group(),chunk.rangeEpoch(),chunk.column(),binding.exportDefinition().fence().participantDomain(chunk.group()).schemaDigest(),chunk.cut(),chunk.lowerInclusive(),chunk.upperExclusive(),chunk.rows(),chunk.payloadBytes(),chunk.fileBytes(),chunk.rows()==0?new byte[0]:chunk.sha256(),chunk.file());
+        try{var copied=archive.copy(binding.exportDefinition().fence().participant(chunk.group()).domainId(),ordinal,id,source);journal.copied(copied);return true;}catch(org.rocksdb.RocksDBException failure){throw new IOException("Copied archive qualification failed",failure);}
     }
     private UUID asset(String key){return UUID.nameUUIDFromBytes((journal.definition().backupId()+"/"+key).getBytes(StandardCharsets.UTF_8));}
     private void abandonOwned(RatisDatabaseBackupJournal.Phase terminal)throws IOException{

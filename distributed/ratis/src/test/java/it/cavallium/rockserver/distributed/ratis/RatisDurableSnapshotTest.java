@@ -151,10 +151,7 @@ class RatisDurableSnapshotTest {
                 journal.consume(control(2)); journal.executeHome(); consumed=journal.snapshot().observedHome(); retireGate(f,consumed,released);
             }
             var old=f.fence; var participant=old.participant(group);
-            var newFence=new SnapshotFence(old.clusterId(),old.databaseId(),old.domainId(),old.fenceId(),newHome.f.groupId,1,
-                    new OperationId(old.operation().sessionId(),2,0),old.directoryGeneration(),old.schemaEpoch(),old.schemaDigest(),
-                    List.of(new SnapshotFence.Participant(participant.rangeId(),group,participant.rangeEpoch(),participant.schemaDigest(),
-                            new OperationId(participant.installOperation().sessionId(),2,0),new OperationId(participant.releaseOperation().sessionId(),2,1),participant.scope())));
+            var newFence=new SnapshotFence(old.clusterId(), old.databaseId(), old.fenceId(), newHome.f.groupId, 1, new OperationId(old.operation().sessionId(),2,0), old.domains(), List.of(new SnapshotFence.Participant(participant.domainId(), participant.rangeId(), group, participant.rangeEpoch(), participant.schemaDigest(), new OperationId(participant.installOperation().sessionId(),2,0), new OperationId(participant.releaseOperation().sessionId(),2,1), participant.scope())));
             var newStatus=newHome.register(newFence);
             var newGate=f.data.f.store.applyGateInstall(new ApplyPosition(1,++f.data.wire.index),newFence).gate(); assertTrue(newGate.active());
             long writes=f.home.wire.index+f.data.wire.index+newHome.wire.index;

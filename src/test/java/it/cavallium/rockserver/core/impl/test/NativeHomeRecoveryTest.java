@@ -29,8 +29,7 @@ class NativeHomeRecoveryTest {
         @Override public void close() throws Exception { pool.close(); }
     }
     TransactionStatus initial(int id) {
-        return TransactionStatus.begin(new UUID(0,20),new UUID(0,21),new UUID(0,22),new UUID(0,100+id),new OperationId(new UUID(0,23),1,id),1,new byte[32],new byte[32],
-                List.of(new TransactionStatus.Participant(participant,participant,1,new byte[32],new byte[32],null,false)));
+        return TransactionStatus.begin(new UUID(0,20), new UUID(0,21), new UUID(0,100+id), new OperationId(new UUID(0,23),1,id), List.of(new DomainBinding(new UUID(0,22), 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(new UUID(0,22), participant, participant, 1, new byte[32], new byte[32], null, false)));
     }
     byte[] key(TransactionStatus status) { return ByteBuffer.allocate(16).putLong(status.transactionId().getMostSignificantBits()).putLong(status.transactionId().getLeastSignificantBits()).array(); }
     DistributedCommand cas(OperationId operation,TransactionStatus before,TransactionStatus next) { return new DistributedCommand(group,1,new byte[32],operation,List.of(new Mutation(Mutation.Kind.PUT,column,key(next),next.encode())),List.of(new KeyPredicate(column,key(next),before==null ? null : before.encode()))); }
@@ -104,11 +103,11 @@ class NativeHomeRecoveryTest {
             var recovery=abort(initial,1); f.store.applyHomeRecovery(new ApplyPosition(1,3),recovery).receipt();
             assertThrows(IllegalArgumentException.class,() -> f.store.estimateReceiptRetention(recovery.command())); assertThrows(IllegalArgumentException.class,() -> f.store.apply(new ApplyPosition(1,4),recovery.command()));
             var scope=new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[16])));
-            var gate=new SnapshotFence(new UUID(0,20),new UUID(0,21),domain,new UUID(0,300),new UUID(0,301),1,new OperationId(new UUID(0,300),1,0),0,1,new byte[32],List.of(new SnapshotFence.Participant(group,group,1,new byte[32],recovery.operation(),new OperationId(new UUID(0,302),0,0),scope)));
+            var gate=new SnapshotFence(new UUID(0,20), new UUID(0,21), new UUID(0,300), new UUID(0,301), 1, new OperationId(new UUID(0,300),1,0), List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), List.of(new SnapshotFence.Participant(domain, group, group, 1, new byte[32], recovery.operation(), new OperationId(new UUID(0,302),0,0), scope)));
             assertThrows(IllegalArgumentException.class,() -> f.store.estimateGateInstall(gate));
             var business=new DistributedCommand(group,1,new byte[32],new OperationId(new UUID(0,700),1,0),List.of(new Mutation(Mutation.Kind.PUT,column,new byte[16],new byte[]{9})));
             var accepted=DistributedCommand.acceptedTransaction(business,new TransactionAcceptance(f.store.applied(),0,new UUID(0,701),scope,new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()));
-            var registration=TransactionStatus.begin(new UUID(0,20),new UUID(0,21),domain,new UUID(0,702),business.operationId(),1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(group,group,1,new byte[32],accepted.payloadDigest(),null,false)));
+            var registration=TransactionStatus.begin(new UUID(0,20), new UUID(0,21), new UUID(0,702), business.operationId(), List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(domain, group, group, 1, new byte[32], accepted.payloadDigest(), null, false)));
             var preparation=new PreparedParticipant.Preparation(new UUID(0,703),1,recovery.operation(),registration,accepted);
             assertThrows(IllegalArgumentException.class,() -> f.store.estimatePreparation(preparation)); assertThrows(IllegalArgumentException.class,() -> f.store.estimateRejection(preparation));
             var finalization=new ParticipantFinalization(new UUID(0,703),1,group,recovery.operation(),registration.decide(TransactionStatus.Phase.ABORT));
@@ -117,7 +116,7 @@ class NativeHomeRecoveryTest {
         }
         try (var f=new Fixture(root.resolve("gate-first"))) {
             var recovery=abort(initial(3),0); var scope=new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[16])));
-            var gate=new SnapshotFence(new UUID(0,20),new UUID(0,21),domain,new UUID(0,300),new UUID(0,301),1,new OperationId(new UUID(0,300),1,0),0,1,new byte[32],List.of(new SnapshotFence.Participant(group,group,1,new byte[32],recovery.operation(),new OperationId(new UUID(0,302),0,0),scope)));
+            var gate=new SnapshotFence(new UUID(0,20), new UUID(0,21), new UUID(0,300), new UUID(0,301), 1, new OperationId(new UUID(0,300),1,0), List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), List.of(new SnapshotFence.Participant(domain, group, group, 1, new byte[32], recovery.operation(), new OperationId(new UUID(0,302),0,0), scope)));
             f.store.applyGateInstall(new ApplyPosition(1,1),gate).gate(); assertThrows(IllegalArgumentException.class,() -> f.store.estimateHomeRecovery(recovery)); assertEquals(0,f.store.homeRecoveryCapacity().count());
         }
     }
@@ -126,7 +125,7 @@ class NativeHomeRecoveryTest {
             f.store.enableScopedHistory(RangeMutationHistory.Limits.defaults()); var recovery=abort(initial(8),0); var scope=new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[16])));
             var business=new DistributedCommand(group,1,new byte[32],new OperationId(new UUID(0,704),1,0),List.of(new Mutation(Mutation.Kind.PUT,column,new byte[16],new byte[]{9})));
             DistributedCommand accepted; try (var pin=f.store.captureTracked(scope)) { accepted=f.store.planScopedCommit(pin,business,0,new UUID(0,705)); }
-            var registration=TransactionStatus.begin(new UUID(0,20),new UUID(0,21),domain,new UUID(0,706),business.operationId(),1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(group,group,1,new byte[32],accepted.payloadDigest(),null,false)));
+            var registration=TransactionStatus.begin(new UUID(0,20), new UUID(0,21), new UUID(0,706), business.operationId(), List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(domain, group, group, 1, new byte[32], accepted.payloadDigest(), null, false)));
             var preparation=new PreparedParticipant.Preparation(new UUID(0,703),1,recovery.operation(),registration,accepted); assertTrue(f.store.applyPrepared(new ApplyPosition(1,1),preparation).prepared());
             assertThrows(IllegalArgumentException.class,() -> f.store.estimateHomeRecovery(recovery)); assertThrows(IllegalArgumentException.class,() -> f.store.applyHomeRecovery(new ApplyPosition(1,2),recovery).receipt()); assertEquals(0,f.store.homeRecoveryCapacity().count());
         }

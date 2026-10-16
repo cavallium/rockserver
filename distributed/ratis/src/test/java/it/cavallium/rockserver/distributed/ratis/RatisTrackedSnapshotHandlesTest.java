@@ -32,7 +32,7 @@ class RatisTrackedSnapshotHandlesTest {
                 assertThrows(IllegalArgumentException.class,() -> registry.open(id,f.fence.participant(f.data.f.groupId).scope(),ttl));
                 assertThrows(IllegalArgumentException.class,() -> registry.captureSnapshot(id,f.snapshots.homes,f.fence,1,ttl));
                 assertThrows(IllegalArgumentException.class,() -> registry.captureSnapshot(id,f.snapshots.homes,f.fence,0,Duration.ofSeconds(11)));
-                var changed=new SnapshotFence(f.fence.clusterId(),f.fence.databaseId(),f.fence.domainId(),f.fence.fenceId(),f.fence.homeGroup(),f.fence.homeEpoch(),f.fence.operation(),f.fence.directoryGeneration()+1,f.fence.schemaEpoch(),f.fence.schemaDigest(),f.fence.participants());
+                var changed=new SnapshotFence(f.fence.clusterId(), f.fence.databaseId(), f.fence.fenceId(), f.fence.homeGroup(), f.fence.homeEpoch(), f.fence.operation(), f.fence.domains().stream().map(d -> new DomainBinding(d.domainId(),d.directoryGeneration()+1,d.directoryDigest(),d.schemaEpoch(),d.schemaDigest())).toList(), f.fence.participants());
                 assertThrows(IllegalArgumentException.class,() -> registry.captureSnapshot(id,f.snapshots.homes,changed,0,ttl));
                 clock.set(ttl.toNanos()); registry.expire(); assertEquals(0,registry.chargedHandles()); assertEquals(0,f.data.f.store.activeTrackedSnapshotPins());
                 assertThrows(IOException.class,() -> registry.captureSnapshot(id,f.snapshots.homes,f.fence,0,ttl)); assertEquals(0,registry.chargedHandles());

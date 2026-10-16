@@ -68,8 +68,8 @@ public final class RatisLogicalSnapshotPages {
         if (Objects.requireNonNull(owners).isEmpty() || owners.size()>MAX_PARTITIONS) throw new IllegalArgumentException("Invalid frozen snapshot owner count");
         var frozen=new ArrayList<>(List.copyOf(owners)); frozen.sort((a,b) -> compareLower(a.route().lowerInclusive(),b.route().lowerInclusive()));
         var fence=frozen.getFirst().target().fence(); var groups=new HashSet<UUID>(); byte[] previousUpper=null; boolean first=true;
-        if (!schema.clusterId().equals(fence.clusterId()) || !schema.databaseId().equals(fence.databaseId()) || !schema.domainId().equals(fence.domainId())
-                || schema.schemaEpoch()!=fence.schemaEpoch() || !Arrays.equals(schema.digest(),fence.schemaDigest())) throw new IllegalArgumentException("Logical schema differs from frozen snapshot");
+        if (!schema.clusterId().equals(fence.clusterId()) || !schema.databaseId().equals(fence.databaseId()) || fence.domains().size()!=1 || !schema.domainId().equals(fence.domains().getFirst().domainId())
+                || schema.schemaEpoch()!=fence.domain(schema.domainId()).schemaEpoch() || !Arrays.equals(schema.digest(),fence.domain(schema.domainId()).schemaDigest())) throw new IllegalArgumentException("Logical schema differs from frozen snapshot");
         for (var owner:frozen) {
             if (!owner.target().fence().equals(fence) || !groups.add(owner.route().groupId()) || !first && (previousUpper==null || owner.route().lowerInclusive()==null || Arrays.compareUnsigned(previousUpper,owner.route().lowerInclusive())>0)) throw new IllegalArgumentException("Frozen snapshot routes overlap or change definition");
             previousUpper=owner.route().upperExclusive(); first=false;

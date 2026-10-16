@@ -14,8 +14,8 @@ class NativeSnapshotHomeRetirementTest {
     final NativeHomeRecoveryTest helper=new NativeHomeRecoveryTest();
     final UUID cluster=new UUID(0,20),database=new UUID(0,21),dataGroup=new UUID(0,30);
     SnapshotFence fence(long epoch) {
-        return new SnapshotFence(cluster,database,new UUID(0,22),new UUID(0,100),helper.group,1,new OperationId(new UUID(0,23),epoch,0),1,1,new byte[32],List.of(
-                new SnapshotFence.Participant(new UUID(0,31),dataGroup,1,new byte[32],new OperationId(new UUID(0,32),epoch,0),new OperationId(new UUID(0,32),epoch,1),new TransactionScope(List.of(TransactionScope.Span.point(new UUID(0,33),new byte[]{1}))))));
+        return new SnapshotFence(cluster, database, new UUID(0,100), helper.group, 1, new OperationId(new UUID(0,23),epoch,0), List.of(new DomainBinding(new UUID(0,22), 1, new byte[32], 1, new byte[32])), List.of(
+                new SnapshotFence.Participant(new UUID(0,22), new UUID(0,31), dataGroup, 1, new byte[32], new OperationId(new UUID(0,32),epoch,0), new OperationId(new UUID(0,32),epoch,1), new TransactionScope(List.of(TransactionScope.Span.point(new UUID(0,33),new byte[]{1}))))));
     }
     byte[] key(SnapshotFence fence) { return ByteBuffer.allocate(16).putLong(fence.fenceId().getMostSignificantBits()).putLong(fence.fenceId().getLeastSignificantBits()).array(); }
     SnapshotHomeIdentity identity(SnapshotFence fence) { return new SnapshotHomeIdentity(helper.group,1,new byte[32],helper.column,fence); }
@@ -78,7 +78,7 @@ class NativeSnapshotHomeRetirementTest {
             helper.apply(f,3,cas(1,initial,consumed)); f.store.applySnapshotHomeRetirement(new ApplyPosition(1,4),retirement);
             var newer=fence(2); var next=SnapshotFenceStatus.begin(newer); helper.apply(f,5,cas(2,null,next)); assertTrue(f.store.snapshotHomeRetired(retirement)); f.store.applySnapshotHomeRetirement(new ApplyPosition(1,6),retirement);
             try (var pin=f.store.capture()) { assertArrayEquals(next.encode(),pin.get(helper.column,key(newer))); assertTrue(pin.snapshotHomeRetired(retirement)); }
-            var changed=new SnapshotFence(newer.clusterId(),newer.databaseId(),newer.domainId(),newer.fenceId(),newer.homeGroup(),newer.homeEpoch(),newer.operation(),2,newer.schemaEpoch(),newer.schemaDigest(),newer.participants()); assertThrows(IllegalArgumentException.class,() -> f.store.snapshotHomeFence(identity(changed)));
+            var changed=new SnapshotFence(newer.clusterId(), newer.databaseId(), newer.fenceId(), newer.homeGroup(), newer.homeEpoch(), newer.operation(), newer.domains().stream().map(d -> new DomainBinding(d.domainId(),2,d.directoryDigest(),d.schemaEpoch(),d.schemaDigest())).toList(), newer.participants()); assertThrows(IllegalArgumentException.class,() -> f.store.snapshotHomeFence(identity(changed)));
             var schema=new byte[32]; schema[0]=1; assertThrows(IllegalArgumentException.class,() -> f.store.snapshotHomeFence(new SnapshotHomeIdentity(helper.group,1,schema,helper.column,newer)));
             assertThrows(IllegalArgumentException.class,() -> f.store.configureHomeRecoveryReservations(cluster,database,helper.column));
         }

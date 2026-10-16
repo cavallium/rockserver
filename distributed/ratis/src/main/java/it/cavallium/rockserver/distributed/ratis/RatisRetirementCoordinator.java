@@ -88,11 +88,11 @@ public final class RatisRetirementCoordinator implements AutoCloseable {
     }
     private void execute(RatisRetirementOperation operation) throws IOException {
         switch (operation.type()) {
-            case PARTICIPANT -> data(operation.participant().consumed().domainId()).retireParticipant(operation.participant());
+            case PARTICIPANT -> data(operation.participant().finalization().participant().domainId()).retireParticipant(operation.participant());
             case HOME -> { if (homes==null) throw new IOException("Transaction HOME client missing"); homes.retire(operation.home()); }
-            case SNAPSHOT_GATE -> data(operation.snapshotGate().consumed().fence().domainId()).retireSnapshotGate(operation.snapshotGate());
+            case SNAPSHOT_GATE -> data(operation.snapshotGate().consumed().fence().participant(operation.snapshotGate().participantGroup()).domainId()).retireSnapshotGate(operation.snapshotGate());
             case SNAPSHOT_HOME -> { if (snapshots==null) throw new IOException("Snapshot HOME client missing"); snapshots.retire(operation.snapshotHome()); }
-            case RELEASE -> {var client=data(operation.release().fence().domainId());client.executeSnapshotGate(client.prepareSnapshotGate(operation.release()));}
+            case RELEASE -> {var client=data(operation.release().fence().participant(operation.release().participantGroup()).domainId());client.executeSnapshotGate(client.prepareSnapshotGate(operation.release()));}
         }
     }
     private boolean discoverOne() throws IOException {
@@ -114,7 +114,7 @@ public final class RatisRetirementCoordinator implements AutoCloseable {
         if (orphan) return submit(RatisRetirementOperation.home(new HomeRetirement(identity,null,List.of())));
         var participants=status.participants(); int start=(Math.floorMod(status.transactionId().hashCode(),participants.size())+round)%participants.size();
         var participant=participants.get(start); var original=new ParticipantIdentity(page.groupId(),page.rangeEpoch(),participant.groupId(),status);
-        var data=data(status.domainId());
+        var data=data(participant.domainId());
         var proof=data.participantFence(original);
         if (proof==null) {
             if (data.stateView(participant.groupId()).minimumSessionEpoch()<=status.operation().epoch()) return false;
@@ -126,14 +126,14 @@ public final class RatisRetirementCoordinator implements AutoCloseable {
         if (page.minimumEpoch()<=status.operation().epoch()) return false;
         var proofs=new ArrayList<ParticipantFenceProof>(participants.size());
         for (int n=0;n<participants.size();n++) {
-            var p=participants.get(n); var actual=n==start ? proof : data.participantFence(new ParticipantIdentity(page.groupId(),page.rangeEpoch(),p.groupId(),status));
+            var p=participants.get(n); var actual=n==start ? proof : data(p.domainId()).participantFence(new ParticipantIdentity(page.groupId(),page.rangeEpoch(),p.groupId(),status));
             if (actual==null) return false; proofs.add(actual);
         }
         return submit(RatisRetirementOperation.home(new HomeRetirement(identity,status,proofs)));
     }
     private boolean snapshot(ReplicatedRangeStore.RetirementPage page,SnapshotFenceStatus status,int round) throws IOException {
         var fence=status.fence(); var participants=fence.participants(); int start=(Math.floorMod(fence.fenceId().hashCode(),participants.size())+round)%participants.size(); UUID group=participants.get(start).groupId();
-        var data=data(fence.domainId());
+        var data=data(fence.participant(group).domainId());
         var proof=data.snapshotFence(fence,group);
         if (proof==null) {
             if (data.stateView(group).minimumSessionEpoch()<=fence.operation().epoch()) return false;
@@ -152,7 +152,7 @@ public final class RatisRetirementCoordinator implements AutoCloseable {
         var fence=status.fence(); if (page.minimumEpoch()<=fence.operation().epoch()) return false;
         var proofs=new ArrayList<SnapshotFenceProof>(fence.participants().size());
         for (int n=0;n<fence.participants().size();n++) {
-            UUID group=fence.participants().get(n).groupId(); var actual=n==start ? proof : data(fence.domainId()).snapshotFence(fence,group); if (actual==null) return false; proofs.add(actual);
+            UUID group=fence.participants().get(n).groupId(); var actual=n==start ? proof : data(fence.participant(group).domainId()).snapshotFence(fence,group); if (actual==null) return false; proofs.add(actual);
         }
         var identity=new SnapshotHomeIdentity(page.groupId(),page.rangeEpoch(),page.schemaDigest(),page.columnId(),fence);
         return submit(RatisRetirementOperation.snapshotHome(new SnapshotHomeRetirement(identity,status,proofs)));

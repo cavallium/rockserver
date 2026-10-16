@@ -115,7 +115,7 @@ class RatisParticipantRecoveryRegistryTest {
             var limits=new RatisParticipantRecoveryRegistry.Limits(1,1,RatisDurableParticipantRecovery.MAX_BYTES);
             try (var registry=registry(path,f,false,limits)) {
                 for (int n=0;n<24;n++) {
-                    var definition=TransactionStatus.begin(before.clusterId(),before.databaseId(),before.domainId(),new UUID(99,n),before.operation(),before.schemaEpoch(),before.schemaDigest(),before.planDigest(),before.participants());
+                    var definition=TransactionStatus.begin(before.clusterId(), before.databaseId(), new UUID(99,n), before.operation(), before.domains(), before.planDigest(), before.participants());
                     var forged=new PreparedParticipant(new PreparedParticipant.Preparation(original.homeGroup(),original.homeEpoch(),original.operation(),definition,original.business()),nativePrepared.position());
                     assertThrows(IOException.class,() -> registry.step(f.right.f.groupId,forged)); assertEquals(0,registry.stats().persistedFiles()); assertEquals(0,registry.stats().reservedBytes());
                     try (var files=Files.list(path)) { assertEquals(1,files.count(),"Only the owned registry lock remains"); }

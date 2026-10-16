@@ -56,8 +56,7 @@ class RatisRetirementFairnessTest {
         assertArrayEquals(new byte[]{7},f.data.read(fixtures.column,new byte[]{1})); assertArrayEquals(new byte[]{8},f.data.read(fixtures.column,new byte[]{(byte)130}));
     }
     RatisRoutedClient.PreparedHomeRecoveryOperation orphan(RatisParticipantPrepareTest.Node home,UUID cluster,UUID database,UUID domain) throws Exception {
-        var absent=new UUID(121,2); var initial=TransactionStatus.begin(cluster,database,domain,new UUID(121,3),new OperationId(new UUID(121,4),1,0),1,new byte[32],new byte[32],
-                List.of(new TransactionStatus.Participant(absent,absent,1,new byte[32],new byte[32],null,false)));
+        var absent=new UUID(121,2); var initial=TransactionStatus.begin(cluster, database, new UUID(121,3), new OperationId(new UUID(121,4),1,0), List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(domain, absent, absent, 1, new byte[32], new byte[32], null, false)));
         var request=home.statuses.prepareRecovery(new OperationId(new UUID(121,5),0,0),initial,initial.decide(TransactionStatus.Phase.ABORT),null);
         assertEquals(CommandResult.Status.CONFLICT,home.statuses.executeRecovery(request).result().status()); assertNull(home.statuses.read(initial.transactionId())); return request;
     }

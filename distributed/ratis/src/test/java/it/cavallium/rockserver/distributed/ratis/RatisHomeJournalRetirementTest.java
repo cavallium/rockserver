@@ -116,8 +116,7 @@ class RatisHomeJournalRetirementTest {
                 var outcome=finalizeForeign(f,commit); consumeAndRetire(f,outcome,commit.finalized(f.data.f.groupId));
             }
             var original=f.plan.initial();
-            var reused=TransactionStatus.begin(original.clusterId(),original.databaseId(),original.domainId(),original.transactionId(),
-                    new OperationId(new UUID(0,2998),2,0),original.schemaEpoch(),original.schemaDigest(),original.planDigest(),original.participants());
+            var reused=TransactionStatus.begin(original.clusterId(), original.databaseId(), original.transactionId(), new OperationId(new UUID(0,2998),2,0), original.domains(), original.planDigest(), original.participants());
             assertEquals(CommandResult.Status.SUCCESS,f.home.statuses.execute(f.home.statuses.prepare(new OperationId(new UUID(0,2999),2,0),null,reused)).status());
             f.reopen(); assertFullExpired(f,commit); long writes=writes(f);
             for (int n=0;n<2;n++) try (var local=RatisDurableParticipantRecovery.reopen(localPath,f.home.statuses,f.data.routed);

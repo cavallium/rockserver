@@ -56,7 +56,7 @@ class RatisHomeRetirementRpcTest {
             assertNull(f.home.statuses.read(f.initial.transactionId()));
             f.home.f.machine.takeSnapshot(); f.home.f.machine.pause(); f.home.f.machine.reinitialize(); index=f.home.wire.index;
             f.home.statuses.retire(retirement); assertEquals(index,f.home.wire.index);
-            var initial=f.initial; var next=TransactionStatus.begin(initial.clusterId(),initial.databaseId(),initial.domainId(),initial.transactionId(),new OperationId(new UUID(81,3),6,0),initial.schemaEpoch(),initial.schemaDigest(),initial.planDigest(),initial.asInitial().participants());
+            var initial=f.initial; var next=TransactionStatus.begin(initial.clusterId(), initial.databaseId(), initial.transactionId(), new OperationId(new UUID(81,3),6,0), List.of(new DomainBinding(initial.domains().getFirst().domainId(), 0, new byte[32], initial.domains().getFirst().schemaEpoch(), initial.domains().getFirst().schemaDigest())), initial.planDigest(), initial.asInitial().participants());
             assertEquals(CommandResult.Status.SUCCESS,f.home.statuses.execute(f.home.statuses.prepare(new OperationId(new UUID(81,4),6,0),null,next)).status());
             f.home.statuses.retire(retirement); assertEquals(next,f.home.statuses.read(next.transactionId()));
             assertThrows(RatisHomeRetiredException.class,() -> f.home.statuses.executeRecovery(recovery)); x.released();
@@ -65,8 +65,7 @@ class RatisHomeRetirementRpcTest {
     @Test void orphanConflictCleanupNeedsNoDataReaderOrInventedDecision() throws Exception {
         var helper=new RatisParticipantPrepareTest(); helper.root=root;
         try (var home=helper.new Node("orphan",true)) {
-            UUID absent=new UUID(82,1); var initial=TransactionStatus.begin(helper.cluster,helper.database,new UUID(82,2),new UUID(82,3),new OperationId(new UUID(82,4),1,0),1,new byte[32],new byte[32],
-                    List.of(new TransactionStatus.Participant(absent,absent,1,new byte[32],new byte[32],null,false)));
+            UUID absent=new UUID(82,1); var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(82,3), new OperationId(new UUID(82,4),1,0), List.of(new DomainBinding(new UUID(82,2), 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(new UUID(82,2), absent, absent, 1, new byte[32], new byte[32], null, false)));
             var frozen=home.statuses.prepareRecovery(new OperationId(new UUID(82,5),0,0),initial,initial.decide(TransactionStatus.Phase.ABORT),null);
             assertEquals(CommandResult.Status.CONFLICT,home.statuses.executeRecovery(frozen).result().status()); assertEquals(1,home.f.store.homeRecoveryCapacity().count());
             home.wire.command(home.directory.ranges().getFirst(),DistributedCommand.advanceSessionEpochFloor(home.f.groupId,1,new byte[32],new OperationId(new UUID(82,6),3,0),3));

@@ -15,7 +15,7 @@ class RatisRemoteParticipantAuthorizationTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     final RatisParticipantPrepareTest helper=new RatisParticipantPrepareTest();
     TransactionStatus register(RatisParticipantPrepareTest.Node home,RatisParticipantPrepareTest.Node data,DistributedCommand accepted) throws Exception {
-        var initial=TransactionStatus.begin(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,48000),accepted.operationId(),1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(data.f.groupId,data.f.groupId,1,new byte[32],accepted.payloadDigest(),null,false)));
+        var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(0,48000), accepted.operationId(), List.of(new DomainBinding(data.directory.domainId(), data.directory.generation(), data.directory.payloadDigest(), 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(data.directory.domainId(), data.f.groupId, data.f.groupId, 1, new byte[32], accepted.payloadDigest(), null, false)));
         home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,0),null,initial)); return initial;
     }
     @Test void remoteReadParticipantPreparesOriginalScopeAndCommitsWithoutUserEffects() throws Exception {

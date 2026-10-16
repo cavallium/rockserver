@@ -26,9 +26,9 @@ class RatisCapturedTransactionPlanTest {
             for (int n=0;n<f.directory.ranges().size();n++) {
                 var route=f.directory.ranges().get(n); byte[] low={(byte)(n==0 ? 1 : 200)},high={(byte)(n==0 ? 5 : 205)};
                 var scope=new TransactionScope(List.of(TransactionScope.Span.range(column,low,high)));
-                participants.add(new SnapshotFence.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),f.schema.digest(),operation(20+n*2),operation(21+n*2),scope));
+                participants.add(new SnapshotFence.Participant(f.directory.domainId(), route.rangeId(), route.groupId(), route.rangeEpoch(), f.schema.digest(), operation(20+n*2), operation(21+n*2), scope));
             }
-            var fence=new SnapshotFence(f.directory.clusterId(),f.directory.databaseId(),f.directory.domainId(),new UUID(180,1),f.snapshotGroup,1,operation(10),f.directory.generation(),f.directory.schemaEpoch(),f.schema.digest(),participants);
+            var fence=new SnapshotFence(f.directory.clusterId(), f.directory.databaseId(), new UUID(180,1), f.snapshotGroup, 1, operation(10), List.of(new DomainBinding(f.directory.domainId(), f.directory.generation(), f.directory.payloadDigest(), f.directory.schemaEpoch(), f.schema.digest())), participants);
             var initial=SnapshotFenceStatus.begin(fence); snapshotPath=f.root.resolve("writable-snapshot.journal");
             RatisDurableSnapshot.Snapshot captured;
             try (var journal=RatisDurableSnapshot.create(snapshotPath,f.snapshots,f.data,initial,f.snapshots.prepare(operation(30),null,initial),f.directory.ranges(),TTL,RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED);

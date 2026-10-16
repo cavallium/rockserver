@@ -10,9 +10,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class ParticipantRetirementTest {
     final UUID home=new UUID(0,1),data=new UUID(0,2),transaction=new UUID(0,3),column=new UUID(0,4);
     TransactionStatus initial() {
-        return TransactionStatus.begin(new UUID(0,5),new UUID(0,6),new UUID(0,7),transaction,
-                new OperationId(new UUID(0,8),1,0),1,new byte[32],new byte[32],
-                List.of(new TransactionStatus.Participant(data,data,1,new byte[32],new byte[32],null,false)));
+        return TransactionStatus.begin(new UUID(0,5), new UUID(0,6), transaction, new OperationId(new UUID(0,8),1,0), List.of(new DomainBinding(new UUID(0,7), 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(new UUID(0,7), data, data, 1, new byte[32], new byte[32], null, false)));
     }
     ParticipantIdentity identity(TransactionStatus status) { return new ParticipantIdentity(home,1,data,status); }
     ParticipantFenceProof fence(TransactionStatus status,long floor,long term,long index) {

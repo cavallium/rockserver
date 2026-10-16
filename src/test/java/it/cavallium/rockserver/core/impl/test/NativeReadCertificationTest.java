@@ -27,7 +27,7 @@ class NativeReadCertificationTest {
         try (var f=outer.new Fixture(source,true)) {
             helper.enable(f); f.apply(1,helper.put(f,0,1,7)); DistributedCommand accepted;
             try (var pin=f.store.captureTracked(helper.point(outer.fixed,1))) { accepted=f.store.planReadCertification(pin,new OperationId(outer.session,1,10),3,incarnation); }
-            var registration=TransactionStatus.begin(outer.cluster,outer.database,outer.domain,new UUID(0,501),accepted.operationId(),1,f.schema.digest(),new byte[32],List.of(new TransactionStatus.Participant(outer.group,outer.group,1,f.schema.digest(),accepted.payloadDigest(),null,false)));
+            var registration=TransactionStatus.begin(outer.cluster, outer.database, new UUID(0,501), accepted.operationId(), List.of(new DomainBinding(outer.domain, 0, new byte[32], 1, f.schema.digest())), new byte[32], List.of(new TransactionStatus.Participant(outer.domain, outer.group, outer.group, 1, f.schema.digest(), accepted.payloadDigest(), null, false)));
             preparation=new PreparedParticipant.Preparation(new UUID(0,100),1,new OperationId(new UUID(0,101),1,0),registration,accepted);
             assertNull(f.store.estimatePreparation(preparation).existing());
             vote=f.store.applyPrepared(new ApplyPosition(1,2),preparation).position(); assertEquals(1,f.store.preparedCapacity().count()); assertTrue(f.store.preparedCapacity().scopeBytes()>0);

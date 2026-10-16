@@ -116,8 +116,8 @@ class RatisParticipantPrepareTest {
     TransactionScope scope(Node node,int lower,int upper) { return new TransactionScope(List.of(TransactionScope.Span.range(node.f.column,new byte[]{(byte)lower},new byte[]{(byte)upper}))); }
     TransactionStatus register(Node home,Node data,ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,long n) throws Exception {
         byte[] digest=data.f.machine.participantPlanDigest(pin,business);
-        var definition=new TransactionStatus.Participant(data.f.groupId,data.f.groupId,1,new byte[32],digest,null,false);
-        var registration=TransactionStatus.begin(cluster,database,data.directory.domainId(),new UUID(0,100+n),business.operationId(),1,new byte[32],new byte[32],List.of(definition));
+        var definition=new TransactionStatus.Participant(data.directory.domainId(), data.f.groupId, data.f.groupId, 1, new byte[32], digest, null, false);
+        var registration=TransactionStatus.begin(cluster, database, new UUID(0,100+n), business.operationId(), List.of(new DomainBinding(data.directory.domainId(), data.directory.generation(), data.directory.payloadDigest(), 1, new byte[32])), new byte[32], List.of(definition));
         assertEquals(CommandResult.Status.SUCCESS,home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,n),null,registration)).status()); return registration;
     }
     void released(Node data) throws Exception { assertEquals(0,data.f.machine.reservedParticipantCount()); assertEquals(0,data.f.machine.reservedParticipantBytes()); data.f.assertReleased(); }
@@ -320,8 +320,8 @@ class RatisParticipantPrepareTest {
             var rightScope=new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{(byte)130})));
             try (var lp=left.f.store.captureTracked(leftScope); var rp=right.f.store.captureTracked(rightScope); var routed=new RatisRoutedClient(directory,transport)) {
                 var ld=left.f.machine.participantPlanDigest(lp,lb); var rd=right.f.machine.participantPlanDigest(rp,rb);
-                var registration=TransactionStatus.begin(cluster,database,domain,new UUID(0,800),businessId,1,new byte[32],new byte[32],List.of(
-                        new TransactionStatus.Participant(l.rangeId(),l.groupId(),1,new byte[32],ld,null,false),new TransactionStatus.Participant(r.rangeId(),r.groupId(),1,new byte[32],rd,null,false)));
+                var registration=TransactionStatus.begin(cluster, database, new UUID(0,800), businessId, List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), new byte[32], List.of(
+                        new TransactionStatus.Participant(domain, l.rangeId(), l.groupId(), 1, new byte[32], ld, null, false),new TransactionStatus.Participant(domain, r.rangeId(), r.groupId(), 1, new byte[32], rd, null, false)));
                 home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,900),1,0),null,registration));
                 try (var lplan=left.f.machine.prepareParticipant(lp,lb,control(0),home.statuses,registration.transactionId()); var rplan=right.f.machine.prepareParticipant(rp,rb,control(1),home.statuses,registration.transactionId())) {
                     var lv=routed.executeParticipant(routed.prepareParticipant(lplan.preparation())).position(); var rv=routed.executeParticipant(routed.prepareParticipant(rplan.preparation())).position();

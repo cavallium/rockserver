@@ -19,11 +19,11 @@ class RatisSnapshotFencesTest {
     SnapshotFenceStatus initial(RangeDirectory directory) {
         var scope=new TransactionScope(List.of(TransactionScope.Span.range(dataColumn,new byte[]{1},new byte[]{8})));
         byte[] dataSchema=new byte[32]; dataSchema[0]=7;
-        var participants=List.of(new SnapshotFence.Participant(a,a,1,dataSchema,control(0),control(1),scope),new SnapshotFence.Participant(b,b,1,dataSchema,control(2),control(3),scope));
-        return SnapshotFenceStatus.begin(new SnapshotFence(directory.clusterId(),directory.databaseId(),new UUID(0,30),new UUID(0,31),directory.ranges().getFirst().groupId(),1,new OperationId(new UUID(0,31),1,0),2,3,dataSchema,participants));
+        var participants=List.of(new SnapshotFence.Participant(new UUID(0,30), a, a, 1, dataSchema, control(0), control(1), scope),new SnapshotFence.Participant(new UUID(0,30), b, b, 1, dataSchema, control(2), control(3), scope));
+        return SnapshotFenceStatus.begin(new SnapshotFence(directory.clusterId(), directory.databaseId(), new UUID(0,31), directory.ranges().getFirst().groupId(), 1, new OperationId(new UUID(0,31),1,0), List.of(new DomainBinding(new UUID(0,30), 2, new byte[32], 3, dataSchema)), participants));
     }
     SnapshotFenceStatus withHome(SnapshotFenceStatus initial,UUID home,long epoch) {
-        var f=initial.fence(); return SnapshotFenceStatus.begin(new SnapshotFence(f.clusterId(),f.databaseId(),f.domainId(),f.fenceId(),home,epoch,f.operation(),f.directoryGeneration(),f.schemaEpoch(),f.schemaDigest(),f.participants()));
+        var f=initial.fence(); return SnapshotFenceStatus.begin(new SnapshotFence(f.clusterId(), f.databaseId(), f.fenceId(), home, epoch, f.operation(), f.domains(), f.participants()));
     }
     SnapshotFenceStatus.Capture capture(long id,ApplyPosition position) { return new SnapshotFenceStatus.Capture(new UUID(0,id),new UUID(0,id+1),position); }
     RatisRoutedClient.Transport transport(RatisTransactionRpcTest.Controlled wire) {
@@ -53,7 +53,7 @@ class RatisSnapshotFencesTest {
                 var complete=captured.complete(); homes.execute(homes.prepare(operation(6),captured,complete));
                 var lateAbort=homes.prepare(operation(7),ready,ready.abort()); assertEquals(CommandResult.Status.CONFLICT,homes.execute(lateAbort).status());
                 var read=homes.readRegistration(id); assertEquals(complete,read.status()); assertEquals(directory.ranges().getFirst(),read.descriptor());
-                assertNotEquals(directory.domainId(),complete.fence().domainId()); assertFalse(Arrays.equals(directory.schemaDigest(),complete.fence().schemaDigest()),"Home schema is independent of frozen data schema");
+                assertNotEquals(directory.domainId(),complete.fence().domains().getFirst().domainId()); assertFalse(Arrays.equals(directory.schemaDigest(),complete.fence().domains().getFirst().schemaDigest()),"Home schema is independent of frozen data schema");
                 f.machine.takeSnapshot(); f.machine.pause(); f.machine.reinitialize(); assertEquals(complete,homes.read(id));
                 assertEquals(CommandResult.Status.SUCCESS,homes.execute(begin).status()); assertEquals(complete,homes.read(id));
                 var ack=routed.prepareAcknowledgement(operation(8),f.column,begin.command().mutations().getFirst().key(),7); assertEquals(CommandResult.Status.SUCCESS,homes.execute(ack).status());
@@ -80,7 +80,7 @@ class RatisSnapshotFencesTest {
             var ready=initial.ready(a,new ApplyPosition(1,1)).ready(b,new ApplyPosition(1,2));
             assertThrows(IllegalArgumentException.class,() -> homes.prepare(operation(4),initial,ready)); assertThrows(IllegalArgumentException.class,() -> homes.prepare(operation(4),null,initial.abort()));
             var abort=initial.abort(); assertThrows(IllegalArgumentException.class,() -> homes.prepare(operation(4),abort,abort));
-            var fence=initial.fence(); var changed=SnapshotFenceStatus.begin(new SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),fence.fenceId(),fence.homeGroup(),1,fence.operation(),3,3,fence.schemaDigest(),fence.participants())).ready(a,new ApplyPosition(1,1));
+            var fence=initial.fence(); var changed=SnapshotFenceStatus.begin(new SnapshotFence(fence.clusterId(), fence.databaseId(), fence.fenceId(), fence.homeGroup(), 1, fence.operation(), List.of(new DomainBinding(fence.domains().getFirst().domainId(), 3, new byte[32], 3, fence.domains().getFirst().schemaDigest())), fence.participants())).ready(a,new ApplyPosition(1,1));
             assertThrows(IllegalArgumentException.class,() -> homes.prepare(operation(4),initial,changed));
         }
     }
@@ -110,8 +110,8 @@ class RatisSnapshotFencesTest {
         try (var f=helper.fixture("snapshot-capacity")) {
             var directory=helper.directory(f); var base=initial(directory).fence();
             var scope=new TransactionScope(List.of(TransactionScope.Span.point(dataColumn,new byte[DistributedCommandCodec.MAX_ENCODED_BYTES/2])));
-            var participant=new SnapshotFence.Participant(a,a,1,new byte[32],control(0),control(1),scope);
-            var oversized=SnapshotFenceStatus.begin(new SnapshotFence(base.clusterId(),base.databaseId(),base.domainId(),base.fenceId(),base.homeGroup(),1,base.operation(),2,3,base.schemaDigest(),List.of(participant)));
+            var participant=new SnapshotFence.Participant(new UUID(0,30), a, a, 1, new byte[32], control(0), control(1), scope);
+            var oversized=SnapshotFenceStatus.begin(new SnapshotFence(base.clusterId(), base.databaseId(), base.fenceId(), base.homeGroup(), 1, base.operation(), List.of(new DomainBinding(base.domains().getFirst().domainId(), 2, new byte[32], 3, base.domains().getFirst().schemaDigest())), List.of(participant)));
             var calls=new AtomicInteger(); var transport=new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { return null; }
                 public java.util.concurrent.CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID column,byte[] key){return java.util.concurrent.CompletableFuture.completedFuture(null);}

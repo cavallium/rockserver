@@ -10,8 +10,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class RatisWritableCaptureCodecTest {
     final UUID owner=new UUID(0,10),snapshot=new UUID(0,11);
     final ApplyPosition position=new ApplyPosition(3,7);
-    final SnapshotFence fence=new SnapshotFence(new UUID(0,1),new UUID(0,2),new UUID(0,3),new UUID(0,4),new UUID(0,5),1,new OperationId(new UUID(0,6),1,0),1,1,new byte[32],List.of(
-            new SnapshotFence.Participant(new UUID(0,7),new UUID(0,8),1,new byte[32],new OperationId(new UUID(0,9),1,0),new OperationId(new UUID(0,9),1,1),new TransactionScope(List.of(TransactionScope.Span.point(new UUID(0,12),new byte[]{1}))))));
+    final SnapshotFence fence=new SnapshotFence(new UUID(0,1), new UUID(0,2), new UUID(0,4), new UUID(0,5), 1, new OperationId(new UUID(0,6),1,0), List.of(new DomainBinding(new UUID(0,3), 1, new byte[32], 1, new byte[32])), List.of(
+            new SnapshotFence.Participant(new UUID(0,3), new UUID(0,7), new UUID(0,8), 1, new byte[32], new OperationId(new UUID(0,9),1,0), new OperationId(new UUID(0,9),1,1), new TransactionScope(List.of(TransactionScope.Span.point(new UUID(0,12),new byte[]{1}))))));
     RatisSnapshotCaptureRequest request(RatisSnapshotCaptureRequest.Mode mode) { return new RatisSnapshotCaptureRequest(fence,owner,snapshot,Duration.ofSeconds(30),mode); }
     SnapshotFenceStatus.Capture token() { return new SnapshotFenceStatus.Capture(owner,snapshot,position); }
     ScopedTransactionRpc.Handle handle() { return new ScopedTransactionRpc.Handle(owner,new UUID(0,13),4,position); }

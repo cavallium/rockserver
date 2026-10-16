@@ -40,11 +40,11 @@ class RatisLogicalSnapshotPagesTest {
                 var replica=new ReplicaDescriptor(new UUID(0,20+n),new UUID(0,30+n),new UUID(0,40+n),"frozen-"+n,"127.0.0.1:"+(12345+n),ReplicaDescriptor.Role.VOTER);
                 var route=new RangeDescriptor(group,group,1,0,low,high,RangeDescriptor.TopologyState.ACTIVE,List.of(replica)); routes.add(route);
                 var partScope=new TransactionScope(List.of(TransactionScope.Span.range(column,low,high)));
-                participants.add(new SnapshotFence.Participant(group,group,1,schema.digest(),new OperationId(new UUID(0,50+n),1,0),new OperationId(new UUID(0,50+n),1,1),partScope));
+                participants.add(new SnapshotFence.Participant(domain, group, group, 1, schema.digest(), new OperationId(new UUID(0,50+n),1,0), new OperationId(new UUID(0,50+n),1,1), partScope));
                 rows.put(group,new TreeMap<>(Arrays::compareUnsigned));
             }
             directory=new RangeDirectory(cluster,database,domain,1,schema.digest(),0,Set.of(column),0,routes);
-            fence=new SnapshotFence(cluster,database,domain,new UUID(0,60),new UUID(0,61),1,new OperationId(new UUID(0,62),1,0),0,1,schema.digest(),participants);
+            fence=new SnapshotFence(cluster, database, new UUID(0,60), new UUID(0,61), 1, new OperationId(new UUID(0,62),1,0), List.of(new DomainBinding(domain, 0, new byte[32], 1, schema.digest())), participants);
             scope=new TransactionScope(List.of(TransactionScope.Span.range(column,null,null)));
             data=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID col,byte[] key) { throw new AssertionError("No live read fallback"); }

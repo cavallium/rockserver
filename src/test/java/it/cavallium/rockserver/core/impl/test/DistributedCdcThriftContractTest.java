@@ -38,8 +38,8 @@ class DistributedCdcThriftContractTest {
     }
     private DistributedCdcSubscriptions.Batch batch(List<Mutation> mutations) {
         var position=new ApplyPosition(1,2);
-        var participant=new TransactionStatus.Participant(lineage.rangeId(),lineage.groupId(),1,new byte[32],new byte[32],null,false);
-        var decision=TransactionStatus.begin(id(1),id(2),id(3),id(60),operation,1,new byte[32],new byte[32],List.of(participant))
+        var participant=new TransactionStatus.Participant(id(3), lineage.rangeId(), lineage.groupId(), 1, new byte[32], new byte[32], null, false);
+        var decision=TransactionStatus.begin(id(1), id(2), id(60), operation, List.of(new DomainBinding(id(3), 0, new byte[32], 1, new byte[32])), new byte[32], List.of(participant))
                 .prepared(lineage.groupId(),new byte[32],new ApplyPosition(1,1)).decide(TransactionStatus.Phase.COMMIT);
         var transaction=new ParticipantFinalization(id(61),1,lineage.groupId(),new OperationId(id(62),0,0),decision);
         var events=new ArrayList<DistributedCdcRecord.Event>();

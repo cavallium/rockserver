@@ -22,8 +22,8 @@ final class RatisDatabaseBackupFixture {
         directory=new RangeDirectory(cluster,database,domain,0,schema.digest(),0,Set.of(column),0,ranges);
         var fences=new ArrayList<SnapshotFence>();var statuses=new ArrayList<SnapshotFenceStatus>();long sequence=0;
         for(int start=0;start<count;start+=64){var participants=new ArrayList<SnapshotFence.Participant>();var operation=new OperationId(session,1,sequence++);
-            for(var range:ranges.subList(start,Math.min(count,start+64)))participants.add(new SnapshotFence.Participant(range.rangeId(),range.groupId(),1,schema.digest(),new OperationId(session,1,sequence++),new OperationId(session,1,sequence++),new TransactionScope(List.of(TransactionScope.Span.range(column,range.lowerInclusive(),range.upperExclusive())))));
-            var fence=new SnapshotFence(cluster,database,domain,UUID.randomUUID(),UUID.randomUUID(),1,operation,0,0,schema.digest(),participants);fences.add(fence);
+            for(var range:ranges.subList(start,Math.min(count,start+64)))participants.add(new SnapshotFence.Participant(domain, range.rangeId(), range.groupId(), 1, schema.digest(), new OperationId(session,1,sequence++), new OperationId(session,1,sequence++), new TransactionScope(List.of(TransactionScope.Span.range(column,range.lowerInclusive(),range.upperExclusive())))));
+            var fence=new SnapshotFence(cluster, database, UUID.randomUUID(), UUID.randomUUID(), 1, operation, List.of(DomainBinding.of(directory)), participants);fences.add(fence);
             var status=SnapshotFenceStatus.begin(fence);for(var participant:participants)status=status.ready(participant.groupId(),cut);for(var participant:participants)status=status.capture(participant.groupId(),new SnapshotFenceStatus.Capture(owner.nodeIncarnation(),UUID.randomUUID(),cut));statuses.add(status);
         }
         definition=new DatabaseBackupDefinition(UUID.randomUUID(),new DatabaseDomainRoster(cluster,database,0,List.of(domain)),List.of(new DatabaseBackupDefinition.Domain(directory,schema,fences)),new DatabaseBackupDefinition.Limits(count,count,Math.max(count,4),archiveBytes,4*1024*1024));

@@ -18,8 +18,8 @@ class RatisTransactionStatusesTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     final UUID a=new UUID(0,20),b=new UUID(0,21);
     TransactionStatus initial(RangeDirectory directory) {
-        var participants=List.of(new TransactionStatus.Participant(a,a,1,new byte[32],new byte[32],null,false),new TransactionStatus.Participant(b,b,1,new byte[32],new byte[32],null,false));
-        return TransactionStatus.begin(directory.clusterId(),directory.databaseId(),new UUID(0,30),new UUID(0,31),new OperationId(new UUID(0,32),1,0),1,new byte[32],new byte[32],participants);
+        var participants=List.of(new TransactionStatus.Participant(new UUID(0,30), a, a, 1, new byte[32], new byte[32], null, false),new TransactionStatus.Participant(new UUID(0,30), b, b, 1, new byte[32], new byte[32], null, false));
+        return TransactionStatus.begin(directory.clusterId(), directory.databaseId(), new UUID(0,31), new OperationId(new UUID(0,32),1,0), List.of(new DomainBinding(new UUID(0,30), 0, new byte[32], 1, new byte[32])), new byte[32], participants);
     }
     OperationId operation(long n) { return new OperationId(new UUID(0,40),1,n); }
     @Test void decisionRaceLostRepliesAndConflictedIdentityRetriesNeverChangeTheChosenOutcome() throws Exception {
@@ -63,7 +63,7 @@ class RatisTransactionStatusesTest {
                 var ack=routed.prepareAcknowledgement(operation(9),f.column,begin.command().mutations().getFirst().key(),8);
                 assertEquals(CommandResult.Status.SUCCESS,statuses.execute(ack).status()); assertEquals(1,f.store.receiptUsage().retainedCount());
                 assertEquals(CommandResult.Status.SESSION_EXPIRED,statuses.execute(begin).status()); assertEquals(consumed,statuses.read(initial.transactionId()),"Receipt GC never deletes the transaction decision");
-                var recoveryTarget=TransactionStatus.begin(directory.clusterId(),directory.databaseId(),initial.domainId(),new UUID(0,50),initial.operation(),1,new byte[32],new byte[32],initial.participants());
+                var recoveryTarget=TransactionStatus.begin(directory.clusterId(), directory.databaseId(), new UUID(0,50), initial.operation(), List.of(new DomainBinding(initial.domains().getFirst().domainId(), 0, new byte[32], 1, new byte[32])), new byte[32], initial.participants());
                 statuses.execute(statuses.prepare(operation(10),null,recoveryTarget));
                 var floor=DistributedCommand.advanceSessionEpochFloor(f.groupId,1,new byte[32],new OperationId(f.admin,2,0),2);
                 assertEquals(CommandResult.Status.SUCCESS,f.apply(f.propose(floor),++writes.index));

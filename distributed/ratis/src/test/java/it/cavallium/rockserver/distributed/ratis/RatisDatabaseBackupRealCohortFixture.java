@@ -65,7 +65,7 @@ final class RatisDatabaseBackupRealCohortFixture implements AutoCloseable {
         }
         public UUID nodeId(){return state.owner.nodeId();}public UUID nodeIncarnation(){return state.owner.nodeIncarnation();}public UUID processIncarnation(){return currentProcess;}public UUID poolId(){return state.poolId;}public DistributedStoragePool pool(){return state.nativePool;}public PoolSnapshotAdmission.Limits poolLimits(){return new PoolSnapshotAdmission.Limits(1,1L<<30,Duration.ofMinutes(5),0);}
         public RatisSnapshotCohortService.Member member(UUID group,SnapshotFence fence,boolean ready)throws Exception{
-            var store=state.stores.get(group);if(store==null)throw new IOException("Unknown actual member");if(fence!=null && (!fence.domainId().equals(state.domain) || !Arrays.equals(fence.schemaDigest(),state.schema.digest())))throw new IOException("Foreign fence");
+            var store=state.stores.get(group);if(store==null)throw new IOException("Unknown actual member");if(fence!=null && (!fence.domains().getFirst().domainId().equals(state.domain) || !Arrays.equals(fence.domains().getFirst().schemaDigest(),state.schema.digest())))throw new IOException("Foreign fence");
             if(ready && fence!=null && !store.snapshotGate(fence.fenceId()).active())throw new IOException("Actual native gate is not READY");
             return new RatisSnapshotCohortService.Member(store,registries.get(group),new RatisSnapshotOwner(group,1,state.schema.digest(),state.registryOwners.get(group),state.owner.peerId(),null),state.owner,0,1,RangeImportAdmission.sha256(store.configuration().data()),store.applied());
         }

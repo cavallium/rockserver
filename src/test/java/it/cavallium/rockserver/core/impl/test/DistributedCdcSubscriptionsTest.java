@@ -91,8 +91,8 @@ class DistributedCdcSubscriptionsTest {
         assertThrows(IllegalArgumentException.class,()->new DistributedCdcSubscriptions.Envelope(new ApplyPosition(1,1),new byte[32],operation,null,List.of(new DistributedCdcRecord.Event(new DistributedCdcCheckpoint.Cursor(new ApplyPosition(1,1),0),mutation),new DistributedCdcRecord.Event(new DistributedCdcCheckpoint.Cursor(new ApplyPosition(1,1),1),mutation))));
     }
     @Test void transactionMetadataBindsCommitOperationNamespaceAndPreparedLineage() {
-        var participant=new TransactionStatus.Participant(lineage.rangeId(),lineage.groupId(),1,new byte[32],new byte[32],null,false);
-        var committed=TransactionStatus.begin(id(1),id(2),id(3),id(60),operation,1,new byte[32],new byte[32],List.of(participant)).prepared(lineage.groupId(),new byte[32],new ApplyPosition(1,1)).decide(TransactionStatus.Phase.COMMIT);
+        var participant=new TransactionStatus.Participant(id(3), lineage.rangeId(), lineage.groupId(), 1, new byte[32], new byte[32], null, false);
+        var committed=TransactionStatus.begin(id(1), id(2), id(60), operation, List.of(new DomainBinding(id(3), 0, new byte[32], 1, new byte[32])), new byte[32], List.of(participant)).prepared(lineage.groupId(),new byte[32],new ApplyPosition(1,1)).decide(TransactionStatus.Phase.COMMIT);
         var transaction=new ParticipantFinalization(id(61),1,lineage.groupId(),new OperationId(id(62),0,0),committed);
         var envelope=new DistributedCdcSubscriptions.Envelope(new ApplyPosition(1,2),new byte[32],operation,transaction,List.of(event(2,0,column)));
         assertSame(transaction,batch(beginning,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,2)),new ApplyPosition(1,3),List.of(envelope)).envelopes().getFirst().transaction());

@@ -19,8 +19,7 @@ class RatisSnapshotRecordTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     final RatisParticipantPrepareTest helper=new RatisParticipantPrepareTest();
     SnapshotFence fence(RatisParticipantPrepareTest.Node data) {
-        return new SnapshotFence(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,400),new UUID(0,401),1,new OperationId(new UUID(0,400),1,0),0,1,new byte[32],
-                List.of(new SnapshotFence.Participant(data.f.groupId,data.f.groupId,1,new byte[32],new OperationId(new UUID(0,402),1,0),new OperationId(new UUID(0,402),1,1),helper.scope(data,1,4))));
+        return new SnapshotFence(helper.cluster, helper.database, new UUID(0,400), new UUID(0,401), 1, new OperationId(new UUID(0,400),1,0), List.of(new DomainBinding(data.directory.domainId(), 0, data.directory.payloadDigest(), 1, new byte[32])), List.of(new SnapshotFence.Participant(data.directory.domainId(), data.f.groupId, data.f.groupId, 1, new byte[32], new OperationId(new UUID(0,402),1,0), new OperationId(new UUID(0,402),1,1), helper.scope(data,1,4))));
     }
     static TransactionContext committed(RatisRangeStateMachine machine,long term,long index,RatisSnapshotRecord request) {
         return TransactionContext.newBuilder().setStateMachine(machine).setServerRole(RaftPeerRole.FOLLOWER)
@@ -124,7 +123,7 @@ class RatisSnapshotRecordTest {
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
                 public byte[] participant(RangeDescriptor route,byte[] record) { return new RatisSnapshotRecord.Result(null).encode(); }
                 public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) {
-                    var changed=new SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),fence.fenceId(),fence.homeGroup(),fence.homeEpoch(),fence.operation(),1,fence.schemaEpoch(),fence.schemaDigest(),fence.participants());
+                    var changed=new SnapshotFence(fence.clusterId(), fence.databaseId(), fence.fenceId(), fence.homeGroup(), fence.homeEpoch(), fence.operation(), fence.domains(), fence.participants());
                     var record=SnapshotGate.install(changed,data.f.groupId,new ApplyPosition(1,1)).encode();
                     return ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_GATE_STATE,ByteBuffer.allocate(4+record.length).putInt(record.length).put(record).array());
                 }

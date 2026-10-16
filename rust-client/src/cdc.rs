@@ -27,7 +27,7 @@ const ENVELOPE_HEADER_BYTES: usize = 92;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 pub const REROUTE_ORIGIN_BYTES: usize = 300;
-pub const MAX_FINALIZATION_BYTES: usize = 76 + 187 + REROUTE_ORIGIN_BYTES + 64 * 121;
+pub const MAX_FINALIZATION_BYTES: usize = 76 + 135 + 64 * 96 + REROUTE_ORIGIN_BYTES + 64 * 137;
 const MAX_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CHECKPOINT_BYTES: usize = 4 + 60 * MAX_LINEAGES;
 const MAX_DEFINITION_BYTES: usize = 120 + 16 * MAX_COLUMNS + MAX_CHECKPOINT_BYTES;
@@ -585,6 +585,7 @@ pub struct Event {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Participant {
+    pub domain_id: Id,
     pub lineage: Lineage,
     pub schema_digest: [u8; 32],
     pub plan_digest: [u8; 32],
@@ -679,15 +680,36 @@ impl RerouteOrigin {
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
-// Participant finalizations always carry the canonical NoEffectOutcome::NONE byte; empty HOME aborts have no participant.
+pub struct DomainBinding {
+    pub domain_id: Id,
+    pub directory_generation: i64,
+    pub directory_digest: [u8; 32],
+    pub schema_epoch: i64,
+    pub schema_digest: [u8; 32],
+}
+impl TryFrom<wire::CdcDomainBinding> for DomainBinding {
+    type Error = RpcStatus;
+    fn try_from(v: wire::CdcDomainBinding) -> Result<Self> {
+        if v.directory_generation < 0 || v.schema_epoch < 0 {
+            return Err(invalid("negative transaction domain generation/epoch"));
+        }
+        Ok(Self {
+            domain_id: id(v.domain_id)?,
+            directory_generation: v.directory_generation,
+            directory_digest: digest(v.directory_digest)?,
+            schema_epoch: v.schema_epoch,
+            schema_digest: digest(v.schema_digest)?,
+        })
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+// Participant finalizations carry NoEffectOutcome::NONE; empty HOME aborts have no participant.
 pub struct Decision {
     pub cluster_id: Id,
     pub database_id: Id,
-    pub domain_id: Id,
     pub transaction_id: Id,
     pub operation: OperationId,
-    pub schema_epoch: i64,
-    pub schema_digest: [u8; 32],
+    pub domains: Vec<DomainBinding>,
     pub plan_digest: [u8; 32],
     pub phase: DecisionPhase,
     pub participants: Vec<Participant>,
@@ -703,13 +725,14 @@ pub struct Finalization {
 }
 impl Finalization {
     fn budget_bytes(&self) -> usize {
-        76 + 187
+        76 + 135
+            + 96 * self.decision.domains.len()
             + self
                 .decision
                 .origin
                 .as_ref()
                 .map_or(0, |_| REROUTE_ORIGIN_BYTES)
-            + 121 * self.decision.participants.len()
+            + 137 * self.decision.participants.len()
     }
 }
 impl TryFrom<wire::CdcFinalization> for Finalization {
@@ -717,12 +740,29 @@ impl TryFrom<wire::CdcFinalization> for Finalization {
     fn try_from(v: wire::CdcFinalization) -> Result<Self> {
         let d = required(v.decision)?;
         if v.home_epoch < 0
-            || d.schema_epoch < 0
+            || d.domains.is_empty()
+            || d.domains.len() > 64
             || d.participants.is_empty()
             || d.participants.len() > 64
         {
             return Err(invalid("invalid CDC decision bounds"));
         }
+        let domains = d
+            .domains
+            .into_iter()
+            .map(DomainBinding::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        if domains
+            .windows(2)
+            .any(|pair| pair[0].domain_id >= pair[1].domain_id)
+        {
+            return Err(invalid("noncanonical transaction domain bindings"));
+        }
+        let by_domain = domains
+            .iter()
+            .map(|binding| (binding.domain_id, binding))
+            .collect::<BTreeMap<_, _>>();
+        let mut used_domains = HashSet::new();
         let mut groups = HashSet::new();
         let mut ranges = HashSet::new();
         let participants = d
@@ -743,14 +783,27 @@ impl TryFrom<wire::CdcFinalization> for Finalization {
                 if d.phase == DecisionPhase::DecisionCommit as i32 && prepared.is_none() {
                     return Err(invalid("unprepared CDC commit participant"));
                 }
+                let domain_id = id(p.domain_id)?;
+                let binding = by_domain
+                    .get(&domain_id)
+                    .ok_or_else(|| invalid("unregistered transaction participant domain"))?;
+                let schema_digest = digest(p.schema_digest)?;
+                if schema_digest != binding.schema_digest {
+                    return Err(invalid("participant schema differs from domain binding"));
+                }
+                used_domains.insert(domain_id);
                 Ok(Participant {
+                    domain_id,
                     lineage,
-                    schema_digest: digest(p.schema_digest)?,
+                    schema_digest,
                     plan_digest: digest(p.plan_digest)?,
                     prepared,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        if used_domains.len() != domains.len() {
+            return Err(invalid("transaction domain has no participant"));
+        }
         let result = Self {
             home_group: id(v.home_group)?,
             home_epoch: v.home_epoch,
@@ -759,11 +812,9 @@ impl TryFrom<wire::CdcFinalization> for Finalization {
             decision: Decision {
                 cluster_id: id(d.cluster_id)?,
                 database_id: id(d.database_id)?,
-                domain_id: id(d.domain_id)?,
                 transaction_id: id(d.transaction_id)?,
                 operation: required(d.operation)?.try_into()?,
-                schema_epoch: d.schema_epoch,
-                schema_digest: digest(d.schema_digest)?,
+                domains,
                 plan_digest: digest(d.plan_digest)?,
                 phase: DecisionPhase::try_from(d.phase)
                     .map_err(|_| invalid("unknown CDC decision phase"))?,
@@ -775,7 +826,9 @@ impl TryFrom<wire::CdcFinalization> for Finalization {
             let decision = &result.decision;
             if origin.cluster_id != decision.cluster_id
                 || origin.database_id != decision.database_id
-                || origin.domain_id != decision.domain_id
+                || decision.domains.len() != 1
+                || origin.domain_id != decision.domains[0].domain_id
+                || origin.target_directory_digest != decision.domains[0].directory_digest
                 || origin.transaction_id() != decision.transaction_id
                 || origin.operation != decision.operation
                 || origin.target_participant_count as usize != decision.participants.len()
@@ -1285,7 +1338,7 @@ impl TryFrom<wire::CdcBatch> for Batch {
                     || p.lineage != result.lineage
                     || d.cluster_id != result.definition.cluster_id
                     || d.database_id != result.definition.database_id
-                    || d.domain_id != result.definition.domain_id
+                    || p.domain_id != result.definition.domain_id
                 {
                     return Err(invalid("CDC transaction changed lineage/namespace"));
                 }
@@ -2531,15 +2584,20 @@ mod tests {
             decision: Some(wire::CdcDecision {
                 cluster_id: definition().cluster_id.to_vec(),
                 database_id: definition().database_id.to_vec(),
-                domain_id: definition().domain_id.to_vec(),
                 transaction_id: [14; 16].to_vec(),
                 operation: Some(operation()),
-                schema_epoch: 1,
-                schema_digest: [11; 32].to_vec(),
+                domains: vec![wire::CdcDomainBinding {
+                    domain_id: definition().domain_id.to_vec(),
+                    directory_generation: 0,
+                    directory_digest: [36; 32].to_vec(),
+                    schema_epoch: 1,
+                    schema_digest: [11; 32].to_vec(),
+                }],
                 plan_digest: [15; 32].to_vec(),
                 phase: DecisionPhase::DecisionCommit as i32,
                 origin: None,
                 participants: vec![wire::CdcParticipant {
+                    domain_id: definition().domain_id.to_vec(),
                     lineage: Some(lineage().encode().unwrap()),
                     schema_digest: [11; 32].to_vec(),
                     plan_digest: [15; 32].to_vec(),
@@ -2625,7 +2683,7 @@ mod tests {
             assert_ne!(decoded.decision.plan_digest, origin.plan_digest);
             assert_eq!(
                 decoded.budget_bytes(),
-                76 + 187 + REROUTE_ORIGIN_BYTES + 121
+                76 + 135 + 96 + REROUTE_ORIGIN_BYTES + 137
             );
         }
         let mut wire = batch();
@@ -2633,7 +2691,7 @@ mod tests {
         assert!(Batch::try_from(wire).is_ok());
         let ordinary = Finalization::try_from(finalization()).unwrap();
         assert!(ordinary.decision.origin.is_none());
-        assert_eq!(ordinary.budget_bytes(), 76 + 187 + 121);
+        assert_eq!(ordinary.budget_bytes(), 76 + 135 + 96 + 137);
     }
     #[test]
     fn reroute_origin_rejects_malformed_fixed_body_cut_and_control_allocation() {
@@ -2692,7 +2750,126 @@ mod tests {
             v.decision.as_mut().unwrap().phase = phase;
             assert!(Finalization::try_from(v).is_err());
         }
-        assert_eq!(MAX_FINALIZATION_BYTES, 8307);
+        assert_eq!(MAX_FINALIZATION_BYTES, 15423);
+    }
+    fn two_domain_finalization() -> wire::CdcFinalization {
+        let mut value = finalization();
+        let decision = value.decision.as_mut().unwrap();
+        decision.domains.push(wire::CdcDomainBinding {
+            domain_id: vec![200; 16],
+            directory_generation: 4,
+            directory_digest: vec![21; 32],
+            schema_epoch: 2,
+            schema_digest: vec![22; 32],
+        });
+        decision.participants.push(wire::CdcParticipant {
+            domain_id: vec![200; 16],
+            lineage: Some(wire::CdcLineage {
+                range_id: vec![201; 16],
+                group_id: vec![202; 16],
+                range_epoch: 3,
+            }),
+            schema_digest: vec![22; 32],
+            plan_digest: vec![23; 32],
+            prepared: Some(Position { term: 1, index: 2 }.encode()),
+        });
+        value
+    }
+    #[test]
+    fn cross_domain_decision_keeps_one_complete_authority_and_local_cdc_lineage() {
+        let mut value = two_domain_finalization();
+        let decoded = Finalization::try_from(value.clone()).unwrap();
+        assert_eq!(
+            decoded.decision.domains[0].domain_id,
+            definition().domain_id
+        );
+        assert_eq!(decoded.decision.domains[1].domain_id, [200; 16]);
+        assert_eq!(decoded.budget_bytes(), 76 + 135 + 2 * 96 + 2 * 137);
+        let mut carrier = batch();
+        carrier.envelopes[0].transaction = Some(value.clone());
+        assert!(Batch::try_from(carrier.clone()).is_ok());
+        let tx = carrier.envelopes[0].transaction.as_mut().unwrap();
+        tx.participant_group = vec![202; 16];
+        carrier.envelopes[0].schema_digest = vec![22; 32];
+        assert!(
+            Batch::try_from(carrier).is_err(),
+            "A different domain participant cannot attach to this batch lineage"
+        );
+        // Group and range identifiers occupy different typed namespaces.
+        let first = value.decision.as_ref().unwrap().participants[0]
+            .lineage
+            .clone()
+            .unwrap();
+        let second = value.decision.as_mut().unwrap().participants[1]
+            .lineage
+            .as_mut()
+            .unwrap();
+        second.range_id = first.group_id;
+        second.group_id = first.range_id;
+        assert!(Finalization::try_from(value).is_ok());
+    }
+    #[test]
+    fn domain_vector_rejects_missing_extra_duplicate_or_changed_authority() {
+        for case in 0..10 {
+            let mut value = two_domain_finalization();
+            let decision = value.decision.as_mut().unwrap();
+            match case {
+                0 => decision.domains.clear(),
+                1 => decision.domains.push(decision.domains[0].clone()),
+                2 => {
+                    decision.domains[1].domain_id = vec![99; 16];
+                }
+                3 => {
+                    decision.participants[1].schema_digest = vec![99; 32];
+                }
+                4 => {
+                    decision.domains[1].directory_generation = -1;
+                }
+                5 => {
+                    decision.domains[1].directory_digest.pop();
+                }
+                6 => {
+                    decision.participants.pop();
+                }
+                7 => {
+                    decision.participants[1].lineage.as_mut().unwrap().group_id = decision
+                        .participants[0]
+                        .lineage
+                        .as_ref()
+                        .unwrap()
+                        .group_id
+                        .clone();
+                }
+                8 => {
+                    decision.participants[1].lineage.as_mut().unwrap().range_id = decision
+                        .participants[0]
+                        .lineage
+                        .as_ref()
+                        .unwrap()
+                        .range_id
+                        .clone();
+                }
+                _ => decision.domains.reverse(),
+            }
+            assert!(
+                Finalization::try_from(value).is_err(),
+                "bad authority case {case}"
+            );
+        }
+        let mut value = reroute_finalization();
+        value.decision.as_mut().unwrap().domains[0].directory_digest = vec![99; 32];
+        assert!(Finalization::try_from(value).is_err());
+        let mut value = two_domain_finalization();
+        let decision = value.decision.as_mut().unwrap();
+        let origin = RerouteOrigin::decode(reroute_origin_bytes()).unwrap();
+        decision.transaction_id = origin.transaction_id().to_vec();
+        let mut encoded = reroute_origin_bytes();
+        encoded[264..268].copy_from_slice(&2i32.to_be_bytes());
+        decision.origin = Some(encoded);
+        assert!(
+            Finalization::try_from(value).is_err(),
+            "Single-command reroute authority cannot gain a second domain"
+        );
     }
     #[test]
     fn transaction_metadata_binds_commit_operation_preparation_and_namespace() {
@@ -2715,6 +2892,7 @@ mod tests {
             .decision
             .as_mut()
             .unwrap()
+            .domains[0]
             .domain_id = [99; 16].to_vec();
         assert!(Batch::try_from(v).is_err());
         let mut v = envelope();

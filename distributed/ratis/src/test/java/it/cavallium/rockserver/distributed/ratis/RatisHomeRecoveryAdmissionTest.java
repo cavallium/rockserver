@@ -52,7 +52,7 @@ class RatisHomeRecoveryAdmissionTest {
                 });
     }
     TransactionStatus initial(int id) {
-        return TransactionStatus.begin(cluster,database,domain,new UUID(12,id),new OperationId(new UUID(12,0),1,id),1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(participant,participant,1,new byte[32],new byte[32],null,false)));
+        return TransactionStatus.begin(cluster, database, new UUID(12,id), new OperationId(new UUID(12,0),1,id), List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(domain, participant, participant, 1, new byte[32], new byte[32], null, false)));
     }
     DistributedCommand cas(RatisRetentionAdmissionTest.Fixture f,long sequence,TransactionStatus before,TransactionStatus next,boolean protectedControl) {
         byte[] key=ByteBuffer.allocate(16).putLong(next.transactionId().getMostSignificantBits()).putLong(next.transactionId().getLeastSignificantBits()).array();

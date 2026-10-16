@@ -35,7 +35,7 @@ class NativeRetirementDiscoveryTest {
             snapshots.configure(f); var small=snapshots.fence(1); var local=small.participant(snapshots.dataGroup); var scope=new TransactionScope(List.of(TransactionScope.Span.point(new UUID(0,33),new byte[1100*1024])));
             SnapshotFenceStatus last=null;
             for (int n=0;n<3;n++) {
-                var fence=new SnapshotFence(small.clusterId(),small.databaseId(),small.domainId(),new UUID(n==2 ? Long.MIN_VALUE : 0,100+n),small.homeGroup(),small.homeEpoch(),new OperationId(new UUID(0,23),1,n),1,1,new byte[32],List.of(new SnapshotFence.Participant(local.rangeId(),local.groupId(),local.rangeEpoch(),local.schemaDigest(),local.installOperation(),local.releaseOperation(),n==2 ? local.scope() : scope)));
+                var fence=new SnapshotFence(small.clusterId(), small.databaseId(), new UUID(n==2 ? Long.MIN_VALUE : 0,100+n), small.homeGroup(), small.homeEpoch(), new OperationId(new UUID(0,23),1,n), small.domains(), List.of(new SnapshotFence.Participant(local.domainId(), local.rangeId(), local.groupId(), local.rangeEpoch(), local.schemaDigest(), local.installOperation(), local.releaseOperation(), n==2 ? local.scope() : scope)));
                 var status=SnapshotFenceStatus.begin(fence); assertEquals(CommandResult.Status.SUCCESS,tx.apply(f,n+1,snapshots.cas(n,null,status)).status()); last=status;
                 if (n==2) { last=status.abort().consume(); assertEquals(CommandResult.Status.SUCCESS,tx.apply(f,4,snapshots.cas(3,status,last)).status()); }
             }

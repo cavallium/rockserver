@@ -46,8 +46,7 @@ class RatisProtectedLogEntryTest {
         for(var setting:Map.of("role",RatisNodePlan.Role.SNAPSHOT_HOME,"snapshotHomeConfigured",true,"homeColumn",COLUMN,"homeCluster",OTHER,"homeDatabase",COLUMN).entrySet()) {
             var field=RatisRangeStateMachine.class.getDeclaredField(setting.getKey());field.setAccessible(true);field.set(f.machine,setting.getValue());
         }
-        var fence=new SnapshotFence(OTHER,COLUMN,OTHER,new UUID(0,10),GROUP,0,OP,0,0,DIGEST,
-                List.of(new SnapshotFence.Participant(COLUMN,OTHER,0,DIGEST,new OperationId(OP.sessionId(),1,2),new OperationId(OP.sessionId(),1,3),new TransactionScope(List.of(TransactionScope.Span.range(COLUMN,null,null))))));
+        var fence=new SnapshotFence(OTHER, COLUMN, new UUID(0,10), GROUP, 0, OP, List.of(new DomainBinding(OTHER, 0, new byte[32], 0, DIGEST)), List.of(new SnapshotFence.Participant(OTHER, COLUMN, OTHER, 0, DIGEST, new OperationId(OP.sessionId(),1,2), new OperationId(OP.sessionId(),1,3), new TransactionScope(List.of(TransactionScope.Span.range(COLUMN,null,null))))));
         var before=SnapshotFenceStatus.begin(fence);var after=before.abort();
         byte[] key=ByteBuffer.allocate(16).putLong(fence.fenceId().getMostSignificantBits()).putLong(fence.fenceId().getLeastSignificantBits()).array();
         var command=new DistributedCommand(GROUP,0,DIGEST,ACK,List.of(new Mutation(Mutation.Kind.PUT,COLUMN,key,after.encode())),List.of(new KeyPredicate(COLUMN,key,before.encode())),-1);
@@ -55,8 +54,7 @@ class RatisProtectedLogEntryTest {
         verifyNoInteractions(f.store);
     }
     @Test void canonicalCommitAndAbortFinalizationsRequireTheExactParticipantGroup() throws Exception {
-        var f=fixture();var initial=TransactionStatus.begin(OTHER,COLUMN,OTHER,new UUID(0,5),OP,0,DIGEST,DIGEST,
-                List.of(new TransactionStatus.Participant(COLUMN,GROUP,0,DIGEST,DIGEST,null,false)));
+        var f=fixture();var initial=TransactionStatus.begin(OTHER, COLUMN, new UUID(0,5), OP, List.of(new DomainBinding(OTHER, 0, new byte[32], 0, DIGEST)), DIGEST, List.of(new TransactionStatus.Participant(OTHER, COLUMN, GROUP, 0, DIGEST, DIGEST, null, false)));
         var recovery=new OperationId(OP.sessionId(),1,1);
         for(var decision:List.of(initial.decide(TransactionStatus.Phase.ABORT),initial.prepared(GROUP,DIGEST,new ApplyPosition(1,2)).decide(TransactionStatus.Phase.COMMIT))) {
             var finalization=new ParticipantFinalization(OTHER,0,GROUP,recovery,decision);
@@ -64,8 +62,7 @@ class RatisProtectedLogEntryTest {
             byte[] malformed=RatisParticipantRecord.encode(finalization);malformed=Arrays.copyOf(malformed,malformed.length-1);
             assertFalse(f.machine.isProtectedLogEntry(entry(malformed)));
         }
-        var foreign=TransactionStatus.begin(OTHER,COLUMN,OTHER,new UUID(0,6),OP,0,DIGEST,DIGEST,
-                List.of(new TransactionStatus.Participant(COLUMN,OTHER,0,DIGEST,DIGEST,null,false))).decide(TransactionStatus.Phase.ABORT);
+        var foreign=TransactionStatus.begin(OTHER, COLUMN, new UUID(0,6), OP, List.of(new DomainBinding(OTHER, 0, new byte[32], 0, DIGEST)), DIGEST, List.of(new TransactionStatus.Participant(OTHER, COLUMN, OTHER, 0, DIGEST, DIGEST, null, false))).decide(TransactionStatus.Phase.ABORT);
         assertFalse(f.machine.isProtectedLogEntry(entry(RatisParticipantRecord.encode(new ParticipantFinalization(COLUMN,0,OTHER,recovery,foreign)))));
         verifyNoInteractions(f.store);
     }

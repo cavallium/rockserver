@@ -54,7 +54,7 @@ public final class DistributedCdcSubscriptions {
                 if(envelope.transaction()!=null) {
                     var transaction=envelope.transaction(); var participant=transaction.participant(); var decision=transaction.decision();
                     if(!transaction.participantGroup().equals(lineage.groupId()) || !participant.rangeId().equals(lineage.rangeId()) || participant.rangeEpoch()!=lineage.rangeEpoch()
-                            || !decision.clusterId().equals(definition.clusterId()) || !decision.databaseId().equals(definition.databaseId()) || !decision.domainId().equals(definition.domainId())) throw new IllegalArgumentException("CDC transaction differs from subscription lineage/namespace");
+                            || !decision.clusterId().equals(definition.clusterId()) || !decision.databaseId().equals(definition.databaseId()) || !participant.domainId().equals(definition.domainId())) throw new IllegalArgumentException("CDC transaction differs from subscription lineage/namespace");
                 }
                 events+=envelope.events().size(); bytes+=envelope.budgetBytes(); if(events>MAX_EVENTS || bytes>MAX_BATCH_BYTES) throw new IllegalArgumentException("CDC projected batch exceeds byte/event bound");
             }

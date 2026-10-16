@@ -23,7 +23,7 @@ class RatisTransactionJournalReclamationTest {
     }
     TransactionStatus consume(RatisTransactionRecoveryTest.Fixture f,TransactionStatus acknowledged) throws Exception {
         var consumed=acknowledged.consume();
-        f.journal.queueHome(f.home.statuses.prepare(RatisTransactionRecoveryTest.next(f.journal.snapshot().lastHome()),acknowledged,consumed));
+        f.journal.queueRecovery(consumed);
         assertEquals(CommandResult.Status.SUCCESS,f.journal.executeHome().status()); return consumed;
     }
     void retire(RatisTransactionRecoveryTest.Fixture f,TransactionStatus consumed) throws Exception {

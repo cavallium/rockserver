@@ -17,8 +17,7 @@ class RatisRetirementJournalTest {
     final UUID home=new UUID(0,1),data=new UUID(0,2),column=new UUID(0,3);
     final byte[] binding=new byte[32];
     TransactionStatus transaction(UUID group,long sequence) {
-        return TransactionStatus.begin(new UUID(0,4),new UUID(0,5),new UUID(0,6),new UUID(0,7),new OperationId(new UUID(0,8),1,sequence),
-                1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(group,group,1,new byte[32],new byte[32],null,false)));
+        return TransactionStatus.begin(new UUID(0,4), new UUID(0,5), new UUID(0,7), new OperationId(new UUID(0,8),1,sequence), List.of(new DomainBinding(new UUID(0,6), 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(new UUID(0,6), group, group, 1, new byte[32], new byte[32], null, false)));
     }
     RatisRetirementOperation participant(UUID group,long sequence) {
         var terminal=transaction(group,sequence).decide(TransactionStatus.Phase.ABORT);
@@ -26,9 +25,7 @@ class RatisRetirementJournalTest {
         return RatisRetirementOperation.participant(new ParticipantRetirement(finalization,new ApplyPosition(2,3),terminal.finalized(group).consume()));
     }
     SnapshotFence fence() {
-        return new SnapshotFence(new UUID(0,4),new UUID(0,5),new UUID(0,6),new UUID(0,10),home,1,new OperationId(new UUID(0,11),1,0),0,1,new byte[32],
-                List.of(new SnapshotFence.Participant(data,data,1,new byte[32],new OperationId(new UUID(0,12),1,0),new OperationId(new UUID(0,12),1,1),
-                        new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1}))))));
+        return new SnapshotFence(new UUID(0,4), new UUID(0,5), new UUID(0,10), home, 1, new OperationId(new UUID(0,11),1,0), List.of(new DomainBinding(new UUID(0,6), 0, new byte[32], 1, new byte[32])), List.of(new SnapshotFence.Participant(new UUID(0,6), data, data, 1, new byte[32], new OperationId(new UUID(0,12),1,0), new OperationId(new UUID(0,12),1,1), new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1}))))));
     }
     List<RatisRetirementOperation> operations() {
         var participant=participant(data,0); var initial=transaction(data,0); var consumed=initial.decide(TransactionStatus.Phase.ABORT).finalized(data).consume();

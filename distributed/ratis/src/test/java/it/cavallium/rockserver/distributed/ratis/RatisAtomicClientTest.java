@@ -274,7 +274,7 @@ class RatisAtomicClientTest {
         var request=new RatisTopologyOperationOutcomeRpc.Request(source.clusterId(),source.databaseId(),source.domainId(),lineage,allocated.business(),original.receiptDigest());var absence=new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.ABSENT,freeze.position(),freeze,1,0,new byte[]{1},null,null);
         var evidence=new RatisOperationRerouteAdmissionRpc.Evidence(original,source,f.directory,absence,List.of());
         var origin=new OperationRerouteOrigin(source.clusterId(),source.databaseId(),source.domainId(),lineage,allocated.business(),original.receiptDigest(),OperatorUpload.sha256(freeze.encode()),absence.cut(),f.directory.payloadDigest(),RatisOperationRerouteAdmissionRpc.normalizedDigest(original,f.directory),RatisOperationRerouteAdmissionRpc.targetParticipantCount(original,f.directory),allocated.firstControl());
-        var reserved=TransactionStatus.reserve(origin,f.schema.schemaEpoch(),f.schema.digest());return new ReservedInput(reserved,new RatisAtomicClient.Identity(reserved.transactionId(),allocated.business(),allocated.firstControl()),evidence);
+        var reserved=TransactionStatus.reserve(origin, DomainBinding.of(f.directory));return new ReservedInput(reserved,new RatisAtomicClient.Identity(reserved.transactionId(),allocated.business(),allocated.firstControl()),evidence);
     }
     @Test void inlineDriverOnSingleMutationWorkerReopensSameNativeCapturesWithoutNestedScheduling()throws Exception {
         try(var f=new Fixture(root);var client=f.client()) {

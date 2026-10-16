@@ -72,11 +72,11 @@ class RatisHomeRolesTest {
         }
         TransactionStatus transaction() {
             var data=plan.domains().getFirst().directory().ranges().getFirst();
-            return TransactionStatus.begin(env.outer.cluster,env.outer.database,plan.domains().getFirst().directory().domainId(),new UUID(94,1),new OperationId(new UUID(94,2),1,0),1,plan.domains().getFirst().directory().schemaDigest(),new byte[32],List.of(new TransactionStatus.Participant(data.rangeId(),data.groupId(),data.rangeEpoch(),plan.domains().getFirst().directory().schemaDigest(),new byte[32],null,false)));
+            return TransactionStatus.begin(env.outer.cluster, env.outer.database, new UUID(94,1), new OperationId(new UUID(94,2),1,0), List.of(new DomainBinding(plan.domains().getFirst().directory().domainId(), 0, new byte[32], 1, plan.domains().getFirst().directory().schemaDigest())), new byte[32], List.of(new TransactionStatus.Participant(plan.domains().getFirst().directory().domainId(), data.rangeId(), data.groupId(), data.rangeEpoch(), plan.domains().getFirst().directory().schemaDigest(), new byte[32], null, false)));
         }
         SnapshotFence fence() {
             var data=plan.domains().getFirst().directory().ranges().getFirst(); var home=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME).directory().ranges().getFirst();
-            return new SnapshotFence(env.outer.cluster,env.outer.database,plan.domains().getFirst().directory().domainId(),new UUID(95,1),home.groupId(),home.rangeEpoch(),new OperationId(new UUID(95,1),1,0),plan.domains().getFirst().directory().generation(),plan.domains().getFirst().directory().schemaEpoch(),plan.domains().getFirst().directory().schemaDigest(),List.of(new SnapshotFence.Participant(data.rangeId(),data.groupId(),data.rangeEpoch(),plan.domains().getFirst().directory().schemaDigest(),new OperationId(new UUID(95,2),1,0),new OperationId(new UUID(95,2),1,1),new TransactionScope(List.of(TransactionScope.Span.point(env.outer.data,new byte[]{1}))))));
+            return new SnapshotFence(env.outer.cluster, env.outer.database, new UUID(95,1), home.groupId(), home.rangeEpoch(), new OperationId(new UUID(95,1),1,0), List.of(new DomainBinding(plan.domains().getFirst().directory().domainId(), plan.domains().getFirst().directory().generation(), new byte[32], plan.domains().getFirst().directory().schemaEpoch(), plan.domains().getFirst().directory().schemaDigest())), List.of(new SnapshotFence.Participant(plan.domains().getFirst().directory().domainId(), data.rangeId(), data.groupId(), data.rangeEpoch(), plan.domains().getFirst().directory().schemaDigest(), new OperationId(new UUID(95,2),1,0), new OperationId(new UUID(95,2),1,1), new TransactionScope(List.of(TransactionScope.Span.point(env.outer.data,new byte[]{1}))))));
         }
         @Override public void close() throws Exception { node.close(); data.close(); env.close(); }
     }
@@ -122,8 +122,8 @@ class RatisHomeRolesTest {
             TransactionStatus initial; ParticipantVote vote;
             try (var pin=store.captureTracked(scope)) {
                 var accepted=machine.participantIntent(pin,business);
-                var participant=new TransactionStatus.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),f.plan.domains().getFirst().directory().schemaDigest(),accepted.payloadDigest(),null,false);
-                initial=TransactionStatus.begin(f.env.outer.cluster,f.env.outer.database,f.plan.domains().getFirst().directory().domainId(),new UUID(97,1),business.operationId(),f.plan.domains().getFirst().directory().schemaEpoch(),f.plan.domains().getFirst().directory().schemaDigest(),accepted.payloadDigest(),List.of(participant));
+                var participant=new TransactionStatus.Participant(f.plan.domains().getFirst().directory().domainId(), route.rangeId(), route.groupId(), route.rangeEpoch(), f.plan.domains().getFirst().directory().schemaDigest(), accepted.payloadDigest(), null, false);
+                initial=TransactionStatus.begin(f.env.outer.cluster, f.env.outer.database, new UUID(97,1), business.operationId(), List.of(new DomainBinding(f.plan.domains().getFirst().directory().domainId(), 0, new byte[32], f.plan.domains().getFirst().directory().schemaEpoch(), f.plan.domains().getFirst().directory().schemaDigest())), accepted.payloadDigest(), List.of(participant));
                 homes.execute(homes.prepare(new OperationId(session,1,3),null,initial));
                 try (var proposal=machine.prepareParticipant(pin,business,new OperationId(session,1,1),homes,initial.transactionId())) { vote=f.data.executeParticipant(f.data.prepareParticipant(proposal.preparation())); }
             }

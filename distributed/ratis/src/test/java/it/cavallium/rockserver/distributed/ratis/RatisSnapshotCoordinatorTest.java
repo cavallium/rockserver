@@ -39,9 +39,9 @@ class RatisSnapshotCoordinatorTest {
             right=helper.helper.new Node(name+"-right",false,new RangeOwnership.Interval(domain,Set.of(column),split,null),home.homes,clock::get);
             var l=route(left,null,split); var r=route(right,split,null);
             directory=new RangeDirectory(helper.helper.cluster,helper.helper.database,domain,1,new byte[32],0,Set.of(column),0,List.of(l,r));
-            fence=new SnapshotFence(directory.clusterId(),directory.databaseId(),domain,new UUID(0,9014),home.f.groupId,1,new OperationId(new UUID(0,9014),1,0),0,1,new byte[32],List.of(
-                    new SnapshotFence.Participant(l.rangeId(),l.groupId(),1,new byte[32],control(0),control(1),scope(1)),
-                    new SnapshotFence.Participant(r.rangeId(),r.groupId(),1,new byte[32],control(2),control(3),new TransactionScope(List.of(TransactionScope.Span.range(column,new byte[]{(byte)130},new byte[]{(byte)134}))))));
+            fence=new SnapshotFence(directory.clusterId(), directory.databaseId(), new UUID(0,9014), home.f.groupId, 1, new OperationId(new UUID(0,9014),1,0), List.of(DomainBinding.of(directory)), List.of(
+                    new SnapshotFence.Participant(domain, l.rangeId(), l.groupId(), 1, new byte[32], control(0), control(1), scope(1)),
+                    new SnapshotFence.Participant(domain, r.rangeId(), r.groupId(), 1, new byte[32], control(2), control(3), new TransactionScope(List.of(TransactionScope.Span.range(column,new byte[]{(byte)130},new byte[]{(byte)134}))))));
             data=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID col,byte[] key) throws IOException { return node(route.groupId()).wire.read(route,col,key); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return node(route.groupId()).wire.command(route,command); }
@@ -72,9 +72,9 @@ class RatisSnapshotCoordinatorTest {
             var lb=put(left,1,7,0); var rb=put(right,130,8,0);
             try (var lp=left.f.store.captureTracked(scope(1)); var rp=right.f.store.captureTracked(scope(130))) {
                 var la=left.f.machine.participantIntent(lp,lb); var ra=right.f.machine.participantIntent(rp,rb);
-                var initial=TransactionStatus.begin(directory.clusterId(),directory.databaseId(),domain,tx,lb.operationId(),1,new byte[32],new byte[32],List.of(
-                        new TransactionStatus.Participant(left.f.groupId,left.f.groupId,1,new byte[32],la.payloadDigest(),null,false),
-                        new TransactionStatus.Participant(right.f.groupId,right.f.groupId,1,new byte[32],ra.payloadDigest(),null,false)));
+                var initial=TransactionStatus.begin(directory.clusterId(), directory.databaseId(), tx, lb.operationId(), List.of(DomainBinding.of(directory)), new byte[32], List.of(
+                        new TransactionStatus.Participant(domain, left.f.groupId, left.f.groupId, 1, new byte[32], la.payloadDigest(), null, false),
+                        new TransactionStatus.Participant(domain, right.f.groupId, right.f.groupId, 1, new byte[32], ra.payloadDigest(), null, false)));
                 txHome(null,initial,10); TransactionStatus voted;
                 try (var l=left.f.machine.prepareParticipant(lp,lb,control(4),transactions.statuses,tx); var r=right.f.machine.prepareParticipant(rp,rb,control(5),transactions.statuses,tx)) {
                     var lv=data.executeParticipant(data.restoreParticipant(l.preparation(),directory.ranges().getFirst()));
@@ -90,8 +90,8 @@ class RatisSnapshotCoordinatorTest {
             UUID other=new UUID(0,9016); var business=put(right,131,6,3);
             try (var pin=right.f.store.captureTracked(scope(131))) {
                 var accepted=right.f.machine.participantIntent(pin,business);
-                var initial=TransactionStatus.begin(directory.clusterId(),directory.databaseId(),domain,other,business.operationId(),1,new byte[32],new byte[32],List.of(
-                        new TransactionStatus.Participant(right.f.groupId,right.f.groupId,1,new byte[32],accepted.payloadDigest(),null,false)));
+                var initial=TransactionStatus.begin(directory.clusterId(), directory.databaseId(), other, business.operationId(), List.of(DomainBinding.of(directory)), new byte[32], List.of(
+                        new TransactionStatus.Participant(domain, right.f.groupId, right.f.groupId, 1, new byte[32], accepted.payloadDigest(), null, false)));
                 txHome(null,initial,30);
                 try (var proposal=right.f.machine.prepareParticipant(pin,business,control(31),transactions.statuses,other)) {
                     data.executeParticipant(data.restoreParticipant(proposal.preparation(),directory.ranges().getLast()));

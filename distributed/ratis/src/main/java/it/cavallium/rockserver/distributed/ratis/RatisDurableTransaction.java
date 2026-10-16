@@ -481,7 +481,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         var lineage=new DistributedCdcCheckpoint.Lineage(route.rangeId(),route.groupId(),route.rangeEpoch());
         var request=new RatisTopologyOperationOutcomeRpc.Request(origin.clusterId(),origin.databaseId(),origin.domainId(),origin.source(),origin.operation(),origin.originalReceiptDigest());
         if(original.kind()!=DistributedCommand.Kind.DATA || !source.clusterId().equals(origin.clusterId()) || !source.databaseId().equals(origin.databaseId()) || !source.domainId().equals(origin.domainId())
-                || source.schemaEpoch()!=status.schemaEpoch() || target.schemaEpoch()!=status.schemaEpoch() || !Arrays.equals(source.schemaDigest(),status.schemaDigest()) || !Arrays.equals(target.schemaDigest(),status.schemaDigest()) || !Arrays.equals(original.schemaDigest(),source.schemaDigest()) || source.routingPrefixBytes()!=target.routingPrefixBytes() || !source.columns().equals(target.columns())
+                || source.schemaEpoch()!=status.domain(origin.domainId()).schemaEpoch() || target.schemaEpoch()!=status.domain(origin.domainId()).schemaEpoch() || !Arrays.equals(source.schemaDigest(),status.domain(origin.domainId()).schemaDigest()) || !Arrays.equals(target.schemaDigest(),status.domain(origin.domainId()).schemaDigest()) || !Arrays.equals(original.schemaDigest(),source.schemaDigest()) || source.routingPrefixBytes()!=target.routingPrefixBytes() || !source.columns().equals(target.columns())
                 || !lineage.equals(origin.source()) || !original.operationId().equals(origin.operation()) || original.rangeEpoch()!=route.rangeEpoch() || !Arrays.equals(original.receiptDigest(),origin.originalReceiptDigest())
                 || !target.clusterId().equals(origin.clusterId()) || !target.databaseId().equals(origin.databaseId()) || !target.domainId().equals(origin.domainId()) || !Arrays.equals(target.payloadDigest(),origin.targetDirectoryDigest())
                 || !Arrays.equals(RatisOperationRerouteAdmissionRpc.normalizedDigest(original,target),origin.planDigest()) || RatisOperationRerouteAdmissionRpc.targetParticipantCount(original,target)!=origin.targetParticipantCount()
@@ -494,7 +494,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         return new RatisOperationRerouteAdmissionRpc.Evidence(saved.original(),saved.sourceDirectory(),saved.targetDirectory(),saved.absence(),entries.values().stream().map(e->e.intent).toList());
     }
     synchronized TransactionStatus registrationExpected() {
-        return initial.origin()==null ? null : TransactionStatus.reserve(initial.origin(),initial.schemaEpoch(),initial.schemaDigest());
+        return initial.origin()==null ? null : TransactionStatus.reserve(initial.origin(),initial.domains().getFirst());
     }
     private RangeDescriptor homeRoute;
     private RangeDescriptor homeRoute() { return homeRoute; }
@@ -594,7 +594,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         return count;
     }
     private static long statusSize(TransactionStatus status) {
-        return TransactionStatus.HEADER_BYTES+(status.origin()==null?0:OperationRerouteOrigin.MAX_BYTES)+(long)TransactionStatus.PARTICIPANT_BYTES*status.participants().size();
+        return TransactionStatus.HEADER_BYTES+(long)DomainBinding.BYTES*status.domains().size()+(status.origin()==null?0:OperationRerouteOrigin.MAX_BYTES)+(long)TransactionStatus.PARTICIPANT_BYTES*status.participants().size();
     }
     private long encodedSize() throws IOException {
         long size=4+64+4L+(reservationEvidence==null ? 0 : reservationEvidence.length)+4L+statusSize(initial)+SessionWindowJournal.routeSize(homeRoute)+32+24+4+(observed==null ? 0 : statusSize(observed))+1;

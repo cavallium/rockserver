@@ -19,7 +19,7 @@ public final class RatisSnapshotPlan {
         if (homeEpoch<0 || business.epoch()<1 || !business.sessionId().equals(firstControl.sessionId()) || business.epoch()!=firstControl.epoch() || firstControl.sequence()<=business.sequence() || firstControl.sequence()>Long.MAX_VALUE-CONTROL_SLOTS) throw new IllegalArgumentException("Invalid reserved snapshot identities");
         // Check complete scope and route-count admission before allocating its clipped representation.
         scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
-        var routes=new TreeMap<UUID,RangeDescriptor>(UUID_ORDER); var scopes=new HashMap<UUID,List<TransactionScope.Span>>(); long bytes=SnapshotFence.HEADER_BYTES,bounds=0;
+        var routes=new TreeMap<UUID,RangeDescriptor>(UUID_ORDER); var scopes=new HashMap<UUID,List<TransactionScope.Span>>(); long bytes=SnapshotFence.HEADER_BYTES+DomainBinding.BYTES,bounds=0;
         for (var span:scope.spans()) {
             byte[] originalLower=span.lowerInclusive(),originalUpper=span.upperExclusive();
             var selected=span.isPoint() ? List.of(directory.route(span.columnId(),originalLower)) : directory.intersect(span.columnId(),originalLower,originalUpper,false);
@@ -29,7 +29,7 @@ public final class RatisSnapshotPlan {
                 if (!span.isPoint() && lower!=null && upper!=null && Arrays.compareUnsigned(lower,upper)>=0) continue;
                 boolean added=!routes.containsKey(route.groupId());
                 long size=(lower==null ? 0 : lower.length)+(long)(upper==null ? 0 : upper.length);
-                bytes+=25+size+(added ? 140 : 0); bounds+=size;
+                bytes+=25+size+(added ? 156 : 0); bounds+=size;
                 if (bytes>SnapshotFence.MAX_BYTES || bounds>TransactionScope.MAX_BOUND_BYTES) throw new IllegalArgumentException("Snapshot scope exceeds aggregate frozen byte budget");
                 routes.putIfAbsent(route.groupId(),route); var spans=scopes.computeIfAbsent(route.groupId(),ignored -> new ArrayList<>());
                 if (spans.size()>=TransactionScope.MAX_SPANS) throw new IllegalArgumentException("Snapshot participant scope exceeds span budget");
@@ -38,23 +38,19 @@ public final class RatisSnapshotPlan {
         }
         var participants=new ArrayList<SnapshotFence.Participant>(); int index=0;
         for (var route:routes.values()) {
-            participants.add(new SnapshotFence.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),directory.schemaDigest(),control(firstControl,index),control(firstControl,64+index),new TransactionScope(scopes.get(route.groupId())))); index++;
+            participants.add(new SnapshotFence.Participant(directory.domainId(), route.rangeId(), route.groupId(), route.rangeEpoch(), directory.schemaDigest(), control(firstControl,index), control(firstControl,64+index), new TransactionScope(scopes.get(route.groupId())))); index++;
         }
-        var fence=new SnapshotFence(directory.clusterId(),directory.databaseId(),directory.domainId(),fenceId,homeGroup,homeEpoch,business,directory.generation(),directory.schemaEpoch(),directory.schemaDigest(),participants);
+        var fence=new SnapshotFence(directory.clusterId(), directory.databaseId(), fenceId, homeGroup, homeEpoch, business, List.of(DomainBinding.of(directory)), participants);
         return new RatisSnapshotPlan(fence,new ArrayList<>(routes.values()),scope);
     }
     /** Qualify the original fence without rewriting equivalent adjacent scope spans or its binding digest. */
     public static RatisSnapshotPlan frozen(RangeDirectory directory,SnapshotFence expected) {
-        Objects.requireNonNull(expected);
+        Objects.requireNonNull(expected);if(expected.domains().size()!=1)throw new IllegalArgumentException("This snapshot planner requires one domain");expected.domain(directory.domainId()).require(directory);
         var first=expected.participants().stream().map(SnapshotFence.Participant::installOperation)
                 .min(Comparator.comparingLong(OperationId::sequence)).orElseThrow();
         var plan=create(directory,scope(expected),expected.fenceId(),expected.operation(),expected.homeGroup(),expected.homeEpoch(),first);
-        var participants=expected.participants().stream().map(p -> new SnapshotFence.Participant(
-                p.rangeId(),p.groupId(),p.rangeEpoch(),p.schemaDigest(),p.installOperation(),p.releaseOperation(),
-                normalize(p.scope().spans()))).toList();
-        var qualified=new SnapshotFence(expected.clusterId(),expected.databaseId(),expected.domainId(),
-                expected.fenceId(),expected.homeGroup(),expected.homeEpoch(),expected.operation(),
-                expected.directoryGeneration(),expected.schemaEpoch(),expected.schemaDigest(),participants);
+        var participants=expected.participants().stream().map(p -> new SnapshotFence.Participant(p.domainId(), p.rangeId(), p.groupId(), p.rangeEpoch(), p.schemaDigest(), p.installOperation(), p.releaseOperation(), normalize(p.scope().spans()))).toList();
+        var qualified=new SnapshotFence(expected.clusterId(), expected.databaseId(), expected.fenceId(), expected.homeGroup(), expected.homeEpoch(), expected.operation(), expected.domains(), participants);
         if (!qualified.equals(plan.fence())) throw new IllegalArgumentException("Frozen source definition differs from cached projection");
         return new RatisSnapshotPlan(expected,plan.routes(),plan.scope());
     }

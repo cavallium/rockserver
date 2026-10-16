@@ -143,7 +143,7 @@ class RatisTransactionCoordinatorTest {
             try (var lp=left.f.store.captureTracked(new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1})))); var rp=right.f.store.captureTracked(new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{(byte)130})))); var routed=new RatisRoutedClient(directory,transport)) {
                 var la=left.f.machine.participantIntent(lp,lb); var ra=right.f.machine.participantIntent(rp,rb);
                 var intents=List.of(new RatisDurableTransaction.Intent(l,la,helper.control(0),new OperationId(new UUID(0,2014),3,0),List.of(1)),new RatisDurableTransaction.Intent(r,ra,helper.control(1),new OperationId(new UUID(0,2015),3,0),List.of(0,2)));
-                var initial=TransactionStatus.begin(helper.cluster,helper.database,domain,new UUID(0,2013),operation,1,new byte[32],RatisDurableTransaction.planDigest(intents),List.of(new TransactionStatus.Participant(l.rangeId(),l.groupId(),1,new byte[32],la.payloadDigest(),null,false),new TransactionStatus.Participant(r.rangeId(),r.groupId(),1,new byte[32],ra.payloadDigest(),null,false)));
+                var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(0,2013), operation, List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), RatisDurableTransaction.planDigest(intents), List.of(new TransactionStatus.Participant(domain, l.rangeId(), l.groupId(), 1, new byte[32], la.payloadDigest(), null, false),new TransactionStatus.Participant(domain, r.rangeId(), r.groupId(), 1, new byte[32], ra.payloadDigest(), null, false)));
                 try (var journal=RatisDurableTransaction.create(root.resolve("multi-coordinator.bin"),home.statuses,routed,initial,home.statuses.prepare(fixtures.journals.homeOperation(0),null,initial),intents); var coordinator=new RatisTransactionCoordinator(journal,home.statuses,routed,RatisTransactionRecoveryTest::next,(tx,p) -> {
                     var isLeft=p.intent().route().groupId().equals(l.groupId()); var node=isLeft ? left : right; RatisRangeStateMachine.ParticipantProposal token;
                     try {
@@ -203,8 +203,7 @@ class RatisTransactionCoordinatorTest {
         try (var f=fixtures.new Fixture("negative-gate"); var coordinator=coordinator(f)) {
             coordinator.step();
             var group=f.data.f.groupId;
-            var gate=new SnapshotFence(fixtures.helper.cluster,fixtures.helper.database,f.data.directory.domainId(),new UUID(0,3010),new UUID(0,3011),1,new OperationId(new UUID(0,3010),1,0),0,1,new byte[32],
-                    List.of(new SnapshotFence.Participant(group,group,1,new byte[32],new OperationId(new UUID(0,3012),1,0),new OperationId(new UUID(0,3012),1,1),fixtures.helper.scope(f.data,1,4))));
+            var gate=new SnapshotFence(fixtures.helper.cluster, fixtures.helper.database, new UUID(0,3010), new UUID(0,3011), 1, new OperationId(new UUID(0,3010),1,0), List.of(new DomainBinding(f.data.directory.domainId(), 0, f.data.directory.payloadDigest(), 1, new byte[32])), List.of(new SnapshotFence.Participant(f.data.directory.domainId(), group, group, 1, new byte[32], new OperationId(new UUID(0,3012),1,0), new OperationId(new UUID(0,3012),1,1), fixtures.helper.scope(f.data,1,4))));
             var install=RatisSnapshotRecord.install(gate,group);
             f.data.f.machine.applyTransaction(RatisSnapshotRecordTest.committed(f.data.f.machine,1,1,install)).get(5,TimeUnit.SECONDS); f.data.wire.index=1;
             long before=f.home.wire.index+f.data.wire.index;

@@ -833,7 +833,7 @@ public final class NativeRangeImage {
                         var record=PreparedParticipant.decode(value); var preparation=record.preparation(); var plan=preparation.business(); var scope=preparation.scope();
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x20).putLong(preparation.transactionId().getMostSignificantBits()).putLong(preparation.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !plan.groupId().equals(header.owner().groupId()) || plan.rangeEpoch()!=header.owner().epoch()
-                                || !acceptSchema(plan.schemaDigest()) || !preparation.registration().domainId().equals(header.interval().domainId())
+                                || !acceptSchema(plan.schemaDigest()) || !preparation.domainBinding().domainId().equals(header.interval().domainId())
                                 || record.position().index()>header.position().index() || record.position().term()>header.position().term() || record.position().index()==header.position().index() && record.position().term()!=header.position().term()) throw new IOException("Prepared image identity/cut differs");
                         for (var span:scope.spans()) {
                             byte[] lo=span.lowerInclusive(),hi=span.upperExclusive();
@@ -852,7 +852,7 @@ public final class NativeRangeImage {
                         var abort=AbortedParticipant.decode(value); var finalization=abort.finalization(); var participant=finalization.participant();
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x21).putLong(finalization.transactionId().getMostSignificantBits()).putLong(finalization.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !participant.groupId().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
-                                || !acceptSchema(participant.schemaDigest()) || !finalization.decision().domainId().equals(header.interval().domainId())
+                                || !acceptSchema(participant.schemaDigest()) || !participant.domainId().equals(header.interval().domainId())
                                 || abort.position().index()>header.position().index() || abort.position().term()>header.position().term() || abort.position().index()==header.position().index() && abort.position().term()!=header.position().term()) throw new IOException("ABORT image identity/cut differs");
                         if (aborted.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("ABORT image count exceeded");
                         aborted.put(finalization.transactionId(),abort);
@@ -863,7 +863,7 @@ public final class NativeRangeImage {
                         var commit=CommittedParticipant.decode(value); var finalization=commit.finalization(); var participant=finalization.participant();
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x22).putLong(finalization.transactionId().getMostSignificantBits()).putLong(finalization.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !participant.groupId().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
-                                || !acceptSchema(participant.schemaDigest()) || !finalization.decision().domainId().equals(header.interval().domainId())
+                                || !acceptSchema(participant.schemaDigest()) || !participant.domainId().equals(header.interval().domainId())
                                 || commit.position().index()>header.position().index() || commit.position().term()>header.position().term() || commit.position().index()==header.position().index() && commit.position().term()!=header.position().term()) throw new IOException("COMMIT image identity/cut differs");
                         if (committed.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("COMMIT image count exceeded"); committed.put(finalization.transactionId(),commit);
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid COMMIT image record",invalid); }
@@ -874,7 +874,7 @@ public final class NativeRangeImage {
                         var participant=record.registration().participants().stream().filter(p -> p.groupId().equals(record.participantGroup())).findFirst().orElseThrow();
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x23).putLong(record.transactionId().getMostSignificantBits()).putLong(record.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !record.participantGroup().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
-                                || !acceptSchema(participant.schemaDigest()) || !record.registration().domainId().equals(header.interval().domainId())
+                                || !acceptSchema(participant.schemaDigest()) || !participant.domainId().equals(header.interval().domainId())
                                 || record.position().index()>header.position().index() || record.position().term()>header.position().term() || record.position().index()==header.position().index() && record.position().term()!=header.position().term()) throw new IOException("Rejected image identity/cut differs");
                         if (rejected.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("Rejected image count exceeded");
                         rejected.put(record.transactionId(),record);
@@ -885,7 +885,7 @@ public final class NativeRangeImage {
                         var gate=SnapshotGate.decode(value); gate.requireCompletedCut(header.position()); var fence=gate.fence(); var participant=fence.participant(gate.participantGroup());
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x24).putLong(fence.fenceId().getMostSignificantBits()).putLong(fence.fenceId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !gate.participantGroup().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
-                                || !acceptSchema(participant.schemaDigest()) || !fence.domainId().equals(header.interval().domainId())) throw new IOException("Gate image identity/cut differs");
+                                || !acceptSchema(participant.schemaDigest()) || !participant.domainId().equals(header.interval().domainId())) throw new IOException("Gate image identity/cut differs");
                         for (var span:participant.scope().spans()) {
                             byte[] lo=span.lowerInclusive(),hi=span.upperExclusive();
                             if (Arrays.equals(participant.schemaDigest(),header.schema()) && !header.interval().columns().contains(span.columnId()) || lower!=null && (lo==null || Arrays.compareUnsigned(lo,lower)<0)

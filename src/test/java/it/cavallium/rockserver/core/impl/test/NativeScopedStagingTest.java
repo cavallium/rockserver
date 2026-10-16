@@ -138,7 +138,7 @@ class NativeScopedStagingTest {
                         assertEquals(2,page.rows().size()); assertEquals(expected,new String(page.rows().getFirst().value(),StandardCharsets.UTF_8));
                         var accepted=store.planScopedCommit(pin,base,0,new UUID(0,9)); assertEquals(base.mutations(),accepted.mutations());
                         if (finalize) {
-                            var registration=TransactionStatus.begin(new UUID(0,10),new UUID(0,11),domain,new UUID(0,12),base.operationId(),1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(group,group,1,new byte[32],accepted.payloadDigest(),null,false)));
+                            var registration=TransactionStatus.begin(new UUID(0,10), new UUID(0,11), new UUID(0,12), base.operationId(), List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), new byte[32], List.of(new TransactionStatus.Participant(domain, group, group, 1, new byte[32], accepted.payloadDigest(), null, false)));
                             var preparation=new PreparedParticipant.Preparation(new UUID(0,13),1,new OperationId(new UUID(0,14),1,0),registration,accepted);
                             var vote=store.applyPrepared(new ApplyPosition(1,2),preparation); var decision=registration.prepared(group,accepted.payloadDigest(),vote.position()).decide(TransactionStatus.Phase.COMMIT);
                             var intent=new ParticipantFinalization(preparation.homeGroup(),1,group,new OperationId(new UUID(0,15),2,0),decision);

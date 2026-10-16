@@ -82,8 +82,8 @@ class NativeParticipantRetirementTest {
             assertNull(f.store.participantFence(identity(p))); floor(f,1); var result=f.store.applyFinalization(new ApplyPosition(1,2),terminal);
             assertTrue(result.retired()); assertNull(result.position()); assertNull(f.store.finalizedParticipant(p.transactionId())); assertEquals(0,f.store.preparedCapacity().count());
             assertTrue(f.store.estimatePreparation(p).existing().retired()); assertTrue(f.store.estimateRejection(p).existing().retired()); assertTrue(f.store.estimateFinalization(terminal).retired());
-            var wrong=new TransactionStatus.Participant(outer.group,outer.group,2,f.schema.digest(),p.business().payloadDigest(),null,false);
-            var definition=TransactionStatus.begin(outer.cluster,outer.database,outer.domain,p.transactionId(),p.business().operationId(),1,f.schema.digest(),new byte[32],List.of(wrong));
+            var wrong=new TransactionStatus.Participant(outer.domain, outer.group, outer.group, 2, f.schema.digest(), p.business().payloadDigest(), null, false);
+            var definition=TransactionStatus.begin(outer.cluster, outer.database, p.transactionId(), p.business().operationId(), List.of(new DomainBinding(outer.domain, 0, new byte[32], 1, f.schema.digest())), new byte[32], List.of(wrong));
             assertThrows(IllegalArgumentException.class,() -> f.store.participantFence(new ParticipantIdentity(p.homeGroup(),p.homeEpoch(),outer.group,definition)));
         }
     }

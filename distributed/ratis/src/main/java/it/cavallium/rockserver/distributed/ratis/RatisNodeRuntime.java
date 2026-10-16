@@ -609,7 +609,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     machine=RatisRangeStateMachine.withSessions(store,group,owner.images(),validator,epochs,effectiveDirectory,owner.retention());
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) {
                         machine.role(role,(key,value) -> RatisTransactionStatuses.validateRecord(directory.clusterId(),directory.databaseId(),key,value));
-                        machine.homeRecoveryProofs(recovery->data(recovery.before().domainId()).finalizedParticipant(recovery.proof().participant(),recovery.before().transactionId()));machine.homeRecoveryFences(participantIdentity->data(participantIdentity.definition().domainId()).participantFence(participantIdentity)); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
+                        machine.homeRecoveryProofs(recovery->data(recovery.before().participant(recovery.proof().participant()).domainId()).finalizedParticipant(recovery.proof().participant(),recovery.before().transactionId()));machine.homeRecoveryFences(participantIdentity->data(participantIdentity.definition().participant(participantIdentity.participantGroup()).domainId()).participantFence(participantIdentity)); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
                         machine.operationRerouteQueries(operationRerouteQueries);
                         var rerouteAuthority=new RatisOperationRerouteAdmission(new RatisOperationRerouteAdmission.Authority(){
                             public it.cavallium.rockserver.core.common.distributed.TopologyChange.State intent(UUID intent)throws IOException{return epochs.topologyCatalogue(plan.catalogue().directoryColumn()).readIntent(intent);}
@@ -621,7 +621,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     }
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
-                        machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeProofs((fence,participantGroup)->data(fence.domainId()).snapshotFence(fence,participantGroup));
+                        machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeProofs((fence,participantGroup)->data(fence.participant(participantGroup).domainId()).snapshotFence(fence,participantGroup));
                     }
                     else { configureDataMachine(machine,effectiveDirectory,descriptor); }
                     if (importDefinition!=null) {

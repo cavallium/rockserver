@@ -81,7 +81,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             homes.restore(registration.command(),registration.descriptor());
             if (expected(registration)!=null || !next(registration).equals(initial)) throw new IllegalArgumentException("Home registration differs from snapshot definition");
             journal.homeRoute=registration.descriptor(); journal.pending=registration; journal.lastHome=registration.command().operationId();
-            var directory=data.directory(); if (directory.generation()!=initial.fence().directoryGeneration()) throw new IllegalArgumentException("Snapshot directory generation changed before freezing routes");
+            var directory=data.directory(); if (initial.fence().domains().size()!=1 || !DomainBinding.of(directory).equals(initial.fence().domains().getFirst())) throw new IllegalArgumentException("Snapshot directory generation changed before freezing routes");
             if (routes.size()!=initial.fence().participants().size()) throw new IllegalArgumentException("Incomplete snapshot route set");
             var supplied=new HashMap<UUID,RangeDescriptor>(); for (var route:routes) if (supplied.putIfAbsent(route.groupId(),route)!=null) throw new IllegalArgumentException("Duplicate snapshot route");
             for (var participant:initial.fence().participants()) {

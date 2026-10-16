@@ -241,12 +241,12 @@ class RatisNodeResourceBudgetTest {
         var helper=new RatisParticipantPrepareTest(); helper.root=root; helper.dataInitializer=machine->machine.nodeResources(budget,pool);
         try(var home=new BudgetSnapshotHome(helper,budget,pool);var data=helper.new Node("snapshot-budget-data",false);var other=helper.new Node("snapshot-ordinary-full",false)) {
             var scope=helper.scope(data,1,4);
-            var participant=new it.cavallium.rockserver.core.common.distributed.SnapshotFence.Participant(data.f.groupId,data.f.groupId,1,new byte[32],new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7200),1,0),new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7200),1,1),scope);
-            var fence=new it.cavallium.rockserver.core.common.distributed.SnapshotFence(helper.cluster,helper.database,data.directory.domainId(),UUID.randomUUID(),home.f.groupId,1,new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7300),1,0),0,1,new byte[32],java.util.List.of(participant));
+            var participant=new it.cavallium.rockserver.core.common.distributed.SnapshotFence.Participant(data.directory.domainId(),data.f.groupId,data.f.groupId,1,new byte[32],new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7200),1,0),new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7200),1,1),scope);
+            var fence=new it.cavallium.rockserver.core.common.distributed.SnapshotFence(helper.cluster,helper.database,UUID.randomUUID(),home.f.groupId,1,new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7300),1,0),java.util.List.of(it.cavallium.rockserver.core.common.distributed.DomainBinding.of(data.directory)),java.util.List.of(participant));
             var initial=it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.begin(fence); home.advance(null,initial);
             var ordinary=other.f.propose(other.f.put(0)); assertNull(ordinary.getException());
             try {
-                var another=new it.cavallium.rockserver.core.common.distributed.SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),UUID.randomUUID(),fence.homeGroup(),fence.homeEpoch(),new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7301),1,0),0,1,new byte[32],fence.participants());
+                var another=new it.cavallium.rockserver.core.common.distributed.SnapshotFence(fence.clusterId(),fence.databaseId(),UUID.randomUUID(),fence.homeGroup(),fence.homeEpoch(),new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7301),1,0),fence.domains(),fence.participants());
                 assertThrows(IOException.class,()->home.advance(null,it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.begin(another)));
                 it.cavallium.rockserver.core.common.distributed.ApplyPosition installed;
                 try(var install=data.f.machine.prepareSnapshotInstall(home.homes,fence)) { installed=RatisSnapshotRecord.Result.decode(data.wire.append(install.bytes())).position(); }

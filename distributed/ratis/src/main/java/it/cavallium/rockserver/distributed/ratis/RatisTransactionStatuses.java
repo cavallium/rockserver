@@ -73,9 +73,9 @@ public final class RatisTransactionStatuses {
         var prepared=routed.prepare(operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),List.of(new KeyPredicate(column,key,expected==null ? null : expected.encode())));
         validate(prepared); return prepared;
     }
-    public RatisRoutedClient.PreparedCommand prepareReservation(OperationId control,OperationRerouteOrigin origin,long schemaEpoch,byte[] schemaDigest) {
+    public RatisRoutedClient.PreparedCommand prepareReservation(OperationId control,OperationRerouteOrigin origin,DomainBinding target) {
         if(!control.equals(origin.firstControl())) throw new IllegalArgumentException("Reservation changed original HOME control identity");
-        return prepare(control,null,TransactionStatus.reserve(origin,schemaEpoch,schemaDigest));
+        return prepare(control,null,TransactionStatus.reserve(origin,target));
     }
     public RatisRoutedClient.PreparedCommand preparePromotion(OperationId control,TransactionStatus reserved,TransactionStatus acceptedInitial) {
         return prepare(control,reserved,reserved.promote(acceptedInitial));

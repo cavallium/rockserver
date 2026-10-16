@@ -26,7 +26,7 @@ class ParticipantFinalizationTest {
         var wrongHome=new ParticipantFinalization(new UUID(0,80),1,fixture.group,recovery,commit()); assertThrows(IllegalArgumentException.class,() -> wrongHome.requirePrepared(prepared));
         var wrongEpoch=new ParticipantFinalization(fixture.home,2,fixture.group,recovery,commit()); assertThrows(IllegalArgumentException.class,() -> wrongEpoch.requirePrepared(prepared));
         var registration=fixture.preparation().registration();
-        var changed=TransactionStatus.begin(registration.clusterId(),registration.databaseId(),registration.domainId(),registration.transactionId(),registration.operation(),2,registration.schemaDigest(),registration.planDigest(),registration.participants())
+        var changed=TransactionStatus.begin(registration.clusterId(), registration.databaseId(), registration.transactionId(), registration.operation(), List.of(new DomainBinding(registration.domains().getFirst().domainId(), 0, new byte[32], 2, registration.domains().getFirst().schemaDigest())), registration.planDigest(), registration.participants())
                 .prepared(fixture.group,PreparedParticipant.Preparation.planDigest(fixture.accepted()),new ApplyPosition(1,1)).decide(TransactionStatus.Phase.COMMIT);
         assertThrows(IllegalArgumentException.class,() -> finalize(changed).requirePrepared(prepared));
         assertFalse(Arrays.equals(intent.decisionDigest(),finalize(registration.decide(TransactionStatus.Phase.ABORT)).decisionDigest()));
@@ -48,9 +48,10 @@ class ParticipantFinalizationTest {
         for (int n=0;n<valid.length;n++) { byte[] truncated=Arrays.copyOf(valid,n); assertThrows(IllegalArgumentException.class,() -> ParticipantFinalization.decode(truncated)); }
         byte[] length=valid.clone(); ByteBuffer.wrap(length).putInt(72,-1); assertThrows(IllegalArgumentException.class,() -> ParticipantFinalization.decode(length));
         assertThrows(IllegalArgumentException.class,() -> ParticipantFinalization.decode(Arrays.copyOf(valid,valid.length+1)));
-        byte[] generation=valid.clone(); ByteBuffer.wrap(generation).putLong(ParticipantFinalization.HEADER_BYTES+168,1);
+        int generationOffset=4*16+2*Long.BYTES+32; // Four UUIDs, operation epoch/sequence, plan digest.
+        byte[] generation=valid.clone(); ByteBuffer.wrap(generation).putLong(ParticipantFinalization.HEADER_BYTES+generationOffset,1);
         assertThrows(IllegalArgumentException.class,() -> ParticipantFinalization.decode(generation));
-        byte[] ack=valid.clone(); ack[ParticipantFinalization.HEADER_BYTES+TransactionStatus.HEADER_BYTES+120]=1;
+        byte[] ack=valid.clone(); ack[ack.length-1]=1;
         assertThrows(IllegalArgumentException.class,() -> ParticipantFinalization.decode(ack));
     }
 }

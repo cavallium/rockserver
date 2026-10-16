@@ -47,7 +47,7 @@ class RatisSnapshotHomeRetirementRpcTest {
             assertEquals(CommandResult.Status.SESSION_EXPIRED,f.home.homes.execute(f.home.homes.prepare(new OperationId(new UUID(101,2),5,0),null,SnapshotFenceStatus.begin(f.fence))).status());
             f.home.f.machine.takeSnapshot(); f.home.f.machine.pause(); f.home.f.machine.reinitialize(); index=f.home.wire.index;
             f.home.homes.retire(retirement); assertEquals(index,f.home.wire.index);
-            var old=f.fence; var next=new SnapshotFence(old.clusterId(),old.databaseId(),old.domainId(),old.fenceId(),old.homeGroup(),old.homeEpoch(),new OperationId(new UUID(101,3),5,0),old.directoryGeneration(),old.schemaEpoch(),old.schemaDigest(),old.participants());
+            var old=f.fence; var next=new SnapshotFence(old.clusterId(), old.databaseId(), old.fenceId(), old.homeGroup(), old.homeEpoch(), new OperationId(new UUID(101,3),5,0), old.domains(), old.participants());
             assertEquals(CommandResult.Status.SUCCESS,f.home.homes.execute(f.home.homes.prepare(new OperationId(new UUID(101,4),5,0),null,SnapshotFenceStatus.begin(next))).status());
             f.home.homes.retire(retirement); assertEquals(next,f.home.homes.read(next.fenceId()).fence()); assertEquals(old,f.home.homes.fence(retirement.identity()).identity().fence()); x.released();
         }

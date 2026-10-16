@@ -406,8 +406,8 @@ public final class RatisRoutedClient implements AutoCloseable {
     private static void requireSnapshotRoute(RangeDirectory directory,RangeDescriptor descriptor,SnapshotFence fence,UUID group) {
         var participant=fence.participant(group);
         if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || !descriptor.groupId().equals(group) || !descriptor.rangeId().equals(participant.rangeId()) || descriptor.rangeEpoch()!=participant.rangeEpoch()
-                || !Arrays.equals(directory.schemaDigest(),participant.schemaDigest()) || !Arrays.equals(directory.schemaDigest(),fence.schemaDigest()) || directory.schemaEpoch()!=fence.schemaEpoch()
-                || !directory.clusterId().equals(fence.clusterId()) || !directory.databaseId().equals(fence.databaseId()) || !directory.domainId().equals(fence.domainId())) throw new IllegalArgumentException("Snapshot route differs from frozen participant");
+                || !Arrays.equals(directory.schemaDigest(),participant.schemaDigest()) || !Arrays.equals(directory.schemaDigest(),fence.participantDomain(participant.groupId()).schemaDigest()) || directory.schemaEpoch()!=fence.participantDomain(participant.groupId()).schemaEpoch()
+                || !directory.clusterId().equals(fence.clusterId()) || !directory.databaseId().equals(fence.databaseId()) || !directory.domainId().equals(participant.domainId())) throw new IllegalArgumentException("Snapshot route differs from frozen participant");
     }
     public record SnapshotGatePreparation(boolean drained,RatisSnapshotRecord.Result receipt) {
         public SnapshotGatePreparation { if (!drained && receipt!=null) throw new IllegalArgumentException("Retained snapshot proof cannot be waiting"); }
@@ -622,7 +622,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     public PreparedFinalizationOperation restoreFinalization(ParticipantFinalization finalization,RangeDescriptor descriptor) {
         var observed=current(); var registered=finalization.participant(); var decision=finalization.decision();
         if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || !descriptor.groupId().equals(registered.groupId()) || !descriptor.rangeId().equals(registered.rangeId()) || descriptor.rangeEpoch()!=registered.rangeEpoch()
-                || !Arrays.equals(observed.schemaDigest(),registered.schemaDigest()) || !observed.domainId().equals(decision.domainId()) || !observed.clusterId().equals(decision.clusterId()) || !observed.databaseId().equals(decision.databaseId())) throw new IllegalArgumentException("Finalization route differs from frozen participant");
+                || !Arrays.equals(observed.schemaDigest(),registered.schemaDigest()) || !observed.domainId().equals(registered.domainId()) || !observed.clusterId().equals(decision.clusterId()) || !observed.databaseId().equals(decision.databaseId())) throw new IllegalArgumentException("Finalization route differs from frozen participant");
         return new PreparedFinalizationOperation(identity,descriptor,finalization);
     }
     /** Obtain ready authority from a fixed server-side HOME reader; frozen bytes never choose that reader. */
@@ -684,7 +684,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         var observed=current();
         var registered=preparation.registration().participants().stream().filter(p -> p.groupId().equals(descriptor.groupId())).findFirst().orElseThrow();
         if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || descriptor.rangeEpoch()!=preparation.business().rangeEpoch() || !registered.rangeId().equals(descriptor.rangeId())
-                || !Arrays.equals(observed.schemaDigest(),preparation.business().schemaDigest()) || !observed.domainId().equals(preparation.registration().domainId())
+                || !Arrays.equals(observed.schemaDigest(),preparation.business().schemaDigest()) || !observed.domainId().equals(preparation.domainBinding().domainId())
                 || !observed.clusterId().equals(preparation.registration().clusterId()) || !observed.databaseId().equals(preparation.registration().databaseId())) throw new IllegalArgumentException("Participant route differs from frozen registration");
         restoreSessionCommand(preparation.business(),descriptor);
         return new PreparedParticipantOperation(identity,descriptor,preparation,negative);
@@ -727,7 +727,7 @@ public final class RatisRoutedClient implements AutoCloseable {
             byte[] bytes=ScopedTransactionRpc.blob(input,ParticipantOutcome.MAX_BYTES,true); if (input.hasRemaining()) throw new IllegalArgumentException("Trailing participant outcome");
             if (bytes==null) return null; var outcome=ParticipantOutcome.decode(bytes); var decision=outcome.finalization().decision(); var participant=outcome.finalization().participant();
             if (!decision.transactionId().equals(transactionId) || !participant.groupId().equals(group) || !participant.rangeId().equals(descriptor.rangeId()) || participant.rangeEpoch()!=descriptor.rangeEpoch()
-                    || !Arrays.equals(participant.schemaDigest(),observed.schemaDigest()) || !decision.clusterId().equals(observed.clusterId()) || !decision.databaseId().equals(observed.databaseId()) || !decision.domainId().equals(observed.domainId())) throw new IllegalArgumentException("Participant outcome route/identity changed");
+                    || !Arrays.equals(participant.schemaDigest(),observed.schemaDigest()) || !decision.clusterId().equals(observed.clusterId()) || !decision.databaseId().equals(observed.databaseId()) || !participant.domainId().equals(observed.domainId())) throw new IllegalArgumentException("Participant outcome route/identity changed");
             return outcome;
         } catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant outcome reply",invalid); }
     }
@@ -872,7 +872,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     }
     ParticipantFenceProof participantFence(RangeDirectory observed,RangeDescriptor descriptor,ParticipantIdentity identity)throws IOException {
         requireNamespace(observed);if(observed.ranges().stream().noneMatch(descriptor::equals))throw new IllegalArgumentException("Frozen participant fence descriptor absent");var participant=identity.participant();
-        if (!observed.clusterId().equals(identity.definition().clusterId()) || !observed.databaseId().equals(identity.definition().databaseId()) || !observed.domainId().equals(identity.definition().domainId())
+        if (!observed.clusterId().equals(identity.definition().clusterId()) || !observed.databaseId().equals(identity.definition().databaseId()) || !observed.domainId().equals(participant.domainId())
                 || !descriptor.rangeId().equals(participant.rangeId()) || descriptor.rangeEpoch()!=participant.rangeEpoch() || !Arrays.equals(observed.schemaDigest(),participant.schemaDigest())) throw new IllegalArgumentException("Participant fence route differs");
         try {
             var input=ByteBuffer.wrap(transaction(descriptor,ScopedTransactionRpc.PARTICIPANT_FENCE,identity.encode(),true));

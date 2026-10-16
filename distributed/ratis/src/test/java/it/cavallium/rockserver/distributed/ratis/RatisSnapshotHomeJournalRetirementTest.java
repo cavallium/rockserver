@@ -107,10 +107,7 @@ class RatisSnapshotHomeJournalRetirementTest {
         try (var f=new Fixture("reused")) {
             f.journal.executeHome(); foreignAbortAndConsume(f);
             var old=f.fence; var participant=old.participant(f.data.f.groupId);
-            var replacement=new SnapshotFence(old.clusterId(),old.databaseId(),old.domainId(),old.fenceId(),old.homeGroup(),old.homeEpoch(),
-                    new OperationId(old.operation().sessionId(),2,0),old.directoryGeneration(),old.schemaEpoch(),old.schemaDigest(),
-                    List.of(new SnapshotFence.Participant(participant.rangeId(),participant.groupId(),participant.rangeEpoch(),participant.schemaDigest(),
-                            new OperationId(participant.installOperation().sessionId(),2,0),new OperationId(participant.releaseOperation().sessionId(),2,1),participant.scope())));
+            var replacement=new SnapshotFence(old.clusterId(), old.databaseId(), old.fenceId(), old.homeGroup(), old.homeEpoch(), new OperationId(old.operation().sessionId(),2,0), old.domains(), List.of(new SnapshotFence.Participant(participant.domainId(), participant.rangeId(), participant.groupId(), participant.rangeEpoch(), participant.schemaDigest(), new OperationId(participant.installOperation().sessionId(),2,0), new OperationId(participant.releaseOperation().sessionId(),2,1), participant.scope())));
             var next=SnapshotFenceStatus.begin(replacement);
             assertEquals(CommandResult.Status.SUCCESS,f.home.homes.execute(f.home.homes.prepare(new OperationId(new UUID(0,44002),2,0),null,next)).status());
             f.reopen(); assertExpired(f,f.initial); f.reopen(); assertExpired(f,f.initial);

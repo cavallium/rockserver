@@ -144,9 +144,7 @@ class NativeSchemaInstallationTest {
     @Test void releasedGateRetainsOriginalDecisionAfterColumnDeletionAndRecovery() throws Exception {
         var source=source(); var target=new DistributedSchema(cluster,database,domain,1,0,List.of()); var change=change(source,target,List.of(descriptor(group,null,null)));
         var session=UUID.randomUUID();
-        var gate=new SnapshotFence(cluster,database,domain,UUID.randomUUID(),UUID.randomUUID(),1,new OperationId(session,1,0),0,0,source.digest(),
-                List.of(new SnapshotFence.Participant(group,group,1,source.digest(),new OperationId(session,1,1),new OperationId(session,1,2),
-                        new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1}))))));
+        var gate=new SnapshotFence(cluster, database, UUID.randomUUID(), UUID.randomUUID(), 1, new OperationId(session,1,0), List.of(new DomainBinding(domain, 0, new byte[32], 0, source.digest())), List.of(new SnapshotFence.Participant(domain, group, group, 1, source.digest(), new OperationId(session,1,1), new OperationId(session,1,2), new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1}))))));
         var terminal=SnapshotFenceStatus.begin(gate).abort(); var path=root.resolve("released-gate");
         try(var pool=open(path)) {
             var store=store(pool,group,source,null,null); store.enableLogicalSchema(source); store.applyNoop(new ApplyPosition(1,0));

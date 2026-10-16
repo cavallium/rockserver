@@ -16,8 +16,8 @@ class RatisSnapshotHelpServiceTest {
     final UUID group=new UUID(1,1);
     SnapshotFence fence(int id) {
         UUID column=new UUID(1,2); var control=new UUID(1,3);
-        return new SnapshotFence(new UUID(1,4),new UUID(1,5),new UUID(1,6),new UUID(2,id),new UUID(1,7),1,new OperationId(new UUID(2,id),1,0),0,1,new byte[32],List.of(
-                new SnapshotFence.Participant(group,group,1,new byte[32],new OperationId(control,0,id*2L),new OperationId(control,0,id*2L+1),new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1}))))));
+        return new SnapshotFence(new UUID(1,4), new UUID(1,5), new UUID(2,id), new UUID(1,7), 1, new OperationId(new UUID(2,id),1,0), List.of(new DomainBinding(new UUID(1,6), 0, new byte[32], 1, new byte[32])), List.of(
+                new SnapshotFence.Participant(new UUID(1,6), group, group, 1, new byte[32], new OperationId(control,0,id*2L), new OperationId(control,0,id*2L+1), new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1}))))));
     }
     RWScheduler scheduler() { return RWScheduler.forTesting(1,1,1,4,1,"snapshot-help-test"); }
     @Test void coalescedViewsAndCancelledStopRetainActualRunningOwnership() throws Exception {

@@ -77,8 +77,8 @@ class NativeBucketMergeTest {
     }
     PreparedParticipant.Preparation prepare(Fixture f,DistributedCommand base,TransactionScope scope,UUID transaction) throws Exception {
         DistributedCommand accepted; try(var pin=f.store.captureTracked(scope)) { accepted=f.store.planScopedCommit(pin,base,0,new UUID(31,70)); }
-        var participant=new TransactionStatus.Participant(group,group,1,f.schema.digest(),PreparedParticipant.Preparation.planDigest(accepted),null,false);
-        var registration=TransactionStatus.begin(cluster,database,domain,transaction,base.operationId(),f.schema.schemaEpoch(),f.schema.digest(),new byte[32],List.of(participant));
+        var participant=new TransactionStatus.Participant(domain, group, group, 1, f.schema.digest(), PreparedParticipant.Preparation.planDigest(accepted), null, false);
+        var registration=TransactionStatus.begin(cluster, database, transaction, base.operationId(), List.of(new DomainBinding(domain, 0, new byte[32], f.schema.schemaEpoch(), f.schema.digest())), new byte[32], List.of(participant));
         return new PreparedParticipant.Preparation(new UUID(31,71),1,new OperationId(new UUID(31,72),1,base.operationId().sequence()),registration,accepted);
     }
     ParticipantFinalization commit(PreparedParticipant prepared) {

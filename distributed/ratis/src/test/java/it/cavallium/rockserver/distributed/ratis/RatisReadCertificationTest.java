@@ -31,8 +31,8 @@ class RatisReadCertificationTest {
         ReplicatedRangeStore.ScopedHistoryPin capture() throws Exception { return data.f.machine.captureTrackedSnapshotGate(snapshots.homes,fence); }
         DistributedCommand intent(ReplicatedRangeStore.ScopedHistoryPin pin) throws Exception { return data.f.machine.participantReadIntent(pin,new OperationId(data.f.session,1,100)); }
         TransactionStatus register(DistributedCommand accepted,int id) throws Exception {
-            var participant=new TransactionStatus.Participant(data.f.groupId,data.f.groupId,1,new byte[32],accepted.payloadDigest(),null,false);
-            var status=TransactionStatus.begin(helper.helper.cluster,helper.helper.database,data.directory.domainId(),new UUID(120,id),accepted.operationId(),1,new byte[32],accepted.payloadDigest(),List.of(participant));
+            var participant=new TransactionStatus.Participant(data.directory.domainId(), data.f.groupId, data.f.groupId, 1, new byte[32], accepted.payloadDigest(), null, false);
+            var status=TransactionStatus.begin(helper.helper.cluster, helper.helper.database, new UUID(120,id), accepted.operationId(), List.of(new DomainBinding(data.directory.domainId(), data.directory.generation(), data.directory.payloadDigest(), 1, new byte[32])), accepted.payloadDigest(), List.of(participant));
             transition(null,status,id*10); return status;
         }
         void transition(TransactionStatus before,TransactionStatus after,long sequence) throws Exception {
@@ -88,7 +88,7 @@ class RatisReadCertificationTest {
     }
     @Test void trackedCaptureRejectsChangedHomeAndLostOwnerWithoutLeakingReaders() throws Exception {
         try (var f=new Fixture("capture-owner")) {
-            var changed=new SnapshotFence(f.fence.clusterId(),f.fence.databaseId(),f.fence.domainId(),f.fence.fenceId(),f.fence.homeGroup(),f.fence.homeEpoch(),f.fence.operation(),f.fence.directoryGeneration()+1,f.fence.schemaEpoch(),f.fence.schemaDigest(),f.fence.participants());
+            var changed=new SnapshotFence(f.fence.clusterId(), f.fence.databaseId(), f.fence.fenceId(), f.fence.homeGroup(), f.fence.homeEpoch(), f.fence.operation(), List.of(new DomainBinding(f.fence.domains().getFirst().domainId(), f.fence.domains().getFirst().directoryGeneration()+1, new byte[32], f.fence.domains().getFirst().schemaEpoch(), f.fence.domains().getFirst().schemaDigest())), f.fence.participants());
             assertThrows(IllegalArgumentException.class,() -> f.data.f.machine.captureTrackedSnapshotGate(f.snapshots.homes,changed));
             f.snapshots.wire.afterRead=() -> { f.data.f.leadership.set(new RatisRangeStateMachine.Leadership(2,false)); f.snapshots.wire.afterRead=null; };
             assertThrows(IOException.class,f::capture); assertEquals(0,f.data.f.store.activeTrackedSnapshotPins()); assertEquals(0,f.data.f.store.activeSnapshotPins());

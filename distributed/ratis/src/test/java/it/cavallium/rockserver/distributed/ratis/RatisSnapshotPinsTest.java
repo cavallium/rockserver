@@ -91,7 +91,7 @@ class RatisSnapshotPinsTest {
                 assertThrows(IllegalArgumentException.class,() -> pins.get(token,f.data.f.column,new byte[]{4}));
                 assertThrows(IllegalArgumentException.class,() -> pins.capture(f.home.homes,f.fence,f.owner,UUID.randomUUID(),ttl,() -> 0));
                 assertThrows(IllegalArgumentException.class,() -> pins.capture(f.home.homes,f.fence,f.owner,f.snapshot,Duration.ofSeconds(11),() -> 0));
-                var changed=new SnapshotFence(f.fence.clusterId(),f.fence.databaseId(),f.fence.domainId(),f.fence.fenceId(),f.fence.homeGroup(),f.fence.homeEpoch(),f.fence.operation(),1,f.fence.schemaEpoch(),f.fence.schemaDigest(),f.fence.participants());
+                var changed=new SnapshotFence(f.fence.clusterId(), f.fence.databaseId(), f.fence.fenceId(), f.fence.homeGroup(), f.fence.homeEpoch(), f.fence.operation(), List.of(new DomainBinding(f.fence.domains().getFirst().domainId(), 1, new byte[32], f.fence.domains().getFirst().schemaEpoch(), f.fence.domains().getFirst().schemaDigest())), f.fence.participants());
                 assertThrows(IllegalArgumentException.class,() -> pins.capture(f.home.homes,changed,f.owner,f.snapshot,ttl,() -> 0));
                 assertArrayEquals(new byte[]{7},pins.get(token,f.data.f.column,new byte[]{2})); pins.release(token);
                 assertEquals(0,pins.stats().pins()); assertThrows(RatisSnapshotLostException.class,() -> pins.capture(f.home.homes,f.fence,f.owner,f.snapshot,ttl,() -> 0));
@@ -167,8 +167,7 @@ class RatisSnapshotPinsTest {
         }
     }
     private SnapshotFence identity(SnapshotFence base,UUID fenceId,long epoch,long sequence) {
-        return new SnapshotFence(base.clusterId(),base.databaseId(),base.domainId(),fenceId,base.homeGroup(),base.homeEpoch(),
-                new OperationId(new UUID(0,9900),epoch,sequence),base.directoryGeneration(),base.schemaEpoch(),base.schemaDigest(),base.participants());
+        return new SnapshotFence(base.clusterId(), base.databaseId(), fenceId, base.homeGroup(), base.homeEpoch(), new OperationId(new UUID(0,9900),epoch,sequence), base.domains(), base.participants());
     }
     @Test void retiredClosedTombstonesRecycleBothIdentityMapsAndCannotReopenOldBusiness() throws Exception {
         try (var f=new Fixture("recycle")) {

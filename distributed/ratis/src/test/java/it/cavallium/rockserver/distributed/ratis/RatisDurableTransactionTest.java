@@ -18,9 +18,9 @@ class RatisDurableTransactionTest {
     record Plan(TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,RatisDurableTransaction.Intent intent) {}
     Plan plan(RatisParticipantPrepareTest.Node home,RatisParticipantPrepareTest.Node data,it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.ScopedHistoryPin pin) throws Exception {
         var accepted=data.f.machine.participantIntent(pin,data.f.put(2));
-        var participant=new TransactionStatus.Participant(data.f.groupId,data.f.groupId,1,new byte[32],accepted.payloadDigest(),null,false);
+        var participant=new TransactionStatus.Participant(data.directory.domainId(), data.f.groupId, data.f.groupId, 1, new byte[32], accepted.payloadDigest(), null, false);
         var intent=new RatisDurableTransaction.Intent(data.directory.ranges().getFirst(),accepted,helper.control(0),new OperationId(new UUID(0,1501),3,0));
-        var initial=TransactionStatus.begin(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,1500),accepted.operationId(),1,new byte[32],RatisDurableTransaction.planDigest(List.of(intent)),List.of(participant));
+        var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(0,1500), accepted.operationId(), List.of(new DomainBinding(data.directory.domainId(), data.directory.generation(), data.directory.payloadDigest(), 1, new byte[32])), RatisDurableTransaction.planDigest(List.of(intent)), List.of(participant));
         return new Plan(initial,home.statuses.prepare(homeOperation(0),null,initial),intent);
     }
     RatisDurableTransaction create(Path path,RatisParticipantPrepareTest.Node home,RatisParticipantPrepareTest.Node data,Plan plan) throws Exception {
@@ -193,7 +193,7 @@ class RatisDurableTransactionTest {
             try (var lp=left.f.store.captureTracked(new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1})))); var rp=right.f.store.captureTracked(new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{(byte)130})))); var routed=new RatisRoutedClient(directory,transport)) {
                 var la=left.f.machine.participantIntent(lp,lb); var ra=right.f.machine.participantIntent(rp,rb);
                 var intents=List.of(new RatisDurableTransaction.Intent(l,la,helper.control(0),new OperationId(new UUID(0,1604),3,0),List.of()),new RatisDurableTransaction.Intent(r,ra,helper.control(1),new OperationId(new UUID(0,1605),3,0),List.of()));
-                var initial=TransactionStatus.begin(helper.cluster,helper.database,domain,new UUID(0,1603),operation,1,new byte[32],RatisDurableTransaction.planDigest(intents),List.of(new TransactionStatus.Participant(l.rangeId(),l.groupId(),1,new byte[32],la.payloadDigest(),null,false),new TransactionStatus.Participant(r.rangeId(),r.groupId(),1,new byte[32],ra.payloadDigest(),null,false)));
+                var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(0,1603), operation, List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), RatisDurableTransaction.planDigest(intents), List.of(new TransactionStatus.Participant(domain, l.rangeId(), l.groupId(), 1, new byte[32], la.payloadDigest(), null, false),new TransactionStatus.Participant(domain, r.rangeId(), r.groupId(), 1, new byte[32], ra.payloadDigest(), null, false)));
                 Path path=root.resolve("multi.bin"); var journal=RatisDurableTransaction.create(path,home.statuses,routed,initial,home.statuses.prepare(homeOperation(0),null,initial),intents);
                 try {
                     journal.executeHome();
@@ -277,10 +277,10 @@ class RatisDurableTransactionTest {
                 var route=new RangeDescriptor(group,group,1,0,n==0 ? null : new byte[]{(byte)(n*28)},n==8 ? null : new byte[]{(byte)((n+1)*28)},RangeDescriptor.TopologyState.ACTIVE,List.of(replica)); ranges.add(route);
                 byte[] key={(byte)(n*28+1)}; var raw=new DistributedCommand(group,1,new byte[32],business,List.of(new Mutation(Mutation.Kind.PUT,data.f.column,key,new byte[1_900_000])));
                 var scope=new TransactionScope(List.of(TransactionScope.Span.point(data.f.column,key))); var accepted=DistributedCommand.acceptedTransaction(raw,new TransactionAcceptance(new ApplyPosition(1,0),0,new UUID(0,1701),scope,new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()));
-                intents.add(new RatisDurableTransaction.Intent(route,accepted,new OperationId(new UUID(0,1702),2,n),new OperationId(new UUID(0,1703),3,n),List.of())); participants.add(new TransactionStatus.Participant(group,group,1,new byte[32],accepted.payloadDigest(),null,false));
+                intents.add(new RatisDurableTransaction.Intent(route,accepted,new OperationId(new UUID(0,1702),2,n),new OperationId(new UUID(0,1703),3,n),List.of())); participants.add(new TransactionStatus.Participant(data.directory.domainId(), group, group, 1, new byte[32], accepted.payloadDigest(), null, false));
             }
             var directory=new RangeDirectory(helper.cluster,helper.database,data.directory.domainId(),1,new byte[32],0,Set.of(data.f.column),0,ranges);
-            var initial=TransactionStatus.begin(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,1704),business,1,new byte[32],RatisDurableTransaction.planDigest(intents),participants);
+            var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(0,1704), business, List.of(new DomainBinding(data.directory.domainId(), data.directory.generation(), data.directory.payloadDigest(), 1, new byte[32])), RatisDurableTransaction.planDigest(intents), participants);
             try (var routed=new RatisRoutedClient(directory,data.wire)) {
                 Path path=root.resolve("budget.bin"); assertThrows(IOException.class,() -> RatisDurableTransaction.create(path,home.statuses,routed,initial,home.statuses.prepare(homeOperation(0),null,initial),intents));
                 assertFalse(Files.exists(path)); assertEquals(0,home.wire.index); assertEquals(0,data.wire.index);
@@ -347,13 +347,13 @@ class RatisDurableTransactionTest {
                     var accepted=DistributedCommand.acceptedTransaction(raw,new TransactionAcceptance(new ApplyPosition(1,0),0,new UUID(0,1721),new TransactionScope(List.of(TransactionScope.Span.point(data.f.column,key))),new CommandResult(CommandResult.Status.SUCCESS,List.of(value)).encode()));
                     int slot=invalid.equals("duplicate") ? 0 : invalid.equals("gap") && n==1 ? 2 : n;
                     intents.add(new RatisDurableTransaction.Intent(route,accepted,new OperationId(new UUID(0,1722),2,n),new OperationId(new UUID(0,1723),3,n),List.of(slot)));
-                    participants.add(new TransactionStatus.Participant(group,group,1,new byte[32],accepted.payloadDigest(),null,false));
+                    participants.add(new TransactionStatus.Participant(data.directory.domainId(), group, group, 1, new byte[32], accepted.payloadDigest(), null, false));
                     assertThrows(IllegalArgumentException.class,() -> new RatisDurableTransaction.Intent(route,accepted,new OperationId(new UUID(0,1722),2,20),new OperationId(new UUID(0,1723),3,20),List.of()));
                     assertThrows(IllegalArgumentException.class,() -> new RatisDurableTransaction.Intent(route,accepted,new OperationId(new UUID(0,1722),2,20),new OperationId(new UUID(0,1723),3,20),List.of(256)));
                 }
                 var directory=new RangeDirectory(helper.cluster,helper.database,data.directory.domainId(),1,new byte[32],0,Set.of(data.f.column),0,routes);
                 byte[] digest=RatisDurableTransaction.planDigest(intents); if (invalid.equals("digest")) digest[0]^=1;
-                var initial=TransactionStatus.begin(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,1740+List.of("bytes","duplicate","gap","digest").indexOf(invalid)),business,1,new byte[32],digest,participants);
+                var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(0,1740+List.of("bytes","duplicate","gap","digest").indexOf(invalid)), business, List.of(new DomainBinding(data.directory.domainId(), data.directory.generation(), data.directory.payloadDigest(), 1, new byte[32])), digest, participants);
                 try (var routed=new RatisRoutedClient(directory,data.wire)) {
                     Path path=root.resolve("global-result-"+invalid+".bin");
                     assertThrows(IOException.class,() -> RatisDurableTransaction.create(path,home.statuses,routed,initial,home.statuses.prepare(homeOperation(0),null,initial),intents));

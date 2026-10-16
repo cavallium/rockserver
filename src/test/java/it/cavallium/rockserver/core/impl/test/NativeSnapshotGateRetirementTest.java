@@ -17,8 +17,8 @@ class NativeSnapshotGateRetirementTest {
     SnapshotFence fence(NativeBucketApplyTest.Fixture f,int id,int point) { return helper.fence(f,id,point); }
     SnapshotFence rebind(SnapshotFence old,OperationId operation,int point) {
         var local=old.participant(outer.group); var controls=new UUID(0,1200);
-        return new SnapshotFence(old.clusterId(),old.databaseId(),old.domainId(),old.fenceId(),old.homeGroup(),old.homeEpoch(),operation,old.directoryGeneration(),old.schemaEpoch(),old.schemaDigest(),List.of(
-                new SnapshotFence.Participant(local.rangeId(),local.groupId(),local.rangeEpoch(),local.schemaDigest(),new OperationId(controls,2,point*2L),new OperationId(controls,2,point*2L+1),prepared.point(outer.fixed,point))));
+        return new SnapshotFence(old.clusterId(), old.databaseId(), old.fenceId(), old.homeGroup(), old.homeEpoch(), operation, old.domains(), List.of(
+                new SnapshotFence.Participant(old.domains().getFirst().domainId(), local.rangeId(), local.groupId(), local.rangeEpoch(), local.schemaDigest(), new OperationId(controls,2,point*2L), new OperationId(controls,2,point*2L+1), prepared.point(outer.fixed,point))));
     }
     void floor(NativeBucketApplyTest.Fixture f,long index) throws Exception { f.store.apply(new ApplyPosition(1,index),DistributedCommand.advanceSessionEpochFloor(outer.group,1,f.schema.digest(),new OperationId(new UUID(0,1201),2,index),2)); }
     @Test void consumedCompleteReclaimsGateWhileHistoricalPinsRemainReadableAcrossReopenAndImage() throws Exception {
@@ -70,7 +70,7 @@ class NativeSnapshotGateRetirementTest {
             assertTrue(f.store.snapshotGateResult(old).retired()); assertTrue(f.store.applyGateInstall(new ApplyPosition(1,6),old).retired()); assertTrue(f.store.applyGateRelease(new ApplyPosition(1,7),consumed).retired()); f.store.applySnapshotGateRetirement(new ApplyPosition(1,8),retirement);
             assertEquals(nativeNext,f.store.snapshotGate(old.fenceId())); assertEquals(1,f.store.gateCapacity().count()); assertNull(f.store.snapshotFence(next));
             assertTrue(f.store.applyGateInstall(new ApplyPosition(1,1),old).retired()); assertTrue(f.store.applyGateRelease(new ApplyPosition(1,2),consumed).retired()); f.store.applySnapshotGateRetirement(new ApplyPosition(1,4),retirement); assertEquals(new ApplyPosition(1,8),f.store.applied());
-            assertThrows(IllegalArgumentException.class,() -> f.store.applyGateInstall(new ApplyPosition(2,8),old)); var changed=new SnapshotFence(next.clusterId(),next.databaseId(),next.domainId(),next.fenceId(),next.homeGroup(),next.homeEpoch(),next.operation(),next.directoryGeneration()+1,next.schemaEpoch(),next.schemaDigest(),next.participants()); assertThrows(IllegalArgumentException.class,() -> f.store.snapshotGateResult(changed));
+            assertThrows(IllegalArgumentException.class,() -> f.store.applyGateInstall(new ApplyPosition(2,8),old)); var changed=new SnapshotFence(next.clusterId(), next.databaseId(), next.fenceId(), next.homeGroup(), next.homeEpoch(), next.operation(), next.domains().stream().map(d -> new DomainBinding(d.domainId(),d.directoryGeneration()+1,d.directoryDigest(),d.schemaEpoch(),d.schemaDigest())).toList(), next.participants()); assertThrows(IllegalArgumentException.class,() -> f.store.snapshotGateResult(changed));
             assertEquals(nativeNext,f.store.snapshotGate(old.fenceId()));
         }
     }
