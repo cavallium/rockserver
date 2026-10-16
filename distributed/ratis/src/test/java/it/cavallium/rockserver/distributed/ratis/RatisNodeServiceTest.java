@@ -77,6 +77,36 @@ class RatisNodeServiceTest {
             }
         }
     }
+    @Test void frontendInitializationRetriesRetainedOwnerAndConnectionWithoutChangingEndpoint() throws Exception {
+        var schema=schema();
+        try(var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
+            initialize(env,schema);publish(env,schema);var fake=new RatisNodeRuntimeTest.FakeServer();
+            try(var service=RatisNodeService.recover(manifest(env,schema),env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create)) {
+                service.start();var backend=org.mockito.Mockito.mock(RatisDatabaseBackendFactory.class);var connection=org.mockito.Mockito.mock(RatisRocksDBConnection.class);
+                var exports=org.mockito.Mockito.mock(RatisExportBackend.class);var endpoint=java.net.URI.create("grpc://localhost:5333");
+                var pending=root.resolve("original-binding");byte[] command={1,3,5,7};var opens=new java.util.concurrent.atomic.AtomicInteger();
+                org.mockito.Mockito.when(backend.open(endpoint)).thenAnswer(call->{
+                    if(opens.incrementAndGet()==1){SessionJournalFiles.write(pending,command,64);throw new IOException("Unknown original binding reply");}
+                    assertArrayEquals(command,SessionJournalFiles.read(pending,64),"Original forced binding must survive initialization retry");return connection;
+                });
+                org.mockito.Mockito.when(backend.exports()).thenThrow(new IOException("Original export initialization retained")).thenReturn(exports);
+                var creates=new java.util.concurrent.atomic.AtomicInteger();RatisNodeService.BackendCreator creator=()->{assertEquals(1,creates.incrementAndGet());return backend;};
+                var listens=new java.util.concurrent.atomic.AtomicInteger();var starts=new java.util.concurrent.atomic.AtomicInteger();var closes=new java.util.concurrent.atomic.AtomicInteger();
+                RatisNodeService.ListenerCreator listener=(actual,api)->{assertSame(connection,actual);assertSame(exports,api);listens.incrementAndGet();return new it.cavallium.rockserver.core.server.Server(actual){public void start(){starts.incrementAndGet();}public void close(){closes.incrementAndGet();}};};
+                assertThrows(IOException.class,()->service.startFrontend(creator,listener,endpoint));
+                assertThrows(IOException.class,()->service.startFrontend(creator,listener,java.net.URI.create("grpc://localhost:5444")));
+                assertEquals(1,opens.get());assertEquals(0,listens.get());
+                assertThrows(IOException.class,()->service.startFrontend(creator,listener,endpoint));
+                assertEquals(2,opens.get());assertEquals(0,listens.get());
+                service.startFrontend(()->{throw new AssertionError("Retained backend must never be replaced");},listener,endpoint);
+                assertEquals(1,creates.get());assertEquals(2,opens.get(),"Successful original connection must never be reopened");assertEquals(1,listens.get());assertEquals(1,starts.get());
+                assertThrows(IOException.class,()->service.startFrontend(creator,listener,endpoint));
+                org.mockito.Mockito.verify(backend,org.mockito.Mockito.never()).close();assertEquals(0,fake.closes);
+                service.close();assertEquals(1,closes.get());org.mockito.Mockito.verify(backend).drainExports();org.mockito.Mockito.verify(backend).close();assertEquals(1,fake.closes);
+            }
+        }
+    }
+
     @Test void backendOpenKeepsNodeResourcesOwnedUntilTheActualAttemptReturns() throws Exception {
         var schema=schema();
         try(var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest());var executor=java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
@@ -113,6 +143,7 @@ class RatisNodeServiceTest {
                     public void close(){closed.incrementAndGet();}
                 };
                 assertThrows(IOException.class,() -> service.startFrontend(() -> backend,(ignored,exports) -> listener,java.net.URI.create("thrift://localhost:5333")));
+                assertThrows(IOException.class,() -> service.startFrontend(() -> {throw new AssertionError("Unknown listener must remain owned");},(ignored,exports) -> listener,java.net.URI.create("thrift://localhost:5333")));
                 org.mockito.Mockito.verify(backend,org.mockito.Mockito.never()).close();assertEquals(0,fake.closes);
                 service.close();assertEquals(1,closed.get());org.mockito.Mockito.verify(backend).close();assertEquals(1,fake.closes);
             }

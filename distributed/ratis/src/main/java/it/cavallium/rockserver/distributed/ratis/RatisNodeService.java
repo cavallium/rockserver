@@ -52,6 +52,8 @@ public final class RatisNodeService implements AutoCloseable {
     private final RatisSchemaCatalogue schemas; private final RatisDatabaseDomainRoster roster;
     private boolean starting,closing,closed,closeRequested; private int checks;
     private RatisDatabaseBackendFactory frontendBackend;
+    private RatisRocksDBConnection frontendConnection;
+    private URI frontendListen;
     private Server frontend;
     private boolean frontendOpening,frontendClosed,exportsClosed,backendClosed;
     @FunctionalInterface interface BackendCreator { RatisDatabaseBackendFactory create() throws IOException; }
@@ -167,13 +169,19 @@ public final class RatisNodeService implements AutoCloseable {
     }
     void startFrontend(BackendCreator backend,ListenerCreator listener,URI listen) throws IOException {
         synchronized(this) {
-            requireOpen();if(restorePending || frontendOpening || frontendBackend!=null || node.state()!=RatisNodeRuntime.State.RUNNING)
-                throw new IOException("Node frontend cannot start in its current state");frontendOpening=true;
+            requireOpen();if(restorePending || frontendOpening || frontend!=null || node.state()!=RatisNodeRuntime.State.RUNNING)
+                throw new IOException("Node frontend cannot start in its current state");
+            if(frontendListen!=null && !frontendListen.equals(listen))throw new IOException("Retained frontend endpoint differs from original initialization");
+            frontendOpening=true;
         }
         try {
             verifyCatalogue();
-            var owner=Objects.requireNonNull(backend.create());synchronized(this){frontendBackend=owner;}
-            var connection=owner.open(listen);
+            // A failed open may already own forced grants/bindings. Retry this same owner and endpoint;
+            // never replace its journal graph or reopen a successfully constructed connection.
+            var owner=frontendBackend;
+            if(owner==null){owner=Objects.requireNonNull(backend.create());synchronized(this){frontendBackend=owner;frontendListen=listen;}}
+            var connection=frontendConnection;
+            if(connection==null){connection=owner.open(listen);synchronized(this){frontendConnection=connection;}}
             var server=Objects.requireNonNull(listener.create(connection,owner.exports()));synchronized(this){frontend=server;}
             server.start();
         } finally { synchronized(this){frontendOpening=false;} }
