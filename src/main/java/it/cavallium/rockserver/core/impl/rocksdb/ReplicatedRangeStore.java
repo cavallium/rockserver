@@ -240,6 +240,92 @@ public final class ReplicatedRangeStore {
         if(activeTopologyFreeze==null || !recovered.request().group().equals(groupId) || !Arrays.equals(recovered.request().header().encode(),activeTopologyFreeze.header().encode()))throw new IllegalStateException("Source CLOSE lost original retirement/FREEZE");
         recovered.requireFreeze(activeTopologyFreeze);sourceClosing=recovered;pendingSourceClosing=null;
     }
+    public static final int MAX_HOME_SOURCE_CLOSINGS=4096;
+    public static final long MAX_HOME_SOURCE_CLOSING_BYTES=16L*1024*1024;
+    private record HomeSource(UUID group,long epoch) {}
+    private volatile Map<HomeSource,it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing> homeSourceClosings=Map.of();
+    private volatile it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing pendingHomeSourceClosing;
+    @FunctionalInterface public interface HomeSourceClosingForceObserver {void at(boolean persisted)throws RocksDBException;}
+    private volatile HomeSourceClosingForceObserver homeSourceClosingForceObserver=persisted->{};
+    public void homeSourceClosingForceObserver(HomeSourceClosingForceObserver observer){homeSourceClosingForceObserver=Objects.requireNonNull(observer);}
+    private HomeSource homeSource(it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.Request request){var source=request.source().request();return new HomeSource(source.group(),source.header().participant(TopologyChange.Stage.FREEZE,source.group()).rangeEpoch());}
+    private byte[] homeSourceClosingKey(HomeSource source){return ByteBuffer.allocate(41).put(markerKey).put((byte)0x7a).put(uuidBytes(source.group())).putLong(source.epoch()).array();}
+    public int recoveredHomeSourceClosingCount(){return homeSourceClosings.size();}
+    public it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing homeSourceClosing(UUID source,long epoch){return homeSourceClosings.get(new HomeSource(source,epoch));}
+    public it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing homeSourceClosingAttempt(UUID source,long epoch){var key=new HomeSource(source,epoch);var saved=homeSourceClosings.get(key);var pending=pendingHomeSourceClosing;return saved!=null?saved:pending!=null && homeSource(pending.request()).equals(key)?pending:null;}
+    private void requireHomeSourceClosing(it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.Request request){
+        var context=homeRecoveryContext!=null?homeRecoveryContext:snapshotHomeContext;var header=request.source().request().header();
+        if(context==null || !request.home().equals(groupId) || request.homeEpoch()!=rangeEpoch || !Arrays.equals(request.schema(),schemaDigest) || !header.clusterId().equals(context.cluster()) || !header.databaseId().equals(context.database()))throw new IllegalArgumentException("HOME closing differs from configured HOME namespace/owner");
+    }
+    /** No mutation; adapter admits the exact persistent inventory and CFG before append. */
+    public void estimateHomeSourceClosing(it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.Request request)throws RocksDBException {
+        enterNative();applyLane.lock();try{requireActive();requireHomeSourceClosing(request);var saved=homeSourceClosings.get(homeSource(request));if(saved!=null){if(!saved.request().equals(request))throw new IllegalArgumentException("HOME closing identity changed");return;}var pending=pendingHomeSourceClosing;if(pending!=null){if(!pending.request().equals(request))throw new IllegalArgumentException("Unknown HOME closing force requires exact retry");return;}
+            if(homeSourceClosings.size()>=MAX_HOME_SOURCE_CLOSINGS || homeSourceClosings.values().stream().mapToLong(v->41L+v.encode().length).sum()+41L+24+request.encode().length>MAX_HOME_SOURCE_CLOSING_BYTES)throw new IllegalStateException("HOME source closing inventory exhausted");
+            var cfg=configurationUnderAdmission();if(cfg==null || cfg.term()!=request.configurationTerm() || cfg.index()!=request.configurationIndex() || !Arrays.equals(cfg.data(),request.configuration()))throw new IllegalArgumentException("HOME closing changed actual configuration");
+        }finally{applyLane.unlock();leaveNative();}
+    }
+    public it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing applyHomeSourceClosing(ApplyPosition position,it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.Request request)throws RocksDBException {
+        enterNative();applyLane.lock();try{
+            requireActive();requireHomeSourceClosing(request);var key=homeSource(request);var saved=homeSourceClosings.get(key);var pending=pendingHomeSourceClosing;
+            if(saved!=null){if(!saved.request().equals(request))throw new IllegalArgumentException("HOME source closing identity changed");advanceCompletedMarker(position);return saved;}
+            if(pending!=null && !pending.request().equals(request))throw new IllegalArgumentException("Unknown HOME closing force requires exact retry");
+            if(pending==null){
+                if(homeSourceClosings.size()>=MAX_HOME_SOURCE_CLOSINGS || homeSourceClosings.values().stream().mapToLong(v->41L+v.encode().length).sum()+41L+24+request.encode().length>MAX_HOME_SOURCE_CLOSING_BYTES)throw new IllegalStateException("HOME source closing inventory exhausted");
+                var cfg=configurationUnderAdmission();if(cfg==null || cfg.term()!=request.configurationTerm() || cfg.index()!=request.configurationIndex() || !Arrays.equals(cfg.data(),request.configuration()))throw new IllegalArgumentException("HOME closing changed actual configuration");
+                requireNext(position);pending=new it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing(request,position);pendingHomeSourceClosing=pending;
+            }
+            pending.requireCut(position);requireNext(position);homeSourceClosingForceObserver.at(false);
+            try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)){batch.put(state,homeSourceClosingKey(key),pending.encode());batch.put(state,markerKey,encodePosition(position));batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position));db.write(options,batch);}
+            var next=new HashMap<>(homeSourceClosings);next.put(key,pending);homeSourceClosings=Map.copyOf(next);pendingHomeSourceClosing=null;applied=position;homeSourceClosingForceObserver.at(true);return pending;
+        }finally{applyLane.unlock();leaveNative();}
+    }
+    private void recoverHomeSourceClosings(ApplyPosition cut)throws RocksDBException {
+        var next=new HashMap<HomeSource,it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing>();long bytes=0;
+        byte[] prefix=ByteBuffer.allocate(17).put(markerKey).put((byte)0x7a).array();
+        try(var iterator=databaseOwner.newIterator(state)){for(iterator.seek(prefix);iterator.isValid() && iterator.key().length>=prefix.length && Arrays.equals(iterator.key(),0,prefix.length,prefix,0,prefix.length);iterator.next()){
+            if(iterator.key().length!=41 || iterator.value(new byte[0])>it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.MAX_BYTES)throw new IllegalStateException("Malformed HOME source closing row");
+            var value=it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.decode(iterator.value());value.requireCut(cut);var key=homeSource(value.request());
+            if(!value.request().home().equals(groupId) || value.request().homeEpoch()!=rangeEpoch || !Arrays.equals(value.request().schema(),schemaDigest) || !Arrays.equals(iterator.key(),homeSourceClosingKey(key)) || next.put(key,value)!=null)throw new IllegalStateException("HOME source closing owner/key changed");
+            bytes+=41L+iterator.value().length;if(next.size()>MAX_HOME_SOURCE_CLOSINGS || bytes>MAX_HOME_SOURCE_CLOSING_BYTES)throw new IllegalStateException("HOME closing inventory exceeded");
+        }iterator.status();}homeSourceClosings=Map.copyOf(next);pendingHomeSourceClosing=null;
+    }
+    private boolean homeReferenceClosed(UUID domain,UUID range,UUID group,long epoch){var saved=homeSourceClosingAttempt(group,epoch);return saved!=null && saved.request().references(domain,range,group,epoch);}
+    private boolean closedHomeRegistration(DistributedCommand command)throws RocksDBException {
+        var context=homeRecoveryContext!=null?homeRecoveryContext:snapshotHomeContext;
+        if(context==null || command.kind()!=DistributedCommand.Kind.DATA || command.mutations().size()!=1 || command.predicates().size()!=1)return false;
+        var mutation=command.mutations().getFirst();if(!mutation.columnId().equals(context.column()) || mutation.kind()!=Mutation.Kind.PUT)return false;
+        var expected=command.predicates().getFirst().expectedValue();
+        // Existing accepted definitions and credited promotions may finish; only new source references are forbidden.
+        if(homeRecoveryContext!=null){var next=TransactionStatus.decode(mutation.value());if(expected!=null)return false;
+            if(next.origin()!=null){var o=next.origin();if(homeReferenceClosed(o.domainId(),o.source().rangeId(),o.source().groupId(),o.source().rangeEpoch()))return true;}
+            for(var p:next.participants())if(homeReferenceClosed(p.domainId(),p.rangeId(),p.groupId(),p.rangeEpoch()))return true;
+        }else if(expected==null){for(var p:SnapshotFenceStatus.decode(mutation.value()).fence().participants())if(homeReferenceClosed(p.domainId(),p.rangeId(),p.groupId(),p.rangeEpoch()))return true;}
+        return false;
+    }
+    public record HomeSourceReferencePage(ApplyPosition position,byte[] next,boolean more,TransactionStatus transaction,SnapshotFenceStatus snapshot){
+        public HomeSourceReferencePage{Objects.requireNonNull(position);next=next==null?null:next.clone();if(transaction!=null && snapshot!=null)throw new IllegalArgumentException("Ambiguous HOME source reference");}
+        @Override public byte[] next(){return next==null?null:next.clone();}
+    }
+    /** Bounded scan after a forced fence. A terminal consumed receipt is historical, not a new reservation capability. */
+    public HomeSourceReferencePage homeSourceReferences(it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing closing,byte[] after,int scans)throws RocksDBException {
+        if(scans<1 || scans>16 || after!=null && after.length!=16)throw new IllegalArgumentException("Invalid HOME source scan bound");enterNative();applyLane.lock();try{
+            requireActive();requireHomeSourceClosing(closing.request());var saved=homeSourceClosings.get(homeSource(closing.request()));if(saved==null || !Arrays.equals(saved.encode(),closing.encode()))throw new IllegalArgumentException("Reference scan requires exact acknowledged HOME fence");
+            var context=homeRecoveryContext!=null?homeRecoveryContext:snapshotHomeContext;byte[] cursor=after==null?interval.lowerInclusive():after.clone();
+            try(var options=new ReadOptions().setFillCache(false);var iterator=databaseOwner.newIterator(columns.get(context.column()),options)){
+                if(cursor==null)iterator.seekToFirst();else{iterator.seek(cursor);if(after!=null && iterator.isValid() && Arrays.equals(after,iterator.key()))iterator.next();}byte[] next=null;long bytes=0;int visited=0;TransactionStatus transaction=null;SnapshotFenceStatus snapshot=null;
+                while(iterator.isValid() && contains(iterator.key()) && visited<scans){int size=iterator.value(new byte[0]);if(size>2*1024*1024)throw new IllegalStateException("HOME reference row exceeds bound");if(size>2*1024*1024-bytes)break;bytes+=size;visited++;next=iterator.key();if(next.length!=16)throw new IllegalArgumentException("Invalid HOME source reference key");
+                    if(homeRecoveryContext!=null){var status=TransactionStatus.decode(iterator.value());boolean references=status.origin()!=null && closing.request().references(status.origin());for(var p:status.participants())references|=closing.request().references(p.domainId(),p.rangeId(),p.groupId(),p.rangeEpoch());if(references && !status.consumed())transaction=status;}
+                    else{var status=SnapshotFenceStatus.decode(iterator.value());boolean references=false;for(var p:status.fence().participants())references|=closing.request().references(p.domainId(),p.rangeId(),p.groupId(),p.rangeEpoch());if(references && !status.consumed())snapshot=status;}
+                    iterator.next();if(transaction!=null || snapshot!=null)break;
+                }iterator.status();return new HomeSourceReferencePage(applied,next,iterator.isValid() && contains(iterator.key()),transaction,snapshot);
+            }
+        }finally{applyLane.unlock();leaveNative();}
+    }
+    /** CLOSED/no-credit is a semantic negative proof, never ABSENT or a public source outcome. */
+    public void requireSourceClosedNoCredit(it.cavallium.rockserver.core.common.distributed.NativeSourceClosing expected,it.cavallium.rockserver.core.common.distributed.OperationRerouteOrigin origin)throws RocksDBException {
+        enterNative();applyLane.lock();try{if(sourceClosing==null || !Arrays.equals(sourceClosing.encode(),expected.encode()))throw new IllegalArgumentException("Exact forced source CLOSE unavailable");var h=expected.request().header();var p=h.participant(TopologyChange.Stage.FREEZE,groupId);if(!h.clusterId().equals(origin.clusterId()) || !h.databaseId().equals(origin.databaseId()) || !h.domainId().equals(origin.domainId()) || !origin.source().rangeId().equals(p.rangeId()) || !origin.source().groupId().equals(groupId) || origin.source().rangeEpoch()!=rangeEpoch || !Arrays.equals(origin.absenceCommitment(),sourceClosingHash(activeTopologyFreeze.encode())) || origin.absenceCut().index()>expected.position().index() || origin.absenceCut().term()>expected.position().term())throw new IllegalArgumentException("Source CLOSED origin authority changed");if(sourceOutcomeCredits.containsKey(origin.operation()) || sourceOutcomePublications.containsKey(origin.operation()) || operationResultUnderAdmission(origin.operation(),origin.originalReceiptDigest())!=null)throw new IllegalArgumentException("Accepted source credit/outcome must be settled, not aborted as CLOSED");}finally{applyLane.unlock();leaveNative();}
+    }
+    private static byte[] sourceClosingHash(byte[] bytes){try{return java.security.MessageDigest.getInstance("SHA-256").digest(bytes);}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}}
     private volatile Map<OperationId,NativeSourceOutcomeCredit> sourceOutcomeCredits=Map.of();
     private volatile Map<OperationId,NativeSourceOutcomePublication> sourceOutcomePublications=Map.of();
     private long sourceOutcomeCountLimit,sourceOutcomeByteLimit;
@@ -964,7 +1050,7 @@ public final class ReplicatedRangeStore {
             recoverImportMetadata();
             ensureReceiptUsage();
             validateReceiptUsage(applied);
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);recoverSourceOutcomes(applied);recoverSourceClosing(applied);
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);recoverSourceOutcomes(applied);recoverSourceClosing(applied);recoverHomeSourceClosings(applied);
         }
     }
 
@@ -1113,7 +1199,7 @@ public final class ReplicatedRangeStore {
                 if(!manifest.owner().equals(owner) || !manifest.interval().equals(interval) || !Arrays.equals(manifest.schemaDigest(),schemaDigest) || !manifest.position().equals(prefix.cut()) || !manifest.deterministicMergeColumns().equals(deterministicMergeColumns) || !sameConfiguration(prefix.configuration(),cfg[0]) || !seed.parentFreezes().get(groupId).equals(freeze[0]))throw new IOException("Local META checkpoint differs from its selected native prefix");
                 byte[] actual;try(var pin=capture()){actual=metadataRowsDigest(pin,prefix.cut());}if(!java.security.MessageDigest.isEqual(projection.digest(),actual))throw new IOException("Local META checkpoint changed portable native metadata");
                 recoverSchemaMetadata();recoverRelocationCompletions();recoverImportMetadata();ensureReceiptUsage();validateReceiptUsage(applied);
-                homeRecoveries=loadHomeRecoveries();homeRecoveryCredits=loadHomeCredits(applied);validateHomeCreditCapacity();abortedIndex=loadAbortedIndex();committedIndex=loadCommittedIndex();rejectedIndex=loadRejectedIndex();snapshotGates=loadSnapshotGates();preparedIndex=loadPreparedIndex();validateAbortedIndex();validateCommittedIndex();validateRejectedIndex();validateSnapshotGates();validateHomeRecoveries();activeSchemaFence=loadSchemaFence(applied);activeTopologyFreeze=loadTopologyFreeze(applied);recoverSourceOutcomes(applied);recoverSourceClosing(applied);configureSourceOutcomeCapacity(sourceOutcomeCount,sourceOutcomeBytes);if(sessions)sessionControlsEnabled=true;
+                homeRecoveries=loadHomeRecoveries();homeRecoveryCredits=loadHomeCredits(applied);validateHomeCreditCapacity();abortedIndex=loadAbortedIndex();committedIndex=loadCommittedIndex();rejectedIndex=loadRejectedIndex();snapshotGates=loadSnapshotGates();preparedIndex=loadPreparedIndex();validateAbortedIndex();validateCommittedIndex();validateRejectedIndex();validateSnapshotGates();validateHomeRecoveries();activeSchemaFence=loadSchemaFence(applied);activeTopologyFreeze=loadTopologyFreeze(applied);recoverSourceOutcomes(applied);recoverSourceClosing(applied);recoverHomeSourceClosings(applied);configureSourceOutcomeCapacity(sourceOutcomeCount,sourceOutcomeBytes);if(sessions)sessionControlsEnabled=true;
                 var range=supersession.scope().range();var lineage=new it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage(range.rangeId(),groupId,rangeEpoch);if(cdc==null)cdc=new NativeRangeCdc(databaseOwner,state,lineage);else if(!cdc.lineage().equals(lineage))throw new IllegalArgumentException("Local META CDC lineage changed");cdc.recover(applied,cdcAuthorityTime());requireCurrent();
                 synchronized(discoveryPublication){return localMetadataPublication=new LocalMetadataActivation(this,manifest);}
             }finally{applyLane.unlock();}}finally{nativeLifecycle.writeLock().unlock();}
@@ -1202,7 +1288,7 @@ public final class ReplicatedRangeStore {
             if(recoverySupersession!=null || currentRangeRecovery!=null && !currentRangeRecoveryReady || topologyRetired() || topologyBirthPending()) throw new IllegalStateException("Topology owner requires qualified future activation");
             if (pendingInstallation != null || importPending()) throw new IllegalStateException("Installation remains incomplete or unpublished");
             try { validateTopologyActivationRecovery(); recoverSchemaMetadata(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover schema generation",failure); }
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);try { recoverSourceOutcomes(applied);recoverSourceClosing(applied); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover source outcome promises",failure); } validateSnapshotHomeUsersUnchecked();
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);try { recoverSourceOutcomes(applied);recoverSourceClosing(applied);recoverHomeSourceClosings(applied); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover source outcome promises",failure); } validateSnapshotHomeUsersUnchecked();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -2195,7 +2281,7 @@ public final class ReplicatedRangeStore {
             for (var receipt:homeRecoveries.values()) {
                 var recovery=receipt.recovery(); if (!recovery.before().clusterId().equals(cluster) || !recovery.before().databaseId().equals(database) || !recovery.command().mutations().getFirst().columnId().equals(column)) throw new IllegalArgumentException("HOME receipt differs from configured context");
             }
-            var recovered=loadHomeCredits(applied,context); homeRecoveryCredits=recovered; validateHomeCreditCapacity(); homeRecoveryContext=context; homeStatusCapacityKnown=false;
+            var recovered=loadHomeCredits(applied,context); homeRecoveryCredits=recovered; validateHomeCreditCapacity(); homeRecoveryContext=context;for(var fence:homeSourceClosings.values())requireHomeSourceClosing(fence.request());homeStatusCapacityKnown=false;
         } finally { applyLane.unlock(); leaveNative(); }
     }
     private byte[] homeCreditKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x26).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
@@ -2216,7 +2302,7 @@ public final class ReplicatedRangeStore {
         var old=homeRecoveryCredits.get(next.transactionId()); TransactionStatus initial;
         if (predicate.expectedValue()==null) { next.requireInitial(); if(next.origin()!=null && !next.reserved())throw new IllegalArgumentException("Reroute HOME must reserve before installing accepted participants"); if (old!=null) throw new IllegalStateException("HOME registration replaced a promise"); initial=next; }
         else {
-            var before=TransactionStatus.decode(predicate.expectedValue()); next.requireSuccessorOf(before);requireHomeNoEffectOutcome(before,next);
+            var before=TransactionStatus.decode(predicate.expectedValue()); next.requireSuccessorOf(before);if(!protectedRecovery && next.noEffectOutcome()==TransactionStatus.NoEffectOutcome.SOURCE_CLOSED)throw new IllegalArgumentException("CLOSED abort requires protected source no-credit qualification");requireHomeNoEffectOutcome(before,next);
             if (old==null && HomeRecoveryCredit.remaining(before)!=0) throw new IllegalStateException("Existing HOME has no future recovery promise");
             if (old!=null && !old.current().equals(before)) throw new IllegalStateException("HOME row and promise differ"); initial=before.reserved() && next.phase()==TransactionStatus.Phase.PREPARING ? next.asInitial() : old==null ? before : old.initial();
         }
@@ -2345,6 +2431,7 @@ public final class ReplicatedRangeStore {
         requireHomeRecoverySuccessor(receipt,bytes==null ? null : TransactionStatus.decode(bytes));
     }
     private void requireHomeNoEffectOutcome(TransactionStatus before,TransactionStatus next) throws RocksDBException {
+        if(before.reserved() && next.noEffectOutcome()==TransactionStatus.NoEffectOutcome.SOURCE_CLOSED){var origin=before.origin();var fence=homeSourceClosing(origin.source().groupId(),origin.source().rangeEpoch());if(fence==null || !fence.request().references(origin))throw new IllegalArgumentException("HOME CLOSED abort lacks exact durable source fence");return;}
         if(!before.reserved() || next.noEffectOutcome()!=TransactionStatus.NoEffectOutcome.SESSION_EXPIRED)return;
         var origin=before.origin();var first=origin.firstControl();var promotion=new OperationId(first.sessionId(),first.epoch(),first.sequence()+128);
         if(!homeIdentityExpired(before.operation(),false) && !homeIdentityExpired(promotion,true))throw new IllegalArgumentException("HOME expired no-effect outcome lacks native business/control expiry evidence");
@@ -2393,7 +2480,7 @@ public final class ReplicatedRangeStore {
         try {
             if (activeTopologyFreeze!=null || activeSchemaFence!=null || homeRecoveryContext!=null || !homeRecoveries.isEmpty() || !homeRecoveryCredits.isEmpty() || !columns.keySet().equals(Set.of(column)) || snapshotHomeContext!=null && !snapshotHomeContext.equals(context)) throw new IllegalArgumentException("Snapshot HOME role/column changed");
             var authority=sessionAuthority(null); if (authority!=null && (!authority.clusterId().equals(cluster) || !authority.databaseId().equals(database))) throw new IllegalArgumentException("Snapshot HOME session authority differs");
-            validateSnapshotHomeUsers(null,context); snapshotHomeContext=context; homeStatusCapacityKnown=false;
+            validateSnapshotHomeUsers(null,context); snapshotHomeContext=context;for(var fence:homeSourceClosings.values())requireHomeSourceClosing(fence.request());homeStatusCapacityKnown=false;
         } catch (RocksDBException failure) { throw new IllegalStateException("Cannot validate snapshot HOME",failure); }
         finally { applyLane.unlock(); leaveNative(); }
     }
@@ -2504,6 +2591,17 @@ public final class ReplicatedRangeStore {
         boolean matching=row!=null && row.operation().equals(identity.business());
         if (matching && !sameHomeReservationDefinition(row,identity.definition())) throw new IllegalArgumentException("Retained HOME definition changed");
         return new HomeState(row,credit,matching);
+    }
+    /** Exact local terminal evidence survives source unavailability; it grants no new abort or publication authority. */
+    public HomeRecoveryReceipt sourceClosedHomeRecoveryReceipt(HomeIdentity identity)throws RocksDBException {
+        Objects.requireNonNull(identity);enterNative();applyLane.lock();try{
+            requireActive();if(!identity.definition().reserved())throw new IllegalArgumentException("CLOSED receipt requires original RESERVED identity");var current=readHomeState(identity,null,applied);var row=current.row();
+            if(!current.matching() || row==null || row.phase()!=TransactionStatus.Phase.ABORT || !row.participants().isEmpty() || row.noEffectOutcome()!=TransactionStatus.NoEffectOutcome.SOURCE_CLOSED)return null;
+            for(var receipt:homeRecoveries.values()){
+                var recovery=receipt.recovery();if(receipt.result().status()!=CommandResult.Status.SUCCESS || recovery.action()!=HomeRecovery.Action.ABORT || recovery.next().noEffectOutcome()!=TransactionStatus.NoEffectOutcome.SOURCE_CLOSED || !recovery.before().equals(identity.definition()))continue;
+                requireHomeRecovery(recovery);receipt.requireCut(applied);if(!homeIdentity(recovery).equals(identity))throw new IllegalArgumentException("CLOSED receipt changed original HOME identity");requireHomeRecoverySuccessor(receipt,row);return receipt;
+            }return null;
+        }finally{applyLane.unlock();leaveNative();}
     }
     private List<HomeRecoveryReceipt> matchingHomeReceipts(HomeIdentity identity,ReadOptions source,ApplyPosition cut,TransactionStatus row) throws RocksDBException {
         var matched=new ArrayList<HomeRecoveryReceipt>();
@@ -3901,6 +3999,7 @@ public final class ReplicatedRangeStore {
             long effectiveAcknowledgement = acceptMaintenance ? command.acknowledgedThrough() : -1;
             boolean installUserEffects = true;
             var scope=saved==null ? commandScope(command) : null;
+            if (saved==null && closedHomeRegistration(command)) {stableResult=new CommandResult(CommandResult.Status.CONFLICT,List.of()).encode();installUserEffects=false;}
             if (saved==null && scope!=null && gated(scope)) {
                 stableResult=new CommandResult(CommandResult.Status.CONFLICT,List.of()).encode(); installUserEffects=false;
             }
@@ -4068,6 +4167,7 @@ public final class ReplicatedRangeStore {
         Evaluation(CommandResult result,List<Mutation> effects) { this(result,effects,Map.of()); }
     }
     private Evaluation evaluate(DistributedCommand command) throws RocksDBException {
+        if (closedHomeRegistration(command)) return new Evaluation(new CommandResult(CommandResult.Status.CONFLICT,List.of()),List.of());
         if (expiredHomeRegistration(command)) return new Evaluation(new CommandResult(CommandResult.Status.SESSION_EXPIRED,List.of()),List.of());
         if (!command.hasBucketData()) return new Evaluation(evaluateRaw(command),command.mutations());
         try { return evaluateBuckets(command); }
@@ -4308,6 +4408,10 @@ public final class ReplicatedRangeStore {
         int total=0;
         int closingBytes=options==null?db.get(state,sourceClosingKey(),new byte[0]):db.get(state,options,sourceClosingKey(),new byte[0]);
         if(closingBytes!=RocksDB.NOT_FOUND){if(closingBytes<0 || closingBytes>it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.MAX_BYTES || closingBytes+17L>limits.maxImageBytes())throw new IOException("Source closing exceeds image metadata bound");total=closingBytes;}
+        byte[] homeClosingPrefix=ByteBuffer.allocate(17).put(markerKey).put((byte)0x7a).array();int homeCount=0;long homeBytes=0;
+        try(var iterator=options==null?databaseOwner.newIterator(state):databaseOwner.newIterator(state,options)){
+            for(iterator.seek(homeClosingPrefix);iterator.isValid();iterator.next()){byte[] key=iterator.key();if(key.length<17 || !Arrays.equals(key,0,17,homeClosingPrefix,0,17))break;int size=iterator.value(new byte[0]);if(key.length!=41 || size<0 || size>it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.MAX_BYTES || (long)size+41>limits.maxImageBytes() || ++homeCount>MAX_HOME_SOURCE_CLOSINGS || (homeBytes+=41L+size)>MAX_HOME_SOURCE_CLOSING_BYTES)throw new IOException("HOME closing image metadata exceeds bound");total=Math.addExact(total,size);}iterator.status();
+        }
         int[] tags={0x67,0x6a,0x72};
         int[] bounds={NativeTopologyLearnerRegistration.MAX_BYTES,NativeTopologyLearnerImagePermission.MAX_BYTES,NativeCurrentRangeRecovery.MAX_BYTES};
         if(registrations)for(int i=0;i<tags.length;i++) {
@@ -4628,6 +4732,11 @@ public final class ReplicatedRangeStore {
             // Own-tail schema changes share this lane; measure and hold their exact graph before normalization.
             if(targetMetadata!=null)targetMetadata.reserve(imageMetadataBytes(null,limits,!metadata));
             if(metadata && applied!=null && !NativeMetadataRecoveryRegistration.covers(expected.position(),applied))throw new IOException("Metadata snapshot regresses actual completed source prefix");
+            if(pendingHomeSourceClosing!=null)throw new IOException("Unknown HOME closing force must settle before image replacement");
+            if(!homeSourceClosings.isEmpty()){
+                var incoming=new HashMap<HomeSource,it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing>();NativeRangeImage.visitKind(image,limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE && key.length==41 && key[16]==0x7a){var fence=it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.decode(value);incoming.put(homeSource(fence.request()),fence);}},metadata);
+                for(var entry:homeSourceClosings.entrySet())if(!entry.getValue().equals(incoming.get(entry.getKey())))throw new IOException("Snapshot cannot erase/change committed HOME source closing authority");
+            }
             if(pendingSourceClosing!=null)throw new IOException("Unknown CLOSE force must settle before image replacement");
             if(sourceClosing!=null){
                 var closingRow=new byte[1][];NativeRangeImage.visitKind(image,limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE && Arrays.equals(key,sourceClosingKey()))closingRow[0]=value;},metadata);
@@ -4736,7 +4845,7 @@ public final class ReplicatedRangeStore {
                     recoverSchemaMetadata(expected.position());
                     if(cdc!=null) cdc.recover(expected.position(),cdcAuthorityTime());
                     validateReceiptUsage(expected.position());
-                    activeSchemaFence=loadSchemaFence(expected.position()); activeTopologyFreeze=loadTopologyFreeze(expected.position(),false);recoverSourceOutcomes(expected.position());recoverSourceClosing(expected.position());
+                    activeSchemaFence=loadSchemaFence(expected.position()); activeTopologyFreeze=loadTopologyFreeze(expected.position(),false);recoverSourceOutcomes(expected.position());recoverSourceClosing(expected.position());recoverHomeSourceClosings(expected.position());
                     homeRecoveries=loadHomeRecoveries(expected.position()); homeRecoveryCredits=loadHomeCredits(expected.position()); validateHomeCreditCapacity();
                     // Flush every prior CF mutation before publishing the final applied marker.
                     db.flushWal(true);

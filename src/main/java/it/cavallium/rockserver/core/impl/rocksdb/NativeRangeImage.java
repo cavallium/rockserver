@@ -393,13 +393,14 @@ public final class NativeRangeImage {
                 long rowBytes = (long) keyLength + valueLength;
                 if (keyLength < 0 || keyLength > limits.maxRowBytes() || valueLength < 0
                         || rowBytes > counted.remaining() - 41
-                        || rowBytes > limits.maxRowBytes() && (section!=Section.STATE || keyLength!=17)) {
+                        || rowBytes > limits.maxRowBytes() && (section!=Section.STATE || keyLength!=17 && keyLength!=41)) {
                     throw new IOException("Invalid image row lengths");
                 }
                 byte[] key = new byte[keyLength];
                 input.readFully(key);
                 if(rowBytes>rowByteLimit(header,section,key,limits))throw new IOException("Image row exceeds byte limit");
                 if(section==Section.STATE && key.length>16 && key[16]==0x67 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration.MAX_BYTES))throw new IOException("Learner registration exceeds bound");
+                if(section==Section.STATE && key.length>16 && key[16]==0x7a && (key.length!=41 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.MAX_BYTES))throw new IOException("HOME source closing exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x76 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.MAX_BYTES))throw new IOException("Source CLOSE exceeds canonical bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x75)throw new IOException("Image contains foreign receiver supersession authority");
                 if(section==Section.STATE && key.length>16 && key[16]==0x72 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery.MAX_BYTES))throw new IOException("CURRENT registration exceeds bound");
@@ -414,7 +415,7 @@ public final class NativeRangeImage {
                 if(section==Section.STATE && key.length>16 && key[16]==0x15 && (key.length!=17 || valueLength!=8))throw new IOException("Invalid ACK namespace count length");
                 if(section==Section.STATE && key.length>16 && key[16]>=0x6d && key[16]<=0x71)throw new IOException("Receiver-local recovery fence is not portable image authority");
                 boolean schemaMetadata=section==Section.STATE && ownGroup(header,key) && schemaMetadataRow(key,valueLength);
-                if(schemaMetadata || recoveryRegistration(header,section,key) || section==Section.STATE && key.length==17 && key[16]==0x76)metadataPass.reserve(valueLength);
+                if(schemaMetadata || recoveryRegistration(header,section,key) || section==Section.STATE && (key.length==17 && key[16]==0x76 || key.length==41 && key[16]==0x7a))metadataPass.reserve(valueLength);
                 byte[] value = new byte[valueLength];
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
@@ -587,6 +588,7 @@ public final class NativeRangeImage {
     }
 
     private static long rowByteLimit(Header header,Section section,byte[] key,Limits limits) {
+        if(section==Section.STATE && key.length==41 && key[16]==0x7a && ownGroup(header,key))return Math.min(limits.maxImageBytes(),Math.max(limits.maxRowBytes(),41L+it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.MAX_BYTES));
         if(section==Section.STATE && key.length==17 && key[16]==0x76 && ownGroup(header,key))return Math.min(limits.maxImageBytes(),Math.max(limits.maxRowBytes(),17L+it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.MAX_BYTES));
         if(!header.metadata() && section==Section.STATE && key.length==17) {
             var group=ByteBuffer.wrap(key);
@@ -630,6 +632,7 @@ public final class NativeRangeImage {
         private it.cavallium.rockserver.core.common.distributed.NativeSchemaFence schemaFence;
         private it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze topologyFreeze;
         private it.cavallium.rockserver.core.common.distributed.NativeSourceClosing sourceClosing;
+        private final Set<String> homeClosings=new HashSet<>();private long homeClosingBytes;
         private NativeTopologyBirth topologyBirth;
         private NativeTopologyActivation topologyActivation;
         private NativeTopologyImageOrigin topologyOrigin;
@@ -784,6 +787,11 @@ public final class NativeRangeImage {
                 if(section==Section.STATE && key.length==17 && key[16]==0x73)currentCompletion=value.clone();
                 if(section==Section.STATE && key.length==17 && key[16]==0x74)currentImageReceipt=value.clone();
                 if(section==Section.STATE && key.length==17 && key[16]==0x67){try{learnerAdoption=it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration.decode(value);}catch(IllegalArgumentException invalid){throw new IOException("Invalid learner adoption evidence",invalid);}}
+                if(section==Section.STATE && key.length>16 && key[16]==0x7a){try{
+                    var closing=it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.decode(value);closing.requireCut(header.position());var request=closing.request();var source=request.source().request();var parent=source.header().participant(it.cavallium.rockserver.core.common.distributed.TopologyChange.Stage.FREEZE,source.group());
+                    var expected=ByteBuffer.allocate(41).putLong(request.home().getMostSignificantBits()).putLong(request.home().getLeastSignificantBits()).put((byte)0x7a).putLong(source.group().getMostSignificantBits()).putLong(source.group().getLeastSignificantBits()).putLong(parent.rangeEpoch()).array();
+                    if(!request.home().equals(header.owner().groupId()) || request.homeEpoch()!=header.owner().epoch() || !Arrays.equals(expected,key) || !Arrays.equals(request.schema(),header.schema()) || !homeClosings.add(java.util.HexFormat.of().formatHex(key)) || homeClosings.size()>ReplicatedRangeStore.MAX_HOME_SOURCE_CLOSINGS || (homeClosingBytes+=key.length+(long)value.length)>ReplicatedRangeStore.MAX_HOME_SOURCE_CLOSING_BYTES)throw new IllegalArgumentException("HOME closing image owner/key/capacity changed");
+                }catch(IllegalArgumentException invalid){throw new IOException("Invalid HOME source closing authority",invalid);}}
                 if(section==Section.STATE && key.length>16 && key[16]==0x76){try{
                     if(key.length!=17 || sourceClosing!=null)throw new IllegalArgumentException("Duplicate/malformed source closing row");sourceClosing=it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.decode(value);sourceClosing.requireCut(header.position());
                     if(topologyFreeze==null || !sourceClosing.request().group().equals(header.owner().groupId()) || !Arrays.equals(sourceClosing.request().header().encode(),topologyFreeze.header().encode()))throw new IllegalArgumentException("Source closing lost original FREEZE");sourceClosing.requireFreeze(topologyFreeze);

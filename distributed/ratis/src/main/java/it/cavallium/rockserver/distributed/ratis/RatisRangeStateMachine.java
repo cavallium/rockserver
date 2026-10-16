@@ -2026,6 +2026,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private void requireRoleRecord(byte[] encoded) {
         if(RatisTopologyRelocationRecord.isRecord(encoded)){requireDataRole();var record=RatisTopologyRelocationRecord.decode(encoded);if(!record.definition().parents().getFirst().groupId().equals(store.ownership().owner().groupId()))throw new IllegalArgumentException("Foreign relocation group");return;}
+        if(RatisHomeSourceClosingRecord.isRecord(encoded)){var request=RatisHomeSourceClosingRecord.decode(encoded).request();if((role!=RatisNodePlan.Role.TRANSACTION_HOME && role!=RatisNodePlan.Role.SNAPSHOT_HOME) || !request.home().equals(store.ownership().owner().groupId()))throw new IllegalArgumentException("Foreign HOME closing record");return;}
         if(RatisSourceClosingRecord.isRecord(encoded)){requireDataRole();if(!RatisSourceClosingRecord.decode(encoded).request().group().equals(store.ownership().owner().groupId()))throw new IllegalArgumentException("Foreign source CLOSE record");return;}
         if(RatisSourceOutcomeRecord.isRecord(encoded)){requireDataRole();if(!RatisSourceOutcomeRecord.decode(encoded).request().original().groupId().equals(store.ownership().owner().groupId()))throw new IllegalArgumentException("Foreign source outcome record");return;}
         if(RatisTopologyActivationRecord.isActivation(encoded)){requireDataRole();if(!RatisTopologyActivationRecord.decode(encoded).groupId().equals(store.ownership().owner().groupId()))throw new IllegalArgumentException("Foreign topology ACTIVATE group");return;}
@@ -2047,6 +2048,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void validateRoleNativeState() throws IOException {
         if(role!=RatisNodePlan.Role.DATA && store.topologyFreeze()!=null)throw new IOException("Non-DATA range contains topology FREEZE state");
         if (role!=RatisNodePlan.Role.DATA && (store.schemaFence()!=null || store.schemaInstallation()!=null)) throw new IOException("Non-DATA range contains schema transition state");
+        if(role!=RatisNodePlan.Role.TRANSACTION_HOME && role!=RatisNodePlan.Role.SNAPSHOT_HOME && store.recoveredHomeSourceClosingCount()!=0)throw new IOException("Non-HOME role contains source-closing fences");
         if (role!=RatisNodePlan.Role.TRANSACTION_HOME && store.recoveredHomeRecoveryCapacity().effectiveCount()!=0) throw new IOException("Range role contains protected transaction-HOME receipts");
         if (role!=RatisNodePlan.Role.DATA && (store.preparedCapacity().count()!=0 || store.gateCapacity().count()!=0)) throw new IOException("Non-DATA range contains participant/snapshot state");
     }
@@ -2119,6 +2121,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(RatisSnapshotRecord.isSnapshot(encoded)) {
                 var snapshot=RatisSnapshotRecord.decode(encoded);return role==RatisNodePlan.Role.DATA && snapshot.isRelease() && group.equals(snapshot.participantGroup());
             }
+            if(RatisHomeSourceClosingRecord.isRecord(encoded))return (role==RatisNodePlan.Role.TRANSACTION_HOME || role==RatisNodePlan.Role.SNAPSHOT_HOME) && group.equals(RatisHomeSourceClosingRecord.decode(encoded).request().home());
             if(RatisSourceClosingRecord.isRecord(encoded))return role==RatisNodePlan.Role.DATA && group.equals(RatisSourceClosingRecord.decode(encoded).request().group());
             if(RatisSourceOutcomeRecord.isRecord(encoded)) {
                 var outcome=RatisSourceOutcomeRecord.decode(encoded);return role==RatisNodePlan.Role.DATA && outcome.kind()==RatisSourceOutcomeRecord.Kind.PUBLISH && group.equals(outcome.request().original().groupId());
@@ -2140,6 +2143,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         } catch(IllegalArgumentException | java.nio.BufferUnderflowException malformed) {return false;}
     }
     private long protectedLogMaximum(ByteString wire,byte[] prefix) {
+        if(RatisHomeSourceClosingRecord.isRecord(prefix))return role==RatisNodePlan.Role.TRANSACTION_HOME || role==RatisNodePlan.Role.SNAPSHOT_HOME?RatisHomeSourceClosingRecord.MAX_BYTES:0;
         if(RatisSourceClosingRecord.isRecord(prefix))return role==RatisNodePlan.Role.DATA?RatisSourceClosingRecord.MAX_BYTES:0;
         if(RatisParticipantRecord.isParticipant(prefix)) {
             if(role!=RatisNodePlan.Role.DATA)return 0;
@@ -2271,6 +2275,36 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         finally{if(store.sourceClosingAdmission())synchronized(admissions){
             for(var hold:List.copyOf(sourceHolds.values()))if(!hold.submitted){hold.invalidated=true;releaseSourceHold(hold);}
             if(sourceClosingHold!=null && sourceClosingHold.record.equals(record))releaseSourceClosing(sourceClosingHold);
+        }}
+    }
+    @FunctionalInterface interface HomeSourceClosingAuthority {void require(it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.Request request)throws IOException;}
+    @FunctionalInterface interface HomeClosedNoCreditAuthority {void require(it.cavallium.rockserver.core.common.distributed.NativeSourceClosing closing,it.cavallium.rockserver.core.common.distributed.OperationRerouteOrigin origin)throws IOException;}
+    private HomeSourceClosingAuthority homeSourceClosingAuthority;private HomeClosedNoCreditAuthority homeClosedNoCreditAuthority;
+    void homeSourceClosingAuthority(HomeSourceClosingAuthority authority,HomeClosedNoCreditAuthority noCredit){if((role!=RatisNodePlan.Role.TRANSACTION_HOME && role!=RatisNodePlan.Role.SNAPSHOT_HOME) || getLifeCycleState()!=LifeCycle.State.NEW || homeSourceClosingAuthority!=null)throw new IllegalStateException("HOME closing authority is fixed before initialize");homeSourceClosingAuthority=java.util.Objects.requireNonNull(authority);homeClosedNoCreditAuthority=java.util.Objects.requireNonNull(noCredit);}
+    private static final class HomeClosingHold extends RetainedProof {
+        final RatisHomeSourceClosingRecord record;final long term,generation,stamp;boolean reading=true,qualified,released,submitted,maybeAppended;int owners;
+        HomeClosingHold(RatisHomeSourceClosingRecord record,long term,long generation,long stamp,RatisNodeResourceBudget.Lease graph){super(graph);this.record=record;this.term=term;this.generation=generation;this.stamp=stamp;}
+    }
+    private HomeClosingHold homeClosingHold;
+    private void releaseHomeClosing(HomeClosingHold hold){synchronized(admissions){hold.released=true;if(hold.reading || hold.owners!=0 || hold.nativeOwners!=0)return;if(homeClosingHold==hold){homeClosingHold=null;topologySlots--;hold.closeGraph();}}}
+    private void requireHomeClosingOwner(HomeClosingHold hold)throws IOException{checkHomeOwner();var leader=leadership();if(homeClosingHold!=hold || hold.released || leader.term()!=hold.term || admissionGeneration.get()!=hold.generation || schemaConfigurationPending || schemaConfigurationStamp!=hold.stamp || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("HOME closing lost actual owner");}
+    void prepareHomeSourceClosing(RatisHomeSourceClosingRecord record)throws Exception {
+        checkHomeOwner();if(!record.request().home().equals(store.ownership().owner().groupId()) || record.request().homeEpoch()!=store.ownership().owner().epoch() || !Arrays.equals(record.request().schema(),store.schemaDigest()))throw new IllegalArgumentException("HOME closing owner/schema changed");if(homeSourceClosingAuthority==null)throw new IOException("HOME closing proof authority unavailable");var request=record.request();var source=request.source().request();var epoch=source.header().participant(TopologyChange.Stage.FREEZE,source.group()).rangeEpoch();var saved=store.homeSourceClosing(source.group(),epoch);
+        if(saved!=null){if(!saved.request().equals(request))throw new IllegalArgumentException("HOME closing retry changed immutable source");return;}
+        store.estimateHomeSourceClosing(request);var leader=leadership();HomeClosingHold hold;
+        synchronized(admissions){reconcileOlderProposalTerms(leader.term());if(homeClosingHold!=null){if(!homeClosingHold.record.equals(record))throw new IOException("Exact HOME closing attempt remains owned");requireHomeClosingOwner(homeClosingHold);if(homeClosingHold.qualified)return;throw new IOException("HOME closing proof already active");}requireHomeInput(record.encode().length);hold=new HomeClosingHold(record,leader.term(),admissionGeneration.get(),schemaConfigurationStamp,retainedProof(RatisHomeSourceClosingRecord.MAX_BYTES,null));homeClosingHold=hold;topologySlots++;}
+        boolean qualified=false;try{homeSourceClosingAuthority.require(request);var cfg=store.configuration();if(cfg==null || cfg.term()!=request.configurationTerm() || cfg.index()!=request.configurationIndex() || !Arrays.equals(cfg.data(),request.configuration()))throw new IOException("HOME closing changed actual configuration");synchronized(admissions){requireHomeClosingOwner(hold);hold.qualified=qualified=true;}}
+        finally{synchronized(admissions){hold.reading=false;if(!qualified || hold.released)releaseHomeClosing(hold);}}
+    }
+    private TransactionContext startHomeSourceClosing(TransactionContext transaction,RatisHomeSourceClosingRecord record)throws Exception {
+        checkHomeOwner();var source=record.request().source().request();var saved=store.homeSourceClosing(source.group(),source.header().participant(TopologyChange.Stage.FREEZE,source.group()).rangeEpoch());
+        synchronized(admissions){if(saved!=null){if(!saved.request().equals(record.request()))throw new IllegalArgumentException("HOME closing retry changed recipe");if(homeClosingHold==null){requireHomeInput(record.encode().length);var leader=leadership();homeClosingHold=new HomeClosingHold(record,leader.term(),admissionGeneration.get(),schemaConfigurationStamp,retainedProof(RatisHomeSourceClosingRecord.MAX_BYTES,null));homeClosingHold.reading=false;homeClosingHold.qualified=true;topologySlots++;}}var hold=homeClosingHold;if(hold==null || !hold.record.equals(record) || hold.reading || !hold.qualified)throw new IOException("HOME closing has no exact prepared authority");requireHomeClosingOwner(hold);hold.owners++;hold.submitted=true;transaction.setStateMachineContext(hold);return transaction;}
+    }
+    private byte[] applyHomeSourceClosing(ApplyPosition position,RatisHomeSourceClosingRecord record)throws Exception {
+        try{return store.applyHomeSourceClosing(position,record.request()).encode();}finally{synchronized(admissions){
+            var source=record.request().source().request();var epoch=source.header().participant(TopologyChange.Stage.FREEZE,source.group()).rangeEpoch();var attempt=store.homeSourceClosingAttempt(source.group(),epoch);
+            if(attempt!=null && attempt.request().equals(record.request()))for(var hold:List.copyOf(importPublicationHolds.values()))if(!hold.submitted && RatisTransactionStatuses.isReservation(hold.command) && record.request().references(TransactionStatus.decode(hold.command.mutations().getFirst().value()).origin())){hold.invalidated=true;releaseImportPublication(hold);}
+            if(store.homeSourceClosing(source.group(),epoch)!=null && homeClosingHold!=null && homeClosingHold.record.equals(record))releaseHomeClosing(homeClosingHold);
         }}
     }
     private record SourceKey(OperationId operation,RatisSourceOutcomeRecord.Kind kind){}
@@ -3726,7 +3760,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         if(kind==null && (RatisRangeImportRecord.isImport(prefix) || RatisReferencedFile.Request.isRequest(prefix) || RatisTopologyFreezeRecord.isFreeze(prefix)
                 || RatisTopologyActivationRecord.isActivation(prefix) || prefix.length>=4 && ByteBuffer.wrap(prefix).getInt()==RatisTopologyRelocationRecord.MAGIC
-                || RatisSchemaFenceRecord.isFence(prefix) || RatisSchemaInstallRecord.isInstall(prefix) || RatisSchemaActivateRecord.isActivate(prefix) || RatisSourceOutcomeRecord.isRecord(prefix) || RatisSourceClosingRecord.isRecord(prefix)))kind=RatisNodeResourceBudget.Kind.PROTECTED;
+                || RatisSchemaFenceRecord.isFence(prefix) || RatisSchemaInstallRecord.isInstall(prefix) || RatisSchemaActivateRecord.isActivate(prefix) || RatisSourceOutcomeRecord.isRecord(prefix) || RatisSourceClosingRecord.isRecord(prefix) || RatisHomeSourceClosingRecord.isRecord(prefix)))kind=RatisNodeResourceBudget.Kind.PROTECTED;
         var lease=kind==null ? null : reserveNodeResources(kind,256L+4L*content.size(),1);
         boolean retained=false;
         try {
@@ -3750,6 +3784,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray(); requireRoleRecord(encoded);
             if(RatisTopologyRelocationRecord.isRecord(encoded))return startRelocation(transaction,RatisTopologyRelocationRecord.decode(encoded));
+            if(RatisHomeSourceClosingRecord.isRecord(encoded)){if(!initialGroup.getGroupId().equals(request.getRaftGroupId()))throw new IOException("HOME closing crossed group");return startHomeSourceClosing(transaction,RatisHomeSourceClosingRecord.decode(encoded));}
             if(RatisSourceClosingRecord.isRecord(encoded)){if(!initialGroup.getGroupId().equals(request.getRaftGroupId()))throw new IOException("CLOSE crossed group");return startSourceClosing(transaction,RatisSourceClosingRecord.decode(encoded));}
             if(RatisSourceOutcomeRecord.isRecord(encoded)){if(!initialGroup.getGroupId().equals(request.getRaftGroupId()))throw new IOException("Source record crossed Raft group");return startSourceOutcome(transaction,RatisSourceOutcomeRecord.decode(encoded));}
             if(RatisTopologyActivationRecord.isActivation(encoded)){if(!initialGroup.getGroupId().equals(request.getRaftGroupId()))throw new IOException("Topology activation request crossed group");return startTopologyActivation(transaction,RatisTopologyActivationRecord.decode(encoded),generation,leadership);}
@@ -4165,6 +4200,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     return super.preAppendTransaction(transaction);
                 }
                 if(transaction.getStateMachineContext() instanceof RelocationHold hold){requireRelocationHold(hold,current);if(hold.owners<=0)throw new IOException("Relocation owner released");return super.preAppendTransaction(transaction);}
+                if(transaction.getStateMachineContext() instanceof HomeClosingHold hold){requireHomeClosingOwner(hold);if(hold.owners<=0 || !hold.qualified || hold.reading || hold.released)throw new IOException("HOME closing append owner released");return super.preAppendTransaction(transaction);}
                 if(transaction.getStateMachineContext() instanceof SourceClosingHold hold){requireSourceClosingOwner(hold,current);if(hold.owners<=0 || !hold.qualified || hold.reading)throw new IOException("CLOSE proof released");return super.preAppendTransaction(transaction);}
                 if(transaction.getStateMachineContext() instanceof SourceHold hold){requireSourceOwner(hold,current);if(hold.owners<=0 || !hold.qualified || hold.reading)throw new IOException("Source record owner released");return super.preAppendTransaction(transaction);}
                 if(transaction.getStateMachineContext() instanceof ActivationHold hold){requireTopologyActivationOwner(hold,hold.record,current,admissionGeneration.get());if(hold.owners<=0)throw new IOException("Topology activation proposal owner released");return super.preAppendTransaction(transaction);}
@@ -4215,6 +4251,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private AppliedRecord applyRecord(ApplyPosition positionArg,byte[] encoded) throws Exception {
         if(RatisTopologyRelocationRecord.isRecord(encoded))return new AppliedRecord(null,applyRelocation(positionArg,RatisTopologyRelocationRecord.decode(encoded)));
         requireRoleRecord(encoded);
+        if(RatisHomeSourceClosingRecord.isRecord(encoded))return new AppliedRecord(null,applyHomeSourceClosing(positionArg,RatisHomeSourceClosingRecord.decode(encoded)));
         if(RatisSourceClosingRecord.isRecord(encoded))return new AppliedRecord(null,applySourceClosing(positionArg,RatisSourceClosingRecord.decode(encoded)));
         if(RatisSourceOutcomeRecord.isRecord(encoded))return new AppliedRecord(null,applySourceOutcome(positionArg,RatisSourceOutcomeRecord.decode(encoded)));
         if(RatisTopologyActivationRecord.isActivation(encoded)) {
@@ -4290,6 +4327,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
         if(RatisTopologyRelocationRecord.isRecord(encoded))return new AppliedRecord(null,new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode());
+        if(RatisHomeSourceClosingRecord.isRecord(encoded)){var request=RatisHomeSourceClosingRecord.decode(encoded).request();var source=request.source().request();var saved=store.homeSourceClosing(source.group(),source.header().participant(TopologyChange.Stage.FREEZE,source.group()).rangeEpoch());return new AppliedRecord(null,saved!=null && saved.request().equals(request)?saved.encode():null);}
         if(RatisSourceClosingRecord.isRecord(encoded)){var saved=store.sourceClosing();if(saved==null || !saved.request().equals(RatisSourceClosingRecord.decode(encoded).request()))return new AppliedRecord(null,null);return new AppliedRecord(null,saved.encode());}
         if(RatisSourceOutcomeRecord.isRecord(encoded))return new AppliedRecord(null,recoveredSourceRecord(RatisSourceOutcomeRecord.decode(encoded)));
         requireRoleRecord(encoded);
@@ -4575,6 +4613,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         synchronized (admissions) {
             savedAppendStamps.remove(transaction);
             if(transaction.getStateMachineContext() instanceof RelocationHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.released || hold.invalidated || !hold.maybeAppended && hold.owners==0)releaseRelocation(hold);}
+            if(transaction.getStateMachineContext() instanceof HomeClosingHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.released || !hold.maybeAppended && hold.owners==0)releaseHomeClosing(hold);}
             if(transaction.getStateMachineContext() instanceof SourceClosingHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.released || !hold.maybeAppended && hold.owners==0)releaseSourceClosing(hold);}
             if(transaction.getStateMachineContext() instanceof SourceHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.released)releaseSourceHold(hold);else if(!hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseSourceHold(hold);}}
             if(transaction.getStateMachineContext() instanceof ActivationHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.released)releaseTopologyActivation(hold);else if(!hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseTopologyActivation(hold);}}
@@ -4672,6 +4711,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         synchronized(admissions){if(relocationHold!=null)releaseRelocation(relocationHold);invalidateUnsubmitted();}
     }
     private void invalidateUnsubmitted() {
+        if(homeClosingHold!=null && !homeClosingHold.submitted)releaseHomeClosing(homeClosingHold);
         if(sourceClosingHold!=null && !sourceClosingHold.submitted)releaseSourceClosing(sourceClosingHold);
         for(var hold:List.copyOf(sourceHolds.values())){hold.invalidated=true;if(!hold.submitted)releaseSourceHold(hold);}
         if(topologyActivationHold!=null){topologyActivationHold.invalidated=true;if(!topologyActivationHold.submitted)releaseTopologyActivation(topologyActivationHold);}
@@ -4708,6 +4748,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         // Leadership alone does not exclude a possibly appended activation. A newer completed
         // native term does; retained TransactionContexts still own the charged record until release.
         var nativeCut=store.applied();
+        if(homeClosingHold!=null && homeClosingHold.term<term && nativeCut!=null && nativeCut.term()>=term)releaseHomeClosing(homeClosingHold);
         if(sourceClosingHold!=null && sourceClosingHold.owner.term()<term && nativeCut!=null && nativeCut.term()>=term)releaseSourceClosing(sourceClosingHold);
         if(topologyActivationHold!=null && topologyActivationHold.term<term && nativeCut!=null && nativeCut.term()>=term)releaseTopologyActivation(topologyActivationHold);
         if (term<=reconciledProposalTerm) return;
@@ -4829,6 +4870,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         boolean retained=false;
         try {
             boolean existing=reserveHomeCapacity(hold);
+            if(!existing && recovery.next().noEffectOutcome()==TransactionStatus.NoEffectOutcome.SOURCE_CLOSED){var origin=recovery.before().origin();var closing=store.homeSourceClosing(origin.source().groupId(),origin.source().rangeEpoch());if(closing==null || homeClosedNoCreditAuthority==null || !closing.request().references(origin))throw new IOException("CLOSED abort lacks acknowledged HOME source fence");homeClosedNoCreditAuthority.require(closing.request().source(),origin);}
             if (!existing && recovery.action()==HomeRecovery.Action.ACK) {
                 if (recovery.proof().fenced()) {
                     var reader=homeRecoveryFences; if (reader==null) throw new IllegalStateException("HOME recovery has no qualified DATA fence reader");
@@ -5761,7 +5803,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             int kind=ScopedTransactionRpc.kind(bytes,Math.max(RatisSnapshotCohortRpc.MAX_REQUEST_BYTES,
                     Math.max(RatisOperationRerouteAdmissionRpc.MAX_BYTES,RatisSourceOutcomeRpc.MAX_REQUEST_BYTES)));
             // STATE is also the leader-discovery barrier preceding a single, non-retried metadata WRITE.
-            if(kind==ScopedTransactionRpc.STATE)return true;
+            if(kind==ScopedTransactionRpc.STATE || RatisHomeSourceClosingRpc.kind(kind))return true;
             return switch(role) {
                 case CATALOGUE -> switch(kind) {
                     case RatisCatalogueViewRpc.KIND,RatisRecoveryLineageRpc.KIND,RatisTopologyAuthority.KIND,
@@ -5939,6 +5981,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(kind>=RatisSnapshotCohortRpc.OWNER && kind<=RatisSnapshotCohortRpc.CANCEL){requireDataRole();if(snapshotCohorts==null)throw new IOException("Cohort capture is not configured");if(kind==RatisSnapshotCohortRpc.OWNER && !freshBarrier)throw new IOException("Cohort owner qualification requires fresh barrier");var packet=ScopedTransactionRpc.parse(encoded,RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);return snapshotCohorts.query(store.ownership().owner().groupId(),kind,packet.body()).thenApply(bytes->Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(kind,bytes))));}
             if(kind==RatisTopologyLearnerRecoveryRpc.KIND){if(topologyImageQueries==null || learnerRecoveryInstaller==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Learner recovery dispatcher unavailable");return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologyLearnerRecoveryRpc.MAX_REPLY_BYTES,false,owned->{try{return Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerRecoveryRpc.reply(learnerRecoveryInstaller.prepare(RatisTopologyLearnerRecoveryRpc.decode(owned)))));}catch(RatisTopologySourceSnapshotRpc.AbandonedException terminal){return Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerRecoveryRpc.reply(terminal.receipt())));}});}
             if(kind==RatisTopologyLearnerJoinRpc.KIND){if(topologyImageQueries==null || learnerInstaller==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Node learner bootstrap unavailable");return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologyLearnerJoinRpc.MAX_REPLY_BYTES,false,owned->{var join=RatisTopologyLearnerJoinRpc.decode(owned);var registration=learnerInstaller.install(join);return Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerJoinRpc.reply(join,registration)));});}
+            if(RatisHomeSourceClosingRpc.kind(kind)){
+                if(!freshBarrier || proofQueries==null)throw new IOException("HOME/source closing requires fresh protected proof dispatcher");
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisHomeSourceClosingRpc.MAX_BYTES,false,owned->{var packet=ScopedTransactionRpc.parse(owned,RatisHomeSourceClosingRpc.MAX_BYTES);
+                    if(kind==RatisHomeSourceClosingRpc.SOURCE_STATE){requireDataRole();var owner=checkCdcMetadataOwner();var query=RatisHomeSourceClosingRpc.sourceQuery(packet.body());var saved=store.sourceClosing();if(saved==null || !Arrays.equals(saved.encode(),query.closing().encode()))throw new IOException("Exact forced source closing receipt unavailable");if(query.noCredit()!=null)store.requireSourceClosedNoCredit(saved,query.noCredit());var after=checkCdcMetadataOwner();if(!sameCdcConfiguration(owner,after))throw new IOException("Source closing query lost actual owner");return Message.valueOf(ByteString.copyFrom(RatisHomeSourceClosingRpc.sourceAck(query)));}
+                    checkHomeOwner();if(kind==RatisHomeSourceClosingRpc.STATE){var identity=HomeIdentity.decode(packet.body());var origin=identity.definition().origin();if(role!=RatisNodePlan.Role.TRANSACTION_HOME || !identity.definition().reserved() || !identity.groupId().equals(store.ownership().owner().groupId()) || identity.rangeEpoch()!=store.ownership().owner().epoch() || !Arrays.equals(identity.schemaDigest(),store.schemaDigest()) || !identity.columnId().equals(homeColumn) || !identity.definition().clusterId().equals(homeCluster) || !identity.definition().databaseId().equals(homeDatabase))throw new IllegalArgumentException("CLOSED lookup changed HOME reservation scope");var saved=store.homeSourceClosing(origin.source().groupId(),origin.source().rangeEpoch());if(saved==null)return Message.valueOf(ByteString.EMPTY);if(!saved.request().references(origin) || homeClosedNoCreditAuthority==null)throw new IOException("HOME source closing does not qualify original reservation");if(store.sourceClosedHomeRecoveryReceipt(identity)==null)homeClosedNoCreditAuthority.require(saved.request().source(),origin);checkHomeOwner();return Message.valueOf(ByteString.copyFrom(saved.encode()));}
+                    var requestClosing=it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.Request.decode(packet.body());prepareHomeSourceClosing(new RatisHomeSourceClosingRecord(requestClosing));return Message.valueOf(ByteString.copyFrom(requestClosing.digest()));
+                });
+            }
             if(kind==RatisSourceHeadRpc.KIND){
                 requireDataRole();if(!freshBarrier || sourceSnapshots==null || topologyImageQueries==null)throw new IOException("Source head requires fresh DATA dispatcher");var head=RatisSourceHeadRpc.request(encoded);if(!head.source().sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Source head crossed group");
                 return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*(encoded.length+RatisSourceHeadRpc.MAX_REPLY_BYTES),false,owned->Message.valueOf(ByteString.copyFrom(RatisSourceHeadRpc.reply(sourceSnapshots.head(RatisSourceHeadRpc.request(owned))))));

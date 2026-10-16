@@ -1438,6 +1438,23 @@ public final class RatisRoutedClient implements AutoCloseable {
         try { return readOriginalOutcome(prepared); }
         finally { endCall(); }
     }
+    /** Re-establish the exact forced CLOSE (and optionally its no-credit fact), never ABSENT. */
+    public void requireSourceClosing(RangeDirectory source,NativeSourceClosing closing,OperationRerouteOrigin noCredit)throws IOException {
+        requireNamespace(source);var header=closing.request().header();var parent=header.participant(TopologyChange.Stage.FREEZE,closing.request().group());var route=source.ranges().stream().filter(r->r.groupId().equals(parent.groupId()) && r.rangeId().equals(parent.rangeId()) && r.rangeEpoch()==parent.rangeEpoch()).findFirst().orElseThrow(()->new IOException("Source closing original route unavailable"));
+        if(!source.domainId().equals(header.domainId()) || !Arrays.equals(source.payloadDigest(),header.sourceDirectoryDigest()))throw new IOException("Source closing immutable directory changed");
+        beginCall();try{RatisHomeSourceClosingRpc.requireSourceAck(transport.transaction(route,RatisHomeSourceClosingRpc.source(closing,noCredit),true),closing,noCredit);}catch(IllegalArgumentException invalid){throw new IOException("Invalid source CLOSED proof",invalid);}finally{endCall();}
+    }
+    /** Null means no acknowledged HOME fence, never fresh source absence. A non-null result includes fresh no-credit qualification. */
+    public NativeHomeSourceClosing closedReservation(HomeIdentity identity)throws IOException {
+        var descriptor=directory.ranges().stream().filter(r->r.groupId().equals(identity.groupId())).findFirst().orElseThrow(()->new IllegalArgumentException("HOME closing group absent"));if(!identity.definition().reserved())throw new IllegalArgumentException("CLOSED lookup requires original RESERVED");beginCall();try{byte[] bytes=transport.transaction(descriptor,RatisHomeSourceClosingRpc.lookup(identity),true);if(bytes.length==0)return null;var value=NativeHomeSourceClosing.decode(bytes);var request=value.request();if(!request.home().equals(identity.groupId()) || request.homeEpoch()!=identity.rangeEpoch() || !Arrays.equals(request.schema(),identity.schemaDigest()) || !request.references(identity.definition().origin()))throw new IOException("CLOSED proof changed original HOME/source identity");return value;}catch(IllegalArgumentException invalid){throw new IOException("Invalid CLOSED reservation proof",invalid);}finally{endCall();}
+    }
+    public NativeHomeSourceClosing closeHomeSource(RangeDescriptor home,NativeHomeSourceClosing.Request request)throws IOException {
+        if(!home.groupId().equals(request.home()) || home.rangeEpoch()!=request.homeEpoch())throw new IllegalArgumentException("HOME closing route changed");
+        beginCall();try{
+            var prepared=transport.transaction(home,RatisHomeSourceClosingRpc.request(RatisHomeSourceClosingRpc.PREPARE,request),true);if(!Arrays.equals(prepared,request.digest()))throw new IOException("HOME closing preparation changed identity");
+            var value=NativeHomeSourceClosing.decode(transport.participant(home,new RatisHomeSourceClosingRecord(request).encode()));if(!value.request().equals(request))throw new IOException("HOME closing result changed identity");return value;
+        }finally{endCall();}
+    }
     public RatisSourceOutcomeRpc.Prepared prepareSourceOutcome(RangeDirectory source,RatisSourceOutcomeRpc.Proposal proposal)throws IOException {
         var route=sourceOutcomeRoute(source,proposal.request());beginCall();try{return RatisSourceOutcomeRpc.prepared(transport.transaction(route,RatisSourceOutcomeRpc.prepare(proposal),true),proposal);}catch(IllegalArgumentException invalid){throw new IOException("Invalid source preparation reply",invalid);}finally{endCall();}
     }

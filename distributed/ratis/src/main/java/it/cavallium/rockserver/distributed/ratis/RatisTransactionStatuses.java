@@ -109,6 +109,14 @@ public final class RatisTransactionStatuses {
         if (proof!=null) recovery.requireOutcome(proof);
         return routed.restoreHomeRecovery(recovery,command.descriptor());
     }
+    public boolean sourceClosedWithoutCredit(TransactionStatus reserved)throws IOException {
+        if(!reserved.reserved())throw new IllegalArgumentException("CLOSED no-effect proof requires original reservation");var route=routed.directory().route(column,key(reserved.transactionId()));return routed.closedReservation(identity(reserved,route))!=null;
+    }
+    /** The protected leader re-reads exact CLOSED/no-credit; this is never an ABSENT or EXPIRED proof. */
+    public RatisRoutedClient.PreparedHomeRecoveryOperation prepareClosedReservationAbort(OperationId operation,TransactionStatus reserved){
+        if(!reserved.reserved())throw new IllegalArgumentException("CLOSED no-effect abort requires original RESERVED identity");
+        return prepareRecovery(operation,reserved,reserved.abortReservation(TransactionStatus.NoEffectOutcome.SOURCE_CLOSED),null);
+    }
     public RatisRoutedClient.PreparedHomeRecoveryOperation prepareFencedRecovery(OperationId operation,TransactionStatus expected,TransactionStatus next,ParticipantFenceProof proof) {
         var command=prepare(operation,expected,next);
         var recovery=new HomeRecovery(HomeRecovery.Action.ACK,command.command(),HomeRecovery.Proof.from(proof)); recovery.requireFence(proof);

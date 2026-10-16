@@ -614,6 +614,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     machine=RatisRangeStateMachine.withSessions(store,group,owner.images(),validator,epochs,effectiveDirectory,owner.retention());
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) {
                         machine.role(role,(key,value) -> RatisTransactionStatuses.validateRecord(directory.clusterId(),directory.databaseId(),key,value));
+                        machine.homeSourceClosingAuthority(this::requireHomeSourceClosingAuthority,this::requireHomeClosedNoCredit);
                         machine.homeRecoveryProofs(recovery->data(recovery.before().participant(recovery.proof().participant()).domainId()).finalizedParticipant(recovery.proof().participant(),recovery.before().transactionId()));machine.homeRecoveryFences(participantIdentity->data(participantIdentity.definition().participant(participantIdentity.participantGroup()).domainId()).participantFence(participantIdentity)); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
                         machine.operationRerouteQueries(operationRerouteQueries);
                         var rerouteAuthority=new RatisOperationRerouteAdmission(new RatisOperationRerouteAdmission.Authority(){
@@ -626,6 +627,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     }
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
+                        machine.homeSourceClosingAuthority(this::requireHomeSourceClosingAuthority,this::requireHomeClosedNoCredit);
                         machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeProofs((fence,participantGroup)->data(fence.participant(participantGroup).domainId()).snapshotFence(fence,participantGroup));
                     }
                     else { configureDataMachine(machine,effectiveDirectory,descriptor); }
@@ -758,6 +760,37 @@ public final class RatisNodeRuntime implements AutoCloseable {
             var actual=server.submitClientRequestAsync(request).thenApply(reply->{if(reply==null || !reply.isSuccess() || reply.getMessage()==null)throw new CompletionException(new IOException("Source CLOSE outcome is unknown",reply==null?null:reply.getException()));var value=it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.decode(reply.getMessage().getContent().toByteArray());if(!value.request().equals(record.request()))throw new CompletionException(new IOException("Source CLOSE reply changed original request"));return value;});
             actual.whenComplete((result,failure)->endSeedLifecycle());return actual.copy();
         }catch(Exception failed){endSeedLifecycle();return CompletableFuture.failedFuture(failed);}
+    }
+    /** One actual logical HOME must acknowledge this fence before source reference closure can be certified. */
+    public CompletableFuture<it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing> closeHomeSource(UUID homeGroup,it.cavallium.rockserver.core.common.distributed.NativeSourceClosing closing){
+        try{beginSeedLifecycle(true);}catch(IOException busy){return CompletableFuture.failedFuture(busy);}
+        try{
+            var entry=groups.require(homeGroup);var store=stores.get(homeGroup);var machine=machines.get(RaftGroupId.valueOf(homeGroup));var division=server.getDivision(RaftGroupId.valueOf(homeGroup));
+            if((entry.role()!=RatisNodePlan.Role.TRANSACTION_HOME && entry.role()!=RatisNodePlan.Role.SNAPSHOT_HOME) || store==null || machine==null || division.getStateMachine()!=machine || !division.getInfo().isLeaderReady())throw new IOException("HOME close requires its actual configured leader");
+            var source=closing.request();var epoch=source.header().participant(TopologyChange.Stage.FREEZE,source.group()).rangeEpoch();var saved=store.homeSourceClosingAttempt(source.group(),epoch);final it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.Request recipe;
+            if(saved!=null){if(!Arrays.equals(saved.request().source().encode(),closing.encode()))throw new IOException("HOME closing source receipt changed");recipe=saved.request();}
+            else{var cfg=store.configuration();if(cfg==null)throw new IOException("HOME close lacks actual CFG");recipe=new it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.Request(homeGroup,store.ownership().owner().epoch(),store.schemaDigest(),cfg.term(),cfg.index(),cfg.data(),closing);}
+            var record=new RatisHomeSourceClosingRecord(recipe);machine.prepareHomeSourceClosing(record);
+            var request=org.apache.ratis.protocol.RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(server.getId()).setGroupId(RaftGroupId.valueOf(homeGroup)).setCallId(++groupManagementCall).setType(org.apache.ratis.protocol.RaftClientRequest.writeRequestType()).setMessage(org.apache.ratis.protocol.Message.valueOf(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(record.encode()))).build();
+            var actual=server.submitClientRequestAsync(request).thenApply(reply->{if(reply==null || !reply.isSuccess() || reply.getMessage()==null)throw new CompletionException(new IOException("HOME closing outcome is unknown",reply==null?null:reply.getException()));var value=it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.decode(reply.getMessage().getContent().toByteArray());if(!value.request().equals(recipe))throw new CompletionException(new IOException("HOME closing reply changed original request"));return value;});actual.whenComplete((result,failure)->endSeedLifecycle());return actual.copy();
+        }catch(Exception failed){endSeedLifecycle();return CompletableFuture.failedFuture(failed);}
+    }
+    /** Bounded inventory of pre-fence work; callers must finish every configured HOME before certifying closure. */
+    public ReplicatedRangeStore.HomeSourceReferencePage homeSourceReferences(it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing closing,byte[] after,int scans)throws Exception {
+        beginSeedLifecycle(true);try{var group=closing.request().home();var entry=groups.require(group);var store=stores.get(group);if((entry.role()!=RatisNodePlan.Role.TRANSACTION_HOME && entry.role()!=RatisNodePlan.Role.SNAPSHOT_HOME) || store==null)throw new IOException("Source references require actual configured HOME");return store.homeSourceReferences(closing,after,scans);}finally{endSeedLifecycle();}
+    }
+    /** Exact deterministic protected identity survives a lost abort ACK; CLOSED is never published on the source. */
+    public it.cavallium.rockserver.core.common.distributed.HomeRecoveryReceipt abortClosedHomeReservation(it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing closing,it.cavallium.rockserver.core.common.distributed.TransactionStatus reserved)throws Exception {
+        beginSeedLifecycle(true);try{
+            if(transactionHomes==null || !reserved.reserved() || !closing.request().references(reserved.origin()))throw new IllegalArgumentException("Closed reservation changed original source/HOME scope");var group=closing.request().home();var entry=groups.require(group);var store=stores.get(group);if(entry.role()!=RatisNodePlan.Role.TRANSACTION_HOME || store==null)throw new IOException("Closed abort requires actual transaction HOME");var source=closing.request().source().request();var saved=store.homeSourceClosing(source.group(),reserved.origin().source().rangeEpoch());if(saved==null || !Arrays.equals(saved.encode(),closing.encode()))throw new IOException("Closed abort requires exact acknowledged HOME fence");
+            byte[] original=reserved.encode();byte[] digest=OperatorUpload.sha256(ByteBuffer.allocate(36+original.length).putInt(0x48434142).put(closing.request().digest()).put(original).array());var key=ByteBuffer.wrap(digest);var operation=new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(key.getLong(),key.getLong()),0,0);var request=transactionHomes.prepareClosedReservationAbort(operation,reserved);if(!request.descriptor().groupId().equals(group))throw new IllegalArgumentException("Reservation is not owned by closing HOME shard");return transactionHomes.executeRecovery(request);
+        }finally{endSeedLifecycle();}
+    }
+    private void requireHomeSourceClosingAuthority(it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.Request request)throws IOException {
+        requireSourceClosingAuthority(request.source().request());var source=request.source().request();var view=seedAuthority.read(source.header(),TopologyChange.Stage.ACTIVATE);view.require(RatisTopologyAuthority.Request.of(source.header(),TopologyChange.Stage.ACTIVATE));data(source.header().domainId()).requireSourceClosing(view.definition().sourceDirectory(),request.source(),null);
+    }
+    private void requireHomeClosedNoCredit(it.cavallium.rockserver.core.common.distributed.NativeSourceClosing closing,it.cavallium.rockserver.core.common.distributed.OperationRerouteOrigin origin)throws IOException {
+        var source=closing.request();var view=seedAuthority.read(source.header(),TopologyChange.Stage.ACTIVATE);view.require(RatisTopologyAuthority.Request.of(source.header(),TopologyChange.Stage.ACTIVATE));data(source.header().domainId()).requireSourceClosing(view.definition().sourceDirectory(),closing,origin);
     }
     private void requireSourceClosingAuthority(it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.Request request)throws IOException{
         if(!request.catalogue().equals(plan.catalogue().groupId()))throw new IOException("Source closing catalogue changed");

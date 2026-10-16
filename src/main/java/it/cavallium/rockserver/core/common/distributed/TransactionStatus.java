@@ -6,7 +6,7 @@ import java.util.*;
 /** Immutable home record. Vote positions are durable participant evidence supplied by the coordinator, not self-verifying proofs. */
 public final class TransactionStatus {
     public enum Phase { PREPARING, COMMIT, ABORT, RESERVED }
-    public enum NoEffectOutcome { NONE, CONFLICT, SESSION_EXPIRED }
+    public enum NoEffectOutcome { NONE, CONFLICT, SESSION_EXPIRED, SOURCE_CLOSED }
     public static final int MAX_PARTICIPANTS=64, HEADER_BYTES=135, PARTICIPANT_BYTES=137;
     public static final int MAX_BYTES=HEADER_BYTES+DomainBinding.MAX_DOMAINS*DomainBinding.BYTES+OperationRerouteOrigin.MAX_BYTES+MAX_PARTICIPANTS*PARTICIPANT_BYTES;
     public record Participant(UUID domainId,UUID rangeId,UUID groupId,long rangeEpoch,byte[] schemaDigest,byte[] planDigest,ApplyPosition prepared,boolean finalized) {
