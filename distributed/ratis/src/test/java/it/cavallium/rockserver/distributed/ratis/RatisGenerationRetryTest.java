@@ -23,7 +23,10 @@ class RatisGenerationRetryTest {
                 return f.factory.create(generationBindings,path,ids);
             };
             var limits=RatisRocksDBConnection.Limits.defaults();
-            assertThrows(IOException.class,() -> new RatisRocksDBConnection(URI.create("ratis://controlled/retry"),f.connectionRoot,java.util.Map.of(f.direct.f.schema.domainId(),f.direct.routed),(name,shape)->f.direct.f.schema.domainId(),f.direct.f.scheduler,f.binding,f.direct.f.catalogue.client,replicas,null,null,factory,limits,List.of(), RatisJournalAccess.standalone()));
+            try(var initial=new RatisRocksDBConnection(URI.create("ratis://controlled/retry"),f.connectionRoot,java.util.Map.of(f.direct.f.schema.domainId(),f.direct.routed),(name,shape)->f.direct.f.schema.domainId(),f.direct.f.scheduler,f.binding,f.direct.f.catalogue.client,replicas,null,null,factory,limits,List.of(),RatisJournalAccess.standalone())){
+                assertEquals(0,calls.get(),"Opening validates authority without creating absent generation owners");
+                assertThrows(java.util.concurrent.ExecutionException.class,()->initial.remoteMutationOwners(71,RequestContext.batch()).get(10,java.util.concurrent.TimeUnit.SECONDS));
+            }
             Path binding=f.connectionRoot.resolve("generations").resolve(RatisGenerationRegistry.key(f.direct.f.schema,f.direct.routed.directory())).resolve("binding");
             byte[] original=Files.readAllBytes(binding);
             try (var recovered=new RatisRocksDBConnection(URI.create("ratis://controlled/retry"),f.connectionRoot,java.util.Map.of(f.direct.f.schema.domainId(),f.direct.routed),(name,shape)->f.direct.f.schema.domainId(),f.direct.f.scheduler,f.binding,f.direct.f.catalogue.client,replicas,null,null,factory,limits,List.of(), RatisJournalAccess.standalone())) {

@@ -34,7 +34,8 @@ final class RatisGenerationRegistry implements AutoCloseable {
                 add(selected,folder,false);
             }
         }
-        for(var domain:routed.keySet())current(domain);validateColumns();
+        // Restoration must not allocate new grants/bindings before a retained token can be recovered.
+        validateColumns();
         } catch (Throwable failure) { try { close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); } if (failure instanceof IOException io) throw io; throw new IOException("Generation inventory open failed",failure); }
     }
     static String key(DistributedSchema schema,RangeDirectory directory) { return key(schema.digest(),directory); }
