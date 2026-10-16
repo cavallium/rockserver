@@ -24,7 +24,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class RatisRetentionAdmissionTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     @Test void pendingReservationsDuplicatesCancellationAndAckAtCapacityConserveUsage() throws Exception {
-        try (var f=new Fixture(root,new RatisRangeStateMachine.RetentionLimits(2,176,1,88))) {
+        try (var f=new Fixture(root,new RatisRangeStateMachine.RetentionLimits(2,178,1,89))) {
             var zero=f.propose(f.put(0)); var one=f.propose(f.put(1));
             assertNull(zero.getException()); assertNull(one.getException());
             assertNotNull(f.propose(f.put(2)).getException()); assertEquals(0,f.store.receiptUsage().retainedCount());
@@ -48,7 +48,7 @@ class RatisRetentionAdmissionTest {
         }
     }
     @Test void maintenanceHeadroomIsBoundedAndNoGrowthGcStillRunsAtHardCapacity() throws Exception {
-        try (var f=new Fixture(root,new RatisRangeStateMachine.RetentionLimits(1,88,1,88))) {
+        try (var f=new Fixture(root,new RatisRangeStateMachine.RetentionLimits(1,89,1,89))) {
             assertEquals(CommandResult.Status.SUCCESS,f.apply(f.propose(f.put(0)),1));
             var first=DistributedCommand.advanceSessionEpochFloor(f.groupId,1,new byte[32],new OperationId(f.admin,2,0),1);
             assertEquals(CommandResult.Status.SUCCESS,f.apply(f.propose(first),2));
@@ -63,7 +63,7 @@ class RatisRetentionAdmissionTest {
         }
     }
     @Test void maximumReturnedOutcomeIsReservedAndStaleTermReleasesWithoutStepDown() throws Exception {
-        try (var f=new Fixture(root,new RatisRangeStateMachine.RetentionLimits(2,176,1,88))) {
+        try (var f=new Fixture(root,new RatisRangeStateMachine.RetentionLimits(2,178,1,89))) {
             var returning=new DistributedCommand(f.groupId,1,new byte[32],new OperationId(f.session,1,0),
                     List.of(new Mutation(Mutation.Kind.PUT,f.column,new byte[]{0},new byte[]{7},Mutation.ReturnMode.PREVIOUS)));
             assertNotNull(f.propose(returning).getException());
@@ -76,7 +76,7 @@ class RatisRetentionAdmissionTest {
         }
     }
     @Test void snapshotCoveredMaintenanceSettlesRetentionBeforeDuplicatePayloadOwners() throws Exception {
-        try (var f=new Fixture(root,new RatisRangeStateMachine.RetentionLimits(2,176,1,88))) {
+        try (var f=new Fixture(root,new RatisRangeStateMachine.RetentionLimits(2,178,1,89))) {
             var command=f.ack(1,0);
             var covered=f.propose(command); var duplicate=f.propose(command);
             // Model the native result arriving through an installed image rather than this adapter's apply callback.

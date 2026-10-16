@@ -34,6 +34,19 @@ class NativeSourceClosingTest {
             }
         }
     }
+    @Test void originalBusinessResultRemainsDebtAfterCloseUntilActualAckWhileControlOutcomeSurvivesCold()throws Exception{
+        var path=root.resolve("original-results");DistributedCommand original;RangeDescriptor parent;NativeSourceClosing closed;
+        try(var f=topology.new Fixture(path)){
+            original=f.write(f.parent,0,9);f.parent.apply(new ApplyPosition(1,1),original);f.freeze();f.seed();parent=f.definition.parents().getFirst();closed=f.parent.applySourceClosing(new ApplyPosition(1,3),request(f));
+            var before=f.parent.sourceResultDebt(16,4096);assertEquals(1,before.businessResults());assertEquals(original.operationId(),before.firstBusiness());assertEquals(0,before.controlResults());assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.parent.operationResult(original.operationId(),original.receiptDigest())).status());
+            var id=original.operationId();var acknowledgement=new DistributedCommand(parent.groupId(),parent.rangeEpoch(),f.parent.schemaDigest(),new OperationId(id.sessionId(),id.epoch(),1),List.of(),List.of(),0);
+            assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.parent.apply(new ApplyPosition(1,4),acknowledgement)).status());var after=f.parent.sourceResultDebt(16,4096);assertEquals(0,after.businessResults());assertNull(after.firstBusiness());assertEquals(1,after.controlResults());assertEquals(89,after.controlBytes());
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(f.parent.operationResult(original.operationId(),original.receiptDigest())).status(),"Only actual ACK authorizes this explicit retired outcome");
+            try(var pin=f.parent.captureMetadataForRecovery()){var image=root.resolve("control-receipt-meta");NativeRangeImage.writeMetadataAdmitted(image,pin,pin.interval(),topology.limits,NativeRangeImage.IoAdmission.UNLIMITED);var count=new java.util.concurrent.atomic.AtomicInteger();NativeRangeImage.visitMetadata(image,topology.limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.RECEIPTS){assertEquals(NativeOperationReceipt.Kind.CONTROL,NativeOperationReceipt.validate(value));count.incrementAndGet();}});assertEquals(1,count.get());}
+            assertArrayEquals(topology.helper.helper.key(9),f.child.readCurrentPoint(topology.helper.outer.fixed,topology.helper.helper.key(1)));
+        }
+        try(var pool=topology.helper.pool(path)){var store=topology.helper.open(pool,parent);assertEquals(closed,store.sourceClosing());var debt=store.sourceResultDebt(16,4096);assertEquals(0,debt.businessResults());assertEquals(1,debt.controlResults());assertEquals(89,debt.controlBytes());assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(store.operationResult(original.operationId(),original.receiptDigest())).status());}
+    }
     @Test void exactClosingForceBeforeAndAfterAckLossColdRetryNeverResurrectsAdmission()throws Exception {
         for(boolean persisted:List.of(false,true)){
             Path path=root.resolve("source-"+persisted);NativeSourceClosing.Request request;NativeSourceOutcomeCredit.Request accepted;RangeDescriptor parent;NativeSourceClosing expected;

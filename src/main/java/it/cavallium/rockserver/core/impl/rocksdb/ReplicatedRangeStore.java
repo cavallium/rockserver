@@ -17,6 +17,7 @@ import it.cavallium.rockserver.core.common.distributed.NativeRecoverySupersessio
 import it.cavallium.rockserver.core.common.distributed.RangeImportAdmission;
 import it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery;
 import it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit;
+import it.cavallium.rockserver.core.common.distributed.NativeOperationReceipt;
 import it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomePublication;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyBirth;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyActivation;
@@ -216,6 +217,30 @@ public final class ReplicatedRangeStore {
     public it.cavallium.rockserver.core.common.distributed.NativeSourceClosing sourceClosingAttempt(){return sourceClosing!=null?sourceClosing:pendingSourceClosing;}
     public boolean sourceClosingAdmission(){return sourceClosing!=null || pendingSourceClosing!=null;}
     public static final class SourceClosing extends IllegalStateException {public SourceClosing(){super("Source is closing; fresh CREDIT/ABSENT authority is unavailable");}}
+    /** Bounded prerequisite evidence, never a deletion permit. Every BUSINESS result remains debt
+     * until its real ACK/floor authority retires it; CONTROL results must later be retained exactly. */
+    public record SourceResultDebt(ApplyPosition position,long businessResults,long businessBytes,long controlResults,long controlBytes,OperationId firstBusiness){}
+    public SourceResultDebt sourceResultDebt(int maximumRows,long maximumBytes)throws RocksDBException{
+        if(maximumRows<1 || maximumRows>MAX_SESSION_ACK_NAMESPACES || maximumBytes<1 || maximumBytes>64L*1024*1024)throw new IllegalArgumentException("Invalid source result debt scan budget");
+        enterNative();applyLane.lock();try{
+            requireTopologyMetadataOwner(false);if(sourceClosing==null || pendingSourceClosing!=null)throw new IllegalStateException("Source result debt requires acknowledged exact CLOSE");sourceClosing.requireCut(applied);ensureReceiptUsage();
+            long business=0,businessBytes=0,controls=0,controlBytes=0,bytes=0;OperationId first=null;
+            try(var options=new ReadOptions().setFillCache(false);var iterator=databaseOwner.newIterator(receipts,options)){
+                iterator.seek(markerKey);byte[] prefix=new byte[NativeOperationReceipt.HEADER_BYTES];
+                while(iterator.isValid()){
+                    if(iterator.key(new byte[0])!=NativeOperationReceipt.KEY_BYTES)throw new IllegalStateException("Malformed source result key");byte[] key=iterator.key();if(!Arrays.equals(key,0,16,markerKey,0,16))break;int length=iterator.value(prefix);
+                    if(ByteBuffer.wrap(key,16,8).getLong()<0 || ByteBuffer.wrap(key,40,8).getLong()<0 || key.length!=NativeOperationReceipt.KEY_BYTES || length<NativeOperationReceipt.MIN_BYTES || length>NativeOperationReceipt.MAX_BYTES || prefix[0]!=0 && prefix[0]!=1)throw new IllegalStateException("Malformed source result debt");
+                    long rowBytes=key.length+(long)length;bytes=Math.addExact(bytes,rowBytes);if(business+controls>=maximumRows || bytes>maximumBytes)throw new IllegalStateException("Source result debt exceeds admitted scan budget");
+                    if(prefix[0]==NativeOperationReceipt.Kind.CONTROL.ordinal()){
+                        if(length!=NativeOperationReceipt.HEADER_BYTES+8)throw new IllegalStateException("Source control receipt contains values");byte[] value=iterator.value();NativeOperationReceipt.validate(value);controls++;controlBytes+=rowBytes;
+                    }else{business++;businessBytes+=rowBytes;if(first==null){var input=ByteBuffer.wrap(key);input.position(16);long epoch=input.getLong();first=new OperationId(new UUID(input.getLong(),input.getLong()),epoch,input.getLong());}}
+                    iterator.next();
+                }
+                iterator.status();
+            }
+            return new SourceResultDebt(applied,business,businessBytes,controls,controlBytes,first);
+        }finally{applyLane.unlock();leaveNative();}
+    }
     private byte[] sourceClosingKey(){return topologyOwnershipKey(0x76);}
     /** Trusted committed source record. It closes admission but deliberately keeps every accepted debt. */
     public it.cavallium.rockserver.core.common.distributed.NativeSourceClosing applySourceClosing(ApplyPosition position,it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.Request request)throws RocksDBException {
@@ -331,7 +356,7 @@ public final class ReplicatedRangeStore {
     private long sourceOutcomeCountLimit,sourceOutcomeByteLimit;
     /** Trusted adapter bootstrap; ordinary standalone admission is unchanged without promises. */
     public void configureSourceOutcomeCapacity(long count,long bytes) {
-        if(count<1 || bytes<88)throw new IllegalArgumentException("Invalid source receipt capacity");enterNative();applyLane.lock();
+        if(count<1 || bytes<NativeOperationReceipt.MINIMUM_ROW_BYTES)throw new IllegalArgumentException("Invalid source receipt capacity");enterNative();applyLane.lock();
         try { if(sourceOutcomeCountLimit!=0 && (sourceOutcomeCountLimit!=count || sourceOutcomeByteLimit!=bytes))throw new IllegalStateException("Source receipt capacity already configured");ensureReceiptUsage();var effective=readUsage(usageKey).plus(sourceOutcomePromises(null));if(effective.count()>count || effective.bytes()>bytes)throw new IllegalStateException("Retained receipts/promises exceed proposed source capacity");sourceOutcomeCountLimit=count;sourceOutcomeByteLimit=bytes; }
         catch(RocksDBException failure) { throw new IllegalStateException("Cannot qualify source receipt capacity",failure); }
         finally { applyLane.unlock();leaveNative(); }
@@ -427,7 +452,7 @@ public final class ReplicatedRangeStore {
                     if(sessionMetadata!=null)batch.put(state,sessionAckCountKey(),ByteBuffer.allocate(8).putLong(sessionMetadata.count()).array());
                     if(ack>floor) { batch.put(state,sessionFloorKey(id),ByteBuffer.allocate(8).putLong(ack).array());batch.deleteRange(receipts,receiptKey(new OperationId(id.sessionId(),id.epoch(),0)),receiptKey(new OperationId(id.sessionId(),id.epoch(),ack+1))); }
                     for(var prior:List.copyOf(published.keySet()))if(prior.epoch()<minimum || prior.sessionId().equals(id.sessionId()) && prior.epoch()==id.epoch() && prior.sequence()<=ack) { batch.delete(state,sourceOutcomeKey(0x66,prior));published.remove(prior); }
-                    byte[] receipt=encodeReceipt(command.receiptDigest(),stable);updateReceiptUsage(batch,command,-1,ack,minimum,floor,receipt.length,position,id);batch.put(receipts,receiptKey(id),receipt);
+                    byte[] receipt=NativeOperationReceipt.encode(command,stable);updateReceiptUsage(batch,command,-1,ack,minimum,floor,receipt.length,position,id);batch.put(receipts,receiptKey(id),receipt);
                 } else batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position));
                 published.put(id,publication);batch.delete(state,sourceOutcomeKey(0x65,id));batch.put(state,sourceOutcomeKey(0x66,id),publication.encode());batch.put(state,markerKey,encodePosition(position));db.write(options,batch);
             }
@@ -2133,7 +2158,7 @@ public final class ReplicatedRangeStore {
         var id=command.operationId(); long minimum=minimumSessionEpoch(null),floor=id.epoch()<minimum ? -1 : acknowledgedThrough(id,null);
         if(id.epoch()<minimum || id.sequence()<=floor) { advanceCompletedMarker(position); return expiredResult(); }
         requireUnlocked(command); requireNext(position);
-        byte[] result=new CommandResult(CommandResult.Status.STALE_SCHEMA,List.of()).encode(),encoded=encodeReceipt(command.receiptDigest(),result);
+        byte[] result=new CommandResult(CommandResult.Status.STALE_SCHEMA,List.of()).encode(),encoded=NativeOperationReceipt.encode(command,result);
         var history=prepareScopedWrites(false,List.of(),Map.of());
         try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
             if(cdc!=null) cdc.initialize(batch);
@@ -3900,6 +3925,13 @@ public final class ReplicatedRangeStore {
         if(currentRangeRecovery==null || pendingInstallation!=null || applied==null)return false;byte[] receipt=db.get(state,topologyOwnershipKey(0x74));if(receipt==null)return false;if(!Arrays.equals(receipt,currentImageReceipt()))throw new IllegalArgumentException("CURRENT receipt changed registered image");return NativeMetadataRecoveryRegistration.covers(applied,currentRangeRecovery.imageCut());
     }
     public boolean currentRangeRecoveryImageInstalled()throws RocksDBException{return readSchemaMetadata(this::currentImageInstalledUnderLane);}
+    /** Exact admitted metadata accounting only. A retained CURRENT registration does not
+     * turn this into GROUP replay permission after receiver supersession. */
+    public byte[] applyTopologyMetadataControl(ApplyPosition position,DistributedCommand command)throws RocksDBException{
+        Objects.requireNonNull(position);Objects.requireNonNull(command);
+        if(!metadataTopologyControl(command) || NativeOperationReceipt.classify(command)!=NativeOperationReceipt.Kind.CONTROL)throw new IllegalArgumentException("Not an original topology metadata accounting control");
+        return applyInternal(position,command,null);
+    }
     /** Committed own-group replay after a genuine current image; no intermediate historical USER replay is needed. */
     public byte[] applyCurrentRangeRecoveryTail(ApplyPosition position,DistributedCommand command)throws RocksDBException {
         if(currentRangeRecovery==null)throw new IllegalStateException("No CURRENT recovery registration");return applyTopologyLearnerTail(position,command);
@@ -4067,7 +4099,7 @@ public final class ReplicatedRangeStore {
                                 receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), floor + 1)));
                     }
                     if(sessionMetadata!=null)batch.put(state,sessionAckCountKey(),ByteBuffer.allocate(8).putLong(sessionMetadata.count()).array());
-                    byte[] encodedReceipt = encodeReceipt(digest, stableResult);
+                    byte[] encodedReceipt = NativeOperationReceipt.encode(command,stableResult);
                     updateReceiptUsage(batch, command, effectiveMinimum, effectiveAcknowledgement, currentEpochFloor, currentFloor, encodedReceipt.length, position);
                     publishSourceGc=sourcePublicationGc(batch,Math.max(currentEpochFloor,effectiveMinimum),effectiveAcknowledgement,command.operationId());
                     batch.put(receipts, receiptKey, encodedReceipt);
@@ -4944,7 +4976,7 @@ public final class ReplicatedRangeStore {
             if (id.epoch() < minimumSessionEpoch(null) || id.sequence() <= acknowledgedThrough(id, null)) return expiredResult();
             byte[] key=receiptKey(id);int size=db.get(receipts,key,new byte[0]);
             if(size==org.rocksdb.RocksDB.NOT_FOUND)return null;
-            if(size<32 || size>32+MAX_RESULT_BYTES)throw new IllegalStateException("Invalid durable receipt size");
+            if(size<NativeOperationReceipt.MIN_BYTES || size>NativeOperationReceipt.MAX_BYTES)throw new IllegalStateException("Invalid durable receipt size");
             byte[] saved=new byte[size];if(db.get(receipts,key,saved)!=size)throw new IllegalStateException("Durable receipt changed during bounded outcome read");
             return decodeReceipt(saved,payloadDigest);
         } finally { applyLane.unlock(); }
@@ -5932,7 +5964,7 @@ public final class ReplicatedRangeStore {
                 return new ReceiptRetentionEstimate(usage, false, 0, 0, maintenance);
             }
             requireUnlocked(command);
-            if(staleControl) return new ReceiptRetentionEstimate(usage,true,1,88,false);
+            if(staleControl) return new ReceiptRetentionEstimate(usage,true,1,NativeOperationReceipt.MINIMUM_ROW_BYTES,false);
             var scope=commandScope(command); if(scope!=null) requireUngated(scope);
             var authority=sessionAuthority();
             if (requireSessionAuthority && command.sessionControl()==null && command.minimumSessionEpoch()<0 && authority==null) {
@@ -5950,7 +5982,7 @@ public final class ReplicatedRangeStore {
                 removed = removed.plus(scanUsage(receipts, receiptKey(new OperationId(id.sessionId(), id.epoch(), 0)),
                         receiptKey(new OperationId(id.sessionId(), id.epoch(), command.acknowledgedThrough() + 1)), true));
             }
-            long maximumBytes = 80L + (terminalExpiry || command.mutations().stream().allMatch(m -> m.returnMode() == Mutation.ReturnMode.NONE)
+            long maximumBytes = (long)NativeOperationReceipt.KEY_BYTES+NativeOperationReceipt.HEADER_BYTES + (terminalExpiry || command.mutations().stream().allMatch(m -> m.returnMode() == Mutation.ReturnMode.NONE)
                     ? 8 : CommandResult.MAX_BYTES);
             return new ReceiptRetentionEstimate(usage, true, Math.max(0, 1 - removed.count),
                     Math.max(0, maximumBytes - removed.bytes), maintenance);
@@ -6040,10 +6072,10 @@ public final class ReplicatedRangeStore {
 
     private static void validateReceiptRow(byte[] key, byte[] value) {
         if (key.length != 48 || ByteBuffer.wrap(key, 16, 8).getLong() < 0
-                || ByteBuffer.wrap(key, 40, 8).getLong() < 0 || value.length < 32
-                || value.length > 32 + MAX_RESULT_BYTES) {
+                || ByteBuffer.wrap(key, 40, 8).getLong() < 0) {
             throw new IllegalStateException("Invalid durable receipt row");
         }
+        try{NativeOperationReceipt.validate(value);}catch(IllegalArgumentException malformed){throw new IllegalStateException("Invalid durable receipt semantic",malformed);}
     }
 
     private static Usage decodeTotalUsage(byte[] value,ApplyPosition position) {
@@ -6250,17 +6282,8 @@ public final class ReplicatedRangeStore {
         var buffer = ByteBuffer.wrap(value);
         return new ApplyPosition(buffer.getLong(), buffer.getLong());
     }
-    private static byte[] encodeReceipt(byte[] digest, byte[] result) {
-        return ByteBuffer.allocate(32 + result.length).put(digest).put(result).array();
-    }
     private static byte[] decodeReceipt(byte[] value, byte[] digest) {
-        if (digest.length != 32 || value.length < 32 || value.length > 32 + MAX_RESULT_BYTES) {
-            throw new IllegalStateException("Invalid durable receipt");
-        }
-        var buffer = ByteBuffer.wrap(value);
-        byte[] originalHash = new byte[32];
-        buffer.get(originalHash);
-        if (!Arrays.equals(originalHash, digest)) throw new IllegalArgumentException("Operation identity reused with different payload");
-        return Arrays.copyOfRange(value, 32, value.length);
+        try{NativeOperationReceipt.validate(value);}catch(IllegalArgumentException malformed){throw new IllegalStateException("Invalid durable receipt semantic",malformed);}
+        return NativeOperationReceipt.result(value,digest);
     }
 }

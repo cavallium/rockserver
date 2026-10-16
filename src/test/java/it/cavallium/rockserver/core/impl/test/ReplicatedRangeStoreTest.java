@@ -641,9 +641,9 @@ class ReplicatedRangeStoreTest {
                 assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(oldCut.operationResult(ack.operationId(),ack.payloadDigest())).status());
                 Path before = path.resolve("before-clean.image"), after = path.resolve("after-clean.image");
                 try (var pin = pool.store.capture()) { it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.write(before,pin,pin.interval(),limits); }
-                assertThrows(IllegalArgumentException.class,() -> pool.store.reclaimExpiredSessions(null,1,87));
-                var page = pool.store.reclaimExpiredSessions(null,1,88);
-                assertEquals(1,page.examined()); assertEquals(0,page.deleted()); assertEquals(88,page.scannedBytes());
+                assertThrows(IllegalArgumentException.class,() -> pool.store.reclaimExpiredSessions(null,1,88));
+                var page = pool.store.reclaimExpiredSessions(null,1,89);
+                assertEquals(1,page.examined()); assertEquals(0,page.deleted()); assertEquals(89,page.scannedBytes());
                 assertNotNull(page.continuation());
                 int scanned = page.examined(), deleted = page.deleted(), pages = 1;
                 while (page.continuation()!=null) {

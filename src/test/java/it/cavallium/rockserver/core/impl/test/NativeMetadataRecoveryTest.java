@@ -475,8 +475,8 @@ class NativeMetadataRecoveryTest {
     @Test void sourceCreditPublicationAndAckTailStayAuthoritativeAcrossNewMetadataImage()throws Exception {
         var promises=new NativeSourceOutcomePublicationTest();Path first=root.resolve("credit-image"),latest=root.resolve("ack-image"),path=root.resolve("receiver");NativeMetadataRecoveryRegistration next;NativeSourceOutcomeCredit.Request request;
         try(var source=nativeTest.new Fixture(root.resolve("source"));var home=promises.home.new Fixture(root.resolve("home"));var pool=helper.pool(path)) {
-            source.freeze();source.parent.configureSourceOutcomeCapacity(4,352);request=promises.reserve(source,home,1,1);var credit=source.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);source.seed();
-            var original=registration(source,NativeRangeImage.writeMetadata(first,source.parent,nativeTest.limits));var target=pool.openMetadataRecovery(original);configure(target,source.definition);target.installMetadataSnapshot(first,nativeTest.limits);target.configureSourceOutcomeCapacity(4,352);
+            source.freeze();source.parent.configureSourceOutcomeCapacity(4,356);request=promises.reserve(source,home,1,1);var credit=source.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);source.seed();
+            var original=registration(source,NativeRangeImage.writeMetadata(first,source.parent,nativeTest.limits));var target=pool.openMetadataRecovery(original);configure(target,source.definition);target.installMetadataSnapshot(first,nativeTest.limits);target.configureSourceOutcomeCapacity(4,356);
             assertThrows(IllegalStateException.class,()->target.sourceOutcomeCredit(request.original().operationId(),request.original().receiptDigest()));
             var replay=target.readCommittedSourceOutcome(request);assertEquals(credit,replay.credit());assertNull(replay.publication());assertFalse(replay.fenced());
             target.completeMetadataRecovery(original,original.imageCut(),target.configuration());assertEquals(credit,target.sourceOutcomeCredit(request.original().operationId(),request.original().receiptDigest()));
@@ -489,15 +489,15 @@ class NativeMetadataRecoveryTest {
             assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(target.operationResult(request.original().operationId(),request.original().receiptDigest())).status());
             assertEquals(source.parent.sourceOutcomePublication(request,result),target.sourceOutcomePublication(request,result));assertEquals(NativeSourceOutcomePublication.Outcome.RETAINED,publication.outcome());
         }
-        try(var pool=helper.pool(path)) {var target=pool.openMetadataRecovery(next);target.configureSourceOutcomeCapacity(4,352);assertFalse(target.metadataRecoveryPending());assertTrue(target.sourceOutcomeCredits().isEmpty());assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(target.operationResult(request.original().operationId(),request.original().receiptDigest())).status());}
+        try(var pool=helper.pool(path)) {var target=pool.openMetadataRecovery(next);target.configureSourceOutcomeCapacity(4,356);assertFalse(target.metadataRecoveryPending());assertTrue(target.sourceOutcomeCredits().isEmpty());assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(target.operationResult(request.original().operationId(),request.original().receiptDigest())).status());}
     }
 
     @Test void committedCreditAndPublicationTailReplayDoesNotOpenFreshAuthority()throws Exception {
         var promises=new NativeSourceOutcomePublicationTest();Path image=root.resolve("metadata");
         try(var source=nativeTest.new Fixture(root.resolve("source"));var home=promises.home.new Fixture(root.resolve("home"));var pool=helper.pool(root.resolve("receiver"))) {
             source.freeze();source.seed();var registration=registration(source,NativeRangeImage.writeMetadata(image,source.parent,nativeTest.limits));
-            source.parent.configureSourceOutcomeCapacity(4,352);var request=promises.reserve(source,home,1,1);var credit=source.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);byte[] result=promises.success();var publication=source.parent.publishSourceOutcome(new ApplyPosition(1,3),request,result);
-            var target=pool.openMetadataRecovery(registration);configure(target,source.definition);target.installMetadataSnapshot(image,nativeTest.limits);target.configureSourceOutcomeCapacity(4,352);
+            source.parent.configureSourceOutcomeCapacity(4,356);var request=promises.reserve(source,home,1,1);var credit=source.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);byte[] result=promises.success();var publication=source.parent.publishSourceOutcome(new ApplyPosition(1,3),request,result);
+            var target=pool.openMetadataRecovery(registration);configure(target,source.definition);target.installMetadataSnapshot(image,nativeTest.limits);target.configureSourceOutcomeCapacity(4,356);
             assertNull(target.readCommittedSourceOutcome(request).credit());assertEquals(credit,target.applySourceOutcomeCredit(new ApplyPosition(1,2),request));assertEquals(credit,target.applySourceOutcomeCredit(new ApplyPosition(1,2),request));
             assertEquals(credit,target.readCommittedSourceOutcome(request).credit());assertThrows(IllegalStateException.class,()->target.estimateSourceOutcomeCredit(request));
             assertEquals(publication,target.publishSourceOutcome(new ApplyPosition(1,3),request,result));var replay=target.readCommittedSourceOutcome(request);assertNull(replay.credit());assertEquals(publication.publication(),replay.publication());assertArrayEquals(result,replay.result());

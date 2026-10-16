@@ -22,6 +22,7 @@ import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallProof;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof;
 import it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit;
+import it.cavallium.rockserver.core.common.distributed.NativeOperationReceipt;
 import it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomePublication;
 import it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool;
 import it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec;
@@ -1046,7 +1047,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final boolean enableSessionControls;
     public record RetentionLimits(long dataCount, long dataBytes, long maintenanceCount, long maintenanceBytes) {
         public RetentionLimits {
-            if (dataCount < 1 || dataBytes < 88 || maintenanceCount < 1 || maintenanceBytes < 88) throw new IllegalArgumentException("Invalid retention limits");
+            if (dataCount < 1 || dataBytes < NativeOperationReceipt.MINIMUM_ROW_BYTES || maintenanceCount < 1 || maintenanceBytes < NativeOperationReceipt.MINIMUM_ROW_BYTES) throw new IllegalArgumentException("Invalid retention limits");
             Math.addExact(dataCount,maintenanceCount); Math.addExact(dataBytes,maintenanceBytes);
         }
         public static RetentionLimits defaults() { return new RetentionLimits(4096,16L*1024*1024,16,64*1024); }
@@ -4323,7 +4324,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             return new AppliedRecord(preparation.operation(),RatisParticipantRecord.result(record));
         }
         var command=DistributedCommandCodec.decode(encoded); commandValidator.accept(command);
-        return new AppliedRecord(command.operationId(),store.currentRangeRecoveryRegistration()!=null ? store.applyCurrentRangeRecoveryTail(positionArg,command) : store.topologyLearnerRegistration()==null ? store.apply(positionArg,command) : store.applyTopologyLearnerTail(positionArg,command));
+        return new AppliedRecord(command.operationId(),store.metadataTopologyControl(command) ? store.applyTopologyMetadataControl(positionArg,command) : store.currentRangeRecoveryRegistration()!=null ? store.applyCurrentRangeRecoveryTail(positionArg,command) : store.topologyLearnerRegistration()==null ? store.apply(positionArg,command) : store.applyTopologyLearnerTail(positionArg,command));
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
         if(RatisTopologyRelocationRecord.isRecord(encoded))return new AppliedRecord(null,new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode());

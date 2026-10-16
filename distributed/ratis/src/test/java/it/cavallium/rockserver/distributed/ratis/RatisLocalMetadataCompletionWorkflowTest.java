@@ -36,6 +36,8 @@ class RatisLocalMetadataCompletionWorkflowTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     private long operation;
     private boolean exerciseSourceClosing;
+    private final AtomicReference<DistributedCommand> permittedPoint=new AtomicReference<>();
+    private final AtomicBoolean loseAccountingAck=new AtomicBoolean(true);private final AtomicInteger accountingSubmits=new AtomicInteger();
     private final AtomicLong calls=new AtomicLong();
     private final AtomicReference<RaftServer> actual=new AtomicReference<>();
     private final AtomicBoolean self=new AtomicBoolean(),losePrepare=new AtomicBoolean(true);
@@ -64,9 +66,14 @@ class RatisLocalMetadataCompletionWorkflowTest {
             var nodeRoot=Files.createDirectory(root.resolve("node"));SessionJournalFiles.force(nodeRoot);SessionJournalFiles.force(root);
             var epochs=new RatisSessionEpochs(donor.catalogue,directory.clusterId(),directory.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
             try(var route=new RatisRoutedClient(bootstrap,new RatisRoutedClient.Transport(){
-                public byte[] read(RangeDescriptor r,UUID column,byte[] key){throw new AssertionError("No routed USER read");}public CommandResult command(RangeDescriptor r,DistributedCommand command){throw new AssertionError("No routed USER write");}
+                public byte[] read(RangeDescriptor r,UUID column,byte[] key){throw new AssertionError("No routed USER read");}
+                public CommandResult command(RangeDescriptor r,DistributedCommand command)throws IOException{
+                    boolean ack=command.kind()==DistributedCommand.Kind.DATA && command.mutations().isEmpty() && command.predicates().isEmpty() && command.acknowledgedThrough()>=0;
+                    var permitted=permittedPoint.get();if(!ack && (permitted==null || !Arrays.equals(DistributedCommandCodec.encode(permitted),DistributedCommandCodec.encode(command))))throw new AssertionError("Unexpected routed USER command");
+                    try{var result=CommandResult.decode(requireSuccess(submit(actual.get(),r.groupId(),DistributedCommandCodec.encode(command),true)).getMessage().getContent().toByteArray());if(ack){accountingSubmits.incrementAndGet();if(exerciseSourceClosing && loseAccountingAck.compareAndSet(true,false)){var machine=(RatisRangeStateMachine)actual.get().getDivision(RaftGroupId.valueOf(r.groupId())).getStateMachine();awaitSourceClosingPrefix(actual.get(),machine.getGroupId(),field(machine,"store",ReplicatedRangeStore.class));throw new IOException("Controlled lost original-parent ACK reply after actual commit");}}return result;}catch(Exception failure){throw new IOException("Actual original point/ACK failed",failure);}
+                }
                 public byte[] transaction(RangeDescriptor r,byte[] request,boolean fresh)throws IOException{
-                    assertTrue(fresh);assertEquals(RatisHomeSourceClosingRpc.SOURCE_STATE,ScopedTransactionRpc.kind(request,RatisHomeSourceClosingRpc.MAX_BYTES));
+                    assertTrue(fresh);int kind=ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES);assertTrue(kind==RatisHomeSourceClosingRpc.SOURCE_STATE || kind==RatisTopologyOperationOutcomeRpc.KIND);
                     try{return requireSuccess(submit(actual.get(),r.groupId(),request,false)).getMessage().getContent().toByteArray();}catch(Exception failure){throw new IOException("Actual original source CLOSE proof failed",failure);}
                 }
             })) {
@@ -88,6 +95,13 @@ class RatisLocalMetadataCompletionWorkflowTest {
                     node=open(donor,plan,nodeRoot,epochs,route,RatisNodeRuntime.Startup.RECOVER,this::electedServer);
                     var server=actual.get();var machine=(RatisRangeStateMachine)server.getDivision(id).getStateMachine();var store=field(machine,"store",ReplicatedRangeStore.class);
                     bootstrap(node);awaitLeader(server,id,store);assertTrue(store.currentRangeRecoveryReady());assertArrayEquals(new byte[]{11},store.readCurrentPoint(donor.first.columnIds().iterator().next(),new byte[]{7}));
+                    RatisRoutedClient.PreparedCommand debtOriginal=null,debtAcknowledgement=null;
+                    if(exerciseSourceClosing){
+                        var ledger=epochs.read();var issued=epochs.prepareGrant(op(),ledger,new UUID(13410,71),ledger.logicalTimeMillis()+60_000);assertEquals(CommandResult.Status.SUCCESS,epochs.execute(issued.command()).status());var grant=issued.grant();
+                        var binding=epochs.prepareSessionBinding(directory,group,new OperationId(new UUID(13410,72),grant.epoch(),0),grant,16,-1);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(requireSuccess(submit(server,group,DistributedCommandCodec.encode(binding),true)).getMessage().getContent().toByteArray()).status());
+                        var pointOperation=new OperationId(grant.sessionId(),grant.epoch(),0);var mutations=List.of(new Mutation(Mutation.Kind.PUT,donor.first.columnIds().iterator().next(),new byte[]{8},new byte[]{12}));
+                        debtOriginal=route.prepareAt(directory,pointOperation,mutations,List.of(),-1);permittedPoint.set(debtOriginal.command());try{assertEquals(CommandResult.Status.SUCCESS,route.execute(debtOriginal).status());}finally{permittedPoint.set(null);}
+                    }
                     node.discoverConfiguredRecovery().get(20,TimeUnit.SECONDS);var graph=field(node,"recoveryGraph",RatisConfiguredRecoveryGraph.class).snapshot();requireRequest(original,graph.activeRequests().get(group));
                     node.recoverConfigured(original).get(20,TimeUnit.SECONDS);var manager=field(node,"configuredRecoveries",RatisConfiguredRecoveries.class);
                     var initialManager=manager;var lost=assertThrows(ExecutionException.class,()->initialManager.step().get(20,TimeUnit.SECONDS));if(losePrepare.get())throw new AssertionError("PREPARE did not reach controlled ACK loss",lost);
@@ -160,6 +174,10 @@ class RatisLocalMetadataCompletionWorkflowTest {
                         var activeSource=(RatisRangeStateMachine)actual.get().getDivision(id).getStateMachine();var activeStore=field(activeSource,"store",ReplicatedRangeStore.class);awaitSourceClosingPrefix(actual.get(),id,activeStore);
                         sourceClosed=node.closeTopologySource(group).get(20,TimeUnit.SECONDS);assertEquals(sourceClosed,activeStore.sourceClosing());awaitSourceClosingPrefix(actual.get(),id,activeStore);
                         assertEquals(sourceClosed,node.closeTopologySource(group).get(20,TimeUnit.SECONDS),"Exact retry retains the original committed CLOSE cut and request");
+                        var originalOutcome=route.operationOutcome(debtOriginal);assertEquals(RatisTopologyOperationOutcomeRpc.Outcome.FOUND,originalOutcome.outcome());assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(originalOutcome.result()).status());
+                        var beforeAck=activeStore.sourceResultDebt(65536,64L*1024*1024);assertTrue(beforeAck.businessResults()>0,"UnACKed original point must keep terminal outcome reclamation pending after CLOSE");
+                        var originalOperation=debtOriginal.command().operationId();debtAcknowledgement=route.prepareAcknowledgementAt(new OperationId(originalOperation.sessionId(),originalOperation.epoch(),1),directory,parent,0);assertEquals(CommandResult.Status.SUCCESS,route.execute(debtAcknowledgement).status());assertFalse(loseAccountingAck.get());assertEquals(1,accountingSubmits.get(),"Lost ACK reply resolves its exact retained result without a second dispatch");
+                        var afterAck=activeStore.sourceResultDebt(65536,64L*1024*1024);assertEquals(beforeAck.businessResults()-1,afterAck.businessResults());assertEquals(beforeAck.controlResults()+1,afterAck.controlResults(),"Pure ACK retains its own exact control outcome; it is not falsely forgotten");assertEquals(RatisTopologyOperationOutcomeRpc.Outcome.EXPIRED,route.operationOutcome(debtOriginal).outcome(),"Only actual original-session ACK advances the explicit result floor");
                         var homeGroupId=RaftGroupId.valueOf(homeId);var actualHome=(RatisRangeStateMachine)actual.get().getDivision(homeGroupId).getStateMachine();var homeStore=field(actualHome,"store",ReplicatedRangeStore.class);awaitSourceClosingPrefix(actual.get(),homeGroupId,homeStore);
                         var homeClosing=node.closeHomeSource(homeId,sourceClosed).get(20,TimeUnit.SECONDS);awaitSourceClosingPrefix(actual.get(),homeGroupId,homeStore);
                         try(var references=new RatisRoutedClient(homeDirectory,new RatisRoutedClient.Transport(){
@@ -177,7 +195,7 @@ class RatisLocalMetadataCompletionWorkflowTest {
                         var currentNode=node;bootstrap(currentNode);assertLocal(currentNode,group,consuming);assertEquals(localProof,topology.readRecovery(consuming.intentId()).completions().get(key));assertEquals("LOCAL_DONE",phase(journal));assertArrayEquals(witness,RatisSchemaClientJournal.read(journal).get("cleanupScope"));
                         currentNode.bootstrapDeferredRecovery().get(20,TimeUnit.SECONDS);assertLocal(currentNode,group,consuming);assertEquals(0,metaPrepares.get());
                         if(sourceClosed!=null){
-                            var sourceMachine=(RatisRangeStateMachine)actual.get().getDivision(id).getStateMachine();var sourceStore=field(sourceMachine,"store",ReplicatedRangeStore.class);assertEquals(sourceClosed,sourceStore.sourceClosing());awaitSourceClosingPrefix(actual.get(),id,sourceStore);assertEquals(sourceClosed,currentNode.closeTopologySource(group).get(20,TimeUnit.SECONDS));
+                            var sourceMachine=(RatisRangeStateMachine)actual.get().getDivision(id).getStateMachine();var sourceStore=field(sourceMachine,"store",ReplicatedRangeStore.class);assertEquals(sourceClosed,sourceStore.sourceClosing());awaitSourceClosingPrefix(actual.get(),id,sourceStore);assertEquals(sourceClosed,currentNode.closeTopologySource(group).get(20,TimeUnit.SECONDS));assertEquals(CommandResult.Status.SUCCESS,route.execute(debtAcknowledgement).status(),"Cold exact ACK retry keeps its original identity/result");
                             var childMachine=(RatisRangeStateMachine)actual.get().getDivision(RaftGroupId.valueOf(consuming.targets().getFirst().groupId())).getStateMachine();var childStore=field(childMachine,"store",ReplicatedRangeStore.class);awaitLeader(actual.get(),childMachine.getGroupId(),childStore);assertArrayEquals(new byte[]{11},childStore.readCurrentPoint(donor.first.columnIds().iterator().next(),new byte[]{7}));
                         }
                         node.close();node=null;

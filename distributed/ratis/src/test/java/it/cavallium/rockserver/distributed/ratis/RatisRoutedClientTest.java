@@ -211,11 +211,11 @@ class RatisRoutedClientTest {
             assertEquals(DistributedCommand.Kind.DATA,ack.command().kind()); assertEquals(4,ack.command().acknowledgedThrough());
             assertEquals(OPERATION,ack.command().operationId()); assertTrue(ack.command().mutations().isEmpty());
             var original = DistributedCommandCodec.encode(ack.command());
-            client.refresh(directory(2,3)); assertThrows(IOException.class,()->client.execute(ack));
+            client.refresh(directory(2,3)); assertSame(success,client.execute(ack));
             assertEquals(new UUID(8,1),transport.lastDescriptor.groupId());
             assertArrayEquals(original,DistributedCommandCodec.encode(ack.command()));
-            assertTrue(transport.commands.isEmpty());
-            assertArrayEquals(ack.command().receiptDigest(),transport.outcomes.getFirst().receiptDigest());
+            assertEquals(List.of(ack.command()),transport.commands);
+            assertTrue(transport.outcomes.isEmpty(),"Fresh ABSENT authority is not needed to apply an exact old-parent ACK");
             var piggyback = client.prepare(OPERATION,List.of(put(A,1)),List.of(),4);
             assertEquals(new UUID(8,3),piggyback.command().groupId());
             assertEquals(4,piggyback.command().acknowledgedThrough());
@@ -243,6 +243,19 @@ class RatisRoutedClientTest {
         }
     }
 
+    @Test void movedAsyncPureAckDispatchesOriginalIdentityWhileMixedBusinessStillRequiresOutcomeProof()throws Exception{
+        var sends=new AtomicInteger();var queries=new AtomicInteger();var observed=new AtomicReference<DistributedCommand>();var replyLost=new IOException("ACK reply lost");var lookupClosed=new IOException("CLOSE refuses fresh absence");var lose=new java.util.concurrent.atomic.AtomicBoolean(true);
+        var transport=new RecordingTransport(){
+            @Override public CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command){assertEquals(new UUID(8,1),route.groupId());sends.incrementAndGet();observed.set(command);return lose.getAndSet(false)?CompletableFuture.failedFuture(replyLost):CompletableFuture.completedFuture(success);}
+            @Override public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh){assertEquals(new UUID(8,1),route.groupId());assertTrue(fresh);queries.incrementAndGet();return CompletableFuture.failedFuture(lookupClosed);}
+        };
+        try(var client=new RatisRoutedClient(directory(1,1),transport)){
+            var ack=client.prepareAcknowledgement(OPERATION,A,key(1),4);var mixed=client.prepare(OPERATION,List.of(put(A,1)),List.of(),4);byte[] encoded=DistributedCommandCodec.encode(ack.command());client.refresh(directory(2,3));
+            var unresolved=assertThrows(ExecutionException.class,()->client.executeAsync(ack).get(5,TimeUnit.SECONDS));assertSame(replyLost,unresolved.getCause());assertEquals(1,sends.get());assertEquals(1,queries.get());assertArrayEquals(encoded,DistributedCommandCodec.encode(observed.get()));assertArrayEquals(new Throwable[]{lookupClosed},replyLost.getSuppressed());
+            assertSame(success,client.executeAsync(ack).get(5,TimeUnit.SECONDS));assertEquals(2,sends.get());assertEquals(1,queries.get(),"Exact retry sends same control without a new ABSENT claim");assertArrayEquals(encoded,DistributedCommandCodec.encode(observed.get()));
+            assertThrows(ExecutionException.class,()->client.executeAsync(mixed).get(5,TimeUnit.SECONDS));assertEquals(2,sends.get(),"ACK-piggyback USER effects cannot take the control path");assertEquals(2,queries.get());
+        }
+    }
     @Test void interruptedOriginalSubmissionDoesNotStartAnotherLookup() throws Exception {
         var interrupted=new java.io.InterruptedIOException("Original caller cancelled");
         var transport=new RecordingTransport() {

@@ -58,6 +58,22 @@ class NativeLocalMetadataDiscoveryTest {
             f.target.deferDiscovery();assertFalse(f.target.localMetadataDiscoveryActive());assertThrows(IllegalStateException.class,f.target::metadataOutcomeState);assertThrows(IllegalStateException.class,ready::publish);assertThrows(IllegalStateException.class,candidate::capture);
         }
     }
+    @Test void supersededCurrentAllowsOnlyQualifiedMetadataAckAndNeverGroupUserReplay()throws Exception{
+        try(var f=fixture("local-meta-ack")){
+            retire(f);f.pool.forceRecoverySupersession(f.scope);var original=f.source.write(f.target,0,9);var id=original.operationId();var ack=new DistributedCommand(f.current.groupId(),f.current.range().rangeEpoch(),f.target.schemaDigest(),new OperationId(id.sessionId(),id.epoch(),1),List.of(),List.of(),0);
+            assertTrue(f.target.metadataTopologyControl(ack));assertThrows(IllegalStateException.class,()->f.target.applyTopologyMetadataControl(new ApplyPosition(1,3),ack),"75 alone grants no metadata accounting authority");
+            var prepared=candidate(f);Path image=root.resolve("local-meta-ack.image");write(prepared,image);activation(prepared,image).publish();assertTrue(f.target.localMetadataDiscoveryActive());
+            assertThrows(IllegalStateException.class,()->f.target.applyCurrentRangeRecoveryTail(new ApplyPosition(1,3),ack),"The generic superseded GROUP replay path remains permanently closed");
+            assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.target.applyTopologyMetadataControl(new ApplyPosition(1,3),ack)).status());assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(f.target.operationResult(original.operationId(),original.receiptDigest())).status());
+            var ledger=SessionEpochLedger.initial(f.source.definition.header().clusterId(),f.source.definition.header().databaseId(),10).issue(new UUID(22100,1),1000);
+            var clock=DistributedCommand.sessionControl(f.current.groupId(),f.current.range().rangeEpoch(),f.target.schemaDigest(),new OperationId(new UUID(22100,2),1,0),RangeSessionControl.advance(ledger),-1);assertTrue(f.target.metadataTopologyControl(clock));assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.target.applyTopologyMetadataControl(new ApplyPosition(1,4),clock)).status());
+            var floor=DistributedCommand.advanceSessionEpochFloor(f.current.groupId(),f.current.range().rangeEpoch(),f.target.schemaDigest(),new OperationId(new UUID(22100,3),2,0),2);var binding=DistributedCommand.sessionControl(f.current.groupId(),f.current.range().rangeEpoch(),f.target.schemaDigest(),new OperationId(new UUID(22100,4),1,0),RangeSessionControl.bind(ledger,ledger.grants().getFirst(),4),-1);
+            for(var unsupported:List.of(floor,binding)){assertFalse(f.target.metadataTopologyControl(unsupported));assertThrows(IllegalArgumentException.class,()->f.target.applyTopologyMetadataControl(new ApplyPosition(1,5),unsupported));}
+            var mixed=new DistributedCommand(f.current.groupId(),f.current.range().rangeEpoch(),f.target.schemaDigest(),new OperationId(id.sessionId(),id.epoch(),2),original.mutations(),List.of(),1);var cut=f.target.applied();
+            assertFalse(f.target.metadataTopologyControl(mixed));assertThrows(IllegalArgumentException.class,()->f.target.applyTopologyMetadataControl(new ApplyPosition(1,5),mixed));assertThrows(IllegalStateException.class,()->f.target.applyCurrentRangeRecoveryTail(new ApplyPosition(1,5),mixed));assertEquals(cut,f.target.applied());closedUser(f);
+            f.reopen();f.target=f.pool.forceRecoverySupersession(f.scope);assertThrows(IllegalArgumentException.class,()->f.target.applyTopologyMetadataControl(new ApplyPosition(2,5),ack));var cold=candidate(f);Path retained=root.resolve("local-meta-ack-cold.image");write(cold,retained);activation(cold,retained).publish();assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.target.applyTopologyMetadataControl(new ApplyPosition(2,5),ack)).status());closedUser(f);
+        }
+    }
     @Test void localMetadataCandidateAndPublicationAreRevokedByFenceAndColdReopen()throws Exception {
         try(var f=fixture("local-meta-cold")) {
             retire(f);f.pool.forceRecoverySupersession(f.scope);var expected=f.target.acknowledgedRecoverySupersession();var candidate=candidate(f);Path image=root.resolve("local-meta-cold.image");write(candidate,image);var ready=activation(candidate,image);f.target.fence();assertThrows(IllegalStateException.class,ready::publish);

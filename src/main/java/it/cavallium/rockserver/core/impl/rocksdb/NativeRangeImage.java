@@ -334,7 +334,7 @@ public final class NativeRangeImage {
         return inspectReceiptCapacity(image,limits,maximumCount,maximumBytes,false);
     }
     static Manifest inspectReceiptCapacity(Path image,Limits limits,long maximumCount,long maximumBytes,boolean metadata) throws IOException {
-        if(maximumCount<1 || maximumBytes<88)throw new IllegalArgumentException("Invalid receiver receipt capacity");long[] total={0,0};
+        if(maximumCount<1 || maximumBytes<it.cavallium.rockserver.core.common.distributed.NativeOperationReceipt.MINIMUM_ROW_BYTES)throw new IllegalArgumentException("Invalid receiver receipt capacity");long[] total={0,0};
         var manifest=visitKind(image,limits,(section,column,key,value)-> {
             if(section==Section.RECEIPTS){total[0]++;total[1]=Math.addExact(total[1],key.length+(long)value.length);}
             if(section==Section.STATE && key.length>16 && key[16]==0x65){var credit=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.decode(value);total[0]++;total[1]=Math.addExact(total[1],credit.request().reservedBytes());}
@@ -399,6 +399,7 @@ public final class NativeRangeImage {
                 byte[] key = new byte[keyLength];
                 input.readFully(key);
                 if(rowBytes>rowByteLimit(header,section,key,limits))throw new IOException("Image row exceeds byte limit");
+                if(section==Section.RECEIPTS && (keyLength!=it.cavallium.rockserver.core.common.distributed.NativeOperationReceipt.KEY_BYTES || valueLength<it.cavallium.rockserver.core.common.distributed.NativeOperationReceipt.MIN_BYTES || valueLength>it.cavallium.rockserver.core.common.distributed.NativeOperationReceipt.MAX_BYTES))throw new IOException("Native receipt exceeds current semantic bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x67 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration.MAX_BYTES))throw new IOException("Learner registration exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x7a && (key.length!=41 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeHomeSourceClosing.MAX_BYTES))throw new IOException("HOME source closing exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x76 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeSourceClosing.MAX_BYTES))throw new IOException("Source CLOSE exceeds canonical bound");
@@ -962,11 +963,12 @@ public final class NativeRangeImage {
                     }
                 }
                 if (section == Section.RECEIPTS) {
-                    if (key.length != 48 || value.length < 32 || value.length > 32 + 2 * 1024 * 1024
+                    if (key.length != 48 || value.length < it.cavallium.rockserver.core.common.distributed.NativeOperationReceipt.MIN_BYTES || value.length > it.cavallium.rockserver.core.common.distributed.NativeOperationReceipt.MAX_BYTES
                             || ByteBuffer.wrap(key, 16, 8).getLong() < epochFloor
                             || ByteBuffer.wrap(key, 40, 8).getLong() < 0) {
                         throw new IOException("Invalid image receipt row");
                     }
+                    it.cavallium.rockserver.core.common.distributed.NativeOperationReceipt.validate(value);
                     var receipt=ByteBuffer.wrap(key); receipt.position(16);long receiptEpoch=receipt.getLong();var id=new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(receipt.getLong(),receipt.getLong()),receiptEpoch,receipt.getLong());
                     for (var commit:committed.values()) if (commit.ownsOperation(id)) throw new IOException("COMMIT image identity also has ordinary receipt");
                     for (var abort:aborted.values()) if (abort.ownsOperation(id)) throw new IOException("ABORT image identity also has ordinary receipt");

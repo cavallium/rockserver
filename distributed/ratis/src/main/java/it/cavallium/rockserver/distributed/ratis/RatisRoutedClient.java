@@ -1520,13 +1520,16 @@ public final class RatisRoutedClient implements AutoCloseable {
         var observed=current();var descriptor=prepared.descriptor;
         boolean moved=observed.ranges().stream().noneMatch(range->range.rangeId().equals(descriptor.rangeId())
                 && range.groupId().equals(descriptor.groupId()) && range.rangeEpoch()==descriptor.rangeEpoch());
-        if(moved)requireNamespace(prepared.source);else requireIdentity(prepared.source);
+        boolean acknowledgementOnly=RatisOperationRerouteAdmissionRpc.acknowledgementOnly(prepared.command);
+        if(moved && !acknowledgementOnly)requireNamespace(prepared.source);else requireIdentity(prepared.source);
         beginCall();
         try {
-            if(moved)return resolvedOriginalOutcome(prepared,readOriginalOutcome(prepared));
+            // This control has no USER operands or child route. CLOSE denies fresh ABSENT,
+            // so dispatch its exact frozen parent identity before attempting outcome resolution.
+            if(moved && !acknowledgementOnly)return resolvedOriginalOutcome(prepared,readOriginalOutcome(prepared));
             try {
                 CommandResult result=transport.command(prepared.descriptor(),prepared.command());
-                if(result==null)throw new IOException("Missing command result");
+                if(result==null || acknowledgementOnly && result.valueCount()!=0)throw new IOException("Missing/invalid original command result");
                 return result;
             } catch(IOException unresolved) {
                 if(unresolved instanceof java.io.InterruptedIOException || Thread.currentThread().isInterrupted())throw unresolved;
@@ -1541,13 +1544,14 @@ public final class RatisRoutedClient implements AutoCloseable {
         Objects.requireNonNull(prepared,"prepared");var observed=current();var descriptor=prepared.descriptor;
         boolean moved=observed.ranges().stream().noneMatch(range->range.rangeId().equals(descriptor.rangeId())
                 &&range.groupId().equals(descriptor.groupId())&&range.rangeEpoch()==descriptor.rangeEpoch());
-        if(moved)requireNamespace(prepared.source);else requireIdentity(prepared.source);
+        boolean acknowledgementOnly=RatisOperationRerouteAdmissionRpc.acknowledgementOnly(prepared.command);
+        if(moved && !acknowledgementOnly)requireNamespace(prepared.source);else requireIdentity(prepared.source);
         return snapshotAsync(()->{
-            if(moved)return readOriginalOutcomeAsync(prepared).thenCompose(reply->resolvedOriginalOutcomeAsync(prepared,reply));
+            if(moved && !acknowledgementOnly)return readOriginalOutcomeAsync(prepared).thenCompose(reply->resolvedOriginalOutcomeAsync(prepared,reply));
             CompletableFuture<CommandResult> submitted;
             try{submitted=transport.commandAsync(descriptor,prepared.command);}catch(IOException failure){submitted=CompletableFuture.failedFuture(failure);}
             return submitted.handle((result,failure)->{
-                if(failure==null)return result==null?CompletableFuture.<CommandResult>failedFuture(new IOException("Missing command result")):CompletableFuture.completedFuture(result);
+                if(failure==null)return result==null || acknowledgementOnly && result.valueCount()!=0?CompletableFuture.<CommandResult>failedFuture(new IOException("Missing/invalid original command result")):CompletableFuture.completedFuture(result);
                 Throwable cause=unwrap(failure);
                 if(!(cause instanceof IOException unresolved)||cause instanceof java.io.InterruptedIOException)return CompletableFuture.<CommandResult>failedFuture(cause);
                 return readOriginalOutcomeAsync(prepared).thenCompose(reply->resolvedOriginalOutcomeAsync(prepared,reply)).handle((resolved,lookupFailure)->{

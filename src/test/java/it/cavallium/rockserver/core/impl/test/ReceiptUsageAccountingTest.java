@@ -19,10 +19,10 @@ class ReceiptUsageAccountingTest {
 
     @Test void retentionEstimatesBoundNewResultsAndPreserveNativeStateForRetries() throws Exception {
         try (Pool pool = new Pool(root.resolve("estimates"))) {
-            assertEstimate(pool, command(1, 0), true, 1, 88, false);
+            assertEstimate(pool, command(1, 0), true, 1, 89, false);
             var returned = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 99),
                     List.of(new Mutation(Mutation.Kind.PUT, COLUMN, new byte[] {1}, new byte[] {3}, Mutation.ReturnMode.PREVIOUS)));
-            assertEstimate(pool, returned, true, 1, 80L + CommandResult.MAX_BYTES, false);
+            assertEstimate(pool, returned, true, 1, 81L + CommandResult.MAX_BYTES, false);
             pool.store.apply(new ApplyPosition(1, 0), command(1, 0), new byte[7]);
             assertEstimate(pool, command(1, 0), false, 0, 0, false);
             long sequence = pool.db.getLatestSequenceNumber();
@@ -32,7 +32,7 @@ class ReceiptUsageAccountingTest {
             var wrongGroup = new DistributedCommand(ADMIN, 1, new byte[32], new OperationId(SESSION, 1, 1), List.of(put()));
             assertThrows(IllegalArgumentException.class, () -> pool.store.estimateReceiptRetention(wrongGroup));
             assertEquals(sequence, pool.db.getLatestSequenceNumber());
-            assertUsage(pool, new ApplyPosition(1, 0), 1, 87);
+            assertUsage(pool, new ApplyPosition(1, 0), 1, 88);
             assertArrayEquals(new byte[] {2}, pool.db.get(pool.handles.get(1), new byte[] {1}));
         }
     }
@@ -42,17 +42,17 @@ class ReceiptUsageAccountingTest {
             pool.store.apply(new ApplyPosition(1, 0), command(1, 0), new byte[7]);
             pool.store.apply(new ApplyPosition(1, 1), command(1, 1), new byte[13]);
             var partial = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 2), List.of(), List.of(), 0);
-            assertEstimate(pool, partial, true, 0, 1, true); // New92 minus covered91; count and bytes clamp independently.
+            assertEstimate(pool, partial, true, 0, 1, true); // New89 minus covered88; count and bytes clamp independently.
             var returned = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 2),
                     List.of(new Mutation(Mutation.Kind.PUT, COLUMN, new byte[] {1}, new byte[] {3}, Mutation.ReturnMode.PREVIOUS)), List.of(), 0);
-            assertEstimate(pool, returned, true, 0, 80L + CommandResult.MAX_BYTES - 87, true);
+            assertEstimate(pool, returned, true, 0, 81L + CommandResult.MAX_BYTES - 88, true);
             pool.store.apply(new ApplyPosition(1, 2), partial);
             assertEstimate(pool, partial, false, 0, 0, true);
             assertEstimate(pool, command(1, 0), false, 0, 0, false);
             var regressive = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 3), List.of(), List.of(), 0);
-            assertEstimate(pool, regressive, true, 1, 88, true);
+            assertEstimate(pool, regressive, true, 1, 89, true);
             var advancing = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 3), List.of(), List.of(), 1);
-            assertEstimate(pool, advancing, true, 0, 0, true); // Covered97 exceeds the new92; no negative credit escapes.
+            assertEstimate(pool, advancing, true, 0, 0, true); // Covered94 exceeds the new89; no negative credit escapes.
             pool.store.apply(new ApplyPosition(1, 3), command(2, 0));
             var floor = DistributedCommand.advanceSessionEpochFloor(GROUP, 1, new byte[32], new OperationId(ADMIN, 3, 0), 2);
             assertEstimate(pool, floor, true, 0, 0, true);
@@ -60,8 +60,8 @@ class ReceiptUsageAccountingTest {
             assertEstimate(pool, floor, false, 0, 0, true);
             assertEstimate(pool, command(1, 99), false, 0, 0, false);
             var oldFloor = DistributedCommand.advanceSessionEpochFloor(GROUP, 1, new byte[32], new OperationId(ADMIN, 3, 1), 1);
-            assertEstimate(pool, oldFloor, true, 1, 88, true);
-            assertUsage(pool, new ApplyPosition(1, 4), 2, 176);
+            assertEstimate(pool, oldFloor, true, 1, 89, true);
+            assertUsage(pool, new ApplyPosition(1, 4), 2, 178);
             assertArrayEquals(new byte[] {2}, pool.db.get(pool.handles.get(1), new byte[] {1}));
         }
     }
@@ -84,22 +84,22 @@ class ReceiptUsageAccountingTest {
             assertUsage(pool, null, 0, 0);
             pool.store.apply(new ApplyPosition(1, 0), first, new byte[11]);
             pool.store.apply(new ApplyPosition(1, 1), second, new byte[23]);
-            assertUsage(pool, new ApplyPosition(1, 1), 2, 2 * 80 + 34);
+            assertUsage(pool, new ApplyPosition(1, 1), 2, 2 * 81 + 34);
             assertArrayEquals(new byte[11], pool.store.apply(new ApplyPosition(1, 2), first, new byte[99]));
-            assertUsage(pool, new ApplyPosition(1, 2), 2, 2 * 80 + 34);
+            assertUsage(pool, new ApplyPosition(1, 2), 2, 2 * 81 + 34);
             var ack = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 2), List.of(), List.of(), 0);
             byte[] result = pool.store.apply(new ApplyPosition(1, 3), ack);
-            assertUsage(pool, new ApplyPosition(1, 3), 2, 80 + 23 + 80 + result.length);
+            assertUsage(pool, new ApplyPosition(1, 3), 2, 81 + 23 + 81 + result.length);
             assertEquals(CommandResult.Status.SESSION_EXPIRED,
                     CommandResult.decode(pool.store.apply(new ApplyPosition(1, 4), first)).status());
-            assertUsage(pool, new ApplyPosition(1, 4), 2, 80 + 23 + 80 + result.length);
+            assertUsage(pool, new ApplyPosition(1, 4), 2, 81 + 23 + 81 + result.length);
             byte[] live = pool.store.apply(new ApplyPosition(1, 5), command(2, 0));
             var fence = DistributedCommand.advanceSessionEpochFloor(GROUP, 1, new byte[32], new OperationId(ADMIN, 3, 0), 2);
             byte[] fenced = pool.store.apply(new ApplyPosition(1, 6), fence);
-            bytes = 160L + live.length + fenced.length;
+            bytes = 162L + live.length + fenced.length;
             assertUsage(pool, new ApplyPosition(1, 6), 2, bytes);
             assertNull(pool.db.get(pool.state(), bucket(SESSION, 1)));
-            assertBucket(pool, SESSION, 2, 1, 80 + live.length);
+            assertBucket(pool, SESSION, 2, 1, 81 + live.length);
             var page = pool.store.reclaimExpiredSessions(null, 1, 4 * 1024 * 1024);
             while (page.continuation() != null) page = pool.store.reclaimExpiredSessions(page.continuation(), 1, 4 * 1024 * 1024);
             assertUsage(pool, new ApplyPosition(1, 6), 2, bytes);
@@ -117,9 +117,9 @@ class ReceiptUsageAccountingTest {
                 pool.store.apply(new ApplyPosition(1,0),command(1,0),new byte[7]);
                 switch (corruption) {
                     case "missing" -> pool.db.delete(pool.state(),metadata((byte)0x10));
-                    case "short" -> pool.db.put(pool.state(),metadata((byte)0x10),usage(1,87));
-                    case "position" -> pool.db.put(pool.state(),metadata((byte)0x10),total(1,87,new ApplyPosition(1,99)));
-                    case "count" -> { byte[] bad=total(1,87,new ApplyPosition(1,0)); bad[3]=2; pool.db.put(pool.state(),metadata((byte)0x10),bad); }
+                    case "short" -> pool.db.put(pool.state(),metadata((byte)0x10),usage(1,88));
+                    case "position" -> pool.db.put(pool.state(),metadata((byte)0x10),total(1,88,new ApplyPosition(1,99)));
+                    case "count" -> { byte[] bad=total(1,88,new ApplyPosition(1,0)); bad[3]=2; pool.db.put(pool.state(),metadata((byte)0x10),bad); }
                     case "reserved" -> pool.db.put(pool.state(),metadata((byte)0x12),new byte[]{1});
                     case "bucket-missing" -> pool.db.delete(pool.state(),bucket(SESSION,1));
                     case "bucket-count" -> pool.db.put(pool.state(),bucket(SESSION,1),usage(2,182));
@@ -147,15 +147,15 @@ class ReceiptUsageAccountingTest {
                     List.of(put()), List.of(new KeyPredicate(COLUMN, new byte[] {1}, new byte[] {9})), 0);
             byte[] result = pool.store.apply(new ApplyPosition(1, 1), conflict);
             assertEquals(CommandResult.Status.CONFLICT, CommandResult.decode(result).status());
-            assertUsage(pool, new ApplyPosition(1, 1), 1, 80 + result.length);
+            assertUsage(pool, new ApplyPosition(1, 1), 1, 81 + result.length);
             pool.db.put(pool.handles.get(1), new byte[] {1}, new byte[2 * 1024 * 1024]);
             var large = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 2),
                     List.of(new Mutation(Mutation.Kind.PUT, COLUMN, new byte[] {1}, new byte[] {3}, Mutation.ReturnMode.PREVIOUS)), List.of(), 1);
             byte[] largeResult = pool.store.apply(new ApplyPosition(1, 2), large);
             assertEquals(CommandResult.Status.RESULT_TOO_LARGE, CommandResult.decode(largeResult).status());
-            assertUsage(pool, new ApplyPosition(1, 2), 1, 80 + largeResult.length);
+            assertUsage(pool, new ApplyPosition(1, 2), 1, 81 + largeResult.length);
             assertArrayEquals(largeResult, pool.store.apply(new ApplyPosition(1, 3), large));
-            assertUsage(pool, new ApplyPosition(1, 3), 1, 80 + largeResult.length);
+            assertUsage(pool, new ApplyPosition(1, 3), 1, 81 + largeResult.length);
         }
     }
 
@@ -179,8 +179,8 @@ class ReceiptUsageAccountingTest {
             if (receipt) {
                 var command=command(1,0);
                 byte[] key=ByteBuffer.allocate(48).putLong(0).putLong(1).putLong(0).putLong(2).putLong(1).putLong(0).array();
-                pool.db.put(pool.handles.get(3),key,ByteBuffer.allocate(40).put(command.receiptDigest()).put(new byte[8]).array());
-            } else pool.db.put(pool.state(),bucket(SESSION,1),usage(1,88));
+                pool.db.put(pool.handles.get(3),key,NativeOperationReceipt.encode(command,new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()));
+            } else pool.db.put(pool.state(),bucket(SESSION,1),usage(1,89));
             long sequence=pool.db.getLatestSequenceNumber();
             assertThrows(IllegalStateException.class,pool::openStore);
             assertThrows(IllegalStateException.class,pool.store::receiptUsage);
@@ -196,7 +196,7 @@ class ReceiptUsageAccountingTest {
             try (var pin=pool.store.capture()) {
                 assertThrows(java.io.IOException.class,() -> NativeRangeImage.write(root.resolve("bad.image"),pin,pin.interval(),LIMITS));
             }
-            pool.db.put(pool.state(),bucket(SESSION,1),usage(1,87));
+            pool.db.put(pool.state(),bucket(SESSION,1),usage(1,88));
             expectedTotal=pool.db.get(pool.state(),metadata((byte)0x10)); expectedBucket=pool.db.get(pool.state(),bucket(SESSION,1));
             try (var pin=pool.store.capture()) { NativeRangeImage.write(image,pin,pin.interval(),LIMITS); }
         }
@@ -230,9 +230,9 @@ class ReceiptUsageAccountingTest {
             target.store.fence(); target.store.installSnapshot(image,LIMITS);
             assertArrayEquals(expectedTotal,target.db.get(target.state(),metadata((byte)0x10)));
             assertArrayEquals(expectedBucket,target.db.get(target.state(),bucket(SESSION,1)));
-            assertUsage(target,new ApplyPosition(1,0),1,87); target.store.activate();
+            assertUsage(target,new ApplyPosition(1,0),1,88); target.store.activate();
             assertArrayEquals(new byte[7],target.store.apply(new ApplyPosition(1,1),command(1,0)));
-            assertUsage(target,new ApplyPosition(1,1),1,87);
+            assertUsage(target,new ApplyPosition(1,1),1,88);
         }
     }
 
@@ -241,7 +241,7 @@ class ReceiptUsageAccountingTest {
         try (Pool source=new Pool(root.resolve("swapped-source"))) {
             source.store.apply(new ApplyPosition(1,0),command(1,0),new byte[7]);
             source.store.apply(new ApplyPosition(1,1),command(2,0),new byte[13]);
-            source.db.put(source.state(),bucket(SESSION,1),usage(1,93)); source.db.put(source.state(),bucket(SESSION,2),usage(1,87));
+            source.db.put(source.state(),bucket(SESSION,1),usage(1,94)); source.db.put(source.state(),bucket(SESSION,2),usage(1,88));
             try (var pin=source.store.capture()) { NativeRangeImage.write(image,pin,pin.interval(),LIMITS); }
         }
         // Aggregate image accounting is bounded; the imported native rows permit exact per-bucket validation.
@@ -252,7 +252,7 @@ class ReceiptUsageAccountingTest {
             assertTrue(target.store.pendingInstallation()); assertNull(target.store.applied());
             assertEquals(RangeOwnership.State.FENCED,target.store.ownership().state());
             assertThrows(IllegalStateException.class,target.store::activate); assertThrows(IllegalStateException.class,target.store::receiptUsage);
-            assertBucket(target,SESSION,1,1,93); assertBucket(target,SESSION,2,1,87);
+            assertBucket(target,SESSION,1,1,94); assertBucket(target,SESSION,2,1,88);
         }
         try (Pool recovered=new Pool(targetPath)) {
             assertTrue(recovered.store.pendingInstallation()); assertNull(recovered.store.applied());
