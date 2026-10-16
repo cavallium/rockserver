@@ -123,6 +123,7 @@ public class ThriftServer extends Server {
                 new DistributedCdcThriftService(client.getCapabilities().withTransportLimit(validatedMaxFrameSize).cdcMode()==it.cavallium.rockserver.core.common.RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS ? client.getDistributedCdcApi() : null,validatedMaxFrameSize).boundedProcessor());
         processor.registerProcessor(RemoteMutationThriftService.SERVICE_NAME,
                 new RemoteMutationThriftService(remoteMutationBackend(client),validatedMaxFrameSize).boundedProcessor());
+        processor.registerProcessor(SchemaOperationsThriftService.SERVICE_NAME,new SchemaOperationsThriftService(client::getSchemaOperationsApi,validatedMaxFrameSize).boundedProcessor());
         registerPhysical(processor,physicalBackend,validatedMaxFrameSize);
         try {
             var serverTransport = new ConfiguredNonblockingServerSocket(

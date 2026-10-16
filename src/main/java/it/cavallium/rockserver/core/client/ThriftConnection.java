@@ -126,6 +126,7 @@ public final class ThriftConnection extends BaseConnection {
 	}
     @Override public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() { return delegate.getDistributedCdcApi(); }
     @Override public it.cavallium.rockserver.core.common.distributed.RemoteMutationAsyncAPI getRemoteMutationApi() { return delegate.getRemoteMutationApi(); }
+    @Override public it.cavallium.rockserver.core.common.schema.SchemaOperationsAsyncAPI getSchemaOperationsApi(){return delegate.getSchemaOperationsApi();}
 
 	@Override
 	public void close() throws IOException {
@@ -171,6 +172,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	private final AtomicBoolean closed = new AtomicBoolean();
     private ThriftDistributedCdcClient distributedCdc;
     private ThriftRemoteMutationClient remoteMutations;
+    private ThriftSchemaOperationsClient schemaOperations;
 
 	private static it.cavallium.rockserver.core.common.api.RequestContext[] createNoTimeoutWireContexts() {
 		var contexts = new it.cavallium.rockserver.core.common.api.RequestContext[WorkloadProfile.values().length];
@@ -252,6 +254,10 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
         return distributedCdc;
     }
 
+    @Override public synchronized it.cavallium.rockserver.core.common.schema.SchemaOperationsAsyncAPI getSchemaOperationsApi(){
+        if(closed.get())throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,"Connection closed");
+        if(schemaOperations==null)schemaOperations=new ThriftSchemaOperationsClient(host,port,executor,maxFrameSize);return schemaOperations;
+    }
     @Override public synchronized it.cavallium.rockserver.core.common.distributed.RemoteMutationAsyncAPI getRemoteMutationApi() {
         if(capabilities.backendMode()!=RockserverCapabilities.BackendMode.DISTRIBUTED)throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,"Explicit remote mutations require a distributed backend");
         if(closed.get())throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,"Connection closed");
@@ -272,9 +278,11 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		}
         final ThriftDistributedCdcClient cdc;
         final ThriftRemoteMutationClient mutations;
-        synchronized(this) { cdc=distributedCdc; mutations=remoteMutations; }
+        final ThriftSchemaOperationsClient schemas;
+        synchronized(this) { cdc=distributedCdc; mutations=remoteMutations;schemas=schemaOperations; }
         if(cdc!=null) cdc.close();
         if(mutations!=null) mutations.close();
+        if(schemas!=null)schemas.close();
 		for (var slot : allClientSlots) {
 			slot.close();
 		}

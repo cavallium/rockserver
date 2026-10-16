@@ -143,6 +143,20 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     }
     @Override public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() { requireOpen(); return cdc; }
     @Override public RemoteMutationAsyncAPI getRemoteMutationApi(){requireOpen();return new RatisRemoteMutationApi(this,clock);}
+    @Override public it.cavallium.rockserver.core.common.schema.SchemaOperationsAsyncAPI getSchemaOperationsApi(){
+        requireOpen();return new it.cavallium.rockserver.core.common.schema.SchemaOperationsAsyncAPI(){
+            private void check(RequestContext context){Objects.requireNonNull(context);requireOpen();long deadline=clock.resolveMonotonicDeadline(context);if(deadline!=Long.MAX_VALUE && clock.remainingMonotonicDeadlineNanos(deadline)<=0)throw RocksDBException.of(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,"Schema operation deadline expired");}
+            public CompletableFuture<List<it.cavallium.rockserver.core.common.schema.SchemaOperations.Status>> inventory(RequestContext context){try{check(context);return CompletableFuture.completedFuture(it.cavallium.rockserver.core.common.schema.SchemaOperations.inventory(schemas.inventory().stream().map(RatisRocksDBConnection::schemaOperation).toList()));}catch(Throwable failure){return CompletableFuture.failedFuture(failure);}}
+            public CompletableFuture<it.cavallium.rockserver.core.common.schema.SchemaOperations.Status> status(UUID id,RequestContext context){try{check(context);return CompletableFuture.completedFuture(schemaOperation(schemas.status(id)));}catch(Throwable failure){return CompletableFuture.failedFuture(failure);}}
+            private CompletableFuture<it.cavallium.rockserver.core.common.schema.SchemaOperations.Status> act(UUID id,RequestContext context,boolean abort){try{check(context);return schemas.resume(Objects.requireNonNull(id),context,abort).thenApply(ignored->schemaOperation(schemas.status(id)));}catch(Throwable failure){return CompletableFuture.failedFuture(failure);}}
+            public CompletableFuture<it.cavallium.rockserver.core.common.schema.SchemaOperations.Status> resume(UUID id,RequestContext context){return act(id,context,false);}
+            public CompletableFuture<it.cavallium.rockserver.core.common.schema.SchemaOperations.Status> abort(UUID id,RequestContext context){return act(id,context,true);}
+        };
+    }
+    private static it.cavallium.rockserver.core.common.schema.SchemaOperations.Status schemaOperation(RatisSchemaRequests.Status status){
+        var kind=it.cavallium.rockserver.core.common.schema.SchemaOperations.Kind.valueOf(status.kind().name());var result=status.result();
+        return new it.cavallium.rockserver.core.common.schema.SchemaOperations.Status(status.requestId(),kind,it.cavallium.rockserver.core.common.schema.SchemaOperations.State.valueOf(status.state().name()),status.phase()==null?null:it.cavallium.rockserver.core.common.schema.SchemaOperations.Phase.valueOf(status.phase().name()),result==null?null:new it.cavallium.rockserver.core.common.schema.SchemaOperations.Result(result.requestId(),it.cavallium.rockserver.core.common.schema.SchemaOperations.Kind.valueOf(result.kind().name()),result.value(),result.changed(),result.aborted()));
+    }
     @Override public URI getUrl() { return uri; }
     @Override public RockserverCapabilities getCapabilities() { return new RockserverCapabilities(RockserverCapabilities.BackendMode.DISTRIBUTED,RockserverCapabilities.RawScanMode.UNSUPPORTED,RangeBudget.DEFAULT_MAX_ITEMS,RangeBudget.DEFAULT_MAX_BYTES,RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS); }
     public List<RatisSchemaRequests.Status> pendingSchemaRequests() { return schemas.pending(); }

@@ -30,6 +30,11 @@ public interface RocksDBConnection extends Closeable {
 				"Remote mutation ownership is unavailable through this connection");
 	}
 
+	/** Observe or resume an existing schema UUID. Ordinary create/delete/upload calls issue new UUIDs. */
+	default it.cavallium.rockserver.core.common.schema.SchemaOperationsAsyncAPI getSchemaOperationsApi() {
+		return it.cavallium.rockserver.core.common.schema.SchemaOperationsAsyncAPI.unsupported();
+	}
+
 	/** Return the effective backend features and limits supported through this connection. */
 	RockserverCapabilities getCapabilities();
 

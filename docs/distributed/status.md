@@ -90,9 +90,26 @@ This section and the remaining gates at the end describe the current branch.
   recovery after both DATA pools restart without new grants. HOME kernels remain
   live in that cold fixture. Native FREEZE refuses undrained writable owners; after
   rollback the same split completes and fresh transactions capture descendants.
-  Existing backup and two-pool workflows also pass. These controlled transports do
-  not prove independent endpoint/quorum or performance acceptance. The public
+  Existing backup and two-pool workflows also pass. The broader client selection
+  covers 383 cases using 319 unchanged passing cases from
+  `cross-domain-clients-coupled98.log` and all 64 cases in repaired classes from
+  `cross-domain-clients-repair100.log`; the saved per-class manifest identifies
+  source and report hashes. These controlled transports do not prove independent
+  endpoint/quorum or performance acceptance. The public
   durable `executeAtomic(mutations, predicates)` owner remains a separate gap.
+- Retained schema inventory, status, resume and abort are available through Java,
+  gRPC, Thrift and Rust using the original UUID/controller. Ordinary schema calls
+  still create new requests. Initial UUIDs and terminal results, including conflict,
+  become observable only after exact journal force; cold rows are validated and
+  re-forced before exposure. Fresh overload exposes no unretained UUID. Cancelled
+  observations retain actual controller/native ownership until drain. Standalone
+  servers start normally and refuse only lifecycle requests with typed
+  NOT_IMPLEMENTED. `schema-lifecycle-final99.log` passes three core transport/codec
+  cases in both executions, nine connection cases and seven actual-controller/native
+  fault cases on JDK 25. These include prewrite/ACK loss, exact cold retry, concurrent
+  rejection, UPLOAD pause/resume and cancellation during native installation.
+  Rust's full workspace passes 105 cases in `schema-lifecycle-rust-workspace92.log`;
+  later bridge-only fixes leave that Rust/protobuf contract unchanged.
 - Unqualified common physical CF estimates, table/SST metadata and maintenance now
   return typed NOT_IMPLEMENTED before generation lookup in both connection and
   adapter dispatch. Physical observations and maintenance retain the qualified

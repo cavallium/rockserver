@@ -186,12 +186,13 @@ public final class ExportWire {
         if (error instanceof io.grpc.StatusException || error instanceof io.grpc.StatusRuntimeException) return error;
         if (error instanceof RocksDBException rocks) {
             var status = switch (rocks.getErrorUniqueId()) {
+                case NOT_IMPLEMENTED -> Status.UNIMPLEMENTED;
                 case READ_DEADLINE_EXCEEDED -> Status.DEADLINE_EXCEEDED;
                 case SERVER_OVERLOADED -> Status.RESOURCE_EXHAUSTED;
                 case PUT_INVALID_REQUEST -> Status.INVALID_ARGUMENT;
-                case TRANSACTION_NOT_FOUND, CDC_SUBSCRIPTION_NOT_FOUND -> Status.NOT_FOUND;
+                case TRANSACTION_NOT_FOUND, CDC_SUBSCRIPTION_NOT_FOUND, SCHEMA_OPERATION_NOT_FOUND -> Status.NOT_FOUND;
                 case COMPACTION_CONFLICT -> Status.ABORTED;
-                case CDC_RESPONSE_TOO_LARGE -> Status.FAILED_PRECONDITION;
+                case CDC_RESPONSE_TOO_LARGE, SCHEMA_OPERATION_NOT_RESUMABLE -> Status.FAILED_PRECONDITION;
                 default -> Status.INTERNAL;
             };
             return status.withDescription(rocks.getLocalizedMessage()).asRuntimeException();

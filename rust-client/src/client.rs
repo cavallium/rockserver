@@ -221,6 +221,11 @@ impl RockserverClient {
         Ok(crate::RemoteMutationClient::from_client(self.clone(), self.channel.clone()))
     }
 
+    /// Retained schema lifecycle; unsupported backends refuse individual calls lazily.
+    pub fn schema_operations(&self) -> crate::SchemaOperationsClient {
+        crate::SchemaOperationsClient::from_client(self.clone(), self.channel.clone())
+    }
+
     fn validated_timeout(&self) -> Result<Option<Duration>> {
         match self.context.profile {
             2 | 3 | 4 | 6 => {}

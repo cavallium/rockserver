@@ -46,6 +46,7 @@ module rockserver.core {
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;
 	exports it.cavallium.rockserver.core.common.distributed;
+	exports it.cavallium.rockserver.core.common.schema;
 	exports it.cavallium.rockserver.core.common.cdc;
 	exports it.cavallium.rockserver.core.common.export;
 	exports it.cavallium.rockserver.core.config;

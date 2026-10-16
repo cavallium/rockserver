@@ -1,0 +1,25 @@
+syntax = "proto3";
+package rockserver.schema;
+option java_package = "it.cavallium.rockserver.core.common.api.proto";
+option java_multiple_files = true;
+import "rocksdb.proto";
+enum SchemaOperationKind { SCHEMA_CREATE = 0; SCHEMA_DELETE = 1; SCHEMA_DELETE_IF_EXISTS = 2; SCHEMA_UPLOAD = 3; }
+enum SchemaOperationState { SCHEMA_QUEUED = 0; SCHEMA_NOT_STARTED = 1; SCHEMA_RUNNING = 2; SCHEMA_PAUSED = 3; SCHEMA_DONE = 4; SCHEMA_ABORTED = 5; SCHEMA_CONFLICT = 6; }
+enum SchemaOperationPhase {
+  SCHEMA_PHASE_ALLOCATE = 0; SCHEMA_PHASE_SCHEMA = 1; SCHEMA_PHASE_DEFINITION = 2; SCHEMA_PHASE_BEGIN = 3;
+  SCHEMA_PHASE_ARTIFACTS = 4; SCHEMA_PHASE_CAPACITY = 5; SCHEMA_PHASE_ADMISSIONS = 6; SCHEMA_PHASE_FENCING = 7;
+  SCHEMA_PHASE_FENCE = 8; SCHEMA_PHASE_INSTALL = 9; SCHEMA_PHASE_PUBLISH = 10; SCHEMA_PHASE_ACTIVATE = 11;
+  SCHEMA_PHASE_RETIRE = 12; SCHEMA_PHASE_CLEANUP = 13; SCHEMA_PHASE_DONE = 14; SCHEMA_PHASE_ABORTED = 15;
+  SCHEMA_PHASE_CONFLICT = 16; SCHEMA_PHASE_OPERATOR_BEGIN = 17; SCHEMA_PHASE_OPERATOR_CHUNKS = 18; SCHEMA_PHASE_OPERATOR_PUBLISH = 19;
+}
+message SchemaOperationResult { bytes request_id = 1; SchemaOperationKind kind = 2; int64 value = 3; bool changed = 4; bool aborted = 5; }
+message SchemaOperationStatus { bytes request_id = 1; SchemaOperationKind kind = 2; SchemaOperationState state = 3; optional SchemaOperationPhase phase = 4; SchemaOperationResult result = 5; }
+message SchemaOperationInventoryRequest { it.cavallium.rockserver.core.common.api.proto.RequestContext context = 1; }
+message SchemaOperationRequest { bytes request_id = 1; it.cavallium.rockserver.core.common.api.proto.RequestContext context = 2; }
+message SchemaOperationInventory { repeated SchemaOperationStatus operations = 1; }
+service SchemaOperationsService {
+  rpc Inventory(SchemaOperationInventoryRequest) returns (SchemaOperationInventory);
+  rpc Status(SchemaOperationRequest) returns (SchemaOperationStatus);
+  rpc Resume(SchemaOperationRequest) returns (SchemaOperationStatus);
+  rpc Abort(SchemaOperationRequest) returns (SchemaOperationStatus);
+}

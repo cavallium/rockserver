@@ -53,7 +53,9 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
   CDC_SUBSCRIPTION_NOT_FOUND(42),
   SERVER_OVERLOADED(43),
   RANGE_ITEM_TOO_LARGE(44),
-  TX_SCOPE_REQUIRED(45);
+  TX_SCOPE_REQUIRED(45),
+  SCHEMA_OPERATION_NOT_FOUND(46),
+  SCHEMA_OPERATION_NOT_RESUMABLE(47);
 
   private final int value;
 
@@ -168,6 +170,10 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
         return RANGE_ITEM_TOO_LARGE;
       case 45:
         return TX_SCOPE_REQUIRED;
+      case 46:
+        return SCHEMA_OPERATION_NOT_FOUND;
+      case 47:
+        return SCHEMA_OPERATION_NOT_RESUMABLE;
       default:
         return null;
     }

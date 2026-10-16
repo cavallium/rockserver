@@ -47,7 +47,9 @@ public class RocksDBException extends RuntimeException {
 		SERVER_OVERLOADED,
 		RANGE_ITEM_TOO_LARGE,
 		COMPACTION_CONFLICT,
-		COMPACTION_FAILED
+		COMPACTION_FAILED,
+		SCHEMA_OPERATION_NOT_FOUND,
+		SCHEMA_OPERATION_NOT_RESUMABLE
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {

@@ -377,6 +377,7 @@ public class GrpcServer extends Server {
 				.addService(new ExportGrpcService(exports).bindBoundedService())
                 .addService(new DistributedCdcGrpcService(client.getCapabilities().cdcMode()==it.cavallium.rockserver.core.common.RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS ? client.getDistributedCdcApi() : null).bindBoundedService())
                 .addService(new RemoteMutationGrpcService(remoteMutationBackend(client)).bindBoundedService())
+                .addService(new SchemaOperationsGrpcService(client::getSchemaOperationsApi).bindBoundedService())
                 .addService(new ReplicaPhysicalGrpcService(physical).bindBoundedService())
 				.permitKeepAliveWithoutCalls(true)
 				.permitKeepAliveTime(5, TimeUnit.SECONDS)

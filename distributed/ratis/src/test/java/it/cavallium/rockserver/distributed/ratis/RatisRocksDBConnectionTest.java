@@ -166,7 +166,10 @@ class RatisRocksDBConnectionTest {
                     assertEquals(RatisSchemaRequests.State.PAUSED,connection.schemaRequestStatus(pendingId).state()); assertEquals(1,nativeSchema.routed.directory().schemaEpoch());
                     assertNotNull(pin); assertEquals(SchemaChange.Phase.FENCED,nativeSchema.admin.readHead(nativeSchema.initial.domainId()).status().phase());
                 }
-                var resumed=await(connection.resumeSchemaRequest(pendingId,RequestContext.batch())); assertTrue(resumed.changed()); long created=resumed.value(); assertEquals(2,nativeSchema.routed.directory().schemaEpoch());
+                var saved=new java.util.concurrent.atomic.AtomicReference<it.cavallium.rockserver.core.common.schema.SchemaOperations.Status>();
+                schemaTransport(connection,false,api->{assertEquals(it.cavallium.rockserver.core.common.schema.SchemaOperations.State.PAUSED,await(api.status(pendingId,RequestContext.batch())).state());saved.set(await(api.resume(pendingId,RequestContext.batch())));});
+                schemaTransport(connection,true,api->{assertEquals(saved.get(),await(api.resume(pendingId,RequestContext.batch())));assertTrue(await(api.inventory(RequestContext.batch())).contains(saved.get()));});
+                var resumed=saved.get().result(); assertTrue(resumed.changed()); long created=resumed.value(); assertEquals(2,nativeSchema.routed.directory().schemaEpoch());
                 assertEquals(created,sync.createColumn("dynamic",RatisSchemaClientTest.shape()));
                 for(var peer:nativeSchema.peers) assertArrayEquals(nativeSchema.routed.directory().schemaDigest(),peer.store.schemaDigest());
                 assertNull(point(connection,created,dataKey,value(8),RequestType.RequestTypeId.PREVIOUS)); assertArrayEquals(new byte[]{8},sync.get(0,created,dataKey,RequestType.<Buf>current()).toByteArray());
@@ -243,6 +246,39 @@ class RatisRocksDBConnectionTest {
                 long newTransaction=await(api.openTransactionAsync(RatisRocksDBAdapterTest.scope(7), Duration.ofSeconds(10))); long newCursor=await(api.openIteratorAsync(0,7,dataKey,null,false,Duration.ofSeconds(10))); assertTrue(newTransaction>Math.max(oldTransaction,oldCursor)); assertTrue(newCursor>newTransaction);
                 assertArrayEquals(new byte[]{2},await(api.getAsync(newTransaction,7,dataKey,RequestType.<Buf>current())).toByteArray()); assertArrayEquals(new byte[]{2},await(api.subsequentAsync(newCursor,0,1,RequestType.<Buf>multi())).getFirst().toByteArray());
                 assertTrue(await(api.closeTransactionAsync(newTransaction,false))); await(api.closeIteratorAsync(newCursor)); assertEquals(0,activePins.get()); assertEquals(List.of(1L,2L),transactionSchemas); assertEquals(List.of(1L,2L),cursorSchemas);
+            }
+        }
+    }
+    @FunctionalInterface interface SchemaCheck {void accept(it.cavallium.rockserver.core.common.schema.SchemaOperationsAsyncAPI api)throws Exception;}
+    static void schemaTransport(RatisRocksDBConnection connection,boolean thrift,SchemaCheck check)throws Exception {
+        if(thrift){int port;try(var socket=new java.net.ServerSocket(0)){port=socket.getLocalPort();}
+            try(var server=new it.cavallium.rockserver.core.server.ThriftServer(connection,"127.0.0.1",port)){
+                server.start();try(var remote=new it.cavallium.rockserver.core.client.ThriftConnection("schema-retained","127.0.0.1",port)){check.accept(remote.getSchemaOperationsApi());}
+            }
+        }else try(var server=new it.cavallium.rockserver.core.server.GrpcServer(connection,new java.net.InetSocketAddress("127.0.0.1",0))){
+            server.start();try(var remote=it.cavallium.rockserver.core.client.GrpcConnection.forHostAndPort("schema-retained",new Utils.HostAndPort("127.0.0.1",server.getPort()))){check.accept(remote.getSchemaOperationsApi());}
+        }
+    }
+    @Test void retainedNotStartedAbortAndColdTerminalInventoryCrossBothActualSockets()throws Exception {
+        try(var f=new Fixture()){
+            UUID id;
+            try(var connection=f.open(8,1)){
+                var failure=assertThrows(ExecutionException.class,()->await(connection.getAsyncApi(RequestContext.batch()).createColumnAsync("cannot-start",f.direct.f.schema.column(71).schema())));
+                id=assertInstanceOf(RatisSchemaRequestPendingException.class,failure.getCause()).requestId();
+                for(boolean thrift:new boolean[]{false,true})schemaTransport(connection,thrift,api->{
+                    var before=await(api.status(id,RequestContext.batch()));
+                    assertEquals(thrift?it.cavallium.rockserver.core.common.schema.SchemaOperations.State.ABORTED:it.cavallium.rockserver.core.common.schema.SchemaOperations.State.NOT_STARTED,before.state());
+                    if(!thrift){var rejected=assertThrows(ExecutionException.class,()->await(api.resume(id,RequestContext.batch())));assertEquals(RocksDBException.RocksDBErrorType.SCHEMA_OPERATION_NOT_RESUMABLE,assertInstanceOf(RocksDBException.class,rejected.getCause()).getErrorUniqueId());}
+                    var aborted=await(api.abort(id,RequestContext.batch()));assertEquals(id,aborted.result().requestId());assertTrue(aborted.result().aborted());assertFalse(aborted.result().changed());
+                    assertEquals(List.of(aborted),await(api.inventory(RequestContext.batch())));
+                    var unknown=assertThrows(ExecutionException.class,()->await(api.status(new UUID(999,999),RequestContext.batch())));assertEquals(RocksDBException.RocksDBErrorType.SCHEMA_OPERATION_NOT_FOUND,assertInstanceOf(RocksDBException.class,unknown.getCause()).getErrorUniqueId());
+                });
+                assertFalse(Files.exists(f.connectionRoot.resolve("schema").resolve(id+".request")),"Abort cannot allocate a replacement schema controller");
+            }
+            try(var connection=f.open(8,1)){
+                byte[] directoryBefore=f.direct.routed.directory().payloadDigest();
+                for(boolean thrift:new boolean[]{false,true})schemaTransport(connection,thrift,api->{var terminal=await(api.resume(id,RequestContext.batch()));assertEquals(id,terminal.requestId());assertTrue(terminal.result().aborted());assertEquals(List.of(terminal),await(api.inventory(RequestContext.batch())));});
+                assertArrayEquals(directoryBefore,f.direct.routed.directory().payloadDigest());
             }
         }
     }

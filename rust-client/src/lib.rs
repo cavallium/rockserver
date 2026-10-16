@@ -69,6 +69,7 @@ mod generated {
         }
     }
     pub mod rockserver {
+        pub mod schema { tonic::include_proto!("rockserver.schema"); }
         pub mod cdc {
             #![allow(clippy::all, non_camel_case_types)]
             tonic::include_proto!("rockserver.cdc");
@@ -94,3 +95,7 @@ pub use remote_mutation::*;
 
 pub mod replica_physical;
 pub use replica_physical::*;
+
+pub use generated::rockserver::schema as schema_proto;
+pub mod schema_operations;
+pub use schema_operations::*;

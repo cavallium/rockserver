@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    for name in ["rocksdb.proto", "exports.proto", "cdc.proto"] {
+    for name in ["rocksdb.proto", "exports.proto", "cdc.proto", "schema-operations.proto"] {
         let bundled = format!("proto/{name}");
         let canonical = format!("../src/main/proto/{name}");
         println!("cargo:rerun-if-changed={bundled}");
@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bundled_proto,
             Path::new("proto/exports.proto"),
             Path::new("proto/cdc.proto"),
+            Path::new("proto/schema-operations.proto"),
         ],
         &["proto", &include_path],
     )?;
