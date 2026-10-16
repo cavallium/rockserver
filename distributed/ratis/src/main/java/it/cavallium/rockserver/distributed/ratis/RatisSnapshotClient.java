@@ -33,10 +33,8 @@ public final class RatisSnapshotClient implements AutoCloseable {
     public RatisRoutedClient.SnapshotTarget restoreExportTarget(SnapshotFence fence,RatisExportJournal.SourceOwner owner,SnapshotFenceStatus.Capture capture) {
         return data.restoreSnapshotTarget(fence,owner.route(),owner.replica(),capture.ownerIncarnation());
     }
-    private final DistributedSchema schema;
-    private final RangeDirectory directory;
     private final RatisSnapshotFences homes;
-    private final RatisRoutedClient data;
+    private final RatisTransactionBindings data;
     private final RWScheduler scheduler;
     private final Limits limits;private final RatisJournalAccess journalAccess;
     private final RatisSnapshotCaptureRequest.Mode mode;
@@ -44,27 +42,16 @@ public final class RatisSnapshotClient implements AutoCloseable {
     private long chargedBytes;
     private int reads,cursors;
     private boolean closing,closed;
-    public RatisSnapshotClient(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits) {
-        this(schema,homes,data,scheduler,limits,RatisSnapshotCaptureRequest.Mode.READ_ONLY);
+    public RatisSnapshotClient(RatisTransactionBindings data,RatisSnapshotFences homes,RWScheduler scheduler,Limits limits) {this(data,homes,scheduler,limits,RatisSnapshotCaptureRequest.Mode.READ_ONLY);}
+    RatisSnapshotClient(RatisTransactionBindings data,RatisSnapshotFences homes,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode) {this(data,homes,scheduler,limits,mode,RatisJournalAccess.standalone());}
+    static RatisSnapshotClient journalOwned(RatisTransactionBindings data,RatisSnapshotFences homes,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access){return new RatisSnapshotClient(data,homes,scheduler,limits,mode,access);}
+    private RatisSnapshotClient(RatisTransactionBindings data,RatisSnapshotFences homes,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access) {
+        journalAccess=Objects.requireNonNull(access);this.data=Objects.requireNonNull(data);this.mode=Objects.requireNonNull(mode);this.homes=Objects.requireNonNull(homes);this.scheduler=Objects.requireNonNull(scheduler);this.limits=Objects.requireNonNull(limits);homes.requireDatabaseBinding(data.clusterId(),data.databaseId());
     }
-    RatisSnapshotClient(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode) {
-        this(schema,data.directory(schema),homes,data,scheduler,limits,mode,RatisJournalAccess.standalone());
-    }
-    static RatisSnapshotClient journalOwned(DistributedSchema schema,RangeDirectory directory,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access){return new RatisSnapshotClient(schema,directory,homes,data,scheduler,limits,mode,access);}
-    private RatisSnapshotClient(DistributedSchema schema,RangeDirectory directory,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access) {
-        journalAccess=Objects.requireNonNull(access);
-        this.mode=Objects.requireNonNull(mode); this.schema=Objects.requireNonNull(schema); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); this.scheduler=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits);
-        this.directory=qualifiedDirectory(schema,directory,data); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
-    }
-    static RangeDirectory qualifiedDirectory(DistributedSchema schema,RangeDirectory directory,RatisRoutedClient data) {
-        schema.requireMatches(Objects.requireNonNull(directory));var qualified=data.directory(schema);
-        if(directory.generation()>qualified.generation() || directory.generation()==qualified.generation() && !Arrays.equals(directory.payloadDigest(),qualified.payloadDigest()))
-            throw new IllegalArgumentException("Frozen snapshot placement is not qualified by current schema authority");
-        return directory;
-    }
+    RatisTransactionBindings bindings(){return data;}
     RatisSnapshotCaptureRequest.Mode captureMode() { return mode; }
     public byte[] identityDigest() {
-        var bytes=java.nio.ByteBuffer.allocate(97).put(mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY?data.snapshotNamespaceDigest():data.sessionIdentityDigest()).put(homes.identityDigest()).put(schema.digest()).put((byte)(mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY ? 0 : 1)).array();
+        var bytes=java.nio.ByteBuffer.allocate(65).put(mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY?data.snapshotNamespaceDigest():data.sessionIdentityDigest()).put(homes.identityDigest()).put((byte)(mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY ? 0 : 1)).array();
         try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); }
         catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
@@ -74,7 +61,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
         var home=homes.route(expected.fenceId());
         if (!home.groupId().equals(expected.homeGroup()) || home.rangeEpoch()!=expected.homeEpoch()) throw new IOException("Frozen source HOME placement changed");
         final RatisSnapshotPlan plan;
-        try { plan=RatisSnapshotPlan.frozen(directory,expected); }
+        try { plan=RatisSnapshotPlan.frozen(data.directories(),expected); }
         catch (IllegalArgumentException invalid) { throw new IOException("Frozen source definition differs from current cached projection",invalid); }
         long bytes=64*1024L+3L*expected.encode().length+128*1024L*plan.routes().size(); for (var route:plan.routes()) bytes+=2L*SessionWindowJournal.routeSize(route);
         if (bytes>RatisDurableSnapshot.MAX_BYTES) throw new IOException("Snapshot retained metadata exceeds journal capacity");
@@ -89,7 +76,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
     public RatisSnapshotPlan plan(Identity identity,TransactionScope scope) {
         Objects.requireNonNull(identity); Objects.requireNonNull(scope);
         var home=homes.route(identity.fence());
-        return RatisSnapshotPlan.create(directory,scope,identity.fence(),identity.business(),home.groupId(),home.rangeEpoch(),identity.firstControl());
+        return RatisSnapshotPlan.create(data.directories(),scope,identity.fence(),identity.business(),home.groupId(),home.rangeEpoch(),identity.firstControl());
     }
     public Lease open(Path path,Identity identity,TransactionScope scope,Duration ttl,RequestContext context) throws IOException {
         long deadline=scheduler.resolveMonotonicDeadline(context); Objects.requireNonNull(identity); validateTtl(ttl);
@@ -218,11 +205,11 @@ public final class RatisSnapshotClient implements AutoCloseable {
         }
         public CompletableFuture<Buf> get(long column,Keys key,RequestContext context) {
             long deadline=scheduler.resolveMonotonicDeadline(context); Keys frozen=freeze(Objects.requireNonNull(key));
-            return read(Kind.GET,OperationFamily.POINT_LOOKUP,POINT_BYTES,context,deadline,task -> { task.check(); return RatisLogicalSnapshotPages.get(binding.reader(),owners(),scope(),schema,column,frozen); },null);
+            return read(Kind.GET,OperationFamily.POINT_LOOKUP,POINT_BYTES,context,deadline,task -> { task.check(); return RatisLogicalSnapshotPages.get(binding.reader(),owners(),scope(),data.schema(column),column,frozen); },null);
         }
         public CompletableFuture<RangePage<KV>> page(long column,Keys lower,Keys upper,boolean reverse,Keys resume,RangeBudget budget,RequestContext context) {
             long deadline=scheduler.resolveMonotonicDeadline(context); Keys low=freeze(lower), high=freeze(upper), after=freeze(resume); Objects.requireNonNull(budget);
-            return read(Kind.PAGE,OperationFamily.RANGE_PAGE,PAGE_BYTES,context,deadline,task -> { task.check(); return RatisLogicalSnapshotPages.read(binding.reader(),owners(),scope(),schema,column,low,high,reverse,after,budget); },null);
+            return read(Kind.PAGE,OperationFamily.RANGE_PAGE,PAGE_BYTES,context,deadline,task -> { task.check(); return RatisLogicalSnapshotPages.read(binding.reader(),owners(),scope(),data.schema(column),column,low,high,reverse,after,budget); },null);
         }
         private TransactionScope scope() throws IOException { var current=binding; if (current==null) throw new RatisSnapshotLostException("Snapshot read scope unavailable"); return current.scope(); }
         private OperationId firstControl() throws IOException {
@@ -237,7 +224,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
             if (candidate.mode()!=mode) throw new IOException("Snapshot journal capture mode differs from client");
             var saved=candidate.snapshot(); var fence=saved.initial().fence();
             if (expectedFence!=null && !expectedFence.equals(fence)) throw new IOException("Original source journal differs from frozen expected fence");
-            if (!fence.clusterId().equals(schema.clusterId()) || !fence.databaseId().equals(schema.databaseId()) || fence.domains().size()!=1 || !fence.domains().getFirst().domainId().equals(schema.domainId()) || fence.domain(schema.domainId()).schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(fence.domain(schema.domainId()).schemaDigest(),schema.digest())) throw new IOException("Snapshot journal schema differs from this client");
+            data.require(fence.domains());
             var first=fence.participants().stream().map(SnapshotFence.Participant::installOperation).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow(); new Identity(fence.fenceId(),fence.operation(),first);
             int n=0; for (var p:fence.participants()) {
                 OperationId install=new OperationId(first.sessionId(),first.epoch(),first.sequence()+n), release=new OperationId(first.sessionId(),first.epoch(),first.sequence()+64+n++);
@@ -313,7 +300,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
             return bytes;
         }
         private boolean samePrefix(RatisTransactionPlan a,RatisTransactionPlan b) {
-            if (!a.operation().equals(b.operation()) || !Arrays.equals(a.directory().payloadDigest(),b.directory().payloadDigest()) || a.partitions().size()!=b.partitions().size()) return false;
+            if (!a.operation().equals(b.operation()) || !a.directories().stream().map(DomainBinding::of).toList().equals(b.directories().stream().map(DomainBinding::of).toList()) || a.partitions().size()!=b.partitions().size()) return false;
             for (int n=0;n<a.partitions().size();n++) {
                 var x=a.partitions().get(n); var y=b.partitions().get(n);
                 if (!x.route().equals(y.route()) || !x.resultPositions().equals(y.resultPositions()) || !Arrays.equals(ScopedTransactionRpc.scopeBytes(x.scope()),ScopedTransactionRpc.scopeBytes(y.scope())) || !Arrays.equals(DistributedCommandCodec.encode(x.command()),DistributedCommandCodec.encode(y.command()))) return false;
@@ -334,7 +321,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
             for (var part:prefix.partitions()) { mutations.addAll(part.command().mutations()); predicates.addAll(part.command().predicates()); }
             // Rebuild only for validating the complete original capture vector. Result positions are
             // caller-global ordering and need not follow the grouped flattened validation operands.
-            var checked=RatisTransactionPlan.captured(prefix.directory(),prefix.operation(),mutations,predicates,snapshot());
+            var checked=RatisTransactionPlan.captured(prefix.directories(),prefix.operation(),mutations,predicates,snapshot());
             if (checked.partitions().size()!=prefix.partitions().size()) throw new IllegalArgumentException("Prefix omits original captured participants");
             for (int n=0;n<checked.partitions().size();n++) {
                 var a=checked.partitions().get(n); var b=prefix.partitions().get(n);
@@ -375,7 +362,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
         synchronized RatisTransactionPlan.Accepted preparedPrefix(RatisAtomicClient.Identity identity) throws IOException {
             if (mode!=RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED || commitFrozen) throw new IOException("Writable commit unavailable");
             owners(); requireIdleControl();
-            var prefix=stagedPrefix==null ? RatisTransactionPlan.captured(directory,identity.business(),List.of(),List.of(),snapshot()) : stagedPrefix;
+            var prefix=stagedPrefix==null ? RatisTransactionPlan.captured(data.directories(),identity.business(),List.of(),List.of(),snapshot()) : stagedPrefix;
             if (!prefix.operation().equals(identity.business())) throw new IllegalArgumentException("Commit business differs from staged prefix");
             var accepted=new LinkedHashMap<UUID,DistributedCommand>(); var prepares=new LinkedHashMap<UUID,OperationId>(); var finalizes=new LinkedHashMap<UUID,OperationId>(); int n=0;
             for (var part:prefix.partitions()) {
@@ -391,8 +378,8 @@ public final class RatisSnapshotClient implements AutoCloseable {
         synchronized void undoCommitFreeze() { if (!commitFinished) commitFrozen=false; }
         synchronized void finishCommitOwnership() { if (!commitFrozen) throw new IllegalStateException("Commit was not frozen"); commitFinished=true; }
         public synchronized Cursor openCursor(long column,Keys lower,Keys upper,boolean reverse) throws IOException {
-            owners(); if (control!=null) throw new IOException("Snapshot control active"); RatisLogicalClient.supported(schema,column);
-            Keys low=freeze(lower),high=freeze(upper); RatisLogicalRangePages.validateBounds(scope(),schema,column,low,high); long bytes=256+keyBytes(low)+keyBytes(high)+TransactionScope.MAX_BOUND_BYTES+RangeBudget.DEFAULT_MAX_BYTES;
+            owners(); if (control!=null) throw new IOException("Snapshot control active"); RatisLogicalClient.supported(data.schema(column),column);
+            Keys low=freeze(lower),high=freeze(upper); RatisLogicalRangePages.validateBounds(scope(),data.schema(column),column,low,high); long bytes=256+keyBytes(low)+keyBytes(high)+TransactionScope.MAX_BOUND_BYTES+RangeBudget.DEFAULT_MAX_BYTES;
             reserve(bytes,false,true); var cursor=new Cursor(column,low,high,reverse,bytes); borrowedCursors.add(cursor); return cursor;
         }
         private long keyBytes(Keys keys) { long bytes=0; if (keys!=null) for (var key:keys.keys()) { bytes+=4L+Objects.requireNonNull(key).size(); if (bytes>TransactionScope.MAX_BOUND_BYTES) throw new IllegalArgumentException("Snapshot key bound exceeds limit"); } return bytes; }
@@ -419,7 +406,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
                     try {
                         pendingBudget=Objects.requireNonNull(budget);
                         pending=Lease.this.<RangePage<KV>>startRead(Kind.PAGE,OperationFamily.RANGE_PAGE,PAGE_BYTES,context,deadline,task -> {
-                            var result=RatisLogicalSnapshotPages.read(binding.reader(),owners(),scope(),schema,column,lower,upper,reverse,after,budget);
+                            var result=RatisLogicalSnapshotPages.read(binding.reader(),owners(),scope(),data.schema(column),column,lower,upper,reverse,after,budget);
                             task.committed=() -> { if (!closed) { resume=RatisLogicalRangePages.copy(result.resumeAfter()); exhausted=!result.hasMore(); } };
                             return result;
                         },this);

@@ -83,7 +83,7 @@ public final class RatisRocksDBDirect implements AutoCloseable {
                     case DELETE -> RatisLogicalClient.Change.delete(column,keys.get(n),mode);
                     case MERGE -> RatisLogicalClient.Change.merge(column,keys.get(n),values.get(n),mode);
                 };
-                var plan=RatisLogicalClient.plan(schema,List.of(change),List.of()); if (plan.mutations().size()!=1 || !plan.predicates().isEmpty()) throw new IllegalArgumentException("Direct sequence requires point effects");
+                var plan=RatisLogicalClient.plan(scopeColumnId -> schema,List.of(change),List.of()); if (plan.mutations().size()!=1 || !plan.predicates().isEmpty()) throw new IllegalArgumentException("Direct sequence requires point effects");
                 var mutation=plan.mutations().getFirst(); var route=directory.route(mutation.columnId(),mutation.key()); var item=new DistributedCommand(route.groupId(),route.rangeEpoch(),directory.schemaDigest(),new OperationId(grant.sessionId(),grant.epoch(),0),List.of(mutation));
                 input+=DistributedCommandCodec.encodedSize(item); if (input>RatisDirectRequestJournal.MAX_INPUT) throw new IllegalArgumentException("Direct request exceeds aggregate input bound"); items.add(item);
             }

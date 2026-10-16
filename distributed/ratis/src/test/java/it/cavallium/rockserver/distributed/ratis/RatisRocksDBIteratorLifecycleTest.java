@@ -58,7 +58,7 @@ class RatisRocksDBIteratorLifecycleTest {
     }
 
     @Test void concurrentDemandCannotOvertakeFirstRowWhilePageCompletionPublishesIt() throws Exception {
-        var iterators=new RatisRocksDBIterators(schema()); var resource=new Resource(); resource.released.complete(null);
+        var iterators=new RatisRocksDBIterators(scopeColumnId -> schema()); var resource=new Resource(); resource.released.complete(null);
         var observer=new Observer(); var copying=new CountDownLatch(1); var publish=new CountDownLatch(1);
         Buf delegate=Buf.wrap(new byte[]{1});
         Buf blocked=(Buf)Proxy.newProxyInstance(Buf.class.getClassLoader(),new Class<?>[]{Buf.class},(proxy,method,args) -> {
@@ -83,7 +83,7 @@ class RatisRocksDBIteratorLifecycleTest {
     @Test void closeAllWaitsForActualIteratorPageAndRelease() throws Exception { closeEntry(true); }
     @Test void transactionInvalidationWaitsForActualIteratorPageAndRelease() throws Exception { closeEntry(false); }
     void closeEntry(boolean all) throws Exception {
-        var iterators=new RatisRocksDBIterators(schema()); var resource=new Resource();
+        var iterators=new RatisRocksDBIterators(scopeColumnId -> schema()); var resource=new Resource();
         long id=await(iterators.open(42,71,key(1),key(3),false,Duration.ofSeconds(30),() -> CompletableFuture.completedFuture(resource),CONTEXT));
         var reading=iterators.subsequent(id,0,2,RequestType.RequestTypeId.MULTI,CONTEXT); latch(resource.requested);
         var closing=all ? iterators.closeAll(CONTEXT) : iterators.invalidateTransaction(42,CONTEXT);
@@ -99,7 +99,7 @@ class RatisRocksDBIteratorLifecycleTest {
     }
 
     @Test void invalidatingSubscribedTransactionStreamSignalsFailureAndWaitsForNativeDrain() throws Exception {
-        var iterators=new RatisRocksDBIterators(schema()); var resource=new Resource(); var observer=new Observer();
+        var iterators=new RatisRocksDBIterators(scopeColumnId -> schema()); var resource=new Resource(); var observer=new Observer();
         iterators.stream(42,71,key(1),key(3),false,() -> CompletableFuture.completedFuture(resource),CONTEXT).subscribe(observer); latch(resource.requested);
         var closing=iterators.invalidateTransaction(42,CONTEXT);
         try {
@@ -112,7 +112,7 @@ class RatisRocksDBIteratorLifecycleTest {
     }
 
     @Test void closeAllSubscribedStreamWaitsForActualPageAndRelease() throws Exception {
-        var iterators=new RatisRocksDBIterators(schema()); var resource=new Resource(); var observer=new Observer();
+        var iterators=new RatisRocksDBIterators(scopeColumnId -> schema()); var resource=new Resource(); var observer=new Observer();
         iterators.stream(0,71,key(1),key(3),false,() -> CompletableFuture.completedFuture(resource),CONTEXT).subscribe(observer); latch(resource.requested);
         var closing=iterators.closeAll(CONTEXT);
         try {
@@ -123,7 +123,7 @@ class RatisRocksDBIteratorLifecycleTest {
     }
 
     @Test void expiryReleaseCallbackCannotHoldRegistryMonitorOrBlockIndependentAdmission() throws Exception {
-        var iterators=new RatisRocksDBIterators(schema()); var resource=new Resource(); var releaseReturns=new CountDownLatch(1);
+        var iterators=new RatisRocksDBIterators(scopeColumnId -> schema()); var resource=new Resource(); var releaseReturns=new CountDownLatch(1);
         resource.released.complete(null); resource.releaseHook=() -> latch(releaseReturns);
         long id=await(iterators.open(42,71,key(1),key(3),false,Duration.ofMillis(100),() -> CompletableFuture.completedFuture(resource),CONTEXT)); Thread.sleep(150);
         try (var executor=Executors.newFixedThreadPool(2)) {

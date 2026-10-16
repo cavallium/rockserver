@@ -45,15 +45,15 @@ class RatisSnapshotAsyncCaptureLossTest {
             };
             try(var data=new RatisRoutedClient(f.directory,transport)){
                 var initial=SnapshotFenceStatus.begin(f.fence);var path=root.resolve("changed-capture.journal");
-                try(var journal=RatisDurableSnapshot.create(path,f.home.homes,data,initial,f.home.homes.prepare(helper.control(20),null,initial),f.directory.ranges());
-                    var coordinator=new RatisSnapshotCoordinator(journal,f.home.homes,data,last->new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10))){
+                try(var journal=RatisDurableSnapshot.create(path,f.home.homes,RatisTransactionBindings.of(data),initial,f.home.homes.prepare(helper.control(20),null,initial),f.directory.ranges());
+                    var coordinator=new RatisSnapshotCoordinator(journal,f.home.homes,RatisTransactionBindings.of(data),last->new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10))){
                     boolean ready=false;for(int n=0;n<32&&!ready;n++)ready=coordinator.stepAsync(RatisSnapshotCoordinator.StopAt.GATES_READY).get(10,TimeUnit.SECONDS).action()==RatisSnapshotCoordinator.Action.GATES_READY;assertTrue(ready);
                     var aborted=coordinator.stepAsync(RatisSnapshotCoordinator.StopAt.CAPTURES_REPORTED).get(10,TimeUnit.SECONDS);
                     assertTrue(changed.get());assertEquals(RatisSnapshotCoordinator.Action.ABORTED,aborted.action());assertEquals(SnapshotFenceStatus.Phase.ABORT,journal.snapshot().observedHome().phase());
                     assertTrue(journal.snapshot().participant(aborted.participant()).captureLost());assertNotNull(journal.snapshot().participant(aborted.participant()).capture());assertNull(journal.snapshot().participant(aborted.participant()).captureToken());
                 }
-                try(var journal=RatisDurableSnapshot.reopen(path,f.home.homes,data);
-                    var coordinator=new RatisSnapshotCoordinator(journal,f.home.homes,data,last->new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10))){
+                try(var journal=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(data));
+                    var coordinator=new RatisSnapshotCoordinator(journal,f.home.homes,RatisTransactionBindings.of(data),last->new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10))){
                     assertEquals(1,journal.snapshot().participants().stream().filter(RatisDurableSnapshot.ParticipantProgress::captureLost).count());
                     boolean released=false;for(int n=0;n<32&&!released;n++)released=coordinator.stepAsync(RatisSnapshotCoordinator.StopAt.RELEASED).get(10,TimeUnit.SECONDS).complete();assertTrue(released);
                     var saved=journal.snapshot();journal.consume(new OperationId(saved.lastHome().sessionId(),saved.lastHome().epoch(),saved.lastHome().sequence()+1));assertEquals(CommandResult.Status.SUCCESS,journal.executeHomeAsync().get(10,TimeUnit.SECONDS).status());

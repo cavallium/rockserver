@@ -23,8 +23,8 @@ class RatisTransactionRecoveryTest {
             helper.root=root; home=helper.new Node(name+"-home",true); data=helper.new Node(name+"-data",false);
             pin=data.f.store.captureTracked(helper.scope(data,1,4)); plan=journals.plan(home,data,pin); path=root.resolve(name+".bin"); journal=journals.create(path,home,data,plan);
         }
-        void reopen() throws Exception { journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed); }
-        RatisTransactionRecovery recovery() throws IOException { return new RatisTransactionRecovery(journal,home.statuses,data.routed,RatisTransactionRecoveryTest::next); }
+        void reopen() throws Exception { journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed)); }
+        RatisTransactionRecovery recovery() throws IOException { return new RatisTransactionRecovery(journal,home.statuses,RatisTransactionBindings.of(data.routed),RatisTransactionRecoveryTest::next); }
         TransactionStatus commit(boolean lose) throws Exception {
             journal.executeHome();
             try (var token=data.f.machine.prepareParticipant(pin,data.f.put(2),helper.control(0),home.statuses,plan.initial().transactionId())) { journal.freezePreparation(data.routed.prepareParticipant(token.preparation())); journal.executePreparation(data.f.groupId); }
@@ -150,7 +150,7 @@ class RatisTransactionRecoveryTest {
             try (var token=f.data.f.machine.prepareFinalization(f.home.statuses,f.plan.initial().transactionId(),foreign)) { f.data.routed.executeFinalization(f.data.routed.prepareFinalization(token.finalization())); }
             var ack=commit.finalized(f.data.f.groupId); f.home.statuses.execute(f.home.statuses.prepare(new OperationId(new UUID(0,1902),2,0),commit,ack));
             f.reopen(); long writes=f.home.wire.index+f.data.wire.index;
-            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next)) { assertTrue(recovery.step().complete()); }
+            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,RatisTransactionBindings.of(f.data.routed),RatisTransactionRecoveryTest::next)) { assertTrue(recovery.step().complete()); }
             var progress=f.journal.snapshot().participant(f.data.f.groupId); assertEquals(foreign,progress.outcome().finalization().operation()); assertNull(progress.finalization()); assertNull(progress.finalizationReceipt()); assertEquals(writes,f.home.wire.index+f.data.wire.index);
         }
     }
@@ -170,8 +170,8 @@ class RatisTransactionRecoveryTest {
                 public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException { return f.home.wire.participant(route,bytes); }
             };
             try (var routed=new RatisRoutedClient(f.home.directory,transport)) {
-                var racedHomes=new RatisTransactionStatuses(routed,f.home.f.column); f.journal.close(); f.journal=RatisDurableTransaction.reopen(f.path,racedHomes,f.data.routed);
-                try (var recovery=new RatisTransactionRecovery(f.journal,racedHomes,f.data.routed,RatisTransactionRecoveryTest::next)) {
+                var racedHomes=new RatisTransactionStatuses(routed,f.home.f.column); f.journal.close(); f.journal=RatisDurableTransaction.reopen(f.path,racedHomes,RatisTransactionBindings.of(f.data.routed));
+                try (var recovery=new RatisTransactionRecovery(f.journal,racedHomes,RatisTransactionBindings.of(f.data.routed),RatisTransactionRecoveryTest::next)) {
                 assertEquals(RatisTransactionRecovery.Action.ABORT_ATTEMPTED,recovery.step().action()); assertEquals(CommandResult.Status.CONFLICT,f.journal.snapshot().homeResult().status()); assertEquals(TransactionStatus.Phase.COMMIT,f.home.statuses.read(f.plan.initial().transactionId()).phase()); drain(f,recovery);
                 }
             }
@@ -181,11 +181,11 @@ class RatisTransactionRecoveryTest {
     @Test void recoveryAbortDoesNotNeedOrdinaryControlGrantAndFailedRemoteAuthorizationCannotDispatch() throws Exception {
         try (var f=new Fixture("failures")) {
             f.journal.executeHome();
-            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,f.data.routed,last -> { throw new AssertionError("Protected ABORT must not allocate ordinary control"); })) { assertEquals(RatisTransactionRecovery.Action.ABORT_ATTEMPTED,recovery.step().action()); }
+            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,RatisTransactionBindings.of(f.data.routed),last -> { throw new AssertionError("Protected ABORT must not allocate ordinary control"); })) { assertEquals(RatisTransactionRecovery.Action.ABORT_ATTEMPTED,recovery.step().action()); }
             assertEquals(TransactionStatus.Phase.ABORT,f.home.statuses.read(f.plan.initial().transactionId()).phase()); assertEquals(0,f.data.wire.index);
             assertEquals(0,f.journal.snapshot().pendingRecovery().recovery().operation().epoch()); assertNotNull(f.journal.snapshot().recoveryReceipt());
             f.data.wire.beforeFinalization=() -> { throw new IllegalStateException("Qualified finalization RPC unavailable"); };
-            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next)) { assertThrows(IOException.class,recovery::step); }
+            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,RatisTransactionBindings.of(f.data.routed),RatisTransactionRecoveryTest::next)) { assertThrows(IOException.class,recovery::step); }
             f.data.wire.beforeFinalization=null;
             assertEquals(0,f.data.wire.index); assertEquals(0,f.data.f.machine.protectedFinalizationSlots()); assertEquals(0,f.data.f.machine.reservedFinalizationCount());
             try (var recovery=f.recovery()) { drain(f,recovery); }
@@ -222,7 +222,7 @@ class RatisTransactionRecoveryTest {
                 var la=left.f.machine.participantIntent(lp,lb); var ra=right.f.machine.participantIntent(rp,rb);
                 var intents=List.of(new RatisDurableTransaction.Intent(l,la,helper.control(0),new OperationId(new UUID(0,1974),3,0),List.of()),new RatisDurableTransaction.Intent(r,ra,helper.control(1),new OperationId(new UUID(0,1975),3,0),List.of()));
                 var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(0,1973), business, List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), RatisDurableTransaction.planDigest(intents), List.of(new TransactionStatus.Participant(domain, l.rangeId(), l.groupId(), 1, new byte[32], la.payloadDigest(), null, false),new TransactionStatus.Participant(domain, r.rangeId(), r.groupId(), 1, new byte[32], ra.payloadDigest(), null, false)));
-                try (var journal=RatisDurableTransaction.create(root.resolve("multi-recovery.bin"),home.statuses,routed,initial,home.statuses.prepare(journals.homeOperation(0),null,initial),intents); var recovery=new RatisTransactionRecovery(journal,home.statuses,routed,RatisTransactionRecoveryTest::next)) {
+                try (var journal=RatisDurableTransaction.create(root.resolve("multi-recovery.bin"),home.statuses,RatisTransactionBindings.of(routed),initial,home.statuses.prepare(journals.homeOperation(0),null,initial),intents); var recovery=new RatisTransactionRecovery(journal,home.statuses,RatisTransactionBindings.of(routed),RatisTransactionRecoveryTest::next)) {
                     journal.executeHome(); lp.close(); rp.close();
                     for (int n=0;n<12 && !journal.snapshot().observedHome().participants().stream().filter(p -> p.groupId().equals(r.groupId())).findFirst().orElseThrow().finalized();n++) { try { recovery.step(); } catch (IOException expected) { assertTrue(expected.getMessage().contains("Left participant unavailable")); } }
                     assertTrue(journal.snapshot().observedHome().participants().stream().filter(p -> p.groupId().equals(r.groupId())).findFirst().orElseThrow().finalized()); assertNull(journal.snapshot().participant(l.groupId()).outcome()); assertThrows(IllegalStateException.class,journal::result); unavailable.set(false);

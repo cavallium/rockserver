@@ -34,8 +34,8 @@ class RatisSnapshotAsyncMetadataTest {
             };
             try(var routed=new RatisRoutedClient(f.home.routed.directory(),transport)){
                 var homes=new RatisSnapshotFences(routed,f.home.f.column);var initial=SnapshotFenceStatus.begin(f.fence);
-                try(var journal=RatisDurableSnapshot.create(root.resolve("async.journal"),homes,f.data,initial,homes.prepare(helper.control(20),null,initial),f.directory.ranges());
-                    var coordinator=new RatisSnapshotCoordinator(journal,homes,f.data,last->new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10))){
+                try(var journal=RatisDurableSnapshot.create(root.resolve("async.journal"),homes,RatisTransactionBindings.of(f.data),initial,homes.prepare(helper.control(20),null,initial),f.directory.ranges());
+                    var coordinator=new RatisSnapshotCoordinator(journal,homes,RatisTransactionBindings.of(f.data),last->new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10))){
                     scheduler.setStoragePressure(true);
                     var observed=new CompletableFuture<RatisSnapshotCoordinator.Step>();
                     var actual=new java.util.concurrent.atomic.AtomicReference<CompletableFuture<RatisSnapshotCoordinator.Step>>();

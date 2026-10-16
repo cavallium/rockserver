@@ -22,7 +22,7 @@ class RatisExportJournalTest {
         for (int n=0;n<count;n++) ranges.add(new RangeDescriptor(new UUID(0,20+n),new UUID(0,30+n),1,0,n==0 ? null : new byte[]{(byte)128},n==count-1 ? null : new byte[]{(byte)128},RangeDescriptor.TopologyState.ACTIVE,List.of(replica)));
         return new RangeDirectory(new UUID(0,40),new UUID(0,41),new UUID(0,42),1,new byte[32],1,Set.of(column),0,ranges);
     }
-    SnapshotFence fence(RangeDirectory directory) { return RatisSnapshotPlan.create(directory,new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),new UUID(0,50),new OperationId(new UUID(0,51),1,0),home,1,new OperationId(new UUID(0,51),1,1)).fence(); }
+    SnapshotFence fence(RangeDirectory directory) { return RatisSnapshotPlan.create(List.of(directory),new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),new UUID(0,50),new OperationId(new UUID(0,51),1,0),home,1,new OperationId(new UUID(0,51),1,1)).fence(); }
     RatisExportJournal.Definition definition(RangeDirectory directory) { return new RatisExportJournal.Definition(job,fence(directory),List.of(column),root.resolve("original-snapshot.journal"),new byte[32],RatisExportJournal.Limits.defaults(),java.time.Duration.ofSeconds(30)); }
     Map<UUID,SnapshotFenceStatus.Capture> tokens(SnapshotFence fence) { var tokens=new LinkedHashMap<UUID,SnapshotFenceStatus.Capture>(); int n=0; for (var p:fence.participants()) tokens.put(p.groupId(),new SnapshotFenceStatus.Capture(new UUID(0,60+n),new UUID(0,70+n),new ApplyPosition(1,5+n++))); return tokens; }
     NativeRangeSstExport.Chunk artifact(RatisExportJournal journal,RatisExportJournal.ChunkIntent intent,byte[] end,boolean more,boolean empty) throws Exception {

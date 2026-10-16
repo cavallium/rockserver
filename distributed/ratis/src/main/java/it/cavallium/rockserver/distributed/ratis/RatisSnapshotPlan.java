@@ -14,41 +14,55 @@ public final class RatisSnapshotPlan {
     public SnapshotFence fence() { return fence; }
     public List<RangeDescriptor> routes() { return routes; }
     public TransactionScope scope() { return scope; }
-    public static RatisSnapshotPlan create(RangeDirectory directory,TransactionScope scope,UUID fenceId,OperationId business,UUID homeGroup,long homeEpoch,OperationId firstControl) {
-        Objects.requireNonNull(directory); Objects.requireNonNull(scope); Objects.requireNonNull(fenceId); Objects.requireNonNull(business); Objects.requireNonNull(homeGroup); Objects.requireNonNull(firstControl);
-        if (homeEpoch<0 || business.epoch()<1 || !business.sessionId().equals(firstControl.sessionId()) || business.epoch()!=firstControl.epoch() || firstControl.sequence()<=business.sequence() || firstControl.sequence()>Long.MAX_VALUE-CONTROL_SLOTS) throw new IllegalArgumentException("Invalid reserved snapshot identities");
-        // Check complete scope and route-count admission before allocating its clipped representation.
-        scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
-        var routes=new TreeMap<UUID,RangeDescriptor>(UUID_ORDER); var scopes=new HashMap<UUID,List<TransactionScope.Span>>(); long bytes=SnapshotFence.HEADER_BYTES+DomainBinding.BYTES,bounds=0;
-        for (var span:scope.spans()) {
-            byte[] originalLower=span.lowerInclusive(),originalUpper=span.upperExclusive();
-            var selected=span.isPoint() ? List.of(directory.route(span.columnId(),originalLower)) : directory.intersect(span.columnId(),originalLower,originalUpper,false);
-            for (var route:selected) {
-                byte[] lower=span.isPoint() ? originalLower : maximum(originalLower,route.lowerInclusive());
-                byte[] upper=span.isPoint() ? null : minimum(originalUpper,route.upperExclusive());
-                if (!span.isPoint() && lower!=null && upper!=null && Arrays.compareUnsigned(lower,upper)>=0) continue;
-                boolean added=!routes.containsKey(route.groupId());
-                long size=(lower==null ? 0 : lower.length)+(long)(upper==null ? 0 : upper.length);
-                bytes+=25+size+(added ? 156 : 0); bounds+=size;
-                if (bytes>SnapshotFence.MAX_BYTES || bounds>TransactionScope.MAX_BOUND_BYTES) throw new IllegalArgumentException("Snapshot scope exceeds aggregate frozen byte budget");
-                routes.putIfAbsent(route.groupId(),route); var spans=scopes.computeIfAbsent(route.groupId(),ignored -> new ArrayList<>());
-                if (spans.size()>=TransactionScope.MAX_SPANS) throw new IllegalArgumentException("Snapshot participant scope exceeds span budget");
-                spans.add(span.isPoint() ? TransactionScope.Span.point(span.columnId(),lower) : TransactionScope.Span.range(span.columnId(),lower,upper));
+    static RangeDirectory column(List<RangeDirectory> directories,UUID column){
+        RangeDirectory selected=null;for(var directory:directories)if(directory.columns().contains(column)){if(selected!=null)throw new IllegalArgumentException("Ambiguous transaction column");selected=directory;}if(selected==null)throw new IllegalArgumentException("Unknown transaction column");return selected;
+    }
+    static RangeDirectory group(List<RangeDirectory> directories,UUID group){return directories.stream().filter(d->d.ranges().stream().anyMatch(r->r.groupId().equals(group))).findFirst().orElseThrow(()->new IllegalArgumentException("Unknown transaction group"));}
+    public static List<RangeDescriptor> participants(List<RangeDirectory> directories,TransactionScope scope){
+        if(directories.isEmpty() || directories.size()>DomainBinding.MAX_DOMAINS)throw new IllegalArgumentException("Invalid snapshot domain count");
+        var namespace=directories.getFirst();var columns=new HashSet<UUID>();var groups=new HashSet<UUID>();var domains=new HashSet<UUID>();
+        for(var directory:directories){if(!namespace.clusterId().equals(directory.clusterId()) || !namespace.databaseId().equals(directory.databaseId()) || !domains.add(directory.domainId()))throw new IllegalArgumentException("Foreign or duplicate snapshot namespace");for(var column:directory.columns())if(!columns.add(column))throw new IllegalArgumentException("Ambiguous snapshot column");for(var range:directory.ranges())if(!groups.add(range.groupId()))throw new IllegalArgumentException("Ambiguous snapshot group");}
+        var selected=new TreeMap<UUID,RangeDescriptor>(UUID_ORDER);
+        for(var span:scope.spans()){var directory=column(directories,span.columnId());var ranges=span.isPoint()?List.of(directory.route(span.columnId(),span.lowerInclusive())):directory.intersect(span.columnId(),span.lowerInclusive(),span.upperExclusive(),false);for(var range:ranges){selected.putIfAbsent(range.groupId(),range);if(selected.size()>SnapshotFence.MAX_PARTICIPANTS)throw new IllegalArgumentException("Aggregate transaction participant budget exceeded");}}
+        return List.copyOf(selected.values());
+    }
+    private record Projection(List<RangeDescriptor> routes,Map<UUID,List<TransactionScope.Span>> scopes,List<DomainBinding> authority) {}
+    /** Exact clipped wire envelope validation, without allocating a transaction or any operation identity. */
+    public static void preflight(List<RangeDirectory> directories,TransactionScope scope){project(directories,scope);}
+    private static Projection project(List<RangeDirectory> directories,TransactionScope scope){
+        var routes=participants(directories,scope);var used=new HashSet<UUID>();for(var route:routes)used.add(group(directories,route.groupId()).domainId());
+        var authority=DomainBinding.canonical(directories.stream().filter(directory->used.contains(directory.domainId())).map(DomainBinding::of).toList());
+        var scopes=new HashMap<UUID,List<TransactionScope.Span>>();long bytes=SnapshotFence.HEADER_BYTES+(long)authority.size()*DomainBinding.BYTES,bounds=0;
+        for(var span:scope.spans()){
+            var directory=column(directories,span.columnId());byte[] originalLower=span.lowerInclusive(),originalUpper=span.upperExclusive();
+            var selected=span.isPoint()?List.of(directory.route(span.columnId(),originalLower)):directory.intersect(span.columnId(),originalLower,originalUpper,false);
+            for(var route:selected){
+                byte[] lower=span.isPoint()?originalLower:maximum(originalLower,route.lowerInclusive()),upper=span.isPoint()?null:minimum(originalUpper,route.upperExclusive());
+                if(!span.isPoint() && lower!=null && upper!=null && Arrays.compareUnsigned(lower,upper)>=0)continue;
+                long size=(lower==null?0:lower.length)+(long)(upper==null?0:upper.length);bytes+=25+size+(scopes.containsKey(route.groupId())?0:156);bounds+=size;
+                if(bytes>SnapshotFence.MAX_BYTES || bounds>TransactionScope.MAX_BOUND_BYTES)throw new IllegalArgumentException("Snapshot scope exceeds aggregate frozen byte budget");
+                var spans=scopes.computeIfAbsent(route.groupId(),ignored->new ArrayList<>());if(spans.size()>=TransactionScope.MAX_SPANS)throw new IllegalArgumentException("Participant scope exceeds span budget");
+                spans.add(span.isPoint()?TransactionScope.Span.point(span.columnId(),lower):TransactionScope.Span.range(span.columnId(),lower,upper));
             }
         }
-        var participants=new ArrayList<SnapshotFence.Participant>(); int index=0;
-        for (var route:routes.values()) {
-            participants.add(new SnapshotFence.Participant(directory.domainId(), route.rangeId(), route.groupId(), route.rangeEpoch(), directory.schemaDigest(), control(firstControl,index), control(firstControl,64+index), new TransactionScope(scopes.get(route.groupId())))); index++;
-        }
-        var fence=new SnapshotFence(directory.clusterId(), directory.databaseId(), fenceId, homeGroup, homeEpoch, business, List.of(DomainBinding.of(directory)), participants);
-        return new RatisSnapshotPlan(fence,new ArrayList<>(routes.values()),scope);
+        return new Projection(routes,Map.copyOf(scopes),authority);
     }
+    public static RatisSnapshotPlan create(List<RangeDirectory> directories,TransactionScope scope,UUID fenceId,OperationId business,UUID homeGroup,long homeEpoch,OperationId firstControl) {
+        Objects.requireNonNull(scope);Objects.requireNonNull(fenceId);Objects.requireNonNull(business);Objects.requireNonNull(homeGroup);Objects.requireNonNull(firstControl);
+        if(homeEpoch<0 || business.epoch()<1 || !business.sessionId().equals(firstControl.sessionId()) || business.epoch()!=firstControl.epoch() || firstControl.sequence()<=business.sequence() || firstControl.sequence()>Long.MAX_VALUE-CONTROL_SLOTS)throw new IllegalArgumentException("Invalid reserved snapshot identities");
+        var projection=project(directories,scope);var participants=new ArrayList<SnapshotFence.Participant>();int index=0;
+        for(var route:projection.routes()){
+            var directory=group(directories,route.groupId());participants.add(new SnapshotFence.Participant(directory.domainId(),route.rangeId(),route.groupId(),route.rangeEpoch(),directory.schemaDigest(),control(firstControl,index),control(firstControl,64+index),new TransactionScope(projection.scopes().get(route.groupId()))));index++;
+        }
+        var namespace=directories.getFirst();return new RatisSnapshotPlan(new SnapshotFence(namespace.clusterId(),namespace.databaseId(),fenceId,homeGroup,homeEpoch,business,projection.authority(),participants),projection.routes(),scope);
+    }
+    static void requireDomain(RangeDirectory directory,SnapshotFence fence){fence.domain(directory.domainId()).require(directory);for(var participant:fence.participants())if(participant.domainId().equals(directory.domainId())){var route=directory.ranges().stream().filter(r->r.groupId().equals(participant.groupId())).findFirst().orElseThrow();if(!route.rangeId().equals(participant.rangeId()) || route.rangeEpoch()!=participant.rangeEpoch() || !Arrays.equals(directory.schemaDigest(),participant.schemaDigest()))throw new IllegalArgumentException("Frozen participant route changed");var covered=participant.scope().participants(directory,SnapshotFence.MAX_PARTICIPANTS);if(covered.size()!=1 || !covered.getFirst().equals(route))throw new IllegalArgumentException("Frozen participant scope changed");}}
     /** Qualify the original fence without rewriting equivalent adjacent scope spans or its binding digest. */
-    public static RatisSnapshotPlan frozen(RangeDirectory directory,SnapshotFence expected) {
-        Objects.requireNonNull(expected);if(expected.domains().size()!=1)throw new IllegalArgumentException("This snapshot planner requires one domain");expected.domain(directory.domainId()).require(directory);
+    public static RatisSnapshotPlan frozen(List<RangeDirectory> directories,SnapshotFence expected) {
+        Objects.requireNonNull(expected);if(!DomainBinding.canonical(directories.stream().map(DomainBinding::of).toList()).equals(expected.domains()))throw new IllegalArgumentException("Snapshot authority vector changed");
         var first=expected.participants().stream().map(SnapshotFence.Participant::installOperation)
                 .min(Comparator.comparingLong(OperationId::sequence)).orElseThrow();
-        var plan=create(directory,scope(expected),expected.fenceId(),expected.operation(),expected.homeGroup(),expected.homeEpoch(),first);
+        var plan=create(directories,scope(expected),expected.fenceId(),expected.operation(),expected.homeGroup(),expected.homeEpoch(),first);
         var participants=expected.participants().stream().map(p -> new SnapshotFence.Participant(p.domainId(), p.rangeId(), p.groupId(), p.rangeEpoch(), p.schemaDigest(), p.installOperation(), p.releaseOperation(), normalize(p.scope().spans()))).toList();
         var qualified=new SnapshotFence(expected.clusterId(), expected.databaseId(), expected.fenceId(), expected.homeGroup(), expected.homeEpoch(), expected.operation(), expected.domains(), participants);
         if (!qualified.equals(plan.fence())) throw new IllegalArgumentException("Frozen source definition differs from cached projection");

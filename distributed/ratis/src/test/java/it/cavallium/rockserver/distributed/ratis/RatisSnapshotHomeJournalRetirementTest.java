@@ -25,10 +25,10 @@ class RatisSnapshotHomeJournalRetirementTest {
             helper.root=root; helper.helper.root=root; home=helper.new Home(name+"-home");
             data=helper.helper.new Node(name+"-data",false,null,home.homes,System::nanoTime);
             fence=helper.fence(home,data,81,helper.scope(data,1,4)); initial=SnapshotFenceStatus.begin(fence); path=root.resolve(name+".journal");
-            journal=RatisDurableSnapshot.create(path,home.homes,data.routed,initial,home.homes.prepare(control(0),null,initial),data.directory.ranges());
+            journal=RatisDurableSnapshot.create(path,home.homes,RatisTransactionBindings.of(data.routed),initial,home.homes.prepare(control(0),null,initial),data.directory.ranges());
         }
-        void reopen() throws Exception { journal.close(); journal=RatisDurableSnapshot.reopen(path,home.homes,data.routed); }
-        RatisSnapshotCoordinator driver() throws Exception { return new RatisSnapshotCoordinator(journal,home.homes,data.routed,last -> control(last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10)); }
+        void reopen() throws Exception { journal.close(); journal=RatisDurableSnapshot.reopen(path,home.homes,RatisTransactionBindings.of(data.routed)); }
+        RatisSnapshotCoordinator driver() throws Exception { return new RatisSnapshotCoordinator(journal,home.homes,RatisTransactionBindings.of(data.routed),last -> control(last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10)); }
         long writes() { return home.wire.index+data.wire.index; }
         public void close() throws Exception { try { journal.close(); } finally { try { data.close(); } finally { home.close(); } } }
     }
@@ -125,7 +125,7 @@ class RatisSnapshotHomeJournalRetirementTest {
                 journal.consume(fixtures.control(100)); journal.executeHome(); saved=journal.snapshot().observedHome(); retire(f.home,f.data,saved,released);
             }
             long writes=f.home.wire.index+f.data.wire.index;
-            for (int n=0;n<2;n++) try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=fixtures.coordinator(journal,f)) {
+            for (int n=0;n<2;n++) try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.client)); var driver=fixtures.coordinator(journal,f)) {
                 var step=driver.step(); assertEquals(RatisSnapshotCoordinator.Action.HOME_RETIRED,step.action()); assertTrue(step.complete());
                 assertEquals(saved,journal.snapshot().observedHome()); var progress=journal.snapshot().participant(group);
                 assertEquals(token,progress.captureToken()); assertEquals(released,progress.releaseReceipt()); assertArrayEquals(capture.bytes(),progress.capture().bytes());

@@ -20,7 +20,7 @@ class RatisAtomicOwnershipTest {
         try (var f=new RatisAtomicClientTest.Fixture(root)) {
             var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var once=new AtomicBoolean();
             f.beforeAuthorize=() -> { if (once.compareAndSet(false,true)) { entered.countDown(); await(release); } };
-            var client=new RatisAtomicClient(f.schema,f.homes,f.data,f.scheduler,new RatisAtomicClient.Limits(1,RatisAtomicClient.MAX_BYTES));
+            var client=new RatisAtomicClient(RatisTransactionBindings.of(f.schema,f.data.directory(f.schema),f.data),f.homes,f.scheduler,new RatisAtomicClient.Limits(1,RatisAtomicClient.MAX_BYTES));
             var operation=client.executeAtomic(root.resolve("cancel.bin"),f.identity(0),RatisAtomicClientTest.changes(),RatisAtomicClientTest.absentIdentity(),RatisAtomicClientTest.TTL,RequestContext.batch());
             try {
                 assertTrue(entered.await(5,TimeUnit.SECONDS)); var views=new ArrayList<CompletableFuture<CommandResult>>();
@@ -59,7 +59,7 @@ class RatisAtomicOwnershipTest {
                 assertThrows(ExecutionException.class,() -> operation.completion().get(10,TimeUnit.SECONDS)); saved=operation.snapshot();
             }
             f.beforeAuthorize=null; var path=root.resolve("wrong-home-block.bin");
-            try (var generic=RatisDurableTransaction.create(path,f.homes,f.data,saved.initial(),f.homes.prepare(new OperationId(f.session,f.grant.epoch(),700),null,saved.initial()),saved.participants().stream().map(RatisDurableTransaction.ParticipantProgress::intent).toList())) { assertNotNull(generic.snapshot()); }
+            try (var generic=RatisDurableTransaction.create(path,f.homes,RatisTransactionBindings.of(f.data),saved.initial(),f.homes.prepare(new OperationId(f.session,f.grant.epoch(),700),null,saved.initial()),saved.participants().stream().map(RatisDurableTransaction.ParticipantProgress::intent).toList())) { assertNotNull(generic.snapshot()); }
             long writes=f.writes(); int opens=f.opens.get();
             try (var operation=client.reopen(path,RequestContext.batch())) {
                 var failure=assertThrows(ExecutionException.class,() -> operation.completion().get(10,TimeUnit.SECONDS)); assertInstanceOf(IOException.class,failure.getCause());

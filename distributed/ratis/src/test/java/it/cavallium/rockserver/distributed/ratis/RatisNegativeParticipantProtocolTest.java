@@ -63,18 +63,18 @@ class RatisNegativeParticipantProtocolTest {
         try (var home=helper.helper.new Node("journal-home",true); var data=helper.helper.new Node("journal-data",false); var pin=data.f.store.captureTracked(helper.helper.scope(data,1,4))) {
             var plan=helper.plan(home,data,pin); var preparation=preparation(home,plan); var wire=new Wire(data.wire);
             try (var routed=new RatisRoutedClient(data.directory,wire)) {
-                Path path=root.resolve("negative.bin"); var journal=RatisDurableTransaction.create(path,home.statuses,routed,plan.initial(),plan.registration(),List.of(plan.intent()));
+                Path path=root.resolve("negative.bin"); var journal=RatisDurableTransaction.create(path,home.statuses,RatisTransactionBindings.of(routed),plan.initial(),plan.registration(),List.of(plan.intent()));
                 try {
                     journal.executeHome(); var operation=routed.prepareParticipant(preparation,true); journal.freezePreparation(operation); wire.lose=true;
                     var owned=journal; assertThrows(IOException.class,() -> owned.executePreparation(data.f.groupId)); assertNull(journal.snapshot().participant(data.f.groupId).vote());
-                    journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,routed);
+                    journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(routed));
                     var saved=journal.snapshot().participant(data.f.groupId).preparation(); assertTrue(saved.negative()); assertArrayEquals(operation.bytes(),saved.bytes()); assertEquals(operation.descriptor(),saved.descriptor());
                     var reopened=journal; assertThrows(IllegalArgumentException.class,() -> reopened.freezePreparation(routed.prepareParticipant(preparation,false)));
                     assertEquals(ParticipantVote.negative(),journal.executePreparation(data.f.groupId)); assertEquals(2,wire.requests.size()); assertArrayEquals(wire.requests.getFirst(),wire.requests.getLast());
-                    journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,routed); assertEquals(ParticipantVote.negative(),journal.snapshot().participant(data.f.groupId).vote()); assertTrue(journal.snapshot().participant(data.f.groupId).preparation().negative());
+                    journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(routed)); assertEquals(ParticipantVote.negative(),journal.snapshot().participant(data.f.groupId).vote()); assertTrue(journal.snapshot().participant(data.f.groupId).preparation().negative());
                     // The inverse kind change is also forbidden, even before a positive RPC is sent.
                     Path positivePath=root.resolve("positive.bin");
-                    try (var positiveJournal=RatisDurableTransaction.create(positivePath,home.statuses,routed,plan.initial(),plan.registration(),List.of(plan.intent()))) {
+                    try (var positiveJournal=RatisDurableTransaction.create(positivePath,home.statuses,RatisTransactionBindings.of(routed),plan.initial(),plan.registration(),List.of(plan.intent()))) {
                         positiveJournal.refreshHome(); positiveJournal.freezePreparation(routed.prepareParticipant(preparation,false));
                         assertThrows(IllegalArgumentException.class,() -> positiveJournal.freezePreparation(operation));
                     }
@@ -86,7 +86,7 @@ class RatisNegativeParticipantProtocolTest {
         helper.helper.root=root;
         try (var home=helper.helper.new Node("proof-home",true); var data=helper.helper.new Node("proof-data",false); var pin=data.f.store.captureTracked(helper.helper.scope(data,1,4))) {
             var plan=helper.plan(home,data,pin); var preparation=preparation(home,plan); var wire=new Wire(data.wire);
-            try (var routed=new RatisRoutedClient(data.directory,wire); var journal=RatisDurableTransaction.create(root.resolve("proof.bin"),home.statuses,routed,plan.initial(),plan.registration(),List.of(plan.intent()))) {
+            try (var routed=new RatisRoutedClient(data.directory,wire); var journal=RatisDurableTransaction.create(root.resolve("proof.bin"),home.statuses,RatisTransactionBindings.of(routed),plan.initial(),plan.registration(),List.of(plan.intent()))) {
                 journal.executeHome(); journal.freezePreparation(routed.prepareParticipant(preparation,true));
                 wire.positive=true; assertThrows(IOException.class,() -> journal.executePreparation(data.f.groupId)); assertNull(journal.snapshot().participant(data.f.groupId).vote());
                 wire.prepared=new PreparedParticipant(preparation,new ApplyPosition(1,1));
@@ -104,16 +104,16 @@ class RatisNegativeParticipantProtocolTest {
             var plan=helper.plan(home,data,pin); var preparation=preparation(home,plan); var wire=new Wire(data.wire); wire.positive=true;
             try (var routed=new RatisRoutedClient(data.directory,wire)) {
                 Path path=root.resolve("decode.bin");
-                try (var journal=RatisDurableTransaction.create(path,home.statuses,routed,plan.initial(),plan.registration(),List.of(plan.intent()))) {
+                try (var journal=RatisDurableTransaction.create(path,home.statuses,RatisTransactionBindings.of(routed),plan.initial(),plan.registration(),List.of(plan.intent()))) {
                     journal.executeHome(); journal.freezePreparation(routed.prepareParticipant(preparation,false)); assertTrue(journal.executePreparation(data.f.groupId).prepared());
                 }
                 byte[] body=SessionJournalFiles.read(path,RatisDurableTransaction.MAX_BYTES); int offset=preparationKind(body);
                 assertEquals(1,body[offset]); byte[] negative=body.clone(); negative[offset]=2; SessionJournalFiles.write(path,negative,RatisDurableTransaction.MAX_BYTES);
-                assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,routed));
+                assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(routed)));
                 byte[] malformed=body.clone(); malformed[offset]=3; SessionJournalFiles.write(path,malformed,RatisDurableTransaction.MAX_BYTES);
-                assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,routed));
+                assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(routed)));
                 SessionJournalFiles.write(path,body,RatisDurableTransaction.MAX_BYTES);
-                try (var journal=RatisDurableTransaction.reopen(path,home.statuses,routed)) { assertFalse(journal.snapshot().participant(data.f.groupId).preparation().negative()); assertTrue(journal.snapshot().participant(data.f.groupId).vote().prepared()); }
+                try (var journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(routed))) { assertFalse(journal.snapshot().participant(data.f.groupId).preparation().negative()); assertTrue(journal.snapshot().participant(data.f.groupId).vote().prepared()); }
             }
         }
     }

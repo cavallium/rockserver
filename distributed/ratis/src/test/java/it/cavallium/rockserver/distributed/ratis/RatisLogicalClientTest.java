@@ -61,7 +61,7 @@ class RatisLogicalClientTest {
         try (var f=new Fixture(root)) {
             int sent=f.sent.size(),reads=f.reads;
             assertThrows(IllegalArgumentException.class,() -> f.logical.get(101,new Keys(Buf.wrap(new byte[8]))));
-            assertEquals(Mutation.Kind.PUT,RatisLogicalClient.plan(f.schema,List.of(RatisLogicalClient.Change.put(111,key(1),Buf.wrap(new byte[]{1}),Mutation.ReturnMode.NONE)),List.of()).mutations().getFirst().kind());
+            assertEquals(Mutation.Kind.PUT,RatisLogicalClient.plan(scopeColumnId -> f.schema,List.of(RatisLogicalClient.Change.put(111,key(1),Buf.wrap(new byte[]{1}),Mutation.ReturnMode.NONE)),List.of()).mutations().getFirst().kind());
             assertThrows(IllegalArgumentException.class,() -> f.logical.get(999,key(1)));
             assertThrows(IllegalArgumentException.class,() -> f.logical.get(71,new Keys(Buf.wrap(new byte[8]))));
             assertThrows(IllegalArgumentException.class,() -> f.logical.preparePut(71,key(1),null,Mutation.ReturnMode.NONE));

@@ -118,7 +118,7 @@ class RatisHomeReservationTest {
         byte[] reply=f.machine.queryLinearizable(message(RatisOperationRerouteAdmissionRpc.prepareRequest(command,evidence))).get(5,TimeUnit.SECONDS).getContent().toByteArray();RatisOperationRerouteAdmissionRpc.requireEcho(reply,RatisOperationRerouteAdmissionRpc.PREPARE,command);
     }
     RatisTransactionPlan.Accepted controlledAccepted(Fixture f,ReservedEvidence base) {
-        var plan=RatisTransactionPlan.create(f.source.target,base.evidence().original().operationId(),base.evidence().original().mutations(),base.evidence().original().predicates());var accepted=new HashMap<UUID,DistributedCommand>();var captures=new HashMap<UUID,UUID>();var prepares=new HashMap<UUID,OperationId>();var finalizes=new HashMap<UUID,OperationId>();int n=0;
+        var plan=RatisTransactionPlan.create(List.of(f.source.target),base.evidence().original().operationId(),base.evidence().original().mutations(),base.evidence().original().predicates());var accepted=new HashMap<UUID,DistributedCommand>();var captures=new HashMap<UUID,UUID>();var prepares=new HashMap<UUID,OperationId>();var finalizes=new HashMap<UUID,OperationId>();int n=0;
         // These canonical accepted images exercise HOME normalization, not live child DATA certification.
         for(var part:plan.partitions()){
             var values=part.command().mutations().stream().filter(m->m.returnMode()!=Mutation.ReturnMode.NONE).map(Mutation::value).toList();

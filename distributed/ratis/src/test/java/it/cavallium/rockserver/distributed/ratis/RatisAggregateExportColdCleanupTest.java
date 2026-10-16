@@ -149,7 +149,7 @@ class RatisAggregateExportColdCleanupTest {
                     var homes=new RatisSnapshotFences(homeRoute,source.f.snapshotColumn);
                     for(var slot:slots) {
                         var domain=recovered.input().domain(slot.domainId());
-                        try(var frozen=source.routes.get(slot.domainId()).borrowedSnapshotCleanupView(domain.directory(),slot.fence());var journal=RatisDurableSnapshot.reopen(slot.snapshot(),homes,frozen)) {
+                        try(var frozen=source.routes.get(slot.domainId()).borrowedSnapshotCleanupView(domain.directory(),slot.fence());var journal=RatisDurableSnapshot.reopen(slot.snapshot(),homes,RatisTransactionBindings.of(frozen))) {
                             var saved=journal.snapshot();assertEquals(slot.fence(),saved.initial().fence());assertEquals(RatisSnapshotCaptureRequest.Mode.READ_ONLY,saved.captureMode());assertEquals(recovered.input().limits().snapshotTtl(),saved.requestedTtl());
                             assertNotNull(saved.observedHome());assertTrue(saved.observedHome().consumed());assertTrue(saved.releaseRequested());
                             for(var participant:saved.participants()) {

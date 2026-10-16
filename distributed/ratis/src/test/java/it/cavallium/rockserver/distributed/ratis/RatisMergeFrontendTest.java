@@ -58,7 +58,7 @@ class RatisMergeFrontendTest {
             DistributedStoragePool.stageOperator(f.root.resolve("catalogue/catalogue"),operator,new MergeOperatorRegistry.DeterministicContract("append-contract",1,true),jar);
             var current=install(f.schema,75,new UUID(310,75),"fixed-merge",operator,false);
             schema=install(current,76,new UUID(310,76),"bucket-merge",operator,true);
-            transactions=new RatisTransactionClient(schema,f.snapshots,f.homes,f.data,f.scheduler,RatisTransactionClient.Limits.defaults()); allocations=new RatisRocksDBAdapterTest.Allocations(f);
+            transactions=new RatisTransactionClient(RatisTransactionBindings.of(schema,f.data.directory(schema),f.data),f.snapshots,f.homes,f.scheduler,RatisTransactionClient.Limits.defaults()); allocations=new RatisRocksDBAdapterTest.Allocations(f);
             issuance=f.ledger.issue(new UUID(310,1),1000); grant=issuance.grants().getLast();
             assertEquals(CommandResult.Status.SUCCESS,f.catalogue.epochs.execute(f.catalogue.epochs.prepare(f.outer.operation(2),f.ledger,issuance)).status());
             int n=0; for (var group:f.groups) assertEquals(CommandResult.Status.SUCCESS,f.data.execute(f.data.prepareSessionControl(f.catalogue.epochs.prepareSessionBinding(f.data.directory(),group,new OperationId(f.admin,2,n++),grant,32,-1))).status());
@@ -70,7 +70,7 @@ class RatisMergeFrontendTest {
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException { return transport.transaction(route,bytes,fresh); }
             });
             window=f.root.resolve("merge-window"); journal=f.root.resolve("merge-request"); session=RatisDurableSessionClient.create(window,routed,issuance,grant,RatisSessionClient.Limits.defaults());
-            direct=budget.open(schema,routed,session,f.scheduler,journal,window); adapter=new RatisRocksDBAdapter(schema,f.data.directory(),transactions,allocations,direct,null,new AtomicLong()::incrementAndGet);
+            direct=budget.open(schema,routed,session,f.scheduler,journal,window); adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(schema,f.data.directory(),(transactions).bindings().domain((schema).domainId()).client()),transactions,allocations,direct,null,new AtomicLong()::incrementAndGet);
         }
         DistributedSchema install(DistributedSchema source,long api,UUID column,String name,DistributedSchema.Operator operator,boolean bucket) throws Exception {
             var shape=ColumnSchema.of(IntArrayList.of(1),bucket ? ObjectArrayList.of(ColumnHashType.ALLSAME8) : ObjectArrayList.of(),true,operator.name(),operator.version(),operator.className());

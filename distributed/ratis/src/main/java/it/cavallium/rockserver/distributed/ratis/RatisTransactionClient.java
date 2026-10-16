@@ -26,9 +26,7 @@ public final class RatisTransactionClient implements AutoCloseable {
         }
     }
     public record Stats(RatisSnapshotClient.Stats snapshots,RatisAtomicClient.Stats commits) {}
-    private final DistributedSchema schema;
-    private final RangeDirectory directory;
-    private final RatisRoutedClient data;
+    private final RatisTransactionBindings data;
     private final RatisSnapshotClient snapshots;
     private final RatisAtomicClient commits;
     private final Map<Path,Lease> leases=new LinkedHashMap<>();
@@ -36,16 +34,12 @@ public final class RatisTransactionClient implements AutoCloseable {
     private boolean closing,closed;
 
     /** Infrastructure and grant maintenance are borrowed; only the bounded client wrappers are owned. */
-    public RatisTransactionClient(DistributedSchema schema,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,
-                                  RatisRoutedClient data,RWScheduler scheduler,Limits limits) {
-        this(schema,data.directory(schema),snapshotHomes,transactionHomes,data,scheduler,limits,RatisJournalAccess.standalone());
+    public RatisTransactionClient(RatisTransactionBindings data,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RWScheduler scheduler,Limits limits) {this(data,snapshotHomes,transactionHomes,scheduler,limits,RatisJournalAccess.standalone());}
+    static RatisTransactionClient journalOwned(RatisTransactionBindings data,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RWScheduler scheduler,Limits limits,RatisJournalAccess access){return new RatisTransactionClient(data,snapshotHomes,transactionHomes,scheduler,limits,access);}
+    private RatisTransactionClient(RatisTransactionBindings data,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RWScheduler scheduler,Limits limits,RatisJournalAccess access) {
+        this.data=Objects.requireNonNull(data);Objects.requireNonNull(limits);snapshots=RatisSnapshotClient.journalOwned(data,snapshotHomes,scheduler,limits.snapshots(),RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED,access);commits=RatisAtomicClient.journalOwned(data,transactionHomes,scheduler,limits.commits(),access);
     }
-    static RatisTransactionClient journalOwned(DistributedSchema schema,RangeDirectory directory,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisJournalAccess access){return new RatisTransactionClient(schema,directory,snapshotHomes,transactionHomes,data,scheduler,limits,access);}
-    private RatisTransactionClient(DistributedSchema schema,RangeDirectory directory,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisJournalAccess access) {
-        this.schema=Objects.requireNonNull(schema); this.data=Objects.requireNonNull(data); Objects.requireNonNull(limits); this.directory=RatisSnapshotClient.qualifiedDirectory(schema,directory,data);
-        snapshots=RatisSnapshotClient.journalOwned(schema,directory,snapshotHomes,data,scheduler,limits.snapshots(),RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED,access);
-        commits=RatisAtomicClient.journalOwned(schema,directory,transactionHomes,data,scheduler,limits.commits(),access);
-    }
+    RatisTransactionBindings bindings(){return data;}
     public synchronized Lease open(Path snapshotPath,Path commitPath,Identity identity,TransactionScope scope,Duration ttl,RequestContext context) throws IOException {
         requireOpen(); Objects.requireNonNull(identity); Path capture=Objects.requireNonNull(snapshotPath).toAbsolutePath().normalize(),commit=Objects.requireNonNull(commitPath).toAbsolutePath().normalize();
         if (capture.equals(commit) || owned(capture) || owned(commit)) throw new IOException("Transaction journal path already owned or overlaps its snapshot");
@@ -120,8 +114,8 @@ public final class RatisTransactionClient implements AutoCloseable {
             try {
                 requireLease(); requireOpen(); if (operation!=null) throw new IOException("Commit already owns the frozen prefix");
                 changes=List.copyOf(changes); conditions=List.copyOf(conditions);
-                var physical=changes.isEmpty() && conditions.isEmpty() ? null : RatisLogicalClient.plan(schema,changes,conditions,RatisTransactionPlan.MAX_BYTES);
-                var plan=RatisTransactionPlan.captured(directory,identity.commit().business(),physical==null ? List.of() : physical.mutations(),physical==null ? List.of() : physical.predicates(),snapshot.snapshot());
+                var physical=changes.isEmpty() && conditions.isEmpty() ? null : RatisLogicalClient.plan(data::schema,changes,conditions,RatisTransactionPlan.MAX_BYTES);
+                var plan=RatisTransactionPlan.captured(data.directories(),identity.commit().business(),physical==null ? List.of() : physical.mutations(),physical==null ? List.of() : physical.predicates(),snapshot.snapshot());
                 return snapshot.stagePrefix(plan,context);
             } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
         }

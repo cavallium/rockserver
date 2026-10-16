@@ -111,7 +111,7 @@ class RatisRemoteExportSourceTest {
                     spans.add(TransactionScope.Span.range(column,new byte[]{4},null));
                 } else spans.add(TransactionScope.Span.range(column,null,null));
             }
-            var home=f.snapshots.route(id.fence()); var plan=RatisSnapshotPlan.create(f.directory,new TransactionScope(spans),id.fence(),id.business(),home.groupId(),home.rangeEpoch(),id.firstControl());
+            var home=f.snapshots.route(id.fence()); var plan=RatisSnapshotPlan.create(List.of(f.directory),new TransactionScope(spans),id.fence(),id.business(),home.groupId(),home.rangeEpoch(),id.firstControl());
             var baseline=definition(f,source,directory.resolve("source.snapshot"));
             var definition=new RatisExportJournal.Definition(baseline.jobId(),plan.fence(),new ArrayList<>(f.schema.columnIds()),baseline.sourceJournal(),source.identityDigest(),baseline.limits(),java.time.Duration.ofSeconds(60)); var builds=new java.util.concurrent.atomic.AtomicInteger();
             var builder=new RatisExportSourceRegistry.NativeBuilder() {
@@ -169,7 +169,7 @@ class RatisRemoteExportSourceTest {
         var directory=Files.createDirectory(root.resolve("boundary-job")); var path=directory.resolve("export.log"); var artifacts=root.resolve("boundary-artifacts");
         try (var f=new Fixture(root.resolve("boundary-source"),true); var snapshots=snapshots(f)) {
             seed(f); var baseline=definition(f,snapshots,directory.resolve("source.snapshot")); var selected=List.of(f.schema.column(71).columnId(),f.schema.column(72).columnId());
-            var id=RatisExportWorkflowTest.identity(f); var home=f.snapshots.route(id.fence()); var plan=RatisSnapshotPlan.create(f.directory,new TransactionScope(selected.stream().map(column -> TransactionScope.Span.range(column,null,null)).toList()),id.fence(),id.business(),home.groupId(),home.rangeEpoch(),id.firstControl());
+            var id=RatisExportWorkflowTest.identity(f); var home=f.snapshots.route(id.fence()); var plan=RatisSnapshotPlan.create(List.of(f.directory),new TransactionScope(selected.stream().map(column -> TransactionScope.Span.range(column,null,null)).toList()),id.fence(),id.business(),home.groupId(),home.rangeEpoch(),id.firstControl());
             var definition=new RatisExportJournal.Definition(baseline.jobId(),plan.fence(),selected,baseline.sourceJournal(),snapshots.identityDigest(),baseline.limits(),java.time.Duration.ofSeconds(60)); var builds=new java.util.concurrent.atomic.AtomicInteger();
             var builder=new RatisExportSourceRegistry.NativeBuilder() {
                 public NativeRangeSstExport.Chunk build(RatisExportSourceRpc.JobDefinition d,RatisExportJournal.ChunkIntent i,Path artifact,RatisExportSourceRegistry.Completion completion) throws Exception { builds.incrementAndGet(); return f.machines.get(d.group()).exportSnapshotPinChunk(d.capture(),pin -> { var chunk=f.catalogue.pool.exportSstChunk(artifact,pin,i.column(),i.scopeStart(),d.scope(i.column()).upperExclusive(),i.limits()); completion.persist(chunk); return chunk; }); }

@@ -19,7 +19,7 @@ class RatisWritableSnapshotJournalTest {
     static final Duration TTL=Duration.ofSeconds(10);
     RatisDurableSnapshot create(Path path,RatisSnapshotCoordinatorTest.Fixture f,RatisSnapshotCaptureRequest.Mode mode) throws Exception {
         var initial=SnapshotFenceStatus.begin(f.fence);
-        return RatisDurableSnapshot.create(path,f.home.homes,f.data,initial,f.home.homes.prepare(helper.control(10),null,initial),f.directory.ranges(),TTL,mode);
+        return RatisDurableSnapshot.create(path,f.home.homes,RatisTransactionBindings.of(f.data),initial,f.home.homes.prepare(helper.control(10),null,initial),f.directory.ranges(),TTL,mode);
     }
     static void drain(RatisSnapshotCoordinator coordinator) throws Exception {
         for (int n=0;n<64;n++) if (coordinator.step().complete()) return;
@@ -46,7 +46,7 @@ class RatisWritableSnapshotJournalTest {
                 assertFalse(requests.isEmpty());
             }
             Map<UUID,ScopedTransactionRpc.Handle> handles=new HashMap<>();
-            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.data); var driver=f.driver(journal)) {
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.data)); var driver=f.driver(journal)) {
                 assertEquals(RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED,journal.snapshot().captureMode()); drain(driver);
                 for (var participant:journal.snapshot().participants()) {
                     assertEquals(RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED,participant.capture().request().mode());
@@ -58,7 +58,7 @@ class RatisWritableSnapshotJournalTest {
                 assertEquals(1,f.left.f.store.activeTrackedSnapshotPins()); assertEquals(1,f.right.f.store.activeTrackedSnapshotPins());
                 assertThrows(IllegalArgumentException.class,() -> journal.freezeCapture(f.data.prepareSnapshotCapture(journal.snapshot().participants().getFirst().capture().target(),UUID.randomUUID(),TTL)));
             }
-            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.data)) {
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.data))) {
                 for (var participant:journal.snapshot().participants()) assertEquals(handles.get(participant.route().groupId()),participant.certifiedHandle());
                 release(journal); assertEquals(0,f.left.f.store.activeTrackedSnapshotPins()); assertEquals(0,f.right.f.store.activeTrackedSnapshotPins());
             }
@@ -96,10 +96,10 @@ class RatisWritableSnapshotJournalTest {
     }
     @Test void canonicalModeAndHandleBindingRejectCorruptedJournalAndReadOnlyClientCannotAcquireWriteMode() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root,true)) {
-            var home=f.snapshotDirectory.ranges().getFirst(); var plan=RatisSnapshotPlan.create(f.directory,RatisSnapshotClientTest.scope(f),new UUID(130,1),new OperationId(f.session,1,513),home.groupId(),home.rangeEpoch(),new OperationId(f.session,1,514));
+            var home=f.snapshotDirectory.ranges().getFirst(); var plan=RatisSnapshotPlan.create(List.of(f.directory),RatisSnapshotClientTest.scope(f),new UUID(130,1),new OperationId(f.session,1,513),home.groupId(),home.rangeEpoch(),new OperationId(f.session,1,514));
             var initial=SnapshotFenceStatus.begin(plan.fence()); Path path=root.resolve("bound-write.bin"); ScopedTransactionRpc.Handle handle;
-            try (var journal=RatisDurableSnapshot.create(path,f.snapshots,f.data,initial,f.snapshots.prepare(new OperationId(f.session,1,642),null,initial),plan.routes(),TTL,RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED);
-                 var driver=new RatisSnapshotCoordinator(journal,f.snapshots,f.data,last -> new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,TTL)) {
+            try (var journal=RatisDurableSnapshot.create(path,f.snapshots,RatisTransactionBindings.of(f.data),initial,f.snapshots.prepare(new OperationId(f.session,1,642),null,initial),plan.routes(),TTL,RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED);
+                 var driver=new RatisSnapshotCoordinator(journal,f.snapshots,RatisTransactionBindings.of(f.data),last -> new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,TTL)) {
                 drain(driver); handle=journal.snapshot().participants().getFirst().certifiedHandle(); assertEquals(0,f.opens.get(),"Writable snapshot capture adopts tracked cuts without ordinary OPEN substitution");
             }
             int calls=f.rpcs.get();
@@ -107,12 +107,12 @@ class RatisWritableSnapshotJournalTest {
                 var failure=assertThrows(ExecutionException.class,() -> lease.completion().get(5,TimeUnit.SECONDS)); assertInstanceOf(IOException.class,failure.getCause()); assertEquals(calls,f.rpcs.get());
             }
             byte[] original=SessionJournalFiles.read(path,RatisDurableSnapshot.MAX_BYTES); byte[] mode=original.clone(); mode[68]=0;
-            SessionJournalFiles.write(path,mode,RatisDurableSnapshot.MAX_BYTES); assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.snapshots,f.data));
+            SessionJournalFiles.write(path,mode,RatisDurableSnapshot.MAX_BYTES); assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.snapshots,RatisTransactionBindings.of(f.data)));
             var encoded=ByteBuffer.allocate(ScopedTransactionRpc.HANDLE_BYTES); ScopedTransactionRpc.writeHandle(encoded,handle); int offset=indexOf(original,encoded.array()); assertTrue(offset>=0);
             byte[] corrupt=original.clone(); corrupt[offset]^=1; SessionJournalFiles.write(path,corrupt,RatisDurableSnapshot.MAX_BYTES);
-            assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.snapshots,f.data));
+            assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.snapshots,RatisTransactionBindings.of(f.data)));
             SessionJournalFiles.write(path,original,RatisDurableSnapshot.MAX_BYTES);
-            try (var journal=RatisDurableSnapshot.reopen(path,f.snapshots,f.data)) { release(journal); }
+            try (var journal=RatisDurableSnapshot.reopen(path,f.snapshots,RatisTransactionBindings.of(f.data))) { release(journal); }
         }
     }
     static int indexOf(byte[] haystack,byte[] needle) {

@@ -34,7 +34,7 @@ final class RatisOperationRerouteAdmission {
                     || evidence.sourceDirectory().ranges().stream().noneMatch(r->sameLineageBounds(r,descriptor)))throw new IOException("Original frozen descriptor/schema changed");
             requireOriginalOwnership(original,descriptor,source.columns());
             if(original.kind()==DistributedCommand.Kind.COMMIT_ACCEPTED){var participants=original.acceptance().scope().participants(source,1);if(participants.size()!=1 || !participants.getFirst().groupId().equals(descriptor.groupId()))throw new IOException("Original certification changed source projection");}
-            else {var sourcePlan=RatisTransactionPlan.create(source,original.operationId(),original.mutations(),original.predicates());if(sourcePlan.partitions().size()!=1 || !sourcePlan.partitions().getFirst().route().groupId().equals(descriptor.groupId()))throw new IOException("Original input crosses frozen source");}
+            else {var sourcePlan=RatisTransactionPlan.create(List.of(source),original.operationId(),original.mutations(),original.predicates());if(sourcePlan.partitions().size()!=1 || !sourcePlan.partitions().getFirst().route().groupId().equals(descriptor.groupId()))throw new IOException("Original input crosses frozen source");}
             saved.freeze().requireRequest(header,admissionDigest(header));
             var request=new RatisTopologyOperationOutcomeRpc.Request(origin.clusterId(),origin.databaseId(),origin.domainId(),origin.source(),origin.operation(),origin.originalReceiptDigest());
             requireAbsence(origin,request,saved);

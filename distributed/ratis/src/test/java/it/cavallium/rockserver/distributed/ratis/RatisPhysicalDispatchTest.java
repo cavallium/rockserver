@@ -57,7 +57,7 @@ class RatisPhysicalDispatchTest {
     @Test void directAdapterRefusesBeforeAllocatingTransactionIdentity()throws Exception {
         try(var fixture=new RatisAtomicClientTest.Fixture(root.resolve("adapter"),true);var transactions=RatisRocksDBAdapterTest.client(fixture,fixture.data)) {
             var allocations=new RatisRocksDBAdapterTest.Allocations(fixture);
-            try(var adapter=new RatisRocksDBAdapter(fixture.schema,fixture.directory,transactions,allocations,null,null)) {
+            try(var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(fixture.schema,fixture.directory,fixture.data),transactions,allocations,null,null)) {
                 var api=adapter.api(CONTEXT);int requests=fixture.rpcs.get();
                 for(var request:physical(Long.MAX_VALUE)) {
                     CompletableFuture<?> result=api.requestAsync(request);

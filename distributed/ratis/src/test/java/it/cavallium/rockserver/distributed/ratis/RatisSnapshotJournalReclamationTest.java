@@ -37,14 +37,14 @@ class RatisSnapshotJournalReclamationTest {
                 f.lose=true; assertThrows(IOException.class,() -> journal.releaseCapture(group)); assertFalse(journal.snapshot().participant(group).captureReleased());
                 assertThrows(RatisSnapshotHomeRetiredException.class,() -> journal.executeCapture(group)); assertTrue(Files.exists(path));
             }
-            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)) {
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.client))) {
                 var group=f.data.f.groupId; assertEquals(token,journal.snapshot().participant(group).captureToken()); journal.releaseCapture(group); assertTrue(journal.snapshot().participant(group).captureReleased()); journal.releaseCapture(group);
             }
-            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)) {
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.client))) {
                 assertTrue(journal.snapshot().participant(f.data.f.groupId).captureReleased()); journal.reclaimRetired(); assertFalse(Files.exists(path)); assertTrue(Files.exists(path.resolveSibling(path.getFileName()+".lock"))); assertThrows(IOException.class,journal::snapshot);
                 assertThrows(IOException.class,() -> helper.create(path,f));
             }
-            assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.home.homes,f.client));
+            assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.client)));
         }
     }
     @Test void lostInitialTokenRecoversOnlyTheFrozenPinAfterHomeRetirementAndExpiredPinsSettleLost() throws Exception {
@@ -64,7 +64,7 @@ class RatisSnapshotJournalReclamationTest {
                     assertEquals(expired ? RatisDurableSnapshot.CaptureReleaseProgress.LOST : RatisDurableSnapshot.CaptureReleaseProgress.RECOVERED,journal.releaseCapture(group));
                     if (!expired) { assertEquals(token,journal.snapshot().participant(group).captureToken()); assertFalse(journal.snapshot().participant(group).captureReleased()); assertThrows(IllegalStateException.class,journal::reclaimRetired); }
                 }
-                try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)) {
+                try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.client))) {
                     assertEquals(expired ? RatisDurableSnapshot.CaptureReleaseProgress.LOST : RatisDurableSnapshot.CaptureReleaseProgress.RELEASED,reopened.releaseCapture(group));
                     reopened.reclaimRetired(); assertFalse(Files.exists(path));
                 }
@@ -90,7 +90,7 @@ class RatisSnapshotJournalReclamationTest {
                     assertEquals(created ? RatisDurableSnapshot.CaptureReleaseProgress.RECOVERED : RatisDurableSnapshot.CaptureReleaseProgress.LOST,journal.releaseCapture(group));
                     if (created) assertEquals(token,journal.snapshot().participant(group).captureToken());
                 }
-                try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)) {
+                try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.client))) {
                     assertEquals(created ? RatisDurableSnapshot.CaptureReleaseProgress.RELEASED : RatisDurableSnapshot.CaptureReleaseProgress.LOST,reopened.releaseCapture(group));
                     assertThrows(IllegalStateException.class,reopened::reclaimRetired); // HOME is consumed, but its retirement is still unproven.
                 }
@@ -127,7 +127,7 @@ class RatisSnapshotJournalReclamationTest {
             try (var journal=helper.create(path,f)) {
                 helper.installed(journal,f); journal.requestRelease(); journal.requestRelease(); assertTrue(journal.snapshot().releaseRequested());
             }
-            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=helper.coordinator(journal,f)) {
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.client)); var driver=helper.coordinator(journal,f)) {
                 assertTrue(journal.snapshot().releaseRequested()); long before=f.home.wire.index+f.data.wire.index; assertEquals(RatisSnapshotCoordinator.Action.ABORTED,driver.step().action()); assertEquals(1,f.home.wire.index+f.data.wire.index-before);
                 assertEquals(SnapshotFenceStatus.Phase.ABORT,journal.snapshot().observedHome().phase()); assertNull(journal.snapshot().participant(f.data.f.groupId).capture()); assertEquals(0,f.data.f.machine.snapshotPinStats().pins());
                 assertTrue(driver.step().complete()); assertNotNull(journal.snapshot().participant(f.data.f.groupId).releaseReceipt());
@@ -143,7 +143,7 @@ class RatisSnapshotJournalReclamationTest {
                 journal.queueHome(f.home.homes.prepare(helper.control(3),captured,captured.complete())); var exact=DistributedCommandCodec.encode(journal.snapshot().pendingHome().command()); journal.requestRelease();
                 assertArrayEquals(exact,DistributedCommandCodec.encode(journal.snapshot().pendingHome().command())); assertFalse(journal.snapshot().participant(group).captureLost());
             }
-            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=helper.coordinator(journal,f)) {
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.client)); var driver=helper.coordinator(journal,f)) {
                 assertTrue(journal.snapshot().releaseRequested()); assertEquals(RatisSnapshotCoordinator.Action.RETRIED_HOME,driver.step().action()); assertEquals(SnapshotFenceStatus.Phase.COMPLETE,journal.snapshot().observedHome().phase());
                 assertTrue(driver.step().complete()); assertEquals(SnapshotFenceStatus.Phase.COMPLETE,journal.snapshot().observedHome().phase()); assertNotNull(journal.snapshot().participant(f.data.f.groupId).releaseReceipt()); assertEquals(1,f.data.f.machine.snapshotPinStats().pins());
             }
@@ -152,17 +152,17 @@ class RatisSnapshotJournalReclamationTest {
     @Test void declaredTtlSurvivesReopenBeforeFirstCaptureAndRejectsChangedLifetimeWithoutRpc() throws Exception {
         var path=root.resolve("declared-ttl.journal"); var ttl=Duration.ofSeconds(30);
         try (var f=fixture("declared-ttl")) {
-            try (var journal=RatisDurableSnapshot.create(path,f.home.homes,f.client,f.initial,f.home.homes.prepare(helper.control(0),null,f.initial),f.data.directory.ranges(),ttl)) {
+            try (var journal=RatisDurableSnapshot.create(path,f.home.homes,RatisTransactionBindings.of(f.client),f.initial,f.home.homes.prepare(helper.control(0),null,f.initial),f.data.directory.ranges(),ttl)) {
                 assertEquals(ttl,journal.snapshot().requestedTtl()); assertNull(journal.snapshot().participant(f.data.f.groupId).capture());
             }
             int owners=f.owners.get(),homes=f.homes.get();
-            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)) {
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.client))) {
                 assertEquals(owners,f.owners.get()); assertEquals(homes,f.homes.get()); assertEquals(ttl,journal.snapshot().requestedTtl());
                 helper.installed(journal,f); var ready=f.initial.ready(f.data.f.groupId,journal.snapshot().participant(f.data.f.groupId).readyProof()); helper.transition(journal,f,ready,1);
                 var wrong=f.operation(); owners=f.owners.get(); homes=f.homes.get(); assertThrows(IllegalArgumentException.class,() -> journal.freezeCapture(wrong)); assertEquals(owners,f.owners.get()); assertEquals(homes,f.homes.get());
                 var exact=f.client.prepareSnapshotCapture(wrong.target(),wrong.request().snapshotId(),ttl); journal.freezeCapture(exact);
             }
-            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)) { assertEquals(ttl,journal.snapshot().requestedTtl()); assertEquals(ttl,journal.snapshot().participant(f.data.f.groupId).capture().request().ttl()); }
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(f.client))) { assertEquals(ttl,journal.snapshot().requestedTtl()); assertEquals(ttl,journal.snapshot().participant(f.data.f.groupId).capture().request().ttl()); }
             try (var generic=helper.create(root.resolve("generic-ttl.journal"),f)) { assertNull(generic.snapshot().requestedTtl()); }
         }
     }
@@ -187,10 +187,10 @@ class RatisSnapshotJournalReclamationTest {
             public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
                 if(lost.get())throw new RatisSnapshotLostException("Controlled original owner is gone");var message=Message.valueOf(ByteString.copyFrom(request));return (owner==null?f.data.f.machine.queryLinearizable(message):f.data.f.machine.queryStale(message,0)).thenApply(reply->reply.getContent().toByteArray());
             }
-        }); var journal=RatisDurableSnapshot.create(path,f.home.homes,data,f.initial,f.home.homes.prepare(helper.control(0),null,f.initial),f.data.directory.ranges())) {
+        }); var journal=RatisDurableSnapshot.create(path,f.home.homes,RatisTransactionBindings.of(data),f.initial,f.home.homes.prepare(helper.control(0),null,f.initial),f.data.directory.ranges())) {
             complete(journal,f); retire(journal,f); lost.set(true); journal.releaseCapture(f.data.f.groupId);
             assertTrue(journal.snapshot().participant(f.data.f.groupId).captureLost()); assertTrue(journal.snapshot().participant(f.data.f.groupId).captureReleaseLost()); assertFalse(journal.snapshot().participant(f.data.f.groupId).captureReleased());
-            journal.close(); try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,data)) { assertTrue(reopened.snapshot().participant(f.data.f.groupId).captureLost()); assertTrue(reopened.snapshot().participant(f.data.f.groupId).captureReleaseLost()); reopened.reclaimRetired(); }
+            journal.close(); try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(data))) { assertTrue(reopened.snapshot().participant(f.data.f.groupId).captureLost()); assertTrue(reopened.snapshot().participant(f.data.f.groupId).captureReleaseLost()); reopened.reclaimRetired(); }
             assertFalse(Files.exists(path));
         }
     }
@@ -205,14 +205,14 @@ class RatisSnapshotJournalReclamationTest {
                 if(block.get()&&ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES)==ScopedTransactionRpc.SNAPSHOT_RELEASE){entered.countDown();try{if(!resume.await(5,TimeUnit.SECONDS))throw new IOException("Release barrier timed out");}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new IOException(failure);}}
                 var message=Message.valueOf(ByteString.copyFrom(request));return (owner==null?f.data.f.machine.queryLinearizable(message):f.data.f.machine.queryStale(message,0)).thenApply(reply->reply.getContent().toByteArray());
             }
-        }); var journal=RatisDurableSnapshot.create(path,f.home.homes,data,f.initial,f.home.homes.prepare(helper.control(0),null,f.initial),f.data.directory.ranges())) {
+        }); var journal=RatisDurableSnapshot.create(path,f.home.homes,RatisTransactionBindings.of(data),f.initial,f.home.homes.prepare(helper.control(0),null,f.initial),f.data.directory.ranges())) {
             complete(journal,f); block.set(true);
             var release=CompletableFuture.runAsync(() -> { try { journal.releaseCapture(f.data.f.groupId); } catch (IOException failure) { throw new CompletionException(failure); } });
             try {
-                assertTrue(entered.await(5,TimeUnit.SECONDS)); assertThrows(IOException.class,journal::close); assertThrows(IOException.class,journal::reclaimRetired); assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.home.homes,data));
+                assertTrue(entered.await(5,TimeUnit.SECONDS)); assertThrows(IOException.class,journal::close); assertThrows(IOException.class,journal::reclaimRetired); assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(data)));
             } finally { resume.countDown(); }
             release.get(5,TimeUnit.SECONDS); assertTrue(journal.snapshot().participant(f.data.f.groupId).captureReleased()); journal.close();
-            try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,data)) { assertTrue(reopened.snapshot().participant(f.data.f.groupId).captureReleased()); }
+            try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,RatisTransactionBindings.of(data))) { assertTrue(reopened.snapshot().participant(f.data.f.groupId).captureReleased()); }
         } finally { resume.countDown(); }
     }
 }

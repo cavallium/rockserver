@@ -20,10 +20,10 @@ import static it.cavallium.rockserver.distributed.ratis.RatisAtomicClientTest.*;
 class RatisExportClientTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     static <T> T await(CompletableFuture<T> value) throws Exception { return value.get(10,TimeUnit.SECONDS); }
-    static RatisSnapshotClient snapshots(Fixture f) { return new RatisSnapshotClient(f.schema,f.snapshots,f.data,f.scheduler,RatisSnapshotClient.Limits.defaults()); }
+    static RatisSnapshotClient snapshots(Fixture f) { return new RatisSnapshotClient(RatisTransactionBindings.of(f.schema,f.data.directory(f.schema),f.data),f.snapshots,f.scheduler,RatisSnapshotClient.Limits.defaults()); }
     static RatisExportJournal.Definition definition(Fixture f,RatisSnapshotClient source,Path journal) {
         var id=RatisExportWorkflowTest.identity(f); var column=f.schema.column(71).columnId(); var home=f.snapshots.route(id.fence());
-        var plan=RatisSnapshotPlan.create(f.directory,new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),id.fence(),id.business(),home.groupId(),home.rangeEpoch(),id.firstControl());
+        var plan=RatisSnapshotPlan.create(List.of(f.directory),new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),id.fence(),id.business(),home.groupId(),home.rangeEpoch(),id.firstControl());
         var limits=new RatisExportJournal.Limits(16,16L*1024*1024,16L*1024*1024,new NativeRangeSstExport.Limits(1,1024,1024*1024,Duration.ofSeconds(5)));
         return new RatisExportJournal.Definition(new UUID(270,1),plan.fence(),List.of(column),journal,source.identityDigest(),limits,java.time.Duration.ofSeconds(60));
     }

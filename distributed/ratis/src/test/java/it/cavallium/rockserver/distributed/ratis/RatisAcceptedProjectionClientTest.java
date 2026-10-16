@@ -62,7 +62,7 @@ class RatisAcceptedProjectionClientTest {
         var h=helper();
         try (var x=h.new Captured("accepted-result-budget"); var client=x.f.client()) {
             var identity=identity(x);
-            var plan=RatisTransactionPlan.captured(x.f.directory,identity.business(),List.of(
+            var plan=RatisTransactionPlan.captured(List.of(x.f.directory),identity.business(),List.of(
                     new Mutation(Mutation.Kind.PUT,x.column,new byte[]{2},new byte[]{7},Mutation.ReturnMode.PREVIOUS),
                     new Mutation(Mutation.Kind.PUT,x.column,new byte[]{(byte)200},new byte[]{7},Mutation.ReturnMode.PREVIOUS)),List.of(),x.cuts);
             var commands=new HashMap<UUID,DistributedCommand>();

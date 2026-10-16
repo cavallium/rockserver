@@ -31,15 +31,15 @@ class RatisCapturedTransactionPlanTest {
             var fence=new SnapshotFence(f.directory.clusterId(), f.directory.databaseId(), new UUID(180,1), f.snapshotGroup, 1, operation(10), List.of(new DomainBinding(f.directory.domainId(), f.directory.generation(), f.directory.payloadDigest(), f.directory.schemaEpoch(), f.schema.digest())), participants);
             var initial=SnapshotFenceStatus.begin(fence); snapshotPath=f.root.resolve("writable-snapshot.journal");
             RatisDurableSnapshot.Snapshot captured;
-            try (var journal=RatisDurableSnapshot.create(snapshotPath,f.snapshots,f.data,initial,f.snapshots.prepare(operation(30),null,initial),f.directory.ranges(),TTL,RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED);
-                    var coordinator=new RatisSnapshotCoordinator(journal,f.snapshots,f.data,last -> operation(last.sequence()+1),UUID::randomUUID,TTL)) {
+            try (var journal=RatisDurableSnapshot.create(snapshotPath,f.snapshots,RatisTransactionBindings.of(f.data),initial,f.snapshots.prepare(operation(30),null,initial),f.directory.ranges(),TTL,RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED);
+                    var coordinator=new RatisSnapshotCoordinator(journal,f.snapshots,RatisTransactionBindings.of(f.data),last -> operation(last.sequence()+1),UUID::randomUUID,TTL)) {
                 boolean complete=false; for (int n=0;n<40 && !complete;n++) { int before=f.writes(); complete=coordinator.step().complete(); assertTrue(f.writes()-before<=1); }
                 assertTrue(complete); captured=journal.snapshot(); assertEquals(SnapshotFenceStatus.Phase.COMPLETE,captured.observedHome().phase()); assertTrue(captured.observedHome().allReady());
                 assertFalse(captured.observedHome().consumed()); assertEquals(RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED,captured.captureMode());
                 for (var progress:captured.participants()) { assertNotNull(progress.certifiedHandle()); assertEquals(progress.captureToken().position(),progress.certifiedHandle().position()); assertEquals(progress.releaseReceipt(),progress.nativeGate().released()); }
             }
             int opens=f.opens.get(),requests=f.captureRequests.get();
-            try (var journal=RatisDurableSnapshot.reopen(snapshotPath,f.snapshots,f.data)) {
+            try (var journal=RatisDurableSnapshot.reopen(snapshotPath,f.snapshots,RatisTransactionBindings.of(f.data))) {
                 cuts=journal.snapshot();
                 for (var progress:cuts.participants()) {
                     assertEquals(captured.participant(progress.route().groupId()).certifiedHandle(),progress.certifiedHandle());
@@ -53,7 +53,7 @@ class RatisCapturedTransactionPlanTest {
         void write(int key,int value,long sequence) throws IOException {
             assertEquals(CommandResult.Status.SUCCESS,f.data.execute(f.data.prepare(operation(sequence),List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{(byte)key},new byte[]{(byte)value})))).status());
         }
-        RatisTransactionPlan plan() { return RatisTransactionPlan.captured(f.directory,operation(100),List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{2},new byte[]{7},Mutation.ReturnMode.PREVIOUS)),List.of(),cuts); }
+        RatisTransactionPlan plan() { return RatisTransactionPlan.captured(List.of(f.directory),operation(100),List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{2},new byte[]{7},Mutation.ReturnMode.PREVIOUS)),List.of(),cuts); }
         Map<UUID,OperationId> controls(boolean finalize) { return Map.of(left,operation(finalize ? 130 : 110),right,operation(finalize ? 131 : 111)); }
         Map<UUID,DistributedCommand> accept(RatisTransactionPlan plan) throws Exception {
             var accepted=new HashMap<UUID,DistributedCommand>();
@@ -66,13 +66,13 @@ class RatisCapturedTransactionPlanTest {
             return accepted;
         }
         RatisTransactionCoordinator driver(RatisDurableTransaction journal) throws IOException {
-            return new RatisTransactionCoordinator(journal,f.homes,f.data,last -> operation(last.sequence()+1),(transaction,progress) -> {
+            return new RatisTransactionCoordinator(journal,f.homes,RatisTransactionBindings.of(f.data),last -> operation(last.sequence()+1),(transaction,progress) -> {
                 var operation=handles.get(progress.intent().route().groupId()).authorizeParticipant(progress.intent().acceptedBusiness(),progress.intent().prepareControl(),transaction);
                 return new RatisTransactionCoordinator.Authorization(operation.preparation(),operation.negative(),() -> {});
             });
         }
         RatisDurableTransaction journal(Path path,RatisTransactionPlan.Accepted accepted) throws IOException {
-            return RatisDurableTransaction.create(path,f.homes,f.data,accepted.initial(),f.homes.prepare(operation(200),null,accepted.initial()),accepted.intents());
+            return RatisDurableTransaction.create(path,f.homes,RatisTransactionBindings.of(f.data),accepted.initial(),f.homes.prepare(operation(200),null,accepted.initial()),accepted.intents());
         }
         void drain(RatisDurableTransaction journal) throws Exception {
             try (var driver=driver(journal)) { boolean complete=false; for (int n=0;n<40 && !complete;n++) { int before=f.writes(); complete=driver.step().complete(); assertTrue(f.writes()-before<=1); } assertTrue(complete); }
@@ -95,7 +95,7 @@ class RatisCapturedTransactionPlanTest {
                 assertTrue(journal.snapshot().participant(x.right).intent().acceptedBusiness().readCertification());
             }
             int requests=x.f.captureRequests.get();
-            try (var journal=RatisDurableTransaction.reopen(path,x.f.homes,x.f.data)) {
+            try (var journal=RatisDurableTransaction.reopen(path,x.f.homes,RatisTransactionBindings.of(x.f.data))) {
                 for (var progress:journal.snapshot().participants()) {
                     var original=x.cuts.participant(progress.intent().route().groupId()).certifiedHandle(); assertEquals(original.id(),progress.intent().captureId()); assertEquals(original.position(),progress.intent().acceptedBusiness().acceptance().snapshot());
                 }
@@ -126,9 +126,9 @@ class RatisCapturedTransactionPlanTest {
             var plan=x.plan(); var accepted=x.accept(plan); var transaction=new UUID(180,3); int writes=x.f.writes(),opens=x.f.opens.get(),captures=x.f.captureRequests.get();
             var missing=new HashMap<>(accepted); missing.remove(x.right); assertThrows(IllegalArgumentException.class,() -> plan.acceptCaptured(transaction,missing,x.controls(false),x.controls(true)));
             var missingCuts=new RatisDurableSnapshot.Snapshot(x.cuts.initial(),x.cuts.observedHome(),x.cuts.pendingHome(),x.cuts.homeResult(),x.cuts.homeSuperseded(),x.cuts.lastHome(),List.of(x.cuts.participant(x.left)),x.cuts.homeRetirementProof(),x.cuts.releaseRequested(),x.cuts.requestedTtl(),x.cuts.captureMode());
-            assertThrows(IllegalArgumentException.class,() -> RatisTransactionPlan.captured(x.f.directory,x.operation(100),List.of(),List.of(),missingCuts));
-            assertThrows(IllegalArgumentException.class,() -> RatisTransactionPlan.captured(x.f.directory,x.operation(100),List.of(new Mutation(Mutation.Kind.PUT,x.column,new byte[]{(byte)206},new byte[]{9})),List.of(),x.cuts));
-            assertThrows(IllegalArgumentException.class,() -> RatisTransactionPlan.captured(x.f.directory,x.operation(100),List.of(new Mutation(Mutation.Kind.PUT,x.f.schema.column(72).columnId(),new byte[]{2},new byte[]{9})),List.of(),x.cuts));
+            assertThrows(IllegalArgumentException.class,() -> RatisTransactionPlan.captured(List.of(x.f.directory),x.operation(100),List.of(),List.of(),missingCuts));
+            assertThrows(IllegalArgumentException.class,() -> RatisTransactionPlan.captured(List.of(x.f.directory),x.operation(100),List.of(new Mutation(Mutation.Kind.PUT,x.column,new byte[]{(byte)206},new byte[]{9})),List.of(),x.cuts));
+            assertThrows(IllegalArgumentException.class,() -> RatisTransactionPlan.captured(List.of(x.f.directory),x.operation(100),List.of(new Mutation(Mutation.Kind.PUT,x.f.schema.column(72).columnId(),new byte[]{2},new byte[]{9})),List.of(),x.cuts));
             var ids=new HashMap<UUID,UUID>(); x.cuts.participants().forEach(progress -> ids.put(progress.route().groupId(),progress.certifiedHandle().id())); ids.put(x.right,new UUID(182,1));
             assertThrows(IllegalArgumentException.class,() -> plan.accept(transaction,accepted,x.controls(false),x.controls(true),ids));
             var audit=accepted.get(x.left).acceptance(); var forged=new TransactionAcceptance(audit.snapshot(),audit.leaderGeneration(),new UUID(182,2),audit.scope(),audit.result());

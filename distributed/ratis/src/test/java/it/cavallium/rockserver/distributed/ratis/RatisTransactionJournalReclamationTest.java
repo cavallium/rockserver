@@ -37,7 +37,7 @@ class RatisTransactionJournalReclamationTest {
     }
     void ready(RatisTransactionRecoveryTest.Fixture f) throws Exception { retire(f,consume(f,completed(f,true))); assertTrue(f.journal.reclaimable()); }
     void missing(RatisTransactionRecoveryTest.Fixture f) {
-        assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(f.path,f.home.statuses,f.data.routed));
+        assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(f.path,f.home.statuses,RatisTransactionBindings.of(f.data.routed)));
     }
 
     @Test void explicitReclamationDiscardsConsumedSavedResultsAndRetainsTheStableLock() throws Exception {

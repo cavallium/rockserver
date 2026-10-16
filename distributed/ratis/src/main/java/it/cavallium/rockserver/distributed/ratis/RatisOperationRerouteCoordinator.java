@@ -117,7 +117,7 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
             var home=homes.read(reserved.transactionId());
             if(home!=null && home.terminal() && home.participants().isEmpty())actual=home.terminalBusinessResult();
             else {
-                check.check();try(var atomic=RatisAtomicClient.journalOwned(schema,input.targetDirectory(),homes,routed,scheduler,RatisAtomicClient.Limits.defaults(),access);var operation=Files.exists(input.atomicPath()) ? atomic.reopenInline(input.atomicPath(),context,check) : atomic.executeReservedPlanInline(input.atomicPath(),identity,reserved,RatisTransactionPlan.fromOriginal(input.targetDirectory(),input.originalCommand()),evidence,input.captureTtl(),context,check)) {
+                check.check();try(var atomic=RatisAtomicClient.journalOwned(RatisTransactionBindings.of(schema,input.targetDirectory(),routed),homes,scheduler,RatisAtomicClient.Limits.defaults(),access);var operation=Files.exists(input.atomicPath()) ? atomic.reopenInline(input.atomicPath(),context,check) : atomic.executeReservedPlanInline(input.atomicPath(),identity,reserved,RatisTransactionPlan.fromOriginal(input.targetDirectory(),input.originalCommand()),evidence,input.captureTtl(),context,check)) {
                     actual=operation.resumeInline(context,check);
                     if(operation.rejectedBeforeRegistration())abort(job,reserved,check);else intents=operation.snapshot().participants().stream().map(p->p.intent()).toList();
                 }
@@ -212,7 +212,7 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
                     }
                     boolean atomicPresent=Files.exists(input.atomicPath()),rejected=atomicPresent && RatisAtomicRejection.isRejection(input.atomicPath());
                     if(atomicPresent) {
-                        try(var atomic=RatisAtomicClient.journalOwned(schema,input.targetDirectory(),homes,routed,scheduler,RatisAtomicClient.Limits.defaults(),access);var operation=atomic.reopenForConsumptionInline(input.atomicPath(),context,check)){operation.consumeInline(context,check);}
+                        try(var atomic=RatisAtomicClient.journalOwned(RatisTransactionBindings.of(schema,input.targetDirectory(),routed),homes,scheduler,RatisAtomicClient.Limits.defaults(),access);var operation=atomic.reopenForConsumptionInline(input.atomicPath(),context,check)){operation.consumeInline(context,check);}
                     }
                     if((!atomicPresent || rejected) && input.origin()!=null) {
                         if(!rejected && job.credited && input.originalCommand().kind()==DistributedCommand.Kind.DATA)throw new IOException("Accepted reroute lost its atomic journal; reserved identity cannot prove promoted retirement");

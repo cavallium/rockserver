@@ -31,7 +31,7 @@ class RatisRocksDBRangeTest {
     static final class RangeAllocations implements RatisRocksDBAdapter.AllocationSource {
         final RatisAtomicClientTest.Fixture f; final AtomicInteger count=new AtomicInteger();
         RangeAllocations(RatisAtomicClientTest.Fixture f) { this.f=f; }
-        public CompletableFuture<RatisRocksDBAdapter.Allocation> allocate(RequestContext context) {
+        public CompletableFuture<RatisRocksDBAdapter.Allocation> allocate(RequestContext context,List<RatisBackendSessions.Target> dataTargets) {
             int n=count.getAndIncrement(); long base=n*513L;
             var snapshot=new RatisSnapshotClient.Identity(new UUID(230,n*2+1),new OperationId(f.session,1,base),new OperationId(f.session,1,base+1));
             // Range helpers borrow only the snapshot block; this disjoint commit block is never dispatched.
@@ -43,12 +43,12 @@ class RatisRocksDBRangeTest {
         seed(f,74,member(2,"alpha"),value(1),1900); seed(f,74,member(2,"beta"),value(2),1901);
         seed(f,74,member(200,"alpha"),value(3),1902); seed(f,74,member(200,"beta"),value(4),1903);
     }
-    static RatisSnapshotClient snapshots(RatisAtomicClientTest.Fixture f) { return new RatisSnapshotClient(f.schema,f.snapshots,f.data,f.scheduler,RatisSnapshotClient.Limits.defaults()); }
+    static RatisSnapshotClient snapshots(RatisAtomicClientTest.Fixture f) { return new RatisSnapshotClient(RatisTransactionBindings.of(f.schema,f.data.directory(f.schema),f.data),f.snapshots,f.scheduler,RatisSnapshotClient.Limits.defaults()); }
 
     @Test void zeroTransactionPagesCrossGroupsAndUseExclusiveLogicalResumeInBothDirections() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("pages"),true); var transactions=client(f,f.data); var snapshots=snapshots(f)) {
             buckets(f); var source=new RangeAllocations(f);
-            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,ranges)) {
+            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new Allocations(f),null,ranges)) {
                 var api=adapter.api(CONTEXT);
                 var first=await(api.getRangePageAsync(0,74,key(2),key(201),false,null,RequestType.<KV>allInRange(),new RangeBudget(2,1024)));
                 assertEquals(List.of(member(2,"alpha"),member(2,"beta")),keys(first)); assertTrue(first.hasMore());
@@ -65,7 +65,7 @@ class RatisRocksDBRangeTest {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("iterators"),true); var transactions=client(f,f.data); var snapshots=snapshots(f)) {
             seed(f,71,key(2),value(1),1900); seed(f,71,key(4),value(2),1901); seed(f,71,key(200),value(3),1902);
             var source=new RangeAllocations(f);
-            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,ranges)) {
+            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new Allocations(f),null,ranges)) {
                 var api=adapter.api(CONTEXT); long id=await(api.openIteratorAsync(0,71,key(1),key(201),false,TTL));
                 seed(f,71,key(4),value(9),1903);
                 var fresh=await(api.getRangePageAsync(0,71,key(1),key(201),false,null,RequestType.<KV>allInRange(),RangeBudget.DEFAULT)); bytes(9,fresh.items().get(1).value());
@@ -84,7 +84,7 @@ class RatisRocksDBRangeTest {
     @Test void collisionMemberSeekRetainsLogicalCaptureBounds() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("member-seek"),true); var transactions=client(f,f.data); var snapshots=snapshots(f)) {
             buckets(f); var source=new RangeAllocations(f);
-            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,ranges)) {
+            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new Allocations(f),null,ranges)) {
                 var api=adapter.api(CONTEXT);
                 long iterator=await(api.openIteratorAsync(0,74,member(2,"beta"),member(200,"beta"),true,TTL));
                 await(api.seekToAsync(iterator,member(200,"alpha")));
@@ -104,7 +104,7 @@ class RatisRocksDBRangeTest {
     @Test void reductionsAndDemandDrivenStreamReadLogicalRows() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("reductions"),true); var transactions=client(f,f.data); var snapshots=snapshots(f)) {
             buckets(f); var source=new RangeAllocations(f);
-            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,ranges)) {
+            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new Allocations(f),null,ranges)) {
                 var api=adapter.api(CONTEXT);
                 assertEquals(4L,await(api.reduceRangeAsync(0,74,key(2),key(201),false,RequestType.<KV>entriesCount())));
                 var ends=await(api.reduceRangeAsync(0,74,key(2),key(201),false,RequestType.<KV>firstAndLast()));
@@ -120,7 +120,7 @@ class RatisRocksDBRangeTest {
     @Test void firstAndLastUsesOneCutAcrossBothEdgesAndSupportsReverseAndEmptyRanges() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("edges"),true); var transactions=client(f,f.data); var snapshots=snapshots(f)) {
             seed(f,71,key(2),value(1),1900); seed(f,71,key(200),value(3),1901); var source=new RangeAllocations(f);
-            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,ranges)) {
+            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new Allocations(f),null,ranges)) {
                 var reads=new AtomicInteger();
                 f.beforeSnapshotRead=() -> { if (reads.incrementAndGet()==2) try { seed(f,71,key(200),value(9),1902); } catch (IOException failure) { throw new CompletionException(failure); } };
                 FirstAndLast<KV> ends;
@@ -137,7 +137,7 @@ class RatisRocksDBRangeTest {
     @Test void cancellationDuringNativePageRetainsOwnerUntilActualCallbackReturns() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("cancel"),true); var transactions=client(f,f.data); var snapshots=snapshots(f)) {
             seed(f,71,key(2),value(1),1900); var entered=new CountDownLatch(1); var proceed=new CountDownLatch(1); var source=new RangeAllocations(f);
-            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,ranges)) {
+            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new Allocations(f),null,ranges)) {
                 var stream=adapter.api(CONTEXT).getRangeAsync(0,71,key(1),key(3),false,RequestType.<KV>allInRange()); assertEquals(0,source.count.get()); assertEquals(0,snapshots.stats().leases());
                 f.beforeSnapshotRead=() -> { entered.countDown(); try { if (!proceed.await(5,TimeUnit.SECONDS)) throw new AssertionError("Native page was not unblocked"); } catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new AssertionError(failure); } };
                 try {
@@ -155,7 +155,7 @@ class RatisRocksDBRangeTest {
     @Test void expiredIteratorIdFailsAndReleasesItsOriginalCut() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("expired"),true); var transactions=client(f,f.data); var snapshots=snapshots(f)) {
             seed(f,71,key(2),value(1),1900); var source=new RangeAllocations(f);
-            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,ranges)) {
+            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new Allocations(f),null,ranges)) {
                 var api=adapter.api(CONTEXT); long id=await(api.openIteratorAsync(0,71,key(1),key(3),false,Duration.ofSeconds(1)));
                 Thread.sleep(1100);
                 error(RocksDBException.RocksDBErrorType.TX_NOT_FOUND,api.subsequentAsync(id,0,1,RequestType.<Buf>multi()));
@@ -182,7 +182,7 @@ class RatisRocksDBRangeTest {
                 }
             };
             try (var data=new RatisRoutedClient(f.directory,transport); var transactions=client(f,data);
-                 var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,null)) {
+                 var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new Allocations(f),null,null)) {
                 var api=adapter.api(CONTEXT); long tx=await(api.openTransactionAsync(scope(71,72,73,74), TTL));
                 CompletableFuture<FirstAndLast<KV>> first=api.reduceRangeAsync(tx,71,key(1),key(201),false,RequestType.<KV>firstAndLast()),second;
                 try { assertTrue(entered.await(5,TimeUnit.SECONDS)); second=api.reduceRangeAsync(tx,71,key(1),key(201),false,RequestType.<KV>firstAndLast()); }
@@ -215,7 +215,7 @@ class RatisRocksDBRangeTest {
                 }
             };
             try (var data=new RatisRoutedClient(f.directory,transport); var transactions=client(f,data);
-                 var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,null)) {
+                 var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new Allocations(f),null,null)) {
                 var api=adapter.api(CONTEXT); long tx=await(api.openTransactionAsync(scope(71,72,73,74), TTL));
                 var first=new CompletableFuture<KV>(); var terminal=new CompletableFuture<Throwable>(); var rows=new AtomicInteger();
                 var subscriber=new reactor.core.publisher.BaseSubscriber<KV>() {
@@ -240,7 +240,7 @@ class RatisRocksDBRangeTest {
     @Test void transactionRangesSeeStagedPrefixAndNeverSilentlyContinueAcrossPrefixChanges() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("transaction"),true); var transactions=client(f,f.data); var snapshots=snapshots(f)) {
             seed(f,71,key(2),value(1),1900); seed(f,71,key(200),value(3),1901); var source=new RangeAllocations(f);
-            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new Allocations(f),null,ranges)) {
+            try (var ranges=new RatisRocksDBRanges(f.schema,f.directory,snapshots,source); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new Allocations(f),null,ranges)) {
                 var api=adapter.api(CONTEXT); long tx=await(api.openTransactionAsync(scope(71,72,73,74), TTL)); await(api.putAsync(tx,71,key(2),value(7),RequestType.<Buf>none()));
                 var page=await(api.getRangePageAsync(tx,71,key(1),key(201),false,null,RequestType.<KV>allInRange(),RangeBudget.DEFAULT)); bytes(7,page.items().getFirst().value());
                 long iterator=await(api.openIteratorAsync(tx,71,key(1),key(201),false,TTL)); assertEquals(List.of(7),numbers(await(api.subsequentAsync(iterator,0,1,RequestType.<Buf>multi()))));

@@ -47,10 +47,10 @@ class RatisWritableLeaseTest {
             return reply;
         }
     }
-    RatisSnapshotClient client(Fixture f,RatisRoutedClient data) { return new RatisSnapshotClient(f.schema,f.snapshots,data,f.scheduler,RatisSnapshotClient.Limits.defaults(),RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED); }
+    RatisSnapshotClient client(Fixture f,RatisRoutedClient data) { return new RatisSnapshotClient(RatisTransactionBindings.of(f.schema,data.directory(f.schema),data),f.snapshots,f.scheduler,RatisSnapshotClient.Limits.defaults(),RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED); }
     static RatisTransactionPlan prefix(Fixture f,RatisSnapshotClient.Lease lease,List<RatisLogicalClient.Change> changes) throws Exception {
-        var logical=RatisLogicalClient.plan(f.schema,changes,List.of());
-        return RatisTransactionPlan.captured(f.directory,f.identity(4).business(),logical.mutations(),logical.predicates(),lease.snapshot());
+        var logical=RatisLogicalClient.plan(scopeColumnId -> f.schema,changes,List.of());
+        return RatisTransactionPlan.captured(List.of(f.directory),f.identity(4).business(),logical.mutations(),logical.predicates(),lease.snapshot());
     }
     static List<RatisLogicalClient.Change> edits() {
         return List.of(RatisLogicalClient.Change.put(71,key(2),value(9),Mutation.ReturnMode.CURRENT),

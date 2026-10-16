@@ -50,12 +50,12 @@ class RatisRocksDBConnectionTest {
             assertEquals(CommandResult.Status.SUCCESS,schemas.execute(schemas.prepare(f.outer.operation(3),f.schema)).status());
             var catalogue=new RatisCatalogue(f.catalogue.client,f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn);
             assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepare(f.outer.operation(4),null,f.directory)).status());
-            factory=(schema,directory,path,ids) -> {
+            factory=(generationBindings,path,ids)->{if(generationBindings.domains().size()!=1)throw new java.io.IOException("This singleton fixture requires one domain");var selectedDomain=generationBindings.domains().getFirst();var schema=selectedDomain.schema();var directory=selectedDomain.directory();
                 var session=first ? direct.session : RatisDurableSessionClient.reopen(direct.window,direct.routed);
                 var writer=first ? direct.direct : direct.budget.open(schema,direct.routed,session,f.scheduler,direct.journal,direct.window); first=false;
-                var transactions=new RatisTransactionClient(schema,f.snapshots,f.homes,f.data,f.scheduler,RatisTransactionClient.Limits.defaults());
-                var snapshots=suppliedSnapshots==null ? new RatisSnapshotClient(schema,f.snapshots,f.data,f.scheduler,RatisSnapshotClient.Limits.defaults()) : suppliedSnapshots;
-                var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(schema,directory,transactions,allocations,writer,ranges,ids);
+                var transactions=new RatisTransactionClient(RatisTransactionBindings.of(schema,f.data.directory(schema),f.data),f.snapshots,f.homes,f.scheduler,RatisTransactionClient.Limits.defaults());
+                var snapshots=suppliedSnapshots==null ? new RatisSnapshotClient(RatisTransactionBindings.of(schema,f.data.directory(schema),f.data),f.snapshots,f.scheduler,RatisSnapshotClient.Limits.defaults()) : suppliedSnapshots;
+                var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(schema,directory,(transactions).bindings().domain((schema).domainId()).client()),transactions,allocations,writer,ranges,ids);
                 return new RatisRocksDBConnection.Generation(adapter,writer,ranges,transactions,snapshots,List.of(session));
             };
         }
@@ -99,7 +99,7 @@ class RatisRocksDBConnectionTest {
             assertEquals(1,java.nio.ByteBuffer.wrap(SessionJournalFiles.read(ledger,4096)).getInt());
             // Crash after binding force, before capacity.bound and before controller DONE.
             var folder=Files.createDirectory(bindings.resolve(RatisGenerationRegistry.key(target,directory))); byte[] a=DistributedSchemaCodec.encode(target),b=RangeDirectoryCodec.encode(directory);
-            SessionJournalFiles.write(folder.resolve("binding"),java.nio.ByteBuffer.allocate(8+a.length+b.length).putInt(a.length).put(a).putInt(b.length).put(b).array(),8*1024*1024); SessionJournalFiles.force(bindings);
+            SessionJournalFiles.write(folder.resolve("binding"),java.nio.ByteBuffer.allocate(12+a.length+b.length).putInt(1).putInt(a.length).put(a).putInt(b.length).put(b).array(),8*1024*1024); SessionJournalFiles.force(bindings);
             var forced=new ArrayList<Path>(); var failRoot=new java.util.concurrent.atomic.AtomicBoolean(true);
             RatisGenerationRegistry.Capacity.BindingForce force=path -> { forced.add(path); if(path.equals(bindings) && failRoot.getAndSet(false)) throw new IOException("Uncertain generations directory force"); SessionJournalFiles.force(path); };
             assertThrows(IOException.class,() -> new RatisGenerationRegistry.Capacity(ledger,bindings,sdk,2,true,force, RatisJournalAccess.standalone()));
@@ -140,8 +140,8 @@ class RatisRocksDBConnectionTest {
             nativeSchema.beforeDataCommand=command -> { if(command.sessionControl()!=null) epochs.sessionControlAdmission(routed.get().directory(),command.groupId()).accept(command); };
             // Native controls are activated only after fresh catalogue proposal authority is installed.
             for(var peer:nativeSchema.peers) peer.store.enableSessionControls();
-            RatisRocksDBAdapter.AllocationSource unused=context -> CompletableFuture.failedFuture(new IOException("This schema fixture does not implement transaction capture RPC"));
-            RatisRocksDBConnection.GenerationFactory factory=(schema,directory,path,ids) -> {
+            RatisRocksDBAdapter.AllocationSource unused=(context,dataTargets)-> CompletableFuture.failedFuture(new IOException("This schema fixture does not implement transaction capture RPC"));
+            RatisRocksDBConnection.GenerationFactory factory=(generationBindings,path,ids)->{if(generationBindings.domains().size()!=1)throw new java.io.IOException("This singleton fixture requires one domain");var selectedDomain=generationBindings.domains().getFirst();var schema=selectedDomain.schema();var directory=selectedDomain.directory();
                 var data=routed.get();
                 // Production factory owns constructor unwind and all generation wrappers.
                 return RatisRocksDBConnection.durableGenerationFactory(data,homes.scheduler,homes.snapshots,homes.homes,epochs,epochs.catalogue(nativeSchema.catalogue.directoryColumn()),header->epochs.topologyCatalogue(nativeSchema.catalogue.directoryColumn()).readDefinition(header.definitionDigest()).sourceDirectory(),unused,new RatisRocksDBConnection.SessionFactory(List.of(data),(generationRoot,selected,bindings)-> {var placement=bindings.directory(selected.domainId());
@@ -153,7 +153,7 @@ class RatisRocksDBConnectionTest {
                         assertEquals(CommandResult.Status.SUCCESS,data.execute(data.prepareSessionControl(control)).status());
                     }
                     return RatisDurableSessionClient.create(window,data,issuance,grant,RatisSessionClient.Limits.defaults());
-                }),List.of(),pointBudget.shared).create(schema,directory,path,ids);
+                }),List.of(),pointBudget.shared).create(generationBindings,path,ids);
             };
             Path connectionRoot=root.resolve("dynamic-connection"); var limits=new RatisRocksDBConnection.Limits(4,64,8,128L*1024*1024,8);
             long recreated;RemoteMutationToken retainedToken;
@@ -199,13 +199,13 @@ class RatisRocksDBConnectionTest {
             for(var peer:nativeSchema.peers) peer.store.enableSessionControls();
             var activePins=new AtomicInteger(); var transactionSchemas=new ArrayList<Long>(); var cursorSchemas=new ArrayList<Long>();
             var dataKey=new Keys(Buf.wrap(new byte[]{0,0,0,0,0,0,0,2}));
-            RatisRocksDBConnection.GenerationFactory factory=(schema,directory,path,ids) -> {
+            RatisRocksDBConnection.GenerationFactory factory=(generationBindings,path,ids)->{if(generationBindings.domains().size()!=1)throw new java.io.IOException("This singleton fixture requires one domain");var selectedDomain=generationBindings.domains().getFirst();var schema=selectedDomain.schema();var directory=selectedDomain.directory();
                 var base=RatisRocksDBConnection.durableGenerationFactory(nativeSchema.routed,homes.scheduler,homes.snapshots,homes.homes,epochs,epochs.catalogue(nativeSchema.catalogue.directoryColumn()),header->epochs.topologyCatalogue(nativeSchema.catalogue.directoryColumn()).readDefinition(header.definitionDigest()).sourceDirectory(),allocations,new RatisRocksDBConnection.SessionFactory(List.of(nativeSchema.routed),(generationRoot,selected,bindings)-> {var placement=bindings.directory(selected.domainId());
                     Path window=generationRoot.resolve("window.bin"); if(Files.exists(window)) return RatisDurableSessionClient.reopen(window,nativeSchema.routed);
                     var before=epochs.read(); var issuance=before.issue(UUID.randomUUID(),1000); var grant=issuance.grants().getLast(); assertEquals(CommandResult.Status.SUCCESS,epochs.execute(epochs.prepare(nativeSchema.outer.operation(operations.getAndIncrement()),before,issuance)).status());
                     for(var range:placement.ranges()) { var control=epochs.prepareSessionBinding(placement,range.groupId(),new OperationId(new UUID(950,1),issuance.nextEpoch(),operations.getAndIncrement()),grant,32,-1); assertEquals(CommandResult.Status.SUCCESS,nativeSchema.routed.execute(nativeSchema.routed.prepareSessionControl(control)).status()); }
                     return RatisDurableSessionClient.create(window,nativeSchema.routed,issuance,grant,RatisSessionClient.Limits.defaults());
-                }),List.of(),pointBudget.shared).create(schema,directory,path,ids);
+                }),List.of(),pointBudget.shared).create(generationBindings,path,ids);
                 try {
                     var transactions=mock(RatisTransactionClient.class); var snapshots=mock(RatisSnapshotClient.class);
                     when(transactions.open(any(),any(),any(),any(),any(),any())).thenAnswer(call -> {
@@ -224,7 +224,7 @@ class RatisRocksDBConnectionTest {
                         Runnable release=() -> { if(closed.compareAndSet(false,true)) { pin.close(); activePins.decrementAndGet(); } };
                         when(lease.release(any())).thenAnswer(releasing -> { release.run(); return CompletableFuture.completedFuture(null); }); doAnswer(close -> { release.run(); return null; }).when(lease).close(); return lease;
                     });
-                    var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(schema,directory,transactions,allocations,base.direct(),ranges,ids);
+                    var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(schema,directory,(transactions).bindings().domain((schema).domainId()).client()),transactions,allocations,base.direct(),ranges,ids);
                     return new RatisRocksDBConnection.Generation(adapter,base.direct(),ranges,transactions,snapshots,List.of(base));
                 } catch(Throwable failure) { try { base.close(); } catch(Throwable cleanup) { failure.addSuppressed(cleanup); } if(failure instanceof IOException io) throw io; throw new IOException(failure); }
             };

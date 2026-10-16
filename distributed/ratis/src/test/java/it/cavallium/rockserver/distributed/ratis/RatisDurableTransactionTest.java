@@ -24,7 +24,7 @@ class RatisDurableTransactionTest {
         return new Plan(initial,home.statuses.prepare(homeOperation(0),null,initial),intent);
     }
     RatisDurableTransaction create(Path path,RatisParticipantPrepareTest.Node home,RatisParticipantPrepareTest.Node data,Plan plan) throws Exception {
-        return RatisDurableTransaction.create(path,home.statuses,data.routed,plan.initial(),plan.registration(),List.of(plan.intent()));
+        return RatisDurableTransaction.create(path,home.statuses,RatisTransactionBindings.of(data.routed),plan.initial(),plan.registration(),List.of(plan.intent()));
     }
     @Test void deniedPersistenceWorkspaceDoesNotEncodeRetainedMetadata()throws Exception {
         helper.root=root;
@@ -35,7 +35,7 @@ class RatisDurableTransactionTest {
             org.mockito.Mockito.doAnswer(call->{var result=org.mockito.Mockito.spy(home.statuses.execute(call.getArgument(0)));retained.set(result);return result;})
                     .when(homes).execute(org.mockito.ArgumentMatchers.any(RatisRoutedClient.PreparedCommand.class));
             try(var credit=budget.request(RemoteMutationToken.Kind.RANGE,0);
-                    var journal=RatisDurableTransaction.createAccounted(root.resolve("count.bin"),homes,data.routed,plan.initial(),plan.registration(),List.of(plan.intent()),null,budget,credit)) {
+                    var journal=RatisDurableTransaction.createAccounted(root.resolve("count.bin"),homes,RatisTransactionBindings.of(data.routed),plan.initial(),plan.registration(),List.of(plan.intent()),null,budget,credit)) {
                 org.mockito.Mockito.doThrow(new IllegalStateException("Workspace denied before metadata encoding")).when(budget).work(org.mockito.ArgumentMatchers.anyLong());
                 assertThrows(IOException.class,journal::executeHome);
                 assertNotNull(retained.get());org.mockito.Mockito.verify(retained.get(),org.mockito.Mockito.never()).encode();
@@ -49,14 +49,14 @@ class RatisDurableTransactionTest {
             var plan=plan(home,data,pin); Path path=root.resolve("transaction.bin"); var journal=create(path,home,data,plan);
             try {
                 home.wire.lose=true; assertThrows(IOException.class,journal::executeHome); assertEquals(plan.initial(),home.statuses.read(plan.initial().transactionId()));
-                assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,data.routed));
-                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
+                assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed)));
+                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed));
                 assertEquals(plan.initial(),journal.refreshHome()); assertEquals(CommandResult.Status.SUCCESS,journal.executeHome().status());
                 try (var preparation=data.f.machine.prepareParticipant(pin,data.f.put(2),helper.control(0),home.statuses,plan.initial().transactionId())) {
                     journal.freezePreparation(data.routed.prepareParticipant(preparation.preparation())); data.wire.lose=true;
                     var owned=journal; assertThrows(IOException.class,() -> owned.executePreparation(data.f.groupId));
                 }
-                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
+                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed));
                 var prepared=journal.resolveParticipant(data.f.groupId); assertTrue(prepared.vote().prepared());
                 var ready=plan.initial().prepared(data.f.groupId,plan.intent().acceptedBusiness().payloadDigest(),prepared.vote().position());
                 journal.queueHome(home.statuses.prepare(homeOperation(1),plan.initial(),ready)); assertEquals(CommandResult.Status.SUCCESS,journal.executeHome().status());
@@ -65,12 +65,12 @@ class RatisDurableTransactionTest {
                     journal.freezeFinalization(data.routed.prepareFinalization(finalization.finalization())); data.wire.lose=true;
                     var owned=journal; assertThrows(IOException.class,() -> owned.executeFinalization(data.f.groupId));
                 }
-                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
+                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed));
                 var outcome=journal.resolveParticipant(data.f.groupId).outcome(); assertNotNull(outcome); assertEquals(TransactionStatus.Phase.COMMIT,outcome.finalization().decision().phase());
                 assertArrayEquals(plan.intent().acceptedBusiness().acceptance().result(),outcome.result()); assertArrayEquals(new byte[]{7},data.routed.read(data.f.column,new byte[]{2}));
                 var ack=commit.finalized(data.f.groupId); journal.queueRecovery(ack); journal.executeHome();
                 var consumed=ack.consume(); journal.queueRecovery(consumed); journal.executeHome(); assertTrue(journal.snapshot().observedHome().gcEligible());
-                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
+                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed));
                 assertTrue(journal.snapshot().observedHome().gcEligible()); assertEquals(outcome,journal.snapshot().participant(data.f.groupId).outcome()); helper.released(data);
             } finally { journal.close(); }
         }
@@ -87,7 +87,7 @@ class RatisDurableTransactionTest {
                 home.wire.command(home.directory.ranges().getFirst(),DistributedCommand.advanceSessionEpochFloor(home.f.groupId,1,new byte[32],new OperationId(home.f.admin,2,0),2));
                 home.wire.lose=true; var owned=journal; assertThrows(IOException.class,owned::executeHome);
                 var nativeAbort=home.statuses.recoveryResult(frozen); assertNotNull(nativeAbort); assertNull(journal.snapshot().recoveryReceipt());
-                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
+                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed));
                 assertArrayEquals(frozen.bytes(),journal.snapshot().pendingRecovery().bytes()); assertEquals(frozen.descriptor(),journal.snapshot().pendingRecovery().descriptor());
                 assertEquals(CommandResult.Status.SUCCESS,journal.executeHome().status()); assertEquals(nativeAbort,journal.snapshot().recoveryReceipt()); assertEquals(ordinary,journal.snapshot().lastHome());
                 var ack=abort.finalized(data.f.groupId); owned=journal; var noProof=owned; assertThrows(IllegalArgumentException.class,() -> noProof.queueRecovery(ack));
@@ -98,12 +98,12 @@ class RatisDurableTransactionTest {
                 journal.queueRecovery(ack); var frozenAck=journal.snapshot().pendingRecovery();
                 assertEquals(frozen.recovery().operation().sessionId(),frozenAck.recovery().operation().sessionId()); assertEquals(1,frozenAck.recovery().operation().sequence());
                 frozenAck.recovery().requireOutcome(journal.snapshot().participant(data.f.groupId).outcome()); home.wire.lose=true; owned=journal; assertThrows(IOException.class,owned::executeHome);
-                var nativeAck=home.statuses.recoveryResult(frozenAck); journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
+                var nativeAck=home.statuses.recoveryResult(frozenAck); journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed));
                 assertArrayEquals(frozenAck.bytes(),journal.snapshot().pendingRecovery().bytes()); journal.executeHome(); assertEquals(nativeAck,journal.snapshot().recoveryReceipt());
                 long index=home.wire.index; journal.executeHome(); assertEquals(index,home.wire.index); assertEquals(CommandResult.Status.CONFLICT,journal.result().status()); assertFalse(journal.snapshot().observedHome().consumed());
-                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed); assertEquals(nativeAck,journal.snapshot().recoveryReceipt()); assertEquals(ordinary,journal.snapshot().lastHome());
+                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed)); assertEquals(nativeAck,journal.snapshot().recoveryReceipt()); assertEquals(ordinary,journal.snapshot().lastHome());
                 journal.queueRecovery(ack.consume());var frozenConsume=journal.snapshot().pendingRecovery();assertEquals(HomeRecovery.Action.CONSUME,frozenConsume.recovery().action());assertEquals(frozenAck.recovery().operation().sessionId(),frozenConsume.recovery().operation().sessionId());assertEquals(2,frozenConsume.recovery().operation().sequence());journal.executeHome();
-                assertEquals(ordinary,journal.snapshot().lastHome());assertEquals(frozenConsume.recovery(),journal.snapshot().recoveryReceipt().recovery());journal.close();journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);assertArrayEquals(frozenConsume.bytes(),journal.snapshot().pendingRecovery().bytes());assertTrue(journal.snapshot().observedHome().consumed());
+                assertEquals(ordinary,journal.snapshot().lastHome());assertEquals(frozenConsume.recovery(),journal.snapshot().recoveryReceipt().recovery());journal.close();journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed));assertArrayEquals(frozenConsume.bytes(),journal.snapshot().pendingRecovery().bytes());assertTrue(journal.snapshot().observedHome().consumed());
             } finally { journal.close(); }
         }
     }
@@ -144,7 +144,7 @@ class RatisDurableTransactionTest {
                     Files.createDirectory(path.resolveSibling(path.getFileName()+".pending")); var operation=data.routed.prepareParticipant(preparation.preparation()); var owned=journal;
                     assertThrows(IOException.class,() -> owned.freezePreparation(operation)); assertThrows(IOException.class,() -> owned.executePreparation(data.f.groupId)); assertEquals(0,data.wire.index);
                 }
-                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed); assertEquals(plan.initial(),journal.snapshot().observedHome()); assertNull(journal.snapshot().participant(data.f.groupId).preparation()); helper.released(data);
+                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed)); assertEquals(plan.initial(),journal.snapshot().observedHome()); assertNull(journal.snapshot().participant(data.f.groupId).preparation()); helper.released(data);
             } finally { journal.close(); }
         }
     }
@@ -156,11 +156,11 @@ class RatisDurableTransactionTest {
                 journal.executeHome(); var entered=new CountDownLatch(1); var release=new CountDownLatch(1);
                 home.wire.afterRead=() -> { entered.countDown(); try { if (!release.await(5,TimeUnit.SECONDS)) throw new AssertionError("Fixture timeout"); } catch (InterruptedException e) { throw new AssertionError(e); } };
                 var pending=executor.submit(journal::refreshHome);
-                try { assertTrue(entered.await(5,TimeUnit.SECONDS)); assertThrows(IOException.class,journal::close); assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,data.routed)); }
+                try { assertTrue(entered.await(5,TimeUnit.SECONDS)); assertThrows(IOException.class,journal::close); assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed))); }
                 finally { release.countDown(); }
                 assertEquals(plan.initial(),pending.get(5,TimeUnit.SECONDS));
             } finally { journal.close(); }
-            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,data.routed)) { assertEquals(plan.initial(),reopened.snapshot().observedHome()); }
+            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed))) { assertEquals(plan.initial(),reopened.snapshot().observedHome()); }
         }
     }
     @Test void exclusiveChecksumAndDatabaseBindingsRejectInvalidReopenWithoutRpc() throws Exception {
@@ -169,9 +169,9 @@ class RatisDurableTransactionTest {
             var plan=plan(home,data,pin); Path path=root.resolve("bound.bin");
             try (var journal=create(path,home,data,plan)) { assertThrows(IOException.class,() -> create(path,home,data,plan)); }
             var source=data.directory; var wrong=new RangeDirectory(source.clusterId(),source.databaseId(),new UUID(0,1510),source.schemaEpoch(),source.schemaDigest(),source.generation(),source.columns(),source.routingPrefixBytes(),source.ranges());
-            try (var other=new RatisRoutedClient(wrong,data.wire)) { assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,other)); }
+            try (var other=new RatisRoutedClient(wrong,data.wire)) { assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(other))); }
             byte[] bytes=Files.readAllBytes(path); bytes[bytes.length-1]^=1; Files.write(path,bytes);
-            assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,data.routed)); assertEquals(0,home.wire.index); assertEquals(0,data.wire.index);
+            assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed))); assertEquals(0,home.wire.index); assertEquals(0,data.wire.index);
         }
     }
     @Test void laterParticipantVotesAndRefreshedHomeRoutesRemainFrozenAcrossReopen() throws Exception {
@@ -194,17 +194,17 @@ class RatisDurableTransactionTest {
                 var la=left.f.machine.participantIntent(lp,lb); var ra=right.f.machine.participantIntent(rp,rb);
                 var intents=List.of(new RatisDurableTransaction.Intent(l,la,helper.control(0),new OperationId(new UUID(0,1604),3,0),List.of()),new RatisDurableTransaction.Intent(r,ra,helper.control(1),new OperationId(new UUID(0,1605),3,0),List.of()));
                 var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(0,1603), operation, List.of(new DomainBinding(domain, 0, new byte[32], 1, new byte[32])), RatisDurableTransaction.planDigest(intents), List.of(new TransactionStatus.Participant(domain, l.rangeId(), l.groupId(), 1, new byte[32], la.payloadDigest(), null, false),new TransactionStatus.Participant(domain, r.rangeId(), r.groupId(), 1, new byte[32], ra.payloadDigest(), null, false)));
-                Path path=root.resolve("multi.bin"); var journal=RatisDurableTransaction.create(path,home.statuses,routed,initial,home.statuses.prepare(homeOperation(0),null,initial),intents);
+                Path path=root.resolve("multi.bin"); var journal=RatisDurableTransaction.create(path,home.statuses,RatisTransactionBindings.of(routed),initial,home.statuses.prepare(homeOperation(0),null,initial),intents);
                 try {
                     journal.executeHome();
                     try (var prepare=left.f.machine.prepareParticipant(lp,lb,helper.control(0),home.statuses,initial.transactionId())) { journal.freezePreparation(routed.prepareParticipant(prepare.preparation())); journal.executePreparation(l.groupId()); }
                     var leftVote=journal.snapshot().participant(l.groupId()).vote(); var one=initial.prepared(l.groupId(),la.payloadDigest(),leftVote.position()); journal.queueHome(home.statuses.prepare(homeOperation(1),initial,one)); journal.executeHome();
                     try (var prepare=right.f.machine.prepareParticipant(rp,rb,helper.control(1),home.statuses,initial.transactionId())) { assertEquals(one,prepare.preparation().registration()); journal.freezePreparation(routed.prepareParticipant(prepare.preparation())); right.wire.lose=true; var owned=journal; assertThrows(IOException.class,() -> owned.executePreparation(r.groupId())); }
-                    journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,routed); assertEquals(one,journal.snapshot().participant(r.groupId()).preparation().preparation().registration());
+                    journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(routed)); assertEquals(one,journal.snapshot().participant(r.groupId()).preparation().preparation().registration());
                     var rightVote=journal.resolveParticipant(r.groupId()).vote(); var ready=one.prepared(r.groupId(),ra.payloadDigest(),rightVote.position());
                     var old=home.directory.ranges().getFirst(); var refreshed=new RangeDescriptor(old.rangeId(),old.groupId(),old.rangeEpoch(),1,null,null,RangeDescriptor.TopologyState.ACTIVE,old.replicas()); home.routed.refresh(new RangeDirectory(helper.cluster,helper.database,home.directory.domainId(),1,new byte[32],1,home.directory.columns(),0,List.of(refreshed)));
                     journal.queueHome(home.statuses.prepare(homeOperation(2),one,ready)); home.wire.lose=true; var owned=journal; assertThrows(IOException.class,owned::executeHome);
-                    journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,routed); assertEquals(1,journal.snapshot().pendingHome().descriptor().configurationVersion()); journal.refreshHome(); journal.executeHome();
+                    journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(routed)); assertEquals(1,journal.snapshot().pendingHome().descriptor().configurationVersion()); journal.refreshHome(); journal.executeHome();
                     var commit=ready.decide(TransactionStatus.Phase.COMMIT); journal.queueHome(home.statuses.prepare(homeOperation(3),ready,commit)); journal.executeHome();
                     try (var finalize=left.f.machine.prepareFinalization(home.statuses,initial.transactionId(),intents.get(0).finalizeControl())) { journal.freezeFinalization(routed.prepareFinalization(finalize.finalization())); journal.executeFinalization(l.groupId()); }
                     var ack=commit.finalized(l.groupId()); journal.queueRecovery(ack); journal.executeHome();
@@ -230,7 +230,7 @@ class RatisDurableTransactionTest {
                     assertEquals(ParticipantVote.negative(),journal.resolveParticipant(data.f.groupId).outcome().vote()); helper.released(data);
                 }
             }
-            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,data.routed)) { assertEquals(ParticipantVote.negative(),reopened.snapshot().participant(data.f.groupId).outcome().vote()); }
+            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed))) { assertEquals(ParticipantVote.negative(),reopened.snapshot().participant(data.f.groupId).outcome().vote()); }
         }
     }
 
@@ -254,14 +254,14 @@ class RatisDurableTransactionTest {
             };
             var plan=plan(home,data,pin); Path path=root.resolve("receipt.bin");
             try (var routed=new RatisRoutedClient(data.directory,transport)) {
-                var journal=RatisDurableTransaction.create(path,home.statuses,routed,plan.initial(),plan.registration(),List.of(plan.intent()));
+                var journal=RatisDurableTransaction.create(path,home.statuses,RatisTransactionBindings.of(routed),plan.initial(),plan.registration(),List.of(plan.intent()));
                 try {
                     journal.executeHome();
                     try (var prepare=data.f.machine.prepareParticipant(pin,data.f.put(2),helper.control(0),home.statuses,plan.initial().transactionId())) { journal.freezePreparation(routed.prepareParticipant(prepare.preparation())); journal.executePreparation(data.f.groupId); }
                     var vote=journal.snapshot().participant(data.f.groupId).vote(); var ready=plan.initial().prepared(data.f.groupId,plan.intent().acceptedBusiness().payloadDigest(),vote.position()); journal.queueHome(home.statuses.prepare(homeOperation(1),plan.initial(),ready)); journal.executeHome(); var commit=ready.decide(TransactionStatus.Phase.COMMIT); journal.queueHome(home.statuses.prepare(homeOperation(2),ready,commit)); journal.executeHome();
                     try (var finalize=data.f.machine.prepareFinalization(home.statuses,plan.initial().transactionId(),plan.intent().finalizeControl())) { journal.freezeFinalization(routed.prepareFinalization(finalize.finalization())); mode.set(1); var owned=journal; assertThrows(IOException.class,() -> owned.executeFinalization(data.f.groupId)); }
                     assertNotNull(journal.snapshot().participant(data.f.groupId).finalizationReceipt()); assertNull(journal.snapshot().participant(data.f.groupId).outcome()); long index=data.wire.index;
-                    journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,routed);
+                    journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(routed));
                     mode.set(2); var owned=journal; assertThrows(IOException.class,() -> owned.executeFinalization(data.f.groupId)); mode.set(3); assertThrows(IOException.class,() -> owned.executeFinalization(data.f.groupId));
                     mode.set(4); assertEquals(new ApplyPosition(1,2),journal.executeFinalization(data.f.groupId)); assertEquals(index,data.wire.index); assertEquals(4,queries.get()); assertNotNull(journal.snapshot().participant(data.f.groupId).outcome());
                 } finally { journal.close(); }
@@ -282,7 +282,7 @@ class RatisDurableTransactionTest {
             var directory=new RangeDirectory(helper.cluster,helper.database,data.directory.domainId(),1,new byte[32],0,Set.of(data.f.column),0,ranges);
             var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(0,1704), business, List.of(new DomainBinding(data.directory.domainId(), data.directory.generation(), data.directory.payloadDigest(), 1, new byte[32])), RatisDurableTransaction.planDigest(intents), participants);
             try (var routed=new RatisRoutedClient(directory,data.wire)) {
-                Path path=root.resolve("budget.bin"); assertThrows(IOException.class,() -> RatisDurableTransaction.create(path,home.statuses,routed,initial,home.statuses.prepare(homeOperation(0),null,initial),intents));
+                Path path=root.resolve("budget.bin"); assertThrows(IOException.class,() -> RatisDurableTransaction.create(path,home.statuses,RatisTransactionBindings.of(routed),initial,home.statuses.prepare(homeOperation(0),null,initial),intents));
                 assertFalse(Files.exists(path)); assertEquals(0,home.wire.index); assertEquals(0,data.wire.index);
             }
         }
@@ -298,7 +298,7 @@ class RatisDurableTransactionTest {
                 var recovery=new OperationId(new UUID(0,1800),3,0); journal.queueHome(home.statuses.prepare(recovery,null,plan.initial())); assertEquals(CommandResult.Status.SUCCESS,journal.executeHome().status());
                 assertEquals(plan.initial(),journal.snapshot().observedHome()); assertEquals(plan.intent().acceptedBusiness().operationId(),journal.snapshot().initial().operation()); assertEquals(0,data.wire.index);
             }
-            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,data.routed)) { assertEquals(plan.initial(),reopened.snapshot().observedHome()); assertEquals(3,reopened.snapshot().pendingHome().command().operationId().epoch()); }
+            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed))) { assertEquals(plan.initial(),reopened.snapshot().observedHome()); assertEquals(3,reopened.snapshot().pendingHome().command().operationId().epoch()); }
         }
     }
 
@@ -314,7 +314,7 @@ class RatisDurableTransactionTest {
                 home.routed.refresh(new RangeDirectory(helper.cluster,helper.database,home.directory.domainId(),1,new byte[32],2,home.directory.columns(),0,List.of(original)));
                 assertEquals(plan.initial(),journal.refreshHome()); assertTrue(journal.resolveHomeFromObserved()); assertNull(journal.snapshot().homeResult());
             }
-            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,data.routed)) { assertTrue(reopened.snapshot().homeSuperseded()); assertThrows(IllegalStateException.class,reopened::executeHome); }
+            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed))) { assertTrue(reopened.snapshot().homeSuperseded()); assertThrows(IllegalStateException.class,reopened::executeHome); }
         }
     }
 
@@ -328,7 +328,7 @@ class RatisDurableTransactionTest {
                 var abort=plan.initial().decide(TransactionStatus.Phase.ABORT); assertThrows(IOException.class,() -> journal.queueRecovery(abort)); assertEquals(plan.initial(),home.statuses.read(plan.initial().transactionId()));
                 assertThrows(IOException.class,journal::executeHome); assertEquals(0,data.wire.index);
             }
-            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,data.routed)) { assertEquals(plan.initial(),reopened.snapshot().observedHome()); }
+            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,RatisTransactionBindings.of(data.routed))) { assertEquals(plan.initial(),reopened.snapshot().observedHome()); }
         }
     }
 
@@ -356,7 +356,7 @@ class RatisDurableTransactionTest {
                 var initial=TransactionStatus.begin(helper.cluster, helper.database, new UUID(0,1740+List.of("bytes","duplicate","gap","digest").indexOf(invalid)), business, List.of(new DomainBinding(data.directory.domainId(), data.directory.generation(), data.directory.payloadDigest(), 1, new byte[32])), digest, participants);
                 try (var routed=new RatisRoutedClient(directory,data.wire)) {
                     Path path=root.resolve("global-result-"+invalid+".bin");
-                    assertThrows(IOException.class,() -> RatisDurableTransaction.create(path,home.statuses,routed,initial,home.statuses.prepare(homeOperation(0),null,initial),intents));
+                    assertThrows(IOException.class,() -> RatisDurableTransaction.create(path,home.statuses,RatisTransactionBindings.of(routed),initial,home.statuses.prepare(homeOperation(0),null,initial),intents));
                     assertFalse(Files.exists(path)); assertEquals(0,home.wire.index); assertEquals(0,data.wire.index);
                 }
             }

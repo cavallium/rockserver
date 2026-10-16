@@ -20,14 +20,14 @@ class RatisOwnedStreamDrainTest {
     static <T> T await(CompletableFuture<T> future) throws Exception { return RatisRocksDBIteratorLifecycleTest.await(future); }
     static Keys key(int n) { return RatisRocksDBIteratorLifecycleTest.key(n); }
     @Test void cancellationBeforeSubscriptionDrainsWithoutStartingAcquisition() throws Exception {
-        var iterators=new RatisRocksDBIterators(RatisRocksDBIteratorLifecycleTest.schema()); var calls=new AtomicInteger();
+        var iterators=new RatisRocksDBIterators(scopeColumnId -> RatisRocksDBIteratorLifecycleTest.schema()); var calls=new AtomicInteger();
         var owned=iterators.streamOwned(0,71,key(1),key(3),false,() -> { calls.incrementAndGet(); throw new AssertionError("Cancelled subscription must not acquire"); },CONTEXT);
         assertFalse(owned.drained().isDone()); owned.cancelObserver().run(); await(owned.drained());
         var observer=new RatisRocksDBIteratorLifecycleTest.Observer(); owned.observer().subscribe(observer); assertNull(await(observer.terminal)); assertEquals(0,calls.get()); RatisRocksDBIteratorLifecycleTest.empty(iterators);
     }
     @Test void cancelledAcquisitionAndCancelledPageWaitForActualReleaseAndClose() throws Exception {
         for (boolean acquiring:List.of(true,false)) {
-            var iterators=new RatisRocksDBIterators(RatisRocksDBIteratorLifecycleTest.schema()); var resource=new RatisRocksDBIteratorLifecycleTest.Resource();
+            var iterators=new RatisRocksDBIterators(scopeColumnId -> RatisRocksDBIteratorLifecycleTest.schema()); var resource=new RatisRocksDBIteratorLifecycleTest.Resource();
             var ready=new CompletableFuture<RatisRocksDBIterators.Resource>(); if (!acquiring) ready.complete(resource);
             var owned=iterators.streamOwned(0,71,key(1),key(3),false,() -> new RatisRocksDBIterators.Acquisition(ready,CompletableFuture.completedFuture(null)),CONTEXT);
             var observer=new RatisRocksDBIteratorLifecycleTest.Observer(); owned.observer().subscribe(observer); observer.subscription.get().cancel();
@@ -38,7 +38,7 @@ class RatisOwnedStreamDrainTest {
         }
     }
     @Test void failedCleanupRetainsLifetimeDrainUntilActualRetrySucceeds() throws Exception {
-        var iterators=new RatisRocksDBIterators(RatisRocksDBIteratorLifecycleTest.schema()); var releasing=new CompletableFuture<Void>(); var calls=new AtomicInteger(); var closes=new AtomicInteger();
+        var iterators=new RatisRocksDBIterators(scopeColumnId -> RatisRocksDBIteratorLifecycleTest.schema()); var releasing=new CompletableFuture<Void>(); var calls=new AtomicInteger(); var closes=new AtomicInteger();
         RatisRocksDBIterators.Resource resource=new RatisRocksDBIterators.Resource() {
             public CompletableFuture<RangePage<KV>> page(Keys low,Keys high,boolean reverse,Keys resume,RangeBudget budget,RequestContext context) { return CompletableFuture.completedFuture(new RangePage<>(List.of(RatisRocksDBIteratorLifecycleTest.row(1)),key(1),false)); }
             public CompletableFuture<Void> release(RequestContext context) { return calls.incrementAndGet()==1 ? CompletableFuture.failedFuture(new IOException("Unknown release")) : releasing; }
@@ -55,7 +55,7 @@ class RatisOwnedStreamDrainTest {
         liveObserver.subscription.get().cancel(); liveResource.finishPage(); liveResource.released.complete(null); await(live.drained()); RatisRocksDBIteratorLifecycleTest.empty(iterators);
     }
     @Test void publicColdStreamCreatesIndependentOwnershipForRepeatedSubscription() throws Exception {
-        var iterators=new RatisRocksDBIterators(RatisRocksDBIteratorLifecycleTest.schema()); var acquisitions=new AtomicInteger();
+        var iterators=new RatisRocksDBIterators(scopeColumnId -> RatisRocksDBIteratorLifecycleTest.schema()); var acquisitions=new AtomicInteger();
         var stream=iterators.stream(0,71,key(1),key(3),false,() -> {
             acquisitions.incrementAndGet(); var resource=new RatisRocksDBIteratorLifecycleTest.Resource(); resource.finishPage(); resource.released.complete(null); return CompletableFuture.completedFuture(resource);
         },CONTEXT);
@@ -73,9 +73,9 @@ class RatisOwnedStreamDrainTest {
         when(snapshots.open(any(),any(),any(),any(),any())).thenReturn(lease);
         UUID session=new UUID(3,1);
         var identity=new RatisTransactionClient.Identity(new RatisSnapshotClient.Identity(new UUID(3,2),new OperationId(session,1,0),new OperationId(session,1,1)),new RatisAtomicClient.Identity(new UUID(3,3),new OperationId(session,1,513),new OperationId(session,1,514)));
-        RatisRocksDBAdapter.AllocationSource allocations=context -> CompletableFuture.completedFuture(new RatisRocksDBAdapter.Allocation(Path.of("snapshot"),Path.of("commit"),identity));
+        RatisRocksDBAdapter.AllocationSource allocations=(context,dataTargets)-> CompletableFuture.completedFuture(new RatisRocksDBAdapter.Allocation(Path.of("snapshot"),Path.of("commit"),identity));
         var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations);
-        var adapter=new RatisRocksDBAdapter(schema,directory,mock(RatisTransactionClient.class),allocations,null,ranges);
+        var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(schema,directory,(mock(RatisTransactionClient.class)).bindings().domain((schema).domainId()).client()),mock(RatisTransactionClient.class),allocations,null,ranges);
         var request=new RocksDBAPICommand.RocksDBAPICommandStream.GetRange<KV>(0,71,key(1),key(3),false,RequestType.<KV>allInRange());
         var dispatched=adapter.dispatchOwned(request,CONTEXT); assertFalse(dispatched.drained().isDone());
         @SuppressWarnings("unchecked") var stream=(Flux<KV>)dispatched.observer(); var observer=new RatisRocksDBIteratorLifecycleTest.Observer(); stream.subscribe(observer);
@@ -99,8 +99,8 @@ class RatisOwnedStreamDrainTest {
         when(lease.completion()).thenReturn(acquiring); when(lease.release(any())).thenReturn(CompletableFuture.failedFuture(new IOException("Unknown first release")),releasing);
         doAnswer(call -> { closes.incrementAndGet(); return null; }).when(lease).close(); when(snapshots.open(any(),any(),any(),any(),any())).thenReturn(lease);
         UUID session=new UUID(6,1); var identity=new RatisTransactionClient.Identity(new RatisSnapshotClient.Identity(new UUID(6,2),new OperationId(session,1,0),new OperationId(session,1,1)),new RatisAtomicClient.Identity(new UUID(6,3),new OperationId(session,1,513),new OperationId(session,1,514)));
-        RatisRocksDBAdapter.AllocationSource allocations=context -> CompletableFuture.completedFuture(new RatisRocksDBAdapter.Allocation(Path.of("finite-snapshot"),Path.of("finite-commit"),identity));
-        var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(schema,directory,mock(RatisTransactionClient.class),allocations,null,ranges);
+        RatisRocksDBAdapter.AllocationSource allocations=(context,dataTargets)-> CompletableFuture.completedFuture(new RatisRocksDBAdapter.Allocation(Path.of("finite-snapshot"),Path.of("finite-commit"),identity));
+        var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(schema,directory,(mock(RatisTransactionClient.class)).bindings().domain((schema).domainId()).client()),mock(RatisTransactionClient.class),allocations,null,ranges);
         RocksDBAPICommand<?,?,?> request=switch (operation) {
             case 0 -> new RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<KV>(0,71,key(1),key(3),false,null,RequestType.<KV>allInRange(),RangeBudget.DEFAULT);
             case 1 -> new RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<FirstAndLast<KV>>(0,71,key(1),key(3),false,RequestType.<KV>firstAndLast());

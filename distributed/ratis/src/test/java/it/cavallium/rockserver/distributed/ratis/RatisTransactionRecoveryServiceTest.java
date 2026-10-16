@@ -96,7 +96,7 @@ class RatisTransactionRecoveryServiceTest {
             f.journal.executeHome(); var abort=f.plan.initial().decide(TransactionStatus.Phase.ABORT); f.journal.queueRecovery(abort); f.journal.executeHome();
             var entered=new CountDownLatch(1); var release=new CountDownLatch(1);
             f.data.wire.beforeFinalization=() -> { entered.countDown(); try { if (!release.await(5,TimeUnit.SECONDS)) throw new AssertionError("Fixture timeout"); } catch (InterruptedException failure) { throw new AssertionError(failure); } };
-            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next); var laterRecovery=later.recovery()) {
+            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,RatisTransactionBindings.of(f.data.routed),RatisTransactionRecoveryTest::next); var laterRecovery=later.recovery()) {
                 var scheduler=scheduler(); var service=new RatisTransactionRecoveryService(scheduler,List.of(recovery,laterRecovery),2);
                 try {
                     var view=service.tick(); assertTrue(entered.await(5,TimeUnit.SECONDS)); assertTrue(view.cancel(false)); assertThrows(IOException.class,recovery::close);
@@ -112,7 +112,7 @@ class RatisTransactionRecoveryServiceTest {
         try (var first=helper.new Fixture("first"); var second=helper.new Fixture("second")) {
             first.journal.executeHome(); second.journal.executeHome();
             first.data.wire.beforeFinalization=() -> { throw new IllegalStateException("Qualified finalization RPC unavailable"); };
-            try (var failed=new RatisTransactionRecovery(first.journal,first.home.statuses,first.data.routed,RatisTransactionRecoveryTest::next); var healthy=second.recovery()) {
+            try (var failed=new RatisTransactionRecovery(first.journal,first.home.statuses,RatisTransactionBindings.of(first.data.routed),RatisTransactionRecoveryTest::next); var healthy=second.recovery()) {
                 var scheduler=scheduler(); var service=new RatisTransactionRecoveryService(scheduler,List.of(failed,healthy),1);
                 try {
                     for (int n=0;n<16 && service.remaining()>1;n++) { try { service.tick().get(5,TimeUnit.SECONDS); } catch (ExecutionException expected) { assertInstanceOf(IOException.class,expected.getCause()); } idle(scheduler); }

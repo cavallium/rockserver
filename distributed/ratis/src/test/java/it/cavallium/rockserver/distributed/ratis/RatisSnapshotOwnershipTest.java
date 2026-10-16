@@ -21,7 +21,7 @@ class RatisSnapshotOwnershipTest {
     void pinsClosed(Fixture f) { for (var group:f.groups) assertEquals(0,f.machines.get(group).snapshotPinStats().pins()); }
     @Test void cancelledCursorViewsRetainActualReaderAndCursorChargesUntilReturn() throws Exception {
         try (var f=new Fixture(root,true)) {
-            write(f,0,7,"seed.bin"); var client=new RatisSnapshotClient(f.schema,f.snapshots,f.data,f.scheduler,new RatisSnapshotClient.Limits(1,RatisSnapshotClient.MAX_BYTES));
+            write(f,0,7,"seed.bin"); var client=new RatisSnapshotClient(RatisTransactionBindings.of(f.schema,f.data.directory(f.schema),f.data),f.snapshots,f.scheduler,new RatisSnapshotClient.Limits(1,RatisSnapshotClient.MAX_BYTES));
             var lease=client.open(root.resolve("read.bin"),snapshotIdentity(f,1),scope(f),RatisSnapshotClientTest.TTL,RequestContext.batch()); ready(lease);
             var cursor=lease.openCursor(74,null,null,false); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var once=new AtomicBoolean();
             f.beforeSnapshotRead=() -> { if (once.compareAndSet(false,true)) { entered.countDown(); await(release); } };
@@ -59,7 +59,7 @@ class RatisSnapshotOwnershipTest {
         }
     }
     @Test void readAndCursorByteAdmissionRejectBeforeRemoteWorkWithoutLeakingCharges() throws Exception {
-        try (var f=new Fixture(root,true); var client=new RatisSnapshotClient(f.schema,f.snapshots,f.data,f.scheduler,new RatisSnapshotClient.Limits(1,4L*1024*1024))) {
+        try (var f=new Fixture(root,true); var client=new RatisSnapshotClient(RatisTransactionBindings.of(f.schema,f.data.directory(f.schema),f.data),f.snapshots,f.scheduler,new RatisSnapshotClient.Limits(1,4L*1024*1024))) {
             write(f,0,7,"budget-seed.bin");
             try (var lease=client.open(root.resolve("budget.bin"),snapshotIdentity(f,1),scope(f),RatisSnapshotClientTest.TTL,RequestContext.batch())) {
                 ready(lease); var before=client.stats(); int rpcs=f.rpcs.get();
@@ -80,7 +80,7 @@ class RatisSnapshotOwnershipTest {
                 assertTrue(entered.await(5,TimeUnit.SECONDS)); assertTrue(first.cancel(false)); var actual=lease.release(RequestContext.batch());
                 assertFalse(actual.isDone()); assertTrue(lease.snapshot().releaseRequested()); assertTrue(lease.snapshot().observedHome().consumed());
                 lost(lease.get(71,key(2),RequestContext.batch())); assertThrows(IOException.class,lease::close); assertThrows(IOException.class,client::close);
-                assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(lease.path(),f.snapshots,f.data));
+                assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(lease.path(),f.snapshots,RatisTransactionBindings.of(f.data)));
                 resume.countDown(); actual.get(5,TimeUnit.SECONDS); pinsClosed(f); lease.close(); client.close();
                 int captures=f.captureRequests.get();
                 try (var other=RatisSnapshotClientTest.client(f); var restored=other.reopen(lease.path(),RequestContext.batch())) { lost(restored.completion()); lost(restored.get(71,key(2),RequestContext.batch())); assertEquals(captures,f.captureRequests.get()); }

@@ -39,13 +39,13 @@ class RatisRemoteTransactionJournalTest {
                     return data.wire.transaction(route,bytes,fresh);
                 }
             });
-            plan=RatisTransactionPlan.create(data.directory,business(),List.of(new Mutation(Mutation.Kind.PUT,data.f.column,new byte[]{2},new byte[]{7},Mutation.ReturnMode.CURRENT)),List.of());
+            plan=RatisTransactionPlan.create(List.of(data.directory),business(),List.of(new Mutation(Mutation.Kind.PUT,data.f.column,new byte[]{2},new byte[]{7},Mutation.ReturnMode.CURRENT)),List.of());
             var part=plan.partitions().getFirst(); capture=routed.openTransaction(part.scope(),Duration.ofSeconds(1));
             accepted=capture.participantIntent(part.command(),capture.stage(part.command().mutations(),part.command().predicates()));
             frozen=plan.accept(new UUID(0,46002),Map.of(data.f.groupId,accepted),prepares(data.f.groupId),finalizes(data.f.groupId),Map.of(data.f.groupId,capture.captureId()));
         }
         RatisDurableTransaction create(Path path,RatisTransactionPlan.Accepted accepted) throws IOException {
-            return RatisDurableTransaction.create(path,home.statuses,routed,accepted.initial(),home.statuses.prepare(owner.homeOperation(0),null,accepted.initial()),accepted.intents());
+            return RatisDurableTransaction.create(path,home.statuses,RatisTransactionBindings.of(routed),accepted.initial(),home.statuses.prepare(owner.homeOperation(0),null,accepted.initial()),accepted.intents());
         }
         public void close() throws Exception { try { capture.close(); } finally { try { routed.close(); } finally { try { data.close(); } finally { home.close(); } } } }
     }
@@ -58,7 +58,7 @@ class RatisRemoteTransactionJournalTest {
                 assertEquals(f.capture.captureId(),remote.snapshot().participant(group).intent().captureId()); assertNull(journal.snapshot().participant(group).intent().captureId());
             }
             assertEquals(16,Files.size(remotePath)-Files.size(localPath)); int before=queries.get();
-            for (var path:List.of(remotePath,localPath)) try (var reopened=RatisDurableTransaction.reopen(path,f.home.statuses,f.routed)) {
+            for (var path:List.of(remotePath,localPath)) try (var reopened=RatisDurableTransaction.reopen(path,f.home.statuses,RatisTransactionBindings.of(f.routed))) {
                 var intent=reopened.snapshot().participant(group).intent(); assertEquals(path.equals(remotePath) ? f.capture.captureId() : null,intent.captureId());
                 assertArrayEquals(DistributedCommandCodec.encode(f.accepted),DistributedCommandCodec.encode(intent.acceptedBusiness())); assertEquals(f.plan.partitions().getFirst().route(),intent.route());
                 assertEquals(f.accepted.acceptance(),intent.acceptedBusiness().acceptance()); assertNull(reopened.snapshot().observedHome());
@@ -72,7 +72,7 @@ class RatisRemoteTransactionJournalTest {
             var path=root.resolve("expired.journal"); try (var journal=f.create(path,f.frozen)) {}
             var original=f.capture.captureId(); var cut=f.capture.snapshot(); clock.addAndGet(Duration.ofSeconds(1).toNanos()); f.data.f.machine.expireTransactions();
             assertEquals(0,f.data.f.store.activeTrackedSnapshotPins()); int before=queries.get();
-            try (var journal=RatisDurableTransaction.reopen(path,f.home.statuses,f.routed)) {
+            try (var journal=RatisDurableTransaction.reopen(path,f.home.statuses,RatisTransactionBindings.of(f.routed))) {
                 var intent=journal.snapshot().participant(f.data.f.groupId).intent();
                 try (var restored=f.routed.restoreTransaction(intent)) {
                     assertEquals(original,restored.captureId()); assertEquals(cut,restored.snapshot()); assertEquals(before,queries.get());
@@ -92,7 +92,7 @@ class RatisRemoteTransactionJournalTest {
             var other=f.plan.accept(f.frozen.initial().transactionId(),Map.of(group,changed),prepares(group),finalizes(group),Map.of(group,f.capture.captureId()));
             assertEquals(f.capture.captureId(),other.intents().getFirst().captureId()); assertFalse(Arrays.equals(f.frozen.initial().planDigest(),other.initial().planDigest()));
             var path=root.resolve("changed-proof.journal");
-            assertThrows(IllegalArgumentException.class,() -> RatisDurableTransaction.create(path,f.home.statuses,f.routed,f.frozen.initial(),f.home.statuses.prepare(owner.homeOperation(0),null,f.frozen.initial()),other.intents()));
+            assertThrows(IllegalArgumentException.class,() -> RatisDurableTransaction.create(path,f.home.statuses,RatisTransactionBindings.of(f.routed),f.frozen.initial(),f.home.statuses.prepare(owner.homeOperation(0),null,f.frozen.initial()),other.intents()));
             assertFalse(Files.exists(path)); assertEquals(1,opens.get()); assertEquals(0,f.home.wire.index); assertEquals(0,f.data.wire.index);
             assertThrows(IllegalArgumentException.class,() -> new RatisDurableTransaction.Intent(f.plan.partitions().getFirst().route(),f.plan.partitions().getFirst().command(),helper.control(0),finalizes(group).get(group),List.of(0),f.capture.captureId()));
         }
@@ -105,7 +105,7 @@ class RatisRemoteTransactionJournalTest {
             byte[] original=ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array(); int offset=-1,count=0;
             for (int n=0;n<=body.length-original.length;n++) if (Arrays.equals(body,n,n+original.length,original,0,original.length)) { offset=n; count++; }
             assertEquals(1,count); ByteBuffer.wrap(body).putLong(offset,id.getMostSignificantBits()^1); SessionJournalFiles.write(path,body,RatisDurableTransaction.MAX_BYTES);
-            assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,f.home.statuses,f.routed));
+            assertThrows(IOException.class,() -> RatisDurableTransaction.reopen(path,f.home.statuses,RatisTransactionBindings.of(f.routed)));
             assertEquals(1,opens.get()); assertEquals(0,f.home.wire.index); assertEquals(0,f.data.wire.index);
         }
     }

@@ -55,7 +55,7 @@ class RatisHomeJournalRetirementTest {
             assertThrows(RatisTransactionOutcomeExpiredException.class,f.journal::result);
             f.reopen(); assertFullExpired(f,null);
             long writes=writes(f);
-            try (var coordinator=new RatisTransactionCoordinator(f.journal,f.home.statuses,f.data.routed,
+            try (var coordinator=new RatisTransactionCoordinator(f.journal,f.home.statuses,RatisTransactionBindings.of(f.data.routed),
                     last -> { throw new AssertionError("Expired HOME must not allocate registration"); },
                     (tx,p) -> { throw new AssertionError("Expired HOME must not prepare effects"); })) {
                 var step=coordinator.step(); assertEquals(RatisTransactionCoordinator.Action.HOME_RETIRED,step.action()); assertTrue(step.complete());
@@ -96,7 +96,7 @@ class RatisHomeJournalRetirementTest {
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException { return f.home.wire.transaction(route,bytes,fresh); }
             };
             try (var routed=new RatisRoutedClient(f.home.directory,transport)) {
-                var homes=new RatisTransactionStatuses(routed,f.home.f.column); f.journal.close(); f.journal=RatisDurableTransaction.reopen(f.path,homes,f.data.routed);
+                var homes=new RatisTransactionStatuses(routed,f.home.f.column); f.journal.close(); f.journal=RatisDurableTransaction.reopen(f.path,homes,RatisTransactionBindings.of(f.data.routed));
                 long writes=writes(f); var failure=assertThrows(IOException.class,f.journal::refreshHome); assertFalse(failure instanceof RatisHomeRetiredException);
                 assertNull(f.journal.snapshot().homeRetirementProof()); assertEquals(commit,f.journal.snapshot().observedHome());
                 try (var local=RatisDurableParticipantRecovery.reopen(path,homes,f.data.routed)) {

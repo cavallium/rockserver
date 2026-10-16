@@ -35,7 +35,7 @@ class RatisTransactionPlanTest {
                 assertArrayEquals(new byte[]{(byte)(left ? 0 : 128)},deletion.key()); assertArrayEquals(new byte[]{(byte)(left ? 128 : 255)},deletion.value());
                 assertTrue(part.scope().containsRange(helper.column,deletion.key(),deletion.value()));
             }
-            assertThrows(IllegalArgumentException.class,() -> RatisTransactionPlan.create(f.directory,operation(0),List.of(),List.of()));
+            assertThrows(IllegalArgumentException.class,() -> RatisTransactionPlan.create(List.of(f.directory),operation(0),List.of(),List.of()));
         }
     }
     @Test void remoteAcceptanceFreezesACompleteCaptureSetAndLocalAuthorityRemainsExplicit() throws Exception {
@@ -77,8 +77,8 @@ class RatisTransactionPlanTest {
                 }
                 var frozen=plan.accept(new UUID(0,10004),accepted,prepares,finalizes);
                 Path file=root.resolve("read-only.journal");
-                try (var journal=RatisDurableTransaction.create(file,f.transactions.statuses,f.data,frozen.initial(),f.transactions.statuses.prepare(helper.control(80),null,frozen.initial()),frozen.intents());
-                        var coordinator=new RatisTransactionCoordinator(journal,f.transactions.statuses,f.data,last -> helper.control(last.sequence()+1),(tx,progress) -> {
+                try (var journal=RatisDurableTransaction.create(file,f.transactions.statuses,RatisTransactionBindings.of(f.data),frozen.initial(),f.transactions.statuses.prepare(helper.control(80),null,frozen.initial()),frozen.intents());
+                        var coordinator=new RatisTransactionCoordinator(journal,f.transactions.statuses,RatisTransactionBindings.of(f.data),last -> helper.control(last.sequence()+1),(tx,progress) -> {
                             try {
                                 var part=plan.partitions().stream().filter(p -> p.route().groupId().equals(progress.intent().route().groupId())).findFirst().orElseThrow();
                                 var token=f.node(part.route().groupId()).f.machine.prepareParticipant(pins.get(part.route().groupId()),part.command(),progress.intent().prepareControl(),f.transactions.statuses,tx);
@@ -97,7 +97,7 @@ class RatisTransactionPlanTest {
                     assertTrue(complete); assertTrue(locked); var result=journal.result(); assertEquals(CommandResult.Status.SUCCESS,result.status()); assertEquals(1,result.valueCount()); assertArrayEquals(new byte[]{8},result.value(0));
                     assertFalse(journal.snapshot().observedHome().consumed()); assertArrayEquals(new byte[]{2},f.data.read(helper.column,new byte[]{1}));
                 }
-                try (var reopened=RatisDurableTransaction.reopen(file,f.transactions.statuses,f.data)) { assertArrayEquals(new byte[]{8},reopened.result().value(0)); assertFalse(reopened.snapshot().observedHome().consumed()); }
+                try (var reopened=RatisDurableTransaction.reopen(file,f.transactions.statuses,RatisTransactionBindings.of(f.data))) { assertArrayEquals(new byte[]{8},reopened.result().value(0)); assertFalse(reopened.snapshot().observedHome().consumed()); }
             } finally { for (var pin:pins.values()) pin.close(); }
         }
     }

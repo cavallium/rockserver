@@ -37,14 +37,14 @@ class RatisScopedGenerationTest {
                 var directories=new RatisCatalogue(f.catalogue.client,f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn);
                 assertEquals(CommandResult.Status.SUCCESS,directories.execute(directories.prepare(f.outer.operation(4),null,f.directory)).status());
                 var allocations=new Allocations(f);var created=new CopyOnWriteArrayList<RangeDirectory>();
-                RatisRocksDBConnection.GenerationFactory factory=(schema,directory,path,ids)->{
+                RatisRocksDBConnection.GenerationFactory factory=(generationBindings,path,ids)->{if(generationBindings.domains().size()!=1)throw new java.io.IOException("This singleton fixture requires one domain");var selectedDomain=generationBindings.domains().getFirst();var schema=selectedDomain.schema();var directory=selectedDomain.directory();
                     created.add(directory);
-                    var transactions=RatisTransactionClient.journalOwned(schema,directory,f.snapshots,f.homes,routed,f.scheduler,RatisTransactionClient.Limits.defaults(),RatisJournalAccess.standalone());
-                    var snapshots=RatisSnapshotClient.journalOwned(schema,directory,f.snapshots,routed,f.scheduler,RatisSnapshotClient.Limits.defaults(),RatisSnapshotCaptureRequest.Mode.READ_ONLY,RatisJournalAccess.standalone());
+                    var transactions=RatisTransactionClient.journalOwned(RatisTransactionBindings.of(schema,directory,routed),f.snapshots,f.homes,f.scheduler,RatisTransactionClient.Limits.defaults(),RatisJournalAccess.standalone());
+                    var snapshots=RatisSnapshotClient.journalOwned(RatisTransactionBindings.of(schema,directory,routed),f.snapshots,f.scheduler,RatisSnapshotClient.Limits.defaults(),RatisSnapshotCaptureRequest.Mode.READ_ONLY,RatisJournalAccess.standalone());
                     var plan=snapshots.plan(new RatisSnapshotClient.Identity(new UUID(900,1),new OperationId(f.session,1,0),new OperationId(f.session,1,1)),
                             new TransactionScope(List.of(TransactionScope.Span.range(schema.column(71).columnId(),null,null))));
                     assertEquals(Set.copyOf(directory.ranges()),Set.copyOf(plan.routes()),"Cold historical clients keep their explicitly frozen placement");
-                    var adapter=new RatisRocksDBAdapter(schema,directory,transactions,allocations,null,null,ids);
+                    var adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(schema,directory,(transactions).bindings().domain((schema).domainId()).client()),transactions,allocations,null,null,ids);
                     return new RatisRocksDBConnection.Generation(adapter,null,null,transactions,snapshots,List.of());
                 };
                 var relocated=new RangeDirectory(f.directory.clusterId(),f.directory.databaseId(),f.directory.domainId(),f.directory.schemaEpoch(),f.directory.schemaDigest(),f.directory.generation()+1,f.directory.columns(),f.directory.routingPrefixBytes(),f.directory.ranges().stream().map(range->new RangeDescriptor(range.rangeId(),range.groupId(),range.rangeEpoch(),range.configurationVersion(),range.lowerInclusive(),range.upperExclusive(),range.topologyState(),range.replicas().stream().map(peer->new ReplicaDescriptor(peer.nodeId(),peer.nodeIncarnation(),peer.replicaId(),peer.peerId(),"relocated-"+peer.replicaId()+":12345",peer.role())).toList())).toList());

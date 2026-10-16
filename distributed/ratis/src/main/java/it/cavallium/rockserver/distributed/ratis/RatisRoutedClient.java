@@ -231,9 +231,10 @@ public final class RatisRoutedClient implements AutoCloseable {
         public UUID incarnation() { return incarnation; }
         public RatisSnapshotCohortRpc.Capabilities cohort(){return cohort;}
     }
-    public CompletableFuture<RatisSnapshotReadiness> snapshotReadinessAsync(SnapshotFence fence,UUID group) {
+    public CompletableFuture<RatisSnapshotReadiness> snapshotReadinessAsync(SnapshotFence fence,UUID group)  {return snapshotReadinessAsyncAt(current(),fence,group);}
+    CompletableFuture<RatisSnapshotReadiness> snapshotReadinessAsyncAt(RangeDirectory observed,SnapshotFence fence,UUID group)  {
 
-        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+         var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
         requireSnapshotRoute(observed,descriptor,fence,group);
         return snapshotAsync(()->transactionReplyAsync(descriptor,ScopedTransactionRpc.SNAPSHOT_READY,fence.encode(),true).thenApply(reply->{
         try {
@@ -243,14 +244,17 @@ public final class RatisRoutedClient implements AutoCloseable {
 
         }));
     }
-    public RatisSnapshotReadiness snapshotReadiness(SnapshotFence fence,UUID group) throws IOException {
-        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+
+    public RatisSnapshotReadiness snapshotReadiness(SnapshotFence fence,UUID group) throws IOException  {return snapshotReadinessAt(current(),fence,group);}
+    RatisSnapshotReadiness snapshotReadinessAt(RangeDirectory observed,SnapshotFence fence,UUID group) throws IOException  {
+         var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
         requireSnapshotRoute(observed,descriptor,fence,group);
         try {
             var proof=RatisSnapshotReadiness.decode(transaction(descriptor,ScopedTransactionRpc.SNAPSHOT_READY,fence.encode(),true));
             if (!proof.group().equals(group) || !proof.binding().equals(ScopedTransactionRpc.SnapshotBinding.of(fence)) || proof.retired() && !proof.retirement().fence().equals(fence)) throw new IllegalArgumentException("Snapshot readiness binding changed"); return proof;
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot readiness reply",malformed); }
     }
+
     public RatisSnapshotBlockers snapshotBlockers(SnapshotFence fence,UUID group,UUID after,int limit) throws IOException {
         var observed=current(); var route=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
         requireSnapshotRoute(observed,route,fence,group); var request=new RatisSnapshotBlockers.Request(fence,after,limit);
@@ -261,16 +265,21 @@ public final class RatisRoutedClient implements AutoCloseable {
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot blocker page",malformed); }
     }
     public SnapshotTarget snapshotTarget(SnapshotFence fence,UUID group)throws IOException{return awaitSnapshot(snapshotTargetAsync(fence,group));}
-    public CompletableFuture<SnapshotTarget> snapshotTargetAsync(SnapshotFence fence,UUID group) {
-        try{var observed=current();var descriptor=observed.ranges().stream().filter(r->r.groupId().equals(group)).findFirst().orElseThrow(()->new IllegalArgumentException("Snapshot participant route absent"));requireSnapshotRoute(observed,descriptor,fence,group);
+    SnapshotTarget snapshotTargetAt(RangeDirectory directory,SnapshotFence fence,UUID group)throws IOException{return awaitSnapshot(snapshotTargetAsyncAt(directory,fence,group));}
+    public CompletableFuture<SnapshotTarget> snapshotTargetAsync(SnapshotFence fence,UUID group)  {return snapshotTargetAsyncAt(current(),fence,group);}
+    CompletableFuture<SnapshotTarget> snapshotTargetAsyncAt(RangeDirectory observed,SnapshotFence fence,UUID group)  {
+        try{var descriptor=observed.ranges().stream().filter(r->r.groupId().equals(group)).findFirst().orElseThrow(()->new IllegalArgumentException("Snapshot participant route absent"));requireSnapshotRoute(observed,descriptor,fence,group);
             return snapshotAsync(()->transport.snapshot(descriptor,null,ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_OWNER,new byte[0])).thenApply(bytes->{try{var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REPLY_BYTES);if(packet.kind()!=ScopedTransactionRpc.SNAPSHOT_OWNER)throw new IllegalArgumentException("Snapshot owner opcode changed");var owner=RatisSnapshotOwner.decode(packet.body());if(!owner.groupId().equals(group) || owner.rangeEpoch()!=descriptor.rangeEpoch() || !Arrays.equals(owner.schemaDigest(),observed.schemaDigest()))throw new IllegalArgumentException("Snapshot owner reply changed range/schema");var replica=descriptor.replicas().stream().filter(r->r.peerId().equals(owner.peerId())&&r.role()==ReplicaDescriptor.Role.VOTER).findFirst().orElseThrow(()->new IllegalArgumentException("Snapshot owner is not a frozen voter"));return new SnapshotTarget(identity,fence,descriptor,replica,owner.incarnation(),owner.cohort());}catch(IllegalArgumentException invalid){throw new CompletionException(new IOException("Invalid snapshot owner reply",invalid));}}));
         }catch(Exception failure){return CompletableFuture.failedFuture(failure);}
     }
-    public SnapshotTarget restoreSnapshotTarget(SnapshotFence fence,RangeDescriptor descriptor,ReplicaDescriptor replica,UUID incarnation) {
-        Objects.requireNonNull(incarnation); requireSnapshotRoute(current(),descriptor,fence,descriptor.groupId());
+
+    public SnapshotTarget restoreSnapshotTarget(SnapshotFence fence,RangeDescriptor descriptor,ReplicaDescriptor replica,UUID incarnation)  {return restoreSnapshotTargetAt(current(),fence,descriptor,replica,incarnation);}
+    SnapshotTarget restoreSnapshotTargetAt(RangeDirectory observed,SnapshotFence fence,RangeDescriptor descriptor,ReplicaDescriptor replica,UUID incarnation)  {
+        Objects.requireNonNull(incarnation); requireSnapshotRoute(observed,descriptor,fence,descriptor.groupId());
         if (!descriptor.replicas().contains(replica) || replica.role()!=ReplicaDescriptor.Role.VOTER) throw new IllegalArgumentException("Snapshot replica differs from frozen route");
         return new SnapshotTarget(identity,fence,descriptor,replica,incarnation,null);
     }
+
     /** Exact frozen voter route; no current-leader or arbitrary-endpoint fallback. */
     public CompletableFuture<byte[]> cohortQuery(SnapshotTarget anchor,int kind,byte[] body) {
         try{Objects.requireNonNull(anchor);requireIdentity(anchor.source);if(kind<RatisSnapshotCohortRpc.OWNER || kind>RatisSnapshotCohortRpc.CANCEL)throw new IllegalArgumentException("Invalid cohort operation");return snapshotAsync(()->transport.snapshot(anchor.descriptor,anchor.replica,ScopedTransactionRpc.frame(kind,body)).thenApply(bytes->{var packet=ScopedTransactionRpc.parse(bytes,RatisSnapshotCohortRpc.MAX_REPLY_BYTES);if(packet.kind()!=kind)throw new CompletionException(new IOException("Cohort reply operation changed"));return packet.body();}));}catch(Exception failure){return CompletableFuture.failedFuture(failure);}
@@ -399,10 +408,12 @@ public final class RatisRoutedClient implements AutoCloseable {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(request.participantGroup())).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
         return restoreSnapshotGate(request,descriptor);
     }
-    public PreparedSnapshotOperation restoreSnapshotGate(RatisSnapshotRecord request,RangeDescriptor descriptor) {
-        var observed=current(); requireSnapshotRoute(observed,descriptor,request.fence(),request.participantGroup());
+    public PreparedSnapshotOperation restoreSnapshotGate(RatisSnapshotRecord request,RangeDescriptor descriptor)  {return restoreSnapshotGateAt(current(),request,descriptor);}
+    PreparedSnapshotOperation restoreSnapshotGateAt(RangeDirectory observed,RatisSnapshotRecord request,RangeDescriptor descriptor)  {
+         requireSnapshotRoute(observed,descriptor,request.fence(),request.participantGroup());
         return new PreparedSnapshotOperation(identity,descriptor,request);
     }
+
     private static void requireSnapshotRoute(RangeDirectory directory,RangeDescriptor descriptor,SnapshotFence fence,UUID group) {
         var participant=fence.participant(group);
         if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || !descriptor.groupId().equals(group) || !descriptor.rangeId().equals(participant.rangeId()) || descriptor.rangeEpoch()!=participant.rangeEpoch()
@@ -478,9 +489,10 @@ public final class RatisRoutedClient implements AutoCloseable {
         } finally { endCall(); }
     }
     /** One bounded server-side recovery quantum; false or an empty blocker page never proves READY. */
-    public CompletableFuture<Boolean> helpSnapshotFenceAsync(SnapshotFence fence,UUID group) {
+    public CompletableFuture<Boolean> helpSnapshotFenceAsync(SnapshotFence fence,UUID group)  {return helpSnapshotFenceAsyncAt(current(),fence,group);}
+    CompletableFuture<Boolean> helpSnapshotFenceAsyncAt(RangeDirectory observed,SnapshotFence fence,UUID group)  {
 
-        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot helper route absent"));
+         var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot helper route absent"));
         requireSnapshotRoute(observed,descriptor,fence,group);
         var binding=ScopedTransactionRpc.SnapshotBinding.of(fence); var body=ByteBuffer.allocate(48); ScopedTransactionRpc.snapshotBinding(body,binding);
         return snapshotAsync(()->transactionReplyAsync(descriptor,ScopedTransactionRpc.SNAPSHOT_HELP,body.array(),true).thenApply(reply->{
@@ -493,8 +505,10 @@ public final class RatisRoutedClient implements AutoCloseable {
 
         }));
     }
-    public boolean helpSnapshotFence(SnapshotFence fence,UUID group) throws IOException {
-        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot helper route absent"));
+
+    public boolean helpSnapshotFence(SnapshotFence fence,UUID group) throws IOException  {return helpSnapshotFenceAt(current(),fence,group);}
+    boolean helpSnapshotFenceAt(RangeDirectory observed,SnapshotFence fence,UUID group) throws IOException  {
+         var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot helper route absent"));
         requireSnapshotRoute(observed,descriptor,fence,group);
         try {
             var binding=ScopedTransactionRpc.SnapshotBinding.of(fence); var body=ByteBuffer.allocate(48); ScopedTransactionRpc.snapshotBinding(body,binding);
@@ -504,10 +518,12 @@ public final class RatisRoutedClient implements AutoCloseable {
             int helped=input.get()&255; if (helped>1) throw new IllegalArgumentException("Invalid snapshot helper progress"); return helped==1;
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot helper reply",malformed); }
     }
-    /** Fresh retained gate/terminal state remains queryable independently of control grants. */
-    public CompletableFuture<SnapshotGate> snapshotGateAsync(SnapshotFence fence,UUID group) {
 
-        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+    /** Fresh retained gate/terminal state remains queryable independently of control grants. */
+    public CompletableFuture<SnapshotGate> snapshotGateAsync(SnapshotFence fence,UUID group)  {return snapshotGateAsyncAt(current(),fence,group);}
+    CompletableFuture<SnapshotGate> snapshotGateAsyncAt(RangeDirectory observed,SnapshotFence fence,UUID group)  {
+
+         var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
         requireSnapshotRoute(observed,descriptor,fence,group); var body=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(body,fence.fenceId());
         return snapshotAsync(()->transactionReplyAsync(descriptor,ScopedTransactionRpc.SNAPSHOT_GATE_STATE,body.array(),true).thenApply(reply->{
         try {
@@ -520,8 +536,10 @@ public final class RatisRoutedClient implements AutoCloseable {
 
         }));
     }
-    public SnapshotGate snapshotGate(SnapshotFence fence,UUID group) throws IOException {
-        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+
+    public SnapshotGate snapshotGate(SnapshotFence fence,UUID group) throws IOException  {return snapshotGateAt(current(),fence,group);}
+    SnapshotGate snapshotGateAt(RangeDirectory observed,SnapshotFence fence,UUID group) throws IOException  {
+         var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
         requireSnapshotRoute(observed,descriptor,fence,group); var body=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(body,fence.fenceId());
         try {
             var input=ByteBuffer.wrap(transaction(descriptor,ScopedTransactionRpc.SNAPSHOT_GATE_STATE,body.array(),true));
@@ -531,6 +549,7 @@ public final class RatisRoutedClient implements AutoCloseable {
             return record;
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot gate state reply",malformed); }
     }
+
     public static final class PreparedHomeRecoveryOperation {
         private final RangeDirectory source;
         private final RangeDescriptor descriptor;
@@ -619,12 +638,14 @@ public final class RatisRoutedClient implements AutoCloseable {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(finalization.participantGroup())).findFirst().orElseThrow(() -> new IllegalArgumentException("Finalization route absent"));
         return restoreFinalization(finalization,descriptor);
     }
-    public PreparedFinalizationOperation restoreFinalization(ParticipantFinalization finalization,RangeDescriptor descriptor) {
-        var observed=current(); var registered=finalization.participant(); var decision=finalization.decision();
+    public PreparedFinalizationOperation restoreFinalization(ParticipantFinalization finalization,RangeDescriptor descriptor)  {return restoreFinalizationAt(current(),finalization,descriptor);}
+    PreparedFinalizationOperation restoreFinalizationAt(RangeDirectory observed,ParticipantFinalization finalization,RangeDescriptor descriptor)  {
+         var registered=finalization.participant(); var decision=finalization.decision();
         if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || !descriptor.groupId().equals(registered.groupId()) || !descriptor.rangeId().equals(registered.rangeId()) || descriptor.rangeEpoch()!=registered.rangeEpoch()
                 || !Arrays.equals(observed.schemaDigest(),registered.schemaDigest()) || !observed.domainId().equals(registered.domainId()) || !observed.clusterId().equals(decision.clusterId()) || !observed.databaseId().equals(decision.databaseId())) throw new IllegalArgumentException("Finalization route differs from frozen participant");
         return new PreparedFinalizationOperation(identity,descriptor,finalization);
     }
+
     /** Obtain ready authority from a fixed server-side HOME reader; frozen bytes never choose that reader. */
     public void authorizeFinalization(PreparedFinalizationOperation operation) throws IOException {
         Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
@@ -680,15 +701,17 @@ public final class RatisRoutedClient implements AutoCloseable {
         return restoreParticipant(preparation,descriptor,negative);
     }
     public PreparedParticipantOperation restoreParticipant(PreparedParticipant.Preparation preparation,RangeDescriptor descriptor) { return restoreParticipant(preparation,descriptor,false); }
-    public PreparedParticipantOperation restoreParticipant(PreparedParticipant.Preparation preparation,RangeDescriptor descriptor,boolean negative) {
-        var observed=current();
+    public PreparedParticipantOperation restoreParticipant(PreparedParticipant.Preparation preparation,RangeDescriptor descriptor,boolean negative)  {return restoreParticipantAt(current(),preparation,descriptor,negative);}
+    PreparedParticipantOperation restoreParticipantAt(RangeDirectory observed,PreparedParticipant.Preparation preparation,RangeDescriptor descriptor,boolean negative)  {
+
         var registered=preparation.registration().participants().stream().filter(p -> p.groupId().equals(descriptor.groupId())).findFirst().orElseThrow();
         if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || descriptor.rangeEpoch()!=preparation.business().rangeEpoch() || !registered.rangeId().equals(descriptor.rangeId())
                 || !Arrays.equals(observed.schemaDigest(),preparation.business().schemaDigest()) || !observed.domainId().equals(preparation.domainBinding().domainId())
                 || !observed.clusterId().equals(preparation.registration().clusterId()) || !observed.databaseId().equals(preparation.registration().databaseId())) throw new IllegalArgumentException("Participant route differs from frozen registration");
-        restoreSessionCommand(preparation.business(),descriptor);
+        restoreSessionCommand(observed,preparation.business(),descriptor);
         return new PreparedParticipantOperation(identity,descriptor,preparation,negative);
     }
+
     public ParticipantVote executeParticipant(PreparedParticipantOperation operation) throws IOException {
         java.util.Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
         try {
@@ -703,17 +726,19 @@ public final class RatisRoutedClient implements AutoCloseable {
         finally { endCall(); }
     }
     /** Fresh independently queryable state survives prepare-response loss and control-session receipt GC. */
-    public PreparedParticipant preparedParticipant(UUID group,UUID transactionId) throws IOException {
-        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Participant route absent"));
+    public PreparedParticipant preparedParticipant(UUID group,UUID transactionId) throws IOException  {return preparedParticipantAt(current(),group,transactionId);}
+    PreparedParticipant preparedParticipantAt(RangeDirectory observed,UUID group,UUID transactionId) throws IOException  {
+         var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Participant route absent"));
         var body=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(body,transactionId);
         try {
             var input=ByteBuffer.wrap(transaction(descriptor,ScopedTransactionRpc.PARTICIPANT_STATE,body.array(),true));
             byte[] bytes=ScopedTransactionRpc.blob(input,16+PreparedParticipant.Preparation.MAX_BYTES,true); if (input.hasRemaining()) throw new IllegalArgumentException("Trailing prepared state");
             if (bytes==null) return null; var record=PreparedParticipant.decode(bytes);
             if (!record.preparation().transactionId().equals(transactionId) || !record.preparation().business().groupId().equals(group)) throw new IllegalArgumentException("Prepared reply identity changed");
-            prepareParticipant(record.preparation()); return record;
+            restoreParticipantAt(observed,record.preparation(),descriptor,false); return record;
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid prepared state reply",malformed); }
     }
+
     /** Fresh terminal result lookup does not depend on either business or recovery grant eligibility. */
     public ParticipantOutcome finalizedParticipant(UUID group,UUID transactionId) throws IOException {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Participant route absent"));
@@ -731,9 +756,10 @@ public final class RatisRoutedClient implements AutoCloseable {
             return outcome;
         } catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant outcome reply",invalid); }
     }
-    public CompletableFuture<SnapshotFenceProof> snapshotFenceAsync(SnapshotFence fence,UUID group) {
+    public CompletableFuture<SnapshotFenceProof> snapshotFenceAsync(SnapshotFence fence,UUID group)  {return snapshotFenceAsyncAt(current(),fence,group);}
+    CompletableFuture<SnapshotFenceProof> snapshotFenceAsyncAt(RangeDirectory observed,SnapshotFence fence,UUID group)  {
 
-        var observed=current(); var route=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent")); requireSnapshotRoute(observed,route,fence,group);
+         var route=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent")); requireSnapshotRoute(observed,route,fence,group);
         return snapshotAsync(()->transactionReplyAsync(route,ScopedTransactionRpc.SNAPSHOT_FENCE,fence.encode(),true).thenApply(reply->{
         try {
             var input=ByteBuffer.wrap(reply);
@@ -745,8 +771,10 @@ public final class RatisRoutedClient implements AutoCloseable {
 
         }));
     }
-    public SnapshotFenceProof snapshotFence(SnapshotFence fence,UUID group) throws IOException {
-        var observed=current(); var route=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent")); requireSnapshotRoute(observed,route,fence,group); beginCall();
+
+    public SnapshotFenceProof snapshotFence(SnapshotFence fence,UUID group) throws IOException  {return snapshotFenceAt(current(),fence,group);}
+    SnapshotFenceProof snapshotFenceAt(RangeDirectory observed,SnapshotFence fence,UUID group) throws IOException  {
+         var route=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent")); requireSnapshotRoute(observed,route,fence,group); beginCall();
         try {
             var input=ByteBuffer.wrap(transactionReply(route,ScopedTransactionRpc.SNAPSHOT_FENCE,fence.encode(),true));
             byte[] binding=new byte[48]; if (input.remaining()<52) throw new IllegalArgumentException("Truncated snapshot fence reply"); input.get(binding);
@@ -755,6 +783,7 @@ public final class RatisRoutedClient implements AutoCloseable {
             if (bytes==null) return null; var proof=SnapshotFenceProof.decode(bytes); if (!proof.fence().equals(fence) || !proof.participantGroup().equals(group)) throw new IllegalArgumentException("Snapshot fence identity changed"); return new SnapshotFenceProof(fence,group,proof.minimumEpoch(),proof.position());
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot fence reply",malformed); } finally { endCall(); }
     }
+
     public void retireSnapshotGate(SnapshotGateRetirement retirement) throws IOException {
         var fence=retirement.fence(); var observed=current(); var route=observed.ranges().stream().filter(r -> r.groupId().equals(retirement.participantGroup())).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent")); requireSnapshotRoute(observed,route,fence,retirement.participantGroup()); beginCall();
         try {
@@ -901,7 +930,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     private RatisRoutedClient(RangeDirectory identity,RangeDirectory frozen,SnapshotCleanupTransport transport){this.identity=identity;directory=frozen;acceptedSchemas=List.of(frozen);this.transport=transport;snapshotCleanup=transport;}
     /** Trusted forced snapshot metadata only. No independent client pool or new capture authority is created. */
     synchronized RatisRoutedClient borrowedSnapshotCleanupView(RangeDirectory frozen,SnapshotFence fence)throws IOException {
-        requireOpen();requireNamespace(frozen);RatisSnapshotPlan.frozen(frozen,fence);if(snapshotCleanup!=null || snapshotCleanupBorrowers>=8192)throw new IOException("Snapshot cleanup view capacity exhausted");var borrowed=new SnapshotCleanupTransport(frozen,fence);snapshotCleanupBorrowers++;return new RatisRoutedClient(identity,frozen,borrowed);
+        requireOpen();requireNamespace(frozen);RatisSnapshotPlan.requireDomain(frozen,fence);if(snapshotCleanup!=null || snapshotCleanupBorrowers>=8192)throw new IOException("Snapshot cleanup view capacity exhausted");var borrowed=new SnapshotCleanupTransport(frozen,fence);snapshotCleanupBorrowers++;return new RatisRoutedClient(identity,frozen,borrowed);
     }
     /** Called only after the original durable journal has been decoded, bound and forced. */
     void restoreSnapshotCleanupCaptures(RatisDurableSnapshot.Snapshot saved)throws IOException {
@@ -958,16 +987,18 @@ public final class RatisRoutedClient implements AutoCloseable {
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid transaction open reply",malformed); }
     }
     /** Reattach only the original server handle recorded with an accepted intent; never opens a new cut. */
-    public ScopedTransaction restoreTransaction(RatisDurableTransaction.Intent intent) throws IOException {
+    public ScopedTransaction restoreTransaction(RatisDurableTransaction.Intent intent) throws IOException  {return restoreTransactionAt(current(),intent);}
+    ScopedTransaction restoreTransactionAt(RangeDirectory observed,RatisDurableTransaction.Intent intent) throws IOException  {
         Objects.requireNonNull(intent); if (intent.captureId()==null) throw new RatisPreparationUnavailableException("Intent has no original remote capture handle");
-        var directory=current(); var accepted=intent.acceptedBusiness(); var audit=Objects.requireNonNull(accepted.acceptance(),"Intent has no accepted cut"); var route=intent.route();
-        restoreSessionCommand(accepted,route);
+        var directory=observed; var accepted=intent.acceptedBusiness(); var audit=Objects.requireNonNull(accepted.acceptance(),"Intent has no accepted cut"); var route=intent.route();
+        restoreSessionCommand(observed,accepted,route);
         var participants=audit.scope().participants(directory,1);
         if (participants.size()!=1) throw new IllegalArgumentException("Original capture scope changed participant");
         var current=participants.getFirst();
         if (!current.rangeId().equals(route.rangeId()) || !current.groupId().equals(route.groupId()) || current.rangeEpoch()!=route.rangeEpoch() || !Arrays.equals(current.lowerInclusive(),route.lowerInclusive()) || !Arrays.equals(current.upperExclusive(),route.upperExclusive())) throw new IllegalArgumentException("Original capture route changed ownership/bounds");
         return new ScopedTransaction(route,new ScopedTransactionRpc.Handle(audit.ownerIncarnation(),intent.captureId(),audit.leaderGeneration(),audit.snapshot()),audit.scope(),accepted.schemaDigest());
     }
+
     public final class ScopedTransaction implements AutoCloseable {
         private final RangeDescriptor descriptor; private final ScopedTransactionRpc.Handle handle;
         private final TransactionScope scope;
@@ -1167,7 +1198,7 @@ public final class RatisRoutedClient implements AutoCloseable {
 
     /** Freeze a complete multi-group business plan before snapshots, allocation or any network dispatch. */
     public RatisTransactionPlan transactionPlan(OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates) {
-        return RatisTransactionPlan.create(current(),operation,mutations,predicates);
+        return RatisTransactionPlan.create(List.of(current()),operation,mutations,predicates);
     }
 
     public PreparedCommand prepare(OperationId operation, List<Mutation> mutations) {

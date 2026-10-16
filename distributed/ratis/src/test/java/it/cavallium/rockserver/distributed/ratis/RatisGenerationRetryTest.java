@@ -18,9 +18,9 @@ class RatisGenerationRetryTest {
         var tests=new RatisRocksDBConnectionTest(); tests.root=root;
         try (var f=tests.new Fixture(); var replicas=new RatisSchemaReplicaClient(1,(range,owner) -> { throw new IOException("No replica query during binding retry"); })) {
             var calls=new AtomicInteger();
-            RatisRocksDBConnection.GenerationFactory factory=(schema,directory,path,ids) -> {
+            RatisRocksDBConnection.GenerationFactory factory=(generationBindings,path,ids)->{if(generationBindings.domains().size()!=1)throw new java.io.IOException("This singleton fixture requires one domain");var selectedDomain=generationBindings.domains().getFirst();var schema=selectedDomain.schema();var directory=selectedDomain.directory();
                 if (calls.getAndIncrement()==0) throw new IOException("Controlled generation factory failure");
-                return f.factory.create(schema,directory,path,ids);
+                return f.factory.create(generationBindings,path,ids);
             };
             var limits=RatisRocksDBConnection.Limits.defaults();
             assertThrows(IOException.class,() -> new RatisRocksDBConnection(URI.create("ratis://controlled/retry"),f.connectionRoot,java.util.Map.of(f.direct.f.schema.domainId(),f.direct.routed),(name,shape)->f.direct.f.schema.domainId(),f.direct.f.scheduler,f.binding,f.direct.f.catalogue.client,replicas,null,null,factory,limits,List.of(), RatisJournalAccess.standalone()));

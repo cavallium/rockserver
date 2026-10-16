@@ -22,7 +22,7 @@ final class RatisRocksDBIterators {
         void closeLocal() throws IOException;
     }
     record Stats(int iterators,int streams,long bytes) {}
-    private final DistributedSchema schema;
+    private final java.util.function.LongFunction<DistributedSchema> schemas;
     private final java.util.function.LongSupplier handleIds;
     private final Map<Long,Entry> entries=new LinkedHashMap<>();
     private final Set<Flow> flows=new HashSet<>();
@@ -58,8 +58,8 @@ final class RatisRocksDBIterators {
     }
     private record Advance(long skip,long take,RequestType.RequestTypeId type) {}
     private record Progress(Keys resume,boolean exhausted,List<KV> taken) {}
-    RatisRocksDBIterators(DistributedSchema schema) { this(schema,new java.util.concurrent.atomic.AtomicLong(ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE/2))::incrementAndGet); }
-    RatisRocksDBIterators(DistributedSchema schema,java.util.function.LongSupplier handleIds) { this.schema=Objects.requireNonNull(schema); this.handleIds=Objects.requireNonNull(handleIds); }
+    RatisRocksDBIterators(java.util.function.LongFunction<DistributedSchema> schemas) { this(schemas,new java.util.concurrent.atomic.AtomicLong(ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE/2))::incrementAndGet); }
+    RatisRocksDBIterators(java.util.function.LongFunction<DistributedSchema> schemas,java.util.function.LongSupplier handleIds) { this.schemas=Objects.requireNonNull(schemas); this.handleIds=Objects.requireNonNull(handleIds); }
     synchronized boolean owns(long id) { return entries.containsKey(id); }
     synchronized Stats stats() { return new Stats(entries.size(),flows.size(),bytes); }
     private long metadata(Keys lower,Keys upper) {
@@ -111,7 +111,7 @@ final class RatisRocksDBIterators {
     CompletableFuture<Void> seek(long id,Keys keys,RequestContext context) {
         try {
             Entry entry=entry(id);
-            var target=copy(Objects.requireNonNull(keys)); if (target.keys().length!=0) schema.encodeLogicalKey(schema.column(entry.column).columnId(),target);
+            var target=copy(Objects.requireNonNull(keys)); if (target.keys().length!=0) schemas.apply(entry.column).encodeLogicalKey(schemas.apply(entry.column).column(entry.column).columnId(),target);
             synchronized (this) { synchronized (entry) {
                 if (entries.get(id)!=entry || entry.closed || entry.disposed || expired(entry)) throw RocksDBException.of(TX_NOT_FOUND,"Iterator closed or expired before seek");
                 if (entry.active!=null) throw RocksDBException.of(SERVER_OVERLOADED,"Iterator work active"); new Deadline(context).remaining(); entry.seek=target.keys().length==0 ? null : target; entry.resume=null; entry.exhausted=false;
@@ -151,7 +151,7 @@ final class RatisRocksDBIterators {
         } catch (Throwable failure) { return CompletableFuture.failedFuture(failure); }
     }
     private int compare(long column,Keys a,Keys b) {
-        var id=schema.column(column).columnId(); byte[] x=RatisLogicalRangePages.bound(schema,id,a),y=RatisLogicalRangePages.bound(schema,id,b); int order=Arrays.compareUnsigned(x,y);
+        var schema=schemas.apply(column);var id=schema.column(column).columnId(); byte[] x=RatisLogicalRangePages.bound(schema,id,a),y=RatisLogicalRangePages.bound(schema,id,b); int order=Arrays.compareUnsigned(x,y);
         if (order!=0 || a.keys().length!=schema.column(column).schema().keysCount() || b.keys().length!=a.keys().length) return order;
         var left=schema.encodeLogicalKey(id,a).variableKeys(); var right=schema.encodeLogicalKey(id,b).variableKeys();
         for (int n=0;n<left.size();n++) { order=Arrays.compareUnsigned(left.get(n),right.get(n)); if (order!=0) return order; } return 0;

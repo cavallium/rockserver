@@ -56,7 +56,7 @@ final class RatisDatabaseBackupRealCohortFixture implements AutoCloseable {
             };
             routed=new RatisRoutedClient(state.directory,transport);UUID homeColumn=UUID.randomUUID();var homeRange=new RangeDescriptor(UUID.randomUUID(),state.fence.homeGroup(),1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(state.owner));
             homeRouted=new RatisRoutedClient(new RangeDirectory(base.cluster,base.database,UUID.randomUUID(),0,new byte[32],0,Set.of(homeColumn),0,List.of(homeRange)),transport);
-            snapshots=new RatisSnapshotClient(state.schema,new RatisSnapshotFences(homeRouted,homeColumn),routed,scheduler,RatisSnapshotClient.Limits.defaults());
+            snapshots=new RatisSnapshotClient(RatisTransactionBindings.of(state.schema,routed.directory(state.schema),routed),new RatisSnapshotFences(homeRouted,homeColumn),scheduler,RatisSnapshotClient.Limits.defaults());
             var old=base.bindings.get(state.fence.fenceId());var d=old.exportDefinition();var definition=new RatisExportJournal.Definition(d.jobId(),d.fence(),d.columns(),d.sourceJournal(),snapshots.identityDigest(),d.limits(),d.snapshotTtl());
             bindings.put(state.fence.fenceId(),new RatisDatabaseBackupDriver.Binding(state.durable,state.coordinator,routed,old.exportPath(),definition,new RatisRemoteExportSource(snapshots,routed,RatisJournalAccess.standalone())));
             for(var group:state.stores.keySet())groups.put(group,routed);

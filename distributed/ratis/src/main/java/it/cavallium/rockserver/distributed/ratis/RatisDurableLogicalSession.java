@@ -194,14 +194,14 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
         }
         /** Full equal/extended prefix. Original-image conditions and result order match ordinary logical operations. */
         public synchronized CommandResult stage(List<RatisLogicalClient.Change> changes,List<RatisLogicalClient.Condition> conditions) throws IOException {
-            requireMutable(); return run(() -> { var plan=RatisLogicalClient.plan(schema,changes,conditions); validatePlan(plan); return scoped.stage(plan.mutations(),plan.predicates()); });
+            requireMutable(); return run(() -> { var plan=RatisLogicalClient.plan(scopeColumnId -> schema,changes,conditions); validatePlan(plan); return scoped.stage(plan.mutations(),plan.predicates()); });
         }
         public CommandResult stage(List<RatisLogicalClient.Change> changes) throws IOException { return stage(changes,List.of()); }
         /** Freezes one durable intent, binds its session, accepts and forces it, then waits for applied consensus outcome. */
         public synchronized CommandResult commit(List<RatisLogicalClient.Change> changes,List<RatisLogicalClient.Condition> conditions) throws IOException {
             requireOpen();
             return run(() -> {
-                var plan=RatisLogicalClient.plan(schema,changes,conditions); validatePlan(plan);
+                var plan=RatisLogicalClient.plan(scopeColumnId -> schema,changes,conditions); validatePlan(plan);
                 if (commit!=null && (!commit.command().mutations().equals(plan.mutations()) || !commit.command().predicates().equals(plan.predicates()))) throw new IllegalArgumentException("Logical commit retry changed the frozen plan");
                 if (commit==null) {
                     commit=new Pending(RatisDurableLogicalSession.this,window.prepareTransactionIntent(plan.mutations(),plan.predicates()));
@@ -228,7 +228,7 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
     public Pending preparePut(long column,Keys keys,Buf value,Mutation.ReturnMode returns) throws IOException { return prepare(List.of(RatisLogicalClient.Change.put(column,keys,value,returns)),List.of()); }
     public Pending prepareDelete(long column,Keys keys,Mutation.ReturnMode returns) throws IOException { return prepare(List.of(RatisLogicalClient.Change.delete(column,keys,returns)),List.of()); }
     public Pending prepare(List<RatisLogicalClient.Change> changes,List<RatisLogicalClient.Condition> conditions) throws IOException {
-        return run(() -> { var plan=RatisLogicalClient.plan(schema,changes,conditions); return new Pending(this,window.prepare(plan.mutations(),plan.predicates())); });
+        return run(() -> { var plan=RatisLogicalClient.plan(scopeColumnId -> schema,changes,conditions); return new Pending(this,window.prepare(plan.mutations(),plan.predicates())); });
     }
     /** A never-accepted intent has no write authority. Persist its local no-effects outcome; ACK remains explicit. */
     public CommandResult abandonTransactionIntent(Pending pending) throws IOException { return run(() -> window.abandonTransactionIntent(owned(pending))); }

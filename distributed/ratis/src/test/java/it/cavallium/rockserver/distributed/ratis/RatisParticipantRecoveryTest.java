@@ -142,8 +142,8 @@ class RatisParticipantRecoveryTest {
             try (var local=create(root.resolve("helper-local.journal"),f,helper.tx); var recovery=recovery(local,f,false)) {
                 f.recovery=(group,prepared) -> { assertEquals(local.snapshot().prepared(),prepared); return recovery.step().action()!=RatisParticipantRecovery.Action.WAITING; };
                 var initial=SnapshotFenceStatus.begin(f.fence);
-                try (var snapshots=RatisDurableSnapshot.create(root.resolve("helper-snapshot.journal"),f.home.homes,f.data,initial,f.home.homes.prepare(helper.control(50),null,initial),f.directory.ranges());
-                        var coordinator=new RatisSnapshotCoordinator(snapshots,f.home.homes,f.data,last -> helper.control(last.sequence()+1),UUID::randomUUID,java.time.Duration.ofSeconds(10))) {
+                try (var snapshots=RatisDurableSnapshot.create(root.resolve("helper-snapshot.journal"),f.home.homes,RatisTransactionBindings.of(f.data),initial,f.home.homes.prepare(helper.control(50),null,initial),f.directory.ranges());
+                        var coordinator=new RatisSnapshotCoordinator(snapshots,f.home.homes,RatisTransactionBindings.of(f.data),last -> helper.control(last.sequence()+1),UUID::randomUUID,java.time.Duration.ofSeconds(10))) {
                     boolean complete=false;
                     for (int n=0;n<32 && !complete;n++) { long before=f.writes(); complete=coordinator.step().complete(); assertTrue(f.writes()-before<=1); }
                     assertTrue(complete); assertNotNull(local.snapshot().outcome()); assertEquals(SnapshotFenceStatus.Phase.COMPLETE,snapshots.snapshot().observedHome().phase());

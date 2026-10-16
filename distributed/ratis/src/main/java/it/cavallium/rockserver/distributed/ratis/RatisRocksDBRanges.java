@@ -34,7 +34,7 @@ public final class RatisRocksDBRanges implements AutoCloseable {
         var owned=new OwnedRead(column,lower,upper,reverse);
         synchronized (this) { if (closing || owners.size()>=MAX_OWNERS) throw new IOException("Readonly range ownership exhausted"); owners.add(owned); }
         CompletableFuture<RatisRocksDBAdapter.Allocation> allocating;
-        try { allocating=Objects.requireNonNull(allocations.allocate(deadline.remaining())); }
+        try { allocating=Objects.requireNonNull(allocations.allocate(deadline.remaining(),snapshots.bindings().targets(scope))); }
         catch (Throwable failure) { owned.acquisition.completeExceptionally(failure); owned.remove(); return owned; }
         allocating.thenCompose(allocation -> {
             try { owned.lease=snapshots.open(allocation.snapshot(),allocation.identity().snapshot(),scope,ttl,deadline.remaining()); return owned.lease.completion(); }

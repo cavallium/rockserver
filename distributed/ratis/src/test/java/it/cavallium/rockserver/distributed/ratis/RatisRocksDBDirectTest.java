@@ -49,7 +49,7 @@ class RatisRocksDBDirectTest {
             });
             window=root.resolve("direct-window.bin"); session=RatisDurableSessionClient.create(window,routed,ledger,grant,RatisSessionClient.Limits.defaults());
             journal=root.resolve("direct-request.bin"); direct=budget.open(f.schema,routed,session,f.scheduler,journal,window); transactions=RatisRocksDBAdapterTest.client(f,f.data);
-            adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new RatisRocksDBAdapterTest.Allocations(f),direct,null);
+            adapter=new RatisRocksDBAdapter(RatisTransactionBindings.of(f.schema,f.directory,(transactions).bindings().domain((f.schema).domainId()).client()),transactions,new RatisRocksDBAdapterTest.Allocations(f),direct,null);
         }
         public void close() throws Exception { if (!abandoned) adapter.close(); direct.close(); session.close(); routed.close(); transactions.close(); budget.close(); f.close(); }
     }

@@ -69,7 +69,7 @@ public final class RatisTransactionIdentities implements RatisRocksDBAdapter.All
             try { channel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure;
         }
     }
-    @Override public CompletableFuture<RatisRocksDBAdapter.Allocation> allocate(RequestContext context) {
+    @Override public CompletableFuture<RatisRocksDBAdapter.Allocation> allocate(RequestContext context,List<RatisBackendSessions.Target> dataTargets) {
         long deadline=scheduler.resolveMonotonicDeadline(context); final Task task;
         lane.lock();
         try {

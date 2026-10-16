@@ -16,7 +16,7 @@ class RatisSnapshotAsyncCleanupViewTest {
         var owner=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"local","localhost:19010",ReplicaDescriptor.Role.VOTER);
         var range=new RangeDescriptor(UUID.randomUUID(),group,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(owner));
         var original=new RangeDirectory(cluster,database,domain,0,new byte[32],0,Set.of(column),0,List.of(range));
-        var session=UUID.randomUUID();var fence=RatisSnapshotPlan.create(original,new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),UUID.randomUUID(),new OperationId(session,1,0),UUID.randomUUID(),1,new OperationId(session,1,1)).fence();
+        var session=UUID.randomUUID();var fence=RatisSnapshotPlan.create(List.of(original),new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),UUID.randomUUID(),new OperationId(session,1,0),UUID.randomUUID(),1,new OperationId(session,1,1)).fence();
         var applied=new CompletableFuture<byte[]>();var calls=new AtomicInteger();var appends=new AtomicInteger();var closes=new AtomicInteger();
         var transport=new RatisRoutedClient.Transport(){
             public byte[] read(RangeDescriptor route,UUID col,byte[] key){throw new AssertionError("Sync USER read");}
@@ -38,7 +38,7 @@ class RatisSnapshotAsyncCleanupViewTest {
             var view=parent.borrowedSnapshotCleanupView(original,fence);
             try{
                 assertNull(view.snapshotGateAsync(fence,group).get(5,TimeUnit.SECONDS));assertEquals(1,calls.get());
-                var other=RatisSnapshotPlan.create(original,new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),UUID.randomUUID(),new OperationId(session,1,0),UUID.randomUUID(),1,new OperationId(session,1,1)).fence();
+                var other=RatisSnapshotPlan.create(List.of(original),new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),UUID.randomUUID(),new OperationId(session,1,0),UUID.randomUUID(),1,new OperationId(session,1,1)).fence();
                 assertThrows(ExecutionException.class,()->view.snapshotGateAsync(other,group).get(5,TimeUnit.SECONDS));
                 assertThrows(ExecutionException.class,()->view.readWithRouteAsync(column,new byte[]{1}).get(5,TimeUnit.SECONDS));
                 byte[] newerSchema=new byte[32];newerSchema[0]=1;

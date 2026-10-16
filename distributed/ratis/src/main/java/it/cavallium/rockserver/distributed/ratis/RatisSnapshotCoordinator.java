@@ -16,7 +16,7 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
     public record Step(Action action,UUID participant,boolean complete) {}
     private final RatisDurableSnapshot journal;
     private final RatisSnapshotFences homes;
-    private final RatisRoutedClient data;
+    private final RatisTransactionBindings data;
     private final RatisTransactionRecovery.ControlIds controls;
     private final Supplier<UUID> captureIds;
     private final Duration ttl;
@@ -24,7 +24,7 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
     private int cursor;
     private boolean active,closed,cancelled;
 
-    public RatisSnapshotCoordinator(RatisDurableSnapshot journal,RatisSnapshotFences homes,RatisRoutedClient data,
+    public RatisSnapshotCoordinator(RatisDurableSnapshot journal,RatisSnapshotFences homes,RatisTransactionBindings data,
             RatisTransactionRecovery.ControlIds controls,Supplier<UUID> captureIds,Duration ttl) throws IOException {
         this.journal=Objects.requireNonNull(journal); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
         this.controls=Objects.requireNonNull(controls);

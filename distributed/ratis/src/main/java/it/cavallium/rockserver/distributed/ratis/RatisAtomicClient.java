@@ -37,10 +37,8 @@ public final class RatisAtomicClient implements AutoCloseable {
         }
     }
     public record Stats(int operations,long bytes) {}
-    private final DistributedSchema schema;
-    private final RangeDirectory directory;
     private final RatisTransactionStatuses homes;
-    private final RatisRoutedClient data;
+    private final RatisTransactionBindings data;
     private final RWScheduler scheduler;
     private final Limits limits;
     private RatisJournalAccess journalAccess=RatisJournalAccess.standalone();
@@ -54,39 +52,28 @@ public final class RatisAtomicClient implements AutoCloseable {
     private boolean closing,closed;
 
     /** Clients, scheduler, and grant maintenance are borrowed. Install adequate DATA/HOME grant windows before use. */
-    public RatisAtomicClient(DistributedSchema schema,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits) {
-        this(schema,data.directory(schema),homes,data,scheduler,limits,path -> {});
+    public RatisAtomicClient(RatisTransactionBindings data,RatisTransactionStatuses homes,RWScheduler scheduler,Limits limits) {this(data,homes,scheduler,limits,path->{});}
+    RatisAtomicClient(RatisTransactionBindings data,RatisTransactionStatuses homes,RWScheduler scheduler,Limits limits,PublicationObserver publicationObserver) {
+        this.publicationObserver=Objects.requireNonNull(publicationObserver);this.data=Objects.requireNonNull(data);this.homes=Objects.requireNonNull(homes);this.scheduler=Objects.requireNonNull(scheduler);this.limits=Objects.requireNonNull(limits);homes.requireDatabaseBinding(data.clusterId(),data.databaseId());
+        try{binding=java.security.MessageDigest.getInstance("SHA-256").digest(java.nio.ByteBuffer.allocate(64).put(homes.identityDigest()).put(data.sessionIdentityDigest()).array());}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
     }
-    RatisAtomicClient(DistributedSchema schema,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,PublicationObserver publicationObserver) {
-        this(schema,data.directory(schema),homes,data,scheduler,limits,publicationObserver);
-    }
-    RatisAtomicClient(DistributedSchema schema,RangeDirectory frozenTarget,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits) {
-        this(schema,frozenTarget,homes,data,scheduler,limits,path -> {});
-    }
-    private RatisAtomicClient(DistributedSchema schema,RangeDirectory frozenTarget,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,PublicationObserver publicationObserver) {
-        this.publicationObserver=Objects.requireNonNull(publicationObserver);
-        this.schema=Objects.requireNonNull(schema); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); this.scheduler=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits);
-        data.requireKnownSchema(schema);directory=Objects.requireNonNull(frozenTarget);schema.requireMatches(directory); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
-        try { binding=java.security.MessageDigest.getInstance("SHA-256").digest(java.nio.ByteBuffer.allocate(96).put(schema.digest()).put(homes.identityDigest()).put(data.sessionIdentityDigest()).array()); }
-        catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
-    }
-    RatisAtomicClient(DistributedSchema schema,RangeDirectory target,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisRequestBudget budget,java.util.function.Supplier<RatisRequestBudget.Lease> retainedCredit) {
-        this(schema,target,homes,data,scheduler,limits);
-        this.budget=Objects.requireNonNull(budget);this.retainedCredit=Objects.requireNonNull(retainedCredit);
-    }
-    static RatisAtomicClient journalOwned(DistributedSchema schema,RangeDirectory target,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisJournalAccess access){var client=new RatisAtomicClient(schema,target,homes,data,scheduler,limits);client.journalAccess=Objects.requireNonNull(access);return client;}
+    RatisAtomicClient(RatisTransactionBindings data,RatisTransactionStatuses homes,RWScheduler scheduler,Limits limits,RatisRequestBudget budget,java.util.function.Supplier<RatisRequestBudget.Lease> retainedCredit){this(data,homes,scheduler,limits);this.budget=Objects.requireNonNull(budget);this.retainedCredit=Objects.requireNonNull(retainedCredit);}
+    static RatisAtomicClient journalOwned(RatisTransactionBindings data,RatisTransactionStatuses homes,RWScheduler scheduler,Limits limits,RatisJournalAccess access){var client=new RatisAtomicClient(data,homes,scheduler,limits);client.journalAccess=Objects.requireNonNull(access);return client;}
+    private byte[] singletonDirectoryDigest(){if(data.domains().size()!=1)throw new IllegalArgumentException("Origin-bearing operation requires one domain");return data.domains().getFirst().directory().payloadDigest();}
+    private static byte[] directoryDigest(List<RangeDirectory> directories){try{var digest=java.security.MessageDigest.getInstance("SHA-256");for(var domain:DomainBinding.canonical(directories.stream().map(DomainBinding::of).toList())){digest.update(domain.directoryDigest());digest.update(domain.schemaDigest());}return digest.digest();}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}}
     public Operation executeAtomic(Path journal,Identity identity,List<RatisLogicalClient.Change> changes,List<RatisLogicalClient.Condition> conditions,Duration ttl,RequestContext context) throws IOException {
+        if(data.domains().size()!=1)throw new IllegalArgumentException("Cross-domain commits require the original globally captured projection");
         long deadline=scheduler.resolveMonotonicDeadline(context);
-        var plan=RatisTransactionPlan.logical(schema,directory,identity.business(),changes,conditions);
+        var plan=RatisTransactionPlan.logical(data.schemas(),data.directories(),identity.business(),changes,conditions);
         return executePlan(journal,identity,plan,ttl,context,deadline);
     }
     /** Canonical normalized physical target plan, before any native acceptance or capture. */
     public static byte[] rawPlanDigest(RatisTransactionPlan plan) {
         try {
             var bytes=new java.io.ByteArrayOutputStream();var out=new java.io.DataOutputStream(bytes);
-            out.write(plan.directory().payloadDigest());out.writeLong(plan.operation().sessionId().getMostSignificantBits());out.writeLong(plan.operation().sessionId().getLeastSignificantBits());out.writeLong(plan.operation().epoch());out.writeLong(plan.operation().sequence());
+            out.write(directoryDigest(plan.directories()));out.writeLong(plan.operation().sessionId().getMostSignificantBits());out.writeLong(plan.operation().sessionId().getLeastSignificantBits());out.writeLong(plan.operation().epoch());out.writeLong(plan.operation().sequence());
             out.writeInt(plan.partitions().size());
-            for(var part:plan.partitions().stream().sorted(Comparator.comparing(p->p.route().groupId())).toList()) {
+            for(var part:plan.partitions().stream().sorted(Comparator.comparing(p->p.route().groupId(),RangeDirectoryCodec.UUID_ORDER)).toList()) {
                 var command=part.command();if(command.acceptance()!=null)throw new IllegalArgumentException("Reserved plan must precede native acceptance");
                 byte[] encoded=DistributedCommandCodec.encode(command);out.writeInt(encoded.length);out.write(encoded);out.writeInt(part.resultPositions().size());for(int index:part.resultPositions())out.writeInt(index);
             }
@@ -108,10 +95,10 @@ public final class RatisAtomicClient implements AutoCloseable {
         byte[] retained=RatisDurableTransaction.validateReservationEvidence(reservation,evidence);
         var origin=reservation.origin();
         if(!reservation.reserved() || origin==null || !reservation.transactionId().equals(identity.transaction()) || !reservation.operation().equals(identity.business()) || !origin.firstControl().equals(identity.firstControl())
-                || !reservation.clusterId().equals(schema.clusterId()) || !reservation.databaseId().equals(schema.databaseId()) || !reservation.domains().equals(List.of(DomainBinding.of(directory)))
-                || reservation.domain(schema.domainId()).schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(reservation.domain(schema.domainId()).schemaDigest(),schema.digest()) || !Arrays.equals(origin.targetDirectoryDigest(),directory.payloadDigest())
+                || !reservation.clusterId().equals(data.clusterId()) || !reservation.databaseId().equals(data.databaseId())
+                || !reservation.domains().equals(data.authority()) || !Arrays.equals(origin.targetDirectoryDigest(),singletonDirectoryDigest())
                 || !Arrays.equals(origin.planDigest(),rawPlanDigest(plan)) || origin.targetParticipantCount()!=plan.partitions().size())throw new IllegalArgumentException("Reserved atomic origin differs from frozen target plan/identities");
-        if(!identity.business().equals(plan.operation()) || !Arrays.equals(directory.payloadDigest(),plan.directory().payloadDigest()) || ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis())))throw new IllegalArgumentException("Reserved atomic plan/TTL changed");
+        if(!identity.business().equals(plan.operation()) || !Arrays.equals(directoryDigest(data.directories()),directoryDigest(plan.directories())) || ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis())))throw new IllegalArgumentException("Reserved atomic plan/TTL changed");
         long bytes=estimate(plan)+3L*retained.length;if(bytes>RatisDurableTransaction.MAX_BYTES)throw new IOException("Reserved evidence future persistence exceeds journal budget");
         var operation=admit(journal,identity,plan,ttl,bytes);operation.reservation=reservation;operation.reservationEvidence=RatisOperationRerouteAdmissionRpc.Evidence.decode(retained);return operation;
     }
@@ -120,10 +107,9 @@ public final class RatisAtomicClient implements AutoCloseable {
         long deadline=scheduler.resolveMonotonicDeadline(context); Objects.requireNonNull(identity); Objects.requireNonNull(accepted);
         var initial=accepted.initial(); initial.requireInitial();
         if (!initial.transactionId().equals(identity.transaction()) || !initial.operation().equals(identity.business())
-                || !initial.clusterId().equals(schema.clusterId()) || !initial.databaseId().equals(schema.databaseId()) || initial.domains().size()!=1 || !initial.domains().getFirst().domainId().equals(schema.domainId())
-                || initial.domain(schema.domainId()).schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(initial.domain(schema.domainId()).schemaDigest(),schema.digest())
+                || !initial.clusterId().equals(data.clusterId()) || !initial.databaseId().equals(data.databaseId()) || !initial.domains().equals(data.authority())
                 || !Arrays.equals(initial.planDigest(),RatisDurableTransaction.planDigest(accepted.intents())) || accepted.intents().size()!=initial.participants().size()) throw new IllegalArgumentException("Accepted projection differs from reserved atomic identity/schema");
-        var ordered=accepted.intents().stream().sorted(Comparator.comparing(i -> i.route().groupId())).toList();
+        var ordered=accepted.intents().stream().sorted(Comparator.comparing(i -> i.route().groupId(),RangeDirectoryCodec.UUID_ORDER)).toList();
         var groups=new HashSet<UUID>(); long bytes=64*1024L+2*1024*1024L; int n=0;
         for (var intent:ordered) {
             if (!groups.add(intent.route().groupId()) || intent.captureId()==null || !intent.acceptedBusiness().operationId().equals(identity.business())
@@ -136,13 +122,13 @@ public final class RatisAtomicClient implements AutoCloseable {
         if (bytes>RatisDurableTransaction.MAX_BYTES) throw new IOException("Accepted projection exceeds retained journal capacity");
         RatisDurableTransaction.validateResultPlan(accepted.intents());
         var expected=initial.origin()==null ? null : TransactionStatus.reserve(initial.origin(),initial.domains().getFirst());
-        if(expected!=null && (!initial.origin().firstControl().equals(identity.firstControl()) || !Arrays.equals(initial.origin().targetDirectoryDigest(),directory.payloadDigest())))throw new IllegalArgumentException("Accepted reserved projection changed target/control binding");
+        if(expected!=null && (!initial.origin().firstControl().equals(identity.firstControl()) || !Arrays.equals(initial.origin().targetDirectoryDigest(),singletonDirectoryDigest())))throw new IllegalArgumentException("Accepted reserved projection changed target/control binding");
         var registration=homes.prepare(identity.control(128),expected,initial);
         var operation=admit(path,identity,null,null,bytes,accepted,registration); operation.beginExecution(context,deadline); return operation;
     }
     Operation executePlan(Path journal,Identity identity,RatisTransactionPlan plan,Duration ttl,RequestContext context,long deadline) throws IOException {
         Objects.requireNonNull(identity); Objects.requireNonNull(plan); Objects.requireNonNull(ttl); Objects.requireNonNull(context);
-        if (!identity.business().equals(plan.operation()) || !Arrays.equals(directory.payloadDigest(),plan.directory().payloadDigest()) || ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Atomic plan/TTL differs from frozen request");
+        if (!identity.business().equals(plan.operation()) || !Arrays.equals(directoryDigest(data.directories()),directoryDigest(plan.directories())) || ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Atomic plan/TTL differs from frozen request");
         var operation=admit(journal,identity,plan,ttl,estimate(plan)); operation.beginExecution(context,deadline); return operation;
     }
     /** Reopening reads the existing journal on a workload thread and never opens replacement server captures. */
@@ -193,7 +179,7 @@ public final class RatisAtomicClient implements AutoCloseable {
     }
     private static byte[] requestDigest(RatisTransactionPlan plan) {
         try {
-            var digest=java.security.MessageDigest.getInstance("SHA-256"); digest.update(plan.directory().payloadDigest());
+            var digest=java.security.MessageDigest.getInstance("SHA-256"); digest.update(directoryDigest(plan.directories()));
             for (var part:plan.partitions()) {
                 var bytes=DistributedCommandCodec.encode(part.command()); digest.update(java.nio.ByteBuffer.allocate(4).putInt(bytes.length).array()); digest.update(bytes);
                 digest.update(java.nio.ByteBuffer.allocate(4).putInt(part.resultPositions().size()).array());
@@ -285,7 +271,7 @@ public final class RatisAtomicClient implements AutoCloseable {
             try {
                 var saved=candidate.snapshot();var first=saved.participants().stream().map(p->p.intent().prepareControl()).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow();var restored=new Identity(saved.initial().transactionId(),saved.initial().operation(),first);int n=0;
                 for(var p:saved.participants())if(p.intent().captureId()==null || !p.intent().prepareControl().equals(restored.control(n)) || !p.intent().finalizeControl().equals(restored.control(64+n++)))throw new IOException("Consumption journal changed original control allocation");
-                restored.requireHome(saved.lastHome());if(saved.initial().origin()!=null && (!saved.initial().origin().firstControl().equals(first) || !Arrays.equals(saved.initial().origin().targetDirectoryDigest(),directory.payloadDigest())))throw new IOException("Consumption journal changed reserved CONTROL grant");identity=restored;journal=candidate;
+                restored.requireHome(saved.lastHome());if(saved.initial().origin()!=null && (!saved.initial().origin().firstControl().equals(first) || !Arrays.equals(saved.initial().origin().targetDirectoryDigest(),singletonDirectoryDigest())))throw new IOException("Consumption journal changed reserved CONTROL grant");identity=restored;journal=candidate;
             }catch(IOException|RuntimeException failure){try{candidate.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}throw failure;}
         }
         private TransactionStatus reservation;
@@ -304,7 +290,7 @@ public final class RatisAtomicClient implements AutoCloseable {
                         var restored=new Identity(saved.initial().transactionId(),saved.initial().operation(),first);
                         int n=0; for (var p:saved.participants()) if (p.intent().captureId()==null || !p.intent().prepareControl().equals(restored.control(n)) || !p.intent().finalizeControl().equals(restored.control(64+n++))) throw new IOException("Journal differs from remote atomic identity block");
                         restored.requireHome(saved.lastHome());
-                        if(saved.initial().origin()!=null && (!saved.initial().origin().firstControl().equals(first) || !Arrays.equals(saved.initial().origin().targetDirectoryDigest(),directory.payloadDigest())))throw new IOException("Reserved atomic journal changed control allocation"); if (saved.pendingRecovery()==null && saved.pendingHome()!=null) restored.requireHome(saved.pendingHome().command().operationId());
+                        if(saved.initial().origin()!=null && (!saved.initial().origin().firstControl().equals(first) || !Arrays.equals(saved.initial().origin().targetDirectoryDigest(),singletonDirectoryDigest())))throw new IOException("Reserved atomic journal changed control allocation"); if (saved.pendingRecovery()==null && saved.pendingHome()!=null) restored.requireHome(saved.pendingHome().command().operationId());
                         identity=restored; journal=candidate;
                     } catch (Exception invalid) { try { candidate.close(); } catch (IOException cleanup) { invalid.addSuppressed(cleanup); } throw invalid; }
                 } else initialize(task);
@@ -335,12 +321,12 @@ public final class RatisAtomicClient implements AutoCloseable {
             var accepted=new HashMap<UUID,DistributedCommand>(); var prepares=new HashMap<UUID,OperationId>(); var finalizes=new HashMap<UUID,OperationId>(); var leases=new HashMap<UUID,UUID>(); int n=0;
             for (var part:plan.partitions()) {
                 task.check(); var group=part.route().groupId(); var capture=captures.get(group);
-                if (capture==null) { capture=data.openTransaction(part.scope(),ttl); if (!capture.descriptor().equals(part.route())) { capture.close(); throw new IOException("Atomic directory changed while opening its capture"); } captures.put(group,capture); }
+                if (capture==null) { capture=data.client(part.route().groupId()).openTransaction(part.scope(),ttl); if (!capture.descriptor().equals(part.route())) { capture.close(); throw new IOException("Atomic directory changed while opening its capture"); } captures.put(group,capture); }
                 task.check();
                 if (!checkedConditions.contains(group)) {
                     for (var predicate:part.command().predicates()) {
                         byte[] value=capture.get(predicate.columnId(),predicate.key()); task.check();
-                        if (predicate.bucket()) value=schema.decodeBucket(predicate.columnId(),predicate.key(),value).get(predicate.memberKeys());
+                        if (predicate.bucket()) value=data.schema(predicate.columnId()).decodeBucket(predicate.columnId(),predicate.key(),value).get(predicate.memberKeys());
                         if (!Arrays.equals(value,predicate.expectedValue())) { rejectedRequest=requestDigest(plan); publishRejection(); return; }
                     }
                     checkedConditions.add(group);

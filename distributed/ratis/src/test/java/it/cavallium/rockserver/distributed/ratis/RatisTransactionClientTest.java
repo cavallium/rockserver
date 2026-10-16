@@ -28,17 +28,17 @@ class RatisTransactionClientTest {
         return new TransactionScope(List.of(TransactionScope.Span.range(f.schema.column(71).columnId(),new byte[]{1},new byte[]{(byte)205}),
                 TransactionScope.Span.range(f.schema.column(74).columnId(),new byte[]{2},new byte[]{(byte)201})));
     }
-    RatisTransactionClient client(RatisAtomicClientTest.Fixture f) { return new RatisTransactionClient(f.schema,f.snapshots,f.homes,f.data,f.scheduler,RatisTransactionClient.Limits.defaults()); }
+    RatisTransactionClient client(RatisAtomicClientTest.Fixture f) { return new RatisTransactionClient(RatisTransactionBindings.of(f.schema,f.data.directory(f.schema),f.data),f.snapshots,f.homes,f.scheduler,RatisTransactionClient.Limits.defaults()); }
     void seed(RatisAtomicClientTest.Fixture f) throws Exception {
         put(f,71,key(2),1,900); put(f,71,key(200),3,901);
         for (int prefix:new int[]{2,200}) {
             var changes=List.of(RatisLogicalClient.Change.put(74,member(prefix,"alpha"),value(prefix==2 ? 4 : 6),Mutation.ReturnMode.NONE),RatisLogicalClient.Change.put(74,member(prefix,"beta"),value(prefix==2 ? 5 : 7),Mutation.ReturnMode.NONE));
-            var physical=RatisLogicalClient.plan(f.schema,changes,List.of(),RatisTransactionPlan.MAX_BYTES);
+            var physical=RatisLogicalClient.plan(scopeColumnId -> f.schema,changes,List.of(),RatisTransactionPlan.MAX_BYTES);
             assertEquals(CommandResult.Status.SUCCESS,f.data.execute(f.data.prepare(new OperationId(f.session,1,prefix==2 ? 902 : 903),physical.mutations(),physical.predicates())).status());
         }
     }
     void put(RatisAtomicClientTest.Fixture f,long column,Keys key,int value,long sequence) throws IOException {
-        var physical=RatisLogicalClient.plan(f.schema,List.of(RatisLogicalClient.Change.put(column,key,value(value),Mutation.ReturnMode.NONE)),List.of(),RatisTransactionPlan.MAX_BYTES);
+        var physical=RatisLogicalClient.plan(scopeColumnId -> f.schema,List.of(RatisLogicalClient.Change.put(column,key,value(value),Mutation.ReturnMode.NONE)),List.of(),RatisTransactionPlan.MAX_BYTES);
         assertEquals(CommandResult.Status.SUCCESS,f.data.execute(f.data.prepare(new OperationId(f.session,1,sequence),physical.mutations(),physical.predicates())).status());
     }
     List<RatisLogicalClient.Change> prefix() { return List.of(RatisLogicalClient.Change.put(71,key(2),value(7),Mutation.ReturnMode.PREVIOUS),RatisLogicalClient.Change.put(74,member(2,"beta"),value(8),Mutation.ReturnMode.CURRENT)); }
@@ -99,7 +99,7 @@ class RatisTransactionClientTest {
                 assertThrows(ExecutionException.class,() -> lease.release(CONTEXT).get(5,TimeUnit.SECONDS)); assertNotNull(f.stores.get(f.groups.getLast()).preparedParticipant(id.commit().transaction()));
             }
             var ids=new HashMap<UUID,UUID>(); var commands=new HashMap<UUID,byte[]>();
-            try (var journal=RatisDurableTransaction.reopen(path,f.homes,f.data)) { for (var progress:journal.snapshot().participants()) { ids.put(progress.intent().route().groupId(),progress.intent().captureId()); commands.put(progress.intent().route().groupId(),DistributedCommandCodec.encode(progress.intent().acceptedBusiness())); } }
+            try (var journal=RatisDurableTransaction.reopen(path,f.homes,RatisTransactionBindings.of(f.data))) { for (var progress:journal.snapshot().participants()) { ids.put(progress.intent().route().groupId(),progress.intent().captureId()); commands.put(progress.intent().route().groupId(),DistributedCommandCodec.encode(progress.intent().acceptedBusiness())); } }
             try (var client=client(f); var operation=client.reopenCommit(path,CONTEXT)) {
                 assertEquals(CommandResult.Status.SUCCESS,operation.completion().get(10,TimeUnit.SECONDS).status());
                 for (var progress:operation.snapshot().participants()) { assertEquals(ids.get(progress.intent().route().groupId()),progress.intent().captureId()); assertArrayEquals(commands.get(progress.intent().route().groupId()),DistributedCommandCodec.encode(progress.intent().acceptedBusiness())); }
@@ -138,7 +138,7 @@ class RatisTransactionClientTest {
         assertThrows(IllegalArgumentException.class,() -> new RatisTransactionClient.Identity(snapshotId,new RatisAtomicClient.Identity(snapshotId.fence(),new OperationId(session,1,600),new OperationId(session,1,601))));
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("guards"),true)) {
             seed(f); var limits=new RatisTransactionClient.Limits(RatisSnapshotClient.Limits.defaults(),new RatisAtomicClient.Limits(1,128L*1024*1024));
-            try (var client=new RatisTransactionClient(f.schema,f.snapshots,f.homes,f.data,f.scheduler,limits)) {
+            try (var client=new RatisTransactionClient(RatisTransactionBindings.of(f.schema,f.data.directory(f.schema),f.data),f.snapshots,f.homes,f.scheduler,limits)) {
                 var snapshot=f.root.resolve("snapshot.journal"); var commit=f.root.resolve("commit.journal"); var id=identity(f);
                 try (var lease=client.open(snapshot,commit,id,scope(f),TTL,CONTEXT)) {
                     acquired(lease,f); int captures=f.captureRequests.get();

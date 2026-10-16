@@ -20,10 +20,9 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     public record Allocation(Path snapshot,Path commit,RatisTransactionClient.Identity identity) {
         public Allocation { Objects.requireNonNull(snapshot); Objects.requireNonNull(commit); Objects.requireNonNull(identity); }
     }
-    @FunctionalInterface public interface AllocationSource { CompletableFuture<Allocation> allocate(RequestContext context); }
+    @FunctionalInterface public interface AllocationSource { CompletableFuture<Allocation> allocate(RequestContext context,List<RatisBackendSessions.Target> dataTargets); }
     public record Stats(int transactions,int opening) {}
-    private final DistributedSchema schema;
-    private final RangeDirectory directory;
+    private final RatisTransactionBindings schema;
     private final RatisTransactionClient transactions;
     private final AllocationSource allocations;
     private final RatisRocksDBDirect direct;
@@ -83,18 +82,18 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             return new RequestContext(context.profile(),remaining);
         }
     }
-    public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges) {
-        this(schema,directory,transactions,allocations,direct,ranges,new java.util.concurrent.atomic.AtomicLong(ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE/2))::incrementAndGet);
+    public RatisRocksDBAdapter(RatisTransactionBindings schema,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges) {
+        this(schema,transactions,allocations,direct,ranges,new java.util.concurrent.atomic.AtomicLong(ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE/2))::incrementAndGet);
     }
-    public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges,java.util.function.LongSupplier handleIds) {
-        this(schema,directory,transactions,allocations,direct,ranges,handleIds,null);
+    public RatisRocksDBAdapter(RatisTransactionBindings schema,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges,java.util.function.LongSupplier handleIds) {
+        this(schema,transactions,allocations,direct,ranges,handleIds,null);
     }
     /** Optional bulk owner has its own exclusive session; other wrappers remain borrowed. */
-    public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges,java.util.function.LongSupplier handleIds,RatisRocksDBBatches batches) {
-        if(batches!=null && !batches.binds(schema,directory)) throw new IllegalArgumentException("Bulk owner differs from adapter's frozen generation");
-        this.batches=batches; this.direct=direct; this.ranges=ranges; this.schema=Objects.requireNonNull(schema); this.directory=Objects.requireNonNull(directory); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); this.handleIds=Objects.requireNonNull(handleIds); schema.requireMatches(directory); iterators=new RatisRocksDBIterators(schema,handleIds);
+    public RatisRocksDBAdapter(RatisTransactionBindings schema,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges,java.util.function.LongSupplier handleIds,RatisRocksDBBatches batches) {
+        if(batches!=null && (schema.domains().size()!=1 || !batches.binds(schema.domains().getFirst().schema(),schema.domains().getFirst().directory()))) throw new IllegalArgumentException("Bulk owner differs from adapter's frozen generation");
+        this.batches=batches; this.direct=direct; this.ranges=ranges; this.schema=Objects.requireNonNull(schema); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); this.handleIds=Objects.requireNonNull(handleIds); iterators=new RatisRocksDBIterators(schema::schema,handleIds);
     }
-    synchronized RatisRocksDBAdapter rangeDeletes(RatisRangeDeleteClient owner){if(rangeDeletes!=null || closing || !owner.binds(schema,directory))throw new IllegalStateException("Range delete owner differs or is already configured");rangeDeletes=owner;return this;}
+    synchronized RatisRocksDBAdapter rangeDeletes(RatisRangeDeleteClient owner){if(rangeDeletes!=null || closing || (schema.domains().size()!=1 || !owner.binds(schema.domains().getFirst().schema(),schema.domains().getFirst().directory())))throw new IllegalStateException("Range delete owner differs or is already configured");rangeDeletes=owner;return this;}
     RatisRangeDeleteClient rangeDeletes(){return rangeDeletes;}
     synchronized boolean ownsTransactionOrUpdate(long id) { return entries.containsKey(id); }
     boolean ownsIterator(long id) { return iterators.owns(id); }
@@ -223,7 +222,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         try {
             var entry=entry(transaction); final long revision;
             synchronized (entry) { if (entry.active!=null || entry.pending!=null || entry.commit!=null || entry.needsReread) throw new IOException("Transaction range ownership busy or unavailable"); revision=entry.revision; }
-            RatisLogicalRangePages.validateBounds(RatisSnapshotPlan.scope(entry.lease.snapshot().initial().fence()),schema,column,lower,upper);
+            RatisLogicalRangePages.validateBounds(RatisSnapshotPlan.scope(entry.lease.snapshot().initial().fence()),schema.schema(column),column,lower,upper);
             return CompletableFuture.completedFuture(new RatisRocksDBIterators.Resource() {
                 public CompletableFuture<RangePage<KV>> page(Keys low,Keys high,boolean back,Keys resume,RangeBudget budget,RequestContext context) {
                     synchronized (entry) { if (entry.revision!=revision) return CompletableFuture.failedFuture(RocksDBException.of(TX_NOT_FOUND,"Iterator staged revision changed")); }
@@ -263,16 +262,9 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             return iterators.streamOwned(transaction,column,low,high,reverse,() -> readResource(transaction,column,low,high,reverse,Duration.ofSeconds(60),deadline,true),deadline.remaining()).observer();
         });
     }
-    private TransactionScope scope(TransactionOpenScope declaration) { return scope(schema,directory,declaration); }
-    static TransactionScope scope(DistributedSchema schema,RangeDirectory directory,TransactionOpenScope declaration) {
-        if (declaration==null) throw RocksDBException.of(TX_SCOPE_REQUIRED,"Distributed transactions require an explicit bounded scope");
-        var spans=new ArrayList<TransactionScope.Span>();
-        for (var span:declaration.spans()) {
-            var column=schema.column(span.columnId()).columnId();
-            spans.add(span.point() ? TransactionScope.Span.point(column,schema.encodeLogicalKey(column,span.lowerInclusive()).physicalKey())
-                    : TransactionScope.Span.range(column,RatisLogicalRangePages.bound(schema,column,span.lowerInclusive()),RatisLogicalRangePages.upperBound(schema,column,span.upperExclusive())));
-        }
-        var scope=new TransactionScope(spans); scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS); return scope;
+    private TransactionScope scope(TransactionOpenScope declaration) { return scope(schema,declaration); }
+    static TransactionScope scope(RatisTransactionBindings bindings,TransactionOpenScope declaration) {
+        if(declaration==null)throw RocksDBException.of(TX_SCOPE_REQUIRED,"Distributed transactions require an explicit bounded scope");return bindings.scope(declaration);
     }
     private CompletableFuture<Long> open(TransactionOpenScope declaration,Duration ttl,Deadline deadline) {
         try { return open(scope(declaration),ttl,deadline,Mode.EXPLICIT); }
@@ -284,13 +276,13 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private CompletableFuture<Long> open(TransactionScope scope,Duration ttl,Deadline deadline,Mode mode) {
         try {
             if (Objects.requireNonNull(ttl).isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Transaction TTL must be whole milliseconds up to60seconds");
-            scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
+            schema.preflight(scope);
             final Entry entry;
             synchronized (this) { if (closing || entries.size()>=MAX_TRANSACTIONS) throw RocksDBException.of(SERVER_OVERLOADED,"Transaction ID capacity exhausted");
                 long id=handleIds.getAsLong(); if (id<=0 || entries.containsKey(id)) throw new IllegalStateException("Shared handle allocator returned an invalid or reused ID"); entry=new Entry(id,mode); entries.put(entry.id,entry); }
             var view=new CompletableFuture<Long>();
             CompletableFuture<Allocation> allocation;
-            try { allocation=Objects.requireNonNull(allocations.allocate(deadline.remaining())); }
+            try { allocation=Objects.requireNonNull(allocations.allocate(deadline.remaining(),schema.targets(scope))); }
             catch (Throwable failure) { synchronized (this) { entries.remove(entry.id,entry); } return CompletableFuture.failedFuture(failure); }
             var acquired=allocation.thenCompose(saved -> {
                 try { entry.lease=transactions.open(saved.snapshot(),saved.commit(),saved.identity(),scope,ttl,deadline.remaining()); return entry.lease.completion(); }
@@ -375,8 +367,8 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         CompletableFuture<Void> cleaned=entry.needsReread ? CompletableFuture.completedFuture(null) : cleanupAttempt(entry,deadline,false);
         return cleaned.thenCompose(ignored -> {
             if (entry.lease!=null) return entry.lease.resume(deadline.remaining());
-            var scope=new TransactionScope(schema.columns().stream().map(value -> TransactionScope.Span.range(value.columnId(),null,null)).toList()); scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
-            return allocations.allocate(deadline.remaining()).thenCompose(saved -> {
+            var scope=new TransactionScope(schema.columns().stream().map(value -> TransactionScope.Span.range(value.columnId(),null,null)).toList()); schema.preflight(scope);
+            return allocations.allocate(deadline.remaining(),schema.targets(scope)).thenCompose(saved -> {
                 try { entry.lease=transactions.open(saved.snapshot(),saved.commit(),saved.identity(),scope,UPDATE_TTL,deadline.remaining()); }
                 catch (IOException failure) { return CompletableFuture.failedFuture(failure); }
                 return entry.lease.completion();
@@ -439,7 +431,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             if (entry.mode==Mode.UPDATE && entry.updateWrite!=null) {
                 if (!entry.updateWrite.same(candidate)) throw new IOException("Resume the exact uncertain update write"); request=entry.updateWrite;
             } else request=candidate;
-            RatisLogicalClient.plan(schema,request.prefix,List.of(),RatisTransactionPlan.MAX_BYTES); // reject invalid full prefixes before claiming uncertain native ownership
+            RatisLogicalClient.plan(schema::schema,request.prefix,List.of(),RatisTransactionPlan.MAX_BYTES); // reject invalid full prefixes before claiming uncertain native ownership
         }
         return invoke(entry,request,() -> {
             if (request.keys.isEmpty()) {
@@ -454,8 +446,8 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             var pending=entry.pending;
             return iterators.invalidateTransaction(entry.id,deadline.remaining()).thenCompose(ignored -> entry.lease.stage(pending.prefix,List.of(),deadline.remaining())).thenApply(results -> {
                 deadline.remaining();
-                var logical=RatisLogicalClient.plan(schema,pending.prefix,List.of(),RatisTransactionPlan.MAX_BYTES); final RatisTransactionPlan plan;
-                try { plan=RatisTransactionPlan.captured(directory,entry.lease.identity().commit().business(),logical.mutations(),logical.predicates(),entry.lease.snapshot()); }
+                var logical=RatisLogicalClient.plan(schema::schema,pending.prefix,List.of(),RatisTransactionPlan.MAX_BYTES); final RatisTransactionPlan plan;
+                try { plan=RatisTransactionPlan.captured(schema.directories(),entry.lease.identity().commit().business(),logical.mutations(),logical.predicates(),entry.lease.snapshot()); }
                 catch (IOException unavailable) { throw new CompletionException(unavailable); }
                 var ordered=new HashMap<Integer,byte[]>();
                 for (var part:plan.partitions()) { var result=results.get(part.route().groupId()); if (result==null || result.valueCount()!=part.resultPositions().size()) throw new CompletionException(new IOException("Stage result mapping changed")); for (int n=0;n<result.valueCount();n++) ordered.put(part.resultPositions().get(n),result.value(n)); }

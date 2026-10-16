@@ -48,7 +48,7 @@ final class RatisDatabaseBackupFactoryFixture implements AutoCloseable,RatisData
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{assertTrue(fresh);var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);if(packet.kind()!=ScopedTransactionRpc.SNAPSHOT_HOME_FENCE)throw new AssertionError("Unexpected HOME query");var identity=SnapshotHomeIdentity.decode(packet.body());return ScopedTransactionRpc.frame(packet.kind(),ByteBuffer.allocate(36).put(identity.digest()).putInt(-1).array());}
             });fences=new RatisSnapshotFences(routed,column);
             long offset=1000L*index;var identity=new RatisSnapshotClient.Identity(UUID.randomUUID(),new OperationId(grant.sessionId(),grant.epoch(),offset),new OperationId(grant.sessionId(),grant.epoch(),offset+1));
-            var plan=RatisSnapshotPlan.create(data.directory,new TransactionScope(List.of(TransactionScope.Span.range(data.column,null,null))),identity.fence(),identity.business(),group,1,identity.firstControl());fence=plan.fence();
+            var plan=RatisSnapshotPlan.create(List.of(data.directory),new TransactionScope(List.of(TransactionScope.Span.range(data.column,null,null))),identity.fence(),identity.business(),group,1,identity.firstControl());fence=plan.fence();
             reservations.put(fence.fenceId(),new RatisDatabaseBackupFactory.Reservation(grant,identity));access.put(data.domain,new RatisDatabaseBackupFactory.Domain(fences,endpoint.routed,endpoint.scheduler));
         }
         byte[] value(byte[] key)throws Exception{try(var snapshot=store.capture(new TransactionScope(List.of(TransactionScope.Span.point(column,key))))){return snapshot.get(column,key);}}

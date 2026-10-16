@@ -25,7 +25,7 @@ class RatisSnapshotClientTest {
         return new RatisSnapshotClient.Identity(f.identity(block).transaction(),new OperationId(f.session,1,business),new OperationId(f.session,1,business+1));
     }
     static RatisSnapshotClient client(Fixture f) {
-        return new RatisSnapshotClient(f.schema,f.snapshots,f.data,f.scheduler,RatisSnapshotClient.Limits.defaults());
+        return new RatisSnapshotClient(RatisTransactionBindings.of(f.schema,f.data.directory(f.schema),f.data),f.snapshots,f.scheduler,RatisSnapshotClient.Limits.defaults());
     }
     static List<RatisLogicalClient.Change> image(int value) {
         var changes=new ArrayList<RatisLogicalClient.Change>();

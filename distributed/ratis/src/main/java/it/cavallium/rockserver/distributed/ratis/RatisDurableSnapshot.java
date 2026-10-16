@@ -40,7 +40,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     Persistence persistence;
     private final Path path;
     private final RatisSnapshotFences homes;
-    private final RatisRoutedClient data;
+    private final RatisTransactionBindings data;
     private byte[] identity;private final byte[] homeIdentity;
     private final FileChannel channel;
     private final FileLock lock;
@@ -55,23 +55,23 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     private RatisSnapshotCaptureRequest.Mode captureMode;
     private boolean homeSuperseded,active,closed,fenced,reclaimed,releaseRequested;
 
-    public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
+    public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisTransactionBindings data,SnapshotFenceStatus initial,
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes) throws IOException {
         return create(path,homes,data,initial,registration,routes,null,RatisSnapshotCaptureRequest.Mode.READ_ONLY);
     }
-    public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
+    public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisTransactionBindings data,SnapshotFenceStatus initial,
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl) throws IOException {
         return create(path,homes,data,initial,registration,routes,requestedTtl,RatisSnapshotCaptureRequest.Mode.READ_ONLY);
     }
-    public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
+    public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisTransactionBindings data,SnapshotFenceStatus initial,
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,RatisSnapshotCaptureRequest.Mode mode) throws IOException {
         return create(path,homes,data,initial,registration,routes,null,mode);
     }
-    public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
+    public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisTransactionBindings data,SnapshotFenceStatus initial,
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl,RatisSnapshotCaptureRequest.Mode mode) throws IOException {
         return createOwned(path,homes,data,initial,registration,routes,requestedTtl,mode,RatisJournalAccess.standalone());
     }
-    static RatisDurableSnapshot createOwned(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access)throws IOException {
+    static RatisDurableSnapshot createOwned(Path path,RatisSnapshotFences homes,RatisTransactionBindings data,SnapshotFenceStatus initial,RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access)throws IOException {
         requireTtl(requestedTtl,mode);
         var journal=new RatisDurableSnapshot(path,homes,data,true,access);
         journal.requestedTtl=requestedTtl; journal.captureMode=mode;journal.identity=dataBinding(data,mode);
@@ -81,12 +81,12 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             homes.restore(registration.command(),registration.descriptor());
             if (expected(registration)!=null || !next(registration).equals(initial)) throw new IllegalArgumentException("Home registration differs from snapshot definition");
             journal.homeRoute=registration.descriptor(); journal.pending=registration; journal.lastHome=registration.command().operationId();
-            var directory=data.directory(); if (initial.fence().domains().size()!=1 || !DomainBinding.of(directory).equals(initial.fence().domains().getFirst())) throw new IllegalArgumentException("Snapshot directory generation changed before freezing routes");
+            data.require(initial.fence().domains());
             if (routes.size()!=initial.fence().participants().size()) throw new IllegalArgumentException("Incomplete snapshot route set");
             var supplied=new HashMap<UUID,RangeDescriptor>(); for (var route:routes) if (supplied.putIfAbsent(route.groupId(),route)!=null) throw new IllegalArgumentException("Duplicate snapshot route");
             for (var participant:initial.fence().participants()) {
                 var route=Objects.requireNonNull(supplied.get(participant.groupId()),"Missing participant route");
-                var current=directory.ranges().stream().filter(r -> r.groupId().equals(participant.groupId())).findFirst().orElseThrow();
+                var directory=data.directoryForGroup(participant.groupId());var current=directory.ranges().stream().filter(r -> r.groupId().equals(participant.groupId())).findFirst().orElseThrow();
                 if (!route.equals(current)) throw new IllegalArgumentException("Snapshot route differs from original directory");
                 var covered=participant.scope().participants(directory,SnapshotFence.MAX_PARTICIPANTS);
                 if (covered.size()!=1 || !covered.getFirst().equals(route)) throw new IllegalArgumentException("Snapshot scope crosses its frozen participant route");
@@ -95,9 +95,9 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             journal.capacity(); journal.persist(); return journal;
         } catch (IOException | RuntimeException | Error failure) { try { journal.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
-    public static RatisDurableSnapshot reopen(Path path,RatisSnapshotFences homes,RatisRoutedClient data) throws IOException { return new RatisDurableSnapshot(path,homes,data,false,RatisJournalAccess.standalone()); }
-    static RatisDurableSnapshot reopenOwned(Path path,RatisSnapshotFences homes,RatisRoutedClient data,RatisJournalAccess access)throws IOException {return new RatisDurableSnapshot(path,homes,data,false,access);}
-    private RatisDurableSnapshot(Path file,RatisSnapshotFences homes,RatisRoutedClient data,boolean create,RatisJournalAccess access) throws IOException {
+    public static RatisDurableSnapshot reopen(Path path,RatisSnapshotFences homes,RatisTransactionBindings data) throws IOException { return new RatisDurableSnapshot(path,homes,data,false,RatisJournalAccess.standalone()); }
+    static RatisDurableSnapshot reopenOwned(Path path,RatisSnapshotFences homes,RatisTransactionBindings data,RatisJournalAccess access)throws IOException {return new RatisDurableSnapshot(path,homes,data,false,access);}
+    private RatisDurableSnapshot(Path file,RatisSnapshotFences homes,RatisTransactionBindings data,boolean create,RatisJournalAccess access) throws IOException {
         journalAccess=Objects.requireNonNull(access);persistence=access::write;access.register(file,MAX_BYTES);access.register(file.resolveSibling(file.getFileName()+".lock"),32);
         path=file.toAbsolutePath(); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); identity=data.sessionIdentityDigest(); homeIdentity=homes.identityDigest();
         if (!Files.isDirectory(path.getParent())) throw new IOException("Snapshot journal parent is absent");
@@ -112,8 +112,8 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             try { channel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure;
         }
     }
-    private static byte[] dataBinding(RatisRoutedClient data,RatisSnapshotCaptureRequest.Mode mode){return mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY?data.snapshotNamespaceDigest():data.sessionIdentityDigest();}
-    synchronized void requireClients(RatisSnapshotFences expectedHomes,RatisRoutedClient expectedData) throws IOException {
+    private static byte[] dataBinding(RatisTransactionBindings data,RatisSnapshotCaptureRequest.Mode mode){return mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY?data.snapshotNamespaceDigest():data.sessionIdentityDigest();}
+    synchronized void requireClients(RatisSnapshotFences expectedHomes,RatisTransactionBindings expectedData) throws IOException {
         requireOpen(); if (!Arrays.equals(homeIdentity,Objects.requireNonNull(expectedHomes).identityDigest()) || !Arrays.equals(identity,dataBinding(Objects.requireNonNull(expectedData),captureMode))) throw new IllegalArgumentException("Snapshot clients differ from journal binding");
     }
     public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,lastHome,entries.values().stream().map(Entry::progress).toList(),homeRetirementProof,releaseRequested,requestedTtl,captureMode); }
@@ -615,7 +615,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     }
     private static long futureRoute(RangeDescriptor route) { return 60L+(route.lowerInclusive()==null ? 0 : route.lowerInclusive().length)+(route.upperExclusive()==null ? 0 : route.upperExclusive().length)+RangeDirectoryCodec.MAX_REPLICAS*(57L+128+256); }
     private void validateScope(RangeDescriptor route) {
-        var directory=data.directory(); int prefix=directory.routingPrefixBytes(); var participant=initial.fence().participant(route.groupId());
+        var directory=data.directoryForGroup(route.groupId()); int prefix=directory.routingPrefixBytes(); var participant=initial.fence().participant(route.groupId());
         byte[] routeLower=route.lowerInclusive(),routeUpper=route.upperExclusive();
         if (prefix>0 && (routeLower!=null && routeLower.length!=prefix || routeUpper!=null && routeUpper.length!=prefix)) throw new IllegalArgumentException("Snapshot route bounds differ from projection");
         for (var span:participant.scope().spans()) {

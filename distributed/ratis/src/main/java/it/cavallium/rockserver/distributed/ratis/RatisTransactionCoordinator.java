@@ -23,7 +23,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
 
     private final RatisDurableTransaction journal;
     private final RatisTransactionStatuses homes;
-    private final RatisRoutedClient data;
+    private final RatisTransactionBindings data;
     private final RatisTransactionRecovery.ControlIds controls;
     private final PreparationAuthority authority;
     private final RatisTransactionRecovery terminal;
@@ -31,7 +31,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
     private int cursor;
     private boolean active,closed;
 
-    public RatisTransactionCoordinator(RatisDurableTransaction journal,RatisTransactionStatuses homes,RatisRoutedClient data,
+    public RatisTransactionCoordinator(RatisDurableTransaction journal,RatisTransactionStatuses homes,RatisTransactionBindings data,
             RatisTransactionRecovery.ControlIds controls,PreparationAuthority authority) throws IOException {
         this.journal=Objects.requireNonNull(journal); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
         this.controls=Objects.requireNonNull(controls); this.authority=Objects.requireNonNull(authority);

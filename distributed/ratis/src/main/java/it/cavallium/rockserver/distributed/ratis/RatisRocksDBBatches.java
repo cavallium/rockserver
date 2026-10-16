@@ -128,7 +128,7 @@ public final class RatisRocksDBBatches implements AutoCloseable {
         var grouped=new LinkedHashMap<UUID,List<Mutation>>(); long copied=0; var grant=session.grant();
         for(int i=0;i<keys.size();i++) {
             var change=merge ? RatisLogicalClient.Change.merge(column,keys.get(i),values.get(i),Mutation.ReturnMode.NONE) : RatisLogicalClient.Change.put(column,keys.get(i),values.get(i),Mutation.ReturnMode.NONE);
-            var plan=RatisLogicalClient.plan(schema,List.of(change),List.of()); var mutation=plan.mutations().getFirst(); var route=directory.route(mutation.columnId(),mutation.key());
+            var plan=RatisLogicalClient.plan(scopeColumnId -> schema,List.of(change),List.of()); var mutation=plan.mutations().getFirst(); var route=directory.route(mutation.columnId(),mutation.key());
             var single=new DistributedCommand(route.groupId(),route.rangeEpoch(),directory.schemaDigest(),new OperationId(grant.sessionId(),grant.epoch(),0),List.of(mutation));
             int bytes=DistributedCommandCodec.encodedSize(single); if(bytes>MAX_CHUNK_BYTES) throw new IllegalArgumentException("One batch mutation exceeds native chunk bound"); copied+=bytes-DistributedCommandCodec.HEADER_BYTES; if(copied>MAX_INPUT_BYTES) throw new IllegalArgumentException("Copied KVBatch exceeds input bound");
             grouped.computeIfAbsent(route.groupId(),ignored -> new ArrayList<>()).add(mutation);

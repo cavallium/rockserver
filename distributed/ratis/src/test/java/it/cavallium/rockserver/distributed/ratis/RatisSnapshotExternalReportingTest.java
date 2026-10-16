@@ -16,7 +16,7 @@ class RatisSnapshotExternalReportingTest {
         var tests=new RatisSnapshotCoordinatorTest();tests.root=root;
         try(var f=tests.new Fixture("external-report")){
             var initial=SnapshotFenceStatus.begin(f.fence);Path path=root.resolve("external.journal");
-            try(var journal=RatisDurableSnapshot.create(path,f.home.homes,f.data,initial,f.home.homes.prepare(tests.control(20),null,initial),f.directory.ranges(),Duration.ofSeconds(10));var coordinator=f.driver(journal)){
+            try(var journal=RatisDurableSnapshot.create(path,f.home.homes,RatisTransactionBindings.of(f.data),initial,f.home.homes.prepare(tests.control(20),null,initial),f.directory.ranges(),Duration.ofSeconds(10));var coordinator=f.driver(journal)){
                 for(int i=0;i<32;i++)if(coordinator.step(RatisSnapshotCoordinator.StopAt.GATES_READY).action()==RatisSnapshotCoordinator.Action.GATES_READY)break;
                 assertTrue(journal.snapshot().observedHome().allReady());var expected=journal.snapshot().observedHome();
                 for(var p:expected.progress()){

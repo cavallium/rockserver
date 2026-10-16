@@ -95,13 +95,13 @@ public final class RatisLogicalClient {
     }
     /** One atomic same-range plan. Cross-range inputs are rejected before allocation or any RPC. */
     public Pending prepare(List<Change> changes,List<Condition> conditions) {
-        var plan=plan(schema,changes,conditions); return new Pending(this,session.prepareAt(directory,plan.mutations(),plan.predicates()));
+        var plan=plan(scopeColumnId -> schema,changes,conditions); return new Pending(this,session.prepareAt(directory,plan.mutations(),plan.predicates()));
     }
     record Plan(List<Mutation> mutations,List<KeyPredicate> predicates) {}
-    static Plan plan(DistributedSchema schema,List<Change> changes,List<Condition> conditions) {
-        return plan(schema,changes,conditions,DistributedCommandCodec.MAX_ENCODED_BYTES);
+    static Plan plan(java.util.function.LongFunction<DistributedSchema> schemas,List<Change> changes,List<Condition> conditions) {
+        return plan(schemas,changes,conditions,DistributedCommandCodec.MAX_ENCODED_BYTES);
     }
-    static Plan plan(DistributedSchema schema,List<Change> changes,List<Condition> conditions,long maxBytes) {
+    static Plan plan(java.util.function.LongFunction<DistributedSchema> schemas,List<Change> changes,List<Condition> conditions,long maxBytes) {
         if (maxBytes<1 || maxBytes>RatisTransactionPlan.MAX_BYTES) throw new IllegalArgumentException("Invalid logical transaction byte budget");
         changes=List.copyOf(changes); conditions=List.copyOf(conditions);
         if (changes.isEmpty() && conditions.isEmpty() || (long)changes.size()+conditions.size()>DistributedCommandCodec.MAX_ITEMS) {
@@ -110,7 +110,7 @@ public final class RatisLogicalClient {
         var mutations=new ArrayList<Mutation>(changes.size()); var predicates=new ArrayList<KeyPredicate>(conditions.size());
         long bytes=0;
         for (var change:changes) {
-            var column=supported(schema,change.column); var encoded=schema.encodeLogicalKey(column.columnId(),change.keys); var key=encoded.physicalKey(); var members=encoded.variableKeys();
+            var schema=schemas.apply(change.column);var column=supported(schema,change.column); var encoded=schema.encodeLogicalKey(column.columnId(),change.keys); var key=encoded.physicalKey(); var members=encoded.variableKeys();
             byte[] value;
             if (change.kind==Mutation.Kind.MERGE) {
                 if (column.operator()==null) throw new IllegalArgumentException("MERGE requires an operator-bearing column");
@@ -126,7 +126,7 @@ public final class RatisLogicalClient {
             else mutations.add(new Mutation(change.kind,column.columnId(),key,value,change.returns));
         }
         for (var condition:conditions) {
-            var column=supported(schema,condition.column); var encoded=schema.encodeLogicalKey(column.columnId(),condition.keys); var key=encoded.physicalKey(); var members=encoded.variableKeys();
+            var schema=schemas.apply(condition.column);var column=supported(schema,condition.column); var encoded=schema.encodeLogicalKey(column.columnId(),condition.keys); var key=encoded.physicalKey(); var members=encoded.variableKeys();
             // Null is an absence predicate even for value-bearing columns.
             byte[] expected=condition.expected==null ? null : storedValue(column,condition.expected);
             bytes+=25L+key.length+(expected==null ? 0 : expected.length)+memberBytes(members); if (bytes>maxBytes) throw new IllegalArgumentException("Logical plan exceeds byte budget");

@@ -27,9 +27,8 @@ This section and the remaining gates at the end describe the current branch.
   out-of-scope refusal, rollback, reopen and commit over both gRPC and Thrift.
   Immutable connection generations and recovery identities bind both schema and
   exact directory digests, preserving old handles across same-schema placement
-  changes while new opens capture the current directory. Cross-domain scopes
-  remain an explicit implementation gap; domains are placement units within one
-  database, not a relaxation of the required cross-column atomicity contract.
+  changes while new opens capture the current directory. The database-wide
+  orchestration below extends this behavior across placement domains.
   `scoped-prefix-native57.log` passes 43 core cases in each execution.
   `scoped-recovery-combined58.log` passes 128 core cases in each execution,
   28 server cases and 16 gRPC lifecycle cases. Packaging succeeds separately in
@@ -53,7 +52,7 @@ This section and the remaining gates at the end describe the current branch.
   namespaces, lost binding reply/exact grant recovery, unselected DATA groups
   receiving no binding, renewal, pipeline and factory ownership. Thirty further
   batch/connection/reroute/topology cases pass in `session-domain-consumers63.log`.
-  This is a prerequisite for cross-domain transactions, not frontend acceptance.
+  These binding checks are prerequisites; frontend acceptance is recorded below.
 - Snapshot fences and transaction decisions now register one canonical vector of
   domain/schema/directory bindings and explicitly qualify each participant's domain.
   Native prepare, rejection, finalization, retained images and snapshot gates select
@@ -74,9 +73,26 @@ This section and the remaining gates at the end describe the current branch.
   Its sole failure was an obsolete timer-count fixture; all five HOME role cases
   pass in `domain-vector-runtime78.log`, and all 33 Runtime lifecycle cases plus
   packaging pass in `domain-vector-runtime79.log` after accounting for continuous
-  recovery discovery. Public cross-domain transaction orchestration is still an
-  explicit implementation gate; native authority support does not establish that
-  frontend capability or production performance.
+  recovery discovery. These native-authority checks are separate from the
+  database-wide frontend evidence below and do not establish production performance.
+- Common explicit transactions now resolve the whole declaration into one frozen
+  database-wide schema/directory/client vector before creating an actor, handle,
+  grant or capture. A single global fence and HOME decision cover all selected
+  domains, with the aggregate 64-DATA-participant limit and exact clipped-envelope
+  preflight. Aggregate generations count independently and cannot consume schema
+  publication credits reserved for singleton generations. Allocations preserve
+  deterministic identities, bind exact DATA targets and charge their bounded
+  configured HOME administrative union. `cross-domain-clients-native86.log` passes
+  eleven adapter/capacity/native cases. `cross-domain-clients-topology96.log` passes
+  twelve cases, including heterogeneous native pools/schemas, ordered interleaved
+  results, read-only-participant conflicts with zero partial effects, cancellation,
+  lost PREPARE/COMMIT/FINALIZE replies without recapture, and exact committed-journal
+  recovery after both DATA pools restart without new grants. HOME kernels remain
+  live in that cold fixture. Native FREEZE refuses undrained writable owners; after
+  rollback the same split completes and fresh transactions capture descendants.
+  Existing backup and two-pool workflows also pass. These controlled transports do
+  not prove independent endpoint/quorum or performance acceptance. The public
+  durable `executeAtomic(mutations, predicates)` owner remains a separate gap.
 - Unqualified common physical CF estimates, table/SST metadata and maintenance now
   return typed NOT_IMPLEMENTED before generation lookup in both connection and
   adapter dispatch. Physical observations and maintenance retain the qualified
