@@ -28,6 +28,8 @@ import io.grpc.Status.Code;
 import io.grpc.StatusException;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyServerBuilder;
+import io.grpc.stub.ServerCalls;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Metrics;
 import io.netty.channel.ChannelOption;
@@ -91,6 +93,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -348,9 +351,7 @@ public class GrpcServer extends Server {
 			channelType = NioServerSocketChannel.class;
 		}
 		this.elg = elg;
-		ServerServiceDefinition service = grpcGetStrategy == GrpcGetStrategy.LEGACY
-				? grpc.bindService()
-				: bindFastGetService();
+		ServerServiceDefinition service = bindReadService();
 		this.server = NettyServerBuilder
 				.forAddress(socketAddress)
 				.bossEventLoopGroup(elg)
@@ -444,13 +445,24 @@ public class GrpcServer extends Server {
 		return true;
 	}
 
-	private ServerServiceDefinition bindFastGetService() {
+	private ServerServiceDefinition bindReadService() {
 		ServerServiceDefinition generated = grpc.bindService();
 		var builder = ServerServiceDefinition.builder(generated.getServiceDescriptor().getName());
 		String getMethodName = RocksDBServiceGrpc.getGetMethod().getFullMethodName();
+		String multiGetMethodName = RocksDBServiceGrpc.getGetMultiMethod().getFullMethodName();
 		for (ServerMethodDefinition<?, ?> method : generated.getMethods()) {
-			if (method.getMethodDescriptor().getFullMethodName().equals(getMethodName)) {
+			if (grpcGetStrategy != GrpcGetStrategy.LEGACY
+					&& method.getMethodDescriptor().getFullMethodName().equals(getMethodName)) {
 				builder.addMethod(fastGetMethodDescriptor(), new FastGetCallHandler());
+			} else if (method.getMethodDescriptor().getFullMethodName().equals(multiGetMethodName)) {
+				var descriptor = RocksDBServiceGrpc.getGetMultiMethod().toBuilder(
+						RocksDBServiceGrpc.getGetMultiMethod().getRequestMarshaller(),
+						MultiGetResponseMarshaller.INSTANCE).build();
+				builder.addMethod(descriptor, ServerCalls.asyncUnaryCall((request, observer) -> {
+					var task = new MultiGetTask(request, (ServerCallStreamObserver<MultiGetResponse>) observer);
+					task.observer.setOnCancelHandler(task::cancel);
+					task.schedule();
+				}));
 			} else {
 				addUnchangedMethod(builder, method);
 			}
@@ -467,6 +479,270 @@ public class GrpcServer extends Server {
 	private static void addUnchangedMethod(ServerServiceDefinition.Builder builder,
 			ServerMethodDefinition<?, ?> method) {
 		builder.addMethod((ServerMethodDefinition) method);
+	}
+
+	private static RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti mapGetMultiRequest(GetMultiRequest request) {
+		if (!request.hasBudget()) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "MultiGet budget is required");
+		}
+		final it.cavallium.rockserver.core.common.RangeBudget budget;
+		try {
+			budget = new it.cavallium.rockserver.core.common.RangeBudget(
+					request.getBudget().getMaxItems(), request.getBudget().getMaxBytes());
+		} catch (IllegalArgumentException invalid) {
+			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, invalid.getMessage(), invalid);
+		}
+		MultiGetPage.validateLimits(request.getKeysMultiCount(), budget);
+		long keyBytes = 0;
+		for (var tuple : request.getKeysMultiList()) {
+			keyBytes += MultiGetPage.KEY_PART_BYTES * tuple.getKeysCount();
+			MultiGetPage.validateKeyBytes(keyBytes);
+			for (var part : tuple.getKeysList()) {
+				keyBytes += part.size();
+				MultiGetPage.validateKeyBytes(keyBytes);
+			}
+		}
+		var keys = request.getKeysMultiList().stream()
+				.map(tuple -> GrpcServerImpl.mapKeys(tuple.getKeysList())).toList();
+		return new RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti(request.getColumnId(), keys, budget);
+	}
+
+	/** Cancellation never releases a result while the worker or transport is borrowing it. */
+	private final class MultiGetTask implements Runnable, RWScheduler.EstimatedWork, RWScheduler.RejectionAwareTask {
+		private final GetMultiRequest request;
+		private final ServerCallStreamObserver<MultiGetResponse> observer;
+		private final Context callContext = Context.current();
+		private final AtomicBoolean claimed = new AtomicBoolean();
+		private final AtomicBoolean terminal = new AtomicBoolean();
+		private volatile boolean cancelled;
+		private volatile @Nullable Disposable scheduled;
+		private ResolvedRequestContext context;
+		private RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti command;
+		private WorkloadProfile profile;
+
+		private MultiGetTask(GetMultiRequest request, ServerCallStreamObserver<MultiGetResponse> observer) {
+			this.request = request;
+			this.observer = observer;
+		}
+
+		private void schedule() {
+			try {
+				context = grpc.mapRequestContext(request.getContext());
+				command = mapGetMultiRequest(request);
+				profile = grpc.preAdmit(context, OperationFamily.BOUNDED_FAN_OUT, command);
+				if (isCancelled()) {
+					return;
+				}
+				var task = commandWorkloadScheduler(command).scheduler(profile, command.operationFamily(),
+						context.localMonotonicDeadlineNanos()).schedule(this);
+				scheduled = task;
+				if (isCancelled()) {
+					task.dispose();
+				}
+			} catch (Throwable error) {
+				if (claimed.compareAndSet(false, true)) {
+					fail(error);
+				}
+			}
+		}
+
+		private boolean isCancelled() {
+			return cancelled || observer.isCancelled() || callContext.isCancelled();
+		}
+
+		private void cancel() {
+			cancelled = true;
+			var task = scheduled;
+			if (task != null) {
+				task.dispose();
+			}
+		}
+
+		@Override
+		public void run() {
+			if (!claimed.compareAndSet(false, true) || isCancelled()) {
+				return;
+			}
+			Context previous = callContext.attach();
+			try {
+				try (var response = createResponse()) {
+					if (!isCancelled()) {
+						// sendMessage consumes the marshaller stream before onNext returns.
+						observer.onNext(response);
+					}
+				}
+				if (!isCancelled() && terminal.compareAndSet(false, true)) {
+					observer.onCompleted();
+				}
+			} catch (Throwable error) {
+				fail(error);
+			} finally {
+				callContext.detach(previous);
+			}
+		}
+
+		private MultiGetResponse createResponse() {
+			if (embeddedDatabase == null) {
+				return new MultiGetResponse(command.handleSync(grpc.syncApi(context.value())), null);
+			}
+			var owner = embeddedDatabase.getMultiPinned(command.columnId(), command.keys(), command.budget(),
+					profile, context.localMonotonicDeadlineNanos(), this::isCancelled);
+			try {
+				return new MultiGetResponse(owner.page(), owner);
+			} catch (Throwable error) {
+				owner.close();
+				throw error;
+			}
+		}
+
+		private void fail(Throwable error) {
+			if (!isCancelled() && terminal.compareAndSet(false, true)) {
+				observer.onError(grpc.mapRequestError("getMulti", request, error));
+			}
+		}
+
+		@Override
+		public long estimatedBytes() {
+			return command.estimatedBytes();
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			if (claimed.compareAndSet(false, true)) {
+				Context previous = callContext.attach();
+				try {
+					fail(failure);
+				} finally {
+					callContext.detach(previous);
+				}
+			}
+		}
+	}
+
+	private record MultiGetResponse(MultiGetPage page, @Nullable EmbeddedDB.PinnedMultiGetResult owner)
+			implements AutoCloseable {
+		@Override
+		public void close() {
+			if (owner != null) {
+				owner.close();
+			}
+		}
+	}
+
+	private enum MultiGetResponseMarshaller implements MethodDescriptor.Marshaller<MultiGetResponse> {
+		INSTANCE;
+
+		@Override
+		public InputStream stream(MultiGetResponse response) {
+			return new MultiGetInputStream(response.page(), response.owner() != null);
+		}
+
+		@Override
+		public MultiGetResponse parse(InputStream stream) {
+			try {
+				var parsed = it.cavallium.rockserver.core.common.api.proto.MultiGetPage.parseFrom(stream);
+				List<Buf> values = new ArrayList<>(parsed.getValuesCount());
+				for (var value : parsed.getValuesList()) {
+					values.add(value.hasValue() ? Buf.wrap(value.getValue().toByteArray()) : null);
+				}
+				return new MultiGetResponse(new MultiGetPage(values, parsed.getHasMore()), null);
+			} catch (IOException error) {
+				throw Status.INTERNAL.withDescription("Invalid MultiGet response").withCause(error).asRuntimeException();
+			}
+		}
+	}
+
+	/** Only framing is allocated; value bytes are borrowed until sendMessage returns. */
+	private static final class MultiGetInputStream extends InputStream implements Drainable, KnownLength {
+		private final MultiGetPage page;
+		private final boolean pinned;
+		private int remaining;
+		private int slot;
+		private InputStream current = InputStream.nullInputStream();
+		private @Nullable FastGetInputStream valueStream;
+
+		private MultiGetInputStream(MultiGetPage page, boolean pinned) {
+			this.page = page;
+			this.pinned = pinned;
+			long size = page.hasMore() ? 2L : 0L;
+			for (var value : page.values()) {
+				long inner = value == null ? 0L : 1L + FastGetInputStream.varintSize(value.size()) + value.size();
+				if (inner > Integer.MAX_VALUE) {
+					throw new IllegalArgumentException("MultiGet value exceeds the gRPC message length limit");
+				}
+				size += 1L + FastGetInputStream.varintSize((int) inner) + inner;
+			}
+			if (size > Integer.MAX_VALUE) {
+				throw new IllegalArgumentException("MultiGet response exceeds the gRPC message length limit: " + size);
+			}
+			remaining = (int) size;
+		}
+
+		private boolean advance() {
+			if (valueStream != null) {
+				current = valueStream;
+				valueStream = null;
+				return true;
+			}
+			if (slot < page.values().size()) {
+				var value = page.values().get(slot++);
+				valueStream = new FastGetInputStream(value != null, value, pinned);
+				current = new java.io.ByteArrayInputStream(
+						FastGetInputStream.protobufBytesPrefix(valueStream.available()));
+				return true;
+			}
+			if (slot == page.values().size() && page.hasMore()) {
+				slot++;
+				current = new java.io.ByteArrayInputStream(new byte[]{0x10, 0x01});
+				return true;
+			}
+			return false;
+		}
+
+		@Override
+		public int read() throws IOException {
+			int result;
+			while ((result = current.read()) < 0) {
+				if (!advance()) {
+					return -1;
+				}
+			}
+			remaining--;
+			return result;
+		}
+
+		@Override
+		public int read(byte[] target, int offset, int length) throws IOException {
+			Objects.checkFromIndexSize(offset, length, target.length);
+			if (length == 0) {
+				return 0;
+			}
+			int count;
+			while ((count = current.read(target, offset, length)) < 0) {
+				if (!advance()) {
+					return -1;
+				}
+			}
+			remaining -= count;
+			return count;
+		}
+
+		@Override
+		public int drainTo(OutputStream target) throws IOException {
+			int written = 0;
+			do {
+				int count = current instanceof Drainable drainable
+						? drainable.drainTo(target) : Math.toIntExact(current.transferTo(target));
+				remaining -= count;
+				written += count;
+			} while (advance());
+			return written;
+		}
+
+		@Override
+		public int available() {
+			return remaining;
+		}
 	}
 
 	private final class FastGetCallHandler implements ServerCallHandler<GetRequest, FastGetResponse> {
@@ -1329,33 +1605,8 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<it.cavallium.rockserver.core.common.api.proto.MultiGetPage> getMulti(GetMultiRequest request) {
 			return Mono.defer(() -> {
-				if (!request.hasBudget()) {
-					return Mono.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-							"MultiGet budget is required"));
-				}
-				final it.cavallium.rockserver.core.common.RangeBudget budget;
-				try {
-					budget = new it.cavallium.rockserver.core.common.RangeBudget(
-							request.getBudget().getMaxItems(), request.getBudget().getMaxBytes());
-				} catch (IllegalArgumentException invalid) {
-					return Mono.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-							invalid.getMessage(), invalid));
-				}
-				MultiGetPage.validateLimits(request.getKeysMultiCount(), budget);
-				long keyBytes = 0;
-				for (var tuple : request.getKeysMultiList()) {
-					keyBytes += MultiGetPage.KEY_PART_BYTES * tuple.getKeysCount();
-					MultiGetPage.validateKeyBytes(keyBytes);
-					for (var part : tuple.getKeysList()) {
-						keyBytes += part.size();
-						MultiGetPage.validateKeyBytes(keyBytes);
-					}
-				}
-				var keys = request.getKeysMultiList().stream()
-						.map(tuple -> mapKeys(tuple.getKeysList())).toList();
-				MultiGetPage.validateRequest(keys, budget);
-				return fromCancellableFuture(asyncApi(request.getContext()).getMultiAsync(
-						request.getColumnId(), keys, budget));
+				var command = mapGetMultiRequest(request);
+				return fromCancellableFuture(command.handleAsync(asyncApi(request.getContext())));
 			}).map(page -> {
 				var response = it.cavallium.rockserver.core.common.api.proto.MultiGetPage.newBuilder()
 						.setHasMore(page.hasMore());

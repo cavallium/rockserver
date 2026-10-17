@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -14,12 +15,14 @@ import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -35,13 +38,86 @@ class MultiGetContractTest {
             api.put(0, column, key(1), first, RequestType.none());
             api.put(0, column, key(3), third, RequestType.none());
             var keys = List.of(key(3), key(2), key(1), key(3));
-            var page = api.getMulti(column, keys, new RangeBudget(4, 72));
-            assertEquals(Arrays.asList(third, null), page.values());
-            assertTrue(page.hasMore());
-            var remainder = api.getMulti(column, keys.subList(page.values().size(), keys.size()), new RangeBudget(2, 72));
-            assertEquals(List.of(first, third), remainder.values());
-            assertFalse(remainder.hasMore());
+            var expected = Arrays.asList(third, null, first, third);
+            var actual = new ArrayList<Buf>();
+            var budget = new RangeBudget(4, 72);
+            do {
+                var remaining = keys.subList(actual.size(), keys.size());
+                var page = api.getMulti(column, remaining, budget);
+                page.validateResponse(remaining.size(), budget);
+                assertFalse(page.values().isEmpty(), "every continuation must advance the input prefix");
+                assertEquals(expected.subList(actual.size(), actual.size() + page.values().size()), page.values());
+                actual.addAll(page.values());
+                assertEquals(actual.size() < keys.size(), page.hasMore());
+            } while (actual.size() < keys.size());
+            assertEquals(expected, actual);
             assertEquals(List.of(), api.getMulti(column, List.of(), new RangeBudget(1, 72)).values());
+        }
+    }
+
+    @Test
+    void borrowedPinnedMultiGetResultViewsExpireWhenOwnerCloses(@TempDir Path directory) throws Exception {
+        try (var connection = new EmbeddedConnection(directory.resolve("db"), "multi-get-owner", null)) {
+            var api = connection.getSyncApi(RequestContext.batch());
+            long column = api.createColumn("messages", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
+            byte[] expected = {1, 2, 3};
+            api.put(0, column, key(1), Buf.wrap(expected), RequestType.none());
+            var db = connection.getInternalDB();
+            var pending = db.getPendingOpsCount();
+            var owner = db.getMultiPinned(column, List.of(key(1), key(2), key(1)),
+                    new RangeBudget(3, 128), WorkloadProfile.BATCH, Long.MAX_VALUE, () -> false);
+            Buf borrowed;
+            try (owner) {
+                var page = owner.page();
+                assertEquals(Arrays.asList(Buf.wrap(expected), null, Buf.wrap(expected)), page.values());
+                assertFalse(page.hasMore());
+                borrowed = page.values().getFirst();
+                assertArrayEquals(expected, borrowed.toByteArray());
+                assertEquals(pending + 1, db.getPendingOpsCount());
+            }
+            assertThrows(IllegalStateException.class, owner::page);
+            assertThrows(IllegalStateException.class, borrowed::toByteArray);
+            owner.close();
+            assertEquals(pending, db.getPendingOpsCount());
+            api.deleteColumn(column);
+        }
+    }
+
+    @Test
+    void ordinaryMultiGetValuesSurviveOwnerAndDatabaseClose(@TempDir Path directory) throws Exception {
+        MultiGetPage page;
+        byte[] expected = {5, 6, 7};
+        try (var connection = new EmbeddedConnection(directory.resolve("db"), "multi-get-copy", null)) {
+            var api = connection.getSyncApi(RequestContext.batch());
+            long column = api.createColumn("messages", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
+            api.put(0, column, key(1), Buf.wrap(expected), RequestType.none());
+            var pending = connection.getInternalDB().getPendingOpsCount();
+            page = api.getMulti(column, List.of(key(1), key(2), key(1)), new RangeBudget(3, 128));
+            assertEquals(pending, connection.getInternalDB().getPendingOpsCount());
+            api.put(0, column, key(1), Buf.wrap(new byte[]{9}), RequestType.none());
+            api.deleteColumn(column);
+        }
+        assertEquals(Arrays.asList(Buf.wrap(expected), null, Buf.wrap(expected)), page.values());
+        assertArrayEquals(expected, page.values().getFirst().toByteArray());
+    }
+
+    @Test
+    void cancellationAfterAdmissionAndExpiredDeadlineReleaseLeases(@TempDir Path directory) throws Exception {
+        try (var connection = new EmbeddedConnection(directory.resolve("db"), "multi-get-cancel", null)) {
+            var api = connection.getSyncApi(RequestContext.batch());
+            long column = api.createColumn("messages", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
+            var db = connection.getInternalDB();
+            var pending = db.getPendingOpsCount();
+            var keys = List.of(key(1));
+            var budget = new RangeBudget(1, 128);
+            assertThrows(CancellationException.class, () -> db.getMultiPinned(column, keys, budget,
+                    WorkloadProfile.BATCH, Long.MAX_VALUE, () -> db.getPendingOpsCount() > pending));
+            assertEquals(pending, db.getPendingOpsCount());
+            var failure = assertThrows(RocksDBException.class, () -> db.getMultiPinned(column, keys, budget,
+                    WorkloadProfile.BATCH, System.nanoTime() - 1, () -> false));
+            assertEquals(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED, failure.getErrorUniqueId());
+            assertEquals(pending, db.getPendingOpsCount());
+            api.deleteColumn(column);
         }
     }
 

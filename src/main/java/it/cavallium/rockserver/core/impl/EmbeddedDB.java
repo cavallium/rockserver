@@ -14,6 +14,7 @@ import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.util.NamedThreadFactory;
 import it.cavallium.buffer.Buf;
+import it.cavallium.buffer.MemorySegmentBuf;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RequestType.RequestEntriesCount;
@@ -120,6 +121,7 @@ import org.rocksdb.CompactRangeOptions;
 import org.rocksdb.CompactRangeOptions.BottommostLevelCompaction;
 import org.rocksdb.DBOptions;
 import org.rocksdb.FlushOptions;
+import org.rocksdb.PinnedMultiGet;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.ReadTier;
 import org.rocksdb.RocksDB;
@@ -5593,18 +5595,56 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private MultiGetPage readMultiGetPage(long columnId, List<Keys> keys, RangeBudget budget,
 			WorkloadProfile workloadProfile, long monotonicDeadlineNanos, BooleanSupplier cancelled) {
+		try (var lease = readMultiGetPinned(columnId, keys, budget, workloadProfile,
+				monotonicDeadlineNanos, cancelled)) {
+			var page = lease.page();
+			var values = new ArrayList<Buf>(page.values().size());
+			for (var value : page.values()) {
+				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+				values.add(value == null ? null : Buf.wrap(value.toByteArray()));
+			}
+			checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+			return new MultiGetPage(values, page.hasMore());
+		}
+	}
+
+	/**
+	 * Reads an ordered page whose value views remain valid until the result is closed.
+	 * The caller must retain the result throughout any asynchronous serialization.
+	 */
+	public PinnedMultiGetResult getMultiPinned(long columnId, @NotNull List<Keys> keys,
+			@NotNull RangeBudget budget, WorkloadProfile workloadProfile,
+			long monotonicDeadlineNanos, BooleanSupplier cancelled) {
+		Objects.requireNonNull(cancelled, "cancelled");
+		checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+		var requestKeys = copyMultiGetKeys(keys, budget);
+		return readMultiGetPinned(columnId, requestKeys, budget, workloadProfile,
+				monotonicDeadlineNanos, cancelled);
+	}
+
+	private PinnedMultiGetResult readMultiGetPinned(long columnId, List<Keys> keys, RangeBudget budget,
+			WorkloadProfile workloadProfile, long monotonicDeadlineNanos, BooleanSupplier cancelled) {
 		Objects.requireNonNull(workloadProfile, "workloadProfile");
 		checkMultiGetActive(monotonicDeadlineNanos, cancelled);
 		ops.beginOp();
-		try (var columnUse = acquireColumnUse(columnId)) {
+		ColumnInstance.ColumnUse columnUse = null;
+		PinnedMultiGet pinned = null;
+		boolean transferred = false;
+		try {
+			columnUse = acquireColumnUse(columnId);
 			var col = columnUse.column();
 			if (!col.schema().hasValue()) {
 				throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
 						"MultiGet requires a column with values");
 			}
-			if (keys.isEmpty()) return MultiGetPage.empty();
+			if (keys.isEmpty()) {
+				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+				var result = new PinnedMultiGetResult(MultiGetPage.empty(), null, columnUse);
+				transferred = true;
+				return result;
+			}
 			checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-			// Even missing values consume a response slot; do not probe keys that cannot fit.
+			// Even missing values consume a response slot; do not read keys that cannot fit.
 			long maximumSlots = Math.max(0L,
 					(budget.maxBytes() - MultiGetPage.RESPONSE_BASE_BYTES) / MultiGetPage.RESPONSE_ITEM_BYTES);
 			int count = (int) Math.min(Math.min(keys.size(), budget.maxItems()), maximumSlots);
@@ -5612,41 +5652,57 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				throw RocksDBException.of(RocksDBErrorType.GET_MULTI_ITEM_TOO_LARGE,
 						"MultiGet byte budget cannot hold one response slot");
 			}
-			var calculatedKeys = new ArrayList<Buf>(count);
+			var nativeKeys = new byte[count][];
 			long physicalKeyBytes = 0;
 			for (int i = 0; i < count; i++) {
+				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
 				var calculatedKey = col.calculateKey(keys.get(i).keys());
 				physicalKeyBytes += calculatedKey.size();
 				if (physicalKeyBytes > MultiGetPage.MAX_KEY_BYTES) {
 					throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 							"MultiGet physical keys exceed server byte limit");
 				}
-				calculatedKeys.add(calculatedKey);
+				nativeKeys[i] = calculatedKey.toByteArray();
 			}
-			// The size probe and value fetch must observe exactly the same versions.
-			var snapshot = db.get().getSnapshot();
-			try (var readOptions = newReadOptions("get-multi-read-options"); var arena = Arena.ofConfined()) {
+			// Retain one snapshot for the uncommon first-key retry after native key sorting.
+			var nativeDb = db.get();
+			var snapshot = nativeDb.getSnapshot();
+			MultiGetPage page;
+			try (var readOptions = newReadOptions("get-multi-read-options")) {
 				readOptions.setSnapshot(snapshot);
 				readOptions.setDeadline(nativeReadDeadlineMicros(monotonicDeadlineNanos));
 				readOptions.setFillCache(true);
-				var nativeKeys = new MemorySegment[count];
-				var emptyValues = new MemorySegment[count];
-				var emptyValue = arena.allocate(0);
-				for (int i = 0; i < count; i++) {
-					nativeKeys[i] = copyToNativeSegment(arena, calculatedKeys.get(i));
-					emptyValues[i] = emptyValue;
-				}
+				// This is a soft value limit, not a hard native allocation bound: a
+				// native chunk can retain the value which crosses it before aborting.
+				readOptions.setValueSizeSoftLimit(Math.max(1L, budget.maxBytes()
+						- MultiGetPage.RESPONSE_BASE_BYTES - count * MultiGetPage.RESPONSE_ITEM_BYTES));
+				pinned = new PinnedMultiGet();
 				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				var statuses = runValueMultiGet(col, readOptions, nativeKeys, emptyValues, workloadProfile);
+				runPinnedValueMultiGet(col, readOptions, nativeKeys, pinned);
+				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+				if (pinned.isAborted(0)) {
+					// RocksDB may sort keys internally. An aborted first input must
+					// still make progress, rather than publish an empty continuation.
+					pinned.close();
+					pinned = null;
+					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+					pinned = new PinnedMultiGet();
+					// Resolve this one value so an oversized first item receives
+					// the page-budget error below instead of another soft-limit abort.
+					readOptions.setValueSizeSoftLimit(Long.MAX_VALUE);
+					runPinnedValueMultiGet(col, readOptions, new byte[][] { nativeKeys[0] }, pinned);
+					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+				}
 				int accepted = 0;
 				long responseBytes = MultiGetPage.RESPONSE_BASE_BYTES;
-				for (var status : statuses) {
-					long requiredBytes = switch (status.status.getCode()) {
-						case Ok -> status.requiredSize;
-						case NotFound -> 0L;
-						default -> throw mapIteratorStatusException(new org.rocksdb.RocksDBException(status.status));
-					};
-					long itemBytes = saturatingAdd(MultiGetPage.RESPONSE_ITEM_BYTES, requiredBytes);
+				for (int i = 0; i < pinned.size(); i++) {
+					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+					if (pinned.isAborted(i)) {
+						if (i == 0) throw new IllegalStateException("Single-key pinned MultiGet aborted without progress");
+						break;
+					}
+					long physicalValueBytes = pinned.isPresent(i) ? pinned.valueSize(i) : 0L;
+					long itemBytes = saturatingAdd(MultiGetPage.RESPONSE_ITEM_BYTES, physicalValueBytes);
 					if (itemBytes > budget.maxBytes() - responseBytes) {
 						if (accepted == 0) {
 							throw RocksDBException.of(RocksDBErrorType.GET_MULTI_ITEM_TOO_LARGE,
@@ -5658,55 +5714,75 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					accepted++;
 				}
 				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				// Missing and empty values are already resolved by the size probe.
-				var values = new ArrayList<Buf>(Collections.nCopies(accepted, null));
-				var fetchedIndexes = new int[accepted];
-				var fetchedKeys = new MemorySegment[accepted];
-				var nativeValues = new MemorySegment[accepted];
-				int fetchCount = 0;
+				// Drop rejected pins before creating views: truncation invalidates
+				// existing views, and only the accepted prefix must survive serialization.
+				pinned.retainPrefix(accepted);
+				var values = new ArrayList<Buf>(accepted);
 				for (int i = 0; i < accepted; i++) {
-					var status = statuses.get(i);
-					if (status.status.getCode() == org.rocksdb.Status.Code.NotFound) continue;
-					if (status.requiredSize == 0 && !col.hasBuckets()) {
-						values.set(i, Buf.createZeroes(0));
-						continue;
-					}
-					fetchedIndexes[fetchCount] = i;
-					fetchedKeys[fetchCount] = nativeKeys[i];
-					nativeValues[fetchCount++] = arena.allocate(status.requiredSize);
-				}
-				if (fetchCount > 0) {
 					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-					var valueStatuses = runValueMultiGet(col, readOptions,
-							fetchCount == accepted ? fetchedKeys : Arrays.copyOf(fetchedKeys, fetchCount),
-							fetchCount == accepted ? nativeValues : Arrays.copyOf(nativeValues, fetchCount), workloadProfile);
-					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-					for (int i = 0; i < fetchCount; i++) {
-						var status = valueStatuses.get(i);
-						if (status.status.getCode() != org.rocksdb.Status.Code.Ok) {
-							throw mapIteratorStatusException(new org.rocksdb.RocksDBException(status.status));
-						}
-						if (status.requiredSize != nativeValues[i].byteSize()) {
-							throw new IllegalStateException("MultiGet value changed under retained snapshot");
-						}
-						int index = fetchedIndexes[i];
-						var value = Buf.wrap(copyMemorySegment(nativeValues[i], status.requiredSize));
-						if (col.hasBuckets()) {
-							value = new Bucket(col, value).getElement(col.getBucketElementKeys(keys.get(index).keys()));
-							if (value != null) value = Buf.wrap(value.toByteArray());
-						}
-						values.set(index, value);
+					Buf value = pinned.isPresent(i) ? new MemorySegmentBuf(pinned.value(i)) : null;
+					if (value != null && col.hasBuckets()) {
+						value = new Bucket(col, value).getElement(col.getBucketElementKeys(keys.get(i).keys()));
 					}
+					values.add(value);
 				}
 				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				return new MultiGetPage(values, accepted < keys.size());
+				page = new MultiGetPage(values, accepted < keys.size());
 			} finally {
-				db.get().releaseSnapshot(snapshot);
+				nativeDb.releaseSnapshot(snapshot);
 			}
+			checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+			var result = new PinnedMultiGetResult(page, pinned, columnUse);
+			transferred = true;
+			return result;
 		} catch (org.rocksdb.RocksDBException failure) {
 			throw mapIteratorStatusException(failure);
 		} finally {
-			ops.endOp();
+			if (!transferred) {
+				try {
+					if (pinned != null) pinned.close();
+				} finally {
+					try {
+						if (columnUse != null) columnUse.close();
+					} finally {
+						ops.endOp();
+					}
+				}
+			}
+		}
+	}
+
+	/** Owns the native pins; page access and serialization must finish before close. */
+	public final class PinnedMultiGetResult implements AutoCloseable {
+		private final MultiGetPage page;
+		private final @Nullable PinnedMultiGet pinned;
+		private final ColumnInstance.ColumnUse columnUse;
+		private final AtomicBoolean closed = new AtomicBoolean();
+
+		private PinnedMultiGetResult(MultiGetPage page, @Nullable PinnedMultiGet pinned,
+				ColumnInstance.ColumnUse columnUse) {
+			this.page = page;
+			this.pinned = pinned;
+			this.columnUse = columnUse;
+		}
+
+		public MultiGetPage page() {
+			if (closed.get()) throw new IllegalStateException("Pinned MultiGet result has already been closed");
+			return page;
+		}
+
+		@Override
+		public void close() {
+			if (!closed.compareAndSet(false, true)) return;
+			try {
+				if (pinned != null) pinned.close();
+			} finally {
+				try {
+					columnUse.close();
+				} finally {
+					ops.endOp();
+				}
+			}
 		}
 	}
 
@@ -5721,19 +5797,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private List<org.rocksdb.ByteBufferGetStatus> runValueMultiGet(ColumnInstance col, ReadOptions readOptions,
-			MemorySegment[] keys, MemorySegment[] values, WorkloadProfile workloadProfile)
-			throws org.rocksdb.RocksDBException {
-		var nativeDb = db.get();
-		var sample = workloadProfile == WorkloadProfile.LATENCY ? existsMultiPerfSampler.begin(nativeDb) : null;
+	private void runPinnedValueMultiGet(ColumnInstance col, ReadOptions readOptions,
+			byte[][] keys, PinnedMultiGet pinned) throws org.rocksdb.RocksDBException {
 		long start = System.nanoTime();
 		activeNativeMultiGets.incrementAndGet();
 		try {
-			return nativeDb.multiGetByteBuffers(readOptions, List.of(col.cfh()), keys, values);
+			pinned.read(db.get(), col.cfh(), readOptions, keys);
 		} finally {
 			activeNativeMultiGets.decrementAndGet();
 			recordCompactionForegroundRead(start, keys.length);
-			if (sample != null) existsMultiPerfSampler.finish(sample);
 		}
 	}
 
@@ -5784,7 +5856,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				finished = true;
 				if (cancelRequested && failure == null) failure = new CancellationException();
 			}
-			// readMultiGetPage has released its arena, snapshot, column and operation before publication.
+			// readMultiGetPage has copied its values and released native ownership before publication.
 			if (failure != null) completeExceptionally(failure);
 			else complete(Objects.requireNonNull(result));
 		}
