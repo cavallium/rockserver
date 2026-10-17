@@ -219,6 +219,12 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new Get<>(transactionOrUpdateId, columnId, keys, requestType));
 	}
 
+	/** Read an ordered, bounded prefix of current values without a transaction.
+	 * See {@link MultiGetPage} for continuation, limits, and physical bucket accounting. */
+	default CompletableFuture<MultiGetPage> getMultiAsync(long columnId, List<Keys> keys, RangeBudget budget) {
+		return requestAsync(new RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti(columnId, keys, budget));
+	}
+
 	/** See: {@link ExistsMulti}. */
 	default CompletableFuture<List<Boolean>> existsMultiAsync(long transactionId,
 			long columnId,

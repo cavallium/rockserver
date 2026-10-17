@@ -179,6 +179,9 @@ message GetResponse {optional bytes value = 1;}
 message KeyTuple {repeated bytes keys = 1;}
 message ExistsMultiRequest {int64 transactionId = 1; int64 columnId = 2; repeated KeyTuple keysMulti = 3; reserved 4; RequestContext context = 5;}
 message ExistsMultiResponse {repeated bool present = 1;}
+message GetMultiRequest {int64 columnId = 1; repeated KeyTuple keysMulti = 2; RangeBudget budget = 3; RequestContext context = 4;}
+message MultiGetValue {optional bytes value = 1;}
+message MultiGetPage {repeated MultiGetValue values = 1; bool hasMore = 2;}
 
 message OpenIteratorRequest {int64 transactionId = 1; int64 columnId = 2; repeated bytes startKeysInclusive = 3; repeated bytes endKeysExclusive = 4; bool reverse = 5; int64 iteratorLeaseTtlNanos = 6; RequestContext context = 7;}
 message OpenIteratorResponse {int64 iteratorId = 1;}
@@ -321,6 +324,7 @@ service RocksDBService {
   rpc getForUpdate(GetRequest) returns (UpdateBegin);
   rpc exists(GetRequest) returns (PreviousPresence);
   rpc existsMulti(ExistsMultiRequest) returns (ExistsMultiResponse);
+  rpc getMulti(GetMultiRequest) returns (MultiGetPage);
   rpc openIterator(OpenIteratorRequest) returns (OpenIteratorResponse);
   rpc closeIterator(CloseIteratorRequest) returns (google.protobuf.Empty);
   rpc seekTo(SeekToRequest) returns (google.protobuf.Empty);

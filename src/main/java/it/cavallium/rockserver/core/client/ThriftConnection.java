@@ -10,6 +10,7 @@ import it.cavallium.rockserver.core.common.LeaseTtl;
 import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RangeBudget;
+import it.cavallium.rockserver.core.common.MultiGetPage;
 import it.cavallium.rockserver.core.common.RangePage;
 import it.cavallium.rockserver.core.common.RawScanEvent;
 import it.cavallium.rockserver.core.common.RawSstToken;
@@ -656,6 +657,39 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		} catch (TException e) {
 			throw wrap(e);
 		}
+	}
+
+	@Override
+	public MultiGetPage getMulti(long columnId, List<Keys> keys, RangeBudget budget) {
+		MultiGetPage.validateRequest(keys, budget);
+		try {
+			var response = client.getMulti(columnId, mapKeysList(keys),
+					new it.cavallium.rockserver.core.common.api.RangeBudget(budget.maxItems(), budget.maxBytes()),
+					currentWireRequestContext());
+			if (response.getValuesSize() > Math.min(keys.size(), budget.maxItems())) {
+				throw new IllegalStateException("Invalid MultiGet response size");
+			}
+			var page = new MultiGetPage(mapOptionalBinaryList(response.getValues()), response.isHasMore());
+			page.validateResponse(keys.size(), budget);
+			return page;
+		} catch (TException e) {
+			throw wrap(e);
+		}
+	}
+
+	@Override
+	public CompletableFuture<MultiGetPage> getMultiAsync(long columnId, List<Keys> keys, RangeBudget budget) {
+		MultiGetPage.validateRequest(keys, budget);
+		// The queued call must not observe subsequent mutations of caller-owned keys.
+		var retainedKeys = new ArrayList<Keys>(keys.size());
+		for (var key : keys) {
+			var parts = new Buf[key.keys().length];
+			for (int i = 0; i < parts.length; i++) {
+				parts[i] = Buf.wrap(key.keys()[i].toByteArray());
+			}
+			retainedKeys.add(new Keys(parts));
+		}
+		return supplyAsyncContextual(() -> getMulti(columnId, retainedKeys, budget), executor);
 	}
 
 	@Override

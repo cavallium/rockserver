@@ -94,6 +94,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
@@ -5531,6 +5532,292 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			ops.endOp();
 			var end = System.nanoTime();
 			getTimer.record(end - start, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	@Override
+	public MultiGetPage getMulti(long columnId, @NotNull List<Keys> keys, @NotNull RangeBudget budget) {
+		return getMulti(columnId, keys, budget, WorkloadProfile.BATCH, Long.MAX_VALUE);
+	}
+
+	public MultiGetPage getMulti(long columnId, @NotNull List<Keys> keys, @NotNull RangeBudget budget,
+			WorkloadProfile workloadProfile, long contextMonotonicDeadlineNanos) {
+		checkMultiGetDeadline(contextMonotonicDeadlineNanos);
+		var requestKeys = copyMultiGetKeys(keys, budget);
+		return readMultiGetPage(columnId, requestKeys, budget, workloadProfile, contextMonotonicDeadlineNanos, () -> false);
+	}
+
+	public CompletableFuture<MultiGetPage> getMultiAsyncInternal(long columnId, @NotNull List<Keys> keys,
+			@NotNull RangeBudget budget, WorkloadProfile workloadProfile, Executor executor,
+			long contextMonotonicDeadlineNanos) {
+		try {
+			checkMultiGetDeadline(contextMonotonicDeadlineNanos);
+			var requestKeys = copyMultiGetKeys(keys, budget);
+			Objects.requireNonNull(workloadProfile, "workloadProfile");
+			Objects.requireNonNull(executor, "executor");
+			var request = new AsyncGetMultiRequest(columnId, requestKeys, budget, workloadProfile,
+					executor, contextMonotonicDeadlineNanos);
+			try {
+				executor.execute(request);
+			} catch (Throwable failure) {
+				request.rejectBeforeRun(failure);
+			}
+			return request;
+		} catch (Throwable failure) {
+			return CompletableFuture.failedFuture(failure);
+		}
+	}
+
+	private static List<Keys> copyMultiGetKeys(List<Keys> keys, RangeBudget budget) {
+		Objects.requireNonNull(keys, "keys");
+		MultiGetPage.validateLimits(keys.size(), budget);
+		var copy = new ArrayList<Keys>(keys.size());
+		long keyBytes = 0;
+		for (var key : keys) {
+			Objects.requireNonNull(key, "keys contains null");
+			var parts = key.keys();
+			// Bound reference arrays before allocating them, including zero-length key parts.
+			keyBytes += MultiGetPage.KEY_PART_BYTES * parts.length;
+			MultiGetPage.validateKeyBytes(keyBytes);
+			var copiedParts = new Buf[parts.length];
+			for (int i = 0; i < parts.length; i++) {
+				var part = Objects.requireNonNull(parts[i], "key part");
+				keyBytes += part.size();
+				MultiGetPage.validateKeyBytes(keyBytes);
+				copiedParts[i] = Buf.wrap(part.toByteArray());
+			}
+			copy.add(new Keys(copiedParts));
+		}
+		return copy;
+	}
+
+	private MultiGetPage readMultiGetPage(long columnId, List<Keys> keys, RangeBudget budget,
+			WorkloadProfile workloadProfile, long monotonicDeadlineNanos, BooleanSupplier cancelled) {
+		Objects.requireNonNull(workloadProfile, "workloadProfile");
+		checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+		ops.beginOp();
+		try (var columnUse = acquireColumnUse(columnId)) {
+			var col = columnUse.column();
+			if (!col.schema().hasValue()) {
+				throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
+						"MultiGet requires a column with values");
+			}
+			if (keys.isEmpty()) return MultiGetPage.empty();
+			checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+			// Even missing values consume a response slot; do not probe keys that cannot fit.
+			long maximumSlots = Math.max(0L,
+					(budget.maxBytes() - MultiGetPage.RESPONSE_BASE_BYTES) / MultiGetPage.RESPONSE_ITEM_BYTES);
+			int count = (int) Math.min(Math.min(keys.size(), budget.maxItems()), maximumSlots);
+			if (count == 0) {
+				throw RocksDBException.of(RocksDBErrorType.GET_MULTI_ITEM_TOO_LARGE,
+						"MultiGet byte budget cannot hold one response slot");
+			}
+			var calculatedKeys = new ArrayList<Buf>(count);
+			long physicalKeyBytes = 0;
+			for (int i = 0; i < count; i++) {
+				var calculatedKey = col.calculateKey(keys.get(i).keys());
+				physicalKeyBytes += calculatedKey.size();
+				if (physicalKeyBytes > MultiGetPage.MAX_KEY_BYTES) {
+					throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+							"MultiGet physical keys exceed server byte limit");
+				}
+				calculatedKeys.add(calculatedKey);
+			}
+			// The size probe and value fetch must observe exactly the same versions.
+			var snapshot = db.get().getSnapshot();
+			try (var readOptions = newReadOptions("get-multi-read-options"); var arena = Arena.ofConfined()) {
+				readOptions.setSnapshot(snapshot);
+				readOptions.setDeadline(nativeReadDeadlineMicros(monotonicDeadlineNanos));
+				readOptions.setFillCache(true);
+				var nativeKeys = new MemorySegment[count];
+				var emptyValues = new MemorySegment[count];
+				var emptyValue = arena.allocate(0);
+				for (int i = 0; i < count; i++) {
+					nativeKeys[i] = copyToNativeSegment(arena, calculatedKeys.get(i));
+					emptyValues[i] = emptyValue;
+				}
+				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+				var statuses = runValueMultiGet(col, readOptions, nativeKeys, emptyValues, workloadProfile);
+				int accepted = 0;
+				long responseBytes = MultiGetPage.RESPONSE_BASE_BYTES;
+				for (var status : statuses) {
+					long requiredBytes = switch (status.status.getCode()) {
+						case Ok -> status.requiredSize;
+						case NotFound -> 0L;
+						default -> throw mapIteratorStatusException(new org.rocksdb.RocksDBException(status.status));
+					};
+					long itemBytes = saturatingAdd(MultiGetPage.RESPONSE_ITEM_BYTES, requiredBytes);
+					if (itemBytes > budget.maxBytes() - responseBytes) {
+						if (accepted == 0) {
+							throw RocksDBException.of(RocksDBErrorType.GET_MULTI_ITEM_TOO_LARGE,
+									"First MultiGet physical value exceeds the page byte budget");
+						}
+						break;
+					}
+					responseBytes += itemBytes;
+					accepted++;
+				}
+				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+				// Missing and empty values are already resolved by the size probe.
+				var values = new ArrayList<Buf>(Collections.nCopies(accepted, null));
+				var fetchedIndexes = new int[accepted];
+				var fetchedKeys = new MemorySegment[accepted];
+				var nativeValues = new MemorySegment[accepted];
+				int fetchCount = 0;
+				for (int i = 0; i < accepted; i++) {
+					var status = statuses.get(i);
+					if (status.status.getCode() == org.rocksdb.Status.Code.NotFound) continue;
+					if (status.requiredSize == 0 && !col.hasBuckets()) {
+						values.set(i, Buf.createZeroes(0));
+						continue;
+					}
+					fetchedIndexes[fetchCount] = i;
+					fetchedKeys[fetchCount] = nativeKeys[i];
+					nativeValues[fetchCount++] = arena.allocate(status.requiredSize);
+				}
+				if (fetchCount > 0) {
+					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+					var valueStatuses = runValueMultiGet(col, readOptions,
+							fetchCount == accepted ? fetchedKeys : Arrays.copyOf(fetchedKeys, fetchCount),
+							fetchCount == accepted ? nativeValues : Arrays.copyOf(nativeValues, fetchCount), workloadProfile);
+					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+					for (int i = 0; i < fetchCount; i++) {
+						var status = valueStatuses.get(i);
+						if (status.status.getCode() != org.rocksdb.Status.Code.Ok) {
+							throw mapIteratorStatusException(new org.rocksdb.RocksDBException(status.status));
+						}
+						if (status.requiredSize != nativeValues[i].byteSize()) {
+							throw new IllegalStateException("MultiGet value changed under retained snapshot");
+						}
+						int index = fetchedIndexes[i];
+						var value = Buf.wrap(copyMemorySegment(nativeValues[i], status.requiredSize));
+						if (col.hasBuckets()) {
+							value = new Bucket(col, value).getElement(col.getBucketElementKeys(keys.get(index).keys()));
+							if (value != null) value = Buf.wrap(value.toByteArray());
+						}
+						values.set(index, value);
+					}
+				}
+				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
+				return new MultiGetPage(values, accepted < keys.size());
+			} finally {
+				db.get().releaseSnapshot(snapshot);
+			}
+		} catch (org.rocksdb.RocksDBException failure) {
+			throw mapIteratorStatusException(failure);
+		} finally {
+			ops.endOp();
+		}
+	}
+
+	private void checkMultiGetActive(long deadline, BooleanSupplier cancelled) {
+		checkMultiGetDeadline(deadline);
+		if (cancelled.getAsBoolean()) throw new CancellationException();
+	}
+
+	private void checkMultiGetDeadline(long monotonicDeadlineNanos) {
+		if (scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
+			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded");
+		}
+	}
+
+	private List<org.rocksdb.ByteBufferGetStatus> runValueMultiGet(ColumnInstance col, ReadOptions readOptions,
+			MemorySegment[] keys, MemorySegment[] values, WorkloadProfile workloadProfile)
+			throws org.rocksdb.RocksDBException {
+		var nativeDb = db.get();
+		var sample = workloadProfile == WorkloadProfile.LATENCY ? existsMultiPerfSampler.begin(nativeDb) : null;
+		long start = System.nanoTime();
+		activeNativeMultiGets.incrementAndGet();
+		try {
+			return nativeDb.multiGetByteBuffers(readOptions, List.of(col.cfh()), keys, values);
+		} finally {
+			activeNativeMultiGets.decrementAndGet();
+			recordCompactionForegroundRead(start, keys.length);
+			if (sample != null) existsMultiPerfSampler.finish(sample);
+		}
+	}
+
+	private final class AsyncGetMultiRequest extends CompletableFuture<MultiGetPage>
+			implements Runnable, RWScheduler.RejectionAwareTask, RWScheduler.EstimatedWork {
+		private final long columnId;
+		private final List<Keys> keys;
+		private final RangeBudget budget;
+		private final WorkloadProfile workloadProfile;
+		private final Executor executor;
+		private final long deadline;
+		private final long estimatedBytes;
+		private boolean running;
+		private boolean finished;
+		private boolean cancelRequested;
+
+		@Override
+		public long estimatedBytes() {
+			return estimatedBytes;
+		}
+
+		private AsyncGetMultiRequest(long columnId, List<Keys> keys, RangeBudget budget,
+				WorkloadProfile workloadProfile, Executor executor, long deadline) {
+			this.columnId = columnId;
+			this.keys = keys;
+			this.budget = budget;
+			this.workloadProfile = workloadProfile;
+			this.executor = executor;
+			this.deadline = deadline;
+			this.estimatedBytes = new RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti(
+					columnId, keys, budget).estimatedBytes();
+		}
+
+		@Override
+		public void run() {
+			synchronized (this) {
+				if (finished || running) return;
+				running = true;
+			}
+			MultiGetPage result = null;
+			Throwable failure = null;
+			try {
+				result = readMultiGetPage(columnId, keys, budget, workloadProfile, deadline, this::isCancellationRequested);
+			} catch (Throwable error) {
+				failure = error;
+			}
+			synchronized (this) {
+				finished = true;
+				if (cancelRequested && failure == null) failure = new CancellationException();
+			}
+			// readMultiGetPage has released its arena, snapshot, column and operation before publication.
+			if (failure != null) completeExceptionally(failure);
+			else complete(Objects.requireNonNull(result));
+		}
+
+		private synchronized boolean isCancellationRequested() {
+			return cancelRequested;
+		}
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			synchronized (this) {
+				if (finished) return false;
+				if (running) {
+					cancelRequested = true;
+					return false;
+				}
+				finished = true;
+			}
+			scheduler.removeQueuedTask(executor, this);
+			return super.cancel(false);
+		}
+
+		private void rejectBeforeRun(Throwable failure) {
+			synchronized (this) {
+				if (finished || running) return;
+				finished = true;
+			}
+			completeExceptionally(failure);
+		}
+
+		@Override
+		public void reject(RuntimeException failure) {
+			rejectBeforeRun(failure);
 		}
 	}
 
@@ -11027,6 +11314,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch value -> getSchedulerForColumn(value.columnId());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.Get<?> value -> getSchedulerForColumn(value.columnId());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti value -> getSchedulerForColumn(value.columnId());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator value -> getSchedulerForColumn(value.columnId());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?> value -> getSchedulerForColumn(value.columnId());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<?> value -> getSchedulerForColumn(value.columnId());

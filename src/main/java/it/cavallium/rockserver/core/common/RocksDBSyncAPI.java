@@ -215,6 +215,12 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		return requestSync(new Get<>(transactionOrUpdateId, columnId, keys, requestType));
 	}
 
+	/** Read an ordered, bounded prefix of current values without a transaction.
+	 * See {@link MultiGetPage} for continuation, limits, and physical bucket accounting. */
+	default MultiGetPage getMulti(long columnId, List<Keys> keys, RangeBudget budget) {
+		return requestSync(new RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti(columnId, keys, budget));
+	}
+
 	/** See: {@link ExistsMulti}. */
 	default List<Boolean> existsMulti(long transactionId,
 			long columnId,

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.server;
 
+import it.cavallium.rockserver.core.common.MultiGetPage;
 import static it.cavallium.rockserver.core.common.Utils.toByteArray;
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
@@ -1323,6 +1324,50 @@ public class GrpcServer extends Server {
 				);
 				return Empty.getDefaultInstance();
 			}).transform(this.onErrorMapMonoWithRequestInfo("deleteRange", request));
+		}
+
+		@Override
+		public Mono<it.cavallium.rockserver.core.common.api.proto.MultiGetPage> getMulti(GetMultiRequest request) {
+			return Mono.defer(() -> {
+				if (!request.hasBudget()) {
+					return Mono.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+							"MultiGet budget is required"));
+				}
+				final it.cavallium.rockserver.core.common.RangeBudget budget;
+				try {
+					budget = new it.cavallium.rockserver.core.common.RangeBudget(
+							request.getBudget().getMaxItems(), request.getBudget().getMaxBytes());
+				} catch (IllegalArgumentException invalid) {
+					return Mono.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+							invalid.getMessage(), invalid));
+				}
+				MultiGetPage.validateLimits(request.getKeysMultiCount(), budget);
+				long keyBytes = 0;
+				for (var tuple : request.getKeysMultiList()) {
+					keyBytes += MultiGetPage.KEY_PART_BYTES * tuple.getKeysCount();
+					MultiGetPage.validateKeyBytes(keyBytes);
+					for (var part : tuple.getKeysList()) {
+						keyBytes += part.size();
+						MultiGetPage.validateKeyBytes(keyBytes);
+					}
+				}
+				var keys = request.getKeysMultiList().stream()
+						.map(tuple -> mapKeys(tuple.getKeysList())).toList();
+				MultiGetPage.validateRequest(keys, budget);
+				return fromCancellableFuture(asyncApi(request.getContext()).getMultiAsync(
+						request.getColumnId(), keys, budget));
+			}).map(page -> {
+				var response = it.cavallium.rockserver.core.common.api.proto.MultiGetPage.newBuilder()
+						.setHasMore(page.hasMore());
+				for (var value : page.values()) {
+					var slot = MultiGetValue.newBuilder();
+					if (value != null) {
+						slot.setValue(Utils.toByteString(value));
+					}
+					response.addValues(slot);
+				}
+				return response.build();
+			}).transform(this.onErrorMapMonoWithRequestInfo("getMulti", request));
 		}
 
 		@Override

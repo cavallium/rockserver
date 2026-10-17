@@ -194,7 +194,8 @@ enum RocksDBErrorType {
 	CDC_SUBSCRIPTION_CHANGED = 41,
 	CDC_SUBSCRIPTION_NOT_FOUND = 42,
 	SERVER_OVERLOADED = 43,
-	RANGE_ITEM_TOO_LARGE = 44
+	RANGE_ITEM_TOO_LARGE = 44,
+  GET_MULTI_ITEM_TOO_LARGE = 45
 }
 
 exception RocksDBThriftException {
@@ -233,6 +234,11 @@ struct ColumnTablePropertiesData {
   27: required map<string, i64> prefixExtractors,
   28: required map<string, i64> propertyCollectors,
   29: required map<string, i64> compressions,
+}
+
+struct MultiGetPage {
+  1: required list<OptionalBinary> values,
+  2: required bool hasMore
 }
 
 service RocksDB {
@@ -289,6 +295,8 @@ service RocksDB {
    UpdateBegin getForUpdate(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<binary> keys, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
    bool exists(1: required i64 transactionOrUpdateId, 3: required i64 columnId, 4: required list<binary> keys, 5: required RequestContext context) throws (1: RocksDBThriftException e),
+
+   MultiGetPage getMulti(1: required i64 columnId, 2: required list<list<binary>> keysMulti, 3: required RangeBudget budget, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
    list<bool> existsMulti(1: required i64 transactionId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 

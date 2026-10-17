@@ -46,6 +46,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			case RocksDBAPICommandSingle.Merge<?> merge -> estimatedBytes(merge.keys(), merge.value());
 			case RocksDBAPICommandSingle.MergeMulti<?> merge -> estimatedBytes(merge.keys(), merge.values());
 			case RocksDBAPICommandSingle.Get<?> get -> estimatedBytes(get.keys());
+			case RocksDBAPICommandSingle.GetMulti get -> saturatedAdd(estimatedBytes(get.keys()), get.budget().maxBytes());
 			case RocksDBAPICommandSingle.ExistsMulti exists -> estimatedBytes(exists.keys());
 			case RocksDBAPICommandSingle.OpenIterator open -> estimatedBytes(
 					open.startKeysInclusive(), open.endKeysExclusive());
@@ -169,7 +170,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 					get.requestType().getRequestTypeId() == RequestTypeId.FOR_UPDATE
 							? OperationFamily.MUTATION
 							: OperationFamily.POINT_LOOKUP;
-			case RocksDBAPICommandSingle.ExistsMulti _ -> OperationFamily.BOUNDED_FAN_OUT;
+			case RocksDBAPICommandSingle.GetMulti _, RocksDBAPICommandSingle.ExistsMulti _ -> OperationFamily.BOUNDED_FAN_OUT;
 			case RocksDBAPICommandSingle.OpenIterator _ -> OperationFamily.BOUNDARY_SEEK;
 			case RocksDBAPICommandSingle.CloseIterator _ -> OperationFamily.CONTROL;
 			case RocksDBAPICommandSingle.SeekTo _ -> OperationFamily.BOUNDARY_SEEK;
@@ -877,6 +878,30 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 				return sb.toString();
 			}
 		}
+		/** Read a bounded prefix of current values. See {@link MultiGetPage} for continuation and limits. */
+		record GetMulti(long columnId, List<Keys> keys, RangeBudget budget)
+				implements RocksDBAPICommandSingle<MultiGetPage> {
+			public GetMulti {
+				MultiGetPage.validateRequest(keys, budget);
+				keys = List.copyOf(keys);
+			}
+
+			@Override
+			public MultiGetPage handleSync(RocksDBSyncAPI api) {
+				return api.getMulti(columnId, keys, budget);
+			}
+
+			@Override
+			public CompletableFuture<MultiGetPage> handleAsync(RocksDBAsyncAPI api) {
+				return api.getMultiAsync(columnId, keys, budget);
+			}
+
+			@Override
+			public boolean isReadOnly() {
+				return true;
+			}
+		}
+
 		/**
 		 * Test several logical keys for presence in one bounded read.
 		 *

@@ -52,7 +52,8 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
   CDC_SUBSCRIPTION_CHANGED(41),
   CDC_SUBSCRIPTION_NOT_FOUND(42),
   SERVER_OVERLOADED(43),
-  RANGE_ITEM_TOO_LARGE(44);
+  RANGE_ITEM_TOO_LARGE(44),
+  GET_MULTI_ITEM_TOO_LARGE(45);
 
   private final int value;
 
@@ -165,6 +166,8 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
         return SERVER_OVERLOADED;
       case 44:
         return RANGE_ITEM_TOO_LARGE;
+      case 45:
+        return GET_MULTI_ITEM_TOO_LARGE;
       default:
         return null;
     }

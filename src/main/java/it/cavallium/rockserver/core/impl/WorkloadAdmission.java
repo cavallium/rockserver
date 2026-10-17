@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl;
 
+import it.cavallium.rockserver.core.common.MultiGetPage;
 import static it.cavallium.rockserver.core.common.OperationFamily.BOUNDED_FAN_OUT;
 import static it.cavallium.rockserver.core.common.OperationFamily.BOUNDARY_SEEK;
 import static it.cavallium.rockserver.core.common.OperationFamily.COMPACTION;
@@ -244,6 +245,12 @@ public final class WorkloadAdmission {
 					encodedBytes(merge.keys(), merge.values()),
 					maximumLatencyItems,
 					maximumLatencyEncodedInputBytes);
+			case RocksDBAPICommandSingle.GetMulti get -> {
+				MultiGetPage.validateRequest(get.keys(), get.budget());
+				validateLatencyInput(profile, command, get.keys().size(), encodedBytes(get.keys()),
+						maximumLatencyItems, maximumLatencyEncodedInputBytes);
+				validateRangeBudget(profile, command, get.budget(), maximumLatencyRangeItems, maximumLatencyRangeBytes);
+			}
 			case RocksDBAPICommandSingle.ExistsMulti exists -> validateLatencyInput(profile,
 					command,
 					exists.keys().size(),

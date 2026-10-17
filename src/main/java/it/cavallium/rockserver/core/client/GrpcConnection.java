@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.client;
 
+import it.cavallium.rockserver.core.common.MultiGetPage;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -212,6 +213,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			RocksDBServiceGrpc.getGetMethod(),
 			RocksDBServiceGrpc.getExistsMethod(),
 			RocksDBServiceGrpc.getExistsMultiMethod(),
+			RocksDBServiceGrpc.getGetMultiMethod(),
 			RocksDBServiceGrpc.getReduceRangeFirstAndLastMethod(),
 			RocksDBServiceGrpc.getReduceRangeEntriesCountMethod(),
 			RocksDBServiceGrpc.getGetRangePageMethod(),
@@ -981,6 +983,39 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	@SuppressWarnings("unchecked")
 	private static <T> T mapCurrentGetResponse(GetResponse response) {
 		return response.hasValue() ? (T) mapByteString(response.getValue()) : null;
+	}
+
+	@Override
+	public CompletableFuture<MultiGetPage> getMultiAsync(
+			long columnId, List<Keys> keys, it.cavallium.rockserver.core.common.RangeBudget budget) {
+		MultiGetPage.validateRequest(keys, budget);
+		int requestedKeys = keys.size();
+		var responseBudget = new it.cavallium.rockserver.core.common.RangeBudget(budget.maxItems(),
+				Math.min(budget.maxBytes(), maxInboundMessageSize));
+		var request = GetMultiRequest.newBuilder().setColumnId(columnId)
+				.setBudget(it.cavallium.rockserver.core.common.api.proto.RangeBudget.newBuilder()
+						.setMaxItems(budget.maxItems())
+						.setMaxBytes(responseBudget.maxBytes()))
+				.setContext(currentWireRequestContext());
+		for (var logicalKeys : keys) {
+			var wireKeys = KeyTuple.newBuilder();
+			for (var key : logicalKeys.keys()) {
+				wireKeys.addKeys(mapKey(key));
+			}
+			request.addKeysMulti(wireKeys);
+		}
+		return toResponse(futureStubWithRequestDeadline().getMulti(request.build()), response -> {
+			if (response.getValuesCount() > Math.min(requestedKeys, responseBudget.maxItems())) {
+				throw new IllegalStateException("Invalid MultiGet response size");
+			}
+			var values = new java.util.ArrayList<Buf>(response.getValuesCount());
+			for (var value : response.getValuesList()) {
+				values.add(value.hasValue() ? mapByteString(value.getValue()) : null);
+			}
+			var page = new MultiGetPage(values, response.getHasMore());
+			page.validateResponse(requestedKeys, responseBudget);
+			return page;
+		}, GrpcConnectionDelegate::mapReadDeadlineError);
 	}
 
 	@Override

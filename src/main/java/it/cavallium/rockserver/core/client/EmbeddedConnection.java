@@ -28,6 +28,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 
 import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
+import it.cavallium.rockserver.core.common.MultiGetPage;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -279,6 +280,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch mergeBatch -> this.mergeBatchAsync(
 					mergeBatch.columnId(), mergeBatch.batchPublisher(), mergeBatch.mode());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti get -> this.getMultiAsync(get.columnId(), get.keys(), get.budget());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti existsMulti -> this.existsMultiAsync(
 					existsMulti.transactionId(), existsMulti.columnId(), existsMulti.keys());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator closeIterator -> this.closeIteratorAsync(
@@ -522,6 +524,24 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				keys,
 				requestType,
 				currentRequestContext().profile());
+	}
+
+	@Override
+	public MultiGetPage getMulti(long columnId, List<Keys> keys, RangeBudget budget) {
+		MultiGetPage.validateRequest(keys, budget);
+		var context = currentRequestContext();
+		return db.getMulti(columnId, keys, budget, context.profile(),
+				db.getScheduler().resolveMonotonicDeadline(context));
+	}
+
+	@Override
+	public CompletableFuture<MultiGetPage> getMultiAsync(long columnId, List<Keys> keys, RangeBudget budget) {
+		MultiGetPage.validateRequest(keys, budget);
+		var context = currentRequestContext();
+		var deadline = db.getScheduler().resolveMonotonicDeadline(context);
+		return db.getMultiAsyncInternal(columnId, keys, budget, context.profile(),
+				db.getSchedulerForColumn(columnId).executor(context.profile(), OperationFamily.BOUNDED_FAN_OUT, deadline),
+				deadline);
 	}
 
 	@Override
