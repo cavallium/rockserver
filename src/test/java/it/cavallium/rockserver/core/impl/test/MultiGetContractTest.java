@@ -114,7 +114,7 @@ class MultiGetContractTest {
                     WorkloadProfile.BATCH, Long.MAX_VALUE, () -> db.getPendingOpsCount() > pending));
             assertEquals(pending, db.getPendingOpsCount());
             var failure = assertThrows(RocksDBException.class, () -> db.getMultiPinned(column, keys, budget,
-                    WorkloadProfile.BATCH, System.nanoTime() - 1, () -> false));
+                    WorkloadProfile.BATCH, 0L, () -> false));
             assertEquals(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED, failure.getErrorUniqueId());
             assertEquals(pending, db.getPendingOpsCount());
             api.deleteColumn(column);
