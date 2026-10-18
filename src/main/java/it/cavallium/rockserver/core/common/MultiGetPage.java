@@ -36,14 +36,14 @@ public record MultiGetPage(List<@Nullable Buf> values, boolean hasMore) {
 		Objects.requireNonNull(budget, "budget");
 		if (keyCount < 0 || keyCount > MAX_KEYS || budget.maxItems() > MAX_KEYS
 				|| budget.maxBytes() > RangeBudget.DEFAULT_MAX_BYTES) {
-			throw RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+			throw RocksDBException.of(RocksDBException.RocksDBErrorType.INVALID_REQUEST,
 					"MultiGet requires at most 128 keys/items and an 8 MiB response budget");
 		}
 	}
 
 	public static void validateKeyBytes(long bytes) {
 		if (bytes > MAX_KEY_BYTES) {
-			throw RocksDBException.of(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+			throw RocksDBException.of(RocksDBException.RocksDBErrorType.INVALID_REQUEST,
 					"MultiGet key bytes exceed 2 MiB including key part references");
 		}
 	}
@@ -61,6 +61,29 @@ public record MultiGetPage(List<@Nullable Buf> values, boolean hasMore) {
 				validateKeyBytes(bytes);
 			}
 		}
+	}
+
+	/** Copies bounded request bytes before a call can be queued. */
+	public static List<Keys> copyRequestKeys(List<Keys> keys, RangeBudget budget) {
+		Objects.requireNonNull(keys, "keys");
+		validateLimits(keys.size(), budget);
+		var copy = new ArrayList<Keys>(keys.size());
+		long bytes = 0;
+		for (var key : keys) {
+			var parts = Objects.requireNonNull(key, "key").keys();
+			// Bound reference arrays before allocating, including empty key parts.
+			bytes += KEY_PART_BYTES * parts.length;
+			validateKeyBytes(bytes);
+			var copiedParts = new Buf[parts.length];
+			for (int i = 0; i < parts.length; i++) {
+				var part = Objects.requireNonNull(parts[i], "key part");
+				bytes += part.size();
+				validateKeyBytes(bytes);
+				copiedParts[i] = Buf.wrap(part.toByteArray());
+			}
+			copy.add(new Keys(copiedParts));
+		}
+		return List.copyOf(copy);
 	}
 
 	/** Reject malformed transport responses before exposing them to a caller. */

@@ -679,16 +679,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	@Override
 	public CompletableFuture<MultiGetPage> getMultiAsync(long columnId, List<Keys> keys, RangeBudget budget) {
-		MultiGetPage.validateRequest(keys, budget);
-		// The queued call must not observe subsequent mutations of caller-owned keys.
-		var retainedKeys = new ArrayList<Keys>(keys.size());
-		for (var key : keys) {
-			var parts = new Buf[key.keys().length];
-			for (int i = 0; i < parts.length; i++) {
-				parts[i] = Buf.wrap(key.keys()[i].toByteArray());
-			}
-			retainedKeys.add(new Keys(parts));
-		}
+		var retainedKeys = MultiGetPage.copyRequestKeys(keys, budget);
 		return supplyAsyncContextual(() -> getMulti(columnId, retainedKeys, budget), executor);
 	}
 

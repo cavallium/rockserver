@@ -1,6 +1,5 @@
 package it.cavallium.rockserver.core.server;
 
-import it.cavallium.rockserver.core.common.MultiGetPage;
 import static it.cavallium.rockserver.core.common.Utils.toByteArray;
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
@@ -41,6 +40,8 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
+import it.cavallium.rockserver.core.common.MultiGetPage;
+import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.ColumnHashType;
@@ -483,14 +484,14 @@ public class GrpcServer extends Server {
 
 	private static RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti mapGetMultiRequest(GetMultiRequest request) {
 		if (!request.hasBudget()) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "MultiGet budget is required");
+			throw RocksDBException.of(RocksDBErrorType.INVALID_REQUEST, "MultiGet budget is required");
 		}
-		final it.cavallium.rockserver.core.common.RangeBudget budget;
+		final RangeBudget budget;
 		try {
-			budget = new it.cavallium.rockserver.core.common.RangeBudget(
+			budget = new RangeBudget(
 					request.getBudget().getMaxItems(), request.getBudget().getMaxBytes());
 		} catch (IllegalArgumentException invalid) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, invalid.getMessage(), invalid);
+			throw RocksDBException.of(RocksDBErrorType.INVALID_REQUEST, invalid.getMessage(), invalid);
 		}
 		MultiGetPage.validateLimits(request.getKeysMultiCount(), budget);
 		long keyBytes = 0;
@@ -583,7 +584,7 @@ public class GrpcServer extends Server {
 
 		private MultiGetResponse createResponse() {
 			if (embeddedDatabase == null) {
-				return new MultiGetResponse(command.handleSync(grpc.syncApi(context.value())), null);
+				return new MultiGetResponse(command.handleSync(grpc.syncApi(context)), null);
 			}
 			var owner = embeddedDatabase.getMultiPinned(command.columnId(), command.keys(), command.budget(),
 					profile, context.localMonotonicDeadlineNanos(), this::isCancelled);
@@ -4487,8 +4488,8 @@ public class GrpcServer extends Server {
 			if (rocksError != null) {
 				return switch (rocksError.getErrorUniqueId()) {
 						case COMPACTION_CONFLICT -> Status.ABORTED
-                                .withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
-                        case PUT_INVALID_REQUEST -> Status.INVALID_ARGUMENT
+								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
+						case PUT_INVALID_REQUEST, INVALID_REQUEST -> Status.INVALID_ARGUMENT
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case CDC_SUBSCRIPTION_NOT_FOUND, TRANSACTION_NOT_FOUND -> Status.NOT_FOUND
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);

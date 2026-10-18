@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.ByteString;
@@ -9,14 +10,20 @@ import io.grpc.CallOptions;
 import io.grpc.ClientCall;
 import io.grpc.Metadata;
 import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
+import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.MultiGetPage;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.common.api.proto.GetMultiRequest;
 import it.cavallium.rockserver.core.common.api.proto.KeyTuple;
 import it.cavallium.rockserver.core.common.api.proto.RangeBudget;
@@ -99,6 +106,84 @@ class GrpcMultiGetTest {
             if (previous == null) System.clearProperty(property);
             else System.setProperty(property, previous);
         }
+    }
+
+    @Test
+    void proxyForwardsPagesErrorsAndRepeatedReadsToRealGrpcBackend() throws Exception {
+        try (var embedded = openEmbedded()) {
+            var sync = embedded.getSyncApi(RequestContext.batch());
+            long column = sync.createColumn("messages", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
+            var value = Buf.wrap(new byte[]{3, 4, 5, 6, 7, 8, 9, 10});
+            var empty = Buf.wrap(new byte[0]);
+            sync.put(0, column, key(1), value, RequestType.none());
+            sync.put(0, column, key(3), empty, RequestType.none());
+            var keys = List.of(key(1), key(2), key(3), key(1));
+            var expected = Arrays.asList(value, null, empty, value);
+            try (var backend = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
+                backend.start();
+                try (var forwarding = GrpcConnection.forHostAndPort("multi-get-forwarding",
+                        new HostAndPort("127.0.0.1", backend.getPort()));
+                        var proxy = new GrpcServer(forwarding, new InetSocketAddress("127.0.0.1", 0))) {
+                    proxy.start();
+                    try (var client = GrpcConnection.forHostAndPort("multi-get-proxy-client",
+                            new HostAndPort("127.0.0.1", proxy.getPort()))) {
+                        var api = client.getSyncApi(RequestContext.batch(java.time.Duration.ofSeconds(20)));
+                        var budget = new it.cavallium.rockserver.core.common.RangeBudget(4, 56);
+                        var actual = new ArrayList<Buf>();
+                        while (actual.size() < keys.size()) {
+                            var remaining = keys.subList(actual.size(), keys.size());
+                            var page = api.getMulti(column, remaining, budget);
+                            page.validateResponse(remaining.size(), budget);
+                            assertFalse(page.values().isEmpty());
+                            actual.addAll(page.values());
+                            assertEquals(expected.subList(0, actual.size()), actual);
+                            assertEquals(actual.size() < keys.size(), page.hasMore());
+                        }
+                        var failure = assertThrows(RocksDBException.class,
+                                () -> api.getMulti(column, List.of(key(1)),
+                                        new it.cavallium.rockserver.core.common.RangeBudget(1, 32)));
+                        assertEquals(RocksDBException.RocksDBErrorType.GET_MULTI_ITEM_TOO_LARGE,
+                                failure.getErrorUniqueId());
+                        var fullBudget = new it.cavallium.rockserver.core.common.RangeBudget(4, 256);
+                        assertEquals(expected, api.getMulti(column, keys, fullBudget).values());
+                        assertEquals(expected, client.getAsyncApi(RequestContext.batch())
+                                .getMultiAsync(column, keys, fullBudget).get(20, TimeUnit.SECONDS).values());
+                    }
+                    var channel = NettyChannelBuilder.forAddress("127.0.0.1", proxy.getPort())
+                            .usePlaintext().build();
+                    try {
+                        // Bypass client-side validation to exercise the wire boundary.
+                        var malformed = request(column, List.of(1), 64).toBuilder()
+                                .setBudget(RangeBudget.newBuilder().setMaxItems(129).setMaxBytes(64)).build();
+                        var failure = assertThrows(StatusRuntimeException.class,
+                                () -> RocksDBServiceGrpc.newBlockingStub(channel)
+                                        .withDeadlineAfter(20, TimeUnit.SECONDS).getMulti(malformed));
+                        assertEquals(Status.Code.INVALID_ARGUMENT, failure.getStatus().getCode());
+                        assertTrue(failure.getStatus().getDescription().contains("[uid:INVALID_REQUEST]"));
+                        assertEquals(expected, values(RocksDBServiceGrpc.newBlockingStub(channel)
+                                .withDeadlineAfter(20, TimeUnit.SECONDS)
+                                .getMulti(request(column, List.of(1, 2, 3, 1), 256))));
+                    } finally {
+                        channel.shutdownNow();
+                        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+                    }
+                    awaitIdle(proxy.getSchedulerForTesting());
+                    awaitIdle(backend.getSchedulerForTesting());
+                    assertEquals(0, embedded.getInternalDB().getPendingOpsCount());
+                    sync.deleteColumn(column);
+                }
+            }
+        }
+    }
+
+    private static void awaitIdle(RWScheduler scheduler) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while ((scheduler.activeTasks(WorkloadProfile.BATCH) != 0
+                || scheduler.queuedTasks(WorkloadProfile.BATCH) != 0) && System.nanoTime() < deadline) {
+            Thread.sleep(1);
+        }
+        assertEquals(0, scheduler.activeTasks(WorkloadProfile.BATCH));
+        assertEquals(0, scheduler.queuedTasks(WorkloadProfile.BATCH));
     }
 
     @Test

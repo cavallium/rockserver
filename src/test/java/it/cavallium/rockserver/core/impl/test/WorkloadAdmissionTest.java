@@ -109,6 +109,7 @@ class WorkloadAdmissionTest {
 			Map.entry("mergeBatch", OperationFamily.MUTATION),
 			Map.entry("get", OperationFamily.POINT_LOOKUP),
 			Map.entry("existsMulti", OperationFamily.BOUNDED_FAN_OUT),
+			Map.entry("getMulti", OperationFamily.BOUNDED_FAN_OUT),
 			Map.entry("openIterator", OperationFamily.BOUNDARY_SEEK),
 			Map.entry("closeIterator", OperationFamily.CONTROL),
 			Map.entry("seekTo", OperationFamily.BOUNDARY_SEEK),
@@ -428,6 +429,33 @@ class WorkloadAdmissionTest {
 	}
 
 	@Test
+	void multiGetChecksConfiguredInputAndResponseLimitsAndPublicCeilings() {
+		var fittingBudget = new RangeBudget(2, 64);
+		var atLimit = new RocksDBAPICommandSingle.GetMulti(1, keysList(3, 8), fittingBudget);
+		assertEquals(LATENCY, WorkloadAdmission.resolve(context(LATENCY), atLimit, 3, 8, 2, 64));
+		var aboveConfigured = List.of(
+				new RocksDBAPICommandSingle.GetMulti(1, keysList(4, 0), fittingBudget),
+				new RocksDBAPICommandSingle.GetMulti(1, keysList(1, 9), fittingBudget),
+				new RocksDBAPICommandSingle.GetMulti(1, List.of(EMPTY_KEYS), new RangeBudget(3, 64)),
+				new RocksDBAPICommandSingle.GetMulti(1, List.of(EMPTY_KEYS), new RangeBudget(2, 65)));
+		for (var command : aboveConfigured) {
+			assertThrows(RocksDBException.class,
+					() -> WorkloadAdmission.resolve(context(LATENCY), command, 3, 8, 2, 64));
+			for (var profile : List.of(ANALYTICAL, INGEST, BATCH)) {
+				assertEquals(profile, WorkloadAdmission.resolve(context(profile), command, 3, 8, 2, 64));
+			}
+		}
+		for (var invalid : List.<Runnable>of(
+				() -> new RocksDBAPICommandSingle.GetMulti(1, emptyKeysList(129), fittingBudget),
+				() -> new RocksDBAPICommandSingle.GetMulti(1, List.of(EMPTY_KEYS), new RangeBudget(129, 64)),
+				() -> new RocksDBAPICommandSingle.GetMulti(1, List.of(EMPTY_KEYS),
+						new RangeBudget(1, RangeBudget.DEFAULT_MAX_BYTES + 1)))) {
+			var failure = assertThrows(RocksDBException.class, invalid::run);
+			assertEquals(RocksDBException.RocksDBErrorType.INVALID_REQUEST, failure.getErrorUniqueId());
+		}
+	}
+
+	@Test
 	void latencyIteratorAdvanceChecksCombinedLimitBelowAtAndAbove() {
 		assertLatencyAllowed(subsequent(0, WorkloadAdmission.MAX_LATENCY_ITERATOR_ADVANCE - 1));
 		assertLatencyAllowed(subsequent(1, WorkloadAdmission.MAX_LATENCY_ITERATOR_ADVANCE - 1));
@@ -558,6 +586,8 @@ class WorkloadAdmissionTest {
 		commands.add(client("get", new RocksDBAPICommandSingle.Get<>(0, 1, EMPTY_KEYS, RequestType.current()), all));
 		commands.add(client("existsMulti", new RocksDBAPICommandSingle.ExistsMulti(
 				0, 1, List.of(EMPTY_KEYS)), all));
+		commands.add(client("getMulti", new RocksDBAPICommandSingle.GetMulti(
+				1, List.of(EMPTY_KEYS), new RangeBudget(1, 64)), all));
 		commands.add(client("openIterator", new RocksDBAPICommandSingle.OpenIterator(
 				0, 1, EMPTY_KEYS, null, false, Duration.ofSeconds(1)), seek));
 		commands.add(protectedCommand("closeIterator", new RocksDBAPICommandSingle.CloseIterator(1), CONTROL));

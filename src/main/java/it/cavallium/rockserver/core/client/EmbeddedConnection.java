@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.SstMaintenance;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.common.MultiGetPage;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
@@ -28,7 +29,6 @@ import java.util.OptionalLong;
 import java.util.Set;
 
 import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
-import it.cavallium.rockserver.core.common.MultiGetPage;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -280,7 +280,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 					putBatch.columnId(), putBatch.batchPublisher(), putBatch.mode());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch mergeBatch -> this.mergeBatchAsync(
 					mergeBatch.columnId(), mergeBatch.batchPublisher(), mergeBatch.mode());
-			case RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti get -> this.getMultiAsync(get.columnId(), get.keys(), get.budget());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti get -> this.getMultiAsync(
+					get.columnId(), get.keys(), get.budget());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti existsMulti -> this.existsMultiAsync(
 					existsMulti.transactionId(), existsMulti.columnId(), existsMulti.keys());
 			case RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator closeIterator -> this.closeIteratorAsync(

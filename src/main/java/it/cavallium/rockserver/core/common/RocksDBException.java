@@ -47,7 +47,8 @@ public class RocksDBException extends RuntimeException {
 		RANGE_ITEM_TOO_LARGE,
 		COMPACTION_CONFLICT,
 		COMPACTION_FAILED,
-		GET_MULTI_ITEM_TOO_LARGE
+		GET_MULTI_ITEM_TOO_LARGE,
+		INVALID_REQUEST
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {

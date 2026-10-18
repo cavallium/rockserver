@@ -5545,7 +5545,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public MultiGetPage getMulti(long columnId, @NotNull List<Keys> keys, @NotNull RangeBudget budget,
 			WorkloadProfile workloadProfile, long contextMonotonicDeadlineNanos) {
 		checkMultiGetDeadline(contextMonotonicDeadlineNanos);
-		var requestKeys = copyMultiGetKeys(keys, budget);
+		var requestKeys = MultiGetPage.copyRequestKeys(keys, budget);
 		return readMultiGetPage(columnId, requestKeys, budget, workloadProfile, contextMonotonicDeadlineNanos, () -> false);
 	}
 
@@ -5554,7 +5554,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long contextMonotonicDeadlineNanos) {
 		try {
 			checkMultiGetDeadline(contextMonotonicDeadlineNanos);
-			var requestKeys = copyMultiGetKeys(keys, budget);
+			var requestKeys = MultiGetPage.copyRequestKeys(keys, budget);
 			Objects.requireNonNull(workloadProfile, "workloadProfile");
 			Objects.requireNonNull(executor, "executor");
 			var request = new AsyncGetMultiRequest(columnId, requestKeys, budget, workloadProfile,
@@ -5568,29 +5568,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} catch (Throwable failure) {
 			return CompletableFuture.failedFuture(failure);
 		}
-	}
-
-	private static List<Keys> copyMultiGetKeys(List<Keys> keys, RangeBudget budget) {
-		Objects.requireNonNull(keys, "keys");
-		MultiGetPage.validateLimits(keys.size(), budget);
-		var copy = new ArrayList<Keys>(keys.size());
-		long keyBytes = 0;
-		for (var key : keys) {
-			Objects.requireNonNull(key, "keys contains null");
-			var parts = key.keys();
-			// Bound reference arrays before allocating them, including zero-length key parts.
-			keyBytes += MultiGetPage.KEY_PART_BYTES * parts.length;
-			MultiGetPage.validateKeyBytes(keyBytes);
-			var copiedParts = new Buf[parts.length];
-			for (int i = 0; i < parts.length; i++) {
-				var part = Objects.requireNonNull(parts[i], "key part");
-				keyBytes += part.size();
-				MultiGetPage.validateKeyBytes(keyBytes);
-				copiedParts[i] = Buf.wrap(part.toByteArray());
-			}
-			copy.add(new Keys(copiedParts));
-		}
-		return copy;
 	}
 
 	private MultiGetPage readMultiGetPage(long columnId, List<Keys> keys, RangeBudget budget,
@@ -5617,7 +5594,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long monotonicDeadlineNanos, BooleanSupplier cancelled) {
 		Objects.requireNonNull(cancelled, "cancelled");
 		checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-		var requestKeys = copyMultiGetKeys(keys, budget);
+		var requestKeys = MultiGetPage.copyRequestKeys(keys, budget);
 		return readMultiGetPinned(columnId, requestKeys, budget, workloadProfile,
 				monotonicDeadlineNanos, cancelled);
 	}
@@ -5659,7 +5636,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				var calculatedKey = col.calculateKey(keys.get(i).keys());
 				physicalKeyBytes += calculatedKey.size();
 				if (physicalKeyBytes > MultiGetPage.MAX_KEY_BYTES) {
-					throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+					throw RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
 							"MultiGet physical keys exceed server byte limit");
 				}
 				nativeKeys[i] = calculatedKey.toByteArray();
@@ -5698,7 +5675,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				for (int i = 0; i < pinned.size(); i++) {
 					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
 					if (pinned.isAborted(i)) {
-						if (i == 0) throw new IllegalStateException("Single-key pinned MultiGet aborted without progress");
+						if (i == 0) {
+							throw new IllegalStateException("Single-key pinned MultiGet aborted without progress");
+						}
 						break;
 					}
 					long physicalValueBytes = pinned.isPresent(i) ? pinned.valueSize(i) : 0L;
@@ -5740,10 +5719,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} finally {
 			if (!transferred) {
 				try {
-					if (pinned != null) pinned.close();
+					if (pinned != null) {
+						pinned.close();
+					}
 				} finally {
 					try {
-						if (columnUse != null) columnUse.close();
+						if (columnUse != null) {
+							columnUse.close();
+						}
 					} finally {
 						ops.endOp();
 					}
@@ -5767,15 +5750,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		public MultiGetPage page() {
-			if (closed.get()) throw new IllegalStateException("Pinned MultiGet result has already been closed");
+			if (closed.get()) {
+				throw new IllegalStateException("Pinned MultiGet result has already been closed");
+			}
 			return page;
 		}
 
 		@Override
 		public void close() {
-			if (!closed.compareAndSet(false, true)) return;
+			if (!closed.compareAndSet(false, true)) {
+				return;
+			}
 			try {
-				if (pinned != null) pinned.close();
+				if (pinned != null) {
+					pinned.close();
+				}
 			} finally {
 				try {
 					columnUse.close();
@@ -5788,7 +5777,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private void checkMultiGetActive(long deadline, BooleanSupplier cancelled) {
 		checkMultiGetDeadline(deadline);
-		if (cancelled.getAsBoolean()) throw new CancellationException();
+		if (cancelled.getAsBoolean()) {
+			throw new CancellationException();
+		}
 	}
 
 	private void checkMultiGetDeadline(long monotonicDeadlineNanos) {
@@ -5842,7 +5833,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		@Override
 		public void run() {
 			synchronized (this) {
-				if (finished || running) return;
+				if (finished || running) {
+					return;
+				}
 				running = true;
 			}
 			MultiGetPage result = null;
@@ -5854,11 +5847,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			synchronized (this) {
 				finished = true;
-				if (cancelRequested && failure == null) failure = new CancellationException();
+				if (cancelRequested && failure == null) {
+					failure = new CancellationException();
+				}
 			}
 			// readMultiGetPage has copied its values and released native ownership before publication.
-			if (failure != null) completeExceptionally(failure);
-			else complete(Objects.requireNonNull(result));
+			if (failure != null) {
+				completeExceptionally(failure);
+			} else {
+				complete(Objects.requireNonNull(result));
+			}
 		}
 
 		private synchronized boolean isCancellationRequested() {
@@ -5868,7 +5866,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		@Override
 		public boolean cancel(boolean mayInterruptIfRunning) {
 			synchronized (this) {
-				if (finished) return false;
+				if (finished) {
+					return false;
+				}
 				if (running) {
 					cancelRequested = true;
 					return false;
@@ -5881,7 +5881,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private void rejectBeforeRun(Throwable failure) {
 			synchronized (this) {
-				if (finished || running) return;
+				if (finished || running) {
+					return;
+				}
 				finished = true;
 			}
 			completeExceptionally(failure);

@@ -1,11 +1,14 @@
 package it.cavallium.rockserver.core.server;
 
-import it.cavallium.rockserver.core.common.MultiGetPage;
 import static it.cavallium.rockserver.core.common.Utils.asByteBuffer;
 
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.MultiGetPage;
+import it.cavallium.rockserver.core.common.RangeBudget;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
@@ -952,17 +955,17 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				if (budget == null) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					throw RocksDBException.of(
+							RocksDBErrorType.INVALID_REQUEST,
 							"MultiGet budget is required");
 				}
-				final it.cavallium.rockserver.core.common.RangeBudget mappedBudget;
+				final RangeBudget mappedBudget;
 				try {
-					mappedBudget = new it.cavallium.rockserver.core.common.RangeBudget(
+					mappedBudget = new RangeBudget(
 							budget.getMaxItems(), budget.getMaxBytes());
 				} catch (IllegalArgumentException invalid) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					throw RocksDBException.of(
+							RocksDBErrorType.INVALID_REQUEST,
 							invalid.getMessage(), invalid);
 				}
 				MultiGetPage.validateLimits(keysMulti.size(), mappedBudget);
@@ -980,7 +983,7 @@ public class ThriftServer extends Server {
 				var page = api(context).getMulti(columnId, keys, mappedBudget);
 				return new it.cavallium.rockserver.core.common.api.MultiGetPage(
 						page.values().stream().map(ThriftServer::mapResult).toList(), page.hasMore());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}

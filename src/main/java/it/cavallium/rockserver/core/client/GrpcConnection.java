@@ -1,6 +1,5 @@
 package it.cavallium.rockserver.core.client;
 
-import it.cavallium.rockserver.core.common.MultiGetPage;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -26,6 +25,8 @@ import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
+import it.cavallium.rockserver.core.common.MultiGetPage;
+import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.RequestContext;
@@ -987,10 +988,10 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	@Override
 	public CompletableFuture<MultiGetPage> getMultiAsync(
-			long columnId, List<Keys> keys, it.cavallium.rockserver.core.common.RangeBudget budget) {
+			long columnId, List<Keys> keys, RangeBudget budget) {
 		MultiGetPage.validateRequest(keys, budget);
 		int requestedKeys = keys.size();
-		var responseBudget = new it.cavallium.rockserver.core.common.RangeBudget(budget.maxItems(),
+		var responseBudget = new RangeBudget(budget.maxItems(),
 				Math.min(budget.maxBytes(), maxInboundMessageSize));
 		var request = GetMultiRequest.newBuilder().setColumnId(columnId)
 				.setBudget(it.cavallium.rockserver.core.common.api.proto.RangeBudget.newBuilder()
