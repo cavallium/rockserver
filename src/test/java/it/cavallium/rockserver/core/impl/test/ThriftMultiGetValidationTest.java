@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
@@ -54,8 +55,8 @@ class ThriftMultiGetValidationTest {
 				assertEquals(RocksDBErrorType.INVALID_REQUEST, failure.getErrorType());
 				var page = client.getMulti(column, keys, new RangeBudget(1, 64), context);
 				assertEquals(1, page.getValuesSize());
-				assertEquals(false, page.getValues().getFirst().isSetValue());
-				assertEquals(false, page.isHasMore());
+				assertFalse(page.getValues().getFirst().isSetValue());
+				assertFalse(page.isHasMore());
 				assertEquals(0, embedded.getInternalDB().getPendingOpsCount());
 			}
 		}

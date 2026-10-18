@@ -1,8 +1,5 @@
 package it.cavallium.rockserver.core.impl.test;
 
-import it.cavallium.rockserver.core.impl.InternalConnection;
-import it.cavallium.rockserver.core.impl.RWScheduler;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -26,6 +23,8 @@ import it.cavallium.rockserver.core.common.api.proto.GetMultiRequest;
 import it.cavallium.rockserver.core.common.api.proto.KeyTuple;
 import it.cavallium.rockserver.core.common.api.proto.RangeBudget;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
+import it.cavallium.rockserver.core.impl.InternalConnection;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import java.net.InetSocketAddress;
 import java.net.URI;
@@ -37,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import reactor.core.publisher.Mono;
 
 @Timeout(30)
 class GrpcMultiGetProxyDeadlineTest {
@@ -91,16 +91,12 @@ class GrpcMultiGetProxyDeadlineTest {
 						.setTimeoutNanos(TIMEOUT)).build();
 	}
 
-	private static RWScheduler scheduler(AtomicLong clock) {
-		try {
-			var factory = RWScheduler.class.getDeclaredMethod("forTesting", int.class, int.class,
-					int.class, int.class, int.class, String.class, java.util.function.LongSupplier.class);
-			factory.setAccessible(true);
-			return (RWScheduler) factory.invoke(null, 1, 1, 1, 8, 8,
-					"multi-get-proxy-deadline", (java.util.function.LongSupplier) clock::get);
-		} catch (ReflectiveOperationException failure) {
-			throw new AssertionError(failure);
-		}
+	private static RWScheduler scheduler(AtomicLong clock) throws ReflectiveOperationException {
+		var factory = RWScheduler.class.getDeclaredMethod("forTesting", int.class, int.class,
+				int.class, int.class, int.class, String.class, java.util.function.LongSupplier.class);
+		factory.setAccessible(true);
+		return (RWScheduler) factory.invoke(null, 1, 1, 1, 8, 8,
+				"multi-get-proxy-deadline", (java.util.function.LongSupplier) clock::get);
 	}
 
 	private static final class Fixture implements AutoCloseable {
@@ -192,13 +188,7 @@ class GrpcMultiGetProxyDeadlineTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
-			return new RocksDBAsyncAPI() {
-				@Override
-				public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(
-						String id, Long fromSeq, long maxEvents) {
-					return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC is unused"));
-				}
-			};
+			return (id, fromSeq, maxEvents) -> Mono.error(new UnsupportedOperationException("CDC is unused"));
 		}
 
 		@Override

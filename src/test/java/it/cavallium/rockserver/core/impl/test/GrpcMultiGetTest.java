@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.protobuf.ByteString;
 import io.grpc.CallOptions;
 import io.grpc.ClientCall;
+import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
@@ -18,28 +19,30 @@ import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.MultiGetPage;
+import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
-import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.common.api.proto.GetMultiRequest;
 import it.cavallium.rockserver.core.common.api.proto.KeyTuple;
-import it.cavallium.rockserver.core.common.api.proto.RangeBudget;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -80,24 +83,15 @@ class GrpcMultiGetTest {
                         assertFalse(complete.getValues(1).hasValue(), "missing keys must retain their slot");
                         assertEquals(expected, values(complete));
 
-                        var actual = new ArrayList<Buf>();
-                        do {
-                            var remaining = keys.subList(actual.size(), keys.size());
-                            var response = stub.getMulti(request(column, remaining, 56));
-                            var page = new MultiGetPage(values(response), response.getHasMore());
-                            page.validateResponse(remaining.size(),
-                                    new it.cavallium.rockserver.core.common.RangeBudget(remaining.size(), 56));
-                            assertFalse(page.values().isEmpty());
-                            assertEquals(expected.subList(actual.size(), actual.size() + page.values().size()), page.values());
-                            actual.addAll(page.values());
-                            assertEquals(actual.size() < keys.size(), page.hasMore());
-                        } while (actual.size() < keys.size());
-                        assertEquals(expected, actual);
+                        assertPrefixes(keys, expected,
+                                new RangeBudget(keys.size(), 56), remaining -> {
+                                    var response = stub.getMulti(request(column, remaining, 56));
+                                    return new MultiGetPage(values(response), response.getHasMore());
+                                });
                         // A second full request exercises fresh ownership after all page owners closed.
                         assertEquals(expected, values(stub.getMulti(request(column, keys, 256))));
                     } finally {
-                        channel.shutdownNow();
-                        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+                        closeChannel(channel);
                     }
                 }
             }
@@ -127,24 +121,15 @@ class GrpcMultiGetTest {
                     proxy.start();
                     try (var client = GrpcConnection.forHostAndPort("multi-get-proxy-client",
                             new HostAndPort("127.0.0.1", proxy.getPort()))) {
-                        var api = client.getSyncApi(RequestContext.batch(java.time.Duration.ofSeconds(20)));
-                        var budget = new it.cavallium.rockserver.core.common.RangeBudget(4, 56);
-                        var actual = new ArrayList<Buf>();
-                        while (actual.size() < keys.size()) {
-                            var remaining = keys.subList(actual.size(), keys.size());
-                            var page = api.getMulti(column, remaining, budget);
-                            page.validateResponse(remaining.size(), budget);
-                            assertFalse(page.values().isEmpty());
-                            actual.addAll(page.values());
-                            assertEquals(expected.subList(0, actual.size()), actual);
-                            assertEquals(actual.size() < keys.size(), page.hasMore());
-                        }
+                        var api = client.getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
+                        var budget = new RangeBudget(4, 56);
+                        assertPrefixes(keys, expected, budget, remaining -> api.getMulti(column, remaining, budget));
                         var failure = assertThrows(RocksDBException.class,
                                 () -> api.getMulti(column, List.of(key(1)),
-                                        new it.cavallium.rockserver.core.common.RangeBudget(1, 32)));
+                                        new RangeBudget(1, 32)));
                         assertEquals(RocksDBException.RocksDBErrorType.GET_MULTI_ITEM_TOO_LARGE,
                                 failure.getErrorUniqueId());
-                        var fullBudget = new it.cavallium.rockserver.core.common.RangeBudget(4, 256);
+                        var fullBudget = new RangeBudget(4, 256);
                         assertEquals(expected, api.getMulti(column, keys, fullBudget).values());
                         assertEquals(expected, client.getAsyncApi(RequestContext.batch())
                                 .getMultiAsync(column, keys, fullBudget).get(20, TimeUnit.SECONDS).values());
@@ -154,18 +139,14 @@ class GrpcMultiGetTest {
                     try {
                         // Bypass client-side validation to exercise the wire boundary.
                         var malformed = request(column, List.of(1), 64).toBuilder()
-                                .setBudget(RangeBudget.newBuilder().setMaxItems(129).setMaxBytes(64)).build();
-                        var failure = assertThrows(StatusRuntimeException.class,
-                                () -> RocksDBServiceGrpc.newBlockingStub(channel)
-                                        .withDeadlineAfter(20, TimeUnit.SECONDS).getMulti(malformed));
+                                .setBudget(it.cavallium.rockserver.core.common.api.proto.RangeBudget.newBuilder().setMaxItems(129).setMaxBytes(64)).build();
+                        var stub = RocksDBServiceGrpc.newBlockingStub(channel).withDeadlineAfter(20, TimeUnit.SECONDS);
+                        var failure = assertThrows(StatusRuntimeException.class, () -> stub.getMulti(malformed));
                         assertEquals(Status.Code.INVALID_ARGUMENT, failure.getStatus().getCode());
                         assertTrue(failure.getStatus().getDescription().contains("[uid:INVALID_REQUEST]"));
-                        assertEquals(expected, values(RocksDBServiceGrpc.newBlockingStub(channel)
-                                .withDeadlineAfter(20, TimeUnit.SECONDS)
-                                .getMulti(request(column, List.of(1, 2, 3, 1), 256))));
+                        assertEquals(expected, values(stub.getMulti(request(column, List.of(1, 2, 3, 1), 256))));
                     } finally {
-                        channel.shutdownNow();
-                        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+                        closeChannel(channel);
                     }
                     awaitIdle(proxy.getSchedulerForTesting());
                     awaitIdle(backend.getSchedulerForTesting());
@@ -174,6 +155,27 @@ class GrpcMultiGetTest {
                 }
             }
         }
+    }
+
+    private static <K> void assertPrefixes(List<K> keys, List<Buf> expected,
+            RangeBudget budget,
+            Function<List<K>, MultiGetPage> read) {
+        var actual = new ArrayList<Buf>();
+        while (actual.size() < keys.size()) {
+            var remaining = keys.subList(actual.size(), keys.size());
+            var page = read.apply(remaining);
+            page.validateResponse(remaining.size(), budget);
+            assertFalse(page.values().isEmpty());
+            actual.addAll(page.values());
+            assertEquals(expected.subList(0, actual.size()), actual);
+            assertEquals(actual.size() < keys.size(), page.hasMore());
+        }
+        assertEquals(expected, actual);
+    }
+
+    private static void closeChannel(ManagedChannel channel) throws InterruptedException {
+        channel.shutdownNow();
+        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
     }
 
     private static void awaitIdle(RWScheduler scheduler) throws InterruptedException {
@@ -228,8 +230,7 @@ class GrpcMultiGetTest {
                     assertEquals(0, embedded.getInternalDB().getPendingOpsCount());
                     api.deleteColumn(column);
                 } finally {
-                    channel.shutdownNow();
-                    assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+                    closeChannel(channel);
                 }
             }
         }
@@ -262,7 +263,7 @@ class GrpcMultiGetTest {
 
     private static GetMultiRequest request(long column, List<Integer> keys, long maxBytes) {
         var request = GetMultiRequest.newBuilder().setColumnId(column)
-                .setBudget(RangeBudget.newBuilder().setMaxItems(keys.size()).setMaxBytes(maxBytes))
+                .setBudget(it.cavallium.rockserver.core.common.api.proto.RangeBudget.newBuilder().setMaxItems(keys.size()).setMaxBytes(maxBytes))
                 .setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
                         .setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
                         .setWorkloadContractVersion(3).setTimeoutNanos(Long.MAX_VALUE));

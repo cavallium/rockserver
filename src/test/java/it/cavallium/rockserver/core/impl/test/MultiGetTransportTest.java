@@ -20,11 +20,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.stream.Stream;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 @Timeout(120)
@@ -33,12 +31,8 @@ class MultiGetTransportTest {
     @TempDir
     Path directory;
 
-    static Stream<Arguments> allImplementations() {
-        return DBTest.allImplementations();
-    }
-
     @ParameterizedTest(name = "{0}")
-    @MethodSource("allImplementations")
+    @MethodSource("it.cavallium.rockserver.core.impl.test.DBTest#allImplementations")
     void collidingBucketValuesRetainOrderAcrossPagesErrorsAndReopen(String name,
             ConnectionConfig config) throws Exception {
         Path database = directory.resolve("db");
