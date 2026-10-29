@@ -93,13 +93,22 @@ class PauseTest {
 	 */
 	private static final Duration RUNNING_NODE_BLIP = Duration.ofMillis(1500);
 	/**
-	 * The same for the failover client, which may sit on the frozen follower for one attempt per operation until a
-	 * read moves it to another node.
+	 * The same for the failover client. It starts each call on the node that last answered and never retries an
+	 * ambiguous write, so a run of puts can keep it on the frozen follower, one timed-out attempt each, until a read
+	 * fails over or the pause ends: it must not stay stuck any longer than that.
 	 */
-	private static final Duration FAILOVER_BLIP = ATTEMPT_TIMEOUT.multipliedBy(3);
+	private static final Duration FAILOVER_BLIP = PAUSE.plus(ATTEMPT_TIMEOUT);
 	private static final int REGISTERS = 6;
-	/** Operations sent straight to the old leader the moment it is continued, while it still believes it leads. */
-	private static final int RESUME_BURST = 16;
+	/**
+	 * Operations queued in the frozen leader's API socket, handled the moment it is continued, while it may still
+	 * believe it leads its old term; their deadline outlives the pause.
+	 */
+	private static final int QUEUED_ON_FROZEN_LEADER = 18;
+	private static final RequestContext QUEUED = RequestContext.latency(Duration.ofSeconds(15));
+	/** Time for the queued requests to reach the frozen leader's socket buffers. */
+	private static final Duration QUEUE_TIME = Duration.ofMillis(300);
+	/** Operations sent to the old leader right after it is continued. */
+	private static final int RESUME_BURST = 12;
 	private static final String FAILOVER_CLIENT = "any";
 	private static final String COLUMN = "registers";
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
@@ -171,19 +180,27 @@ class PauseTest {
 		awaitCondition("every register overwritten through the running nodes", () -> IntStream.range(0, REGISTERS)
 				.allMatch(register -> survivors.stream().anyMatch(w -> w.putAcknowledgedSince(leaderPausedAt, register))));
 
-		// ---- Continue it, and hit it at once while it may still believe it leads its old term.
+		// ---- Queue requests on it, continue it, and hit it again at once: it may still believe it leads its old
+		// term until it handles the Raft messages of the new leader, which race with these requests. (Ratis tends to
+		// win: the leader steps down within a few hundred ms, usually before it routes the queued requests.)
+		var oldLeaderWorker = workers.get(oldLeader);
+		var oldLeaderOps = new ArrayList<Future<?>>();
+		for (int i = 0; i < QUEUED_ON_FROZEN_LEADER; i++) {
+			boolean put = i % 3 == 0;
+			int register = i % REGISTERS;
+			oldLeaderOps.add(executor.submit(() -> oldLeaderWorker.operation(put, register, "queued", QUEUED)));
+		}
+		holdUntil(System.nanoTime() + QUEUE_TIME.toNanos());
 		cluster.resume(oldLeader);
 		long leaderResumedAt = System.nanoTime();
-		var burst = new ArrayList<Future<?>>();
-		var oldLeaderWorker = workers.get(oldLeader);
 		for (int i = 0; i < RESUME_BURST; i++) {
 			boolean put = i % 2 == 0;
 			int register = i % REGISTERS;
-			burst.add(executor.submit(() -> oldLeaderWorker.operation(put, register, "burst")));
+			oldLeaderOps.add(executor.submit(() -> oldLeaderWorker.operation(put, register, "burst", ATTEMPT)));
 		}
 		var stepDown = probe.awaitRole(oldLeader, RaftPeerRole.FOLLOWER, newLeader.term());
 		long steppedDownAt = System.nanoTime();
-		for (var future : burst) {
+		for (var future : oldLeaderOps) {
 			future.get(WAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
 		}
 		awaitCondition("acknowledged operation through the continued old leader",
@@ -328,7 +345,7 @@ class PauseTest {
 		public void run() {
 			var random = ThreadLocalRandom.current();
 			while (!stopped && !Thread.currentThread().isInterrupted()) {
-				operation(random.nextBoolean(), random.nextInt(REGISTERS), "op");
+				operation(random.nextBoolean(), random.nextInt(REGISTERS), "op", ATTEMPT);
 			}
 		}
 
@@ -336,19 +353,19 @@ class PauseTest {
 			stopped = true;
 		}
 
-		void operation(boolean put, int register, String label) {
+		void operation(boolean put, int register, String label, RequestContext context) {
 			String key = registerName(register);
 			if (put) {
 				String value = name + "-" + label + "-" + sequence.incrementAndGet();
 				long invoked = System.nanoTime();
 				var pending = history.invokePut(key, value);
-				var result = client.put(columnId, key(register), text(value), ATTEMPT);
+				var result = client.put(columnId, key(register), text(value), context);
 				pending.complete(result.status());
 				record(true, register, invoked, result);
 			} else {
 				long invoked = System.nanoTime();
 				var pending = history.invokeGet(key);
-				var result = client.get(columnId, key(register), ATTEMPT);
+				var result = client.get(columnId, key(register), context);
 				pending.complete(result.status(), result.acknowledged() ? text(result.value()) : null);
 				record(false, register, invoked, result);
 			}
