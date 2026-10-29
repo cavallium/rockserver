@@ -6,7 +6,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.CountDownLatch;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftClientReply;
@@ -67,19 +66,21 @@ public final class ReplicatedServerMain {
 			System.exit(1);
 			return;
 		}
-		var stopped = new CountDownLatch(1);
 		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
 			try {
 				node.close();
 			} catch (IOException ex) {
 				System.err.println("Failed to stop cleanly: " + ex);
-			} finally {
-				stopped.countDown();
 			}
 		}, "rockserver-shutdown"));
 		System.out.println("READY " + config.nodeId());
 		System.out.flush();
-		stopped.await();
+		var failure = node.stopped().join();
+		if (failure != null) {
+			// The replica cannot apply the log: exit, so that a supervisor notices and an operator repairs it.
+			System.err.println("Node " + config.nodeId() + " stopped after a replica failure: " + failure);
+			System.exit(3);
+		}
 	}
 
 	private static void admin(Options options) throws IOException {

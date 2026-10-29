@@ -12,6 +12,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -51,6 +52,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final GrpcServer apiServer;
 	private final ScheduledExecutorService maintenance;
 	private final AtomicBoolean closed = new AtomicBoolean();
+	private final CompletableFuture<@Nullable Throwable> stopped = new CompletableFuture<>();
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
 		this.config = config;
@@ -64,6 +66,9 @@ public final class ReplicatedNode implements AutoCloseable {
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
 		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress));
 		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
+		if (!existing) {
+			requireNoClusterData(config);
+		}
 		this.server = RaftServer.newBuilder()
 				.setServerId(RaftPeerId.valueOf(config.nodeId()))
 				.setGroup(group)
@@ -150,11 +155,34 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 	}
 
+	/**
+	 * A node without Raft state starts a fresh member (term 0, no vote). Its database must then not belong to the
+	 * cluster already: a member that lost its Raft state but kept its id could vote twice in one term. Such a node
+	 * must be replaced: wipe it and add it back under a new id.
+	 */
+	private static void requireNoClusterData(NodeConfig config) throws IOException {
+		if (!Files.isDirectory(config.dbDir())) {
+			return;
+		}
+		try (var store = NodeStore.open(config.dbDir(), config.rockserverConfig(), config.nodeId())) {
+			if (store.clusterId() != null) {
+				throw new IOException("Node " + config.nodeId() + " has the database of cluster " + store.clusterId()
+						+ " but no Raft state in " + config.raftDir() + ": it cannot rejoin under the same id."
+						+ " Remove it from the cluster, wipe its data directory and add it back under a new id");
+			}
+		}
+	}
+
+	/** Completes when the node stopped: normally with null, or with the failure that stopped its replica. */
+	public CompletableFuture<@Nullable Throwable> stopped() {
+		return stopped;
+	}
+
 	private void onReplicaFailure(Throwable error) {
 		// Leave the group: a replica that cannot apply the log must not vote or lead.
 		Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-failure").start(() -> {
 			try {
-				halt();
+				shutdown(true, error);
 			} catch (IOException | RuntimeException ex) {
 				LOG.error("{}: failed to stop after a replica failure", config.nodeId(), ex);
 			}
@@ -204,12 +232,12 @@ public final class ReplicatedNode implements AutoCloseable {
 		if (isLeader()) {
 			transferLeadership();
 		}
-		shutdown();
+		shutdown(false, null);
 	}
 
 	/** Abrupt stop for tests: no leadership hand-off. */
 	public void halt() throws IOException {
-		shutdown();
+		shutdown(false, null);
 	}
 
 	/**
@@ -257,14 +285,33 @@ public final class ReplicatedNode implements AutoCloseable {
 				.orElse(null);
 	}
 
-	private void shutdown() throws IOException {
+	/**
+	 * Normally stops taking requests first, then consensus, then the database (closed by the state machine). After a
+	 * replica failure consensus stops first, so that a failed leader stops leading at once.
+	 */
+	private void shutdown(boolean consensusFirst, @Nullable Throwable cause) throws IOException {
 		if (!closed.compareAndSet(false, true)) {
 			return;
 		}
 		maintenance.shutdownNow();
 		IOException failure = null;
-		// Stop taking requests first, then consensus, then the database (closed by the state machine).
-		for (Closeable resource : List.<Closeable>of(apiServer, proposer, barrier, forwarder, server)) {
+		var order = consensusFirst
+				? List.<Closeable>of(server, apiServer, proposer, barrier, forwarder)
+				: List.<Closeable>of(apiServer, proposer, barrier, forwarder, server);
+		try {
+			failure = closeAll(order);
+		} finally {
+			stopped.complete(cause);
+		}
+		LOG.info("{}: stopped", config.nodeId());
+		if (failure != null) {
+			throw failure;
+		}
+	}
+
+	private @Nullable IOException closeAll(List<Closeable> resources) {
+		IOException failure = null;
+		for (Closeable resource : resources) {
 			try {
 				resource.close();
 			} catch (IOException | RuntimeException ex) {
@@ -275,9 +322,6 @@ public final class ReplicatedNode implements AutoCloseable {
 				}
 			}
 		}
-		LOG.info("{}: stopped", config.nodeId());
-		if (failure != null) {
-			throw failure;
-		}
+		return failure;
 	}
 }

@@ -54,6 +54,11 @@ final class RaftSettings {
 		RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(properties, config.snapshotEveryEntries());
 		RaftServerConfigKeys.Log.setPurgeUptoSnapshotIndex(properties, true);
 		RaftServerConfigKeys.Log.setPurgeGap(properties, 1024);
+		// Keep a margin of log behind the snapshot, so that a member restarted during a deploy catches up from the
+		// log instead of downloading the whole database.
+		RaftServerConfigKeys.Log.setPurgePreservationLogNum(properties, config.snapshotEveryEntries());
+		// Allow the snapshot requested right after a seeded genesis, whatever the gap since the last one.
+		RaftServerConfigKeys.Snapshot.setCreationGap(properties, 1);
 		RaftServerConfigKeys.Log.Appender.setInstallSnapshotEnabled(properties, true);
 		RaftServerConfigKeys.Log.Appender.setSnapshotChunkSizeMax(properties, SizeInBytes.valueOf("8MB"));
 		return properties;
