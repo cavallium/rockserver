@@ -290,6 +290,42 @@ class ReadBarrierTest {
 	}
 
 	@Test
+	void unansweringPeerHasAtMostOneQueryInFlight() throws Exception {
+		startCluster();
+		var leader = awaitLeader();
+		var followers = followersOf(leader);
+		var paused = followers.get(0);
+		var other = followers.get(1);
+		var barrier = barrier(leader);
+		barrier.await().get(10, TimeUnit.SECONDS);
+
+		// Like a paused process: its connection stays up, but it never answers.
+		paused.ignoreTermCalls = true;
+		long callsBefore = paused.termCalls.get();
+		long start = System.nanoTime();
+		int rounds = 0;
+		while (System.nanoTime() - start < ROUND_TIMEOUT.multipliedBy(3).toNanos()) {
+			// Confirmed by the leader and the other follower.
+			barrier.await().get(10, TimeUnit.SECONDS);
+			rounds++;
+		}
+		long timeouts = Math.ceilDiv(System.nanoTime() - start, ROUND_TIMEOUT.toNanos());
+		long calls = paused.termCalls.get() - callsBefore;
+
+		assertTrue(rounds >= 50, "rounds: " + rounds);
+		// A query lasts until the end of the round that sent it; only a round after that sends the next one.
+		assertTrue(calls <= 2 * timeouts + 1, calls + " calls in " + rounds + " rounds and " + timeouts + " timeouts");
+		// One, plus at most one that the caller gave up on but whose cancellation the peer did not see yet.
+		assertTrue(paused.mostOpenTermCalls.get() <= 2, "open calls: " + paused.mostOpenTermCalls.get());
+
+		// Once the peer answers again it confirms rounds as before, here alone with the leader.
+		paused.ignoreTermCalls = false;
+		waitUntil(() -> paused.openTermCalls.get() == 0, "the unanswered call given up");
+		other.stop();
+		barrier.await().get(10, TimeUnit.SECONDS);
+	}
+
+	@Test
 	void closeFailsPendingCalls() throws Exception {
 		startCluster();
 		var leader = awaitLeader();
@@ -687,6 +723,12 @@ class ReadBarrierTest {
 		final AtomicLong termCalls = new AtomicLong();
 		/** While set, term requests are answered only once it opens, with the term at that time. */
 		private volatile CountDownLatch termCallGate;
+		/** While set, term requests are never answered, and stay open until the caller gives up on them. */
+		volatile boolean ignoreTermCalls;
+		/** Term requests ignored and not given up yet by their caller. */
+		final AtomicLong openTermCalls = new AtomicLong();
+		/** The highest {@link #openTermCalls} seen. */
+		final AtomicLong mostOpenTermCalls = new AtomicLong();
 		/** Ratis methods (full names) refused with UNAVAILABLE, to cut Raft traffic into this node. */
 		volatile Set<String> rejectedMethods = Set.of();
 		/** Drop the log entries that carry a joint (old and new) configuration, so that it never commits. */
@@ -757,6 +799,9 @@ class ReadBarrierTest {
 					var method = call.getMethodDescriptor();
 					if (TermService.SERVICE_NAME.equals(method.getServiceName())) {
 						termCalls.incrementAndGet();
+						if (ignoreTermCalls) {
+							return ignore();
+						}
 					} else if (rejectedMethods.contains(method.getFullMethodName())) {
 						call.close(Status.UNAVAILABLE.withDescription("partitioned by the test"), new Metadata());
 						return new ServerCall.Listener<>() {};
@@ -764,6 +809,17 @@ class ReadBarrierTest {
 						return dropJointConfiguration(call, next.startCall(call, headers));
 					}
 					return next.startCall(call, headers);
+				}
+			};
+		}
+
+		/** Leaves a call open, unanswered, until its caller cancels it. */
+		private <Q> ServerCall.Listener<Q> ignore() {
+			mostOpenTermCalls.accumulateAndGet(openTermCalls.incrementAndGet(), Math::max);
+			return new ServerCall.Listener<>() {
+				@Override
+				public void onCancel() {
+					openTermCalls.decrementAndGet();
 				}
 			};
 		}
