@@ -146,6 +146,11 @@ public final class ProcessCluster implements AutoCloseable {
 		return new HostAndPort(LOOPBACK, node(id).apiPort);
 	}
 
+	/** Address of the node's Raft server, reachable directly from the test JVM (e.g. for group info queries). */
+	public HostAndPort raftAddress(String id) {
+		return new HostAndPort(LOOPBACK, node(id).raftPort);
+	}
+
 	public Map<String, HostAndPort> apiAddresses() {
 		var result = new LinkedHashMap<String, HostAndPort>();
 		nodes.keySet().forEach(id -> result.put(id, apiAddress(id)));
@@ -292,6 +297,11 @@ public final class ProcessCluster implements AutoCloseable {
 		var node = runningNode(id);
 		signal(node, "-CONT");
 		node.paused = false;
+	}
+
+	/** The node's stderr log (where it logs), appended to by every start; each start begins with a marker line. */
+	public Path stderrLog(String id) {
+		return node(id).stderr();
 	}
 
 	/** The last lines of the node's stdout and stderr, for failure messages. */
