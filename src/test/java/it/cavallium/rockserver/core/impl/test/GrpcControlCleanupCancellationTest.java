@@ -14,8 +14,6 @@ import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.netty.NettyServerBuilder;
-import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
-import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
@@ -245,48 +243,6 @@ class GrpcControlCleanupCancellationTest {
 		assertEquals(WorkloadProfile.BATCH, backendContext.profile());
 		assertEquals(Long.MAX_VALUE, backendContext.timeoutNanos());
 		assertEquals(0, embeddedConnection.getInternalDB().getOpenTransactionsCount());
-	}
-
-	@Test
-	void cancelledCdcAcknowledgementCompletesAndLateFailureIsCountedOnce() throws Exception {
-		var exportedRegistry = new SimpleMeterRegistry();
-		((CompositeMeterRegistry) embeddedConnection.getInternalDB().getMetricsRegistry())
-				.add(exportedRegistry);
-		var blockingBackend = new BlockingCdcCommitConnection(embeddedConnection);
-		replaceServer(blockingBackend);
-		var client = newClient();
-		var sync = client.getSyncApi(RequestContext.batch());
-		var async = client.getAsyncApi(RequestContext.batch());
-		sync.cdcCreate("progress", 1L, null, false, java.util.OptionalLong.empty());
-		var successfulCommit = async.cdcCommitAsync("progress", 42L);
-		var failingCommit = async.cdcCommitAsync("missing", 99L);
-		try {
-			assertTrue(blockingBackend.awaitCommitsStarted(5, TimeUnit.SECONDS),
-					"CDC acknowledgements did not begin running");
-			awaitCondition(() -> grpcServer.getAcceptedMustCompleteOperationCountForTesting() == 2,
-					"CDC acknowledgements were not accepted");
-			assertFalse(successfulCommit.isDone());
-			assertFalse(failingCommit.isDone());
-			assertTrue(successfulCommit.cancel(true));
-			assertTrue(failingCommit.cancel(true));
-			awaitCondition(() -> grpcServer.getCancelledMustCompleteOperationCountForTesting() == 2,
-					"CDC cancellation signals did not reach the server");
-			assertEquals(2, grpcServer.getAcceptedMustCompleteOperationCountForTesting());
-		} finally {
-			blockingBackend.releaseCommits();
-		}
-
-		awaitCondition(() -> sync.cdcGetLastCommittedSequence("progress").orElse(-1L) == 42L,
-				"cancelled CDC acknowledgement did not persist progress");
-		awaitCondition(() -> grpcServer.getAcceptedMustCompleteOperationCountForTesting() == 0,
-				"cancelled CDC acknowledgements did not terminate");
-		assertEquals(1L, grpcServer.getLateProtectedOperationFailureCountForTesting("cdcCommit"));
-		var exportedCounter = exportedRegistry.find("rockserver.grpc.protected.late.failures")
-				.tag("operation", "cdcCommit")
-				.counter();
-		assertNotNull(exportedCounter, "late protected-operation failure metric was not exported");
-		assertEquals(1.0, exportedCounter.count(),
-				"late protected-operation failure metric must be incremented exactly once");
 	}
 
 	@Test
@@ -861,68 +817,6 @@ class GrpcControlCleanupCancellationTest {
 		@Override
 		public void close() {
 			// The test owns the embedded delegate separately.
-		}
-	}
-
-	private static final class BlockingCdcCommitConnection implements RocksDBConnection, InternalConnection {
-		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
-
-		private final EmbeddedConnection delegate;
-		private final CountDownLatch commitsStarted = new CountDownLatch(2);
-		private final CountDownLatch releaseCommits = new CountDownLatch(1);
-
-		private BlockingCdcCommitConnection(EmbeddedConnection delegate) {
-			this.delegate = delegate;
-		}
-
-		@Override
-		public URI getUrl() {
-			return delegate.getUrl();
-		}
-
-		@Override
-		public RocksDBSyncAPI getSyncApi(RequestContext context) {
-			var delegateApi = delegate.getSyncApi(context);
-			return new RocksDBSyncAPI() {
-				@Override
-				public <RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> SYNC_RESULT requestSync(
-						RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> request) {
-					if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CdcCommit) {
-						commitsStarted.countDown();
-						awaitUninterruptibly(releaseCommits);
-					}
-					return delegateApi.requestSync(request);
-				}
-			};
-		}
-
-		@Override
-		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
-			return delegate.getAsyncApi(context);
-		}
-
-		@Override
-		public RWScheduler getScheduler() {
-			return delegate.getScheduler();
-		}
-
-		@Override
-		public EmbeddedDB getEmbeddedDB() {
-			return delegate.getEmbeddedDB();
-		}
-
-		@Override
-		public void close() {
-			// The test owns the embedded delegate separately.
-		}
-
-		private boolean awaitCommitsStarted(long timeout, TimeUnit unit) throws InterruptedException {
-			return commitsStarted.await(timeout, unit);
-		}
-
-		private void releaseCommits() {
-			releaseCommits.countDown();
 		}
 	}
 

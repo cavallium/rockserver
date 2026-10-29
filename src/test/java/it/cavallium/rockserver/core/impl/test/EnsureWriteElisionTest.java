@@ -71,24 +71,19 @@ class EnsureWriteElisionTest {
 		var key = intKey(1);
 		var first = value("first");
 		var second = value("second");
-		api.cdcCreate("single-ensure", null, List.of(columnId), null, java.util.OptionalLong.empty());
 
 		assertNull(api.put(0, columnId, key, first, RequestType.ensure()));
 		assertNull(api.put(0, columnId, key, first, RequestType.ensure()));
 		assertValue(first, api.get(0, columnId, key, RequestType.current()));
-		assertEquals(1L, cdcEventCount("single-ensure"));
 		assertEquals(1.0, decisionCount("ensure", "fallback_not_found"));
 		assertEquals(1.0, decisionCount("ensure", "elided"));
 
 		assertNull(api.put(0, columnId, key, second, RequestType.ensure()));
 		assertValue(second, api.get(0, columnId, key, RequestType.current()));
-		assertEquals(2L, cdcEventCount("single-ensure"));
 		assertEquals(1.0, decisionCount("ensure", "fallback_different"));
 
 		api.flush();
 		assertNull(api.put(0, columnId, key, second, RequestType.ensure()));
-		assertEquals(3L, cdcEventCount("single-ensure"),
-				"a cold cache-tier miss must retain ordinary Put and CDC behavior");
 		assertEquals(1.0, decisionCount("ensure", "fallback_incomplete"));
 	}
 
@@ -164,7 +159,6 @@ class EnsureWriteElisionTest {
 		assertTrue(probeCalls.stream().allMatch(call -> call.keys() <= 4_096 && call.bytes() <= MAX_PROBE_BYTES));
 
 		long orderedColumn = api.createColumn("ordered", fixedSchema(true));
-		api.cdcCreate("ordered-ensure", null, List.of(orderedColumn), null, java.util.OptionalLong.empty());
 		var duplicate = intKey(9);
 		var first = value("first");
 		var second = value("second");
@@ -173,8 +167,6 @@ class EnsureWriteElisionTest {
 				List.of(duplicate, duplicate),
 				List.of(first, first),
 				RequestType.ensure()).isEmpty());
-		assertEquals(1L, cdcEventCount("ordered-ensure"),
-				"the second duplicate must see the first write and elide");
 
 		assertTrue(api.putMulti(0,
 				orderedColumn,
@@ -182,8 +174,6 @@ class EnsureWriteElisionTest {
 				List.of(first, second),
 				RequestType.ensure()).isEmpty());
 		assertValue(second, api.get(0, orderedColumn, duplicate, RequestType.current()));
-		assertEquals(2L, cdcEventCount("ordered-ensure"),
-				"the different later value must remain an ordinary Put in input order");
 
 		var presenceKey = intKey(10);
 		assertEquals(List.of(false, true), api.putMulti(0,
@@ -191,8 +181,6 @@ class EnsureWriteElisionTest {
 				List.of(presenceKey, presenceKey),
 				List.of(first, first),
 				RequestType.previousPresence()));
-		assertEquals(3L, cdcEventCount("ordered-ensure"),
-				"the first previous-presence write must publish CDC and the equal duplicate must elide");
 	}
 
 	@Test
@@ -285,14 +273,12 @@ class EnsureWriteElisionTest {
 
 		var key = intKey(2);
 		var value = value("transactional");
-		api.cdcCreate("transactional-ensure", null, List.of(columnId), null, java.util.OptionalLong.empty());
 		long rollbackTx = api.openTransaction( java.time.Duration.ofMillis(5_000));
 		assertNull(api.put(rollbackTx, columnId, key, value, RequestType.ensure()));
 		assertFalse(api.get(0, columnId, key, RequestType.exists()));
 		assertTrue(api.get(rollbackTx, columnId, key, RequestType.exists()));
 		assertTrue(api.closeTransaction(rollbackTx, false));
 		assertFalse(api.get(0, columnId, key, RequestType.exists()));
-		assertEquals(0L, cdcEventCount("transactional-ensure"));
 
 		long commitTx = api.openTransaction( java.time.Duration.ofMillis(5_000));
 		assertTrue(api.putMulti(commitTx,
@@ -302,20 +288,16 @@ class EnsureWriteElisionTest {
 				RequestType.ensure()).isEmpty());
 		assertTrue(api.closeTransaction(commitTx, true));
 		assertValue(value, api.get(0, columnId, key, RequestType.current()));
-		assertEquals(1L, cdcEventCount("transactional-ensure"));
 		assertEquals(2.0, decisionCount("ensure", "bypass_writer"));
 
 		long equalCommitTx = api.openTransaction( java.time.Duration.ofMillis(5_000));
 		assertNull(api.put(equalCommitTx, columnId, key, value, RequestType.ensure()));
 		assertTrue(api.closeTransaction(equalCommitTx, true));
-		assertEquals(2L, cdcEventCount("transactional-ensure"),
-				"an explicit transaction must retain ordinary Put CDC semantics even for equality");
 
 		var updated = value("updated");
 		var update = api.get(0, columnId, key, RequestType.forUpdate());
 		assertNull(api.put(update.updateId(), columnId, key, updated, RequestType.ensure()));
 		assertValue(updated, api.get(0, columnId, key, RequestType.current()));
-		assertEquals(3L, cdcEventCount("transactional-ensure"));
 
 		var firstConflictUpdate = api.get(0, columnId, key, RequestType.forUpdate());
 		var secondConflictUpdate = api.get(0, columnId, key, RequestType.forUpdate());
@@ -335,20 +317,17 @@ class EnsureWriteElisionTest {
 		assertValue(firstConflictValue, retriedUpdate.previous());
 		assertNull(api.put(retriedUpdate.updateId(), columnId, key, secondConflictValue, RequestType.ensure()));
 		assertValue(secondConflictValue, api.get(0, columnId, key, RequestType.current()));
-		assertEquals(5L, cdcEventCount("transactional-ensure"));
 		assertEquals(7.0, decisionCount("ensure", "bypass_writer"));
 	}
 
 	@Test
-	void previousPresenceUsesTheSameHotEqualityElisionAndSuppressesDuplicateCdc() {
+	void previousPresenceUsesTheSameHotEqualityElision() {
 		long columnId = api.createColumn("previous-presence", fixedSchema(true));
 		var key = intKey(1);
 		var value = value("same");
-		api.cdcCreate("previous-presence", null, List.of(columnId), null, java.util.OptionalLong.empty());
 
 		assertFalse(api.put(0, columnId, key, value, RequestType.previousPresence()));
 		assertTrue(api.put(0, columnId, key, value, RequestType.previousPresence()));
-		assertEquals(1L, cdcEventCount("previous-presence"));
 		assertEquals(1.0, decisionCount("previous_presence", "fallback_not_found"));
 		assertEquals(1.0, decisionCount("previous_presence", "elided"));
 	}
@@ -361,12 +340,6 @@ class EnsureWriteElisionTest {
 				RequestType.RequestTypeId.ENSURE.ordinal());
 		assertEquals(12, exportedMetrics.find("rockserver.write.elision.decisions").counters().size(),
 				"two request types times six decisions must be registered eagerly");
-	}
-
-	private long cdcEventCount(String subscription) {
-		try (var events = api.cdcPoll(subscription, null, 100_000)) {
-			return events.count();
-		}
 	}
 
 	private double decisionCount(String requestType, String decision) {

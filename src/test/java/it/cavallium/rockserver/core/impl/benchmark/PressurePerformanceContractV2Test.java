@@ -28,9 +28,10 @@ class PressurePerformanceContractV2Test {
 				.count();
 		long deterministic = scheduler.size() + signal.size() - stochastic;
 
-		assertEquals(242L, stochastic);
+		// Six scheduler metrics fewer than before CDC was removed: its profile lane is gone.
+		assertEquals(236L, stochastic);
 		assertEquals(55L, deterministic);
-		assertEquals(297, scheduler.size() + signal.size());
+		assertEquals(291, scheduler.size() + signal.size());
 	}
 
 	@Test

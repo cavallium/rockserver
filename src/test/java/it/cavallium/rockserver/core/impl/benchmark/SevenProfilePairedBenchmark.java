@@ -27,7 +27,7 @@ import java.util.Set;
  */
 public final class SevenProfilePairedBenchmark {
 
-	private static final String RESULT_SCHEMA = "rockserver-seven-profile-paired-comparison-v1";
+	private static final String RESULT_SCHEMA = "rockserver-seven-profile-paired-comparison-v2";
 	private static final String SCHEDULE_SCHEMA = "rockserver-seven-profile-paired-schedule-v1";
 	private static final String PERFORMANCE_BASELINE_SHA =
 			"bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e";

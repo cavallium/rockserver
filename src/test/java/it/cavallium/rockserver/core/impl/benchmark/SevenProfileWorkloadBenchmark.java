@@ -62,18 +62,17 @@ import java.util.stream.Stream;
 import org.rocksdb.RocksDB;
 
 /**
- * Opt-in, disk-backed workload benchmark that keeps all seven scheduler profiles active.
+ * Opt-in, disk-backed workload benchmark that keeps every scheduler profile active.
  * It is deliberately a test-source main class: ordinary Maven tests never run hardware work.
  */
 public final class SevenProfileWorkloadBenchmark {
 
-	private static final String RESULT_SCHEMA = "rockserver-seven-profile-workload-v4";
-	static final String PARETO_WORKER_SCHEMA = "rockserver-seven-profile-pareto-worker-v1";
+	private static final String RESULT_SCHEMA = "rockserver-seven-profile-workload-v5";
+	static final String PARETO_WORKER_SCHEMA = "rockserver-seven-profile-pareto-worker-v2";
 	private static final String DATASET_SCHEMA = "rockserver-seven-profile-dataset-v3";
 	private static final String RUN_ATTEMPT_SCHEMA = "rockserver-seven-profile-run-attempt-v1";
 	private static final String RUN_ATTEMPT_FILE = "run-attempt.properties";
 	private static final String COLUMN_NAME = "seven-profile-workload";
-	private static final String CDC_SUBSCRIPTION = "seven-profile-workload-cdc";
 	private static final long LATENCY_DEADLINE_MILLIS = 5_000L;
 	private static final long FALLBACK_P99_LIMIT_NANOS = TimeUnit.SECONDS.toNanos(1L);
 	private static final long RESOURCE_DRAIN_SECONDS = 30L;
@@ -83,11 +82,11 @@ public final class SevenProfileWorkloadBenchmark {
 	private static final Set<String> RUN_OPTIONS = Set.of(
 			"root", "database-name", "build-id", "candidate", "storage-label", "cache-state", "seed",
 			"preload-keys", "preload-flush-keys", "value-bytes", "range-width", "write-key-space",
-			"warmup-seconds", "measure-seconds", "pressure-seconds", "cdc-lag-limit",
+			"warmup-seconds", "measure-seconds", "pressure-seconds",
 			"ingest-isolated-baseline-file", "control-workers", "latency-workers",
-			"analytical-workers", "ingest-workers", "cdc-workers", "batch-workers", "physical-workers",
+			"analytical-workers", "ingest-workers", "batch-workers", "physical-workers",
 			"cancellation-workers", "control-rate", "latency-rate", "analytical-rate", "ingest-rate",
-			"cdc-rate", "batch-rate", "physical-rate", "cancellation-rate", "cdc-max-events",
+			"batch-rate", "physical-rate", "cancellation-rate",
 			"sample-micros", "max-latency-samples", "write-buffer-size", "direct-io", "spinning",
 			"prepare-only", "reuse-prepared", "ingest-baseline-only", "enforce");
 	private static final Comparator<WorkloadKey> WORKLOAD_KEY_ORDER = Comparator
@@ -302,11 +301,6 @@ public final class SevenProfileWorkloadBenchmark {
 		var analytical = connection.getSyncApi(RequestContext.analytical());
 		var ingest = connection.getSyncApi(RequestContext.ingest());
 		var batch = connection.getSyncApi(RequestContext.batch());
-		// Cold preparation closes RocksDB, which may retire every WAL file after
-		// flushing the preloaded dataset. Create the subscription only after the
-		// prepared database is reopened so its starting cursor is backed by the
-		// live WAL used by this one-shot mixed run.
-		createCdcSubscriptionForMixedRun(batch, dataset.columnId());
 		byte[][] writeValues = writeValues(options);
 		List<Keys> cancellationKeys = deterministicKeys(options.preloadKeys(), 256, options.seed() ^ 0x43414e43454cL);
 		Thread pressureThread = null;
@@ -365,19 +359,6 @@ public final class SevenProfileWorkloadBenchmark {
 									Buf.wrap(writeValues[(int) (value & (writeValues.length - 1))]), RequestType.none());
 						});
 			}));
-		}
-		for (int worker = 0; worker < options.cdcWorkers(); worker++) {
-			int workerIndex = worker;
-			futures.add(workers.submit(() -> runWorker(control, pressure,
-					new WorkloadKey(WorkloadProfile.CDC, OperationFamily.WAL_PAGE),
-					new Pacer(options.cdcRate(), options.cdcWorkers(), workerIndex), () -> {
-						try (var events = batch.cdcPoll(CDC_SUBSCRIPTION, null, options.cdcMaxEvents())) {
-							var page = events.toList();
-							if (!page.isEmpty()) {
-								batch.cdcCommit(CDC_SUBSCRIPTION, page.getLast().seq());
-							}
-						}
-					})));
 		}
 		for (int worker = 0; worker < options.batchWorkers(); worker++) {
 			int workerIndex = worker;
@@ -462,10 +443,6 @@ public final class SevenProfileWorkloadBenchmark {
 				}
 			}
 		}
-	}
-
-	static long createCdcSubscriptionForMixedRun(RocksDBSyncAPI batch, long columnId) {
-		return batch.cdcCreate(CDC_SUBSCRIPTION, null, List.of(columnId), false, java.util.OptionalLong.empty());
 	}
 
 	private static double runIsolatedIngestBaseline(PreparedDataset dataset, Options options) throws Exception {
@@ -711,7 +688,7 @@ public final class SevenProfileWorkloadBenchmark {
 			boolean sloPassed = profileSlo(profile, throughput, endToEndP99, deadlines, errors, run,
 					ingestIsolatedBaseline, options);
 			boolean relevant = switch (profile) {
-				case CONTROL, LATENCY, ANALYTICAL, INGEST, CDC -> true;
+				case CONTROL, LATENCY, ANALYTICAL, INGEST -> true;
 				case BATCH, PHYSICAL_MAINTENANCE -> false;
 			};
 			profiles.put(profile, new WorkloadBenchmarkSelector.ProfileMeasurement(
@@ -758,7 +735,7 @@ public final class SevenProfileWorkloadBenchmark {
 		var measurement = new WorkloadBenchmarkSelector.CandidateMeasurement(
 				options.candidate(), fingerprint, comparisonFingerprint(options), options.buildId(), options.storageLabel(),
 				options.seed(), options.enforce(), runChecksPassed, profiles,
-				run.observation().maximumCdcLag(), run.observation().maximumRetainedSnapshots(),
+				run.observation().maximumRetainedSnapshots(),
 				run.observation().maximumStoragePressure(), leakedResources);
 		return new Result(RESULT_SCHEMA, started, finished, options, fingerprint, ingestIsolatedBaseline, run, measurement,
 				process, List.copyOf(checks), shutdownClean, nativeLeaks);
@@ -782,8 +759,6 @@ public final class SevenProfileWorkloadBenchmark {
 			case ANALYTICAL -> p99Nanos > 0L && p99Nanos < FALLBACK_P99_LIMIT_NANOS;
 			case INGEST -> ingestIsolatedBaseline <= 0.0d
 					|| throughput >= ingestIsolatedBaseline * 0.95d;
-			case CDC -> run.observation().cdcLagObserved()
-					&& run.observation().maximumCdcLag() <= options.cdcLagLimit();
 			case BATCH -> !run.pressure().injected()
 					|| (run.observation().maximumStoragePressure() > 0L
 							&& run.pressure().batchAfterPressure() > 0L);
@@ -860,7 +835,6 @@ public final class SevenProfileWorkloadBenchmark {
 			case "latency" -> WorkloadProfile.LATENCY;
 			case "analytical" -> WorkloadProfile.ANALYTICAL;
 			case "ingest" -> WorkloadProfile.INGEST;
-			case "cdc" -> WorkloadProfile.CDC;
 			case "batch" -> WorkloadProfile.BATCH;
 			case "physical_maintenance" -> WorkloadProfile.PHYSICAL_MAINTENANCE;
 			default -> throw new IllegalArgumentException("Unknown workload profile tag: " + value);
@@ -1142,9 +1116,7 @@ public final class SevenProfileWorkloadBenchmark {
 				.append(", \"peak_resident_set_bytes\": ").append(process.peaks().residentSetBytes())
 				.append(", \"peak_thread_count\": ").append(process.peaks().threadCount())
 				.append(", \"peak_native_handles\": ").append(process.peaks().nativeHandles())
-				.append("},\n  \"maximum_cdc_lag\": ").append(result.measurement().maximumCdcLag())
-				.append(",\n  \"cdc_lag_observed\": ").append(result.run().observation().cdcLagObserved())
-				.append(",\n  \"maximum_retained_snapshots\": ").append(result.measurement().maximumRetainedSnapshots())
+				.append("},\n  \"maximum_retained_snapshots\": ").append(result.measurement().maximumRetainedSnapshots())
 				.append(",\n  \"maximum_parked\": ").append(result.run().observation().maximumParked())
 				.append(",\n  \"maximum_outstanding\": ").append(result.run().observation().maximumOutstanding())
 				.append(",\n  \"maximum_storage_pressure\": ").append(result.measurement().maximumStoragePressure())
@@ -1223,8 +1195,6 @@ public final class SevenProfileWorkloadBenchmark {
 					.append(value.sloPassed() ? "PASS" : "FAIL").append("|\n");
 		}
 		markdown.append("\n## Pressure and resources\n\n")
-				.append("- Maximum CDC lag: `").append(result.measurement().maximumCdcLag()).append("`\n")
-				.append("- CDC lag meter observed: `").append(result.run().observation().cdcLagObserved()).append("`\n")
 				.append("- Maximum retained snapshots: `").append(result.measurement().maximumRetainedSnapshots()).append("`\n")
 				.append("- Storage pressure observed: `").append(result.measurement().maximumStoragePressure()).append("`\n")
 				.append("- BATCH completions after pressure: `").append(result.run().pressure().batchAfterPressure()).append("`\n")
@@ -1321,14 +1291,12 @@ public final class SevenProfileWorkloadBenchmark {
 				+ "\nwarmup-seconds=" + options.warmupSeconds()
 				+ "\nmeasure-seconds=" + options.measureSeconds()
 				+ "\npressure-seconds=" + options.pressureSeconds()
-				+ "\ncdc-lag-limit=" + options.cdcLagLimit()
 				+ "\nworkers=" + options.controlWorkers() + ',' + options.latencyWorkers() + ','
-				+ options.analyticalWorkers() + ',' + options.ingestWorkers() + ',' + options.cdcWorkers() + ','
+				+ options.analyticalWorkers() + ',' + options.ingestWorkers() + ','
 				+ options.batchWorkers() + ',' + options.physicalWorkers() + ',' + options.cancellationWorkers()
 				+ "\nrates=" + options.controlRate() + ',' + options.latencyRate() + ',' + options.analyticalRate()
-				+ ',' + options.ingestRate() + ',' + options.cdcRate() + ',' + options.batchRate() + ','
+				+ ',' + options.ingestRate() + ',' + options.batchRate() + ','
 				+ options.physicalRate() + ',' + options.cancellationRate()
-				+ "\ncdc-max-events=" + options.cdcMaxEvents()
 				+ "\nsample-micros=" + options.sampleMicros()
 				+ "\nmax-latency-samples=" + options.maxLatencySamples()
 				+ "\nwrite-buffer-size=" + options.writeBufferSize()
@@ -1454,7 +1422,7 @@ public final class SevenProfileWorkloadBenchmark {
 
 	private static int workerCount(Options options) {
 		return options.controlWorkers() + options.latencyWorkers() + options.analyticalWorkers()
-				+ options.ingestWorkers() + options.cdcWorkers() + options.batchWorkers()
+				+ options.ingestWorkers() + options.batchWorkers()
 				+ options.physicalWorkers() + options.cancellationWorkers() + 1;
 	}
 
@@ -1578,10 +1546,10 @@ public final class SevenProfileWorkloadBenchmark {
 
 				Important options (defaults): preload-keys=1000000 preload-flush-keys=50000
 				value-bytes=256 range-width=4096 write-key-space=65536 seed=5931033225068892758
-				warmup-seconds=15 measure-seconds=60 pressure-seconds=5 cdc-lag-limit=100000
+				warmup-seconds=15 measure-seconds=60 pressure-seconds=5
 				control-workers=1 latency-workers=8 analytical-workers=1 ingest-workers=4
-				cdc-workers=1 batch-workers=2 physical-workers=1 cancellation-workers=1
-				control-rate=50 latency-rate=0 analytical-rate=10 ingest-rate=1000 cdc-rate=50
+				batch-workers=2 physical-workers=1 cancellation-workers=1
+				control-rate=50 latency-rate=0 analytical-rate=10 ingest-rate=1000
 				batch-rate=100 physical-rate=1 cancellation-rate=25 direct-io=false spinning=false
 
 				The runner never drops caches itself. --cache-state=cold is an operator assertion recorded
@@ -1629,8 +1597,6 @@ public final class SevenProfileWorkloadBenchmark {
 			Map<WorkloadProfile, Integer> maximumActive,
 			int maximumParked,
 			int maximumOutstanding,
-			long maximumCdcLag,
-			boolean cdcLagObserved,
 			long maximumRetainedSnapshots,
 			long maximumStoragePressure,
 			BenchmarkProcessTelemetry.Peaks processPeaks) {
@@ -1926,8 +1892,6 @@ public final class SevenProfileWorkloadBenchmark {
 		private final EnumMap<WorkloadProfile, AtomicInteger> maximumActive = new EnumMap<>(WorkloadProfile.class);
 		private final AtomicInteger maximumParked = new AtomicInteger();
 		private final AtomicInteger maximumOutstanding = new AtomicInteger();
-		private final AtomicLong maximumCdcLag = new AtomicLong();
-		private final AtomicBoolean cdcLagObserved = new AtomicBoolean();
 		private final AtomicLong maximumRetainedSnapshots = new AtomicLong();
 		private final AtomicLong maximumStoragePressure = new AtomicLong();
 		private final long[] poolTelemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
@@ -1950,8 +1914,6 @@ public final class SevenProfileWorkloadBenchmark {
 			}
 			maximumParked.set(0);
 			maximumOutstanding.set(0);
-			maximumCdcLag.set(0L);
-			cdcLagObserved.set(false);
 			maximumRetainedSnapshots.set(0L);
 			maximumStoragePressure.set(0L);
 			processPeaks.reset();
@@ -1989,12 +1951,6 @@ public final class SevenProfileWorkloadBenchmark {
 			maximumRetainedSnapshots.accumulateAndGet(
 					connection.getInternalDB().getRetainedRangeSnapshotCount(), Math::max);
 			maximumStoragePressure.accumulateAndGet(scheduler.isStoragePressure() ? 1L : 0L, Math::max);
-			var cdcLag = meterRegistry.find("rockserver.workload.cdc.lag")
-					.tag("database", databaseName).gauge();
-			if (cdcLag != null) {
-				cdcLagObserved.set(true);
-				maximumCdcLag.accumulateAndGet(Math.max(0L, Math.round(cdcLag.value())), Math::max);
-			}
 		}
 
 		private ObservationSnapshot snapshot() {
@@ -2005,8 +1961,7 @@ public final class SevenProfileWorkloadBenchmark {
 				active.put(profile, maximumActive.get(profile).get());
 			}
 			return new ObservationSnapshot(Map.copyOf(queued), Map.copyOf(active), maximumParked.get(),
-					maximumOutstanding.get(), maximumCdcLag.get(),
-					cdcLagObserved.get(),
+					maximumOutstanding.get(),
 					maximumRetainedSnapshots.get(), maximumStoragePressure.get(), processPeaks.peaks());
 		}
 
@@ -2115,13 +2070,11 @@ public final class SevenProfileWorkloadBenchmark {
 			int warmupSeconds,
 			int measureSeconds,
 			int pressureSeconds,
-			long cdcLagLimit,
 			String ingestIsolatedBaselineFile,
 			int controlWorkers,
 			int latencyWorkers,
 			int analyticalWorkers,
 			int ingestWorkers,
-			int cdcWorkers,
 			int batchWorkers,
 			int physicalWorkers,
 			int cancellationWorkers,
@@ -2129,11 +2082,9 @@ public final class SevenProfileWorkloadBenchmark {
 			long latencyRate,
 			long analyticalRate,
 			long ingestRate,
-			long cdcRate,
 			long batchRate,
 			long physicalRate,
 			long cancellationRate,
-			long cdcMaxEvents,
 			int sampleMicros,
 			int maxLatencySamples,
 			String writeBufferSize,
@@ -2168,17 +2119,16 @@ public final class SevenProfileWorkloadBenchmark {
 			}
 			if (warmupSeconds < 0 || measureSeconds < 1 || pressureSeconds < 0
 					|| (pressureSeconds > 0 && (long) pressureSeconds * 3L >= (long) measureSeconds * 2L)
-					|| (pressureSeconds > 0 && pressureStartSeconds + pressureSeconds >= measureSeconds)
-					|| cdcLagLimit < 0L) {
-				throw new IllegalArgumentException("duration or CDC lag settings are invalid");
+					|| (pressureSeconds > 0 && pressureStartSeconds + pressureSeconds >= measureSeconds)) {
+				throw new IllegalArgumentException("duration settings are invalid");
 			}
 			if (controlWorkers < 1 || latencyWorkers < 1 || analyticalWorkers < 1 || ingestWorkers < 1
-					|| cdcWorkers < 1 || batchWorkers < 1 || physicalWorkers < 1 || cancellationWorkers < 1) {
+					|| batchWorkers < 1 || physicalWorkers < 1 || cancellationWorkers < 1) {
 				throw new IllegalArgumentException("every workload producer must have at least one worker");
 			}
 			if (controlRate < 0L || latencyRate < 0L || analyticalRate < 0L || ingestRate < 0L
-					|| cdcRate < 0L || batchRate < 0L || physicalRate < 0L || cancellationRate < 0L
-					|| cdcMaxEvents < 1L || sampleMicros < 1 || maxLatencySamples < 1) {
+					|| batchRate < 0L || physicalRate < 0L || cancellationRate < 0L
+					|| sampleMicros < 1 || maxLatencySamples < 1) {
 				throw new IllegalArgumentException("rate and sampling settings are invalid");
 			}
 			if (prepareOnly && reusePrepared) {
@@ -2233,13 +2183,11 @@ public final class SevenProfileWorkloadBenchmark {
 					integer(values, "warmup-seconds", 15),
 					integer(values, "measure-seconds", 60),
 					integer(values, "pressure-seconds", 5),
-					longValue(values, "cdc-lag-limit", 100_000L),
 					values.getOrDefault("ingest-isolated-baseline-file", ""),
 					integer(values, "control-workers", 1),
 					integer(values, "latency-workers", 8),
 					integer(values, "analytical-workers", 1),
 					integer(values, "ingest-workers", 4),
-					integer(values, "cdc-workers", 1),
 					integer(values, "batch-workers", 2),
 					integer(values, "physical-workers", 1),
 					integer(values, "cancellation-workers", 1),
@@ -2247,11 +2195,9 @@ public final class SevenProfileWorkloadBenchmark {
 					longValue(values, "latency-rate", 0L),
 					longValue(values, "analytical-rate", 10L),
 					longValue(values, "ingest-rate", 1_000L),
-					longValue(values, "cdc-rate", 50L),
 					longValue(values, "batch-rate", 100L),
 					longValue(values, "physical-rate", 1L),
 					longValue(values, "cancellation-rate", 25L),
-					longValue(values, "cdc-max-events", 4_096L),
 					integer(values, "sample-micros", 250),
 					integer(values, "max-latency-samples", 1_000_000),
 					values.getOrDefault("write-buffer-size", "64MiB"),

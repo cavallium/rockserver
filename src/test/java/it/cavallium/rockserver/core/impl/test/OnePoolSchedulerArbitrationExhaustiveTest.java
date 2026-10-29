@@ -31,13 +31,11 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 
 	private static final WorkloadProfile[] GUARANTEED = {
 			WorkloadProfile.INGEST,
-			WorkloadProfile.CDC,
 			WorkloadProfile.ANALYTICAL,
 			WorkloadProfile.BATCH
 	};
 	private static final Map<WorkloadProfile, Integer> QUANTA = Map.of(
 			WorkloadProfile.INGEST, 4,
-			WorkloadProfile.CDC, 4,
 			WorkloadProfile.ANALYTICAL, 2,
 			WorkloadProfile.BATCH, 1);
 
@@ -57,7 +55,7 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 	@Test
 	void everySmallGuaranteedProfileAndCostCombinationMatchesIndependentDrr() throws Exception {
 		long scenarios = 0L;
-		for (int ternary = 1; ternary < 81; ternary++) {
+		for (int ternary = 1; ternary < 27; ternary++) {
 			int value = ternary;
 			var tasks = new ArrayList<Task>();
 			for (int index = 0; index < GUARANTEED.length; index++) {
@@ -68,7 +66,7 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 			assertDrrScenario(tasks);
 			scenarios++;
 		}
-		assertEquals(80L, scenarios);
+		assertEquals(26L, scenarios);
 	}
 
 	@Test
@@ -114,7 +112,6 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 			for (var profile : new WorkloadProfile[] {
 					WorkloadProfile.LATENCY,
 					WorkloadProfile.INGEST,
-					WorkloadProfile.CDC,
 					WorkloadProfile.ANALYTICAL,
 					WorkloadProfile.BATCH
 			}) {
@@ -130,7 +127,7 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 				assertTrue(!task.ran().get());
 			}
 			assertEventuallyConserved(scheduler);
-			assertEquals(5L, scheduler.poolSnapshot(RWScheduler.Pool.READ)
+			assertEquals(4L, scheduler.poolSnapshot(RWScheduler.Pool.READ)
 					.outcomes().get(RWScheduler.TerminalOutcome.DEADLINE));
 		} finally {
 			scheduler.disposeNow();
@@ -271,7 +268,6 @@ class OnePoolSchedulerArbitrationExhaustiveTest {
 	private static OperationFamily family(WorkloadProfile profile) {
 		return switch (profile) {
 			case INGEST, BATCH -> OperationFamily.RANGE_PAGE;
-			case CDC -> OperationFamily.WAL_PAGE;
 			case ANALYTICAL -> OperationFamily.FULL_SCAN_AGGREGATE;
 			case LATENCY, CONTROL, PHYSICAL_MAINTENANCE ->
 					throw new IllegalArgumentException("not a guaranteed profile: " + profile);

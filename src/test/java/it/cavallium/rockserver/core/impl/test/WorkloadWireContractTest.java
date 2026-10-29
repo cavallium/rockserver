@@ -31,23 +31,15 @@ class WorkloadWireContractTest {
 			"closeIterator",
 			"flush",
 			"compact",
-			"compactFiles",
-			"cdcCreate",
-			"cdcDelete",
-			"cdcGetEarliestAvailableSequence",
-			"cdcGetLastCommittedSequence",
-			"cdcPoll",
-			"cdcPollBatch",
-			"cdcCommit");
+			"compactFiles");
 
 	@Test
-	void allSevenProfileNumbersAreExplicitAndStableAcrossJavaProtobufAndThrift() {
+	void allProfileNumbersAreExplicitAndStableAcrossJavaProtobufAndThrift() {
 		var profiles = List.of(
 				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.CONTROL, 1),
 				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.LATENCY, 2),
 				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.ANALYTICAL, 3),
 				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.INGEST, 4),
-				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.CDC, 5),
 				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, 6),
 				new ProfileWireValue(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE, 7));
 		for (var expected : profiles) {
@@ -65,6 +57,11 @@ class WorkloadWireContractTest {
 				() -> it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(0));
 		assertThrows(IllegalArgumentException.class,
 				() -> it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(8));
+		// 5 belonged to the removed CDC profile and stays reserved on every wire.
+		assertThrows(IllegalArgumentException.class,
+				() -> it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(5));
+		assertNull(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.forNumber(5));
+		assertNull(it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(5));
 	}
 
 	private record ProfileWireValue(
@@ -198,7 +195,6 @@ class WorkloadWireContractTest {
 		mapper.setAccessible(true);
 		for (var profile : List.of(
 				it.cavallium.rockserver.core.common.api.WorkloadProfile.CONTROL,
-				it.cavallium.rockserver.core.common.api.WorkloadProfile.CDC,
 				it.cavallium.rockserver.core.common.api.WorkloadProfile.PHYSICAL_MAINTENANCE)) {
 			var wire = new it.cavallium.rockserver.core.common.api.RequestContext(
 					profile,

@@ -20,7 +20,6 @@ public final class WorkloadBenchmarkSelector {
 			WorkloadProfile.LATENCY,
 			WorkloadProfile.ANALYTICAL,
 			WorkloadProfile.INGEST,
-			WorkloadProfile.CDC,
 			WorkloadProfile.BATCH,
 			WorkloadProfile.PHYSICAL_MAINTENANCE);
 
@@ -194,7 +193,6 @@ public final class WorkloadBenchmarkSelector {
 			boolean enforcedHardwareRun,
 			boolean runChecksPassed,
 			Map<WorkloadProfile, ProfileMeasurement> profiles,
-			long maximumCdcLag,
 			long maximumRetainedSnapshots,
 			long maximumStoragePressure,
 			long leakedResources) {
@@ -217,14 +215,14 @@ public final class WorkloadBenchmarkSelector {
 							"Benchmark identity values must be single-line canonical property values");
 				}
 			}
-			if (maximumCdcLag < 0L || maximumRetainedSnapshots < 0L
+			if (maximumRetainedSnapshots < 0L
 					|| maximumStoragePressure < 0L || leakedResources < 0L) {
 				throw new IllegalArgumentException("Candidate counters must be non-negative");
 			}
 			var copy = new EnumMap<WorkloadProfile, ProfileMeasurement>(WorkloadProfile.class);
 			copy.putAll(profiles);
 			if (copy.size() != ALL_PROFILES.size()) {
-				throw new IllegalArgumentException("Every one of the seven profiles must be measured");
+				throw new IllegalArgumentException("Every workload profile must be measured");
 			}
 			for (var profile : ALL_PROFILES) {
 				Objects.requireNonNull(copy.get(profile), "Missing profile measurement: " + profile);

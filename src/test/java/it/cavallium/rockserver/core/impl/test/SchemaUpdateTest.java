@@ -5,7 +5,6 @@ import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
-import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import org.junit.jupiter.api.Test;
@@ -13,8 +12,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
-import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -50,15 +47,11 @@ public class SchemaUpdateTest {
         String dbName = "schema-update-test";
         String colName = "test-col";
         long colId;
-        String subId = "test-sub";
 
         // --- STEP 1: V1 ---
         try (EmbeddedConnection db = new EmbeddedConnection(tempDir, dbName, configV1)) {
             // Create column with V1 schema (explicit class name)
             colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.MyStringAppendOperator"));
-
-            // Create CDC subscription (Resolved=true)
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate(subId, null, List.of(colId), true, java.util.OptionalLong.empty());
 
             // Put "A", Merge "B" -> "A,B"
             db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("A".getBytes()), RequestType.none());
@@ -82,17 +75,6 @@ public class SchemaUpdateTest {
             String valStr = new String(val.toByteArray());
             System.out.println("[DEBUG_LOG] Result value: " + valStr);
             assertTrue(valStr.contains(";"), "Result " + valStr + " should contain semicolon, proving V2 was used");
-
-            // --- CDC Verification ---
-            // Poll all events. Resolved=true.
-            // All events should resolve to LATEST state ("A,B;C" or "A;B;C")
-            List<CDCEvent> events = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPoll(subId, null, 100).collect(Collectors.toList());
-            assertEquals(3, events.size());
-
-            String latestState = valStr;
-            assertEquals(latestState, new String(events.get(0).value().toByteArray()));
-            assertEquals(latestState, new String(events.get(1).value().toByteArray()));
-            assertEquals(latestState, new String(events.get(2).value().toByteArray()));
         }
     }
 

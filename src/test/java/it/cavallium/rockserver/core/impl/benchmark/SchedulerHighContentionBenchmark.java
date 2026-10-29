@@ -1210,16 +1210,15 @@ public final class SchedulerHighContentionBenchmark {
 	}
 
 	static int queueBound(Config config, RWScheduler.Pool pool, int workers) {
-		int cdc = Math.max(64, Math.min(config.foregroundQueueCapacity(), 1_024));
 		int analytical = Math.max(1, Math.min(config.batchQueueCapacity(), 512));
 		return switch (pool) {
 			// A running cooperative task may YIELD after producers fill the queue slot it
 			// vacated. Those retained outstanding allowances can accumulate independently
 			// for every cooperative profile: INGEST, ANALYTICAL, and BATCH on READ; INGEST
 			// and BATCH on WRITE. Non-cooperative profiles cannot retain such an excess.
-			case READ -> config.foregroundQueueCapacity() * 2 + cdc + analytical
+			case READ -> config.foregroundQueueCapacity() * 2 + analytical
 					+ config.batchQueueCapacity() + workers * 3;
-			case WRITE -> config.foregroundQueueCapacity() * 2 + cdc
+			case WRITE -> config.foregroundQueueCapacity() * 2
 					+ config.batchQueueCapacity() + workers * 2;
 			case CONTROL -> 256;
 			case PHYSICAL -> 16;
@@ -1227,16 +1226,15 @@ public final class SchedulerHighContentionBenchmark {
 	}
 
 	private static int outstandingBound(Config config, RWScheduler.Pool pool, int workers) {
-		int cdc = Math.max(64, Math.min(config.foregroundQueueCapacity(), 1_024));
 		int analytical = Math.max(1, Math.min(config.batchQueueCapacity(), 512));
 		return switch (pool) {
 			// Each profile has an independently checked capacity + workerCount
 			// outstanding ceiling. Summing those explicit scheduler bounds remains
 			// valid even when multiple profiles are PARKED simultaneously.
-			case READ -> config.foregroundQueueCapacity() * 2 + cdc + analytical
-					+ config.batchQueueCapacity() + workers * 5;
-			case WRITE -> config.foregroundQueueCapacity() * 2 + cdc
+			case READ -> config.foregroundQueueCapacity() * 2 + analytical
 					+ config.batchQueueCapacity() + workers * 4;
+			case WRITE -> config.foregroundQueueCapacity() * 2
+					+ config.batchQueueCapacity() + workers * 3;
 			case CONTROL -> 256 + workers;
 			case PHYSICAL -> 16 + workers;
 		};

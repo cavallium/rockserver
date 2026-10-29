@@ -559,11 +559,6 @@ class EmbeddedConnectionAsyncRegressionTest {
 		private final CompletableFuture<Buf> future;
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {};
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {

@@ -34,7 +34,6 @@ class MixedBackfillPressureBenchmarkTest {
 		assertEquals(512L, result.cancelledRows() + result.resumedRows());
 		assertTrue(result.durableCheckpoints() > 0);
 		assertTrue(result.backfillRows() > 0L);
-		assertTrue(result.cdcEvents() > 0L);
 		assertTrue(result.maintenanceOperations() > 0L);
 		assertEquals(2, result.maximumPressuredBatchActive());
 		assertEquals(3L, result.pressuredBatchCapWitnesses(),
@@ -44,7 +43,7 @@ class MixedBackfillPressureBenchmarkTest {
 				.contains("database.parallelism.workload.pressured-batch-maximum-active = 2"));
 		var marker = new Properties();
 		marker.load(new StringReader(Files.readString(root.resolve(".rockserver-mixed-pressure-benchmark"))));
-		assertEquals("rockserver-mixed-backfill-pressure-v2", marker.getProperty("schema"));
+		assertEquals("rockserver-mixed-backfill-pressure-v3", marker.getProperty("schema"));
 		assertEquals("0".repeat(40), marker.getProperty("git-head"));
 		assertEquals("1".repeat(64), marker.getProperty("production-classes-sha256"));
 		assertEquals("2".repeat(64), marker.getProperty("harness-classes-sha256"));
@@ -57,7 +56,6 @@ class MixedBackfillPressureBenchmarkTest {
 	void parserDefaultsToOneAndAcceptsOnlySafeExplicitPressuredCaps() {
 		Path root = temporary.resolve("invalid");
 		var defaults = MixedBackfillPressureBenchmark.Options.parse(new String[] {"--root=" + root});
-		assertEquals(8_192L, defaults.cdcBatchSize());
 		assertEquals(1, defaults.pressuredBatchMaximumActive(),
 				"omitting the option must preserve the historical single-permit behavior");
 		var explicit = MixedBackfillPressureBenchmark.Options.parse(new String[] {"--root=" + root,
@@ -119,11 +117,11 @@ class MixedBackfillPressureBenchmarkTest {
 	}
 
 	@Test
-	void v2SchemaRequiresEveryResultPropertyIncludingCapProvenance() throws Exception {
+	void v3SchemaRequiresEveryResultPropertyIncludingCapProvenance() throws Exception {
 		var result = result(options(temporary.resolve("schema"), 3), 3, 3L);
 		var properties = new Properties();
 		properties.load(new StringReader(result.properties()));
-		assertEquals("rockserver-mixed-backfill-pressure-v2", properties.getProperty("schema"));
+		assertEquals("rockserver-mixed-backfill-pressure-v3", properties.getProperty("schema"));
 		assertEquals("3", properties.getProperty("pressured-batch-maximum-active"));
 		assertEquals("3", properties.getProperty("maximum-pressured-batch-active"));
 		assertEquals("3", properties.getProperty("pressured-batch-cap-witnesses"));
@@ -135,9 +133,9 @@ class MixedBackfillPressureBenchmarkTest {
 		assertEquals("true", properties.getProperty("checkout-clean"));
 
 		String schema = Files.readString(Path.of("benchmarks", "schemas",
-				"mixed-backfill-pressure-v2.schema.json"));
+				"mixed-backfill-pressure-v3.schema.json"));
 		assertEquals(properties.stringPropertyNames(), requiredSchemaKeys(schema),
-				"the strict V2 required set must neither omit emitted evidence nor require absent data");
+				"the strict V3 required set must neither omit emitted evidence nor require absent data");
 	}
 
 	@Test
@@ -151,8 +149,8 @@ class MixedBackfillPressureBenchmarkTest {
 
 	private static MixedBackfillPressureBenchmark.Options options(Path root, int pressuredCap) {
 		return new MixedBackfillPressureBenchmark.Options(root,
-				512, 64, 128, Duration.ofSeconds(1), 1, 1, 4, 4, 2, pressuredCap, 128,
-				Duration.ofMillis(50), Duration.ofSeconds(3), 20_000,
+				512, 64, 128, Duration.ofSeconds(1), 1, 1, 4, 4, 2, pressuredCap,
+				Duration.ofMillis(50), Duration.ofSeconds(3),
 				Duration.ofSeconds(5), 10_000, 1.0d, 1.0d, "", "");
 	}
 
@@ -163,8 +161,8 @@ class MixedBackfillPressureBenchmarkTest {
 		return new MixedBackfillPressureBenchmark.Result(options,
 				MixedBackfillPressureBenchmark.Provenance.testing(),
 				128L, 384L, 4, Duration.ofSeconds(1).toNanos(),
-				1_000L, 4L, 1_000L, 1_000L, 1_000L, 2L, 2L,
-				maximumPressuredActive, capWitnesses, 1L, 1L, 1L,
+				1_000L, 4L, 1_000L, 1_000L, 2L, 2L,
+				maximumPressuredActive, capWitnesses, 1L, 1L,
 				1.0d, 1.0d, 0L, 0L, 0, 0, 0,
 				new BenchmarkProcessTelemetry.Peaks(1L, 0L, 1L, 1, 1L),
 				0L, options.root().resolve("mixed-results.properties"));

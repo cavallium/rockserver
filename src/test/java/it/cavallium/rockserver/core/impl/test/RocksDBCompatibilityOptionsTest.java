@@ -19,7 +19,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.OptionalLong;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
@@ -39,8 +38,7 @@ class RocksDBCompatibilityOptionsTest {
 	private static final List<String> STARTUP_COLUMN_FAMILIES = List.of(
 			"default",
 			"_column_schemas_",
-			"_merge_operators_",
-			"_cdc_meta_"
+			"_merge_operators_"
 	);
 
 	@Test
@@ -142,7 +140,6 @@ class RocksDBCompatibilityOptionsTest {
 		var key = new Keys(Buf.wrap(new byte[]{1}));
 		var value = Buf.wrap(new byte[]{2, 3});
 		Map<String, List<byte[]>> persistedMetadata = new LinkedHashMap<>();
-		long cdcCommitted;
 		long operatorVersion;
 		byte[] operatorHash;
 		var db = new EmbeddedDB(dbPath, "internal-paths", configPath);
@@ -156,8 +153,6 @@ class RocksDBCompatibilityOptionsTest {
 			operatorHash = java.security.MessageDigest.getInstance("SHA-256").digest(jarBytes.toByteArray());
 			operatorVersion = db.uploadMergeOperator("reopen-operator", HotSwapMergeOperatorTest.OperatorA.class.getName(),
 					jarBytes.toByteArray());
-			db.cdcCreate("reopen-subscription", null, List.of(columnId), false, OptionalLong.empty());
-			cdcCommitted = db.cdcGetLastCommittedSequence("reopen-subscription").orElseThrow();
 			db.flush();
 			for (String family : STARTUP_COLUMN_FAMILIES.subList(1, STARTUP_COLUMN_FAMILIES.size())) {
 				var handle = internalHandle(db, family);
@@ -180,7 +175,6 @@ class RocksDBCompatibilityOptionsTest {
 		try {
 			if (internalPaths != null) assertInternalPaths(reopened, internalPaths);
 			assertEquals(value, reopened.get(0, reopened.getColumnId("data"), key, RequestType.current()));
-			assertEquals(cdcCommitted, reopened.cdcGetLastCommittedSequence("reopen-subscription").orElseThrow());
 			assertEquals(operatorVersion, reopened.checkMergeOperator("reopen-operator", operatorHash));
 			for (var entry : persistedMetadata.entrySet()) {
 				var restored = metadata(reopened, internalHandle(reopened, entry.getKey()));
@@ -198,7 +192,6 @@ class RocksDBCompatibilityOptionsTest {
 		String fieldName = switch (family) {
 			case "_column_schemas_" -> "columnSchemasColumnDescriptorHandle";
 			case "_merge_operators_" -> "mergeOperatorsColumnDescriptorHandle";
-			case "_cdc_meta_" -> "cdcMetaColumnDescriptorHandle";
 			default -> throw new IllegalArgumentException(family);
 		};
 		var field = EmbeddedDB.class.getDeclaredField(fieldName);

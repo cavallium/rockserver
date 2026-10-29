@@ -36,10 +36,6 @@ class WalFlushTest {
 		assertEquals(1, syncCalls.get());
 		var asyncCalls = new AtomicInteger();
 		new RocksDBAPICommand.Flush(true).handleAsync(new RocksDBAsyncAPI() {
-			@Override public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch>
-					cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException());
-			}
 			@Override public CompletableFuture<Void> flushAsync() {
 				asyncCalls.incrementAndGet();
 				return CompletableFuture.completedFuture(null);

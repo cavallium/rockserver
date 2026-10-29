@@ -178,14 +178,10 @@ class CrossPoolBatchPermitRaceTest {
 	private static void primeReadDrrCursorAtBatch(RWScheduler scheduler) throws Exception {
 		for (var profile : new WorkloadProfile[] {
 				WorkloadProfile.INGEST,
-				WorkloadProfile.CDC,
 				WorkloadProfile.ANALYTICAL
 		}) {
 			var completed = new CountDownLatch(1);
-			var family = profile == WorkloadProfile.CDC
-					? OperationFamily.WAL_PAGE
-					: OperationFamily.RANGE_PAGE;
-			scheduler.executor(profile, family, Long.MAX_VALUE)
+			scheduler.executor(profile, OperationFamily.RANGE_PAGE, Long.MAX_VALUE)
 					.execute(completed::countDown);
 			assertTrue(completed.await(5, SECONDS), "failed to prime DRR through " + profile);
 		}

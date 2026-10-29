@@ -2,7 +2,6 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static it.cavallium.rockserver.core.common.WorkloadProfile.ANALYTICAL;
 import static it.cavallium.rockserver.core.common.WorkloadProfile.BATCH;
-import static it.cavallium.rockserver.core.common.WorkloadProfile.CDC;
 import static it.cavallium.rockserver.core.common.WorkloadProfile.CONTROL;
 import static it.cavallium.rockserver.core.common.WorkloadProfile.INGEST;
 import static it.cavallium.rockserver.core.common.WorkloadProfile.LATENCY;
@@ -42,7 +41,6 @@ import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.OptionalLong;
 import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.function.IntFunction;
@@ -70,9 +68,6 @@ class WorkloadAdmissionTest {
 					OperationFamily.BOUNDED_FAN_OUT,
 					OperationFamily.RANGE_PAGE,
 					OperationFamily.MUTATION),
-			CDC, EnumSet.of(OperationFamily.WAL_PAGE,
-					OperationFamily.MUTATION,
-					OperationFamily.FLUSH),
 			BATCH, EnumSet.of(OperationFamily.METADATA,
 					OperationFamily.POINT_LOOKUP,
 					OperationFamily.BOUNDARY_SEEK,
@@ -120,17 +115,11 @@ class WorkloadAdmissionTest {
 			Map.entry("getRange", OperationFamily.RANGE_PAGE),
 			Map.entry("scanRaw", OperationFamily.RANGE_PAGE),
 			Map.entry("scanRawResumable", OperationFamily.RANGE_PAGE),
-			Map.entry("cdcPoll", OperationFamily.WAL_PAGE),
 			Map.entry("flush", OperationFamily.FLUSH),
 			Map.entry("compact", OperationFamily.COMPACTION),
             Map.entry("compactFiles", OperationFamily.COMPACTION),
             Map.entry("getSstMetadata", OperationFamily.METADATA),
-			Map.entry("getAllColumnDefinitions", OperationFamily.METADATA),
-			Map.entry("cdcCreate", OperationFamily.MUTATION),
-			Map.entry("cdcDelete", OperationFamily.MUTATION),
-			Map.entry("cdcEarliest", OperationFamily.WAL_PAGE),
-			Map.entry("cdcLastCommitted", OperationFamily.WAL_PAGE),
-			Map.entry("cdcCommit", OperationFamily.MUTATION));
+			Map.entry("getAllColumnDefinitions", OperationFamily.METADATA));
 
 	@Test
 	void everyProfileAndOperationPairHasTheDocumentedResult() {
@@ -204,7 +193,7 @@ class WorkloadAdmissionTest {
 			case CONTROL -> RWScheduler.Pool.CONTROL;
 			case COMPACTION -> RWScheduler.Pool.PHYSICAL;
 			case METADATA, POINT_LOOKUP, BOUNDARY_SEEK, BOUNDED_FAN_OUT,
-					RANGE_PAGE, FULL_SCAN_AGGREGATE, WAL_PAGE -> RWScheduler.Pool.READ;
+					RANGE_PAGE, FULL_SCAN_AGGREGATE -> RWScheduler.Pool.READ;
 		};
 	}
 
@@ -495,7 +484,7 @@ class WorkloadAdmissionTest {
 
 	@Test
 	void protectedProfilesCannotBeConstructedAsClientContexts() {
-		for (var profile : EnumSet.of(CONTROL, CDC, PHYSICAL_MAINTENANCE)) {
+		for (var profile : EnumSet.of(CONTROL, PHYSICAL_MAINTENANCE)) {
 			assertFalse(profile.isClientSelectable());
 			assertThrows(IllegalArgumentException.class,
 					() -> new RequestContext(profile, Long.MAX_VALUE));
@@ -604,19 +593,12 @@ class WorkloadAdmissionTest {
 		commands.add(client("scanRaw", new RocksDBAPICommandStream.ScanRaw(1, 0, 1), batch));
 		commands.add(client("scanRawResumable",
 				new RocksDBAPICommandStream.ScanRawResumable(1, 0, 1, Set.of()), batch));
-		commands.add(protectedCommand("cdcPoll", new RocksDBAPICommandStream.CdcPoll("cdc", null, 1), CDC));
 		commands.add(protectedCommand("flush", new RocksDBAPICommand.Flush(), PHYSICAL_MAINTENANCE));
 		commands.add(protectedCommand("compact", new RocksDBAPICommand.Compact(), PHYSICAL_MAINTENANCE));
         commands.add(protectedCommand("compactFiles", new RocksDBAPICommand.CompactFiles(
                 new it.cavallium.rockserver.core.common.SstMaintenance.Request(1,"session",List.of("1.sst"),6,0,1024,1024,1,true)), PHYSICAL_MAINTENANCE));
         commands.add(client("getSstMetadata", new RocksDBAPICommand.GetSstMetadata(1,6), batch));
 		commands.add(client("getAllColumnDefinitions", new RocksDBAPICommand.GetAllColumnDefinitions(), all));
-		commands.add(protectedCommand("cdcCreate", new RocksDBAPICommand.CdcCreate(
-				"cdc", null, null, null, OptionalLong.empty()), CDC));
-		commands.add(protectedCommand("cdcDelete", new RocksDBAPICommand.CdcDelete("cdc"), CDC));
-		commands.add(protectedCommand("cdcEarliest", new RocksDBAPICommand.CdcGetEarliestAvailableSequence(), CDC));
-		commands.add(protectedCommand("cdcLastCommitted", new RocksDBAPICommand.CdcGetLastCommittedSequence("cdc"), CDC));
-		commands.add(protectedCommand("cdcCommit", new RocksDBAPICommand.CdcCommit("cdc", 1), CDC));
 		return List.copyOf(commands);
 	}
 

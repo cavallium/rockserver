@@ -61,8 +61,8 @@ class ConfigParserBoundaryTest {
 				() -> assertEquals(0.5d, config.global().blockCacheHighPriorityRatio()),
 				() -> assertNull(config.global().databaseWriteBufferSize()),
 				() -> assertEquals(new DataSize("4GiB"), config.global().maxTotalWalSize()),
-				() -> assertEquals(86_400L, config.global().walTtlSeconds()),
-				() -> assertEquals(102_400L, config.global().walSizeLimitMb()),
+				() -> assertEquals(0L, config.global().walTtlSeconds()),
+				() -> assertEquals(0L, config.global().walSizeLimitMb()),
 				() -> assertEquals(Duration.ofSeconds(5), config.global().delayWalFlushDuration()),
 				() -> assertNull(config.global().maxSubcompactions()),
 				() -> assertNull(config.global().maxBackgroundJobs()),
@@ -114,17 +114,14 @@ class ConfigParserBoundaryTest {
 		for (String key : new String[] {
 				"latency-queue-capacity",
 				"ingest-queue-capacity",
-				"cdc-queue-capacity",
 				"analytical-queue-capacity",
 				"batch-queue-capacity",
 				"control-queue-capacity",
 				"physical-maintenance-queue-capacity",
 				"read-latency-reservation",
 				"read-ingest-reservation",
-				"read-cdc-reservation",
 				"write-latency-reservation",
 				"write-ingest-reservation",
-				"write-cdc-reservation",
 				"control-threads",
 				"physical-concurrency",
 				"analytical-active-limit",
@@ -132,7 +129,6 @@ class ConfigParserBoundaryTest {
 				"retained-snapshot-maximum-age",
 				"latency-burst",
 				"ingest-drr-weight",
-				"cdc-drr-weight",
 				"analytical-drr-weight",
 				"batch-drr-weight",
 				"competing-batch-read-maximum-active",
@@ -145,9 +141,6 @@ class ConfigParserBoundaryTest {
 				"range-quantum-max-duration",
 				"raw-scan-file-concurrency",
 				"raw-scan-readahead-bytes",
-				"cdc-quantum-max-mutations",
-				"cdc-quantum-max-bytes",
-				"cdc-quantum-max-duration",
 				"latency-range-max-items",
 				"latency-range-max-bytes",
 				"latency-fan-out-max-items",
@@ -164,7 +157,7 @@ class ConfigParserBoundaryTest {
 				"database.parallelism.workload.latency-queue-capacity = 0",
 				"database.parallelism.workload.read-latency-reservation = -1",
 				"database.parallelism.read = 3\n"
-						+ "database.parallelism.workload.read-latency-reservation = 2",
+						+ "database.parallelism.workload.read-latency-reservation = 3",
 				"database.parallelism.workload.analytical-active-limit = 21",
 				"database.parallelism.workload.control-threads = 0",
 				"database.parallelism.workload.retained-snapshot-maximum-age = PT0S",
@@ -177,15 +170,13 @@ class ConfigParserBoundaryTest {
 				"database.parallelism.workload.raw-scan-file-concurrency = 0",
 				"database.parallelism.workload.raw-scan-file-concurrency = 65",
 				"database.parallelism.workload.raw-scan-readahead-bytes = 0B",
-				"database.parallelism.workload.cdc-quantum-max-bytes = 0B",
 				"database.parallelism.workload.latency-queue-capacity = 2147483647",
 				"database.parallelism.workload.control-queue-capacity = 2147483647",
 				"database.parallelism.workload.physical-maintenance-queue-capacity = 2147483647",
-				"database.parallelism.workload.latency-queue-capacity = 500000000\n"
-						+ "database.parallelism.workload.ingest-queue-capacity = 500000000\n"
-						+ "database.parallelism.workload.cdc-queue-capacity = 500000000\n"
-						+ "database.parallelism.workload.analytical-queue-capacity = 500000000\n"
-						+ "database.parallelism.workload.batch-queue-capacity = 500000000"
+				"database.parallelism.workload.latency-queue-capacity = 600000000\n"
+						+ "database.parallelism.workload.ingest-queue-capacity = 600000000\n"
+						+ "database.parallelism.workload.analytical-queue-capacity = 600000000\n"
+						+ "database.parallelism.workload.batch-queue-capacity = 600000000"
 		};
 		for (int i = 0; i < invalidOverrides.length; i++) {
 			Path invalid = write("invalid-workload-" + i + ".conf", invalidOverrides[i]);
@@ -325,17 +316,14 @@ class ConfigParserBoundaryTest {
 				database.parallelism.write = 21
 				database.parallelism.workload.latency-queue-capacity = 101
 				database.parallelism.workload.ingest-queue-capacity = 102
-				database.parallelism.workload.cdc-queue-capacity = 103
 				database.parallelism.workload.analytical-queue-capacity = 104
 				database.parallelism.workload.batch-queue-capacity = 105
 				database.parallelism.workload.control-queue-capacity = 106
 				database.parallelism.workload.physical-maintenance-queue-capacity = 107
 				database.parallelism.workload.read-latency-reservation = 2
 				database.parallelism.workload.read-ingest-reservation = 3
-				database.parallelism.workload.read-cdc-reservation = 4
 				database.parallelism.workload.write-latency-reservation = 5
 				database.parallelism.workload.write-ingest-reservation = 6
-				database.parallelism.workload.write-cdc-reservation = 7
 				database.parallelism.workload.control-threads = 8
 				database.parallelism.workload.physical-concurrency = 9
 				database.parallelism.workload.analytical-active-limit = 10
@@ -343,7 +331,6 @@ class ConfigParserBoundaryTest {
 				database.parallelism.workload.retained-snapshot-maximum-age = PT12S
 				database.parallelism.workload.latency-burst = 13
 				database.parallelism.workload.ingest-drr-weight = 14
-				database.parallelism.workload.cdc-drr-weight = 15
 				database.parallelism.workload.analytical-drr-weight = 16
 				database.parallelism.workload.batch-drr-weight = 1
 				database.parallelism.workload.competing-batch-read-maximum-active = 18
@@ -356,9 +343,6 @@ class ConfigParserBoundaryTest {
 				database.parallelism.workload.range-quantum-max-duration = PT0.021S
 				database.parallelism.workload.raw-scan-file-concurrency = 6
 				database.parallelism.workload.raw-scan-readahead-bytes = 32MiB
-				database.parallelism.workload.cdc-quantum-max-mutations = 2200
-				database.parallelism.workload.cdc-quantum-max-bytes = 23MiB
-				database.parallelism.workload.cdc-quantum-max-duration = PT0.024S
 				database.parallelism.workload.latency-range-max-items = 2500
 				database.parallelism.workload.latency-range-max-bytes = 6MiB
 				database.parallelism.workload.latency-fan-out-max-items = 200

@@ -13,7 +13,6 @@ final class SchedulerStateTraceRunner {
 	private static final WorkloadProfile[] DATA_PROFILES = {
 			WorkloadProfile.LATENCY,
 			WorkloadProfile.INGEST,
-			WorkloadProfile.CDC,
 			WorkloadProfile.ANALYTICAL,
 			WorkloadProfile.BATCH
 	};
@@ -111,9 +110,7 @@ final class SchedulerStateTraceRunner {
 		for (var profile : WorkloadProfile.values()) capacities.put(profile, DATA_PROFILES_LIST.contains(profile) ? 8 : 0);
 		reservations.put(WorkloadProfile.LATENCY, 1);
 		reservations.put(WorkloadProfile.INGEST, 1);
-		reservations.put(WorkloadProfile.CDC, 1);
 		quanta.put(WorkloadProfile.INGEST, 4);
-		quanta.put(WorkloadProfile.CDC, 4);
 		quanta.put(WorkloadProfile.ANALYTICAL, 2);
 		quanta.put(WorkloadProfile.BATCH, 1);
 		return new SchedulerReferenceModel.Settings(3, 1, 8, capacities, reservations, quanta);

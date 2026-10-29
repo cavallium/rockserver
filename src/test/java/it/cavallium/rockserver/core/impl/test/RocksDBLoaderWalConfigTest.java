@@ -28,8 +28,8 @@ class RocksDBLoaderWalConfigTest {
     }
 
     @Test
-    void usesIncidentScaleDefault() throws Exception {
-        assertEquals(86_400L,
+    void keepsNoWalArchiveByDefault() throws Exception {
+        assertEquals(0L,
                 RocksDBLoader.resolveWalTtlSeconds(ConfigParser.parseDefault().global()));
     }
 
@@ -40,8 +40,8 @@ class RocksDBLoaderWalConfigTest {
     }
 
     @Test
-    void boundsArchivedWalByDefault() throws Exception {
-        assertEquals(102_400L,
+    void setsNoWalArchiveSizeCapByDefault() throws Exception {
+        assertEquals(0L,
                 RocksDBLoader.resolveWalSizeLimitMb(ConfigParser.parseDefault().global()));
     }
 
@@ -55,8 +55,8 @@ class RocksDBLoaderWalConfigTest {
                     ConfigParser.parseDefault(), logger, registry, "wal-config-test");
             try {
                 assertEquals(4L * 1024 * 1024 * 1024, loaded.dbOptions().maxTotalWalSize());
-                assertEquals(86_400L, loaded.dbOptions().walTtlSeconds());
-                assertEquals(102_400L, loaded.dbOptions().walSizeLimitMB());
+                assertEquals(0L, loaded.dbOptions().walTtlSeconds());
+                assertEquals(0L, loaded.dbOptions().walSizeLimitMB());
                 assertEquals(0.0d, registry.get("rocksdb.startup.native.open.active")
                         .tag("database", "wal-config-test").gauge().value());
                 assertEquals(1.0d, registry.get("rocksdb.startup.wal.observed.progress.ratio")
@@ -69,8 +69,8 @@ class RocksDBLoaderWalConfigTest {
                 verify(logger).info(startsWith("Starting RocksDB native open:"), any(Object[].class));
                 verify(logger).info(startsWith("Completed RocksDB native open:"), any(Object[].class));
                 verify(logger).info("Opened RocksDB with effective WAL configuration: "
-                        + "max-total-wal-size=4GiB (4294967296 bytes), wal-ttl-seconds=86400, "
-                        + "wal-size-limit-mb=102400");
+                        + "max-total-wal-size=4GiB (4294967296 bytes), wal-ttl-seconds=0, "
+                        + "wal-size-limit-mb=0");
             } finally {
                 loaded.db().close();
                 loaded.refs().close();
@@ -88,9 +88,12 @@ class RocksDBLoaderWalConfigTest {
     }
 
     @Test
-    void rejectsNonPositiveOrMalformedOverrides() throws Exception {
+    void rejectsNegativeOrMalformedOverrides() throws Exception {
         var global = ConfigParser.parseDefault().global();
         System.setProperty(WAL_TTL_SECONDS_PROPERTY, "0");
+        assertEquals(0L, RocksDBLoader.resolveWalTtlSeconds(global));
+
+        System.setProperty(WAL_TTL_SECONDS_PROPERTY, "-1");
         assertThrows(RocksDBException.class, () -> RocksDBLoader.resolveWalTtlSeconds(global));
 
         System.setProperty(WAL_TTL_SECONDS_PROPERTY, "not-a-number");

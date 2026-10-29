@@ -48,13 +48,11 @@ class RWSchedulerCooperativeTest {
 			var rejectedProfiles = new WorkloadProfile[] {
 					WorkloadProfile.LATENCY,
 					WorkloadProfile.CONTROL,
-					WorkloadProfile.CDC,
 					WorkloadProfile.PHYSICAL_MAINTENANCE
 			};
 			var rejectedFamilies = new OperationFamily[] {
 					OperationFamily.POINT_LOOKUP,
 					OperationFamily.CONTROL,
-					OperationFamily.WAL_PAGE,
 					OperationFamily.FLUSH
 			};
 			for (int i = 0; i < rejectedProfiles.length; i++) {
@@ -369,7 +367,7 @@ class RWSchedulerCooperativeTest {
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).activeTasks() == 4);
 			assertEquals(0, scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks());
 
-			var foregroundStarted = new CountDownLatch(5);
+			var foregroundStarted = new CountDownLatch(4);
 			long queuedAtNanos = System.nanoTime();
 			var latestStartNanos = new java.util.concurrent.atomic.AtomicLong();
 			Runnable foreground = () -> {
@@ -381,9 +379,6 @@ class RWSchedulerCooperativeTest {
 					scheduler.bindTimeoutNanos(SECONDS.toNanos(5))).execute(foreground);
 			scheduler.executor(WorkloadProfile.INGEST,
 					OperationFamily.POINT_LOOKUP,
-					Long.MAX_VALUE).execute(foreground);
-			scheduler.executor(WorkloadProfile.CDC,
-					OperationFamily.WAL_PAGE,
 					Long.MAX_VALUE).execute(foreground);
 			scheduler.executor(WorkloadProfile.ANALYTICAL,
 					OperationFamily.FULL_SCAN_AGGREGATE,

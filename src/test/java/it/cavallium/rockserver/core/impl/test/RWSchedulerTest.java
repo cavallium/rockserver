@@ -187,7 +187,7 @@ class RWSchedulerTest {
 			case CONTROL -> RWScheduler.Pool.CONTROL;
 			case COMPACTION -> RWScheduler.Pool.PHYSICAL;
 			case METADATA, POINT_LOOKUP, BOUNDARY_SEEK, BOUNDED_FAN_OUT,
-					RANGE_PAGE, FULL_SCAN_AGGREGATE, WAL_PAGE -> RWScheduler.Pool.READ;
+					RANGE_PAGE, FULL_SCAN_AGGREGATE -> RWScheduler.Pool.READ;
 		};
 	}
 
@@ -290,7 +290,7 @@ class RWSchedulerTest {
 		var releaseBatch = new CountDownLatch(1);
 		var analyticalStarted = new CountDownLatch(1);
 		var releaseAnalytical = new CountDownLatch(1);
-		var reservedDone = new CountDownLatch(3);
+		var reservedDone = new CountDownLatch(2);
 		var order = Collections.synchronizedList(new ArrayList<String>());
 		try {
 			var batch = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
@@ -313,18 +313,16 @@ class RWSchedulerTest {
 					.execute(() -> record("latency", order, reservedDone));
 			scheduler.executor(RequestContext.ingest(), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("ingest", order, reservedDone));
-			scheduler.executor(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE)
-					.execute(() -> record("cdc", order, reservedDone));
 
 			releaseAnalytical.countDown();
 			assertTrue(reservedDone.await(5, SECONDS));
-			List<String> firstThree;
+			List<String> firstTwo;
 			synchronized (order) {
-				assertTrue(order.size() >= 3);
-				firstThree = List.copyOf(order.subList(0, 3));
+				assertTrue(order.size() >= 2);
+				firstTwo = List.copyOf(order.subList(0, 2));
 			}
-			assertEquals(new HashSet<>(List.of("latency", "ingest", "cdc")),
-					new HashSet<>(firstThree));
+			assertEquals(new HashSet<>(List.of("latency", "ingest")),
+					new HashSet<>(firstTwo));
 		} finally {
 			releaseAnalytical.countDown();
 			releaseBatch.countDown();
@@ -367,7 +365,7 @@ class RWSchedulerTest {
 		var scheduler = scheduler(1, "drr-shares");
 		var blockerStarted = new CountDownLatch(1);
 		var release = new CountDownLatch(1);
-		var completed = new CountDownLatch(33);
+		var completed = new CountDownLatch(21);
 		var order = Collections.synchronizedList(new ArrayList<WorkloadProfile>());
 		try {
 			scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE).execute(() -> {
@@ -376,16 +374,14 @@ class RWSchedulerTest {
 			});
 			assertTrue(blockerStarted.await(5, SECONDS));
 			enqueue(scheduler, WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, 12, 0L, order, completed);
-			enqueue(scheduler, WorkloadProfile.CDC, OperationFamily.WAL_PAGE, 12, 0L, order, completed);
 			enqueue(scheduler, WorkloadProfile.ANALYTICAL, OperationFamily.FULL_SCAN_AGGREGATE,
 					6, 0L, order, completed);
 			enqueue(scheduler, WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, 3, 0L, order, completed);
 			release.countDown();
 			assertTrue(completed.await(5, SECONDS));
 
-			var firstRound = frequencies(order.subList(0, 11));
+			var firstRound = frequencies(order.subList(0, 7));
 			assertEquals(4, firstRound.get(WorkloadProfile.INGEST));
-			assertEquals(4, firstRound.get(WorkloadProfile.CDC));
 			assertEquals(2, firstRound.get(WorkloadProfile.ANALYTICAL));
 			assertEquals(1, firstRound.get(WorkloadProfile.BATCH));
 		} finally {
@@ -941,16 +937,14 @@ class RWSchedulerTest {
 	}
 
 	@Test
-	void oneThreadFactoryProducesUniqueNamesAndNoExtraCdcWorker() throws Exception {
+	void oneThreadFactoryProducesUniqueNames() throws Exception {
 		var scheduler = scheduler(3, "thread-name-test");
 		var started = new CountDownLatch(3);
 		var release = new CountDownLatch(1);
 		try {
-			var cdc = scheduler.executor(WorkloadProfile.CDC,
-					OperationFamily.WAL_PAGE,
-					Long.MAX_VALUE);
+			var ingest = scheduler.executor(RequestContext.ingest(), OperationFamily.POINT_LOOKUP);
 			for (int i = 0; i < 3; i++) {
-				cdc.execute(() -> {
+				ingest.execute(() -> {
 					started.countDown();
 					awaitUninterruptibly(release);
 				});

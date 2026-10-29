@@ -49,7 +49,6 @@ class EmbeddedRangeSchedulingTest {
 				""");
 		try (var connection = new EmbeddedConnection(tempDir.resolve("cleanup-db"),
 				"cleanup-scheduling", configFile)) {
-			connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("progress", 1L, null, false, java.util.OptionalLong.empty());
 			var writeStarted = new CountDownLatch(DATA_WORKERS);
 			var releaseWrite = new CountDownLatch(1);
 			occupyWorkers(connection.getScheduler().executor(it.cavallium.rockserver.core.common.WorkloadProfile.INGEST, it.cavallium.rockserver.core.common.OperationFamily.MUTATION, Long.MAX_VALUE), DATA_WORKERS, writeStarted, releaseWrite);
@@ -59,18 +58,11 @@ class EmbeddedRangeSchedulingTest {
 						.get(5, TimeUnit.SECONDS);
 				assertTrue(connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransactionAsync(Long.MAX_VALUE, false)
 						.get(5, TimeUnit.SECONDS));
-				var cdcCommit = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
-						.cdcCommitAsync("progress", 42L);
-				assertThrows(TimeoutException.class, () -> cdcCommit.get(200, TimeUnit.MILLISECONDS),
-						"cdcCommit must remain queued as must-complete CDC mutation work");
 
 				var commit = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).closeTransactionAsync(Long.MAX_VALUE, true);
 				assertThrows(TimeoutException.class, () -> commit.get(200, TimeUnit.MILLISECONDS),
 						"commit=true must remain queued on the saturated write lane");
 				releaseWrite.countDown();
-				cdcCommit.get(5, TimeUnit.SECONDS);
-				assertEquals(java.util.OptionalLong.of(42L),
-						connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcGetLastCommittedSequence("progress"));
 				commit.handle((_, _) -> null).get(5, TimeUnit.SECONDS);
 				assertTrue(commit.isCompletedExceptionally());
 			} finally {

@@ -35,9 +35,6 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.api.proto.FirstAndLast;
-import it.cavallium.rockserver.core.common.api.proto.CdcCommitRequest;
-import it.cavallium.rockserver.core.common.api.proto.CdcCreateRequest;
-import it.cavallium.rockserver.core.common.api.proto.CdcPollRequest;
 import it.cavallium.rockserver.core.common.api.proto.CloseTransactionRequest;
 import it.cavallium.rockserver.core.common.api.proto.FlushRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetRangeRequest;
@@ -97,7 +94,7 @@ import org.rocksdb.RocksDB;
  * Opt-in, disk-backed gRPC overload regression benchmark.
  *
  * <p>The runner opens one real RocksDB database, preloads and flushes it, then runs a
- * foreground-only phase followed by a seven-profile mixed-flood phase against the same state. The
+ * foreground-only phase followed by an all-profile mixed-flood phase against the same state. The
  * five-second client and range budgets are fixed deliberately: changing the timeout is not a
  * benchmark knob. Every transport call is independently counted at start and terminal close, and
  * the mixed phase samples scheduler work conservation in every pool. This class lives in test
@@ -112,7 +109,6 @@ public final class GrpcOverloadBenchmark {
 	private static final int MAX_RECORDED_ERRORS = 20;
 	private static final long COOPERATIVE_QUANTUM_NANOS = TimeUnit.MILLISECONDS.toNanos(8L);
 	private static final long RUNTIME_RESOURCE_SAMPLE_NANOS = TimeUnit.MILLISECONDS.toNanos(100L);
-	private static final String CDC_SUBSCRIPTION_PREFIX = "grpc-overload-cdc-";
 	private static final String RESULT_SCHEMA = "rockserver-grpc-overload-v6";
 	private static final String PERFORMANCE_BASELINE_SHA = "bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e";
 	private static final String DATASET_SCHEMA = "rockserver-grpc-overload-dataset-v4";
@@ -354,10 +350,10 @@ public final class GrpcOverloadBenchmark {
 				+ "\nworkers=" + options.pointReaders() + ',' + options.foregroundWriters() + ','
 				+ options.maintenanceWriters() + ',' + options.firstLastReaders() + ','
 				+ options.cancellationWorkers() + ',' + options.analyticalReaders() + ','
-				+ options.controlWorkers() + ',' + options.cdcWorkers() + ',' + options.physicalWorkers()
+				+ options.controlWorkers() + ',' + options.physicalWorkers()
 				+ "\nrates=" + options.foregroundWriteRate() + ',' + options.maintenanceWriteRate() + ','
 				+ options.firstLastRate() + ',' + options.cancellationRate() + ',' + options.analyticalRate()
-				+ ',' + options.controlRate() + ',' + options.cdcRate() + ',' + options.physicalRate()
+				+ ',' + options.controlRate() + ',' + options.physicalRate()
 				+ "\ncancellation=" + options.cancellationDelayMillis() + ',' + options.cancellationBurst()
 				+ "\nintegrity-requests=" + options.integrityRequests()
 				+ "\nrequest-counts=" + options.pointRequestCount() + ',' + options.rangeRequestCount()
@@ -586,14 +582,6 @@ public final class GrpcOverloadBenchmark {
 		if (!rollback.getSuccessful()) {
 			throw new IllegalStateException("CONTROL rollback preflight was not successful");
 		}
-		for (int worker = 0; worker < options.cdcWorkers(); worker++) {
-			client.blockingWithDeadline().cdcCreate(CdcCreateRequest.newBuilder()
-					.setId(cdcSubscription(worker))
-					.addColumnIds(columnId)
-					.setExpectAbsent(Empty.getDefaultInstance())
-					.setWorkloadContractVersion(3)
-					.build());
-		}
 		client.blockingWithDeadline().flush(
 				FlushRequest.newBuilder().setWorkloadContractVersion(3).build());
 	}
@@ -605,10 +593,6 @@ public final class GrpcOverloadBenchmark {
 				.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE - 1L)
 				.build();
-	}
-
-	private static String cdcSubscription(int worker) {
-		return CDC_SUBSCRIPTION_PREFIX + worker;
 	}
 
 	private static PhaseResult runPhase(int round,
@@ -623,7 +607,6 @@ public final class GrpcOverloadBenchmark {
 		int cancellationWorkers = maintenanceFlood ? options.cancellationWorkers() : 0;
 		int analyticalWorkers = maintenanceFlood ? options.analyticalReaders() : 0;
 		int controlWorkers = maintenanceFlood ? options.controlWorkers() : 0;
-		int cdcWorkers = maintenanceFlood ? options.cdcWorkers() : 0;
 		int physicalWorkers = maintenanceFlood ? options.physicalWorkers() : 0;
 		int workerCount = options.pointReaders()
 				+ options.foregroundWriters()
@@ -632,7 +615,6 @@ public final class GrpcOverloadBenchmark {
 				+ cancellationWorkers
 				+ analyticalWorkers
 				+ controlWorkers
-				+ cdcWorkers
 				+ physicalWorkers
 				+ 1;
 		var runtimeTelemetry = new RuntimeTelemetryTracker(
@@ -651,10 +633,10 @@ public final class GrpcOverloadBenchmark {
 		System.out.printf(Locale.ROOT,
 				"Starting round %d %s: warmup=%ds measure=%ds point-readers=%d foreground-writers=%d "
 						+ "first-last-readers=%d maintenance-writers=%d cancellation-workers=%d "
-						+ "analytical=%d control=%d cdc=%d physical=%d%n",
+						+ "analytical=%d control=%d physical=%d%n",
 				round, phase.value, options.warmupSeconds(), options.measureSeconds(), options.pointReaders(),
 				options.foregroundWriters(), options.firstLastReaders(), maintenanceWorkers,
-				cancellationWorkers, analyticalWorkers, controlWorkers, cdcWorkers, physicalWorkers);
+				cancellationWorkers, analyticalWorkers, controlWorkers, physicalWorkers);
 		try {
 			for (int index = 0; index < options.pointReaders(); index++) {
 				int worker = index;
@@ -703,11 +685,6 @@ public final class GrpcOverloadBenchmark {
 				int worker = index;
 				submit(executor, futures, control,
 						() -> runControlWorker(client, options, worker, control));
-			}
-			for (int index = 0; index < cdcWorkers; index++) {
-				int worker = index;
-				submit(executor, futures, control,
-						() -> runCdcWorker(client, options, worker, control));
 			}
 			for (int index = 0; index < physicalWorkers; index++) {
 				int worker = index;
@@ -929,48 +906,6 @@ public final class GrpcOverloadBenchmark {
 				detail = describe(failure);
 			}
 			control.record(Operation.CONTROL,
-					outcome,
-					System.nanoTime() - started,
-					sequence++,
-					detail);
-			pacer.awaitNext(control.stop);
-		}
-	}
-
-	private static void runCdcWorker(Client client,
-			Options options,
-			int worker,
-			PhaseControl control) throws InterruptedException {
-		Pacer pacer = new Pacer(options.cdcRate(), options.cdcWorkers(), worker);
-		var poll = CdcPollRequest.newBuilder()
-				.setId(cdcSubscription(worker))
-				.setMaxEvents(256L)
-				.setMaxResponseBytes(4 * 1024 * 1024)
-				.setWorkloadContractVersion(3)
-				.build();
-		control.ready.countDown();
-		control.start.await();
-		long sequence = worker;
-		while (!control.stop.get()) {
-			long started = System.nanoTime();
-			Outcome outcome;
-			String detail = null;
-			try {
-				var response = client.blockingWithDeadline().cdcPollBatch(poll);
-				if (response.getEventsCount() > 0) {
-					long committed = response.getEvents(response.getEventsCount() - 1).getSeq();
-					client.blockingWithDeadline().cdcCommit(CdcCommitRequest.newBuilder()
-							.setId(cdcSubscription(worker))
-							.setSeq(committed)
-							.setWorkloadContractVersion(3)
-							.build());
-				}
-				outcome = Outcome.SUCCESS;
-			} catch (Throwable failure) {
-				outcome = classify(failure);
-				detail = describe(failure);
-			}
-			control.record(Operation.CDC,
 					outcome,
 					System.nanoTime() - started,
 					sequence++,
@@ -1263,7 +1198,6 @@ public final class GrpcOverloadBenchmark {
 		int retainedSnapshots = db.getRetainedRangeSnapshotCount();
 		int retainedPermits = db.getRetainedRangePermitCount();
 		int retainedWaiters = db.getRetainedRangeWaiterCount();
-		int cdcCursors = db.getActiveCdcPollCursorCount();
 		int existsMultiRequests = db.getActiveExistsMultiRequestCount();
 		int iteratorLeases = server.getActiveIteratorOperationLeaseCountForTesting();
 		SchedulerConservation schedulerConservation = schedulerConservation(scheduler);
@@ -1276,7 +1210,6 @@ public final class GrpcOverloadBenchmark {
 				&& retainedSnapshots == 0
 				&& retainedPermits == 0
 				&& retainedWaiters == 0
-				&& cdcCursors == 0
 				&& existsMultiRequests == 0
 				&& iteratorLeases == 0;
 		return new ResourceResult(foregroundQueued,
@@ -1292,7 +1225,6 @@ public final class GrpcOverloadBenchmark {
 				retainedSnapshots,
 				retainedPermits,
 				retainedWaiters,
-				cdcCursors,
 				existsMultiRequests,
 				iteratorLeases,
 				TimeUnit.NANOSECONDS.toMillis(drainNanos),
@@ -1437,9 +1369,6 @@ public final class GrpcOverloadBenchmark {
 		}
 		if (successes(flood, Operation.FOREGROUND_WRITE) > 0L) {
 			progressedProfiles.add(WorkloadProfile.INGEST);
-		}
-		if (successes(flood, Operation.CDC) > 0L) {
-			progressedProfiles.add(WorkloadProfile.CDC);
 		}
 		if (successes(flood, Operation.MAINTENANCE_WRITE) > 0L) {
 			progressedProfiles.add(WorkloadProfile.BATCH);
@@ -2179,7 +2108,6 @@ public final class GrpcOverloadBenchmark {
 				.append(",\n    \"cancellation_workers\": ").append(options.cancellationWorkers())
 				.append(",\n    \"analytical_readers\": ").append(options.analyticalReaders())
 				.append(",\n    \"control_workers\": ").append(options.controlWorkers())
-				.append(",\n    \"cdc_workers\": ").append(options.cdcWorkers())
 				.append(",\n    \"physical_workers\": ").append(options.physicalWorkers())
 				.append(",\n    \"foreground_write_rate\": ").append(options.foregroundWriteRate())
 				.append(",\n    \"maintenance_write_rate\": ").append(options.maintenanceWriteRate())
@@ -2187,7 +2115,6 @@ public final class GrpcOverloadBenchmark {
 				.append(",\n    \"cancellation_rate\": ").append(options.cancellationRate())
 				.append(",\n    \"analytical_rate\": ").append(options.analyticalRate())
 				.append(",\n    \"control_rate\": ").append(options.controlRate())
-				.append(",\n    \"cdc_rate\": ").append(options.cdcRate())
 				.append(",\n    \"physical_rate\": ").append(options.physicalRate())
 				.append(",\n    \"cancellation_delay_ms\": ").append(options.cancellationDelayMillis())
 				.append(",\n    \"cancellation_burst\": ").append(options.cancellationBurst())
@@ -2388,7 +2315,6 @@ public final class GrpcOverloadBenchmark {
 				.append(", \"retained_range_snapshots\": ").append(resources.retainedRangeSnapshots())
 				.append(", \"retained_range_permits\": ").append(resources.retainedRangePermits())
 				.append(", \"retained_range_waiters\": ").append(resources.retainedRangeWaiters())
-				.append(", \"active_cdc_poll_cursors\": ").append(resources.activeCdcPollCursors())
 				.append(", \"active_exists_multi_requests\": ").append(resources.activeExistsMultiRequests())
 				.append(", \"iterator_leases\": ").append(resources.iteratorLeases())
 				.append(", \"drain_ms\": ").append(resources.drainMillis())
@@ -2651,10 +2577,10 @@ public final class GrpcOverloadBenchmark {
 					  warmup-seconds=15  measure-seconds=60  rounds=5 (alternating phase order)
 					  point-readers=40  foreground-writers=4  maintenance-writers=64
 					  first-last-readers=2  cancellation-workers=2  analytical-readers=4
-					  control-workers=2  cdc-workers=2  physical-workers=1
+					  control-workers=2  physical-workers=1
 					  foreground-write-rate=1000  maintenance-write-rate=0
 					  first-last-rate=50  cancellation-rate=100  analytical-rate=0 (unpaced)
-					  control-rate=50  cdc-rate=100  physical-rate=1  cancellation-burst=64
+					  control-rate=50  physical-rate=1  cancellation-burst=64
 					  integrity-requests=1024
 				  read-parallelism=20  write-parallelism=36
 				  foreground-queue-capacity=4096  maintenance-queue-capacity=512
@@ -2709,7 +2635,6 @@ public final class GrpcOverloadBenchmark {
 		FIRST_LAST("first-last"),
 		ANALYTICAL_READ("analytical-read"),
 		CONTROL("control"),
-		CDC("cdc"),
 		PHYSICAL("physical"),
 		MAINTENANCE_WRITE("maintenance-write"),
 		CANCELLATION("cancellation");
@@ -3778,7 +3703,6 @@ public final class GrpcOverloadBenchmark {
 		int retainedRangeSnapshots,
 		int retainedRangePermits,
 		int retainedRangeWaiters,
-		int activeCdcPollCursors,
 		int activeExistsMultiRequests,
 		int iteratorLeases,
 			long drainMillis,
@@ -4284,7 +4208,6 @@ public final class GrpcOverloadBenchmark {
 			int cancellationWorkers,
 			int analyticalReaders,
 			int controlWorkers,
-			int cdcWorkers,
 			int physicalWorkers,
 			long foregroundWriteRate,
 			long maintenanceWriteRate,
@@ -4292,7 +4215,6 @@ public final class GrpcOverloadBenchmark {
 			long cancellationRate,
 			long analyticalRate,
 			long controlRate,
-			long cdcRate,
 			long physicalRate,
 			int cancellationDelayMillis,
 			int cancellationBurst,
@@ -4338,7 +4260,6 @@ public final class GrpcOverloadBenchmark {
 					"cancellation-workers",
 					"analytical-readers",
 					"control-workers",
-					"cdc-workers",
 					"physical-workers",
 					"foreground-write-rate",
 					"maintenance-write-rate",
@@ -4346,7 +4267,6 @@ public final class GrpcOverloadBenchmark {
 					"cancellation-rate",
 					"analytical-rate",
 					"control-rate",
-					"cdc-rate",
 					"physical-rate",
 					"cancellation-delay-ms",
 					"cancellation-burst",
@@ -4412,7 +4332,6 @@ public final class GrpcOverloadBenchmark {
 					integer(values, "cancellation-workers", smoke ? 1 : 2),
 					integer(values, "analytical-readers", smoke ? 3 : 4),
 					integer(values, "control-workers", smoke ? 1 : 2),
-					integer(values, "cdc-workers", smoke ? 1 : 2),
 					integer(values, "physical-workers", 1),
 					longValue(values, "foreground-write-rate", smoke ? 100 : 1_000),
 					longValue(values, "maintenance-write-rate", 0),
@@ -4420,7 +4339,6 @@ public final class GrpcOverloadBenchmark {
 					longValue(values, "cancellation-rate", smoke ? 64 : 100),
 					longValue(values, "analytical-rate", 0),
 					longValue(values, "control-rate", smoke ? 10 : 50),
-					longValue(values, "cdc-rate", smoke ? 10 : 100),
 					longValue(values, "physical-rate", 1),
 					integer(values, "cancellation-delay-ms", 1),
 					integer(values, "cancellation-burst", WRITE_REQUEST_VARIANTS),
@@ -4484,12 +4402,12 @@ public final class GrpcOverloadBenchmark {
 			}
 			if (pointReaders < 1 || foregroundWriters < 1 || maintenanceWriters < 1
 					|| firstLastReaders < 1 || cancellationWorkers < 0 || analyticalReaders < 1
-					|| controlWorkers < 1 || cdcWorkers < 1 || physicalWorkers < 1) {
+					|| controlWorkers < 1 || physicalWorkers < 1) {
 				throw new IllegalArgumentException("all mixed-workload worker counts must be positive");
 			}
 			if (foregroundWriteRate < 0 || maintenanceWriteRate < 0 || firstLastRate < 0
 					|| cancellationRate < 0 || analyticalRate < 0 || controlRate < 0
-					|| cdcRate < 0 || physicalRate < 0) {
+					|| physicalRate < 0) {
 				throw new IllegalArgumentException("rates must be non-negative; zero means unbounded");
 			}
 			if (cancellationWorkers > 0 && cancellationRate == 0) {

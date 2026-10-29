@@ -45,7 +45,6 @@ class SchedulerStateModelPropertyTest {
 	private static final WorkloadProfile[] DATA_PROFILES = {
 			WorkloadProfile.LATENCY,
 			WorkloadProfile.INGEST,
-			WorkloadProfile.CDC,
 			WorkloadProfile.ANALYTICAL,
 			WorkloadProfile.BATCH
 	};
@@ -439,7 +438,6 @@ class SchedulerStateModelPropertyTest {
 		return switch (profile) {
 			case LATENCY -> OperationFamily.POINT_LOOKUP;
 			case INGEST, BATCH -> OperationFamily.RANGE_PAGE;
-			case CDC -> OperationFamily.WAL_PAGE;
 			case ANALYTICAL -> OperationFamily.FULL_SCAN_AGGREGATE;
 			case CONTROL, PHYSICAL_MAINTENANCE -> throw new IllegalArgumentException("not a data profile");
 		};

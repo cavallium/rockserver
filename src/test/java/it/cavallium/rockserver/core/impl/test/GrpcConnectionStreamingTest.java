@@ -18,8 +18,6 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
-import it.cavallium.rockserver.core.common.api.proto.CdcPollRequest;
-import it.cavallium.rockserver.core.common.api.proto.CdcPollResponse;
 import it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest;
 import it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse;
 import it.cavallium.rockserver.core.common.api.proto.GetColumnIdRequest;
@@ -201,10 +199,6 @@ class GrpcConnectionStreamingTest {
 		try {
 			assertEquals(73, client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnIdAsync("responsive-unary")
 					.get(5, TimeUnit.SECONDS));
-			var cdcBatch = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcPollBatchAsync("responsive-cdc", null, 10)
-					.toFuture()
-					.get(5, TimeUnit.SECONDS);
-			assertEquals(101, cdcBatch.nextSeq());
 		} finally {
 			service.releaseFirstCleanupWrite();
 		}
@@ -420,11 +414,6 @@ class GrpcConnectionStreamingTest {
 		@Override
 		public Mono<GetColumnIdResponse> getColumnId(GetColumnIdRequest request) {
 			return Mono.just(GetColumnIdResponse.newBuilder().setColumnId(73).build());
-		}
-
-		@Override
-		public Mono<CdcPollResponse> cdcPollBatch(CdcPollRequest request) {
-			return Mono.just(CdcPollResponse.newBuilder().setNextSeq(101).build());
 		}
 
 		private void releaseFirstCleanupWrite() {

@@ -356,7 +356,7 @@ class ExactCountContinuationTest {
 	}
 
 	@Test
-	void latencyAndCdcProgressBetweenAnalyticalCountQuanta() throws Exception {
+	void latencyProgressesBetweenAnalyticalCountQuanta() throws Exception {
 		try (var connection = populatedConnection("snapshot-inter-quantum-progress", """
 				database.parallelism.workload.range-quantum-max-items = 1
 				database.parallelism.workload.range-quantum-max-duration = PT1S
@@ -380,16 +380,11 @@ class ExactCountContinuationTest {
 				assertEquals(0, connection.getScheduler().poolSnapshot(RWScheduler.Pool.READ).activeTasks());
 
 				var latencyProgress = new CountDownLatch(1);
-				var cdcProgress = new CountDownLatch(1);
 				connection.getScheduler().executor(WorkloadProfile.LATENCY,
 						OperationFamily.POINT_LOOKUP,
 						connection.getScheduler().bindTimeoutNanos(TimeUnit.MILLISECONDS.toNanos(5_000L)))
 						.execute(latencyProgress::countDown);
-				connection.getScheduler().executor(WorkloadProfile.CDC,
-						OperationFamily.WAL_PAGE,
-						Long.MAX_VALUE).execute(cdcProgress::countDown);
 				assertTrue(latencyProgress.await(5, TimeUnit.SECONDS));
-				assertTrue(cdcProgress.await(5, TimeUnit.SECONDS));
 
 				release.countDown();
 				assertEquals(2L, count.get(10, TimeUnit.SECONDS));

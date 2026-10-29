@@ -215,8 +215,9 @@ scheduler. Those tasks wait on one benchmark-only barrier while three allocation
 snapshots verify the stable concurrent peak is exactly N. The barrier is released and the scheduler
 must drain before process telemetry begins, so proof work cannot inflate the real RocksDB throughput
 or latency measurements. Consequently, a cap-N result proves N permits were actually exercised under
-pressure rather than merely written to configuration. V2 results use
-`mixed-backfill-pressure-v2.schema.json`; the V1 schema remains immutable for earlier artifacts.
+pressure rather than merely written to configuration. Results use
+`mixed-backfill-pressure-v3.schema.json`, which no longer has the removed CDC fields; the V1 and V2
+schemas remain immutable for earlier artifacts.
 The CLI refuses to create its root unless the whole checkout is clean, its full HEAD matches the
 declared revision, loaded production and harness classes come from that worktree's `target` tree,
 and the production directory digest matches the declared SHA-256. The marker and result both record

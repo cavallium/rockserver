@@ -392,11 +392,6 @@ class GrpcIteratorLeaseTest {
 		private final CountDownLatch finished = new CountDownLatch(1);
 		private final AtomicInteger subsequentCalls = new AtomicInteger();
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-
 			@Override
 			@SuppressWarnings("unchecked")
 			public <T> CompletableFuture<T> subsequentAsync(long iterationId,
@@ -499,11 +494,6 @@ class GrpcIteratorLeaseTest {
 		private final CountDownLatch multiReturned = new CountDownLatch(1);
 		private final AtomicBoolean secondPageBeforeForeground = new AtomicBoolean();
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-
 			@Override
 			@SuppressWarnings("unchecked")
 			public <T> CompletableFuture<T> subsequentAsync(long iterationId,
@@ -651,12 +641,7 @@ class GrpcIteratorLeaseTest {
 		private final CountDownLatch release = new CountDownLatch(1);
 		private final CountDownLatch closed = new CountDownLatch(1);
 		private final AtomicBoolean iteratorOpen = new AtomicBoolean();
-		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-};
+		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {};
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
 			@Override
 			@SuppressWarnings("unchecked")

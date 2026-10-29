@@ -162,9 +162,7 @@ class GrpcRetryPolicyTest {
 				RocksDBServiceGrpc.getReduceRangeEntriesCountMethod().getFullMethodName(),
 				RocksDBServiceGrpc.getGetRangePageMethod().getFullMethodName(),
 				RocksDBServiceGrpc.getGetAllColumnDefinitionsMethod().getFullMethodName(),
-				RocksDBServiceGrpc.getCheckMergeOperatorMethod().getFullMethodName(),
-				RocksDBServiceGrpc.getCdcGetEarliestAvailableSequenceMethod().getFullMethodName(),
-				RocksDBServiceGrpc.getCdcGetLastCommittedSequenceMethod().getFullMethodName());
+				RocksDBServiceGrpc.getCheckMergeOperatorMethod().getFullMethodName());
 
 		var descriptorsField = Class.forName("it.cavallium.rockserver.core.client.GrpcConnectionDelegate")
 				.getDeclaredField("AUTOMATIC_RETRY_METHOD_DESCRIPTORS");

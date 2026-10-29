@@ -60,7 +60,7 @@ class WorkloadBenchmarkSelectorTest {
 
 		assertEquals(8, selection.winner());
 		assertEquals(List.of(4, 16), selection.adjacentCandidates());
-		assertEquals(101.0d * 7.0d, selection.maximumThroughput());
+		assertEquals(101.0d * 6.0d, selection.maximumThroughput());
 		assertEquals(9_900_000L, selection.minimumRelevantP99Nanos());
 		assertTrue(selection.evaluations().get(1).eligible());
 	}
@@ -84,19 +84,19 @@ class WorkloadBenchmarkSelectorTest {
 
 		var differentHost = new WorkloadBenchmarkSelector.CandidateMeasurement(
 				16, "dataset", "comparison", "build", "nvme", 42L, true, true,
-				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L, 0L);
+				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L);
 		assertThrows(IllegalArgumentException.class,
 				() -> WorkloadBenchmarkSelector.select(List.of(candidate(8, 100, 10_000_000L, true, 0L), differentHost)));
 
 		var differentShape = new WorkloadBenchmarkSelector.CandidateMeasurement(
 				16, "dataset", "different-comparison", "build", "hdd-zfs", 42L, true, true,
-				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L, 0L);
+				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L);
 		assertThrows(IllegalArgumentException.class,
 				() -> WorkloadBenchmarkSelector.select(List.of(
 						candidate(8, 100, 10_000_000L, true, 0L), differentShape)));
 		var differentBuild = new WorkloadBenchmarkSelector.CandidateMeasurement(
 				16, "dataset", "comparison", "other-build", "hdd-zfs", 42L, true, true,
-				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L, 0L);
+				candidateProfiles(100.0d, 10_000_000L, true), 0L, 0L, 0L);
 		assertThrows(IllegalArgumentException.class,
 				() -> WorkloadBenchmarkSelector.select(List.of(
 						candidate(8, 100, 10_000_000L, true, 0L), differentBuild)));
@@ -197,28 +197,6 @@ class WorkloadBenchmarkSelectorTest {
 		assertTrue(Files.notExists(root));
 	}
 
-	@Test
-	void coldReopenCreatesCdcSubscriptionAgainstLiveWal(@TempDir Path temporary) throws Exception {
-		Path database = temporary.resolve("db");
-		long columnId;
-		try (var prepared = new EmbeddedConnection(database, "benchmark-cdc-reopen", null)) {
-			var batch = prepared.getSyncApi(RequestContext.batch());
-			columnId = batch.createColumn("benchmark-cdc-reopen",
-					ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
-			batch.put(0L, columnId, key(1L), Buf.wrap(new byte[] { 1 }), RequestType.none());
-			batch.flush();
-		}
-
-		try (var reopened = new EmbeddedConnection(database, "benchmark-cdc-reopen", null)) {
-			var batch = reopened.getSyncApi(RequestContext.batch());
-			SevenProfileWorkloadBenchmark.createCdcSubscriptionForMixedRun(batch, columnId);
-			batch.put(0L, columnId, key(2L), Buf.wrap(new byte[] { 2 }), RequestType.none());
-			try (var events = batch.cdcPoll("seven-profile-workload-cdc", null, 100L)) {
-				assertEquals(1L, events.count());
-			}
-		}
-	}
-
 	private static Keys key(long value) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(value).array()));
 	}
@@ -248,7 +226,6 @@ class WorkloadBenchmarkSelectorTest {
 				enforcedHardwareRun,
 				runChecksPassed,
 				candidateProfiles(perProfileThroughput, p99Nanos, sloPassed),
-				0L,
 				0L,
 				0L,
 				leaks);

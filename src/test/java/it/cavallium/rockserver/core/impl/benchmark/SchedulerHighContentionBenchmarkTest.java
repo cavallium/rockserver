@@ -92,10 +92,9 @@ class SchedulerHighContentionBenchmarkTest {
 	@Test
 	void queueBoundsAccountForIndependentCooperativeProfileRequeues() {
 		var config = config(1_000, 8, 8, 8, 65_536, 65_536, 256, 1L);
-		int cdcCapacity = 1_024;
 		int analyticalCapacity = 512;
-		int staticReadCapacity = 65_536 * 2 + cdcCapacity + analyticalCapacity + 65_536;
-		int staticWriteCapacity = 65_536 * 2 + cdcCapacity + 65_536;
+		int staticReadCapacity = 65_536 * 2 + analyticalCapacity + 65_536;
+		int staticWriteCapacity = 65_536 * 2 + 65_536;
 
 		assertEquals(staticReadCapacity + 8 * 3,
 				SchedulerHighContentionBenchmark.queueBound(config, RWScheduler.Pool.READ, 8));

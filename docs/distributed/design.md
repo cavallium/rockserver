@@ -278,6 +278,10 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
 ## Left before a first deployment
 
 1. **Client side.**
+   - Yotsuba does not compile against this version as is: CDC was removed from the client API, and
+     `server/source/api/src/main/java/org/yotsuba/database/RockserverAsyncApiViews.java:133` still overrides
+     `cdcPollBatchAsync` (and imports `it.cavallium.rockserver.core.common.cdc.CdcBatch`). It is a pass-through
+     that nothing calls: delete it, and the few Yotsuba tests that mention it. telegramdb has no CDC references.
    - Yotsuba must use several node addresses and fail over between them. Today `GrpcConnection` takes a
      single address.
    - The core client's automatic gRPC retry of reads holds requests against a stopping node for up to its

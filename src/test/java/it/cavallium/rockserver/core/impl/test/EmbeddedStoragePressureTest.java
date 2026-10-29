@@ -167,7 +167,7 @@ class EmbeddedStoragePressureTest {
 			var db = connection.getInternalDB();
 			var api = connection.getSyncApi(RequestContext.batch());
 			int initialColumns = db.getStoragePressureColumnCountForTesting();
-			assertTrue(initialColumns >= 4, "default and internal columns must be polled after initialization");
+			assertTrue(initialColumns >= 3, "default and internal columns must be polled after initialization");
 
 			long columnId = api.createColumn("runtime-pressure-column", TEST_SCHEMA);
 			assertEquals(initialColumns + 1, db.getStoragePressureColumnCountForTesting());

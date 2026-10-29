@@ -76,7 +76,6 @@ final class SchedulerReferenceModel {
 
 	private static final WorkloadProfile[] GUARANTEED = {
 			WorkloadProfile.INGEST,
-			WorkloadProfile.CDC,
 			WorkloadProfile.ANALYTICAL,
 			WorkloadProfile.BATCH
 	};

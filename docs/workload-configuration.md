@@ -224,5 +224,7 @@ no longer reads archived WAL files, so the archive is off by default:
 
 Both values must be zero or greater. The system property
 `it.cavallium.dbengine.wal.ttl.seconds` overrides `wal-ttl-seconds`. With both limits
-at 0 no archive is kept. Archive usage is exported as `rocksdb.wal.archived.bytes`,
+at 0 no archive is kept, and startup deletes an archive that an earlier configuration left
+in `<wal-path>/archive` (RocksDB itself never cleans it once archiving is off). Archive usage is
+exported as `rocksdb.wal.archived.bytes`,
 `rocksdb.wal.archived.files`, and `rocksdb.wal.archived.oldest.age.seconds`.

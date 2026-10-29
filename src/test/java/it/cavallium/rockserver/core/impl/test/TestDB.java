@@ -113,11 +113,6 @@ public class TestDB implements AutoCloseable {
 	}
 
 	private static class ForceAPIType implements RocksDBAPI, Closeable {
-		@Override
-		public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(
-				String id, Long fromSeq, long maxEvents) {
-			return asyncApi.cdcPollBatchAsync(id, fromSeq, maxEvents);
-		}
 
 		private final ConnectionType type;
 		private final RocksDBConnection connection;

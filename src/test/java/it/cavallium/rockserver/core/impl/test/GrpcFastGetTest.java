@@ -113,17 +113,6 @@ class GrpcFastGetTest {
 					assertEquals(Status.Code.INVALID_ARGUMENT, rollbackFailure.getStatus().getCode());
 					assertEquals(1, embedded.getInternalDB().getOpenTransactionsCount(),
 							"v2 rollback reached the protected backend");
-
-					var missingPrecondition = assertThrows(StatusRuntimeException.class,
-							() -> client.stub().cdcCreate(
-									it.cavallium.rockserver.core.common.api.proto.CdcCreateRequest.newBuilder()
-											.setId("must-not-create")
-											.setWorkloadContractVersion(3)
-											.build()));
-					assertEquals(Status.Code.INVALID_ARGUMENT, missingPrecondition.getStatus().getCode());
-					assertEquals(java.util.OptionalLong.empty(), embedded.getSyncApi(
-							it.cavallium.rockserver.core.common.RequestContext.batch())
-							.cdcGetLastCommittedSequence("must-not-create"));
 				}
 			} finally {
 				embeddedApi.closeTransaction(rollbackTransaction, false);

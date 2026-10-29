@@ -20,7 +20,7 @@ import java.util.Set;
 /** Command-line, machine-readable selection over completed seven-profile candidate runs. */
 public final class WorkloadBenchmarkSelection {
 
-	public static final String INPUT_SCHEMA = "rockserver-seven-profile-selection-input-v3";
+	public static final String INPUT_SCHEMA = "rockserver-seven-profile-selection-input-v4";
 	public static final String OUTPUT_SCHEMA = "rockserver-seven-profile-selection-v3";
 
 	private WorkloadBenchmarkSelection() {
@@ -65,7 +65,6 @@ public final class WorkloadBenchmarkSelection {
 		lines.add("seed=" + measurement.seed());
 		lines.add("enforced-hardware-run=" + measurement.enforcedHardwareRun());
 		lines.add("run-checks-passed=" + measurement.runChecksPassed());
-		lines.add("maximum-cdc-lag=" + measurement.maximumCdcLag());
 		lines.add("maximum-retained-snapshots=" + measurement.maximumRetainedSnapshots());
 		lines.add("maximum-storage-pressure=" + measurement.maximumStoragePressure());
 		lines.add("leaked-resources=" + measurement.leakedResources());
@@ -118,7 +117,6 @@ public final class WorkloadBenchmarkSelection {
 				requiredBoolean(properties, "enforced-hardware-run"),
 				requiredBoolean(properties, "run-checks-passed"),
 				profiles,
-				Long.parseLong(required(properties, "maximum-cdc-lag")),
 				Long.parseLong(required(properties, "maximum-retained-snapshots")),
 				Long.parseLong(required(properties, "maximum-storage-pressure")),
 				Long.parseLong(required(properties, "leaked-resources")));
@@ -160,7 +158,6 @@ public final class WorkloadBenchmarkSelection {
 		keys.add("seed");
 		keys.add("enforced-hardware-run");
 		keys.add("run-checks-passed");
-		keys.add("maximum-cdc-lag");
 		keys.add("maximum-retained-snapshots");
 		keys.add("maximum-storage-pressure");
 		keys.add("leaked-resources");

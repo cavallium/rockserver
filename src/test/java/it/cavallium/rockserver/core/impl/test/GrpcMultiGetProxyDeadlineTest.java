@@ -36,7 +36,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import reactor.core.publisher.Mono;
 
 @Timeout(30)
 class GrpcMultiGetProxyDeadlineTest {
@@ -188,7 +187,7 @@ class GrpcMultiGetProxyDeadlineTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
-			return (id, fromSeq, maxEvents) -> Mono.error(new UnsupportedOperationException("CDC is unused"));
+			return new RocksDBAsyncAPI() {};
 		}
 
 		@Override

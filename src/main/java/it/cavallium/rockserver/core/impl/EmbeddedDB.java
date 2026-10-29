@@ -2712,6 +2712,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@Override
 	public long createColumn(String name, @NotNull ColumnSchema schema) throws RocksDBException {
+		var nameBytes = name.getBytes(StandardCharsets.UTF_8);
+		if (SYSTEM_COLUMNS.stream().anyMatch(system -> Arrays.equals(system, nameBytes))) {
+			throw RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, "Reserved column name: " + name);
+		}
 		var start = System.nanoTime();
 		actionLogger.logAction("CreateColumn", start, name, null, schema, null, null, null, null);
 		ops.beginOp();

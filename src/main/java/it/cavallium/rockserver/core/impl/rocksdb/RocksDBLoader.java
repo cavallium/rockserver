@@ -1111,6 +1111,42 @@ public class RocksDBLoader {
         return walTtlSeconds;
     }
 
+    /**
+     * With both WAL archive settings at 0, RocksDB no longer archives WAL files, but it also never looks at an
+     * archive left by an earlier configuration (the CDC history kept up to 24 h / 100 GiB by default): delete it.
+     * Nothing reads archived WAL files; recovery only uses the live ones.
+     */
+    static void deleteUnusedWalArchive(Path walDir, GlobalDatabaseConfig globalConfig, Logger logger)
+            throws GestaltException, IOException {
+        if (resolveWalTtlSeconds(globalConfig) != 0 || resolveWalSizeLimitMb(globalConfig) != 0) {
+            return;
+        }
+        Path archive = walDir.resolve("archive");
+        if (!Files.isDirectory(archive)) {
+            return;
+        }
+        long files = 0;
+        long bytes = 0;
+        try (var entries = Files.list(archive)) {
+            for (Path file : (Iterable<Path>) entries::iterator) {
+                if (Files.isRegularFile(file) && file.getFileName().toString().endsWith(".log")) {
+                    bytes += Files.size(file);
+                    Files.delete(file);
+                    files++;
+                }
+            }
+        }
+        try (var remaining = Files.list(archive)) {
+            if (remaining.findAny().isEmpty()) {
+                Files.delete(archive);
+            }
+        }
+        if (files > 0) {
+            logger.info("Deleted {} archived WAL files ({} bytes) from {}: the WAL archive is disabled",
+                    files, bytes, archive);
+        }
+    }
+
     public static long resolveWalSizeLimitMb(GlobalDatabaseConfig globalConfig) throws GestaltException {
         long walSizeLimitMb = Objects.requireNonNullElse(
                 globalConfig.walSizeLimitMb(), DEFAULT_WAL_SIZE_LIMIT_MB);
@@ -1173,6 +1209,7 @@ public class RocksDBLoader {
             if (walPath.isPresent() && Files.notExists(walPath.get())) {
                 Files.createDirectories(walPath.get());
             }
+            deleteUnusedWalArchive(walPath.orElse(definitiveDbPath), databaseOptions.global(), logger);
             if (logPath.isPresent() && Files.notExists(logPath.get())) {
                 Files.createDirectories(logPath.get());
             }

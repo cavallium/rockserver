@@ -111,13 +111,11 @@ class GrpcServerDeadlineErrorTest {
 						backend.rollbackContextDeadline.get());
 				api.closeFailedUpdate(12L);
 				api.closeIterator(13L);
-				api.cdcCommit("protected", 14L);
 			}
 		}
 		assertTrue(backend.rollback.get());
 		assertEquals(12L, backend.closedUpdate.get());
 		assertEquals(13L, backend.closedIterator.get());
-		assertEquals(14L, backend.committedCdcSequence.get());
 	}
 
 	@Test
@@ -131,7 +129,6 @@ class GrpcServerDeadlineErrorTest {
 			try {
 				for (var profile : List.of(
 						it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.CONTROL,
-						it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.CDC,
 						it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.PHYSICAL_MAINTENANCE)) {
 					var request = it.cavallium.rockserver.core.common.api.proto.PutRequest.newBuilder()
 							.setColumnId(1L)
@@ -516,12 +513,7 @@ class GrpcServerDeadlineErrorTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-};
+			return new RocksDBAsyncAPI() {};
 		}
 
 		@Override
@@ -538,11 +530,6 @@ class GrpcServerDeadlineErrorTest {
 
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {};
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
@@ -602,12 +589,7 @@ class GrpcServerDeadlineErrorTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-};
+			return new RocksDBAsyncAPI() {};
 		}
 
 		@Override
@@ -627,11 +609,6 @@ class GrpcServerDeadlineErrorTest {
 		private final CountDownLatch release = new CountDownLatch(1);
 		private final CountDownLatch finished = new CountDownLatch(1);
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
@@ -688,11 +665,6 @@ class GrpcServerDeadlineErrorTest {
 
 		private final AtomicLong observedTimeoutMs = new AtomicLong(-1);
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
@@ -739,11 +711,6 @@ class GrpcServerDeadlineErrorTest {
 		private final CountDownLatch cancelObserved = new CountDownLatch(1);
 		private final AtomicLong observedTimeoutMs = new AtomicLong(-1);
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
@@ -794,7 +761,6 @@ class GrpcServerDeadlineErrorTest {
 		private final AtomicLong rollbackContextDeadline = new AtomicLong(-1L);
 		private final AtomicLong closedUpdate = new AtomicLong(-1L);
 		private final AtomicLong closedIterator = new AtomicLong(-1L);
-		private final AtomicLong committedCdcSequence = new AtomicLong(-1L);
 
 		@Override
 		public URI getUrl() {
@@ -820,22 +786,12 @@ class GrpcServerDeadlineErrorTest {
 				public void closeIterator(long iteratorId) {
 					closedIterator.set(iteratorId);
 				}
-
-				@Override
-				public void cdcCommit(String id, long seq) {
-					committedCdcSequence.set(seq);
-				}
 			};
 		}
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-};
+			return new RocksDBAsyncAPI() {};
 		}
 
 		@Override
@@ -879,12 +835,7 @@ class GrpcServerDeadlineErrorTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-};
+			return new RocksDBAsyncAPI() {};
 		}
 
 		@Override

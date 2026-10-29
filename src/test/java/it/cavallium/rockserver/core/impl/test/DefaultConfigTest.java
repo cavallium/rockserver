@@ -24,8 +24,8 @@ class DefaultConfigTest {
 		Assertions.assertNull(def.global().fallbackColumnOptions().blockCacheName());
 		Assertions.assertFalse(def.global().fallbackColumnOptions().bloomFilter().useRibbon());
 		Assertions.assertNull(def.global().fallbackColumnOptions().bloomFilter().ribbonBloomBeforeLevel());
-		Assertions.assertEquals(86_400L, def.global().walTtlSeconds());
-		Assertions.assertEquals(102_400L, def.global().walSizeLimitMb());
+		Assertions.assertEquals(0L, def.global().walTtlSeconds());
+		Assertions.assertEquals(0L, def.global().walSizeLimitMb());
 		Assertions.assertEquals(WorkloadSettings.DEFAULT_RAW_SCAN_FILE_CONCURRENCY,
 				def.parallelism().workload().rawScanFileConcurrency());
 		Assertions.assertEquals(new DataSize("8MiB"),

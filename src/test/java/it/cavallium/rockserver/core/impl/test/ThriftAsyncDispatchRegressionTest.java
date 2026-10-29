@@ -23,7 +23,6 @@ import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
-import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.RWScheduler;
@@ -61,7 +60,6 @@ import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.transport.TSocket;
 import org.apache.thrift.transport.layered.TFramedTransport;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
 
 @Timeout(30)
 class ThriftAsyncDispatchRegressionTest {
@@ -140,22 +138,6 @@ class ThriftAsyncDispatchRegressionTest {
 				RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti.class,
 				RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch.class),
 				connection.asyncRequests);
-	}
-
-	@Test
-	void prefixlessCdcWorkUsesTheAsyncBridgeForTheDedicatedCdcLane() {
-		var connection = new TrackingConnection();
-		var api = ThriftServer.createDispatchingSyncApiForTesting(connection);
-
-		assertEquals(it.cavallium.rockserver.core.common.OperationFamily.WAL_PAGE,
-				new RocksDBAPICommand.CdcGetEarliestAvailableSequence().operationFamily());
-		assertEquals(37L, api.cdcGetEarliestAvailableSequence());
-		assertEquals(41L, api.cdcCreate("prefixless", 0L, null, false, java.util.OptionalLong.empty()));
-
-		assertTrue(connection.syncRequests.isEmpty());
-		assertEquals(List.of(
-				RocksDBAPICommand.CdcGetEarliestAvailableSequence.class,
-				RocksDBAPICommand.CdcCreate.class), connection.asyncRequests);
 	}
 
 	@Test
@@ -251,24 +233,6 @@ class ThriftAsyncDispatchRegressionTest {
 		} finally {
 			scheduler.disposeNow();
 		}
-	}
-
-	@Test
-	void cdcCommitUsesTheAsyncBridgeAndSurvivesWorkerInterruption() throws Exception {
-		var connection = new TrackingConnection();
-		connection.cdcCommitFuture = new CompletableFuture<>();
-		var api = ThriftServer.createDispatchingSyncApiForTesting(connection);
-
-		var interrupted = runInterrupted(
-				() -> api.cdcCommit("progress", 42L), connection.cdcCommitRequested);
-
-		assertInstanceOf(RocksDBException.class, interrupted.failure());
-		assertTrue(interrupted.interruptRestored());
-		assertFalse(connection.cdcCommitFuture.isCancelled(),
-				"an interrupted CDC checkpoint must remain live after the Thrift worker returns");
-		assertEquals(List.of(RocksDBAPICommand.CdcCommit.class), connection.asyncRequests);
-		connection.cdcCommitFuture.complete(null);
-		connection.cdcCommitFuture.get(1, SECONDS);
 	}
 
 	@Test
@@ -583,12 +547,7 @@ class ThriftAsyncDispatchRegressionTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-};
+			return new RocksDBAsyncAPI() {};
 		}
 
 		@Override
@@ -627,12 +586,7 @@ class ThriftAsyncDispatchRegressionTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
-			return new RocksDBAsyncAPI() {
-				@Override
-				public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-					return Mono.error(new UnsupportedOperationException());
-				}
-			};
+			return new RocksDBAsyncAPI() {};
 		}
 
 		@Override public void close() {}
@@ -656,12 +610,10 @@ class ThriftAsyncDispatchRegressionTest {
 		private final List<Long> closedIteratorIds = new CopyOnWriteArrayList<>();
 		private final CountDownLatch openIteratorRequested = new CountDownLatch(1);
 		private final CountDownLatch closeIteratorRequested = new CountDownLatch(1);
-		private final CountDownLatch cdcCommitRequested = new CountDownLatch(1);
 		private final AtomicBoolean openIteratorRunning = new AtomicBoolean();
 		private final AtomicLong lastApiContextDeadline = new AtomicLong(-1L);
 		private final CompletableFuture<Long> openIteratorFuture = new CompletableFuture<>();
 		private volatile CompletableFuture<Void> closeIteratorFuture = CompletableFuture.completedFuture(null);
-		private volatile CompletableFuture<Void> cdcCommitFuture = CompletableFuture.completedFuture(null);
 		private volatile Buf pointReadResult;
 
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
@@ -679,11 +631,6 @@ class ThriftAsyncDispatchRegressionTest {
 		};
 
 		private final RocksDBAsyncAPI asyncApi = new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-
 			@Override
 			@SuppressWarnings("unchecked")
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
@@ -699,17 +646,10 @@ class ThriftAsyncDispatchRegressionTest {
 							CompletableFuture.completedFuture(List.of(false));
 					case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch _ ->
 							CompletableFuture.completedFuture(null);
-					case RocksDBAPICommand.CdcGetEarliestAvailableSequence _ ->
-							CompletableFuture.completedFuture(37L);
-					case RocksDBAPICommand.CdcCreate _ -> CompletableFuture.completedFuture(41L);
 					case RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate _ ->
 							CompletableFuture.completedFuture(null);
 					case RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction _ ->
 							CompletableFuture.completedFuture(true);
-					case RocksDBAPICommand.CdcCommit _ -> {
-						cdcCommitRequested.countDown();
-						yield cdcCommitFuture;
-					}
 					case RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator _ -> {
 						openIteratorRequested.countDown();
 						yield openIteratorFuture;

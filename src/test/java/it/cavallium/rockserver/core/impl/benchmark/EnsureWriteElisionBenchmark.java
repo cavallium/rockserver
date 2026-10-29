@@ -72,7 +72,6 @@ public final class EnsureWriteElisionBenchmark {
 			var api = connection.getSyncApi(RequestContext.batch());
 			hotColumn = api.createColumn("hot", schema());
 			coldColumn = api.createColumn("cold", schema());
-			api.cdcCreate("ensure-benchmark-hot", null, List.of(hotColumn), null, java.util.OptionalLong.empty());
 
 			api.putMulti(0, hotColumn, keys, oldValues, RequestType.ensure());
 			long hotStart = System.nanoTime();
@@ -80,11 +79,6 @@ public final class EnsureWriteElisionBenchmark {
 				api.putMulti(0, hotColumn, keys, oldValues, RequestType.ensure());
 			}
 			hotRate = rate((long) entries * hotRounds, System.nanoTime() - hotStart);
-			long hotEvents = cdcEventCount(api, "ensure-benchmark-hot");
-			if (hotEvents != entries) {
-				throw new IllegalStateException("hot equal batches published " + hotEvents
-						+ " CDC events instead of " + entries);
-			}
 
 			api.putMulti(0, coldColumn, keys, oldValues, RequestType.none());
 			api.flush();
@@ -105,7 +99,6 @@ public final class EnsureWriteElisionBenchmark {
 			embedded.setWriteElisionMultiGetObserverForTesting(
 					(keysInCall, bytes) -> probeCalls.add(new ProbeCall(keysInCall, bytes)));
 			var api = connection.getSyncApi(RequestContext.batch());
-			api.cdcCreate("ensure-benchmark-cold", null, List.of(coldColumn), null, java.util.OptionalLong.empty());
 			if (embedded.getPendingOpsCount() != 0L) {
 				throw new IllegalStateException("benchmark started with pending work");
 			}
@@ -132,11 +125,6 @@ public final class EnsureWriteElisionBenchmark {
 					|| elided != 0.0) {
 				throw new IllegalStateException("cold distinct probe decisions were unexpected: incomplete="
 						+ coldIncomplete + " different=" + coldDifferent + " notFound=" + coldNotFound + " elided=" + elided);
-			}
-			long coldEvents = cdcEventCount(api, "ensure-benchmark-cold");
-			if (coldEvents != entries) {
-				throw new IllegalStateException("cold distinct batch did not retain ordinary Put CDC semantics: "
-						+ coldEvents);
 			}
 			assertValue(newValues.getFirst(), api.get(0, coldColumn, keys.getFirst(), RequestType.current()));
 			assertValue(newValues.getLast(), api.get(0, coldColumn, keys.getLast(), RequestType.current()));
@@ -173,12 +161,6 @@ public final class EnsureWriteElisionBenchmark {
 
 	private static ColumnSchema schema() {
 		return ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true);
-	}
-
-	private static long cdcEventCount(RocksDBSyncAPI api, String subscription) {
-		try (var events = api.cdcPoll(subscription, null, 100_000)) {
-			return events.count();
-		}
 	}
 
 	private static double rate(long entries, long elapsedNanos) {

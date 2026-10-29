@@ -72,7 +72,7 @@ class RocksDBWalMetricsTest {
 	}
 
 	@Test
-	void exportsWalVisibilityWithoutChangingCdcReadableArchives(@TempDir Path walDirectory)
+	void exportsWalVisibilityWithoutChangingArchives(@TempDir Path walDirectory)
 			throws Exception {
 		var now = Instant.parse("2026-07-22T12:00:00Z");
 		var livePath = walDirectory.resolve("000003.log");
@@ -106,7 +106,7 @@ class RocksDBWalMetricsTest {
 			assertEquals(123.0d, gauge(registry, MIN_LOG_NUMBER_TO_KEEP_METRIC));
 			assertEquals((double) LIVE_WAL_LIMIT, gauge(registry, CONFIGURED_LIVE_LIMIT_METRIC));
 			assertArrayEquals(archivedContents, Files.readAllBytes(archivedPath),
-					"metrics collection must not purge or rewrite archived WALs used by CDC");
+					"metrics collection must not purge or rewrite archived WALs");
 		}
 	}
 

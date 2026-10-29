@@ -10,7 +10,6 @@ import it.cavallium.rockserver.core.common.RawSstToken;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
-import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -47,9 +46,8 @@ import reactor.core.publisher.Flux;
  */
 public final class MixedBackfillPressureBenchmark {
 
-	static final String RESULT_SCHEMA = "rockserver-mixed-backfill-pressure-v2";
+	static final String RESULT_SCHEMA = "rockserver-mixed-backfill-pressure-v3";
 	private static final String COLUMN = "mixed-pressure";
-	private static final String CDC = "mixed-pressure-cdc";
 	private static final String MARKER = ".rockserver-mixed-pressure-benchmark";
 	private static final int MAX_PRESSURED_BATCH_ACTIVE = 64;
 	private static final RWScheduler.Pool[] POOLS = RWScheduler.Pool.values();
@@ -114,7 +112,6 @@ public final class MixedBackfillPressureBenchmark {
 			long skippedRows = consumeScan(batch.scanRawResumable(reopenedColumn, 0, 1, Set.copyOf(checkpoints)),
 					new HashSet<>(), null, null);
 			if (skippedRows != 0L) throw new IllegalStateException("reopen did not skip completed SSTs: " + skippedRows);
-			batch.cdcCreate(CDC, null, List.of(reopenedColumn), false, java.util.OptionalLong.empty());
 			result = measure(reopened, reopenedColumn, options, provenance, keySpace,
 					firstRows, resumedRows, checkpoints.size());
 			awaitDrain(reopened);
@@ -135,24 +132,22 @@ public final class MixedBackfillPressureBenchmark {
 		var pressureCapWitness = exercisePressuredBatchCap(connection, options);
 		BenchmarkProcessTelemetry.enableAllocationMeasurement();
 		var stop = new AtomicBoolean();
-		var ready = new CountDownLatch(options.writers() + options.latencyReaders() + 5);
+		var ready = new CountDownLatch(options.writers() + options.latencyReaders() + 4);
 		var start = new CountDownLatch(1);
 		var backfillRows = new LongAdder();
 		var backfillBatches = new LongAdder();
 		var ingestWrites = new LongAdder();
 		var latencyReads = new LongAdder();
-		var cdcEvents = new LongAdder();
 		var maintenance = new LongAdder();
 		var pressureTransitions = new LongAdder();
 		var lastProgress = new AtomicLong();
 		var maximumGap = new AtomicLong();
-		var maximumCdcLag = new AtomicLong();
 		var maximumQueued = new AtomicInteger();
 		var maximumParked = new AtomicInteger();
 		var maximumOutstanding = new AtomicInteger();
 		var latencies = new LatencySamples(options.maximumLatencySamples());
 		var failures = Collections.synchronizedList(new ArrayList<Throwable>());
-		int threads = options.writers() + options.latencyReaders() + 5;
+		int threads = options.writers() + options.latencyReaders() + 4;
 		ExecutorService executor = Executors.newFixedThreadPool(threads,
 				Thread.ofPlatform().name("mixed-pressure-", 0).factory());
 		List<Future<?>> futures = new ArrayList<>();
@@ -201,19 +196,6 @@ public final class MixedBackfillPressureBenchmark {
 				ready.countDown(); await(start);
 				var api = connection.getSyncApi(RequestContext.batch());
 				while (!stop.get()) {
-					try (var events = api.cdcPoll(CDC, null, options.cdcBatchSize())) {
-						List<CDCEvent> page = events.toList();
-						if (!page.isEmpty()) {
-							api.cdcCommit(CDC, page.getLast().seq());
-							cdcEvents.add(page.size());
-						}
-					}
-				}
-			}));
-			futures.add(submit(executor, failures, () -> {
-				ready.countDown(); await(start);
-				var api = connection.getSyncApi(RequestContext.batch());
-				while (!stop.get()) {
 					api.flush(); maintenance.increment();
 					api.compact(); maintenance.increment();
 				}
@@ -247,7 +229,6 @@ public final class MixedBackfillPressureBenchmark {
 					long now = System.nanoTime();
 					long progress = lastProgress.get();
 					maximumGap.accumulateAndGet(Math.max(0L, now - progress), Math::max);
-					maximumCdcLag.accumulateAndGet(Math.max(0L, ingestWrites.sum() - cdcEvents.sum()), Math::max);
 					for (var pool : POOLS) {
 						long[] telemetry = poolTelemetry[pool.ordinal()];
 						BenchmarkSchedulerTelemetry.copyPoolTelemetry(connection.getScheduler(), pool, telemetry);
@@ -276,12 +257,12 @@ public final class MixedBackfillPressureBenchmark {
 			var process = BenchmarkProcessTelemetry.processSnapshot().minus(processBefore);
 			if (!failures.isEmpty()) throw rethrow(failures.getFirst());
 			awaitDrain(connection);
-			long completed = backfillBatches.sum() + ingestWrites.sum() + latencyReads.sum() + cdcEvents.sum();
+			long completed = backfillBatches.sum() + ingestWrites.sum() + latencyReads.sum();
 			long p99 = latencies.p99();
 			return new Result(options, provenance, firstRows, resumedRows, checkpoints, elapsed,
-					backfillRows.sum(), backfillBatches.sum(), ingestWrites.sum(), latencyReads.sum(), cdcEvents.sum(),
+					backfillRows.sum(), backfillBatches.sum(), ingestWrites.sum(), latencyReads.sum(),
 					maintenance.sum(), pressureTransitions.sum(), pressureCapWitness.maximumActive(),
-					pressureCapWitness.capWitnesses(), maximumGap.get(), maximumCdcLag.get(), p99,
+					pressureCapWitness.capWitnesses(), maximumGap.get(), p99,
 					completed == 0L ? 0.0d : process.cpuNanos() / (double) completed,
 					completed == 0L ? 0.0d : process.allocatedBytes() / (double) completed,
 					process.gcCollections(), process.gcMillis(), maximumQueued.get(), maximumParked.get(),
@@ -651,10 +632,8 @@ public final class MixedBackfillPressureBenchmark {
 			int writeWorkers,
 			int rawScanConcurrency,
 			int pressuredBatchMaximumActive,
-			long cdcBatchSize,
 			Duration pressurePeriod,
 			Duration maximumZeroProgressGap,
-			long maximumCdcLag,
 			Duration maximumLatencyP99,
 			int maximumLatencySamples,
 			double minimumBackfillRowsPerSecond,
@@ -670,10 +649,9 @@ public final class MixedBackfillPressureBenchmark {
 					|| pressuredBatchMaximumActive < 1
 					|| pressuredBatchMaximumActive > MAX_PRESSURED_BATCH_ACTIVE
 					|| pressuredBatchMaximumActive > (long) readWorkers + writeWorkers
-					|| cdcBatchSize < 1
 					|| pressurePeriod == null || pressurePeriod.isZero() || pressurePeriod.isNegative()
 					|| maximumZeroProgressGap == null || maximumZeroProgressGap.isZero() || maximumZeroProgressGap.isNegative()
-					|| maximumCdcLag < 1 || maximumLatencyP99 == null || maximumLatencyP99.isZero()
+					|| maximumLatencyP99 == null || maximumLatencyP99.isZero()
 					|| maximumLatencyP99.isNegative() || maximumLatencySamples < 1
 					|| !Double.isFinite(minimumBackfillRowsPerSecond) || minimumBackfillRowsPerSecond <= 0.0d
 					|| !Double.isFinite(minimumIngestWritesPerSecond) || minimumIngestWritesPerSecond <= 0.0d
@@ -696,7 +674,7 @@ public final class MixedBackfillPressureBenchmark {
 			Set<String> allowed = Set.of("root", "preload-keys", "value-bytes", "flush-every", "measure-ms",
 					"writers", "latency-readers", "read-workers", "write-workers", "raw-scan-concurrency",
 					"pressured-batch-maximum-active",
-					"cdc-batch-size", "pressure-period-ms", "maximum-zero-gap-ms", "maximum-cdc-lag",
+					"pressure-period-ms", "maximum-zero-gap-ms",
 					"maximum-latency-p99-ms", "maximum-latency-samples", "minimum-backfill-rows-per-second",
 					"minimum-ingest-writes-per-second", "expected-git-head", "expected-production-sha256");
 			for (String key : values.keySet()) if (!allowed.contains(key)) throw new IllegalArgumentException("Unknown option --" + key);
@@ -706,9 +684,9 @@ public final class MixedBackfillPressureBenchmark {
 					integer(values, "writers", 2), integer(values, "latency-readers", 2), integer(values, "read-workers", 8),
 					integer(values, "write-workers", 8), integer(values, "raw-scan-concurrency", 4),
 					integer(values, "pressured-batch-maximum-active", 1),
-					longValue(values, "cdc-batch-size", 8_192), Duration.ofMillis(longValue(values, "pressure-period-ms", 100)),
+					Duration.ofMillis(longValue(values, "pressure-period-ms", 100)),
 					Duration.ofMillis(longValue(values, "maximum-zero-gap-ms", 2_000)),
-					longValue(values, "maximum-cdc-lag", 100_000), Duration.ofMillis(longValue(values, "maximum-latency-p99-ms", 5_000)),
+					Duration.ofMillis(longValue(values, "maximum-latency-p99-ms", 5_000)),
 					integer(values, "maximum-latency-samples", 100_000),
 					doubleValue(values, "minimum-backfill-rows-per-second", 100.0d),
 					doubleValue(values, "minimum-ingest-writes-per-second", 100.0d),
@@ -732,13 +710,11 @@ public final class MixedBackfillPressureBenchmark {
 			long backfillBatches,
 			long ingestWrites,
 			long latencyReads,
-			long cdcEvents,
 			long maintenanceOperations,
 			long pressureTransitions,
 			int maximumPressuredBatchActive,
 			long pressuredBatchCapWitnesses,
 			long maximumZeroProgressGapNanos,
-			long maximumCdcLag,
 			long latencyP99Nanos,
 			double cpuNanosPerUsefulOperation,
 			double allocatedBytesPerUsefulOperation,
@@ -752,9 +728,9 @@ public final class MixedBackfillPressureBenchmark {
 			Path output) {
 
 		Result withNativeLeaks(long leaks) { return new Result(options, provenance, cancelledRows, resumedRows, durableCheckpoints,
-				elapsedNanos, backfillRows, backfillBatches, ingestWrites, latencyReads, cdcEvents,
+				elapsedNanos, backfillRows, backfillBatches, ingestWrites, latencyReads,
 				maintenanceOperations, pressureTransitions, maximumPressuredBatchActive,
-				pressuredBatchCapWitnesses, maximumZeroProgressGapNanos, maximumCdcLag,
+				pressuredBatchCapWitnesses, maximumZeroProgressGapNanos,
 				latencyP99Nanos, cpuNanosPerUsefulOperation, allocatedBytesPerUsefulOperation,
 				gcCollections, gcMillis, maximumQueued, maximumParked, maximumOutstanding, peaks, leaks, output); }
 
@@ -765,11 +741,11 @@ public final class MixedBackfillPressureBenchmark {
 					|| elapsedNanos <= 0L || backfillRows <= 0L || backfillBatches <= 0L || ingestWrites <= 0L
 					|| backfillRows / seconds < options.minimumBackfillRowsPerSecond()
 					|| ingestWrites / seconds < options.minimumIngestWritesPerSecond()
-					|| latencyReads <= 0L || cdcEvents <= 0L || maintenanceOperations <= 0L || pressureTransitions < 2L
+					|| latencyReads <= 0L || maintenanceOperations <= 0L || pressureTransitions < 2L
 					|| maximumPressuredBatchActive != options.pressuredBatchMaximumActive()
 					|| pressuredBatchCapWitnesses <= 0L
 					|| maximumZeroProgressGapNanos > options.maximumZeroProgressGap().toNanos()
-					|| maximumCdcLag > options.maximumCdcLag() || latencyP99Nanos <= 0L
+					|| latencyP99Nanos <= 0L
 					|| latencyP99Nanos > options.maximumLatencyP99().toNanos()
 					|| !Double.isFinite(cpuNanosPerUsefulOperation) || cpuNanosPerUsefulOperation <= 0.0d
 					|| !Double.isFinite(allocatedBytesPerUsefulOperation) || allocatedBytesPerUsefulOperation <= 0.0d
@@ -802,11 +778,11 @@ public final class MixedBackfillPressureBenchmark {
 					+ "backfill-rows-per-second=" + (backfillRows * 1_000_000_000.0d / elapsedNanos) + '\n'
 					+ "backfill-batches=" + backfillBatches + '\n' + "ingest-writes=" + ingestWrites + '\n'
 					+ "ingest-writes-per-second=" + (ingestWrites * 1_000_000_000.0d / elapsedNanos) + '\n'
-					+ "latency-reads=" + latencyReads + '\n' + "cdc-events=" + cdcEvents + '\n'
+					+ "latency-reads=" + latencyReads + '\n'
 					+ "maintenance-operations=" + maintenanceOperations + '\n'
 					+ "pressure-transitions=" + pressureTransitions + '\n'
 					+ "maximum-zero-progress-gap-nanos=" + maximumZeroProgressGapNanos + '\n'
-					+ "maximum-cdc-lag=" + maximumCdcLag + '\n' + "latency-p99-nanos=" + latencyP99Nanos + '\n'
+					+ "latency-p99-nanos=" + latencyP99Nanos + '\n'
 					+ "cpu-nanos-per-useful-operation=" + cpuNanosPerUsefulOperation + '\n'
 					+ "allocated-bytes-per-useful-operation=" + allocatedBytesPerUsefulOperation + '\n'
 					+ "gc-collections=" + gcCollections + '\n' + "gc-millis=" + gcMillis + '\n'
@@ -824,7 +800,7 @@ public final class MixedBackfillPressureBenchmark {
 					+ "- Pressured BATCH cap / observed peak / witnesses: `"
 					+ options.pressuredBatchMaximumActive() + " / " + maximumPressuredBatchActive + " / "
 					+ pressuredBatchCapWitnesses + "`\n"
-					+ "- Ingest / CDC: `" + ingestWrites + "` / `" + cdcEvents + "`\n"
+					+ "- Ingest: `" + ingestWrites + "`\n"
 					+ "- LATENCY p99: `" + String.format(Locale.ROOT, "%.3f", latencyP99Nanos / 1_000_000.0d) + " ms`\n"
 					+ "- Maximum zero-progress gap: `" + String.format(Locale.ROOT, "%.3f", maximumZeroProgressGapNanos / 1_000_000.0d) + " ms`\n"
 					+ "- Checkpoint/resume rows: `" + cancelledRows + " + " + resumedRows + "`\n"

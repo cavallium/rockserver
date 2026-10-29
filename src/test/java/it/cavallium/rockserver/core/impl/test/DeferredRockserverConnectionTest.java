@@ -263,15 +263,14 @@ class DeferredRockserverConnectionTest {
 	}
 
 	@Test
-	void connectionWaitConsumesFiniteSingleStreamAndCdcBudgets() throws Exception {
-		for (int operation = 0; operation < 3; operation++) {
+	void connectionWaitConsumesFiniteSingleAndStreamBudgets() throws Exception {
+		for (int operation = 0; operation < 2; operation++) {
 			var clock = new AtomicLong();
 			var client = client();
 			var api = mock(RocksDBAsyncAPI.class);
 			when(api.requestAsync(any())).thenAnswer(invocation -> invocation.getArgument(0)
 					instanceof it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream<?>
 					? Flux.empty() : CompletableFuture.completedFuture(11L));
-			when(api.cdcPollBatchAsync(anyString(), any(), anyLong())).thenReturn(Mono.empty());
 			when(client.getAsyncApi(any())).thenReturn(api);
 			try (var deferred = deferred(URL, () -> {
 				clock.set(Duration.ofMillis(750).toNanos());
@@ -285,8 +284,8 @@ class DeferredRockserverConnectionTest {
 	}
 
 	@Test
-	void expiredSingleStreamAndCdcBudgetsDoNotDispatch() throws Exception {
-		for (int operation = 0; operation < 3; operation++) {
+	void expiredSingleAndStreamBudgetsDoNotDispatch() throws Exception {
+		for (int operation = 0; operation < 2; operation++) {
 			int selectedOperation = operation;
 			var clock = new AtomicLong();
 			var client = client();
@@ -308,7 +307,6 @@ class DeferredRockserverConnectionTest {
 			case 0 -> api.getColumnIdAsync("column");
 			case 1 -> Flux.from(api.requestAsync(new it.cavallium.rockserver.core.common.RocksDBAPICommand
 					.RocksDBAPICommandStream.ScanRaw(1, 0, 1))).collectList().toFuture();
-			case 2 -> api.cdcPollBatchAsync("cdc", null, 1).toFuture();
 			default -> throw new AssertionError(operation);
 		};
 	}

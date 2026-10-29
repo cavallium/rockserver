@@ -17,7 +17,6 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
-import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.config.WorkloadSettings;
 import it.cavallium.rockserver.core.impl.RWScheduler;
@@ -44,7 +43,7 @@ class WorkloadProfileLifecycleIntegrationTest {
 	Path tempDir;
 
 	@Test
-	void sevenProfilesRemainBoundedAndDrainAcrossPressureAndRecovery() throws Exception {
+	void everyProfileRemainsBoundedAndDrainsAcrossPressureAndRecovery() throws Exception {
 		var registry = new SimpleMeterRegistry();
 		var settings = WorkloadSettings.resolve(ConfigParser.parse(writeConfig("scheduler")));
 		var scheduler = new RWScheduler(settings, "profile-lifecycle", registry, "profile-lifecycle");
@@ -80,7 +79,6 @@ class WorkloadProfileLifecycleIntegrationTest {
 
 			long columnId = batch.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
-			batch.cdcCreate("lifecycle", null, null, null, java.util.OptionalLong.empty());
 			ingest.put(0, columnId, key(1), value(1), RequestType.none());
 			assertEquals(value(1), latency.get(0, columnId, key(1), RequestType.current()));
 			assertEquals(1L, analytical.reduceRange(0,
@@ -95,14 +93,6 @@ class WorkloadProfileLifecycleIntegrationTest {
 			long iteratorId = batch.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 5_000));
 			batch.closeIterator(iteratorId);
 
-			List<CDCEvent> events;
-			try (var poll = batch.cdcPoll("lifecycle", null, 16)) {
-				events = poll.toList();
-			}
-			if (!events.isEmpty()) {
-				batch.cdcCommit("lifecycle", events.getLast().seq());
-			}
-			batch.cdcDelete("lifecycle");
 			batch.flush();
 
 			assertTrue(awaitCondition(() -> embeddedResourcesDrained(connection)),
@@ -116,7 +106,7 @@ class WorkloadProfileLifecycleIntegrationTest {
 		var releaseBatch = new CountDownLatch(1);
 		var analyticalStarted = new CountDownLatch(1);
 		var releaseAnalytical = new CountDownLatch(1);
-		var reservedDone = new CountDownLatch(3);
+		var reservedDone = new CountDownLatch(2);
 		var batchBacklogDone = new CountDownLatch(2);
 		var order = Collections.synchronizedList(new ArrayList<String>());
 		var batch = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
@@ -150,20 +140,16 @@ class WorkloadProfileLifecycleIntegrationTest {
 					.execute(() -> record("latency", order, reservedDone));
 			scheduler.executor(RequestContext.ingest(), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("ingest", order, reservedDone));
-			scheduler.executor(WorkloadProfile.CDC,
-					OperationFamily.WAL_PAGE,
-					Long.MAX_VALUE)
-					.execute(() -> record("cdc", order, reservedDone));
 
 			releaseAnalytical.countDown();
 			assertTrue(reservedDone.await(5, SECONDS),
-					"LATENCY, INGEST, and CDC reservations did not recover borrowed capacity");
-			List<String> firstThree;
+					"LATENCY and INGEST reservations did not recover borrowed capacity");
+			List<String> firstTwo;
 			synchronized (order) {
-				firstThree = List.copyOf(order.subList(0, 3));
+				firstTwo = List.copyOf(order.subList(0, 2));
 			}
-			assertEquals(new HashSet<>(List.of("latency", "ingest", "cdc")),
-					new HashSet<>(firstThree),
+			assertEquals(new HashSet<>(List.of("latency", "ingest")),
+					new HashSet<>(firstTwo),
 					"reserved profiles must run before queued work borrows the reclaimed slot");
 		} finally {
 			releaseAnalytical.countDown();
@@ -179,7 +165,7 @@ class WorkloadProfileLifecycleIntegrationTest {
 		var releaseSecondBatch = new CountDownLatch(1);
 		var secondBatchFinished = new CountDownLatch(1);
 		var recoveredBatchDone = new CountDownLatch(1);
-		var dataProgress = new CountDownLatch(4);
+		var dataProgress = new CountDownLatch(3);
 		var controlDone = new CountDownLatch(1);
 		var physicalDone = new CountDownLatch(1);
 		var batch = scheduler.executor(RequestContext.batch(), OperationFamily.MUTATION);
@@ -205,10 +191,6 @@ class WorkloadProfileLifecycleIntegrationTest {
 					.execute(dataProgress::countDown);
 			scheduler.executor(RequestContext.ingest(), OperationFamily.MUTATION)
 					.execute(dataProgress::countDown);
-			scheduler.executor(WorkloadProfile.CDC,
-					OperationFamily.WAL_PAGE,
-					Long.MAX_VALUE)
-					.execute(dataProgress::countDown);
 			scheduler.executor(RequestContext.analytical(), OperationFamily.FULL_SCAN_AGGREGATE)
 					.execute(dataProgress::countDown);
 			scheduler.executor(WorkloadProfile.CONTROL,
@@ -217,7 +199,7 @@ class WorkloadProfileLifecycleIntegrationTest {
 					.execute(controlDone::countDown);
 
 			assertTrue(dataProgress.await(5, SECONDS),
-					"LATENCY, INGEST, CDC, and ANALYTICAL must progress during pressure");
+					"LATENCY, INGEST, and ANALYTICAL must progress during pressure");
 			assertTrue(controlDone.await(2, SECONDS),
 					"CONTROL must complete independently of pressured data and physical work");
 			assertFalse(physicalDone.await(100, MILLISECONDS),
@@ -253,7 +235,6 @@ class WorkloadProfileLifecycleIntegrationTest {
 				database.parallelism.write = 3
 				database.parallelism.workload.latency-queue-capacity = 2
 				database.parallelism.workload.ingest-queue-capacity = 2
-				database.parallelism.workload.cdc-queue-capacity = 2
 				database.parallelism.workload.analytical-queue-capacity = 2
 				database.parallelism.workload.batch-queue-capacity = 2
 				database.parallelism.workload.control-queue-capacity = 2
@@ -280,8 +261,7 @@ class WorkloadProfileLifecycleIntegrationTest {
 				&& db.getActiveRangeCursorCount() == 0
 				&& db.getRetainedRangeSnapshotCount() == 0
 				&& db.getRetainedRangePermitCount() == 0
-				&& db.getRetainedRangeWaiterCount() == 0
-				&& db.getActiveCdcPollCursorCount() == 0;
+				&& db.getRetainedRangeWaiterCount() == 0;
 	}
 
 	private static void assertSchedulerDrained(RWScheduler scheduler) throws InterruptedException {

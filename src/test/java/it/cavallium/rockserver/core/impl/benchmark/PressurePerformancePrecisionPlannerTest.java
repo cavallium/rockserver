@@ -64,14 +64,14 @@ class PressurePerformancePrecisionPlannerTest {
 		assertTrue(json.contains("\"schema\": \"rockserver-pressure-performance-precision-plan-v2\""));
 		assertTrue(json.contains("\"source_decision\": \"inconclusive\""));
 		assertTrue(json.contains("\"planning_effect\": \"exact-equality\""));
-		assertTrue(json.contains("\"stochastic_metrics\": 143"));
-		assertTrue(json.contains("\"critical_scheduling_metrics\": 54"));
+		assertTrue(json.contains("\"stochastic_metrics\": 137"));
+		assertTrue(json.contains("\"critical_scheduling_metrics\": 48"));
 		assertTrue(json.contains("\"critical_beta_budget\": 0.03"));
 		assertTrue(json.contains("\"used_for_decision\":false"));
 		assertTrue(json.contains("\"equal\":true"));
 		assertTrue(json.contains("scheduler.cpu_nanos_per_attempt"));
 		assertTrue(json.contains("\"critical\":true"));
-		assertEquals(143L, json.lines().filter(line -> line.contains("\"suite\":")).count());
+		assertEquals(137L, json.lines().filter(line -> line.contains("\"suite\":")).count());
 		assertTrue(markdown.contains("Source decision: `INCONCLUSIVE` (unchanged)"));
 		assertTrue(markdown.contains("provenance only; never used for PASS"));
 		assertTrue(next.contains("contract-version=v2.1"));

@@ -234,12 +234,7 @@ class GrpcPhysicalMaintenanceIdentityTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
-			return new RocksDBAsyncAPI() {
-
-			public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return reactor.core.publisher.Mono.error(new UnsupportedOperationException("CDC polling is not used by this test double"));
-			}
-};
+			return new RocksDBAsyncAPI() {};
 		}
 
 		@Override

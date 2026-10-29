@@ -704,7 +704,7 @@ class RWSchedulerIndexedQueueTest {
 		var scheduler = scheduler(1, 64, "indexed-drr");
 		var blockerStarted = new CountDownLatch(1);
 		var releaseBlocker = new CountDownLatch(1);
-		var completed = new CountDownLatch(33);
+		var completed = new CountDownLatch(21);
 		var order = Collections.synchronizedList(new ArrayList<WorkloadProfile>());
 		try {
 			scheduler.executor(
@@ -716,7 +716,6 @@ class RWSchedulerIndexedQueueTest {
 			assertTrue(blockerStarted.await(5, SECONDS));
 
 			enqueue(scheduler, WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, 12, order, completed);
-			enqueue(scheduler, WorkloadProfile.CDC, OperationFamily.WAL_PAGE, 12, order, completed);
 			enqueue(scheduler,
 					WorkloadProfile.ANALYTICAL,
 					OperationFamily.FULL_SCAN_AGGREGATE,
@@ -727,9 +726,8 @@ class RWSchedulerIndexedQueueTest {
 
 			releaseBlocker.countDown();
 			assertTrue(completed.await(5, SECONDS));
-			var firstRound = frequencies(order.subList(0, 11));
+			var firstRound = frequencies(order.subList(0, 7));
 			assertEquals(4, firstRound.get(WorkloadProfile.INGEST));
-			assertEquals(4, firstRound.get(WorkloadProfile.CDC));
 			assertEquals(2, firstRound.get(WorkloadProfile.ANALYTICAL));
 			assertEquals(1, firstRound.get(WorkloadProfile.BATCH));
 			assertReadPoolDrained(scheduler);
@@ -746,7 +744,7 @@ class RWSchedulerIndexedQueueTest {
 		var releaseBatch = new CountDownLatch(1);
 		var analyticalStarted = new CountDownLatch(1);
 		var releaseAnalytical = new CountDownLatch(1);
-		var reservedDone = new CountDownLatch(3);
+		var reservedDone = new CountDownLatch(2);
 		var order = Collections.synchronizedList(new ArrayList<String>());
 		try {
 			var batch = scheduler.executor(
@@ -777,18 +775,15 @@ class RWSchedulerIndexedQueueTest {
 			scheduler.executor(
 						WorkloadProfile.INGEST, OperationFamily.POINT_LOOKUP, Long.MAX_VALUE)
 					.execute(() -> record("ingest", order, reservedDone));
-			scheduler.executor(
-						WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE)
-					.execute(() -> record("cdc", order, reservedDone));
 
 			releaseAnalytical.countDown();
 			assertTrue(reservedDone.await(5, SECONDS));
-			List<String> firstThree;
+			List<String> firstTwo;
 			synchronized (order) {
-				firstThree = List.copyOf(order.subList(0, 3));
+				firstTwo = List.copyOf(order.subList(0, 2));
 			}
-			assertEquals(new HashSet<>(List.of("latency", "ingest", "cdc")),
-					new HashSet<>(firstThree));
+			assertEquals(new HashSet<>(List.of("latency", "ingest")),
+					new HashSet<>(firstTwo));
 		} finally {
 			releaseAnalytical.countDown();
 			releaseBatch.countDown();

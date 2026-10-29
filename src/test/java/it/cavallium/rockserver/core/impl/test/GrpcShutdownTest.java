@@ -255,7 +255,6 @@ class GrpcShutdownTest {
 	void remoteCleanupBypassesASaturatedWriteLane() throws Exception {
 		var client = newClient();
 		var api = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcCreate("progress", 1L, null, false, java.util.OptionalLong.empty());
 		var writeStarted = new CountDownLatch(DATA_WORKERS);
 		var releaseWrite = new CountDownLatch(1);
 		for (int i = 0; i < DATA_WORKERS; i++) {
@@ -272,17 +271,11 @@ class GrpcShutdownTest {
 			assertTrue(writeStarted.await(5, TimeUnit.SECONDS));
 			api.closeFailedUpdateAsync(Long.MAX_VALUE).get(5, TimeUnit.SECONDS);
 			assertTrue(api.closeTransactionAsync(Long.MAX_VALUE, false).get(5, TimeUnit.SECONDS));
-			var cdcCommit = api.cdcCommitAsync("progress", 42L);
-			assertThrows(TimeoutException.class, () -> cdcCommit.get(200, TimeUnit.MILLISECONDS),
-					"remote cdcCommit must remain queued as must-complete CDC mutation work");
 
 			var commit = api.closeTransactionAsync(Long.MAX_VALUE, true);
 			assertThrows(TimeoutException.class, () -> commit.get(200, TimeUnit.MILLISECONDS),
 					"remote commit=true must remain queued on the saturated write lane");
 			releaseWrite.countDown();
-			cdcCommit.get(5, TimeUnit.SECONDS);
-			assertEquals(java.util.OptionalLong.of(42L),
-					embeddedConnection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).cdcGetLastCommittedSequence("progress"));
 			commit.handle((_, _) -> null).get(5, TimeUnit.SECONDS);
 			assertTrue(commit.isCompletedExceptionally());
 		} finally {
