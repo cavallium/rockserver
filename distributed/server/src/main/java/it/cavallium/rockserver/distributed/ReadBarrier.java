@@ -11,11 +11,15 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.thirdparty.io.grpc.ConnectivityState;
 import org.apache.ratis.thirdparty.io.grpc.ManagedChannel;
 import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.jetbrains.annotations.Nullable;
@@ -36,6 +40,8 @@ import org.jetbrains.annotations.Nullable;
  *   <li>waits until the local applied index reaches {@code c}.</li>
  * </ol>
  * <p>Concurrent calls share rounds. A round costs one network round trip, no fsync.</p>
+ * <p>The returned futures complete on threads of this barrier, never on gRPC, Ratis apply or JDK timer threads,
+ * so callers may run blocking work, such as a database read, in their continuations.</p>
  */
 final class ReadBarrier implements Closeable {
 
@@ -56,6 +62,10 @@ final class ReadBarrier implements Closeable {
 	private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
 	/** Every future returned by {@link #await} and not completed yet, failed by {@link #close}. */
 	private final Set<CompletableFuture<Void>> outstanding = ConcurrentHashMap.newKeySet();
+	/** Completes the callers' futures and starts queued rounds; see {@link #execute}. */
+	private final ExecutorService executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
+			.name("rockserver-read-barrier-", 0)
+			.factory());
 
 	private final Object lock = new Object();
 	/** Waiters of the next round, whose RPCs have not been sent yet. Guarded by {@link #lock}. */
@@ -104,7 +114,9 @@ final class ReadBarrier implements Closeable {
 			round = takeNextRoundIfIdle();
 		}
 		future.whenComplete((_, _) -> outstanding.remove(future));
-		runRounds(round);
+		if (round != null) {
+			startRound(round);
+		}
 		return future;
 	}
 
@@ -117,10 +129,12 @@ final class ReadBarrier implements Closeable {
 			closed = true;
 			nextRound = new ArrayList<>();
 		}
+		// On the closing thread: the executor is about to stop.
 		for (var future : outstanding) {
 			future.completeExceptionally(new NotLeaderException("Read barrier closed"));
 		}
 		closeChannels();
+		executor.shutdown();
 	}
 
 	/** The waiters of the next round, if no round is running; the caller must then run it. */
@@ -135,30 +149,27 @@ final class ReadBarrier implements Closeable {
 		return round;
 	}
 
-	/** Runs {@code round} and then every round that queued up behind it. At most one round runs at a time. */
-	private void runRounds(@Nullable List<Waiter> round) {
-		// A loop rather than recursion: rounds that complete immediately (a single voter, or no longer leader)
-		// would otherwise nest one stack frame per round.
-		while (round != null) {
-			var waiters = round;
-			CompletableFuture<Long> outcome;
-			try {
-				outcome = confirmLeadership(waiters);
-			} catch (RuntimeException e) {
-				// Never leave roundRunning set: that would stall every later barrier.
-				outcome = CompletableFuture.failedFuture(e);
-			}
-			if (!outcome.isDone()) {
-				outcome.whenComplete((term, error) -> {
-					finish(waiters, term, error);
-					runRounds(afterRound());
-				});
-				return;
-			}
-			// Already complete: whenComplete runs right here.
-			outcome.whenComplete((term, error) -> finish(waiters, term, error));
-			round = afterRound();
+	/**
+	 * Sends the RPCs of a round now and, when it ends, completes its waiters and starts the round that queued up
+	 * behind it. At most one round runs at a time.
+	 */
+	private void startRound(List<Waiter> waiters) {
+		CompletableFuture<Long> outcome;
+		try {
+			outcome = confirmLeadership(waiters);
+		} catch (RuntimeException e) {
+			// Never leave roundRunning set: that would stall every later barrier.
+			outcome = CompletableFuture.failedFuture(e);
 		}
+		// A round ends on a gRPC thread inside Votes' monitor, on the JDK timeout thread or, for a single voter,
+		// on the caller's thread: none of them should go on to run the next round.
+		outcome.whenCompleteAsync((term, error) -> {
+			finish(waiters, term, error);
+			var next = afterRound();
+			if (next != null) {
+				startRound(next);
+			}
+		}, this::execute);
 	}
 
 	private @Nullable List<Waiter> afterRound() {
@@ -168,17 +179,31 @@ final class ReadBarrier implements Closeable {
 		}
 	}
 
-	/** Completes each waiter once the applied index reaches its commit index, or fails it. */
+	/**
+	 * Completes each waiter once the applied index reaches its commit index, or fails it. Each waiter is completed
+	 * by a task of its own, so that callers' continuations run in parallel and never on the Ratis apply thread.
+	 */
 	private void finish(List<Waiter> waiters, @Nullable Long confirmedTerm, @Nullable Throwable error) {
 		for (var waiter : waiters) {
 			if (error != null) {
-				waiter.future.completeExceptionally(error);
+				execute(() -> waiter.future.completeExceptionally(error));
 			} else if (waiter.term != confirmedTerm) {
-				waiter.future.completeExceptionally(new NotLeaderException(
-						"Leadership of term " + waiter.term + " ended, current term " + confirmedTerm));
+				var notLeader = new NotLeaderException(
+						"Leadership of term " + waiter.term + " ended, current term " + confirmedTerm);
+				execute(() -> waiter.future.completeExceptionally(notLeader));
 			} else {
-				applied.await(waiter.commitIndex).thenRun(() -> waiter.future.complete(null));
+				applied.await(waiter.commitIndex).thenRunAsync(() -> waiter.future.complete(null), this::execute);
 			}
+		}
+	}
+
+	/** Runs {@code task} on this barrier's executor, or right here once it is closed. */
+	private void execute(Runnable task) {
+		try {
+			executor.execute(task);
+		} catch (RejectedExecutionException e) {
+			// Closed: every caller's future has already failed, so the task only finishes the bookkeeping.
+			task.run();
 		}
 	}
 
@@ -297,6 +322,12 @@ final class ReadBarrier implements Closeable {
 		if (closed) {
 			// close() may have swept the channels before this one was added.
 			closeChannels();
+		}
+		// While a peer is down, gRPC waits longer and longer (up to two minutes) between attempts to reach it, and
+		// fails calls at once in between. A round must reach a peer as soon as it is back, so each round that finds
+		// the channel failed makes a fresh attempt: at most one connection attempt per peer and round.
+		if (channel.getState(false) == ConnectivityState.TRANSIENT_FAILURE) {
+			channel.resetConnectBackoff();
 		}
 		return channel;
 	}

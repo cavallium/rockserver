@@ -58,7 +58,10 @@ final class TermService {
 	/** Asks the server behind {@code channel} for its current term in {@code groupId}. */
 	static CompletableFuture<Long> currentTerm(Channel channel, RaftGroupId groupId, Duration timeout) {
 		var result = new CompletableFuture<Long>();
-		var options = CallOptions.DEFAULT.withDeadlineAfter(timeout.toNanos(), TimeUnit.NANOSECONDS);
+		// Wait for a connection being (re)established, within the deadline, rather than failing at once.
+		var options = CallOptions.DEFAULT
+				.withDeadlineAfter(timeout.toNanos(), TimeUnit.NANOSECONDS)
+				.withWaitForReady();
 		ClientCalls.asyncUnaryCall(channel.newCall(CURRENT_TERM, options), encodeGroupId(groupId),
 				new StreamObserver<>() {
 					@Override
