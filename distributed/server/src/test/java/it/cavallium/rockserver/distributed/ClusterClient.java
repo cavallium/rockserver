@@ -1,0 +1,304 @@
+package it.cavallium.rockserver.distributed;
+
+import io.grpc.Status;
+import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.client.GrpcConnection;
+import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
+import org.jetbrains.annotations.Nullable;
+
+/**
+ * Test client for a cluster: one gRPC connection per node, with failover.
+ *
+ * <p>Each call starts on the node that last answered. On a retryable failure ({@link #isRetryable}) it moves to the
+ * next node and tries again until the retry timeout; every attempt uses the given {@link RequestContext}, so its
+ * timeout bounds a single attempt. The core client itself retries reads on {@code UNAVAILABLE} with backoff, so a
+ * read sent to a node that just died fails over only after a few seconds or its request timeout, whichever comes
+ * first: fault tests should use short request timeouts.</p>
+ *
+ * <p>Every call reports an {@link OpStatus}. A read has no effect, so it is {@code OK} or {@code FAILED}. A write is
+ * {@code OK} only when an attempt succeeded and no earlier attempt may have reached a server; it is {@code FAILED}
+ * only when no attempt may have reached a server; otherwise it is {@code UNKNOWN}, even when a later attempt
+ * succeeded, because the earlier one may still be applied after this call returns. Only a refused connection
+ * proves that a request was not delivered: any server-reported error is treated as possibly applied, since a
+ * forwarded write can fail after its leader committed it.</p>
+ *
+ * <p>Retrying a write after an ambiguous failure can apply it twice, as there is no exactly-once retry yet. That is
+ * fine for availability tests but breaks register histories, so it is a constructor option.</p>
+ */
+public final class ClusterClient implements AutoCloseable {
+
+	private static final Duration ROUND_PAUSE = Duration.ofMillis(100);
+	private static final int PROBE_TIMEOUT_MILLIS = 1_000;
+	private static final Set<RocksDBErrorType> RETRYABLE_TYPES = Set.of(RocksDBErrorType.SERVER_OVERLOADED,
+			RocksDBErrorType.UPDATE_RETRY,
+			RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+			RocksDBErrorType.COMMIT_FAILED_TRY_AGAIN);
+	private static final Set<Status.Code> RETRYABLE_CODES = Set.of(Status.Code.UNAVAILABLE,
+			Status.Code.DEADLINE_EXCEEDED,
+			Status.Code.ABORTED,
+			Status.Code.RESOURCE_EXHAUSTED);
+
+	private final List<String> nodeIds;
+	private final Map<String, HostAndPort> addresses;
+	private final Duration retryTimeout;
+	private final boolean retryAmbiguousWrites;
+	private final Map<String, GrpcConnection> connections = new ConcurrentHashMap<>();
+	private volatile String preferred;
+
+	/**
+	 * @param addresses API address of every node, in failover order
+	 * @param retryTimeout how long one call keeps retrying
+	 * @param retryAmbiguousWrites whether to retry a write after a failure that may have applied it
+	 */
+	public ClusterClient(Map<String, HostAndPort> addresses, Duration retryTimeout, boolean retryAmbiguousWrites) {
+		if (addresses.isEmpty()) {
+			throw new IllegalArgumentException("No nodes");
+		}
+		this.nodeIds = List.copyOf(addresses.keySet());
+		this.addresses = Map.copyOf(addresses);
+		this.retryTimeout = retryTimeout;
+		this.retryAmbiguousWrites = retryAmbiguousWrites;
+		this.preferred = nodeIds.getFirst();
+	}
+
+	/**
+	 * Outcome of one call.
+	 *
+	 * @param value the result of the successful attempt, null if none succeeded
+	 * @param error the failure of the last attempt, null if an attempt succeeded
+	 * @param node the node of the last attempt
+	 */
+	public record Result<T>(OpStatus status, @Nullable T value, @Nullable RuntimeException error, String node,
+			int attempts) {
+
+		/** True if an attempt succeeded, so {@link #value} is its result. */
+		public boolean acknowledged() {
+			return error == null;
+		}
+
+		public T valueOrThrow() {
+			if (error != null) {
+				throw error;
+			}
+			return value;
+		}
+	}
+
+	/** Statements of a transaction, run on the node that opened it. Re-run from scratch on every attempt. */
+	@FunctionalInterface
+	public interface TransactionBody {
+		void run(RocksDBSyncAPI api, long transactionId);
+	}
+
+	public Result<Long> createColumn(String name, ColumnSchema schema, RequestContext context) {
+		return write(context, api -> api.createColumn(name, schema));
+	}
+
+	public Result<Long> getColumnId(String name, RequestContext context) {
+		return read(context, api -> api.getColumnId(name));
+	}
+
+	public Result<Void> put(long columnId, Keys keys, Buf value, RequestContext context) {
+		return write(context, api -> api.put(0, columnId, keys, value, RequestType.none()));
+	}
+
+	public Result<Void> merge(long columnId, Keys keys, Buf value, RequestContext context) {
+		return write(context, api -> api.merge(0, columnId, keys, value, RequestType.none()));
+	}
+
+	/** The current value, null if absent. */
+	public Result<Buf> get(long columnId, Keys keys, RequestContext context) {
+		return read(context, api -> api.get(0, columnId, keys, RequestType.current()));
+	}
+
+	/**
+	 * Opens a transaction, runs {@code body} and commits, all on one node. A failure before the commit is sent
+	 * leaves the database unchanged, so it never makes the outcome ambiguous; a retryable one restarts the whole
+	 * transaction on the next node. The value is the commit result: false means a conflict, nothing applied.
+	 */
+	public Result<Boolean> transaction(RequestContext context, Duration leaseTtl, TransactionBody body) {
+		return execute(context, true, api -> {
+			long transactionId;
+			try {
+				transactionId = api.openTransaction(leaseTtl);
+			} catch (RuntimeException e) {
+				throw new NotApplied(e);
+			}
+			try {
+				body.run(api, transactionId);
+			} catch (RuntimeException e) {
+				abort(api, transactionId);
+				throw new NotApplied(e);
+			}
+			return api.closeTransaction(transactionId, true);
+		});
+	}
+
+	/** Runs an arbitrary write with failover. */
+	public <T> Result<T> write(RequestContext context, Function<RocksDBSyncAPI, T> operation) {
+		return execute(context, true, operation);
+	}
+
+	/** Runs an arbitrary read with failover. */
+	public <T> Result<T> read(RequestContext context, Function<RocksDBSyncAPI, T> operation) {
+		return execute(context, false, operation);
+	}
+
+	/** Direct access to one node, without failover. */
+	public RocksDBSyncAPI api(String nodeId, RequestContext context) {
+		return connection(nodeId).getSyncApi(context);
+	}
+
+	/** True for failures worth retrying on another node: overload, conflicts, timeouts, unreachable nodes. */
+	public static boolean isRetryable(Throwable error) {
+		if (error instanceof RocksDBException e) {
+			return RETRYABLE_TYPES.contains(e.getErrorUniqueId());
+		}
+		return RETRYABLE_CODES.contains(Status.fromThrowable(error).getCode());
+	}
+
+	@Override
+	public void close() {
+		connections.values().forEach(GrpcConnection::close);
+		connections.clear();
+	}
+
+	private <T> Result<T> execute(RequestContext context, boolean mutation, Function<RocksDBSyncAPI, T> operation) {
+		long deadline = System.nanoTime() + retryTimeout.toNanos();
+		boolean ambiguous = false;
+		int attempts = 0;
+		String node = preferred;
+		while (true) {
+			attempts++;
+			var attempt = attempt(node, context, operation);
+			if (attempt.error() == null) {
+				preferred = node;
+				var status = mutation && ambiguous ? OpStatus.UNKNOWN : OpStatus.OK;
+				return new Result<>(status, attempt.value(), null, node, attempts);
+			}
+			ambiguous |= mutation && attempt.delivered();
+			boolean retry = attempt.retryable()
+					&& (!mutation || !ambiguous || retryAmbiguousWrites)
+					&& System.nanoTime() < deadline;
+			if (!retry) {
+				var status = ambiguous ? OpStatus.UNKNOWN : OpStatus.FAILED;
+				return new Result<>(status, null, attempt.error(), node, attempts);
+			}
+			node = nextNode(node);
+			if (attempts % nodeIds.size() == 0) {
+				pauseBeforeNextRound(deadline);
+			}
+		}
+	}
+
+	/**
+	 * One attempt on one node.
+	 *
+	 * @param delivered false only if the request certainly did not reach the node, or certainly left it unchanged
+	 */
+	private record Attempt<T>(@Nullable T value, @Nullable RuntimeException error, boolean delivered,
+			boolean retryable) {}
+
+	private <T> Attempt<T> attempt(String node, RequestContext context, Function<RocksDBSyncAPI, T> operation) {
+		GrpcConnection connection;
+		try {
+			connection = connection(node);
+		} catch (RuntimeException e) {
+			// Unreachable or unresponsive node: no connection, so no request was sent. Always worth another node.
+			return new Attempt<>(null, e, false, true);
+		}
+		try {
+			return new Attempt<>(operation.apply(connection.getSyncApi(context)), null, true, false);
+		} catch (NotApplied e) {
+			return new Attempt<>(null, e.getCause(), false, isRetryable(e.getCause()));
+		} catch (RuntimeException e) {
+			return new Attempt<>(null, e, !isRefusedConnection(e), isRetryable(e));
+		}
+	}
+
+	private GrpcConnection connection(String nodeId) {
+		var address = addresses.get(nodeId);
+		if (address == null) {
+			throw new IllegalArgumentException("Unknown node " + nodeId);
+		}
+		// The constructor performs a handshake and throws if the node is down; nothing is cached then.
+		return connections.computeIfAbsent(nodeId, id -> {
+			probe(address);
+			return GrpcConnection.forHostAndPort("cluster-client-" + id, address);
+		});
+	}
+
+	/** The handshake retries a refused connection for seconds: fail fast on a node that is down instead. */
+	private static void probe(HostAndPort address) {
+		try (var socket = new Socket()) {
+			socket.connect(new InetSocketAddress(address.host(), address.port()), PROBE_TIMEOUT_MILLIS);
+		} catch (IOException e) {
+			throw new UncheckedIOException("Node unreachable at " + address, e);
+		}
+	}
+
+	private String nextNode(String node) {
+		return nodeIds.get((nodeIds.indexOf(node) + 1) % nodeIds.size());
+	}
+
+	/** Every node failed once: wait a little (an election, a restart) instead of spinning. */
+	private static void pauseBeforeNextRound(long deadlineNanos) {
+		long pause = Math.min(ROUND_PAUSE.toNanos(), deadlineNanos - System.nanoTime());
+		if (pause > 0) {
+			try {
+				Thread.sleep(Duration.ofNanos(pause));
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				throw new IllegalStateException("Interrupted while retrying", e);
+			}
+		}
+	}
+
+	/** A refused TCP connection is the only failure proving that the request never reached the node. */
+	private static boolean isRefusedConnection(Throwable error) {
+		for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+			if (cause instanceof ConnectException) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static void abort(RocksDBSyncAPI api, long transactionId) {
+		try {
+			api.closeTransaction(transactionId, false);
+		} catch (RuntimeException ignored) {
+			// The transaction dies with its node or its leadership anyway.
+		}
+	}
+
+	/** Wraps a failure that certainly left the database unchanged. */
+	private static final class NotApplied extends RuntimeException {
+		NotApplied(RuntimeException cause) {
+			super(cause);
+		}
+
+		@Override
+		public synchronized RuntimeException getCause() {
+			return (RuntimeException) super.getCause();
+		}
+	}
+}
