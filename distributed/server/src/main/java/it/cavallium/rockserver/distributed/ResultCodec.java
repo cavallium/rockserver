@@ -1,8 +1,10 @@
 package it.cavallium.rockserver.distributed;
 
 import static it.cavallium.rockserver.distributed.LogEntryCodec.writeBuf;
+import static it.cavallium.rockserver.distributed.LogEntryCodec.writeBytes;
 import static it.cavallium.rockserver.distributed.LogEntryCodec.writeNullableBuf;
 import static it.cavallium.rockserver.distributed.LogEntryCodec.writeString;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.Delta;
@@ -22,6 +24,9 @@ import org.jetbrains.annotations.Nullable;
  * <p>Layout: a tag byte for {@code Ok} or {@code Failed}. {@code Ok} is followed by its value, written as a type
  * byte and then the value's fields; {@code Failed} by the error type name and the message. Primitive encodings
  * are those of {@link LogEntryCodec}.</p>
+ *
+ * <p>A failure message is written leniently: it comes from an arbitrary exception during apply, so characters
+ * that are not valid Unicode, such as unpaired surrogates, become {@code '?'} instead of failing the reply.</p>
  */
 final class ResultCodec {
 
@@ -54,7 +59,7 @@ final class ResultCodec {
 				case ApplyResult.Failed(RocksDBErrorType type, String message) -> {
 					out.writeByte(FAILED);
 					writeString(out, type.name());
-					writeString(out, message);
+					writeBytes(out, message.getBytes(UTF_8));
 				}
 			}
 		} catch (IOException e) {
@@ -129,7 +134,8 @@ final class ResultCodec {
 					throw new IllegalArgumentException("Result lists are nested deeper than " + MAX_LIST_DEPTH);
 				}
 				int size = in.readCount(1);
-				var list = new ArrayList<>(size);
+				// Not presized: nested lists could each claim the whole input before any element is read
+				var list = new ArrayList<>();
 				for (int i = 0; i < size; i++) {
 					list.add(readValue(in, depth + 1));
 				}

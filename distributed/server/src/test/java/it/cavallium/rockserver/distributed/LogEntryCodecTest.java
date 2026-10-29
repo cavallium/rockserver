@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import it.cavallium.buffer.Buf;
@@ -248,6 +249,30 @@ class LogEntryCodecTest {
 			assertRejected(withInt(guarded, 18, size), "conflict count " + size);
 			assertRejected(withInt(guarded, 22, size), "write count " + size);
 		}
+	}
+
+	@Test
+	void rejectsNestedOversizedListsWithoutReservingMemoryForThem() {
+		var write = new DeleteMulti(1, List.of(new Keys()), RequestTypeId.NOTHING);
+		byte[] encoded = LogEntryCodec.encode(new Guarded(1, 2, new long[0], new long[0], List.of(write), false));
+		// version, tag, epoch (8), snapshot index (8), conflict count (4), write count (4), write tag,
+		// column id (8), key list size (4), key segment count (4), request type, single result
+		assertEquals(45, encoded.length);
+		int size = 1 << 22;
+		var buffer = ByteBuffer.allocate(size);
+		buffer.put(encoded, 0, 43);
+		// Each list claims as much as the bytes left allow, then the first key segment has length -1
+		buffer.putInt(22, size - 26);
+		buffer.putInt(35, (size - 39) / Integer.BYTES);
+		buffer.putInt(39, (size - 43) / Integer.BYTES);
+		while (buffer.hasRemaining()) {
+			buffer.put((byte) -1);
+		}
+		byte[] malformed = buffer.array();
+		long allocated = ResultCodecTest.allocatedBytes(
+				() -> assertRejected(malformed, "nested lists claiming the whole input"));
+		// Only the innermost key segment array may be sized from the input: at most one reference per 4 bytes
+		assertTrue(allocated < 3L * size, "Rejecting " + size + " bytes allocated " + allocated + " bytes");
 	}
 
 	@Test

@@ -330,7 +330,7 @@ final class LogEntryCodec {
 			case DELETE_MULTI -> {
 				long columnId = in.readLong();
 				int count = in.readCount(Integer.BYTES);
-				var keys = new ArrayList<Keys>(count);
+				var keys = new ArrayList<Keys>();
 				for (int i = 0; i < count; i++) {
 					keys.add(readKeys(in));
 				}
@@ -368,7 +368,9 @@ final class LogEntryCodec {
 			hashes[i] = in.readLong();
 		}
 		int writeCount = in.readCount(1);
-		var writes = new ArrayList<LogEntry.Write>(writeCount);
+		// Not presized from the untrusted count, nor is the key list of a nested write: together they could
+		// reserve several times the input size before a truncation is noticed.
+		var writes = new ArrayList<LogEntry.Write>();
 		for (int i = 0; i < writeCount; i++) {
 			writes.add(readWrite(in, in.readByte()));
 		}
@@ -404,7 +406,7 @@ final class LogEntryCodec {
 			keys.add(in.readInt());
 		}
 		int hashTypeCount = in.readCount(1);
-		var hashTypes = new ObjectArrayList<ColumnHashType>(hashTypeCount);
+		var hashTypes = new ObjectArrayList<ColumnHashType>();
 		for (int i = 0; i < hashTypeCount; i++) {
 			int ordinal = in.readByte() & 0xFF;
 			if (ordinal >= HASH_TYPES.length) {

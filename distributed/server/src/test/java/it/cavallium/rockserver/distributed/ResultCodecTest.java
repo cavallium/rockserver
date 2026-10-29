@@ -4,6 +4,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import it.cavallium.buffer.Buf;
@@ -12,6 +13,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.distributed.ApplyResult.Failed;
 import it.cavallium.rockserver.distributed.ApplyResult.Ok;
 import java.io.ByteArrayOutputStream;
+import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -81,6 +83,13 @@ class ResultCodecTest {
 	}
 
 	@Test
+	void encodesFailureMessagesThatAreNotValidUnicode() {
+		var failed = new Failed(RocksDBErrorType.INTERNAL_ERROR, "bad \uD800 surrogate \uDC00");
+		assertEquals(new Failed(RocksDBErrorType.INTERNAL_ERROR, "bad ? surrogate ?"),
+				ResultCodec.decode(ResultCodec.encode(failed)));
+	}
+
+	@Test
 	void rejectsUnsupportedValueTypesAtEncode() {
 		List<Object> unsupported = List.of(
 				1,
@@ -109,6 +118,32 @@ class ResultCodecTest {
 		assertEquals(new Ok(nestedNullListsValue(ResultCodec.MAX_LIST_DEPTH)),
 				ResultCodec.decode(nestedNullLists(ResultCodec.MAX_LIST_DEPTH)));
 		assertEquals(ApplyResult.OK_NULL, ResultCodec.decode(nestedNullLists(0)));
+	}
+
+	@Test
+	void rejectsNestedOversizedListsWithoutReservingMemoryForThem() {
+		// Every nested list claims as many elements as there are bytes left, then the first element is invalid
+		int size = 1 << 20;
+		var buffer = ByteBuffer.allocate(size);
+		buffer.put(ResultCodec.encode(ApplyResult.OK_NULL)[0]);
+		byte listType = ResultCodec.encode(new Ok(List.of()))[1];
+		for (int depth = 0; depth < ResultCodec.MAX_LIST_DEPTH; depth++) {
+			buffer.put(listType);
+			buffer.putInt(buffer.remaining() - Integer.BYTES);
+		}
+		while (buffer.hasRemaining()) {
+			buffer.put((byte) -1);
+		}
+		byte[] malformed = buffer.array();
+		long allocated = allocatedBytes(() -> assertRejected(malformed, "nested lists claiming the whole input"));
+		assertTrue(allocated < size, "Rejecting " + size + " bytes allocated " + allocated + " bytes");
+	}
+
+	static long allocatedBytes(Runnable action) {
+		var threads = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+		long before = threads.getCurrentThreadAllocatedBytes();
+		action.run();
+		return threads.getCurrentThreadAllocatedBytes() - before;
 	}
 
 	/** The encoding of {@code depth} lists nested inside each other around a null, built from a one-level encoding. */
