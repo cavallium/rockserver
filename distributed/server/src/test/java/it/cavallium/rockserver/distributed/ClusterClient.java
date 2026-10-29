@@ -141,7 +141,8 @@ public final class ClusterClient implements AutoCloseable {
 	/**
 	 * Opens a transaction, runs {@code body} and commits, all on one node. A failure before the commit is sent
 	 * leaves the database unchanged, so it never makes the outcome ambiguous; a retryable one restarts the whole
-	 * transaction on the next node. The value is the commit result: false means a conflict, nothing applied.
+	 * transaction on the next node. The value is the commit result: false means a conflict, nothing applied
+	 * (the transaction is then rolled back).
 	 */
 	public Result<Boolean> transaction(RequestContext context, Duration leaseTtl, TransactionBody body) {
 		return execute(context, true, api -> {
@@ -157,7 +158,12 @@ public final class ClusterClient implements AutoCloseable {
 				abort(api, transactionId);
 				throw new NotApplied(e);
 			}
-			return api.closeTransaction(transactionId, true);
+			boolean committed = api.closeTransaction(transactionId, true);
+			if (!committed) {
+				// A conflicting commit leaves the transaction open: release it instead of waiting for its lease.
+				abort(api, transactionId);
+			}
+			return committed;
 		});
 	}
 

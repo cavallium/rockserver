@@ -146,6 +146,11 @@ public final class ProcessCluster implements AutoCloseable {
 		return new HostAndPort(LOOPBACK, node(id).apiPort);
 	}
 
+	/** Address of the node's Raft server, reachable directly from the test JVM (e.g. to query its group info). */
+	public HostAndPort raftAddress(String id) {
+		return new HostAndPort(LOOPBACK, node(id).raftPort);
+	}
+
 	public Map<String, HostAndPort> apiAddresses() {
 		var result = new LinkedHashMap<String, HostAndPort>();
 		nodes.keySet().forEach(id -> result.put(id, apiAddress(id)));
