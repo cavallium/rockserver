@@ -185,6 +185,28 @@ class ConflictTrackerTest {
 	}
 
 	@Test
+	void entryThatFailedToAppendStopsConflictingOnceALaterEntryApplies() {
+		// Ratis rejects both appends after preAppendTransaction registered them: they are never resolved.
+		tracker.register(put(COLUMN, key("k")));
+		tracker.register(new LogEntry.CreateColumn("c", ColumnSchema.of(IntList.of(), ObjectList.of(), true)));
+		assertTrue(tracker.conflicts(transaction(20, COLUMN, key("k"))));
+		assertTrue(tracker.conflicts(transaction(20, OTHER_COLUMN, key("x"))));
+
+		var appended = tracker.register(put(OTHER_COLUMN, key("y")));
+		var later = tracker.register(put(COLUMN, key("later")));
+		tracker.resolve(appended, 21);
+
+		assertFalse(tracker.conflicts(transaction(20, COLUMN, key("k"))));
+		assertFalse(tracker.conflicts(transaction(20, OTHER_COLUMN, key("x"))));
+		assertTrue(tracker.conflicts(transaction(19, COLUMN, key("k"))), "settled as if applied at index 20");
+		assertTrue(tracker.conflicts(transaction(21, COLUMN, key("later"))), "entries registered later stay pending");
+
+		tracker.resolve(later, 22);
+		tracker.prune(22);
+		assertEquals(0, tracker.size());
+	}
+
+	@Test
 	void keyHashIsStable() {
 		// Changing these values breaks transactions in flight during a rolling upgrade of the leader.
 		assertEquals(0x6393D51C06C618DCL, ConflictTracker.keyHash(0, new Keys()));
@@ -241,8 +263,9 @@ class ConflictTrackerTest {
 
 	/**
 	 * Drives the tracker and a naive reference with the same random leader history: entries registered in log
-	 * order, applied in log order (some never get appended, so they never apply), conflict checks with snapshots
-	 * between the prune watermark and the applied index, and prunes up to some applied index.
+	 * order, applied in log order, conflict checks with snapshots between the prune watermark and the applied index,
+	 * and prunes up to some applied index. Some entries fail to append: they take no log index and never apply, and
+	 * the reference treats them as applied just before the next entry that applies.
 	 */
 	private static final class RandomHistory {
 
@@ -252,8 +275,9 @@ class ConflictTrackerTest {
 		private final Random random;
 		private final boolean withLostEntries;
 		private final ConflictTracker tracker = new ConflictTracker();
-		private final List<ReferenceEntry> log = new ArrayList<>();
+		private final List<ReferenceEntry> registered = new ArrayList<>();
 		private final ArrayDeque<ReferenceEntry> unapplied = new ArrayDeque<>();
+		private final List<ReferenceEntry> unsettledLost = new ArrayList<>();
 		private long nextIndex = 1;
 		private long appliedIndex = 0;
 		private long pruneWatermark = 0;
@@ -281,33 +305,44 @@ class ConflictTrackerTest {
 			}
 			assertTrue(conflictsSeen > 100 && nonConflictsSeen > 100,
 					"history too one-sided: " + conflictsSeen + " conflicts, " + nonConflictsSeen + " not");
-			if (!withLostEntries) {
-				while (!unapplied.isEmpty()) {
-					applyNext();
-				}
-				tracker.prune(appliedIndex);
-				assertEquals(0, tracker.size(), "everything applied and pruned");
+			// One more entry that applies settles the entries that failed to append, so nothing stays tracked.
+			register(new LogEntry.Genesis("cluster", false), false);
+			while (!unapplied.isEmpty()) {
+				applyNext();
 			}
+			tracker.prune(appliedIndex);
+			assertEquals(0, tracker.size(), "everything applied and pruned");
 		}
 
 		private void register() {
-			LogEntry entry = randomEntry();
-			var reference = new ReferenceEntry(entry, tracker.register(entry), nextIndex++);
-			log.add(reference);
-			if (withLostEntries && random.nextInt(10) == 0) {
-				reference.lost = true;
+			register(randomEntry(), withLostEntries && random.nextInt(10) == 0);
+		}
+
+		private void register(LogEntry entry, boolean lost) {
+			var reference = new ReferenceEntry(entry, tracker.register(entry), registered.size());
+			registered.add(reference);
+			if (lost) {
+				unsettledLost.add(reference);
 			} else {
+				reference.index = nextIndex++;
 				unapplied.add(reference);
 			}
 		}
 
 		private void applyNext() {
 			var next = unapplied.poll();
-			if (next != null) {
-				next.applied = true;
-				appliedIndex = next.index;
-				tracker.resolve(next.token, next.index);
+			if (next == null) {
+				return;
 			}
+			next.writtenAt = next.index;
+			appliedIndex = next.index;
+			for (var lost : unsettledLost) {
+				if (lost.sequence < next.sequence) {
+					lost.writtenAt = next.index - 1;
+				}
+			}
+			unsettledLost.removeIf(lost -> lost.writtenAt != ReferenceEntry.PENDING);
+			tracker.resolve(next.token, next.index);
 		}
 
 		private void check(int step) {
@@ -325,15 +360,14 @@ class ConflictTrackerTest {
 			}
 			var guarded = new LogEntry.Guarded(EPOCH, snapshot, columns, hashes, List.of(), false);
 
-			boolean expected = log.stream()
-					.anyMatch(entry -> entry.applied ? entry.index > snapshot && entry.touchesAny(keys)
-							: !entry.lost && entry.touchesAny(keys));
+			boolean expected = registered.stream()
+					.anyMatch(entry -> entry.writtenAt > snapshot && entry.touchesAny(keys));
 			boolean actual = tracker.conflicts(guarded);
 			String context = "step " + step + ", snapshot " + snapshot + ", keys " + keys;
 			if (expected) {
 				assertTrue(actual, "missed conflict at " + context);
-			} else if (!withLostEntries) {
-				assertFalse(actual, "false conflict without lost entries at " + context);
+			} else {
+				assertFalse(actual, "false conflict at " + context);
 			}
 			if (expected) {
 				conflictsSeen++;
@@ -416,18 +450,22 @@ class ConflictTrackerTest {
 	/** What a log entry writes, computed independently of the tracker. */
 	private static final class ReferenceEntry {
 
+		static final long PENDING = Long.MAX_VALUE;
+
 		final ConflictTracker.Token token;
-		final long index;
+		/** Registration order. */
+		final int sequence;
 		final Set<ReferenceKey> keys = new HashSet<>();
 		final Set<Long> wholeColumns = new HashSet<>();
 		final boolean allColumns;
-		boolean applied;
-		/** Never appended to the log, so never applied. */
-		boolean lost;
+		/** Log index, or 0 if the entry failed to append. */
+		long index;
+		/** Index of the write as conflict checks must see it. */
+		long writtenAt = PENDING;
 
-		ReferenceEntry(LogEntry entry, ConflictTracker.Token token, long index) {
+		ReferenceEntry(LogEntry entry, ConflictTracker.Token token, int sequence) {
 			this.token = token;
-			this.index = index;
+			this.sequence = sequence;
 			this.allColumns = entry instanceof LogEntry.CreateColumn || entry instanceof LogEntry.DeleteColumnIfExists;
 			if (entry instanceof LogEntry.DeleteColumn deleteColumn) {
 				wholeColumns.add(deleteColumn.columnId());
@@ -461,7 +499,7 @@ class ConflictTrackerTest {
 
 		@Override
 		public String toString() {
-			return "entry " + index;
+			return "entry " + sequence + " at index " + index;
 		}
 	}
 

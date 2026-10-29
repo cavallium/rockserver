@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -22,7 +23,12 @@ import org.jetbrains.annotations.Nullable;
  * snapshot) until {@link #resolve} records its log index at apply time. A {@link LogEntry.DeleteRange}, a column
  * deletion or a column creation marks the whole column as written.</p>
  *
- * <p>False conflicts are allowed (hash collisions, coarse column markers, pending entries that never resolve);
+ * <p>Ratis can still reject an entry after {@code preAppendTransaction} registered it (for example when the entry
+ * exceeds the log buffer size), without telling the state machine. Such an entry would stay pending for good, so
+ * resolving an entry also settles every entry registered before it: those precede it in the log, or were never
+ * appended and write nothing.</p>
+ *
+ * <p>False conflicts are allowed (hash collisions, coarse column markers, entries that failed to append);
  * missed conflicts are not. Thread-safe.</p>
  */
 final class ConflictTracker {
@@ -44,6 +50,8 @@ final class ConflictTracker {
 	private @Nullable Token globalWriter;
 	/** Resolved entries, oldest index first, so that {@link #prune} only visits what it can drop. */
 	private final PriorityQueue<Token> resolved = new PriorityQueue<>(Comparator.comparingLong(token -> token.index));
+	/** Pending entries in registration order, which is log order. */
+	private final ArrayDeque<Token> pending = new ArrayDeque<>();
 
 	/** Opaque handle for one registered entry. */
 	static final class Token {
@@ -126,6 +134,7 @@ final class ConflictTracker {
 		if (global) {
 			globalWriter = token;
 		}
+		pending.add(token);
 		return token;
 	}
 
@@ -170,11 +179,23 @@ final class ConflictTracker {
 	/**
 	 * Marks the entry of {@code token} as applied at {@code index}, unless a later entry wrote the same key.
 	 * Resolving a token again has no effect.
+	 *
+	 * <p>Entries registered before this one and still pending are settled as if applied at {@code index - 1}: they
+	 * are earlier in the log, or their append failed. A snapshot at or after {@code index - 1} already contains
+	 * them.</p>
 	 */
 	synchronized void resolve(Token token, long index) {
 		if (token.index != PENDING) {
 			return;
 		}
+		Token earliest;
+		do {
+			earliest = pending.removeFirst();
+			settle(earliest, earliest == token ? index : index - 1);
+		} while (earliest != token);
+	}
+
+	private void settle(Token token, long index) {
 		token.index = index;
 		if (!token.isEmpty()) {
 			resolved.add(token);
