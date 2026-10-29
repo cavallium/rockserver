@@ -27,6 +27,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.jetbrains.annotations.Nullable;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -120,6 +121,66 @@ class NodeStoreTest {
 		for (Path table : tables) {
 			Path original = tempDir.resolve("source").resolve(checkpointDir.relativize(table));
 			assertTrue(Files.isSameFile(original, table), table + " is not a hard link of " + original);
+		}
+	}
+
+	@Test
+	void checkpointLeavesOutWalsMadeObsoleteByItsFlush() throws IOException {
+		Path checkpointDir = tempDir.resolve("checkpoint");
+		String largeValue = "x".repeat(4096);
+		Expected checkpointed;
+		try (var store = NodeStore.open(tempDir.resolve("db"), null, "source")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			// About 4 MiB that only the WAL and the memtable hold until the checkpoint flushes them.
+			for (int i = 0; i < 1024; i++) {
+				put(store, column, i, largeValue);
+			}
+			setApplied(store, TermIndex.valueOf(1, 1024));
+			checkpointed = Expected.of(store, column);
+			store.checkpoint(checkpointDir);
+		}
+
+		long walBytes = 0;
+		for (Path file : regularFiles(checkpointDir)) {
+			if (file.toString().endsWith(".log")) {
+				walBytes += Files.size(file);
+			}
+		}
+		assertTrue(walBytes < 64 * 1024, "the checkpoint holds " + walBytes + " bytes of WAL");
+		Path restored = tempDir.resolve("restored");
+		NodeStore.restore(checkpointDir, restored);
+		assertMatchesCheckpoint(restored, checkpointed);
+	}
+
+	@Test
+	void checkpointAndRestoreCopyFilesThatCannotBeHardLinked() throws IOException {
+		Path otherFileSystem = otherFileSystemDir();
+		try {
+			Path checkpointDir = otherFileSystem.resolve("checkpoint");
+			Expected checkpointed = checkpointWithData(checkpointDir, 10, TermIndex.valueOf(2, 10));
+			assertTrue(regularFiles(checkpointDir).stream().anyMatch(file -> file.toString().endsWith(".sst")));
+
+			Path dbDir = tempDir.resolve("db");
+			NodeStore.restore(checkpointDir, dbDir);
+			assertMatchesCheckpoint(dbDir, checkpointed);
+		} finally {
+			NodeStore.deleteRecursively(otherFileSystem);
+		}
+	}
+
+	@Test
+	void openRefusesADatabaseDirectoryOnAnotherFileSystem() throws IOException {
+		Path otherFileSystem = otherFileSystemDir();
+		try {
+			// restore() swaps directories by renaming, which cannot move a volume mounted from another disk.
+			Path dbDir = tempDir.resolve("db");
+			Files.createDirectories(dbDir);
+			Files.createSymbolicLink(dbDir.resolve("volume"), otherFileSystem);
+
+			var failure = assertThrows(IOException.class, () -> NodeStore.open(dbDir, null, "mounted").close());
+			assertTrue(failure.getMessage().contains("file system"), failure.getMessage());
+		} finally {
+			NodeStore.deleteRecursively(otherFileSystem);
 		}
 	}
 
@@ -223,6 +284,16 @@ class NodeStoreTest {
 			assertEquals(applied, store.checkpoint(checkpointDir));
 			return Expected.of(store, column);
 		}
+	}
+
+	/** A new directory on a different file system than {@link #tempDir}; skips the test if there is none. */
+	private Path otherFileSystemDir() throws IOException {
+		Path dir = Files.createTempDirectory(Path.of("target").toAbsolutePath(), "other-file-system");
+		if (Files.getFileStore(dir).equals(Files.getFileStore(tempDir))) {
+			NodeStore.deleteRecursively(dir);
+			Assumptions.abort("The build directory and the temporary directory are on the same file system");
+		}
+		return dir;
 	}
 
 	private static void assertMatchesCheckpoint(Path dbDir, Expected expected) throws IOException {

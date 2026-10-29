@@ -13,6 +13,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileStore;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -30,6 +33,8 @@ import org.rocksdb.LiveFileMetaData;
 import org.rocksdb.LogFile;
 import org.rocksdb.RocksDB;
 import org.rocksdb.WalFileType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The node's local Rockserver database plus the replication metadata stored inside it.
@@ -42,9 +47,14 @@ import org.rocksdb.WalFileType;
  * </ul>
  *
  * <p>Every database file must live under the database directory: column volumes and a WAL directory inside it
- * (such as the default {@code ./volume} and {@code ./wal}) are supported, directories elsewhere are not.</p>
+ * (such as the default {@code ./volume} and {@code ./wal}) are supported, directories elsewhere are not. The
+ * database directory and everything under it must be on the same file system as its parent directory, because
+ * {@link #restore} swaps it by renaming: mount the node's data directory, not the database directory or a volume
+ * inside it. {@link #open} refuses other layouts.</p>
  */
 final class NodeStore implements Closeable {
+
+	private static final Logger LOG = LoggerFactory.getLogger(NodeStore.class);
 
 	static final String META_COLUMN = "__rockserver_replication";
 	static final byte APPLIED = 1;
@@ -76,6 +86,7 @@ final class NodeStore implements Closeable {
 		RestoreDirs.of(dbDir).recover();
 		var connection = new EmbeddedConnection(dbDir, name, rockserverConfig);
 		try {
+			checkSingleFileSystem(dbDir);
 			Path walDir = walDir(dbDir, connection.getEmbeddedDB());
 			// createColumn returns the existing id when the column already exists with the same schema.
 			long metaColumnId = connection.getEmbeddedDB().createColumn(META_COLUMN, META_SCHEMA);
@@ -102,6 +113,26 @@ final class NodeStore implements Closeable {
 			throw new IOException("wal-path must be inside the database directory " + dbDir + ": " + walDir);
 		}
 		return walDir;
+	}
+
+	/** Fails unless {@code dbDir} and every directory under it are on the file system of its parent. */
+	private static void checkSingleFileSystem(Path dbDir) throws IOException {
+		if (!Files.exists(dbDir)) {
+			return;
+		}
+		FileStore parentStore = Files.getFileStore(dbDir.getParent());
+		List<Path> directories;
+		try (Stream<Path> walk = Files.walk(dbDir)) {
+			// Files.isDirectory and getFileStore follow symbolic links, so a linked volume is checked too.
+			directories = walk.filter(Files::isDirectory).toList();
+		}
+		for (Path directory : directories) {
+			if (!Files.getFileStore(directory).equals(parentStore)) {
+				throw new IOException(directory + " is on a different file system than " + dbDir.getParent()
+						+ ": the database directory and its volumes must be on the file system of its parent, so that"
+						+ " a snapshot can be restored by renaming");
+			}
+		}
 	}
 
 	EmbeddedConnection connection() {
@@ -145,9 +176,10 @@ final class NodeStore implements Closeable {
 	 * <p>RocksDB's own {@code Checkpoint} refuses databases whose SST files live in column volumes
 	 * ({@code cf_paths}, which the default Rockserver config uses), so the checkpoint is built from the public
 	 * live-file APIs while file deletions are disabled: live SST and blob files are hard-linked at their path
-	 * relative to the database directory, the MANIFEST is copied up to its live size, CURRENT is written for it,
-	 * and the OPTIONS file and live WAL files are copied. It is built in {@code <target>.tmp}, fsynced and renamed
-	 * into place.</p>
+	 * relative to the database directory (copied if {@code target} is on another file system), the MANIFEST is
+	 * copied up to its live size, CURRENT is written for it, and the OPTIONS file and the WAL files that RocksDB
+	 * still needs after the flush are copied. It is built in {@code <target>.tmp}, fsynced and renamed into
+	 * place.</p>
 	 *
 	 * <p>The applied position is read before the live files are listed: without concurrent applies it equals the
 	 * checkpoint's own marker, and if that guarantee were broken it could only be lower (Raft then re-sends
@@ -183,6 +215,8 @@ final class NodeStore implements Closeable {
 		// Flushes every column family, then lists the files of the current version and the MANIFEST size.
 		RocksDB.LiveFiles live = rocksDB.getLiveFiles(true);
 		rocksDB.flushWal(true);
+		// The flush made the older WALs obsolete, but they stay in the WAL directory while deletions are disabled.
+		long minWalNumber = rocksDB.getLongProperty("rocksdb.min-log-number-to-keep");
 		List<LogFile> wals = rocksDB.getSortedWalFiles();
 
 		// The live file list has no directories. Table files are found through their metadata; a file that a
@@ -197,6 +231,7 @@ final class NodeStore implements Closeable {
 		}
 
 		String manifest = null;
+		boolean linked = true;
 		for (String liveFile : live.files) {
 			String name = relativeName(liveFile);
 			if (name.equals("CURRENT")) {
@@ -209,10 +244,14 @@ final class NodeStore implements Closeable {
 				Path source = locateDataFile(name, tablePaths, dataDirs);
 				Path link = target.resolve(dbDir.relativize(source));
 				Files.createDirectories(link.getParent());
-				Files.createLink(link, source);
+				linked &= linkOrCopy(source, link);
 			} else {
 				Files.copy(dbDir.resolve(name), target.resolve(name));
 			}
+		}
+		if (!linked) {
+			LOG.warn("Checkpoint {} copies the table files of {}: hard links between them are not possible",
+					target, dbDir);
 		}
 		if (manifest == null) {
 			throw new IOException("RocksDB listed no MANIFEST among the live files of " + dbDir);
@@ -221,7 +260,7 @@ final class NodeStore implements Closeable {
 		Path walTarget = target.resolve(dbDir.relativize(walDir));
 		Files.createDirectories(walTarget);
 		for (LogFile wal : wals) {
-			if (wal.type() == WalFileType.kAliveLogFile) {
+			if (wal.type() == WalFileType.kAliveLogFile && wal.logNumber() >= minWalNumber) {
 				String name = relativeName(wal.pathName());
 				copyPrefix(walDir.resolve(name), walTarget.resolve(name), wal.sizeFileBytes());
 			}
@@ -257,6 +296,22 @@ final class NodeStore implements Closeable {
 		return rocksDbName.startsWith("/") ? rocksDbName.substring(1) : rocksDbName;
 	}
 
+	/**
+	 * Hard-links an immutable file, or copies it when that is not possible (such as across file systems); returns
+	 * false if it copied. Copies are fsynced with the rest of the directory they are in.
+	 */
+	private static boolean linkOrCopy(Path source, Path target) throws IOException {
+		try {
+			Files.createLink(target, source);
+			return true;
+		} catch (FileAlreadyExistsException e) {
+			throw e;
+		} catch (FileSystemException | UnsupportedOperationException e) {
+			Files.copy(source, target);
+			return false;
+		}
+	}
+
 	private static void copyPrefix(Path source, Path target, long size) throws IOException {
 		try (var in = FileChannel.open(source, StandardOpenOption.READ);
 				var out = FileChannel.open(target, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
@@ -278,8 +333,9 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * Replaces the contents of {@code dbDir} (which must not be open) with the checkpoint in {@code checkpointDir}.
-	 * Immutable files ({@code *.sst}, {@code *.blob}) are hard-linked, the rest copied, so the checkpoint itself
-	 * stays intact. Crash-safe: the new contents are prepared next to {@code dbDir} and swapped in by rename.
+	 * Immutable files ({@code *.sst}, {@code *.blob}) are hard-linked when both are on the same file system, the
+	 * rest copied, so the checkpoint itself stays intact. Crash-safe: the new contents are prepared next to
+	 * {@code dbDir} and swapped in by rename.
 	 *
 	 * <p>Subdirectories (column volumes) are kept. Ratis' digest side files ({@code *.md5}, written next to every
 	 * file of an installed snapshot) are skipped. Steps: build {@code <db>.restore-tmp}, fsync it, rename it to
@@ -289,11 +345,13 @@ final class NodeStore implements Closeable {
 	 */
 	static void restore(Path checkpointDir, Path dbDir) throws IOException {
 		var dirs = RestoreDirs.of(dbDir);
+		checkSingleFileSystem(dirs.dbDir);
 		dirs.recover();
 		List<Path> sources;
 		try (Stream<Path> walk = Files.walk(checkpointDir)) {
 			sources = walk.sorted().toList();
 		}
+		boolean linked = true;
 		for (Path source : sources) {
 			Path copy = dirs.building.resolve(checkpointDir.relativize(source).toString());
 			String fileName = source.getFileName().toString();
@@ -302,10 +360,14 @@ final class NodeStore implements Closeable {
 			} else if (!Files.isRegularFile(source)) {
 				throw new IOException("Unexpected non-regular file in checkpoint: " + source);
 			} else if (fileName.endsWith(".sst") || fileName.endsWith(".blob")) {
-				Files.createLink(copy, source);
+				linked &= linkOrCopy(source, copy);
 			} else if (!fileName.endsWith(".md5")) {
 				Files.copy(source, copy);
 			}
+		}
+		if (!linked) {
+			LOG.warn("Restoring {} copies the table files of {}: hard links between them are not possible", dbDir,
+					checkpointDir);
 		}
 		syncTree(dirs.building);
 		Files.move(dirs.building, dirs.ready);

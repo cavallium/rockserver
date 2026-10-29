@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed;
 import static it.cavallium.rockserver.distributed.NodeStoreTest.DATA_COLUMN;
 import static it.cavallium.rockserver.distributed.NodeStoreTest.DATA_SCHEMA;
 import static it.cavallium.rockserver.distributed.NodeStoreTest.contents;
+import static it.cavallium.rockserver.distributed.NodeStoreTest.delete;
 import static it.cavallium.rockserver.distributed.NodeStoreTest.put;
 import static it.cavallium.rockserver.distributed.NodeStoreTest.setApplied;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -17,13 +18,18 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.apache.ratis.io.MD5Hash;
+import org.apache.ratis.proto.RaftProtos.FileChunkProto;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.protocol.TermIndex;
+import org.apache.ratis.server.storage.FileChunkReader;
 import org.apache.ratis.server.storage.FileInfo;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.impl.FileListSnapshotInfo;
+import org.apache.ratis.util.MD5FileUtil;
 import org.apache.ratis.util.SizeInBytes;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -48,9 +54,7 @@ class CheckpointStorageTest {
 	@AfterEach
 	void closeAll() throws IOException {
 		store.close();
-		for (RaftStorage raftStorage : raftStorages) {
-			raftStorage.close();
-		}
+		closeRaftStorages();
 	}
 
 	@Test
@@ -61,7 +65,7 @@ class CheckpointStorageTest {
 	}
 
 	@Test
-	void takeKeepsOnlyTheLatestSnapshot() throws IOException {
+	void takeKeepsTheLatestAndThePreviousSnapshot() throws IOException {
 		var storage = initStorage(tempDir.resolve("raft"), RaftStorage.StartupOption.FORMAT);
 
 		put(store, column, 1, "first");
@@ -73,20 +77,39 @@ class CheckpointStorageTest {
 		setApplied(store, TermIndex.valueOf(2, 20));
 		assertEquals(TermIndex.valueOf(2, 20), storage.take(store));
 
+		put(store, column, 3, "third");
+		setApplied(store, TermIndex.valueOf(2, 30));
+		assertEquals(TermIndex.valueOf(2, 30), storage.take(store));
+
 		FileListSnapshotInfo latest = storage.getLatestSnapshot();
-		assertEquals(TermIndex.valueOf(2, 20), latest.getTermIndex());
+		assertEquals(TermIndex.valueOf(2, 30), latest.getTermIndex());
 		assertListsExactlyTheSnapshotFiles(storage, latest);
+		assertEquals(Set.of("snapshot-2-20", "snapshot-2-30"), fileNames(storage.getSnapshotDir().toPath()));
 		Path stateMachineDir = storage.getSnapshotDir().toPath().getParent();
-		assertEquals(Set.of("snapshot", "tmp"), fileNames(stateMachineDir));
+		assertEquals(Set.of("snapshots", "tmp"), fileNames(stateMachineDir));
 		assertEquals(Set.of(), fileNames(storage.getTmpDir().toPath()));
 
 		Path restored = tempDir.resolve("restored");
 		NodeStore.restore(storage.snapshotDbDir(), restored);
 		try (var restoredStore = NodeStore.open(restored, null, "restored")) {
-			assertEquals(TermIndex.valueOf(2, 20), restoredStore.applied());
-			assertEquals(Map.of(1, "first", 2, "second"),
+			assertEquals(TermIndex.valueOf(2, 30), restoredStore.applied());
+			assertEquals(Map.of(1, "first", 2, "second", 3, "third"),
 					contents(restoredStore, restoredStore.db().getColumnId(DATA_COLUMN)));
 		}
+	}
+
+	@Test
+	void takingAgainWithoutNewEntriesKeepsTheSameSnapshotFiles() throws IOException {
+		var storage = initStorage(tempDir.resolve("raft"), RaftStorage.StartupOption.FORMAT);
+		put(store, column, 1, "value");
+		setApplied(store, TermIndex.valueOf(1, 10));
+		storage.take(store);
+		FileListSnapshotInfo first = storage.getLatestSnapshot();
+
+		assertEquals(TermIndex.valueOf(1, 10), storage.take(store));
+
+		assertEquals(paths(first), paths(storage.getLatestSnapshot()));
+		assertListsExactlyTheSnapshotFiles(storage, first);
 	}
 
 	@Test
@@ -105,24 +128,37 @@ class CheckpointStorageTest {
 	}
 
 	@Test
-	void initRecoversASnapshotSwapInterruptedByACrash() throws IOException {
-		Path raftDir = tempDir.resolve("raft");
-		var storage = initStorage(raftDir, RaftStorage.StartupOption.FORMAT);
-		setApplied(store, TermIndex.valueOf(1, 5));
-		storage.take(store);
-		Path snapshotDir = storage.getSnapshotDir().toPath();
-		Path stateMachineDir = snapshotDir.getParent();
-		closeRaftStorages();
+	void installStreamedWhileANewerSnapshotIsTakenStaysConsistent() throws IOException {
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		for (int i = 0; i < 10; i++) {
+			put(store, column, i, "old" + i);
+		}
+		setApplied(store, TermIndex.valueOf(1, 10));
+		leader.take(store);
+		// A leader starts installing this snapshot on a follower...
+		FileListSnapshotInfo streamed = leader.getLatestSnapshot();
 
-		// Crash after the old snapshot was moved aside, before the new one took its place.
-		Files.move(snapshotDir, stateMachineDir.resolve("snapshot.old"));
-		Files.createDirectories(stateMachineDir.resolve("tmp").resolve("snapshot-6-123").resolve("db"));
+		// ...and takes a newer one before the transfer ends, after a compaction replaced every table file.
+		for (int i = 0; i < 10; i++) {
+			delete(store, column, i);
+		}
+		put(store, column, 100, "new");
+		store.db().flush();
+		store.db().compact();
+		setApplied(store, TermIndex.valueOf(2, 20));
+		leader.take(store);
 
-		var reopened = initStorage(raftDir, RaftStorage.StartupOption.RECOVER);
-		assertEquals(TermIndex.valueOf(1, 5), reopened.getLatestSnapshot().getTermIndex());
-		assertListsExactlyTheSnapshotFiles(reopened, reopened.getLatestSnapshot());
-		assertEquals(Set.of("snapshot", "tmp"), fileNames(stateMachineDir));
-		assertEquals(Set.of(), fileNames(stateMachineDir.resolve("tmp")));
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT);
+		install(leader, streamed, follower);
+		follower.reload();
+
+		assertEquals(TermIndex.valueOf(1, 10), follower.getLatestSnapshot().getTermIndex());
+		Path restored = tempDir.resolve("restored");
+		NodeStore.restore(follower.snapshotDbDir(), restored);
+		try (var restoredStore = NodeStore.open(restored, null, "restored")) {
+			assertEquals(TermIndex.valueOf(1, 10), restoredStore.applied());
+			assertEquals(10, contents(restoredStore, restoredStore.db().getColumnId(DATA_COLUMN)).size());
+		}
 	}
 
 	@Test
@@ -132,16 +168,9 @@ class CheckpointStorageTest {
 		setApplied(store, TermIndex.valueOf(4, 40));
 		leader.take(store);
 
-		// What a Ratis install leaves behind: the leader's files at the same relative paths, plus <file>.md5.
-		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT);
-		Path leaderDir = leader.getSnapshotDir().toPath();
-		Path followerDir = follower.getSnapshotDir().toPath();
-		for (FileInfo file : leader.getLatestSnapshot().getFiles()) {
-			Path target = followerDir.resolve(leaderDir.relativize(file.getPath()));
-			Files.createDirectories(target.getParent());
-			Files.copy(file.getPath(), target);
-			Files.writeString(target.resolveSibling(target.getFileName() + ".md5"), "digest");
-		}
+		Path followerRaftDir = tempDir.resolve("follower");
+		var follower = initStorage(followerRaftDir, RaftStorage.StartupOption.FORMAT);
+		install(leader, leader.getLatestSnapshot(), follower);
 		assertNull(follower.getLatestSnapshot());
 
 		follower.reload();
@@ -158,6 +187,88 @@ class CheckpointStorageTest {
 			assertEquals(TermIndex.valueOf(4, 40), restoredStore.applied());
 			assertEquals(Map.of(7, "installed"), contents(restoredStore, restoredStore.db().getColumnId(DATA_COLUMN)));
 		}
+
+		closeRaftStorages();
+		var restarted = initStorage(followerRaftDir, RaftStorage.StartupOption.RECOVER);
+		assertEquals(paths(installed), paths(restarted.getLatestSnapshot()));
+	}
+
+	@Test
+	void installedSnapshotDamagedByACrashIsNotUsed() throws IOException {
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		put(store, column, 7, "installed");
+		setApplied(store, TermIndex.valueOf(4, 40));
+		leader.take(store);
+		Path followerRaftDir = tempDir.resolve("follower");
+		var follower = initStorage(followerRaftDir, RaftStorage.StartupOption.FORMAT);
+		install(leader, leader.getLatestSnapshot(), follower);
+
+		// Power loss before the state machine reloaded: Ratis never synced the installed files, and one lost its data.
+		Path table;
+		try (Stream<Path> walk = Files.walk(follower.getSnapshotDir().toPath())) {
+			table = walk.filter(file -> file.toString().endsWith(".sst")).findFirst().orElseThrow();
+		}
+		Files.write(table, new byte[0]);
+		closeRaftStorages();
+
+		var restarted = initStorage(followerRaftDir, RaftStorage.StartupOption.RECOVER);
+		assertNull(restarted.getLatestSnapshot());
+		assertEquals(Set.of(), fileNames(restarted.getSnapshotDir().toPath()));
+	}
+
+	@Test
+	void initRecoversTheSnapshotsOfAnInstallInterruptedByACrash() throws IOException {
+		Path raftDir = tempDir.resolve("raft");
+		var storage = initStorage(raftDir, RaftStorage.StartupOption.FORMAT);
+		setApplied(store, TermIndex.valueOf(1, 5));
+		storage.take(store);
+		Path snapshotsDir = storage.getSnapshotDir().toPath();
+		Path stateMachineDir = snapshotsDir.getParent();
+		closeRaftStorages();
+
+		// Crash after Ratis moved the snapshots aside, before the installed ones took their place.
+		Files.move(snapshotsDir, stateMachineDir.resolve("snapshots.tmp_2026_01_01"));
+		Path installing = stateMachineDir.resolve("tmp").resolve("snapshot-" + UUID.randomUUID());
+		Files.createDirectories(installing.resolve("snapshot-2-9").resolve("db"));
+
+		var reopened = initStorage(raftDir, RaftStorage.StartupOption.RECOVER);
+		assertEquals(TermIndex.valueOf(1, 5), reopened.getLatestSnapshot().getTermIndex());
+		assertListsExactlyTheSnapshotFiles(reopened, reopened.getLatestSnapshot());
+		assertEquals(Set.of("snapshots", "tmp"), fileNames(stateMachineDir));
+		assertEquals(Set.of(), fileNames(stateMachineDir.resolve("tmp")));
+	}
+
+	/**
+	 * Transfers {@code snapshot} as Ratis 3.3.1 installs a snapshot: the leader reads each listed file with Ratis'
+	 * {@link FileChunkReader} (path and size as listed, opened when reached), the follower writes it into a new
+	 * directory at its path relative to the snapshot directory and saves its digest next to it, then that directory
+	 * replaces the follower's snapshot directory.
+	 */
+	private static void install(CheckpointStorage leader, FileListSnapshotInfo snapshot, CheckpointStorage follower)
+			throws IOException {
+		Path leaderDir = leader.getSnapshotDir().toPath();
+		Path installing = follower.getTmpDir().toPath().resolve("snapshot-" + UUID.randomUUID());
+		for (FileInfo file : snapshot.getFiles()) {
+			Path relative = leaderDir.relativize(file.getPath());
+			Path target = installing.resolve(relative);
+			Files.createDirectories(target.getParent());
+			try (var reader = FileChunkReader.newInstance(file, relative);
+					var out = Files.newOutputStream(target)) {
+				FileChunkProto chunk;
+				do {
+					chunk = reader.readFileChunk(16 * 1024);
+					chunk.getData().writeTo(out);
+				} while (!chunk.getDone());
+				MD5FileUtil.saveMD5File(target.toFile(), MD5Hash.newInstance(chunk.getFileDigest().toByteArray()));
+			}
+		}
+		Path followerDir = follower.getSnapshotDir().toPath();
+		Path aside = followerDir.resolveSibling(followerDir.getFileName() + ".tmp_installing");
+		if (Files.exists(followerDir)) {
+			Files.move(followerDir, aside);
+		}
+		Files.move(installing, followerDir);
+		NodeStore.deleteRecursively(aside);
 	}
 
 	private CheckpointStorage initStorage(Path dir, RaftStorage.StartupOption option) throws IOException {
@@ -181,10 +292,10 @@ class CheckpointStorageTest {
 		raftStorages.clear();
 	}
 
-	/** Every listed file exists under the snapshot directory, and every snapshot file except digests is listed. */
+	/** Every listed file exists in the snapshot's directory, and every file there except digests is listed. */
 	private static void assertListsExactlyTheSnapshotFiles(CheckpointStorage storage, FileListSnapshotInfo snapshot)
 			throws IOException {
-		Path snapshotDir = storage.getSnapshotDir().toPath();
+		Path snapshotDir = storage.snapshotDbDir().getParent();
 		Set<Path> onDisk;
 		try (Stream<Path> walk = Files.walk(snapshotDir)) {
 			onDisk = walk.filter(Files::isRegularFile).collect(Collectors.toSet());
