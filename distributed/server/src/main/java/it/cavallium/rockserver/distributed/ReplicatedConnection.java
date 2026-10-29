@@ -38,6 +38,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
+import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -60,7 +61,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private static final Duration UPDATE_LEASE = Duration.ofMinutes(2);
 	/** Bytes of keys and values per replicated chunk of a batch write. */
 	private static final long BATCH_CHUNK_BYTES = 4L * 1024 * 1024;
-	private static final int BATCH_CONCURRENCY = 4;
+	/** Encoding overhead counted per key segment and per value, so many tiny items still fit in one entry. */
+	private static final long ITEM_OVERHEAD_BYTES = 16;
 	private static final int ROUTING_ATTEMPTS = 3;
 
 	private final NodeConfig config;
@@ -150,6 +152,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	private CompletableFuture<?> single(RequestContext context, RocksDBAPICommandSingle<?> command) {
 		try {
+			requireUserColumn(command);
 			return switch (command) {
 				case Put<?> c when c.transactionOrUpdateId() == 0 ->
 						proposer.propose(new LogEntry.Put(c.columnId(), c.keys(), c.value(), id(c.requestType())));
@@ -231,6 +234,11 @@ final class ReplicatedConnection implements RocksDBConnection {
 	}
 
 	private Publisher<Object> stream(RequestContext context, RocksDBAPICommandStream<?> command) {
+		try {
+			requireUserColumn(command);
+		} catch (RocksDBException ex) {
+			return Flux.error(ex);
+		}
 		if (command instanceof RocksDBAPICommandStream.GetRange<?> range && range.transactionId() != 0) {
 			// Iterates inside a transaction: only the leader that opened it can serve it.
 			return Flux.defer(() -> {
@@ -292,6 +300,11 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private CompletableFuture<?> forward(RequestContext context, RocksDBAPICommandSingle<?> command) {
 		return forwarder.leader(stateMachine).thenCompose(leader -> {
 			if (leader.equals(config.nodeId())) {
+				if (!isLeader()) {
+					// Raft still names this node as leader, but it cannot serve (its replica failed).
+					return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+							"This node cannot serve as leader"));
+				}
 				// We became the leader meanwhile.
 				return (CompletableFuture<Object>) single(context, command);
 			}
@@ -304,6 +317,10 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private Flux<Object> forwardStream(RequestContext context, RocksDBAPICommandStream<?> command) {
 		return Mono.fromFuture(forwarder.leader(stateMachine)).flatMapMany(leader -> {
 			if (leader.equals(config.nodeId())) {
+				if (!isLeader()) {
+					return Flux.error(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+							"This node cannot serve as leader"));
+				}
 				return Flux.from(stream(context, command));
 			}
 			return Mono.fromFuture(forwarder.api(leader, stateMachine, context))
@@ -320,6 +337,45 @@ final class ReplicatedConnection implements RocksDBConnection {
 		return Flux.from((Publisher<Object>) stateMachine.store().connection().getAsyncApi(context).requestAsync(command));
 	}
 
+	/** Rejects commands that name the internal replication column, whose contents only the log may change. */
+	private void requireUserColumn(RocksDBAPICommand<?, ?, ?> command) {
+		long internal = stateMachine.store().metaColumnId();
+		Long column = switch (command) {
+			case Put<?> c -> c.columnId();
+			case PutMulti<?> c -> c.columnId();
+			case Delete<?> c -> c.columnId();
+			case DeleteMulti<?> c -> c.columnId();
+			case Merge<?> c -> c.columnId();
+			case MergeMulti<?> c -> c.columnId();
+			case Get<?> c -> c.columnId();
+			case RocksDBAPICommandSingle.DeleteRange c -> c.columnId();
+			case RocksDBAPICommandSingle.PutBatch c -> c.columnId();
+			case RocksDBAPICommandSingle.MergeBatch c -> c.columnId();
+			case RocksDBAPICommandSingle.DeleteColumn c -> c.columnId();
+			case RocksDBAPICommandSingle.EstimateNumKeys c -> c.columnId();
+			case RocksDBAPICommandSingle.GetMulti c -> c.columnId();
+			case RocksDBAPICommandSingle.ExistsMulti c -> c.columnId();
+			case RocksDBAPICommandSingle.OpenIterator c -> c.columnId();
+			case RocksDBAPICommandSingle.ReduceRange<?> c -> c.columnId();
+			case RocksDBAPICommandSingle.GetRangePage<?> c -> c.columnId();
+			case RocksDBAPICommandStream.GetRange<?> c -> c.columnId();
+			case RocksDBAPICommandStream.ScanRaw c -> c.columnId();
+			case RocksDBAPICommandStream.ScanRawResumable c -> c.columnId();
+			case RocksDBAPICommand.GetTableProperties c -> c.columnId();
+			case RocksDBAPICommand.GetSstMetadata c -> c.columnId();
+			default -> null;
+		};
+		String name = switch (command) {
+			case RocksDBAPICommandSingle.GetColumnId c -> c.name();
+			case RocksDBAPICommandSingle.DeleteColumnIfExists c -> c.name();
+			case RocksDBAPICommandSingle.CreateColumn c -> c.name();
+			default -> null;
+		};
+		if ((column != null && column == internal) || NodeStore.META_COLUMN.equals(name)) {
+			throw RocksDBException.of(RocksDBErrorType.INVALID_REQUEST, "The column is internal to replication");
+		}
+	}
+
 	// ---------------------------------------------------------------------------------------------------------
 	// Writes
 
@@ -328,17 +384,19 @@ final class ReplicatedConnection implements RocksDBConnection {
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
 					"Reserved column name: " + name));
 		}
-		return proposer.propose(new LogEntry.CreateColumn(name, schema));
+		return proposer.propose(new LogEntry.CreateColumn(name, schema)).thenCompose(id ->
+				// Every replica checks that it assigned the same id; the leader's apply produced this one.
+				proposer.propose(new LogEntry.VerifyColumn(name, (Long) id)).handle((_, _) -> id));
 	}
 
 	/** Splits a batch stream into bounded replicated entries, applied in order. */
 	private CompletableFuture<Void> batch(long columnId, Publisher<? extends KVBatch> batches, boolean merge) {
 		return Flux.from(batches)
 				.concatMapIterable(ReplicatedConnection::chunks)
-				.flatMapSequential(chunk -> Mono.fromFuture(() -> proposer.propose(merge
+				// One chunk at a time: a later chunk must not overtake an earlier one writing the same key.
+				.concatMap(chunk -> Mono.fromFuture(() -> proposer.propose(merge
 						? new LogEntry.MergeMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING)
-						: new LogEntry.PutMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING))),
-						BATCH_CONCURRENCY)
+						: new LogEntry.PutMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING))))
 				.then()
 				.toFuture();
 	}
@@ -350,7 +408,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		int start = 0;
 		long bytes = 0;
 		for (int i = 0; i < keys.size(); i++) {
-			long size = size(keys.get(i)) + values.get(i).size();
+			long size = size(keys.get(i)) + values.get(i).size() + ITEM_OVERHEAD_BYTES;
 			if (i > start && bytes + size > BATCH_CHUNK_BYTES) {
 				result.add(new KVBatch.KVBatchRef(keys.subList(start, i), values.subList(start, i)));
 				start = i;
@@ -367,7 +425,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private static long size(Keys keys) {
 		long size = 0;
 		for (Buf key : keys.keys()) {
-			size += key.size();
+			size += key.size() + ITEM_OVERHEAD_BYTES;
 		}
 		return size;
 	}
@@ -380,16 +438,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 			if (error != null) {
 				throw new CompletionException(barrierFailure(unwrap(error)));
 			}
-			var session = currentSession();
-			var reservation = session.reserve(stateMachine.appliedIndex());
-			return local(context, command).handle((id, openError) -> {
-				if (openError != null) {
-					session.cancel(reservation);
-					throw new CompletionException(unwrap(openError));
-				}
-				session.register(reservation, (Long) id, false, command.transactionLeaseTtl().toNanos());
-				return id;
-			});
+			return openNative(context, command, false, command.transactionLeaseTtl(), result -> (Long) result, null);
 		}).thenCompose(f -> f);
 	}
 
@@ -405,19 +454,48 @@ final class ReplicatedConnection implements RocksDBConnection {
 			if (error != null) {
 				throw new CompletionException(barrierFailure(unwrap(error)));
 			}
-			var session = currentSession();
-			var reservation = session.reserve(stateMachine.appliedIndex());
-			return local(context, command).handle((result, getError) -> {
-				if (getError != null) {
-					session.cancel(reservation);
-					throw new CompletionException(unwrap(getError));
-				}
-				var update = (UpdateContext<?>) result;
-				var transaction = session.register(reservation, update.updateId(), true, UPDATE_LEASE.toNanos());
-				transaction.addConflict(command.columnId(), command.keys());
-				return result;
-			});
+			return openNative(context, command, true, UPDATE_LEASE,
+					result -> ((UpdateContext<?>) result).updateId(), command);
 		}).thenCompose(f -> f);
+	}
+
+	/**
+	 * Opens a native transaction or update on the local database and registers it in the current leader session.
+	 * The snapshot index is reserved first, so that no history it needs can be pruned meanwhile.
+	 */
+	private CompletableFuture<?> openNative(RequestContext context,
+			RocksDBAPICommandSingle<?> command,
+			boolean update,
+			Duration lease,
+			java.util.function.Function<Object, Long> idOf,
+			@Nullable Get<?> forUpdate) {
+		var session = currentSession();
+		var reservation = session.reserve(stateMachine.appliedIndex());
+		CompletableFuture<?> opened;
+		try {
+			opened = local(context, command);
+		} catch (RuntimeException ex) {
+			session.cancel(reservation);
+			throw ex;
+		}
+		return opened.handle((result, openError) -> {
+			if (openError != null) {
+				session.cancel(reservation);
+				throw new CompletionException(unwrap(openError));
+			}
+			long id = idOf.apply(result);
+			LeaderSession.OpenTransaction transaction;
+			try {
+				transaction = session.register(reservation, id, update, lease.toNanos());
+			} catch (IllegalStateException leadershipEnded) {
+				rollBackNativeQuietly(id, update);
+				throw new CompletionException(new RocksDBRetryException());
+			}
+			if (forUpdate != null) {
+				transaction.addConflict(forUpdate.columnId(), forUpdate.keys());
+			}
+			return result;
+		});
 	}
 
 	/** A write with a transaction id: staged in an open transaction, or the final write of an update. */
@@ -433,13 +511,16 @@ final class ReplicatedConnection implements RocksDBConnection {
 		}
 		if (transaction.update) {
 			var entry = transaction.updateEntry(session.term(), write, keys);
-			return proposer.propose(entry).whenComplete((_, error) -> {
+			return commit(session, transaction, entry).handle((result, error) -> {
 				session.remove(transaction);
-				closeNativeQuietly(transaction);
-				if (error != null && unwrap(error) instanceof Proposer.ConflictException) {
-					// Same contract as a single node: the update is closed and must be retried.
-					throw new CompletionException(new RocksDBRetryException());
+				rollBackNativeQuietly(transaction.id, true);
+				if (error == null) {
+					return result;
 				}
+				var cause = unwrap(error);
+				// On a conflict the update is closed and must be retried, as on a single node.
+				throw new CompletionException(cause instanceof Proposer.ConflictException
+						? new RocksDBRetryException() : cause);
 			});
 		}
 		var staged = stagedOnly(write);
@@ -454,6 +535,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		var transaction = session.get(command.transactionId());
 		if (transaction == null) {
 			if (command.commit()) {
+				// Expired, or opened by a previous leader: the client must run the transaction again.
 				throw new RocksDBRetryException();
 			}
 			return CompletableFuture.completedFuture(true);
@@ -462,22 +544,34 @@ final class ReplicatedConnection implements RocksDBConnection {
 			session.remove(transaction);
 			return local(context, command);
 		}
-		if (!transaction.hasWrites() && transaction.commitEntry(session.term()).conflictHashes().length == 0) {
+		var entry = transaction.commitEntry(session.term());
+		if (entry.writes().isEmpty() && entry.conflictHashes().length == 0) {
 			session.remove(transaction);
 			return local(context, new CloseTransaction(command.transactionId(), false));
 		}
-		return proposer.propose(transaction.commitEntry(session.term())).handle((_, error) -> {
+		return commit(session, transaction, entry).handle((_, error) -> {
 			if (error != null && unwrap(error) instanceof Proposer.ConflictException) {
 				// Same contract as a single node: false, and the transaction stays open.
 				return false;
 			}
 			session.remove(transaction);
-			closeNativeQuietly(transaction);
+			rollBackNativeQuietly(transaction.id, false);
 			if (error != null) {
 				throw new CompletionException(unwrap(error));
 			}
 			return true;
 		});
+	}
+
+	/**
+	 * Proposes a commit entry, keeping its snapshot's write history pinned until the leader validated it, whatever
+	 * happens to the transaction meanwhile.
+	 */
+	private CompletableFuture<Object> commit(LeaderSession session,
+			LeaderSession.OpenTransaction transaction,
+			LogEntry.Guarded entry) {
+		var pin = session.pin(transaction.snapshotIndex);
+		return proposer.proposeOnce(entry).whenComplete((_, _) -> session.unpin(pin));
 	}
 
 	private CompletableFuture<?> closeFailedUpdate(RequestContext context, CloseFailedUpdate command) {
@@ -516,13 +610,13 @@ final class ReplicatedConnection implements RocksDBConnection {
 		return session;
 	}
 
-	private void closeNativeQuietly(LeaderSession.OpenTransaction transaction) {
+	private void rollBackNativeQuietly(long id, boolean update) {
 		try {
 			var db = stateMachine.store().db();
-			if (transaction.update) {
-				db.closeFailedUpdate(transaction.id);
+			if (update) {
+				db.closeFailedUpdate(id);
 			} else {
-				db.closeTransaction(transaction.id, false);
+				db.closeTransaction(id, false);
 			}
 		} catch (RuntimeException ignored) {
 			// Already expired or closed.

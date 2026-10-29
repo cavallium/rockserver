@@ -43,12 +43,17 @@ import org.slf4j.LoggerFactory;
 /**
  * The node's local Rockserver database plus the replication metadata stored inside it.
  *
- * <p>Metadata lives in the internal column {@value #META_COLUMN} (one fixed 1-byte key, with values), so that
- * it is written in the same RocksDB WAL as the data and travels inside checkpoints:</p>
+ * <p>Metadata lives in the internal column {@value #META_COLUMN} (fixed 17-byte keys: a kind byte, then two
+ * longs), so that it is written in the same RocksDB WAL as the data and travels inside checkpoints:</p>
  * <ul>
  *   <li>{@link #APPLIED}: the last applied {@link TermIndex}, encoded by {@link #encodeTermIndex}</li>
  *   <li>{@link #CLUSTER_ID}: UTF-8 cluster id, written when the {@link LogEntry.Genesis} entry is applied</li>
+ *   <li>{@link #REQUEST} + proposer id + sequence: the encoded result of an applied {@link Request}, kept until its
+ *   proposer reports it complete</li>
  * </ul>
+ *
+ * <p>The meta column is created locally when a database is first opened, before any log entry is applied, so it
+ * gets the same column id on every replica. No other column may ever be created locally.</p>
  *
  * <p>Every database file must live under the database directory: column volumes and a WAL directory inside it
  * (such as the default {@code ./volume} and {@code ./wal}) are supported, directories elsewhere are not. The
@@ -66,8 +71,10 @@ final class NodeStore implements Closeable {
 	static final String META_COLUMN = "__rockserver_replication";
 	static final byte APPLIED = 1;
 	static final byte CLUSTER_ID = 2;
+	static final byte REQUEST = 3;
 
-	private static final ColumnSchema META_SCHEMA = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
+	private static final int META_KEY_BYTES = 1 + 2 * Long.BYTES;
+	private static final ColumnSchema META_SCHEMA = ColumnSchema.of(IntList.of(META_KEY_BYTES), ObjectList.of(), true);
 	private static final int TERM_INDEX_BYTES = 2 * Long.BYTES;
 
 	/**
@@ -452,7 +459,17 @@ final class NodeStore implements Closeable {
 	}
 
 	static Keys key(byte metaKey) {
-		return new Keys(Buf.wrap(new byte[] {metaKey}));
+		return metaKey(metaKey, 0, 0);
+	}
+
+	/** Key of the recorded result of request {@code sequence} of proposer {@code proposerId}. */
+	static Keys requestKey(long proposerId, long sequence) {
+		return metaKey(REQUEST, proposerId, sequence);
+	}
+
+	private static Keys metaKey(byte kind, long first, long second) {
+		var key = java.nio.ByteBuffer.allocate(META_KEY_BYTES).put(kind).putLong(first).putLong(second).array();
+		return new Keys(Buf.wrap(key));
 	}
 
 	/** 16 bytes: term then index, big-endian. */

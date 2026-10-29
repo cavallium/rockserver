@@ -83,7 +83,8 @@ final class LeaderSession {
 	private final long term;
 	private final ConflictTracker tracker = new ConflictTracker();
 	private final ConcurrentHashMap<Long, OpenTransaction> transactions = new ConcurrentHashMap<>();
-	private final ConcurrentHashMap<Object, Long> reservations = new ConcurrentHashMap<>();
+	private final ConcurrentHashMap<Object, Long> pins = new ConcurrentHashMap<>();
+	private long appliesSincePrune;
 	private volatile boolean closed;
 
 	LeaderSession(long term) {
@@ -103,19 +104,41 @@ final class LeaderSession {
 	}
 
 	/**
-	 * Pins the current applied index as a snapshot index before the native transaction is opened, so that the write history after it is
-	 * kept: the native snapshot, taken afterwards, can only be newer, which at worst causes false conflicts.
+	 * Pins the current applied index as a snapshot index before the native transaction is opened, so that the write
+	 * history after it is kept: the native snapshot, taken afterwards, can only be newer, which at worst causes false
+	 * conflicts.
 	 */
 	synchronized Object reserve(AppliedIndex applied) {
 		// Read the applied index under the same lock as pruning, so nothing newer can be pruned in between.
-		var reservation = new Object();
-		reservations.put(reservation, applied.get());
-		return reservation;
+		return pin(applied.get());
 	}
 
-	/** Turns a reservation into an open transaction once the native transaction exists. */
-	OpenTransaction register(Object reservation, long id, boolean update, long leaseNanos) {
-		Long snapshotIndex = reservations.get(reservation);
+	/**
+	 * Keeps the write history after {@code snapshotIndex} until {@link #unpin}: a commit holds one while its entry
+	 * is in flight, so that rolling back, expiring or closing the transaction meanwhile cannot drop the history its
+	 * validation still needs.
+	 */
+	synchronized Object pin(long snapshotIndex) {
+		var pin = new Object();
+		pins.put(pin, snapshotIndex);
+		return pin;
+	}
+
+	synchronized void unpin(Object pin) {
+		pins.remove(pin);
+		tracker.prune(minSnapshotIndex());
+	}
+
+	/**
+	 * Turns a reservation into an open transaction once the native transaction exists. Fails if leadership ended
+	 * meanwhile: the caller must then roll the native transaction back itself.
+	 */
+	synchronized OpenTransaction register(Object reservation, long id, boolean update, long leaseNanos) {
+		if (closed) {
+			pins.remove(reservation);
+			throw new IllegalStateException("Leadership of term " + term + " ended");
+		}
+		Long snapshotIndex = pins.get(reservation);
 		if (snapshotIndex == null) {
 			throw new IllegalStateException("Unknown reservation");
 		}
@@ -123,13 +146,13 @@ final class LeaderSession {
 		if (transactions.putIfAbsent(id, transaction) != null) {
 			throw new IllegalStateException("Transaction id reused: " + id);
 		}
-		reservations.remove(reservation);
+		pins.remove(reservation);
 		return transaction;
 	}
 
 	/** Releases a reservation whose transaction could not be opened. */
 	void cancel(Object reservation) {
-		reservations.remove(reservation);
+		unpin(reservation);
 	}
 
 	@Nullable OpenTransaction get(long id) {
@@ -140,6 +163,14 @@ final class LeaderSession {
 	synchronized void remove(OpenTransaction transaction) {
 		transactions.remove(transaction.id, transaction);
 		tracker.prune(minSnapshotIndex());
+	}
+
+	/** Called after each applied entry of this term: keeps the tracker bounded when there are no transactions. */
+	synchronized void afterApply() {
+		if (++appliesSincePrune >= 256) {
+			appliesSincePrune = 0;
+			tracker.prune(minSnapshotIndex());
+		}
 	}
 
 	/** Drops expired transactions (their native transaction expires on its own) and prunes the tracker. */
@@ -154,8 +185,8 @@ final class LeaderSession {
 		for (OpenTransaction transaction : transactions.values()) {
 			min = Math.min(min, transaction.snapshotIndex);
 		}
-		for (long reserved : reservations.values()) {
-			min = Math.min(min, reserved);
+		for (long pinned : pins.values()) {
+			min = Math.min(min, pinned);
 		}
 		// Writes at or below the oldest snapshot can no longer conflict with anything.
 		return min;
@@ -163,7 +194,9 @@ final class LeaderSession {
 
 	/** Leadership ended: roll back every open transaction. Their ids become unknown, so clients retry them. */
 	void close(EmbeddedDB db) {
-		closed = true;
+		synchronized (this) {
+			closed = true;
+		}
 		for (OpenTransaction transaction : transactions.values()) {
 			try {
 				if (transaction.update) {

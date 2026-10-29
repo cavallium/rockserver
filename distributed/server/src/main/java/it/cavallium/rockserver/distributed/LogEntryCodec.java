@@ -49,6 +49,7 @@ final class LogEntryCodec {
 	private static final byte UPLOAD_MERGE_OPERATOR = 11;
 	private static final byte GUARDED = 12;
 	private static final byte GENESIS = 13;
+	private static final byte VERIFY_COLUMN = 14;
 
 	/**
 	 * Request type of each code: the code is the index. Append only; never reorder. An explicit table instead of
@@ -100,6 +101,38 @@ final class LogEntryCodec {
 		return bytes.toByteArray();
 	}
 
+	/** Encodes a proposed request: version, proposer id, sequence, completedBelow, then the entry. */
+	static byte[] encodeRequest(Request request) {
+		Objects.requireNonNull(request, "request");
+		var bytes = new ByteArrayOutputStream();
+		try (var out = new DataOutputStream(bytes)) {
+			out.writeByte(VERSION);
+			out.writeLong(request.proposerId());
+			out.writeLong(request.sequence());
+			out.writeLong(request.completedBelow());
+			writeEntry(out, request.entry());
+		} catch (IOException e) {
+			// ByteArrayOutputStream never throws
+			throw new UncheckedIOException(e);
+		}
+		return bytes.toByteArray();
+	}
+
+	/** @throws IllegalArgumentException on malformed input or unknown version */
+	static Request decodeRequest(byte[] data) {
+		var in = new Input(data);
+		byte version = in.readByte();
+		if (version != VERSION) {
+			throw new IllegalArgumentException("Unknown log entry version: " + version);
+		}
+		long proposerId = in.readLong();
+		long sequence = in.readLong();
+		long completedBelow = in.readLong();
+		LogEntry entry = readEntry(in);
+		in.finish();
+		return new Request(proposerId, sequence, completedBelow, entry);
+	}
+
 	/** @throws IllegalArgumentException on malformed input or unknown version */
 	static LogEntry decode(byte[] data) {
 		var in = new Input(data);
@@ -135,6 +168,11 @@ final class LogEntryCodec {
 				writeBytes(out, jarData);
 			}
 			case LogEntry.Guarded guarded -> writeGuarded(out, guarded);
+			case LogEntry.VerifyColumn(String name, long columnId) -> {
+				out.writeByte(VERIFY_COLUMN);
+				writeString(out, name);
+				out.writeLong(columnId);
+			}
 			case LogEntry.Genesis(String clusterId, boolean seeded) -> {
 				out.writeByte(GENESIS);
 				writeString(out, clusterId);
@@ -312,6 +350,7 @@ final class LogEntryCodec {
 					new LogEntry.UploadMergeOperator(in.readString(), in.readString(), in.readBytes());
 			case GUARDED -> readGuarded(in);
 			case GENESIS -> new LogEntry.Genesis(in.readString(), in.readBoolean());
+			case VERIFY_COLUMN -> new LogEntry.VerifyColumn(in.readString(), in.readLong());
 			default -> readWrite(in, tag);
 		};
 	}

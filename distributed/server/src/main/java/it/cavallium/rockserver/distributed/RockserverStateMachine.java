@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed;
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroupId;
@@ -58,12 +59,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	/** State attached to a request on the leader between admission and apply. */
 	private static final class Proposal {
-		final LogEntry entry;
+		final Request request;
 		@Nullable LeaderSession session;
 		@Nullable ConflictTracker.Token token;
 
-		Proposal(LogEntry entry) {
-			this.entry = entry;
+		Proposal(Request request) {
+			this.request = request;
 		}
 	}
 
@@ -182,7 +183,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 				.setStateMachine(this)
 				.setClientRequest(request);
 		try {
-			var entry = LogEntryCodec.decode(request.getMessage().getContent().toByteArray());
+			var decoded = LogEntryCodec.decodeRequest(request.getMessage().getContent().toByteArray());
+			var entry = decoded.entry();
 			if (!(entry instanceof LogEntry.Genesis) && store.clusterId() == null) {
 				throw new NotReadyException("The cluster is not initialized yet");
 			}
@@ -194,7 +196,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 				}
 			}
 			return builder.setLogData(request.getMessage().getContent())
-					.setStateMachineContext(new Proposal(entry))
+					.setStateMachineContext(new Proposal(decoded))
 					.build();
 		} catch (IllegalArgumentException ex) {
 			return builder.build().setException(new IOException("Malformed log entry: " + ex.getMessage(), ex));
@@ -217,7 +219,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (session == null) {
 			throw new StateMachineException("Not the leader", new NotReadyException("Not the leader"), false);
 		}
-		if (proposal.entry instanceof LogEntry.Guarded guarded) {
+		if (proposal.request.entry() instanceof LogEntry.Guarded guarded) {
 			if (guarded.leaderEpoch() != session.term()) {
 				throw new StateMachineException("Stale transaction",
 						new RetryableException("The transaction was opened by another leader"), false);
@@ -227,7 +229,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			}
 		}
 		proposal.session = session;
-		proposal.token = session.tracker().register(proposal.entry);
+		proposal.token = session.tracker().register(proposal.request.entry());
 		return trx;
 	}
 
@@ -238,17 +240,22 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (failed) {
 			return CompletableFuture.failedFuture(new IllegalStateException("Replica failed"));
 		}
-		if (position.getIndex() <= applied.get()) {
-			// Already applied before a restart: the database contains its effects.
-			return CompletableFuture.completedFuture(Message.EMPTY);
-		}
 		try {
 			var proposal = trx.getStateMachineContext() instanceof Proposal p ? p : null;
-			var entry = proposal != null ? proposal.entry
-					: LogEntryCodec.decode(logEntry.getStateMachineLogEntry().getLogData().toByteArray());
-			var result = applier.apply(entry, position);
+			var request = proposal != null ? proposal.request
+					: LogEntryCodec.decodeRequest(logEntry.getStateMachineLogEntry().getLogData().toByteArray());
+			if (position.getIndex() <= applied.get()) {
+				// Already applied before a restart: the database holds its effects and, unless its proposer already
+				// reported it complete, its result.
+				var recorded = applier.recordedResult(request);
+				return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(ResultCodec.encode(
+						recorded != null ? recorded : new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR,
+								"Result no longer available")))));
+			}
+			var result = applier.apply(request, position);
 			if (proposal != null && proposal.token != null && proposal.session != null) {
 				proposal.session.tracker().resolve(proposal.token, position.getIndex());
+				proposal.session.afterApply();
 			}
 			updateLastAppliedTermIndex(position);
 			applied.advance(position.getIndex());
@@ -295,6 +302,13 @@ final class RockserverStateMachine extends BaseStateMachine {
 				throw new IOException("No snapshot to install");
 			}
 			var old = store;
+			if (snapshot.getIndex() <= old.applied().getIndex()) {
+				// The local database already contains everything in the snapshot: rewinding it would make the
+				// entries in between look applied while their effects are gone.
+				LOG.info("{}: keeping the local database at {}, ahead of the installed snapshot at {}",
+						config.nodeId(), old.applied(), snapshot.getTermIndex());
+				return;
+			}
 			old.close();
 			NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
 			openStore();

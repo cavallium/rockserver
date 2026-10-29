@@ -105,4 +105,10 @@ public sealed interface LogEntry {
 	 * the data from a snapshot, never from replaying the log.
 	 */
 	record Genesis(String clusterId, boolean seeded) implements LogEntry {}
+
+	/**
+	 * Proposed by the leader after it created column {@code name} as {@code columnId}: every replica checks that it
+	 * assigned the same id, and stops if not, instead of silently writing other columns' data into it.
+	 */
+	record VerifyColumn(String name, long columnId) implements LogEntry {}
 }
