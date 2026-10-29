@@ -31,9 +31,13 @@ final class Proposer implements Closeable {
 	/** The leader rejected a transaction commit because one of its keys changed after its snapshot. */
 	static final class ConflictException extends RocksDBRetryException {}
 
+	private static final long NOT_READY_RETRY_MS = 50;
+
 	private final RaftClient client;
+	private final long requestTimeoutNanos;
 
 	Proposer(RaftGroup group, RaftProperties properties, NodeConfig config) {
+		this.requestTimeoutNanos = config.requestTimeout().toNanos();
 		long sleepMs = 100;
 		int attempts = (int) Math.max(1, config.requestTimeout().toMillis() / sleepMs);
 		this.client = RaftClient.newBuilder()
@@ -66,13 +70,42 @@ final class Proposer implements Closeable {
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
 					"Write too large for one replicated entry: " + data.length + " bytes"));
 		}
-		return client.async().send(Message.valueOf(ByteString.copyFrom(data)))
-				.handle((reply, error) -> {
-					if (error != null) {
-						throw new CompletionException(unavailable(error));
-					}
-					return toResult(reply);
-				});
+		var message = Message.valueOf(ByteString.copyFrom(data));
+		return send(message, System.nanoTime() + requestTimeoutNanos);
+	}
+
+	private CompletableFuture<Object> send(Message message, long deadlineNanos) {
+		return client.async().send(message).handle((reply, error) -> {
+			// Ratis reports state machine refusals either in the reply or as the future's failure.
+			var refusal = error != null ? stateMachineException(error)
+					: !reply.isSuccess() && reply.getException() instanceof StateMachineException e ? e : null;
+			if (refusal != null && isNotReady(refusal) && System.nanoTime() - deadlineNanos < 0) {
+				// Refused before being appended: resending cannot apply it twice.
+				return CompletableFuture.supplyAsync(() -> send(message, deadlineNanos),
+						CompletableFuture.delayedExecutor(NOT_READY_RETRY_MS, TimeUnit.MILLISECONDS)).thenCompose(f -> f);
+			}
+			if (refusal != null) {
+				throw new CompletionException(admissionFailure(refusal));
+			}
+			if (error != null) {
+				throw new CompletionException(unavailable(error));
+			}
+			return CompletableFuture.completedFuture(toResult(reply));
+		}).thenCompose(f -> f);
+	}
+
+	private static StateMachineException stateMachineException(Throwable error) {
+		for (Throwable t = error; t != null; t = t.getCause()) {
+			if (t instanceof StateMachineException exception) {
+				return exception;
+			}
+		}
+		return null;
+	}
+
+	private static boolean isNotReady(StateMachineException exception) {
+		return exception.getCause() != null
+				&& exception.getCause().getClass().getName().equals(RockserverStateMachine.NotReadyException.class.getName());
 	}
 
 	private static Object toResult(RaftClientReply reply) {
@@ -98,7 +131,8 @@ final class Proposer implements Closeable {
 		if (type.equals(RockserverStateMachine.ConflictException.class.getName())) {
 			return new ConflictException();
 		}
-		if (type.equals(RockserverStateMachine.RetryableException.class.getName())) {
+		if (type.equals(RockserverStateMachine.RetryableException.class.getName())
+				|| type.equals(RockserverStateMachine.NotReadyException.class.getName())) {
 			return new RocksDBRetryException();
 		}
 		return RocksDBException.of(RocksDBErrorType.INVALID_REQUEST, message);

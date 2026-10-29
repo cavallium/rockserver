@@ -38,12 +38,19 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 	}
 
-	/**
-	 * The request cannot be admitted now (stale transaction from another leadership, cluster not initialized):
-	 * the client should retry.
-	 */
+	/** The transaction was opened by another leadership: the client must start it over. */
 	public static final class RetryableException extends IOException {
 		public RetryableException(String message) {
+			super(message);
+		}
+	}
+
+	/**
+	 * The entry was refused before being appended because this node cannot admit it yet (cluster not
+	 * initialized, leadership changing): resending the same entry is safe.
+	 */
+	public static final class NotReadyException extends IOException {
+		public NotReadyException(String message) {
 			super(message);
 		}
 	}
@@ -161,7 +168,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		try {
 			var entry = LogEntryCodec.decode(request.getMessage().getContent().toByteArray());
 			if (!(entry instanceof LogEntry.Genesis) && store.clusterId() == null) {
-				throw new RetryableException("The cluster is not initialized yet");
+				throw new NotReadyException("The cluster is not initialized yet");
 			}
 			if (entry instanceof LogEntry.Guarded guarded) {
 				var division = division();
@@ -192,7 +199,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 		var session = leaderSession(division.getInfo().getCurrentTerm());
 		if (session == null) {
-			throw new StateMachineException("Not the leader", new RetryableException("Not the leader"), false);
+			throw new StateMachineException("Not the leader", new NotReadyException("Not the leader"), false);
 		}
 		if (proposal.entry instanceof LogEntry.Guarded guarded) {
 			if (guarded.leaderEpoch() != session.term()) {

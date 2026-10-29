@@ -36,6 +36,7 @@ final class RaftSettings {
 		RaftServerConfigKeys.Log.setLogMetadataEnabled(properties, false);
 		RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf("64MB"));
 		RaftServerConfigKeys.Log.Appender.setBufferByteLimit(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (1 << 20)));
+		RaftServerConfigKeys.Log.setWriteBufferSize(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (2 << 20)));
 		RaftServerConfigKeys.Log.setQueueByteLimit(properties, SizeInBytes.valueOf(4L * MAX_ENTRY_BYTES));
 		GrpcConfigKeys.setMessageSizeMax(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (2 << 20)));
 
