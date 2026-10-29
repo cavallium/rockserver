@@ -179,6 +179,11 @@ public final class ReplicatedNode implements AutoCloseable {
 		return stateMachine.appliedIndex().get();
 	}
 
+	/** The local replica, for tests that inspect each node's own database. */
+	RockserverStateMachine stateMachine() {
+		return stateMachine;
+	}
+
 	/** True once this replica failed to apply the log and stopped. */
 	public boolean isFailed() {
 		return stateMachine.isFailed();
