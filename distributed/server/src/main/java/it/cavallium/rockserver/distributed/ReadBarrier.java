@@ -40,6 +40,11 @@ import org.jetbrains.annotations.Nullable;
  *   <li>waits until the local applied index reaches {@code c}.</li>
  * </ol>
  * <p>Concurrent calls share rounds. A round costs one network round trip, no fsync.</p>
+ * <p>Each peer has at most one term query in flight, whose deadline is the end of the round that sent it, so a
+ * paused or dead peer does not pile up calls, nor connection attempts, while rounds keep succeeding without it. A
+ * reply counts only for the round that sent the query, so only if the query was sent after the read arrived: a
+ * round that finds an earlier round's query still in flight to a peer sends its own once that one ends, if it
+ * still needs that peer and has time left; meanwhile the peer simply does not contribute to it.</p>
  * <p>The returned futures complete on threads of this barrier, never on gRPC, Ratis apply or JDK timer threads,
  * so callers may run blocking work, such as a database read, in their continuations.</p>
  */
@@ -60,6 +65,8 @@ final class ReadBarrier implements Closeable {
 	private final Duration roundTimeout;
 	/** Channels to the other peers' Raft ports, by address, so that a peer whose address changes gets a new one. */
 	private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
+	/** The term queries to each other voting peer. */
+	private final Map<RaftPeerId, PeerLink> links = new ConcurrentHashMap<>();
 	/** Every future returned by {@link #await} and not completed yet, failed by {@link #close}. */
 	private final Set<CompletableFuture<Void>> outstanding = ConcurrentHashMap.newKeySet();
 	/** Completes the callers' futures and starts queued rounds; see {@link #execute}. */
@@ -225,7 +232,8 @@ final class ReadBarrier implements Closeable {
 			return CompletableFuture.failedFuture(new NotLeaderException("No longer the leader of term " + term));
 		}
 		var conf = division.getRaftConf();
-		var votes = new Votes(division, term, conf.getCurrentPeers(), conf.getPreviousPeers());
+		long deadline = System.nanoTime() + roundTimeout.toNanos();
+		var votes = new Votes(division, term, deadline, conf.getCurrentPeers(), conf.getPreviousPeers());
 
 		Map<RaftPeerId, RaftPeer> others = new LinkedHashMap<>();
 		for (var peers : List.of(conf.getCurrentPeers(), conf.getPreviousPeers())) {
@@ -236,6 +244,7 @@ final class ReadBarrier implements Closeable {
 			}
 		}
 		dropUnusedChannels(others.values());
+		links.keySet().retainAll(others.keySet());
 		votes.check();
 		for (var peer : others.values()) {
 			if (votes.outcome.isDone()) {
@@ -244,14 +253,16 @@ final class ReadBarrier implements Closeable {
 			if (peer.getAddress() == null) {
 				continue;
 			}
-			TermService.currentTerm(channel(peer.getAddress()), groupId, roundTimeout)
-					.whenComplete((peerTerm, error) -> {
-						if (error == null) {
-							votes.onReply(peer.getId(), peerTerm);
-						}
-					});
+			link(peer).ask(votes);
 		}
-		return votes.outcome.orTimeout(roundTimeout.toNanos(), TimeUnit.NANOSECONDS);
+		return votes.outcome.orTimeout(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+	}
+
+	/** The link to {@code peer}, a new one if its address changed. */
+	private PeerLink link(RaftPeer peer) {
+		return links.compute(peer.getId(), (id, link) -> link != null && link.address.equals(peer.getAddress())
+				? link
+				: new PeerLink(id, peer.getAddress()));
 	}
 
 	/** True if this division is the leader and its term is {@code term}. */
@@ -265,6 +276,8 @@ final class ReadBarrier implements Closeable {
 	private static final class Votes {
 
 		final CompletableFuture<Long> outcome = new CompletableFuture<>();
+		/** When the round times out, in {@link System#nanoTime()} units; no query of the round outlives it. */
+		final long deadline;
 		private final RaftServer.Division self;
 		private final long term;
 		private final Set<RaftPeerId> current;
@@ -272,9 +285,14 @@ final class ReadBarrier implements Closeable {
 		private final Set<RaftPeerId> previous;
 		private final Set<RaftPeerId> confirmed = new HashSet<>();
 
-		Votes(RaftServer.Division self, long term, Iterable<RaftPeer> current, Iterable<RaftPeer> previous) {
+		Votes(RaftServer.Division self,
+				long term,
+				long deadline,
+				Iterable<RaftPeer> current,
+				Iterable<RaftPeer> previous) {
 			this.self = self;
 			this.term = term;
+			this.deadline = deadline;
 			this.current = ids(current);
 			this.previous = ids(previous);
 			confirmed.add(self.getId());
@@ -316,6 +334,74 @@ final class ReadBarrier implements Closeable {
 		}
 	}
 
+	/**
+	 * The term queries to one peer, at most one in flight at a time. Without this limit every round would send its
+	 * own query to a paused peer, and each would stay pending until its deadline.
+	 */
+	private final class PeerLink {
+
+		final RaftPeerId id;
+		final String address;
+		/** Guarded by this. */
+		private boolean inFlight;
+		/** The round that found a query in flight and needs one of its own once that one ends. Guarded by this. */
+		private @Nullable Votes waiting;
+
+		PeerLink(RaftPeerId id, String address) {
+			this.id = id;
+			this.address = address;
+		}
+
+		/** Asks the peer for its term on behalf of {@code votes}, now or once the query in flight ends. */
+		void ask(Votes votes) {
+			synchronized (this) {
+				if (inFlight) {
+					// The query in flight was sent before this round started: its reply cannot count for it.
+					// Rounds run one at a time, so any round already waiting here has ended: this one replaces it.
+					waiting = votes;
+					return;
+				}
+				inFlight = true;
+			}
+			send(votes);
+		}
+
+		/**
+		 * Sends the query of {@code votes}, which owns the link; if that round no longer needs it, passes the link
+		 * on to the round waiting behind it, or frees it.
+		 */
+		private void send(@Nullable Votes votes) {
+			while (votes != null) {
+				long remaining = votes.deadline - System.nanoTime();
+				if (!closed && !votes.outcome.isDone() && remaining > 0) {
+					var round = votes;
+					try {
+						TermService.currentTerm(channel(address), groupId, Duration.ofNanos(remaining))
+								.whenComplete((peerTerm, error) -> {
+									var next = release();
+									if (error == null) {
+										round.onReply(id, peerTerm);
+									}
+									send(next);
+								});
+						return;
+					} catch (RuntimeException e) {
+						// Such as an unusable address: this peer does not contribute to the round.
+					}
+				}
+				votes = release();
+			}
+		}
+
+		/** Ends the query in flight; returns the round that now owns the link and must send its own, if any. */
+		private synchronized @Nullable Votes release() {
+			var next = waiting;
+			waiting = null;
+			inFlight = next != null;
+			return next;
+		}
+	}
+
 	private ManagedChannel channel(String address) {
 		var channel = channels.computeIfAbsent(address,
 				_ -> NettyChannelBuilder.forTarget(address).usePlaintext().build());
@@ -324,8 +410,9 @@ final class ReadBarrier implements Closeable {
 			closeChannels();
 		}
 		// While a peer is down, gRPC waits longer and longer (up to two minutes) between attempts to reach it, and
-		// fails calls at once in between. A round must reach a peer as soon as it is back, so each round that finds
-		// the channel failed makes a fresh attempt: at most one connection attempt per peer and round.
+		// fails calls at once in between. A round must reach a peer as soon as it is back, so each query that finds
+		// the channel failed makes a fresh attempt: at most one connection attempt per query, and a peer has at
+		// most one query in flight, which lasts at most a round timeout.
 		if (channel.getState(false) == ConnectivityState.TRANSIENT_FAILURE) {
 			channel.resetConnectBackoff();
 		}
