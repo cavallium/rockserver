@@ -254,6 +254,22 @@ public final class ProcessCluster implements AutoCloseable {
 		awaitExit(node);
 	}
 
+	/**
+	 * SIGKILL to every node at once, like a power cut of the whole cluster: all signals are sent before waiting for
+	 * any node to exit, so no node outlives another by more than the time it takes to send them.
+	 */
+	public synchronized void killAll() {
+		for (var node : nodes.values()) {
+			node.shouldRun = false;
+		}
+		killAllNow();
+		for (var node : nodes.values()) {
+			if (node.process != null) {
+				awaitExit(node);
+			}
+		}
+	}
+
 	/** SIGTERM, then waits for the node to stop gracefully; kills it and fails if it does not. */
 	public synchronized void stop(String id) {
 		var node = node(id);
