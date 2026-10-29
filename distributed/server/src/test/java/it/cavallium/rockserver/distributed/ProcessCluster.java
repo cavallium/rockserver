@@ -157,6 +157,14 @@ public final class ProcessCluster implements AutoCloseable {
 		return result;
 	}
 
+	/**
+	 * Address of the node's Raft server, reachable directly from the test JVM: for a Ratis admin client that asks
+	 * each node for its role, like {@code ReplicatedServerMain admin status}.
+	 */
+	public HostAndPort raftAddress(String id) {
+		return new HostAndPort(LOOPBACK, node(id).raftPort);
+	}
+
 	public Path dataDir(String id) {
 		return node(id).dataDir();
 	}
