@@ -146,6 +146,14 @@ public final class ProcessCluster implements AutoCloseable {
 		return new HostAndPort(LOOPBACK, node(id).apiPort);
 	}
 
+	/**
+	 * Address of the node's Raft server, reachable directly from the test JVM: a Ratis client there can ask any
+	 * node for its role and log state, even while the network isolates it.
+	 */
+	public HostAndPort raftAddress(String id) {
+		return new HostAndPort(LOOPBACK, node(id).raftPort);
+	}
+
 	public Map<String, HostAndPort> apiAddresses() {
 		var result = new LinkedHashMap<String, HostAndPort>();
 		nodes.keySet().forEach(id -> result.put(id, apiAddress(id)));
