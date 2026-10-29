@@ -58,7 +58,7 @@ import reactor.core.publisher.Mono;
 final class ReplicatedConnection implements RocksDBConnection {
 
 	/** Default lease of {@code getForUpdate} updates; the native update transaction expires on its own. */
-	private static final Duration UPDATE_LEASE = Duration.ofMinutes(2);
+	private static final Duration UPDATE_LEASE = Duration.ofSeconds(15);
 	/** Bytes of keys and values per replicated chunk of a batch write. */
 	private static final long BATCH_CHUNK_BYTES = 4L * 1024 * 1024;
 	/** Encoding overhead counted per key segment and per value, so many tiny items still fit in one entry. */
@@ -434,12 +434,19 @@ final class ReplicatedConnection implements RocksDBConnection {
 	// Transactions (leader only)
 
 	private CompletableFuture<?> openTransaction(RequestContext context, OpenTransaction command) {
+		long term = currentTerm();
 		return barrier.await().handle((_, error) -> {
 			if (error != null) {
 				throw new CompletionException(barrierFailure(unwrap(error)));
 			}
-			return openNative(context, command, false, command.transactionLeaseTtl(), result -> (Long) result, null);
+			return openNative(context, command, term, false, command.transactionLeaseTtl(), result -> (Long) result,
+					null);
 		}).thenCompose(f -> f);
+	}
+
+	private long currentTerm() {
+		var division = stateMachine.division();
+		return division != null ? division.getInfo().getCurrentTerm() : -1;
 	}
 
 	private CompletableFuture<?> getForUpdate(RequestContext context, Get<?> command) {
@@ -450,26 +457,33 @@ final class ReplicatedConnection implements RocksDBConnection {
 				return result;
 			});
 		}
+		long term = currentTerm();
 		return barrier.await().handle((_, error) -> {
 			if (error != null) {
 				throw new CompletionException(barrierFailure(unwrap(error)));
 			}
-			return openNative(context, command, true, UPDATE_LEASE,
+			return openNative(context, command, term, true, UPDATE_LEASE,
 					result -> ((UpdateContext<?>) result).updateId(), command);
 		}).thenCompose(f -> f);
 	}
 
 	/**
 	 * Opens a native transaction or update on the local database and registers it in the current leader session.
-	 * The snapshot index is reserved first, so that no history it needs can be pruned meanwhile.
+	 * The snapshot index is reserved first, so that no history it needs can be pruned meanwhile. The session must
+	 * belong to the term the read barrier confirmed: a later term of this same node may not have applied, nor
+	 * tracked, the entries another leader committed in between.
 	 */
 	private CompletableFuture<?> openNative(RequestContext context,
 			RocksDBAPICommandSingle<?> command,
+			long confirmedTerm,
 			boolean update,
 			Duration lease,
 			java.util.function.Function<Object, Long> idOf,
 			@Nullable Get<?> forUpdate) {
 		var session = currentSession();
+		if (session.term() != confirmedTerm) {
+			throw new RocksDBRetryException();
+		}
 		var reservation = session.reserve(stateMachine.appliedIndex());
 		CompletableFuture<?> opened;
 		try {
@@ -599,7 +613,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	private LeaderSession currentSession() {
 		var division = stateMachine.division();
-		if (division == null || !division.getInfo().isLeader()) {
+		if (division == null || !division.getInfo().isLeader() || !division.getInfo().isLeaderReady()) {
 			throw new NotLeader();
 		}
 		var session = stateMachine.leaderSession(division.getInfo().getCurrentTerm());

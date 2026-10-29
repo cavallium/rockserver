@@ -91,8 +91,14 @@ and the `LogEntry`.
   later copy of the same request reaches the log (a retry that went to a new leader, or to a restarted node
   whose in-memory Ratis retry cache is empty), applying it returns the recorded result and does nothing else.
   So a write takes effect at most once and its caller always gets the first result.
-- **Records are deleted.** Each proposer reports `completedBelow`, the sequence below which it will never
-  retry. Every 256 sequences, apply deletes that proposer's older records, the same way on every replica.
+- **Late copies never run.** Each proposer reports `completedBelow`: every request below it has its final
+  answer (a result, or "outcome unknown" after the deadline), so the proposer sends none of them again. Apply
+  keeps the highest value per proposer as that proposer's **floor**. A copy numbered below the floor, for
+  example an attempt that was still queued when the proposer gave up on it, is refused without being executed
+  and without reading any record. Sequence numbers are allocated and registered atomically, so
+  `completedBelow` never passes a request that is still in flight.
+- **Records are deleted.** Each time a floor crosses a multiple of 256, apply deletes the records below it. They
+  are never read again, so this cannot change any result.
 
 **Apply.** Every replica applies entries in log order on the Ratis apply thread, through the `EmbeddedDB`
 API.
@@ -100,8 +106,11 @@ API.
 - **Data writes** (puts, deletes, merges, transaction commits) run in one short local transaction. That
   transaction also writes the result record and the applied position, so a crash keeps either all three or
   none.
-- **Schema changes and `deleteRange`** cannot run in a transaction. They are idempotent at their log
-  position, so their record and position are written right after them: RocksDB recovers a prefix of its WAL.
+- **Schema changes and `deleteRange`** cannot run in a transaction. Their record and position are written right
+  after them. Schema changes are also wrapped in two WAL syncs, because RocksDB writes their column family
+  changes to the MANIFEST synchronously while their schema rows go to the (delayed) WAL: a crash cannot keep
+  one without the other. A crash between a `deleteColumn` and its record makes the replayed entry answer "not
+  found" on that replica only; the database contents still match.
 - **Return values** (previous value, delta, merged value...) are computed by apply, so they are the same on
   every replica.
 
@@ -161,7 +170,10 @@ Production uses `OptimisticTransactionDB`. Yotsuba relies on conflicts spanning 
 - **Staged writes** happen natively. The leader also records them, with their conflict keys: the written keys
   plus the `getForUpdate` keys.
 - **Commit** proposes one `Guarded` entry that carries the writes, the snapshot index and the conflict keys.
-  It goes to the local leader in a single attempt, so a refusal really means the entry was not appended.
+  It is submitted straight to the local Raft server in a single attempt, so a refusal really means the entry
+  was not appended.
+- **Open** also checks that the leader session belongs to the term the read barrier confirmed. A node that lost
+  and regained leadership meanwhile might not have applied, or tracked, what the other leader committed.
 
 **Validation.** Ratis calls `preAppendTransaction` under its log write lock, in log order.
 
@@ -172,7 +184,9 @@ Production uses `OptimisticTransactionDB`. Yotsuba relies on conflicts spanning 
 - **Otherwise** the entry is appended and later applied atomically on every replica. The leader's native
   transaction is then rolled back, because its effects arrive through the log.
 - **Hash collisions** can only cause false conflicts.
-- **History is kept** as long as any open transaction, reservation or in-flight commit pins a snapshot.
+- **History is kept** as long as any open transaction, reservation or in-flight commit pins a snapshot. A commit
+  whose snapshot is older than history that was already forgotten always conflicts, whatever released it, so a
+  timing mistake can only cause a false conflict, never a missed one.
 
 **Leader changes.** Transactions, update ids and iterators do not survive a leader change. Clients get
 `UPDATE_RETRY` and run the transaction again, which Yotsuba already does. A commit of a transaction that

@@ -158,7 +158,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			if (current != null) {
 				current.close(store.db());
 			}
-			var created = new LeaderSession(term);
+			var created = new LeaderSession(term, applied);
 			leaderSession = created;
 			LOG.info("{}: leading term {}", config.nodeId(), term);
 			return created;
@@ -294,25 +294,34 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/** Called after Ratis installed a snapshot received from the leader, once {@link #pause} returned. */
 	@Override
 	public void reinitialize() throws IOException {
-		getLifeCycle().startAndTransition(() -> {
-			LOG.info("{}: installing snapshot", config.nodeId());
-			storage.reload();
-			var snapshot = storage.getLatestSnapshot();
-			if (snapshot == null) {
-				throw new IOException("No snapshot to install");
-			}
-			var old = store;
-			if (snapshot.getIndex() <= old.applied().getIndex()) {
-				// The local database already contains everything in the snapshot: rewinding it would make the
-				// entries in between look applied while their effects are gone.
-				LOG.info("{}: keeping the local database at {}, ahead of the installed snapshot at {}",
-						config.nodeId(), old.applied(), snapshot.getTermIndex());
-				return;
-			}
-			old.close();
-			NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
-			openStore();
-		});
+		try {
+			getLifeCycle().startAndTransition(this::installSnapshot);
+		} catch (IOException | RuntimeException ex) {
+			// Ratis would only close this division and leave the process running: stop the node for good instead.
+			fail("install a snapshot", ex instanceof RuntimeException runtime ? runtime
+					: new java.io.UncheckedIOException((IOException) ex));
+			throw ex;
+		}
+	}
+
+	private void installSnapshot() throws IOException {
+		LOG.info("{}: installing snapshot", config.nodeId());
+		storage.reload();
+		var snapshot = storage.getLatestSnapshot();
+		if (snapshot == null) {
+			throw new IOException("No snapshot to install");
+		}
+		var old = store;
+		if (snapshot.getIndex() <= old.applied().getIndex()) {
+			// The local database already contains everything in the snapshot: rewinding it would make the
+			// entries in between look applied while their effects are gone.
+			LOG.info("{}: keeping the local database at {}, ahead of the installed snapshot at {}",
+					config.nodeId(), old.applied(), snapshot.getTermIndex());
+			return;
+		}
+		old.close();
+		NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
+		openStore();
 	}
 
 	@Override

@@ -20,7 +20,13 @@ import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
+import java.util.function.Supplier;
+import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroup;
+import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.protocol.exceptions.LeaderNotReadyException;
+import org.apache.ratis.protocol.exceptions.ResourceUnavailableException;
+import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.exceptions.StateMachineException;
 import org.apache.ratis.retry.RetryPolicies;
@@ -47,43 +53,39 @@ final class Proposer implements Closeable {
 	static final class ConflictException extends RocksDBRetryException {}
 
 	private static final long NOT_READY_RETRY_MS = 50;
-	private static final Duration ATTEMPT_TIMEOUT = Duration.ofSeconds(1);
+	private static final Duration MIN_ATTEMPT_TIMEOUT = Duration.ofSeconds(3);
 	private static final long ATTEMPT_SLEEP_MS = 100;
 
 	private final long proposerId = new SecureRandom().nextLong();
 	private final AtomicLong nextSequence = new AtomicLong();
 	private final ConcurrentSkipListSet<Long> inFlight = new ConcurrentSkipListSet<>();
 	private final RaftClient client;
-	private final RaftClient singleAttemptClient;
+	private final Supplier<RaftServer> localServer;
+	private final RaftGroupId groupId;
+	private final RaftPeerId self;
+	private final ClientId localClientId = ClientId.randomId();
+	private final AtomicLong localCallIds = new AtomicLong();
 	private final ExecutorService sender = Executors.newThreadPerTaskExecutor(
 			Thread.ofVirtual().name("rockserver-propose-", 0).factory());
 	private final long requestTimeoutNanos;
 
-	Proposer(RaftGroup group, RaftProperties properties, NodeConfig config) {
+	Proposer(RaftGroup group, RaftProperties properties, NodeConfig config, Supplier<RaftServer> localServer) {
 		this.requestTimeoutNanos = config.requestTimeout().toNanos();
+		this.localServer = localServer;
+		this.groupId = group.getGroupId();
+		this.self = RaftPeerId.valueOf(config.nodeId());
 		var attemptProperties = new RaftProperties(properties);
-		RaftClientConfigKeys.Rpc.setRequestTimeout(attemptProperties, RaftSettings.duration(ATTEMPT_TIMEOUT));
+		// Long enough that a slow but healthy commit is not resent: a resend is safe, but re-replicates the entry.
+		var attemptTimeout = config.electionTimeoutMax().multipliedBy(2);
+		RaftClientConfigKeys.Rpc.setRequestTimeout(attemptProperties,
+				RaftSettings.duration(attemptTimeout.compareTo(MIN_ATTEMPT_TIMEOUT) > 0 ? attemptTimeout : MIN_ATTEMPT_TIMEOUT));
 		// One Ratis call per attempt; send() resends until the deadline.
-		this.client = newClient(group, null, attemptProperties, RetryPolicies.noRetry());
-		var singleProperties = new RaftProperties(properties);
-		RaftClientConfigKeys.Rpc.setRequestTimeout(singleProperties, RaftSettings.duration(config.requestTimeout()));
-		this.singleAttemptClient = newClient(group, RaftPeerId.valueOf(config.nodeId()), singleProperties,
-				RetryPolicies.noRetry());
-	}
-
-	private static RaftClient newClient(RaftGroup group,
-			@Nullable RaftPeerId leader,
-			RaftProperties properties,
-			RetryPolicy retryPolicy) {
-		var builder = RaftClient.newBuilder()
+		this.client = RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
 				.setRaftGroup(group)
-				.setProperties(properties)
-				.setRetryPolicy(retryPolicy);
-		if (leader != null) {
-			builder.setLeaderId(leader);
-		}
-		return builder.build();
+				.setProperties(attemptProperties)
+				.setRetryPolicy(RetryPolicies.noRetry())
+				.build();
 	}
 
 	RaftClient client() {
@@ -96,25 +98,31 @@ final class Proposer implements Closeable {
 	 * when no leader answered in time; then the outcome is unknown.
 	 */
 	CompletableFuture<Object> propose(LogEntry entry) {
-		return propose(entry, client);
+		return propose(entry, true);
 	}
 
 	/**
-	 * Proposes a transaction commit to this node, which must be the leader that opened it, in a single attempt:
-	 * a retry could reach another leader, which would refuse it although the first attempt may have been committed.
-	 * Fails with {@link ConflictException} on a conflict, {@link RocksDBRetryException} if it was refused before
-	 * being appended, and {@code SERVER_OVERLOADED} if its outcome is unknown.
+	 * Proposes a transaction commit to this node's own Raft server, which must be the leader that opened it, in a
+	 * single attempt: a resend could reach another leader, which would refuse it although the first attempt may
+	 * have been committed. Fails with {@link ConflictException} on a conflict, {@link RocksDBRetryException} if it
+	 * was refused before being appended, and {@code SERVER_OVERLOADED} if its outcome is unknown.
 	 */
 	CompletableFuture<Object> proposeOnce(LogEntry.Guarded entry) {
-		return propose(entry, singleAttemptClient);
+		return propose(entry, false);
 	}
 
-	private CompletableFuture<Object> propose(LogEntry entry, RaftClient via) {
-		long sequence = nextSequence.getAndIncrement();
-		inFlight.add(sequence);
+	private CompletableFuture<Object> propose(LogEntry entry, boolean anyLeader) {
+		long sequence;
+		long completedBelow;
+		synchronized (inFlight) {
+			// Allocate and register together: completedBelow must never pass a number that is taken but not done.
+			sequence = nextSequence.getAndIncrement();
+			inFlight.add(sequence);
+			completedBelow = inFlight.first();
+		}
 		byte[] data;
 		try {
-			data = LogEntryCodec.encodeRequest(new Request(proposerId, sequence, inFlight.first(), entry));
+			data = LogEntryCodec.encodeRequest(new Request(proposerId, sequence, completedBelow, entry));
 		} catch (IllegalArgumentException ex) {
 			inFlight.remove(sequence);
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST, ex.getMessage()));
@@ -125,8 +133,49 @@ final class Proposer implements Closeable {
 					"Write too large for one replicated entry: " + data.length + " bytes"));
 		}
 		var message = Message.valueOf(ByteString.copyFrom(data));
-		return send(via, message, System.nanoTime() + requestTimeoutNanos)
-				.whenComplete((_, _) -> inFlight.remove(sequence));
+		var result = anyLeader ? send(client, message, System.nanoTime() + requestTimeoutNanos) : sendLocal(message);
+		return result.whenComplete((_, _) -> {
+			synchronized (inFlight) {
+				inFlight.remove(sequence);
+			}
+		});
+	}
+
+	/** Submits straight to the local Raft server, with no client in between that could redirect it elsewhere. */
+	private CompletableFuture<Object> sendLocal(Message message) {
+		var request = RaftClientRequest.newBuilder()
+				.setClientId(localClientId)
+				.setServerId(self)
+				.setGroupId(groupId)
+				.setCallId(localCallIds.incrementAndGet())
+				.setMessage(message)
+				.setType(RaftClientRequest.writeRequestType())
+				.build();
+		CompletableFuture<RaftClientReply> reply;
+		try {
+			reply = localServer.get().submitClientRequestAsync(request);
+		} catch (IOException ex) {
+			return CompletableFuture.failedFuture(new RocksDBRetryException());
+		}
+		return reply.orTimeout(requestTimeoutNanos, TimeUnit.NANOSECONDS).handle((answer, error) -> {
+			var refusal = error != null ? stateMachineException(error)
+					: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
+			if (refusal != null) {
+				throw new CompletionException(refusal(refusal));
+			}
+			if (error == null && !answer.isSuccess() && isRefusedBeforeAppend(answer.getException())) {
+				throw new CompletionException(new RocksDBRetryException());
+			}
+			if (error != null) {
+				throw new CompletionException(unavailable(error));
+			}
+			return toResult(answer);
+		});
+	}
+
+	/** Errors Ratis returns only before appending: not ready to lead yet, or no room for another pending request. */
+	private static boolean isRefusedBeforeAppend(@Nullable Throwable error) {
+		return error instanceof LeaderNotReadyException || error instanceof ResourceUnavailableException;
 	}
 
 	private CompletableFuture<Object> send(RaftClient via, Message message, long deadlineNanos) {
@@ -134,7 +183,7 @@ final class Proposer implements Closeable {
 			// Ratis reports state machine refusals either in the reply or as the future's failure.
 			var refusal = error != null ? stateMachineException(error)
 					: !reply.isSuccess() && reply.getException() instanceof StateMachineException e ? e : null;
-			boolean retryable = via == client && System.nanoTime() - deadlineNanos < 0
+			boolean retryable = System.nanoTime() - deadlineNanos < 0
 					&& (refusal != null ? isNotReady(refusal) : error != null || !reply.isSuccess());
 			if (retryable) {
 				// No answer yet (no leader, unreachable, refused before append): send the same request again. If an
@@ -219,7 +268,7 @@ final class Proposer implements Closeable {
 
 	@Override
 	public void close() throws IOException {
-		try (client; singleAttemptClient) {
+		try (client) {
 			sender.shutdownNow();
 		}
 	}

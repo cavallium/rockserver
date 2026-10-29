@@ -98,6 +98,24 @@ class ApplierTest {
 	}
 
 	@Test
+	void aLateCopyBelowTheProposersFloorNeverExecutes() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			var merge = new Request(9, 3, 3, new LogEntry.Merge(column, key(1), text("x"), RequestTypeId.NOTHING));
+			applier.apply(merge, TermIndex.valueOf(1, 1));
+			// The proposer finished with 3 and reported it: records below 512 are deleted.
+			applier.apply(new Request(9, 512, 512, new LogEntry.Put(column, key(2), text("y"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 2));
+			assertNull(applier.recordedResult(merge));
+			// A copy of 3 that was still in flight is appended afterwards: it must not run again.
+			var late = applier.apply(merge, TermIndex.valueOf(1, 3));
+			assertInstanceOf(ApplyResult.Failed.class, late);
+			assertEquals("x", value(store, column, 1));
+		}
+	}
+
+	@Test
 	void logicalRejectionsBecomeResultsAndTheLogMovesOn() throws Exception {
 		try (var store = open()) {
 			var applier = new Applier(store);
@@ -132,10 +150,24 @@ class ApplierTest {
 	void columnIdDivergenceStopsTheReplica() throws Exception {
 		try (var store = open()) {
 			var applier = new Applier(store);
-			long column = store.db().createColumn("c", SCHEMA);
-			applier.apply(new Request(1, 0, 0, new LogEntry.VerifyColumn("c", column)), TermIndex.valueOf(1, 1));
+			long c = store.db().createColumn("c", SCHEMA);
+			long d = store.db().createColumn("d", SCHEMA);
+			applier.apply(new Request(1, 0, 0, new LogEntry.VerifyColumn("c", c)), TermIndex.valueOf(1, 1));
+			// The leader says "c" is d's id here: writes for "c" would land in "d".
 			assertThrows(Applier.ReplicaFailedException.class, () -> applier.apply(
-					new Request(1, 1, 0, new LogEntry.VerifyColumn("c", column + 1)), TermIndex.valueOf(1, 2)));
+					new Request(1, 1, 0, new LogEntry.VerifyColumn("c", d)), TermIndex.valueOf(1, 2)));
+		}
+	}
+
+	@Test
+	void aColumnDeletedAndRecreatedBeforeItsVerificationIsNotDivergence() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long first = store.db().createColumn("c", SCHEMA);
+			store.db().deleteColumn(first);
+			store.db().createColumn("c", SCHEMA);
+			applier.apply(new Request(1, 0, 0, new LogEntry.VerifyColumn("c", first)), TermIndex.valueOf(1, 1));
+			assertEquals(TermIndex.valueOf(1, 1), store.applied());
 		}
 	}
 }

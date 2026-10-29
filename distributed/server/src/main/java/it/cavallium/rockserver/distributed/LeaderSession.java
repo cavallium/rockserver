@@ -81,14 +81,16 @@ final class LeaderSession {
 	}
 
 	private final long term;
+	private final AppliedIndex applied;
 	private final ConflictTracker tracker = new ConflictTracker();
 	private final ConcurrentHashMap<Long, OpenTransaction> transactions = new ConcurrentHashMap<>();
 	private final ConcurrentHashMap<Object, Long> pins = new ConcurrentHashMap<>();
 	private long appliesSincePrune;
 	private volatile boolean closed;
 
-	LeaderSession(long term) {
+	LeaderSession(long term, AppliedIndex applied) {
 		this.term = term;
+		this.applied = applied;
 	}
 
 	long term() {
@@ -165,11 +167,14 @@ final class LeaderSession {
 		tracker.prune(minSnapshotIndex());
 	}
 
-	/** Called after each applied entry of this term: keeps the tracker bounded when there are no transactions. */
+	/**
+	 * Called after each applied entry of this term: keeps the tracker bounded when there are no transactions, and
+	 * when transactions are abandoned without being closed.
+	 */
 	synchronized void afterApply() {
 		if (++appliesSincePrune >= 256) {
 			appliesSincePrune = 0;
-			tracker.prune(minSnapshotIndex());
+			expire();
 		}
 	}
 
@@ -188,8 +193,9 @@ final class LeaderSession {
 		for (long pinned : pins.values()) {
 			min = Math.min(min, pinned);
 		}
-		// Writes at or below the oldest snapshot can no longer conflict with anything.
-		return min;
+		// Writes at or below the oldest snapshot can no longer conflict with anything. Never beyond what is applied:
+		// a transaction opened next takes its snapshot at the applied index.
+		return Math.min(min, applied.get());
 	}
 
 	/** Leadership ended: roll back every open transaction. Their ids become unknown, so clients retry them. */

@@ -50,6 +50,7 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #CLUSTER_ID}: UTF-8 cluster id, written when the {@link LogEntry.Genesis} entry is applied</li>
  *   <li>{@link #REQUEST} + proposer id + sequence: the encoded result of an applied {@link Request}, kept until its
  *   proposer reports it complete</li>
+ *   <li>{@link #FLOOR} + proposer id: the highest {@link Request#completedBelow()} applied for that proposer</li>
  * </ul>
  *
  * <p>The meta column is created locally when a database is first opened, before any log entry is applied, so it
@@ -72,6 +73,7 @@ final class NodeStore implements Closeable {
 	static final byte APPLIED = 1;
 	static final byte CLUSTER_ID = 2;
 	static final byte REQUEST = 3;
+	static final byte FLOOR = 4;
 
 	private static final int META_KEY_BYTES = 1 + 2 * Long.BYTES;
 	private static final ColumnSchema META_SCHEMA = ColumnSchema.of(IntList.of(META_KEY_BYTES), ObjectList.of(), true);
@@ -91,6 +93,7 @@ final class NodeStore implements Closeable {
 	private final Path walDir;
 	private final EmbeddedConnection connection;
 	private final long metaColumnId;
+	private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
 
 	private NodeStore(Path dbDir, Path walDir, EmbeddedConnection connection, long metaColumnId) {
 		this.dbDir = dbDir;
@@ -383,6 +386,9 @@ final class NodeStore implements Closeable {
 
 	@Override
 	public void close() throws IOException {
+		if (!closed.compareAndSet(false, true)) {
+			return;
+		}
 		try {
 			// With a delayed WAL flush (the default config), the last applied entries may still be in RocksDB's
 			// in-process WAL buffer: write them out, so a cleanly stopped replica has its whole applied state on disk.
@@ -468,6 +474,11 @@ final class NodeStore implements Closeable {
 
 	static Keys key(byte metaKey) {
 		return metaKey(metaKey, 0, 0);
+	}
+
+	/** Key of the completion floor of proposer {@code proposerId}. */
+	static Keys floorKey(long proposerId) {
+		return metaKey(FLOOR, proposerId, 0);
 	}
 
 	/** Key of the recorded result of request {@code sequence} of proposer {@code proposerId}. */

@@ -34,6 +34,17 @@ class ConflictTrackerTest {
 	private final ConflictTracker tracker = new ConflictTracker();
 
 	@Test
+	void snapshotOlderThanPrunedHistoryAlwaysConflicts() {
+		var token = tracker.register(put(COLUMN, key("k")));
+		tracker.resolve(token, 12);
+		tracker.prune(20);
+		// The write at 12 is forgotten; a transaction that started before 20 might have missed it.
+		assertTrue(tracker.conflicts(transaction(10, COLUMN, key("k"))));
+		assertTrue(tracker.conflicts(transaction(19, COLUMN, key("unrelated"))));
+		assertFalse(tracker.conflicts(transaction(20, COLUMN, key("k"))));
+	}
+
+	@Test
 	void pendingWriteConflictsWithEveryOlderSnapshot() {
 		var token = tracker.register(put(COLUMN, key("k")));
 
@@ -149,7 +160,7 @@ class ConflictTrackerTest {
 		tracker.resolve(upload, 1);
 		tracker.resolve(genesis, 2);
 		tracker.prune(2);
-		assertFalse(tracker.conflicts(transaction(0, COLUMN, key("k"))));
+		assertFalse(tracker.conflicts(transaction(2, COLUMN, key("k"))));
 	}
 
 	@Test

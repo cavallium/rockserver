@@ -48,6 +48,8 @@ final class ConflictTracker {
 	private final Map<Long, Token> columnWriters = new HashMap<>();
 	/** Last column creation or name-based column deletion: its column id is unknown, so it covers every column. */
 	private @Nullable Token globalWriter;
+	/** Highest index whose older writes may have been forgotten. */
+	private long prunedThrough = -1;
 	/** Resolved entries, oldest index first, so that {@link #prune} only visits what it can drop. */
 	private final PriorityQueue<Token> resolved = new PriorityQueue<>(Comparator.comparingLong(token -> token.index));
 	/** Pending entries in registration order, which is log order. */
@@ -158,6 +160,10 @@ final class ConflictTracker {
 	/** True if any conflict key of {@code guarded} (or its column) was written by an entry newer than its snapshot. */
 	synchronized boolean conflicts(LogEntry.Guarded guarded) {
 		long snapshotIndex = guarded.snapshotIndex();
+		if (snapshotIndex < prunedThrough) {
+			// Writes after this snapshot may have been forgotten already: it cannot be validated, so it conflicts.
+			return true;
+		}
 		if (isNewer(globalWriter, snapshotIndex)) {
 			return true;
 		}
@@ -202,8 +208,13 @@ final class ConflictTracker {
 		}
 	}
 
-	/** Forgets resolved writes at or below {@code index}: no open transaction has a snapshot older than that. */
+	/**
+	 * Forgets resolved writes at or below {@code index}: no open transaction has a snapshot older than that. A
+	 * transaction whose snapshot is older than a pruned index is then always reported as conflicting, whatever
+	 * pinned or forgot it, so pruning too eagerly can only cause false conflicts.
+	 */
 	synchronized void prune(long index) {
+		prunedThrough = Math.max(prunedThrough, index);
 		while (!resolved.isEmpty() && resolved.peek().index <= index) {
 			Token token = resolved.poll();
 			// Only the keys this token still owns: a later writer of the same key keeps its own state.

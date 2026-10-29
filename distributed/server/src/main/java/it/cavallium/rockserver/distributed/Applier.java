@@ -48,7 +48,7 @@ final class Applier {
 	 * would look like a rejected entry on this replica only.
 	 */
 	private static final long APPLY_TRANSACTION_TIMEOUT_MS = 24L * 60 * 60 * 1000;
-	/** Records of completed requests are deleted when a proposer's sequence crosses a multiple of this. */
+	/** Records below a proposer's floor are deleted each time the floor crosses a multiple of this. */
 	private static final long RECORD_CLEANUP_EVERY = 256;
 
 	private final NodeStore store;
@@ -64,27 +64,43 @@ final class Applier {
 		return recorded == null ? null : ResultCodec.decode(recorded.toByteArray());
 	}
 
-	/** Applies {@code request} at {@code position} and records its result and the position. */
+	/**
+	 * Applies {@code request} at {@code position} and records its result and the position.
+	 *
+	 * <p>A request numbered below its proposer's floor is a late copy of a request the proposer already finished
+	 * with (answered, or given up as unknown): it is never executed, so cleaning up records cannot make an old
+	 * request run again. A request with a record is a copy of one that already took effect: it gets the recorded
+	 * result.</p>
+	 */
 	ApplyResult apply(Request request, TermIndex position) {
 		try {
+			long floor = floor(request.proposerId());
+			if (request.sequence() < floor) {
+				markApplied(0L, position);
+				return STALE_COPY;
+			}
 			var recorded = recordedResult(request);
 			if (recorded != null) {
-				// A retry of a request that already took effect: answer as the first time.
 				markApplied(0L, position);
 				return recorded;
 			}
 			var entry = request.entry();
 			ApplyResult result = switch (entry) {
 				case LogEntry.Write write when !(write instanceof LogEntry.DeleteRange) ->
-						applyInTransaction(request, position);
-				case LogEntry.Guarded _ -> applyInTransaction(request, position);
+						applyInTransaction(request, floor, position);
+				case LogEntry.Guarded _ -> applyInTransaction(request, floor, position);
 				default -> {
+					// Schema changes write the RocksDB MANIFEST synchronously, while their schema rows, record and
+					// position go to the WAL. Make everything before them durable first and everything after them
+					// durable at once, so a crash cannot keep one without the other.
+					syncWal();
 					var outcome = applyLogical(() -> execute(0L, entry));
-					finish(0L, request, outcome, position);
+					finish(0L, request, floor, outcome, position);
+					syncWal();
 					yield outcome;
 				}
 			};
-			cleanUpRecords(request);
+			cleanUpRecords(request, floor);
 			return result;
 		} catch (ReplicaFailedException ex) {
 			throw ex;
@@ -102,7 +118,23 @@ final class Applier {
 		}
 	}
 
-	private ApplyResult applyInTransaction(Request request, TermIndex position) {
+	private static final ApplyResult STALE_COPY = new ApplyResult.Failed(RocksDBErrorType.INVALID_REQUEST,
+			"Late copy of a request that its proposer already finished");
+
+	private long floor(long proposerId) {
+		Buf value = store.db().get(0L, store.metaColumnId(), NodeStore.floorKey(proposerId), RequestType.<Buf>current());
+		return value == null ? 0 : java.nio.ByteBuffer.wrap(value.toByteArray()).getLong();
+	}
+
+	private void syncWal() {
+		try {
+			store.db().getDb().get().flushWal(true);
+		} catch (org.rocksdb.RocksDBException e) {
+			throw new ReplicaFailedException("Failed to sync the WAL", e);
+		}
+	}
+
+	private ApplyResult applyInTransaction(Request request, long floor, TermIndex position) {
 		var db = store.db();
 		long tx = db.openTransaction(APPLY_TRANSACTION_TIMEOUT_MS, WorkloadProfile.BATCH);
 		boolean open = true;
@@ -112,10 +144,10 @@ final class Applier {
 				// A rejected entry has no effects: roll back partial writes, then record the rejection.
 				db.closeTransaction(tx, false);
 				open = false;
-				finish(0L, request, result, position);
+				finish(0L, request, floor, result, position);
 				return result;
 			}
-			finish(tx, request, result, position);
+			finish(tx, request, floor, result, position);
 			open = false;
 			if (!db.closeTransaction(tx, true)) {
 				// Only the apply thread writes the database, so an optimistic conflict means local corruption.
@@ -179,6 +211,14 @@ final class Applier {
 					// failure that would stop them all.
 					throw new IllegalArgumentException("Merge operator " + upload.name() + " cannot be loaded: " + badJar,
 							null);
+				} catch (RocksDBException failed) {
+					// An operator that cannot be instantiated (missing class, wrong type, failing constructor) is
+					// reported as PUT_UNKNOWN_ERROR; only a native storage error below it is a local failure.
+					if (isNativeFailure(failed)) {
+						throw failed;
+					}
+					throw new IllegalArgumentException("Merge operator " + upload.name() + " rejected: "
+							+ failed.getMessage(), null);
 				}
 			}
 			case LogEntry.Guarded guarded -> {
@@ -231,24 +271,35 @@ final class Applier {
 				Buf.wrap(genesis.clusterId().getBytes(StandardCharsets.UTF_8)), RequestType.none());
 	}
 
+	/**
+	 * Stops this replica if the id the leader assigned to {@code name} belongs here to another column: writes meant
+	 * for {@code name} would land in it. The column may have been deleted (and its name reused) since it was created,
+	 * so a missing id or a different id for the name is not evidence of divergence.
+	 */
 	private void verifyColumn(LogEntry.VerifyColumn verify) {
-		Long local;
-		try {
-			local = store.db().getColumnId(verify.name());
-		} catch (RocksDBException ex) {
-			// Deleted again since: nothing left to compare.
-			return;
-		}
-		if (local != verify.columnId()) {
-			throw new ReplicaFailedException("Column " + verify.name() + " has id " + local + " on this replica, but "
-					+ verify.columnId() + " on the leader: the replicas diverged");
+		for (String name : store.db().getAllColumnDefinitions().keySet()) {
+			long id;
+			try {
+				id = store.db().getColumnId(name);
+			} catch (RocksDBException ex) {
+				continue;
+			}
+			if (id == verify.columnId() && !name.equals(verify.name())) {
+				throw new ReplicaFailedException("Column id " + id + " is " + verify.name() + " on the leader but " + name
+						+ " on this replica: the replicas diverged");
+			}
 		}
 	}
 
-	/** Writes the result record and the applied position, in transaction {@code tx} if not zero. */
-	private void finish(long tx, Request request, ApplyResult result, TermIndex position) {
+	/** Writes the result record, the proposer's floor and the applied position, in transaction {@code tx} if not 0. */
+	private void finish(long tx, Request request, long floor, ApplyResult result, TermIndex position) {
 		store.db().put(tx, store.metaColumnId(), NodeStore.requestKey(request.proposerId(), request.sequence()),
 				Buf.wrap(ResultCodec.encode(result)), RequestType.none());
+		if (request.completedBelow() > floor) {
+			store.db().put(tx, store.metaColumnId(), NodeStore.floorKey(request.proposerId()),
+					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(request.completedBelow()).array()),
+					RequestType.none());
+		}
 		markApplied(tx, position);
 	}
 
@@ -257,13 +308,17 @@ final class Applier {
 				NodeStore.encodeTermIndex(position), RequestType.none());
 	}
 
-	/** Deletes the records of requests their proposer reported complete; deterministic, so equal on every replica. */
-	private void cleanUpRecords(Request request) {
-		if (request.sequence() % RECORD_CLEANUP_EVERY != 0 || request.completedBelow() == 0) {
+	/**
+	 * Deletes the records below a proposer's new floor. They are never read again (copies below the floor are
+	 * refused before any lookup), so whether a crash interrupts this does not change any result.
+	 */
+	private void cleanUpRecords(Request request, long oldFloor) {
+		long newFloor = request.completedBelow();
+		if (newFloor / RECORD_CLEANUP_EVERY <= oldFloor / RECORD_CLEANUP_EVERY) {
 			return;
 		}
 		store.db().deleteRange(store.metaColumnId(), NodeStore.requestKey(request.proposerId(), 0),
-				NodeStore.requestKey(request.proposerId(), request.completedBelow()));
+				NodeStore.requestKey(request.proposerId(), newFloor));
 	}
 
 	private interface Operation {
@@ -305,6 +360,15 @@ final class Applier {
 			}
 			if (t.getCause() == t) {
 				break;
+			}
+		}
+		return false;
+	}
+
+	private static boolean isNativeFailure(Throwable error) {
+		for (Throwable t = error; t != null && t.getCause() != t; t = t.getCause()) {
+			if (t instanceof org.rocksdb.RocksDBException || t instanceof IOException || t instanceof UncheckedIOException) {
+				return true;
 			}
 		}
 		return false;

@@ -84,7 +84,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			started.add(server);
 			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout());
 			started.add(barrier);
-			this.proposer = new Proposer(group, RaftSettings.client(config), config);
+			this.proposer = new Proposer(group, RaftSettings.client(config), config, this::raftServer);
 			started.add(proposer);
 			this.forwarder = new LeaderForwarder(config);
 			started.add(forwarder);
@@ -293,11 +293,16 @@ public final class ReplicatedNode implements AutoCloseable {
 		if (!closed.compareAndSet(false, true)) {
 			return;
 		}
-		maintenance.shutdownNow();
+		if (maintenance != null) {
+			maintenance.shutdownNow();
+		}
 		IOException failure = null;
-		var order = consensusFirst
-				? List.<Closeable>of(server, apiServer, proposer, barrier, forwarder)
-				: List.<Closeable>of(apiServer, proposer, barrier, forwarder, server);
+		// A replica can fail while the constructor is still starting the rest: skip what does not exist yet.
+		var order = (consensusFirst
+				? java.util.stream.Stream.<Closeable>of(server, apiServer, proposer, barrier, forwarder)
+				: java.util.stream.Stream.<Closeable>of(apiServer, proposer, barrier, forwarder, server))
+				.filter(java.util.Objects::nonNull)
+				.toList();
 		try {
 			failure = closeAll(order);
 		} finally {
