@@ -307,6 +307,11 @@ public final class ProcessCluster implements AutoCloseable {
 		node.paused = false;
 	}
 
+	/** The node's stderr log (where it logs), appended to by every start; each start begins with a marker line. */
+	public Path stderrLog(String id) {
+		return node(id).stderr();
+	}
+
 	/** The last lines of the node's stdout and stderr, for failure messages. */
 	public String logTail(String id) {
 		var node = node(id);

@@ -7,6 +7,8 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Executors;
@@ -15,10 +17,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.grpc.GrpcConfigKeys;
+import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.protocol.TransferLeadershipRequest;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.jetbrains.annotations.Nullable;
@@ -206,23 +210,49 @@ public final class ReplicatedNode implements AutoCloseable {
 		shutdown();
 	}
 
+	/**
+	 * Hands leadership to one follower, chosen among those that answered recently: the one with the highest commit
+	 * index. Only one attempt is made: while a transfer is pending, Ratis refuses writes and refuses transfers to
+	 * any other peer, and a failed attempt can stay pending until its timeout. The request goes straight to the
+	 * local Raft server, not through a client that may still route it to a stopped former leader.
+	 */
 	private void transferLeadership() {
-		for (PeerConfig peer : config.peers()) {
-			if (peer.id().equals(config.nodeId())) {
-				continue;
+		var transferee = transferee();
+		if (transferee == null) {
+			LOG.warn("{}: no follower answered recently, stopping as leader without a hand-off", config.nodeId());
+			return;
+		}
+		try {
+			var request = new TransferLeadershipRequest(ClientId.randomId(), server.getId(), group.getGroupId(),
+					0, transferee, LEADERSHIP_TRANSFER_TIMEOUT_MS);
+			var reply = server.transferLeadership(request);
+			if (reply.isSuccess()) {
+				LOG.info("{}: leadership transferred to {}", config.nodeId(), transferee);
+				return;
 			}
-			try {
-				var reply = proposer.client().admin()
-						.transferLeadership(RaftPeerId.valueOf(peer.id()), LEADERSHIP_TRANSFER_TIMEOUT_MS);
-				if (reply.isSuccess()) {
-					LOG.info("{}: leadership transferred to {}", config.nodeId(), peer.id());
-					return;
-				}
-			} catch (IOException | RuntimeException ex) {
-				LOG.warn("{}: leadership transfer to {} failed", config.nodeId(), peer.id(), ex);
-			}
+			LOG.warn("{}: leadership transfer to {} failed", config.nodeId(), transferee, reply.getException());
+		} catch (IOException | RuntimeException ex) {
+			LOG.warn("{}: leadership transfer to {} failed", config.nodeId(), transferee, ex);
 		}
 		LOG.warn("{}: stopping as leader without a hand-off", config.nodeId());
+	}
+
+	/** The most up-to-date follower that answered this leader within an election timeout, null if none. */
+	private @Nullable RaftPeerId transferee() {
+		var division = stateMachine.division();
+		if (division == null || !division.getInfo().isLeader()) {
+			return null;
+		}
+		var commitIndices = new HashMap<RaftPeerId, Long>();
+		for (var info : division.getCommitInfos()) {
+			commitIndices.put(RaftPeerId.valueOf(info.getServer().getId()), info.getCommitIndex());
+		}
+		long recentMillis = config.electionTimeoutMin().toMillis();
+		return division.getInfo().getRoleInfoProto().getLeaderInfo().getFollowerInfoList().stream()
+				.filter(follower -> follower.getLastRpcElapsedTimeMs() < recentMillis)
+				.map(follower -> RaftPeerId.valueOf(follower.getId().getId()))
+				.max(Comparator.comparingLong(id -> commitIndices.getOrDefault(id, -1L)))
+				.orElse(null);
 	}
 
 	private void shutdown() throws IOException {
