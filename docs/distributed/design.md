@@ -312,6 +312,11 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
    - The result records of a proposer process that crashed are never deleted. Only the few that were in flight
      remain per crash; add a cleanup entry if crashes turn out to be frequent.
    - A result larger than the Ratis message limit makes a committed write look failed.
-   - Snapshots are triggered by entry count only.
+   - Snapshots are triggered by entry count only, and a failing snapshot is retried at every apply step.
+   - Iterator calls after a leader change fail with an internal "iterator not found" error, not `UPDATE_RETRY`.
+   - After a read barrier confirms leadership, the wait for the local apply to catch up has no deadline of its
+     own.
+   - The snapshot taken right after a seeded genesis is attempted once, on the leader only.
+   - A SIGTERM that races a replica failure can exit with 0 instead of 3.
 8. **Upstream.** Report the Ratis ReadIndex reuse bug, and switch back to Ratis ReadIndex once it is fixed
    upstream.
