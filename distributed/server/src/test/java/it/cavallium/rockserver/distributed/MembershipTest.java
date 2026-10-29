@@ -180,11 +180,12 @@ class MembershipTest {
 	}
 
 	/**
-	 * A member with an empty database added to a seeded cluster whose log still starts at its first entry would
-	 * replay a log that lacks the seed: it must stop with a clear error instead of diverging.
+	 * A member with an empty database added to a seeded cluster right after it started must get the seed from the
+	 * snapshot the leader takes after genesis, never by replaying a log that lacks the seed. (If it ever did replay
+	 * the genesis entry, it would stop with a clear error instead of diverging.)
 	 */
 	@Test
-	void emptyMemberJoiningASeededClusterBeforeTheLogIsPurgedStops() throws Exception {
+	void emptyMemberJoiningASeededClusterRightAwayGetsTheSeedFromASnapshot() throws Exception {
 		cluster = ProcessCluster.create(root, 3, 1, serverArgs());
 		var seed = createSeed();
 		for (var id : List.of("1", "2", "3")) {
@@ -196,28 +197,13 @@ class MembershipTest {
 
 		cluster.start("4");
 		cluster.waitReady("4", READY_TIMEOUT);
-		// The configuration change itself may or may not complete before the new member stops.
-		String addOutput;
-		try {
-			addOutput = cluster.admin(List.of("1", "2", "3"), "add-peer", cluster.peer("4").format());
-		} catch (IllegalStateException failed) {
-			addOutput = failed.getMessage();
-		}
-		var addResult = addOutput;
-		InProcessCluster.await(TIMEOUT, () -> cluster.output("4").contains(SEEDED_BUT_EMPTY));
-		assertFalse(cluster.output("4").contains(SNAPSHOT_INSTALLED), "node 4 received a snapshot: " + addResult);
+		assertOk(cluster.admin(List.of("1", "2", "3"), "add-peer", cluster.peer("4").format()));
+		InProcessCluster.await(TIMEOUT, () -> cluster.output("4").contains(SNAPSHOT_INSTALLED));
+		assertFalse(cluster.output("4").contains(SEEDED_BUT_EMPTY), "node 4 replayed the seeded genesis entry");
 
-		// The rest of the cluster keeps serving, and the failed member is removed.
-		assertSeedServed(seed, List.of("1", "2", "3"));
-		assertOk(cluster.admin(List.of("1", "2", "3", "4"), "remove-peer", "4"));
 		var column = client.getColumnId("seeded", CONTEXT).valueOrThrow();
 		client.put(column, key(1_000_000), text("after"), CONTEXT).valueOrThrow();
-		assertEquals("after", text(client.get(column, key(1_000_000), CONTEXT).valueOrThrow()));
-
-		cluster.kill("4");
-		// The failed member's database holds nothing of the cluster: no seed, no later write.
-		assertEquals(Map.of(), dump(cluster.dataDir("4").resolve("db")));
-		var members = List.of("1", "2", "3");
+		var members = List.of("1", "2", "3", "4");
 		awaitAppliedEverywhere(members, column, key(1_000_000), text("after"));
 		stopAll(members);
 		var expected = new TreeMap<String, Long>(seed.keysByColumn);

@@ -26,16 +26,16 @@ import org.apache.ratis.protocol.exceptions.StateMachineException;
 import org.apache.ratis.retry.RetryPolicies;
 import org.apache.ratis.retry.RetryPolicy;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
-import org.apache.ratis.util.TimeDuration;
 import org.jetbrains.annotations.Nullable;
 
 /**
  * Submits log entries to the current leader through a Ratis client, from any node.
  *
- * <p>Every proposal is a numbered {@link Request}. It is retried (leader changes, timeouts) with the same number
- * until it gets an answer or the request timeout passes, and applying a retry of a request that already took
- * effect returns the recorded result instead of executing it again. So a write takes effect at most once even when
- * retries reach a new leader or a restarted node, whose Ratis retry cache is empty.</p>
+ * <p>Every proposal is a numbered {@link Request}. It is resent (leader changes, unreachable nodes, timeouts) with
+ * the same number until it gets an answer or the request timeout passes, and applying a copy of a request that
+ * already took effect returns the recorded result instead of executing it again. So a write takes effect at most
+ * once even when copies reach a new leader or a restarted node. Each attempt is a single Ratis call, which follows
+ * the leader hints Ratis returns; the deadline bounds the whole proposal.</p>
  *
  * <p>Each proposal is an independent blocking call on its own virtual thread, not a request of the client's
  * ordered async stream: once one request of that stream runs out of retries, Ratis closes the stream for good, and
@@ -49,7 +49,6 @@ final class Proposer implements Closeable {
 	private static final long NOT_READY_RETRY_MS = 50;
 	private static final Duration ATTEMPT_TIMEOUT = Duration.ofSeconds(1);
 	private static final long ATTEMPT_SLEEP_MS = 100;
-	private static final int MIN_ATTEMPTS = 5;
 
 	private final long proposerId = new SecureRandom().nextLong();
 	private final AtomicLong nextSequence = new AtomicLong();
@@ -64,12 +63,8 @@ final class Proposer implements Closeable {
 		this.requestTimeoutNanos = config.requestTimeout().toNanos();
 		var attemptProperties = new RaftProperties(properties);
 		RaftClientConfigKeys.Rpc.setRequestTimeout(attemptProperties, RaftSettings.duration(ATTEMPT_TIMEOUT));
-		// Bounded so that all attempts end close to the request timeout.
-		// A few attempts at least, to follow leader redirects.
-		int attempts = (int) Math.max(MIN_ATTEMPTS,
-				config.requestTimeout().toMillis() / (ATTEMPT_TIMEOUT.toMillis() + ATTEMPT_SLEEP_MS));
-		this.client = newClient(group, null, attemptProperties, RetryPolicies.retryUpToMaximumCountWithFixedSleep(
-				attempts, TimeDuration.valueOf(ATTEMPT_SLEEP_MS, TimeUnit.MILLISECONDS)));
+		// One Ratis call per attempt; send() resends until the deadline.
+		this.client = newClient(group, null, attemptProperties, RetryPolicies.noRetry());
 		var singleProperties = new RaftProperties(properties);
 		RaftClientConfigKeys.Rpc.setRequestTimeout(singleProperties, RaftSettings.duration(config.requestTimeout()));
 		this.singleAttemptClient = newClient(group, RaftPeerId.valueOf(config.nodeId()), singleProperties,
@@ -139,10 +134,14 @@ final class Proposer implements Closeable {
 			// Ratis reports state machine refusals either in the reply or as the future's failure.
 			var refusal = error != null ? stateMachineException(error)
 					: !reply.isSuccess() && reply.getException() instanceof StateMachineException e ? e : null;
-			if (refusal != null && isNotReady(refusal) && via == client && System.nanoTime() - deadlineNanos < 0) {
-				// Refused before being appended: resending cannot apply it twice.
+			boolean retryable = via == client && System.nanoTime() - deadlineNanos < 0
+					&& (refusal != null ? isNotReady(refusal) : error != null || !reply.isSuccess());
+			if (retryable) {
+				// No answer yet (no leader, unreachable, refused before append): send the same request again. If an
+				// earlier copy took effect, applying this one returns its recorded result.
+				long delay = refusal != null ? NOT_READY_RETRY_MS : ATTEMPT_SLEEP_MS;
 				return CompletableFuture.supplyAsync(() -> send(via, message, deadlineNanos),
-						CompletableFuture.delayedExecutor(NOT_READY_RETRY_MS, TimeUnit.MILLISECONDS)).thenCompose(f -> f);
+						CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS)).thenCompose(f -> f);
 			}
 			if (refusal != null) {
 				throw new CompletionException(refusal(refusal));
