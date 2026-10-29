@@ -254,14 +254,6 @@ public final class ProcessCluster implements AutoCloseable {
 		return result;
 	}
 
-	/**
-	 * Address of the node's Raft server, reachable directly from the test JVM: for a Ratis admin client that asks
-	 * each node for its role, like {@code ReplicatedServerMain admin status}.
-	 */
-	public HostAndPort raftAddress(String id) {
-		return new HostAndPort(LOOPBACK, node(id).raftPort);
-	}
-
 	public Path dataDir(String id) {
 		return node(id).dataDir();
 	}
@@ -423,6 +415,18 @@ public final class ProcessCluster implements AutoCloseable {
 	/** The node's stderr log (where it logs), appended to by every start; each start begins with a marker line. */
 	public Path stderrLog(String id) {
 		return node(id).stderr();
+	}
+
+	/** Everything the node printed on stdout and stderr, over all its starts. */
+	public String output(String id) {
+		var node = node(id);
+		try {
+			var stdout = Files.exists(node.stdout()) ? Files.readString(node.stdout()) : "";
+			var stderr = Files.exists(node.stderr()) ? Files.readString(node.stderr()) : "";
+			return stdout + stderr;
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
 	}
 
 	/** The last lines of the node's stdout and stderr, for failure messages. */
