@@ -22,9 +22,12 @@ import java.util.concurrent.TimeUnit;
 /**
  * A cluster of {@link ReplicatedServerMain} JVMs on this machine, connected through a {@link Network}.
  *
- * <p>Node ids are {@code "1"} to {@code "N"}. Every node binds its Raft and API ports on {@code 127.0.0.1} and
- * names its peers {@code node-<id>} for both ports, so all node-to-node traffic goes through the network's link
- * proxies. The test JVM reaches each node's API directly through {@link #apiAddress}, bypassing the proxies.</p>
+ * <p>Node ids are {@code "1"} to {@code "N"}, followed by the ids of spare nodes, if any ({@link #create}): those
+ * have ports, links and directories from the start but join the group only when the test starts them and changes
+ * the membership ({@link #setMembers}, {@link #admin}). Every node binds its Raft and API ports on
+ * {@code 127.0.0.1} and names its peers {@code node-<id>} for both ports, so all node-to-node traffic goes through
+ * the network's link proxies. The test JVM reaches each node's API directly through {@link #apiAddress},
+ * bypassing the proxies.</p>
  *
  * <p>Everything lives under the root directory given at start: {@code <root>/node-<id>/data} (the node's data
  * directory, kept across restarts), {@code <root>/node-<id>/stdout.log} and {@code stderr.log} (appended to by
@@ -36,6 +39,7 @@ import java.util.concurrent.TimeUnit;
 public final class ProcessCluster implements AutoCloseable {
 
 	private static final String MAIN_CLASS = "it.cavallium.rockserver.distributed.ReplicatedServerMain";
+	private static final Duration ADMIN_TIMEOUT = Duration.ofSeconds(60);
 	private static final String LOOPBACK = "127.0.0.1";
 	private static final Duration GRACEFUL_STOP_TIMEOUT = Duration.ofSeconds(60);
 	private static final Duration READY_POLL_INTERVAL = Duration.ofMillis(50);
@@ -50,6 +54,8 @@ public final class ProcessCluster implements AutoCloseable {
 	private final List<String> serverArgs;
 	private final Network network;
 	private final Map<String, Node> nodes;
+	/** The peer list given to nodes when they start. Guarded by this. */
+	private List<String> members;
 	private final Thread shutdownHook = new Thread(this::killAllNow, "process-cluster-shutdown");
 
 	private static final class Node {
@@ -90,11 +96,13 @@ public final class ProcessCluster implements AutoCloseable {
 		}
 	}
 
-	private ProcessCluster(String mainClass, List<String> serverArgs, Network network, Map<String, Node> nodes) {
+	private ProcessCluster(String mainClass, List<String> serverArgs, Network network, Map<String, Node> nodes,
+			List<String> members) {
 		this.mainClass = mainClass;
 		this.serverArgs = serverArgs;
 		this.network = network;
 		this.nodes = nodes;
+		this.members = members;
 	}
 
 	/**
@@ -108,22 +116,9 @@ public final class ProcessCluster implements AutoCloseable {
 
 	/** Like {@link #start(Path, int, List)}, with another main class taking the same {@code run} options. */
 	static ProcessCluster start(Path root, int size, List<String> serverArgs, String mainClass) throws IOException {
-		var nodes = new LinkedHashMap<String, Node>();
-		var ports = new LinkedHashMap<String, List<Integer>>();
-		var linkAddresses = Network.linkAddresses(size);
-		var freePorts = freePorts(size * 2, linkAddresses);
-		for (int i = 0; i < size; i++) {
-			var id = String.valueOf(i + 1);
-			var node = new Node(id, freePorts.get(2 * i), freePorts.get(2 * i + 1), root.resolve(Network.hostname(id)));
-			Files.createDirectories(node.dir);
-			nodes.put(id, node);
-			ports.put(id, List.of(node.raftPort, node.apiPort));
-		}
-		var network = Network.start(ports, root.resolve("network"));
-		var cluster = new ProcessCluster(mainClass, List.copyOf(serverArgs), network, nodes);
-		Runtime.getRuntime().addShutdownHook(cluster.shutdownHook);
+		var cluster = create(root, size, 0, serverArgs, mainClass);
 		try {
-			for (var id : nodes.keySet()) {
+			for (var id : cluster.members()) {
 				cluster.start(id);
 			}
 		} catch (IOException | RuntimeException e) {
@@ -133,8 +128,110 @@ public final class ProcessCluster implements AutoCloseable {
 		return cluster;
 	}
 
+	/**
+	 * Prepares {@code size} member nodes and {@code spares} spare nodes without starting any, so that the test can
+	 * fill their data directories first; start them with {@link #start(String)}.
+	 *
+	 * @param serverArgs extra {@code run} options passed to every node, e.g. {@code --snapshot-every 100}
+	 */
+	public static ProcessCluster create(Path root, int size, int spares, List<String> serverArgs) throws IOException {
+		return create(root, size, spares, serverArgs, MAIN_CLASS);
+	}
+
+	private static ProcessCluster create(Path root, int size, int spares, List<String> serverArgs, String mainClass)
+			throws IOException {
+		int total = size + spares;
+		var nodes = new LinkedHashMap<String, Node>();
+		var ports = new LinkedHashMap<String, List<Integer>>();
+		var linkAddresses = Network.linkAddresses(total);
+		var freePorts = freePorts(total * 2, linkAddresses);
+		for (int i = 0; i < total; i++) {
+			var id = String.valueOf(i + 1);
+			var node = new Node(id, freePorts.get(2 * i), freePorts.get(2 * i + 1), root.resolve(Network.hostname(id)));
+			Files.createDirectories(node.dir);
+			nodes.put(id, node);
+			ports.put(id, List.of(node.raftPort, node.apiPort));
+		}
+		var network = Network.start(ports, root.resolve("network"));
+		var members = List.copyOf(nodes.keySet()).subList(0, size);
+		var cluster = new ProcessCluster(mainClass, List.copyOf(serverArgs), network, nodes, members);
+		Runtime.getRuntime().addShutdownHook(cluster.shutdownHook);
+		return cluster;
+	}
+
+	/** Every node, members and spares. */
 	public List<String> nodeIds() {
 		return List.copyOf(nodes.keySet());
+	}
+
+	/** The peer list that nodes get when they start: the initial members unless {@link #setMembers} changed it. */
+	public synchronized List<String> members() {
+		return members;
+	}
+
+	/**
+	 * Sets the peer list given to nodes started from now on (a node not in it gets it plus itself). Running nodes
+	 * keep theirs; the group's own membership changes only through {@link #admin}.
+	 */
+	public synchronized void setMembers(List<String> ids) {
+		ids.forEach(this::node);
+		members = List.copyOf(ids);
+	}
+
+	/** The node's address as nodes see it, in the {@code --peer} format of {@link ReplicatedServerMain}. */
+	public PeerConfig peer(String id) {
+		var node = node(id);
+		var host = Network.hostname(id);
+		return new PeerConfig(id, host, node.raftPort, host, node.apiPort);
+	}
+
+	/**
+	 * Runs {@code ReplicatedServerMain admin --peer <each of peerIds> <command...>} in its own JVM, which reaches
+	 * the nodes directly (see {@link Network#directHostsFile}), and returns its output. Fails with the output if
+	 * it exits with an error or does not finish in time.
+	 */
+	public String admin(List<String> peerIds, String... command) throws IOException {
+		var args = new ArrayList<String>();
+		args.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
+		args.add("-cp");
+		args.add(System.getProperty("java.class.path"));
+		args.add("--enable-native-access=ALL-UNNAMED");
+		args.add("-Djdk.net.hosts.file=" + network.directHostsFile());
+		args.add(MAIN_CLASS);
+		args.add("admin");
+		for (var id : peerIds) {
+			args.add("--peer");
+			args.add(peer(id).format());
+		}
+		args.addAll(List.of(command));
+		var process = new ProcessBuilder(args).redirectErrorStream(true).start();
+		var output = new StringBuilder();
+		var reader = Thread.ofVirtual().start(() -> {
+			try (var in = process.getInputStream()) {
+				output.append(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+			} catch (IOException e) {
+				output.append("(output unreadable: ").append(e).append(")");
+			}
+		});
+		try {
+			if (!process.waitFor(ADMIN_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS)) {
+				process.destroyForcibly();
+				process.waitFor();
+				reader.join();
+				throw new IllegalStateException("admin " + String.join(" ", command) + " did not finish within "
+						+ ADMIN_TIMEOUT + ":\n" + output);
+			}
+			reader.join();
+		} catch (InterruptedException e) {
+			process.destroyForcibly();
+			Thread.currentThread().interrupt();
+			throw new IllegalStateException("Interrupted while running admin " + String.join(" ", command), e);
+		}
+		if (process.exitValue() != 0) {
+			throw new IllegalStateException("admin " + String.join(" ", command) + " exited with code "
+					+ process.exitValue() + ":\n" + output);
+		}
+		return output.toString();
 	}
 
 	public Network network() {
@@ -363,10 +460,13 @@ public final class ProcessCluster implements AutoCloseable {
 		command.add("run");
 		command.add("--node-id");
 		command.add(node.id);
-		for (var peer : nodes.values()) {
-			var host = Network.hostname(peer.id);
+		var peers = new ArrayList<>(members);
+		if (!peers.contains(node.id)) {
+			peers.add(node.id);
+		}
+		for (var peer : peers) {
 			command.add("--peer");
-			command.add(new PeerConfig(peer.id, host, peer.raftPort, host, peer.apiPort).format());
+			command.add(peer(peer).format());
 		}
 		command.add("--data-dir");
 		command.add(node.dataDir().toString());

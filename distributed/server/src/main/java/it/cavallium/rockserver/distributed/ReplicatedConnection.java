@@ -295,7 +295,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 				// We became the leader meanwhile.
 				return (CompletableFuture<Object>) single(context, command);
 			}
-			return (CompletableFuture<Object>) forwarder.api(leader, context).requestAsync(command);
+			return forwarder.api(leader, stateMachine, context)
+					.thenCompose(api -> (CompletableFuture<Object>) api.requestAsync(command));
 		});
 	}
 
@@ -305,7 +306,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 			if (leader.equals(config.nodeId())) {
 				return Flux.from(stream(context, command));
 			}
-			return Flux.from((Publisher<Object>) forwarder.api(leader, context).requestAsync(command));
+			return Mono.fromFuture(forwarder.api(leader, stateMachine, context))
+					.flatMapMany(api -> Flux.from((Publisher<Object>) api.requestAsync(command)));
 		});
 	}
 

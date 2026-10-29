@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import it.cavallium.rockserver.core.client.RocksDBConnection;
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import java.io.Closeable;
 import java.io.IOException;
@@ -60,7 +61,8 @@ public final class ReplicatedNode implements AutoCloseable {
 		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure);
 
 		var parameters = new Parameters();
-		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer));
+		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
+		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress));
 		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
 		this.server = RaftServer.newBuilder()
 				.setServerId(RaftPeerId.valueOf(config.nodeId()))
