@@ -174,6 +174,51 @@ class ReplicationTest {
 		}
 	}
 
+	/**
+	 * A follower whose missing entries are gone from the leader's log can only catch up by installing a snapshot
+	 * (found by {@link RandomFaultTest}: the install stopped the follower's Raft server for good, because Ratis
+	 * reloads a state machine only once it is paused).
+	 */
+	@Test
+	void followerBehindThePurgedLogInstallsASnapshot() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withSnapshotEveryEntries(64)).startAll();
+		long column = api(cluster.awaitLeader(TIMEOUT)).createColumn("c", SCHEMA);
+		var lagging = cluster.anyFollower();
+		var laggingId = lagging.config().nodeId();
+		long laggingApplied = lagging.appliedIndex();
+		cluster.halt(laggingId);
+		int written = 0;
+		// A new term starts a new log segment, and only closed segments are purged: change leaders a few times.
+		for (int term = 0; term < 3; term++) {
+			var leader = cluster.awaitLeader(TIMEOUT);
+			for (int i = 0; i < 600; i++, written++) {
+				api(leader).put(0, column, key(written), text("v" + written), RequestType.none());
+			}
+			var leaderId = leader.config().nodeId();
+			cluster.stop(leaderId);
+			cluster.start(leaderId);
+		}
+		var leader = cluster.awaitLeader(TIMEOUT);
+		api(leader).put(0, column, key(written), text("v" + written), RequestType.none());
+		written++;
+		long logStart = leader.stateMachine().division().getRaftLog().getStartIndex();
+		assertTrue(logStart > laggingApplied + 1, "log not purged past the lagging follower: starts at " + logStart
+				+ ", follower applied " + laggingApplied);
+
+		cluster.start(laggingId);
+		cluster.awaitConverged(Duration.ofSeconds(60));
+		var node = cluster.node(laggingId);
+		assertFalse(node.stateMachine().isFailed());
+		for (int i = 0; i < written; i += 97) {
+			assertEquals("v" + i, localValue(node, column, i));
+		}
+		assertEquals("v" + (written - 1), localValue(node, column, written - 1));
+		// The installed replica keeps applying new entries.
+		api(cluster.awaitLeader(TIMEOUT)).put(0, column, key(written), text("after"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		assertEquals("after", localValue(node, column, written));
+	}
+
 	@Test
 	void batchWritesAreReplicated() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();

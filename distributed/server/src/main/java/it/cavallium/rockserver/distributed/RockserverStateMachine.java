@@ -16,6 +16,7 @@ import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.util.LifeCycle;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -88,7 +89,22 @@ final class RockserverStateMachine extends BaseStateMachine {
 		this.server = server;
 		this.groupId = groupId;
 		storage.init(raftStorage);
-		openStore();
+		getLifeCycle().startAndTransition(this::openStore);
+	}
+
+	/**
+	 * Called by Ratis once a snapshot from the leader is fully received, before {@link #reinitialize}: Ratis reloads
+	 * the state machine only if it is {@code PAUSED}, and otherwise stops this replica's Raft server for good. The
+	 * state machine updater thread then runs {@link #reinitialize} instead of applying entries, which makes it
+	 * {@code RUNNING} again.
+	 */
+	@Override
+	public synchronized void pause() {
+		var lifeCycle = getLifeCycle();
+		if (lifeCycle.getCurrentState() == LifeCycle.State.RUNNING) {
+			lifeCycle.transition(LifeCycle.State.PAUSING);
+			lifeCycle.transition(LifeCycle.State.PAUSED);
+		}
 	}
 
 	/** Opens the local database, first restoring the snapshot if it is ahead of the database. */
@@ -271,16 +287,18 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/** Called after Ratis installed a snapshot received from the leader. */
 	@Override
 	public void reinitialize() throws IOException {
-		LOG.info("{}: installing snapshot", config.nodeId());
-		storage.reload();
-		var snapshot = storage.getLatestSnapshot();
-		if (snapshot == null) {
-			throw new IOException("No snapshot to install");
-		}
-		var old = store;
-		old.close();
-		NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
-		openStore();
+		getLifeCycle().startAndTransition(() -> {
+			LOG.info("{}: installing snapshot", config.nodeId());
+			storage.reload();
+			var snapshot = storage.getLatestSnapshot();
+			if (snapshot == null) {
+				throw new IOException("No snapshot to install");
+			}
+			var old = store;
+			old.close();
+			NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
+			openStore();
+		});
 	}
 
 	@Override
