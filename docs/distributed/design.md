@@ -46,7 +46,7 @@ config file.
 
 **What core needs from this module.** Nothing changed in core except
 `MergeOperatorRegistry.upload`, which was made atomic. Single-node behavior and the wire contract are
-unchanged (CDC aside).
+unchanged, apart from the separate removal of CDC from Rockserver.
 
 | Class | Role |
 |---|---|

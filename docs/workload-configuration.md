@@ -2,7 +2,7 @@
 
 Default workload tuning is under `database.parallelism.workload`. The old
 `maintenance-write`, `foreground-write-queue-capacity`, and
-`maintenance-write-queue-capacity` keys do not describe the seven-profile
+`maintenance-write-queue-capacity` keys do not describe the workload-profile
 scheduler and have been removed. There is no compatibility translation.
 
 The effective database configuration logged at startup prints every value below.
@@ -44,13 +44,13 @@ Each group has independent bounded queues, workers, profile reservations and
 batch-pressure admission. Its pending-compaction backlog does not throttle another
 group. RocksDB's database-wide write-stop and delayed-write signals still apply
 to every group. Column reads, mutations, ranges, scans and iterator continuations
-use their group over both embedded and gRPC APIs. WAL/CDC, transaction commits,
+use their group over both embedded and gRPC APIs. WAL, transaction commits,
 whole-database flush/compact and global control operations use global admission;
 a transaction can still operate on columns in different groups without acquiring
 nested scheduler permits. Root shutdown drains all groups.
 
 Group workload overrides cover scheduler admission settings. Retained snapshots,
-response limits, scan/WAL quanta and other bounded-operation settings remain
+response limits, scan quanta and other bounded-operation settings remain
 global; differing overrides are rejected. Groups share RocksDB WAL, memory, CPU
 and physical storage. Admission isolation does not guarantee disk-latency isolation.
 Adaptive compaction observes the most contended read group and database-wide
@@ -66,17 +66,14 @@ limits. Production values must each be at least three.
 | --- | ---: | --- |
 | `latency-queue-capacity` | 4096 | Maximum queued LATENCY submissions per data pool |
 | `ingest-queue-capacity` | 4096 | Maximum queued INGEST submissions per data pool |
-| `cdc-queue-capacity` | 1024 | Maximum queued CDC submissions per data pool |
 | `analytical-queue-capacity` | 512 | Maximum queued ANALYTICAL submissions in the read pool |
 | `batch-queue-capacity` | 512 | Maximum queued BATCH submissions per data pool |
 | `control-queue-capacity` | 256 | Maximum queued protected CONTROL submissions |
 | `physical-maintenance-queue-capacity` | 16 | Maximum queued physical-maintenance submissions |
 | `read-latency-reservation` | 1 | Borrowable LATENCY worker reservation in the read pool |
 | `read-ingest-reservation` | 1 | Borrowable INGEST worker reservation in the read pool |
-| `read-cdc-reservation` | 1 | Borrowable CDC worker reservation in the read pool |
 | `write-latency-reservation` | 1 | Borrowable LATENCY worker reservation in the write pool |
 | `write-ingest-reservation` | 1 | Borrowable INGEST worker reservation in the write pool |
-| `write-cdc-reservation` | 1 | Borrowable CDC worker reservation in the write pool |
 | `control-threads` | 2 | Workers in the isolated CONTROL pool |
 | `physical-concurrency` | 1 | Workers in the isolated physical-maintenance pool |
 | `analytical-active-limit` | 1 | Maximum active ANALYTICAL submissions in the read pool |
@@ -102,7 +99,6 @@ When that profile has queued work, dispatch restores its guaranteed share.
 | --- | ---: | --- |
 | `latency-burst` | 8 | Maximum consecutive eligible LATENCY selections before guaranteed work is reconsidered |
 | `ingest-drr-weight` | 4 | INGEST deficit-round-robin quantum |
-| `cdc-drr-weight` | 4 | CDC deficit-round-robin quantum |
 | `analytical-drr-weight` | 2 | ANALYTICAL deficit-round-robin quantum |
 | `batch-drr-weight` | 1 | BATCH deficit-round-robin quantum |
 | `competing-batch-read-maximum-active` | 4 | Read-side BATCH quantum cap while any non-BATCH request is queued or active |
@@ -136,7 +132,7 @@ unlock. Once the peer has a free worker it becomes eligible for the next bounded
 | Workload key | Default | Meaning |
 | --- | ---: | --- |
 | `retained-analytical-snapshots` | 1 | FIFO permit capacity for retained analytical snapshots |
-| `retained-snapshot-maximum-age` | `PT60S` | Absolute maximum lifetime of a retained analytical snapshot or CDC WAL cursor |
+| `retained-snapshot-maximum-age` | `PT60S` | Absolute maximum lifetime of a retained analytical snapshot |
 
 The permit capacity must be positive; a zero maximum age is already expired. For
 retained analytical work, the age is combined with the request and
@@ -151,15 +147,12 @@ transport/operation deadline, and the earliest deadline wins.
 | `range-quantum-max-duration` | `PT0.008S` | Maximum monotonic runtime of one range/count quantum |
 | `raw-scan-file-concurrency` | 4 | Maximum simultaneously subscribed SST readers for one unsharded raw scan |
 | `raw-scan-readahead-bytes` | `8MiB` | Sequential readahead reserved by each active raw-SST reader |
-| `cdc-quantum-max-mutations` | 4096 | Maximum mutations parsed in one CDC quantum |
-| `cdc-quantum-max-bytes` | `8MiB` | Maximum decoded WAL key/value bytes scanned in one CDC quantum |
-| `cdc-quantum-max-duration` | `PT0.008S` | Maximum monotonic runtime of one CDC quantum |
 | `latency-range-max-items` | 4096 | Server maximum items accepted for a LATENCY range page |
 | `latency-range-max-bytes` | `8MiB` | Server maximum bytes accepted for a LATENCY range page |
 | `latency-fan-out-max-items` | 256 | Server maximum items accepted for LATENCY fixed multi/fan-out commands |
 | `latency-fan-out-max-bytes` | `2MiB` | Server maximum encoded input for LATENCY point mutations and fixed multi/fan-out commands |
 
-Every item, mutation, and byte limit must be positive. Raw-scan concurrency must
+Every item and byte limit must be positive. Raw-scan concurrency must
 be between 1 and 64, and raw-scan readahead must be positive. Quantum durations
 must be positive and representable. A quantum stops at the first key, byte, or elapsed
 time bound it reaches; continuations reacquire workload admission. Every bounded
@@ -196,20 +189,11 @@ misclassify downstream backpressure or later cooperative redispatch as initial q
 Execution is total active time, and `rockserver.workload.quantums` retains the exact number
 of scheduler quanta. Registry recording is therefore outside repeated cooperative yields.
 
-CDC captures one conservative completed-mutation tail, then publishes the application
-WAL through `CDC + FLUSH` before opening the logical poll. WAL parsing,
-filtered-empty progress, latest-value resolution,
-and every continuation remain in the CDC profile. An indivisible mutation larger than
-the byte quantum is processed alone to guarantee cursor progress. The database-level
-CDC lag gauge is the maximum across durable subscriptions, using each subscription's
-furthest observed or durably committed cursor; it does not create per-subscription
-meters.
-
 The gRPC adapter validates and buffers a LATENCY fixed multi-operation within
 the configured fan-out bounds before executing its first mutation. INGEST and
 BATCH multi-operations remain streamed and are not constrained by LATENCY limits.
 
-Tune only with the seven-profile hardware harness. Keep the smallest candidate
+Tune only with the `SevenProfileWorkloadBenchmark` hardware harness. Keep the smallest candidate
 within the throughput/latency acceptance envelope, then verify it and its
 adjacent candidates on the target storage class. CI results alone are not
 hardware acceptance and must not be used to retune these defaults.
@@ -227,3 +211,18 @@ contract version 3. An omitted/false flag keeps full-flush behavior. Older serve
 ignore the additive flag and safely perform a full flush; older Java backend and
 Thrift implementations use the full-flush fallback. Both modes retain the global
 physical-maintenance FLUSH admission and shutdown accounting.
+
+## WAL archive
+
+RocksDB can keep obsolete WAL files in an archive instead of deleting them. Rockserver
+no longer reads archived WAL files, so the archive is off by default:
+
+| `database.global` key | Default | Meaning |
+| --- | ---: | --- |
+| `wal-ttl-seconds` | 0 | Keep obsolete WAL files for this many seconds (RocksDB `WAL_ttl_seconds`); 0 deletes them as soon as they are obsolete |
+| `wal-size-limit-mb` | 0 | Cap of the WAL archive in MiB (RocksDB `WAL_size_limit_MB`); 0 means no cap |
+
+Both values must be zero or greater. The system property
+`it.cavallium.dbengine.wal.ttl.seconds` overrides `wal-ttl-seconds`. With both limits
+at 0 no archive is kept. Archive usage is exported as `rocksdb.wal.archived.bytes`,
+`rocksdb.wal.archived.files`, and `rocksdb.wal.archived.oldest.age.seconds`.

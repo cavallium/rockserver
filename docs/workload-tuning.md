@@ -1,7 +1,7 @@
 # Workload tuning and hardware selection
 
 `SevenProfileWorkloadBenchmark` is the release tuning harness for Rockserver's
-seven-profile scheduler. It is an opt-in `main` class under test sources; ordinary CI
+workload-profile scheduler. It is an opt-in `main` class under test sources; ordinary CI
 may compile it and run the pure selector tests, but CI output is never hardware
 acceptance and must not change production defaults.
 
@@ -17,7 +17,6 @@ The harness keeps these producers active at the same time:
 | `LATENCY` | Point lookup with a fresh five-second relative timeout policy | `POINT_LOOKUP` |
 | `ANALYTICAL` | Bounded fallback range scan | `RANGE_PAGE` |
 | `INGEST` | Live point mutation | `MUTATION` |
-| `CDC` | Poll and commit against concurrent writes | `WAL_PAGE` |
 | `BATCH` | Recovery point mutation | `MUTATION` |
 | `PHYSICAL_MAINTENANCE` | Protected flush | `FLUSH` |
 
@@ -37,7 +36,7 @@ clears.
 - queue, execution, and end-to-end p99;
 - scheduler rejection/cancellation counters, client-observed rejected/cancelled
   attempts, deadlines, and scheduler quantum counts;
-- maximum retained snapshots, CDC lag, observed pressure, and
+- maximum retained snapshots, observed pressure, and
   queue/active/parked/outstanding depths;
 - process CPU ns/operation, allocated bytes/operation, GC collections/time, peak live
   heap, direct memory, RSS, thread count, and native handles;
@@ -60,7 +59,6 @@ The candidate SLO gates are intentionally conservative:
   seconds;
 - CONTROL and the ANALYTICAL fallback both make progress with p99 below one second;
 - mixed INGEST throughput is at least 95% of its candidate's isolated baseline;
-- CDC makes progress, exposes its lag meter, and stays below `--cdc-lag-limit`;
 - ANALYTICAL and BATCH continue, and BATCH completes work after injected pressure;
 - injected storage pressure is observed, PHYSICAL work progresses, every profile has
   zero unexpected errors, all logical resources drain, no native handle leaks are
@@ -70,7 +68,7 @@ The candidate SLO gates are intentionally conservative:
 The LATENCY and ANALYTICAL rows are scheduler-level chat/fallback proxies. They do
 not replace the Yotsuba one-hour canary or prove the end-to-end message path.
 Run the complementary
-[`GrpcOverloadBenchmark`](grpc-mixed-workload-benchmark.md) to exercise all seven
+[`GrpcOverloadBenchmark`](grpc-mixed-workload-benchmark.md) to exercise all six
 profiles through the generated gRPC client and server, prove exact RPC terminal
 accounting and acknowledged-write round trips, and gate avoidable sleeping workers
 plus paired foreground confidence intervals. Neither harness replaces the canary.
@@ -80,8 +78,8 @@ plus paired foreground confidence intervals. Neither harness replaces the canary
 `SchedulerHighContentionBenchmark` isolates `RWScheduler` from RocksDB and transport
 cost so admission, dispatch, arbitration, and cooperative transitions can be driven
 far harder than a disk-backed benchmark. Its default fresh-process run submits one
-million operations from at least 64 platform threads across twelve profile/family
-lanes, all seven profiles, and all four pools. It mixes:
+million operations from at least 64 platform threads across every admitted profile/family
+lane, all six profiles, and all four pools. It mixes:
 
 - normal and byte-weighted DRR work;
 - already-expired deadlines and bounded overload;
@@ -198,7 +196,7 @@ java -cp "${workload_classpath}" "${workload_main}" \
 ```
 
 The smallest candidate is four because production pools reserve borrowable slots
-for LATENCY, INGEST, and CDC and require at least three workers. Use the same
+for LATENCY and INGEST and require at least three workers. Use the same
 candidate list, seed, workload rates, dataset dimensions, JVM, and Rockserver SHA
 throughout one comparison.
 
@@ -232,12 +230,10 @@ common_options=(
   "--warmup-seconds=15"
   "--measure-seconds=60"
   "--pressure-seconds=5"
-  "--cdc-lag-limit=100000"
   "--control-workers=1"
   "--latency-workers=8"
   "--analytical-workers=1"
   "--ingest-workers=4"
-  "--cdc-workers=1"
   "--batch-workers=2"
   "--physical-workers=1"
   "--cancellation-workers=1"
@@ -245,7 +241,6 @@ common_options=(
   "--latency-rate=0"
   "--analytical-rate=10"
   "--ingest-rate=1000"
-  "--cdc-rate=50"
   "--batch-rate=100"
   "--physical-rate=1"
   "--cancellation-rate=25"
@@ -327,7 +322,7 @@ java -cp "${workload_classpath}" "${selector_main}" \
 Selection is mechanical:
 
 1. Reject inputs that were not enforced cold-cache hardware runs.
-2. Find maximum aggregate throughput across the seven profiles.
+2. Find maximum aggregate throughput across the six profiles.
 3. Retain candidates within 5% of that maximum.
 4. Retain candidates whose worst relevant p99 is within 10% of the minimum such p99.
 5. Reject any candidate with a per-profile SLO failure or any leak.

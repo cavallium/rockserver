@@ -42,4 +42,4 @@ Physical SST-token identity, complete source coverage, completion barriers and d
 
 ## Search limits
 
-The scoped search found no direct native merge/operator-registration or `putBatchAsync` usage in non-test Yotsuba Java. A mapping-document reference to merge setup does not prove an operand algebra. The observed migration destination uses logical `putMultiAsync`, not SST ingestion. CDC is delegated by `api/RockserverAsyncApiViews.java:128`, but no active polling consumer was found. These absences do not remove Rockserver's general merge, bulk-ingestion, or CDC contracts; inspect the server API and tests.
+The scoped search found no direct native merge/operator-registration or `putBatchAsync` usage in non-test Yotsuba Java. A mapping-document reference to merge setup does not prove an operand algebra. The observed migration destination uses logical `putMultiAsync`, not SST ingestion. CDC is delegated by `api/RockserverAsyncApiViews.java:128`, but no active polling consumer was found; CDC has since been removed from Rockserver altogether. These absences do not remove Rockserver's general merge or bulk-ingestion contracts; inspect the server API and tests.

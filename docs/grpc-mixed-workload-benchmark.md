@@ -28,7 +28,6 @@ thermal bias. The mixed phase keeps every scheduler profile active:
 | `LATENCY` | Point GET and bounded first/last range reduction |
 | `ANALYTICAL` | Unpaced bounded first/last range reduction |
 | `INGEST` | Rate-limited point PUT |
-| `CDC` | Poll a server-owned CDC subscription and commit its cursor |
 | `BATCH` | Unpaced point PUT flood and cancellable PUT bursts |
 | `PHYSICAL_MAINTENANCE` | Protected flush |
 
@@ -90,7 +89,7 @@ attached only during each measured window. Acceptance requires:
 - the two profile-ordering relationships in at least four of five paired rounds,
   allowing one correlated host-jitter outlier while still requiring the median
   ordering;
-- successful end-to-end progress for all seven profiles.
+- successful end-to-end progress for all six profiles.
 
 For each paired round, the runner computes mixed/foreground-only throughput and
 p99 ratios with a two-sided 95% Student-t confidence interval. These within-build

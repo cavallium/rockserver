@@ -9,9 +9,9 @@
     "pressured-batch-maximum-active", "maximum-pressured-batch-active",
     "pressured-batch-cap-witnesses", "cancelled-rows", "resumed-rows", "durable-checkpoints",
     "elapsed-nanos", "backfill-rows", "backfill-rows-per-second", "backfill-batches",
-    "ingest-writes", "ingest-writes-per-second", "latency-reads", "cdc-events",
+    "ingest-writes", "ingest-writes-per-second", "latency-reads",
     "maintenance-operations", "pressure-transitions", "maximum-zero-progress-gap-nanos",
-    "maximum-cdc-lag", "latency-p99-nanos", "cpu-nanos-per-useful-operation",
+    "latency-p99-nanos", "cpu-nanos-per-useful-operation",
     "allocated-bytes-per-useful-operation", "gc-collections", "gc-millis", "maximum-queued",
     "maximum-parked", "maximum-outstanding", "peak-live-heap-bytes", "peak-direct-memory-bytes",
     "peak-rss-bytes", "peak-threads", "peak-native-handles", "native-leaks"
