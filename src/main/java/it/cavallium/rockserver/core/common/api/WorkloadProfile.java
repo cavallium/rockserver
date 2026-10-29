@@ -12,7 +12,6 @@ public enum WorkloadProfile implements org.apache.thrift.TEnum {
   LATENCY(2),
   ANALYTICAL(3),
   INGEST(4),
-  CDC(5),
   BATCH(6),
   PHYSICAL_MAINTENANCE(7);
 
@@ -45,8 +44,6 @@ public enum WorkloadProfile implements org.apache.thrift.TEnum {
         return ANALYTICAL;
       case 4:
         return INGEST;
-      case 5:
-        return CDC;
       case 6:
         return BATCH;
       case 7:

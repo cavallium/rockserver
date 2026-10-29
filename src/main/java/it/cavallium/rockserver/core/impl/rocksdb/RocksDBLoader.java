@@ -32,8 +32,9 @@ import static org.rocksdb.ColumnFamilyOptionsInterface.DEFAULT_COMPACTION_MEMTAB
 public class RocksDBLoader {
 
     static final String WAL_TTL_SECONDS_PROPERTY = "it.cavallium.dbengine.wal.ttl.seconds";
-    static final long DEFAULT_WAL_TTL_SECONDS = 24L * 60L * 60L;
-    static final long DEFAULT_WAL_SIZE_LIMIT_MB = 100L * 1024L;
+    /** No WAL archive by default: nothing reads obsolete WAL files since CDC was removed. */
+    static final long DEFAULT_WAL_TTL_SECONDS = 0L;
+    static final long DEFAULT_WAL_SIZE_LIMIT_MB = 0L;
 
     private static final long AUTO_MEMTABLE_MAX_RANGE_DELETION_BYTES_PER_TOMBSTONE = 64L * SizeUnit.KB;
     private static final int AUTO_MEMTABLE_MAX_RANGE_DELETIONS_MIN = 64;
@@ -1093,17 +1094,17 @@ public class RocksDBLoader {
             } catch (NumberFormatException ex) {
                 throw it.cavallium.rockserver.core.common.RocksDBException.of(
                         RocksDBErrorType.CONFIG_ERROR,
-                        "System property %s must be a positive integer number of seconds"
+                        "System property %s must be a non-negative integer number of seconds"
                                 .formatted(WAL_TTL_SECONDS_PROPERTY),
                         ex);
             }
         } else {
             walTtlSeconds = Objects.requireNonNullElse(globalConfig.walTtlSeconds(), DEFAULT_WAL_TTL_SECONDS);
         }
-        if (walTtlSeconds <= 0) {
+        if (walTtlSeconds < 0) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(
                     RocksDBErrorType.CONFIG_ERROR,
-                    "%s must be greater than zero, but was %d".formatted(
+                    "%s must be zero (no WAL archive) or greater, but was %d".formatted(
                             propertyValue != null ? WAL_TTL_SECONDS_PROPERTY : "database.global.wal-ttl-seconds",
                             walTtlSeconds));
         }
@@ -1216,6 +1217,7 @@ public class RocksDBLoader {
             for (Map.Entry<String, FallbackColumnConfig> entry : columnConfigMap.entrySet()) {
                 String name = entry.getKey();
                 var columnFamilyOptions = !(entry.getValue() instanceof NamedColumnConfig)
+                        // _cdc_meta_ belongs to the removed CDC feature; older databases still contain it.
                         && (name.equals("_column_schemas_") || name.equals("_merge_operators_") || name.equals("_cdc_meta_"))
                         ? new ColumnOptionsWithMerge(getCompatibilityColumnOptions(refs, path, definitiveDbPath, databaseOptions), null)
                         : getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),

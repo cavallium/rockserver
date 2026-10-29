@@ -10,7 +10,7 @@ package it.cavallium.rockserver.core.common;
  * {@code docs/workload-profiles.md}.</p>
  *
  * <p>Clients may request only {@link #LATENCY}, {@link #ANALYTICAL},
- * {@link #INGEST}, or {@link #BATCH}. {@link #CONTROL}, {@link #CDC}, and
+ * {@link #INGEST}, or {@link #BATCH}. {@link #CONTROL} and
  * {@link #PHYSICAL_MAINTENANCE} are protected profiles assigned by Rockserver.</p>
  *
  * <table class="striped">
@@ -21,18 +21,16 @@ package it.cavallium.rockserver.core.common;
  *   <tr><td>LATENCY</td><td>Request-bound work expected inside the normal API latency budget</td><td>Fast admission or immediate overload</td><td>Point lookup, first/last seek, bounded multi-get, metadata estimate</td><td>Full counts, unbounded ranges, backfills</td></tr>
  *   <tr><td>ANALYTICAL</td><td>Caller waits for an intrinsically expensive query</td><td>Capped guaranteed progress; caller cancellation stops it</td><td>Exact count, full aggregation, operator-requested statistics</td><td>Periodic metrics, migrations, unattended jobs</td></tr>
  *   <tr><td>INGEST</td><td>Sustained live pipeline whose lag affects primary freshness or durability</td><td>Reserved progress and bounded backlog</td><td>Crawler writes, transactional updates, live monitor persistence</td><td>Historical replay, cleanup, ad-hoc statistics</td></tr>
- *   <tr><td>CDC</td><td>WAL discovery, publication, polling, or acknowledgement</td><td>Independent lag SLO and reserved progress across every stage</td><td>CDC pages, cursor resume, commit, required WAL flush</td><td>Ordinary scans or generic maintenance</td></tr>
  *   <tr><td>BATCH</td><td>Retryable or deferrable work with no waiting caller</td><td>Uses spare capacity, pauses under pressure, eventually progresses</td><td>Backfill, migration, cleanup, scheduled exact statistics</td><td>Live ingestion or synchronous operator queries</td></tr>
- *   <tr><td>PHYSICAL_MAINTENANCE</td><td>Explicit physical database servicing</td><td>Serialized and admitted only when storage policy permits</td><td>Manual flush and compaction</td><td>CDC-required flush, logical cleanup</td></tr>
+ *   <tr><td>PHYSICAL_MAINTENANCE</td><td>Explicit physical database servicing</td><td>Serialized and admitted only when storage policy permits</td><td>Manual flush and compaction</td><td>Logical cleanup</td></tr>
  *   </tbody>
  * </table>
  *
- * <p>Decision tree, in order: (1) CDC lifecycle or WAL work is CDC; (2) resource
- * release, rollback, or cancellation is CONTROL; (3) explicit manual flush or
- * compaction is PHYSICAL_MAINTENANCE; (4) a live primary or derived pipeline is
- * INGEST; (5) a bounded request expected within the normal deadline is LATENCY;
- * (6) expensive work with a waiting caller is ANALYTICAL; (7) retryable or unattended
- * work is BATCH. If none applies, its service contract must be defined before merge.</p>
+ * <p>Decision tree, in order: (1) resource release, rollback, or cancellation is
+ * CONTROL; (2) explicit manual flush or compaction is PHYSICAL_MAINTENANCE; (3) a live
+ * primary or derived pipeline is INGEST; (4) a bounded request expected within the
+ * normal deadline is LATENCY; (5) expensive work with a waiting caller is ANALYTICAL;
+ * (6) retryable or unattended work is BATCH. If none applies, its service contract must be defined before merge.</p>
  *
  * <p>An exact heavy count is ANALYTICAL when a caller waits, BATCH when periodic or
  * retryable, and LATENCY only when it uses a bounded metadata estimate such as
@@ -51,9 +49,6 @@ public enum WorkloadProfile {
 
 	/** A sustained live pipeline whose lag affects primary freshness or durability. */
 	INGEST(4, true),
-
-	/** WAL discovery, publication, polling, acknowledgement, or required WAL flush work. */
-	CDC(5, false),
 
 	/** Retryable or deferrable work with no waiting caller. */
 	BATCH(6, true),
@@ -74,14 +69,13 @@ public enum WorkloadProfile {
 		return wireValue;
 	}
 
-	/** Decode one of the seven stable wire values without relying on enum order. */
+	/** Decode one of the stable wire values without relying on enum order. */
 	public static WorkloadProfile fromWireValue(int wireValue) {
 		return switch (wireValue) {
 			case 1 -> CONTROL;
 			case 2 -> LATENCY;
 			case 3 -> ANALYTICAL;
 			case 4 -> INGEST;
-			case 5 -> CDC;
 			case 6 -> BATCH;
 			case 7 -> PHYSICAL_MAINTENANCE;
 			default -> throw new IllegalArgumentException("Unknown workload profile: " + wireValue);

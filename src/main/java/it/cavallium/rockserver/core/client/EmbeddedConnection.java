@@ -12,8 +12,6 @@ import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
-import it.cavallium.rockserver.core.common.cdc.CDCEvent;
-import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
@@ -106,14 +104,6 @@ public final class EmbeddedConnection extends BaseConnection implements Internal
 	@Override
 	<R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestAsync(context, request);
-	}
-
-	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
-			@NotNull String id,
-			@Nullable Long fromSeq,
-			long maxEvents) {
-		return delegate.cdcPollBatchAsync(context, id, fromSeq, maxEvents);
 	}
 }
 
@@ -311,8 +301,6 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			case RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable scanRaw ->
 					this.scanRawResumableAsync(scanRaw.columnId(), scanRaw.shardIndex(), scanRaw.shardCount(),
 							scanRaw.completedSsts());
-            case RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll cdcPoll -> this.cdcPollAsync(cdcPoll.id(), cdcPoll.fromSeq(), cdcPoll.maxEvents());
-			case RocksDBAPICommand.CdcCommit cdcCommit -> db.cdcCommitAsyncInternal(cdcCommit.id(), cdcCommit.seq());
 			case RocksDBAPICommand.RocksDBAPICommandSingle<?> _ -> supplyAsyncPreservingRunningCompletion(
 					() -> withRequestContext(context, () -> req.handleSync(this)),
 					commandExecutor(req),
@@ -1567,67 +1555,5 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
     @org.jetbrains.annotations.VisibleForTesting
     public EmbeddedDB getInternalDB() {
         return db;
-    }
-
-    // CDC API implementation stubs delegating to EmbeddedDB
-    public long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds) throws RocksDBException {
-        return db.cdcCreate(id, fromSeq, columnIds, null, null);
-    }
-
-    public long cdcCreate(@NotNull String id, @Nullable Long fromSeq, @Nullable List<Long> columnIds, @Nullable Boolean resolvedValues) throws RocksDBException {
-        return db.cdcCreate(id, fromSeq, columnIds, resolvedValues, null);
-    }
-
-    @Override
-    public long cdcCreate(@NotNull String id,
-                          @Nullable Long fromSeq,
-                          @Nullable List<Long> columnIds,
-                          @Nullable Boolean resolvedValues,
-                          @Nullable OptionalLong expectedLastCommitted) throws RocksDBException {
-        return db.cdcCreate(id, fromSeq, columnIds, resolvedValues, expectedLastCommitted);
-    }
-
-	public void cdcDelete(@NotNull String id) throws RocksDBException {
-		db.cdcDelete(id);
-	}
-
-	@Override
-	public long cdcGetEarliestAvailableSequence() throws RocksDBException {
-		return db.cdcGetEarliestAvailableSequence();
-	}
-
-	@Override
-	public java.util.OptionalLong cdcGetLastCommittedSequence(@NotNull String id) throws RocksDBException {
-		return db.cdcGetLastCommittedSequence(id);
-	}
-
-	public void cdcCommit(@NotNull String id, long seq) throws RocksDBException {
-        db.cdcCommit(id, seq);
-    }
-
-    public @NotNull java.util.stream.Stream<CDCEvent> cdcPoll(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
-        return db.cdcPoll(id, fromSeq, maxEvents);
-    }
-
-    public @NotNull Publisher<CDCEvent> cdcPollAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
-        // Default: defer to DB implementation; fallback to blocking stream if async is not supported
-        return db.cdcPollAsyncInternal(id, fromSeq, maxEvents);
-    }
-
-	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
-			@NotNull String id,
-			@Nullable Long fromSeq,
-			long maxEvents) {
-		return withRequestContext(context, () -> cdcPollBatchAsync(id, fromSeq, maxEvents));
-	}
-
-    @Override
-    public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
-        try {
-            return db.cdcPollBatchAsyncInternal(id, fromSeq, maxEvents);
-        } catch (Throwable e) {
-            return Mono.error(e);
-        }
     }
 }

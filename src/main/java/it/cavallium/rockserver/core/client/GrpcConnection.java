@@ -96,8 +96,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-import it.cavallium.rockserver.core.common.cdc.CdcBatch;
-import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
@@ -162,14 +160,6 @@ public final class GrpcConnection extends BaseConnection {
 	}
 
 	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
-			@NotNull String id,
-			@Nullable Long fromSeq,
-			long maxEvents) {
-		return delegate.cdcPollBatchAsync(context, id, fromSeq, maxEvents);
-	}
-
-	@Override
 	public void close() {
 		delegate.close();
 	}
@@ -202,8 +192,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	/*
 	 * A retry can run after the server completed an operation but before its
 	 * response reached the client. Keep this allowlist to stateless unary reads:
-	 * transaction/update/iterator creation, mutations, maintenance, CDC polling
-	 * and every streaming method require caller-owned recovery instead.
+	 * transaction/update/iterator creation, mutations, maintenance and every
+	 * streaming method require caller-owned recovery instead.
 	 *
 	 * Generated descriptors bind the service-config names to the wire schema.
 	 */
@@ -219,9 +209,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			RocksDBServiceGrpc.getReduceRangeEntriesCountMethod(),
 			RocksDBServiceGrpc.getGetRangePageMethod(),
 			RocksDBServiceGrpc.getGetAllColumnDefinitionsMethod(),
-			RocksDBServiceGrpc.getCheckMergeOperatorMethod(),
-			RocksDBServiceGrpc.getCdcGetEarliestAvailableSequenceMethod(),
-			RocksDBServiceGrpc.getCdcGetLastCommittedSequenceMethod());
+			RocksDBServiceGrpc.getCheckMergeOperatorMethod());
 	private static final List<Map<String, String>> AUTOMATIC_RETRY_METHOD_CONFIG_NAMES =
 			AUTOMATIC_RETRY_METHOD_DESCRIPTORS.stream()
 					.map(GrpcConnectionDelegate::serviceConfigName)
@@ -1270,109 +1258,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 					.map(GrpcConnectionDelegate::mapKV));
 		};
 	}
-
-    // ============ CDC Async API ============
-
-	@Override
-	public CompletableFuture<Long> cdcCreateAsync(@NotNull String id,
-			@Nullable Long fromSeq,
-			@Nullable List<Long> columnIds,
-			@Nullable Boolean resolvedValues,
-			@NotNull OptionalLong expectedLastCommitted) throws RocksDBException {
-		var builder = CdcCreateRequest.newBuilder()
-				.setId(id)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-        if (fromSeq != null) builder.setFromSeq(fromSeq);
-        if (columnIds != null) builder.addAllColumnIds(columnIds);
-        if (resolvedValues != null) builder.setResolvedValues(resolvedValues);
-		if (expectedLastCommitted.isPresent()) {
-			builder.setExpectedLastCommittedSeq(expectedLastCommitted.getAsLong());
-		} else {
-			builder.setExpectAbsent(Empty.getDefaultInstance());
-		}
-        return toResponse(futureStub.cdcCreate(builder.build()), CdcCreateResponse::getStartSeq);
-    }
-
-    @Override
-    public CompletableFuture<Void> cdcDeleteAsync(@NotNull String id) throws RocksDBException {
-		return toResponse(futureStub.cdcDelete(CdcDeleteRequest.newBuilder()
-				.setId(id)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
-				.build()), _ -> null);
-    }
-
-	@Override
-	public CompletableFuture<Long> cdcGetEarliestAvailableSequenceAsync() throws RocksDBException {
-		return toResponse(futureStub.cdcGetEarliestAvailableSequence(
-				CdcGetEarliestAvailableSequenceRequest.newBuilder()
-						.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
-						.build()),
-				CdcGetEarliestAvailableSequenceResponse::getSequence);
-	}
-
-    @Override
-    public CompletableFuture<OptionalLong> cdcGetLastCommittedSequenceAsync(@NotNull String id) throws RocksDBException {
-		var request = CdcGetLastCommittedSequenceRequest.newBuilder()
-				.setId(id)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
-				.build();
-        return toResponse(futureStub.cdcGetLastCommittedSequence(request), response ->
-                response.hasLastCommittedSeq()
-                        ? OptionalLong.of(response.getLastCommittedSeq())
-                        : OptionalLong.empty());
-    }
-
-    @Override
-    public CompletableFuture<Void> cdcCommitAsync(@NotNull String id, long seq) throws RocksDBException {
-		return toResponse(futureStub.cdcCommit(CdcCommitRequest.newBuilder()
-				.setId(id).setSeq(seq)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
-				.build()), _ -> null);
-    }
-
-    @Override
-    public Publisher<CDCEvent> cdcPollAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
-		var builder = CdcPollRequest.newBuilder()
-				.setId(id)
-				.setMaxEvents(maxEvents)
-				.setMaxResponseBytes(maxInboundMessageSize)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-        if (fromSeq != null) builder.setFromSeq(fromSeq);
-        return toResponse(reactiveStub.cdcPoll(builder.build()))
-                .map(GrpcConnectionDelegate::mapCDCEvent);
-    }
-
-	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
-			@NotNull String id,
-			@Nullable Long fromSeq,
-			long maxEvents) {
-		return withRequestContext(context, () -> cdcPollBatchAsync(id, fromSeq, maxEvents));
-	}
-
-    @Override
-    public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
-		var builder = CdcPollRequest.newBuilder()
-				.setId(id)
-				.setMaxEvents(maxEvents)
-				.setMaxResponseBytes(maxInboundMessageSize)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-        if (fromSeq != null) builder.setFromSeq(fromSeq);
-		return toResponse(reactiveStub.cdcPollBatch(builder.build()))
-				.map(response -> new CdcBatch(
-						response.getEventsList().stream().map(GrpcConnectionDelegate::mapCDCEvent).toList(),
-						response.getNextSeq()));
-    }
-
-    private static CDCEvent mapCDCEvent(it.cavallium.rockserver.core.common.api.proto.CDCEvent ev) {
-        var op = switch (ev.getOp()) {
-            case PUT -> CDCEvent.Op.PUT;
-            case DELETE -> CDCEvent.Op.DELETE;
-            case MERGE -> CDCEvent.Op.MERGE;
-            case UNRECOGNIZED -> CDCEvent.Op.PUT;
-        };
-        return new CDCEvent(ev.getSeq(), ev.getColumnId(), mapByteString(ev.getKey()), mapByteString(ev.getValue()), op);
-    }
 
 	@Override
 	public CompletableFuture<Void> flushAsync() {

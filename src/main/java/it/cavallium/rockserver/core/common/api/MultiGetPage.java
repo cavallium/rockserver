@@ -419,14 +419,14 @@ public class MultiGetPage implements org.apache.thrift.TBase<MultiGetPage, Multi
           case 1: // VALUES
             if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
               {
-                org.apache.thrift.protocol.TList _list166 = iprot.readListBegin();
-                struct.values = new java.util.ArrayList<OptionalBinary>(_list166.size);
-                @org.apache.thrift.annotation.Nullable OptionalBinary _elem167;
-                for (int _i168 = 0; _i168 < _list166.size; ++_i168)
+                org.apache.thrift.protocol.TList _list150 = iprot.readListBegin();
+                struct.values = new java.util.ArrayList<OptionalBinary>(_list150.size);
+                @org.apache.thrift.annotation.Nullable OptionalBinary _elem151;
+                for (int _i152 = 0; _i152 < _list150.size; ++_i152)
                 {
-                  _elem167 = new OptionalBinary();
-                  _elem167.read(iprot);
-                  struct.values.add(_elem167);
+                  _elem151 = new OptionalBinary();
+                  _elem151.read(iprot);
+                  struct.values.add(_elem151);
                 }
                 iprot.readListEnd();
               }
@@ -466,9 +466,9 @@ public class MultiGetPage implements org.apache.thrift.TBase<MultiGetPage, Multi
         oprot.writeFieldBegin(VALUES_FIELD_DESC);
         {
           oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.values.size()));
-          for (OptionalBinary _iter169 : struct.values)
+          for (OptionalBinary _iter153 : struct.values)
           {
-            _iter169.write(oprot);
+            _iter153.write(oprot);
           }
           oprot.writeListEnd();
         }
@@ -497,9 +497,9 @@ public class MultiGetPage implements org.apache.thrift.TBase<MultiGetPage, Multi
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       {
         oprot.writeI32(struct.values.size());
-        for (OptionalBinary _iter170 : struct.values)
+        for (OptionalBinary _iter154 : struct.values)
         {
-          _iter170.write(oprot);
+          _iter154.write(oprot);
         }
       }
       oprot.writeBool(struct.hasMore);
@@ -509,14 +509,14 @@ public class MultiGetPage implements org.apache.thrift.TBase<MultiGetPage, Multi
     public void read(org.apache.thrift.protocol.TProtocol prot, MultiGetPage struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       {
-        org.apache.thrift.protocol.TList _list171 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-        struct.values = new java.util.ArrayList<OptionalBinary>(_list171.size);
-        @org.apache.thrift.annotation.Nullable OptionalBinary _elem172;
-        for (int _i173 = 0; _i173 < _list171.size; ++_i173)
+        org.apache.thrift.protocol.TList _list155 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+        struct.values = new java.util.ArrayList<OptionalBinary>(_list155.size);
+        @org.apache.thrift.annotation.Nullable OptionalBinary _elem156;
+        for (int _i157 = 0; _i157 < _list155.size; ++_i157)
         {
-          _elem172 = new OptionalBinary();
-          _elem172.read(iprot);
-          struct.values.add(_elem172);
+          _elem156 = new OptionalBinary();
+          _elem156.read(iprot);
+          struct.values.add(_elem156);
         }
       }
       struct.setValuesIsSet(true);

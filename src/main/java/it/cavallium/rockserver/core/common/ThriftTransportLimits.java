@@ -1,19 +1,15 @@
 package it.cavallium.rockserver.core.common;
 
-/** Shared, explicit Thrift transport and CDC response-size limits. */
+/** Shared, explicit Thrift transport limits. */
 public final class ThriftTransportLimits {
 
 	public static final String CLIENT_MAX_FRAME_SIZE_PROPERTY =
 			"it.cavallium.rockserver.thrift.client.max-frame-size-bytes";
-	public static final String CLIENT_MAX_CDC_RESPONSE_SIZE_PROPERTY =
-			"it.cavallium.rockserver.thrift.client.max-cdc-response-size-bytes";
 	public static final String SERVER_MAX_FRAME_SIZE_PROPERTY =
 			"it.cavallium.rockserver.thrift.server.max-frame-size-bytes";
 
 	public static final int DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024;
 	public static final int MIN_MAX_FRAME_SIZE = 1024 * 1024;
-	public static final int FRAME_ENVELOPE_RESERVE_BYTES = 64 * 1024;
-	public static final int MIN_MAX_CDC_RESPONSE_SIZE = 64;
 
 	private ThriftTransportLimits() {}
 
@@ -22,11 +18,7 @@ public final class ThriftTransportLimits {
 				DEFAULT_MAX_FRAME_SIZE,
 				MIN_MAX_FRAME_SIZE,
 				Integer.MAX_VALUE);
-		int maxCdcResponseSize = configuredSize(CLIENT_MAX_CDC_RESPONSE_SIZE_PROPERTY,
-				safeCdcResponseSize(maxFrameSize),
-				MIN_MAX_CDC_RESPONSE_SIZE,
-				safeCdcResponseSize(maxFrameSize));
-		return new ClientLimits(maxFrameSize, maxCdcResponseSize);
+		return new ClientLimits(maxFrameSize);
 	}
 
 	public static int configuredServerMaxFrameSize() {
@@ -36,16 +28,12 @@ public final class ThriftTransportLimits {
 				Integer.MAX_VALUE);
 	}
 
-	public static ClientLimits validateClientLimits(int maxFrameSize, int maxCdcResponseSize) {
+	public static ClientLimits validateClientLimits(int maxFrameSize) {
 		validateSize("maxFrameSize",
 				maxFrameSize,
 				MIN_MAX_FRAME_SIZE,
 				Integer.MAX_VALUE);
-		validateSize("maxCdcResponseSize",
-				maxCdcResponseSize,
-				MIN_MAX_CDC_RESPONSE_SIZE,
-				safeCdcResponseSize(maxFrameSize));
-		return new ClientLimits(maxFrameSize, maxCdcResponseSize);
+		return new ClientLimits(maxFrameSize);
 	}
 
 	public static int validateServerMaxFrameSize(int maxFrameSize) {
@@ -54,10 +42,6 @@ public final class ThriftTransportLimits {
 				MIN_MAX_FRAME_SIZE,
 				Integer.MAX_VALUE);
 		return maxFrameSize;
-	}
-
-	public static int safeCdcResponseSize(int maxFrameSize) {
-		return Math.subtractExact(maxFrameSize, FRAME_ENVELOPE_RESERVE_BYTES);
 	}
 
 	private static int configuredSize(String property, int defaultValue, int minimum, int maximum) {
@@ -87,5 +71,5 @@ public final class ThriftTransportLimits {
 		}
 	}
 
-	public record ClientLimits(int maxFrameSize, int maxCdcResponseSize) {}
+	public record ClientLimits(int maxFrameSize) {}
 }

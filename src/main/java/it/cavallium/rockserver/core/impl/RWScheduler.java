@@ -24,9 +24,9 @@ import reactor.core.scheduler.Scheduler;
 /**
  * Workload-aware shared read/write admission for one database.
  *
- * <p>LATENCY requests are ordered by an immutable local monotonic deadline. INGEST, CDC, ANALYTICAL,
+ * <p>LATENCY requests are ordered by an immutable local monotonic deadline. INGEST, ANALYTICAL,
  * and BATCH use byte-cost deficit round-robin. Read and write pools each reserve
- * one borrowable slot for LATENCY, INGEST, and CDC by default while retaining a
+ * one borrowable slot for LATENCY and INGEST by default while retaining a
  * hard worker cap. CONTROL and physical maintenance have isolated pools.</p>
  */
 public final class RWScheduler {
@@ -466,7 +466,7 @@ public final class RWScheduler {
 			case CONTROL -> Pool.CONTROL;
 			case COMPACTION -> Pool.PHYSICAL;
 			case METADATA, POINT_LOOKUP, BOUNDARY_SEEK, BOUNDED_FAN_OUT,
-					RANGE_PAGE, FULL_SCAN_AGGREGATE, WAL_PAGE -> Pool.READ;
+					RANGE_PAGE, FULL_SCAN_AGGREGATE -> Pool.READ;
 		};
 	}
 

@@ -10,7 +10,6 @@ public interface WorkloadConfig {
 
 	Integer ingestQueueCapacity() throws GestaltException;
 
-	Integer cdcQueueCapacity() throws GestaltException;
 
 	Integer analyticalQueueCapacity() throws GestaltException;
 
@@ -24,13 +23,11 @@ public interface WorkloadConfig {
 
 	Integer readIngestReservation() throws GestaltException;
 
-	Integer readCdcReservation() throws GestaltException;
 
 	Integer writeLatencyReservation() throws GestaltException;
 
 	Integer writeIngestReservation() throws GestaltException;
 
-	Integer writeCdcReservation() throws GestaltException;
 
 	Integer controlThreads() throws GestaltException;
 
@@ -46,7 +43,6 @@ public interface WorkloadConfig {
 
 	Integer ingestDrrWeight() throws GestaltException;
 
-	Integer cdcDrrWeight() throws GestaltException;
 
 	Integer analyticalDrrWeight() throws GestaltException;
 
@@ -72,11 +68,8 @@ public interface WorkloadConfig {
 
 	DataSize rawScanReadaheadBytes() throws GestaltException;
 
-	Integer cdcQuantumMaxMutations() throws GestaltException;
 
-	DataSize cdcQuantumMaxBytes() throws GestaltException;
 
-	Duration cdcQuantumMaxDuration() throws GestaltException;
 
 	Integer latencyRangeMaxItems() throws GestaltException;
 

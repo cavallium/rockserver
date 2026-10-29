@@ -38,11 +38,9 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable;
-import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.OptionalLong;
 import java.util.Set;
 import java.util.stream.Stream;
 
@@ -341,43 +339,4 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	default Map<String, ColumnSchema> getAllColumnDefinitions() throws RocksDBException {
 		return requestSync(new GetAllColumnDefinitions());
 	}
-
-    // CDC API
-    /**
-     * Atomically create or update a CDC subscription if its durable checkpoint still matches.
-     * Empty requires absence; a present value requires an exact durable checkpoint.
-     */
-    default long cdcCreate(@NotNull String id,
-                           @Nullable Long fromSeq,
-                           @Nullable List<Long> columnIds,
-                           @Nullable Boolean emitLatestValues,
-                           @NotNull OptionalLong expectedLastCommitted) throws RocksDBException {
-        return requestSync(new RocksDBAPICommand.CdcCreate(
-                id, fromSeq, columnIds, emitLatestValues, expectedLastCommitted));
-    }
-
-    /** Delete a CDC subscription */
-    default void cdcDelete(@NotNull String id) throws RocksDBException {
-        requestSync(new RocksDBAPICommand.CdcDelete(id));
-    }
-
-	/** Return the earliest CDC cursor still available in this database's WAL. */
-	default long cdcGetEarliestAvailableSequence() throws RocksDBException {
-		return requestSync(new RocksDBAPICommand.CdcGetEarliestAvailableSequence());
-	}
-
-    /** Return the durable last committed sequence for a CDC subscription, if it exists. */
-    default OptionalLong cdcGetLastCommittedSequence(@NotNull String id) throws RocksDBException {
-        return requestSync(new RocksDBAPICommand.CdcGetLastCommittedSequence(id));
-    }
-
-    /** Commit the last processed CDC sequence for a subscription */
-    default void cdcCommit(@NotNull String id, long seq) throws RocksDBException {
-        requestSync(new RocksDBAPICommand.CdcCommit(id, seq));
-    }
-
-    /** Poll CDC events as a blocking Stream */
-    default Stream<CDCEvent> cdcPoll(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
-        return requestSync(new RocksDBAPICommand.RocksDBAPICommandStream.CdcPoll(id, fromSeq, maxEvents));
-    }
 }

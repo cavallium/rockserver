@@ -17,17 +17,14 @@ public record WorkloadSettings(
 		int writeParallelism,
 		int latencyQueueCapacity,
 		int ingestQueueCapacity,
-		int cdcQueueCapacity,
 		int analyticalQueueCapacity,
 		int batchQueueCapacity,
 		int controlQueueCapacity,
 		int physicalMaintenanceQueueCapacity,
 		int readLatencyReservation,
 		int readIngestReservation,
-		int readCdcReservation,
 		int writeLatencyReservation,
 		int writeIngestReservation,
-		int writeCdcReservation,
 		int controlThreads,
 		int physicalConcurrency,
 		int analyticalActiveLimit,
@@ -35,7 +32,6 @@ public record WorkloadSettings(
 		Duration retainedSnapshotMaximumAge,
 		int latencyBurst,
 		int ingestDrrWeight,
-		int cdcDrrWeight,
 		int analyticalDrrWeight,
 		int batchDrrWeight,
 		int competingBatchReadMaximumActive,
@@ -48,9 +44,6 @@ public record WorkloadSettings(
 		Duration rangeQuantumMaxDuration,
 		int rawScanFileConcurrency,
 		long rawScanReadaheadBytes,
-		int cdcQuantumMaxMutations,
-		long cdcQuantumMaxBytes,
-		Duration cdcQuantumMaxDuration,
 		int latencyRangeMaxItems,
 		long latencyRangeMaxBytes,
 		int latencyFanOutMaxItems,
@@ -71,7 +64,6 @@ public record WorkloadSettings(
 		positive("database.parallelism.write", writeParallelism);
 		positive("latency-queue-capacity", latencyQueueCapacity);
 		positive("ingest-queue-capacity", ingestQueueCapacity);
-		positive("cdc-queue-capacity", cdcQueueCapacity);
 		positive("analytical-queue-capacity", analyticalQueueCapacity);
 		positive("batch-queue-capacity", batchQueueCapacity);
 		positive("control-queue-capacity", controlQueueCapacity);
@@ -82,7 +74,6 @@ public record WorkloadSettings(
 		positive("retained-analytical-snapshots", retainedAnalyticalSnapshots);
 		positive("latency-burst", latencyBurst);
 		drrWeight("ingest-drr-weight", ingestDrrWeight);
-		drrWeight("cdc-drr-weight", cdcDrrWeight);
 		drrWeight("analytical-drr-weight", analyticalDrrWeight);
 		drrWeight("batch-drr-weight", batchDrrWeight);
 		positive("competing-batch-read-maximum-active", competingBatchReadMaximumActive);
@@ -93,8 +84,6 @@ public record WorkloadSettings(
 		positive("range-quantum-max-bytes", rangeQuantumMaxBytes);
 		positive("raw-scan-file-concurrency", rawScanFileConcurrency);
 		positive("raw-scan-readahead-bytes", rawScanReadaheadBytes);
-		positive("cdc-quantum-max-mutations", cdcQuantumMaxMutations);
-		positive("cdc-quantum-max-bytes", cdcQuantumMaxBytes);
 		positive("latency-range-max-items", latencyRangeMaxItems);
 		positive("latency-range-max-bytes", latencyRangeMaxBytes);
 		positive("latency-fan-out-max-items", latencyFanOutMaxItems);
@@ -102,7 +91,6 @@ public record WorkloadSettings(
 		positiveDuration("retained-snapshot-maximum-age", retainedSnapshotMaximumAge, true);
 		positiveDuration("pressured-batch-interval", pressuredBatchInterval, false);
 		positiveDuration("range-quantum-max-duration", rangeQuantumMaxDuration, false);
-		positiveDuration("cdc-quantum-max-duration", cdcQuantumMaxDuration, false);
 		if (analyticalActiveLimit > readParallelism) {
 			throw invalid("analytical-active-limit must not exceed read-pool capacity");
 		}
@@ -128,14 +116,13 @@ public record WorkloadSettings(
 			throw invalid("LATENCY fan-out maximum exceeds the 256-item/2-MiB contract ceiling");
 		}
 		validateReservations("read", readParallelism,
-				readLatencyReservation, readIngestReservation, readCdcReservation);
+				readLatencyReservation, readIngestReservation);
 		validateReservations("write", writeParallelism,
-				writeLatencyReservation, writeIngestReservation, writeCdcReservation);
+				writeLatencyReservation, writeIngestReservation);
 		validateCounterBounds(readParallelism,
 				writeParallelism,
 				latencyQueueCapacity,
 				ingestQueueCapacity,
-				cdcQueueCapacity,
 				analyticalQueueCapacity,
 				batchQueueCapacity,
 				controlQueueCapacity,
@@ -148,7 +135,6 @@ public record WorkloadSettings(
 			int writeParallelism,
 			int latencyQueueCapacity,
 			int ingestQueueCapacity,
-			int cdcQueueCapacity,
 			int analyticalQueueCapacity,
 			int batchQueueCapacity,
 			int controlQueueCapacity,
@@ -157,12 +143,10 @@ public record WorkloadSettings(
 			int physicalConcurrency) {
 		long readQueueCapacity = sum(latencyQueueCapacity,
 				ingestQueueCapacity,
-				cdcQueueCapacity,
 				analyticalQueueCapacity,
 				batchQueueCapacity);
 		long writeQueueCapacity = sum(latencyQueueCapacity,
 				ingestQueueCapacity,
-				cdcQueueCapacity,
 				batchQueueCapacity);
 		maximumInt("read-pool aggregate queue capacity", readQueueCapacity);
 		maximumInt("write-pool aggregate queue capacity", writeQueueCapacity);
@@ -181,7 +165,6 @@ public record WorkloadSettings(
 		for (var entry : Map.of(
 				"LATENCY", latencyQueueCapacity,
 				"INGEST", ingestQueueCapacity,
-				"CDC", cdcQueueCapacity,
 				"BATCH", batchQueueCapacity).entrySet()) {
 			maximumInt(entry.getKey() + " aggregate queue capacity", (long) entry.getValue() * 2L);
 		}
@@ -225,7 +208,7 @@ public record WorkloadSettings(
 	}
 
 	private static void validateGroupOperationBounds(WorkloadSettings group, WorkloadSettings global) {
-		// Retained native state, response contracts and WAL quanta still belong to the database.
+		// Retained native state and response contracts still belong to the database.
 		if (!Objects.equals(group.retainedAnalyticalSnapshots(), global.retainedAnalyticalSnapshots())
 				|| !Objects.equals(group.retainedSnapshotMaximumAge(), global.retainedSnapshotMaximumAge())
 				|| !Objects.equals(group.rangeQuantumMaxItems(), global.rangeQuantumMaxItems())
@@ -233,9 +216,6 @@ public record WorkloadSettings(
 				|| !Objects.equals(group.rangeQuantumMaxDuration(), global.rangeQuantumMaxDuration())
 				|| !Objects.equals(group.rawScanFileConcurrency(), global.rawScanFileConcurrency())
 				|| !Objects.equals(group.rawScanReadaheadBytes(), global.rawScanReadaheadBytes())
-				|| !Objects.equals(group.cdcQuantumMaxMutations(), global.cdcQuantumMaxMutations())
-				|| !Objects.equals(group.cdcQuantumMaxBytes(), global.cdcQuantumMaxBytes())
-				|| !Objects.equals(group.cdcQuantumMaxDuration(), global.cdcQuantumMaxDuration())
 				|| !Objects.equals(group.latencyRangeMaxItems(), global.latencyRangeMaxItems())
 				|| !Objects.equals(group.latencyRangeMaxBytes(), global.latencyRangeMaxBytes())
 				|| !Objects.equals(group.latencyFanOutMaxItems(), global.latencyFanOutMaxItems())
@@ -253,7 +233,7 @@ public record WorkloadSettings(
 	public void validateProductionCapacities() {
 		if (readParallelism < MIN_PRODUCTION_DATA_THREADS || writeParallelism < MIN_PRODUCTION_DATA_THREADS) {
 			throw invalid("read and write capacities must each be at least "
-					+ MIN_PRODUCTION_DATA_THREADS + " for LATENCY, INGEST, and CDC reservations");
+					+ MIN_PRODUCTION_DATA_THREADS + " for the LATENCY and INGEST reservations plus shared capacity");
 		}
 	}
 
@@ -287,17 +267,14 @@ public record WorkloadSettings(
 				writeParallelism,
 				require(o.latencyQueueCapacity(), fallback.latencyQueueCapacity(), "latency-queue-capacity"),
 				require(o.ingestQueueCapacity(), fallback.ingestQueueCapacity(), "ingest-queue-capacity"),
-				require(o.cdcQueueCapacity(), fallback.cdcQueueCapacity(), "cdc-queue-capacity"),
 				require(o.analyticalQueueCapacity(), fallback.analyticalQueueCapacity(), "analytical-queue-capacity"),
 				require(o.batchQueueCapacity(), fallback.batchQueueCapacity(), "batch-queue-capacity"),
 				require(o.controlQueueCapacity(), fallback.controlQueueCapacity(), "control-queue-capacity"),
 				require(o.physicalMaintenanceQueueCapacity(), fallback.physicalMaintenanceQueueCapacity(), "physical-maintenance-queue-capacity"),
 				require(o.readLatencyReservation(), fallback.readLatencyReservation(), "read-latency-reservation"),
 				require(o.readIngestReservation(), fallback.readIngestReservation(), "read-ingest-reservation"),
-				require(o.readCdcReservation(), fallback.readCdcReservation(), "read-cdc-reservation"),
 				require(o.writeLatencyReservation(), fallback.writeLatencyReservation(), "write-latency-reservation"),
 				require(o.writeIngestReservation(), fallback.writeIngestReservation(), "write-ingest-reservation"),
-				require(o.writeCdcReservation(), fallback.writeCdcReservation(), "write-cdc-reservation"),
 				require(o.controlThreads(), fallback.controlThreads(), "control-threads"),
 				require(o.physicalConcurrency(), fallback.physicalConcurrency(), "physical-concurrency"),
 				require(o.analyticalActiveLimit(), fallback.analyticalActiveLimit(), "analytical-active-limit"),
@@ -305,7 +282,6 @@ public record WorkloadSettings(
 				require(o.retainedSnapshotMaximumAge(), fallback.retainedSnapshotMaximumAge(), "retained-snapshot-maximum-age"),
 				require(o.latencyBurst(), fallback.latencyBurst(), "latency-burst"),
 				require(o.ingestDrrWeight(), fallback.ingestDrrWeight(), "ingest-drr-weight"),
-				require(o.cdcDrrWeight(), fallback.cdcDrrWeight(), "cdc-drr-weight"),
 				require(o.analyticalDrrWeight(), fallback.analyticalDrrWeight(), "analytical-drr-weight"),
 				require(o.batchDrrWeight(), fallback.batchDrrWeight(), "batch-drr-weight"),
 				require(o.competingBatchReadMaximumActive(), fallback.competingBatchReadMaximumActive(), "competing-batch-read-maximum-active"),
@@ -318,9 +294,6 @@ public record WorkloadSettings(
 				require(o.rangeQuantumMaxDuration(), fallback.rangeQuantumMaxDuration(), "range-quantum-max-duration"),
 				require(o.rawScanFileConcurrency(), fallback.rawScanFileConcurrency(), "raw-scan-file-concurrency"),
 				require(o.rawScanReadaheadBytes(), fallback.rawScanReadaheadBytes(), "raw-scan-readahead-bytes").longValue(),
-				require(o.cdcQuantumMaxMutations(), fallback.cdcQuantumMaxMutations(), "cdc-quantum-max-mutations"),
-				require(o.cdcQuantumMaxBytes(), fallback.cdcQuantumMaxBytes(), "cdc-quantum-max-bytes").longValue(),
-				require(o.cdcQuantumMaxDuration(), fallback.cdcQuantumMaxDuration(), "cdc-quantum-max-duration"),
 				require(o.latencyRangeMaxItems(), fallback.latencyRangeMaxItems(), "latency-range-max-items"),
 				require(o.latencyRangeMaxBytes(), fallback.latencyRangeMaxBytes(), "latency-range-max-bytes").longValue(),
 				require(o.latencyFanOutMaxItems(), fallback.latencyFanOutMaxItems(), "latency-fan-out-max-items"),
@@ -339,15 +312,12 @@ public record WorkloadSettings(
 				writeParallelism,
 				foregroundQueueCapacity,
 				foregroundQueueCapacity,
-				Math.max(64, Math.min(foregroundQueueCapacity, 1_024)),
 				Math.max(1, Math.min(batchQueueCapacity, 512)),
 				batchQueueCapacity,
 				256,
 				16,
 				readReservation,
 				readReservation,
-				readReservation,
-				writeReservation,
 				writeReservation,
 				writeReservation,
 				2,
@@ -356,7 +326,6 @@ public record WorkloadSettings(
 				1,
 				Duration.ofSeconds(60),
 				8,
-				4,
 				4,
 				2,
 				1,
@@ -372,9 +341,6 @@ public record WorkloadSettings(
 				DEFAULT_RAW_SCAN_READAHEAD_BYTES,
 				4_096,
 				8L * 1024L * 1024L,
-				Duration.ofMillis(8),
-				4_096,
-				8L * 1024L * 1024L,
 				256,
 				2L * 1024L * 1024L);
 	}
@@ -383,44 +349,40 @@ public record WorkloadSettings(
 		var result = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
 		result.put(WorkloadProfile.LATENCY, latencyQueueCapacity);
 		result.put(WorkloadProfile.INGEST, ingestQueueCapacity);
-		result.put(WorkloadProfile.CDC, cdcQueueCapacity);
 		result.put(WorkloadProfile.ANALYTICAL, analyticalQueueCapacity);
 		result.put(WorkloadProfile.BATCH, batchQueueCapacity);
 		return Map.copyOf(result);
 	}
 
 	public Map<WorkloadProfile, Integer> readReservations() {
-		return reservations(readLatencyReservation, readIngestReservation, readCdcReservation);
+		return reservations(readLatencyReservation, readIngestReservation);
 	}
 
 	public Map<WorkloadProfile, Integer> writeReservations() {
-		return reservations(writeLatencyReservation, writeIngestReservation, writeCdcReservation);
+		return reservations(writeLatencyReservation, writeIngestReservation);
 	}
 
 	public Map<WorkloadProfile, Integer> drrWeights() {
 		return Map.of(
 				WorkloadProfile.INGEST, ingestDrrWeight,
-				WorkloadProfile.CDC, cdcDrrWeight,
 				WorkloadProfile.ANALYTICAL, analyticalDrrWeight,
 				WorkloadProfile.BATCH, batchDrrWeight);
 	}
 
-	private static Map<WorkloadProfile, Integer> reservations(int latency, int ingest, int cdc) {
+	private static Map<WorkloadProfile, Integer> reservations(int latency, int ingest) {
 		return Map.of(
 				WorkloadProfile.LATENCY, latency,
-				WorkloadProfile.INGEST, ingest,
-				WorkloadProfile.CDC, cdc);
+				WorkloadProfile.INGEST, ingest);
 	}
 
 	private static void validateReservations(String pool,
 			int capacity,
 			int latency,
-			int ingest,
-			int cdc) {
-		if (latency < 0 || ingest < 0 || cdc < 0) {
+			int ingest) {
+		if (latency < 0 || ingest < 0) {
 			throw invalid(pool + " reservations must not be negative");
 		}
-		long sum = (long) latency + ingest + cdc;
+		long sum = (long) latency + ingest;
 		if (sum > capacity) {
 			throw invalid(pool + " reservation sum " + sum + " exceeds capacity " + capacity);
 		}

@@ -520,14 +520,14 @@ public class RangePage implements org.apache.thrift.TBase<RangePage, RangePage._
           case 1: // ITEMS
             if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
               {
-                org.apache.thrift.protocol.TList _list40 = iprot.readListBegin();
-                struct.items = new java.util.ArrayList<KV>(_list40.size);
-                @org.apache.thrift.annotation.Nullable KV _elem41;
-                for (int _i42 = 0; _i42 < _list40.size; ++_i42)
+                org.apache.thrift.protocol.TList _list24 = iprot.readListBegin();
+                struct.items = new java.util.ArrayList<KV>(_list24.size);
+                @org.apache.thrift.annotation.Nullable KV _elem25;
+                for (int _i26 = 0; _i26 < _list24.size; ++_i26)
                 {
-                  _elem41 = new KV();
-                  _elem41.read(iprot);
-                  struct.items.add(_elem41);
+                  _elem25 = new KV();
+                  _elem25.read(iprot);
+                  struct.items.add(_elem25);
                 }
                 iprot.readListEnd();
               }
@@ -539,13 +539,13 @@ public class RangePage implements org.apache.thrift.TBase<RangePage, RangePage._
           case 2: // RESUME_AFTER
             if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
               {
-                org.apache.thrift.protocol.TList _list43 = iprot.readListBegin();
-                struct.resumeAfter = new java.util.ArrayList<java.nio.ByteBuffer>(_list43.size);
-                @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem44;
-                for (int _i45 = 0; _i45 < _list43.size; ++_i45)
+                org.apache.thrift.protocol.TList _list27 = iprot.readListBegin();
+                struct.resumeAfter = new java.util.ArrayList<java.nio.ByteBuffer>(_list27.size);
+                @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem28;
+                for (int _i29 = 0; _i29 < _list27.size; ++_i29)
                 {
-                  _elem44 = iprot.readBinary();
-                  struct.resumeAfter.add(_elem44);
+                  _elem28 = iprot.readBinary();
+                  struct.resumeAfter.add(_elem28);
                 }
                 iprot.readListEnd();
               }
@@ -585,9 +585,9 @@ public class RangePage implements org.apache.thrift.TBase<RangePage, RangePage._
         oprot.writeFieldBegin(ITEMS_FIELD_DESC);
         {
           oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRUCT, struct.items.size()));
-          for (KV _iter46 : struct.items)
+          for (KV _iter30 : struct.items)
           {
-            _iter46.write(oprot);
+            _iter30.write(oprot);
           }
           oprot.writeListEnd();
         }
@@ -598,9 +598,9 @@ public class RangePage implements org.apache.thrift.TBase<RangePage, RangePage._
           oprot.writeFieldBegin(RESUME_AFTER_FIELD_DESC);
           {
             oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.resumeAfter.size()));
-            for (java.nio.ByteBuffer _iter47 : struct.resumeAfter)
+            for (java.nio.ByteBuffer _iter31 : struct.resumeAfter)
             {
-              oprot.writeBinary(_iter47);
+              oprot.writeBinary(_iter31);
             }
             oprot.writeListEnd();
           }
@@ -630,9 +630,9 @@ public class RangePage implements org.apache.thrift.TBase<RangePage, RangePage._
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       {
         oprot.writeI32(struct.items.size());
-        for (KV _iter48 : struct.items)
+        for (KV _iter32 : struct.items)
         {
-          _iter48.write(oprot);
+          _iter32.write(oprot);
         }
       }
       oprot.writeBool(struct.hasMore);
@@ -644,9 +644,9 @@ public class RangePage implements org.apache.thrift.TBase<RangePage, RangePage._
       if (struct.isSetResumeAfter()) {
         {
           oprot.writeI32(struct.resumeAfter.size());
-          for (java.nio.ByteBuffer _iter49 : struct.resumeAfter)
+          for (java.nio.ByteBuffer _iter33 : struct.resumeAfter)
           {
-            oprot.writeBinary(_iter49);
+            oprot.writeBinary(_iter33);
           }
         }
       }
@@ -656,14 +656,14 @@ public class RangePage implements org.apache.thrift.TBase<RangePage, RangePage._
     public void read(org.apache.thrift.protocol.TProtocol prot, RangePage struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       {
-        org.apache.thrift.protocol.TList _list50 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
-        struct.items = new java.util.ArrayList<KV>(_list50.size);
-        @org.apache.thrift.annotation.Nullable KV _elem51;
-        for (int _i52 = 0; _i52 < _list50.size; ++_i52)
+        org.apache.thrift.protocol.TList _list34 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
+        struct.items = new java.util.ArrayList<KV>(_list34.size);
+        @org.apache.thrift.annotation.Nullable KV _elem35;
+        for (int _i36 = 0; _i36 < _list34.size; ++_i36)
         {
-          _elem51 = new KV();
-          _elem51.read(iprot);
-          struct.items.add(_elem51);
+          _elem35 = new KV();
+          _elem35.read(iprot);
+          struct.items.add(_elem35);
         }
       }
       struct.setItemsIsSet(true);
@@ -672,13 +672,13 @@ public class RangePage implements org.apache.thrift.TBase<RangePage, RangePage._
       java.util.BitSet incoming = iprot.readBitSet(1);
       if (incoming.get(0)) {
         {
-          org.apache.thrift.protocol.TList _list53 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.resumeAfter = new java.util.ArrayList<java.nio.ByteBuffer>(_list53.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem54;
-          for (int _i55 = 0; _i55 < _list53.size; ++_i55)
+          org.apache.thrift.protocol.TList _list37 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.resumeAfter = new java.util.ArrayList<java.nio.ByteBuffer>(_list37.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem38;
+          for (int _i39 = 0; _i39 < _list37.size; ++_i39)
           {
-            _elem54 = iprot.readBinary();
-            struct.resumeAfter.add(_elem54);
+            _elem38 = iprot.readBinary();
+            struct.resumeAfter.add(_elem38);
           }
         }
         struct.setResumeAfterIsSet(true);

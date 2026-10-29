@@ -14,7 +14,6 @@ public enum OperationFamily {
 	BOUNDED_FAN_OUT,
 	RANGE_PAGE,
 	FULL_SCAN_AGGREGATE,
-	WAL_PAGE,
 	MUTATION,
 	CONTROL,
 	FLUSH,

@@ -43,7 +43,6 @@ import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.MultiGetPage;
 import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.*;
-import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.OperationFamily;
@@ -1320,16 +1319,6 @@ public class GrpcServer extends Server {
 							context.localMonotonicDeadlineNanos(),
 							() -> asyncApi(downstreamContext).requestAsync(request));
 				}
-
-				@Override
-				public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-					return Mono.defer(() -> {
-						var downstreamContext = remainingContext(context);
-						return scheduler.withDeadlineBinding(downstreamContext,
-								context.localMonotonicDeadlineNanos(),
-								() -> asyncApi(downstreamContext).cdcPollBatchAsync(id, fromSeq, maxEvents));
-					});
-				}
 			};
 		}
 
@@ -1378,10 +1367,6 @@ public class GrpcServer extends Server {
 
 		private RocksDBSyncAPI protectedApi() {
 			return noDeadlineSyncApis[WorkloadProfile.BATCH.ordinal()];
-		}
-
-		private RocksDBAsyncAPI protectedAsyncApi() {
-			return noDeadlineAsyncApis[WorkloadProfile.BATCH.ordinal()];
 		}
 
 		private RocksDBAPICommand<?, ?, ?> captureCommand(Function<RocksDBSyncAPI, ?> operation) {
@@ -2875,114 +2860,6 @@ public class GrpcServer extends Server {
 				return builder.build();
 			}).transform(this.onErrorMapMonoWithRequestInfo("checkMergeOperator", request));
 		}
-
-            // ============ CDC RPCs ============
-
-			@Override
-			public Mono<CdcCreateResponse> cdcCreate(CdcCreateRequest request) {
-				requireV3(request.getWorkloadContractVersion());
-				Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
-				OptionalLong expectedLastCommitted = switch (request.getExpectedLastCommittedCase()) {
-					case EXPECTABSENT -> OptionalLong.empty();
-					case EXPECTEDLASTCOMMITTEDSEQ -> OptionalLong.of(request.getExpectedLastCommittedSeq());
-					case EXPECTEDLASTCOMMITTED_NOT_SET -> throw RocksDBException.of(
-							RocksDBErrorType.PUT_INVALID_REQUEST,
-							"CDC creation precondition is required");
-				};
-				return executeScheduled(() -> {
-					var cols = request.getColumnIdsCount() > 0 ? request.getColumnIdsList().stream().map(Long::valueOf).toList() : null;
-					Boolean resolvedValues = request.hasResolvedValues() ? request.getResolvedValues() : null;
-					long startSeq = protectedApi().cdcCreate(
-							request.getId(), fromSeq, cols, resolvedValues, expectedLastCommitted);
-					return CdcCreateResponse.newBuilder().setStartSeq(startSeq).build();
-				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.MUTATION,
-						Long.MAX_VALUE))
-						.transform(this.onErrorMapMonoWithRequestInfo("cdcCreate", request));
-			}
-
-            @Override
-			public Mono<Empty> cdcDelete(CdcDeleteRequest request) {
-				requireV3(request.getWorkloadContractVersion());
-				return executeScheduled(() -> {
-					protectedApi().cdcDelete(request.getId());
-					return Empty.getDefaultInstance();
-				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.MUTATION,
-						Long.MAX_VALUE))
-						.transform(this.onErrorMapMonoWithRequestInfo("cdcDelete", request));
-            }
-
-			@Override
-			public Mono<CdcGetEarliestAvailableSequenceResponse> cdcGetEarliestAvailableSequence(
-					CdcGetEarliestAvailableSequenceRequest request) {
-				requireV3(request.getWorkloadContractVersion());
-				return executeScheduled(() -> CdcGetEarliestAvailableSequenceResponse.newBuilder()
-						.setSequence(protectedApi().cdcGetEarliestAvailableSequence())
-						.build(), scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE))
-						.transform(this.onErrorMapMonoWithRequestInfo(
-								"cdcGetEarliestAvailableSequence", request));
-			}
-
-            @Override
-			public Mono<CdcGetLastCommittedSequenceResponse> cdcGetLastCommittedSequence(
-					CdcGetLastCommittedSequenceRequest request) {
-				requireV3(request.getWorkloadContractVersion());
-				return executeScheduled(() -> {
-					var sequence = protectedApi().cdcGetLastCommittedSequence(request.getId());
-                    var response = CdcGetLastCommittedSequenceResponse.newBuilder();
-                    sequence.ifPresent(response::setLastCommittedSeq);
-                    return response.build();
-				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE))
-						.transform(this.onErrorMapMonoWithRequestInfo(
-                        "cdcGetLastCommittedSequence", request));
-            }
-
-            @Override
-			public Flux<it.cavallium.rockserver.core.common.api.proto.CDCEvent> cdcPoll(CdcPollRequest request) {
-				requireV3(request.getWorkloadContractVersion());
-                return Flux.defer(() -> {
-                            long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
-                            Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
-                            int maxResponseBytes = requestedMaxResponseBytes(request);
-							return Flux.from(protectedAsyncApi().cdcPollAsync(request.getId(), fromSeq, maxEvents))
-                                    .map(event -> CdcResponseBudget.buildEvent(event, maxResponseBytes));
-                        })
-                        .transform(this.onErrorMapFluxWithRequestInfo("cdcPoll", request));
-            }
-
-            @Override
-			public Mono<CdcPollResponse> cdcPollBatch(CdcPollRequest request) {
-				requireV3(request.getWorkloadContractVersion());
-                return Mono.defer(() -> {
-                            long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
-                            Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
-                            int maxResponseBytes = requestedMaxResponseBytes(request);
-							return protectedAsyncApi().cdcPollBatchAsync(request.getId(), fromSeq, maxEvents)
-                                    .map(batch -> CdcResponseBudget.build(batch, maxResponseBytes));
-                        })
-                        .transform(this.onErrorMapMonoWithRequestInfo("cdcPollBatch", request));
-            }
-
-            private static int requestedMaxResponseBytes(CdcPollRequest request) {
-                int requestedMaxResponseBytes = request.getMaxResponseBytes();
-				if (requestedMaxResponseBytes <= 0) {
-					throw Status.INVALID_ARGUMENT
-							.withDescription("maxResponseBytes must be positive: "
-									+ requestedMaxResponseBytes)
-							.asRuntimeException();
-				}
-				return requestedMaxResponseBytes;
-            }
-
-			@Override
-			public Mono<Empty> cdcCommit(CdcCommitRequest request) {
-				requireV3(request.getWorkloadContractVersion());
-				return executeMustComplete("cdcCommit", () -> {
-					protectedApi().cdcCommit(request.getId(), request.getSeq());
-					return Empty.getDefaultInstance();
-				}, scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.MUTATION,
-						Long.MAX_VALUE))
-						.transform(this.onErrorMapMonoWithRequestInfo("cdcCommit", request));
-            }
 
 		// utils
 
@@ -4491,9 +4368,7 @@ public class GrpcServer extends Server {
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case PUT_INVALID_REQUEST, INVALID_REQUEST -> Status.INVALID_ARGUMENT
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
-						case CDC_SUBSCRIPTION_NOT_FOUND, TRANSACTION_NOT_FOUND -> Status.NOT_FOUND
-								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
-						case CDC_RESPONSE_TOO_LARGE -> Status.FAILED_PRECONDITION
+						case TRANSACTION_NOT_FOUND -> Status.NOT_FOUND
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case READ_DEADLINE_EXCEEDED -> Status.DEADLINE_EXCEEDED
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);

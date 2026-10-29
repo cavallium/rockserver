@@ -48,10 +48,7 @@ import it.cavallium.rockserver.core.common.SerializedKVBatch;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
-import it.cavallium.rockserver.core.common.cdc.CDCEvent;
-import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
-import it.cavallium.rockserver.core.common.api.OptionalLongValue;
 import it.cavallium.rockserver.core.common.api.RocksDB;
 import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
 import it.cavallium.rockserver.core.common.api.UpdateBegin;
@@ -106,14 +103,12 @@ public final class ThriftConnection extends BaseConnection {
 	public ThriftConnection(String name,
 			String host,
 			int port,
-			int maxFrameSize,
-			int maxCdcResponseSize) throws TException {
+			int maxFrameSize) throws TException {
 		super(name);
 		this.delegate = new ThriftConnectionDelegate(name,
 				host,
 				port,
-				maxFrameSize,
-				maxCdcResponseSize);
+				maxFrameSize);
 	}
 
 	@Override
@@ -141,14 +136,6 @@ public final class ThriftConnection extends BaseConnection {
 	<R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestAsync(context, request);
 	}
-
-	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
-			String id,
-			Long fromSeq,
-			long maxEvents) {
-		return delegate.cdcPollBatchAsync(context, id, fromSeq, maxEvents);
-	}
 }
 
 /** Package-private raw implementation behind {@link ThriftConnection}. */
@@ -160,7 +147,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	private final String host;
 	private final int port;
 	private final int maxFrameSize;
-	private final int maxCdcResponseSize;
 	private final List<ClientSlot> allClientSlots;
 	private final ArrayBlockingQueue<ClientSlot> availableClientSlots;
 	private final RocksDB.Iface client;
@@ -188,21 +174,19 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			String host,
 			int port,
 			ThriftTransportLimits.ClientLimits limits) throws TException {
-		this(name, host, port, limits.maxFrameSize(), limits.maxCdcResponseSize());
+		this(name, host, port, limits.maxFrameSize());
 	}
 
 	ThriftConnectionDelegate(String name,
 			String host,
 			int port,
-			int maxFrameSize,
-			int maxCdcResponseSize) throws TException {
+			int maxFrameSize) throws TException {
 		super(name);
-		var validatedLimits = ThriftTransportLimits.validateClientLimits(maxFrameSize, maxCdcResponseSize);
+		var validatedLimits = ThriftTransportLimits.validateClientLimits(maxFrameSize);
 		this.uri = URI.create("thrift://" + host + ":" + port);
 		this.host = host;
 		this.port = port;
 		this.maxFrameSize = validatedLimits.maxFrameSize();
-		this.maxCdcResponseSize = validatedLimits.maxCdcResponseSize();
 		int poolSize = thriftClientPoolSize();
 		this.allClientSlots = new ArrayList<>(poolSize);
 		this.availableClientSlots = new ArrayBlockingQueue<>(poolSize);
@@ -875,81 +859,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		}
 	}
 
-	@Override
-	public long cdcCreate(String id,
-			Long fromSeq,
-			List<Long> columnIds,
-			Boolean emitLatestValues,
-			OptionalLong expectedLastCommitted) {
-		try {
-			var request = new it.cavallium.rockserver.core.common.api.CdcCreateRequest().setId(id);
-			if (fromSeq != null) {
-				request.setFromSeq(fromSeq);
-			}
-			if (columnIds != null) {
-				request.setColumnIds(columnIds);
-			}
-			if (emitLatestValues != null) {
-				request.setEmitLatestValues(emitLatestValues);
-			}
-			request.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-			if (expectedLastCommitted.isPresent()) {
-				request.setExpectedLastCommittedSeq(expectedLastCommitted.getAsLong());
-			} else {
-				request.setExpectAbsent(true);
-			}
-			return client.cdcCreate(request);
-		} catch (TException e) {
-			throw wrap(e);
-		}
-	}
-
-	@Override
-	public void cdcDelete(String id) {
-		try {
-			client.cdcDelete(id, RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-		} catch (TException e) {
-			throw wrap(e);
-		}
-	}
-
-	@Override
-	public long cdcGetEarliestAvailableSequence() {
-		try {
-			return client.cdcGetEarliestAvailableSequence(
-					RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-		} catch (TException e) {
-			throw wrap(e);
-		}
-	}
-
-	@Override
-	public OptionalLong cdcGetLastCommittedSequence(String id) {
-		try {
-			OptionalLongValue response = client.cdcGetLastCommittedSequence(id,
-					RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-			return response.isSetValue()
-					? OptionalLong.of(response.getValue())
-					: OptionalLong.empty();
-		} catch (TException e) {
-			throw wrap(e);
-		}
-	}
-
-	@Override
-	public Stream<CDCEvent> cdcPoll(String id, Long fromSeq, long maxEvents) {
-		return cdcPollBatch(id, fromSeq, maxEvents).events().stream();
-	}
-
-	@Override
-	public void cdcCommit(String id, long seq) {
-		try {
-			client.cdcCommit(id, seq, RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-		} catch (TException e) {
-			throw wrap(e);
-		}
-	}
-
 	// --- Async API ---
 
 	@Override
@@ -1144,57 +1053,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	@Override
-	public CompletableFuture<Long> cdcCreateAsync(String id,
-			Long fromSeq,
-			List<Long> columnIds,
-			Boolean emitLatestValues,
-			OptionalLong expectedLastCommitted) {
-		return supplyAsyncContextual(
-				() -> cdcCreate(id, fromSeq, columnIds, emitLatestValues, expectedLastCommitted), executor);
-	}
-
-	@Override
-	public CompletableFuture<Void> cdcDeleteAsync(String id) {
-		return runAsyncContextual(() -> cdcDelete(id), executor);
-	}
-
-	@Override
-	public CompletableFuture<Long> cdcGetEarliestAvailableSequenceAsync() {
-		return supplyAsyncContextual(this::cdcGetEarliestAvailableSequence, executor);
-	}
-
-	@Override
-	public CompletableFuture<OptionalLong> cdcGetLastCommittedSequenceAsync(String id) {
-		return supplyAsyncContextual(() -> cdcGetLastCommittedSequence(id), executor);
-	}
-
-	@Override
-	public Publisher<CDCEvent> cdcPollAsync(String id, Long fromSeq, long maxEvents) {
-		return cdcPollBatchAsync(id, fromSeq, maxEvents)
-				.flatMapMany(batch -> Flux.fromIterable(batch.events()));
-	}
-
-	@Override
-	Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
-			String id,
-			Long fromSeq,
-			long maxEvents) {
-		return withRequestContext(context, () -> cdcPollBatchAsync(id, fromSeq, maxEvents));
-	}
-
-	@Override
-	public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-		var context = currentBoundRequestContext();
-		return Mono.fromCallable(() -> withRequestContext(context, () -> cdcPollBatch(id, fromSeq, maxEvents)))
-				.subscribeOn(executorScheduler);
-	}
-
-	@Override
-	public CompletableFuture<Void> cdcCommitAsync(String id, long seq) {
-		return runAsyncContextual(() -> cdcCommit(id, seq), executor);
-	}
-
-	@Override
 	public <R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> req) {
 		validateRequestDeadline(context, req);
 		return withRequestContext(context, () -> req.handleSync(this));
@@ -1219,35 +1077,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 					"rockserver.thrift.client.connections must be between 1 and 256, got " + configuredSize);
 		}
 		return configuredSize;
-	}
-
-	private CdcBatch cdcPollBatch(String id, Long fromSeq, long maxEvents) {
-		try {
-			var request = new it.cavallium.rockserver.core.common.api.CdcPollRequest()
-					.setId(id)
-					.setMaxEvents(maxEvents)
-					.setMaxResponseBytes(maxCdcResponseSize)
-					.setWorkloadContractVersion(
-							RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-			if (fromSeq != null) {
-				request.setFromSeq(fromSeq);
-			}
-			var batch = client.cdcPollBatch(request);
-			return new CdcBatch(batch.getEvents().stream()
-					.map(ThriftConnectionDelegate::mapCdcEvent)
-					.toList(), batch.getNextSeq());
-		} catch (TException e) {
-			throw wrap(e);
-		}
-	}
-
-	private static CDCEvent mapCdcEvent(
-			it.cavallium.rockserver.core.common.api.CDCEvent event) {
-		return new CDCEvent(event.getSeq(),
-				event.getColumnId(),
-				Utils.fromByteBuffer(event.bufferForKey()),
-				event.isSetValue() ? Utils.fromByteBuffer(event.bufferForValue()) : null,
-				CDCEvent.Op.valueOf(event.getOp().name()));
 	}
 
 	private Object invokeClient(Object proxy, Method method, Object[] args) throws Throwable {

@@ -8,7 +8,6 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RawScanEvent;
 import it.cavallium.rockserver.core.common.RawSstToken;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
-import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
 import java.net.URI;
 import java.util.concurrent.CompletableFuture;
@@ -148,17 +147,6 @@ public class LoggingClient implements RocksDBConnection {
 				Set<RawSstToken> completedSsts) {
 			return requestAsync(new RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable(
 					columnId, shardIndex, shardCount, completedSsts));
-		}
-
-		@Override
-		public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-			Mono<CdcBatch> result = asyncApi.cdcPollBatchAsync(id, fromSeq, maxEvents);
-			if (!logger.isEnabledForLevel(Level.TRACE)) {
-				return result;
-			}
-			logger.trace("CDC batch request: id={}, fromSeq={}, maxEvents={}", id, fromSeq, maxEvents);
-			return result.doOnSuccess(batch -> logger.trace("CDC batch request executed: id={}, result={}", id, batch))
-					.doOnError(error -> logger.trace("CDC batch request failed: id={}, error={}", id, error.getMessage()));
 		}
 	}
 }

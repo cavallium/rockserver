@@ -38,7 +38,7 @@ enum WorkloadProfile {
   LATENCY = 2,
   ANALYTICAL = 3,
   INGEST = 4,
-  CDC = 5,
+  // 5 is reserved (removed CDC profile)
   BATCH = 6,
   PHYSICAL_MAINTENANCE = 7
 }
@@ -74,48 +74,6 @@ struct Delta {
 
 struct OptionalBinary {
   1: optional binary value
-}
-
-struct OptionalLongValue {
-  1: optional i64 value
-}
-
-enum CDCOperation {
-  PUT = 0,
-  DELETE = 1,
-  MERGE = 2
-}
-
-struct CDCEvent {
-  1: required i64 seq,
-  2: required i64 columnId,
-  3: required binary key,
-  4: optional binary value,
-  5: required CDCOperation op
-}
-
-struct CdcPollBatchResult {
-  1: required list<CDCEvent> events,
-  2: required i64 nextSeq
-}
-
-struct CdcCreateRequest {
-  1: required string id,
-  2: optional i64 fromSeq,
-  3: optional list<i64> columnIds,
-  4: optional bool emitLatestValues,
-  // Exactly one precondition is required.
-  5: optional bool expectAbsent,
-  6: optional i64 expectedLastCommittedSeq,
-  7: required i32 workloadContractVersion
-}
-
-struct CdcPollRequest {
-  1: required string id,
-  2: optional i64 fromSeq,
-  3: required i64 maxEvents,
-  4: required i32 maxResponseBytes,
-  5: required i32 workloadContractVersion
 }
 
 struct UpdateBegin {
@@ -189,10 +147,7 @@ enum RocksDBErrorType {
   TRANSACTION_NOT_FOUND = 36,
   NULL_ARGUMENT = 37,
   READ_DEADLINE_EXCEEDED = 38,
-	CDC_GAP_DETECTED = 39,
-	CDC_RESPONSE_TOO_LARGE = 40,
-	CDC_SUBSCRIPTION_CHANGED = 41,
-	CDC_SUBSCRIPTION_NOT_FOUND = 42,
+	// 39-42 are reserved (removed CDC error types)
 	SERVER_OVERLOADED = 43,
 	RANGE_ITEM_TOO_LARGE = 44,
   GET_MULTI_ITEM_TOO_LARGE = 45,
@@ -350,18 +305,6 @@ service RocksDB {
    void compact(1: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
 
    list<Column> getAllColumnDefinitions(1: required RequestContext context) throws (1: RocksDBThriftException e),
-
-   i64 cdcCreate(1: required CdcCreateRequest request) throws (1: RocksDBThriftException e),
-
-   void cdcDelete(1: required string id, 2: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
-
-   i64 cdcGetEarliestAvailableSequence(1: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
-
-   OptionalLongValue cdcGetLastCommittedSequence(1: required string id, 2: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
-
-   CdcPollBatchResult cdcPollBatch(1: required CdcPollRequest request) throws (1: RocksDBThriftException e),
-
-   void cdcCommit(1: required string id, 2: required i64 seq, 3: required i32 workloadContractVersion) throws (1: RocksDBThriftException e),
 
    Capabilities getCapabilities(),
 

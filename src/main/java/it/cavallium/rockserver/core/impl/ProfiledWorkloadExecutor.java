@@ -55,7 +55,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private static final TaskState[] TASK_STATES = TaskState.values();
 	private static final WorkloadProfile[] GUARANTEED = {
 			WorkloadProfile.INGEST,
-			WorkloadProfile.CDC,
 			WorkloadProfile.ANALYTICAL,
 			WorkloadProfile.BATCH
 	};
@@ -1329,7 +1328,6 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 	private static boolean isGuaranteedProfile(int profileIndex) {
 		return profileIndex == WorkloadProfile.INGEST.ordinal()
-				|| profileIndex == WorkloadProfile.CDC.ordinal()
 				|| profileIndex == WorkloadProfile.ANALYTICAL.ordinal()
 				|| profileIndex == WorkloadProfile.BATCH.ordinal();
 	}

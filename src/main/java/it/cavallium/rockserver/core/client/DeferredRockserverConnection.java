@@ -5,7 +5,6 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
-import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
 import java.net.URI;
 import java.time.Duration;
@@ -90,15 +89,6 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 				return acquire(budget)
 							.flatMap(client -> Mono.fromFuture(() -> (CompletableFuture<R>)
 								client.getAsyncApi(budget.remainingContext()).requestAsync(request))).toFuture();
-			}
-
-			@Override
-			public Mono<CdcBatch> cdcPollBatchAsync(String id, Long fromSeq, long maxEvents) {
-				return Mono.defer(() -> {
-					var budget = new Budget(context);
-					return acquire(budget).flatMap(client -> client.getAsyncApi(budget.remainingContext())
-							.cdcPollBatchAsync(id, fromSeq, maxEvents));
-				});
 			}
 		};
 	}

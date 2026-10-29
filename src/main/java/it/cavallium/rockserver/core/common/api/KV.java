@@ -428,13 +428,13 @@ public class KV implements org.apache.thrift.TBase<KV, KV._Fields>, java.io.Seri
           case 1: // KEYS
             if (schemeField.type == org.apache.thrift.protocol.TType.LIST) {
               {
-                org.apache.thrift.protocol.TList _list32 = iprot.readListBegin();
-                struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list32.size);
-                @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem33;
-                for (int _i34 = 0; _i34 < _list32.size; ++_i34)
+                org.apache.thrift.protocol.TList _list16 = iprot.readListBegin();
+                struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list16.size);
+                @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem17;
+                for (int _i18 = 0; _i18 < _list16.size; ++_i18)
                 {
-                  _elem33 = iprot.readBinary();
-                  struct.keys.add(_elem33);
+                  _elem17 = iprot.readBinary();
+                  struct.keys.add(_elem17);
                 }
                 iprot.readListEnd();
               }
@@ -471,9 +471,9 @@ public class KV implements org.apache.thrift.TBase<KV, KV._Fields>, java.io.Seri
         oprot.writeFieldBegin(KEYS_FIELD_DESC);
         {
           oprot.writeListBegin(new org.apache.thrift.protocol.TList(org.apache.thrift.protocol.TType.STRING, struct.keys.size()));
-          for (java.nio.ByteBuffer _iter35 : struct.keys)
+          for (java.nio.ByteBuffer _iter19 : struct.keys)
           {
-            oprot.writeBinary(_iter35);
+            oprot.writeBinary(_iter19);
           }
           oprot.writeListEnd();
         }
@@ -513,9 +513,9 @@ public class KV implements org.apache.thrift.TBase<KV, KV._Fields>, java.io.Seri
       if (struct.isSetKeys()) {
         {
           oprot.writeI32(struct.keys.size());
-          for (java.nio.ByteBuffer _iter36 : struct.keys)
+          for (java.nio.ByteBuffer _iter20 : struct.keys)
           {
-            oprot.writeBinary(_iter36);
+            oprot.writeBinary(_iter20);
           }
         }
       }
@@ -530,13 +530,13 @@ public class KV implements org.apache.thrift.TBase<KV, KV._Fields>, java.io.Seri
       java.util.BitSet incoming = iprot.readBitSet(2);
       if (incoming.get(0)) {
         {
-          org.apache.thrift.protocol.TList _list37 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
-          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list37.size);
-          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem38;
-          for (int _i39 = 0; _i39 < _list37.size; ++_i39)
+          org.apache.thrift.protocol.TList _list21 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRING);
+          struct.keys = new java.util.ArrayList<java.nio.ByteBuffer>(_list21.size);
+          @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer _elem22;
+          for (int _i23 = 0; _i23 < _list21.size; ++_i23)
           {
-            _elem38 = iprot.readBinary();
-            struct.keys.add(_elem38);
+            _elem22 = iprot.readBinary();
+            struct.keys.add(_elem22);
           }
         }
         struct.setKeysIsSet(true);

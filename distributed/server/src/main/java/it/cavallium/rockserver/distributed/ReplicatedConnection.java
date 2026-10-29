@@ -119,14 +119,6 @@ final class ReplicatedConnection implements RocksDBConnection {
 			this.context = context;
 		}
 
-		/** Removed together with CDC from core; kept only until that removal lands on this branch. */
-		@Override
-		public reactor.core.publisher.Mono<it.cavallium.rockserver.core.common.cdc.CdcBatch> cdcPollBatchAsync(
-				String id, Long fromSeq, long maxEvents) {
-			return reactor.core.publisher.Mono.error(RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
-					"CDC is not available"));
-		}
-
 		@Override
 		@SuppressWarnings("unchecked")
 		public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {

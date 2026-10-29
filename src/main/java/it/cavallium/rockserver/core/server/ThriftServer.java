@@ -26,7 +26,6 @@ import it.cavallium.rockserver.core.common.api.FirstAndLast;
 import it.cavallium.rockserver.core.common.api.KV;
 import it.cavallium.rockserver.core.common.api.MergeBatchMode;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
-import it.cavallium.rockserver.core.common.api.OptionalLongValue;
 import it.cavallium.rockserver.core.common.api.PutBatchMode;
 import it.cavallium.rockserver.core.common.api.RocksDB.Iface;
 import it.cavallium.rockserver.core.common.api.RocksDB.Processor;
@@ -84,8 +83,7 @@ public class ThriftServer extends Server {
 		var handler = new ThriftHandler(this.getClient(),
 				client instanceof InternalConnection internalConnection
 						? internalConnection.getScheduler()
-						: null,
-				ThriftTransportLimits.safeCdcResponseSize(validatedMaxFrameSize));
+						: null);
 
 		try {
 			var serverTransport = new ConfiguredNonblockingServerSocket(
@@ -303,14 +301,11 @@ public class ThriftServer extends Server {
 
 		private final RocksDBConnection client;
 		private final @Nullable RWScheduler scheduler;
-		private final int maxCdcResponseSize;
 
 		public ThriftHandler(RocksDBConnection client,
-				@Nullable RWScheduler scheduler,
-				int maxCdcResponseSize) {
+				@Nullable RWScheduler scheduler) {
 			this.client = client;
 			this.scheduler = scheduler;
-			this.maxCdcResponseSize = maxCdcResponseSize;
 		}
 
 		private static RocksDBSyncAPI dispatchingSyncApi(RocksDBConnection client, RequestContext context) {
@@ -391,10 +386,6 @@ public class ThriftServer extends Server {
 			return dispatchingSyncApi(client, RequestContext.batch());
 		}
 
-		private RocksDBAsyncAPI protectedAsyncApi() {
-			return client.getAsyncApi(RequestContext.batch());
-		}
-
 		private static boolean shouldDispatchAsync(RocksDBAPICommand<?, ?, ?> request) {
 			if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch
@@ -410,16 +401,12 @@ public class ThriftServer extends Server {
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction
-					|| request instanceof RocksDBAPICommand.CdcCommit
-					|| (request instanceof RocksDBAPICommand.CdcCreate create
-					&& create.fromSeq() != null
-					&& create.fromSeq() == 0L)
 					|| request instanceof RocksDBAPICommand.Flush
 					|| request instanceof RocksDBAPICommand.Compact) {
 				return true;
 			}
 			return switch (request.operationFamily()) {
-				case BOUNDED_FAN_OUT, RANGE_PAGE, FULL_SCAN_AGGREGATE, WAL_PAGE -> true;
+				case BOUNDED_FAN_OUT, RANGE_PAGE, FULL_SCAN_AGGREGATE -> true;
 				default -> false;
 			};
 		}
@@ -485,8 +472,7 @@ public class ThriftServer extends Server {
 		private static boolean mustCompleteAfterInterrupt(RocksDBAPICommand<?, ?, ?> request) {
 			return request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator
 					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction
-					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate
-					|| request instanceof RocksDBAPICommand.CdcCommit;
+					|| request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
 		}
 
 		private static @Nullable Function<Object, CompletableFuture<?>> lateSuccessCleanup(
@@ -1367,112 +1353,6 @@ public class ThriftServer extends Server {
 				List<Column> columns = new ArrayList<>();
 				map.forEach((name, schema) -> columns.add(new Column(name, mapSchemaToThrift(schema))));
 				return columns;
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
-				throw mapException(e);
-			}
-		}
-
-		@Override
-		public long cdcCreate(it.cavallium.rockserver.core.common.api.CdcCreateRequest request)
-				throws RocksDBThriftException {
-			try {
-				requireV3(request.getWorkloadContractVersion());
-				if (request.isSetExpectAbsent() && request.isSetExpectedLastCommittedSeq()) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
-							"CDC create request cannot set both expectAbsent and expectedLastCommittedSeq");
-				}
-				if (request.isSetExpectAbsent() && !request.isExpectAbsent()) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
-							"CDC create expectAbsent must be true when set");
-				}
-				final OptionalLong expectedLastCommitted;
-				if (request.isSetExpectAbsent()) {
-					expectedLastCommitted = OptionalLong.empty();
-				} else if (request.isSetExpectedLastCommittedSeq()) {
-					expectedLastCommitted = OptionalLong.of(request.getExpectedLastCommittedSeq());
-				} else {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
-							"CDC creation precondition is required");
-				}
-				return protectedApi().cdcCreate(request.getId(),
-						request.isSetFromSeq() ? request.getFromSeq() : null,
-						request.isSetColumnIds() ? request.getColumnIds() : null,
-						request.isSetEmitLatestValues() ? request.isEmitLatestValues() : null,
-						expectedLastCommitted);
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
-				throw mapException(e);
-			}
-		}
-
-		@Override
-		public void cdcDelete(String id, int workloadContractVersion) throws RocksDBThriftException {
-			try {
-				requireV3(workloadContractVersion);
-				protectedApi().cdcDelete(id);
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
-				throw mapException(e);
-			}
-		}
-
-		@Override
-		public long cdcGetEarliestAvailableSequence(int workloadContractVersion) throws RocksDBThriftException {
-			try {
-				requireV3(workloadContractVersion);
-				return protectedApi().cdcGetEarliestAvailableSequence();
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
-				throw mapException(e);
-			}
-		}
-
-		@Override
-		public OptionalLongValue cdcGetLastCommittedSequence(String id, int workloadContractVersion)
-				throws RocksDBThriftException {
-			try {
-				requireV3(workloadContractVersion);
-				var sequence = protectedApi().cdcGetLastCommittedSequence(id);
-				var response = new OptionalLongValue();
-				sequence.ifPresent(response::setValue);
-				return response;
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
-				throw mapException(e);
-			}
-		}
-
-		@Override
-		public it.cavallium.rockserver.core.common.api.CdcPollBatchResult cdcPollBatch(
-				it.cavallium.rockserver.core.common.api.CdcPollRequest request)
-				throws RocksDBThriftException {
-			try {
-				requireV3(request.getWorkloadContractVersion());
-				int requestedMaxResponseSize = request.getMaxResponseBytes();
-				if (requestedMaxResponseSize <= 0) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
-							"maxResponseBytes must be positive: " + requestedMaxResponseSize);
-				}
-				var batch = protectedAsyncApi().cdcPollBatchAsync(request.getId(),
-						request.isSetFromSeq() ? request.getFromSeq() : null,
-						request.getMaxEvents()).block();
-				if (batch == null) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.INTERNAL_ERROR,
-							"CDC poll completed without a batch");
-				}
-				return ThriftCdcResponseBudget.build(batch,
-						Math.min(requestedMaxResponseSize, maxCdcResponseSize));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
-				throw mapException(e);
-			}
-		}
-
-		@Override
-		public void cdcCommit(String id, long seq, int workloadContractVersion) throws RocksDBThriftException {
-			try {
-				requireV3(workloadContractVersion);
-				protectedApi().cdcCommit(id, seq);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}

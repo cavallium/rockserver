@@ -75,7 +75,8 @@ enum WorkloadProfile {
   LATENCY = 2;
   ANALYTICAL = 3;
   INGEST = 4;
-  CDC = 5;
+  reserved 5;
+  reserved "CDC";
   BATCH = 6;
   PHYSICAL_MAINTENANCE = 7;
 }
@@ -346,92 +347,6 @@ service RocksDBService {
   rpc getAllColumnDefinitions(GetAllColumnDefinitionsRequest) returns (GetAllColumnDefinitionsResponse);
   rpc uploadMergeOperator(UploadMergeOperatorRequest) returns (UploadMergeOperatorResponse);
   rpc checkMergeOperator(CheckMergeOperatorRequest) returns (CheckMergeOperatorResponse);
-  // Change Data Capture (CDC) API
-  // Create or update a CDC subscription. If fromSeq is not provided, it starts from the latest sequence.
-  rpc cdcCreate(CdcCreateRequest) returns (CdcCreateResponse);
-  // Delete a CDC subscription
-  rpc cdcDelete(CdcDeleteRequest) returns (google.protobuf.Empty);
-  // Return the earliest CDC cursor still available in the database WAL.
-  rpc cdcGetEarliestAvailableSequence(CdcGetEarliestAvailableSequenceRequest) returns (CdcGetEarliestAvailableSequenceResponse);
-  // Return the durable last committed sequence, or an empty response when the subscription is absent.
-  rpc cdcGetLastCommittedSequence(CdcGetLastCommittedSequenceRequest) returns (CdcGetLastCommittedSequenceResponse);
-  // Stream CDC events starting from fromSeq (inclusive). If fromSeq is not provided, starts from last committed + 1
-  rpc cdcPoll(CdcPollRequest) returns (stream CDCEvent);
-  // Poll a CDC batch together with the server cursor. Unlike cdcPoll, this preserves cursor
-  // advancement when column filtering produces an empty event list.
-  rpc cdcPollBatch(CdcPollRequest) returns (CdcPollResponse);
-  // Commit the last processed sequence for a subscription
-  rpc cdcCommit(CdcCommitRequest) returns (google.protobuf.Empty);
-}
-
-// CDC messages
-message CdcCreateRequest {
-  string id = 1;
-  // Optional start sequence. If not set, server will start from latest sequence number.
-  optional int64 fromSeq = 2;
-  // Optional filter of column ids. Empty means all columns.
-  repeated int64 columnIds = 3;
-  // If true, CDC will emit the resolved current values as seen by readers (post-merge),
-  // instead of raw operands for MERGE operations. Defaults to false if not set.
-  optional bool resolvedValues = 4;
-  // Required atomic checkpoint precondition. The server rejects PRECONDITION_NOT_SET.
-  oneof expectedLastCommitted {
-    // Require that the subscription metadata does not exist.
-    google.protobuf.Empty expectAbsent = 5;
-    // Require that the subscription exists at exactly this durable checkpoint.
-    int64 expectedLastCommittedSeq = 6;
-  }
-  int32 workloadContractVersion = 7;
-}
-
-message CdcCreateResponse {
-  // The starting sequence the server will use for this subscription (committed seq + 1)
-  int64 startSeq = 1;
-}
-
-message CdcDeleteRequest { string id = 1; int32 workloadContractVersion = 2; }
-
-message CdcGetEarliestAvailableSequenceRequest { int32 workloadContractVersion = 1; }
-
-message CdcGetEarliestAvailableSequenceResponse {
-  int64 sequence = 1;
-}
-
-message CdcGetLastCommittedSequenceRequest { string id = 1; int32 workloadContractVersion = 2; }
-
-message CdcGetLastCommittedSequenceResponse {
-  optional int64 lastCommittedSeq = 1;
-}
-
-message CdcPollRequest {
-  string id = 1;
-  // Optional override for start sequence. If not set, starts from last committed + 1
-  optional int64 fromSeq = 2;
-  // Max events to try to buffer per request cycle (server may emit fewer based on backpressure)
-  int64 maxEvents = 3;
-  // Positive maximum serialized CdcPollResponse, or individual streamed CDCEvent, accepted by the caller.
-  // Servers paginate without splitting one CDC sequence.
-  int32 maxResponseBytes = 4;
-  int32 workloadContractVersion = 5;
-}
-
-message CdcPollResponse {
-  repeated CDCEvent events = 1;
-  // Server cursor for the next poll. It may advance even when events is empty.
-  int64 nextSeq = 2;
-}
-
-message CdcCommitRequest { string id = 1; int64 seq = 2; int32 workloadContractVersion = 3; }
-
-message CDCEvent {
-  int64 seq = 1;
-  int64 columnId = 2;
-  // Raw calculated key bytes for the target column family
-  bytes key = 3;
-  // Value bytes; empty for deletes
-  bytes value = 4;
-  enum Op { PUT = 0; DELETE = 1; MERGE = 2; }
-  Op op = 5;
 }
 
 message GetSstMetadataRequest {

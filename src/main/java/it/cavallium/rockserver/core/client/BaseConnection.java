@@ -4,7 +4,6 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
-import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.function.Supplier;
@@ -60,11 +59,6 @@ abstract class BaseConnection implements RocksDBConnection {
 
 	abstract <R, RS, RA> RA requestAsync(BoundRequestContext context,
 			RocksDBAPICommand<R, RS, RA> request);
-
-	abstract Mono<CdcBatch> cdcPollBatchAsync(BoundRequestContext context,
-			@NotNull String id,
-			@Nullable Long fromSeq,
-			long maxEvents);
 
 	@Override
 	public void close() throws IOException {

@@ -88,17 +88,17 @@ final class RocksDBWalMetrics implements AutoCloseable {
 				.tag("database", databaseName)
 				.register(registry));
 		meters.add(Gauge.builder(ARCHIVED_BYTES_METRIC, snapshot, value -> value.get().archived().bytes())
-				.description("Bytes in archived RocksDB WAL files retained for CDC")
+				.description("Bytes in archived RocksDB WAL files (wal-ttl-seconds, wal-size-limit-mb)")
 				.baseUnit("bytes")
 				.tag("database", databaseName)
 				.register(registry));
 		meters.add(Gauge.builder(ARCHIVED_FILES_METRIC, snapshot, value -> value.get().archived().fileCount())
-				.description("Number of archived RocksDB WAL files retained for CDC")
+				.description("Number of archived RocksDB WAL files (wal-ttl-seconds, wal-size-limit-mb)")
 				.tag("database", databaseName)
 				.register(registry));
 		meters.add(Gauge.builder(ARCHIVED_OLDEST_AGE_METRIC, this,
 					value -> value.oldestAgeSeconds(value.snapshot.get().archived()))
-				.description("Age of the oldest archived RocksDB WAL file retained for CDC")
+				.description("Age of the oldest archived RocksDB WAL file")
 				.baseUnit("seconds")
 				.tag("database", databaseName)
 				.register(registry));

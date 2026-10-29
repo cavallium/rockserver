@@ -9,10 +9,8 @@ import static it.cavallium.rockserver.core.common.OperationFamily.METADATA;
 import static it.cavallium.rockserver.core.common.OperationFamily.MUTATION;
 import static it.cavallium.rockserver.core.common.OperationFamily.POINT_LOOKUP;
 import static it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE;
-import static it.cavallium.rockserver.core.common.OperationFamily.WAL_PAGE;
 import static it.cavallium.rockserver.core.common.WorkloadProfile.ANALYTICAL;
 import static it.cavallium.rockserver.core.common.WorkloadProfile.BATCH;
-import static it.cavallium.rockserver.core.common.WorkloadProfile.CDC;
 import static it.cavallium.rockserver.core.common.WorkloadProfile.CONTROL;
 import static it.cavallium.rockserver.core.common.WorkloadProfile.INGEST;
 import static it.cavallium.rockserver.core.common.WorkloadProfile.LATENCY;
@@ -105,7 +103,6 @@ public final class WorkloadAdmission {
 		Objects.requireNonNull(family, "family");
 		var resolved = switch (family) {
 			case CONTROL -> WorkloadProfile.CONTROL;
-			case WAL_PAGE -> WorkloadProfile.CDC;
 			case FLUSH, COMPACTION -> WorkloadProfile.PHYSICAL_MAINTENANCE;
 			default -> context.profile();
 		};
@@ -279,11 +276,9 @@ public final class WorkloadAdmission {
 					RocksDBAPICommandSingle.GetColumnId _, RocksDBAPICommandSingle.EstimateNumKeys _,
 					RocksDBAPICommandSingle.OpenIterator _,
 					RocksDBAPICommandSingle.CloseIterator _, RocksDBAPICommandSingle.SeekTo _,
-					RocksDBAPICommandSingle.ReduceRange<?> _, RocksDBAPICommandStream.CdcPoll _,
+					RocksDBAPICommandSingle.ReduceRange<?> _,
 					RocksDBAPICommand.Flush _, RocksDBAPICommand.Compact _, RocksDBAPICommand.CompactFiles _,
-					RocksDBAPICommand.GetAllColumnDefinitions _, RocksDBAPICommand.CdcCreate _,
-					RocksDBAPICommand.CdcDelete _, RocksDBAPICommand.CdcGetEarliestAvailableSequence _,
-					RocksDBAPICommand.CdcGetLastCommittedSequence _, RocksDBAPICommand.CdcCommit _ -> {
+					RocksDBAPICommand.GetAllColumnDefinitions _ -> {
 				// The operation-family matrix or protected server ownership is sufficient.
 			}
 		}
@@ -460,7 +455,6 @@ public final class WorkloadAdmission {
 				BOUNDED_FAN_OUT,
 				RANGE_PAGE,
 				MUTATION);
-		allowed[CDC.ordinal()] = mask(WAL_PAGE, MUTATION, FLUSH);
 		allowed[BATCH.ordinal()] = mask(METADATA,
 				POINT_LOOKUP,
 				BOUNDARY_SEEK,

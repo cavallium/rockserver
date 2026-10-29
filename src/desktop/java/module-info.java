@@ -50,7 +50,6 @@ module rockserver.core {
 	opens it.cavallium.rockserver.core.gui to rockserver.core.test;
 	exports it.cavallium.rockserver.core.client;
 	exports it.cavallium.rockserver.core.common;
-	exports it.cavallium.rockserver.core.common.cdc;
 	exports it.cavallium.rockserver.core.config;
 	opens it.cavallium.rockserver.core.resources;
 	opens it.cavallium.rockserver.core.config to org.github.gestalt.core, org.github.gestalt.hocon;
