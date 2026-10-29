@@ -57,7 +57,16 @@ public final class ReplicatedServerMain {
 				Long.parseLong(options.value("--snapshot-every", "100000")),
 				Duration.ofMillis(Long.parseLong(options.value("--request-timeout-ms", "10000"))));
 		options.requireConsumed();
-		var node = ReplicatedNode.start(config);
+		ReplicatedNode node;
+		try {
+			node = ReplicatedNode.start(config);
+		} catch (IOException | RuntimeException e) {
+			// Ratis and gRPC leave non-daemon threads behind, which would keep the JVM running without a node.
+			System.err.println("Failed to start node " + config.nodeId() + ":");
+			e.printStackTrace();
+			System.exit(1);
+			return;
+		}
 		var stopped = new CountDownLatch(1);
 		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
 			try {
