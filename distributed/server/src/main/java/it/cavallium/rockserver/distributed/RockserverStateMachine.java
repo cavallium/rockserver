@@ -284,16 +284,6 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return position.getIndex();
 	}
 
-	/**
-	 * Called by Ratis before it installs a snapshot received from the leader. Ratis refuses to install it unless
-	 * the life cycle is then PAUSED; no entry is applied until {@link #reinitialize}.
-	 */
-	@Override
-	public void pause() {
-		getLifeCycle().transition(LifeCycle.State.PAUSING);
-		getLifeCycle().transition(LifeCycle.State.PAUSED);
-	}
-
 	/** Called after Ratis installed a snapshot received from the leader, once {@link #pause} returned. */
 	@Override
 	public void reinitialize() throws IOException {
