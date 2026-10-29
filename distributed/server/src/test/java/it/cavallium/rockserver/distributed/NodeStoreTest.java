@@ -16,9 +16,12 @@ import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -65,6 +68,29 @@ class NodeStoreTest {
 			assertEquals(TermIndex.valueOf(3, 42), store.applied());
 			assertEquals("cluster-a", store.clusterId());
 			assertFalse(store.hasUserColumns());
+		}
+	}
+
+	/** A crash can tear the tail of the un-synced WAL: the replica opens the prefix and Raft replays the rest. */
+	@Test
+	void openRecoversThePrefixOfAWalWithATornTail() throws IOException {
+		Path dbDir = tempDir.resolve("db");
+		try (var store = NodeStore.open(dbDir, null, "first")) {
+			for (int index = 1; index <= 10; index++) {
+				setApplied(store, TermIndex.valueOf(1, index));
+			}
+		}
+		Path wal;
+		try (Stream<Path> files = Files.walk(dbDir)) {
+			wal = files.filter(file -> file.getFileName().toString().matches("\\d+\\.log"))
+					.max(Comparator.comparing(file -> file.getFileName().toString()))
+					.orElseThrow();
+		}
+		try (var channel = FileChannel.open(wal, StandardOpenOption.WRITE)) {
+			channel.truncate(channel.size() - 1);
+		}
+		try (var store = NodeStore.open(dbDir, null, "second")) {
+			assertEquals(TermIndex.valueOf(1, 9), store.applied());
 		}
 	}
 

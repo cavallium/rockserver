@@ -1,5 +1,9 @@
 package it.cavallium.rockserver.distributed;
 
+import com.typesafe.config.ConfigException;
+import com.typesafe.config.ConfigFactory;
+import com.typesafe.config.ConfigParseOptions;
+import com.typesafe.config.ConfigRenderOptions;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
@@ -51,6 +55,9 @@ import org.slf4j.LoggerFactory;
  * database directory and everything under it must be on the same file system as its parent directory, because
  * {@link #restore} swaps it by renaming: mount the node's data directory, not the database directory or a volume
  * inside it. {@link #open} refuses other layouts.</p>
+ *
+ * <p>The database is opened with the node's Rockserver config plus {@link #REPLICA_OVERRIDES}, settings that every
+ * replica needs whatever that config says.</p>
  */
 final class NodeStore implements Closeable {
 
@@ -62,6 +69,15 @@ final class NodeStore implements Closeable {
 
 	private static final ColumnSchema META_SCHEMA = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
 	private static final int TERM_INDEX_BYTES = 2 * Long.BYTES;
+
+	/**
+	 * The RocksDB WAL is not synced, so a crash can tear its tail: a power loss keeps an arbitrary prefix of what was
+	 * written, and with a delayed WAL flush ({@code delay-wal-flush-duration}) even a killed process loses its
+	 * buffer. A replica then needs the consistent prefix that RocksDB's point-in-time recovery opens, and replays the
+	 * rest from the Raft log. Rockserver's {@code absolute-consistency} (on by default) would refuse to open such a
+	 * database, so the replica could not restart without being repaired.
+	 */
+	private static final String REPLICA_OVERRIDES = "database.global.absolute-consistency = false\n";
 
 	private final Path dbDir;
 	/** RocksDB WAL directory: {@code dbDir} itself or the configured {@code wal-path} (default {@code ./wal}). */
@@ -84,7 +100,14 @@ final class NodeStore implements Closeable {
 	static NodeStore open(Path dbDir, @Nullable Path rockserverConfig, String name) throws IOException {
 		dbDir = dbDir.toAbsolutePath().normalize();
 		RestoreDirs.of(dbDir).recover();
-		var connection = new EmbeddedConnection(dbDir, name, rockserverConfig);
+		Path config = replicaConfig(rockserverConfig);
+		EmbeddedConnection connection;
+		try {
+			connection = new EmbeddedConnection(dbDir, name, config);
+		} finally {
+			// The database parses its config once, when it opens.
+			Files.deleteIfExists(config);
+		}
 		try {
 			checkSingleFileSystem(dbDir);
 			Path walDir = walDir(dbDir, connection.getEmbeddedDB());
@@ -99,6 +122,31 @@ final class NodeStore implements Closeable {
 			}
 			throw failure;
 		}
+	}
+
+	/**
+	 * Writes the config the replica opens its database with to a new temporary file: {@link #REPLICA_OVERRIDES} over
+	 * the given Rockserver config (HOCON), or over the defaults when there is none.
+	 */
+	private static Path replicaConfig(@Nullable Path rockserverConfig) throws IOException {
+		var config = ConfigFactory.parseString(REPLICA_OVERRIDES);
+		try {
+			if (rockserverConfig != null) {
+				config = config.withFallback(ConfigFactory.parseFile(rockserverConfig.toFile(),
+						ConfigParseOptions.defaults().setAllowMissing(false)));
+			}
+			config = config.resolve();
+		} catch (ConfigException e) {
+			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
+		}
+		Path file = Files.createTempFile("rockserver-replica-", ".conf");
+		try {
+			Files.writeString(file, config.root().render(ConfigRenderOptions.concise()), StandardCharsets.UTF_8);
+		} catch (IOException | RuntimeException e) {
+			Files.deleteIfExists(file);
+			throw e;
+		}
+		return file;
 	}
 
 	private static Path walDir(Path dbDir, EmbeddedDB db) throws IOException {
