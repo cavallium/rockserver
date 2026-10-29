@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.distributed.ReadBarrier.NotLeaderException;
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -557,7 +558,7 @@ class ReadBarrierTest {
 		RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMax(properties, max);
 
 		var parameters = new Parameters();
-		var termService = TermService.customizer(node::serverAnsweringTermCalls);
+		var termService = TermService.customizer(node::serverAnsweringTermCalls, new HostAndPort("127.0.0.1", 0));
 		GrpcConfigKeys.Server.setServicesCustomizer(parameters, (builder, types) -> {
 			if (types.contains(GrpcServices.Type.SERVER)) {
 				builder.intercept(node.faults());
