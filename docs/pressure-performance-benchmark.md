@@ -187,15 +187,15 @@ after the first completion token, persists every acknowledged token with `DSYNC`
 `force`, resumes with exact row conservation, closes/reopens the database, and proves completed SSTs
 are skipped.
 
-The timed phase concurrently runs full raw-SST BATCH scans, INGEST writes, LATENCY gets, CDC poll and
-durable commit, flush/compaction, and alternating injected pressure. It gates configured minimum
-backfill and ingest throughput, maximum zero-progress gap, CDC lag, LATENCY p99, CPU/allocation/GC,
+The timed phase concurrently runs full raw-SST BATCH scans, INGEST writes, LATENCY gets,
+flush/compaction, and alternating injected pressure. It gates configured minimum
+backfill and ingest throughput, maximum zero-progress gap, LATENCY p99, CPU/allocation/GC,
 queue/parked/outstanding peaks, heap/direct/RSS/thread/handle peaks, final drain, clean shutdown, and
 native leaks. A bounded smoke run is part of Maven; a representative run is opt-in:
 
 The driver precomputes and reuses the entire immutable key space and value payload, so measured
 allocation is not dominated by key construction. Allocations intentionally left in the contract are
-the real API/scheduler task wrappers, raw-scan event and wire-batch objects, CDC event/page objects,
+the real API/scheduler task wrappers, raw-scan event and wire-batch objects,
 and RocksDB/JNI result ownership needed by the production paths.
 
 ```bash

@@ -2,7 +2,7 @@
 
 ## Workload admission
 
-Rockserver schedules requests by the explicit `LATENCY`, `INGEST`, `CDC`,
+Rockserver schedules requests by the explicit `LATENCY`, `INGEST`,
 `ANALYTICAL`, `BATCH`, `CONTROL`, and `PHYSICAL_MAINTENANCE` profiles. Data
 profiles share hard read/write worker limits with borrowable reservations;
 CONTROL and physical maintenance use isolated pools.
@@ -14,7 +14,6 @@ database.parallelism {
   workload {
     latency-queue-capacity = 4096
     ingest-queue-capacity = 4096
-    cdc-queue-capacity = 1024
     analytical-queue-capacity = 512
     batch-queue-capacity = 512
   }
@@ -37,7 +36,6 @@ as `RESOURCE_EXHAUSTED`. Admission metrics use bounded `database`, `resource`,
 - `rockserver.workload.worker.failures`
 - `rockserver.workload.storage.pressure`
 - `rockserver.workload.retained.snapshots`
-- `rockserver.workload.cdc.lag`
 
 See [workload profiles](docs/workload-profiles.md) for admission rules and
 [workload configuration](docs/workload-configuration.md) for every setting,
@@ -47,7 +45,7 @@ default, and startup invariant.
 
 `GrpcOverloadBenchmark` is the opt-in, disk-backed whole-path complement to the
 embedded `SevenProfileWorkloadBenchmark`. It sends real loopback gRPC traffic for
-all seven profiles during a harsh mixed phase. Every measured RPC is counted at
+all six profiles during a harsh mixed phase. Every measured RPC is counted at
 client-call start and exactly one terminal close; an independent integrity phase
 writes unique INGEST/BATCH values and reads every acknowledged value back through
 LATENCY. Scheduler snapshots prove all four pools drain with balanced
@@ -94,6 +92,12 @@ documented in [`docs/iterator-quantum-ablation.md`](docs/iterator-quantum-ablati
 Both read gates and the paired seven-profile gate share the v1.3.11 Pareto rules and
 versioned result schemas documented in
 [`docs/v1.3.11-performance-contract.md`](docs/v1.3.11-performance-contract.md).
+
+## Merge operators
+
+Columns can use a server-side `MergeOperator` instead of client-side
+read-modify-write. See [merge operators](docs/merge-operators.md) for the write
+path and how to update or hot-swap an operator.
 
 ## Fast unary GET
 

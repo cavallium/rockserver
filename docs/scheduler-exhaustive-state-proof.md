@@ -91,10 +91,10 @@ barriers and compares dispatch against small independent queue models:
 
 - all 6 submission permutations of three EDF tasks crossed with all 8 cancellation subsets
   (48 queue states), including equal-deadline sequence tie-breaking;
-- every nonempty four-profile vector where INGEST, CDC, ANALYTICAL, and BATCH are absent, cost 1, or
-  cost 5 (80 DRR queue/cost states);
+- every nonempty three-profile vector where INGEST, ANALYTICAL, and BATCH are absent, cost 1, or
+  cost 5 (26 DRR queue/cost states);
 - nine LATENCY tasks plus INGEST, proving that priority yields exactly after the configured burst;
-- already-expired admission for all five data profiles, proving exactly one rejection and no run.
+- already-expired admission for all four data profiles, proving exactly one rejection and no run.
 
 These scenarios end with exact scheduler conservation. There are no correctness sleeps: latches
 establish worker/queue ordering, and bounded waits only fail a missing transition.

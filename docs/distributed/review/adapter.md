@@ -245,7 +245,7 @@ Meanwhile, items 5 (bootstrap and replace node) and 7 (plain API) are **missing*
 | `RatisSchema*`, `RatisColumnAllocation`, `RatisColumnIdentities`, `RatisOperatorCatalogue` | **REWRITE (small)** | Column create/delete can be one replicated command applied in order. The fence/install/activate jobs are unnecessary. |
 | `RatisCatalogue*`, `RatisTopologyCatalogue`, `RatisDatabaseDomainRoster`, CATALOGUE role | **DELETE** for v1 | With a static single group there is no directory to replicate separately. |
 | `RatisExport*`, `RatisAggregateExport*`, `RatisDatabaseBackup*`, `RatisDatabaseRestore*`, `RatisDatabaseCapture*`, `RatisRemoteExportSource`, `RatisBackend*` | **DELETE** for v1 | Backup can be a leader-side RocksDB checkpoint. Restore can be "bootstrap from checkpoint". |
-| `RatisCdc*` | **REWRITE later** | CDC can be derived from the applied log index plus the existing CDC CF. Not needed for HA. |
+| `RatisCdc*` | **DELETE** | CDC was removed from Rockserver altogether. |
 | `RatisNodeResourceBudget`, `RatisLogResourceBudget`, `RatisDiskRunway*`, `RatisPoolPressureService`, `RatisMetadataClaims`, `RatisCommittedApplyDispatcher`, `RatisProofQueryService` | **DELETE** | Byte-level accounting that couples to forked Ratis internals. Use Ratis queue limits and an RocksDB write-stall/disk alarm. |
 | `ScopedTransactionRpc` and the other 50 `*Rpc`/`*Record` codecs | **REWRITE** | Replace with one protobuf envelope. |
 | `RatisStreamingTransport` | **KEEP if needed** | Only useful for large snapshot transfer. |
