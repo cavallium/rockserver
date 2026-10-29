@@ -60,19 +60,18 @@ fn all_workload_profile_values_are_stable() {
         (2, WorkloadProfile::Latency),
         (3, WorkloadProfile::Analytical),
         (4, WorkloadProfile::Ingest),
-        (5, WorkloadProfile::Cdc),
         (6, WorkloadProfile::Batch),
         (7, WorkloadProfile::PhysicalMaintenance),
     ] {
         assert_eq!(WorkloadProfile::try_from(wire_value), Ok(expected));
     }
+    assert!(WorkloadProfile::try_from(5).is_err());
 }
 
 #[test]
 fn typed_context_constructor_rejects_protected_profiles() {
     for profile in [
         WorkloadProfile::Control,
-        WorkloadProfile::Cdc,
         WorkloadProfile::PhysicalMaintenance,
     ] {
         assert!(std::panic::catch_unwind(|| RequestContext::for_profile(profile, None)).is_err());

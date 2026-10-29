@@ -12,7 +12,6 @@
 //! - Batching and Multi-Key Operations
 //! - Iterators and Range Scans
 //! - Bounded Range Pages with Exclusive Continuations
-//! - Change Data Capture (CDC) streaming
 //!
 //! ## Example
 //!

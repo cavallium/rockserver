@@ -3,9 +3,8 @@ use std::time::Duration;
 
 // Re-export proto types that are part of the public API
 pub use crate::proto::{
-    CdcEvent, Changed, ColumnHashType, Delta, FirstAndLast, Kv, KvBatch, MergeBatchMode, Merged,
-    Operation, Previous, PreviousPresence, PutBatchMode, RequestContext, UpdateBegin,
-    WorkloadProfile,
+    Changed, ColumnHashType, Delta, FirstAndLast, Kv, KvBatch, MergeBatchMode, Merged, Operation,
+    Previous, PreviousPresence, PutBatchMode, RequestContext, UpdateBegin, WorkloadProfile,
 };
 
 /// Opaque, database-scoped identity of an immutable RocksDB SST file.
@@ -59,7 +58,6 @@ fn workload_profile_wire_value(profile: WorkloadProfile) -> i32 {
         WorkloadProfile::Latency => 2,
         WorkloadProfile::Analytical => 3,
         WorkloadProfile::Ingest => 4,
-        WorkloadProfile::Cdc => 5,
         WorkloadProfile::Batch => 6,
         WorkloadProfile::PhysicalMaintenance => 7,
     }
@@ -194,126 +192,6 @@ impl From<Column> for proto::Column {
         proto::Column {
             name: val.name,
             schema: val.schema.map(|s| s.into()),
-        }
-    }
-}
-
-/// Configuration options for the CDC (Change Data Capture) stream.
-#[derive(Clone, Debug)]
-pub struct CdcStreamOptions {
-    /// The sequence number to start streaming from. If None, starts from the beginning or handled by server default.
-    pub from_seq: Option<i64>,
-    /// The maximum number of events to fetch in a single poll request.
-    pub batch_size: i64,
-    /// The delay to wait when no new events are available before polling again.
-    pub idle_delay: Duration,
-    /// Strategy for committing processed offsets back to the server.
-    pub commit_mode: CdcCommitMode,
-}
-
-/// Strategies for committing CDC offsets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CdcCommitMode {
-    /// Commit the offset after every successfully processed event. Slowest but safest.
-    PerEvent,
-    /// Commit the offset after processing a batch of events.
-    Batch,
-    /// Do not commit offsets automatically.
-    None,
-}
-
-/// Atomic precondition for creating or updating a CDC subscription.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CdcCreatePrecondition {
-    /// Require that the subscription metadata does not exist.
-    Absent,
-    /// Require that the subscription exists at exactly this durable checkpoint.
-    LastCommitted(i64),
-}
-
-/// Typed failure returned by checked CDC operations.
-#[derive(Debug)]
-pub enum CdcError {
-    /// The subscription was absent, present, or at a checkpoint different from the requested precondition.
-    SubscriptionChanged(tonic::Status),
-    /// The subscription metadata was deleted or never created.
-    SubscriptionNotFound(tonic::Status),
-    /// Any other transport or server failure.
-    Rpc(tonic::Status),
-}
-
-impl CdcError {
-    pub fn status(&self) -> &tonic::Status {
-        match self {
-            Self::SubscriptionChanged(status)
-            | Self::SubscriptionNotFound(status)
-            | Self::Rpc(status) => status,
-        }
-    }
-
-    pub fn into_status(self) -> tonic::Status {
-        match self {
-            Self::SubscriptionChanged(status)
-            | Self::SubscriptionNotFound(status)
-            | Self::Rpc(status) => status,
-        }
-    }
-}
-
-impl std::fmt::Display for CdcError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.status().fmt(formatter)
-    }
-}
-
-impl std::error::Error for CdcError {}
-
-impl From<tonic::Status> for CdcError {
-    fn from(status: tonic::Status) -> Self {
-        const SUBSCRIPTION_CHANGED: &str = "RocksDBError: [uid:CDC_SUBSCRIPTION_CHANGED]";
-        const SUBSCRIPTION_NOT_FOUND: &str = "RocksDBError: [uid:CDC_SUBSCRIPTION_NOT_FOUND]";
-        if status.message().starts_with(SUBSCRIPTION_CHANGED) {
-            Self::SubscriptionChanged(status)
-        } else if status.message().starts_with(SUBSCRIPTION_NOT_FOUND) {
-            Self::SubscriptionNotFound(status)
-        } else {
-            Self::Rpc(status)
-        }
-    }
-}
-
-#[cfg(test)]
-mod cdc_error_tests {
-    use super::CdcError;
-
-    #[test]
-    fn classifies_subscription_not_found() {
-        let status = tonic::Status::not_found(
-            "RocksDBError: [uid:CDC_SUBSCRIPTION_NOT_FOUND] CDC subscription not found: missing",
-        );
-
-        assert!(matches!(
-            CdcError::from(status),
-            CdcError::SubscriptionNotFound(_)
-        ));
-    }
-
-    #[test]
-    fn leaves_unrelated_statuses_as_rpc_errors() {
-        assert!(matches!(
-            CdcError::from(tonic::Status::unavailable("temporarily unavailable")),
-            CdcError::Rpc(_)
-        ));
-    }
-}
-
-impl Default for CdcStreamOptions {
-    fn default() -> Self {
-        Self {
-            from_seq: None,
-            batch_size: 1000,
-            idle_delay: Duration::from_millis(500),
-            commit_mode: CdcCommitMode::Batch,
         }
     }
 }
