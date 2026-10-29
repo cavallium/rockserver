@@ -4,9 +4,11 @@ import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
@@ -14,6 +16,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -26,6 +29,9 @@ import java.util.concurrent.TimeUnit;
  * <p>Everything lives under the root directory given at start: {@code <root>/node-<id>/data} (the node's data
  * directory, kept across restarts), {@code <root>/node-<id>/stdout.log} and {@code stderr.log} (appended to by
  * every start), and {@code <root>/network} (hosts files).</p>
+ *
+ * <p>The node JVMs are killed by {@link #close()}, or by a shutdown hook if the test JVM exits (or gets SIGTERM)
+ * without closing the cluster. Only a SIGKILL of the test JVM leaves them running.</p>
  */
 public final class ProcessCluster implements AutoCloseable {
 
@@ -34,19 +40,29 @@ public final class ProcessCluster implements AutoCloseable {
 	private static final Duration GRACEFUL_STOP_TIMEOUT = Duration.ofSeconds(60);
 	private static final Duration READY_POLL_INTERVAL = Duration.ofMillis(50);
 	private static final int FAILURE_LOG_LINES = 60;
+	/** Lowest port handed to nodes; ports from here up to the kernel's ephemeral range are never auto-assigned. */
+	private static final int FIRST_NODE_PORT = 10_000;
+	private static final Path EPHEMERAL_PORT_RANGE = Path.of("/proc/sys/net/ipv4/ip_local_port_range");
+	/** Linux default, used where the range cannot be read. */
+	private static final int DEFAULT_EPHEMERAL_PORT_START = 32_768;
 
+	private final String mainClass;
 	private final List<String> serverArgs;
 	private final Network network;
 	private final Map<String, Node> nodes;
+	private final Thread shutdownHook = new Thread(this::killAllNow, "process-cluster-shutdown");
 
 	private static final class Node {
 		final String id;
 		final int raftPort;
 		final int apiPort;
 		final Path dir;
-		Process process;
+		/** Volatile for the shutdown hook, which must not take the cluster lock. */
+		volatile Process process;
 		/** Size of the stdout log when the current process started: its own output follows. */
 		long stdoutStart;
+		/** Started and not killed or stopped since: a node that should run but does not has crashed. */
+		boolean shouldRun;
 		boolean paused;
 		int starts;
 
@@ -74,7 +90,8 @@ public final class ProcessCluster implements AutoCloseable {
 		}
 	}
 
-	private ProcessCluster(List<String> serverArgs, Network network, Map<String, Node> nodes) {
+	private ProcessCluster(String mainClass, List<String> serverArgs, Network network, Map<String, Node> nodes) {
+		this.mainClass = mainClass;
 		this.serverArgs = serverArgs;
 		this.network = network;
 		this.nodes = nodes;
@@ -86,9 +103,15 @@ public final class ProcessCluster implements AutoCloseable {
 	 * @param serverArgs extra {@code run} options passed to every node, e.g. {@code --snapshot-every 100}
 	 */
 	public static ProcessCluster start(Path root, int size, List<String> serverArgs) throws IOException {
+		return start(root, size, serverArgs, MAIN_CLASS);
+	}
+
+	/** Like {@link #start(Path, int, List)}, with another main class taking the same {@code run} options. */
+	static ProcessCluster start(Path root, int size, List<String> serverArgs, String mainClass) throws IOException {
 		var nodes = new LinkedHashMap<String, Node>();
 		var ports = new LinkedHashMap<String, List<Integer>>();
-		var freePorts = freePorts(size * 2);
+		var linkAddresses = Network.linkAddresses(size);
+		var freePorts = freePorts(size * 2, linkAddresses);
 		for (int i = 0; i < size; i++) {
 			var id = String.valueOf(i + 1);
 			var node = new Node(id, freePorts.get(2 * i), freePorts.get(2 * i + 1), root.resolve(Network.hostname(id)));
@@ -97,7 +120,8 @@ public final class ProcessCluster implements AutoCloseable {
 			ports.put(id, List.of(node.raftPort, node.apiPort));
 		}
 		var network = Network.start(ports, root.resolve("network"));
-		var cluster = new ProcessCluster(List.copyOf(serverArgs), network, nodes);
+		var cluster = new ProcessCluster(mainClass, List.copyOf(serverArgs), network, nodes);
+		Runtime.getRuntime().addShutdownHook(cluster.shutdownHook);
 		try {
 			for (var id : nodes.keySet()) {
 				cluster.start(id);
@@ -136,17 +160,34 @@ public final class ProcessCluster implements AutoCloseable {
 		return node(id).running();
 	}
 
-	/** Waits until every running node printed its {@code READY} line. */
+	/** Process id of the node's current (or last) JVM. */
+	synchronized long pid(String id) {
+		var process = node(id).process;
+		if (process == null) {
+			throw new IllegalStateException("Node " + id + " was never started");
+		}
+		return process.pid();
+	}
+
+	/**
+	 * Waits until every node that was started and not killed or stopped since printed its {@code READY} line.
+	 * Fails if one of them exited instead, even if it printed {@code READY} first.
+	 */
 	public void waitReady(Duration timeout) {
 		long deadline = System.nanoTime() + timeout.toNanos();
-		for (var id : nodes.keySet()) {
-			if (isRunning(id)) {
-				waitReady(id, Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
-			}
+		List<String> expected;
+		synchronized (this) {
+			expected = nodes.values().stream().filter(node -> node.shouldRun).map(node -> node.id).toList();
+		}
+		for (var id : expected) {
+			waitReady(id, Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
 		}
 	}
 
-	/** Waits until the node printed {@code READY <id>} since its last start; fails with its log tail otherwise. */
+	/**
+	 * Waits until the node printed {@code READY <id>} since its last start and is still alive; fails with its log
+	 * tail otherwise.
+	 */
 	public void waitReady(String id, Duration timeout) {
 		var node = node(id);
 		long deadline = System.nanoTime() + timeout.toNanos();
@@ -160,14 +201,14 @@ public final class ProcessCluster implements AutoCloseable {
 			if (process == null) {
 				throw new IllegalStateException("Node " + id + " was never started");
 			}
-			// Check liveness before reading the log, so that a READY printed right before exiting still counts.
-			boolean alive = process.isAlive();
-			if (printedReady(node, stdoutStart)) {
-				return;
-			}
-			if (!alive) {
+			boolean ready = printedReady(node, stdoutStart);
+			// Checked after reading the log: if the node is alive now, the READY line read above is current.
+			if (!process.isAlive()) {
 				throw new IllegalStateException("Node " + id + " exited with code " + process.exitValue()
-						+ " before printing READY\n" + logTail(id));
+						+ (ready ? " after" : " before") + " printing READY\n" + logTail(id));
+			}
+			if (ready) {
+				return;
 			}
 			if (System.nanoTime() - deadline >= 0) {
 				throw new IllegalStateException("Node " + id + " not ready after " + timeout + "\n" + logTail(id));
@@ -198,12 +239,14 @@ public final class ProcessCluster implements AutoCloseable {
 				.redirectOutput(ProcessBuilder.Redirect.appendTo(node.stdout().toFile()))
 				.redirectError(ProcessBuilder.Redirect.appendTo(node.stderr().toFile()))
 				.start();
+		node.shouldRun = true;
 		node.paused = false;
 	}
 
 	/** SIGKILL: no shutdown hook, no leadership hand-off. */
 	public synchronized void kill(String id) {
 		var node = node(id);
+		node.shouldRun = false;
 		if (node.process == null) {
 			return;
 		}
@@ -214,6 +257,7 @@ public final class ProcessCluster implements AutoCloseable {
 	/** SIGTERM, then waits for the node to stop gracefully; kills it and fails if it does not. */
 	public synchronized void stop(String id) {
 		var node = node(id);
+		node.shouldRun = false;
 		if (!node.running()) {
 			return;
 		}
@@ -260,17 +304,29 @@ public final class ProcessCluster implements AutoCloseable {
 	/** Kills every node and closes the network. Directories are left for inspection. */
 	@Override
 	public synchronized void close() {
+		killAllNow();
 		for (var node : nodes.values()) {
-			if (node.process != null) {
-				node.process.destroyForcibly();
-			}
-		}
-		for (var node : nodes.values()) {
+			node.shouldRun = false;
 			if (node.process != null) {
 				awaitExit(node);
 			}
 		}
 		network.close();
+		try {
+			Runtime.getRuntime().removeShutdownHook(shutdownHook);
+		} catch (IllegalStateException shuttingDown) {
+			// close() runs during shutdown: the hook is running or has run, nothing to remove.
+		}
+	}
+
+	/** Sends SIGKILL to every node without waiting: also the shutdown hook, so it takes no lock. */
+	private void killAllNow() {
+		for (var node : nodes.values()) {
+			var process = node.process;
+			if (process != null) {
+				process.destroyForcibly();
+			}
+		}
 	}
 
 	private List<String> command(Node node) {
@@ -285,7 +341,7 @@ public final class ProcessCluster implements AutoCloseable {
 				.filter(name -> name.startsWith("org.slf4j.simpleLogger."))
 				.sorted()
 				.forEach(name -> command.add("-D" + name + "=" + System.getProperty(name)));
-		command.add(MAIN_CLASS);
+		command.add(mainClass);
 		command.add("run");
 		command.add("--node-id");
 		command.add(node.id);
@@ -357,16 +413,64 @@ public final class ProcessCluster implements AutoCloseable {
 	}
 
 	/**
-	 * Picks distinct free ports. They are released before the nodes bind them, so another process could take one
-	 * in between; that is unlikely enough for tests.
+	 * Picks distinct ports that are free on {@code 127.0.0.1} and on every link address.
+	 *
+	 * <p>A node keeps its ports across restarts, so they must stay free while it is down. Ports in the kernel's
+	 * ephemeral range would not: any outgoing connection (a link proxy retrying the dead node, a client) may get
+	 * one as its source port, and the restarted node would fail to bind it. So the ports come from below that
+	 * range, starting at a random offset to keep parallel test JVMs apart. Requiring the link addresses to be free
+	 * also skips the ports of other clusters on this machine, even while their node is down, since their link
+	 * proxies keep those addresses bound. Another process could still bind a port between this check and the
+	 * node's first start; that is unlikely enough for tests.</p>
 	 */
-	private static List<Integer> freePorts(int count) throws IOException {
+	private static List<Integer> freePorts(int count, List<InetAddress> linkAddresses) throws IOException {
+		var addresses = new ArrayList<InetAddress>();
+		addresses.add(InetAddress.getByName(LOOPBACK));
+		addresses.addAll(linkAddresses);
+		int span = ephemeralPortStart() - FIRST_NODE_PORT;
+		if (span < count) {
+			throw new IllegalStateException("No room below the ephemeral port range (" + EPHEMERAL_PORT_RANGE
+					+ ") for " + count + " ports from " + FIRST_NODE_PORT);
+		}
+		int offset = ThreadLocalRandom.current().nextInt(span);
+		var ports = new ArrayList<Integer>(count);
+		for (int i = 0; i < span && ports.size() < count; i++) {
+			int port = FIRST_NODE_PORT + (offset + i) % span;
+			if (isFree(port, addresses)) {
+				ports.add(port);
+			}
+		}
+		if (ports.size() < count) {
+			throw new IOException("Only " + ports.size() + " of " + count + " free ports below the ephemeral range");
+		}
+		return ports;
+	}
+
+	/** First port the kernel auto-assigns to outgoing connections. */
+	private static int ephemeralPortStart() {
+		// Read a line: Files.readString and readAllBytes return only the first byte of this /proc file on JDK 27.
+		try (var reader = Files.newBufferedReader(EPHEMERAL_PORT_RANGE)) {
+			return Integer.parseInt(reader.readLine().strip().split("\\s+")[0]);
+		} catch (NoSuchFileException e) {
+			return DEFAULT_EPHEMERAL_PORT_START;
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
+	/** Binds the port on every address the way the nodes and proxies will (with SO_REUSEADDR), then releases it. */
+	private static boolean isFree(int port, List<InetAddress> addresses) throws IOException {
 		var sockets = new ArrayList<ServerSocket>();
 		try {
-			for (int i = 0; i < count; i++) {
-				sockets.add(new ServerSocket(0, 1, InetAddress.getByName(LOOPBACK)));
+			for (var address : addresses) {
+				var socket = new ServerSocket();
+				sockets.add(socket);
+				socket.setReuseAddress(true);
+				socket.bind(new InetSocketAddress(address, port), 1);
 			}
-			return sockets.stream().map(ServerSocket::getLocalPort).toList();
+			return true;
+		} catch (IOException e) {
+			return false;
 		} finally {
 			for (var socket : sockets) {
 				socket.close();

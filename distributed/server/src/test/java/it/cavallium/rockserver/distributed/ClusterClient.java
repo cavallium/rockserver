@@ -20,7 +20,11 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import org.jetbrains.annotations.Nullable;
 
@@ -32,6 +36,11 @@ import org.jetbrains.annotations.Nullable;
  * timeout bounds a single attempt. The core client itself retries reads on {@code UNAVAILABLE} with backoff, so a
  * read sent to a node that just died fails over only after a few seconds or its request timeout, whichever comes
  * first: fault tests should use short request timeouts.</p>
+ *
+ * <p>The first attempt on a node opens its connection, whose handshake waits up to 10 seconds for an answer. A
+ * frozen node (SIGSTOP) still accepts TCP connections, so the attempt waits for the handshake only as long as the
+ * request timeout and the remaining retry time allow, then moves on; the handshake goes on in the background and
+ * later attempts reuse its connection once it completes.</p>
  *
  * <p>Every call reports an {@link OpStatus}. A read has no effect, so it is {@code OK} or {@code FAILED}. A write is
  * {@code OK} only when an attempt succeeded and no earlier attempt may have reached a server; it is {@code FAILED}
@@ -60,7 +69,7 @@ public final class ClusterClient implements AutoCloseable {
 	private final Map<String, HostAndPort> addresses;
 	private final Duration retryTimeout;
 	private final boolean retryAmbiguousWrites;
-	private final Map<String, GrpcConnection> connections = new ConcurrentHashMap<>();
+	private final Map<String, CompletableFuture<GrpcConnection>> connections = new ConcurrentHashMap<>();
 	private volatile String preferred;
 
 	/**
@@ -164,7 +173,7 @@ public final class ClusterClient implements AutoCloseable {
 
 	/** Direct access to one node, without failover. */
 	public RocksDBSyncAPI api(String nodeId, RequestContext context) {
-		return connection(nodeId).getSyncApi(context);
+		return connection(nodeId, context.timeoutNanos()).getSyncApi(context);
 	}
 
 	/** True for failures worth retrying on another node: overload, conflicts, timeouts, unreachable nodes. */
@@ -177,7 +186,8 @@ public final class ClusterClient implements AutoCloseable {
 
 	@Override
 	public void close() {
-		connections.values().forEach(GrpcConnection::close);
+		// A handshake still in progress closes its connection when it completes.
+		connections.values().forEach(pending -> pending.thenAccept(GrpcConnection::close));
 		connections.clear();
 	}
 
@@ -188,7 +198,8 @@ public final class ClusterClient implements AutoCloseable {
 		String node = preferred;
 		while (true) {
 			attempts++;
-			var attempt = attempt(node, context, operation);
+			long connectTimeout = Math.min(context.timeoutNanos(), Math.max(0, deadline - System.nanoTime()));
+			var attempt = attempt(node, context, connectTimeout, operation);
 			if (attempt.error() == null) {
 				preferred = node;
 				var status = mutation && ambiguous ? OpStatus.UNKNOWN : OpStatus.OK;
@@ -217,12 +228,13 @@ public final class ClusterClient implements AutoCloseable {
 	private record Attempt<T>(@Nullable T value, @Nullable RuntimeException error, boolean delivered,
 			boolean retryable) {}
 
-	private <T> Attempt<T> attempt(String node, RequestContext context, Function<RocksDBSyncAPI, T> operation) {
+	private <T> Attempt<T> attempt(String node, RequestContext context, long connectTimeoutNanos,
+			Function<RocksDBSyncAPI, T> operation) {
 		GrpcConnection connection;
 		try {
-			connection = connection(node);
+			connection = connection(node, connectTimeoutNanos);
 		} catch (RuntimeException e) {
-			// Unreachable or unresponsive node: no connection, so no request was sent. Always worth another node.
+			// Unreachable or frozen node: no connection, so no request was sent. Always worth another node.
 			return new Attempt<>(null, e, false, true);
 		}
 		try {
@@ -234,16 +246,45 @@ public final class ClusterClient implements AutoCloseable {
 		}
 	}
 
-	private GrpcConnection connection(String nodeId) {
+	/**
+	 * The node's connection, opening it if needed. Waits at most {@code timeoutNanos} for the handshake, which
+	 * keeps going after a timeout: concurrent and later callers wait on the same one, and a failed one is replaced.
+	 */
+	private GrpcConnection connection(String nodeId, long timeoutNanos) {
 		var address = addresses.get(nodeId);
 		if (address == null) {
 			throw new IllegalArgumentException("Unknown node " + nodeId);
 		}
-		// The constructor performs a handshake and throws if the node is down; nothing is cached then.
-		return connections.computeIfAbsent(nodeId, id -> {
-			probe(address);
-			return GrpcConnection.forHostAndPort("cluster-client-" + id, address);
+		var pending = connections.compute(nodeId, (id, current) ->
+				current == null || current.isCompletedExceptionally() ? connect(id, address) : current);
+		try {
+			return pending.get(timeoutNanos, TimeUnit.NANOSECONDS);
+		} catch (ExecutionException e) {
+			if (e.getCause() instanceof RuntimeException cause) {
+				throw cause;
+			}
+			throw new IllegalStateException("Cannot connect to node " + nodeId, e.getCause());
+		} catch (TimeoutException e) {
+			throw new IllegalStateException("Node " + nodeId + " did not complete the handshake within "
+					+ Duration.ofNanos(timeoutNanos), e);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new IllegalStateException("Interrupted while connecting to node " + nodeId, e);
+		}
+	}
+
+	/** Opens a connection on a virtual thread. The constructor performs the handshake and throws if it fails. */
+	private static CompletableFuture<GrpcConnection> connect(String nodeId, HostAndPort address) {
+		var connection = new CompletableFuture<GrpcConnection>();
+		Thread.ofVirtual().name("cluster-client-connect-" + nodeId).start(() -> {
+			try {
+				probe(address);
+				connection.complete(GrpcConnection.forHostAndPort("cluster-client-" + nodeId, address));
+			} catch (Throwable e) {
+				connection.completeExceptionally(e);
+			}
 		});
+		return connection;
 	}
 
 	/** The handshake retries a refused connection for seconds: fail fast on a node that is down instead. */

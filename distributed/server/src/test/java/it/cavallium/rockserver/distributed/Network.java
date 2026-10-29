@@ -58,16 +58,13 @@ public final class Network implements AutoCloseable {
 		var hostsFiles = new LinkedHashMap<String, Path>();
 		var network = new Network(nodeIds, links, hostsFiles);
 		try {
-			int host = FIRST_LINK_HOST;
+			var addresses = linkAddresses(nodeIds.size()).iterator();
 			for (String src : nodeIds) {
 				for (String dst : nodeIds) {
 					if (src.equals(dst)) {
 						continue;
 					}
-					if (host > 254) {
-						throw new IllegalArgumentException("Too many nodes for 127.0.0.0/24 link addresses");
-					}
-					var address = InetAddress.getByAddress(new byte[] {127, 0, 0, (byte) host++});
+					var address = addresses.next();
 					var proxies = new ArrayList<LinkProxy>();
 					// Register first so that close() releases the proxies already bound if a later bind fails.
 					links.put(new Link(src, dst), new LinkState(address, proxies));
@@ -87,6 +84,23 @@ public final class Network implements AutoCloseable {
 			throw e;
 		}
 		return network;
+	}
+
+	/** The addresses of the links between {@code nodeCount} nodes, in the order {@link #start} assigns them. */
+	static List<InetAddress> linkAddresses(int nodeCount) {
+		int count = nodeCount * (nodeCount - 1);
+		if (FIRST_LINK_HOST + count - 1 > 254) {
+			throw new IllegalArgumentException("Too many nodes for 127.0.0.0/24 link addresses: " + nodeCount);
+		}
+		var addresses = new ArrayList<InetAddress>(count);
+		for (int i = 0; i < count; i++) {
+			try {
+				addresses.add(InetAddress.getByAddress(new byte[] {127, 0, 0, (byte) (FIRST_LINK_HOST + i)}));
+			} catch (UnknownHostException e) {
+				throw new IllegalStateException("Invalid IPv4 address", e);
+			}
+		}
+		return addresses;
 	}
 
 	public static String hostname(String nodeId) {

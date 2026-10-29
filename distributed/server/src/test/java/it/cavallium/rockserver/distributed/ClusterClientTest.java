@@ -24,6 +24,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -77,6 +79,41 @@ class ClusterClientTest {
 			assertTrue(commit.value());
 			assertEquals(value("b"), client.get(columnId, key(2), CONTEXT).valueOrThrow());
 			assertNull(client.get(columnId, key(3), CONTEXT).valueOrThrow());
+		}
+	}
+
+	/**
+	 * A node that accepts TCP connections but never answers, like a paused (SIGSTOP) process: the connection
+	 * handshake must not hold calls for longer than their request timeout.
+	 */
+	@Test
+	void failsOverFromFrozenNodeWithinRequestTimeout() throws Exception {
+		long columnId = db.getSyncApi(BATCH_CONTEXT).createColumn("data", SCHEMA);
+		var shortContext = RequestContext.latency(Duration.ofMillis(500));
+		// Never accepted: the kernel still completes the TCP handshakes, as it does for a stopped process.
+		try (var frozen = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
+			var nodes = new LinkedHashMap<String, HostAndPort>();
+			nodes.put("frozen", new HostAndPort("127.0.0.1", frozen.getLocalPort()));
+			nodes.put("up", serverAddress());
+			try (var client = new ClusterClient(nodes, Duration.ofSeconds(30), false);
+					var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+				long start = System.nanoTime();
+				// Concurrent calls, both starting on the frozen node: neither waits for the other's handshake.
+				var put = executor.submit(() -> client.put(columnId, key(1), value("a"), shortContext));
+				var get = executor.submit(() -> client.get(columnId, key(2), shortContext));
+				var putResult = put.get(20, TimeUnit.SECONDS);
+				var getResult = get.get(20, TimeUnit.SECONDS);
+				var elapsed = Duration.ofNanos(System.nanoTime() - start);
+
+				assertEquals(OpStatus.OK, putResult.status(), () -> String.valueOf(putResult.error()));
+				assertEquals("up", putResult.node());
+				assertEquals(2, putResult.attempts());
+				assertEquals(OpStatus.OK, getResult.status(), () -> String.valueOf(getResult.error()));
+				assertNull(getResult.value());
+				// The core client's own handshake timeout is 10 s; each call should spend about 500 ms on it.
+				assertTrue(elapsed.compareTo(Duration.ofSeconds(5)) < 0, "calls took " + elapsed);
+				assertEquals(value("a"), client.get(columnId, key(1), shortContext).valueOrThrow());
+			}
 		}
 	}
 
