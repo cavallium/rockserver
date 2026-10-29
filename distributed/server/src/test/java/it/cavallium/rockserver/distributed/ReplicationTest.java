@@ -13,6 +13,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -126,6 +127,32 @@ class ReplicationTest {
 		for (ReplicatedNode node : cluster.runningNodes()) {
 			assertEquals(expected, localValue(node, column, 1));
 		}
+	}
+
+	/**
+	 * A write that gives up because no majority answered for its whole request timeout must not break later
+	 * writes through the same node (found by {@link RandomFaultTest}: after an isolation, every write proposed by
+	 * the formerly isolated node kept failing until it was restarted).
+	 */
+	@Test
+	void writesThroughANodeRecoverAfterAProposalTimedOut() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withRequestTimeout(Duration.ofSeconds(1))).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var node = cluster.anyFollower();
+		var api = api(node);
+		long column = api.createColumn("c", SCHEMA);
+		var others = cluster.ids().stream().filter(id -> !id.equals(node.config().nodeId())).toList();
+		for (String id : others) {
+			cluster.halt(id);
+		}
+		assertThrows(RocksDBException.class, () -> api.put(0, column, key(1), text("lost"), RequestType.none()));
+
+		for (String id : others) {
+			cluster.start(id);
+		}
+		cluster.awaitLeader(TIMEOUT);
+		api.put(0, column, key(2), text("after"), RequestType.none());
+		assertEquals("after", text(api.get(0, column, key(2), RequestType.current())));
 	}
 
 	@Test

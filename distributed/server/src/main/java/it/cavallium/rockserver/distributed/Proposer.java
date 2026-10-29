@@ -7,6 +7,8 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.conf.RaftProperties;
@@ -25,6 +27,12 @@ import org.apache.ratis.util.TimeDuration;
  * <p>The Ratis client finds the leader and retries on leader changes with the same call id, so the leader's retry
  * cache turns a retried request into one log entry. The reply carries the {@link ApplyResult} computed when the
  * leader applied the entry.</p>
+ *
+ * <p>Each proposal is an independent blocking call on its own virtual thread, not a request of the client's
+ * ordered async stream: once one request of that stream runs out of retries (no majority for the whole request
+ * timeout, e.g. while this node is cut off), Ratis closes the stream for good, and every later proposal of this
+ * node would fail without being sent. Proposals need no ordering among themselves: a caller that needs one write
+ * after another waits for the first reply.</p>
  */
 final class Proposer implements Closeable {
 
@@ -34,6 +42,8 @@ final class Proposer implements Closeable {
 	private static final long NOT_READY_RETRY_MS = 50;
 
 	private final RaftClient client;
+	private final ExecutorService sender = Executors.newThreadPerTaskExecutor(
+			Thread.ofVirtual().name("rockserver-propose-", 0).factory());
 	private final long requestTimeoutNanos;
 
 	Proposer(RaftGroup group, RaftProperties properties, NodeConfig config) {
@@ -75,7 +85,7 @@ final class Proposer implements Closeable {
 	}
 
 	private CompletableFuture<Object> send(Message message, long deadlineNanos) {
-		return client.async().send(message).handle((reply, error) -> {
+		return CompletableFuture.supplyAsync(() -> sendBlocking(message), sender).handle((reply, error) -> {
 			// Ratis reports state machine refusals either in the reply or as the future's failure.
 			var refusal = error != null ? stateMachineException(error)
 					: !reply.isSuccess() && reply.getException() instanceof StateMachineException e ? e : null;
@@ -92,6 +102,14 @@ final class Proposer implements Closeable {
 			}
 			return CompletableFuture.completedFuture(toResult(reply));
 		}).thenCompose(f -> f);
+	}
+
+	private RaftClientReply sendBlocking(Message message) {
+		try {
+			return client.io().send(message);
+		} catch (IOException ex) {
+			throw new CompletionException(ex);
+		}
 	}
 
 	private static StateMachineException stateMachineException(Throwable error) {
@@ -146,6 +164,10 @@ final class Proposer implements Closeable {
 
 	@Override
 	public void close() throws IOException {
-		client.close();
+		try {
+			client.close();
+		} finally {
+			sender.shutdownNow();
+		}
 	}
 }
