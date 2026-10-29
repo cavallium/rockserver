@@ -175,12 +175,12 @@ class ReplicationTest {
 	}
 
 	/**
-	 * A follower whose missing entries are gone from the leader's log can only catch up by installing a snapshot
-	 * (found by {@link RandomFaultTest}: the install stopped the follower's Raft server for good, because Ratis
-	 * reloads a state machine only once it is paused).
+	 * A follower that is down while many snapshots are taken still catches up from the log: the leader purges only
+	 * entries every member committed, so a restarted member never needs a full database download. (Snapshot
+	 * installs for new members are covered by {@code MembershipTest}.)
 	 */
 	@Test
-	void followerBehindThePurgedLogInstallsASnapshot() throws Exception {
+	void followerDownAcrossManySnapshotsCatchesUpFromTheRetainedLog() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c.withSnapshotEveryEntries(64)).startAll();
 		long column = api(cluster.awaitLeader(TIMEOUT)).createColumn("c", SCHEMA);
 		var lagging = cluster.anyFollower();
@@ -202,7 +202,7 @@ class ReplicationTest {
 		api(leader).put(0, column, key(written), text("v" + written), RequestType.none());
 		written++;
 		long logStart = leader.stateMachine().division().getRaftLog().getStartIndex();
-		assertTrue(logStart > laggingApplied + 1, "log not purged past the lagging follower: starts at " + logStart
+		assertTrue(logStart <= laggingApplied + 1, "log purged past the lagging follower: starts at " + logStart
 				+ ", follower applied " + laggingApplied);
 
 		cluster.start(laggingId);

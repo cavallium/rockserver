@@ -52,7 +52,10 @@ final class RaftSettings {
 		// Snapshots are RocksDB checkpoints; the log is purged up to the latest one.
 		RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(properties, true);
 		RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(properties, config.snapshotEveryEntries());
-		RaftServerConfigKeys.Log.setPurgeUptoSnapshotIndex(properties, true);
+		// Purge only what every member already committed: a follower that is restarting or installing a snapshot
+		// can then catch up from the log afterwards, instead of needing a new snapshot install forever. A member
+		// that is gone for good holds the log back until it is removed from the configuration.
+		RaftServerConfigKeys.Log.setPurgeUptoSnapshotIndex(properties, false);
 		RaftServerConfigKeys.Log.setPurgeGap(properties, 1024);
 		// Keep a margin of log behind the snapshot, so that a member restarted during a deploy catches up from the
 		// log instead of downloading the whole database.

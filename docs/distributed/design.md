@@ -192,8 +192,10 @@ against an incomplete history.
 - **Why not `org.rocksdb.Checkpoint`.** It refuses the column volumes (`cf_paths`) that the default config
   uses.
 - **When.** Every `snapshotEveryEntries` applied entries.
-- **Log retention.** The Raft log keeps `snapshotEveryEntries` entries behind the latest snapshot, so a node
-  restarted during a deploy catches up from the log.
+- **Log retention.** The Raft log is purged only up to the snapshot index and the lowest commit index of any
+  member, and keeps `snapshotEveryEntries` entries more. A node restarted during a deploy, or one that just
+  installed a snapshot, therefore catches up from the log. A member that is gone for good holds the log back,
+  so remove it from the configuration promptly, and alert on Raft log size.
 
 **Catch-up and install.**
 
@@ -201,7 +203,10 @@ against an incomplete history.
   Ratis pauses the state machine. `reinitialize` then restores the checkpoint into the database directory:
   immutable files are hard-linked, the swap is crash-safe, and the database is reopened. If the local
   database is already ahead of the installed snapshot, it is kept.
-- **Leader-side retention.** The leader keeps the snapshot that a running install reads.
+- **Leader-side retention.** The leader keeps the previous snapshot, and any snapshot whose file list was read
+  in the last 10 minutes, so a long install is not cut short by newer snapshots.
+- **Damaged installs.** A snapshot that a crash damaged during install makes the replica fail loudly; it is not
+  silently ignored.
 
 **Membership.**
 
@@ -273,21 +278,26 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
    - snapshot creation time and install time at 171 GB, and at the multi-TB message and file datasets;
    - the `RaftSettings` values: segment size, snapshot interval, entry size limit, and log retention in
      bytes, not only in entries.
-4. **Snapshot transfer at TB scale.** Ratis installs restart from scratch after a failure, and are not rate
+4. **Write failover after a frozen leader.** When the leader freezes (SIGSTOP, a long GC pause, a hung disk),
+   writes resume about 4 s later, although the election takes about 1 s and reads resume sooner. The cause is
+   Ratis' client closing the channel to the frozen leader, which waits a hard-coded 3 s
+   (`GrpcUtil.shutdownManagedChannel`). Crashes and graceful restarts are not affected (failover about 1 s,
+   hand-off about 250 ms). Fix by keeping per-peer clients or by reporting it upstream.
+5. **Snapshot transfer at TB scale.** Ratis installs restart from scratch after a failure, and are not rate
    limited. If that proves too slow, switch to install notifications plus a resumable pull of checkpoint
    files.
-5. **Operations.**
+6. **Operations.**
    - Metrics and alerts: role, term, commit and apply lag, snapshot age, follower lag, replica failure exit.
    - A seeding runbook (copy the single-node database to all nodes before the first start).
    - A node replacement runbook.
    - Placement on separate hosts and disks.
    - The same Rockserver config file on every node.
-6. **Known limits to decide on.**
+7. **Known limits to decide on.**
    - `deleteColumn` waits for open iterators on the leader, which stalls apply there until they close or
      expire.
    - The result records of a proposer process that crashed are never deleted. Only the few that were in flight
      remain per crash; add a cleanup entry if crashes turn out to be frequent.
    - A result larger than the Ratis message limit makes a committed write look failed.
    - Snapshots are triggered by entry count only.
-7. **Upstream.** Report the Ratis ReadIndex reuse bug, and switch back to Ratis ReadIndex once it is fixed
+8. **Upstream.** Report the Ratis ReadIndex reuse bug, and switch back to Ratis ReadIndex once it is fixed
    upstream.

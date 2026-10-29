@@ -172,7 +172,14 @@ final class Applier {
 			}
 			case LogEntry.UploadMergeOperator upload -> {
 				requireNoTransaction(tx, entry);
-				yield db.uploadMergeOperator(upload.name(), upload.className(), upload.jarData());
+				try {
+					yield db.uploadMergeOperator(upload.name(), upload.className(), upload.jarData());
+				} catch (LinkageError badJar) {
+					// Malformed or incompatible classes fail the same way on every replica: a rejection, not a local
+					// failure that would stop them all.
+					throw new IllegalArgumentException("Merge operator " + upload.name() + " cannot be loaded: " + badJar,
+							null);
+				}
 			}
 			case LogEntry.Guarded guarded -> {
 				Object last = null;

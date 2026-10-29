@@ -383,7 +383,15 @@ final class NodeStore implements Closeable {
 
 	@Override
 	public void close() throws IOException {
-		connection.close();
+		try {
+			// With a delayed WAL flush (the default config), the last applied entries may still be in RocksDB's
+			// in-process WAL buffer: write them out, so a cleanly stopped replica has its whole applied state on disk.
+			db().getDb().get().flushWal(true);
+		} catch (org.rocksdb.RocksDBException | RuntimeException e) {
+			LOG.warn("Failed to flush the WAL of {} before closing; Raft replays the missing entries", dbDir, e);
+		} finally {
+			connection.close();
+		}
 	}
 
 	/**
