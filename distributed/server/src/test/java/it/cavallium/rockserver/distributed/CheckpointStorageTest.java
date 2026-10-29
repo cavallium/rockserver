@@ -9,16 +9,19 @@ import static it.cavallium.rockserver.distributed.NodeStoreTest.setApplied;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.ratis.io.MD5Hash;
@@ -31,6 +34,7 @@ import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.impl.FileListSnapshotInfo;
 import org.apache.ratis.util.MD5FileUtil;
 import org.apache.ratis.util.SizeInBytes;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -194,7 +198,7 @@ class CheckpointStorageTest {
 	}
 
 	@Test
-	void installedSnapshotDamagedByACrashIsNotUsed() throws IOException {
+	void installedSnapshotDamagedByACrashFailsLoudly() throws IOException {
 		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
 		put(store, column, 7, "installed");
 		setApplied(store, TermIndex.valueOf(4, 40));
@@ -204,16 +208,162 @@ class CheckpointStorageTest {
 		install(leader, leader.getLatestSnapshot(), follower);
 
 		// Power loss before the state machine reloaded: Ratis never synced the installed files, and one lost its data.
-		Path table;
-		try (Stream<Path> walk = Files.walk(follower.getSnapshotDir().toPath())) {
-			table = walk.filter(file -> file.toString().endsWith(".sst")).findFirst().orElseThrow();
-		}
+		Path table = firstTable(follower.getSnapshotDir().toPath());
 		Files.write(table, new byte[0]);
 		closeRaftStorages();
 
+		// The Raft log may already start after the snapshot: the replica must not start as if it had none.
+		var failure = assertThrows(IOException.class,
+				() -> initStorage(followerRaftDir, RaftStorage.StartupOption.RECOVER));
+		assertTrue(failure.getMessage().contains("snapshot-4-40"), failure.getMessage());
+		assertTrue(Files.exists(table), "the damaged snapshot is kept for inspection");
+	}
+
+	@Test
+	void installedSnapshotThatLostItsPositionFailsLoudly() throws IOException {
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		setApplied(store, TermIndex.valueOf(4, 40));
+		leader.take(store);
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT);
+		install(leader, leader.getLatestSnapshot(), follower);
+
+		// Power loss lost the directory entry of the last file Ratis wrote.
+		Path installed = follower.getSnapshotDir().toPath().resolve("snapshot-4-40");
+		Files.delete(installed.resolve("snapshot.properties"));
+		Files.delete(installed.resolve("snapshot.properties.md5"));
+
+		assertThrows(IOException.class, follower::reload);
+	}
+
+	@Test
+	void damagedInstallInterruptedBeforeTheOldSnapshotsWereDeletedFallsBackToThem() throws IOException {
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		put(store, column, 7, "installed");
+		setApplied(store, TermIndex.valueOf(4, 40));
+		leader.take(store);
+		Path followerRaftDir = tempDir.resolve("follower");
+		var follower = initStorage(followerRaftDir, RaftStorage.StartupOption.FORMAT);
+		setApplied(store, TermIndex.valueOf(1, 5));
+		follower.take(store);
+		Path snapshotsDir = follower.getSnapshotDir().toPath();
+		Path stateMachineDir = snapshotsDir.getParent();
+		install(leader, leader.getLatestSnapshot(), follower, file -> {
+		}, false);
+
+		// Crash after Ratis renamed the installed snapshot into place, before it deleted the old snapshots.
+		Files.write(firstTable(snapshotsDir), new byte[0]);
+		closeRaftStorages();
+
 		var restarted = initStorage(followerRaftDir, RaftStorage.StartupOption.RECOVER);
-		assertNull(restarted.getLatestSnapshot());
-		assertEquals(Set.of(), fileNames(restarted.getSnapshotDir().toPath()));
+		assertEquals(TermIndex.valueOf(1, 5), restarted.getLatestSnapshot().getTermIndex());
+		assertListsExactlyTheSnapshotFiles(restarted, restarted.getLatestSnapshot());
+		assertEquals(Set.of("snapshots", "tmp"), fileNames(stateMachineDir));
+		assertEquals(Set.of("snapshot-1-5"), fileNames(snapshotsDir));
+	}
+
+	@Test
+	void installReadingASnapshotKeepsItUntilItStopsReading() throws IOException {
+		var clock = new AtomicLong();
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT, clock);
+		for (int i = 0; i < 10; i++) {
+			put(store, column, i, "old" + i);
+		}
+		setApplied(store, TermIndex.valueOf(1, 10));
+		leader.take(store);
+		FileListSnapshotInfo streamed = leader.getLatestSnapshot();
+		assertTrue(streamed.getFiles().size() > 4);
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT);
+
+		// A long installation reads the snapshot file by file while the leader takes a newer snapshot before each of
+		// the next three files, every time after a compaction replaced every table file.
+		install(leader, streamed, follower, file -> {
+			if (file >= 1 && file <= 3) {
+				int round = file + 1;
+				clock.addAndGet(Duration.ofMinutes(5).toNanos());
+				for (int i = 0; i < 10; i++) {
+					put(store, column, i, "round" + round);
+				}
+				store.db().flush();
+				store.db().compact();
+				setApplied(store, TermIndex.valueOf(round, round * 10L));
+				leader.take(store);
+			}
+		}, true);
+		follower.reload();
+
+		assertEquals(TermIndex.valueOf(1, 10), follower.getLatestSnapshot().getTermIndex());
+		Path restored = tempDir.resolve("restored");
+		NodeStore.restore(follower.snapshotDbDir(), restored);
+		try (var restoredStore = NodeStore.open(restored, null, "restored")) {
+			assertEquals(TermIndex.valueOf(1, 10), restoredStore.applied());
+			Map<Integer, String> restoredContents = contents(restoredStore, restoredStore.db().getColumnId(DATA_COLUMN));
+			assertEquals(10, restoredContents.size());
+			assertEquals("old3", restoredContents.get(3));
+		}
+		Path leaderSnapshots = leader.getSnapshotDir().toPath();
+		assertEquals(Set.of("snapshot-1-10", "snapshot-3-30", "snapshot-4-40"), fileNames(leaderSnapshots));
+
+		// Once nothing read it for longer than the lease, the next snapshot deletes it.
+		clock.addAndGet(CheckpointStorage.DEFAULT_INSTALL_READ_LEASE.plusSeconds(1).toNanos());
+		put(store, column, 200, "newest");
+		setApplied(store, TermIndex.valueOf(5, 50));
+		leader.take(store);
+		assertEquals(Set.of("snapshot-4-40", "snapshot-5-50"), fileNames(leaderSnapshots));
+	}
+
+	@Test
+	void readerOfThePreviousSnapshotCanReadItAfterANewTake() throws IOException {
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		put(store, column, 1, "first");
+		setApplied(store, TermIndex.valueOf(1, 10));
+		leader.take(store);
+		// The installation got the snapshot but has not read its file list yet.
+		FileListSnapshotInfo streamed = leader.getLatestSnapshot();
+
+		put(store, column, 2, "second");
+		store.db().flush();
+		store.db().compact();
+		setApplied(store, TermIndex.valueOf(1, 20));
+		leader.take(store);
+
+		for (FileInfo file : streamed.getFiles()) {
+			assertEquals(file.getFileSize(), Files.readAllBytes(file.getPath()).length);
+		}
+	}
+
+	@Test
+	void newInstallDiscardsThePartialCopiesOfReplacedOnes() throws IOException {
+		var clock = new AtomicLong();
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT, clock);
+		Path tmp = follower.getTmpDir().toPath();
+		Path failed = writePartialInstall(tmp, "snapshot-failed");
+		follower.getLatestSnapshot();
+		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
+		follower.getLatestSnapshot();
+		assertTrue(Files.exists(failed), "the newest installation is kept");
+
+		// Ratis restarts the installation under a new request id and receives its first chunk.
+		writePartialInstall(tmp, "snapshot-retried");
+		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
+		follower.getLatestSnapshot();
+		awaitFileNames(tmp, Set.of("snapshot-retried"));
+
+		// A stale request of the replaced installation writes one more chunk.
+		writePartialInstall(tmp, "snapshot-failed");
+		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
+		follower.getLatestSnapshot();
+		awaitFileNames(tmp, Set.of("snapshot-retried"));
+	}
+
+	@Test
+	void initDeletesPartialInstalls() throws IOException {
+		Path raftDir = tempDir.resolve("raft");
+		var storage = initStorage(raftDir, RaftStorage.StartupOption.FORMAT);
+		writePartialInstall(storage.getTmpDir().toPath(), "snapshot-" + UUID.randomUUID());
+		closeRaftStorages();
+
+		var reopened = initStorage(raftDir, RaftStorage.StartupOption.RECOVER);
+		assertEquals(Set.of(), fileNames(reopened.getTmpDir().toPath()));
 	}
 
 	@Test
@@ -246,9 +396,23 @@ class CheckpointStorageTest {
 	 */
 	private static void install(CheckpointStorage leader, FileListSnapshotInfo snapshot, CheckpointStorage follower)
 			throws IOException {
+		install(leader, snapshot, follower, file -> {
+		}, true);
+	}
+
+	/**
+	 * Like {@link #install(CheckpointStorage, FileListSnapshotInfo, CheckpointStorage)}, running {@code beforeFile}
+	 * with the index of every file before sending it. Without {@code completed}, it stops as a crash would right after the received
+	 * directory took the place of the snapshot directory, which is left aside.
+	 */
+	private static void install(CheckpointStorage leader, FileListSnapshotInfo snapshot, CheckpointStorage follower,
+			BeforeFile beforeFile, boolean completed) throws IOException {
 		Path leaderDir = leader.getSnapshotDir().toPath();
 		Path installing = follower.getTmpDir().toPath().resolve("snapshot-" + UUID.randomUUID());
-		for (FileInfo file : snapshot.getFiles()) {
+		int fileCount = snapshot.getFiles().size();
+		for (int i = 0; i < fileCount; i++) {
+			beforeFile.run(i);
+			FileInfo file = snapshot.getFiles().get(i);
 			Path relative = leaderDir.relativize(file.getPath());
 			Path target = installing.resolve(relative);
 			Files.createDirectories(target.getParent());
@@ -256,6 +420,8 @@ class CheckpointStorageTest {
 					var out = Files.newOutputStream(target)) {
 				FileChunkProto chunk;
 				do {
+					// Ratis reads the file list again for every chunk.
+					snapshot.getFiles();
 					chunk = reader.readFileChunk(16 * 1024);
 					chunk.getData().writeTo(out);
 				} while (!chunk.getDone());
@@ -268,10 +434,22 @@ class CheckpointStorageTest {
 			Files.move(followerDir, aside);
 		}
 		Files.move(installing, followerDir);
-		NodeStore.deleteRecursively(aside);
+		if (completed) {
+			NodeStore.deleteRecursively(aside);
+		}
+	}
+
+	private interface BeforeFile {
+		void run(int index) throws IOException;
 	}
 
 	private CheckpointStorage initStorage(Path dir, RaftStorage.StartupOption option) throws IOException {
+		return initStorage(dir, option, null);
+	}
+
+	/** With a {@code clock}, the storage uses it as its monotonic clock instead of {@link System#nanoTime()}. */
+	private CheckpointStorage initStorage(Path dir, RaftStorage.StartupOption option, @Nullable AtomicLong clock)
+			throws IOException {
 		RaftStorage raftStorage = RaftStorage.newBuilder()
 				.setDirectory(dir.toFile())
 				.setOption(option)
@@ -280,7 +458,8 @@ class CheckpointStorageTest {
 				.build();
 		raftStorage.initialize();
 		raftStorages.add(raftStorage);
-		var storage = new CheckpointStorage();
+		var storage = clock == null ? new CheckpointStorage()
+				: new CheckpointStorage(CheckpointStorage.DEFAULT_INSTALL_READ_LEASE, clock::get);
 		storage.init(raftStorage);
 		return storage;
 	}
@@ -308,6 +487,30 @@ class CheckpointStorageTest {
 		}
 		assertTrue(listed.contains(snapshotDir.resolve("snapshot.properties")));
 		assertTrue(listed.contains(snapshotDir.resolve("db").resolve("CURRENT")));
+	}
+
+	private static Path firstTable(Path snapshotsDir) throws IOException {
+		try (Stream<Path> walk = Files.walk(snapshotsDir)) {
+			return walk.filter(file -> file.toString().endsWith(".sst")).sorted().findFirst().orElseThrow();
+		}
+	}
+
+	/** A directory like the one Ratis receives a snapshot into, after a few chunks. */
+	private static Path writePartialInstall(Path tmp, String name) throws IOException {
+		Path dir = tmp.resolve(name);
+		Path table = dir.resolve("snapshot-1-10").resolve("db").resolve("000010.sst");
+		Files.createDirectories(table.getParent());
+		Files.write(table, new byte[4096]);
+		return dir;
+	}
+
+	/** Partial copies are deleted in the background, after being renamed out of the way. */
+	private static void awaitFileNames(Path dir, Set<String> expected) throws IOException {
+		long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+		while (!fileNames(dir).equals(expected) && System.nanoTime() - deadline < 0) {
+			Thread.onSpinWait();
+		}
+		assertEquals(expected, fileNames(dir));
 	}
 
 	private static List<Path> paths(FileListSnapshotInfo snapshot) {

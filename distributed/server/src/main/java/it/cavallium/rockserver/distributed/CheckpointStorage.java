@@ -6,9 +6,16 @@ import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.function.LongSupplier;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.ratis.io.MD5Hash;
 import org.apache.ratis.server.protocol.TermIndex;
@@ -31,45 +38,98 @@ import org.slf4j.LoggerFactory;
  * {@code snapshots/} once complete and fsynced. The latest snapshot is the usable one with the highest
  * position.</p>
  *
- * <p>A path is never reused for different content: a leader streams a snapshot to a follower from the file list
- * it got when the installation started, opening each file only when it reaches it. {@link #take} also keeps the
- * previous snapshot until the next one is taken, so an installation survives one newer snapshot.</p>
+ * <p><b>Snapshots being sent.</b> A leader streams a snapshot to a follower from the file list it got when the
+ * installation started, opening each file only when it reaches it and reading the list again for every chunk. A
+ * path is therefore never reused for different content, and a snapshot stays on disk while an installation may
+ * still read it: {@link #take} keeps the previous snapshot, and also every older one whose file list was read
+ * within the last {@link #DEFAULT_INSTALL_READ_LEASE} (an installation that read nothing for that long has timed
+ * out). Other snapshots are deleted. A slow installation of a large database thus survives any number of newer
+ * snapshots, at the cost of the disk space of the table files that only its snapshot still links.</p>
  *
- * <p>Ratis' own installation writes the leader's files into a new directory, at the same paths relative to
- * {@link #getSnapshotDir()}, and swaps it in place of that directory. It saves a {@code <file>.md5} next to every
- * file but syncs nothing, so an installed snapshot is used only once each file matches its saved digest; it is
- * then fsynced and marked as verified. The listed files carry no digest (the leader computes it while streaming),
- * and the side files are not listed, so a follower that later leads does not send them on.</p>
+ * <p><b>Snapshots being received.</b> Ratis' installation writes the leader's files into
+ * {@code tmp/snapshot-<request id>/}, at the same paths relative to {@link #getSnapshotDir()}, and when complete
+ * moves {@code snapshots/} aside, renames the new directory into its place and deletes the old one. An
+ * installation that fails is restarted under a new request id and leaves its partial copy behind: the copies are
+ * deleted when the server starts, and when a newer installation starts writing (Ratis reads the latest snapshot
+ * for every chunk it receives; installations on one follower never overlap, a new one invalidates the older
+ * ones).</p>
+ *
+ * <p>Ratis saves a {@code <file>.md5} next to every received file but syncs nothing, so an installed snapshot is
+ * used only once each file matches its saved digest; it is then fsynced and marked as verified. A snapshot that
+ * fails this check lost data in a crash after Ratis installed it, possibly after the Raft log was already reset to
+ * start after it: that is reported as an error rather than ignored, since the replica cannot catch up without it.
+ * The listed files carry no digest (the leader computes it while streaming), and the side files are not listed,
+ * so a follower that later leads does not send them on.</p>
  */
 final class CheckpointStorage implements StateMachineStorage {
 
 	private static final Logger LOG = LoggerFactory.getLogger(CheckpointStorage.class);
+	/** How long a snapshot whose file list was read is kept after a newer one is taken. */
+	static final Duration DEFAULT_INSTALL_READ_LEASE = Duration.ofMinutes(10);
+	/** Minimum interval between two checks for partial installations to delete. */
+	static final Duration INSTALL_SCAN_INTERVAL = Duration.ofSeconds(1);
 	private static final String SNAPSHOTS_DIR = "snapshots";
 	private static final String TMP_DIR = "tmp";
 	private static final String SNAPSHOT_PREFIX = "snapshot-";
+	/** Prefix of the directories Ratis receives snapshots into, under {@link #getTmpDir()}. */
+	private static final String INSTALL_PREFIX = "snapshot-";
 	private static final String DB_DIR = "db";
 	private static final String PROPERTIES_FILE = "snapshot.properties";
 	/** Written into an installed snapshot once its files matched their digests and were fsynced. */
 	private static final String VERIFIED_FILE = "installed.verified";
+	private static final long NEVER = Long.MIN_VALUE;
 
+	private final long installReadLeaseNanos;
+	private final LongSupplier nanoClock;
 	private Path stateMachineDir;
 	private Path snapshotsDir;
-	private Path tmpDir;
+	private volatile Path tmpDir;
 	private @Nullable Path latestDir;
-	private volatile @Nullable FileListSnapshotInfo latest;
+	private volatile @Nullable Snapshot latest;
+	/** The snapshots listed by this instance that are still on disk, by directory. */
+	private final Map<Path, Snapshot> listed = new HashMap<>();
+
+	private final Object installsLock = new Object();
+	private volatile long lastInstallScan = NEVER;
+	/** Every installation directory seen in {@link #tmpDir}, and the ones of the newest installation. */
+	private final Set<String> seenInstalls = new HashSet<>();
+	private Set<String> currentInstalls = Set.of();
+
+	CheckpointStorage() {
+		this(DEFAULT_INSTALL_READ_LEASE, System::nanoTime);
+	}
+
+	/** {@code nanoClock} is a monotonic clock in nanoseconds, like {@link System#nanoTime()}. */
+	CheckpointStorage(Duration installReadLease, LongSupplier nanoClock) {
+		this.installReadLeaseNanos = installReadLease.toNanos();
+		this.nanoClock = nanoClock;
+	}
 
 	@Override
 	public synchronized void init(RaftStorage raftStorage) throws IOException {
 		stateMachineDir = raftStorage.getStorageDir().getStateMachineDir().toPath().toAbsolutePath();
 		snapshotsDir = stateMachineDir.resolve(SNAPSHOTS_DIR);
-		tmpDir = stateMachineDir.resolve(TMP_DIR);
+		Path tmp = stateMachineDir.resolve(TMP_DIR);
 		// No snapshot is being built or installed before the server starts: leftovers are from a crash.
-		NodeStore.deleteRecursively(tmpDir);
-		Files.createDirectories(tmpDir);
+		NodeStore.deleteRecursively(tmp);
+		Files.createDirectories(tmp);
+		tmpDir = tmp;
 		Files.createDirectories(snapshotsDir);
-		reload();
-		for (Path aside : installAsides()) {
-			if (latestDir == null && findLatest(aside) != null) {
+		List<Path> asides = installAsides();
+		try {
+			reload();
+		} catch (DamagedSnapshotException damaged) {
+			if (asides.isEmpty()) {
+				throw damaged;
+			}
+			// Ratis was still swapping the directories, so it had not reset the log yet: the install did not happen.
+			LOG.warn("Discarding a snapshot installation interrupted by a crash", damaged);
+			NodeStore.deleteRecursively(snapshotsDir);
+			Files.createDirectories(snapshotsDir);
+			reload();
+		}
+		for (Path aside : asides) {
+			if (latestDir == null && usableSnapshot(aside)) {
 				NodeStore.deleteRecursively(snapshotsDir);
 				Files.move(aside, snapshotsDir);
 				NodeStore.syncDirectory(stateMachineDir);
@@ -78,13 +138,13 @@ final class CheckpointStorage implements StateMachineStorage {
 				NodeStore.deleteRecursively(aside);
 			}
 		}
-		deleteSnapshotsExcept(latestDir, null);
+		deleteUnusedSnapshots(null);
 	}
 
 	/**
 	 * Ratis installs a snapshot by moving {@code snapshots/} aside to a {@code snapshots.tmp*} sibling, renaming
 	 * the new directory into its place and deleting the old one. After a crash in between, the old directory is
-	 * used only if the current one has no usable snapshot.
+	 * used only if the current one is missing or holds a damaged installation.
 	 */
 	private List<Path> installAsides() throws IOException {
 		try (Stream<Path> siblings = Files.list(stateMachineDir)) {
@@ -95,24 +155,40 @@ final class CheckpointStorage implements StateMachineStorage {
 		}
 	}
 
-	/** The latest usable snapshot, listing every file under its directory by absolute path. */
+	private static boolean usableSnapshot(Path aside) throws IOException {
+		try {
+			return findLatest(aside) != null;
+		} catch (DamagedSnapshotException damaged) {
+			LOG.warn("Ignoring the snapshots moved aside in {}", aside, damaged);
+			return false;
+		}
+	}
+
+	/**
+	 * The latest usable snapshot, listing every file under its directory by absolute path. Also deletes the
+	 * partial copies of installations that a newer installation replaced.
+	 */
 	@Override
 	public @Nullable FileListSnapshotInfo getLatestSnapshot() {
+		discardReplacedInstalls();
 		return latest;
 	}
 
 	/**
 	 * Re-reads the snapshot directory. The state machine calls it first thing after Ratis installed a snapshot
 	 * from the leader: this verifies the installed files against their digests and fsyncs them.
+	 *
+	 * @throws DamagedSnapshotException if an installed snapshot lost data, see the class documentation
 	 */
 	synchronized void reload() throws IOException {
+		listed.clear();
 		latestDir = findLatest(snapshotsDir);
-		latest = latestDir == null ? null : new FileListSnapshotInfo(listFiles(latestDir), readTermIndex(latestDir));
+		latest = latestDir == null ? null : listSnapshot(latestDir, readTermIndex(latestDir));
 	}
 
 	/**
-	 * Checkpoints {@code store} into a new snapshot that becomes the latest one. The previous snapshot is kept
-	 * until the next call, older ones are deleted.
+	 * Checkpoints {@code store} into a new snapshot that becomes the latest one. The previous snapshot is kept, and
+	 * older ones are deleted unless an installation is still reading them.
 	 */
 	synchronized TermIndex take(NodeStore store) throws IOException {
 		Path building = tmpDir.resolve("building-" + System.nanoTime());
@@ -143,8 +219,8 @@ final class CheckpointStorage implements StateMachineStorage {
 		NodeStore.syncDirectory(snapshotsDir);
 		NodeStore.syncDirectory(tmpDir);
 		latestDir = target;
-		latest = new FileListSnapshotInfo(listFiles(target), termIndex);
-		deleteSnapshotsExcept(target, previous);
+		latest = listSnapshot(target, termIndex);
+		deleteUnusedSnapshots(previous);
 		return termIndex;
 	}
 
@@ -175,22 +251,95 @@ final class CheckpointStorage implements StateMachineStorage {
 		return tmpDir.toFile();
 	}
 
-	private void deleteSnapshotsExcept(@Nullable Path kept, @Nullable Path alsoKept) throws IOException {
+	private Snapshot listSnapshot(Path dir, TermIndex termIndex) throws IOException {
+		var snapshot = new Snapshot(listFiles(dir), termIndex);
+		listed.put(dir, snapshot);
+		return snapshot;
+	}
+
+	/** Deletes every snapshot except the latest, {@code previous} and the ones an installation is reading. */
+	private void deleteUnusedSnapshots(@Nullable Path previous) throws IOException {
+		long now = nanoClock.getAsLong();
 		for (Path dir : snapshotDirs(snapshotsDir)) {
-			if (!dir.equals(kept) && !dir.equals(alsoKept)) {
-				NodeStore.deleteRecursively(dir);
+			if (dir.equals(latestDir) || dir.equals(previous)) {
+				continue;
+			}
+			Snapshot snapshot = listed.get(dir);
+			if (snapshot != null && snapshot.readSince(now - installReadLeaseNanos)) {
+				LOG.info("Keeping snapshot {}: an installation is still reading it", dir);
+				continue;
+			}
+			NodeStore.deleteRecursively(dir);
+			listed.remove(dir);
+		}
+	}
+
+	/**
+	 * Deletes the directories of the installations a newer one replaced: every installation directory except the
+	 * ones that appeared since the previous check that found a new one. A directory that comes back after being
+	 * deleted (a stale request writing one more chunk) is never taken for a new installation.
+	 */
+	private void discardReplacedInstalls() {
+		Path tmp = tmpDir;
+		long now = nanoClock.getAsLong();
+		long last = lastInstallScan;
+		if (tmp == null || (last != NEVER && now - last < INSTALL_SCAN_INTERVAL.toNanos())) {
+			return;
+		}
+		synchronized (installsLock) {
+			lastInstallScan = now;
+			try {
+				Set<String> present;
+				try (Stream<Path> children = Files.list(tmp)) {
+					present = children
+							.filter(path -> path.getFileName().toString().startsWith(INSTALL_PREFIX))
+							.filter(Files::isDirectory)
+							.map(path -> path.getFileName().toString())
+							.collect(Collectors.toSet());
+				}
+				Set<String> fresh = present.stream()
+						.filter(name -> !seenInstalls.contains(name))
+						.collect(Collectors.toSet());
+				if (!fresh.isEmpty()) {
+					seenInstalls.addAll(fresh);
+					currentInstalls = fresh;
+				}
+				for (String name : present) {
+					if (!currentInstalls.contains(name)) {
+						discard(tmp.resolve(name));
+					}
+				}
+			} catch (IOException ex) {
+				LOG.warn("Cannot delete the partial copies of replaced snapshot installations in {}", tmp, ex);
 			}
 		}
 	}
 
-	/** The usable snapshot with the highest position among the snapshot directories in {@code parent}. */
+	/** Renames {@code dir} out of the way, then deletes it in the background: it can hold a whole database. */
+	private void discard(Path dir) throws IOException {
+		Path discarded = dir.resolveSibling("discarded-" + System.nanoTime());
+		Files.move(dir, discarded);
+		LOG.info("Deleting {}, the partial copy of a replaced snapshot installation", dir);
+		Thread.ofVirtual().name("snapshot-install-cleanup").start(() -> {
+			try {
+				NodeStore.deleteRecursively(discarded);
+			} catch (IOException | RuntimeException ex) {
+				LOG.warn("Cannot delete {}", discarded, ex);
+			}
+		});
+	}
+
+	/**
+	 * The snapshot with the highest position among the snapshot directories in {@code parent}, verifying installed
+	 * snapshots first.
+	 */
 	private static @Nullable Path findLatest(Path parent) throws IOException {
 		Path best = null;
 		TermIndex bestTermIndex = null;
 		for (Path dir : snapshotDirs(parent)) {
+			verifyIfInstalled(dir);
 			TermIndex termIndex = readTermIndex(dir);
-			if (termIndex != null && (bestTermIndex == null || termIndex.compareTo(bestTermIndex) > 0)
-					&& isVerified(dir)) {
+			if (termIndex != null && (bestTermIndex == null || termIndex.compareTo(bestTermIndex) > 0)) {
 				best = dir;
 				bestTermIndex = termIndex;
 			}
@@ -212,28 +361,32 @@ final class CheckpointStorage implements StateMachineStorage {
 	}
 
 	/**
-	 * True for a snapshot taken locally (fsynced before it was renamed into place) or an installed one verified
-	 * earlier. Otherwise the snapshot was installed by Ratis, and every file must match its saved digest, which
-	 * fails if a crash lost data that Ratis never synced; the files are then fsynced and the snapshot marked.
+	 * Does nothing for a snapshot taken locally (fsynced before it was renamed into place) or an installed one
+	 * verified earlier. Otherwise the snapshot was installed by Ratis, and every file must match its saved digest,
+	 * which fails if a crash lost data that Ratis never synced; the files are then fsynced and the snapshot marked.
 	 */
-	private static boolean isVerified(Path dir) throws IOException {
+	private static void verifyIfInstalled(Path dir) throws IOException {
 		boolean installed;
 		try (Stream<Path> walk = Files.walk(dir)) {
 			installed = walk.anyMatch(path -> path.getFileName().toString().endsWith(MD5FileUtil.MD5_SUFFIX));
 		}
 		if (!installed || Files.exists(dir.resolve(VERIFIED_FILE))) {
-			return true;
+			return;
+		}
+		if (readTermIndex(dir) == null) {
+			throw new DamagedSnapshotException(dir, "its position is missing", null);
 		}
 		for (Path file : snapshotFiles(dir)) {
+			MD5Hash saved;
+			MD5Hash actual;
 			try {
-				MD5Hash saved = MD5FileUtil.readStoredMd5ForFile(file.toFile());
-				if (saved == null || !saved.equals(MD5FileUtil.computeMd5ForFile(file.toFile()))) {
-					LOG.warn("Ignoring installed snapshot {}: {} does not match its saved digest", dir, file);
-					return false;
-				}
-			} catch (IOException e) {
-				LOG.warn("Ignoring installed snapshot {}: cannot verify {}", dir, file, e);
-				return false;
+				saved = MD5FileUtil.readStoredMd5ForFile(file.toFile());
+				actual = MD5FileUtil.computeMd5ForFile(file.toFile());
+			} catch (IOException ex) {
+				throw new DamagedSnapshotException(dir, "cannot verify " + file, ex);
+			}
+			if (saved == null || !saved.equals(actual)) {
+				throw new DamagedSnapshotException(dir, file + " does not match its saved digest", null);
 			}
 		}
 		NodeStore.syncTree(dir);
@@ -241,7 +394,6 @@ final class CheckpointStorage implements StateMachineStorage {
 		Files.createFile(verified);
 		NodeStore.syncFile(verified);
 		NodeStore.syncDirectory(dir);
-		return true;
 	}
 
 	/** The files of a snapshot without Ratis' digest side files and the marker, with the properties file last. */
@@ -285,6 +437,37 @@ final class CheckpointStorage implements StateMachineStorage {
 		} catch (IllegalArgumentException e) {
 			// A damaged file: malformed escapes or numbers.
 			return null;
+		}
+	}
+
+	/** A listed snapshot that records when its file list was last read, as an installation does for every chunk. */
+	private final class Snapshot extends FileListSnapshotInfo {
+
+		private volatile long lastRead = NEVER;
+
+		Snapshot(List<FileInfo> files, TermIndex termIndex) {
+			super(files, termIndex);
+		}
+
+		@Override
+		public List<FileInfo> getFiles() {
+			lastRead = nanoClock.getAsLong();
+			return super.getFiles();
+		}
+
+		boolean readSince(long since) {
+			long read = lastRead;
+			return read != NEVER && read - since >= 0;
+		}
+	}
+
+	/** An installed snapshot lost data in a crash; this replica cannot use it and must be rebuilt. */
+	static final class DamagedSnapshotException extends IOException {
+
+		DamagedSnapshotException(Path dir, String reason, @Nullable Throwable cause) {
+			super("Installed snapshot " + dir + " is damaged (" + reason + "), probably by a crash before it was"
+					+ " synced. The Raft log may already start after it, so this replica cannot catch up by itself:"
+					+ " rebuild it from the other members", cause);
 		}
 	}
 }
