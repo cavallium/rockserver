@@ -2,6 +2,8 @@ package it.cavallium.rockserver.core.impl;
 
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.impl.rocksdb.LeakSafeWriteBatch;
+import it.cavallium.rockserver.core.impl.rocksdb.LeakSafeWriteOptions;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
@@ -12,6 +14,7 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureClassLoader;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -66,7 +69,7 @@ public class MergeOperatorRegistry implements Closeable {
         synchronized (this) {
             try {
                 // Check deduplication
-                Long existing = check(name, hash);
+                Long existing = findIndexedVersion(name, hash);
                 if (existing != null) {
                     // double check if the data exists
                     byte[] key = encodeKey(name, existing);
@@ -75,21 +78,33 @@ public class MergeOperatorRegistry implements Closeable {
                         return existing;
                     }
                 }
-                
-                long version = getNextVersion(name);
+
+                // A data record without its hash index can only come from an interrupted write performed
+                // before the records were written atomically. Reuse its version (and repair the index)
+                // so that replaying the same upload yields the same version as on a clean replica.
+                long currentVersion = readCurrentVersion(name);
+                Long orphan = findVersionWithJar(name, currentVersion, jarData);
+                if (orphan != null) {
+                    try (var batch = new LeakSafeWriteBatch()) {
+                        batch.put(cfh, encodeHashKey(name, hash), encodeLong(orphan));
+                        write(batch);
+                    }
+                    LOG.info("Merge operator '{}' with same content already exists as version {} without hash index."
+                            + " Repaired the index and reusing.", name, orphan);
+                    return orphan;
+                }
+
+                long version = nextVersion(name, currentVersion);
                 byte[] key = encodeKey(name, version);
                 byte[] value = encodeValue(className, jarData);
-                
-                // Write data
-                db.put(cfh, key, value);
 
-                // Write hash index
-                byte[] hashKey = encodeHashKey(name, hash);
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                try (DataOutputStream dos = new DataOutputStream(baos)) {
-                    dos.writeLong(version);
+                // Write the version counter, the data and the hash index atomically
+                try (var batch = new LeakSafeWriteBatch()) {
+                    batch.put(cfh, encodeMetaKey(name), encodeLong(version));
+                    batch.put(cfh, key, value);
+                    batch.put(cfh, encodeHashKey(name, hash), encodeLong(version));
+                    write(batch);
                 }
-                db.put(cfh, hashKey, baos.toByteArray());
 
                 // Pre-load to verify instantiation and cache it
                 FFMAbstractMergeOperator op = loadAndInstantiate(className, jarData);
@@ -114,17 +129,24 @@ public class MergeOperatorRegistry implements Closeable {
     public Long check(String name, byte[] hash) {
         if (name == null || hash == null) return null;
         try {
-            byte[] key = encodeHashKey(name, hash);
-            byte[] val = db.get(cfh, key);
-            if (val != null) {
-                try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(val))) {
-                    return dis.readLong();
-                }
-            }
+            return findIndexedVersion(name, hash);
         } catch (Exception e) {
             LOG.warn("Failed to check merge operator existence by hash", e);
         }
         return null;
+    }
+
+    /**
+     * Looks up the hash index, propagating read failures.
+     */
+    private Long findIndexedVersion(String name, byte[] hash) throws org.rocksdb.RocksDBException, IOException {
+        byte[] val = db.get(cfh, encodeHashKey(name, hash));
+        if (val == null) {
+            return null;
+        }
+        try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(val))) {
+            return dis.readLong();
+        }
     }
 
     private byte[] encodeHashKey(String name, byte[] hash) {
@@ -184,22 +206,76 @@ public class MergeOperatorRegistry implements Closeable {
         }
     }
 
-    private long getNextVersion(String name) throws org.rocksdb.RocksDBException, IOException {
-        byte[] metaKey = ("meta:" + name).getBytes(StandardCharsets.UTF_8);
-        byte[] val = db.get(cfh, metaKey);
-        long ver = 0;
-        if (val != null) {
-            try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(val))) {
-                ver = dis.readLong();
+    private long readCurrentVersion(String name) throws org.rocksdb.RocksDBException, IOException {
+        byte[] val = db.get(cfh, encodeMetaKey(name));
+        if (val == null) {
+            return 0;
+        }
+        try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(val))) {
+            return dis.readLong();
+        }
+    }
+
+    /**
+     * Returns the version to assign to a new upload.
+     * <p>
+     * Normally this is the current version plus one. If the current version has no data record, the counter
+     * was advanced by an interrupted write performed before the records were written atomically, so the
+     * version was never assigned and is reused.
+     */
+    private long nextVersion(String name, long currentVersion) throws org.rocksdb.RocksDBException {
+        if (currentVersion > 0 && db.get(cfh, encodeKey(name, currentVersion)) == null) {
+            return currentVersion;
+        }
+        return currentVersion + 1;
+    }
+
+    /**
+     * Finds a stored version of the operator whose JAR content equals {@code jarData}.
+     */
+    private Long findVersionWithJar(String name, long currentVersion, byte[] jarData)
+            throws org.rocksdb.RocksDBException, IOException {
+        for (long version = 1; version <= currentVersion; version++) {
+            byte[] value = db.get(cfh, encodeKey(name, version));
+            if (value == null) {
+                continue;
+            }
+            try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(value))) {
+                dis.readUTF();
+                int jarLen = dis.readInt();
+                if (jarLen != jarData.length) {
+                    continue;
+                }
+                byte[] storedJar = new byte[jarLen];
+                dis.readFully(storedJar);
+                if (Arrays.equals(storedJar, jarData)) {
+                    return version;
+                }
             }
         }
-        long newVer = ver + 1;
+        return null;
+    }
+
+    /**
+     * Writes a batch with the default write options, which are the ones {@link RocksDB#put} uses.
+     */
+    private void write(LeakSafeWriteBatch batch) throws org.rocksdb.RocksDBException {
+        try (var writeOptions = new LeakSafeWriteOptions("merge-operator-registry-write-options")) {
+            db.write(writeOptions, batch);
+        }
+    }
+
+    private static byte[] encodeLong(long value) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         try (DataOutputStream dos = new DataOutputStream(baos)) {
-            dos.writeLong(newVer);
+            dos.writeLong(value);
         }
-        db.put(cfh, metaKey, baos.toByteArray());
-        return newVer;
+        return baos.toByteArray();
+    }
+
+    private byte[] encodeMetaKey(String name) {
+        // Key: "meta:<name>", holds the last assigned version
+        return ("meta:" + name).getBytes(StandardCharsets.UTF_8);
     }
 
     private byte[] encodeKey(String name, long version) {
@@ -219,7 +295,12 @@ public class MergeOperatorRegistry implements Closeable {
 
     private FFMAbstractMergeOperator loadAndInstantiate(String className, byte[] jarData) {
         try {
-            InMemoryClassLoader cl = new InMemoryClassLoader(jarData, this.getClass().getClassLoader());
+            InMemoryClassLoader cl;
+            try {
+                cl = new InMemoryClassLoader(jarData, this.getClass().getClassLoader());
+            } catch (IOException e) {
+                throw invalidJar(e);
+            }
             Class<?> clazz = cl.loadClass(className);
             if (!FFMAbstractMergeOperator.class.isAssignableFrom(clazz)) {
                 throw new IllegalArgumentException("Class " + className + " does not extend FFMAbstractMergeOperator");
@@ -239,8 +320,18 @@ public class MergeOperatorRegistry implements Closeable {
         try (JarInputStream jis = new JarInputStream(new ByteArrayInputStream(jarData))) {
             jis.getNextJarEntry();
         } catch (IOException e) {
-            throw new IllegalArgumentException("Invalid JAR data", e);
+            throw invalidJar(e);
         }
+    }
+
+    /**
+     * Rejects JAR content that cannot be parsed. The parse error is kept as suppressed rather than as the
+     * cause: invalid content is a deterministic rejection, not an I/O failure of this machine's storage.
+     */
+    private static IllegalArgumentException invalidJar(IOException parseError) {
+        var invalid = new IllegalArgumentException("Invalid JAR data");
+        invalid.addSuppressed(parseError);
+        return invalid;
     }
 
     @Override
