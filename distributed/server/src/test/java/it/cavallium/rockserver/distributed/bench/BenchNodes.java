@@ -143,6 +143,13 @@ final class BenchNodes implements AutoCloseable {
 		command.add("--add-modules=jdk.incubator.vector");
 		command.add("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn");
 		command.add("-Dorg.slf4j.simpleLogger.log.it.cavallium.rockserver.distributed=info");
+		// In the node's directory: a killed JVM leaves its copy of the RocksDB library behind (17 MB each time).
+		try {
+			java.nio.file.Files.createDirectories(dir.resolve("tmp"));
+		} catch (java.io.IOException ex) {
+			throw new java.io.UncheckedIOException(ex);
+		}
+		command.add("-Djava.io.tmpdir=" + dir.resolve("tmp"));
 		for (var option : jvmOptions) {
 			command.add(option.replace("{dir}", dir.toString()).replace("{id}", id));
 		}

@@ -148,7 +148,7 @@ public final class ProcessCluster implements AutoCloseable {
 		for (int i = 0; i < total; i++) {
 			var id = String.valueOf(i + 1);
 			var node = new Node(id, freePorts.get(2 * i), freePorts.get(2 * i + 1), root.resolve(Network.hostname(id)));
-			Files.createDirectories(node.dir);
+			Files.createDirectories(node.dir.resolve("tmp"));
 			nodes.put(id, node);
 			ports.put(id, List.of(node.raftPort, node.apiPort));
 		}
@@ -473,6 +473,8 @@ public final class ProcessCluster implements AutoCloseable {
 		command.add("--enable-native-access=ALL-UNNAMED");
 		command.add("--add-modules=jdk.incubator.vector");
 		command.add("-Djdk.net.hosts.file=" + network.hostsFile(node.id));
+		// Inside the test's directory: a killed JVM leaves its copy of the RocksDB library behind (17 MB each time).
+		command.add("-Djava.io.tmpdir=" + node.dir.resolve("tmp"));
 		// Same logging configuration as the test JVM (surefire sets the slf4j-simple levels).
 		System.getProperties().stringPropertyNames().stream()
 				.filter(name -> name.startsWith("org.slf4j.simpleLogger."))
