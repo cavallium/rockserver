@@ -48,7 +48,8 @@ final class InProcessCluster implements AutoCloseable {
 					.withRockserverConfig(rockserverConfig)
 					.withBindHosts("127.0.0.1", "127.0.0.1")
 					.withElectionTimeouts(Duration.ofMillis(400), Duration.ofMillis(800))
-					.withRequestTimeout(Duration.ofSeconds(10));
+					.withRequestTimeout(Duration.ofSeconds(10))
+					.withPipelinedUpdates(ProcessCluster.PIPELINED_UPDATES);
 			configs.put(peer.id(), customize.apply(config));
 		}
 	}

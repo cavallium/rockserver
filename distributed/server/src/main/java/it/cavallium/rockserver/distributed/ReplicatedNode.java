@@ -235,6 +235,10 @@ public final class ReplicatedNode implements AutoCloseable {
 	}
 
 	/** The local replica, for tests that inspect each node's own database. */
+	Proposer proposer() {
+		return proposer;
+	}
+
 	RockserverStateMachine stateMachine() {
 		return stateMachine;
 	}

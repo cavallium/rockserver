@@ -94,7 +94,9 @@ final class RockserverStateMachine extends BaseStateMachine {
 		final long startedNanos = System.nanoTime();
 		long appendedNanos;
 		@Nullable LeaderSession session;
-		@Nullable ConflictTracker.Token token;
+		ConflictTracker.@Nullable Token token;
+		/** Commits of this entry that handed their key over, see {@link LeaderSession#admitted}. */
+		@Nullable List<LeaderSession.ChainLink> links;
 
 		Proposal(List<Request> requests) {
 			this.requests = requests;
@@ -364,7 +366,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			}
 		}
 		if (guarded) {
-			var conflicting = session.tracker().conflicts(entries);
+			var conflicting = session.tracker().conflicts(entries, session::chainCheck);
 			if (!conflicting.isEmpty()) {
 				var conflict = ConflictException.of(conflicting);
 				throw new StateMachineException(conflict.getMessage(), conflict, false);
@@ -374,6 +376,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 		proposal.token = session.tracker().register(entries);
 		proposal.appendedNanos = System.nanoTime();
 		admitTime.record(proposal.appendedNanos - proposal.startedNanos);
+		// Last: a refusal must hand nothing over.
+		proposal.links = session.admitted(proposal.requests, proposal.token);
 		return trx;
 	}
 
@@ -678,6 +682,11 @@ final class RockserverStateMachine extends BaseStateMachine {
 			}
 			updateLastAppliedTermIndex(position);
 			applied.advance(position.getIndex());
+			if (proposal != null && proposal.links != null) {
+				// After the applied index: the next update of the key may be a head, which reads the database at that
+				// index or later.
+				proposal.session.settle(proposal.links, results);
+			}
 			// The entry is applied: building its reply must not stop the replica, and encodeAll never fails
 			// (results that do not fit become failures, the same on every replica).
 			entry.reply().complete(encodeReply(results));

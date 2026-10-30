@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.common.RocksDBException;
@@ -10,12 +11,15 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,21 +31,78 @@ import org.slf4j.LoggerFactory;
  * it provides the snapshot and read-your-writes exactly as on a single node. Its writes are also recorded here, so
  * that the commit can be proposed as one {@link LogEntry.Guarded} entry; the native transaction itself is always
  * rolled back, because the committed effects arrive through the log like every other write.</p>
+ *
+ * <p>With {@link NodeConfig#pipelinedUpdates()}, a key passes to its next update as soon as the commit of the previous
+ * one is admitted to the log ({@link #admitted}), and that update is <em>chained</em>: it reads the value the admitted
+ * commit writes, from memory, with no native transaction, under a positive id. Its commit carries a
+ * {@link LogEntry.Guard}, which every replica checks at the commit's log position, so that chain state here decides
+ * only what is granted: when it is wrong, the cost is a retry. See "Transactions" in the design document.</p>
  */
 final class LeaderSession {
 
 	private static final Logger LOG = LoggerFactory.getLogger(LeaderSession.class);
 
+	/** Unsettled commits of one key that may be chained on. More wait: this bounds what one failure can reject. */
+	static final int MAX_CHAIN_LINKS = 64;
+	/** Largest value an update may read from memory; a larger write holds its key until it is applied. */
+	static final int MAX_LINK_VALUE_BYTES = 1 << 20;
+
 	/**
 	 * The right to update one key with {@code getForUpdate}, held from before the read until the update's commit is
-	 * applied or the update is closed. Released at most once.
+	 * admitted to the log (with {@link NodeConfig#pipelinedUpdates()}) or applied, or the update is closed. Released at
+	 * most once.
 	 */
 	static final class KeyLock {
 		final long key;
+		/** The admitted commit the update should read, instead of the database; null for a head. */
+		final @Nullable ChainLink base;
 		private final AtomicBoolean released = new AtomicBoolean();
 
-		private KeyLock(long key) {
+		private KeyLock(long key, @Nullable ChainLink base) {
 			this.key = key;
+			this.base = base;
+		}
+	}
+
+	/** A commit admitted to the log that handed its key over, from admission until its outcome is known. */
+	static final class ChainLink {
+		final long columnId;
+		final Keys keys;
+		final long keyHash;
+		/** What the commit writes, null for a delete; from the decoded entry, whose arrays nothing else changes. */
+		final @Nullable Buf value;
+		/** Index of the commit among the requests of its log entry. */
+		final int position;
+		final ConflictTracker.Token token;
+		/** True if the commit applied, false if not or if that is unknown. Completed by {@link #finish}. */
+		final CompletableFuture<Boolean> settled = new CompletableFuture<>();
+		/** Guarded by {@link #chainLock}. */
+		private boolean finished;
+		private volatile LogEntry.@Nullable Guard guard;
+
+		private ChainLink(long columnId, Keys keys, long keyHash, @Nullable Buf value, int position,
+				ConflictTracker.Token token) {
+			this.columnId = columnId;
+			this.keys = keys;
+			this.keyHash = keyHash;
+			this.value = value;
+			this.position = position;
+			this.token = token;
+		}
+
+		/** The guard of whoever reads this link's value. Computed on first use, which is never under the log lock. */
+		LogEntry.Guard guard() {
+			var result = guard;
+			if (result == null) {
+				result = LogEntry.Guard.of(columnId, keys, value);
+				guard = result;
+			}
+			return result;
+		}
+
+		/** True once this commit is known not to have written its value. */
+		boolean failed() {
+			return !settled.getNow(true);
 		}
 	}
 
@@ -49,8 +110,14 @@ final class LeaderSession {
 	private static final class KeyState {
 		final long columnId;
 		final ArrayDeque<CompletableFuture<KeyLock>> waiters = new ArrayDeque<>();
-		/** An update owns the key. */
+		/** An update owns the key and its commit was not admitted to the log. */
 		boolean held;
+		/** Links not settled yet. */
+		int links;
+		/** The newest usable unsettled link. */
+		@Nullable ChainLink tail;
+		/** Nobody may chain until the links are settled. Only ever true while {@code links > 0}, so it always clears. */
+		boolean broken;
 
 		KeyState(long columnId) {
 			this.columnId = columnId;
@@ -64,6 +131,10 @@ final class LeaderSession {
 		final long snapshotIndex;
 		/** The key lock of a single-key update, released when the update is removed. */
 		final @Nullable KeyLock keyLock;
+		/** The commit a chained update read from: it has no native transaction. Null for every other transaction. */
+		final @Nullable ChainLink base;
+		/** Its own commit, once admitted to the log and passed its key on. */
+		private volatile @Nullable ChainLink link;
 		private final long deadlineNanos;
 		private final List<LogEntry.Write> writes = new ArrayList<>();
 		private final LongArrayList conflictColumns = new LongArrayList();
@@ -75,12 +146,22 @@ final class LeaderSession {
 		private long commitBytes = LogEntryCodec.GUARDED_BASE_BYTES;
 
 		private OpenTransaction(long id, boolean update, long snapshotIndex, @Nullable KeyLock keyLock,
-				long deadlineNanos) {
+				@Nullable ChainLink base, long deadlineNanos) {
 			this.id = id;
 			this.update = update;
 			this.snapshotIndex = snapshotIndex;
 			this.keyLock = keyLock;
+			this.base = base;
 			this.deadlineNanos = deadlineNanos;
+		}
+
+		/** True for an update that read from a commit, and has no native transaction. */
+		boolean chained() {
+			return base != null;
+		}
+
+		@Nullable ChainLink link() {
+			return link;
 		}
 
 		/** What a write with {@code keyCount} keys adds to the commit entry: the write and its conflict keys. */
@@ -142,7 +223,7 @@ final class LeaderSession {
 				hashes.add(ConflictTracker.keyHash(write.columnId(), key));
 			}
 			return new LogEntry.Guarded(term, snapshotIndex, columns.toLongArray(), hashes.toLongArray(), List.of(write),
-					true, id, null);
+					true, id, base != null ? base.guard() : null);
 		}
 
 		boolean isExpired(long nowNanos) {
@@ -179,6 +260,9 @@ final class LeaderSession {
 	 * {@link #chainLock}.
 	 */
 	private boolean expiryScheduled;
+	/** Links not finished yet, of every key, so that {@link #close} can finish them. Guarded by {@link #chainLock}. */
+	private final Set<ChainLink> unsettled = new HashSet<>();
+	private final AtomicLong chainedIds = new AtomicLong(1);
 	/** When {@link #expireIfDue} last expired transactions, in {@link System#nanoTime()} units. */
 	private volatile long lastExpireNanos = System.nanoTime();
 	private volatile boolean closed;
@@ -299,23 +383,195 @@ final class LeaderSession {
 	}
 
 	/**
-	 * The only way a key is granted: to the oldest update that still waits, if nobody holds it. The grant runs under
-	 * {@link #chainLock}, so a waiter's dependent stages must be cheap: {@link ReplicatedConnection} has only its
-	 * timeout's cancellation and an async stage there.
+	 * The only way a key is granted: to the oldest update that still waits, if nobody holds it. With unsettled links,
+	 * the update reads the newest one, if the chain is sound: it was not broken, it has room, and no write came after
+	 * that link. This check also makes a chained close correct: every write ordered after the link was registered
+	 * after this grant, so after the update was invoked. Otherwise the waiters stay queued until the links settle, and
+	 * the next one is then a head, which reads the database.
+	 *
+	 * <p>The grant runs under {@link #chainLock}, which appends can wait for, so a waiter's dependent stages must be
+	 * cheap: {@link ReplicatedConnection} has only its timeout's cancellation and an async stage there.</p>
 	 */
 	private void grantNext(long key, KeyState state) {
 		if (state.held) {
 			return;
 		}
+		if (state.waiters.isEmpty()) {
+			if (state.links == 0) {
+				keys.remove(key);
+			}
+			return;
+		}
+		ChainLink base = null;
+		if (state.links > 0) {
+			if (state.broken || state.tail == null || state.links >= MAX_CHAIN_LINKS) {
+				return;
+			}
+			if (!tracker.chainIntact(state.columnId, key, state.tail.token, applied.get())) {
+				state.broken = true;
+				state.tail = null;
+				return;
+			}
+			base = state.tail;
+		}
 		CompletableFuture<KeyLock> next;
 		while ((next = state.waiters.pollFirst()) != null) {
 			// A waiter that timed out or was cancelled is already complete: skip it.
-			if (next.complete(new KeyLock(key))) {
+			if (next.complete(new KeyLock(key, base))) {
 				state.held = true;
 				return;
 			}
 		}
-		keys.remove(key);
+		if (state.links == 0) {
+			keys.remove(key);
+		}
+	}
+
+	/**
+	 * Hands over the keys of the updates whose commits {@code requests}, the requests of one log entry, were just
+	 * admitted as {@code token}, and returns the new links, null if none. Called under Ratis' log lock, in log order.
+	 *
+	 * <p>Only a commit that is one put or delete of the locked key gives a link: nobody could read the value of any
+	 * other. Its update keeps the key until it is removed, as without pipelining.</p>
+	 */
+	@Nullable List<ChainLink> admitted(List<Request> requests, ConflictTracker.Token token) {
+		if (!pipelined) {
+			return null;
+		}
+		List<ChainLink> links = null;
+		for (int position = 0; position < requests.size(); position++) {
+			if (!(requests.get(position).entry() instanceof LogEntry.Guarded commit) || commit.updateId() == 0) {
+				continue;
+			}
+			var transaction = transactions.get(commit.updateId());
+			if (transaction == null || transaction.keyLock == null) {
+				continue;
+			}
+			var link = linkOf(commit, position, token, transaction.keyLock.key);
+			if (link == null) {
+				continue;
+			}
+			synchronized (chainLock) {
+				// The release and the link together: whoever fails to release the lock then sees the link.
+				if (closed || !transaction.keyLock.released.compareAndSet(false, true)) {
+					continue;
+				}
+				var state = keys.get(link.keyHash);
+				if (state == null) {
+					continue;
+				}
+				transaction.link = link;
+				unsettled.add(link);
+				state.links++;
+				state.tail = state.broken ? null : link;
+				state.held = false;
+				grantNext(link.keyHash, state);
+			}
+			if (links == null) {
+				links = new ArrayList<>();
+			}
+			links.add(link);
+		}
+		return links;
+	}
+
+	private static @Nullable ChainLink linkOf(LogEntry.Guarded commit, int position, ConflictTracker.Token token,
+			long key) {
+		Keys keys;
+		Buf value;
+		switch (commit.writes().getFirst()) {
+			case LogEntry.Put put when put.value() != null -> {
+				keys = put.keys();
+				value = put.value();
+			}
+			case LogEntry.Delete delete -> {
+				keys = delete.keys();
+				value = null;
+			}
+			default -> {
+				return null;
+			}
+		}
+		long columnId = commit.writes().getFirst().columnId();
+		if ((value != null && value.size() > MAX_LINK_VALUE_BYTES) || ConflictTracker.keyHash(columnId, keys) != key) {
+			return null;
+		}
+		return new ChainLink(columnId, keys, key, value, position, token);
+	}
+
+	/** Called once the entry of {@code links} was applied, with its results: the commits' outcomes are now known. */
+	void settle(List<ChainLink> links, List<ApplyResult> results) {
+		for (var link : links) {
+			finish(link, results.get(link.position) instanceof ApplyResult.Ok);
+		}
+	}
+
+	/** The commit of {@code link} ended without an outcome: unknown counts as failed. */
+	void linkFailed(ChainLink link) {
+		finish(link, false);
+	}
+
+	private void finish(ChainLink link, boolean ok) {
+		synchronized (chainLock) {
+			if (link.finished) {
+				return;
+			}
+			link.finished = true;
+			unsettled.remove(link);
+			var state = keys.get(link.keyHash);
+			if (state != null) {
+				state.links--;
+				if (!ok && state.links > 0) {
+					state.broken = true;
+					state.tail = null;
+				}
+				if (state.tail == link) {
+					state.tail = null;
+				}
+				if (state.links == 0) {
+					state.broken = false;
+				}
+				grantNext(link.keyHash, state);
+			}
+		}
+		// Outside the lock: a closed update's reply goes on from here.
+		link.settled.complete(ok);
+	}
+
+	/** Stops chaining on {@code key} until its links settle, so that the next update is a head. */
+	void breakChain(long key) {
+		synchronized (chainLock) {
+			var state = keys.get(key);
+			if (state != null && state.links > 0) {
+				state.broken = true;
+				state.tail = null;
+			}
+		}
+	}
+
+	/**
+	 * What the tracker needs to validate a chained commit, null if it must conflict. Called inside the tracker's lock,
+	 * so it takes no lock.
+	 */
+	ConflictTracker.@Nullable ChainCheck chainCheck(LogEntry.Guarded commit) {
+		var transaction = transactions.get(commit.updateId());
+		var base = transaction != null ? transaction.base : null;
+		if (base == null || base.failed()) {
+			return null;
+		}
+		return new ConflictTracker.ChainCheck(base.columnId, base.keyHash, base.token);
+	}
+
+	/** A new id for a chained update: positive, while native ids are at most -2, and unique across terms. */
+	long nextChainedId() {
+		return (term & 0x7FFFFFFFL) << 32 | (chainedIds.getAndIncrement() & 0xFFFFFFFFL);
+	}
+
+	/** Unsettled links of every key, for metrics. */
+	int chainLinks() {
+		synchronized (chainLock) {
+			return unsettled.size();
+		}
 	}
 
 	/** Expires what is due, and runs again later while a key is held and leadership lasts. */
@@ -357,8 +613,12 @@ final class LeaderSession {
 		}
 	}
 
+	OpenTransaction register(Object reservation, long id, boolean update, @Nullable KeyLock keyLock, long leaseNanos) {
+		return register(reservation, id, update, keyLock, null, leaseNanos);
+	}
+
 	synchronized OpenTransaction register(Object reservation, long id, boolean update, @Nullable KeyLock keyLock,
-			long leaseNanos) {
+			@Nullable ChainLink base, long leaseNanos) {
 		if (closed) {
 			unpin(reservation);
 			throw new IllegalStateException("Leadership of term " + term + " ended");
@@ -367,7 +627,7 @@ final class LeaderSession {
 		if (snapshotIndex == null) {
 			throw new IllegalStateException("Unknown reservation");
 		}
-		var transaction = new OpenTransaction(id, update, snapshotIndex, keyLock, System.nanoTime() + leaseNanos);
+		var transaction = new OpenTransaction(id, update, snapshotIndex, keyLock, base, System.nanoTime() + leaseNanos);
 		if (transactions.putIfAbsent(id, transaction) != null) {
 			throw new IllegalStateException("Transaction id reused: " + id);
 		}
@@ -450,6 +710,9 @@ final class LeaderSession {
 			closed = true;
 		}
 		for (OpenTransaction transaction : transactions.values()) {
+			if (transaction.chained()) {
+				continue;
+			}
 			try {
 				if (transaction.update) {
 					db.closeFailedUpdate(transaction.id);
@@ -465,12 +728,18 @@ final class LeaderSession {
 			snapshots.clear();
 		}
 		List<CompletableFuture<KeyLock>> waiters = new ArrayList<>();
+		List<ChainLink> links;
 		synchronized (chainLock) {
 			keys.values().forEach(state -> waiters.addAll(state.waiters));
 			keys.clear();
+			links = List.copyOf(unsettled);
+			unsettled.clear();
+			links.forEach(link -> link.finished = true);
 		}
 		for (var waiter : waiters) {
 			waiter.completeExceptionally(new RocksDBRetryException());
 		}
+		// A commit may still apply, but nobody here will hear of it.
+		links.forEach(link -> link.settled.complete(false));
 	}
 }
