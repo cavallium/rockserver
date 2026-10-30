@@ -62,7 +62,7 @@ import org.junit.jupiter.api.io.TempDir;
  * linearizability (design scenarios 5 and 10).
  *
  * <p>Every node gets its own {@link ClusterClient}, connected to that node only, so some clients keep talking to the
- * cut-off side for the whole fault. The test JVM reaches every node's API and Raft port directly; only node-to-node
+ * cut-off side, until it stops serving (see {@link ApiGate} and {@link IsolatedNodeTest}). The test JVM reaches every node's API and Raft port directly; only node-to-node
  * traffic crosses the {@link Network}.</p>
  */
 @Timeout(300)

@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -379,7 +380,7 @@ class GrpcConnectionFailoverTest {
 		proxy.pause();
 
 		assertEquals(second.port(), awaitServedBy(client, second.port()));
-		assertTrue(!held.isDone(), "the running call ended with the pause");
+		assertFalse(held.isDone(), "the running call ended with the pause");
 		backend.service.releaseHeldReads();
 		assertEquals(FIRST_NODE_COLUMN_ID, held.get(5, TimeUnit.SECONDS));
 		assertThrows(IOException.class, () -> new Socket("127.0.0.1", proxy.getPort()).close());

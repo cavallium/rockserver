@@ -11,10 +11,10 @@ import java.time.Duration;
  * Raft runs on its own port, so the node keeps taking part in elections, and it serves again by itself once it knows a
  * leader, also after a period when no node of the cluster had one.</p>
  *
- * <p>A node without a leader for that long is not in a normal election. A node only loses its leader when its election
- * timer fires, and it wins or hears the winner within one voting round; with the same bound for each failed round, two
- * more rounds lost to a split vote still end well before it. A node that only just started has never known a leader:
- * its clients have nowhere better to go.</p>
+ * <p>A node without a leader for that long is not in a normal election. A node loses its leader when its election timer
+ * fires, and a round of voting lasts at most one election timeout, so the bound leaves room for three rounds, two of them
+ * lost to a split vote. A node that only just started has never known a leader, and is not judged by this: a cluster
+ * that is still forming has nothing better to offer its clients.</p>
  *
  * <p>A node must keep knowing a leader for {@value #ELECTION_TIMEOUTS_TO_RESUME} maximum election timeout to serve
  * again. Its leader was then confirmed by a heartbeat: without one, its election timer would have fired and cleared it.

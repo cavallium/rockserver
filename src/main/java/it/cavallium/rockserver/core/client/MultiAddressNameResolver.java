@@ -42,8 +42,8 @@ import org.slf4j.LoggerFactory;
  * to another node, so: a host whose lookup fails keeps its last good addresses, one that never resolved is left out,
  * and the channel sees an error only while no host ever resolved. Hosts are looked up concurrently, and a lookup that
  * takes longer than {@link #LOOKUP_WAIT_MILLIS} does not hold back the others: what resolved so far is published, and
- * the slow host follows with an update if it ever answers. Each host has at most one lookup running, so a hung name
- * holds one thread.</p>
+ * the slow host follows with an update if it ever answers. A resolver runs one lookup per host at a time, so a hung
+ * name holds one thread, not one for each resolution.</p>
  */
 final class MultiAddressNameResolver extends NameResolver {
 
