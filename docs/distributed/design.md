@@ -170,8 +170,10 @@ Raft log on disk instead of decoded on the heap. Any error on the apply or compl
   results of an entry do not fit together, the largest ones are replaced in the reply by a "resend alone"
   marker. The proposer then sends those requests again, in entries that hold only such copies: their
   sequences are still in flight, so the copies do not run and get their recorded results, each of which fits in
-  a reply by itself (a reply that cannot hold them all carries at least one and marks the others again). A
-  transaction commit is not sent again (the copy would conflict with itself); the leader that answered is
+  a reply by itself. An entry of copies holds at most as many as the reply that marked them carried, and at least
+  one: a reply can mark every result of an entry when they are all close to the limit, and the copies then go one
+  per entry, several entries in flight together.
+  A transaction commit is not sent again (the copy would conflict with itself); the leader that answered is
   this node, which applied it, so its record is read locally. Building the reply never fails. A reply too
   large to receive anyway fails its requests with an "applied" `INVALID_REQUEST` instead of being resent.
 

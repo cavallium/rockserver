@@ -166,10 +166,16 @@ final class Proposer implements Closeable {
 		/**
 		 * Set when its batch's reply had no room for its result ({@link ApplyResult#RESEND_ALONE}): it took effect, and
 		 * its recorded result is fetched instead, see {@link Lane#complete}. A data write is sent again, sharing its
-		 * batch only with other such copies: each of them only reads back its record, and a reply that cannot hold
-		 * them all carries at least one, marking the others again.
+		 * batch only with other such copies, at most {@link #copyBatchLimit} of them: each of them only reads back its
+		 * record.
 		 */
 		volatile boolean resentAlone;
+		/**
+		 * Copies in a batch led by this one: as many results as the last reply carried, and at least one, which always
+		 * fits. The copies then go as several batches in flight together, instead of one batch whose reply again
+		 * carries only what fits (possibly nothing), one round trip after another.
+		 */
+		volatile int copyBatchLimit = 1;
 		/** Completed only by the proposer; callers get a copy, so that cancelling theirs cannot complete this one. */
 		final CompletableFuture<Object> result = new CompletableFuture<>();
 
@@ -345,6 +351,7 @@ final class Proposer implements Closeable {
 				}
 				if (!batch.isEmpty() && (next.alone() || batch.getFirst().alone()
 						|| next.resentAlone != batch.getFirst().resentAlone || next.epoch != batch.getFirst().epoch
+						|| (next.resentAlone && batch.size() >= batch.getFirst().copyBatchLimit)
 						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES)) {
 					break;
 				}
@@ -506,9 +513,11 @@ final class Proposer implements Closeable {
 		/**
 		 * Completes each request of {@code batch} with its own result from {@code reply}. A request whose result did
 		 * not fit in the reply ({@link ApplyResult#RESEND_ALONE}) took effect, and its sequence is still in flight, so
-		 * its record is kept: a data write is sent again in a batch of such copies only, and applying a copy returns
-		 * its record, which fits in a reply by itself. A transaction commit cannot be sent again (a copy would conflict with itself, or reach
-		 * another leader), but this node's own Raft server applied it before answering: its record is read here.
+		 * its record is kept: a data write is sent again in a batch of such copies only, no larger than the number of
+		 * results this reply carried (see {@link Pending#copyBatchLimit}), and applying a copy returns its record,
+		 * which fits in a reply by itself. A transaction commit cannot be sent again (a copy would conflict with itself,
+		 * or reach another leader), but this node's own Raft server applied it before answering: its record is read
+		 * here.
 		 */
 		private void complete(List<Pending> batch, RaftClientReply reply) {
 			if (!reply.isSuccess()) {
@@ -527,6 +536,12 @@ final class Proposer implements Closeable {
 						"Expected " + batch.size() + " results, got " + results.size())));
 				return;
 			}
+			int carried = 0;
+			for (var result : results) {
+				if (!(result instanceof ApplyResult.ResendAlone)) {
+					carried++;
+				}
+			}
 			var resend = new ArrayList<Pending>(0);
 			for (int i = 0; i < results.size(); i++) {
 				var pending = batch.get(i);
@@ -540,6 +555,7 @@ final class Proposer implements Closeable {
 					completeFromLocalRecord(pending);
 				} else {
 					pending.queuedNanos = System.nanoTime();
+					pending.copyBatchLimit = Math.max(1, carried);
 					resend.add(pending);
 				}
 			}

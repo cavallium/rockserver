@@ -93,7 +93,7 @@ final class ResultCodec {
 	 * replica. A result that cannot be encoded, or that does not fit in {@code maxBytes} even alone, is replaced as
 	 * {@link #bounded} does; apply already recorded it so. When the results together do not fit, the largest ones
 	 * (the first of equal ones) are replaced by {@link ApplyResult#RESEND_ALONE} until they fit. Each of those fits
-	 * alone, so its proposer sends it again in a batch of its own and gets its recorded result. The choice depends
+	 * alone, so its proposer sends it again, alone if need be, and gets its recorded result. The choice depends
 	 * only on the results, so every replica builds the same reply: Ratis can answer a client's retry with the reply
 	 * a replica computed before it became the leader.</p>
 	 */

@@ -158,6 +158,54 @@ class ReplicationTest {
 		}
 	}
 
+	/**
+	 * Two results so close to the reply limit that the reply of their batch has room for neither: both are marked
+	 * "resend alone", and their copies must then go one per batch instead of together again, where they would get
+	 * the same reply until their deadline.
+	 */
+	@Test
+	void resentCopiesWhoseReplyCarriedNoResultGoOnePerBatch() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withRequestTimeout(Duration.ofSeconds(30))).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var through = cluster.anyFollower();
+		var api = api(through);
+		long column = api.createColumn("c", SCHEMA);
+		// A delta result is a tag, a value tag and both sides with their lengths.
+		var previous = Buf.wrap(new byte[15 * 1024 * 1024]);
+		var current = Buf.wrap(new byte[ResultCodec.MAX_RESULT_BYTES - 2 - 10 - previous.size()]);
+		var result = new ApplyResult.Ok(new it.cavallium.rockserver.core.common.Delta<>(previous, current));
+		assertEquals(List.of(ApplyResult.RESEND_ALONE, ApplyResult.RESEND_ALONE),
+				ResultCodec.decodeAll(ResultCodec.encodeAll(List.of(result, result))), "precondition");
+		api.put(0, column, key(1), previous, RequestType.none());
+		api.put(0, column, key(2), previous, RequestType.none());
+
+		// Without a majority, every write stays in flight: once MAX_BATCHES_IN_FLIGHT are, the two deltas queue and
+		// then go together in one batch.
+		var halted = cluster.ids().stream().filter(id -> !id.equals(through.config().nodeId())).toList();
+		assertTrue(halted.contains(leader.config().nodeId()));
+		for (String id : halted) {
+			cluster.halt(id);
+		}
+		var async = through.connection().getAsyncApi(CONTEXT);
+		var fillers = new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+		for (int i = 0; i < Proposer.MAX_BATCHES_IN_FLIGHT; i++) {
+			fillers.add(async.putAsync(0, column, key(100 + i), text("filler"), RequestType.none()));
+		}
+		var deltas = List.of(async.putAsync(0, column, key(1), current, RequestType.<Buf>delta()),
+				async.putAsync(0, column, key(2), current, RequestType.<Buf>delta()));
+		for (String id : halted) {
+			cluster.start(id);
+		}
+		for (var filler : fillers) {
+			filler.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		}
+		for (var delta : deltas) {
+			var received = delta.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+			assertEquals(previous.size(), received.previous().size());
+			assertEquals(current.size(), received.current().size());
+		}
+	}
+
 	@Test
 	void writesContinueAfterLeaderLossAndTheOldLeaderCatchesUp() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
