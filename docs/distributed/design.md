@@ -112,7 +112,8 @@ and the `LogEntry`.
   append, one place in a group fsync and one apply transaction, whatever it holds. Transaction commits have a
   queue of their own, and commits of different leader terms never share an entry.
 - **Retries.** A batch is resent with the same bytes across leader changes until the latest deadline of its
-  requests (at most one attempt past the oldest one's). On the leader an attempt goes straight to the local Raft
+  requests (at most one attempt past the oldest one's, and never past a member's caller deadline). A resend
+  goes out only if it can start before that deadline. On the leader an attempt goes straight to the local Raft
   server. Elsewhere it is an independent blocking call on a virtual thread, through the Ratis client's RPC layer,
   to the leader that the node's own Raft server knows. Ratis' ordered async stream closes for good after one
   exhausted request, so it is not used. Every attempt of a batch is the same Ratis invocation (client id and call
@@ -124,7 +125,8 @@ and the `LogEntry`.
   applied".
 - **Caller deadlines.** When the caller's request-context timeout ends before the node's request timeout, a
   write is resent only until the caller's deadline, less a margin of 20 ms (at most a tenth of the timeout). A
-  write still queued at that point, or whose caller cancelled it before it was sent, is never sent. It fails with
+  write still queued at that point, or whose caller cancelled it before it was sent, is never sent; nor is one
+  with less than 100 ms left (at most a quarter of the caller's timeout), which would get one hurried attempt. It fails with
   `READ_DEADLINE_EXCEEDED` and a message that says it was not applied, as on a single node, where a command that
   waited past its deadline fails without running. A write already sent cannot be withdrawn. The synchronous API,
   which `GrpcServer` uses for writes, returns at the caller's deadline with `READ_DEADLINE_EXCEEDED` and "outcome

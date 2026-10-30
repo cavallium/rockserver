@@ -53,9 +53,13 @@ final class RaftSettings {
 		// queue fails writes with ResourceUnavailable instead of letting them join the next group commit.
 		RaftServerConfigKeys.Write.setElementLimit(properties, 65536);
 		RaftServerConfigKeys.Write.setByteLimit(properties, SizeInBytes.valueOf(64L * MAX_ENTRY_BYTES));
-		// Every resend carries a new call id and Rockserver deduplicates requests itself (see Request), so the Ratis
-		// retry cache only holds replies nobody asks for again: keep them briefly instead of 60s.
-		RaftServerConfigKeys.RetryCache.setExpiryTime(properties, TimeDuration.valueOf(5, TimeUnit.SECONDS));
+		// Every attempt at one proposer batch is the same Ratis invocation (see Proposer), so the retry cache answers a
+		// resend while the first copy is still pending instead of appending it again. Keep replies for longer than a
+		// batch can be resent (request timeout plus an attempt), but not the default 60 s: Rockserver deduplicates
+		// requests itself (see Request), so the cache only saves log space.
+		RaftServerConfigKeys.RetryCache.setExpiryTime(properties, TimeDuration.valueOf(
+				Math.max(20_000, config.requestTimeout().toMillis() + 2 * config.electionTimeoutMax().toMillis() + 5_000),
+				TimeUnit.MILLISECONDS));
 		GrpcConfigKeys.setMessageSizeMax(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (2 << 20)));
 		// AppendEntries calls in flight to each follower (default 8). A follower fsyncs once per call it processes, so
 		// with many calls of one entry each its fsync rate caps the commit rate; with fewer calls in flight, the next
