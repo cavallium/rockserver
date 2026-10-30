@@ -39,7 +39,7 @@ final class RaftSettings {
 		// Commit metadata entries only speed up restarts; without them every log entry is a data or
 		// configuration entry, which keeps the applied-index bookkeeping simple.
 		RaftServerConfigKeys.Log.setLogMetadataEnabled(properties, false);
-		RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf("64MB"));
+		RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf(config.logSegmentBytes()));
 		// The corruption policy stays the default, EXCEPTION. WARN_AND_RETURN would let a node start after a power loss
 		// tore the unsynced tail of its open segment, but in Ratis 3.3.1 it applies to closed segments too, which it
 		// truncates: committed, acknowledged entries could disappear. A torn open segment is repaired offline instead,

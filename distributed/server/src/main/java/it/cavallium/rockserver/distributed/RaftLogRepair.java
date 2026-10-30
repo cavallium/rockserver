@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.OverlappingFileLockException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -33,17 +34,37 @@ import org.jetbrains.annotations.Nullable;
  *
  * <p>A write torn in the middle of an entry therefore leaves a size followed by zeros, which fails the checksum, and
  * with the default corruption policy the node does not start. (An entry cut by the end of the file, instead, Ratis
- * drops by itself.) An entry can only be torn if its fsync never finished, so this node never acknowledged it and may
- * lose it: if the entry was committed, the leader sends it again. Should the storage have lost an entry after its fsync
- * instead, the leader remembers the acknowledgement and keeps sending from past the end of this node's log, so the node
- * never catches up under that leader: nothing is lost by the repair, and the node shows that it must be replaced.</p>
+ * drops by itself.) A torn entry had no finished fsync, so this node never acknowledged it and may lose it: if the
+ * entry was committed, a majority without this node has it, and the leader sends it again.</p>
  *
- * <p>The rule is deliberately narrow. The first invalid entry of the open segment is dropped only if every byte after
- * the place where that entry says it ends is zero: a torn last write followed by preallocated zeros, and nothing else.
- * Anything else is refused, because it is not a torn write and could be the loss of durable data: non-zero bytes after
- * the invalid entry (even if they are valid entries of the same group commit, since they cannot be told from later
- * data), a valid checksum over bytes that do not parse, a size that no valid entry has, entries out of order, or any
- * problem in a closed segment, which can hold committed entries. Such a node must be replaced.</p>
+ * <p><b>That is an assumption, and all the safety of the repair rests on it.</b> The bytes cannot prove it. The repair
+ * removes this node's copy from whatever quorum counted it, so if the entry had been fsynced and acknowledged after all
+ * (storage that lies about fsync, or damage that passes the checks below), a committed entry has one copy less. With
+ * three nodes it may be left on the leader alone. If that leader then fails, or forgets the acknowledgement in the same
+ * power cut, the other two can elect a leader without the entry, and an acknowledged write is gone with no error
+ * anywhere. A node that never catches up behind a leader remembering the acknowledgement would give the loss away, but
+ * only while that leader lives, so a node that does catch up proves nothing. The tool states the assumption whenever it
+ * drops something.</p>
+ *
+ * <p>The rule is deliberately narrow. The first invalid entry of the open segment is dropped only if all of this holds,
+ * so that it looks like a torn last write followed by preallocated zeros:</p>
+ * <ul>
+ *   <li>every byte after the place where that entry says it ends is zero;</li>
+ *   <li>the end of the file cuts it, or one of its sectors ({@value #SECTOR_BYTES} bytes, aligned to the offset in the
+ *       file) is all zeros. Ratis' {@code BufferedWriteChannel} flushes only between whole entries and a device loses
+ *       whole sectors, so a torn entry misses at least one. A complete entry that fails its checksum is damaged
+ *       media. This tells the two apart unless the payload itself holds a sector of zeros, or damage inflated the size
+ *       of the last entry over the zeros after it;</li>
+ *   <li>no frame with a valid checksum starts within the bytes it claims: a size inflated by corruption would hide
+ *       whole entries behind it.</li>
+ * </ul>
+ *
+ * <p>Anything else is refused, because it is not a torn write and could be the loss of durable data: non-zero bytes
+ * after the invalid entry (even if they are valid entries of the same group commit, since they cannot be told from
+ * later data), a valid checksum over bytes that do not parse, a size that no valid entry has, entries out of order,
+ * segments that do not follow each other, or any problem in a closed segment, which can hold committed entries. Such a
+ * node must be replaced, which takes a leader. Without one, see "No quorum" in the design document: there is no
+ * override, because a node that this rule refuses could hold the only copy of an acknowledged write.</p>
  *
  * <p>The segment is read twice. {@link LogSegment#readSegmentFile} is what the node will do at its next start and
  * decides which entries are valid, but it says neither where they end nor what follows them, which {@link #scan}
@@ -64,6 +85,18 @@ final class RaftLogRepair {
 	private static final Pattern CLOSED_SEGMENT = Pattern.compile("log_(\\d+)-(\\d+)");
 	private static final Pattern OPEN_SEGMENT = Pattern.compile("log_inprogress_(\\d+)(?:\\..*)?");
 	private static final int CHECKSUM_BYTES = Integer.BYTES;
+	/** The unit a device writes whole. A device with larger sectors loses a multiple of it. */
+	private static final int SECTOR_BYTES = 512;
+	/**
+	 * What every {@code LogEntryProto} starts with: the tag of its first field, the term, which no entry has as 0. It
+	 * keeps {@link #validFrameIn} from computing a checksum of megabytes at each of millions of offsets.
+	 */
+	private static final byte ENTRY_FIRST_BYTE = 0x08;
+	private static final int MAX_VARINT32_SHIFT = 28;
+	private static final String ASSUMPTION = "This is safe only if that entry was never fsynced, so that this node never"
+			+ " acknowledged it, which nothing in the file can prove. It removes this node's copy from any quorum that"
+			+ " counted it: if the storage lost an fsynced entry, an acknowledged write has one copy less, and catching up"
+			+ " afterwards does not show that it survived.";
 
 	/** How a run ended. */
 	enum Outcome {
@@ -95,9 +128,10 @@ final class RaftLogRepair {
 	 * @param reason why it cannot be used
 	 * @param end where its bytes end according to its own size, capped to the end of the file; -1 if it did not leave
 	 *            a size that a torn write of a valid entry could have left, so that this cannot be a torn write
+	 * @param cut the end of the file comes before the end of the entry, so that its checksum cannot be checked
 	 * @param toleratedByRatis Ratis reads the segment as if it ended at {@code offset} instead of failing
 	 */
-	record InvalidEntry(long offset, String reason, long end, boolean toleratedByRatis) {}
+	record InvalidEntry(long offset, String reason, long end, boolean cut, boolean toleratedByRatis) {}
 
 	/**
 	 * A segment read from its bytes.
@@ -144,23 +178,36 @@ final class RaftLogRepair {
 		}
 		var lockFile = groupDir.resolve(LOCK_FILE);
 		// Ratis deletes its lock file when it stops, unless it was killed. A dry run leaves no trace.
-		boolean ownsLockFile = !Files.exists(lockFile);
-		if (ownsLockFile && dryRun) {
+		if (dryRun && !Files.exists(lockFile)) {
 			return inspect(currentDir, true, lines);
 		}
-		try (var lockChannel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+		boolean createdLockFile = createIfMissing(lockFile);
+		try (var lockChannel = FileChannel.open(lockFile, StandardOpenOption.WRITE)) {
 			try (var lock = lockChannel.tryLock()) {
 				if (lock == null) {
 					return nodeRunning(lockFile, lines);
 				}
-				return inspect(currentDir, dryRun, lines);
+				try {
+					return inspect(currentDir, dryRun, lines);
+				} finally {
+					// While holding the lock: a node that opened this file meanwhile fails to get it.
+					if (createdLockFile) {
+						Files.deleteIfExists(lockFile);
+					}
+				}
 			} catch (OverlappingFileLockException e) {
 				return nodeRunning(lockFile, lines);
 			}
-		} finally {
-			if (ownsLockFile) {
-				Files.deleteIfExists(lockFile);
-			}
+		}
+	}
+
+	/** Atomic, so that a lock file created by a node that is just starting is never taken for this process' own. */
+	private static boolean createIfMissing(Path file) throws IOException {
+		try {
+			Files.createFile(file);
+			return true;
+		} catch (FileAlreadyExistsException e) {
+			return false;
 		}
 	}
 
@@ -176,6 +223,16 @@ final class RaftLogRepair {
 		if (open.size() > 1) {
 			lines.add("REFUSED: " + open.size() + " open segments (" + names(open) + "). Ratis keeps one at most: "
 					+ "this is not the result of a torn write. " + replaceTheNode());
+			return new Report(Outcome.REFUSED, lines);
+		}
+		if (!open.isEmpty() && !open.getFirst().equals(segments.getLast())) {
+			lines.add("REFUSED: open segment " + open.getFirst().name() + " is not the last segment. " + replaceTheNode());
+			return new Report(Outcome.REFUSED, lines);
+		}
+		var discontinuity = discontinuity(segments);
+		if (discontinuity != null) {
+			lines.add("REFUSED: " + discontinuity + ". Ratis does not load such a log, and a torn write does not leave one. "
+					+ replaceTheNode());
 			return new Report(Outcome.REFUSED, lines);
 		}
 		for (var segment : segments) {
@@ -194,11 +251,24 @@ final class RaftLogRepair {
 			return new Report(Outcome.OK, lines);
 		}
 		var last = open.getFirst();
-		if (!last.equals(segments.getLast())) {
-			lines.add("REFUSED: open segment " + last.name() + " is not the last segment. " + replaceTheNode());
-			return new Report(Outcome.REFUSED, lines);
-		}
 		return inspectOpenSegment(last, dryRun, lines);
+	}
+
+	/**
+	 * Where a segment does not start right after the one before it, null if they all do. The first one can start
+	 * anywhere, since purging removes segments from the start, and only the last one can be open.
+	 */
+	private static @Nullable String discontinuity(List<Segment> segments) {
+		for (int i = 1; i < segments.size(); i++) {
+			var previous = segments.get(i - 1);
+			var segment = segments.get(i);
+			long expected = previous.end() + 1;
+			if (segment.start() != expected) {
+				return (segment.start() > expected ? "gap" : "overlap") + " between segments " + previous.name() + " and "
+						+ segment.name() + ": the second one should start at index " + expected;
+			}
+		}
+		return null;
 	}
 
 	private static Report inspectOpenSegment(Segment segment, boolean dryRun, List<String> lines) throws IOException {
@@ -209,7 +279,8 @@ final class RaftLogRepair {
 			return new Report(Outcome.REFUSED, lines);
 		}
 		var bytes = Files.readAllBytes(segment.path());
-		var scan = scan(bytes, RaftSettings.LOG_ENTRY_SIZE_MAX.getSizeInt());
+		int maxEntrySize = RaftSettings.LOG_ENTRY_SIZE_MAX.getSizeInt();
+		var scan = scan(bytes, maxEntrySize);
 		var ratis = readWithRatis(segment);
 		lines.add("Open segment " + segment.name() + ": " + bytes.length + " bytes, " + scan.entries() + " valid entries"
 				+ (scan.entries() > 0 ? " (indexes " + scan.firstIndex() + " to " + scan.lastIndex() + ")" : "")
@@ -230,7 +301,7 @@ final class RaftLogRepair {
 			return new Report(Outcome.OK, lines);
 		}
 		lines.add("Invalid entry at offset " + invalid.offset() + ": " + invalid.reason());
-		var notTorn = notATornWrite(invalid, bytes);
+		var notTorn = notATornWrite(invalid, bytes, maxEntrySize);
 		if (notTorn != null) {
 			lines.add("REFUSED: " + notTorn + ". This is not a torn last write, and dropping it could lose entries "
 					+ "this node reported as durable. " + replaceTheNode());
@@ -238,9 +309,11 @@ final class RaftLogRepair {
 		}
 		long expectedIndex = scan.entries() > 0 ? scan.lastIndex() + 1 : segment.start();
 		var dropped = "the torn entry expected to have index " + expectedIndex + " at offset " + invalid.offset() + ", and "
-				+ (bytes.length - invalid.offset()) + " bytes from there to the end of the file";
+				+ (bytes.length - invalid.offset()) + " bytes from there to the end of the file, "
+				+ nonZeroBytes(bytes, (int) invalid.offset()) + " of them not zero";
 		if (dryRun) {
 			lines.add("WOULD REPAIR (dry run, nothing changed): would drop " + dropped);
+			lines.add(ASSUMPTION);
 			return new Report(Outcome.WOULD_REPAIR, lines);
 		}
 		try (var channel = FileChannel.open(segment.path(), StandardOpenOption.WRITE)) {
@@ -253,17 +326,85 @@ final class RaftLogRepair {
 					+ after.entries() + " entries instead of " + scan.entries(), after.failure());
 		}
 		lines.add("REPAIRED: dropped " + dropped);
+		lines.add(ASSUMPTION);
 		return new Report(Outcome.REPAIRED, lines);
 	}
 
 	/** Why the entry is not a torn last write, null if it is one. */
-	private static @Nullable String notATornWrite(InvalidEntry invalid, byte[] bytes) {
+	private static @Nullable String notATornWrite(InvalidEntry invalid, byte[] bytes, int maxEntrySize) {
 		if (invalid.end() < 0) {
 			return "the entry has no size that a torn write could leave";
 		}
 		int end = (int) invalid.end();
 		int nonZero = SegmentedRaftLogFormat.indexOfNonTerminator(bytes, end, bytes.length - end);
-		return nonZero < 0 ? null : "non-zero data at offset " + (end + nonZero) + ", after the end of the invalid entry";
+		if (nonZero >= 0) {
+			return "non-zero data at offset " + (end + nonZero) + ", after the end of the invalid entry";
+		}
+		if (!invalid.cut() && !hasZeroSector(invalid, bytes)) {
+			return "the entry is complete on disk and damaged: the file does not cut it and no sector of it is all zeros, "
+					+ "while a torn write misses at least one";
+		}
+		int frame = validFrameIn(invalid, bytes, maxEntrySize);
+		return frame < 0 ? null : "a frame with a valid checksum at offset " + frame + ", inside the invalid entry";
+	}
+
+	/**
+	 * Whether a sector that holds bytes of the entry is all zeros. The one it starts in holds its first byte, which is
+	 * not zero. The last one can go past the end of the entry, where everything is known to be zero already.
+	 */
+	private static boolean hasZeroSector(InvalidEntry invalid, byte[] bytes) {
+		long firstSector = (invalid.offset() / SECTOR_BYTES + 1) * SECTOR_BYTES;
+		for (long sector = firstSector; sector < invalid.end(); sector += SECTOR_BYTES) {
+			int length = (int) Math.min(SECTOR_BYTES, bytes.length - sector);
+			if (SegmentedRaftLogFormat.indexOfNonTerminator(bytes, (int) sector, length) < 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Where the first entry with a valid checksum starts inside the invalid entry, -1 if none does. */
+	private static int validFrameIn(InvalidEntry invalid, byte[] bytes, int maxEntrySize) {
+		var checksum = new PureJavaCrc32C();
+		for (int start = (int) invalid.offset() + 1; start < invalid.end(); start++) {
+			if (isValidFrame(bytes, start, maxEntrySize, checksum)) {
+				return start;
+			}
+		}
+		return -1;
+	}
+
+	private static boolean isValidFrame(byte[] bytes, int start, int maxEntrySize, PureJavaCrc32C checksum) {
+		int protoStart = start;
+		int protoSize = 0;
+		for (int shift = 0; ; shift += Byte.SIZE - 1) {
+			if (protoStart == bytes.length || shift > MAX_VARINT32_SHIFT) {
+				return false;
+			}
+			byte next = bytes[protoStart++];
+			protoSize |= (next & 0x7F) << shift;
+			if (next >= 0) {
+				break;
+			}
+		}
+		if (protoSize <= 0 || protoSize > maxEntrySize || protoStart + (long) protoSize + CHECKSUM_BYTES > bytes.length
+				|| bytes[protoStart] != ENTRY_FIRST_BYTE) {
+			return false;
+		}
+		int checksumStart = protoStart + protoSize;
+		checksum.reset();
+		checksum.update(bytes, start, checksumStart - start);
+		return (int) checksum.getValue() == ByteBuffer.wrap(bytes, checksumStart, CHECKSUM_BYTES).getInt();
+	}
+
+	private static long nonZeroBytes(byte[] bytes, int from) {
+		long count = 0;
+		for (int i = from; i < bytes.length; i++) {
+			if (bytes[i] != 0) {
+				count++;
+			}
+		}
+		return count;
 	}
 
 	/** Why the two readings of an open segment differ, null if they do not. */
@@ -326,7 +467,7 @@ final class RaftLogRepair {
 			if (SegmentedRaftLogFormat.isTerminator(bytes, matched, bytes.length - matched)) {
 				return new Scan(0, -1, -1, 0, null);
 			}
-			return new Scan(0, -1, -1, 0, new InvalidEntry(0, "bad segment header", -1,
+			return new Scan(0, -1, -1, 0, new InvalidEntry(0, "bad segment header", -1, false,
 					SegmentedRaftLogFormat.isTerminator(bytes, matched, headerRead - matched)));
 		}
 		var scan = new ScanState(bytes, maxEntrySize, headerLength);
@@ -366,7 +507,7 @@ final class RaftLogRepair {
 					return null;
 				}
 				return new InvalidEntry(position, "a zero byte ends the log here, but offset " + (position + nonZero)
-						+ " is not zero", -1, false);
+						+ " is not zero", -1, false, false);
 			}
 			var in = new ByteArrayInputStream(bytes, position + 1, bytes.length - position - 1);
 			int protoSize;
@@ -374,17 +515,17 @@ final class RaftLogRepair {
 				protoSize = CodedInputStream.readRawVarint32(bytes[position], in);
 			} catch (IOException e) {
 				boolean cut = in.available() == 0;
-				return new InvalidEntry(position, "bad entry size: " + e.getMessage(), cut ? bytes.length : -1, false);
+				return new InvalidEntry(position, "bad entry size: " + e.getMessage(), cut ? bytes.length : -1, cut, false);
 			}
 			long framed = (long) CodedOutputStream.computeUInt32SizeNoTag(protoSize) + protoSize;
 			if (protoSize < 0 || framed + CHECKSUM_BYTES > maxEntrySize) {
 				return new InvalidEntry(position, "entry size " + protoSize + " exceeds the limit of " + maxEntrySize, -1,
-						false);
+						false, false);
 			}
 			long end = position + framed + CHECKSUM_BYTES;
 			if (end > bytes.length) {
 				return new InvalidEntry(position, "the entry needs " + (end - position) + " bytes, but the file ends after "
-						+ (bytes.length - position), bytes.length, true);
+						+ (bytes.length - position), bytes.length, true, true);
 			}
 			int checksumStart = (int) (position + framed);
 			checksum.reset();
@@ -392,16 +533,17 @@ final class RaftLogRepair {
 			int computed = (int) checksum.getValue();
 			int stored = ByteBuffer.wrap(bytes, checksumStart, CHECKSUM_BYTES).getInt();
 			if (computed != stored) {
-				return new InvalidEntry(position, String.format("checksum %08X, computed %08X", stored, computed), end, false);
+				return new InvalidEntry(position, String.format("checksum %08X, computed %08X", stored, computed), end, false,
+						false);
 			}
 			LogEntryProto entry;
 			try {
 				entry = LogEntryProto.parseFrom(CodedInputStream.newInstance(bytes, checksumStart - protoSize, protoSize));
 			} catch (IOException e) {
-				return new InvalidEntry(position, "valid checksum over an entry that does not parse: " + e, -1, false);
+				return new InvalidEntry(position, "valid checksum over an entry that does not parse: " + e, -1, false, false);
 			}
 			if (lastIndex != -1 && entry.getIndex() != lastIndex + 1) {
-				return new InvalidEntry(position, "index " + entry.getIndex() + " after index " + lastIndex, -1, false);
+				return new InvalidEntry(position, "index " + entry.getIndex() + " after index " + lastIndex, -1, false, false);
 			}
 			if (firstIndex == -1) {
 				firstIndex = entry.getIndex();
@@ -439,6 +581,7 @@ final class RaftLogRepair {
 	}
 
 	private static String replaceTheNode() {
-		return "Nothing was changed: replace the node under a new id (see \"Replacing a node\" in the design document)";
+		return "Nothing was changed: replace the node under a new id (see \"Replacing a node\" in the design document, "
+				+ "and \"No quorum\" there if too few nodes are left to elect a leader)";
 	}
 }

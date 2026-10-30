@@ -239,11 +239,24 @@ opened, before any entry is applied, and no other column is ever created locally
   zeros) reads back as a corrupt entry, and the default corruption policy keeps the node from starting.
   `WARN_AND_RETURN` would drop the tail, but in Ratis 3.3.1 it also truncates closed segments, which can hold
   committed entries. Instead, `ReplicatedServerMain repair-log --data-dir DIR [--dry-run]`, run on the stopped
-  node, truncates the open segment at the first invalid entry, and only if every byte after the end that entry
-  declares is zero: a torn last write, whose fsync never finished, so the node never acknowledged it. It refuses
-  and changes nothing (exit code 1) if non-zero data follows that entry, or if the problem is anything else or in
-  a closed segment: replace such a node. A repaired node that never catches up under the current leader lost an
-  entry it had acknowledged, so its storage does not keep fsynced data: replace it too.
+  node, truncates the open segment at the first invalid entry. It does so only if that entry looks like a torn
+  last write: every byte after the end it declares is zero; the end of the file cuts it, or one of its 512-byte
+  sectors (aligned in the file) is all zeros, since a torn write misses at least one whole sector and a complete
+  entry that fails its checksum is damaged media; and no frame with a valid checksum starts inside it. It checks
+  every closed segment and that each segment starts right after the one before it, before it changes anything. It
+  refuses and changes nothing (exit code 1) otherwise: replace such a node, or see "No quorum" under Membership
+  if no leader is left to do that.
+
+  The repair's safety rests on one assumption, which the bytes cannot prove and which its output states: the
+  dropped entry was never fsynced, so this node never acknowledged it. The repair removes this node's copy from
+  whatever quorum counted it. If the storage lost an entry it had reported as synced, or damage passed the checks
+  (a payload that holds a zero sector, or the size of the last entry inflated over the zeros after it), a committed
+  entry has one copy less. With three nodes it can be left on the leader alone, and if that leader then fails, or
+  loses its memory of the acknowledgement in the same power cut, the other two can elect a leader without it: an
+  acknowledged write is gone, with no error. A repaired node stuck behind a leader that remembers its match index
+  shows this fault, but only while that leader lives, so a node that catches up proves nothing. Without the repair
+  such a node stays down and the cluster stalls instead. So keep the Raft log on storage that keeps fsynced data,
+  and repair only after a power loss.
 - **RocksDB.** Replicas open it with `atomic-flush` (every column flushed together) and point-in-time WAL
   recovery (`absolute-consistency` forced off). After a crash or power loss the database is the last flushed
   state, a consistent point where the applied position matches the data, and Raft replays the rest: the log
@@ -403,6 +416,25 @@ against an incomplete history.
   list plus or minus one peer, so `--peer` must list every current member, or the ones left out are removed.
   New members catch up from a snapshot. A node that lost its Raft state but kept its id refuses to start,
   because it could vote twice in one term. Replace it under a new id.
+- **No quorum.** Replacing a node takes a leader (`setConfiguration`), so it does not help when too few nodes
+  can start: two of three after a shared power cut, for example, each with a hole in a group commit followed by
+  later data, which `repair-log` refuses. Writes through a volatile device cache can complete out of order within
+  one fdatasync, so this can happen under load. There is no override, on purpose: a log that `repair-log` refuses
+  may hold the only copy of an acknowledged write, and forcing it could elect a leader without that write and hide
+  the loss. Meanwhile the cluster stays down and loses nothing. What exists:
+  1. Stop every node and copy every data directory before anything else.
+  2. Run `repair-log --dry-run` on every node, repair the ones it accepts and start every node that can start. Any
+     majority of the members elects a leader, repaired or not, and the refused nodes can then be replaced as above.
+     A refused node stays a member until then, so it still counts in the size of the majority.
+  3. Otherwise, restore a copy of the whole cluster: every node's complete data directory, from one moment, under
+     the same ids. The writes since then are lost. Restoring only some nodes from an older copy is the fault this
+     section is about, losing fsynced entries and votes. Nothing takes such copies today: they have to come from the
+     storage layer (see "Left before a first deployment").
+  4. Without a copy, each replica's `data/db` still holds its last flushed state, which a plain Rockserver can open.
+     It cannot seed a new cluster as it is, since it belongs to the old cluster and a node without Raft state refuses
+     it, so its keys would have to be exported into a new database that seeds one ("Migrating from a single node").
+     What the replica had not flushed, and all that only a Raft log holds, is lost: no tool reads it out. No tool or
+     test covers this way, which is a last resort.
 - **Graceful stop.** On SIGTERM a leader hands leadership to the most up-to-date live follower before
   stopping. A deploy restart costs a few hundred milliseconds without writes (see the tests).
 
@@ -462,7 +494,7 @@ failover" below).
 | `MembershipTest` | A node replaced through `add-peer`/`remove-peer` catches up from a snapshot. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories are linearizable, and the transactional bank-transfer invariant holds. |
-| `RaftLogRepairTest` | Segments written by Ratis' own output stream: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged, also a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. |
+| `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
 | Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. |
 
 Run them all (about 10 minutes):
@@ -509,6 +541,8 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
      transactional writes, opens, rollbacks and ranges only on the leader, with their local database time only.
    - A seeding runbook (copy the single-node database to all nodes before the first start).
    - A node replacement runbook.
+   - Consistent copies of the whole cluster, and a runbook to restore them: with no quorum (see Membership) they
+     are the only way back that keeps a cluster.
    - Placement on separate hosts, each node's data directory on one file system (see Disk layout).
    - The same Rockserver config file on every node.
 7. **Known limits to decide on.**
