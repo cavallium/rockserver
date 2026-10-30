@@ -2580,6 +2580,39 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	/**
+	 * Marks the current state of an open transaction: {@link #rollbackToSavePoint} undoes the writes made after it.
+	 * For a caller that owns the transaction and does not share it between threads.
+	 */
+	public void setSavePoint(long transactionId) {
+		var tx = txs.get(transactionId);
+		if (tx == null) {
+			throw RocksDBException.of(RocksDBErrorType.TX_NOT_FOUND, "Transaction not found: " + transactionId);
+		}
+		synchronized (tx) {
+			try {
+				tx.val().setSavePoint();
+			} catch (org.rocksdb.RocksDBException e) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+			}
+		}
+	}
+
+	/** Undoes the writes made to an open transaction since its latest {@link #setSavePoint}, and forgets it. */
+	public void rollbackToSavePoint(long transactionId) {
+		var tx = txs.get(transactionId);
+		if (tx == null) {
+			throw RocksDBException.of(RocksDBErrorType.TX_NOT_FOUND, "Transaction not found: " + transactionId);
+		}
+		synchronized (tx) {
+			try {
+				tx.val().rollbackToSavePoint();
+			} catch (org.rocksdb.RocksDBException e) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+			}
+		}
+	}
+
 	@Contract("_, false, _ -> true; _, true, _ -> _")
 	public boolean closeTransaction(long transactionId,
 			boolean commit,

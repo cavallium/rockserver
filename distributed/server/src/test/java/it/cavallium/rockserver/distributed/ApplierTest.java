@@ -316,6 +316,93 @@ class ApplierTest {
 	}
 
 	@Test
+	void aGroupAppliesEntriesTogetherAndCopiesInItGetTheFirstResult() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			var first = new Request(8, 0, 0, new LogEntry.Merge(column, key(1), text("x"), RequestTypeId.MERGED));
+			applier.beginGroup();
+			var r1 = applier.applyBatch(List.of(first,
+					new Request(8, 1, 0, new LogEntry.Put(column, key(2), text("a"), RequestTypeId.NOTHING)),
+					// A copy in the same entry.
+					first), TermIndex.valueOf(1, 1));
+			// A copy in a later entry of the same group: its record is not committed yet.
+			var r2 = applier.applyBatch(List.of(first,
+					new Request(8, 2, 0, new LogEntry.Merge(column, key(1), text("y"), RequestTypeId.MERGED))),
+					TermIndex.valueOf(1, 2));
+			applier.markApplied(TermIndex.valueOf(1, 3));
+			// Nothing is visible before the group commits.
+			assertNull(value(store, column, 2));
+			assertEquals(TermIndex.INITIAL_VALUE, store.applied());
+			applier.endGroup();
+			assertEquals("x", ((Buf) ((ApplyResult.Ok) r1.get(0)).value()).toString(StandardCharsets.UTF_8));
+			assertEquals(r1.get(0), r1.get(2));
+			assertEquals(r1.get(0), r2.get(0));
+			assertEquals("x,y", ((Buf) ((ApplyResult.Ok) r2.get(1)).value()).toString(StandardCharsets.UTF_8));
+			assertEquals("x,y", value(store, column, 1));
+			assertEquals("a", value(store, column, 2));
+			assertEquals(TermIndex.valueOf(1, 3), store.applied());
+		}
+	}
+
+	@Test
+	void aRejectionInAGroupCommitsTheEntriesBeforeItAndUndoesOnlyItsOwnWrites() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			applier.beginGroup();
+			applier.applyBatch(List.of(new Request(9, 0, 0, new LogEntry.Put(column, key(1), text("a"),
+					RequestTypeId.NOTHING))), TermIndex.valueOf(1, 1));
+			var results = applier.applyBatch(List.of(
+					new Request(9, 1, 0, new LogEntry.Put(column, key(2), text("b"), RequestTypeId.NOTHING)),
+					new Request(9, 2, 0, new LogEntry.PutMulti(column, List.of(key(3), new Keys(text("bad"))),
+							List.of(text("c"), text("c")), RequestTypeId.NOTHING))), TermIndex.valueOf(1, 2));
+			applier.applyBatch(List.of(new Request(9, 3, 0, new LogEntry.Put(column, key(4), text("d"),
+					RequestTypeId.NOTHING))), TermIndex.valueOf(1, 3));
+			applier.endGroup();
+			assertInstanceOf(ApplyResult.Ok.class, results.get(0));
+			assertInstanceOf(ApplyResult.Failed.class, results.get(1));
+			assertEquals("a", value(store, column, 1));
+			assertEquals("b", value(store, column, 2));
+			assertNull(value(store, column, 3));
+			assertEquals("d", value(store, column, 4));
+			assertEquals(TermIndex.valueOf(1, 3), store.applied());
+			assertInstanceOf(ApplyResult.Failed.class, applier.recordedResult(new Request(9, 2, 0,
+					new LogEntry.Genesis("x", false))));
+		}
+	}
+
+	@Test
+	void aCrashLosesAnUncommittedGroupWhole() throws Exception {
+		long column;
+		try (var store = open()) {
+			column = store.db().createColumn("c", SCHEMA);
+			var applier = new Applier(store);
+			applier.beginGroup();
+			for (int i = 1; i <= 5; i++) {
+				applier.applyBatch(List.of(new Request(10, i, i, new LogEntry.Put(column, key(i), text("v" + i),
+						RequestTypeId.NOTHING))), TermIndex.valueOf(1, i));
+			}
+			applier.endGroup();
+			store.db().flush();
+		}
+		var crashed = open();
+		var applier = new Applier(crashed);
+		applier.beginGroup();
+		for (int i = 6; i <= 10; i++) {
+			applier.applyBatch(List.of(new Request(10, i, i, new LogEntry.Put(column, key(i), text("v" + i),
+					RequestTypeId.NOTHING))), TermIndex.valueOf(1, i));
+		}
+		applier.abortGroup();
+		crashed.connection().close();
+		try (var store = open()) {
+			assertEquals(TermIndex.valueOf(1, 5), store.applied());
+			assertEquals("v5", value(store, column, 5));
+			assertNull(value(store, column, 6));
+		}
+	}
+
+	@Test
 	void aCrashKeepsAConsistentPrefixOfUnloggedApplies() throws Exception {
 		long column;
 		try (var store = open()) {

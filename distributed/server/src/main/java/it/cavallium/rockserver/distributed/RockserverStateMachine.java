@@ -4,6 +4,7 @@ import java.io.IOException;
 import it.unimi.dsi.fastutil.ints.IntList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.function.Consumer;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import org.apache.ratis.protocol.Message;
@@ -114,6 +115,29 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private volatile @Nullable LeaderSession leaderSession;
 	private volatile boolean failed;
 
+	/** Entries waiting for the apply thread, in log order; see {@link #applyTransaction}. */
+	private final LinkedBlockingQueue<Applying> applyQueue = new LinkedBlockingQueue<>();
+	private final Thread applyThread;
+	/** At most this many entries, and about this many bytes of entries, are applied in one local transaction. */
+	private static final int MAX_GROUP_ENTRIES = 256;
+	private static final long MAX_GROUP_BYTES = 16L << 20;
+
+	/** Work for the apply thread. */
+	private sealed interface Applying {}
+
+	/** A data entry to apply; {@code reply} completes once it is committed. */
+	private record ApplyEntry(TermIndex position, List<Request> requests, @Nullable Proposal proposal, long bytes,
+			CompletableFuture<Message> reply) implements Applying {}
+
+	/** A position without data (configuration entries, leader no-ops) to record. */
+	private record MarkPosition(TermIndex position) implements Applying {}
+
+	/** Completes {@code done} once everything queued before it is applied. */
+	private record Drain(CompletableFuture<Void> done) implements Applying {}
+
+	/** Stops the apply thread. */
+	private record Stop() implements Applying {}
+
 	RockserverStateMachine(NodeConfig config, Consumer<Throwable> onReplicaFailure, NodeMetrics metrics) {
 		this.config = config;
 		this.metrics = metrics;
@@ -136,7 +160,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 			return session == null ? -1 : session.lockedKeys();
 		});
 		metrics.gauge("heapUsedMiB", () -> (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) >> 20);
+		this.applyGroupEntries = metrics.amount("apply.groupEntries");
+		this.applyThread = Thread.ofPlatform().name(config.nodeId() + "-apply").daemon().unstarted(this::applyLoop);
+		applyThread.start();
 	}
+
+	private final NodeMetrics.Series applyGroupEntries;
 
 	private final NodeMetrics.Series snapshotTime;
 	private final NodeMetrics metrics;
@@ -319,6 +348,13 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return trx;
 	}
 
+	/**
+	 * Hands the entry to the apply thread and returns at once: Ratis goes on with the next committed entries, and
+	 * the apply thread applies everything that queued up meanwhile in one local transaction (see
+	 * {@link Applier#beginGroup}). Ratis waits for the returned futures before it takes a snapshot, and replies to a
+	 * client, or counts the entry applied, only once its future completes, after the commit. Decoding happens here,
+	 * on Ratis' thread, off the apply thread.
+	 */
 	@Override
 	public CompletableFuture<Message> applyTransaction(TransactionContext trx) {
 		var logEntry = trx.getLogEntry();
@@ -326,59 +362,184 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (failed) {
 			return CompletableFuture.failedFuture(new IllegalStateException("Replica failed"));
 		}
-		List<ApplyResult> results;
+		var proposal = trx.getStateMachineContext() instanceof Proposal p ? p : null;
+		var data = logEntry.getStateMachineLogEntry().getLogData();
+		List<Request> requests;
 		try {
-			var proposal = trx.getStateMachineContext() instanceof Proposal p ? p : null;
-			var requests = proposal != null ? proposal.requests
-					: LogEntryCodec.decodeBatch(logEntry.getStateMachineLogEntry().getLogData().toByteArray());
-			if (position.getIndex() <= applied.get()) {
-				// Already applied before a restart: the database holds its effects and, unless its proposer already
-				// reported it complete, its result.
-				var recordedResults = new java.util.ArrayList<ApplyResult>(requests.size());
-				for (var request : requests) {
-					var recorded = applier.recordedResult(request);
-					recordedResults.add(recorded != null ? recorded
-							: new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR, "Result no longer available"));
-				}
-				results = recordedResults;
-			} else {
-				long applyStart = System.nanoTime();
-				if (proposal != null && proposal.appendedNanos != 0) {
-					commitWait.record(applyStart - proposal.appendedNanos);
-				}
-				results = applier.applyBatch(requests, position);
-				applyTime.since(applyStart);
-				applyRequests.record(requests.size());
-				if (proposal != null && proposal.token != null && proposal.session != null) {
-					proposal.session.tracker().resolve(proposal.token, position.getIndex());
-					proposal.session.afterApply();
-				}
-				updateLastAppliedTermIndex(position);
-				applied.advance(position.getIndex());
-			}
+			requests = proposal != null ? proposal.requests : LogEntryCodec.decodeBatch(data.toByteArray());
 		} catch (RuntimeException ex) {
-			return CompletableFuture.failedFuture(fail("apply entry " + position, ex));
+			return CompletableFuture.failedFuture(fail("decode entry " + position, ex));
 		}
-		// The entry is applied: building its reply must not stop the replica, and encodeAll never fails (results that
-		// do not fit become failures, the same on every replica).
-		return CompletableFuture.completedFuture(Message.valueOf(UnsafeByteOperations.unsafeWrap(
-				ResultCodec.encodeAll(results))));
+		var reply = new CompletableFuture<Message>();
+		applyQueue.add(new ApplyEntry(position, requests, proposal, data.size(), reply));
+		return reply;
 	}
 
 	/** Configuration entries and leader no-ops: record the position so restarts resume after them. */
 	@Override
 	public void notifyTermIndexUpdated(long term, long index) {
-		if (failed || index <= applied.get()) {
+		if (!failed) {
+			applyQueue.add(new MarkPosition(TermIndex.valueOf(term, index)));
+		}
+	}
+
+	/** Waits until the apply thread applied everything queued so far. */
+	private void drainApplyQueue() throws IOException {
+		var done = new CompletableFuture<Void>();
+		applyQueue.add(new Drain(done));
+		try {
+			done.get();
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
+			throw new java.io.InterruptedIOException("Interrupted while waiting for the apply thread");
+		} catch (java.util.concurrent.ExecutionException ex) {
+			throw new IOException("The apply thread failed", ex.getCause());
+		}
+	}
+
+	private void applyLoop() {
+		var group = new java.util.ArrayList<Applying>();
+		while (true) {
+			Applying first;
+			try {
+				first = applyQueue.take();
+			} catch (InterruptedException ex) {
+				return;
+			}
+			switch (first) {
+				case Stop _ -> {
+					failQueued(new IllegalStateException("The state machine is closed"));
+					return;
+				}
+				case Drain drain -> {
+					drain.done().complete(null);
+					continue;
+				}
+				default -> {
+				}
+			}
+			group.clear();
+			group.add(first);
+			long bytes = first instanceof ApplyEntry entry ? entry.bytes() : 0;
+			while (group.size() < MAX_GROUP_ENTRIES && bytes < MAX_GROUP_BYTES) {
+				var next = applyQueue.peek();
+				if (!(next instanceof ApplyEntry) && !(next instanceof MarkPosition)) {
+					break;
+				}
+				applyQueue.poll();
+				group.add(next);
+				bytes += next instanceof ApplyEntry entry ? entry.bytes() : 0;
+			}
+			applyGroup(group);
+		}
+	}
+
+	/**
+	 * Applies {@code group} in one local transaction, then, in log order, makes each entry count as applied and
+	 * completes its reply. A failure stops the replica: no entry of the group, nor any queued after it, is answered.
+	 */
+	private void applyGroup(List<Applying> group) {
+		if (failed) {
+			failAll(group, new IllegalStateException("Replica failed"));
 			return;
 		}
-		var position = TermIndex.valueOf(term, index);
+		var completions = new java.util.ArrayList<Runnable>(group.size());
+		long start = System.nanoTime();
+		var applier = this.applier;
+		applier.beginGroup();
 		try {
-			applier.markApplied(position);
-			updateLastAppliedTermIndex(position);
-			applied.advance(index);
+			for (var item : group) {
+				switch (item) {
+					case ApplyEntry entry -> completions.add(applyEntry(applier, entry));
+					case MarkPosition mark -> {
+						var position = mark.position();
+						if (position.getIndex() > applied.get()) {
+							applier.markApplied(position);
+							completions.add(() -> {
+								updateLastAppliedTermIndex(position);
+								applied.advance(position.getIndex());
+							});
+						}
+					}
+					default -> throw new IllegalStateException("Not an entry: " + item);
+				}
+			}
+			applier.endGroup();
 		} catch (RuntimeException ex) {
-			fail("record position " + position, ex);
+			applier.abortGroup();
+			var failure = fail("apply entries up to " + positionOf(group.getLast()), ex);
+			failAll(group, failure);
+			failQueued(failure);
+			return;
 		}
+		applyTime.since(start);
+		applyGroupEntries.record(group.size());
+		for (var completion : completions) {
+			completion.run();
+		}
+	}
+
+	/** Applies one entry into the group; returns what to do once the group is committed. */
+	private Runnable applyEntry(Applier applier, ApplyEntry entry) {
+		var position = entry.position();
+		var requests = entry.requests();
+		var proposal = entry.proposal();
+		if (position.getIndex() <= applied.get()) {
+			// Already applied before a restart: the database holds its effects and, unless its proposer already
+			// reported it complete, its result.
+			var recordedResults = new java.util.ArrayList<ApplyResult>(requests.size());
+			for (var request : requests) {
+				var recorded = applier.recordedResult(request);
+				recordedResults.add(recorded != null ? recorded
+						: new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR, "Result no longer available"));
+			}
+			return () -> entry.reply().complete(encodeReply(recordedResults));
+		}
+		if (proposal != null && proposal.appendedNanos != 0) {
+			commitWait.record(System.nanoTime() - proposal.appendedNanos);
+		}
+		var results = applier.applyBatch(requests, position);
+		applyRequests.record(requests.size());
+		return () -> {
+			if (proposal != null && proposal.token != null && proposal.session != null) {
+				proposal.session.tracker().resolve(proposal.token, position.getIndex());
+				proposal.session.afterApply();
+			}
+			updateLastAppliedTermIndex(position);
+			applied.advance(position.getIndex());
+			// The entry is applied: building its reply must not stop the replica, and encodeAll never fails
+			// (results that do not fit become failures, the same on every replica).
+			entry.reply().complete(encodeReply(results));
+		};
+	}
+
+	private static Message encodeReply(List<ApplyResult> results) {
+		return Message.valueOf(UnsafeByteOperations.unsafeWrap(ResultCodec.encodeAll(results)));
+	}
+
+	private static TermIndex positionOf(Applying item) {
+		return switch (item) {
+			case ApplyEntry entry -> entry.position();
+			case MarkPosition mark -> mark.position();
+			default -> null;
+		};
+	}
+
+	private static void failAll(List<Applying> items, Throwable failure) {
+		for (var item : items) {
+			switch (item) {
+				case ApplyEntry entry -> entry.reply().completeExceptionally(failure);
+				case Drain drain -> drain.done().completeExceptionally(failure);
+				default -> {
+				}
+			}
+		}
+	}
+
+	private void failQueued(Throwable failure) {
+		var rest = new java.util.ArrayList<Applying>();
+		applyQueue.drainTo(rest);
+		failAll(rest, failure);
 	}
 
 	@Override
@@ -386,6 +547,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (failed) {
 			throw new IOException("Replica failed, not taking a snapshot");
 		}
+		// Ratis waited for the entries it handed over; positions without data may still be queued.
+		drainApplyQueue();
 		long start = System.nanoTime();
 		var position = storage.take(store);
 		snapshotTime.since(start);
@@ -397,6 +560,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	@Override
 	public void reinitialize() throws IOException {
 		try {
+			// The database is replaced: nothing may still be applying to it.
+			drainApplyQueue();
 			getLifeCycle().startAndTransition(this::installSnapshot);
 		} catch (IOException | RuntimeException ex) {
 			// Ratis would only close this division and leave the process running: stop the node for good instead.
@@ -462,6 +627,13 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	@Override
 	public void close() throws IOException {
+		// Ratis waited for every reply it handed over; stop the apply thread before closing the database.
+		applyQueue.add(new Stop());
+		try {
+			applyThread.join();
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
+		}
 		var session = leaderSession;
 		leaderSession = null;
 		var store = this.store;

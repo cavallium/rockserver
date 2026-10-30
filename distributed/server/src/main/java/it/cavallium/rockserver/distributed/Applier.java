@@ -15,6 +15,7 @@ import java.io.UncheckedIOException;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
 import it.unimi.dsi.fastutil.longs.LongSortedSet;
@@ -99,7 +100,8 @@ final class Applier {
 	/**
 	 * What the meta column says about one proposer's requests: its floor and which requests at or above it have a
 	 * record. Kept in memory, loaded from the database the first time the proposer is seen, so that checking a
-	 * request for an earlier copy costs no database read. Changed only together with the database, after a commit.
+	 * request for an earlier copy costs no database read. Changed only together with the database: after a commit, or
+	 * as an entry is written to the open transaction of a group (see {@link #beginGroup}).
 	 */
 	private static final class ProposerRecords {
 		long floor;
@@ -111,6 +113,15 @@ final class Applier {
 	}
 
 	private final Long2ObjectOpenHashMap<ProposerRecords> proposers = new Long2ObjectOpenHashMap<>();
+
+	/** True between {@link #beginGroup} and {@link #endGroup}. */
+	private boolean grouping;
+	/** The open local transaction of the current group, or 0 if none is open. */
+	private long groupTx;
+	/** The position of the last entry written to {@link #groupTx}. */
+	private @Nullable TermIndex groupPosition;
+	/** Proposers whose floor moved in the current group: their records are purged once it commits. */
+	private final LongArrayList groupPurges = new LongArrayList();
 
 	/** The result recorded for {@code request} by an earlier application, or null if it was never applied. */
 	@Nullable ApplyResult recordedResult(Request request) {
@@ -150,9 +161,10 @@ final class Applier {
 		try {
 			purgeAllProposers();
 			if (requests.size() == 1 && !isBatchable(requests.getFirst().entry())) {
+				commitGroup();
 				return List.of(applyAlone(requests.getFirst(), position));
 			}
-			return applyData(requests, position, true);
+			return grouping ? applyGrouped(requests, position) : applyData(requests, position, true);
 		} catch (ReplicaFailedException ex) {
 			throw ex;
 		} catch (RuntimeException ex) {
@@ -366,6 +378,146 @@ final class Applier {
 	}
 
 	/**
+	 * Starts a group: the data entries applied until {@link #endGroup} share one local transaction, committed once,
+	 * so that its fixed costs (the commit, the floor and position writes) are paid once per group instead of once per
+	 * entry. The group holds a consistent prefix of the log at any moment: each entry's writes, record, floor and
+	 * position are in it, and a crash keeps all of the group or none. The in-memory records are updated as each entry
+	 * is applied, so that the next entries of the group see them; a group that fails to commit stops the replica.
+	 * Anything that cannot join the group (an entry applied alone, a rejected request) first commits it.
+	 */
+	void beginGroup() {
+		grouping = true;
+	}
+
+	/** Commits the current group, see {@link #beginGroup}. */
+	void endGroup() {
+		try {
+			commitGroup();
+		} finally {
+			grouping = false;
+		}
+	}
+
+	/** Drops the current group without committing it: the replica stops after this. */
+	void abortGroup() {
+		grouping = false;
+		groupPurges.clear();
+		long tx = groupTx;
+		groupTx = 0;
+		if (tx != 0) {
+			try {
+				store.db().closeTransaction(tx, false);
+			} catch (RuntimeException ex) {
+				// The replica stops anyway.
+			}
+		}
+	}
+
+	private long openGroupTx(TermIndex position) {
+		if (groupTx == 0) {
+			long openStart = System.nanoTime();
+			groupTx = beginApply();
+			record(openTime, openStart);
+		}
+		groupPosition = position;
+		return groupTx;
+	}
+
+	/** Commits the writes of the group so far, if any, then deletes the records their floors passed. */
+	private void commitGroup() {
+		long tx = groupTx;
+		if (tx != 0) {
+			groupTx = 0;
+			long commitStart = System.nanoTime();
+			boolean committed;
+			try {
+				committed = store.db().closeTransaction(tx, true);
+			} catch (RuntimeException ex) {
+				throw new ReplicaFailedException("Failed to commit the entries applied up to " + groupPosition, ex);
+			}
+			record(commitTime, commitStart);
+			if (!committed) {
+				// Only the apply thread writes the database, so an optimistic conflict means local corruption.
+				throw new ReplicaFailedException("Local apply transaction conflicted at " + groupPosition);
+			}
+		}
+		for (int i = 0; i < groupPurges.size(); i++) {
+			long proposerId = groupPurges.getLong(i);
+			purge(proposerId, records(proposerId));
+		}
+		groupPurges.clear();
+	}
+
+	/**
+	 * {@link #applyData} inside the group's transaction. A rejected request rolls the entry's writes back to the
+	 * savepoint taken before it, commits the group, and applies the entry again on its own, as outside a group.
+	 */
+	private List<ApplyResult> applyGrouped(List<Request> requests, TermIndex position) {
+		long proposerId = requests.getFirst().proposerId();
+		long completedBelow = requests.getFirst().completedBelow();
+		var records = records(proposerId);
+		long floor = records.floor;
+		var results = new ApplyResult[requests.size()];
+		var toRun = new ArrayList<Request>(requests.size());
+		var runIndexes = new IntArrayList(requests.size());
+		var seen = new LongOpenHashSet();
+		var duplicates = new IntArrayList(0);
+		for (int i = 0; i < requests.size(); i++) {
+			var request = requests.get(i);
+			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
+				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
+			}
+			if (request.sequence() < floor) {
+				results[i] = STALE_COPY;
+			} else if (records.recorded.contains(request.sequence())) {
+				results[i] = requireRecorded(request);
+			} else if (!seen.add(request.sequence())) {
+				duplicates.add(i);
+			} else {
+				if (!isBatchable(request.entry())) {
+					throw new IllegalArgumentException("A batch cannot contain " + request.entry().getClass().getSimpleName());
+				}
+				toRun.add(request);
+				runIndexes.add(i);
+			}
+		}
+		var db = store.db();
+		long tx = openGroupTx(position);
+		long executeStart = System.nanoTime();
+		db.setSavePoint(tx);
+		var outcomes = new ApplyResult[toRun.size()];
+		for (int j = 0; j < toRun.size(); j++) {
+			var request = toRun.get(j);
+			outcomes[j] = applyLogical(() -> execute(tx, request.entry()));
+			if (outcomes[j] instanceof ApplyResult.Failed) {
+				db.rollbackToSavePoint(tx);
+				commitGroup();
+				return applyData(requests, position, true);
+			}
+		}
+		for (int j = 0; j < toRun.size(); j++) {
+			outcomes[j] = record(tx, records, toRun.get(j), outcomes[j]);
+			results[runIndexes.getInt(j)] = outcomes[j];
+		}
+		finishBatch(tx, proposerId, completedBelow, floor, position, true);
+		record(executeTime, executeStart);
+		committed(proposerId, records, toRun, completedBelow);
+		groupPurges.add(proposerId);
+		for (int d = 0; d < duplicates.size(); d++) {
+			// A second copy in the same entry gets the first copy's result.
+			int i = duplicates.getInt(d);
+			long sequence = requests.get(i).sequence();
+			for (int j = 0; j < toRun.size(); j++) {
+				if (toRun.get(j).sequence() == sequence) {
+					results[i] = outcomes[j];
+					break;
+				}
+			}
+		}
+		return List.of(results);
+	}
+
+	/**
 	 * The slow path of {@link #applyData}: each request in its own local transaction, all at {@code position}, which
 	 * only the last one records as applied.
 	 */
@@ -468,7 +620,10 @@ final class Applier {
 	}
 
 	private ApplyResult requireRecorded(Request request) {
-		var recorded = recordedResult(request);
+		// Through the open group transaction, if any: the record may have been written by an earlier entry of it.
+		Buf value = store.db().get(groupTx, store.metaColumnId(),
+				NodeStore.requestKey(request.proposerId(), request.sequence()), RequestType.<Buf>current());
+		var recorded = value == null ? null : ResultCodec.decode(value.toByteArray());
 		if (recorded == null) {
 			throw new ReplicaFailedException("Request " + request.sequence() + " of proposer " + request.proposerId()
 					+ " is marked applied, but its record is missing");
@@ -479,6 +634,10 @@ final class Applier {
 	/** Records a position that carries no data entry (configuration changes, leader no-ops). */
 	void markApplied(TermIndex position) {
 		try {
+			if (grouping) {
+				markApplied(openGroupTx(position), position);
+				return;
+			}
 			inApplyTransaction(position, tx -> markApplied(tx, position));
 		} catch (ReplicaFailedException ex) {
 			throw ex;

@@ -67,7 +67,7 @@ forwards to a non-embedded connection:
 | `ReplicatedConnection` | Routes each `RocksDBAPICommand` (see below). |
 | `Proposer` | Batches numbered requests into log entries and submits them to the leader: straight to the local Raft server on the leader, through a Ratis client elsewhere. |
 | `RockserverStateMachine` | Ratis state machine. Leader admission in `startTransaction`/`preAppendTransaction`, synchronous apply, snapshots. |
-| `Applier` | Applies the requests of one log entry to the local database in one transaction without the WAL, with their result records and the applied position. |
+| `Applier` | Applies the requests of log entries to the local database, a group of entries in one transaction without the WAL, with their result records and the applied position. |
 | `LeaderSession`, `ConflictTracker` | Transactions bound to the leader's term, per-key queues of single-key updates, and conflict validation. |
 | `NodeMetrics` | Timers and gauges of the replication path, logged every 10 s. |
 | `ReadBarrier`, `TermService` | Linearizable reads. |
@@ -137,13 +137,20 @@ and the `LogEntry`.
   at or above it, loaded from the internal column the first time the proposer is seen: checking a request for
   an earlier copy costs no read.
 
-**Apply.** Every replica applies entries in log order on the Ratis apply thread, through the `EmbeddedDB`
-API.
+**Apply.** Every replica applies entries in log order, through the `EmbeddedDB` API, on an apply thread of
+its own. `applyTransaction` decodes the entry on the Ratis thread, queues it and returns a future; the apply
+thread takes everything queued (up to 256 entries or about 16 MiB) and applies it as one group. Ratis
+replies to a client, or counts an entry applied, only when its future completes, after the group commits,
+and it waits for these futures before it takes a snapshot; replacing the database with an installed snapshot,
+taking a snapshot and closing first wait until the apply thread is idle.
 
-- **Data writes** (puts, deletes, merges, transaction commits) of one entry run in one local transaction
-  without the RocksDB WAL. It also writes their result records, the proposer's floor and the applied position,
-  so a crash keeps all of the entry or none of it. If one request is rejected for a logical reason, the entry
-  is applied again one request at a time, and only its last request records the position.
+- **Data writes** (puts, deletes, merges, transaction commits) of a group run in one local transaction
+  without the RocksDB WAL. It also writes their result records, each proposer's floor and the applied
+  position, so a crash keeps all of the group or none of it, a consistent prefix of the log either way. Each
+  entry starts at a savepoint: if one of its requests is rejected for a logical reason, its writes are rolled
+  back, the group so far is committed, and the entry is applied again on its own, one request at a time, only
+  its last request recording the position. Positions without data (configuration entries, leader no-ops) are
+  written in the group too.
 - **Schema changes and `deleteRange`** cannot run in a transaction. All memtables are flushed first, so that
   everything applied without the WAL is on disk before a logged write follows it; their record and position
   are then written in one logged transaction, and the WAL is synced, because RocksDB writes column family
@@ -339,7 +346,7 @@ address, so a test can partition any set of links.
 | Test | What it proves |
 |---|---|
 | `ReplicationTest` (in-process) | Replication through any node; results; leader loss; snapshot catch-up; batches; transactions, conflicts and updates; updates whose caller timed out or cancelled while queued, or cancelled while the update opened, do not keep the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
-| `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; crash consistency of applies without the WAL. |
+| `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups. |
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); history kept for open transactions and in-flight commits. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Failover takes about 1 s. |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
