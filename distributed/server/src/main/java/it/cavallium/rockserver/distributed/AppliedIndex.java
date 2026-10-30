@@ -27,7 +27,10 @@ final class AppliedIndex {
 		completeUpTo(index);
 	}
 
-	/** Completes once the applied index reaches {@code index}. */
+	/**
+	 * Completes once the applied index reaches {@code index}. Each caller gets a future of its own: waiters of one
+	 * index share an internal one, which a caller's timeout or cancellation must not complete for the others.
+	 */
 	CompletableFuture<Void> await(long index) {
 		if (value >= index) {
 			return CompletableFuture.completedFuture(null);
@@ -37,7 +40,7 @@ final class AppliedIndex {
 		if (value >= index) {
 			completeUpTo(value);
 		}
-		return future;
+		return future.copy();
 	}
 
 	private void completeUpTo(long index) {

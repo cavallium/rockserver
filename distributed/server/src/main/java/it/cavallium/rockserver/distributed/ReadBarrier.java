@@ -57,6 +57,13 @@ final class ReadBarrier implements Closeable {
 		}
 	}
 
+	/** Thrown (as the future's failure) when leadership was confirmed but the apply did not catch up in time. */
+	static final class ApplyLagException extends Exception {
+		ApplyLagException(long index, long applied) {
+			super("The leader is still applying earlier entries: applied " + applied + " of " + index);
+		}
+	}
+
 	/** A caller of the next round; {@code commitIndex} is the applied index it waits for, -1 for none. */
 	private record Waiter(long term, long commitIndex, CompletableFuture<Void> future) {}
 
@@ -237,7 +244,7 @@ final class ReadBarrier implements Closeable {
 							if (applyError == null) {
 								waiter.future.complete(null);
 							} else {
-								waiter.future.completeExceptionally(applyError);
+								waiter.future.completeExceptionally(new ApplyLagException(waiter.commitIndex, applied.get()));
 							}
 						}, this::execute);
 			}

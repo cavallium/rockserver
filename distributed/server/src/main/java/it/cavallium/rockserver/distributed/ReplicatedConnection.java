@@ -980,6 +980,9 @@ final class ReplicatedConnection implements RocksDBConnection {
 		if (cause instanceof TimeoutException) {
 			return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "Could not confirm leadership in time");
 		}
+		if (cause instanceof ReadBarrier.ApplyLagException lag) {
+			return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, lag.getMessage());
+		}
 		if (cause instanceof RuntimeException runtime) {
 			return runtime;
 		}

@@ -571,10 +571,11 @@ final class RockserverStateMachine extends BaseStateMachine {
 			}
 			applier.endGroup();
 		} catch (RuntimeException ex) {
+			failed = true;
+			failAll(group, ex);
+			failQueued(ex);
 			applier.abortGroup();
-			var failure = fail("apply entries up to " + positionOf(group.getLast()), ex);
-			failAll(group, failure);
-			failQueued(failure);
+			fail("apply entries up to " + positionOf(group.getLast()), ex);
 			return;
 		}
 		applyTime.since(start);
@@ -585,8 +586,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 					completion.run();
 				}
 			} catch (Throwable error) {
-				var failure = fail("complete entries up to " + positionOf(group.getLast()), error);
-				failAll(group, failure);
+				// The replies first: reporting the failure may itself fail.
+				failed = true;
+				failAll(group, error);
+				try {
+					fail("complete entries up to " + positionOf(group.getLast()), error);
+				} catch (Throwable secondary) {
+					error.addSuppressed(secondary);
+				}
 			}
 		});
 	}
@@ -653,6 +660,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 		applyQueue.drainTo(rest);
 		failAll(rest, failure);
 		releaseQueued(rest);
+		// close() waits for the apply thread to see its Stop.
+		for (var item : rest) {
+			if (item instanceof Stop) {
+				applyQueue.add(item);
+			}
+		}
 	}
 
 	@Override
