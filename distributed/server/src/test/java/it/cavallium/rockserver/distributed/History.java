@@ -41,7 +41,7 @@ public final class History {
 		return register(pending);
 	}
 
-	/** Every recorded operation, in invocation order. */
+	/** Every recorded operation, in no particular order: the checker sorts the events. */
 	public synchronized List<Operation> operations() {
 		return pending.stream().map(Pending::toOperation).toList();
 	}

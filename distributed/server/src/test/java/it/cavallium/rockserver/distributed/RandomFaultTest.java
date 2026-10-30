@@ -114,6 +114,7 @@ class RandomFaultTest {
 	private static final int REGISTER_KEYS = 16;
 	private static final int HOT_COUNTERS = 2;
 	private static final int HOT_WORKERS = 4;
+	private static final int MINIMUM_HOT_INCREMENTS = 20;
 	private static final int ACCOUNTS = 8;
 	private static final long INITIAL_BALANCE = 1_000;
 	private static final long TOTAL = ACCOUNTS * INITIAL_BALANCE;
@@ -124,6 +125,11 @@ class RandomFaultTest {
 	@TempDir(cleanup = CleanupMode.ON_SUCCESS)
 	Path root;
 
+	/** What the nodes run with: {@code PipelinedRandomFaultTest} changes it. */
+	List<String> serverArgs() {
+		return SERVER_ARGS;
+	}
+
 	@Test
 	void registersStayLinearizableAndTransfersKeepTheTotalUnderRandomFaults() throws Exception {
 		long seed = Long.getLong(SEED_PROPERTY, new SecureRandom().nextLong());
@@ -133,7 +139,7 @@ class RandomFaultTest {
 		log("RandomFaultTest " + repro + ", " + schedule.size() + " faults over " + length + ", data in " + root);
 		schedule.forEach(step -> log("  planned: " + step));
 
-		try (var cluster = ProcessCluster.start(root, NODES, SERVER_ARGS);
+		try (var cluster = ProcessCluster.start(root, NODES, serverArgs());
 				var probe = new RaftProbe(cluster);
 				var setup = new ClusterClient(cluster.apiAddresses(), FINAL_RETRY, true)) {
 			cluster.waitReady(READY_TIMEOUT);
@@ -165,7 +171,8 @@ class RandomFaultTest {
 			var finalRegisters = workload.finalRegisterReads(setup);
 			var finalBalances = workload.finalAudit(setup);
 			assertBalancesHold(finalBalances, "final balances, " + repro);
-			hot.check(key -> setup.get(hotColumn, HotCounters.key(key), SETUP_CONTEXT).valueOrThrow(), 1);
+			hot.check(key -> setup.get(hotColumn, HotCounters.key(key), SETUP_CONTEXT).valueOrThrow(), MINIMUM_HOT_INCREMENTS,
+					cluster.pipelinedUpdates());
 
 			assertTrue(workload.registerWrites.get() > 0, "no register write was acknowledged, " + repro);
 			assertTrue(workload.committedTransfers.get() > 0, "no transfer committed, " + repro);

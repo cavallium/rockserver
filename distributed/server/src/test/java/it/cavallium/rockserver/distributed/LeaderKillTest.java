@@ -89,6 +89,7 @@ class LeaderKillTest {
 	private static final String HOT_COLUMN = "hot";
 	private static final int HOT_COUNTERS = 2;
 	private static final int HOT_WORKERS = 6;
+	private static final int MINIMUM_HOT_INCREMENTS = 20;
 	private static final RaftGroupId GROUP_ID = RaftGroupId.valueOf(UUID.fromString(NodeConfig.DEFAULT_GROUP_ID));
 
 	@TempDir
@@ -110,14 +111,18 @@ class LeaderKillTest {
 		}
 	}
 
+	/** What the nodes run with: {@code PipelinedLeaderKillTest} changes it. */
+	List<String> serverArgs(Path rockserverConfig) {
+		return List.of("--rockserver-config", rockserverConfig.toString(),
+				"--election-timeout-ms", "400:800",
+				"--request-timeout-ms", "5000");
+	}
+
 	@Test
 	void acknowledgedWritesSurviveRepeatedLeaderKills() throws Exception {
 		var rockserverConfig = root.resolve("rockserver.conf");
 		Files.writeString(rockserverConfig, InProcessCluster.MERGE_CONFIG);
-		cluster = ProcessCluster.start(root.resolve("cluster"), 3, List.of(
-				"--rockserver-config", rockserverConfig.toString(),
-				"--election-timeout-ms", "400:800",
-				"--request-timeout-ms", "5000"));
+		cluster = ProcessCluster.start(root.resolve("cluster"), 3, serverArgs(rockserverConfig));
 		cluster.waitReady(READY_TIMEOUT);
 		client = new ClusterClient(cluster.apiAddresses(), CLIENT_RETRY_TIMEOUT, false);
 		var column = client.createColumn(COLUMN, SCHEMA, BATCH_CONTEXT);
@@ -177,7 +182,7 @@ class LeaderKillTest {
 				hotValues.put(hexKey(key), text(value));
 			}
 			return value;
-		}, HOT_COUNTERS);
+		}, MINIMUM_HOT_INCREMENTS, cluster.pipelinedUpdates());
 
 		for (var id : cluster.nodeIds()) {
 			cluster.stop(id);

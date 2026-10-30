@@ -39,6 +39,10 @@ final class HotCounters {
 	private static final RequestContext CONTEXT = RequestContext.latency(Duration.ofSeconds(5));
 	/** One update in this many closes instead of writing. */
 	private static final int CLOSE_ONE_IN = 6;
+	/** Past this, nothing a worker left behind holds a key: longer than an update's lease, plus its expiry. */
+	private static final Duration LEASE = Duration.ofSeconds(11);
+	/** Well under a lease: a counter that takes longer has a wedged key. */
+	private static final Duration MAX_UPDATE_TIME = Duration.ofSeconds(5);
 
 	private final Map<String, HostAndPort> addresses;
 	private final long columnId;
@@ -51,10 +55,12 @@ final class HotCounters {
 	private final AtomicLong closes = new AtomicLong();
 	private final AtomicLong closeRetries = new AtomicLong();
 	private final AtomicLong retries = new AtomicLong();
+	private final AtomicLong chained = new AtomicLong();
 	private final ConcurrentLinkedQueue<Throwable> crashes = new ConcurrentLinkedQueue<>();
 	private final List<Thread> threads = new ArrayList<>();
 	private final List<ClusterClient> clients = new ArrayList<>();
 	private volatile boolean running;
+	private volatile long stoppedNanos;
 
 	/** Counters at {@code firstKey} and after it, in {@code columnId}, whose key is a {@code long}. */
 	HotCounters(Map<String, HostAndPort> addresses, long columnId, long firstKey, int counters, int workers) {
@@ -128,6 +134,9 @@ final class HotCounters {
 			retries.incrementAndGet();
 			return false;
 		}
+		if (update.updateId() > 0) {
+			chained.incrementAndGet();
+		}
 		long previous = count(update.previous());
 		var read = update.previous() == null ? null : String.valueOf(previous);
 		if (close) {
@@ -182,6 +191,7 @@ final class HotCounters {
 			thread.join(30_000);
 		}
 		clients.forEach(ClusterClient::close);
+		stoppedNanos = System.nanoTime();
 	}
 
 	long acknowledged() {
@@ -193,15 +203,48 @@ final class HotCounters {
 	}
 
 	/**
-	 * Checks the counters, with their final values from {@code finalValue}, and the history.
+	 * Fails if a counter does not take a new update soon, on a settled cluster: faults must leave no key wedged. Plain
+	 * reads ignore key locks, so nothing else shows that.
+	 */
+	private void assertKeysAreFree() throws InterruptedException {
+		long sinceStop = System.nanoTime() - stoppedNanos;
+		Thread.sleep(Duration.ofNanos(Math.max(0, LEASE.toNanos() - sinceStop)));
+		var nodes = List.copyOf(addresses.keySet());
+		try (var client = new ClusterClient(addresses, Duration.ofSeconds(1), false)) {
+			for (int i = 0; i < counters; i++) {
+				long deadline = System.nanoTime() + MAX_UPDATE_TIME.toNanos();
+				var keys = key(firstKey + i);
+				for (int node = 0; ; node++) {
+					try {
+						var api = client.api(nodes.get(node % nodes.size()), RequestContext.latency(MAX_UPDATE_TIME));
+						api.closeFailedUpdate(api.get(0, columnId, keys, RequestType.<Buf>forUpdate()).updateId());
+						break;
+					} catch (RuntimeException ex) {
+						if (System.nanoTime() > deadline) {
+							throw new AssertionError("Counter " + i + " takes no update: " + this, ex);
+						}
+						pause();
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * Checks the counters, with their final values from {@code finalValue}, the history, and that no key was left
+	 * wedged. Workers must be stopped, and the cluster settled.
 	 *
 	 * @param finalValue the database value of a key, read once the cluster settled
 	 * @param minimumAcknowledged how many increments must have gone through for this to prove anything
+	 * @param pipelined whether the cluster has pipelined updates, so that some update must have been chained
 	 */
-	void check(LongFunction<@Nullable Buf> finalValue, long minimumAcknowledged) {
+	void check(LongFunction<@Nullable Buf> finalValue, long minimumAcknowledged, boolean pipelined)
+			throws InterruptedException {
 		assertTrue(crashes.isEmpty(), () -> "Worker failures: " + crashes);
 		assertTrue(acknowledged() >= minimumAcknowledged,
 				() -> "Only " + acknowledged() + " increments acknowledged, " + this);
+		assertTrue(!pipelined || chained.get() > 0, () -> "Pipelined updates, but no update was chained: " + this);
+		assertKeysAreFree();
 		for (int i = 0; i < counters; i++) {
 			long value = count(finalValue.apply(firstKey + i));
 			long low = acknowledged[i].get();
@@ -217,7 +260,7 @@ final class HotCounters {
 
 	@Override
 	public String toString() {
-		return "acknowledged=" + acknowledged() + " closes=" + closes + " closeRetries=" + closeRetries + " retries="
-				+ retries + " unknown=" + List.of(unknown);
+		return "acknowledged=" + acknowledged() + " chained=" + chained + " closes=" + closes + " closeRetries="
+				+ closeRetries + " retries=" + retries + " unknown=" + List.of(unknown);
 	}
 }

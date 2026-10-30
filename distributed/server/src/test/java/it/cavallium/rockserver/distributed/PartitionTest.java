@@ -75,6 +75,7 @@ class PartitionTest {
 	 * Nodes give up on a request after 3 seconds, well within a fault: the test also covers nodes whose Raft client
 	 * ran out of retries while cut off.
 	 */
+	private static final int MINIMUM_HOT_INCREMENTS = 20;
 	private static final List<String> SERVER_ARGS = List.of("--election-timeout-ms", "400:800",
 			"--request-timeout-ms", "3000");
 	/** One attempt of a register operation. */
@@ -99,13 +100,18 @@ class PartitionTest {
 	@TempDir(cleanup = CleanupMode.ON_SUCCESS)
 	Path root;
 
+	/** What the nodes run with: {@code PipelinedPartitionTest} changes it. */
+	List<String> serverArgs() {
+		return SERVER_ARGS;
+	}
+
 	/**
 	 * The leader is cut off from both followers. It must acknowledge nothing (no write and no read: a read could
 	 * only be stale) while the followers elect a new leader and keep serving; after the heal it rejoins.
 	 */
 	@Test
 	void isolatedLeaderAcknowledgesNothingWhileTheMajorityTakesOver() throws Exception {
-		try (var cluster = ProcessCluster.start(root, 3, SERVER_ARGS); var probe = new RaftProbe(cluster)) {
+		try (var cluster = ProcessCluster.start(root, 3, serverArgs()); var probe = new RaftProbe(cluster)) {
 			cluster.waitReady(READY_TIMEOUT);
 			long column = createColumn(cluster);
 			var oldLeader = probe.awaitLeader(cluster.nodeIds(), 0);
@@ -157,7 +163,7 @@ class PartitionTest {
 	 */
 	@Test
 	void leaderWithAMajorityKeepsServingThroughAPartition() throws Exception {
-		try (var cluster = ProcessCluster.start(root, 3, SERVER_ARGS); var probe = new RaftProbe(cluster)) {
+		try (var cluster = ProcessCluster.start(root, 3, serverArgs()); var probe = new RaftProbe(cluster)) {
 			cluster.waitReady(READY_TIMEOUT);
 			long column = createColumn(cluster);
 			var leader = probe.awaitLeader(cluster.nodeIds(), 0);
@@ -288,7 +294,8 @@ class PartitionTest {
 		hot.stop();
 		try (var client = new ClusterClient(cluster.apiAddresses(), WAIT_TIMEOUT, true)) {
 			long column = client.getColumnId(HOT_COLUMN, SETUP_CONTEXT).valueOrThrow();
-			hot.check(key -> client.get(column, HotCounters.key(key), SETUP_CONTEXT).valueOrThrow(), 1);
+			hot.check(key -> client.get(column, HotCounters.key(key), SETUP_CONTEXT).valueOrThrow(), MINIMUM_HOT_INCREMENTS,
+					cluster.pipelinedUpdates());
 		}
 	}
 
