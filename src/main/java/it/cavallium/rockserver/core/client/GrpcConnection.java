@@ -165,6 +165,11 @@ public final class GrpcConnection extends BaseConnection {
 	 * the first node of the list that accepts a connection, within about one connect timeout per dead node before it.
 	 * The connection does not move back to an earlier node while the current one works. One address is the same as
 	 * {@link #forHostAndPort(String, HostAndPort)}.
+	 *
+	 * <p>This call returns once a node answered the capability handshake. No node may be ready yet, for example with a
+	 * cluster that is starting: while the answer is {@code UNAVAILABLE} it tries again, for 30 s by default, and then
+	 * fails as a connection to one address does at once. The system property
+	 * {@code it.cavallium.rockserver.grpc.client.handshake-wait-ms} sets this wait, for one address too.</p>
 	 */
 	public static GrpcConnection forHostsAndPorts(String name, List<HostAndPort> addresses) {
 		return forHostsAndPorts(name, addresses, true);
@@ -254,6 +259,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	static final int DEFAULT_KEEP_ALIVE_TIMEOUT_MILLIS = 5_000;
 	static final String MAX_RECONNECT_DELAY_PROPERTY = "it.cavallium.rockserver.grpc.client.max-reconnect-delay-ms";
 	static final int DEFAULT_MAX_RECONNECT_DELAY_MILLIS = 2_000;
+	static final String HANDSHAKE_WAIT_PROPERTY = "it.cavallium.rockserver.grpc.client.handshake-wait-ms";
+	/** Several addresses are a cluster, whose nodes can all be waiting for each other during a start. */
+	static final int DEFAULT_HANDSHAKE_WAIT_SEVERAL_ADDRESSES_MILLIS = 30_000;
+	/** One address fails at once, as it always did: a plain server that is down is an error for its caller. */
+	static final int DEFAULT_HANDSHAKE_WAIT_ONE_ADDRESS_MILLIS = 0;
+	private static final long HANDSHAKE_RETRY_PAUSE_MILLIS = 500;
 	/**
 	 * One node at a time, the first of the list that accepts a connection: gRPC's default policy, written out so
 	 * that the address order is a contract (never shuffled).
@@ -419,10 +430,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		var futureStub = RocksDBServiceGrpc.newFutureStub(channel);
 		RockserverCapabilities capabilities;
 		try {
-			var response = futureStub
-					.withDeadlineAfter(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-					.getCapabilities(CapabilitiesRequest.getDefaultInstance())
-					.get(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+			var response = handshake(channel, futureStub, severalAddresses);
 			capabilities = new RockserverCapabilities(response.getWorkloadContractVersion());
 			capabilities.requireCompatible();
 		} catch (InterruptedException interrupted) {
@@ -457,6 +465,34 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		this.maxInboundMessageSize = maxInboundMessageSize;
 		this.capabilities = capabilities;
 		this.reconnectTimer = new ReconnectTimer(channel, eventLoopGroup);
+	}
+
+	/**
+	 * Asks for the capabilities of the server, trying again while it answers {@code UNAVAILABLE} within the wait. Failing
+	 * calls do not start a connection, and an attempt after a failure waits for the channel's growing delay: each round
+	 * skips that delay.
+	 */
+	private static CapabilitiesResponse handshake(ManagedChannel channel, RocksDBServiceFutureStub futureStub,
+			boolean severalAddresses) throws InterruptedException, ExecutionException, TimeoutException {
+		long waitNanos = TimeUnit.MILLISECONDS.toNanos(intProperty(HANDSHAKE_WAIT_PROPERTY, severalAddresses
+				? DEFAULT_HANDSHAKE_WAIT_SEVERAL_ADDRESSES_MILLIS
+				: DEFAULT_HANDSHAKE_WAIT_ONE_ADDRESS_MILLIS, 0));
+		long start = System.nanoTime();
+		while (true) {
+			try {
+				return futureStub
+						.withDeadlineAfter(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+						.getCapabilities(CapabilitiesRequest.getDefaultInstance())
+						.get(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+			} catch (ExecutionException failure) {
+				if (Status.fromThrowable(failure.getCause()).getCode() != Code.UNAVAILABLE
+						|| System.nanoTime() - start >= waitNanos) {
+					throw failure;
+				}
+			}
+			Thread.sleep(HANDSHAKE_RETRY_PAUSE_MILLIS);
+			channel.resetConnectBackoff();
+		}
 	}
 
 	/**

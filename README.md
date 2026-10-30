@@ -148,6 +148,7 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 | `it.cavallium.rockserver.grpc.client.keep-alive-time-ms` | `10000` | Silence on a connection before a ping, with one address too. gRPC raises values below 10 s to 10 s. |
 | `it.cavallium.rockserver.grpc.client.keep-alive-timeout-ms` | `5000` | Wait for the answer to a ping, with one address too. |
 | `it.cavallium.rockserver.grpc.client.max-reconnect-delay-ms` | `2000` | The longest wait between two attempts on the list, or on the only address, while they all fail. Each client picks a period between half of this and this. |
+| `it.cavallium.rockserver.grpc.client.handshake-wait-ms` | `30000` with several addresses, `0` with one | How long a new connection keeps asking a server that answers `UNAVAILABLE` for its capabilities, before it fails. A handshake that gets no answer at all still ends after 10 s. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-ms` | `0` (off) | On a server in front of another connection, such as a replicated node, the age at which a connection ends, +/-10%. The client then starts again from the top of its list, which is what brings it back to the first address. It has two costs: a silent first address costs every client the connect timeout at every cycle, not once, and calls that outlive the grace below fail with `UNAVAILABLE`, which includes `Compact` and long scans, on a healthy cluster too. Left off, a client stays on the node it failed over to until that node goes away. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms` | `600000` | With a maximum age, the time left to the calls running on a connection that reached it. |
 
@@ -157,9 +158,14 @@ A replicated node without a leader for that long serves again by itself: once it
 election timeout it listens again, on its own or with every other node after a period when the whole cluster had no
 leader. An election shorter than the bound stops nothing. A client with a single address has nowhere to go: while
 its node does not listen its calls fail with `UNAVAILABLE`, and it reconnects within the 2 s above once the node
-listens again. A node that restarts with a whole cluster that is down can stop listening too, until the cluster
-elects a leader, when no node could serve anyway. Only a node of a new cluster, which has never known a leader, keeps
-listening while the cluster forms.
+listens again. A node that restarts with a whole cluster that is down can stop listening too, if the cluster takes
+longer than the bound to elect a leader, when no node could serve anyway. Only a node of a new cluster, which has never
+known a leader, keeps listening while the cluster forms.
+
+`GrpcConnection` asks the server for its capabilities before it returns, and no node may answer yet, for example during
+a cold start. With several addresses it asks again while the answer is `UNAVAILABLE`, for 30 s by default, and then
+fails. With one address it fails at once, so that a plain client of a server that is down hears it right away.
+`ClientBuilder.setDeferred` skips the handshake until the first use.
 
 Shorter keepalive times find a dead node sooner, but a pause of the server or of the client that outlasts the
 timeout ends a working connection, with its calls in flight. Pings cost next to nothing, and a server accepts them

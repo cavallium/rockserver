@@ -89,6 +89,7 @@ class GrpcConnectionFailoverTest {
 	private static final String MAX_ATTEMPTS_PROPERTY = "it.cavallium.rockserver.grpc.client.max-retry-attempts";
 	private static final String MAX_RECONNECT_DELAY_PROPERTY
 			= "it.cavallium.rockserver.grpc.client.max-reconnect-delay-ms";
+	private static final String HANDSHAKE_WAIT_PROPERTY = "it.cavallium.rockserver.grpc.client.handshake-wait-ms";
 	private static final String MAX_CONNECTION_AGE_PROPERTY = "it.cavallium.rockserver.grpc.server.max-connection-age-ms";
 	private static final String MAX_CONNECTION_AGE_GRACE_PROPERTY
 			= "it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms";
@@ -108,6 +109,7 @@ class GrpcConnectionFailoverTest {
 		System.clearProperty(KEEP_ALIVE_TIMEOUT_PROPERTY);
 		System.clearProperty(MAX_ATTEMPTS_PROPERTY);
 		System.clearProperty(MAX_RECONNECT_DELAY_PROPERTY);
+		System.clearProperty(HANDSHAKE_WAIT_PROPERTY);
 		System.clearProperty(MAX_CONNECTION_AGE_PROPERTY);
 		System.clearProperty(MAX_CONNECTION_AGE_GRACE_PROPERTY);
 	}
@@ -143,6 +145,58 @@ class GrpcConnectionFailoverTest {
 		api.putAsync(0, column, key(3), value(3), RequestType.none()).get(10, TimeUnit.SECONDS);
 		assertEquals(nodes.get(2).port(), remotePort(client));
 		assertArrayEquals(value(3).toByteArray(), nodes.get(2).read(3));
+	}
+
+	/** A cluster that is starting: the connection waits for the first node to answer, without being told how long. */
+	@Test
+	void aConnectionToSeveralAddressesWaitsForTheFirstNodeToServe() throws Exception {
+		var late = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(late);
+		late.stop();
+		var addresses = List.of(new HostAndPort("127.0.0.1", unusedPort()), late.address());
+		var connecting = CompletableFuture.supplyAsync(() -> connect(addresses));
+		Thread.sleep(1_000);
+		assertFalse(connecting.isDone());
+		late.restart();
+		assertEquals(late.port(), awaitServedBy(connecting.get(10, TimeUnit.SECONDS), late));
+	}
+
+	/** The wait ends: an application must not hang in a constructor. */
+	@Test
+	void aConnectionToSeveralAddressesFailsAfterTheConfiguredWait() throws Exception {
+		System.setProperty(HANDSHAKE_WAIT_PROPERTY, "1500");
+		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
+		var addresses = List.of(new HostAndPort("127.0.0.1", unusedPort()), new HostAndPort("127.0.0.1", unusedPort()));
+		long start = System.nanoTime();
+		var failure = assertThrows(StatusRuntimeException.class, () -> connect(addresses));
+		long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		assertEquals(Status.Code.UNAVAILABLE, failure.getStatus().getCode());
+		assertTrue(millis >= 1_500 && millis < 10_000, () -> millis + " ms");
+	}
+
+	/** One address fails at once, as it always did: nothing else serves this client, and its caller may have a plan. */
+	@Test
+	void aConnectionToOneAddressDoesNotWait() throws Exception {
+		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
+		var address = new HostAndPort("127.0.0.1", unusedPort());
+		long start = System.nanoTime();
+		assertThrows(StatusRuntimeException.class, () -> connect(List.of(address)));
+		long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		assertTrue(millis < 3_000, () -> millis + " ms");
+	}
+
+	/** The property sets the wait of one address too. */
+	@Test
+	void aConnectionToOneAddressWaitsIfConfigured() throws Exception {
+		System.setProperty(HANDSHAKE_WAIT_PROPERTY, "20000");
+		var late = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(late);
+		late.stop();
+		var connecting = CompletableFuture.supplyAsync(() -> connect(List.of(late.address())));
+		Thread.sleep(1_000);
+		assertFalse(connecting.isDone());
+		late.restart();
+		assertEquals(late.port(), awaitServedBy(connecting.get(10, TimeUnit.SECONDS), late));
 	}
 
 	@Test
@@ -244,6 +298,7 @@ class GrpcConnectionFailoverTest {
 
 	@Test
 	void noHostResolvingFailsTheConnection() {
+		System.setProperty(HANDSHAKE_WAIT_PROPERTY, "0");
 		var error = assertThrows(StatusRuntimeException.class, () -> connect(List.of(
 				new HostAndPort("no-such-host.invalid", 1),
 				new HostAndPort("no-such-other-host.invalid", 2))));
