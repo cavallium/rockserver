@@ -16,6 +16,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
+import java.util.function.Function;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -115,6 +116,15 @@ final class ConflictTracker {
 
 	private record KeyId(long columnId, long hash) {}
 
+	/**
+	 * What the leader knows about a chained commit, see {@link #conflicts(List, Function)}.
+	 *
+	 * @param columnId column of the key it read
+	 * @param hash {@link #keyHash} of the key it read
+	 * @param base the entry whose value it read; null if that entry is known to have failed, or is unknown
+	 */
+	record ChainCheck(long columnId, long hash, @Nullable Token base) {}
+
 	/** 64-bit hash of a logical key: column id plus every key segment with its length. */
 	static long keyHash(long columnId, Keys keys) {
 		Buf[] segments = keys.keys();
@@ -202,8 +212,32 @@ final class ConflictTracker {
 		return new KeyId(columnId, keyHash(columnId, keys));
 	}
 
+	/**
+	 * True if an update may read the value written by {@code link} instead of the database: {@code link} is the last
+	 * writer of the key, and no pending or applied write of its column or of all columns came after {@code
+	 * appliedIndex}. Stricter than {@link #conflicts(List, Function)}: a forgotten {@code link} is not intact.
+	 */
+	synchronized boolean chainIntact(long columnId, long hash, Token link, long appliedIndex) {
+		return !isNewer(globalWriter, appliedIndex)
+				&& !isNewer(columnWriters.get(columnId), appliedIndex)
+				&& keyWriters.get(new KeyId(columnId, hash)) == link;
+	}
+
 	/** True if any conflict key of {@code guarded} (or its column) was written by an entry newer than its snapshot. */
 	synchronized boolean conflicts(LogEntry.Guarded guarded) {
+		return conflicts(guarded, null);
+	}
+
+	/**
+	 * {@link #conflicts(LogEntry.Guarded)} for a commit that may be chained. The key a chained update read is judged by
+	 * identity: only a writer other than the entry it read from conflicts. Its absence does not: that entry may be
+	 * forgotten once applied, and the commit's guard decides anyway. A chained commit without a usable {@code check}
+	 * conflicts: its update expired, or the entry it read from failed.
+	 */
+	private boolean conflicts(LogEntry.Guarded guarded, @Nullable ChainCheck check) {
+		if (guarded.guard() != null && (check == null || check.base() == null)) {
+			return true;
+		}
 		long snapshotIndex = guarded.snapshotIndex();
 		if (snapshotIndex < prunedThrough) {
 			// Writes after this snapshot may have been forgotten already: it cannot be validated, so it conflicts.
@@ -215,8 +249,15 @@ final class ConflictTracker {
 		long[] columns = guarded.conflictColumns();
 		long[] hashes = guarded.conflictHashes();
 		for (int i = 0; i < columns.length; i++) {
-			if (isNewer(columnWriters.get(columns[i]), snapshotIndex)
-					|| isNewer(keyWriters.get(new KeyId(columns[i], hashes[i])), snapshotIndex)) {
+			if (isNewer(columnWriters.get(columns[i]), snapshotIndex)) {
+				return true;
+			}
+			var writer = keyWriters.get(new KeyId(columns[i], hashes[i]));
+			if (check != null && columns[i] == check.columnId() && hashes[i] == check.hash()) {
+				if (writer != null && writer != check.base()) {
+					return true;
+				}
+			} else if (isNewer(writer, snapshotIndex)) {
 				return true;
 			}
 		}
@@ -230,12 +271,20 @@ final class ConflictTracker {
 	 * appended and registered as one; with one, nothing is registered.
 	 */
 	synchronized IntList conflicts(List<LogEntry> entries) {
+		return conflicts(entries, _ -> null);
+	}
+
+	/**
+	 * {@link #conflicts(List)}, with {@code chains} telling what is known of each chained commit, one with a guard.
+	 * {@code chains} runs inside this tracker's lock: it must take no other lock.
+	 */
+	synchronized IntList conflicts(List<LogEntry> entries, Function<LogEntry.Guarded, @Nullable ChainCheck> chains) {
 		var conflicting = new IntArrayList();
 		Set<KeyId> written = null;
 		for (int i = 0; i < entries.size(); i++) {
 			var entry = entries.get(i);
 			if (entry instanceof LogEntry.Guarded guarded) {
-				boolean conflict = conflicts(guarded);
+				boolean conflict = conflicts(guarded, guarded.guard() != null ? chains.apply(guarded) : null);
 				if (!conflict && written != null) {
 					long[] columns = guarded.conflictColumns();
 					long[] hashes = guarded.conflictHashes();
