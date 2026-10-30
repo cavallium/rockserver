@@ -358,7 +358,7 @@ class GrpcConnectionFailoverTest {
 			assertEquals(node.port(), remotePort(client));
 			node.stopNow();
 			try (var attempts = new ConnectionCounter(node.port())) {
-				assertThrows(StatusRuntimeException.class, () -> remotePort(client));
+				failUntilReconnectTimer(client);
 				Thread.sleep(3_000);
 				// gRPC alone would try 3 times in this time: at about 1 s, 2.6 s and 5.2 s.
 				int counted = attempts.count();
@@ -388,25 +388,24 @@ class GrpcConnectionFailoverTest {
 			assertFalse(hasReconnectTimer(client));
 
 			node.stopNow();
-			assertThrows(StatusRuntimeException.class, () -> remotePort(client));
-			awaitReconnectTimer(client, true);
+			failUntilReconnectTimer(client);
 
 			node.restart();
 			assertEquals(node.port(), awaitServedBy(client, node));
 			awaitReconnectTimer(client, false);
 
 			node.stopNow();
-			assertThrows(StatusRuntimeException.class, () -> remotePort(client));
-			awaitReconnectTimer(client, true);
+			failUntilReconnectTimer(client);
 			channel(client).enterIdle();
 			awaitReconnectTimer(client, false);
+			// gRPC keeps the subchannel it let go for 5 s more, and that one can try once on its own backoff.
+			Thread.sleep(5_500);
 			try (var attempts = new ConnectionCounter(node.port())) {
 				Thread.sleep(1_000);
 				assertEquals(0, attempts.count(), "an idle channel kept reconnecting");
 			}
 
-			assertThrows(StatusRuntimeException.class, () -> remotePort(client));
-			awaitReconnectTimer(client, true);
+			failUntilReconnectTimer(client);
 		} finally {
 			client.close();
 		}
@@ -768,6 +767,19 @@ class GrpcConnectionFailoverTest {
 		synchronized (reconnectTimer) {
 			return scheduled.get(reconnectTimer) != null;
 		}
+	}
+
+	/**
+	 * Only a failed attempt to connect starts the timer. A call can fail on the connection that is going away instead,
+	 * and the channel then waits idle for the next call.
+	 */
+	private static void failUntilReconnectTimer(GrpcConnection client) throws Exception {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+		do {
+			assertThrows(StatusRuntimeException.class, () -> remotePort(client));
+			assertTrue(System.nanoTime() < deadline, "the reconnect timer never started");
+			Thread.sleep(10);
+		} while (!hasReconnectTimer(client));
 	}
 
 	private static void awaitReconnectTimer(GrpcConnection client, boolean expected) throws Exception {
