@@ -201,6 +201,9 @@ class MembershipTest {
 		cluster.stop("4");
 		cluster.start("4", JOIN);
 		cluster.waitReady("4", READY_TIMEOUT);
+		// A transfer needs the follower's match index, which only a reply to an entry moves: the reply to the last entry may
+		// have gone with the stop.
+		client.put(filler, key(keys - 1), fillerValue(keys - 1), CONTEXT).valueOrThrow();
 		assertOk(cluster.admin(members, "transfer-leader", "4"));
 		assertSeedServed(seed, List.of("4"));
 		awaitAppliedEverywhere(members, filler, key(keys - 1), fillerValue(keys - 1));

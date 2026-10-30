@@ -150,6 +150,8 @@ class GrpcConnectionFailoverTest {
 	/** A cluster that is starting: the connection waits for the first node to answer, without being told how long. */
 	@Test
 	void aConnectionToSeveralAddressesWaitsForTheFirstNodeToServe() throws Exception {
+		// One attempt per handshake: the retries of the call must not stand in for the wait.
+		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
 		var late = new FakeNode(FIRST_NODE_COLUMN_ID);
 		resources.add(late);
 		late.stop();
