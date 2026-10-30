@@ -22,6 +22,7 @@ import it.cavallium.rockserver.distributed.LogEntry.DeleteColumnIfExists;
 import it.cavallium.rockserver.distributed.LogEntry.DeleteMulti;
 import it.cavallium.rockserver.distributed.LogEntry.DeleteRange;
 import it.cavallium.rockserver.distributed.LogEntry.Genesis;
+import it.cavallium.rockserver.distributed.LogEntry.Guard;
 import it.cavallium.rockserver.distributed.LogEntry.Guarded;
 import it.cavallium.rockserver.distributed.LogEntry.Merge;
 import it.cavallium.rockserver.distributed.LogEntry.MergeMulti;
@@ -33,6 +34,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Random;
 import java.util.stream.Stream;
@@ -106,6 +108,17 @@ class LogEntryCodecTest {
 						List.of(new Put(3, keys("a"), buf("1"), RequestTypeId.DELTA)),
 						true)),
 				Named.of("guarded, empty", new Guarded(0, -1, new long[0], new long[0], List.of(), false)),
+				Named.of("update commit with its id", new Guarded(1, 0, new long[] {3}, new long[] {77},
+						List.of(new Delete(3, keys("a"), RequestTypeId.NOTHING)), true, -5, null)),
+				Named.of("chained commit", new Guarded(1, 0, new long[] {3}, new long[] {77},
+						List.of(new Put(3, keys("a"), buf("1"), RequestTypeId.NOTHING)), true, 42,
+						Guard.of(3, keys("a", "b"), buf("previous")))),
+				Named.of("chained commit after an absent value", new Guarded(1, 0, new long[] {3}, new long[] {77},
+						List.of(new Put(3, keys("a"), buf("1"), RequestTypeId.NOTHING)), true, 42,
+						Guard.of(3, keys("a"), null))),
+				Named.of("chained commit after an empty value", new Guarded(1, 0, new long[] {3}, new long[] {77},
+						List.of(new Put(3, keys("a"), buf("1"), RequestTypeId.NOTHING)), true, 42,
+						Guard.of(3, keys(), Buf.wrap()))),
 				Named.of("genesis", new Genesis("cluster-1", false)),
 				Named.of("genesis, seeded", new Genesis(UNICODE, true)));
 	}
@@ -137,6 +150,12 @@ class LogEntryCodecTest {
 						+ (long) guarded.conflictHashes().length * LogEntryCodec.CONFLICT_KEY_BYTES;
 				for (LogEntry.Write write : guarded.writes()) {
 					size += LogEntryCodec.writeSize(write);
+				}
+				if (guarded.updateId() != 0) {
+					size += Long.BYTES;
+				}
+				if (guarded.guard() != null) {
+					size += LogEntryCodec.guardSize(guarded.guard());
 				}
 				assertEquals(encoded, size);
 			}
@@ -301,7 +320,7 @@ class LogEntryCodecTest {
 		byte[] keyList = LogEntryCodec.encode(new DeleteMulti(1, List.of(), RequestTypeId.NOTHING));
 		// version, tag, column id (8), key segment count (4), request type
 		byte[] segments = LogEntryCodec.encode(new Delete(1, new Keys(), RequestTypeId.NOTHING));
-		// version, tag, epoch (8), snapshot index (8), conflict count (4), write count (4), single result
+		// version, tag, epoch (8), snapshot index (8), conflict count (4), write count (4), flags
 		byte[] guarded = LogEntryCodec.encode(new Guarded(1, 2, new long[0], new long[0], List.of(), false));
 		for (int size : new int[] {-1, 1, Integer.MAX_VALUE, Integer.MIN_VALUE}) {
 			assertRejected(withInt(keyList, 10, size), "key list size " + size);
@@ -316,7 +335,7 @@ class LogEntryCodecTest {
 		var write = new DeleteMulti(1, List.of(new Keys()), RequestTypeId.NOTHING);
 		byte[] encoded = LogEntryCodec.encode(new Guarded(1, 2, new long[0], new long[0], List.of(write), false));
 		// version, tag, epoch (8), snapshot index (8), conflict count (4), write count (4), write tag,
-		// column id (8), key list size (4), key segment count (4), request type, single result
+		// column id (8), key list size (4), key segment count (4), request type, flags
 		assertEquals(45, encoded.length);
 		int size = 1 << 22;
 		var buffer = ByteBuffer.allocate(size);
@@ -432,6 +451,115 @@ class LogEntryCodecTest {
 		return copy;
 	}
 
+	@Test
+	void aGuardHoldsTheSha256OfTheValue() {
+		// The digest of "abc" from FIPS 180-2.
+		var guard = Guard.of(1, keys("k"), buf("abc"));
+		assertEquals(3, guard.length());
+		assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+				java.util.HexFormat.of().formatHex(guard.sha256()));
+		var empty = Guard.of(1, keys("k"), Buf.wrap());
+		assertEquals(0, empty.length());
+		assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+				java.util.HexFormat.of().formatHex(empty.sha256()));
+		var absent = Guard.of(1, keys("k"), null);
+		assertEquals(-1, absent.length());
+		assertEquals(null, absent.sha256());
+	}
+
+	@Test
+	void aGuardMatchesOnlyItsValue() {
+		var value = Guard.of(1, keys("k"), buf("abc"));
+		assertTrue(value.matches(buf("abc")));
+		assertFalse(value.matches(buf("abd")), "same length, other bytes");
+		assertFalse(value.matches(buf("abcd")));
+		assertFalse(value.matches(Buf.wrap()));
+		assertFalse(value.matches(null));
+
+		var absent = Guard.of(1, keys("k"), null);
+		assertTrue(absent.matches(null));
+		assertFalse(absent.matches(Buf.wrap()), "absent is not empty");
+
+		var empty = Guard.of(1, keys("k"), Buf.wrap());
+		assertTrue(empty.matches(Buf.wrap()));
+		assertFalse(empty.matches(null), "empty is not absent");
+
+		// A value inside a larger array digests only its own bytes.
+		byte[] backing = "__abc__".getBytes(UTF_8);
+		assertTrue(value.matches(Buf.wrap(backing, 2, 5)));
+		assertEquals(java.util.HexFormat.of().formatHex(value.sha256()),
+				java.util.HexFormat.of().formatHex(Guard.of(1, keys("k"), Buf.wrap(backing, 2, 5)).sha256()));
+	}
+
+	@Test
+	void rejectsInconsistentGuardsAndUpdateIds() {
+		var guard = Guard.of(1, keys("k"), buf("abc"));
+		var write = new Put(1, keys("k"), buf("v"), RequestTypeId.NOTHING);
+		assertThrows(IllegalArgumentException.class,
+				() -> new Guarded(1, 2, new long[0], new long[0], List.of(write), true, 0, guard), "a guard without an id");
+		assertThrows(IllegalArgumentException.class,
+				() -> new Guarded(1, 2, new long[0], new long[0], List.of(write), false, 7, null), "not a single result");
+		assertThrows(IllegalArgumentException.class, () -> new Guard(1, keys("k"), 3, null));
+		assertThrows(IllegalArgumentException.class, () -> new Guard(1, keys("k"), -1, new byte[32]));
+		assertThrows(IllegalArgumentException.class, () -> new Guard(1, keys("k"), 3, new byte[31]));
+		assertThrows(IllegalArgumentException.class, () -> new Guard(1, keys("k"), -2, null));
+
+		// A decoder never returns one of those either: a guard without an update id is malformed.
+		byte[] encoded = LogEntryCodec.encode(new Guarded(1, 2, new long[0], new long[0], List.of(write), true, 7, guard));
+		int updateIdAt = encoded.length - (int) LogEntryCodec.guardSize(guard) - Long.BYTES;
+		byte[] noId = encoded.clone();
+		ByteBuffer.wrap(noId).putLong(updateIdAt, 0);
+		assertRejected(noId, "an explicit update id of 0");
+		byte[] guardWithoutId = encoded.clone();
+		guardWithoutId[updateIdAt - 1] &= ~2;
+		assertRejected(guardWithoutId, "the flag of a guard, without an update id");
+		byte[] unknown = encoded.clone();
+		unknown[updateIdAt - 1] |= 8;
+		assertRejected(unknown, "unknown flags");
+	}
+
+	/** What a cluster with pipelined updates off writes keeps its bytes, so a log from before them still reads. */
+	@Test
+	void anEntryWithoutUpdateIdOrGuardEndsWithTheSingleResultBoolean() {
+		var write = new Put(1, keys("k"), buf("v"), RequestTypeId.NOTHING);
+		for (boolean singleResult : new boolean[] {false, true}) {
+			var entry = new Guarded(1, 2, new long[0], new long[0], List.of(write), singleResult);
+			byte[] encoded = LogEntryCodec.encodeEntryBody(entry);
+			assertEquals(singleResult ? 1 : 0, encoded[encoded.length - 1]);
+			assertEquals(LogEntryCodec.GUARDED_BASE_BYTES + LogEntryCodec.writeSize(write), encoded.length);
+		}
+	}
+
+	/**
+	 * The bytes come from the encoder of 5d415ba, before update ids and guards. They must never change: a log written by
+	 * a node of that version has to stay readable, and a flag-off rolling upgrade relies on it.
+	 */
+	@Test
+	void aGuardedEntryWithoutUpdateIdOrGuardKeepsTheBytesOfOldLogs() {
+		var write = new Put(0x0102, keys("k"), buf("v"), RequestTypeId.NOTHING);
+		var entry = new Guarded(3, 4, new long[] {5}, new long[] {6}, List.of(write), true);
+		var bytes = HexFormat.of().parseHex("0c0000000000000003000000000000000400000001000000000000000500000000000000060000000"
+				+ "101000000000000010200000001000000016b00000001760001");
+		assertArrayEquals(bytes, LogEntryCodec.encodeEntryBody(entry));
+	}
+
+	@Test
+	void anUpdateIdTakesItsBytesOnlyWhereItIsSet() {
+		var write = new Put(1, keys("k"), buf("v"), RequestTypeId.NOTHING);
+		long without = LogEntryCodec.entrySize(new Guarded(1, 2, new long[0], new long[0], List.of(write), true));
+		long with = LogEntryCodec.entrySize(new Guarded(1, 2, new long[0], new long[0], List.of(write), true, 5, null));
+		assertEquals(Long.BYTES, with - without);
+	}
+
+	@Test
+	void everyTruncationOfAChainedCommitIsRejected() {
+		byte[] encoded = LogEntryCodec.encode(new Guarded(1, 2, new long[] {1}, new long[] {2},
+				List.of(new Put(1, keys("k"), buf("v"), RequestTypeId.NOTHING)), true, 7, Guard.of(1, keys("k"), buf("abc"))));
+		for (int length = 0; length < encoded.length; length++) {
+			assertRejected(java.util.Arrays.copyOf(encoded, length), "truncated to " + length);
+		}
+	}
+
 	private static void assertSameEntry(LogEntry expected, LogEntry actual) {
 		switch (expected) {
 			case Guarded guarded -> {
@@ -442,6 +570,15 @@ class LogEntryCodecTest {
 				assertArrayEquals(guarded.conflictHashes(), decoded.conflictHashes());
 				assertEquals(guarded.writes(), decoded.writes());
 				assertEquals(guarded.singleResult(), decoded.singleResult());
+				assertEquals(guarded.updateId(), decoded.updateId());
+				if (guarded.guard() == null) {
+					assertEquals(null, decoded.guard());
+				} else {
+					assertEquals(guarded.guard().columnId(), decoded.guard().columnId());
+					assertEquals(guarded.guard().keys(), decoded.guard().keys());
+					assertEquals(guarded.guard().length(), decoded.guard().length());
+					assertArrayEquals(guarded.guard().sha256(), decoded.guard().sha256());
+				}
 			}
 			case UploadMergeOperator upload -> {
 				var decoded = assertInstanceOf(UploadMergeOperator.class, actual);

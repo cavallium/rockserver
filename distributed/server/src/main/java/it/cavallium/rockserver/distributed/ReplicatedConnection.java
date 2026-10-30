@@ -77,6 +77,14 @@ final class ReplicatedConnection implements RocksDBConnection {
 	 * the lease plus the expiry cadence, so that an update queued behind an abandoned one still gets the key.
 	 */
 	private static final Duration UPDATE_LOCK_WAIT = Duration.ofSeconds(12);
+	/**
+	 * How long the close of a chained update waits for the commit it read from. The bound lives in the future:
+	 * {@code requestSync} joins a close without a timeout. {@code GrpcServer} takes the asynchronous path, so that no
+	 * worker waits this long; how many closes can wait for one commit is {@link LeaderSession#MAX_LINK_READERS}.
+	 */
+	private static final Duration CHAINED_CLOSE_WAIT = Duration.ofSeconds(2);
+	/** Tests only: replaces {@link #CHAINED_CLOSE_WAIT}. */
+	volatile Duration chainedCloseWaitForTesting = CHAINED_CLOSE_WAIT;
 	/** Bytes of keys and values per replicated chunk of a batch write. */
 	private static final long BATCH_CHUNK_BYTES = 4L * 1024 * 1024;
 	/** Encoding overhead counted per key segment and per value, so many tiny items still fit in one entry. */
@@ -94,6 +102,12 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private final NodeMetrics.Series commitTime;
 	private final NodeMetrics.Series forwardTime;
 	private final NodeMetrics.Series lockWaitTime;
+	private final NodeMetrics.Series chainedUpdates;
+	private final NodeMetrics.Series chainConflicts;
+	private final NodeMetrics.Series closeWaitTime;
+	private final NodeMetrics.Series closeRetries;
+	private final NodeMetrics.Series transactionConflicts;
+	private final NodeMetrics.Series transactionChainConflicts;
 	private final NodeMetrics.Series localTime;
 	/** Runs short local commands, each on a virtual thread of its own; see {@link #local}. */
 	private static final java.util.concurrent.ExecutorService INLINE = java.util.concurrent.Executors
@@ -111,6 +125,12 @@ final class ReplicatedConnection implements RocksDBConnection {
 		this.commitTime = metrics.duration("commit");
 		this.forwardTime = metrics.duration("forward");
 		this.lockWaitTime = metrics.duration("update.lockWait");
+		this.chainedUpdates = metrics.amount("update.chained");
+		this.chainConflicts = metrics.amount("update.chainConflict");
+		this.closeWaitTime = metrics.duration("update.closeWait");
+		this.closeRetries = metrics.amount("update.closeRetry");
+		this.transactionConflicts = metrics.amount("transaction.conflict");
+		this.transactionChainConflicts = metrics.amount("transaction.chainConflict");
 		this.localTime = metrics.duration("local");
 		this.stateMachine = stateMachine;
 		this.proposer = proposer;
@@ -712,7 +732,20 @@ final class ReplicatedConnection implements RocksDBConnection {
 		// do, and the session's term is checked again when the update opens.
 		long term = currentTerm();
 		var leadership = barrier.awaitLeadership().whenComplete((_, _) -> barrierTime.since(start));
-		var waiter = session.lockKey(ConflictTracker.keyHash(command.columnId(), command.keys()));
+		long hash = ConflictTracker.keyHash(command.columnId(), command.keys());
+		var waiter = new CompletableFuture<LeaderSession.KeyLock>();
+		if (session.pipelined()) {
+			// The key is asked for once leadership is confirmed: its next holder may be running one round trip behind.
+			leadership.whenComplete((_, error) -> {
+				if (error == null) {
+					session.lockKey(hash, command.columnId(), waiter);
+				} else {
+					waiter.completeExceptionally(barrierFailure(error));
+				}
+			});
+		} else {
+			session.lockKey(hash, command.columnId(), waiter);
+		}
 		var result = new CompletableFuture<Object>();
 		// The caller is gone once its deadline passed or it cancelled: an update it cannot learn the id of would keep
 		// the key locked for the whole lease.
@@ -733,6 +766,11 @@ final class ReplicatedConnection implements RocksDBConnection {
 						if (callerGone.getAsBoolean()) {
 							session.unlockKey(lock);
 							throw new CompletionException(new RocksDBRetryException());
+						}
+						var base = lock.base;
+						// With another key, it is a hash collision: that update reads the database.
+						if (base != null && base.columnId == command.columnId() && base.keys.equals(command.keys())) {
+							return openChained(command, term, session, lock);
 						}
 						return openNative(remainingContext(context, start), command, term, true, UPDATE_LEASE,
 								r -> ((UpdateContext<?>) r).updateId(), command, session, lock, callerGone);
@@ -845,6 +883,30 @@ final class ReplicatedConnection implements RocksDBConnection {
 		});
 	}
 
+	/**
+	 * Opens an update that reads the value its predecessor's commit writes. That commit was admitted but may not be
+	 * applied, so the value is provisional until this update ends well: nothing is opened on the database, its commit
+	 * carries a guard, and its close waits for the predecessor. Leadership was confirmed before the key was granted.
+	 */
+	private CompletableFuture<?> openChained(Get<?> command, long confirmedTerm, LeaderSession session,
+			LeaderSession.KeyLock lock) {
+		LeaderSession.OpenTransaction transaction;
+		try {
+			if (currentSession() != session || session.term() != confirmedTerm) {
+				throw new RocksDBRetryException();
+			}
+			transaction = session.register(session.reserve(stateMachine.appliedIndex()), session.nextChainedId(), true, lock,
+					lock.base, UPDATE_LEASE.toNanos());
+		} catch (RuntimeException ex) {
+			session.unlockKey(lock);
+			throw ex instanceof IllegalStateException ? new RocksDBRetryException() : ex;
+		}
+		chainedUpdates.record(1);
+		// Its commit conflicts on what follows the predecessor.
+		transaction.addConflict(command.columnId(), command.keys());
+		return CompletableFuture.completedFuture(new UpdateContext<>(lock.base.value, transaction.id));
+	}
+
 	/** A write with a transaction id: staged in an open transaction, or the final write of an update. */
 	private CompletableFuture<?> stagedWrite(RequestContext context,
 			RocksDBAPICommandSingle<?> command,
@@ -857,14 +919,32 @@ final class ReplicatedConnection implements RocksDBConnection {
 			throw new RocksDBRetryException();
 		}
 		if (transaction.update) {
-			var entry = transaction.updateEntry(session.term(), write, keys);
+			if (session.pipelined() && !transaction.startCommit()) {
+				// A second write on this id: the first commit stays in flight, and the update with it.
+				throw new RocksDBRetryException();
+			}
+			if (transaction.chained() && transaction.base.failed()) {
+				// It read a value that was never written: its guard would reject it.
+				session.remove(transaction);
+				throw new RocksDBRetryException();
+			}
+			var entry = transaction.updateEntry(session.term(), write, keys, session.pipelined());
 			return commit(context, session, transaction, entry).handle((result, error) -> {
 				session.remove(transaction);
 				rollBackNativeQuietly(transaction.id, true);
+				// After remove: the commit can be admitted up to the moment its key is released. The link can only be this
+				// commit's own, see startCommit.
+				var link = transaction.link();
+				if (link != null && error != null) {
+					session.linkFailed(link);
+				}
 				if (error == null) {
 					return result;
 				}
 				var cause = unwrap(error);
+				if (cause instanceof Proposer.ConflictException && transaction.chained()) {
+					chainConflicts.record(1);
+				}
 				// On a conflict the update is closed and must be retried, as on a single node.
 				throw new CompletionException(cause instanceof Proposer.ConflictException
 						? new RocksDBRetryException() : cause);
@@ -903,11 +983,15 @@ final class ReplicatedConnection implements RocksDBConnection {
 		var session = currentSession();
 		var transaction = session.get(command.transactionId());
 		if (transaction == null) {
-			if (command.commit()) {
-				// Expired, or opened by a previous leader: the client must run the transaction again.
+			if (command.commit() || command.transactionId() > 0) {
+				// Expired, or opened by a previous leader: the client must run the transaction again. A positive id is a
+				// chained update, and a clean end of one would confirm a value that may never be written.
 				throw new RocksDBRetryException();
 			}
 			return CompletableFuture.completedFuture(true);
+		}
+		if (transaction.chained()) {
+			throw refuseChained(session, transaction);
 		}
 		// Rollbacks run here, at once: an optimistic rollback does no I/O, and once the transaction left the session
 		// nothing else would close it if a scheduler refused or expired the rollback.
@@ -925,6 +1009,10 @@ final class ReplicatedConnection implements RocksDBConnection {
 		return commit(context, session, transaction, entry).handle((_, error) -> {
 			if (error != null && unwrap(error) instanceof Proposer.ConflictException) {
 				// Same contract as a single node: false, and the transaction stays open.
+				transactionConflicts.record(1);
+				if (session.yieldChainsTo(entry)) {
+					transactionChainConflicts.record(1);
+				}
 				return false;
 			}
 			session.remove(transaction);
@@ -953,14 +1041,45 @@ final class ReplicatedConnection implements RocksDBConnection {
 	}
 
 	private CompletableFuture<?> closeFailedUpdate(RequestContext context, CloseFailedUpdate command) {
+		long start = System.nanoTime();
 		var session = currentSession();
-		var transaction = session.get(command.updateId());
+		long id = command.updateId();
+		var transaction = session.get(id);
+		if (id > 0) {
+			return closeChained(context, start, session, transaction);
+		}
 		if (transaction != null) {
 			session.remove(transaction);
 		}
 		// At once, like the rollbacks of closeTransaction.
-		rollBackNativeQuietly(command.updateId(), true);
+		rollBackNativeQuietly(id, true);
 		return CompletableFuture.completedFuture(null);
+	}
+
+	/**
+	 * The close of a chained update, which wrote nothing, so no log entry is needed: it hands the key on at once, then
+	 * tells whether what the update read was real. Its read counts only if the commit it read from applied: the read
+	 * then linearizes right after that commit (see {@link LeaderSession#admitted}, and the leadership confirmed before
+	 * the grant). Otherwise, or if that is not known in time, or the update is unknown here (expired, or opened by a
+	 * previous leader), the client must run the update again. The answer goes on a pool: {@code settled} completes on
+	 * the thread that completes every applied entry.
+	 */
+	private CompletableFuture<?> closeChained(RequestContext context, long start, LeaderSession session,
+			LeaderSession.@Nullable OpenTransaction transaction) {
+		if (transaction == null) {
+			return CompletableFuture.failedFuture(new RocksDBRetryException());
+		}
+		session.remove(transaction);
+		long wait = Math.min(chainedCloseWaitForTesting.toNanos(), remainingNanos(context, start));
+		// A copy: the timeout would otherwise complete the future every waiter shares.
+		return transaction.base.settled.copy().orTimeout(wait, TimeUnit.NANOSECONDS).handleAsync((ok, error) -> {
+			closeWaitTime.since(start);
+			if (error == null && ok) {
+				return null;
+			}
+			closeRetries.record(1);
+			throw new CompletionException(new RocksDBRetryException());
+		});
 	}
 
 	private CompletableFuture<?> inTransaction(RequestContext context, RocksDBAPICommandSingle<?> command, long id) {
@@ -969,12 +1088,26 @@ final class ReplicatedConnection implements RocksDBConnection {
 	}
 
 	private LeaderSession.OpenTransaction requireLeaderTransaction(long id) {
-		var transaction = currentSession().get(id);
+		var session = currentSession();
+		var transaction = session.get(id);
 		if (transaction == null) {
 			// Unknown here: expired, or opened by a previous leader. Either way the client must start over.
 			throw new RocksDBRetryException();
 		}
+		if (transaction.chained()) {
+			throw refuseChained(session, transaction);
+		}
 		return transaction;
+	}
+
+	/**
+	 * A native operation on a chained update: there is no snapshot to serve it from, and reading the database would
+	 * hide a value the update already read. The update ends, and the next one of the key is a head.
+	 */
+	private static RocksDBRetryException refuseChained(LeaderSession session, LeaderSession.OpenTransaction transaction) {
+		session.breakChain(transaction.keyLock.key);
+		session.remove(transaction);
+		return new RocksDBRetryException();
 	}
 
 	private LeaderSession currentSession() {
@@ -1000,6 +1133,10 @@ final class ReplicatedConnection implements RocksDBConnection {
 	}
 
 	private void rollBackNativeQuietly(long id, boolean update) {
+		if (id > 0) {
+			// A chained update has no native transaction.
+			return;
+		}
 		try {
 			var db = stateMachine.store().db();
 			if (update) {

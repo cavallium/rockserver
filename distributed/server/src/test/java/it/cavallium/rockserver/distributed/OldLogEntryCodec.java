@@ -313,10 +313,23 @@ final class OldLogEntryCodec {
 		for (LogEntry.Write write : guarded.writes()) {
 			writeWrite(out, write);
 		}
-		out.writeBoolean(guarded.singleResult());
+		long updateId = guarded.updateId();
+		var guard = guarded.guard();
+		out.writeByte((guarded.singleResult() ? 1 : 0) | (updateId != 0 ? 2 : 0) | (guard != null ? 4 : 0));
+		if (updateId != 0) {
+			out.writeLong(updateId);
+		}
+		if (guard != null) {
+			out.writeLong(guard.columnId());
+			writeKeys(out, guard.keys());
+			out.writeInt(guard.length());
+			if (guard.sha256() != null) {
+				out.write(guard.sha256());
+			}
+		}
 	}
 
-	/** Encoded size of a {@link LogEntry.Guarded} body without conflict keys and writes. */
+	/** Encoded size of a {@link LogEntry.Guarded} body without conflict keys, writes, update id and guard. */
 	static final int GUARDED_BASE_BYTES = 1 + 2 * Long.BYTES + 2 * Integer.BYTES + 1;
 	/** Encoded size of one conflict key of a {@link LogEntry.Guarded}: its column id and key hash. */
 	static final int CONFLICT_KEY_BYTES = 2 * Long.BYTES;
@@ -514,8 +527,21 @@ final class OldLogEntryCodec {
 		for (int i = 0; i < writeCount; i++) {
 			writes.add(readWrite(in, in.readByte()));
 		}
+		int flags = in.readByte() & 0xFF;
+		if ((flags & ~7) != 0) {
+			throw new IllegalArgumentException("Unknown guarded entry flags: " + flags);
+		}
+		boolean singleResult = (flags & 1) != 0;
+		long updateId = (flags & 2) != 0 ? in.readLong() : 0;
+		LogEntry.Guard guard = null;
+		if ((flags & 4) != 0) {
+			long columnId = in.readLong();
+			var keys = readKeys(in);
+			int length = in.readInt();
+			guard = new LogEntry.Guard(columnId, keys, length, length >= 0 ? in.readFixed(32) : null);
+		}
 		// The constructor rejects inconsistent combinations with IllegalArgumentException
-		return new LogEntry.Guarded(leaderEpoch, snapshotIndex, columns, hashes, writes, in.readBoolean());
+		return new LogEntry.Guarded(leaderEpoch, snapshotIndex, columns, hashes, writes, singleResult, updateId, guard);
 	}
 
 	private static Keys readKeys(Input in) {
@@ -624,6 +650,11 @@ final class OldLogEntryCodec {
 
 		byte[] readBytes() {
 			return readBytes(readCount(1));
+		}
+
+		byte[] readFixed(int length) {
+			require(length);
+			return readBytes(length);
 		}
 
 		Buf readBuf() {

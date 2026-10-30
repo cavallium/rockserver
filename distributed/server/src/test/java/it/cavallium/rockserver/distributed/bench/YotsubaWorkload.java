@@ -36,7 +36,8 @@ import java.util.concurrent.TimeUnit;
  *   <li>{@code file-locations}: key [4] + two XXHASH32 tails, no value, written with {@code putMulti};</li>
  *   <li>{@code monitor-log}: key [8, 8], small transactions of two {@code putMulti}.</li>
  * </ul>
- * Chats are picked with a Zipf-like skew so that hot chats produce real update conflicts.
+ * Chats are picked with a Zipf-like skew so that hot chats produce real update conflicts. {@link #hotKeys} sends a
+ * share of the updates to a few single keys instead, to measure what one key sustains.
  */
 final class YotsubaWorkload {
 
@@ -68,6 +69,9 @@ final class YotsubaWorkload {
 	final int messagesPerChat;
 	final int valueBytes;
 	final double skew;
+	/** Keys that {@link #hotShare} of the updates go to, 0 for none. */
+	final int hotKeys;
+	final double hotShare;
 	long messages;
 	long senderIndex;
 	long history;
@@ -75,10 +79,19 @@ final class YotsubaWorkload {
 	long monitorLog;
 
 	YotsubaWorkload(int chats, int messagesPerChat, int valueBytes, double skew) {
+		this(chats, messagesPerChat, valueBytes, skew, 0, 0);
+	}
+
+	YotsubaWorkload(int chats, int messagesPerChat, int valueBytes, double skew, int hotKeys, double hotShare) {
+		if (hotKeys < 0 || hotKeys > chats || hotShare < 0 || hotShare > 1) {
+			throw new IllegalArgumentException("Invalid hot keys: " + hotKeys + " keys, share " + hotShare);
+		}
 		this.chats = chats;
 		this.messagesPerChat = messagesPerChat;
 		this.valueBytes = valueBytes;
 		this.skew = skew;
+		this.hotKeys = hotKeys;
+		this.hotShare = hotShare;
 	}
 
 	/** Creates (or finds) the columns. */
@@ -211,30 +224,35 @@ final class YotsubaWorkload {
 
 	/**
 	 * The message update of {@code MessagesImpl}: {@code get(forUpdate)}, then the commit {@code put(updateId)} or,
-	 * when nothing changed (about 5%), {@code closeFailedUpdate}; conflicts are retried with 10-250 ms backoff.
+	 * when nothing changed (about 5%), {@code closeFailedUpdate}; conflicts are retried with 10-250 ms backoff, like a
+	 * no-change close told to retry, which needs pipelined updates. A failed {@code get}, such as the lock wait of a hot
+	 * key timing out, is a failed operation, as it always was here, so that runs stay comparable: {@code lockWaitRetries}
+	 * counts the ones that say to retry.
 	 */
 	private long update(RocksDBAsyncAPI api, BenchStats.Op stats, ThreadLocalRandom random) {
-		int chat = chat(random);
-		// Mostly recent messages of the chat: new messages and edits of the latest ones.
-		int message = messagesPerChat - 1 - (int) Math.min(messagesPerChat - 1, Math.abs(random.nextGaussian()) * 20);
-		var key = messageKey(chat, message);
+		var key = updateKey(random);
 		long backoffMs = 10;
 		for (int attempt = 0; ; attempt++) {
-			UpdateContext<Buf> context = api.<UpdateContext<Buf>>getAsync(0, messages, key, RequestType.forUpdate()).join();
-			boolean unchanged = random.nextInt(20) == 0;
-			if (unchanged) {
-				api.closeFailedUpdateAsync(context.updateId()).join();
-				return 12;
-			}
-			var value = value(valueBytes / 2 + random.nextInt(valueBytes * 2));
+			UpdateContext<Buf> context;
 			try {
+				context = api.<UpdateContext<Buf>>getAsync(0, messages, key, RequestType.forUpdate()).join();
+			} catch (CompletionException | RocksDBException e) {
+				if (isRetry(e)) {
+					stats.lockWaitRetries.increment();
+				}
+				throw e;
+			}
+			try {
+				boolean unchanged = random.nextInt(20) == 0;
+				if (unchanged) {
+					api.closeFailedUpdateAsync(context.updateId()).join();
+					return 12;
+				}
+				var value = value(valueBytes / 2 + random.nextInt(valueBytes * 2));
 				api.putAsync(context.updateId(), messages, key, value, RequestType.none()).join();
 				return 12 + value.size();
 			} catch (CompletionException | RocksDBException e) {
-				var cause = e instanceof CompletionException && e.getCause() != null ? e.getCause() : e;
-				boolean retry = cause instanceof RocksDBRetryException
-						|| (cause instanceof RocksDBException r && r.getErrorUniqueId() == RocksDBErrorType.UPDATE_RETRY);
-				if (!retry || attempt + 1 >= UPDATE_RETRY_ATTEMPTS) {
+				if (!isRetry(e) || attempt + 1 >= UPDATE_RETRY_ATTEMPTS) {
 					throw e;
 				}
 				stats.retries.increment();
@@ -242,6 +260,22 @@ final class YotsubaWorkload {
 				backoffMs *= 2;
 			}
 		}
+	}
+
+	private static boolean isRetry(RuntimeException error) {
+		var cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+		return cause instanceof RocksDBRetryException
+				|| (cause instanceof RocksDBException r && r.getErrorUniqueId() == RocksDBErrorType.UPDATE_RETRY);
+	}
+
+	/** The key of one update: a hot one, or one of the skewed chats. */
+	private Keys updateKey(ThreadLocalRandom random) {
+		if (hotKeys > 0 && random.nextDouble() < hotShare) {
+			return messageKey(random.nextInt(hotKeys), messagesPerChat - 1);
+		}
+		// Mostly recent messages of the chat: new messages and edits of the latest ones.
+		int message = messagesPerChat - 1 - (int) Math.min(messagesPerChat - 1, Math.abs(random.nextGaussian()) * 20);
+		return messageKey(chat(random), message);
 	}
 
 	/** A monitor batch: existsMulti, then a transaction with two putMulti. */

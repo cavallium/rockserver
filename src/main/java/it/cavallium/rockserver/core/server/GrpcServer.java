@@ -334,9 +334,13 @@ public class GrpcServer extends Server {
 	private void recordLateProtectedOperationFailure(String operation,
 			Throwable error,
 			ContextView context) {
+		countLateProtectedOperationFailure(operation);
+		GrpcServerImpl.lateErrorHandler(context).accept(error);
+	}
+
+	private void countLateProtectedOperationFailure(String operation) {
 		lateProtectedOperationFailures.computeIfAbsent(operation, _ -> new LongAdder()).increment();
 		metricsRegistry.counter(LATE_PROTECTED_OPERATION_FAILURE_METRIC, "operation", operation).increment();
-		GrpcServerImpl.lateErrorHandler(context).accept(error);
 	}
 
 	private static final class LateReadDeadlineLogState {
@@ -1294,8 +1298,8 @@ public class GrpcServer extends Server {
 			OperationFamily family,
 			long localMonotonicDeadlineNanos) {
 		var proxy = proxyScheduler;
-		// Rollbacks, closeFailedUpdate and maintenance keep the scheduler's isolated pools: they must run even when
-		// data requests fill the proxy's permits.
+		// Rollbacks and maintenance keep the scheduler's isolated pools: they must run even when data requests fill the
+		// proxy's permits. closeFailedUpdate takes no pool at all in proxy mode, see closeFailedUpdate.
 		if (proxy != null && profile != WorkloadProfile.CONTROL && profile != WorkloadProfile.PHYSICAL_MAINTENANCE) {
 			return proxy;
 		}
@@ -1512,6 +1516,10 @@ public class GrpcServer extends Server {
 			return noDeadlineSyncApis[WorkloadProfile.BATCH.ordinal()];
 		}
 
+		private RocksDBAsyncAPI protectedAsyncApi() {
+			return noDeadlineAsyncApis[WorkloadProfile.BATCH.ordinal()];
+		}
+
 		private RocksDBAPICommand<?, ?, ?> captureCommand(Function<RocksDBSyncAPI, ?> operation) {
 			try {
 				operation.apply(commandCaptureApi);
@@ -1596,11 +1604,39 @@ public class GrpcServer extends Server {
 		@Override
 		public Mono<Empty> closeFailedUpdate(CloseFailedUpdateRequest request) {
 			requireV3(request.getWorkloadContractVersion());
+			if (proxyScheduler != null) {
+				// The connection may answer late, as a replicated close does: it must not hold a CONTROL worker meanwhile,
+				// and no queue may refuse it, because a refused close keeps its key for the whole lease.
+				return executeMustCompleteAsync("closeFailedUpdate",
+						() -> protectedAsyncApi().closeFailedUpdateAsync(request.getUpdateId()))
+						.thenReturn(Empty.getDefaultInstance())
+						.transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
+			}
 			return executeMustComplete("closeFailedUpdate", () -> {
 				protectedApi().closeFailedUpdate(request.getUpdateId());
 				return Empty.getDefaultInstance();
 			}, workloadScheduler(scheduler, WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
+		}
+
+		/** Closes an update nobody can learn the id of. Nothing waits for it. */
+		private void closeAbandonedUpdate(long updateId) {
+			if (proxyScheduler == null) {
+				protectedApi().closeFailedUpdate(updateId);
+				return;
+			}
+			protectedAsyncApi().closeFailedUpdateAsync(updateId).whenComplete((_, error) -> {
+				if (error != null && !isRetryOfGoneCaller(error)) {
+					countLateProtectedOperationFailure("closeAbandonedUpdate");
+					LOG.warn("Failed to close the update {} of a cancelled request", updateId, error);
+				}
+			});
+		}
+
+		/** The answer that tells a caller to run its update again, which means nothing once that caller is gone. */
+		private static boolean isRetryOfGoneCaller(Throwable error) {
+			var rocksError = findRocksDBException(error);
+			return rocksError != null && rocksError.getErrorUniqueId() == RocksDBErrorType.UPDATE_RETRY;
 		}
 
 		@Override
@@ -2612,7 +2648,7 @@ public class GrpcServer extends Server {
 				return responseBuilder.build();
 			}, response -> {
 				if (request.getTransactionOrUpdateId() == 0L) {
-					protectedApi().closeFailedUpdate(response.getUpdateId());
+					closeAbandonedUpdate(response.getUpdateId());
 				}
 			}, workloadScheduler(scheduler, WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("getForUpdate", request));
@@ -4123,6 +4159,41 @@ public class GrpcServer extends Server {
 					ScheduledCancellationPolicy.MUST_COMPLETE,
 					operation,
 					0L);
+		}
+
+		/**
+		 * {@link #executeMustComplete} of an operation of a non-embedded connection, which is only started here, on the
+		 * call's own thread, and takes no worker while it waits. Its caller's cancellation does not stop it, and shutdown
+		 * waits for it, like any other must-complete operation.
+		 */
+		private <T> Mono<T> executeMustCompleteAsync(String operation, Supplier<CompletableFuture<T>> start) {
+			return Mono.create(sink -> {
+				if (!mustCompleteOperations.register()) {
+					sink.error(new RejectedExecutionException("gRPC server is shutting down"));
+					return;
+				}
+				var cancelled = new AtomicBoolean();
+				sink.onCancel(() -> {
+					cancelled.set(true);
+					cancelledMustCompleteOperations.incrementAndGet();
+				});
+				CompletableFuture<T> future;
+				try {
+					future = start.get();
+				} catch (Throwable error) {
+					future = CompletableFuture.failedFuture(error);
+				}
+				future.whenComplete((result, error) -> {
+					mustCompleteOperations.operationTerminated();
+					if (error == null) {
+						sink.success(result);
+					} else if (!cancelled.get()) {
+						sink.error(error);
+					} else if (!isRetryOfGoneCaller(error)) {
+						recordLateProtectedOperationFailure(operation, error, sink.contextView());
+					}
+				});
+			});
 		}
 
 		private <T> Mono<T> executeScheduled(Callable<T> callable,

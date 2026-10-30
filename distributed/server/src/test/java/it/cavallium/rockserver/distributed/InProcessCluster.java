@@ -49,7 +49,8 @@ final class InProcessCluster implements AutoCloseable {
 					.withRockserverConfig(rockserverConfig)
 					.withBindHosts("127.0.0.1", "127.0.0.1")
 					.withElectionTimeouts(Duration.ofMillis(400), Duration.ofMillis(800))
-					.withRequestTimeout(Duration.ofSeconds(10));
+					.withRequestTimeout(Duration.ofSeconds(10))
+					.withPipelinedUpdates(ProcessCluster.PIPELINED_UPDATES);
 			configs.put(peer.id(), customize.apply(config));
 		}
 	}
@@ -78,6 +79,14 @@ final class InProcessCluster implements AutoCloseable {
 		var node = ReplicatedNode.start(configs.get(id));
 		running.put(id, node);
 		return node;
+	}
+
+	/** Changes how a stopped node starts next. */
+	void reconfigure(String id, UnaryOperator<NodeConfig> change) {
+		if (running.containsKey(id)) {
+			throw new IllegalStateException(id + " is running");
+		}
+		configs.computeIfPresent(id, (_, config) -> change.apply(config));
 	}
 
 	/** Graceful stop (leadership hand-off). */
@@ -150,7 +159,10 @@ final class InProcessCluster implements AutoCloseable {
 
 	/** Waits until every running node applied at least the leader's applied index at call time. */
 	void awaitConverged(Duration timeout) {
-		long target = awaitLeader(timeout).appliedIndex();
+		var leader = awaitLeader(timeout);
+		// Its log, not what it applied: a new leader may still be applying what the previous one committed.
+		var last = leader.stateMachine().division().getRaftLog().getLastEntryTermIndex();
+		long target = Math.max(leader.appliedIndex(), last != null ? last.getIndex() : -1);
 		await(timeout, () -> running.values().stream().allMatch(n -> n.appliedIndex() >= target));
 	}
 

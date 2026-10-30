@@ -77,6 +77,7 @@ class PartitionTest {
 	 */
 	private static final Duration SERVED_AGAIN_TIMEOUT = Duration.ofSeconds(15);
 	private static final Duration POLL_INTERVAL = Duration.ofMillis(20);
+	private static final int MINIMUM_HOT_INCREMENTS = 20;
 	/**
 	 * Nodes give up on a request after 3 seconds, well within a fault: the test also covers nodes whose Raft client
 	 * ran out of retries while cut off.
@@ -90,6 +91,7 @@ class PartitionTest {
 	private static final RequestContext SETUP_CONTEXT = RequestContext.batch(Duration.ofSeconds(5));
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
 	private static final String COLUMN = "registers";
+	private static final String HOT_COLUMN = "hot";
 	private static final int KEYS = 3;
 	private static final int WORKERS_PER_NODE = 2;
 	private static final Duration HEALTHY = Duration.ofSeconds(2);
@@ -104,16 +106,22 @@ class PartitionTest {
 	@TempDir(cleanup = CleanupMode.ON_SUCCESS)
 	Path root;
 
+	/** What the nodes run with: {@code PipelinedPartitionTest} changes it. */
+	List<String> serverArgs() {
+		return SERVER_ARGS;
+	}
+
 	/**
 	 * The leader is cut off from both followers. It must acknowledge nothing (no write and no read: a read could
 	 * only be stale) while the followers elect a new leader and keep serving; after the heal it rejoins.
 	 */
 	@Test
 	void isolatedLeaderAcknowledgesNothingWhileTheMajorityTakesOver() throws Exception {
-		try (var cluster = ProcessCluster.start(root, 3, SERVER_ARGS); var probe = new RaftProbe(cluster)) {
+		try (var cluster = ProcessCluster.start(root, 3, serverArgs()); var probe = new RaftProbe(cluster)) {
 			cluster.waitReady(READY_TIMEOUT);
 			long column = createColumn(cluster);
 			var oldLeader = probe.awaitLeader(cluster.nodeIds(), 0);
+			var hot = hotCounters(cluster);
 			var majority = others(cluster, oldLeader.id());
 
 			try (var workload = new Workload(cluster, column)) {
@@ -131,6 +139,7 @@ class PartitionTest {
 				workload.letRun(AFTER_HEAL);
 				workload.stop();
 				var ops = workload.sent();
+				checkHotCounters(cluster, hot);
 
 				var isolated = during(ops, oldLeader.id()::equals, isolatedAt, healAt);
 				assertNothingAcknowledged(isolated, "the isolated old leader " + oldLeader.id(), workload, isolatedAt);
@@ -160,10 +169,11 @@ class PartitionTest {
 	 */
 	@Test
 	void leaderWithAMajorityKeepsServingThroughAPartition() throws Exception {
-		try (var cluster = ProcessCluster.start(root, 3, SERVER_ARGS); var probe = new RaftProbe(cluster)) {
+		try (var cluster = ProcessCluster.start(root, 3, serverArgs()); var probe = new RaftProbe(cluster)) {
 			cluster.waitReady(READY_TIMEOUT);
 			long column = createColumn(cluster);
 			var leader = probe.awaitLeader(cluster.nodeIds(), 0);
+			var hot = hotCounters(cluster);
 			var followers = others(cluster, leader.id());
 			var majority = Set.of(leader.id(), followers.getFirst());
 			var minority = followers.getLast();
@@ -180,6 +190,7 @@ class PartitionTest {
 				workload.letRun(AFTER_HEAL);
 				workload.stop();
 				var ops = workload.sent();
+				checkHotCounters(cluster, hot);
 
 				var majoritySide = during(ops, majority::contains, partitionedAt, healAt);
 				var unacknowledged = majoritySide.stream().filter(op -> op.status() != OpStatus.OK).toList();
@@ -273,6 +284,27 @@ class PartitionTest {
 
 	// ---------------------------------------------------------------------------------------------------------
 	// Helpers
+
+	/** Workers updating two counters of a column of their own, through every node, through the whole test. */
+	private static HotCounters hotCounters(ProcessCluster cluster) {
+		long column;
+		try (var client = new ClusterClient(cluster.apiAddresses(), WAIT_TIMEOUT, true)) {
+			column = client.createColumn(HOT_COLUMN, SCHEMA, SETUP_CONTEXT).valueOrThrow();
+		}
+		var hot = new HotCounters(cluster.apiAddresses(), column, 0, 2, 3);
+		hot.start();
+		return hot;
+	}
+
+	private static void checkHotCounters(ProcessCluster cluster, HotCounters hot) throws InterruptedException {
+		hot.awaitChainAfterFault(cluster.pipelinedUpdates());
+		hot.stop();
+		try (var client = new ClusterClient(cluster.apiAddresses(), WAIT_TIMEOUT, true)) {
+			long column = client.getColumnId(HOT_COLUMN, SETUP_CONTEXT).valueOrThrow();
+			hot.check(key -> client.get(column, HotCounters.key(key), SETUP_CONTEXT).valueOrThrow(), MINIMUM_HOT_INCREMENTS,
+					cluster.pipelinedUpdates());
+		}
+	}
 
 	private static long createColumn(ProcessCluster cluster) {
 		// createColumn returns the existing id for the same schema, so retrying an ambiguous attempt is harmless.
@@ -456,10 +488,11 @@ class PartitionTest {
 		 */
 		long awaitServedByEveryNode(long from) {
 			await(SERVED_AGAIN_TIMEOUT, () -> "every node acknowledges a write and a read again\n" + progress(from),
-					() -> clients.keySet().stream().allMatch(id -> Stream.of(Operation.Kind.values())
+					() -> clients.keySet().stream().allMatch(id -> Stream.of(Operation.Kind.PUT, Operation.Kind.GET)
 							.allMatch(kind -> firstAcknowledged(id, kind, from).isPresent())));
 			return clients.keySet().stream()
-					.flatMap(id -> Stream.of(Operation.Kind.values()).map(kind -> firstAcknowledged(id, kind, from)))
+					.flatMap(id -> Stream.of(Operation.Kind.PUT, Operation.Kind.GET)
+							.map(kind -> firstAcknowledged(id, kind, from)))
 					.mapToLong(Optional::orElseThrow)
 					.max()
 					.orElseThrow();

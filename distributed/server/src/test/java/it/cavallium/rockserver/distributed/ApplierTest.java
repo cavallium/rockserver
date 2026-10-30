@@ -10,6 +10,7 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
@@ -238,6 +239,243 @@ class ApplierTest {
 			var result = applier.apply(new Request(1, 0, 0, commit), TermIndex.valueOf(1, 1));
 			assertInstanceOf(ApplyResult.Failed.class, result);
 			assertNull(value(store, column, 1), "the first write of a rejected commit must be rolled back");
+		}
+	}
+
+	/** A chained commit that writes {@code value} to {@code key}, if the key still holds {@code read}. */
+	private static LogEntry.Guarded chained(long column, long key, @org.jetbrains.annotations.Nullable String read,
+			String value) {
+		return new LogEntry.Guarded(1, 0, new long[0], new long[0],
+				List.of(new LogEntry.Put(column, key(key), text(value), RequestTypeId.NOTHING)), true, 99,
+				LogEntry.Guard.of(column, key(key), read == null ? null : text(read)));
+	}
+
+	private static void assertRetry(ApplyResult result) {
+		var failed = assertInstanceOf(ApplyResult.Failed.class, result);
+		assertEquals(RocksDBErrorType.UPDATE_RETRY, failed.type());
+	}
+
+	@Test
+	void aGuardedCommitWritesOnlyOverTheValueItRead() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			assertInstanceOf(ApplyResult.Ok.class, applier.apply(new Request(1, 0, 0, chained(column, 1, null, "a")),
+					TermIndex.valueOf(1, 1)));
+			assertEquals("a", value(store, column, 1));
+			assertInstanceOf(ApplyResult.Ok.class, applier.apply(new Request(1, 1, 0, chained(column, 1, "a", "b")),
+					TermIndex.valueOf(1, 2)));
+			assertEquals("b", value(store, column, 1));
+			assertRetry(applier.apply(new Request(1, 2, 0, chained(column, 1, "a", "c")), TermIndex.valueOf(1, 3)));
+			assertEquals("b", value(store, column, 1), "a rejected commit writes nothing");
+			assertEquals(TermIndex.valueOf(1, 3), store.applied(), "and the log moves on");
+			assertRetry(applier.apply(new Request(1, 3, 0, chained(column, 1, null, "c")), TermIndex.valueOf(1, 4)));
+			assertEquals("b", value(store, column, 1));
+		}
+	}
+
+	@Test
+	void aGuardTellsAnAbsentValueFromAnEmptyOne() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			applier.apply(new Request(1, 0, 0, new LogEntry.Put(column, key(1), Buf.wrap(), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 1));
+			assertRetry(applier.apply(new Request(1, 1, 0, chained(column, 1, null, "a")), TermIndex.valueOf(1, 2)));
+			assertRetry(applier.apply(new Request(1, 2, 0, chained(column, 2, "", "a")), TermIndex.valueOf(1, 3)));
+			assertInstanceOf(ApplyResult.Ok.class, applier.apply(new Request(1, 3, 0, chained(column, 1, "", "a")),
+					TermIndex.valueOf(1, 4)));
+			assertInstanceOf(ApplyResult.Ok.class, applier.apply(new Request(1, 4, 0, chained(column, 2, null, "a")),
+					TermIndex.valueOf(1, 5)));
+			assertEquals("a", value(store, column, 1));
+			assertEquals("a", value(store, column, 2));
+		}
+	}
+
+	@Test
+	void aGuardSeesTheEarlierEntriesOfItsGroupAndOfItsBatch() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			applier.beginGroup();
+			applier.apply(new Request(1, 0, 0, new LogEntry.Put(column, key(1), text("a"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 1));
+			assertInstanceOf(ApplyResult.Ok.class, applier.apply(new Request(1, 1, 0, chained(column, 1, "a", "b")),
+					TermIndex.valueOf(1, 2)));
+			assertInstanceOf(ApplyResult.Ok.class, applier.apply(new Request(1, 2, 0, chained(column, 1, "b", "c")),
+					TermIndex.valueOf(1, 3)));
+			applier.endGroup();
+			assertEquals("c", value(store, column, 1));
+
+			var batch = applier.applyBatch(List.of(new Request(1, 3, 0, chained(column, 2, null, "x")),
+					new Request(1, 4, 0, chained(column, 2, "x", "y"))), TermIndex.valueOf(1, 4));
+			assertInstanceOf(ApplyResult.Ok.class, batch.get(0));
+			assertInstanceOf(ApplyResult.Ok.class, batch.get(1));
+			assertEquals("y", value(store, column, 2));
+		}
+	}
+
+	/** The same entries give the same results and the same database however they are grouped. */
+	@Test
+	void groupBoundariesDoNotChangeTheVerdict() throws Exception {
+		for (int groupSize : new int[] {1, 2, 3, 100}) {
+			var dir = temp.resolve("group-" + groupSize);
+			Files.createDirectories(dir);
+			try (var store = NodeStore.open(dir.resolve("db"), null, "applier-test")) {
+				var applier = new Applier(store);
+				long column = store.db().createColumn("c", SCHEMA);
+				var entries = List.of(
+						new Request(1, 0, 0, chained(column, 1, null, "a")),
+						new Request(1, 1, 0, chained(column, 1, "a", "b")),
+						// Rejected: the key holds b.
+						new Request(1, 2, 0, chained(column, 1, "a", "z")),
+						new Request(1, 3, 0, chained(column, 1, "b", "c")),
+						new Request(1, 4, 0, new LogEntry.Delete(column, key(1), RequestTypeId.NOTHING)),
+						new Request(1, 5, 0, chained(column, 1, "c", "y")),
+						new Request(1, 6, 0, chained(column, 1, null, "d")));
+				var results = new java.util.ArrayList<ApplyResult>();
+				long index = 0;
+				for (int i = 0; i < entries.size(); i++) {
+					if (i % groupSize == 0) {
+						if (i > 0) {
+							applier.endGroup();
+						}
+						applier.beginGroup();
+					}
+					results.add(applier.apply(entries.get(i), TermIndex.valueOf(1, ++index)));
+				}
+				applier.endGroup();
+				assertEquals("d", value(store, column, 1), "group size " + groupSize);
+				assertInstanceOf(ApplyResult.Ok.class, results.get(0));
+				assertInstanceOf(ApplyResult.Ok.class, results.get(1));
+				assertRetry(results.get(2));
+				assertInstanceOf(ApplyResult.Ok.class, results.get(3));
+				assertRetry(results.get(5));
+				assertInstanceOf(ApplyResult.Ok.class, results.get(6));
+			}
+		}
+	}
+
+	@Test
+	void aRejectedEntryInABatchLeavesTheOthersApplied() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			var results = applier.applyBatch(List.of(
+					new Request(1, 0, 0, chained(column, 1, null, "a")),
+					new Request(1, 1, 0, chained(column, 2, "wrong", "b")),
+					new Request(1, 2, 0, chained(column, 3, null, "c"))), TermIndex.valueOf(1, 1));
+			assertInstanceOf(ApplyResult.Ok.class, results.get(0));
+			assertRetry(results.get(1));
+			assertInstanceOf(ApplyResult.Ok.class, results.get(2));
+			assertEquals("a", value(store, column, 1));
+			assertNull(value(store, column, 2));
+			assertEquals("c", value(store, column, 3));
+		}
+	}
+
+	@Test
+	void aGuardOnABucketedColumnReadsItsOwnKey() throws Exception {
+		var bucketed = ColumnSchema.of(IntList.of(Long.BYTES),
+				ObjectList.of(it.cavallium.rockserver.core.common.ColumnHashType.XXHASH32), true);
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("b", bucketed);
+			var first = new Keys(key(1).keys()[0], Buf.wrap(new byte[] {1}));
+			var second = new Keys(key(1).keys()[0], Buf.wrap(new byte[] {2}));
+			applier.apply(new Request(1, 0, 0, new LogEntry.Put(column, first, text("a"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 1));
+			applier.apply(new Request(1, 1, 0, new LogEntry.Put(column, second, text("b"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 2));
+			var write = new LogEntry.Put(column, first, text("c"), RequestTypeId.NOTHING);
+			var stale = new LogEntry.Guarded(1, 0, new long[0], new long[0], List.of(write), true, 99,
+					LogEntry.Guard.of(column, first, text("b")));
+			assertRetry(applier.apply(new Request(1, 2, 0, stale), TermIndex.valueOf(1, 3)));
+			var good = new LogEntry.Guarded(1, 0, new long[0], new long[0], List.of(write), true, 99,
+					LogEntry.Guard.of(column, first, text("a")));
+			assertInstanceOf(ApplyResult.Ok.class, applier.apply(new Request(1, 3, 0, good), TermIndex.valueOf(1, 4)));
+			assertEquals("c", store.db().get(0, column, first, RequestType.<Buf>current()).toString(StandardCharsets.UTF_8));
+		}
+	}
+
+	@Test
+	void aGuardOnADeletedOrInternalColumnIsARejection() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			store.db().deleteColumn(column);
+			var deleted = applier.apply(new Request(1, 0, 0, chained(column, 1, null, "a")), TermIndex.valueOf(1, 1));
+			assertInstanceOf(ApplyResult.Failed.class, deleted);
+			long other = store.db().createColumn("d", SCHEMA);
+			var internal = new LogEntry.Guarded(1, 0, new long[0], new long[0],
+					List.of(new LogEntry.Put(other, key(1), text("x"), RequestTypeId.NOTHING)), true, 99,
+					LogEntry.Guard.of(store.metaColumnId(), key(1), null));
+			assertInstanceOf(ApplyResult.Failed.class, applier.apply(new Request(1, 1, 0, internal),
+					TermIndex.valueOf(1, 2)));
+			assertNull(value(store, other, 1));
+		}
+	}
+
+	/** A replay gives every entry the verdict of the first run, from the record or by applying it again. */
+	@Test
+	void aRejectionIsRecordedAndSurvivesARestart() throws Exception {
+		long column;
+		var rejected = new Request(1, 1, 0, chained(0, 1, "wrong", "b"));
+		try (var store = open()) {
+			var applier = new Applier(store);
+			column = store.db().createColumn("c", SCHEMA);
+			applier.apply(new Request(1, 0, 0, chained(column, 1, null, "a")), TermIndex.valueOf(1, 1));
+			rejected = new Request(1, 1, 0, chained(column, 1, "wrong", "b"));
+			var first = applier.apply(rejected, TermIndex.valueOf(1, 2));
+			assertRetry(first);
+			assertEquals(first, applier.recordedResult(rejected));
+			// A copy gets the recorded verdict, even if the guard would match now.
+			applier.apply(new Request(1, 2, 0, new LogEntry.Put(column, key(1), text("wrong"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 3));
+			assertEquals(first, applier.apply(rejected, TermIndex.valueOf(1, 4)));
+			assertEquals("wrong", value(store, column, 1));
+		}
+		try (var store = open()) {
+			var applier = new Applier(store);
+			assertRetry(applier.apply(rejected, TermIndex.valueOf(1, 5)));
+			assertEquals("wrong", value(store, column, 1));
+		}
+	}
+
+	/** Two replicas applying the same log, one group by group and the other entry by entry, end up identical. */
+	@Test
+	void twoReplicasReachTheSameVerdicts() throws Exception {
+		var random = new java.util.Random(11);
+		Files.createDirectories(temp.resolve("a"));
+		Files.createDirectories(temp.resolve("b"));
+		try (var a = NodeStore.open(temp.resolve("a/db"), null, "a"); var b = NodeStore.open(temp.resolve("b/db"), null, "b")) {
+			var groupedApplier = new Applier(a);
+			var plainApplier = new Applier(b);
+			long column = a.db().createColumn("c", SCHEMA);
+			assertEquals(column, b.db().createColumn("c", SCHEMA));
+			String[] current = new String[4];
+			for (int i = 0; i < 200; i++) {
+				int key = random.nextInt(current.length);
+				String read = random.nextInt(4) == 0 ? "stale" + i : current[key];
+				var request = new Request(1, i, 0, chained(column, key, read, "v" + i));
+				if (i % 8 == 0) {
+					groupedApplier.beginGroup();
+				}
+				var position = TermIndex.valueOf(1, i + 1);
+				var grouped = groupedApplier.apply(request, position);
+				if (i % 8 == 7) {
+					groupedApplier.endGroup();
+				}
+				assertEquals(plainApplier.apply(request, position), grouped);
+				if (grouped instanceof ApplyResult.Ok) {
+					current[key] = "v" + i;
+				}
+			}
+			groupedApplier.endGroup();
+			for (int key = 0; key < current.length; key++) {
+				assertEquals(current[key], value(a, column, key));
+				assertEquals(current[key], value(b, column, key));
+			}
 		}
 	}
 

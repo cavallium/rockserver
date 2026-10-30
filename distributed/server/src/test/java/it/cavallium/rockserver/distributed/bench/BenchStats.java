@@ -21,6 +21,8 @@ final class BenchStats {
 		final Recorder latency = new Recorder(3);
 		final LongAdder ok = new LongAdder();
 		final LongAdder retries = new LongAdder();
+		/** Update opens that failed with a request to retry, such as the lock wait of a hot key running out. */
+		final LongAdder lockWaitRetries = new LongAdder();
 		final LongAdder bytes = new LongAdder();
 		final Map<String, LongAdder> errors = new ConcurrentHashMap<>();
 
@@ -54,8 +56,8 @@ final class BenchStats {
 	}
 
 	/** One interval's results, after {@link #snapshot}. */
-	record Row(String op, long ok, long errors, long retries, double perSecond, double mbPerSecond, double p50ms,
-			double p99ms, double p999ms, double maxMs, Map<String, Long> errorKinds) {}
+	record Row(String op, long ok, long errors, long retries, long lockWaitRetries, double perSecond,
+			double mbPerSecond, double p50ms, double p99ms, double p999ms, double maxMs, Map<String, Long> errorKinds) {}
 
 	/** Takes and resets every counter; {@code seconds} is the interval length. */
 	Map<String, Row> snapshot(double seconds) {
@@ -65,6 +67,7 @@ final class BenchStats {
 			Histogram histogram = op.latency.getIntervalHistogram();
 			long ok = op.ok.sumThenReset();
 			long retries = op.retries.sumThenReset();
+			long lockWaitRetries = op.lockWaitRetries.sumThenReset();
 			long bytes = op.bytes.sumThenReset();
 			var kinds = new TreeMap<String, Long>();
 			long errors = 0;
@@ -75,7 +78,7 @@ final class BenchStats {
 					errors += count;
 				}
 			}
-			rows.put(entry.getKey(), new Row(entry.getKey(), ok, errors, retries, ok / seconds,
+			rows.put(entry.getKey(), new Row(entry.getKey(), ok, errors, retries, lockWaitRetries, ok / seconds,
 					bytes / seconds / (1 << 20), ms(histogram, 50), ms(histogram, 99), ms(histogram, 99.9),
 					histogram.getMaxValue() / 1000.0, kinds));
 		}
@@ -88,14 +91,14 @@ final class BenchStats {
 
 	static String format(Map<String, Row> rows) {
 		var out = new StringBuilder();
-		out.append(String.format(Locale.ROOT, "%-14s %9s %9s %7s %7s %8s %8s %8s %9s%n", "op", "ok/s", "MiB/s",
-				"err", "retry", "p50ms", "p99ms", "p999ms", "maxms"));
+		out.append(String.format(Locale.ROOT, "%-14s %9s %9s %7s %7s %8s %8s %8s %9s %9s%n", "op", "ok/s", "MiB/s",
+				"err", "retry", "p50ms", "p99ms", "p999ms", "maxms", "lockretry"));
 		double total = 0;
 		for (var row : rows.values()) {
 			total += row.perSecond();
-			out.append(String.format(Locale.ROOT, "%-14s %9.0f %9.2f %7d %7d %8.2f %8.2f %8.2f %9.1f%n", row.op(),
+			out.append(String.format(Locale.ROOT, "%-14s %9.0f %9.2f %7d %7d %8.2f %8.2f %8.2f %9.1f %9d%n", row.op(),
 					row.perSecond(), row.mbPerSecond(), row.errors(), row.retries(), row.p50ms(), row.p99ms(),
-					row.p999ms(), row.maxMs()));
+					row.p999ms(), row.maxMs(), row.lockWaitRetries()));
 			if (!row.errorKinds().isEmpty()) {
 				out.append("               errors: ").append(row.errorKinds()).append('\n');
 			}

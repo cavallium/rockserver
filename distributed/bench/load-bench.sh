@@ -2,6 +2,7 @@
 # Runs LoadBench (distributed/server/src/test/java/.../bench/LoadBench.java) with the classes of this checkout.
 # Build first: mvn -o -q -f distributed/pom.xml -pl server -am test-compile -DskipTests
 # Usage: distributed/bench/load-bench.sh --target replicated --root /path/on/a/real/disk [LoadBench options]
+# Hot keys, on and off: add --hot-keys 4:0.5, and --server-arg --pipelined-updates for on.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/../.." && pwd)"
 server="$here/distributed/server"

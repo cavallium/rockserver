@@ -18,6 +18,92 @@ import org.junit.jupiter.api.Test;
 
 class LinearizabilityCheckerTest {
 
+	@Test
+	void updatesChainOnEachOtherInTheOrderTheirReadsAllow() {
+		// Concurrent, in the order only their values give.
+		var history = List.of(
+				Operation.update("k", null, "1", 0, 100, OpStatus.OK),
+				Operation.update("k", "2", "3", 0, 100, OpStatus.OK),
+				Operation.update("k", "1", "2", 0, 100, OpStatus.OK),
+				Operation.get("k", "3", 101, 102, OpStatus.OK));
+		assertTrue(LinearizabilityChecker.check(history).linearizable());
+	}
+
+	@Test
+	void aLostUpdateIsNotLinearizable() {
+		var history = List.of(
+				Operation.update("k", null, "a", 0, 100, OpStatus.OK),
+				Operation.update("k", null, "b", 0, 100, OpStatus.OK));
+		var result = LinearizabilityChecker.check(history);
+		assertFalse(result.linearizable());
+		assertTrue(result.description().contains("update(absent -> "), result.description());
+	}
+
+	@Test
+	void aFailedUpdateDoesNotCountEvenIfItsReadCouldNeverHappen() {
+		var history = List.of(
+				Operation.update("k", "a value never written", "b", 0, 100, OpStatus.FAILED),
+				Operation.get("k", null, 101, 102, OpStatus.OK));
+		assertTrue(LinearizabilityChecker.check(history).linearizable());
+	}
+
+	@Test
+	void aSuccessfulCloseIsAReadAfterTheCommitItReadFrom() {
+		// The close ends before the commit is acknowledged, but after it took effect: fine.
+		var fine = List.of(
+				Operation.update("k", null, "a", 0, 100, OpStatus.OK),
+				Operation.get("k", "a", 10, 50, OpStatus.OK));
+		assertTrue(LinearizabilityChecker.check(fine).linearizable());
+		// A write acknowledged before the close started must be visible to it.
+		var stale = List.of(
+				Operation.update("k", null, "a", 0, 10, OpStatus.OK),
+				Operation.put("k", "w", 20, 30, OpStatus.OK),
+				Operation.get("k", "a", 40, 50, OpStatus.OK));
+		assertFalse(LinearizabilityChecker.check(stale).linearizable());
+	}
+
+	@Test
+	void anUnknownUpdateTakesEffectOnlyWhereItsReadAllows() {
+		// An unknown update read a, so it cannot take effect once the register holds b.
+		var legal = List.of(
+				Operation.put("k", "a", 0, 10, OpStatus.OK),
+				Operation.update("k", "a", "u", 11, 12, OpStatus.UNKNOWN),
+				Operation.get("k", "u", 20, 30, OpStatus.OK));
+		assertTrue(LinearizabilityChecker.check(legal).linearizable());
+		var illegal = List.of(
+				Operation.put("k", "a", 0, 10, OpStatus.OK),
+				Operation.update("k", "a", "u", 11, 12, OpStatus.UNKNOWN),
+				Operation.put("k", "b", 13, 14, OpStatus.OK),
+				Operation.get("k", "b", 15, 16, OpStatus.OK),
+				Operation.get("k", "u", 20, 30, OpStatus.OK));
+		assertFalse(LinearizabilityChecker.check(illegal).linearizable());
+	}
+
+	@Test
+	void anUnknownUpdateThatAKeptOneReadFromIsKept() {
+		var history = List.of(
+				Operation.update("k", null, "1", 0, 10, OpStatus.UNKNOWN),
+				Operation.update("k", "1", "2", 11, 12, OpStatus.UNKNOWN),
+				Operation.get("k", "2", 20, 30, OpStatus.OK));
+		assertTrue(LinearizabilityChecker.check(history).linearizable());
+	}
+
+	@Test
+	void anUpdateIsRecordedByTheHistory() {
+		var history = new History();
+		var ok = history.invokeUpdateAt("k", null, "a", System.nanoTime());
+		ok.complete(OpStatus.OK);
+		var failed = history.invokeUpdateAt("k", "x", "y", System.nanoTime());
+		failed.complete(OpStatus.FAILED);
+		var get = history.invokeGetAt("k", System.nanoTime());
+		get.complete(OpStatus.OK, "a");
+		var operations = history.operations();
+		assertEquals(Operation.Kind.UPDATE, operations.getFirst().kind());
+		assertEquals(null, operations.getFirst().read());
+		assertEquals("x", operations.get(1).read());
+		assertTrue(LinearizabilityChecker.check(operations).linearizable());
+	}
+
 	private static final String K = "k";
 
 	@Test

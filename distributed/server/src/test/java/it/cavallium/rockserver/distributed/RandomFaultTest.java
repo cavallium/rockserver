@@ -112,6 +112,9 @@ class RandomFaultTest {
 	private static final Duration TX_LEASE = Duration.ofSeconds(10);
 
 	private static final int REGISTER_KEYS = 16;
+	private static final int HOT_COUNTERS = 2;
+	private static final int HOT_WORKERS = 4;
+	private static final int MINIMUM_HOT_INCREMENTS = 20;
 	private static final int ACCOUNTS = 8;
 	private static final long INITIAL_BALANCE = 1_000;
 	private static final long TOTAL = ACCOUNTS * INITIAL_BALANCE;
@@ -122,6 +125,11 @@ class RandomFaultTest {
 	@TempDir(cleanup = CleanupMode.ON_SUCCESS)
 	Path root;
 
+	/** What the nodes run with: {@code PipelinedRandomFaultTest} changes it. */
+	List<String> serverArgs() {
+		return SERVER_ARGS;
+	}
+
 	@Test
 	void registersStayLinearizableAndTransfersKeepTheTotalUnderRandomFaults() throws Exception {
 		long seed = Long.getLong(SEED_PROPERTY, new SecureRandom().nextLong());
@@ -131,7 +139,7 @@ class RandomFaultTest {
 		log("RandomFaultTest " + repro + ", " + schedule.size() + " faults over " + length + ", data in " + root);
 		schedule.forEach(step -> log("  planned: " + step));
 
-		try (var cluster = ProcessCluster.start(root, NODES, SERVER_ARGS);
+		try (var cluster = ProcessCluster.start(root, NODES, serverArgs());
 				var probe = new RaftProbe(cluster);
 				var setup = new ClusterClient(cluster.apiAddresses(), FINAL_RETRY, true)) {
 			cluster.waitReady(READY_TIMEOUT);
@@ -141,16 +149,21 @@ class RandomFaultTest {
 				setup.put(bank, key(account), balance(INITIAL_BALANCE), SETUP_CONTEXT).valueOrThrow();
 			}
 
+			long hotColumn = setup.createColumn("hot", SCHEMA, SETUP_CONTEXT).valueOrThrow();
+			var hot = new HotCounters(cluster.apiAddresses(), hotColumn, 0, HOT_COUNTERS, HOT_WORKERS);
+			hot.start();
 			var workload = new Workload(cluster, registers, bank, new Random(seed ^ 0x5DEECE66DL));
 			workload.start();
 			var executed = new ArrayList<ExecutedStep>();
 			try {
 				for (var step : schedule) {
 					executed.add(step.run(cluster, probe));
+					hot.awaitChainAfterFault(cluster.pipelinedUpdates());
 				}
 			} finally {
 				cluster.network().heal();
 				workload.stop();
+				hot.stop();
 			}
 			log("Faults done; " + workload.summary());
 			workload.rethrowWorkerFailures();
@@ -159,6 +172,8 @@ class RandomFaultTest {
 			var finalRegisters = workload.finalRegisterReads(setup);
 			var finalBalances = workload.finalAudit(setup);
 			assertBalancesHold(finalBalances, "final balances, " + repro);
+			hot.check(key -> setup.get(hotColumn, HotCounters.key(key), SETUP_CONTEXT).valueOrThrow(), MINIMUM_HOT_INCREMENTS,
+					cluster.pipelinedUpdates());
 
 			assertTrue(workload.registerWrites.get() > 0, "no register write was acknowledged, " + repro);
 			assertTrue(workload.committedTransfers.get() > 0, "no transfer committed, " + repro);
@@ -408,7 +423,9 @@ class RandomFaultTest {
 		private void registerOp(String worker, ClusterClient client, Random random, boolean multiEndpoint) {
 			int index = random.nextInt(REGISTER_KEYS);
 			var key = "r" + index;
-			if (random.nextBoolean()) {
+			if (random.nextInt(4) == 0) {
+				updateRegister(worker, client, random, index, key);
+			} else if (random.nextBoolean()) {
 				var value = worker + "-" + valueSequence.incrementAndGet();
 				var pending = history.invokePut(key, value);
 				long invoked = System.nanoTime();
@@ -428,6 +445,37 @@ class RandomFaultTest {
 				if (multiEndpoint && result.status() == OpStatus.OK) {
 					acknowledged.add(System.nanoTime());
 				}
+			}
+		}
+
+		/** A read-modify-write of a register, or one in four times the read of an update closed without writing. */
+		private void updateRegister(String worker, ClusterClient client, Random random, int index, String key) {
+			long invoked = System.nanoTime();
+			var opened = client.read(OP_CONTEXT,
+					api -> api.get(0, registers, key(index), RequestType.<Buf>forUpdate()));
+			if (!opened.acknowledged()) {
+				return;
+			}
+			var update = opened.value();
+			var read = update.previous() == null ? null : text(update.previous());
+			if (random.nextInt(4) == 0) {
+				var close = history.invokeGetAt(key, invoked);
+				try {
+					client.api(opened.node(), OP_CONTEXT).closeFailedUpdate(update.updateId());
+					close.complete(OpStatus.OK, read);
+				} catch (RuntimeException ex) {
+					close.complete(OpStatus.FAILED, null);
+				}
+				return;
+			}
+			var value = worker + "-" + valueSequence.incrementAndGet();
+			var pending = history.invokeUpdateAt(key, read, value, invoked);
+			try {
+				client.api(opened.node(), OP_CONTEXT).put(update.updateId(), registers, key(index), text(value),
+						RequestType.none());
+				pending.complete(OpStatus.OK);
+			} catch (RuntimeException ex) {
+				pending.complete(HotCounters.isRetry(ex) ? OpStatus.FAILED : OpStatus.UNKNOWN);
 			}
 		}
 
@@ -683,7 +731,7 @@ class RandomFaultTest {
 		}
 		var reference = contents.values().iterator().next();
 		var referenceId = cluster.nodeIds().getFirst();
-		assertEquals(Set.of("registers", "bank"), reference.keySet(), "user columns of replica " + referenceId);
+		assertEquals(Set.of("registers", "bank", "hot"), reference.keySet(), "user columns of replica " + referenceId);
 		for (var entry : contents.entrySet()) {
 			var replica = entry.getValue();
 			assertEquals(reference.keySet(), replica.keySet(), "columns of replica " + entry.getKey() + ", " + repro);

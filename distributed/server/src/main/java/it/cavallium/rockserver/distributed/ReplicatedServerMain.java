@@ -21,7 +21,7 @@ import org.apache.ratis.protocol.RaftPeerId;
  * run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT (repeat per member) --data-dir DIR
  *       [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
  *       [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
- *       [--max-transaction-lease-ms N] [--log-segment-bytes N]
+ *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates]
  * admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
  * </pre>
@@ -31,6 +31,10 @@ import org.apache.ratis.protocol.RaftPeerId;
  * {@code repair-log} runs on a stopped node, after a power loss left it unable to read its Raft log: see
  * {@link RaftLogRepair}. It exits with 0 if the log is valid or was repaired (with {@code --dry-run}: could be) and
  * with 1 if it refuses.</p>
+ *
+ * <p>{@code --pipelined-updates}, off by default, lets a leader pass a key to its next {@code getForUpdate} update as
+ * soon as the previous update's commit is admitted to the log: see "Transactions" in the design document, which also
+ * tells what it changes for clients.</p>
  */
 public final class ReplicatedServerMain {
 
@@ -68,7 +72,8 @@ public final class ReplicatedServerMain {
 				Duration.ofMillis(Long.parseLong(options.value("--request-timeout-ms", "10000"))),
 				Duration.ofMillis(Long.parseLong(options.value("--max-transaction-lease-ms",
 						String.valueOf(NodeConfig.DEFAULT_MAX_TRANSACTION_LEASE.toMillis())))),
-				Long.parseLong(options.value("--log-segment-bytes", String.valueOf(NodeConfig.DEFAULT_LOG_SEGMENT_BYTES))));
+				Long.parseLong(options.value("--log-segment-bytes", String.valueOf(NodeConfig.DEFAULT_LOG_SEGMENT_BYTES))),
+				options.flag("--pipelined-updates"));
 		options.requireConsumed();
 		ReplicatedNode node;
 		try {
@@ -183,15 +188,15 @@ public final class ReplicatedServerMain {
 				  run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT ... --data-dir DIR
 				        [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
 				        [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
-				        [--max-transaction-lease-ms N] [--log-segment-bytes N]
+				        [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates]
 				  admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]""");
 		System.exit(2);
 	}
 
-	/** Minimal "--name value" parser; {@code --peer} may repeat and {@code --dry-run} takes no value. */
+	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
 	private static final class Options {
-		private static final String DRY_RUN = "--dry-run";
+		private static final List<String> FLAGS = List.of("--pipelined-updates", "--dry-run");
 
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();
@@ -200,8 +205,8 @@ public final class ReplicatedServerMain {
 		Options(List<String> args) {
 			for (int i = 0; i < args.size(); i++) {
 				var arg = args.get(i);
-				if (arg.equals(DRY_RUN)) {
-					pairs.add(new String[] {arg, ""});
+				if (FLAGS.contains(arg)) {
+					pairs.add(new String[] {arg, "true"});
 				} else if (arg.startsWith("--")) {
 					if (i + 1 >= args.size()) {
 						usage("missing value for " + arg);

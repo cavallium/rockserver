@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -85,11 +86,13 @@ final class Applier {
 		this.openTime = metrics == null ? null : metrics.duration("apply.open");
 		this.executeTime = metrics == null ? null : metrics.duration("apply.execute");
 		this.commitTime = metrics == null ? null : metrics.duration("apply.commit");
+		this.guardRejected = metrics == null ? null : metrics.amount("update.guardRejected");
 	}
 
 	private final NodeMetrics.@Nullable Series openTime;
 	private final NodeMetrics.@Nullable Series executeTime;
 	private final NodeMetrics.@Nullable Series commitTime;
+	private final NodeMetrics.@Nullable Series guardRejected;
 
 	private static void record(NodeMetrics.@Nullable Series series, long startNanos) {
 		if (series != null) {
@@ -776,6 +779,16 @@ final class Applier {
 				}
 			}
 			case LogEntry.Guarded guarded -> {
+				if (guarded.guard() != null) {
+					var guard = guarded.guard();
+					requireUserColumn(guard.columnId());
+					// Through the transaction, so that an earlier entry of the same group is seen. Every replica sees the
+					// same value at this log position, so all reach the same verdict.
+					Buf current = db.get(tx, guard.columnId(), guard.keys(), RequestType.<Buf>current());
+					if (!guard.matches(current)) {
+						throw new RocksDBRetryException();
+					}
+				}
 				Object last = null;
 				for (LogEntry.Write write : guarded.writes()) {
 					if (write instanceof LogEntry.DeleteRange) {
@@ -859,6 +872,11 @@ final class Applier {
 	 * alone in a reply, so a copy of the request sent alone always gets it.
 	 */
 	private ApplyResult record(long tx, ProposerRecords records, Request request, ApplyResult result) {
+		if (guardRejected != null && result instanceof ApplyResult.Failed failed
+				&& failed.type() == RocksDBErrorType.UPDATE_RETRY) {
+			// Counted here, not where the guard is checked: a rejected entry is applied up to three times.
+			guardRejected.record(1);
+		}
 		var bounded = ResultCodec.bounded(result);
 		byte[] encoded = ResultCodec.encode(bounded);
 		store.db().put(tx, store.metaColumnId(), NodeStore.requestKey(request.proposerId(), request.sequence()),

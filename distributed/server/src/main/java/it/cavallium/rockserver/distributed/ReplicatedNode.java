@@ -286,6 +286,16 @@ public final class ReplicatedNode implements AutoCloseable {
 		return stateMachine;
 	}
 
+	/** This node's metrics, for tests. */
+	NodeMetrics metrics() {
+		return metrics;
+	}
+
+	/** This node's proposer, for tests that propose what no client could. */
+	Proposer proposer() {
+		return proposer;
+	}
+
 	/** True once this replica failed to apply the log and stopped. */
 	public boolean isFailed() {
 		return stateMachine.isFailed();

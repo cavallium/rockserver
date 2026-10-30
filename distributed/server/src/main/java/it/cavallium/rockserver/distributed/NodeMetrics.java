@@ -27,6 +27,8 @@ final class NodeMetrics {
 		private final LongAdder count = new LongAdder();
 		private final LongAdder sum = new LongAdder();
 		private final AtomicLong max = new AtomicLong();
+		/** Values already logged. Used by the logger only. */
+		private long logged;
 
 		void record(long value) {
 			count.increment();
@@ -37,6 +39,11 @@ final class NodeMetrics {
 		/** Records the time elapsed since {@code startNanos}. */
 		void since(long startNanos) {
 			record(System.nanoTime() - startNanos);
+		}
+
+		/** Every value recorded so far, for tests. */
+		long count() {
+			return count.sum();
 		}
 	}
 
@@ -99,7 +106,9 @@ final class NodeMetrics {
 	private static void append(StringBuilder line, Map<String, Series> series, double scale, String unit) {
 		for (var entry : new TreeMap<>(series).entrySet()) {
 			var s = entry.getValue();
-			long count = s.count.sumThenReset();
+			long total = s.count.sum();
+			long count = total - s.logged;
+			s.logged = total;
 			long sum = s.sum.sumThenReset();
 			long max = s.max.getAndSet(0);
 			if (count == 0) {

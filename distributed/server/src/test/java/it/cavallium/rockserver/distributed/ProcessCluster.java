@@ -482,6 +482,25 @@ public final class ProcessCluster implements AutoCloseable {
 		}
 	}
 
+	/**
+	 * Tests only: {@code -Drockserver.test.pipelinedUpdates=true} runs every test cluster, of processes or in one JVM,
+	 * with {@link NodeConfig#pipelinedUpdates()} on.
+	 */
+	static final boolean PIPELINED_UPDATES = Boolean.getBoolean("rockserver.test.pipelinedUpdates");
+	private static final String PIPELINED_UPDATES_ARG = "--pipelined-updates";
+
+	/** {@code serverArgs} with pipelined updates on, whatever the system property says. */
+	static List<String> pipelined(List<String> serverArgs) {
+		var args = new ArrayList<>(serverArgs);
+		args.add(PIPELINED_UPDATES_ARG);
+		return args;
+	}
+
+	/** Whether this cluster's nodes have pipelined updates on. */
+	boolean pipelinedUpdates() {
+		return PIPELINED_UPDATES || serverArgs.contains(PIPELINED_UPDATES_ARG);
+	}
+
 	private List<String> command(Node node) {
 		var command = new ArrayList<String>();
 		command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
@@ -516,6 +535,9 @@ public final class ProcessCluster implements AutoCloseable {
 		command.add("--api-bind-host");
 		command.add(LOOPBACK);
 		command.addAll(serverArgs);
+		if (PIPELINED_UPDATES && !serverArgs.contains(PIPELINED_UPDATES_ARG)) {
+			command.add(PIPELINED_UPDATES_ARG);
+		}
 		return command;
 	}
 

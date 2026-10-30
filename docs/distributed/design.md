@@ -358,7 +358,8 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
 
 - **Open.** `openTransaction` and `getForUpdate` wait for the read barrier, then open a native transaction or
   update on the leader's `EmbeddedDB`. That gives the same snapshot and read-your-writes behavior as on one
-  node. A `getForUpdate` starts the barrier when it arrives, so the barrier runs while it waits for its key.
+  node. A `getForUpdate` starts the barrier when it arrives, so the barrier runs while it waits for its key
+  (with pipelined updates, below, before: it holds no key during the barrier).
   The caller's timeout counts from the request's arrival, barrier included: a transaction that finishes opening
   after its caller's deadline is rolled back at once instead of being held for its lease.
 - **Lease cap.** A transaction's lease is at most 60 s (`NodeConfig.maxTransactionLease`,
@@ -375,6 +376,59 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
   instead of holding it for the lease. While an update waits, the
   leader expires abandoned updates every 100 ms, so the waiter gets the key at the end of the lease even when no
   other request comes.
+- **Pipelined updates** (`NodeConfig.pipelinedUpdates`, `--pipelined-updates`, off by default; it only changes how
+  a leader behaves, so nodes may differ). A hot key's cycle above is a whole commit: fsync, replication and apply.
+  With the flag on, the key passes to the next waiter when the commit of the update holding it passes
+  `preAppendTransaction`, after the conflict check and `register`, not when it is applied. Acknowledgement still
+  comes after apply.
+  - **Chained read.** While its predecessor's commit is unsettled, the next update is *chained*: it reads the value
+    that commit writes from leader memory, with no native transaction, under a positive id (native ids are at
+    most -2, and chained ids hold the term). The value is **provisional**: the update reads something that may
+    never be written, so its read counts only if the update ends well, by a commit that applies or a chained
+    close that succeeds. A failed update's read is not part of the history. Plain reads never see that value.
+  - **Guard.** A chained commit carries a `Guard`: the key, the value's length and its SHA-256. Every replica
+    checks it at the commit's log position, inside the apply transaction, before any write (`Applier.execute`).
+    A mismatch is a deterministic `UPDATE_RETRY` with no write. So a chained commit at position p is an atomic
+    read-modify-write at p, whatever happened to its predecessor: the leader's chain state decides only who gets
+    the key, and when it is wrong, the cost is a retry. The verdict depends only on the entry and the state at
+    that position, so restarts and snapshots need nothing new.
+  - **Grant.** One method grants a key. With unsettled links, it grants the newest one if the chain is not broken,
+    has fewer than 64 links, and `ConflictTracker.chainIntact` holds: the link is the key's last writer, and no
+    column or global write is newer than the applied index. Otherwise waiters stay queued until the links settle,
+    and the next one is a head, which opens natively. A link settles after `applied.advance`, on the thread that
+    completes applied entries, so a head always reads a state that holds it. A failed or unknown link
+    (`broken`, only ever true while links are unsettled) stops chaining until the links drain.
+  - **Chained close.** `closeFailedUpdate` of a chained update writes no log entry. It hands the key on at once,
+    then waits at most 2 s for the commit it read from, on a copy of that link's future. It succeeds only if that
+    commit applied; a dead base, a timeout, or an unknown positive id (after a leader change, or a lease that ended)
+    is `UPDATE_RETRY`, and so is `closeTransaction` of such an id, a rollback included: a clean end would confirm a
+    value that may never be written. A no-change close hands the key on without making a link, so the next update
+    reads the same one: 64 updates may read a link, and more queue for the key until it settles, like with the flag
+    off. A proxy `GrpcServer`, with the flag on or off, serves `closeFailedUpdate` on the async API, on the call's own
+    virtual thread, with must-complete semantics: the wait holds no CONTROL worker, and no queue can refuse a close,
+    since a refused close would keep its key for the whole lease. So does its close of an update whose caller was gone
+    by the time it opened.
+    It linearizes right after that commit: every writer ordered after it was registered after the grant, which
+    came after the read barrier, so after the close's update was invoked. That is why the barrier stays on both
+    paths, and why the grant check is needed for this and not only as an optimisation.
+  - **What falls back.** A commit that is not one put or delete of the locked key (a merge, several keys, another
+    key) or a value over 1 MiB gives no link: the key is held until the reply, as with the flag off. Any operation
+    that needs a snapshot on a chained id (`get` with the id, ranges, iterators, a second `getForUpdate`,
+    `closeTransaction`) ends the update with `UPDATE_RETRY` and makes the next one a head. A second write on an update
+    whose commit is in flight fails alone with `UPDATE_RETRY`: an update has one commit, so a failed commit can only
+    fail the link it made itself. A cold key costs only the bookkeeping.
+  - **Transactions.** A transaction that touches a key with an unsettled link conflicts at commit, whatever it waits
+    for: its snapshot is fixed when it opens, and a link that is unsettled after that is newer than the snapshot even
+    once applied, so only a new transaction can pass. What it needs is a moment with no unsettled links, and a key
+    that chains without a pause has none. So a commit that conflicts on such a key also stops the chain there until
+    its links settle (`LeaderSession.yieldChainsTo`, counted by `transaction.chainConflict`, among
+    `transaction.conflict`), and the transaction's retry finds room, as it does with the flag off. A key's updates pay
+    for that only while transactions collide with them. In `HotKeyThroughputTest`, in-process, with one client
+    running transactions on the key in a tight loop, four runs of one commit on a busy machine (load 8 to 15) gave,
+    beside 32 update clients, 42–137 commits/s with the flag off and 27–39 with it, and updates of the key at 268–767/s
+    off and 1455–1981/s on. Beside 4 update clients, 68–129 commits/s off and 30–42 on, and updates at 387–799/s off
+    and 960–1250/s on. Without the pause, in one earlier run, 0.2 commits/s and 13400 updates/s beside 32 clients, and
+    13 commits/s beside 4. Single runs differ by up to three times: read these as orders of magnitude.
 - **Staged writes** happen natively. The leader also records them, with their conflict keys: the written keys
   plus the `getForUpdate` keys. It counts the encoded size of the commit entry as they arrive. A write or
   `getForUpdate` that would take it past the 16 MiB entry limit fails at once with `INVALID_REQUEST` and is not
@@ -389,7 +443,10 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
 
 - **Check.** It checks the conflict keys against `ConflictTracker`, a map from key hash (or whole column) to
   the index of the last entry that wrote it, filled as entries are appended. A key written after the snapshot
-  index, including by an entry still in flight, is a conflict.
+  index, including by an entry still in flight, is a conflict. A chained commit reads no snapshot: on the key it
+  read it conflicts only with a last writer other than its base, and its index only pins the history for the
+  rest (columns, other keys). Its base may be forgotten once applied, which is no conflict: the guard decides.
+  One whose base failed, or whose update expired, always conflicts.
 - **On conflict** commit returns `false` and the transaction stays open, as on a single node. Commits share
   entries: the leader rejects the entry before appending it and names the commits that conflict (with history,
   or with an earlier write of the same entry); those fail and the others go again in the next entry.
@@ -397,8 +454,9 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
   appending (leader not ready, no pending-request permit, or the state machine's own refusals) means "not
   committed"; `NotLeaderException`, which a leader stepping down also returns for appended entries, is an
   unknown outcome.
-- **Otherwise** the entry is appended and later applied atomically on every replica. The leader's native
-  transaction is then rolled back, because its effects arrive through the log.
+- **Otherwise** the entry is appended and later applied atomically on every replica (unless a chained commit's
+  guard rejects it: see above). The leader's native transaction is then rolled back, because its effects arrive
+  through the log.
 - **Hash collisions** can only cause false conflicts.
 - **History is kept** as long as any open transaction, reservation or in-flight commit pins a snapshot. A commit
   whose snapshot is older than history that was already forgotten always conflicts, whatever released it, so a
@@ -521,8 +579,15 @@ against an incomplete history.
   opens run each on a virtual thread of their own (one that waited past its deadline fails without running).
   Rollbacks (`closeTransaction` without commit, `closeFailedUpdate`) run at once on the thread that received
   them. Ranges, multi-key reads, multi-key staged writes and iterator calls use the embedded workload scheduler.
-- **Updates of one key run one at a time** on the leader. Nested or crossed updates of the same keys by one
-  client block (up to 12 s) instead of conflicting at once.
+- **Updates of one key run one at a time** on the leader, unless `--pipelined-updates` is on: their reads and
+  commits then overlap, and only the time up to each commit's admission is exclusive. Nested or crossed updates
+  of the same keys by one client block (up to 12 s) instead of conflicting at once, as long as the first has not
+  committed.
+- **With `--pipelined-updates`, a `getForUpdate` value is provisional** until the update ends well, so nothing
+  may act on it first. `closeFailedUpdate` of such an update can wait (up to 2 s) and can fail with `UPDATE_RETRY`,
+  which on a single node it never does: code that uses a no-change close to confirm what it read must retry on
+  it. Its update id is positive, and a call that needs a native snapshot on it fails with `UPDATE_RETRY`. A hot key
+  almost always has a pending write, so transactions that touch one conflict more often.
 - **After a kill** (not a graceful stop), a replica's database files are an older consistent point until it
   starts again and replays its log.
 
@@ -538,28 +603,40 @@ failover" below).
 |---|---|
 | `ReplicationTest` (in-process) | Replication through any node; results; leader loss, including a new leader that has not applied what the old one acknowledged yet; snapshot catch-up; batches; transactions, conflicts and updates; a transaction write too large for the commit refused at once; the capped transaction lease; updates whose caller timed out or cancelled while queued, or cancelled while the update opened, do not keep the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups. |
-| `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); history kept for open transactions and in-flight commits, up to the key cap; the commit size limit of staged writes. |
-| `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
+| `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); chains (handoff at admission, the caps on links and on the readers of one, breaks and their end, a pause for a conflicting transaction, duplicates, expiry, close, no session monitor under the log lock); history kept for open transactions and in-flight commits, up to the key cap; the commit size limit of staged writes. |
+| `PipelinedUpdatesTest` (in-process, flag on) | With the leader's apply stopped: chained updates see each other's values and nothing is acknowledged; wrong guards; plain writes, transactions and `deleteRange` against a chain; closes in mid-chain, and more of them waiting than a server's CONTROL workers and queue hold; refused operations on chained ids; second writes; merges and multi-key commits; caller gone, abandon; a snapshot and a restart inside a chain, around a rejected entry; a leader change with a chain in flight; a commit that ends without an outcome; the flag on and off at restarts, and a chained id handed to a leader without it; concurrent counters. With the flag off: the commit of an update, read back from the Raft log, has the old bytes, and a second write goes to the log. |
+| `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. With `PipelinedUpdatesTest`, the only tests that chain in a default run: the suites below run the plain per-key queue unless the property below is set, and fail if an update chains there. After each fault these three wait for an update that chains. |
+| `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, no acknowledged increment of a hot counter is lost, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `ClientFailoverTest` | One client connection listing all three nodes, while the node it uses is killed (the leader, or a follower): only retryable errors, new calls succeed on another node of the same connection (about 1 s with an election, under 200 ms without), a new connection skips the dead node, and a transaction opened through a dead follower still commits. |
 | `IsolatedNodeTest` | A client listing every node, connected to a node that gets isolated (the leader, or a follower), moves to the majority and keeps working, and the isolated node listens and serves again after the heal. With every node isolated all pause, and after the heal all resume and the client recovers by itself. An election shorter than the bound pauses no node. A follower restarted while cut off pauses too, and the client that lists it first moves. A cluster killed or stopped as a whole and restarted at once serves again, a paused node takes part in the election, and a node of a new cluster does not pause. |
-| `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history is linearizable. |
+| `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history, hot counters included, is linearizable. |
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
 | `MembershipTest` | A node replaced through `add-peer`/`remove-peer` catches up from a snapshot. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
-| `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories are linearizable, and the transactional bank-transfer invariant holds. |
+| `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories, with read-modify-write updates and hot counters in them, are linearizable, and the transactional bank-transfer invariant holds. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
-| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. |
+| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
 
-Run them all (about 10 minutes):
+Run them all (about 15 minutes):
 
 ```bash
 mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockserver.distributed.**' -Dsurefire.failIfNoSpecifiedTests=false
 ```
 
+`-Drockserver.test.pipelinedUpdates=true` runs every test cluster with pipelined updates on. Hot counters also
+require, in both modes, that every key takes a new update well within a lease once the cluster settled, and, with the
+flag on, that an update chained after each fault, and with the flag off that none did. `HotKeyThroughputTest` runs only with `-Drockserver.test.slow=true`.
+
 ## Left before a first deployment
 
+0. **Pipelined updates** stay off until the benchmark on hot keys (see [performance.md](performance.md)) and a full
+   review of the Yotsuba call sites: a chained value must not be acted on before the update ended well, and
+   `UPDATE_RETRY` from a no-change close must be retried. Watch `update.guardRejected`, `update.chainConflict`,
+   `transaction.conflict` and `transaction.chainConflict`. Every node must run a version with the flags of `Guarded`
+   entries before any node turns the option on: an older one would fail on the entries of a pipelined leader. With the
+   option off, entries keep the bytes they always had, and logs written before these flags stay readable.
 1. **Client side.**
    - Yotsuba does not compile against this version as is: CDC was removed from the client API, and
      `server/source/api/src/main/java/org/yotsuba/database/RockserverAsyncApiViews.java:133` still overrides

@@ -615,6 +615,142 @@ class ConflictTrackerTest {
 	}
 
 	/** A single-key update: it read {@code keys} at {@code snapshotIndex} and writes it. */
+	private static LogEntry.Guarded chained(long snapshotIndex, long columnId, Keys keys) {
+		long hash = ConflictTracker.keyHash(columnId, keys);
+		return new LogEntry.Guarded(EPOCH, snapshotIndex, new long[] {columnId, columnId}, new long[] {hash, hash},
+				List.of(new LogEntry.Put(columnId, keys, VALUE, RequestTypeId.NOTHING)), true, 1,
+				LogEntry.Guard.of(columnId, keys, VALUE));
+	}
+
+	private static ConflictTracker.ChainCheck check(long columnId, Keys keys, ConflictTracker.Token base) {
+		return new ConflictTracker.ChainCheck(columnId, ConflictTracker.keyHash(columnId, keys), base);
+	}
+
+	private IntList chainConflicts(LogEntry.Guarded entry, ConflictTracker.ChainCheck check) {
+		return tracker.conflicts(List.of(entry), _ -> check);
+	}
+
+	private boolean intact(long columnId, Keys keys, ConflictTracker.Token link, long applied) {
+		return tracker.chainIntact(columnId, ConflictTracker.keyHash(columnId, keys), link, applied);
+	}
+
+	@Test
+	void aChainIsIntactWhileItsLinkIsTheLastWriter() {
+		var link = tracker.register(put(COLUMN, key("k")));
+		assertTrue(intact(COLUMN, key("k"), link, 10), "pending, and the last writer");
+		var later = tracker.register(put(COLUMN, key("k")));
+		assertFalse(intact(COLUMN, key("k"), link, 10), "another writer came after it");
+		assertTrue(intact(COLUMN, key("k"), later, 10));
+		tracker.resolve(link, 11);
+		tracker.resolve(later, 12);
+		assertTrue(intact(COLUMN, key("k"), later, 12));
+		assertFalse(intact(COLUMN, key("other"), later, 12));
+		assertFalse(intact(OTHER_COLUMN, key("k"), later, 12));
+	}
+
+	@Test
+	void aChainIsNotIntactOnceItsLinkIsForgotten() {
+		var link = tracker.register(put(COLUMN, key("k")));
+		tracker.resolve(link, 11);
+		tracker.prune(11);
+		assertFalse(intact(COLUMN, key("k"), link, 11));
+	}
+
+	@Test
+	void aColumnOrGlobalWriterAfterTheAppliedIndexBreaksAChain() {
+		var link = tracker.register(put(COLUMN, key("k")));
+		var range = tracker.register(new LogEntry.DeleteRange(COLUMN, null, null));
+		assertFalse(intact(COLUMN, key("k"), link, 100), "a pending deleteRange");
+		tracker.resolve(link, 11);
+		tracker.resolve(range, 12);
+		assertFalse(intact(COLUMN, key("k"), link, 11), "a deleteRange after the applied index");
+		assertTrue(intact(COLUMN, key("k"), link, 12), "a deleteRange the applied index covers");
+
+		var create = tracker.register(new LogEntry.CreateColumn("c", ColumnSchema.of(IntList.of(1), ObjectList.of(), true)));
+		assertFalse(intact(COLUMN, key("k"), link, 12));
+		tracker.resolve(create, 13);
+		assertFalse(intact(COLUMN, key("k"), link, 12));
+		assertTrue(intact(COLUMN, key("k"), link, 13));
+	}
+
+	@Test
+	void aChainedCommitIsJudgedByTheIdentityOfItsBase() {
+		var base = tracker.register(put(COLUMN, key("k")));
+		// A pending base, far after the commit's snapshot: an ordinary commit would conflict.
+		assertTrue(tracker.conflicts(update(10, COLUMN, key("k"))));
+		assertTrue(chainConflicts(chained(10, COLUMN, key("k")), check(COLUMN, key("k"), base)).isEmpty());
+
+		var other = tracker.register(put(COLUMN, key("k")));
+		assertEquals(IntList.of(0), chainConflicts(chained(10, COLUMN, key("k")), check(COLUMN, key("k"), base)),
+				"another writer after the base");
+		assertTrue(chainConflicts(chained(10, COLUMN, key("k")), check(COLUMN, key("k"), other)).isEmpty());
+	}
+
+	@Test
+	void aForgottenBaseDoesNotConflictAtPreAppend() {
+		var base = tracker.register(put(COLUMN, key("k")));
+		tracker.resolve(base, 11);
+		tracker.prune(11);
+		assertEquals(0, tracker.size());
+		assertTrue(chainConflicts(chained(11, COLUMN, key("k")), check(COLUMN, key("k"), base)).isEmpty());
+	}
+
+	@Test
+	void aChainedCommitWithoutACheckConflicts() {
+		assertEquals(IntList.of(0), chainConflicts(chained(10, COLUMN, key("k")), null));
+	}
+
+	@Test
+	void aChainedCommitStillSeesColumnAndGlobalWriters() {
+		var base = tracker.register(put(COLUMN, key("k")));
+		var range = tracker.register(new LogEntry.DeleteRange(COLUMN, null, null));
+		assertEquals(IntList.of(0), chainConflicts(chained(10, COLUMN, key("k")), check(COLUMN, key("k"), base)));
+		tracker.resolve(base, 11);
+		tracker.resolve(range, 12);
+		tracker.prune(12);
+		assertTrue(chainConflicts(chained(12, COLUMN, key("k")), check(COLUMN, key("k"), base)).isEmpty());
+		assertEquals(IntList.of(0), chainConflicts(chained(11, COLUMN, key("k")), check(COLUMN, key("k"), base)),
+				"its pin was pruned");
+
+		var create = tracker.register(new LogEntry.CreateColumn("c", ColumnSchema.of(IntList.of(1), ObjectList.of(), true)));
+		assertEquals(IntList.of(0), chainConflicts(chained(12, COLUMN, key("k")), check(COLUMN, key("k"), base)));
+		tracker.resolve(create, 13);
+	}
+
+	@Test
+	void otherKeysOfAChainedCommitAreJudgedByItsPin() {
+		var base = tracker.register(put(COLUMN, key("k")));
+		var other = tracker.register(put(COLUMN, key("other")));
+		tracker.resolve(base, 11);
+		tracker.resolve(other, 12);
+		long hash = ConflictTracker.keyHash(COLUMN, key("k"));
+		long otherHash = ConflictTracker.keyHash(COLUMN, key("other"));
+		var entry = new LogEntry.Guarded(EPOCH, 10, new long[] {COLUMN, COLUMN}, new long[] {hash, otherHash},
+				List.of(new LogEntry.Put(COLUMN, key("other"), VALUE, RequestTypeId.NOTHING)), true, 1,
+				LogEntry.Guard.of(COLUMN, key("k"), VALUE));
+		assertEquals(IntList.of(0), chainConflicts(entry, check(COLUMN, key("k"), base)));
+	}
+
+	@Test
+	void aChainedCommitConflictsWithAWriteOfTheSameLogEntry() {
+		var base = tracker.register(put(COLUMN, key("k")));
+		var first = chained(10, COLUMN, key("k"));
+		var second = chained(10, COLUMN, key("k"));
+		List<LogEntry> entries = List.of(first, second);
+		assertEquals(IntList.of(1), tracker.conflicts(entries, _ -> check(COLUMN, key("k"), base)));
+	}
+
+	@Test
+	void ordinaryEntriesIgnoreTheChainCheck() {
+		var token = tracker.register(put(COLUMN, key("k")));
+		List<LogEntry> entries = List.of(update(10, COLUMN, key("k")), update(10, COLUMN, key("free")));
+		assertEquals(IntList.of(0), tracker.conflicts(entries));
+		assertEquals(IntList.of(0), tracker.conflicts(entries, _ -> {
+			throw new AssertionError("only a chained commit has a check");
+		}));
+		tracker.resolve(token, 11);
+	}
+
 	private static LogEntry.Guarded update(long snapshotIndex, long columnId, Keys keys) {
 		return new LogEntry.Guarded(EPOCH,
 				snapshotIndex,
