@@ -38,6 +38,7 @@ public final class LinkProxy implements AutoCloseable {
 	private final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 	private final Thread acceptor;
 	private volatile boolean blocked;
+	private volatile boolean dropReplies;
 	private volatile boolean closed;
 
 	/** Binds {@code listen} (port 0 picks a free port) and starts forwarding to {@code target}. */
@@ -70,9 +71,18 @@ public final class LinkProxy implements AutoCloseable {
 		connections.forEach(Connection::reset);
 	}
 
-	/** Forwards new connections again. Connections reset while blocked stay closed. */
+	/**
+	 * Keeps forwarding to the target but drops what it sends back, on open connections too, until {@link #unblock()}:
+	 * requests are carried out and their answers are lost, and neither peer gets an error.
+	 */
+	public void dropReplies() {
+		dropReplies = true;
+	}
+
+	/** Forwards new connections and replies again. Connections reset while blocked stay closed. */
 	public void unblock() {
 		blocked = false;
+		dropReplies = false;
 	}
 
 	public boolean isBlocked() {
@@ -143,8 +153,8 @@ public final class LinkProxy implements AutoCloseable {
 				reset();
 				return;
 			}
-			var toTarget = Thread.ofVirtual().name("link-proxy-upstream").start(() -> pump(client, upstream));
-			pump(upstream, client);
+			var toTarget = Thread.ofVirtual().name("link-proxy-upstream").start(() -> pump(client, upstream, false));
+			pump(upstream, client, true);
 			try {
 				toTarget.join();
 			} catch (InterruptedException e) {
@@ -157,14 +167,16 @@ public final class LinkProxy implements AutoCloseable {
 		}
 
 		/** Copies {@code from} to {@code to} until end of stream, then half-closes {@code to}. */
-		private void pump(Socket from, Socket to) {
+		private void pump(Socket from, Socket to, boolean replies) {
 			var buffer = new byte[BUFFER_SIZE];
 			try {
 				InputStream in = from.getInputStream();
 				OutputStream out = to.getOutputStream();
 				int read;
 				while ((read = in.read(buffer)) >= 0) {
-					out.write(buffer, 0, read);
+					if (!replies || !dropReplies) {
+						out.write(buffer, 0, read);
+					}
 				}
 				to.shutdownOutput();
 			} catch (IOException e) {
