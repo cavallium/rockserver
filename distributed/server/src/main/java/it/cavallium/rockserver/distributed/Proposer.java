@@ -264,7 +264,16 @@ final class Proposer implements Closeable {
 		 * deadline or cancellation can again take it out of the queue.
 		 */
 		void unsend() {
+			refusedOnce = true;
 			state.set(QUEUED);
+		}
+
+		/** Set by {@link #unsend}: it was sent once, and refused before the append. */
+		volatile boolean refusedOnce;
+
+		/** Its failure when its caller's deadline comes while it is queued: it was not applied. */
+		RocksDBException callerDeadlineFailure() {
+			return refusedOnce ? callerDeadlinePassedUnaccepted() : callerDeadlinePassed();
 		}
 
 		/**
@@ -366,7 +375,7 @@ final class Proposer implements Closeable {
 
 	private void expireWhenQueued(Pending pending) {
 		try {
-			var expiry = expiries.schedule(() -> pending.abandon(callerDeadlinePassed()),
+			var expiry = expiries.schedule(() -> pending.abandon(pending.callerDeadlineFailure()),
 					pending.deadlineNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
 			pending.result.whenComplete((_, _) -> expiry.cancel(false));
 		} catch (RejectedExecutionException stopping) {
@@ -480,6 +489,11 @@ final class Proposer implements Closeable {
 			int bytes = 0;
 			// The smallest copyBatchLimit of the copies taken: each was marked by a reply that could carry that many.
 			int copyLimit = Integer.MAX_VALUE;
+			// The deadlines of the batch: a caller's deadline caps the resends of its whole batch (see send()), so a
+			// request with one only shares a batch with requests whose deadlines are within an attempt timeout of it.
+			long earliest = Long.MAX_VALUE;
+			long latest = Long.MIN_VALUE;
+			boolean anyCaller = false;
 			while (!queue.isEmpty()) {
 				var next = queue.peekFirst();
 				if (next.result.isDone()) {
@@ -490,14 +504,16 @@ final class Proposer implements Closeable {
 					queue.pollFirst();
 					next.fail(closed ? RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping")
 							: next.maybeAppended ? noAnswer(null)
-							: next.callerDeadline ? callerDeadlinePassed()
+							: next.callerDeadline ? next.callerDeadlineFailure()
 							: notAccepted());
 					continue;
 				}
 				if (!batch.isEmpty() && (next.alone() || batch.getFirst().alone()
 						|| next.resentAlone != batch.getFirst().resentAlone || next.epoch != batch.getFirst().epoch
 						|| (next.resentAlone && batch.size() >= Math.min(copyLimit, next.copyBatchLimit))
-						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES)) {
+						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES
+						|| ((anyCaller || next.callerDeadline) && Math.max(latest, next.deadlineNanos)
+								- Math.min(earliest, next.deadlineNanos) > attemptTimeoutNanos))) {
 					break;
 				}
 				queue.pollFirst();
@@ -507,6 +523,9 @@ final class Proposer implements Closeable {
 				}
 				batch.add(next);
 				bytes += next.body.length + Long.BYTES;
+				earliest = Math.min(earliest, next.deadlineNanos);
+				latest = Math.max(latest, next.deadlineNanos);
+				anyCaller |= next.callerDeadline;
 				if (next.resentAlone) {
 					copyLimit = Math.min(copyLimit, next.copyBatchLimit);
 				}
@@ -639,14 +658,14 @@ final class Proposer implements Closeable {
 		/**
 		 * Ends a batch of data writes whose resends stopped without an answer, at {@code deadlineNanos} or because the
 		 * node is stopping. The batch's deadline is the earliest caller deadline among its members, if any (see
-		 * {@link #send}), so the other members may still have time left. They go back to the head of the queue and
-		 * are sent again in a new batch, a new Ratis invocation, under their own deadlines. That is safe also when a
-		 * copy of this batch may have been appended ({@code ambiguous}): their sequences stay in flight, so applying a
-		 * copy of one that took effect returns its recorded result. Such members are marked
-		 * {@link Pending#maybeAppended}. The others were never appended, so their callers' deadlines and cancellations
-		 * can again take them out of the queue. The members whose own deadline is the batch's, or too close to it
-		 * (see {@link Pending#minTimeLeftNanos}), fail: as not applied if no copy was appended, with an unknown
-		 * outcome otherwise.
+		 * {@link #send}; take() keeps members' deadlines within an attempt timeout of each other when one is a
+		 * caller's), so the other members may still have time left. If no copy of the batch was appended, they go
+		 * back to the head of the queue and are sent again in a new batch, a new Ratis invocation, under their own
+		 * deadlines; their callers' deadlines and cancellations can again take them out of the queue. If a copy may
+		 * have been appended ({@code ambiguous}), they fail with an unknown outcome instead: a new invocation would
+		 * append the whole batch a second time while the first copy may still be pending, the amplification that
+		 * keeping one invocation per batch avoids. The members whose own deadline is the batch's, or too close to it
+		 * (see {@link Pending#minTimeLeftNanos}), fail too: as not applied if no copy was appended.
 		 */
 		private void endUnanswered(List<Pending> batch, long deadlineNanos, boolean ambiguous,
 				@Nullable StateMachineException refusal, @Nullable Throwable cause) {
@@ -654,7 +673,7 @@ final class Proposer implements Closeable {
 			var again = new ArrayList<Pending>(0);
 			for (var pending : batch) {
 				boolean appended = ambiguous || pending.maybeAppended;
-				if (!closed && pending.deadlineNanos - deadlineNanos > 0
+				if (!closed && !appended && pending.deadlineNanos - deadlineNanos > 0
 						&& pending.deadlineNanos - now >= pending.minTimeLeftNanos) {
 					pending.maybeAppended = appended;
 					pending.queuedNanos = now;
@@ -664,6 +683,8 @@ final class Proposer implements Closeable {
 					again.add(pending);
 				} else if (appended) {
 					pending.fail(noAnswer(cause));
+				} else if (closed) {
+					pending.fail(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping"));
 				} else if (refusal != null) {
 					pending.fail(refusal(refusal));
 				} else {

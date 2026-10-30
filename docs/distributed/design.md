@@ -124,19 +124,23 @@ and the `LogEntry`.
   100 ms after other failures. On the leader an attempt goes straight to the local Raft server. Elsewhere it is
   an independent blocking call on a virtual thread, through the Ratis client's RPC layer, to the leader that the
   node's own Raft server knows. Ratis' ordered async stream closes for good after one exhausted request, so it
-  is not used. An attempt already sent is waited for at least one attempt timeout (the larger of 3 s and twice
-  the maximum election timeout, 4 s by default), even past the deadline. Every attempt of a batch is the same
+  is not used. An attempt already sent waits for its reply for up to one attempt timeout (the larger of 3 s and
+  twice the maximum election timeout, 4 s by default; on the leader, up to the later of that and the deadline),
+  even past the deadline. Every attempt of a batch is the same
   Ratis invocation (client id and call id). A leader that has an earlier attempt pending, or applied it, answers
   from its retry cache, for as long as the cache keeps the entry (`RaftSettings`), instead of appending the
   batch again. Every replica fills that cache when it applies an entry, and every replica computes the same
   results, so a new leader answers the same way. A node that never saw the batch appends it again, and the apply
   deduplicates it.
-- **When resends stop** without an answer, and no copy can have been appended (every attempt was refused
-  before the append, as during an election), every request of the batch fails as not applied. A batch whose
-  attempt ended without saying whether it was appended can only end with its results or an unknown outcome,
-  never "not applied". Since the batch stops at its earliest caller deadline, one request with a short caller
-  deadline stops the resends of every request batched with it: if nothing was appended, the requests with a
-  caller deadline then fail with `READ_DEADLINE_EXCEEDED`, even if their own deadline is later.
+- **When resends stop** without an answer, at the batch's earliest caller deadline or at the node's request
+  timeout. A request with a caller deadline only shares a batch with requests whose deadlines are within an
+  attempt timeout of its own. If no copy of the batch can have been appended (every attempt was refused before
+  the append, as during an election), the requests whose own deadline came fail as not applied
+  (`READ_DEADLINE_EXCEEDED` for a caller's deadline, `SERVER_OVERLOADED` for the node's, or a retry error if
+  the last copy was refused by a leader that was not ready), and the others go back to the queue and are sent
+  again under their own deadlines. A batch whose attempt ended without saying whether it was appended ends
+  with an unknown outcome for every request instead: sending its requests again as a new batch would append
+  them a second time while the first copy may still be pending.
 - **Caller deadlines.** When the caller's request-context timeout ends before the node's request timeout, a
   write is resent only until the caller's deadline, less a margin of 20 ms (at most a tenth of the timeout). A
   write still queued at that point, or whose caller cancelled it before it was sent, is never sent; nor is one
@@ -146,7 +150,8 @@ and the `LogEntry`.
   which `GrpcServer` uses for writes, returns at the caller's deadline with `READ_DEADLINE_EXCEEDED` and "outcome
   unknown", and the write may still be applied later. A transaction commit (or the write that ends an update)
   still queued at its caller's deadline is not sent either, but the synchronous API does not return at the
-  caller's deadline for it: once submitted, its single attempt is waited for at least one attempt timeout. The
+  caller's deadline for it: once submitted, its single attempt waits for its reply for up to one attempt
+  timeout, even past the caller's deadline. The
   chunks of a `putBatch` or `mergeBatch` share one deadline, counted from the start of the call.
 - **Results are recorded.** Applying a request writes its encoded result under
   `(proposerId, sequence)` in the internal column, in the same local transaction as its effects. If a
@@ -492,9 +497,9 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
 6. **Operations.**
    - Metrics and alerts: role, term, commit and apply lag, snapshot age, follower lag, replica failure exit.
      Today the replication timers (`NodeMetrics`) are only logged. The existing `rocksdb_operation_timer`
-     changes meaning on a cluster: every node records the calls made on its own `EmbeddedDB`, which are the
-     apply's (each write, the internal result, floor and position puts, one `closeTransaction` per applied
-     group) and the leader's local reads, opens and rollbacks, not client requests.
+     changes meaning on a cluster: replicated writes are counted on every node when applied (with the internal
+     result, floor and position puts and one `closeTransaction` per applied group), and reads, staged
+     transactional writes, opens, rollbacks and ranges only on the leader, with their local database time only.
    - A seeding runbook (copy the single-node database to all nodes before the first start).
    - A node replacement runbook.
    - Placement on separate hosts, each node's data directory on one file system (see Disk layout).

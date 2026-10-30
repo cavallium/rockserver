@@ -393,9 +393,16 @@ final class ReplicatedConnection implements RocksDBConnection {
 	}
 
 	/** The call reached the leader, or may have, and its connection then failed or the call timed out. */
+	/**
+	 * The forwarded call was lost: no answer, the connection failed ({@code UNAVAILABLE}), or the stream was reset
+	 * ({@code CANCELLED}, as a leader whose API server stops with calls still running resets them).
+	 */
 	private static boolean isTransportFailure(Throwable cause) {
-		return cause instanceof TimeoutException
-				|| io.grpc.Status.fromThrowable(cause).getCode() == io.grpc.Status.Code.UNAVAILABLE;
+		if (cause instanceof TimeoutException) {
+			return true;
+		}
+		var code = io.grpc.Status.fromThrowable(cause).getCode();
+		return code == io.grpc.Status.Code.UNAVAILABLE || code == io.grpc.Status.Code.CANCELLED;
 	}
 
 	/** Rollbacks, sent without a deadline. */

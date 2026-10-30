@@ -35,7 +35,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import reactor.core.publisher.Flux;
@@ -957,11 +956,6 @@ class ReplicationTest {
 	 * would answer "retry" although the commit was applied: a client running the transaction again would apply it
 	 * twice. The commit is applied once.
 	 */
-	@Disabled("Bug: ReplicatedConnection.isTransportFailure counts a forwarded call as lost only on UNAVAILABLE or a"
-			+ " TimeoutException. The leader's API server, stopping with calls in progress past its graceful timeout,"
-			+ " resets them (RST_STREAM CANCEL): the follower gets CANCELLED and returns the raw"
-			+ " io.grpc.StatusRuntimeException to its caller, instead of an unknown outcome."
-			+ " ForwardingFailoverTest covers the UNAVAILABLE case.")
 	@Test
 	void aForwardedCommitLostInTransportHasAnUnknownOutcomeAndIsAppliedOnce() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
@@ -1024,11 +1018,6 @@ class ReplicationTest {
 	 * fails with a retryable error: it is not opened again on the next leader, since the old leader may still be
 	 * alive and have opened it.
 	 */
-	@Disabled("Bug: ReplicatedConnection.isTransportFailure counts a forwarded call as lost only on UNAVAILABLE or a"
-			+ " TimeoutException. The leader's API server, stopping with calls in progress past its graceful timeout,"
-			+ " resets them (RST_STREAM CANCEL): the follower gets CANCELLED and returns the raw"
-			+ " io.grpc.StatusRuntimeException to its caller, instead of UPDATE_RETRY."
-			+ " ForwardingFailoverTest covers the UNAVAILABLE case.")
 	@Test
 	void aForwardedUpdateLostInTransportIsNotOpenedAgain() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();

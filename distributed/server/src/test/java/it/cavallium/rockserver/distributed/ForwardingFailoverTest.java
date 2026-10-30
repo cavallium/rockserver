@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -190,7 +191,8 @@ class ForwardingFailoverTest {
 			cluster.waitReady(leader, READY_TIMEOUT);
 			// Applied at most once, whichever node now leads.
 			var value = readEventually(api, column, 1);
-			assertTrue(value == null || value.equals("tx"), "committed value: " + value);
+			// The leader was frozen before the commit reached it: no node ever had it to apply.
+			assertNull(value, "a commit no leader processed was applied: " + value);
 		}
 	}
 

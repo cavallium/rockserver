@@ -183,7 +183,8 @@ Other results:
 - **Disks.** Every write waits for an fsync of the Raft log on the leader and on one follower. Consumer SSDs
   without power-loss protection take 1–3 ms per fdatasync when idle and 10–30 ms when RocksDB compaction writes
   heavily to the same disk. Prefer SSDs with power-loss protection. Do not split the data directory over
-  several disks: a node refuses to start if `data/db` or a column volume is on another file system, and with
+  several disks: a node refuses to start if `data/db`, or a column volume under it, is on another file system
+  (a volume outside `data/db` passes the start but makes every snapshot fail), and with
   `data/raft` on another disk every snapshot copies the whole database (instead of hard-linking it) while the
   apply waits. Keep `data/raft`, `data/db`, every column volume and the RocksDB WAL on one file system.
 - **Disk space.** Each retained snapshot keeps the table files it links, also after compaction replaced them.
@@ -199,11 +200,13 @@ Other results:
   memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.
 - **Memory.** In a 10-minute run at 2× the leader's heap stayed between 1.3 and 2.8 GiB (4 GiB heap). The
   bounds are larger: at most 256 MiB of committed entries wait for the apply thread, the leader holds up to
-  65536 pending client writes or 1 GiB of them, the Raft log write queue 64 MiB, every replica keeps every reply
+  65536 pending Raft requests (proposer batches of up to 4096 writes each) or 1 GiB of them, the Raft log write queue 64 MiB, every replica keeps every reply
   (up to 17 MiB each) in Ratis' retry cache for 8 s by default, and each node admits 16384 requests at once,
   with messages up to 512 MiB. Size the heap for bursts of large `putMulti` calls and large results: an
   `OutOfMemoryError` on the apply thread stops the replica.
-- **Metrics.** On a cluster, `rocksdb_operation_timer` counts the calls made on each node's own database: the
-  apply's writes on every node (with the internal result, floor and position puts, and one `closeTransaction`
-  per applied group) and the leader's local reads, opens and rollbacks. It no longer measures client requests
-  or their latency. The replication timers (`NodeMetrics`) are only in the log, every 10 s.
+- **Metrics.** On a cluster, `rocksdb_operation_timer` counts the calls made on each node's own database.
+  Replicated writes are counted once per node when they are applied, together with the internal result, floor
+  and position puts and one `closeTransaction` per applied group, and never with the client's latency. Reads,
+  staged transactional writes, transaction opens, rollbacks and range calls are counted only on the leader,
+  with their local database time only (no read barrier, forwarding or replication). The replication timers
+  (`NodeMetrics`) are only in the log, every 10 s.
