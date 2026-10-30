@@ -24,8 +24,8 @@ import java.time.Duration;
  * pauses until it does. None of its nodes could serve before that, and elections and everything else that forms the
  * cluster use the Raft ports. What it costs is an answer to the capability handshake of a client that starts meanwhile: a
  * connection to several addresses keeps asking, for 30 s by default (see {@code GrpcConnection.forHostsAndPorts}), and one
- * to a single address fails at once. Only a node that never had any of that, the member of a new cluster, is not judged:
- * a cluster that is still forming has nothing better to offer its clients.</p>
+ * to a single address fails after the retries of the call, about 8 s. Only a node that never had any of that, the member
+ * of a new cluster, is not judged: a cluster that is still forming has nothing better to offer its clients.</p>
  *
  * <p>A node must keep knowing a leader for {@value #ELECTION_TIMEOUTS_TO_RESUME} maximum election timeout to serve
  * again. Its leader was then confirmed by a heartbeat: without one, its election timer would have fired and cleared it.

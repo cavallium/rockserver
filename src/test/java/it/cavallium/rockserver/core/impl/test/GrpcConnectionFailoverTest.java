@@ -23,6 +23,7 @@ import io.grpc.MethodDescriptor;
 import io.grpc.Server;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import io.grpc.netty.NettyChannelBuilder;
 import io.grpc.netty.NettyServerBuilder;
 import io.grpc.stub.StreamObserver;
 import it.cavallium.buffer.Buf;
@@ -33,6 +34,8 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest;
@@ -60,13 +63,16 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -176,7 +182,7 @@ class GrpcConnectionFailoverTest {
 		assertTrue(millis >= 1_500 && millis < 10_000, () -> millis + " ms");
 	}
 
-	/** One address fails at once, as it always did: nothing else serves this client, and its caller may have a plan. */
+	/** One address has no wait of its own: nothing else serves this client, and its caller may have a plan. */
 	@Test
 	void aConnectionToOneAddressDoesNotWait() throws Exception {
 		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
@@ -199,6 +205,262 @@ class GrpcConnectionFailoverTest {
 		assertFalse(connecting.isDone());
 		late.restart();
 		assertEquals(late.port(), awaitServedBy(connecting.get(10, TimeUnit.SECONDS), late));
+	}
+
+	/** What a plain client gets by default: the retries of the call, 0.5, 1, 2 and 4 s with a jitter of 20%. */
+	@Test
+	void aRefusedConnectionToOneAddressFailsAfterTheRetriesOfTheCall() throws Exception {
+		var address = new HostAndPort("127.0.0.1", unusedPort());
+		long start = System.nanoTime();
+		var failure = assertThrows(StatusRuntimeException.class, () -> connect(List.of(address)));
+		long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		assertEquals(Status.Code.UNAVAILABLE, failure.getStatus().getCode());
+		assertTrue(millis >= 5_000 && millis < 10_500, () -> millis + " ms");
+	}
+
+	/** Those retries are why they stay: a client that starts with its server, or during a restart, connects. */
+	@Test
+	void aServerThatStartsDuringTheRetriesOfOneAddressIsReached() throws Exception {
+		var late = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(late);
+		late.stop();
+		var connecting = CompletableFuture.supplyAsync(() -> connect(List.of(late.address())));
+		Thread.sleep(1_500);
+		assertFalse(connecting.isDone());
+		late.restart();
+		assertEquals(late.port(), awaitServedBy(connecting.get(10, TimeUnit.SECONDS), late));
+	}
+
+	/** Silent and frozen nodes use up whole attempts: the wait goes on after the deadline of one. */
+	@Test
+	void theWaitHoldsWithSilentAndFrozenNodes() throws Exception {
+		var late = new FakeNode(FIRST_NODE_COLUMN_ID);
+		var frozen = new FakeNode(SECOND_NODE_COLUMN_ID);
+		resources.add(late);
+		resources.add(frozen);
+		late.stop();
+		try (var silent = new SilentListener(); var process = new NodeProxy(frozen.port())) {
+			process.freeze();
+			var addresses = List.of(new HostAndPort("127.0.0.1", silent.port()),
+					new HostAndPort("127.0.0.1", process.port()), late.address());
+			var connecting = CompletableFuture.supplyAsync(() -> connect(addresses));
+			Thread.sleep(12_000);
+			assertFalse(connecting.isDone());
+			late.restart();
+			assertEquals(late.port(), awaitServedBy(connecting.get(15, TimeUnit.SECONDS), late));
+		}
+	}
+
+	/** The list goes on through the attempts, so its silent nodes can take longer than one attempt. */
+	@Test
+	void aListCanStartWithMoreSilentNodesThanOneAttemptCovers() throws Exception {
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(node);
+		var addresses = new ArrayList<HostAndPort>();
+		for (int i = 0; i < 4; i++) {
+			var silent = new SilentListener();
+			resources.add(silent);
+			addresses.add(new HostAndPort("127.0.0.1", silent.port()));
+		}
+		addresses.add(node.address());
+		var client = connect(addresses);
+		assertEquals(node.port(), remotePort(client));
+	}
+
+	/** The default wait is 30 s and it ends then, also with a node that takes up whole attempts. */
+	@Test
+	void theDefaultWaitEndsAfter30Seconds() throws Exception {
+		try (var silent = new SilentListener()) {
+			var addresses = List.of(new HostAndPort("127.0.0.1", silent.port()),
+					new HostAndPort("127.0.0.1", unusedPort()), new HostAndPort("127.0.0.1", unusedPort()));
+			long start = System.nanoTime();
+			assertThrows(StatusRuntimeException.class, () -> connect(addresses));
+			long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+			assertTrue(millis >= 29_900 && millis < 31_000, () -> millis + " ms");
+		}
+	}
+
+	/** The end of the wait cuts the attempt in progress, which says nothing about the nodes: the failure stays theirs. */
+	@Test
+	void anAttemptCutByTheEndOfTheWaitKeepsTheFailureOfTheNodes() throws Exception {
+		System.setProperty(HANDSHAKE_WAIT_PROPERTY, "12000");
+		var addresses = List.of(new HostAndPort("127.0.0.1", unusedPort()), new HostAndPort("127.0.0.1", unusedPort()));
+		long start = System.nanoTime();
+		var failure = assertThrows(StatusRuntimeException.class, () -> connect(addresses));
+		long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		assertEquals(Status.Code.UNAVAILABLE, failure.getStatus().getCode());
+		assertTrue(millis >= 11_900 && millis < 13_000, () -> millis + " ms");
+	}
+
+	/** A wait shorter than an attempt leaves the attempt its time: a wait of 0 is one attempt, not none. */
+	@Test
+	void aShortWaitLeavesTheFirstAttemptItsTime() throws Exception {
+		System.setProperty(HANDSHAKE_WAIT_PROPERTY, "100");
+		System.setProperty(CONNECT_TIMEOUT_PROPERTY, "500");
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(node);
+		try (var silent = new SilentListener()) {
+			var client = connect(List.of(new HostAndPort("127.0.0.1", silent.port()), node.address()));
+			assertEquals(node.port(), remotePort(client));
+		}
+	}
+
+	/** Each attempt skips the growing delay of the channel, and attempts do not follow each other without a pause. */
+	@Test
+	void theWaitTriesEveryHalfSecond() throws Exception {
+		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
+		System.setProperty(HANDSHAKE_WAIT_PROPERTY, "6000");
+		try (var first = new ConnectionCounter(unusedPort()); var second = new ConnectionCounter(unusedPort())) {
+			assertThrows(StatusRuntimeException.class, () -> connect(List.of(new HostAndPort("127.0.0.1", first.port()),
+					new HostAndPort("127.0.0.1", second.port()))));
+			// gRPC alone would try 4 times: at once, and at about 1 s, 2.6 s and 5.2 s.
+			assertTrue(first.count() >= 8 && first.count() <= 20, () -> first.count() + " attempts");
+		}
+	}
+
+	/** Asking again would give the same answer: a server without the handshake fails the connection at once. */
+	@Test
+	void aServerWithoutTheHandshakeFailsAtOnce() throws Exception {
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(node);
+		node.service.capabilitiesFailure = Status.UNIMPLEMENTED;
+		assertFailsAtOnce(RocksDBException.class, node);
+	}
+
+	/** Only waiting for a node is waiting: no other failure of the handshake is asked again. */
+	@Test
+	void aFailedHandshakeFailsAtOnce() throws Exception {
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(node);
+		node.service.capabilitiesFailure = Status.INTERNAL;
+		var failure = assertFailsAtOnce(StatusRuntimeException.class, node);
+		assertEquals(Status.Code.INTERNAL, failure.getStatus().getCode());
+	}
+
+	@Test
+	void anIncompatibleServerFailsAtOnce() throws Exception {
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(node);
+		node.service.workloadContractVersion = RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION + 1;
+		var failure = assertFailsAtOnce(RocksDBException.class, node);
+		assertEquals(RocksDBErrorType.NOT_IMPLEMENTED, failure.getErrorUniqueId());
+	}
+
+	private <T extends Throwable> T assertFailsAtOnce(Class<T> type, FakeNode node) throws Exception {
+		var addresses = List.of(node.address(), new HostAndPort("127.0.0.1", unusedPort()));
+		long start = System.nanoTime();
+		var failure = assertThrows(type, () -> connect(addresses));
+		long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		assertEquals(1, node.service.capabilitiesCalls.get());
+		assertTrue(millis < 3_000, () -> millis + " ms");
+		return failure;
+	}
+
+	/** Interrupting the constructor is how a caller gives up on the wait: nothing stays behind it, or is forgotten. */
+	@Test
+	void anInterruptEndsTheWait() throws Exception {
+		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
+		var addresses = List.of(new HostAndPort("127.0.0.1", unusedPort()), new HostAndPort("127.0.0.1", unusedPort()));
+		var eventLoopsBefore = eventLoopThreads();
+		var failure = new AtomicReference<RuntimeException>();
+		var flagRestored = new AtomicBoolean();
+		var connecting = Thread.ofPlatform().start(() -> {
+			try {
+				connect(addresses);
+			} catch (RuntimeException e) {
+				failure.set(e);
+				flagRestored.set(Thread.currentThread().isInterrupted());
+			}
+		});
+		Thread.sleep(1_000);
+		assertTrue(connecting.isAlive());
+		assertFalse(eventLoopsBefore.containsAll(eventLoopThreads()), "no channel is running");
+
+		connecting.interrupt();
+		connecting.join(Duration.ofSeconds(2));
+		assertFalse(connecting.isAlive());
+		var rocksDbFailure = assertInstanceOf(RocksDBException.class, failure.get());
+		assertTrue(rocksDbFailure.getMessage().contains("Interrupted"), rocksDbFailure::getMessage);
+		assertTrue(flagRestored.get(), "the interrupt was swallowed");
+		awaitEventLoopsGone(eventLoopsBefore);
+	}
+
+	/** The caller of a deferred connection is released at once, and the handshake stops with it. */
+	@Test
+	void closingADeferredConnectionEndsItsHandshakeWait() throws Exception {
+		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
+		try (var attempts = new ConnectionCounter(unusedPort())) {
+			var eventLoopsBefore = eventLoopThreads();
+			var builder = new ClientBuilder();
+			builder.setName("deferred-wait");
+			builder.setDeferred(true);
+			builder.setHttpAddresses(List.of(new HostAndPort("127.0.0.1", attempts.port()),
+					new HostAndPort("127.0.0.1", unusedPort())));
+			var connection = builder.build();
+			var pending = connection.getAsyncApi(CONTEXT).getColumnIdAsync("x");
+			Thread.sleep(1_000);
+			assertFalse(pending.isDone());
+			assertTrue(attempts.count() > 0);
+
+			connection.close();
+			assertThrows(ExecutionException.class, () -> pending.get(1, TimeUnit.SECONDS));
+			awaitEventLoopsGone(eventLoopsBefore);
+			int attemptsAtClose = attempts.count();
+			Thread.sleep(1_500);
+			assertEquals(attemptsAtClose, attempts.count(), "the handshake went on after close");
+		}
+	}
+
+	/**
+	 * The timeout of the future can end an attempt before the deadline of the call does, so the wait must go on after
+	 * either. This call never ends, which leaves only the timeout.
+	 */
+	@Test
+	void aHandshakeThatTimesOutIsAskedAgain() throws Exception {
+		System.setProperty(HANDSHAKE_WAIT_PROPERTY, "15000");
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(node);
+		var calls = new AtomicInteger();
+		var channel = NettyChannelBuilder.forAddress("127.0.0.1", node.port()).usePlaintext().build();
+		try {
+			var stub = RocksDBServiceGrpc.newFutureStub(ClientInterceptors.intercept(channel, new ClientInterceptor() {
+				@Override
+				public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(MethodDescriptor<ReqT, RespT> method,
+						CallOptions callOptions, Channel next) {
+					return calls.getAndIncrement() == 0 ? new CallThatNeverEnds<>() : next.newCall(method, callOptions);
+				}
+			}));
+			var handshake = Class.forName("it.cavallium.rockserver.core.client.GrpcConnectionDelegate")
+					.getDeclaredMethod("handshake", ManagedChannel.class, stub.getClass(), boolean.class);
+			handshake.setAccessible(true);
+			assertInstanceOf(CapabilitiesResponse.class, handshake.invoke(null, channel, stub, true));
+			assertEquals(2, calls.get());
+		} finally {
+			channel.shutdownNow();
+		}
+	}
+
+	private static final class CallThatNeverEnds<ReqT, RespT> extends ClientCall<ReqT, RespT> {
+
+		@Override
+		public void start(Listener<RespT> listener, Metadata headers) {
+		}
+
+		@Override
+		public void request(int numMessages) {
+		}
+
+		@Override
+		public void cancel(String message, Throwable cause) {
+		}
+
+		@Override
+		public void halfClose() {
+		}
+
+		@Override
+		public void sendMessage(ReqT message) {
+		}
 	}
 
 	@Test
@@ -305,6 +567,36 @@ class GrpcConnectionFailoverTest {
 				new HostAndPort("no-such-host.invalid", 1),
 				new HostAndPort("no-such-other-host.invalid", 2))));
 		assertEquals(Status.Code.UNAVAILABLE, error.getStatus().getCode());
+	}
+
+	/** A name can exist only once its node runs, so a list where no host resolves waits like any other. */
+	@Test
+	void noHostResolvingWaitsBeforeItFails() {
+		System.setProperty(HANDSHAKE_WAIT_PROPERTY, "1500");
+		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
+		long start = System.nanoTime();
+		var error = assertThrows(StatusRuntimeException.class, () -> connect(List.of(
+				new HostAndPort("no-such-host.invalid", 1),
+				new HostAndPort("no-such-other-host.invalid", 2))));
+		long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		assertEquals(Status.Code.UNAVAILABLE, error.getStatus().getCode());
+		assertTrue(millis >= 1_500, () -> millis + " ms");
+	}
+
+	/** Waits for the JVM's cache of failed lookups: see {@link FakeHosts}. */
+	@Test
+	void aNameThatStartsToResolveDuringTheWaitIsUsed() throws Exception {
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(node);
+		FakeHosts.fail("late-name-1.test", Duration.ZERO);
+		FakeHosts.fail("late-name-2.test", Duration.ZERO);
+		var connecting = CompletableFuture.supplyAsync(() -> connect(List.of(
+				new HostAndPort("late-name-1.test", node.port()),
+				new HostAndPort("late-name-2.test", node.port()))));
+		Thread.sleep(1_000);
+		assertFalse(connecting.isDone());
+		FakeHosts.serve("late-name-1.test");
+		assertEquals(node.port(), remotePort(connecting.get(25, TimeUnit.SECONDS)));
 	}
 
 	/** A resolver outage while the connection moves: the new connection is kept, on the last addresses known. */
@@ -759,6 +1051,21 @@ class GrpcConnectionFailoverTest {
 		return Buf.wrap(new byte[] {(byte) value, 1, 2, 3});
 	}
 
+	/** The threads of the event loop groups of gRPC clients and servers: a closed channel leaves none. */
+	private static Set<Thread> eventLoopThreads() {
+		return Thread.getAllStackTraces().keySet().stream()
+				.filter(thread -> thread.getName().startsWith("nioEventLoopGroup"))
+				.collect(Collectors.toSet());
+	}
+
+	private static void awaitEventLoopsGone(Set<Thread> before) throws InterruptedException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		while (!before.containsAll(eventLoopThreads())) {
+			assertTrue(System.nanoTime() - deadline < 0, "a channel still runs");
+			Thread.sleep(20);
+		}
+	}
+
 	private static int unusedPort() throws IOException {
 		try (var socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
 			return socket.getLocalPort();
@@ -983,10 +1290,13 @@ class GrpcConnectionFailoverTest {
 
 		private final long columnId;
 		private final AtomicInteger openTransactionCalls = new AtomicInteger();
+		private final AtomicInteger capabilitiesCalls = new AtomicInteger();
 		private final CountDownLatch heldReads = new CountDownLatch(1);
 		private final CountDownLatch heldWrites = new CountDownLatch(1);
 		private final List<StreamObserver<GetColumnIdResponse>> heldReadObservers = new CopyOnWriteArrayList<>();
 		private volatile boolean holdCalls;
+		private volatile Status capabilitiesFailure;
+		private volatile int workloadContractVersion = RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION;
 
 		ScriptedService(long columnId) {
 			this.columnId = columnId;
@@ -995,8 +1305,13 @@ class GrpcConnectionFailoverTest {
 		@Override
 		public void getCapabilities(CapabilitiesRequest request,
 				StreamObserver<CapabilitiesResponse> responseObserver) {
+			capabilitiesCalls.incrementAndGet();
+			if (capabilitiesFailure != null) {
+				responseObserver.onError(capabilitiesFailure.asRuntimeException());
+				return;
+			}
 			responseObserver.onNext(CapabilitiesResponse.newBuilder()
-					.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
+					.setWorkloadContractVersion(workloadContractVersion)
 					.build());
 			responseObserver.onCompleted();
 		}
@@ -1087,6 +1402,10 @@ class GrpcConnectionFailoverTest {
 					// Closed by the test.
 				}
 			});
+		}
+
+		int port() {
+			return listener.getLocalPort();
 		}
 
 		int count() {

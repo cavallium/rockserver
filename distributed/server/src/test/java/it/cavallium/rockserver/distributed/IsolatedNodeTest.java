@@ -56,6 +56,8 @@ class IsolatedNodeTest {
 	private static final List<String> MEMBERS = List.of("1", "2", "3");
 	/** More than the 7.5 s that the retries of one handshake take. */
 	private static final Duration COLD_START_WAIT = Duration.ofSeconds(9);
+	/** More than the 10 s of one attempt of a handshake. */
+	private static final Duration FROZEN_START_WAIT = Duration.ofSeconds(12);
 
 	/** Kept when a test fails, for the node logs. */
 	@TempDir(cleanup = CleanupMode.ON_SUCCESS)
@@ -210,6 +212,33 @@ class IsolatedNodeTest {
 		assertFalse(connecting.isDone(), "the connection did not wait");
 		cluster.start("2");
 		cluster.waitReady("2", READY_TIMEOUT);
+		try (var connection = connecting.get(WAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS)) {
+			awaitWorks(connection.getAsyncApi(CONTEXT), column);
+		}
+	}
+
+	/** A frozen node gives no answer at all, which ends one attempt of the handshake: the connection keeps waiting. */
+	@Test
+	void aClientStartedDuringAColdStartWaitsPastAFrozenNode() throws Exception {
+		startCluster(SERVER_ARGS);
+		awaitLeader(cluster);
+		var addresses = MEMBERS.stream().map(cluster::apiAddress).toList();
+		long column;
+		try (var setup = GrpcConnection.forHostsAndPorts("frozen-start-setup-client", addresses)) {
+			column = setup.getAsyncApi(SETUP).createColumnAsync("data", SCHEMA).join();
+		}
+		cluster.killAll();
+		cluster.start("3");
+		cluster.waitReady("3", READY_TIMEOUT);
+		cluster.pause("3");
+		cluster.start("1");
+		cluster.waitReady("1", READY_TIMEOUT);
+		await(() -> !serves("1"), "the node alone to pause");
+
+		var connecting = CompletableFuture.supplyAsync(() -> GrpcConnection.forHostsAndPorts("frozen-start-client", addresses));
+		Thread.sleep(FROZEN_START_WAIT);
+		assertFalse(connecting.isDone(), "the connection did not wait");
+		cluster.resume("3");
 		try (var connection = connecting.get(WAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS)) {
 			awaitWorks(connection.getAsyncApi(CONTEXT), column);
 		}

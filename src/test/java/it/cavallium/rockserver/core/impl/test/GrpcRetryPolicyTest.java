@@ -158,6 +158,7 @@ class GrpcRetryPolicyTest {
 				RocksDBServiceGrpc.getGetMethod().getFullMethodName(),
 				RocksDBServiceGrpc.getExistsMethod().getFullMethodName(),
 				RocksDBServiceGrpc.getExistsMultiMethod().getFullMethodName(),
+				RocksDBServiceGrpc.getGetMultiMethod().getFullMethodName(),
 				RocksDBServiceGrpc.getReduceRangeFirstAndLastMethod().getFullMethodName(),
 				RocksDBServiceGrpc.getReduceRangeEntriesCountMethod().getFullMethodName(),
 				RocksDBServiceGrpc.getGetRangePageMethod().getFullMethodName(),

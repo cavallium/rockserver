@@ -167,9 +167,12 @@ public final class GrpcConnection extends BaseConnection {
 	 * {@link #forHostAndPort(String, HostAndPort)}.
 	 *
 	 * <p>This call returns once a node answered the capability handshake. No node may be ready yet, for example with a
-	 * cluster that is starting: while the answer is {@code UNAVAILABLE} it tries again, for 30 s by default, and then
-	 * fails as a connection to one address does at once. The system property
-	 * {@code it.cavallium.rockserver.grpc.client.handshake-wait-ms} sets this wait, for one address too.</p>
+	 * cluster that is starting: while the answer is {@code UNAVAILABLE}, which is also what a list gets when no host
+	 * resolves, or no answer comes within 10 s, as with silent or frozen nodes, it tries again, for 30 s by default, and
+	 * then fails. Any other answer, such as a server that lacks the handshake, fails it at once. The system property
+	 * {@code it.cavallium.rockserver.grpc.client.handshake-wait-ms} sets this wait, for one address too, where it is 0
+	 * by default: that one fails after the call's own retries, which take about 8 s on a refused connection. The wait
+	 * ends on time, unless it is shorter than the first attempt, which always has its 10 s.</p>
 	 */
 	public static GrpcConnection forHostsAndPorts(String name, List<HostAndPort> addresses) {
 		return forHostsAndPorts(name, addresses, true);
@@ -262,7 +265,10 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	static final String HANDSHAKE_WAIT_PROPERTY = "it.cavallium.rockserver.grpc.client.handshake-wait-ms";
 	/** Several addresses are a cluster, whose nodes can all be waiting for each other during a start. */
 	static final int DEFAULT_HANDSHAKE_WAIT_SEVERAL_ADDRESSES_MILLIS = 30_000;
-	/** One address fails at once, as it always did: a plain server that is down is an error for its caller. */
+	/**
+	 * One address has no wait of its own, as it never had: a plain server that is down is an error for its caller, after
+	 * the retries of the call, which let a client that starts with its server connect.
+	 */
 	static final int DEFAULT_HANDSHAKE_WAIT_ONE_ADDRESS_MILLIS = 0;
 	private static final long HANDSHAKE_RETRY_PAUSE_MILLIS = 500;
 	/**
@@ -438,11 +444,9 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			closeFailedConstruction(channel, eventLoopGroup, callbackExecutor);
 			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR,
 					"Interrupted during the Rockserver capability handshake", interrupted);
-		} catch (ExecutionException | TimeoutException failure) {
+		} catch (ExecutionException failure) {
 			closeFailedConstruction(channel, eventLoopGroup, callbackExecutor);
-			var cause = failure instanceof ExecutionException && failure.getCause() != null
-					? failure.getCause()
-					: failure;
+			var cause = failure.getCause() != null ? failure.getCause() : failure;
 			if (Status.fromThrowable(cause).getCode() == Code.UNIMPLEMENTED) {
 				throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
 						"The connected Rockserver does not expose the mandatory workload capability handshake", cause);
@@ -468,30 +472,55 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	/**
-	 * Asks for the capabilities of the server, trying again while it answers {@code UNAVAILABLE} within the wait. Failing
-	 * calls do not start a connection, and an attempt after a failure waits for the channel's growing delay: each round
-	 * skips that delay.
+	 * Asks for the capabilities of the server, trying again within the wait while the server cannot be reached or gives
+	 * no answer in time. Any other answer ends it at once: waiting cannot change it. Failing calls do not start a
+	 * connection, and an attempt after a failure waits for the channel's growing delay: each round skips that delay.
+	 *
+	 * <p>The first attempt always has its whole time, and later ones end with the wait. An attempt can take seconds,
+	 * with the retries of the call, so looking at the clock only between attempts would overshoot the wait by that
+	 * much.</p>
 	 */
 	private static CapabilitiesResponse handshake(ManagedChannel channel, RocksDBServiceFutureStub futureStub,
-			boolean severalAddresses) throws InterruptedException, ExecutionException, TimeoutException {
+			boolean severalAddresses) throws InterruptedException, ExecutionException {
 		long waitNanos = TimeUnit.MILLISECONDS.toNanos(intProperty(HANDSHAKE_WAIT_PROPERTY, severalAddresses
 				? DEFAULT_HANDSHAKE_WAIT_SEVERAL_ADDRESSES_MILLIS
 				: DEFAULT_HANDSHAKE_WAIT_ONE_ADDRESS_MILLIS, 0));
+		long pauseNanos = TimeUnit.MILLISECONDS.toNanos(HANDSHAKE_RETRY_PAUSE_MILLIS);
+		long attemptNanos = TimeUnit.SECONDS.toNanos(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS);
 		long start = System.nanoTime();
+		ExecutionException reported = null;
 		while (true) {
+			var response = futureStub
+					.withDeadlineAfter(attemptNanos, TimeUnit.NANOSECONDS)
+					.getCapabilities(CapabilitiesRequest.getDefaultInstance());
+			ExecutionException failure;
 			try {
-				return futureStub
-						.withDeadlineAfter(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-						.getCapabilities(CapabilitiesRequest.getDefaultInstance())
-						.get(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-			} catch (ExecutionException failure) {
-				if (Status.fromThrowable(failure.getCause()).getCode() != Code.UNAVAILABLE
-						|| System.nanoTime() - start >= waitNanos) {
-					throw failure;
-				}
+				return response.get(attemptNanos, TimeUnit.NANOSECONDS);
+			} catch (ExecutionException callFailure) {
+				failure = callFailure;
+			} catch (TimeoutException timeout) {
+				// The same event as the deadline of the call, which this timeout can reach first.
+				response.cancel(true);
+				failure = new ExecutionException(Status.DEADLINE_EXCEEDED
+						.withDescription("No answer to the capability handshake")
+						.withCause(timeout)
+						.asRuntimeException());
 			}
-			Thread.sleep(HANDSHAKE_RETRY_PAUSE_MILLIS);
+			var code = Status.fromThrowable(failure.getCause()).getCode();
+			if (code != Code.UNAVAILABLE && code != Code.DEADLINE_EXCEEDED) {
+				throw failure;
+			}
+			// An attempt that the end of the wait cut short says less than an UNAVAILABLE heard before it.
+			if (reported == null || code == Code.UNAVAILABLE) {
+				reported = failure;
+			}
+			long leftNanos = waitNanos - (System.nanoTime() - start);
+			if (leftNanos <= 0) {
+				throw reported;
+			}
+			TimeUnit.NANOSECONDS.sleep(Math.min(pauseNanos, leftNanos));
 			channel.resetConnectBackoff();
+			attemptNanos = Math.min(attemptNanos, leftNanos - pauseNanos);
 		}
 	}
 

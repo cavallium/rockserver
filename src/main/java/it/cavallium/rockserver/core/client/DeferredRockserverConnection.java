@@ -14,6 +14,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.function.LongSupplier;
 import org.slf4j.LoggerFactory;
 import org.reactivestreams.Publisher;
+import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
@@ -142,7 +143,13 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 			}
 			if (start) {
 				try {
-					Schedulers.boundedElastic().schedule(() -> connect(current));
+					var task = Schedulers.boundedElastic().schedule(() -> connect(current));
+					boolean closedMeanwhile;
+					synchronized (this) {
+						current.task = task;
+						closedMeanwhile = closed;
+					}
+					if (closedMeanwhile) task.dispose();
 				} catch (RuntimeException failure) {
 					failed(current, failure);
 				}
@@ -203,17 +210,21 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 	public void close() throws IOException {
 		RocksDBConnection existing;
 		Attempt pending;
+		Disposable task;
 		synchronized (this) {
 			closed = true;
 			existing = connection;
 			connection = null;
 			pending = attempt;
+			task = pending != null ? pending.task : null;
 			attempt = null;
 		}
 		if (pending != null) {
 			pending.result.completeExceptionally(new IllegalStateException("Rockserver connection is closed"));
 			pending.finished.complete(null);
 		}
+		// Interrupts the handshake: nobody needs it now, and it holds a thread and keeps connecting until it ends.
+		if (task != null) task.dispose();
 		if (existing != null) existing.close();
 	}
 
@@ -222,5 +233,6 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 		final CompletableFuture<Void> finished = new CompletableFuture<>();
 		int waiters;
 		boolean abandoned;
+		Disposable task;
 	}
 }

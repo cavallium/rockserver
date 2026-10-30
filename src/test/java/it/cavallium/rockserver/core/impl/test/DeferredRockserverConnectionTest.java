@@ -320,7 +320,17 @@ class DeferredRockserverConnectionTest {
 		doAnswer(invocation -> { disposed.countDown(); return null; }).when(late).close();
 		var deferred = deferred(URL, () -> {
 			entered.countDown();
-			assertTrue(release.await(5, TimeUnit.SECONDS));
+			// A factory that finishes although it is interrupted: its result reaches a closed connection.
+			boolean interrupted = false;
+			while (true) {
+				try {
+					assertTrue(release.await(5, TimeUnit.SECONDS));
+					break;
+				} catch (InterruptedException e) {
+					interrupted = true;
+				}
+			}
+			if (interrupted) Thread.currentThread().interrupt();
 			return late;
 		});
 		try {
@@ -336,5 +346,27 @@ class DeferredRockserverConnectionTest {
 			release.countDown();
 			deferred.close();
 		}
+	}
+
+	/** A handshake can wait for 30 s and more, holding a thread and connecting: close ends it. */
+	@Test
+	void closeInterruptsConstructionInProgress() throws Exception {
+		var entered = new CountDownLatch(1);
+		var interrupted = new CountDownLatch(1);
+		var deferred = deferred(URL, () -> {
+			entered.countDown();
+			try {
+				Thread.sleep(Duration.ofSeconds(30));
+			} catch (InterruptedException e) {
+				interrupted.countDown();
+				throw e;
+			}
+			return client();
+		});
+		var pending = deferred.getAsyncApi(RequestContext.analytical()).getColumnIdAsync("pending");
+		assertTrue(entered.await(5, TimeUnit.SECONDS));
+		deferred.close();
+		assertThrows(Exception.class, () -> pending.get(5, TimeUnit.SECONDS));
+		assertTrue(interrupted.await(5, TimeUnit.SECONDS));
 	}
 }

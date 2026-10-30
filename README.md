@@ -148,7 +148,7 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 | `it.cavallium.rockserver.grpc.client.keep-alive-time-ms` | `10000` | Silence on a connection before a ping, with one address too. gRPC raises values below 10 s to 10 s. |
 | `it.cavallium.rockserver.grpc.client.keep-alive-timeout-ms` | `5000` | Wait for the answer to a ping, with one address too. |
 | `it.cavallium.rockserver.grpc.client.max-reconnect-delay-ms` | `2000` | The longest wait between two attempts on the list, or on the only address, while they all fail. Each client picks a period between half of this and this. |
-| `it.cavallium.rockserver.grpc.client.handshake-wait-ms` | `30000` with several addresses, `0` with one | How long a new connection keeps asking a server that answers `UNAVAILABLE` for its capabilities, before it fails. A handshake that gets no answer at all still ends after 10 s. |
+| `it.cavallium.rockserver.grpc.client.handshake-wait-ms` | `30000` with several addresses, `0` with one | How long a new connection keeps asking for the capabilities of a server, before it fails, while the answer is `UNAVAILABLE` or no answer comes within 10 s. It ends at this time, or with the first attempt, which takes up to 10 s, if that is later: `0` means one attempt. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-ms` | `0` (off) | On a server in front of another connection, such as a replicated node, the age at which a connection ends, +/-10%. The client then starts again from the top of its list, which is what brings it back to the first address. It has two costs: a silent first address costs every client the connect timeout at every cycle, not once, and calls that outlive the grace below fail with `UNAVAILABLE`, which includes `Compact` and long scans, on a healthy cluster too. Left off, a client stays on the node it failed over to until that node goes away. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms` | `600000` | With a maximum age, the time left to the calls running on a connection that reached it. |
 
@@ -163,9 +163,14 @@ longer than the bound to elect a leader, when no node could serve anyway. Only a
 known a leader, keeps listening while the cluster forms.
 
 `GrpcConnection` asks the server for its capabilities before it returns, and no node may answer yet, for example during
-a cold start. With several addresses it asks again while the answer is `UNAVAILABLE`, for 30 s by default, and then
-fails. With one address it fails at once, so that a plain client of a server that is down hears it right away.
-`ClientBuilder.setDeferred` skips the handshake until the first use.
+a cold start. With several addresses it asks again while the answer is `UNAVAILABLE` or no answer comes within 10 s, as
+with silent or frozen nodes, for 30 s by default, and then fails. A list where no host resolves waits too, because a name
+can exist only once its node runs, so a list with a typo in every host also takes 30 s to fail. Any other answer fails
+at once, such as a server of another version or one without the handshake. With one address there is no such wait:
+the call's own retries run, which take about 8 s on a refused connection, and then it fails, so that a client that
+starts with its server still connects and a plain client of a server that is down hears it soon. A silent single
+address fails after 10 s. `ClientBuilder.setDeferred` skips the handshake until the first use, and closing that
+connection ends a handshake in progress.
 
 To replace a node of a replicated cluster, start the new node first with `--join`, and run `admin add-peer` when you
 like: the node waits for it, also across restarts. See "Replacing a node" in the [design
@@ -174,8 +179,8 @@ document](docs/distributed/design.md).
 Shorter keepalive times find a dead node sooner, but a pause of the server or of the client that outlasts the
 timeout ends a working connection, with its calls in flight. Pings cost next to nothing, and a server accepts them
 every 5 s. A short connect timeout moves past a dead node sooner, but one that is just slow to accept a connection
-is skipped too. The connection handshake waits 10 s, so with the default connect timeout a list can start with at
-most three silent nodes.
+is skipped too. Each silent node at the start of a list costs a new connection one connect timeout of its handshake
+wait.
 
 ## Merge operators
 
