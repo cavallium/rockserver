@@ -132,7 +132,9 @@ with 11–18 s write latency. In order of discovery:
 ## Results
 
 Suite `s2` (commit `cdca0b2`), 2026-10-30, on the PC described above, with other workloads on it at times;
-the rows marked * come from later runs that include the last changes (`cd8904b`). Open loop, 30 s steps
+the values marked * come from later runs that include `cd8904b`, and ** from runs at `a5b555e` (background
+snapshots, caller deadlines). Results move by 10–15% with the node that wins the election: the one on the
+SATA disk serves fewer operations at saturation than those on NVMe disks. Open loop, 30 s steps
 after 10 s of warmup, 512 reads and 512 writes in flight unless noted, four client connections. Latencies are
 from the planned start of each operation, so a client queue shows up as latency. `UPDATE` is the whole
 `get(forUpdate)` plus commit.
@@ -143,8 +145,8 @@ from the planned start of each operation, so a client queue shows up as latency.
 | Single node | 2× | 21.2k | 0.21 / 37 ms | 0.14 / 4.0 ms |
 | Single node | 4× | 42.5k | 0.33 / 127 ms | 0.21 / 24 ms |
 | Single node | 8× | 54.6k (saturated) | queued | 2.6 / 19 ms |
-| Replicated, leader | 1× | 10.6k | 4.4 / 19 ms | 0.28 / 1.8 ms |
-| Replicated, leader | 2× | 21.2k | 11.9 / 105 ms (9.1 / 28 ms*) | 0.33 / 5.4 ms |
+| Replicated, leader | 1× | 10.6k | 4.4 / 19 ms (5.8 / 16 ms**) | 0.28 / 1.8 ms |
+| Replicated, leader | 2× | 21.2k | 11.9 / 105 ms (9.1 / 28 ms*, 11.7 / 33 ms**) | 0.33 / 5.4 ms |
 | Replicated, leader | 4× | 24.7k (512 writes in flight) | queued | 1.1 / 8.8 ms |
 | Replicated, leader, 2048 in flight | 4× | 37.4k (38.6k*) | queued | 1.8 / 21 ms |
 | Replicated, leader, 2048 in flight | 8× | 36.7k | queued | 2.7 / 19 ms |
