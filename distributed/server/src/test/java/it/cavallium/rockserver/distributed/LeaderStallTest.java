@@ -12,9 +12,12 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.UUID;
@@ -24,8 +27,16 @@ import org.apache.ratis.grpc.server.GrpcServicesImpl;
 import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.TransferLeadershipRequest;
+import org.apache.ratis.server.DivisionInfo;
+import org.apache.ratis.server.RaftConfiguration;
+import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.server.impl.ServerImplUtils;
+import org.apache.ratis.server.protocol.TermIndex;
+import org.apache.ratis.server.raftlog.RaftLog;
+import org.apache.ratis.server.raftlog.segmented.LogWorkerGate;
 import org.apache.ratis.util.CodeInjectionForTesting;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -92,10 +103,108 @@ class LeaderStallTest {
 
 	/** The step down may not happen, for example with the event queue of the leader stuck. */
 	@Test
-	void anotherStepDownTakesAnotherWholeBound() {
+	void anotherStepDownTakesTwiceTheBound() {
 		run(true, COMMIT, STALL);
-		assertFalse(run(true, COMMIT, STALL - TICK));
+		assertFalse(run(true, COMMIT, 2 * STALL - TICK));
 		assertTrue(run(true, COMMIT, TICK));
+	}
+
+	/** Disks that take longer than the bound to answer: each leader must be given the time to reach its first commit. */
+	@Test
+	void theBoundGrowsWithEachStepDownWithoutACommit() {
+		for (int doublings = 0; doublings <= LeaderStall.MAX_DOUBLINGS; doublings++) {
+			assertFalse(run(true, COMMIT, (STALL << doublings) - TICK));
+			assertTrue(run(true, COMMIT, TICK));
+		}
+		assertFalse(run(true, COMMIT, (STALL << LeaderStall.MAX_DOUBLINGS) - TICK));
+		assertTrue(run(true, COMMIT, TICK), "the bound did not stop growing");
+	}
+
+	/** Under another leader this node sees the commit that the slow disks allowed in the end. */
+	@Test
+	void aCommitBringsTheBoundBack() {
+		run(true, COMMIT, STALL);
+		run(true, COMMIT, 2 * STALL);
+		assertFalse(run(false, COMMIT, TICK));
+		assertFalse(run(false, COMMIT + 1, TICK));
+		assertFalse(run(true, COMMIT + 1, STALL - TICK));
+		assertTrue(run(true, COMMIT + 1, TICK));
+	}
+
+	/** A new term is no progress: the term of the next leader of a slow disk starts with the same commit index. */
+	@Test
+	void aNewTermAloneDoesNotBringTheBoundBack() {
+		run(true, COMMIT, STALL);
+		now += TICK;
+		assertFalse(stall.shouldStepDown(true, TERM + 1, COMMIT, now));
+		for (long elapsed = 0; elapsed < 2 * STALL - TICK; elapsed += TICK) {
+			now += TICK;
+			assertFalse(stall.shouldStepDown(true, TERM + 1, COMMIT, now));
+		}
+		now += TICK;
+		assertTrue(stall.shouldStepDown(true, TERM + 1, COMMIT, now));
+	}
+
+	private static final long LOG_STALL = ELECTION_TIMEOUT_MAX.multipliedBy(LeaderStall.ELECTION_TIMEOUTS_TO_LOG_STALL).toNanos();
+
+	/** Observes this every tick for this long, and returns the last answer. */
+	private boolean runLog(boolean leader, long flushIndex, long lastIndex, long nanos) {
+		boolean answer = stall.logStopped(leader, flushIndex, lastIndex, now);
+		for (long elapsed = 0; elapsed < nanos; elapsed += TICK) {
+			now += TICK;
+			answer = stall.logStopped(leader, flushIndex, lastIndex, now);
+		}
+		return answer;
+	}
+
+	@Test
+	void aLeaderWithEntriesItDoesNotFlushStepsDownAfterTheBound() {
+		assertFalse(runLog(true, COMMIT, COMMIT + 1, LOG_STALL - TICK));
+		assertTrue(runLog(true, COMMIT, COMMIT + 1, TICK));
+	}
+
+	@Test
+	void aMovingFlushIndexIsNoStoppedLog() {
+		for (long flushIndex = 0; flushIndex < 100; flushIndex++) {
+			assertFalse(runLog(true, flushIndex, flushIndex + 1, LOG_STALL - TICK));
+		}
+	}
+
+	/** Nothing to write: a hung disk would not show, and costs nothing yet. */
+	@Test
+	void aLeaderWithNothingToFlushIsNoStoppedLog() {
+		assertFalse(runLog(true, COMMIT, COMMIT, 2 * LOG_STALL));
+	}
+
+	/** Only a leader's flush holds back commits: other members can miss a follower. */
+	@Test
+	void aFollowerIsNoStoppedLog() {
+		assertFalse(runLog(false, COMMIT, COMMIT + 1, 2 * LOG_STALL));
+	}
+
+	/** Disks that are all this slow must not end every leader in turn. */
+	@Test
+	void theLogBoundGrowsLikeTheOtherOne() {
+		assertTrue(runLog(true, COMMIT, COMMIT + 1, LOG_STALL));
+		assertFalse(runLog(true, COMMIT, COMMIT + 1, 2 * LOG_STALL - TICK));
+		assertTrue(runLog(true, COMMIT, COMMIT + 1, TICK));
+	}
+
+	@Test
+	void aShortElectionTimeoutDoesNotShortenTheLogBound() {
+		var shortTimeout = LeaderStall.forElectionTimeout(Duration.ofMillis(800));
+		long bound = LeaderStall.MIN_LOG_STALL.toNanos();
+		assertFalse(shortTimeout.logStopped(true, COMMIT, COMMIT + 1, 0));
+		assertFalse(shortTimeout.logStopped(true, COMMIT, COMMIT + 1, bound - 1));
+		assertTrue(shortTimeout.logStopped(true, COMMIT, COMMIT + 1, bound));
+	}
+
+	@Test
+	void aLongElectionTimeoutLengthensTheLogBound() {
+		var longTimeout = LeaderStall.forElectionTimeout(Duration.ofSeconds(4));
+		assertFalse(longTimeout.logStopped(true, COMMIT, COMMIT + 1, 0));
+		assertFalse(longTimeout.logStopped(true, COMMIT, COMMIT + 1, TimeUnit.SECONDS.toNanos(12) - 1));
+		assertTrue(longTimeout.logStopped(true, COMMIT, COMMIT + 1, TimeUnit.SECONDS.toNanos(12)));
 	}
 
 	@Test
@@ -179,6 +288,54 @@ class LeaderStallTest {
 		var followers = new LeaderStall.Follower[] {new LeaderStall.Follower("b", LOG_NEXT, RECENT)};
 		assertTrue(sentToMajority(THREE, List.of("a", "b", "x"), followers));
 		assertFalse(sentToMajority(THREE, List.of("a", "x", "y"), followers));
+	}
+
+	/** What a {@link RaftServer.Division} tells, as a stub: only the calls of the rule answer. */
+	private static RaftServer.Division division(RaftConfiguration conf, String... followerIds) {
+		var follower = (InvocationHandler) (_, method, _) -> switch (method.getName()) {
+			case "getLastCommittedIndex" -> COMMIT;
+			case "getNextIndex" -> LOG_NEXT;
+			case "getTermIndex" -> TermIndex.valueOf(TERM - 1, COMMIT);
+			default -> throw new UnsupportedOperationException(method.getName());
+		};
+		var log = (RaftLog) Proxy.newProxyInstance(RaftLog.class.getClassLoader(), new Class<?>[] {RaftLog.class}, follower);
+		var leaderInfo = RaftProtos.LeaderInfoProto.newBuilder();
+		for (var id : followerIds) {
+			leaderInfo.addFollowerInfo(RaftProtos.ServerRpcProto.newBuilder()
+					.setId(RaftProtos.RaftPeerProto.newBuilder().setId(RaftPeerId.valueOf(id).toByteString()))
+					.setLastRpcElapsedTimeMs(RECENT));
+		}
+		var role = RaftProtos.RoleInfoProto.newBuilder().setLeaderInfo(leaderInfo).build();
+		var nextIndices = new long[followerIds.length];
+		Arrays.fill(nextIndices, LOG_NEXT);
+		var info = (DivisionInfo) Proxy.newProxyInstance(DivisionInfo.class.getClassLoader(),
+				new Class<?>[] {DivisionInfo.class}, (_, method, _) -> switch (method.getName()) {
+					case "isLeader" -> true;
+					case "getCurrentTerm" -> TERM;
+					case "getFollowerNextIndices" -> nextIndices;
+					case "getRoleInfoProto" -> role;
+					default -> throw new UnsupportedOperationException(method.getName());
+				});
+		return (RaftServer.Division) Proxy.newProxyInstance(RaftServer.Division.class.getClassLoader(),
+				new Class<?>[] {RaftServer.Division.class}, (_, method, _) -> switch (method.getName()) {
+					case "getInfo" -> info;
+					case "getRaftLog" -> log;
+					case "getRaftConf" -> conf;
+					default -> throw new UnsupportedOperationException(method.getName());
+				});
+	}
+
+	private static List<RaftPeer> peers(String... ids) {
+		return Arrays.stream(ids).map(id -> RaftPeer.newBuilder().setId(id).build()).toList();
+	}
+
+	/** During a change of configuration the majority of the old one counts too, and the rule must hear of it. */
+	@Test
+	void theRuleOfARealDivisionLooksAtThePreviousConfiguration() {
+		var joint = ServerImplUtils.newRaftConfiguration(peers("a", "b", "c"), List.of(), 1, peers("a", "x", "y"), List.of());
+		var single = ServerImplUtils.newRaftConfiguration(peers("a", "b", "c"), List.of());
+		assertFalse(LeaderStall.waitsForReplyOfSentEntry(division(joint, "b"), "a", ELECTION_TIMEOUT_MAX.toMillis()));
+		assertTrue(LeaderStall.waitsForReplyOfSentEntry(division(single, "b"), "a", ELECTION_TIMEOUT_MAX.toMillis()));
 	}
 
 	/**
@@ -320,6 +477,71 @@ class LeaderStallTest {
 			partner.stateMachine().applyGateForTesting = null;
 			stopped.countDown();
 		}
+	}
+
+	/**
+	 * The node of a graceful stop is the only partner of its successor, with one node down. If it closes before the reply
+	 * to the successor's first entry gets out, and comes back right away, nothing sends that entry again.
+	 */
+	@Test
+	void aGracefulStopOfALeaderWithOneNodeDownLosesNoReply() throws Exception {
+		cluster = new InProcessCluster(root, 3, config -> config.withElectionTimeouts(Duration.ofSeconds(1),
+				ELECTION_TIMEOUT_MAX)).startAll();
+		var oldLeader = cluster.awaitLeader(TIMEOUT);
+		var oldLeaderId = oldLeader.config().nodeId();
+		long column = oldLeader.connection().getSyncApi(CONTEXT).createColumn("data", SCHEMA);
+		cluster.awaitConverged(TIMEOUT);
+		var followers = cluster.runningNodes().stream().filter(node -> node != oldLeader).toList();
+		var partner = followers.getFirst();
+		cluster.halt(followers.getLast().config().nodeId());
+
+		long start = System.nanoTime();
+		cluster.stop(oldLeaderId);
+		var restarted = cluster.start(oldLeaderId);
+		awaitWrite(column);
+		long outageMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		System.out.printf("MEASURE graceful stop with one node down: first write after %d ms%n", outageMillis);
+
+		assertEquals(0, partner.metrics().amount("leader.stall.stepdowns").count()
+				+ restarted.metrics().amount("leader.stall.stepdowns").count());
+		assertTrue(outageMillis < LeaderStall.MIN_STALL.toMillis(), () -> "first write after " + outageMillis + " ms");
+	}
+
+	/**
+	 * A leader commits only what it flushed, whatever its followers hold, and its heartbeats go on: the followers have no
+	 * reason for an election. A single small write leaves the queue of the log worker far from full, so Ratis would never
+	 * block, and no heartbeat would ever stop.
+	 */
+	@Test
+	void aLeaderWhoseLogStoppedStepsDown() throws Exception {
+		cluster = new InProcessCluster(root, 3, config -> config).startAll();
+		var oldLeader = cluster.awaitLeader(TIMEOUT);
+		long column = oldLeader.connection().getSyncApi(CONTEXT).createColumn("data", SCHEMA);
+		cluster.awaitConverged(TIMEOUT);
+
+		var disk = new CountDownLatch(1);
+		try {
+			LogWorkerGate.block(oldLeader.stateMachine().division().getRaftLog(), disk);
+			long start = System.nanoTime();
+			var stuck = oldLeader.connection().getAsyncApi(CONTEXT).putAsync(0, column, key(), Buf.wrap(new byte[] {1}),
+					RequestType.none());
+			awaitOtherLeader(oldLeader);
+			long failoverMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+			System.out.printf("MEASURE leader with a stopped log: new leader after %d ms%n", failoverMillis);
+			assertEquals(1, oldLeader.metrics().amount("leader.log.stepdowns").count());
+			assertTrue(failoverMillis < 2 * LeaderStall.MIN_LOG_STALL.toMillis(), () -> "after " + failoverMillis + " ms");
+			assertFalse(stuck.isDone(), "the write was committed: the log did not stop");
+			var leader = cluster.runningNodes().stream().filter(node -> node != oldLeader && node.isLeader()).findFirst()
+					.orElseThrow();
+			leader.connection().getSyncApi(CONTEXT).put(0, column, key(), Buf.wrap(new byte[] {2}), RequestType.none());
+		} finally {
+			disk.countDown();
+		}
+	}
+
+	private void awaitOtherLeader(ReplicatedNode oldLeader) {
+		InProcessCluster.await(Duration.ofSeconds(25), () -> cluster.runningNodes().stream()
+				.anyMatch(node -> node != oldLeader && node.isLeader()));
 	}
 
 	/** Every node reaches the others through the links of {@link #network}, with its own view of the addresses. */

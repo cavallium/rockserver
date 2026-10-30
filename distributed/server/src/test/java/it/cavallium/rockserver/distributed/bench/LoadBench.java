@@ -67,7 +67,7 @@ public final class LoadBench {
 
 	private void run() throws Exception {
 		Files.createDirectories(root);
-		var jvm = List.of(option("--jvm", "-Xms4g -Xmx4g -XX:+UseZGC -XX:+AlwaysPreTouch").split("\\s+"));
+		var jvm = List.of(option("--jvm", "-Xms4g -Xmx4g -XX:+UseZGC -XX:+AlwaysPreTouch -XX:+ExitOnOutOfMemoryError").split("\\s+"));
 		var serverArgs = splitArgs(option("--server-arg", ""));
 		boolean replicated = option("--target", "replicated").equals("replicated");
 		int nodeCount = Integer.parseInt(option("--nodes", "3"));

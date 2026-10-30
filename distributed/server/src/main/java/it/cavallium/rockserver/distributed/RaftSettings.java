@@ -35,6 +35,15 @@ final class RaftSettings {
 	/** Ratis multiplies each step by a random number from 0.5 to 1.5, so a sleep can reach 1.5 times the step. */
 	static final Duration APPENDER_RETRY_LONGEST_SLEEP = APPENDER_RETRY_LAST_STEP.multipliedBy(3).dividedBy(2);
 
+	/**
+	 * The timeout of a snapshot chunk is 8 times this ({@code install_snapshot.request.element-limit}), and Ratis keeps
+	 * every chunk it sends on the heap, in the timer of that timeout, whether or not its reply came. So a leader that
+	 * sends a snapshot holds what it sends in that time: with Ratis' default of 3 s, 24 s of sending, more than 1 GiB
+	 * of a 1 GiB snapshot. At 4 s that is 800 MB at 200 MB/s. A follower that does not answer a chunk for 4 s makes the
+	 * leader start the snapshot over. See "Heap" in the design document.
+	 */
+	private static final Duration INSTALL_SNAPSHOT_REQUEST_TIMEOUT = Duration.ofMillis(500);
+
 	private RaftSettings() {}
 
 	static RaftProperties server(NodeConfig config) {
@@ -116,6 +125,7 @@ final class RaftSettings {
 		RaftServerConfigKeys.Log.Appender.setRetryPolicy(properties, APPENDER_RETRY_POLICY);
 		RaftServerConfigKeys.Log.Appender.setInstallSnapshotEnabled(properties, true);
 		RaftServerConfigKeys.Log.Appender.setSnapshotChunkSizeMax(properties, SizeInBytes.valueOf("8MB"));
+		GrpcConfigKeys.Server.setInstallSnapshotRequestTimeout(properties, duration(INSTALL_SNAPSHOT_REQUEST_TIMEOUT));
 		return properties;
 	}
 

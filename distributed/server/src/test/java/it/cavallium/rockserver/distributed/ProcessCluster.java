@@ -191,6 +191,16 @@ public final class ProcessCluster implements AutoCloseable {
 	 * it exits with an error or does not finish in time.
 	 */
 	public String admin(List<String> peerIds, String... command) throws IOException {
+		var result = adminResult(peerIds, command);
+		if (result.exitCode() != 0) {
+			throw new IllegalStateException("admin " + String.join(" ", command) + " exited with code "
+					+ result.exitCode() + ":\n" + result.output());
+		}
+		return result.output();
+	}
+
+	/** Like {@link #admin}, for a command that may fail. */
+	public CommandResult adminResult(List<String> peerIds, String... command) throws IOException {
 		var args = new ArrayList<String>();
 		args.add("admin");
 		for (var id : peerIds) {
@@ -198,12 +208,7 @@ public final class ProcessCluster implements AutoCloseable {
 			args.add(peer(id).format());
 		}
 		args.addAll(List.of(command));
-		var result = runMain(args);
-		if (result.exitCode() != 0) {
-			throw new IllegalStateException("admin " + String.join(" ", command) + " exited with code "
-					+ result.exitCode() + ":\n" + result.output());
-		}
-		return result.output();
+		return runMain(args);
 	}
 
 	/** Exit code and merged stdout and stderr of a {@link ReplicatedServerMain} command. */
@@ -530,6 +535,7 @@ public final class ProcessCluster implements AutoCloseable {
 		command.add(System.getProperty("java.class.path"));
 		command.add("--enable-native-access=ALL-UNNAMED");
 		command.add("--add-modules=jdk.incubator.vector");
+		command.add("-XX:+ExitOnOutOfMemoryError");
 		command.add("-Djdk.net.hosts.file=" + network.hostsFile(node.id));
 		// Inside the test's directory: a killed JVM leaves its copy of the RocksDB library behind (17 MB each time).
 		command.add("-Djava.io.tmpdir=" + node.dir.resolve("tmp"));

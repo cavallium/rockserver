@@ -816,26 +816,32 @@ final class Applier {
 		}
 	}
 
+	/**
+	 * The first of these entries binds the database to its cluster. Later ones change nothing: a batch of a former leader
+	 * can reach the next one after that one proposed its own, with another id. Every replica applies them in the same
+	 * order, so they all keep the same id. What finds a node of another cluster is {@code ClusterCheck}.
+	 */
 	private void applyGenesis(LogEntry.Genesis genesis) {
-		var existing = store.clusterId();
-		if (existing != null) {
-			if (!existing.equals(genesis.clusterId())) {
-				throw new ReplicaFailedException("Database belongs to cluster " + existing
-						+ ", but the log belongs to cluster " + genesis.clusterId());
-			}
+		if (store.clusterId() != null) {
 			return;
 		}
 		boolean hasData = store.hasUserColumns();
 		if (genesis.seeded() && !hasData) {
 			throw new ReplicaFailedException("The cluster was seeded with an existing database, but this replica's"
-					+ " database is empty: give it a copy of the seed database, or remove and re-add it so that it"
-					+ " receives a snapshot");
+					+ " database is empty, and it got the log from a leader without a snapshot. It cannot catch up this way."
+					+ " Take this node out with remove-peer (restart it if the cluster has lost its majority), then wipe its"
+					+ " data directory and add it again. A wiped node that is still a member gets no vote, so do not wipe it"
+					+ " first");
 		}
 		if (!genesis.seeded() && hasData) {
 			throw new ReplicaFailedException("The cluster started empty, but this replica's database has data");
 		}
 		store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_ID),
 				Buf.wrap(genesis.clusterId().getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		if (genesis.seeded()) {
+			store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.SEEDED), Buf.wrap(new byte[] {1}),
+					RequestType.none());
+		}
 	}
 
 	/**

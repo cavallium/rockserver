@@ -24,6 +24,7 @@ import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.thirdparty.io.grpc.stub.ClientCalls;
 import org.apache.ratis.thirdparty.io.grpc.stub.ServerCalls;
 import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Tiny gRPC service on the Ratis server port, using the shaded gRPC that Ratis ships
@@ -34,6 +35,10 @@ import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
  *   <li>"where is your Rockserver API?", for {@link LeaderForwarder}, which knows the Raft address of every member
  *   from the Raft configuration but the API address only of the members it was started with. Request: empty.
  *   Response: UTF-8 {@code host:port}, as other members reach it.</li>
+ *   <li>"what do you hold?", for {@link ClusterCheck} and {@code admin add-peer}. Request: the 16-byte group UUID, then
+ *   the UTF-8 id of the caller's cluster, if it speaks for one: a node of another cluster stops. Response: the
+ *   {@link NodeState} encoded by {@link #encode}, or nothing if this server has no such group (or is not started
+ *   yet).</li>
  * </ul>
  */
 final class TermService {
@@ -61,6 +66,28 @@ final class TermService {
 			.setSafe(true)
 			.build();
 
+	static final MethodDescriptor<byte[], byte[]> NODE_STATE = MethodDescriptor.<byte[], byte[]>newBuilder()
+			.setType(MethodDescriptor.MethodType.UNARY)
+			.setFullMethodName(MethodDescriptor.generateFullMethodName(SERVICE_NAME, "NodeState"))
+			.setRequestMarshaller(BytesMarshaller.INSTANCE)
+			.setResponseMarshaller(BytesMarshaller.INSTANCE)
+			.build();
+
+	private static final int GROUP_ID_BYTES = 16;
+	private static final byte SEEDED = 1;
+	private static final byte HAS_SNAPSHOT = 2;
+	private static final byte STARTED_OUTSIDE_JOIN = 4;
+
+	/** Answers {@link #NODE_STATE} on a node. */
+	@FunctionalInterface
+	interface NodeStateSource {
+		/**
+		 * @param callerClusterId the cluster the caller speaks for, null if none
+		 * @return null if this node has no such group, or is not started yet
+		 */
+		@Nullable NodeState state(RaftGroupId groupId, @Nullable String callerClusterId);
+	}
+
 	private TermService() {}
 
 	/**
@@ -68,16 +95,19 @@ final class TermService {
 	 *
 	 * @param apiAddress this node's API address as other members reach it
 	 */
-	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress) {
+	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
+			NodeStateSource nodeState) {
 		ServerCalls.UnaryMethod<byte[], byte[]> handler = (request, response) -> answer(server, request, response);
 		var address = (apiAddress.host() + ":" + apiAddress.port()).getBytes(StandardCharsets.UTF_8);
 		ServerCalls.UnaryMethod<byte[], byte[]> addressHandler = (_, response) -> {
 			response.onNext(address);
 			response.onCompleted();
 		};
+		ServerCalls.UnaryMethod<byte[], byte[]> stateHandler = (request, response) -> answerState(nodeState, request, response);
 		var service = ServerServiceDefinition.builder(SERVICE_NAME)
 				.addMethod(CURRENT_TERM, ServerCalls.asyncUnaryCall(handler))
 				.addMethod(API_ADDRESS, ServerCalls.asyncUnaryCall(addressHandler))
+				.addMethod(NODE_STATE, ServerCalls.asyncUnaryCall(stateHandler))
 				.build();
 		// Ratis may run admin and client services on separate ports; the peers' Raft address is the SERVER one.
 		return (builder, types) -> types.contains(GrpcServices.Type.SERVER) ? builder.addService(service) : builder;
@@ -104,6 +134,41 @@ final class TermService {
 				throw new CompletionException(new IOException("Bad API address reply: " + address, e));
 			}
 		});
+	}
+
+	/**
+	 * Asks the server behind {@code channel} what it holds in {@code groupId}: null if it has no such group, or is not
+	 * started yet.
+	 *
+	 * @param clusterId the cluster that the caller speaks for: a node of another cluster stops. Empty for a caller that
+	 *                  only wants to know
+	 */
+	static CompletableFuture<@Nullable NodeState> nodeState(Channel channel, RaftGroupId groupId, String clusterId,
+			Duration timeout) {
+		var cluster = clusterId.getBytes(StandardCharsets.UTF_8);
+		var request = ByteBuffer.allocate(GROUP_ID_BYTES + cluster.length).put(encodeGroupId(groupId)).put(cluster).array();
+		return call(channel, NODE_STATE, request, timeout).thenApply(TermService::decode);
+	}
+
+	private static byte[] encode(NodeState state) {
+		var cluster = state.clusterId() == null ? new byte[0] : state.clusterId().getBytes(StandardCharsets.UTF_8);
+		byte flags = (byte) ((state.seeded() ? SEEDED : 0) | (state.hasSnapshot() ? HAS_SNAPSHOT : 0)
+				| (state.startedOutsideJoin() ? STARTED_OUTSIDE_JOIN : 0));
+		return ByteBuffer.allocate(Long.BYTES + 1 + cluster.length).putLong(state.nextLogIndex()).put(flags).put(cluster)
+				.array();
+	}
+
+	private static @Nullable NodeState decode(byte[] value) {
+		if (value.length == 0) {
+			return null;
+		}
+		var buffer = ByteBuffer.wrap(value);
+		long nextLogIndex = buffer.getLong();
+		byte flags = buffer.get();
+		var cluster = new byte[buffer.remaining()];
+		buffer.get(cluster);
+		return new NodeState(nextLogIndex, (flags & SEEDED) != 0, (flags & HAS_SNAPSHOT) != 0,
+				(flags & STARTED_OUTSIDE_JOIN) != 0, cluster.length == 0 ? null : new String(cluster, StandardCharsets.UTF_8));
 	}
 
 	private static CompletableFuture<byte[]> call(Channel channel, MethodDescriptor<byte[], byte[]> method,
@@ -149,6 +214,29 @@ final class TermService {
 			term = NO_GROUP;
 		}
 		response.onNext(ByteBuffer.allocate(Long.BYTES).putLong(term).array());
+		response.onCompleted();
+	}
+
+	private static void answerState(NodeStateSource source, byte[] request, StreamObserver<byte[]> response) {
+		if (request.length < GROUP_ID_BYTES) {
+			response.onError(Status.INVALID_ARGUMENT
+					.withDescription("Expected a 16-byte group id, got " + request.length + " bytes")
+					.asRuntimeException());
+			return;
+		}
+		var buffer = ByteBuffer.wrap(request);
+		var groupId = RaftGroupId.valueOf(new UUID(buffer.getLong(), buffer.getLong()));
+		var clusterId = request.length == GROUP_ID_BYTES ? null
+				: new String(request, GROUP_ID_BYTES, request.length - GROUP_ID_BYTES, StandardCharsets.UTF_8);
+		NodeState state;
+		try {
+			state = source.state(groupId, clusterId);
+		} catch (RuntimeException e) {
+			// Its database closes while it installs a snapshot: ask again.
+			response.onError(Status.UNAVAILABLE.withDescription(e.toString()).asRuntimeException());
+			return;
+		}
+		response.onNext(state == null ? new byte[0] : encode(state));
 		response.onCompleted();
 	}
 

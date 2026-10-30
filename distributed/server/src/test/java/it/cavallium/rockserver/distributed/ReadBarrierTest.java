@@ -663,7 +663,8 @@ class ReadBarrierTest {
 		RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMax(properties, max);
 
 		var parameters = new Parameters();
-		var termService = TermService.customizer(node::serverAnsweringTermCalls, new HostAndPort("127.0.0.1", 0));
+		var termService = TermService.customizer(node::serverAnsweringTermCalls, new HostAndPort("127.0.0.1", 0),
+				(_, _) -> null);
 		GrpcConfigKeys.Server.setServicesCustomizer(parameters, (builder, types) -> {
 			if (types.contains(GrpcServices.Type.SERVER)) {
 				builder.intercept(node.faults());
