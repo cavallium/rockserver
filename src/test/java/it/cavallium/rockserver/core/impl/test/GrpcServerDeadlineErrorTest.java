@@ -791,7 +791,13 @@ class GrpcServerDeadlineErrorTest {
 
 		@Override
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-			return new RocksDBAsyncAPI() {};
+			return new RocksDBAsyncAPI() {
+				@Override
+				public java.util.concurrent.CompletableFuture<Void> closeFailedUpdateAsync(long updateId) {
+					closedUpdate.set(updateId);
+					return java.util.concurrent.CompletableFuture.completedFuture(null);
+				}
+			};
 		}
 
 		@Override
