@@ -73,7 +73,9 @@ import org.jetbrains.annotations.Nullable;
  * <p>A request whose caller has less time left than the request timeout is resent only until its caller's deadline,
  * minus {@link #CALLER_MARGIN_NANOS}. If it is still queued then, or its caller cancelled it before it was sent, it
  * leaves the queue without being sent: the caller gets {@code READ_DEADLINE_EXCEEDED}, and the write was not
- * applied.</p>
+ * applied. A batch is resent only until the earliest caller deadline among its requests. If that deadline ends the
+ * batch without an answer, its other requests go back to the queue and are sent again in a new batch, under their
+ * own deadlines (see {@link Lane#endUnanswered}).</p>
  */
 final class Proposer implements Closeable {
 
@@ -172,8 +174,9 @@ final class Proposer implements Closeable {
 	 * Proposes {@code entry} and completes with its result. {@code callerTimeLeftNanos} is what is left of the
 	 * caller's timeout ({@link #NO_CALLER_DEADLINE} if none). Fails with a {@link RocksDBException}: the result's own
 	 * error, {@link RocksDBRetryException} if the leader refused it (stale transaction), {@code READ_DEADLINE_EXCEEDED}
-	 * if the caller's deadline came before it was sent (not applied), or {@code SERVER_OVERLOADED} when no leader
-	 * answered in time; then the outcome is unknown, unless the message says it was not applied.
+	 * if the caller's deadline came before it was sent or before a leader accepted it (not applied), or
+	 * {@code SERVER_OVERLOADED} when no leader answered in time; then the outcome is unknown, unless the message says
+	 * it was not applied.
 	 */
 	CompletableFuture<Object> propose(LogEntry entry, long callerTimeLeftNanos) {
 		return submit(entry, anyLeader, callerTimeLeftNanos);
@@ -226,6 +229,11 @@ final class Proposer implements Closeable {
 		 * carries only what fits (possibly nothing), one round trip after another.
 		 */
 		volatile int copyBatchLimit = 1;
+		/**
+		 * Set when it went back to the queue after a batch whose copy may have been appended (see
+		 * {@link Lane#endUnanswered}): if it then fails without an answer, its outcome is unknown, never "not applied".
+		 */
+		volatile boolean maybeAppended;
 		/** Completed only by the proposer; callers get a copy, so that cancelling theirs cannot complete this one. */
 		final CompletableFuture<Object> result = new CompletableFuture<>();
 		/** QUEUED until it is taken into a batch (SENT), or until its caller gives up on it first (ABANDONED). */
@@ -249,6 +257,14 @@ final class Proposer implements Closeable {
 		/** Marks it as taken into a batch; false if it was abandoned, and must then not be sent. */
 		boolean markSent() {
 			return state.get() == SENT || state.compareAndSet(QUEUED, SENT);
+		}
+
+		/**
+		 * Back in the queue after a batch that no leader appended: as if it was never sent, so that its caller's
+		 * deadline or cancellation can again take it out of the queue.
+		 */
+		void unsend() {
+			state.set(QUEUED);
 		}
 
 		/**
@@ -363,6 +379,22 @@ final class Proposer implements Closeable {
 				"The request deadline came before the write was sent; it was not applied");
 	}
 
+	/** For a request that was sent, and refused before the append by every leader until its caller's deadline. */
+	private static RocksDBException callerDeadlinePassedUnaccepted() {
+		return RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+				"The request deadline came before a leader accepted the write; it was not applied");
+	}
+
+	private static RocksDBException notAccepted() {
+		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+				"No leader accepted the write in time; it was not applied");
+	}
+
+	private static RocksDBException noAnswer(@Nullable Throwable cause) {
+		return unavailable(cause != null ? cause
+				: new java.util.concurrent.TimeoutException("No answer before the deadline"));
+	}
+
 	/** Every request numbered below this has its final answer: no copy of it will ever be sent again. */
 	private long completedBelow() {
 		synchronized (numbering) {
@@ -439,8 +471,8 @@ final class Proposer implements Closeable {
 		/**
 		 * The next batch: the first queued request and, if it is a data write, the data writes behind it, up to the
 		 * batch limits. Requests past their deadline, or with less than {@link #MIN_TIME_LEFT_NANOS} left before the
-		 * node's own deadline, were never sent, so they fail without taking effect (except those resent alone, see
-		 * {@link Pending#fail}). Abandoned requests are dropped.
+		 * node's own deadline, fail as not applied, except those resent alone (see {@link Pending#fail}) and those
+		 * that an earlier batch may have appended ({@link Pending#maybeAppended}). Abandoned requests are dropped.
 		 */
 		private List<Pending> take() {
 			var batch = new ArrayList<Pending>();
@@ -457,9 +489,9 @@ final class Proposer implements Closeable {
 				if (closed || next.deadlineNanos - now < next.minTimeLeftNanos) {
 					queue.pollFirst();
 					next.fail(closed ? RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping")
+							: next.maybeAppended ? noAnswer(null)
 							: next.callerDeadline ? callerDeadlinePassed()
-							: RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
-									"No leader accepted the write in time; it was not applied"));
+							: notAccepted());
 					continue;
 				}
 				if (!batch.isEmpty() && (next.alone() || batch.getFirst().alone()
@@ -510,7 +542,8 @@ final class Proposer implements Closeable {
 			}
 			// Resent until the newest member's deadline, but at most one attempt beyond the oldest one's: its caller
 			// should not wait twice its timeout. The oldest is not past its deadline (see take()). Never resent past
-			// a member's caller deadline: that caller was told its write timed out, and may write it again.
+			// a member's caller deadline: that caller was told its write timed out, and may write it again. The
+			// members with time left then go back to the queue (see endUnanswered).
 			long deadline = Math.min(Math.min(latest, earliest + attemptTimeoutNanos), callers);
 			var message = Message.valueOf(UnsafeByteOperations.unsafeWrap(
 					LogEntryCodec.encodeBatch(proposerId, completedBelow(), sequences, bodies)));
@@ -538,38 +571,39 @@ final class Proposer implements Closeable {
 			var reply = isLocalLeader() ? submitLocal(message, callId, deadlineNanos)
 					: CompletableFuture.supplyAsync(() -> sendToLeader(message, callId), sender);
 			reply.handleAsync((answer, error) -> {
+				var refusal = error != null ? stateMachineException(error)
+						: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
 				try {
-					var refusal = error != null ? stateMachineException(error)
-							: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
 					var cause = error != null ? ReplicatedConnection.unwrap(error)
 							: !answer.isSuccess() ? answer.getException() : null;
-					long delay = refusal != null || cause instanceof LeaderNotReadyException
-							|| cause instanceof NotLeaderException || cause instanceof ResourceUnavailableException
-							? NOT_READY_RETRY_MS : ATTEMPT_SLEEP_MS;
-					// The resend itself must go out before the deadline, not only the decision to resend.
-					boolean retryable = !closed
-							&& System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delay) - deadlineNanos < 0
-							&& (refusal != null ? isNotReady(refusal) : error != null || !answer.isSuccess())
+					// No answer: no leader, unreachable, refused before the append, or a replica not ready.
+					boolean unanswered = (refusal != null ? isNotReady(refusal) : error != null || !answer.isSuccess())
 							&& !isReplyTooLarge(error);
-					if (retryable) {
-						// No answer yet (no leader, unreachable, refused before append): send the same batch again. If
-						// an earlier copy took effect, applying this one returns its recorded results.
+					if (unanswered) {
 						boolean nowAmbiguous = ambiguous || (refusal == null && !isRefusedBeforeAppend(cause));
+						long delay = refusal != null || cause instanceof LeaderNotReadyException
+								|| cause instanceof NotLeaderException || cause instanceof ResourceUnavailableException
+								? NOT_READY_RETRY_MS : ATTEMPT_SLEEP_MS;
+						// The resend itself must go out before the deadline, not only the decision to resend.
+						if (closed || System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delay) - deadlineNanos >= 0) {
+							roundTrip.since(sentNanos);
+							endUnanswered(batch, deadlineNanos, nowAmbiguous, refusal, cause);
+							finished();
+							return null;
+						}
+						// Send the same batch again. If an earlier copy took effect, applying this one returns its
+						// recorded results.
 						resends.record(1);
 						CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS, sender).execute(() -> {
 							if (closed || System.nanoTime() - deadlineNanos >= 0) {
 								// Too late after all (the timer ran late): no copy goes out after the deadline.
-								if (nowAmbiguous) {
-									fail(batch, unavailable(cause != null ? cause
-											: new java.util.concurrent.TimeoutException("No answer before the deadline")));
-								} else {
-									for (var pending : batch) {
-										pending.fail(pending.callerDeadline ? callerDeadlinePassed()
-												: RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
-														"No leader accepted the write in time; it was not applied"));
-									}
+								try {
+									endUnanswered(batch, deadlineNanos, nowAmbiguous, refusal, cause);
+								} catch (Throwable unexpected) {
+									fail(batch, unavailable(unexpected));
+								} finally {
+									finished();
 								}
-								finished();
 								return;
 							}
 							attempt(batch, message, callId, deadlineNanos, sentNanos, nowAmbiguous);
@@ -583,34 +617,15 @@ final class Proposer implements Closeable {
 				}
 				roundTrip.since(sentNanos);
 				try {
-					var finalCause = error != null ? ReplicatedConnection.unwrap(error)
-							: !answer.isSuccess() ? answer.getException() : null;
-					if (!ambiguous && finalCause != null && !(finalCause instanceof StateMachineException)
-							&& isRefusedBeforeAppend(finalCause)) {
-						// No copy was ever appended, and no more will be sent: not applied.
+					if (refusal != null) {
 						for (var pending : batch) {
-							pending.fail(pending.callerDeadline ? callerDeadlinePassed()
-									: RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
-											"No leader accepted the write in time; it was not applied"));
+							// An earlier copy may have been appended, although this one was refused.
+							pending.fail(ambiguous || pending.maybeAppended ? unavailable(refusal) : refusal(refusal));
 						}
-					} else if (error == null && !answer.isSuccess()
-							&& !(answer.getException() instanceof StateMachineException)) {
-						fail(batch, unavailable(answer.getException()));
+					} else if (isReplyTooLarge(error)) {
+						fail(batch, replyTooLarge(error));
 					} else {
-						var refusal = error != null ? stateMachineException(error)
-								: !answer.isSuccess() ? (StateMachineException) answer.getException() : null;
-						if (refusal != null && ambiguous) {
-							// This copy was refused, but an earlier one may have been appended.
-							fail(batch, unavailable(refusal));
-						} else if (refusal != null) {
-							fail(batch, refusal(refusal));
-						} else if (isReplyTooLarge(error)) {
-							fail(batch, replyTooLarge(error));
-						} else if (error != null) {
-							fail(batch, unavailable(error));
-						} else {
-							complete(batch, answer);
-						}
+						complete(batch, answer);
 					}
 				} catch (Throwable unexpected) {
 					fail(batch, unavailable(unexpected));
@@ -619,6 +634,51 @@ final class Proposer implements Closeable {
 				}
 				return null;
 			}, sender);
+		}
+
+		/**
+		 * Ends a batch of data writes whose resends stopped without an answer, at {@code deadlineNanos} or because the
+		 * node is stopping. The batch's deadline is the earliest caller deadline among its members, if any (see
+		 * {@link #send}), so the other members may still have time left. They go back to the head of the queue and
+		 * are sent again in a new batch, a new Ratis invocation, under their own deadlines. That is safe also when a
+		 * copy of this batch may have been appended ({@code ambiguous}): their sequences stay in flight, so applying a
+		 * copy of one that took effect returns its recorded result. Such members are marked
+		 * {@link Pending#maybeAppended}. The others were never appended, so their callers' deadlines and cancellations
+		 * can again take them out of the queue. The members whose own deadline is the batch's, or too close to it
+		 * (see {@link Pending#minTimeLeftNanos}), fail: as not applied if no copy was appended, with an unknown
+		 * outcome otherwise.
+		 */
+		private void endUnanswered(List<Pending> batch, long deadlineNanos, boolean ambiguous,
+				@Nullable StateMachineException refusal, @Nullable Throwable cause) {
+			long now = System.nanoTime();
+			var again = new ArrayList<Pending>(0);
+			for (var pending : batch) {
+				boolean appended = ambiguous || pending.maybeAppended;
+				if (!closed && pending.deadlineNanos - deadlineNanos > 0
+						&& pending.deadlineNanos - now >= pending.minTimeLeftNanos) {
+					pending.maybeAppended = appended;
+					pending.queuedNanos = now;
+					if (!appended && !pending.resentAlone) {
+						pending.unsend();
+					}
+					again.add(pending);
+				} else if (appended) {
+					pending.fail(noAnswer(cause));
+				} else if (refusal != null) {
+					pending.fail(refusal(refusal));
+				} else {
+					pending.fail(pending.callerDeadline ? callerDeadlinePassedUnaccepted() : notAccepted());
+				}
+			}
+			if (!again.isEmpty()) {
+				// Before finished(), so that the dispatch after it, which has this batch's slot, finds them queued.
+				requeue(again);
+				for (var pending : again) {
+					if (pending.callerDeadline && pending.isQueued()) {
+						expireWhenQueued(pending);
+					}
+				}
+			}
 		}
 
 		/**

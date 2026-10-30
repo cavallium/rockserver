@@ -315,6 +315,49 @@ class ReplicationTest {
 	}
 
 	/**
+	 * A write with a short caller deadline and one without a deadline share a batch while no leader can be elected.
+	 * The batch is resent only until the short deadline; then only that write fails, and the other one goes back to
+	 * the queue and is applied once a leader is elected.
+	 */
+	@Test
+	void aShortDeadlineInABatchDoesNotEndTheOtherWritesOfTheBatch() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withRequestTimeout(Duration.ofSeconds(30))).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var through = cluster.anyFollower();
+		var api = api(through);
+		long column = api.createColumn("c", SCHEMA);
+		var halted = cluster.ids().stream().filter(id -> !id.equals(through.config().nodeId())).toList();
+		assertTrue(halted.contains(leader.config().nodeId()));
+		for (String id : halted) {
+			cluster.halt(id);
+		}
+		// Fillers take every batch slot until their own deadline: the two writes queue meanwhile, and then go
+		// together in one batch.
+		var fillerApi = through.connection().getAsyncApi(RequestContext.latency(Duration.ofMillis(500)));
+		var fillers = new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+		for (int i = 0; i < Proposer.MAX_BATCHES_IN_FLIGHT; i++) {
+			fillers.add(fillerApi.putAsync(0, column, key(100 + i), text("filler"), RequestType.none()));
+		}
+		var shortWrite = through.connection().getAsyncApi(RequestContext.latency(Duration.ofSeconds(2)))
+				.putAsync(0, column, key(1), text("short"), RequestType.none());
+		var longWrite = through.connection().getAsyncApi(RequestContext.batch())
+				.putAsync(0, column, key(2), text("long"), RequestType.none());
+		var shortError = assertThrows(ExecutionException.class,
+				() -> shortWrite.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		assertInstanceOf(RocksDBException.class, shortError.getCause());
+		assertFalse(longWrite.isDone(), "the write without a deadline ended with the short one");
+
+		for (String id : halted) {
+			cluster.start(id);
+		}
+		longWrite.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		cluster.awaitConverged(TIMEOUT);
+		for (ReplicatedNode node : cluster.runningNodes()) {
+			assertEquals("long", localValue(node, column, 2));
+		}
+	}
+
+	/**
 	 * A follower's attempt that times out while the leader still has the batch pending is resent as the same Ratis
 	 * invocation: the leader answers it from its retry cache when the first copy is applied, instead of appending
 	 * the whole batch again as a second log entry.
