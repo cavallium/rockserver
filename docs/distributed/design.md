@@ -83,7 +83,8 @@ forwards to a non-embedded connection:
 | `NodeStore`, `CheckpointStorage` | Local database, internal metadata, checkpoint snapshots, restore. |
 | `LeaderForwarder` | Finds the leader's API and forwards to it. |
 | `LogEntry`, `Request`, `LogEntryCodec`, `ResultCodec` | Log entry model and its binary encoding. |
-| `ReplicatedServerMain` | Command line: `run` and `admin`. |
+| `ReplicatedServerMain` | Command line: `run`, `admin` and `repair-log`. |
+| `RaftLogRepair` | Offline repair of a torn last write in the open segment of the Raft log. |
 
 ## Routing
 
@@ -235,9 +236,14 @@ opened, before any entry is applied, and no other column is ever created locally
 - **Raft log.** It is synced (`fsync`) on a majority before a write is acknowledged. It is the only log of
   data writes: they are applied without the RocksDB WAL, which would only write everything a second time.
   After a power loss in the middle of a group commit, the unsynced tail of the open segment (preallocated with
-  zeros) reads back as a corrupt entry, and the default corruption policy keeps the node from starting until
-  that segment is truncated by hand (or the node is replaced). `WARN_AND_RETURN` would drop the tail, but in
-  Ratis 3.3.1 it also truncates closed segments, which can hold committed entries.
+  zeros) reads back as a corrupt entry, and the default corruption policy keeps the node from starting.
+  `WARN_AND_RETURN` would drop the tail, but in Ratis 3.3.1 it also truncates closed segments, which can hold
+  committed entries. Instead, `ReplicatedServerMain repair-log --data-dir DIR [--dry-run]`, run on the stopped
+  node, truncates the open segment at the first invalid entry, and only if every byte after the end that entry
+  declares is zero: a torn last write, whose fsync never finished, so the node never acknowledged it. It refuses
+  and changes nothing (exit code 1) if non-zero data follows that entry, or if the problem is anything else or in
+  a closed segment: replace such a node. A repaired node that never catches up under the current leader lost an
+  entry it had acknowledged, so its storage does not keep fsynced data: replace it too.
 - **RocksDB.** Replicas open it with `atomic-flush` (every column flushed together) and point-in-time WAL
   recovery (`absolute-consistency` forced off). After a crash or power loss the database is the last flushed
   state, a consistent point where the applied position matches the data, and Raft replays the rest: the log
@@ -456,6 +462,7 @@ failover" below).
 | `MembershipTest` | A node replaced through `add-peer`/`remove-peer` catches up from a snapshot. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories are linearizable, and the transactional bank-transfer invariant holds. |
+| `RaftLogRepairTest` | Segments written by Ratis' own output stream: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged, also a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. |
 | Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. |
 
 Run them all (about 10 minutes):

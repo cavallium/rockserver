@@ -187,6 +187,10 @@ Other results:
   (a volume outside `data/db` passes the start but makes every snapshot fail), and with
   `data/raft` on another disk every snapshot copies the whole database (instead of hard-linking it) while the
   apply waits. Keep `data/raft`, `data/db`, every column volume and the RocksDB WAL on one file system.
+- **Power loss.** A node that exits with `Log entry corrupted` after a power loss has a torn last write in its
+  Raft log. With the node stopped, run `ReplicatedServerMain repair-log --data-dir DIR --dry-run`, then the same
+  without `--dry-run`, and start the node: the leader sends it what it lost. If the command refuses, replace the
+  node under a new id.
 - **Disk space.** Each retained snapshot keeps the table files it links, also after compaction replaced them.
   Budget the database plus at least one older snapshot's compacted-away files, more while installs run.
 - **Client concurrency.** Throughput is in-flight requests divided by latency. A replicated write takes

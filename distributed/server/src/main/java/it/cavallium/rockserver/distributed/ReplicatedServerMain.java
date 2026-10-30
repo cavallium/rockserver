@@ -23,10 +23,14 @@ import org.apache.ratis.protocol.RaftPeerId;
  *       [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
  *       [--max-transaction-lease-ms N]
  * admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
+ * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
  * </pre>
  *
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
- * (leadership hand-off) on SIGTERM. For {@code add-peer} the new member must already run with the new peer list.</p>
+ * (leadership hand-off) on SIGTERM. For {@code add-peer} the new member must already run with the new peer list.
+ * {@code repair-log} runs on a stopped node, after a power loss left it unable to read its Raft log: see
+ * {@link RaftLogRepair}. It exits with 0 if the log is valid or was repaired (with {@code --dry-run}: could be) and
+ * with 1 if it refuses.</p>
  */
 public final class ReplicatedServerMain {
 
@@ -45,6 +49,7 @@ public final class ReplicatedServerMain {
 		switch (args[0]) {
 			case "run" -> run(new Options(rest));
 			case "admin" -> admin(new Options(rest));
+			case "repair-log" -> repairLog(new Options(rest));
 			default -> usage("unknown command " + args[0]);
 		}
 	}
@@ -147,6 +152,18 @@ public final class ReplicatedServerMain {
 		}
 	}
 
+	private static void repairLog(Options options) throws IOException {
+		var dataDir = Path.of(options.required("--data-dir"));
+		var groupId = options.value("--group-id", NodeConfig.DEFAULT_GROUP_ID);
+		var dryRun = options.flag("--dry-run");
+		options.requireConsumed();
+		var report = RaftLogRepair.run(dataDir, groupId, dryRun);
+		report.lines().forEach(System.out::println);
+		if (!report.success()) {
+			System.exit(1);
+		}
+	}
+
 	private static String arg(List<String> command) {
 		if (command.size() != 2) {
 			usage(command.getFirst() + " takes exactly one argument");
@@ -166,12 +183,15 @@ public final class ReplicatedServerMain {
 				        [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
 				        [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
 				        [--max-transaction-lease-ms N]
-				  admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID""");
+				  admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
+				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]""");
 		System.exit(2);
 	}
 
-	/** Minimal "--name value" parser; {@code --peer} may repeat. */
+	/** Minimal "--name value" parser; {@code --peer} may repeat and {@code --dry-run} takes no value. */
 	private static final class Options {
+		private static final String DRY_RUN = "--dry-run";
+
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();
 		private final List<String> consumed = new ArrayList<>();
@@ -179,7 +199,9 @@ public final class ReplicatedServerMain {
 		Options(List<String> args) {
 			for (int i = 0; i < args.size(); i++) {
 				var arg = args.get(i);
-				if (arg.startsWith("--")) {
+				if (arg.equals(DRY_RUN)) {
+					pairs.add(new String[] {arg, ""});
+				} else if (arg.startsWith("--")) {
 					if (i + 1 >= args.size()) {
 						usage("missing value for " + arg);
 					}
@@ -204,6 +226,10 @@ public final class ReplicatedServerMain {
 		String value(String name, String fallback) {
 			var result = value(name);
 			return result != null ? result : fallback;
+		}
+
+		boolean flag(String name) {
+			return value(name) != null;
 		}
 
 		String required(String name) {

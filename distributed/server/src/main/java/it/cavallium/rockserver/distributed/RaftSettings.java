@@ -15,6 +15,11 @@ final class RaftSettings {
 
 	/** Upper bound of one encoded log entry; larger writes are split by the caller. */
 	static final int MAX_ENTRY_BYTES = 16 * 1024 * 1024;
+	/**
+	 * Largest log entry Ratis reads back from a segment (it uses the appender's buffer limit as its maximum entry
+	 * size); {@link RaftLogRepair} reads with the same limit.
+	 */
+	static final SizeInBytes LOG_ENTRY_SIZE_MAX = SizeInBytes.valueOf(MAX_ENTRY_BYTES + (1 << 20));
 
 	private RaftSettings() {}
 
@@ -37,8 +42,9 @@ final class RaftSettings {
 		RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf("64MB"));
 		// The corruption policy stays the default, EXCEPTION. WARN_AND_RETURN would let a node start after a power loss
 		// tore the unsynced tail of its open segment, but in Ratis 3.3.1 it applies to closed segments too, which it
-		// truncates: committed, acknowledged entries could disappear.
-		RaftServerConfigKeys.Log.Appender.setBufferByteLimit(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (1 << 20)));
+		// truncates: committed, acknowledged entries could disappear. A torn open segment is repaired offline instead,
+		// by "ReplicatedServerMain repair-log" (RaftLogRepair), which never touches closed segments.
+		RaftServerConfigKeys.Log.Appender.setBufferByteLimit(properties, LOG_ENTRY_SIZE_MAX);
 		RaftServerConfigKeys.Log.setWriteBufferSize(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (2 << 20)));
 		RaftServerConfigKeys.Log.setQueueByteLimit(properties, SizeInBytes.valueOf(4L * MAX_ENTRY_BYTES));
 		// Group commit: entries that queue up during an fsync are written and synced together by the next one. Raise
