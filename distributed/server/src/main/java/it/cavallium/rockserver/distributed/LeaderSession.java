@@ -44,6 +44,11 @@ final class LeaderSession {
 
 	/** Unsettled commits of one key that may be chained on. More wait: this bounds what one failure can reject. */
 	static final int MAX_CHAIN_LINKS = 64;
+	/**
+	 * Updates that may read one link. A write makes a new link, so only updates that end with a close, which waits for
+	 * the link, ever reach this: more wait for the key, so that a stalled apply cannot pile up closes.
+	 */
+	static final int MAX_LINK_READERS = 64;
 	/** Largest value an update may read from memory; a larger write holds its key until it is applied. */
 	static final int MAX_LINK_VALUE_BYTES = 1 << 20;
 
@@ -79,6 +84,8 @@ final class LeaderSession {
 		final CompletableFuture<Boolean> settled = new CompletableFuture<>();
 		/** Guarded by {@link #chainLock}. */
 		private boolean finished;
+		/** Updates granted to read this link. Guarded by {@link #chainLock}. */
+		private int readers;
 		private volatile LogEntry.@Nullable Guard guard;
 
 		private ChainLink(long columnId, Keys keys, long keyHash, @Nullable Buf value, int position,
@@ -261,6 +268,8 @@ final class LeaderSession {
 	 * Guarded by {@link #chainLock}.
 	 */
 	private final Long2ObjectOpenHashMap<KeyState> keys = new Long2ObjectOpenHashMap<>();
+	/** Keys that an update holds now, for metrics. Guarded by {@link #chainLock}. */
+	private int heldKeys;
 	private long appliesSincePrune;
 	/**
 	 * Whether {@link #expiryTick} is scheduled: it runs while some key is held after an update queued behind it, so
@@ -400,10 +409,10 @@ final class LeaderSession {
 
 	/**
 	 * The only way a key is granted: to the oldest update that still waits, if nobody holds it. With unsettled links,
-	 * the update reads the newest one, if the chain is sound: it was not broken, it has room, and no write came after
-	 * that link. This check also makes a chained close correct: every write ordered after the link was registered
-	 * after this grant, so after the update was invoked. Otherwise the waiters stay queued until the links settle, and
-	 * the next one is then a head, which reads the database.
+	 * the update reads the newest one, if the chain is sound: it was not broken, it has room, too many updates are not
+	 * reading that link already, and no write came after it. This check also makes a chained close correct: every write
+	 * ordered after the link was registered after this grant, so after the update was invoked. Otherwise the waiters
+	 * stay queued until the links settle, and the next one is then a head, which reads the database.
 	 *
 	 * <p>The grant runs under {@link #chainLock}, which appends can wait for, so a waiter's dependent stages must be
 	 * cheap: {@link ReplicatedConnection} has only its timeout's cancellation and an async stage there.</p>
@@ -420,7 +429,8 @@ final class LeaderSession {
 		}
 		ChainLink base = null;
 		if (state.links > 0) {
-			if (state.broken || state.tail == null || state.links >= MAX_CHAIN_LINKS) {
+			if (state.broken || state.tail == null || state.links >= MAX_CHAIN_LINKS
+					|| state.tail.readers >= MAX_LINK_READERS) {
 				return;
 			}
 			if (!tracker.chainIntact(state.columnId, key, state.tail.token, applied.get())) {
@@ -434,6 +444,10 @@ final class LeaderSession {
 			// A waiter that timed out or was cancelled is already complete: skip it.
 			if (next.complete(new KeyLock(key, base))) {
 				state.held = true;
+				heldKeys++;
+				if (base != null) {
+					base.readers++;
+				}
 				return;
 			}
 		}

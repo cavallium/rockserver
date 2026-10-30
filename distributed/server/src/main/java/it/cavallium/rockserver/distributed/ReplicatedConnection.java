@@ -78,8 +78,9 @@ final class ReplicatedConnection implements RocksDBConnection {
 	 */
 	private static final Duration UPDATE_LOCK_WAIT = Duration.ofSeconds(12);
 	/**
-	 * How long the close of a chained update waits for the commit it read from. The bound lives in the future: {@code
-	 * requestSync} joins a close without a timeout.
+	 * How long the close of a chained update waits for the commit it read from. The bound lives in the future:
+	 * {@code requestSync} joins a close without a timeout. {@code GrpcServer} takes the asynchronous path, so that no
+	 * worker waits this long; how many closes can wait for one commit is {@link LeaderSession#MAX_LINK_READERS}.
 	 */
 	private static final Duration CHAINED_CLOSE_WAIT = Duration.ofSeconds(2);
 	/** Bytes of keys and values per replicated chunk of a batch write. */
