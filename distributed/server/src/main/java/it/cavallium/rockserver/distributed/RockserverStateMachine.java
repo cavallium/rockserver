@@ -309,7 +309,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 				.setStateMachine(this)
 				.setClientRequest(request);
 		try {
-			var decoded = LogEntryCodec.decodeBatch(request.getMessage().getContent().toByteArray());
+			var decoded = LogEntryCodec.decodeBatch(request.getMessage().getContent().asReadOnlyByteBuffer());
 			if (decoded.size() > 1 && !decoded.stream().allMatch(r -> Applier.isBatchable(r.entry()))) {
 				throw new IllegalArgumentException("Only data writes can share a log entry");
 			}
@@ -395,7 +395,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var data = logEntry.getStateMachineLogEntry().getLogData();
 		List<Request> requests;
 		try {
-			requests = proposal != null ? proposal.requests : LogEntryCodec.decodeBatch(data.toByteArray());
+			requests = proposal != null ? proposal.requests : LogEntryCodec.decodeBatch(data.asReadOnlyByteBuffer());
 		} catch (RuntimeException ex) {
 			return CompletableFuture.failedFuture(fail("decode entry " + position, ex));
 		}
@@ -602,6 +602,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 		applyTime.since(start);
 		applyGroupEntries.record(group.size());
+		prepareSnapshot(positionOf(group.getLast()));
 		completer.execute(() -> {
 			try {
 				for (var completion : completions) {
@@ -618,6 +619,35 @@ final class RockserverStateMachine extends BaseStateMachine {
 				}
 			}
 		});
+	}
+
+	/** The next snapshot's due index whose memtables were already flushed ahead, see {@link #prepareSnapshot}. */
+	private long preflushedFor = -1;
+
+	/**
+	 * Starts a flush of the memtables shortly before Ratis asks for the next snapshot. Ratis takes snapshots on its
+	 * own thread and hands over no entry meanwhile, and most of a snapshot's time is the flush of every memtable
+	 * that the checkpoint starts with (100-300 ms): flushed ahead, without waiting, the checkpoint finds only the
+	 * last moments of writes to flush. Ratis asks once {@code snapshotEveryEntries} entries were applied since the
+	 * latest snapshot; this starts the flush a hundredth of that interval earlier.
+	 */
+	private void prepareSnapshot(@Nullable TermIndex applied) {
+		if (applied == null || Boolean.getBoolean("rockserver.noPreflushAB")) {
+			return;
+		}
+		var latest = storage.getLatestSnapshot();
+		long due = (latest == null ? 0 : latest.getIndex()) + config.snapshotEveryEntries();
+		long margin = Math.max(256, config.snapshotEveryEntries() / 100);
+		if (applied.getIndex() < due - margin || preflushedFor == due) {
+			return;
+		}
+		preflushedFor = due;
+		try {
+			store.db().requestFlush();
+		} catch (RuntimeException ex) {
+			// Only an optimization: the checkpoint flushes anyway.
+			LOG.warn("{}: could not start the flush ahead of the snapshot", config.nodeId(), ex);
+		}
 	}
 
 	/** Applies one entry into the group; returns what to do once the group is committed. */

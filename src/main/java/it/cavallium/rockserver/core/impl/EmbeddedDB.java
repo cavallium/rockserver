@@ -1990,7 +1990,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var decisions = new WriteElisionDecision[logicalKeys.size()];
 		for (int i = 0; i < logicalKeys.size(); i++) {
 			col.checkNullableValue(requestedValues.get(i));
-			physicalKeys[i] = new PhysicalKey(col.calculateKey(logicalKeys.get(i).keys()).toByteArray());
+			physicalKeys[i] = new PhysicalKey(col.calculateKeyBytes(logicalKeys.get(i).keys()));
 		}
 		if (col.hasBuckets()) {
 			probeCachedBuckets(col, logicalKeys, requestedValues, physicalKeys, decisions);
@@ -2030,15 +2030,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					continue;
 				}
 				try (var arena = Arena.ofConfined()) {
-					var nativeKeys = new MemorySegment[indexes.size()];
-					var nativeValues = new MemorySegment[indexes.size()];
+					var keyBytes = new byte[indexes.size()][];
+					// Each value slot is exactly the requested size, so a longer stored value reports its requiredSize
+					var valueSizes = new long[indexes.size()];
 					for (int i = 0; i < indexes.size(); i++) {
 						int logicalIndex = indexes.get(i);
-						nativeKeys[i] = copyToNativeSegment(arena, physicalKeys[logicalIndex].bytes);
-						nativeValues[i] = arena.allocate(col.schema().hasValue()
-								? requestedValues.get(logicalIndex).size()
-								: 0);
+						keyBytes[i] = physicalKeys[logicalIndex].bytes;
+						valueSizes[i] = col.schema().hasValue() ? requestedValues.get(logicalIndex).size() : 0;
 					}
+					var nativeKeys = NativeStaging.stageKeys(arena, keyBytes);
+					var nativeValues = NativeStaging.allocateSlices(arena, valueSizes);
 					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
 					for (int i = 0; i < statuses.size(); i++) {
 						int logicalIndex = indexes.get(i);
@@ -2046,7 +2047,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						decisions[logicalIndex] = switch (status.status.getCode()) {
 							case Ok -> !col.schema().hasValue()
 									|| status.requiredSize == requestedValues.get(logicalIndex).size()
-									&& memorySegmentEquals(nativeValues[i],
+									&& NativeStaging.contentEquals(nativeValues[i],
 									requestedValues.get(logicalIndex), status.requiredSize)
 									? WriteElisionDecision.ELIDED
 									: WriteElisionDecision.FALLBACK_DIFFERENT;
@@ -2103,12 +2104,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					continue;
 				}
 				try (var arena = Arena.ofConfined()) {
-					var nativeKeys = new MemorySegment[chunk.size()];
-					var nativeValues = new MemorySegment[chunk.size()];
+					var keyBytes = new byte[chunk.size()][];
 					for (int i = 0; i < chunk.size(); i++) {
-						nativeKeys[i] = copyToNativeSegment(arena, chunk.get(i).physicalKey.bytes);
-						nativeValues[i] = arena.allocate(0);
+						keyBytes[i] = chunk.get(i).physicalKey.bytes;
 					}
+					var nativeKeys = NativeStaging.stageKeys(arena, keyBytes);
+					// Size-only pass: one shared zero-capacity value segment
+					var nativeValues = new MemorySegment[chunk.size()];
+					Arrays.fill(nativeValues, arena.allocate(0));
 					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
 					for (int i = 0; i < statuses.size(); i++) {
 						var group = chunk.get(i);
@@ -2148,13 +2151,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					offset++;
 				}
 				try (var arena = Arena.ofConfined()) {
-					var nativeKeys = new MemorySegment[chunk.size()];
-					var nativeValues = new MemorySegment[chunk.size()];
+					var keyBytes = new byte[chunk.size()][];
+					var valueSizes = new long[chunk.size()];
 					for (int i = 0; i < chunk.size(); i++) {
 						var group = chunk.get(i);
-						nativeKeys[i] = copyToNativeSegment(arena, group.physicalKey.bytes);
-						nativeValues[i] = arena.allocate(group.requiredSize);
+						keyBytes[i] = group.physicalKey.bytes;
+						valueSizes[i] = group.requiredSize;
 					}
+					var nativeKeys = NativeStaging.stageKeys(arena, keyBytes);
+					var nativeValues = NativeStaging.allocateSlices(arena, valueSizes);
 					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
 					for (int i = 0; i < statuses.size(); i++) {
 						var group = chunk.get(i);
@@ -2224,27 +2229,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private static MemorySegment copyToNativeSegment(Arena arena, byte[] value) {
-		return arena.allocateFrom(ValueLayout.JAVA_BYTE, value);
-	}
-
-	private static MemorySegment copyToNativeSegment(Arena arena, Buf value) {
-		var segment = arena.allocate(value.size());
-		MemorySegment.copy(value.getBackingByteArray(), value.getBackingByteArrayOffset(), segment,
-				ValueLayout.JAVA_BYTE, 0, value.getBackingByteArrayLength());
-		return segment;
-	}
-
-	private static boolean memorySegmentEquals(MemorySegment actual, Buf expected, int length) {
-		if (length != expected.size() || actual.byteSize() < length) {
-			return false;
-		}
-		for (int i = 0; i < length; i++) {
-			if (actual.get(ValueLayout.JAVA_BYTE, i) != expected.getByte(i)) {
-				return false;
-			}
-		}
-		return true;
+	/**
+	 * The bytes of {@code value} for a JNI call that only reads them during the call: the backing array itself when
+	 * it is exact, a copy otherwise. Never store the result, since it may alias the caller's buffer.
+	 */
+	private static byte[] jniArray(Buf value) {
+		byte[] array = value.asArrayStrict();
+		return array != null ? array : value.toByteArray();
 	}
 
 	private static byte[] copyMemorySegment(MemorySegment source, int length) {
@@ -3876,14 +3867,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private byte[] calculateDeleteRangeBeginKey(ColumnInstance col, @Nullable Keys startKeysInclusive) {
 		if (startKeysInclusive != null && startKeysInclusive.keys().length > 0) {
-			return col.calculateKey(startKeysInclusive.keys()).toByteArray();
+			return col.calculateKeyBytes(startKeysInclusive.keys());
 		}
 		return new byte[0];
 	}
 
 	private byte[] calculateDeleteRangeEndKey(ColumnInstance col, @Nullable Keys endKeysExclusive) {
 		if (endKeysExclusive != null && endKeysExclusive.keys().length > 0) {
-			return col.calculateKey(endKeysExclusive.keys()).toByteArray();
+			return col.calculateKeyBytes(endKeysExclusive.keys());
 		}
 		return encodedKeyUpperBound(col.finalKeySizeBytes());
 	}
@@ -4802,16 +4793,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 		boolean wroteEntry = false;
 		entries.sort((a, b) -> {
-			var ka = col.calculateKey(a.getKey().keys()).toByteArray();
-			var kb = col.calculateKey(b.getKey().keys()).toByteArray();
+			var ka = col.calculateKeyBytes(a.getKey().keys());
+			var kb = col.calculateKeyBytes(b.getKey().keys());
 			return Arrays.compareUnsigned(ka, kb);
 		});
 		try (var ro = newPointReadOptions(null)) {
 			for (var entry : entries) {
 				var keys = entry.getKey();
 				var value = entry.getValue();
-				Buf calculatedKey = col.calculateKey(keys.keys());
-				byte[] keyBytes = Utils.toByteArray(calculatedKey);
+				byte[] keyBytes = col.calculateKeyBytes(keys.keys());
+				Buf calculatedKey = Buf.wrap(keyBytes);
 				if (col.hasBuckets()) {
 					var existingRawBucket = dbGet(null, col, ro, calculatedKey);
 					var bucket = existingRawBucket != null ? new Bucket(col, existingRawBucket) : new Bucket(col);
@@ -4825,7 +4816,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						mergedValue = value;
 					}
 					bucket.addElement(bucketElementKeys, mergedValue);
-					byte[] valBytes = Utils.toByteArray(bucket.toSegment());
+					byte[] valBytes = jniArray(bucket.toSegment());
 					sst.put(keyBytes, valBytes);
 					wroteEntry = true;
 				} else {
@@ -4986,7 +4977,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var writeElisionRequest = WriteElisionRequest.from(callback);
 			if (writeElisionRequest != null && allowWriteElisionProbe) {
 				if (optionalDbWriter == null && updateId == 0L) {
-					var physicalKey = new PhysicalKey(col.calculateKey(keys.keys()).toByteArray());
+					var physicalKey = new PhysicalKey(col.calculateKeyBytes(keys.keys()));
 					var decision = probeCachedLogicalValue(col, physicalKey, keys, value);
 					recordWriteElisionDecision(writeElisionRequest, decision);
 					if (decision == WriteElisionDecision.ELIDED) {
@@ -5028,8 +5019,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				boolean committedOwnedTx;
 				do {
 					Buf previousValue;
-					Buf calculatedKey = col.calculateKey(keys.keys());
-					byte[] calculatedKeyArray = calculatedKey.toByteArray();
+					byte[] calculatedKeyArray = col.calculateKeyBytes(keys.keys());
 					if (updateId != 0L) {
 						assert !owningNewTx;
 						((Tx) newTx).val().setSavePoint();
@@ -5044,7 +5034,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
 							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
 							previousValue = transformResultValue(col, bucket.addElement(bucketElementKeys, value));
-							var v = Utils.toByteArray(bucket.toSegment());
+							var v = jniArray(bucket.toSegment());
 							txPut((Tx) newTx, col.cfh(), calculatedKeyArray, v);
 						} catch (org.rocksdb.RocksDBException e) {
 							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
@@ -5074,15 +5064,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							previousValue = null;
 						}
 						switch (newTx) {
-							case WB wb -> wb.wb().put(col.cfh(), calculatedKeyArray, value.toByteArray());
+							case WB wb -> wb.wb().put(col.cfh(), calculatedKeyArray, jniArray(value));
 							case SSTWriter sstWriter -> {
-								var valueBB = (col.schema().hasValue() ? value : dummyRocksDBEmptyValue()).toByteArray();
+								var valueBB = jniArray(col.schema().hasValue() ? value : dummyRocksDBEmptyValue());
 								sstWriter.put(calculatedKeyArray, valueBB);
 							}
-							case Tx t -> txPut(t, col.cfh(), calculatedKeyArray, value.toByteArray());
+							case Tx t -> txPut(t, col.cfh(), calculatedKeyArray, jniArray(value));
 							case null -> {
 								try (var w = new LeakSafeWriteOptions(null)) {
-									var valueBB = (col.schema().hasValue() ? value : dummyRocksDBEmptyValue()).toByteArray();
+									var valueBB = jniArray(col.schema().hasValue() ? value : dummyRocksDBEmptyValue());
 									db.get().put(col.cfh(), w, calculatedKeyArray, valueBB);
 								}
 							}
@@ -5187,8 +5177,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				boolean committedOwnedTx;
 				do {
 					Buf previousValue;
-					Buf calculatedKey = col.calculateKey(keys.keys());
-					byte[] calculatedKeyArray = calculatedKey.toByteArray();
+					byte[] calculatedKeyArray = col.calculateKeyBytes(keys.keys());
 					if (updateId != 0L) {
 						assert !owningNewTx;
 						((Tx) newTx).val().setSavePoint();
@@ -5202,7 +5191,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
 							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
 							previousValue = transformResultValue(col, bucket.removeElement(bucketElementKeys));
-							var v = Utils.toByteArray(bucket.toSegment());
+							var v = jniArray(bucket.toSegment());
 							txPut((Tx) newTx, col.cfh(), calculatedKeyArray, v);
 						} catch (org.rocksdb.RocksDBException e) {
 							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
@@ -5340,8 +5329,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				boolean didGetForUpdateInternally = false;
 				boolean committedOwnedTx;
 				do {
-					Buf calculatedKey = col.calculateKey(keys.keys());
-					byte[] calculatedKeyArray = calculatedKey.toByteArray();
+					byte[] calculatedKeyArray = col.calculateKeyBytes(keys.keys());
+					Buf calculatedKey = Buf.wrap(calculatedKeyArray);
 					if (updateId != 0L) {
 						assert !owningNewTx;
 						((Tx) newTx).val().setSavePoint();
@@ -5363,7 +5352,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								mergedValue = value;
 							}
 							bucket.addElement(bucketElementKeys, mergedValue);
-							var v = Utils.toByteArray(bucket.toSegment());
+							var v = jniArray(bucket.toSegment());
 							txPut((Tx) newTx, col.cfh(), calculatedKeyArray, v);
 							if (callback instanceof RequestType.RequestMerged<?>) {
 								var merged = bucket.getElement(col.getBucketElementKeys(keys.keys()));
@@ -5376,13 +5365,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						}
 					} else {
 						switch (newTx) {
-							case WB wb -> wb.wb().merge(col.cfh(), calculatedKeyArray, value.toByteArray());
+							case WB wb -> wb.wb().merge(col.cfh(), calculatedKeyArray, jniArray(value));
 							case SSTWriter ignored ->
 									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Merge not supported with SST writer");
-							case Tx t -> txMerge(t, col.cfh(), calculatedKeyArray, value.toByteArray());
+							case Tx t -> txMerge(t, col.cfh(), calculatedKeyArray, jniArray(value));
 							case null -> {
 								try (var w = new LeakSafeWriteOptions(null)) {
-									db.get().merge(col.cfh(), w, calculatedKeyArray, value.toByteArray());
+									db.get().merge(col.cfh(), w, calculatedKeyArray, jniArray(value));
 								}
 							}
 						}
@@ -5767,13 +5756,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long physicalKeyBytes = 0;
 			for (int i = 0; i < count; i++) {
 				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				var calculatedKey = col.calculateKey(keys.get(i).keys());
-				physicalKeyBytes += calculatedKey.size();
+				var calculatedKey = col.calculateKeyBytes(keys.get(i).keys());
+				physicalKeyBytes += calculatedKey.length;
 				if (physicalKeyBytes > MultiGetPage.MAX_KEY_BYTES) {
 					throw RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
 							"MultiGet physical keys exceed server byte limit");
 				}
-				nativeKeys[i] = calculatedKey.toByteArray();
+				nativeKeys[i] = calculatedKey;
 			}
 			// Retain one snapshot for the uncommon first-key retry after native key sorting.
 			var nativeDb = db.get();
@@ -6788,14 +6777,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (arenaObserver != null) {
 				arenaObserver.accept(true);
 			}
-			var nativeKeys = new MemorySegment[calculatedKeys.size()];
+			// One native block for all keys, sliced per key
+			var nativeKeys = NativeStaging.stageKeys(arena, calculatedKeys);
 			var emptyValues = new MemorySegment[calculatedKeys.size()];
 			// The MemorySegment overload creates a distinct ByteBuffer per entry; zero capacity prevents writes.
-			var emptyValue = arena.allocate(0);
-			for (int i = 0; i < calculatedKeys.size(); i++) {
-				nativeKeys[i] = copyToNativeSegment(arena, calculatedKeys.get(i));
-				emptyValues[i] = emptyValue;
-			}
+			Arrays.fill(emptyValues, arena.allocate(0));
 
 			var nativeDb = db.get();
 			var columnHandles = List.of(col.cfh());
@@ -6835,7 +6821,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			ReadOptions readOptions,
 			List<Keys> logicalKeys,
 			List<Buf> calculatedKeys) throws org.rocksdb.RocksDBException {
-		var nativeKeys = calculatedKeys.stream().map(Buf::toByteArray).toList();
+		var nativeKeys = calculatedKeys.stream().map(EmbeddedDB::jniArray).toList();
 		List<byte[]> values;
 		long readStarted = System.nanoTime();
 		activeNativeMultiGets.incrementAndGet();
@@ -7177,8 +7163,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					return null;
 				}
 
-				var calculatedKey = state.column.calculateKey(keys.keys());
-				var target = calculatedKey.toByteArray();
+				var target = state.column.calculateKeyBytes(keys.keys());
 				if (state.reverse) {
 					state.iterator.seekForPrev(target);
 				} else {
@@ -10894,6 +10879,28 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		flush(true);
 	}
 
+	/**
+	 * Starts a flush of every column's memtables and returns without waiting for it: for a caller that will flush
+	 * synchronously soon (a checkpoint) and wants that flush to find little left to write.
+	 */
+	public void requestFlush() {
+		ops.beginOp();
+		try {
+			synchronized (columnEditLock) {
+				try (var fo = new FlushOptions().setWaitForFlush(false).setAllowWriteStall(true)) {
+					db.get().flush(fo, columns.values().stream()
+							.map(ColumnInstance::cfh)
+							.filter(AbstractImmutableNativeReference::isOwningHandle)
+							.toList());
+				}
+			}
+		} catch (org.rocksdb.RocksDBException ex) {
+			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
+		} finally {
+			ops.endOp();
+		}
+	}
+
 	private void flush(boolean walOnly) {
 		var start = System.nanoTime();
 		ops.beginOp();
@@ -11176,7 +11183,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			if (tx != null) {
 				byte[] previousRawBucketByteArray;
-				byte[] calculatedKeyArray = calculatedKey.toByteArray();
+				byte[] calculatedKeyArray = jniArray(calculatedKey);
 				if (forUpdate || tx.isFromGetForUpdate()) {
 					previousRawBucketByteArray = pointGetForUpdate(tx, readOptions, col.cfh(), calculatedKeyArray);
 				} else {

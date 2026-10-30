@@ -11,7 +11,9 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
+import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
@@ -25,9 +27,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -37,6 +42,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.reactivestreams.Subscription;
+import reactor.core.publisher.BaseSubscriber;
 import reactor.core.publisher.Flux;
 
 /**
@@ -55,6 +62,17 @@ class ForwardingFailoverTest {
 	/** Range streams are not latency work. */
 	private static final RequestContext STREAM = RequestContext.analytical(Duration.ofSeconds(8));
 	private static final int KEYS = 64;
+	/**
+	 * A range far larger than what fits between a client that stopped asking for elements and the leader, whatever
+	 * flow-control windows gRPC tunes on the way: the leader is still sending when the stream is cut.
+	 */
+	private static final int RANGE_KEYS = 30_000;
+	private static final int RANGE_VALUE_BYTES = 1024;
+	private static final int RANGE_BATCH_KEYS = 1000;
+	private static final int FIRST_ELEMENTS = 16;
+	/** Long enough for a range read that the test holds back, and for its failure to arrive. */
+	private static final Duration RANGE_TIMEOUT = Duration.ofSeconds(60);
+	private static final RequestContext RANGE_STREAM = RequestContext.analytical(RANGE_TIMEOUT);
 
 	@TempDir
 	Path root;
@@ -103,7 +121,7 @@ class ForwardingFailoverTest {
 								var range = streamApi.getRangeAsync(0, column, null, null, false,
 										RequestType.<KV>allInRange());
 								var keys = Flux.from(range)
-										.map(kv -> ByteBuffer.wrap(kv.keys().keys()[0].toByteArray()).getLong())
+										.map(ForwardingFailoverTest::keyOf)
 										.collectList()
 										.block();
 								// Writes only overwrite the keys written before: a complete read returns each once.
@@ -123,9 +141,7 @@ class ForwardingFailoverTest {
 							}
 						} catch (RuntimeException e) {
 							var cause = e instanceof CompletionException && e.getCause() != null ? e.getCause() : e;
-							if (cause instanceof RocksDBException rocks
-									&& (rocks.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED
-									|| rocks.getErrorUniqueId() == RocksDBErrorType.UPDATE_RETRY)) {
+							if (isRetryable(cause)) {
 								retryable.incrementAndGet();
 							} else {
 								unexpected.putIfAbsent(String.valueOf(cause), String.valueOf(cause.getMessage()));
@@ -233,6 +249,218 @@ class ForwardingFailoverTest {
 		}
 	}
 
+	/**
+	 * A range stream whose link to a leader that stays alive breaks after the client received its first elements
+	 * fails with a retryable error. The follower does not send it again, which would repeat those elements, and does
+	 * not end it normally, which would hide the keys never received.
+	 */
+	@Test
+	void aForwardedStreamCutByALostLinkFailsWithoutRepeatingOrLosingKeys() throws Exception {
+		cluster = startForRanges();
+		var members = List.of("1", "2", "3");
+		var leader = awaitLeader(members);
+		var follower = members.stream().filter(id -> !id.equals(leader)).findFirst().orElseThrow();
+
+		try (var connection = GrpcConnection.forHostAndPort("follower-client", cluster.apiAddress(follower))) {
+			long column = createFilledRange(connection);
+
+			var reader = new RangeReader();
+			reader.read(connection.getAsyncApi(RANGE_STREAM), column);
+			reader.awaitFirstElements();
+			cluster.network().blockLink(follower, leader);
+			// The connection is gone, but the leader can be reached again: a stream sent again would repeat keys.
+			cluster.network().heal();
+			reader.requestUnbounded();
+			reader.assertFailedPartWay();
+
+			assertRangeIsComplete(connection.getAsyncApi(RANGE_STREAM), column);
+		}
+	}
+
+	/** Like {@link #aForwardedStreamCutByALostLinkFailsWithoutRepeatingOrLosingKeys}, but the leader is killed. */
+	@Test
+	void aForwardedStreamCutByTheLeadersDeathFailsWithoutRepeatingOrLosingKeys() throws Exception {
+		cluster = startForRanges();
+		var members = List.of("1", "2", "3");
+		var leader = awaitLeader(members);
+		var follower = members.stream().filter(id -> !id.equals(leader)).findFirst().orElseThrow();
+
+		try (var connection = GrpcConnection.forHostAndPort("follower-client", cluster.apiAddress(follower))) {
+			long column = createFilledRange(connection);
+
+			var reader = new RangeReader();
+			reader.read(connection.getAsyncApi(RANGE_STREAM), column);
+			reader.awaitFirstElements();
+			cluster.kill(leader);
+			reader.requestUnbounded();
+			reader.assertFailedPartWay();
+
+			assertRangeIsComplete(connection.getAsyncApi(RANGE_STREAM), column);
+		}
+	}
+
+	/**
+	 * A range stream lost before its first element is sent again to the next leader, and the client gets every key
+	 * once. The leader is frozen first, so that it cannot send anything before it dies.
+	 */
+	@Test
+	void aForwardedStreamCutBeforeItsFirstElementIsSentAgain() throws Exception {
+		cluster = startForRanges();
+		var members = List.of("1", "2", "3");
+		var leader = awaitLeader(members);
+		var follower = members.stream().filter(id -> !id.equals(leader)).findFirst().orElseThrow();
+
+		try (var connection = GrpcConnection.forHostAndPort("follower-client", cluster.apiAddress(follower))) {
+			long column = createFilledRange(connection);
+			connectEverySlot(connection.getAsyncApi(CONTEXT), column);
+
+			cluster.pause(leader);
+			var reader = new RangeReader();
+			reader.read(connection.getAsyncApi(RANGE_STREAM), column);
+			// Time for the follower to forward it to the frozen leader.
+			Thread.sleep(300);
+			assertEquals(0, reader.keys().size(), "precondition: no element came from the frozen leader");
+			assertFalse(reader.isFinished(), "precondition: the stream waits for the frozen leader");
+			cluster.kill(leader);
+			reader.requestUnbounded();
+			reader.awaitEnd();
+
+			assertEveryKeyOnce(reader.keys());
+		}
+	}
+
+	private ProcessCluster startForRanges() throws Exception {
+		var started = ProcessCluster.start(root.resolve("cluster"), 3, List.of(
+				"--election-timeout-ms", "400:800",
+				// A resent stream has this long to find the next leader, even on a loaded machine.
+				"--request-timeout-ms", "30000"));
+		started.waitReady(READY_TIMEOUT);
+		return started;
+	}
+
+	/** Creates a column holding the keys from 0 to {@link #RANGE_KEYS} (excluded). */
+	private static long createFilledRange(GrpcConnection connection) {
+		var api = connection.getAsyncApi(SETUP);
+		long column = api.createColumnAsync("data", SCHEMA).join();
+		var value = Buf.wrap(new byte[RANGE_VALUE_BYTES]);
+		var batches = new ArrayList<KVBatch>();
+		for (int start = 0; start < RANGE_KEYS; start += RANGE_BATCH_KEYS) {
+			var keys = new ArrayList<Keys>(RANGE_BATCH_KEYS);
+			var values = new ArrayList<Buf>(RANGE_BATCH_KEYS);
+			for (int key = start; key < start + RANGE_BATCH_KEYS; key++) {
+				keys.add(key(key));
+				values.add(value);
+			}
+			batches.add(new KVBatch.KVBatchRef(keys, values));
+		}
+		api.putBatchAsync(column, Flux.fromIterable(batches), PutBatchMode.WRITE_BATCH).join();
+		return column;
+	}
+
+	/** Reads the whole range through {@code api}, retrying while the cluster recovers. */
+	private static void assertRangeIsComplete(RocksDBAsyncAPI api, long column) throws Exception {
+		long deadline = System.nanoTime() + READY_TIMEOUT.toNanos();
+		while (true) {
+			try {
+				assertEveryKeyOnce(Flux.from(api.getRangeAsync(0, column, null, null, false, RequestType.<KV>allInRange()))
+						.map(ForwardingFailoverTest::keyOf)
+						.collectList()
+						.block());
+				return;
+			} catch (RocksDBException e) {
+				if (!isRetryable(e) || System.nanoTime() - deadline > 0) {
+					throw e;
+				}
+				Thread.sleep(100);
+			}
+		}
+	}
+
+	private static void assertEveryKeyOnce(List<Long> keys) {
+		assertEquals(RANGE_KEYS, keys.size(), "keys read");
+		assertKeysFromZero(keys);
+	}
+
+	/** Any repeated key, as a stream sent again would give, or any gap, shows here. */
+	private static void assertKeysFromZero(List<Long> keys) {
+		for (int i = 0; i < keys.size(); i++) {
+			assertEquals(i, keys.get(i), "key at position " + i + " of the " + keys.size() + " read");
+		}
+	}
+
+	/**
+	 * Reads a range one demand at a time, so that the test decides how far the stream goes: {@link #FIRST_ELEMENTS}
+	 * at first, then whatever is left once {@link #requestUnbounded()} is called. A cut connection is reported only
+	 * after what it had delivered was consumed, so the read must go on after a cut for its failure to arrive.
+	 */
+	private static final class RangeReader extends BaseSubscriber<KV> {
+
+		private final List<Long> keys = Collections.synchronizedList(new ArrayList<>());
+		private final CountDownLatch firstElements = new CountDownLatch(FIRST_ELEMENTS);
+		private final CompletableFuture<Void> end = new CompletableFuture<>();
+
+		void read(RocksDBAsyncAPI api, long column) {
+			Flux.from(api.getRangeAsync(0, column, null, null, false, RequestType.<KV>allInRange())).subscribe(this);
+		}
+
+		@Override
+		protected void hookOnSubscribe(Subscription subscription) {
+			subscription.request(FIRST_ELEMENTS);
+		}
+
+		@Override
+		protected void hookOnNext(KV kv) {
+			keys.add(keyOf(kv));
+			firstElements.countDown();
+		}
+
+		@Override
+		protected void hookOnComplete() {
+			end.complete(null);
+		}
+
+		@Override
+		protected void hookOnError(Throwable error) {
+			end.completeExceptionally(error);
+		}
+
+		/** Returns when the first elements arrived, while the rest of the stream is held back by the missing demand. */
+		void awaitFirstElements() throws InterruptedException {
+			assertTrue(firstElements.await(RANGE_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS), "no first elements");
+			// Time to fill every buffer up to the leader, which then waits for flow control, most of the range unsent.
+			Thread.sleep(500);
+			assertEquals(FIRST_ELEMENTS, keys().size(), "precondition: the client received only what it asked for");
+			assertFalse(isFinished(), "precondition: the stream is still running");
+		}
+
+		void awaitEnd() throws Exception {
+			end.get(RANGE_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS);
+		}
+
+		/** The read ended with a retryable error, and what came before it is the start of the range, with no repeats. */
+		void assertFailedPartWay() {
+			var error = assertThrows(ExecutionException.class, this::awaitEnd,
+					() -> "a cut stream ended normally with " + keys().size() + " keys of " + RANGE_KEYS);
+			var cause = assertInstanceOf(RocksDBException.class, error.getCause(), () -> String.valueOf(error.getCause()));
+			assertTrue(isRetryable(cause), () -> "not retryable: " + cause);
+			var read = keys();
+			System.out.println("ForwardingFailoverTest: stream cut after " + read.size() + " of " + RANGE_KEYS + " keys: "
+					+ cause);
+			assertTrue(read.size() >= FIRST_ELEMENTS && read.size() < RANGE_KEYS, () -> read.size() + " keys read");
+			assertKeysFromZero(read);
+		}
+
+		boolean isFinished() {
+			return end.isDone();
+		}
+
+		List<Long> keys() {
+			synchronized (keys) {
+				return List.copyOf(keys);
+			}
+		}
+	}
+
 	private ProcessCluster startWithMergeOperator() throws Exception {
 		var rockserverConfig = root.resolve("rockserver.conf");
 		Files.writeString(rockserverConfig, InProcessCluster.MERGE_CONFIG);
@@ -271,6 +499,12 @@ class ForwardingFailoverTest {
 		}
 	}
 
+	private static boolean isRetryable(Throwable error) {
+		return error instanceof RocksDBException rocks
+				&& (rocks.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED
+				|| rocks.getErrorUniqueId() == RocksDBErrorType.UPDATE_RETRY);
+	}
+
 	private static Buf text(String value) {
 		return Buf.wrap(value.getBytes(StandardCharsets.UTF_8));
 	}
@@ -296,5 +530,9 @@ class ForwardingFailoverTest {
 
 	private static Keys key(long value) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(value).array()));
+	}
+
+	private static long keyOf(KV kv) {
+		return ByteBuffer.wrap(kv.keys().keys()[0].toByteArray()).getLong();
 	}
 }
