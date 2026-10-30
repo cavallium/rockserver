@@ -586,6 +586,60 @@ class PipelinedUpdatesTest {
 		assertReplicasHold(1, "after");
 	}
 
+	/**
+	 * The flag only changes how a leader behaves: entries a pipelined leader wrote, guards included, apply the same with
+	 * the flag off, and the cluster goes on through a mix of the two.
+	 */
+	@Test
+	void thePipelineCanBeSwitchedOnAndOffAtARestart() throws Exception {
+		start();
+		long written = 0;
+		for (boolean pipelined : new boolean[] {false, true, false}) {
+			for (var update = forUpdate(1); ; update = forUpdate(1)) {
+				written++;
+				var previous = text(update.previous());
+				assertEquals("v" + (written - 1), previous);
+				if (written % 10 == 0) {
+					await(put(update, 1, "v" + written));
+					break;
+				}
+				put(update, 1, "v" + written);
+			}
+			assertReplicasHold(1, "v" + written);
+			for (var id : cluster.ids()) {
+				cluster.stop(id);
+				cluster.reconfigure(id, c -> c.withPipelinedUpdates(pipelined));
+			}
+			cluster.startAll();
+			leader = cluster.awaitLeader(TIMEOUT);
+			assertReplicasHold(1, "v" + written);
+		}
+		var last = forUpdate(1);
+		assertFalse(chained(last));
+		await(async(leader).closeFailedUpdateAsync(last.updateId()));
+
+		// One node with it on, two with it off: a hand-over of the leadership changes nothing for clients.
+		for (var id : cluster.ids()) {
+			cluster.stop(id);
+		}
+		var first = cluster.ids().getFirst();
+		cluster.reconfigure(first, c -> c.withPipelinedUpdates(true));
+		cluster.startAll();
+		leader = cluster.awaitLeader(TIMEOUT);
+		for (int i = 0; i < 2; i++) {
+			var api = api(leader);
+			var update = api.get(0, column, key(1), RequestType.<Buf>forUpdate());
+			api.put(update.updateId(), column, key(1), text("v" + ++written), RequestType.none());
+			cluster.stop(leader.config().nodeId());
+			var stopped = cluster.ids().stream().filter(id -> cluster.runningNodes().stream()
+					.noneMatch(node -> node.config().nodeId().equals(id))).findFirst().orElseThrow();
+			leader = cluster.awaitLeader(TIMEOUT);
+			cluster.start(stopped);
+			leader = cluster.awaitLeader(TIMEOUT);
+		}
+		assertReplicasHold(1, "v" + written);
+	}
+
 	/** Many clients, one key, retrying as real clients do: nothing is lost, and the replicas agree. */
 	@Test
 	void concurrentClientsLoseNoUpdate() throws Exception {

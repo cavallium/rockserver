@@ -80,6 +80,14 @@ final class InProcessCluster implements AutoCloseable {
 		return node;
 	}
 
+	/** Changes how a stopped node starts next. */
+	void reconfigure(String id, UnaryOperator<NodeConfig> change) {
+		if (running.containsKey(id)) {
+			throw new IllegalStateException(id + " is running");
+		}
+		configs.computeIfPresent(id, (_, config) -> change.apply(config));
+	}
+
 	/** Graceful stop (leadership hand-off). */
 	void stop(String id) throws IOException {
 		var node = running.remove(id);
