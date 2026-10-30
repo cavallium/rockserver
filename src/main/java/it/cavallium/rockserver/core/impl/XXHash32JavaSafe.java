@@ -22,6 +22,9 @@ import static it.cavallium.rockserver.core.impl.XXHashUtils.PRIME5;
 import static java.lang.Integer.rotateLeft;
 
 import it.cavallium.buffer.Buf;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
 import java.util.Objects;
 
 /**
@@ -31,6 +34,8 @@ public final class XXHash32JavaSafe extends XXHash32 {
 
 
 	public static final XXHash32 INSTANCE = new XXHash32JavaSafe();
+
+	private static final VarHandle INT_LE = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
 
 	@Override
 	public int hash(byte[] buf, int off, int len, int seed) {
@@ -97,6 +102,13 @@ public final class XXHash32JavaSafe extends XXHash32 {
 
 	@Override
 	public void hash(Buf buf, int off, int len, int seed, Buf result) {
+		int h32 = hash(buf, off, len, seed);
+		assert result.size() >= Integer.BYTES;
+		result.setInt(0, h32);
+	}
+
+	@Override
+	public int hash(Buf buf, int off, int len, int seed) {
 		Objects.checkFromIndexSize(off, len, buf.size());
 
 		final int end = off + len;
@@ -155,12 +167,11 @@ public final class XXHash32JavaSafe extends XXHash32 {
 		h32 *= PRIME3;
 		h32 ^= h32 >>> 16;
 
-		assert result.size() >= Integer.BYTES;
-		result.setInt(0, h32);
+		return h32;
 	}
 
 	private static int readIntLE(byte[] buf, int i) {
-		return (buf[i] & 0xFF) | ((buf[i+1] & 0xFF) << 8) | ((buf[i+2] & 0xFF) << 16) | ((buf[i+3] & 0xFF) << 24);
+		return (int) INT_LE.get(buf, i);
 	}
 
 	private static int readIntLE(Buf buf, int i) {

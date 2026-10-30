@@ -3,11 +3,14 @@ package it.cavallium.rockserver.core.impl;
 import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
 import static it.cavallium.rockserver.core.common.Utils.toCharExact;
 
+import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.buffer.Buf;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
 import java.util.StringJoiner;
 import java.util.concurrent.TimeoutException;
@@ -20,23 +23,52 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 				    ColumnSchema schema,
 				    int finalKeySizeBytes,
 				    @Nullable FFMAbstractMergeOperator mergeOperator,
-				    SafeShutdown uses) implements AutoCloseable {
+				    SafeShutdown uses,
+				    KeyLayout keyLayout) implements AutoCloseable {
 
 	private static final Buf[] EMPTY_BUF_ARRAY = new Buf[0];
 
 	public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema) {
-		this(cfh, schema, calculateFinalKeySizeBytes(schema), null, new SafeShutdown());
+		this(cfh, schema, null, new SafeShutdown());
 	}
 
 	public ColumnInstance(ColumnFamilyHandle cfh, ColumnSchema schema, @Nullable FFMAbstractMergeOperator mergeOperator) {
-		this(cfh, schema, calculateFinalKeySizeBytes(schema), mergeOperator, new SafeShutdown());
+		this(cfh, schema, mergeOperator, new SafeShutdown());
 	}
 
 	private ColumnInstance(ColumnFamilyHandle cfh,
 			ColumnSchema schema,
 			@Nullable FFMAbstractMergeOperator mergeOperator,
 			SafeShutdown uses) {
-		this(cfh, schema, calculateFinalKeySizeBytes(schema), mergeOperator, uses);
+		this(cfh, schema, calculateFinalKeySizeBytes(schema), mergeOperator, uses, new KeyLayout(schema));
+	}
+
+	/**
+	 * Key parts of a schema flattened into arrays, so that building a composite key does not walk the schema lists.
+	 * It is derived from the schema alone and compares by content.
+	 */
+	public static final class KeyLayout {
+
+		private final int[] lengths;
+		private final int fixedCount;
+		private final ColumnHashType[] tails;
+
+		private KeyLayout(ColumnSchema schema) {
+			this.lengths = schema.keys().toIntArray();
+			this.fixedCount = schema.fixedLengthKeysCount();
+			this.tails = schema.variableTailKeys().toArray(ColumnHashType[]::new);
+		}
+
+		@Override
+		public boolean equals(Object o) {
+			return o instanceof KeyLayout other && fixedCount == other.fixedCount
+					&& Arrays.equals(lengths, other.lengths) && Arrays.equals(tails, other.tails);
+		}
+
+		@Override
+		public int hashCode() {
+			return 31 * Arrays.hashCode(lengths) + Arrays.hashCode(tails);
+		}
 	}
 
 	private static int calculateFinalKeySizeBytes(ColumnSchema schema) {
@@ -130,6 +162,10 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 		return schema.variableLengthKeysCount() > 0;
 	}
 
+	/**
+	 * The composite key as a {@link Buf}. A single fixed key is returned as is, without copying; prefer
+	 * {@link #calculateKeyBytes(Buf[])} when the caller needs a {@code byte[]} anyway.
+	 */
 	@NotNull
 	public Buf calculateKey(Buf[] keys) {
 		validateKeyCount(keys);
@@ -139,17 +175,78 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 		} else if(keys.length == 1 && !hasBuckets()) {
 			finalKey = keys[0];
 		} else {
-			finalKey = Buf.createZeroes(finalKeySizeBytes);
-			int offsetBytes = 0;
-			for (int i = 0; i < schema.keysCount(); i++) {
-				var computedKeyAtI = computeKeyAt(i, keys);
-				var computedKeyAtISize = computedKeyAtI.size();
-				finalKey.setBytesFromBuf(offsetBytes, computedKeyAtI, 0, computedKeyAtISize);
-				offsetBytes += computedKeyAtISize;
-			}
+			return Buf.wrap(calculateKeyBytes(keys));
 		}
 		validateFinalKeySize(finalKey);
 		return finalKey;
+	}
+
+	/**
+	 * The composite key in a fresh array of exactly {@link #finalKeySizeBytes} bytes, never shared with the
+	 * caller: fixed parts are copied in order, then each variable-length tail is replaced by its hash.
+	 */
+	public byte @NotNull [] calculateKeyBytes(Buf[] keys) {
+		var layout = this.keyLayout;
+		var lengths = layout.lengths;
+		if (keys.length != lengths.length) {
+			validateKeyCount(keys);
+		}
+		int fixedCount = layout.fixedCount;
+		if (fixedCount == 1 && keys.length == 1) {
+			var key = keys[0];
+			if (key.size() != finalKeySizeBytes) {
+				throw keyLengthMismatch(0, key.size(), 1);
+			}
+			return key.toByteArray();
+		}
+		byte[] out = new byte[finalKeySizeBytes];
+		int offset = 0;
+		for (int i = 0; i < fixedCount; i++) {
+			var key = keys[i];
+			int length = lengths[i];
+			int keySize = key.size();
+			if (keySize != length) {
+				throw keyLengthMismatch(i, keySize, keys.length);
+			}
+			copyInto(key, 0, out, offset, length);
+			offset += length;
+		}
+		for (int i = fixedCount; i < lengths.length; i++) {
+			layout.tails[i - fixedCount].hashInto(keys[i], out, offset);
+			offset += lengths[i];
+		}
+		return out;
+	}
+
+	private RocksDBException keyLengthMismatch(int i, int keySize, int keysCount) {
+		if (keysCount == 1 && !hasBuckets()) {
+			// The single-key path used to return the key itself and only check the whole key size
+			return RocksDBException.of(RocksDBErrorType.RAW_KEY_LENGTH_MISMATCH,
+					"Keys size must be equal to the column keys size. Expected: "
+							+ finalKeySizeBytes + ", got: " + keySize);
+		}
+		return RocksDBException.of(RocksDBErrorType.KEY_LENGTH_MISMATCH,
+				"Key at index " + i + " has a different length than expected! Expected: " + schema.key(i)
+						+ ", received: " + keySize);
+	}
+
+	/**
+	 * Copies {@code length} bytes of {@code source} into {@code out}: a plain arraycopy for heap buffers, a
+	 * {@link MemorySegment} copy for off-heap ones.
+	 */
+	private static void copyInto(Buf source, int sourceOffset, byte[] out, int outOffset, int length) {
+		byte[] array = source.getBackingByteArrayStrict();
+		if (array != null) {
+			System.arraycopy(array, source.getBackingByteArrayOffset() + sourceOffset, out, outOffset, length);
+		} else {
+			MemorySegment.copy(source.asMemorySegment(), ValueLayout.JAVA_BYTE, sourceOffset, out, outOffset, length);
+		}
+	}
+
+	private static Buf copyOfRange(Buf source, int offset, int length) {
+		byte[] out = new byte[length];
+		copyInto(source, offset, out, 0, length);
+		return Buf.wrap(out);
 	}
 
 	/**
@@ -169,8 +266,7 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 				int offsetBytes = 0;
 				for (int i = 0; i < schema.keysCount(); i++) {
 					var keyLength = schema.key(i);
-					var finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
-					finalKey.setBytesFromBuf(0, calculatedKey, offsetBytes, keyLength);
+					finalKeys[i] = copyOfRange(calculatedKey, offsetBytes, keyLength);
 					offsetBytes += keyLength;
 				}
 			}
@@ -201,8 +297,7 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 				if (bucketValueOffset + keyLength > bucketValue.size()) {
 					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Bucket value too short for key content at index " + i);
 				}
-				Buf finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
-				finalKey.setBytesFromBuf(0, bucketValue, bucketValueOffset, keyLength);
+				finalKeys[i] = copyOfRange(bucketValue, bucketValueOffset, keyLength);
 				bucketValueOffset += keyLength;
 			}
 		}
@@ -305,8 +400,7 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 		int calculatedKeyOffset = 0;
 		for (int i = 0; i < firstVariableKeyIndex; i++) {
 			int keyLength = schema.key(i);
-			Buf finalKey = finalKeys[i] = Buf.createZeroes(keyLength);
-			finalKey.setBytesFromBuf(0, calculatedKey, calculatedKeyOffset, keyLength);
+			finalKeys[i] = copyOfRange(calculatedKey, calculatedKeyOffset, keyLength);
 			calculatedKeyOffset += keyLength;
 		}
 	}
@@ -338,22 +432,6 @@ public record ColumnInstance(ColumnFamilyHandle cfh,
 		Buf value = Buf.createZeroes(valueSize);
 		value.setBytesFromBuf(0, calculatedValue, bucketValueOffset, valueSize);
 		return value;
-	}
-
-	private Buf computeKeyAt(int i, Buf[] keys) {
-		if (i < schema.keysCount() - schema.variableLengthKeysCount()) {
-			if (keys[i].size() != schema.key(i)) {
-				throw RocksDBException.of(RocksDBErrorType.KEY_LENGTH_MISMATCH,
-						"Key at index " + i + " has a different length than expected! Expected: " + schema.key(i)
-								+ ", received: " + keys[i].size());
-			}
-			return keys[i];
-		} else {
-			var tailKey = schema.variableTailKey(i);
-			var hashResult = Buf.createZeroes(tailKey.bytesSize());
-			tailKey.hash(keys[i], hashResult);
-			return hashResult;
-		}
 	}
 
 	private void validateFinalKeySize(Buf key) {

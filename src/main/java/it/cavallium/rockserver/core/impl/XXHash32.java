@@ -35,6 +35,12 @@ public abstract class XXHash32 {
 	 */
 	public abstract void hash(Buf buf, int off, int len, int seed, Buf result);
 
+	/**
+	 * Compute the 32-bits hash of <code>buf[off:off+len]</code> using seed
+	 * <code>seed</code>.
+	 */
+	public abstract int hash(Buf buf, int off, int len, int seed);
+
 	public static XXHash32 getInstance() {
 		return XXHash32JavaSafe.INSTANCE;
 	}
