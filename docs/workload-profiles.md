@@ -150,6 +150,13 @@ atomically rejects new workers and new worker submissions, disposes every regist
 removes its queued tasks through the same indexed cancellation path. A submission that linearizes
 before parent disposal may run or be cancelled; one attempted after disposal is never admitted.
 
+Streamed `PutBatch` and `MergeBatch` follow the request deadline in three steps. While the
+subscription is still queued, the deadline or a dropped task ends the call with an error and the
+batch never runs. Once it runs, the deadline ends the stream only between two batches, after the
+running batch write returns. Once the final write starts (write-batch flush, transaction commit, or
+SST ingestion), neither the deadline nor a dropped task ends the call, so the client sees the
+outcome of that write. A batch that was applied never reports `DEADLINE_EXCEEDED`.
+
 The LATENCY burst counter is a bounded state, not a lifetime completion counter. It saturates at
 the configured burst limit and resets when guaranteed work is selected, so multi-year LATENCY-only
 uptime cannot wrap the counter and starve newly arriving INGEST, ANALYTICAL, or BATCH work.

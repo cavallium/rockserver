@@ -105,13 +105,25 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 	 * deadline passes. It never completes otherwise.
 	 */
 	Mono<RuntimeException> streamFailure() {
-		var dropped = droppedTaskFailureSink().asMono();
 		if (monotonicDeadlineNanos == Long.MAX_VALUE) {
-			return dropped;
+			return droppedTaskFailure();
 		}
-		return dropped.or(Mono.defer(() -> Mono.delay(Duration.ofNanos(
+		return droppedTaskFailure().or(deadlineFailure());
+	}
+
+	/** Emits the executor's failure the first time this view drops an accepted task that has no rejection hook. */
+	Mono<RuntimeException> droppedTaskFailure() {
+		return droppedTaskFailureSink().asMono();
+	}
+
+	/** Emits a {@code READ_DEADLINE_EXCEEDED} failure when the view's deadline passes, and never without a deadline. */
+	Mono<RuntimeException> deadlineFailure() {
+		if (monotonicDeadlineNanos == Long.MAX_VALUE) {
+			return Mono.never();
+		}
+		return Mono.defer(() -> Mono.delay(Duration.ofNanos(
 						executor.remainingDeadlineNanos(monotonicDeadlineNanos))))
-				.map(_ -> ProfiledWorkloadExecutor.deadlineFailure("Workload deadline expired while streaming")));
+				.map(_ -> ProfiledWorkloadExecutor.deadlineFailure("Workload deadline expired while streaming"));
 	}
 
 	private void taskDropped(RuntimeException failure) {

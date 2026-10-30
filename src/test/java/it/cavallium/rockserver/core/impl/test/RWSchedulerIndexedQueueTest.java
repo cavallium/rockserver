@@ -354,6 +354,63 @@ class RWSchedulerIndexedQueueTest {
 	}
 
 	@Test
+	void subscribeOnReportsTheOutcomeOfACommitThatOutlivesItsDeadline() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-subscribe-on-commit-deadline");
+		long deadline = scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(50L));
+		var view = scheduler.scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, deadline);
+		var committed = new AtomicInteger();
+		try {
+			var operation = RWScheduler.<Integer>subscribeOn(commit -> RWScheduler.publishOn(Flux.just(1, 2), view)
+							.then(Mono.fromCallable(() -> {
+								commit.run(() -> {
+									// The deadline passes while the commit runs
+									sleepUninterruptibly(250L);
+									committed.incrementAndGet();
+								});
+								return committed.get();
+							})), view)
+					.toFuture();
+
+			assertEquals(1, operation.get(5, SECONDS));
+			assertReadPoolDrained(scheduler);
+		} finally {
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void streamDeadlineEndsTheStreamOnlyAfterTheRunningElement() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-stream-deadline-between-elements");
+		long deadline = scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(50L));
+		var view = scheduler.scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, deadline);
+		var processing = new AtomicBoolean();
+		var processed = new AtomicInteger();
+		var failedWhileProcessing = new AtomicBoolean();
+		try {
+			var operation = RWScheduler.subscribeOn(RWScheduler.publishOn(Flux.just(1, 2, 3), view)
+							.doOnNext(_ -> {
+								processing.set(true);
+								// The deadline passes while the first element is processed
+								sleepUninterruptibly(250L);
+								processed.incrementAndGet();
+								processing.set(false);
+							})
+							.then(), view)
+					.doOnError(_ -> failedWhileProcessing.set(processing.get()))
+					.toFuture();
+
+			assertDeadlineFailure(assertThrows(ExecutionException.class, () -> operation.get(5, SECONDS)));
+			assertFalse(failedWhileProcessing.get(), "the deadline ended the stream while an element was processed");
+			assertEquals(1, processed.get());
+			assertReadPoolDrained(scheduler);
+		} finally {
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
 	void queuedReactorCancellationRacingShutdownPublishesOneOriginalFailure() throws Exception {
 		for (int repetition = 0; repetition < 32; repetition++) {
 			var scheduler = scheduler(1, 8, "indexed-reactor-terminal-race-" + repetition);
@@ -1486,6 +1543,20 @@ class RWSchedulerIndexedQueueTest {
 			Thread.sleep(5L);
 		}
 		assertTrue(condition.getAsBoolean());
+	}
+
+	private static void sleepUninterruptibly(long millis) {
+		long end = System.nanoTime() + MILLISECONDS.toNanos(millis);
+		boolean interrupted = false;
+		long remaining;
+		while ((remaining = end - System.nanoTime()) > 0L) {
+			try {
+				Thread.sleep(Math.max(1L, remaining / 1_000_000L));
+			} catch (InterruptedException ignored) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) Thread.currentThread().interrupt();
 	}
 
 	private static void awaitUninterruptibly(CountDownLatch latch) {

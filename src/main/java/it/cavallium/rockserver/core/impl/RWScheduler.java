@@ -13,7 +13,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import org.jetbrains.annotations.Nullable;
@@ -311,6 +313,8 @@ public final class RWScheduler {
 	 * queued drain after admitting it (deadline expired while queued, shutdown), or when the view's
 	 * deadline passes. publishOn is never told about such a drop, so without this the stream stops
 	 * without a terminal signal; and a queued drain expires only when a worker of the pool is free.
+	 * takeUntilOther delivers that end after the element being processed, so a failure never ends
+	 * the stream in the middle of an element's downstream work.
 	 * A drop fails every stream published on the same view, so give each stream its own view.
 	 */
 	public static <T> Flux<T> publishOn(Flux<T> source, Scheduler scheduler) {
@@ -337,18 +341,88 @@ public final class RWScheduler {
 	/**
 	 * {@code source.subscribeOn(scheduler)} that also ends with an error when a workload view drops
 	 * the queued subscription, or any later task of the source, after admitting it (deadline
-	 * expired while queued, shutdown), or when the view's deadline passes. subscribeOn is never
-	 * told about such a drop, so without this the source is never subscribed and never terminates. On failure the source is cancelled, which
-	 * removes a still queued subscription without running it and releases the resources of a
-	 * subscribed one. A drop fails every source on the same view, so give each source its own view.
+	 * expired while queued, shutdown), or when the view's deadline passes while the subscription
+	 * is still queued. subscribeOn is never told about such a drop, so without this the source is
+	 * never subscribed and never terminates. On failure the source is cancelled, which removes a
+	 * still queued subscription without running it and releases the resources of a subscribed one.
+	 * Once the subscription runs, the deadline no longer ends the source here: a stream inside it
+	 * ends at the deadline through {@link #publishOn(Flux, Scheduler)}, between two elements. A drop
+	 * fails every source on the same view, so give each source its own view.
 	 */
 	public static <T> Mono<T> subscribeOn(Mono<T> source, Scheduler scheduler) {
+		return subscribeOn(_ -> source, scheduler);
+	}
+
+	/**
+	 * {@link #subscribeOn(Mono, Scheduler)} for a source that ends with a commit, which it runs
+	 * through the given {@link StreamCommit}. Once the commit has started, no failure of the view
+	 * ends the source, so the source reports the commit's own outcome.
+	 */
+	public static <T> Mono<T> subscribeOn(Function<StreamCommit, Mono<T>> source, Scheduler scheduler) {
 		if (scheduler instanceof IndexedWorkloadScheduler indexedScheduler) {
-			// The first signal wins: the source's own termination, or the view's failure
-			return Mono.firstWithSignal(source.subscribeOn(indexedScheduler),
-					indexedScheduler.streamFailure().flatMap(Mono::<T>error));
+			return Mono.defer(() -> {
+				var commit = new StreamCommit();
+				// A failure that won before the subscription ran leaves nothing to subscribe
+				var subscribed = Mono.defer(() -> commit.start() ? source.apply(commit) : Mono.<T>empty());
+				// The first signal wins: the source's own termination, or a failure of the view that
+				// is still allowed to end it. A failure that is not allowed never signals.
+				return Mono.firstWithSignal(subscribed.subscribeOn(indexedScheduler),
+						indexedScheduler.droppedTaskFailure()
+								.flatMap(failure -> commit.failBeforeCommit() ? Mono.<T>error(failure) : Mono.<T>never()),
+						indexedScheduler.deadlineFailure()
+								.flatMap(failure -> commit.failQueued() ? Mono.<T>error(failure) : Mono.<T>never()));
+			});
 		}
-		return source.subscribeOn(scheduler);
+		return Mono.defer(() -> {
+			var commit = new StreamCommit();
+			commit.start();
+			return source.apply(commit);
+		}).subscribeOn(scheduler);
+	}
+
+	/**
+	 * Orders the final commit of a source run by {@link #subscribeOn(Function, Scheduler)} against
+	 * the failures of its workload view: a failure ends the source only before the commit starts,
+	 * and a commit never starts after a failure has ended the source.
+	 */
+	public static final class StreamCommit {
+
+		private static final int QUEUED = 0;
+		private static final int STARTED = 1;
+		private static final int COMMITTING = 2;
+		private static final int FAILED = 3;
+
+		private final AtomicInteger phase = new AtomicInteger(QUEUED);
+
+		private StreamCommit() {
+		}
+
+		/** Runs {@code commit}, unless a failure of the view has already ended the source. */
+		public void run(Runnable commit) {
+			if (phase.compareAndSet(STARTED, COMMITTING)) {
+				commit.run();
+			}
+		}
+
+		private boolean start() {
+			return phase.compareAndSet(QUEUED, STARTED);
+		}
+
+		private boolean failQueued() {
+			return phase.compareAndSet(QUEUED, FAILED);
+		}
+
+		private boolean failBeforeCommit() {
+			for (;;) {
+				int current = phase.get();
+				if (current != QUEUED && current != STARTED) {
+					return false;
+				}
+				if (phase.compareAndSet(current, FAILED)) {
+					return true;
+				}
+			}
+		}
 	}
 
 	/** Resolve and validate the caller context, then return its resource-specific view. */
