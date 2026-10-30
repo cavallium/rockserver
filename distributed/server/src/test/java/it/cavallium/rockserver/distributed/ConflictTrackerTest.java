@@ -696,10 +696,8 @@ class ConflictTrackerTest {
 	}
 
 	@Test
-	void aChainedCommitWithoutABaseConflicts() {
-		var entry = chained(10, COLUMN, key("k"));
-		assertEquals(IntList.of(0), chainConflicts(entry, null), "its update is gone");
-		assertEquals(IntList.of(0), chainConflicts(entry, check(COLUMN, key("k"), null)), "its base failed");
+	void aChainedCommitWithoutACheckConflicts() {
+		assertEquals(IntList.of(0), chainConflicts(chained(10, COLUMN, key("k")), null));
 	}
 
 	@Test

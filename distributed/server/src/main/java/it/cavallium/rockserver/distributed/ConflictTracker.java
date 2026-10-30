@@ -121,9 +121,13 @@ final class ConflictTracker {
 	 *
 	 * @param columnId column of the key it read
 	 * @param hash {@link #keyHash} of the key it read
-	 * @param base the entry whose value it read; null if that entry is known to have failed, or is unknown
+	 * @param base the entry whose value it read
 	 */
-	record ChainCheck(long columnId, long hash, @Nullable Token base) {}
+	record ChainCheck(long columnId, long hash, Token base) {
+		ChainCheck {
+			java.util.Objects.requireNonNull(base, "base");
+		}
+	}
 
 	/** 64-bit hash of a logical key: column id plus every key segment with its length. */
 	static long keyHash(long columnId, Keys keys) {
@@ -231,11 +235,11 @@ final class ConflictTracker {
 	/**
 	 * {@link #conflicts(LogEntry.Guarded)} for a commit that may be chained. The key a chained update read is judged by
 	 * identity: only a writer other than the entry it read from conflicts. Its absence does not: that entry may be
-	 * forgotten once applied, and the commit's guard decides anyway. A chained commit without a usable {@code check}
-	 * conflicts: its update expired, or the entry it read from failed.
+	 * forgotten once applied, and the commit's guard decides anyway. A chained commit without a {@code check} conflicts:
+	 * its update expired, or the entry it read from failed.
 	 */
 	private boolean conflicts(LogEntry.Guarded guarded, @Nullable ChainCheck check) {
-		if (guarded.guard() != null && (check == null || check.base() == null)) {
+		if (guarded.guard() != null && check == null) {
 			return true;
 		}
 		long snapshotIndex = guarded.snapshotIndex();

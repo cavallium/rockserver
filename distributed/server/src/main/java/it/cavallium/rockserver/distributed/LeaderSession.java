@@ -20,6 +20,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongConsumer;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -274,8 +275,8 @@ final class LeaderSession {
 	 */
 	private final Object chainLock = new Object();
 	/**
-	 * Single-key updates by key hash ({@link ConflictTracker#keyHash}): a key is in the map while an update holds it.
-	 * Guarded by {@link #chainLock}.
+	 * Single-key updates by key hash ({@link ConflictTracker#keyHash}): a key is in the map while an update holds it or
+	 * while it has unsettled links. Guarded by {@link #chainLock}.
 	 */
 	private final Long2ObjectOpenHashMap<KeyState> keys = new Long2ObjectOpenHashMap<>();
 	/** Keys that an update holds now, for metrics. Guarded by {@link #chainLock}. */
@@ -506,6 +507,7 @@ final class LeaderSession {
 				chainLength.record(state.links);
 				state.tail = state.broken ? null : link;
 				state.held = false;
+				heldKeys--;
 				grantNext(link.keyHash, state);
 			}
 			if (links == null) {
@@ -638,10 +640,10 @@ final class LeaderSession {
 		return transactions.size();
 	}
 
-	/** Keys held by an update, for metrics. */
+	/** Keys held by an update, for metrics; not those that only wait for their links to settle. */
 	int lockedKeys() {
 		synchronized (chainLock) {
-			return keys.size();
+			return heldKeys;
 		}
 	}
 
@@ -678,6 +680,7 @@ final class LeaderSession {
 				return;
 			}
 			state.held = false;
+			heldKeys--;
 			grantNext(lock.key, state);
 		}
 	}
@@ -775,6 +778,11 @@ final class LeaderSession {
 
 	/** Leadership ended: roll back every open transaction. Their ids become unknown, so clients retry them. */
 	void close(EmbeddedDB db) {
+		close(id -> db.closeFailedUpdate(id), id -> db.closeTransaction(id, false));
+	}
+
+	/** {@link #close(EmbeddedDB)}, with what rolls back a native update and a native transaction. */
+	void close(LongConsumer rollBackUpdate, LongConsumer rollBackTransaction) {
 		synchronized (this) {
 			closed = true;
 		}
@@ -784,9 +792,9 @@ final class LeaderSession {
 			}
 			try {
 				if (transaction.update) {
-					db.closeFailedUpdate(transaction.id);
+					rollBackUpdate.accept(transaction.id);
 				} else {
-					db.closeTransaction(transaction.id, false);
+					rollBackTransaction.accept(transaction.id);
 				}
 			} catch (RuntimeException ex) {
 				LOG.debug("Failed to roll back transaction {} of term {}", transaction.id, term, ex);
@@ -801,6 +809,7 @@ final class LeaderSession {
 		synchronized (chainLock) {
 			keys.values().forEach(state -> waiters.addAll(state.waiters));
 			keys.clear();
+			heldKeys = 0;
 			links = List.copyOf(unsettled);
 			unsettled.clear();
 			links.forEach(link -> link.finished = true);
