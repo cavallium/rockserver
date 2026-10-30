@@ -25,6 +25,22 @@ public final class History {
 		return register(new Pending(key, Operation.Kind.GET, null, System.nanoTime()));
 	}
 
+	/** A get that started at {@code invokeNanos}, recorded once it is known to be one. */
+	public Pending invokeGetAt(String key, long invokeNanos) {
+		return register(new Pending(key, Operation.Kind.GET, null, invokeNanos));
+	}
+
+	/**
+	 * A read-modify-write that started at {@code invokeNanos}: it read {@code read} (null = absent) and now writes
+	 * {@code value}. Completed like a put. An update that failed has no effect, and its read does not count.
+	 */
+	public Pending invokeUpdateAt(String key, @Nullable String read, String value, long invokeNanos) {
+		Objects.requireNonNull(value, "value");
+		var pending = new Pending(key, Operation.Kind.UPDATE, value, invokeNanos);
+		pending.read = read;
+		return register(pending);
+	}
+
 	/** Every recorded operation, in invocation order. */
 	public synchronized List<Operation> operations() {
 		return pending.stream().map(Pending::toOperation).toList();
@@ -42,6 +58,7 @@ public final class History {
 		private final Operation.Kind kind;
 		private final long invokeNanos;
 		private @Nullable String value;
+		private @Nullable String read;
 		private long completeNanos;
 		private @Nullable OpStatus status;
 
@@ -54,7 +71,7 @@ public final class History {
 
 		/** Completes a put. */
 		public void complete(OpStatus status) {
-			if (kind != Operation.Kind.PUT) {
+			if (kind == Operation.Kind.GET) {
 				throw new IllegalStateException("A get completes with the value it read");
 			}
 			finish(status, value);
@@ -81,7 +98,7 @@ public final class History {
 		private synchronized Operation toOperation() {
 			var effectiveStatus = status != null ? status : OpStatus.UNKNOWN;
 			long complete = effectiveStatus == OpStatus.UNKNOWN ? Long.MAX_VALUE : completeNanos;
-			return new Operation(key, kind, value, invokeNanos, complete, effectiveStatus);
+			return new Operation(key, kind, value, read, invokeNanos, complete, effectiveStatus);
 		}
 	}
 }

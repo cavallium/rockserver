@@ -35,8 +35,12 @@ import java.util.concurrent.locks.LockSupport;
  * java -cp ... LoadBench --target replicated|single --root DIR [--scales 1,2,4] [--closed 64,256]
  *     [--step-seconds 30] [--warmup-seconds 10] [--route leader|all] [--connections 4]
  *     [--chats 20000] [--messages-per-chat 50] [--value-bytes 600] [--skew 0.5] [--max-in-flight 512]
- *     [--only UPDATE,GET] [--jvm "-Xmx4g -XX:+UseZGC"] [--server-arg "--snapshot-every 100000"] [--label text]
+ *     [--hot-keys 4:0.5] [--only UPDATE,GET] [--jvm "-Xmx4g -XX:+UseZGC"] [--server-arg "--snapshot-every 100000"]
+ *     [--label text]
  * </pre>
+ *
+ * <p>{@code --hot-keys N:SHARE} sends that share of the updates to N single keys, for what one key sustains; compare
+ * with and without {@code --server-arg --pipelined-updates}. {@code --only UPDATE --hot-keys 1:1} isolates it.</p>
  */
 public final class LoadBench {
 
@@ -67,9 +71,10 @@ public final class LoadBench {
 		var serverArgs = splitArgs(option("--server-arg", ""));
 		boolean replicated = option("--target", "replicated").equals("replicated");
 		int nodeCount = Integer.parseInt(option("--nodes", "3"));
+		var hotKeys = option("--hot-keys", "0:0").split(":");
 		var workload = new YotsubaWorkload(Integer.parseInt(option("--chats", "20000")),
 				Integer.parseInt(option("--messages-per-chat", "50")), Integer.parseInt(option("--value-bytes", "600")),
-				Double.parseDouble(option("--skew", "0.5")));
+				Double.parseDouble(option("--skew", "0.5")), Integer.parseInt(hotKeys[0]), Double.parseDouble(hotKeys[1]));
 
 		line("# " + option("--label", "load benchmark") + " — " + Instant.now());
 		line("target=" + (replicated ? "replicated x" + nodeCount : "single") + " options=" + options);

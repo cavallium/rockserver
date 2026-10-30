@@ -86,6 +86,9 @@ class LeaderKillTest {
 	private static final RequestContext BATCH_CONTEXT = RequestContext.batch(Duration.ofSeconds(30));
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
 	private static final String COLUMN = "data";
+	private static final String HOT_COLUMN = "hot";
+	private static final int HOT_COUNTERS = 2;
+	private static final int HOT_WORKERS = 6;
 	private static final RaftGroupId GROUP_ID = RaftGroupId.valueOf(UUID.fromString(NodeConfig.DEFAULT_GROUP_ID));
 
 	@TempDir
@@ -121,6 +124,9 @@ class LeaderKillTest {
 		assertEquals(OpStatus.OK, column.status(), () -> "createColumn: " + column.error());
 		long columnId = column.value();
 
+		long hotColumn = client.createColumn(HOT_COLUMN, SCHEMA, BATCH_CONTEXT).valueOrThrow();
+		var hot = new HotCounters(cluster.apiAddresses(), hotColumn, 0, HOT_COUNTERS, HOT_WORKERS);
+		hot.start();
 		var workload = new Workload(cluster.apiAddresses(), columnId);
 		workload.start();
 		var failovers = new ArrayList<Duration>();
@@ -146,6 +152,7 @@ class LeaderKillTest {
 			awaitAcknowledged(workload, WRITES_PER_PHASE);
 		} finally {
 			workload.stop();
+			hot.stop();
 		}
 		workload.checkWritersSucceeded();
 
@@ -163,6 +170,14 @@ class LeaderKillTest {
 		int unknownMergesApplied = checkMerges(writes, finalValues);
 		checkPuts(writes, finalValues);
 		System.out.println("Merges with an unknown outcome that were applied: " + unknownMergesApplied);
+		var hotValues = new TreeMap<String, String>();
+		hot.check(key -> {
+			var value = client.get(hotColumn, key(key), READ_CONTEXT).valueOrThrow();
+			if (value != null) {
+				hotValues.put(hexKey(key), text(value));
+			}
+			return value;
+		}, HOT_COUNTERS);
 
 		for (var id : cluster.nodeIds()) {
 			cluster.stop(id);
@@ -173,7 +188,7 @@ class LeaderKillTest {
 		}
 		var expectedColumn = new TreeMap<String, String>();
 		finalValues.forEach((key, value) -> expectedColumn.put(hexKey(key), value));
-		var expected = Map.of(COLUMN, expectedColumn);
+		var expected = Map.of(COLUMN, expectedColumn, HOT_COLUMN, hotValues);
 		for (var replica : replicas.entrySet()) {
 			assertEquals(expected, replica.getValue(),
 					"replica " + replica.getKey() + " differs from the cluster's reads");

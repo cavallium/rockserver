@@ -26,6 +26,10 @@ import org.jetbrains.annotations.Nullable;
  *   <li>{@link OpStatus#UNKNOWN}: a put may take effect at any time after its invocation, or never (its completion
  *       is treated as infinite); a get with an unknown result tells nothing, so it is ignored.</li>
  * </ul>
+ *
+ * <p>A third kind of operation is an update, an atomic read-modify-write: it reads the register and writes it in one
+ * step, at a point where the register holds what it read. A failed one has no effect, and its read does not count.
+ * An update closed without a write is a get.</p>
  */
 public final class LinearizabilityChecker {
 
@@ -37,25 +41,30 @@ public final class LinearizabilityChecker {
 	/**
 	 * One operation on the register {@code key}.
 	 *
-	 * @param value the value written by a put, or the value read by a get (null = absent)
+	 * @param value the value written by a put or update, or the value read by a get (null = absent)
+	 * @param read the value an update read (null = absent); null for any other operation
 	 * @param invokeNanos {@link System#nanoTime()} before the request was sent
 	 * @param completeNanos {@link System#nanoTime()} after the reply arrived; ignored for {@link OpStatus#UNKNOWN}
 	 */
 	public record Operation(String key,
 			Kind kind,
 			@Nullable String value,
+			@Nullable String read,
 			long invokeNanos,
 			long completeNanos,
 			OpStatus status) {
 
-		public enum Kind { PUT, GET }
+		public enum Kind { PUT, GET, UPDATE }
 
 		public Operation {
 			Objects.requireNonNull(key, "key");
 			Objects.requireNonNull(kind, "kind");
 			Objects.requireNonNull(status, "status");
-			if (kind == Kind.PUT && value == null) {
-				throw new IllegalArgumentException("A put needs a value");
+			if (kind != Kind.GET && value == null) {
+				throw new IllegalArgumentException("A write needs a value");
+			}
+			if (kind != Kind.UPDATE && read != null) {
+				throw new IllegalArgumentException("Only an update reads and writes");
 			}
 			if (status != OpStatus.UNKNOWN && (completeNanos < invokeNanos || completeNanos == Long.MAX_VALUE)) {
 				throw new IllegalArgumentException("Invalid completion time for " + status + " operation");
@@ -63,7 +72,7 @@ public final class LinearizabilityChecker {
 		}
 
 		public static Operation put(String key, String value, long invokeNanos, long completeNanos, OpStatus status) {
-			return new Operation(key, Kind.PUT, value, invokeNanos, completeNanos, status);
+			return new Operation(key, Kind.PUT, value, null, invokeNanos, completeNanos, status);
 		}
 
 		public static Operation get(String key,
@@ -71,7 +80,29 @@ public final class LinearizabilityChecker {
 				long invokeNanos,
 				long completeNanos,
 				OpStatus status) {
-			return new Operation(key, Kind.GET, value, invokeNanos, completeNanos, status);
+			return new Operation(key, Kind.GET, value, null, invokeNanos, completeNanos, status);
+		}
+
+		public static Operation update(String key,
+				@Nullable String read,
+				String value,
+				long invokeNanos,
+				long completeNanos,
+				OpStatus status) {
+			return new Operation(key, Kind.UPDATE, value, read, invokeNanos, completeNanos, status);
+		}
+
+		/** The value the register must hold for this operation to take effect now; no constraint for a put. */
+		private boolean legalOn(@Nullable String state) {
+			return switch (kind) {
+				case PUT -> true;
+				case GET -> Objects.equals(state, value);
+				case UPDATE -> Objects.equals(state, read);
+			};
+		}
+
+		private boolean writes() {
+			return kind != Kind.GET;
 		}
 	}
 
@@ -116,25 +147,43 @@ public final class LinearizabilityChecker {
 		}
 
 		/**
-		 * Drops what cannot affect the outcome: failed operations, unknown gets, and unknown puts whose value no
-		 * acknowledged get returned. Such a put can always be left out of a linearization: no read follows it before
-		 * the next put, since every read would have returned its value.
+		 * Drops what cannot affect the outcome: failed operations, unknown gets, and unknown writes whose value no
+		 * acknowledged operation, nor a kept unknown one, read. Such a write can always be left out of a
+		 * linearization: no read follows it before the next write, since every read would have returned its value.
 		 */
 		private static List<Operation> relevant(List<Operation> history) {
 			Set<String> readValues = new HashSet<>();
 			for (var op : history) {
-				if (op.kind() == Operation.Kind.GET && op.status() == OpStatus.OK && op.value() != null) {
-					readValues.add(op.value());
+				if (op.status() == OpStatus.OK) {
+					var read = op.kind() == Operation.Kind.GET ? op.value() : op.read();
+					if (read != null) {
+						readValues.add(read);
+					}
+				}
+			}
+			var unknown = new ArrayList<Operation>();
+			for (var op : history) {
+				if (op.status() == OpStatus.UNKNOWN && op.writes()) {
+					unknown.add(op);
+				}
+			}
+			var kept = new HashSet<Operation>();
+			// An unknown update that is kept needs the unknown write it read from, and so on.
+			for (boolean grew = true; grew; ) {
+				grew = false;
+				for (var op : unknown) {
+					if (!kept.contains(op) && readValues.contains(op.value())) {
+						kept.add(op);
+						grew = true;
+						if (op.read() != null) {
+							readValues.add(op.read());
+						}
+					}
 				}
 			}
 			var result = new ArrayList<Operation>();
 			for (var op : history) {
-				boolean keep = switch (op.status()) {
-					case OK -> true;
-					case FAILED -> false;
-					case UNKNOWN -> op.kind() == Operation.Kind.PUT && readValues.contains(op.value());
-				};
-				if (keep) {
+				if (op.status() == OpStatus.OK || kept.contains(op)) {
 					result.add(op);
 				}
 			}
@@ -151,9 +200,8 @@ public final class LinearizabilityChecker {
 			while (head.next != null) {
 				if (entry.isCall) {
 					var op = ops[entry.op];
-					boolean legal = op.kind() == Operation.Kind.PUT || Objects.equals(state, op.value());
-					if (legal) {
-						String newState = op.kind() == Operation.Kind.PUT ? op.value() : state;
+					if (op.legalOn(state)) {
+						String newState = op.writes() ? op.value() : state;
 						linearized.set(entry.op);
 						if (cache.add(new CacheKey((BitSet) linearized.clone(), newState))) {
 							calls.push(new Frame(entry, state));
@@ -270,9 +318,11 @@ public final class LinearizabilityChecker {
 
 		private String describe(int index) {
 			var op = ops[index];
-			var call = op.kind() == Operation.Kind.PUT
-					? "put(" + quote(op.value()) + ")"
-					: "get() -> " + quote(op.value());
+			var call = switch (op.kind()) {
+				case PUT -> "put(" + quote(op.value()) + ")";
+				case GET -> "get() -> " + quote(op.value());
+				case UPDATE -> "update(" + quote(op.read()) + " -> " + quote(op.value()) + ")";
+			};
 			var end = op.status() == OpStatus.UNKNOWN ? "never" : millis(op.completeNanos());
 			return "#" + index + " " + call + " " + op.status() + " [" + millis(op.invokeNanos()) + ", " + end + "]";
 		}
