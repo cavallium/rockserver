@@ -274,6 +274,8 @@ final class LeaderSession {
 	 * when transactions are abandoned without being closed.
 	 */
 	synchronized void afterApply() {
+		// Pruning costs only what it drops; expiring scans every open transaction, so it is rarer.
+		tracker.prune(minSnapshotIndex());
 		if (++appliesSincePrune >= 256) {
 			appliesSincePrune = 0;
 			expire();

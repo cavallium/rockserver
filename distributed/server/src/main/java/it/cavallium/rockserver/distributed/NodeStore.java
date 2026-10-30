@@ -51,6 +51,7 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #REQUEST} + proposer id + sequence: the encoded result of an applied {@link Request}, kept until its
  *   proposer reports it complete</li>
  *   <li>{@link #FLOOR} + proposer id: the highest {@link Request#completedBelow()} applied for that proposer</li>
+ *   <li>{@link #DELETION}: log index and outcome of a column deletion whose record is not written yet</li>
  * </ul>
  *
  * <p>The meta column is created locally when a database is first opened, before any log entry is applied, so it
@@ -74,6 +75,8 @@ final class NodeStore implements Closeable {
 	static final byte CLUSTER_ID = 2;
 	static final byte REQUEST = 3;
 	static final byte FLOOR = 4;
+	/** A column deletion in progress: its log index and whether the column existed before it ran. */
+	static final byte DELETION = 5;
 
 	private static final int META_KEY_BYTES = 1 + 2 * Long.BYTES;
 	private static final ColumnSchema META_SCHEMA = ColumnSchema.of(IntList.of(META_KEY_BYTES), ObjectList.of(), true);

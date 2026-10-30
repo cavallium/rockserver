@@ -67,10 +67,15 @@ final class Proposer implements Closeable {
 	private static final Duration MIN_ATTEMPT_TIMEOUT = Duration.ofSeconds(3);
 	private static final long ATTEMPT_SLEEP_MS = 100;
 	/** Batches of one queue in flight at once: later requests wait for one of them to finish, and then go together. */
-	static final int MAX_BATCHES_IN_FLIGHT = Integer.getInteger("rockserver.raft.batches-in-flight", 32);
+	static final int MAX_BATCHES_IN_FLIGHT = 32;
 	private static final int MAX_BATCH_REQUESTS = 4096;
 	/** Bytes of entry bodies per batch; a single larger request goes alone. */
 	private static final int MAX_BATCH_BYTES = 8 * 1024 * 1024;
+	/**
+	 * A request with less time left than this when its batch is formed is failed without being sent: it would get at
+	 * most one hurried attempt, and its outcome would then be unknown instead of a clean "not applied".
+	 */
+	private static final long MIN_TIME_LEFT_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
 	/** Batch header, plus a sequence per request. */
 	private static final int BATCH_HEADER_BYTES = 1 + 2 * Long.BYTES + Integer.BYTES;
 
@@ -146,16 +151,23 @@ final class Proposer implements Closeable {
 		final byte[] body;
 		final boolean batchable;
 		final long deadlineNanos;
+		/** Leader epoch of a transaction commit, -1 otherwise: commits of different epochs never share an entry. */
+		final long epoch;
 		final long queuedNanos = System.nanoTime();
+		/** Completed only by the proposer; callers get a copy, so that cancelling theirs cannot complete this one. */
 		final CompletableFuture<Object> result = new CompletableFuture<>();
 
-		Pending(long sequence, byte[] body, boolean batchable, long deadlineNanos) {
+		Pending(long sequence, byte[] body, boolean batchable, long deadlineNanos, long epoch) {
 			this.sequence = sequence;
 			this.body = body;
 			this.batchable = batchable;
 			this.deadlineNanos = deadlineNanos;
+			this.epoch = epoch;
 		}
 	}
+
+	/** Every request submitted and not answered yet, so that close() can answer them all. */
+	private final java.util.Set<Pending> live = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
 	private CompletableFuture<Object> submit(LogEntry entry, Lane lane) {
 		byte[] body;
@@ -177,14 +189,22 @@ final class Proposer implements Closeable {
 			sequence = nextSequence++;
 			inFlight.add(sequence);
 		}
-		var pending = new Pending(sequence, body, Applier.isBatchable(entry), System.nanoTime() + requestTimeoutNanos);
+		var pending = new Pending(sequence, body, Applier.isBatchable(entry), System.nanoTime() + requestTimeoutNanos,
+				entry instanceof LogEntry.Guarded guarded ? guarded.leaderEpoch() : -1);
+		live.add(pending);
 		pending.result.whenComplete((_, _) -> {
+			live.remove(pending);
 			synchronized (numbering) {
 				inFlight.remove(sequence);
 			}
 		});
 		lane.enqueue(pending);
-		return pending.result;
+		if (closed) {
+			// close() may have swept the queues before this request was added.
+			pending.result.completeExceptionally(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+					"The node is stopping"));
+		}
+		return pending.result.copy();
 	}
 
 	/** Every request numbered below this has its final answer: no copy of it will ever be sent again. */
@@ -268,13 +288,17 @@ final class Proposer implements Closeable {
 			int bytes = 0;
 			while (!queue.isEmpty()) {
 				var next = queue.peekFirst();
-				if (closed || now - next.deadlineNanos > 0) {
+				if (next.result.isDone()) {
+					queue.pollFirst();
+					continue;
+				}
+				if (closed || next.deadlineNanos - now < MIN_TIME_LEFT_NANOS) {
 					queue.pollFirst();
 					next.result.completeExceptionally(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
 							closed ? "The node is stopping" : "No leader accepted the write in time; it was not applied"));
 					continue;
 				}
-				if (!batch.isEmpty() && (!next.batchable || !batch.getFirst().batchable
+				if (!batch.isEmpty() && (!next.batchable || !batch.getFirst().batchable || next.epoch != batch.getFirst().epoch
 						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES)) {
 					break;
 				}
@@ -302,7 +326,8 @@ final class Proposer implements Closeable {
 			for (int i = 0; i < sequences.length; i++) {
 				sequences[i] = batch.get(i).sequence;
 				bodies.add(batch.get(i).body);
-				deadline = Math.min(deadline, batch.get(i).deadlineNanos);
+				// The latest: the oldest member has at least MIN_TIME_LEFT_NANOS left (see take()), the newest a full timeout.
+				deadline = Math.max(deadline, batch.get(i).deadlineNanos);
 			}
 			var message = Message.valueOf(UnsafeByteOperations.unsafeWrap(
 					LogEntryCodec.encodeBatch(proposerId, completedBelow(), sequences, bodies)));
@@ -323,29 +348,45 @@ final class Proposer implements Closeable {
 			var reply = isLocalLeader() ? submitLocal(message, deadlineNanos)
 					: CompletableFuture.supplyAsync(() -> sendBlocking(message), sender);
 			reply.handleAsync((answer, error) -> {
-				var refusal = error != null ? stateMachineException(error)
-						: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
-				boolean retryable = System.nanoTime() - deadlineNanos < 0
-						&& (refusal != null ? isNotReady(refusal) : error != null || !answer.isSuccess());
-				if (retryable) {
-					// No answer yet (no leader, unreachable, refused before append): send the same batch again. If an
-					// earlier copy took effect, applying this one returns its recorded results.
-					long delay = refusal != null || isRefusedBeforeAppend(error != null ? ReplicatedConnection.unwrap(error)
-							: answer.getException()) ? NOT_READY_RETRY_MS : ATTEMPT_SLEEP_MS;
-					resends.record(1);
-					CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS, sender)
-							.execute(() -> attempt(batch, message, deadlineNanos, sentNanos));
+				try {
+					var refusal = error != null ? stateMachineException(error)
+							: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
+					boolean retryable = !closed && System.nanoTime() - deadlineNanos < 0
+							&& (refusal != null ? isNotReady(refusal) : error != null || !answer.isSuccess());
+					if (retryable) {
+						// No answer yet (no leader, unreachable, refused before append): send the same batch again. If
+						// an earlier copy took effect, applying this one returns its recorded results.
+						var cause = error != null ? ReplicatedConnection.unwrap(error) : answer.getException();
+						long delay = refusal != null || cause instanceof LeaderNotReadyException
+								|| cause instanceof NotLeaderException || cause instanceof ResourceUnavailableException
+								? NOT_READY_RETRY_MS : ATTEMPT_SLEEP_MS;
+						resends.record(1);
+						CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS, sender)
+								.execute(() -> attempt(batch, message, deadlineNanos, sentNanos));
+						return null;
+					}
+				} catch (Throwable unexpected) {
+					fail(batch, unavailable(unexpected));
+					finished();
 					return null;
 				}
 				roundTrip.since(sentNanos);
 				try {
-					if (refusal != null) {
-						fail(batch, refusal(refusal));
-					} else if (error != null) {
-						fail(batch, unavailable(error));
+					if (error == null && !answer.isSuccess() && !(answer.getException() instanceof StateMachineException)) {
+						fail(batch, unavailable(answer.getException()));
 					} else {
-						complete(batch, answer);
+						var refusal = error != null ? stateMachineException(error)
+								: !answer.isSuccess() ? (StateMachineException) answer.getException() : null;
+						if (refusal != null) {
+							fail(batch, refusal(refusal));
+						} else if (error != null) {
+							fail(batch, unavailable(error));
+						} else {
+							complete(batch, answer);
+						}
 					}
+				} catch (Throwable unexpected) {
+					fail(batch, unavailable(unexpected));
 				} finally {
 					finished();
 				}
@@ -379,14 +420,20 @@ final class Proposer implements Closeable {
 						}
 					} else if (refusal != null) {
 						fail(batch, refusal(refusal));
-					} else if (error == null ? !answer.isSuccess() && isRefusedBeforeAppend(answer.getException())
-							: isRefusedBeforeAppend(ReplicatedConnection.unwrap(error))) {
+					} else if (isRefusedBeforeAppend(error != null ? ReplicatedConnection.unwrap(error)
+							: answer.isSuccess() ? null : answer.getException())) {
 						fail(batch, new RocksDBRetryException());
 					} else if (error != null) {
 						fail(batch, unavailable(error));
+					} else if (!answer.isSuccess()) {
+						// Such as NotLeaderException: a leader stepping down answers so for entries already appended,
+						// which the next leader may still commit. The outcome is unknown, never "not applied".
+						fail(batch, unavailable(answer.getException()));
 					} else {
 						complete(batch, answer);
 					}
+				} catch (Throwable unexpected) {
+					fail(batch, unavailable(unexpected));
 				} finally {
 					finished();
 				}
@@ -430,10 +477,15 @@ final class Proposer implements Closeable {
 		}
 	}
 
-	/** Errors Ratis returns only before appending: not the (ready) leader, or no room for another request. */
+	/**
+	 * Errors Ratis returns only before appending the entry: a leader not ready yet, or no permit for one more pending
+	 * request. Not NotLeaderException, which a leader stepping down also returns for appended entries, nor the
+	 * ResourceUnavailableException for "add a pending write request", raised after the append.
+	 */
 	private static boolean isRefusedBeforeAppend(@Nullable Throwable error) {
-		return error instanceof LeaderNotReadyException || error instanceof NotLeaderException
-				|| error instanceof ResourceUnavailableException;
+		return error instanceof LeaderNotReadyException
+				|| (error instanceof ResourceUnavailableException
+						&& String.valueOf(error.getMessage()).contains("acquire a pending write request"));
 	}
 
 	private static StateMachineException stateMachineException(Throwable error) {
@@ -456,6 +508,10 @@ final class Proposer implements Closeable {
 
 	/** Completes each request of {@code batch} with its own result from {@code reply}. */
 	private static void complete(List<Pending> batch, RaftClientReply reply) {
+		if (!reply.isSuccess()) {
+			fail(batch, unavailable(reply.getException()));
+			return;
+		}
 		List<ApplyResult> results;
 		try {
 			results = ResultCodec.decodeAll(reply.getMessage().getContent().toByteArray());
@@ -519,6 +575,10 @@ final class Proposer implements Closeable {
 		}
 		try (client) {
 			sender.shutdownNow();
+		} finally {
+			// Batches in flight lose their reply handlers with the executor: their outcome is unknown.
+			fail(List.copyOf(live), RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+					"The node stopped before the write was acknowledged; its outcome is unknown"));
 		}
 	}
 }

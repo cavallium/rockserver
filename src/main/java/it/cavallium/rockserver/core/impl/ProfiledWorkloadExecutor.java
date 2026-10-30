@@ -102,6 +102,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final String resourceKind;
 	private final RWScheduler.Pool resourcePool;
 	private final ThreadFactory threadFactory;
+	private final boolean virtualWorkers;
 	private final @Nullable TaskMetrics[][] taskMetrics;
 	private final CounterHandle workerFailureMetric;
 	private volatile boolean shutdown;
@@ -195,6 +196,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			throw new IllegalArgumentException("Reservation sum exceeds workerCount");
 		}
 		// Virtual workers suit pools whose tasks mostly wait on another server (a proxy), not on local storage.
+		this.virtualWorkers = virtualWorkers;
 		this.threadFactory = virtualWorkers
 				? Thread.ofVirtual().name(poolName + "-", 0).uncaughtExceptionHandler(this::uncaughtWorkerFailure).factory()
 				: new ThreadFactoryBuilder()
@@ -1605,7 +1607,13 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		lock.lock();
 		try {
 			timedWaitLeader = null;
-			workAvailable.signalAll();
+			if (virtualWorkers) {
+				// Thousands of idle virtual workers would all wake up for nothing: wake one, which wakes the next
+				// while work is queued (see awaitWorkUnsafe).
+				signalWorkerUnsafe();
+			} else {
+				workAvailable.signalAll();
+			}
 		} finally {
 			lock.unlock();
 		}

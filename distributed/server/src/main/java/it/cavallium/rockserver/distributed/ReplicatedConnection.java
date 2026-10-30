@@ -61,10 +61,18 @@ import reactor.core.publisher.Mono;
  */
 final class ReplicatedConnection implements RocksDBConnection {
 
-	/** Default lease of {@code getForUpdate} updates; the native update transaction expires on its own. */
-	private static final Duration UPDATE_LEASE = Duration.ofSeconds(15);
-	/** How long an update waits for earlier updates of the same key before the client is told to retry. */
-	private static final Duration UPDATE_LOCK_WAIT = Duration.ofSeconds(10);
+	/**
+	 * Default lease of {@code getForUpdate} updates, as on a single node ({@code EmbeddedDB}); the native update
+	 * transaction expires on its own. An abandoned update keeps its key locked this long.
+	 */
+	private static final Duration UPDATE_LEASE = Duration.ofSeconds(10);
+	/** Pause before forwarding a request again after the leader could not be reached. */
+	private static final long FORWARD_RETRY_MS = 50;
+	/**
+	 * How long an update waits for earlier updates of the same key before the client is told to retry: longer than
+	 * the lease plus the expiry cadence, so that an update queued behind an abandoned one still gets the key.
+	 */
+	private static final Duration UPDATE_LOCK_WAIT = Duration.ofSeconds(12);
 	/** Bytes of keys and values per replicated chunk of a batch write. */
 	private static final long BATCH_CHUNK_BYTES = 4L * 1024 * 1024;
 	/** Encoding overhead counted per key segment and per value, so many tiny items still fit in one entry. */
@@ -309,6 +317,17 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	@SuppressWarnings("unchecked")
 	private CompletableFuture<?> forward(RequestContext context, RocksDBAPICommandSingle<?> command) {
+		return forward(context, command, System.nanoTime() + config.requestTimeout().toNanos());
+	}
+
+	/**
+	 * Forwards {@code command} to the leader. When the leader cannot be reached (it died or lost leadership, and this
+	 * node may not know yet), a command that can safely run again ({@link #isReplayable}) is sent again, to whichever
+	 * node leads then, until {@code deadlineNanos}; any other command fails with a retryable error, or with an
+	 * unknown outcome if it may have taken effect.
+	 */
+	@SuppressWarnings("unchecked")
+	private CompletableFuture<?> forward(RequestContext context, RocksDBAPICommandSingle<?> command, long deadlineNanos) {
 		return forwarder.leader(stateMachine).thenCompose(leader -> {
 			if (leader.equals(config.nodeId())) {
 				if (!isLeader()) {
@@ -322,8 +341,71 @@ final class ReplicatedConnection implements RocksDBConnection {
 			long start = System.nanoTime();
 			return forwarder.api(leader, stateMachine, context)
 					.thenCompose(api -> (CompletableFuture<Object>) api.requestAsync(command))
-					.whenComplete((_, _) -> forwardTime.since(start));
+					.whenComplete((_, _) -> forwardTime.since(start))
+					.exceptionallyCompose(error -> {
+						var cause = unwrap(error);
+						boolean unreachable = isUnreachable(cause);
+						if (unreachable) {
+							forwarder.invalidate(leader);
+						}
+						if (!(unreachable || cause instanceof RocksDBRetryException) || !isReplayable(command)) {
+							return CompletableFuture.failedFuture(unreachable ? unreachableFailure(command, cause) : cause);
+						}
+						if (System.nanoTime() - deadlineNanos > 0) {
+							return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+									"No leader could serve the request in time: " + cause));
+						}
+						return CompletableFuture.supplyAsync(() -> null,
+										CompletableFuture.delayedExecutor(FORWARD_RETRY_MS, TimeUnit.MILLISECONDS))
+								.thenCompose(_ -> (CompletableFuture<Object>) forward(context, command, deadlineNanos));
+					});
 		});
+	}
+
+	/** The leader could not be reached: its process is gone or the connection broke. */
+	private static boolean isUnreachable(Throwable cause) {
+		if (cause instanceof RocksDBException rocks) {
+			// Raised by LeaderForwarder when it cannot connect.
+			return rocks.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED
+					&& String.valueOf(rocks.getMessage()).contains("Cannot reach the API of leader");
+		}
+		return io.grpc.Status.fromThrowable(cause).getCode() == io.grpc.Status.Code.UNAVAILABLE;
+	}
+
+	/**
+	 * Commands that can run again on another leader after an attempt whose outcome is unknown: reads, and the
+	 * opening of transactions and updates (one opened on a leader that is gone went away with it).
+	 */
+	private static boolean isReplayable(RocksDBAPICommandSingle<?> command) {
+		return switch (command) {
+			case Get<?> c -> c.transactionOrUpdateId() == 0;
+			case OpenTransaction _ -> true;
+			case RocksDBAPICommandSingle.GetMulti _, RocksDBAPICommandSingle.GetColumnId _,
+					RocksDBAPICommandSingle.EstimateNumKeys _, RocksDBAPICommandSingle.CheckMergeOperator _,
+					RocksDBAPICommandSingle.GetAllColumnDefinitions _ -> true;
+			case RocksDBAPICommandSingle.ExistsMulti c -> c.transactionId() == 0;
+			case RocksDBAPICommandSingle.ReduceRange<?> c -> c.transactionId() == 0;
+			case RocksDBAPICommandSingle.GetRangePage<?> c -> c.transactionId() == 0;
+			default -> false;
+		};
+	}
+
+	/**
+	 * The failure of a command that cannot run again after the leader became unreachable: retryable if it changes
+	 * nothing by itself (it refers to a transaction, update or iterator that went away with the leader), of unknown
+	 * outcome if it is a commit, which may have been applied.
+	 */
+	private static RuntimeException unreachableFailure(RocksDBAPICommandSingle<?> command, Throwable cause) {
+		boolean commits = switch (command) {
+			case CloseTransaction c -> c.commit();
+			case Put<?> _, PutMulti<?> _, Delete<?> _, DeleteMulti<?> _, Merge<?> _, MergeMulti<?> _ -> true;
+			default -> false;
+		};
+		if (commits) {
+			return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+					"The leader became unreachable, the outcome of the commit is unknown: " + cause);
+		}
+		return new RocksDBRetryException();
 	}
 
 	@SuppressWarnings("unchecked")

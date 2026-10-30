@@ -34,9 +34,18 @@ final class LeaderForwarder implements Closeable {
 	private static final Logger LOG = LoggerFactory.getLogger(LeaderForwarder.class);
 	private static final long POLL_MS = 20;
 
+	/** Connections to each peer, used in turn: one connection has a single event loop thread. */
+	private static final int CONNECTIONS_PER_PEER = 4;
+	/** A peer whose API port does not accept a connection this fast is treated as down. */
+	private static final int PROBE_TIMEOUT_MS = 500;
+
 	private final NodeConfig config;
-	/** Connections by peer id; a failed lookup or handshake is removed, so that the next request tries again. */
+	/**
+	 * Connections by peer id and slot; a failed lookup or handshake is removed, so that the next request tries again,
+	 * and so are all of a peer's connections once a call to it fails in transport ({@link #invalidate}).
+	 */
 	private final ConcurrentHashMap<String, CompletableFuture<GrpcConnection>> connections = new ConcurrentHashMap<>();
+	private final java.util.concurrent.atomic.AtomicInteger nextSlot = new java.util.concurrent.atomic.AtomicInteger();
 	private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(
 			Thread.ofPlatform().daemon().name("rockserver-leader-wait").factory());
 	/** Runs the blocking connection handshakes. */
@@ -90,10 +99,11 @@ final class LeaderForwarder implements Closeable {
 	 * peer cannot be reached.
 	 */
 	CompletableFuture<RocksDBAsyncAPI> api(String peerId, RockserverStateMachine stateMachine, RequestContext context) {
-		var connection = connections.computeIfAbsent(peerId, id -> connect(id, stateMachine));
+		var key = peerId + "#" + Math.floorMod(nextSlot.getAndIncrement(), CONNECTIONS_PER_PEER);
+		var connection = connections.computeIfAbsent(key, _ -> connect(peerId, stateMachine));
 		return connection.handle((result, error) -> {
 			if (error != null) {
-				connections.remove(peerId, connection);
+				connections.remove(key, connection);
 				var cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
 				throw new CompletionException(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
 						"Cannot reach the API of leader " + peerId + ": " + cause));
@@ -112,8 +122,29 @@ final class LeaderForwarder implements Closeable {
 				: askApiAddress(peerId, stateMachine);
 		return address.thenApplyAsync(api -> {
 			LOG.debug("{}: connecting to {} at {}:{}", config.nodeId(), peerId, api.host(), api.port());
-			return GrpcConnection.forHostAndPort(config.nodeId() + "->" + peerId, api);
+			probe(api);
+			// Retried here, possibly at another leader, never by gRPC against a peer that may be gone.
+			return GrpcConnection.forHostAndPortWithoutRetry(config.nodeId() + "->" + peerId, api);
 		}, connector);
+	}
+
+	/** The handshake retries a refused connection for seconds: fail at once on a peer that is down instead. */
+	private static void probe(HostAndPort address) {
+		try (var socket = new java.net.Socket()) {
+			socket.connect(new java.net.InetSocketAddress(address.host(), address.port()), PROBE_TIMEOUT_MS);
+		} catch (IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
+	/** Forgets the connections to {@code peerId} after a call to it failed in transport: the next request reconnects. */
+	void invalidate(String peerId) {
+		for (int slot = 0; slot < CONNECTIONS_PER_PEER; slot++) {
+			var connection = connections.remove(peerId + "#" + slot);
+			if (connection != null) {
+				connection.thenAccept(GrpcConnection::close);
+			}
+		}
 	}
 
 	/** Asks a member that is not in this node's peer list for its API address, at its Raft address. */

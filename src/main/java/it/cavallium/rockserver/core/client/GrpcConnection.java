@@ -116,8 +116,12 @@ public final class GrpcConnection extends BaseConnection {
 	private final EventLoopGroup eventLoopGroup;
 
 	private GrpcConnection(String name, SocketAddress socketAddress, URI address) {
+		this(name, socketAddress, address, true);
+	}
+
+	private GrpcConnection(String name, SocketAddress socketAddress, URI address, boolean automaticRetry) {
 		super(name);
-		this.delegate = new GrpcConnectionDelegate(name, socketAddress, address);
+		this.delegate = new GrpcConnectionDelegate(name, socketAddress, address, automaticRetry);
 		this.channel = delegate.channel;
 		this.callbackExecutor = delegate.callbackExecutor;
 		this.eventLoopGroup = delegate.eventLoopGroup;
@@ -131,6 +135,17 @@ public final class GrpcConnection extends BaseConnection {
 		return new GrpcConnection(name,
 				new InetSocketAddress(address.host(), address.port()),
 				URI.create("http://" + address.host() + ":" + address.port()));
+	}
+
+	/**
+	 * Like {@link #forHostAndPort(String, HostAndPort)}, without gRPC's automatic retry of reads after a transport
+	 * loss: for a caller that retries on its own, possibly elsewhere, such as a replica forwarding to its leader.
+	 */
+	public static GrpcConnection forHostAndPortWithoutRetry(String name, HostAndPort address) {
+		return new GrpcConnection(name,
+				new InetSocketAddress(address.host(), address.port()),
+				URI.create("http://" + address.host() + ":" + address.port()),
+				false);
 	}
 
 	public static GrpcConnection forPath(String name, Path unixSocketPath) {
@@ -239,6 +254,10 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	GrpcConnectionDelegate(String name, SocketAddress socketAddress, URI address) {
+		this(name, socketAddress, address, true);
+	}
+
+	GrpcConnectionDelegate(String name, SocketAddress socketAddress, URI address, boolean automaticRetry) {
 		super(name);
 		int maxInboundMessageSize = configuredMaxInboundMessageSize();
 		NettyChannelBuilder channelBuilder;
@@ -256,7 +275,11 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				.keepAliveTime(30, TimeUnit.SECONDS)
 				.keepAliveTimeout(5, TimeUnit.SECONDS)
 				.keepAliveWithoutCalls(true);
-		configureRetry(channelBuilder);
+		if (automaticRetry) {
+			configureRetry(channelBuilder);
+		} else {
+			channelBuilder.disableRetry();
+		}
 
 		// Keep reactive-gRPC's bounded adapters off the transport loop: a backpressured
 		// application callback must not prevent the same channel from making progress.

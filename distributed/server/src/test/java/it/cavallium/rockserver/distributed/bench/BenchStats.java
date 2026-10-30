@@ -28,14 +28,20 @@ final class BenchStats {
 			latency.recordValue(Math.max(1, latencyNanos / 1000));
 			ok.increment();
 			bytes.add(payloadBytes);
+			TIMELINE_OK.increment();
 		}
 
 		void failure(Throwable error) {
+			TIMELINE_ERRORS.increment();
 			var kind = describe(error);
 			errors.computeIfAbsent(kind, _ -> new LongAdder()).increment();
 			SAMPLES.putIfAbsent(kind, String.valueOf(unwrap(error).getMessage()));
 		}
 	}
+
+	/** Successes and failures of every operation, for the per-second timeline. */
+	static final LongAdder TIMELINE_OK = new LongAdder();
+	static final LongAdder TIMELINE_ERRORS = new LongAdder();
 
 	/** The first message seen for each error kind, for the report. */
 	static final Map<String, String> SAMPLES = new ConcurrentHashMap<>();

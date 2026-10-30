@@ -253,7 +253,7 @@ public final class LoadBench {
 
 	/** Runs the warmup, then the measured interval, and reports it with the servers' CPU and disk usage. */
 	private void measure(BenchNodes nodes, BenchStats stats, String title, int warmupSeconds, int stepSeconds)
-			throws InterruptedException {
+			throws Exception {
 		Thread.sleep(warmupSeconds * 1000L);
 		stats.snapshot(warmupSeconds);
 		if (options.containsKey("--jfr")) {
@@ -262,7 +262,20 @@ public final class LoadBench {
 		var cpuBefore = nodes.cpuNanos();
 		var diskBefore = BenchNodes.deviceWriteBytes();
 		long start = System.nanoTime();
-		Thread.sleep(stepSeconds * 1000L);
+		int killAfter = Integer.parseInt(option("--kill-leader-after", "-1"));
+		var timeline = new StringBuilder();
+		BenchStats.TIMELINE_OK.reset();
+		BenchStats.TIMELINE_ERRORS.reset();
+		for (int second = 1; second <= stepSeconds; second++) {
+			Thread.sleep(Math.max(0, start + second * 1_000_000_000L - System.nanoTime()) / 1_000_000);
+			timeline.append(BenchStats.TIMELINE_OK.sumThenReset()).append('/').append(BenchStats.TIMELINE_ERRORS.sumThenReset())
+					.append(' ');
+			if (second == killAfter && nodes.replicated()) {
+				var leader = nodes.leaderId();
+				line("killing leader " + leader + " at second " + second);
+				nodes.kill(leader);
+			}
+		}
 		double seconds = (System.nanoTime() - start) / 1e9;
 		var rows = stats.snapshot(seconds);
 		var cpuAfter = nodes.cpuNanos();
@@ -284,6 +297,7 @@ public final class LoadBench {
 		line(BenchStats.format(rows).stripTrailing());
 		line("dropped (client queue full): " + stats.dropped.sumThenReset());
 		line("server cores used: " + cpu + ", device writes MiB/s (all processes): " + disk);
+		line("ok/errors per second: " + timeline.toString().strip());
 		line("```");
 	}
 

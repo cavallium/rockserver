@@ -121,12 +121,61 @@ final class Applier {
 			if (requests.size() == 1 && !isBatchable(requests.getFirst().entry())) {
 				return List.of(applyAlone(requests.getFirst(), position));
 			}
-			return applyData(requests, position);
+			return applyData(requests, position, true);
 		} catch (ReplicaFailedException ex) {
 			throw ex;
 		} catch (RuntimeException ex) {
 			throw new ReplicaFailedException("Failed to apply entry " + position, ex);
 		}
+	}
+
+	/**
+	 * Deletes a column so that running the deletion again at the same position gives the result of the first run. A
+	 * crash between the deletion (written to the MANIFEST at once) and its record (written to the WAL after it) makes
+	 * the entry run again, and the column is then gone already: whether it existed is decided before the first run
+	 * and kept, synced, until the record is written ({@link NodeStore#DELETION}).
+	 */
+	private ApplyResult deleteColumn(LogEntry entry, TermIndex position) {
+		var db = store.db();
+		var markerKey = NodeStore.key(NodeStore.DELETION);
+		Buf marker = db.get(0L, store.metaColumnId(), markerKey, RequestType.<Buf>current());
+		boolean existed;
+		if (marker != null && java.nio.ByteBuffer.wrap(marker.toByteArray()).getLong() == position.getIndex()) {
+			existed = marker.toByteArray()[Long.BYTES] == 1;
+		} else {
+			existed = switch (entry) {
+				// The internal column is refused whether it exists or not.
+				case LogEntry.DeleteColumn delete -> delete.columnId() != store.metaColumnId()
+						&& columnExists(delete.columnId());
+				case LogEntry.DeleteColumnIfExists delete -> !NodeStore.META_COLUMN.equals(delete.name())
+						&& db.getAllColumnDefinitions().containsKey(delete.name());
+				default -> throw new IllegalArgumentException("Not a column deletion: " + entry);
+			};
+			db.put(0L, store.metaColumnId(), markerKey, Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES + 1)
+					.putLong(position.getIndex()).put((byte) (existed ? 1 : 0)).array()), RequestType.none());
+			syncWal();
+		}
+		var outcome = applyLogical(() -> execute(0L, entry));
+		db.delete(0L, store.metaColumnId(), markerKey, RequestType.none());
+		if (!existed) {
+			// Not found, now as on the first run.
+			return outcome;
+		}
+		return entry instanceof LogEntry.DeleteColumnIfExists ? new ApplyResult.Ok(true) : ApplyResult.OK_NULL;
+	}
+
+	private boolean columnExists(long columnId) {
+		var db = store.db();
+		for (String name : db.getAllColumnDefinitions().keySet()) {
+			try {
+				if (db.getColumnId(name) == columnId) {
+					return true;
+				}
+			} catch (RocksDBException ex) {
+				// Deleted meanwhile.
+			}
+		}
+		return false;
 	}
 
 	/** True for entries that may share a log entry, and a local transaction, with others. */
@@ -150,14 +199,26 @@ final class Applier {
 		// the WAL. Make everything before them durable first (the data writes applied without the WAL included) and
 		// everything after them durable at once, so a crash cannot keep one without the other.
 		makeDurable();
-		var outcome = applyLogical(() -> execute(0L, request.entry()));
-		finish(0L, request, floor, outcome, position);
+		var entry = request.entry();
+		ApplyResult outcome;
+		if (entry instanceof LogEntry.DeleteColumn || entry instanceof LogEntry.DeleteColumnIfExists) {
+			outcome = deleteColumn(entry, position);
+		} else {
+			outcome = applyLogical(() -> execute(0L, entry));
+		}
+		finish(0L, request, floor, outcome, position, true);
 		syncWal();
 		committed(request.proposerId(), records, List.of(request), request.completedBelow());
 		return outcome;
 	}
 
-	private List<ApplyResult> applyData(List<Request> requests, TermIndex position) {
+	/**
+	 * Applies data requests in one local transaction. {@code markPosition} false leaves the applied position alone,
+	 * for all but the last request of an entry applied one request at a time: the entry is then marked applied only
+	 * with its last request, and a crash in between makes it run again, the requests already recorded getting their
+	 * recorded results.
+	 */
+	private List<ApplyResult> applyData(List<Request> requests, TermIndex position, boolean markPosition) {
 		long proposerId = requests.getFirst().proposerId();
 		long completedBelow = requests.getFirst().completedBelow();
 		var records = records(proposerId);
@@ -201,7 +262,7 @@ final class Applier {
 					// Its partial writes are in the transaction with the others' writes: start over one at a time.
 					db.closeTransaction(tx, false);
 					open = false;
-					return applyOneByOne(requests, position);
+					return applyOneByOne(requests, position, markPosition);
 				}
 			}
 			if (toRun.size() == 1 && outcomes[0] instanceof ApplyResult.Failed) {
@@ -209,12 +270,13 @@ final class Applier {
 				db.closeTransaction(tx, false);
 				open = false;
 				var rejected = toRun.getFirst();
-				inApplyTransaction(position, recordTx -> finish(recordTx, rejected, floor, outcomes[0], position));
+				inApplyTransaction(position,
+						recordTx -> finish(recordTx, rejected, floor, outcomes[0], position, markPosition));
 			} else {
 				for (int j = 0; j < toRun.size(); j++) {
 					record(tx, toRun.get(j), outcomes[j]);
 				}
-				finishBatch(tx, proposerId, completedBelow, floor, position);
+				finishBatch(tx, proposerId, completedBelow, floor, position, markPosition);
 				record(executeTime, executeStart);
 				open = false;
 				long commitStart = System.nanoTime();
@@ -242,11 +304,15 @@ final class Applier {
 		return List.of(results);
 	}
 
-	/** The slow path of {@link #applyData}: each request in its own local transaction, all at {@code position}. */
-	private List<ApplyResult> applyOneByOne(List<Request> requests, TermIndex position) {
+	/**
+	 * The slow path of {@link #applyData}: each request in its own local transaction, all at {@code position}, which
+	 * only the last one records as applied.
+	 */
+	private List<ApplyResult> applyOneByOne(List<Request> requests, TermIndex position, boolean markPosition) {
 		var results = new ArrayList<ApplyResult>(requests.size());
-		for (var request : requests) {
-			results.add(applyBatch(List.of(request), position).getFirst());
+		for (int i = 0; i < requests.size(); i++) {
+			boolean last = i == requests.size() - 1;
+			results.add(applyData(List.of(requests.get(i)), position, markPosition && last).getFirst());
 		}
 		return results;
 	}
@@ -488,9 +554,10 @@ final class Applier {
 	}
 
 	/** Writes the result record, the proposer's floor and the applied position, in transaction {@code tx} if not 0. */
-	private void finish(long tx, Request request, long floor, ApplyResult result, TermIndex position) {
+	private void finish(long tx, Request request, long floor, ApplyResult result, TermIndex position,
+			boolean markPosition) {
 		record(tx, request, result);
-		finishBatch(tx, request.proposerId(), request.completedBelow(), floor, position);
+		finishBatch(tx, request.proposerId(), request.completedBelow(), floor, position, markPosition);
 	}
 
 	private void record(long tx, Request request, ApplyResult result) {
@@ -503,7 +570,8 @@ final class Applier {
 	 * records are never read again (copies below the floor are refused before any lookup); deleting them in the same
 	 * write keeps every apply write in one atomic, unlogged transaction (see {@link #beginApply}).
 	 */
-	private void finishBatch(long tx, long proposerId, long completedBelow, long floor, TermIndex position) {
+	private void finishBatch(long tx, long proposerId, long completedBelow, long floor, TermIndex position,
+			boolean markPosition) {
 		if (completedBelow > floor) {
 			store.db().put(tx, store.metaColumnId(), NodeStore.floorKey(proposerId),
 					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(completedBelow).array()),
@@ -520,7 +588,9 @@ final class Applier {
 				}
 			}
 		}
-		markApplied(tx, position);
+		if (markPosition) {
+			markApplied(tx, position);
+		}
 	}
 
 	private void markApplied(long tx, TermIndex position) {
