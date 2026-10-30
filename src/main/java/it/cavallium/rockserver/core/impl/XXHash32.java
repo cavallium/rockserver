@@ -30,16 +30,18 @@ public abstract class XXHash32 {
 	public abstract int hash(byte[] buf, int off, int len, int seed);
 
 	/**
-	 * Compute the big-endian 32-bits hash of <code>buf[off:off+len]</code> using seed
-	 * <code>seed</code>.
-	 */
-	public abstract void hash(Buf buf, int off, int len, int seed, Buf result);
-
-	/**
 	 * Compute the 32-bits hash of <code>buf[off:off+len]</code> using seed
 	 * <code>seed</code>.
 	 */
 	public abstract int hash(Buf buf, int off, int len, int seed);
+
+	/**
+	 * Compute the 32-bits hash of <code>buf[off:off+len]</code> using seed
+	 * <code>seed</code> and write it big-endian into the first 4 bytes of <code>result</code>.
+	 */
+	public final void hash(Buf buf, int off, int len, int seed, Buf result) {
+		result.setInt(0, hash(buf, off, len, seed));
+	}
 
 	public static XXHash32 getInstance() {
 		return XXHash32JavaSafe.INSTANCE;

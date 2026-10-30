@@ -7,12 +7,11 @@ import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 
 public enum ColumnHashType implements HashFunction {
-	XXHASH32(Integer.BYTES, (inputData, hashResult) -> XXHash32.getInstance()
-			.hash(inputData, 0, inputData.size(), 0, hashResult)),
-	XXHASH8(Byte.BYTES, (inputData, hashResult) -> {
-		var xxHash = XXHash32.getInstance().hash(Utils.toByteArray(inputData), 0, inputData.size(), 0);
-		hashResult.setByte(0, (byte) xxHash);
-	}),
+	XXHASH32(Integer.BYTES, (inputData, hashResult) -> hashResult.setInt(0, XXHash32.getInstance()
+			.hash(inputData, 0, inputData.size(), 0))),
+	// The low byte of the xxHash32
+	XXHASH8(Byte.BYTES, (inputData, hashResult) -> hashResult.setByte(0, (byte) XXHash32.getInstance()
+			.hash(inputData, 0, inputData.size(), 0))),
 	ALLSAME8(Byte.BYTES, (inputData, hashResult) -> hashResult.setByte(0, (byte) 0)),
 	FIXEDINTEGER32(Integer.BYTES, (inputData, hashResult) -> {
 		if (inputData.size() != Integer.BYTES) {
