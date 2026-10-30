@@ -167,6 +167,10 @@ a cold start. With several addresses it asks again while the answer is `UNAVAILA
 fails. With one address it fails at once, so that a plain client of a server that is down hears it right away.
 `ClientBuilder.setDeferred` skips the handshake until the first use.
 
+To replace a node of a replicated cluster, start the new node first with `--join`, and run `admin add-peer` when you
+like: the node waits for it, also across restarts. See "Replacing a node" in the [design
+document](docs/distributed/design.md).
+
 Shorter keepalive times find a dead node sooner, but a pause of the server or of the client that outlasts the
 timeout ends a working connection, with its calls in flight. Pings cost next to nothing, and a server accepts them
 every 5 s. A short connect timeout moves past a dead node sooner, but one that is just slow to accept a connection
