@@ -451,6 +451,30 @@ class ReplicationTest {
 		}
 	}
 
+	/**
+	 * A batch whose later chunk fails after an earlier chunk was applied reports a non-retryable error that says so,
+	 * not the later chunk's own retryable "not applied" error: a client resending the whole batch would merge the
+	 * first chunk twice. Here the second batch arrives after the caller's deadline, so it is never sent.
+	 */
+	@Test
+	void aBatchWhoseLaterChunkFailsReportsThatItWasPartlyApplied() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var through = cluster.anyFollower();
+		long column = api(through).createColumn("c", SCHEMA);
+		KVBatch first = new KVBatch.KVBatchRef(List.of(key(1)), List.of(text("first")));
+		KVBatch second = new KVBatch.KVBatchRef(List.of(key(2)), List.of(text("second")));
+		var batches = Flux.concat(Flux.just(first),
+				reactor.core.publisher.Mono.delay(Duration.ofSeconds(2)).thenMany(Flux.just(second)));
+		var call = through.connection().getAsyncApi(RequestContext.batch(Duration.ofSeconds(1)))
+				.mergeBatchAsync(column, batches, it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_WRITE_BATCH);
+		var error = assertThrows(ExecutionException.class, () -> call.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		var cause = assertInstanceOf(RocksDBException.class, error.getCause());
+		assertEquals(RocksDBErrorType.INVALID_REQUEST, cause.getErrorUniqueId());
+		assertTrue(cause.getMessage().contains("partly applied"), cause.getMessage());
+		assertEquals("first", text(api(through).get(0, column, key(1), RequestType.current())));
+		assertNull(api(through).get(0, column, key(2), RequestType.current()));
+	}
+
 	@Test
 	void transactionsCommitAtomicallyAndDetectConflicts() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();

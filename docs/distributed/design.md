@@ -358,7 +358,12 @@ against an incomplete history.
   with "outcome unknown", and the write may still take effect later. Internal retries are exactly once, but
   a client that resends the same write after such an error can apply it twice. A `DEADLINE_EXCEEDED` on a
   replicated write also has an unknown outcome, unless its message says that the write was not applied.
-- **`putBatch`/`mergeBatch`** run as ordered replicated write batches, whatever the requested SST mode.
+- **`putBatch`/`mergeBatch`** run as ordered replicated write batches, whatever the requested SST mode. They
+  are not atomic in any mode: each chunk of at most 4 MiB is applied on its own, and the chunks applied before a
+  failure stay applied. When a chunk fails after an earlier one was applied, the call fails with
+  `INVALID_REQUEST`, whose message gives the number of chunks and keys applied, instead of the chunk's own error.
+  That error could be retryable, and resending the whole batch would apply the first chunks twice. A failure of
+  the first chunk keeps its own error.
 - **Size limit.** One replicated entry (one write, multi-write or transaction commit) is limited to 16 MiB.
 - **`scanRaw` SST tokens** describe the leader's own files, so a leader change invalidates them.
 - **Merge operators** must be deterministic.

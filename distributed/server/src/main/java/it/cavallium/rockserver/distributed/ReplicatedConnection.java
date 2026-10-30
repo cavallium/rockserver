@@ -40,6 +40,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import org.jetbrains.annotations.Nullable;
@@ -598,18 +599,31 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	/**
 	 * Splits a batch stream into bounded replicated entries, applied in order. The caller's deadline counts from
-	 * the start of the call for every chunk.
+	 * the start of the call for every chunk. Each chunk is applied on its own, so once one was acknowledged, a later
+	 * failure (even a retryable one, such as a chunk refused before being sent) leaves the call partly applied: it
+	 * fails with {@code INVALID_REQUEST}, which clients do not resend, and says how much was applied.
 	 */
 	private CompletableFuture<Void> batch(RequestContext context, long columnId, Publisher<? extends KVBatch> batches,
 			boolean merge) {
 		long start = System.nanoTime();
+		var appliedChunks = new AtomicLong();
+		var appliedKeys = new AtomicLong();
 		return Flux.from(batches)
 				.concatMapIterable(ReplicatedConnection::chunks)
 				// One chunk at a time: a later chunk must not overtake an earlier one writing the same key.
 				.concatMap(chunk -> Mono.fromFuture(() -> propose(context, start, merge
-						? new LogEntry.MergeMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING)
-						: new LogEntry.PutMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING))))
+								? new LogEntry.MergeMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING)
+								: new LogEntry.PutMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING)))
+						.doOnSuccess(_ -> {
+							appliedChunks.incrementAndGet();
+							appliedKeys.addAndGet(chunk.keys().size());
+						}))
 				.then()
+				.onErrorMap(error -> appliedChunks.get() == 0 ? error : RocksDBException.of(
+						RocksDBErrorType.INVALID_REQUEST,
+						(merge ? "mergeBatch" : "putBatch") + " was partly applied: " + appliedChunks.get()
+								+ " replicated chunks (" + appliedKeys.get() + " keys) were applied before it failed, so"
+								+ " it is not safe to resend as a whole: " + unwrap(error)))
 				.toFuture();
 	}
 
