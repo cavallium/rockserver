@@ -534,6 +534,9 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
    limited. If that proves too slow, switch to install notifications plus a resumable pull of checkpoint
    files.
 6. **Operations.**
+   - Start nodes with `-Djava.io.tmpdir` on a directory of the node. RocksDB's Java binding extracts its 17 MB
+     native library there at every start, and a killed JVM leaves it behind. On a test machine 2,099 such files
+     filled a `/tmp` quota, and new nodes then could not start.
    - Metrics and alerts: role, term, commit and apply lag, snapshot age, follower lag, replica failure exit.
      Today the replication timers (`NodeMetrics`) are only logged. The existing `rocksdb_operation_timer`
      changes meaning on a cluster: replicated writes are counted on every node when applied (with the internal
