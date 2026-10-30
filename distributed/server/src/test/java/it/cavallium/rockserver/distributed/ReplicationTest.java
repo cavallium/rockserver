@@ -408,6 +408,7 @@ class ReplicationTest {
 		for (ReplicatedNode node : cluster.runningNodes()) {
 			assertEquals("long", localValue(node, column, 2));
 		}
+	}
 
 	/**
 	 * A write whose first attempt timed out after the leader appended it may have been applied: when every later
