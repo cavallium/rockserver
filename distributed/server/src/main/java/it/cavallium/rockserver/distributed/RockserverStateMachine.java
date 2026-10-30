@@ -15,6 +15,7 @@ import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.exceptions.StateMachineException;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
+import org.apache.ratis.server.raftlog.RaftLog;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
@@ -140,6 +141,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * thread can go on with the next group meanwhile.
 	 */
 	private final java.util.concurrent.ExecutorService completer;
+	/** Takes snapshots, see {@link #takeSnapshot}. */
+	private final java.util.concurrent.ExecutorService snapshotter;
+	/** The snapshot being taken, if any; only Ratis' apply thread reads or writes it. */
+	private volatile @Nullable CompletableFuture<TermIndex> snapshotting;
 	/** At most this many entries, and about this many bytes of entries, are applied in one local transaction. */
 	private static final int MAX_GROUP_ENTRIES = 256;
 	private static final long MAX_GROUP_BYTES = 16L << 20;
@@ -185,6 +190,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 		this.applyGroupEntries = metrics.amount("apply.groupEntries");
 		this.completer = java.util.concurrent.Executors.newSingleThreadExecutor(
 				Thread.ofPlatform().name(config.nodeId() + "-applied").daemon().factory());
+		this.snapshotter = java.util.concurrent.Executors.newSingleThreadExecutor(
+				Thread.ofPlatform().name(config.nodeId() + "-snapshot").daemon().factory());
 		this.applyThread = Thread.ofPlatform().name(config.nodeId() + "-apply").daemon().unstarted(this::applyLoop);
 		applyThread.start();
 	}
@@ -668,26 +675,71 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 	}
 
+	/**
+	 * Takes snapshots in the background. Ratis calls this on its apply thread, after waiting for every entry it
+	 * handed over, and hands over nothing more until it returns: copying the database there (a flush of every
+	 * memtable, 150-200 ms) stalled every write. So this starts the copy on a thread of its own and returns the
+	 * latest finished snapshot; Ratis calls again while the new one is due, and gets it once it is finished. The
+	 * apply goes on meanwhile, so a snapshot may hold more than its index says (see {@link NodeStore#checkpoint});
+	 * entries at or below a database's own applied position are not applied again.
+	 */
 	@Override
 	public long takeSnapshot() throws IOException {
 		if (failed) {
 			throw new IOException("Replica failed, not taking a snapshot");
 		}
-		// Ratis waited for the entries it handed over; positions without data may still be queued.
-		drainApplyQueue();
-		long start = System.nanoTime();
-		var position = storage.take(store);
-		snapshotTime.since(start);
-		LOG.info("{}: snapshot taken at {} in {} ms", config.nodeId(), position, (System.nanoTime() - start) / 1_000_000);
-		return position.getIndex();
+		var running = snapshotting;
+		if (running != null) {
+			if (!running.isDone()) {
+				return latestSnapshotIndex();
+			}
+			snapshotting = null;
+			try {
+				return running.join().getIndex();
+			} catch (java.util.concurrent.CompletionException ex) {
+				throw new IOException("Snapshot failed", ex.getCause());
+			}
+		}
+		var store = this.store;
+		snapshotting = CompletableFuture.supplyAsync(() -> {
+			long start = System.nanoTime();
+			try {
+				var position = storage.take(store);
+				snapshotTime.since(start);
+				LOG.info("{}: snapshot taken at {} in {} ms", config.nodeId(), position,
+						(System.nanoTime() - start) / 1_000_000);
+				return position;
+			} catch (IOException ex) {
+				throw new java.io.UncheckedIOException(ex);
+			}
+		}, snapshotter);
+		return latestSnapshotIndex();
+	}
+
+	private long latestSnapshotIndex() {
+		var latest = storage.getLatestSnapshot();
+		return latest == null ? RaftLog.INVALID_LOG_INDEX : latest.getIndex();
+	}
+
+	/** Waits for a snapshot being taken in the background, if any; its failure only means there is no new one. */
+	private void awaitSnapshot() {
+		var running = snapshotting;
+		if (running != null) {
+			try {
+				running.join();
+			} catch (RuntimeException ex) {
+				LOG.warn("{}: background snapshot failed", config.nodeId(), ex);
+			}
+		}
 	}
 
 	/** Called after Ratis installed a snapshot received from the leader, once {@link #pause} returned. */
 	@Override
 	public void reinitialize() throws IOException {
 		try {
-			// The database is replaced: nothing may still be applying to it.
+			// The database is replaced: nothing may still be applying to it, nor copying it.
 			drainApplyQueue();
+			awaitSnapshot();
 			getLifeCycle().startAndTransition(this::installSnapshot);
 		} catch (IOException | RuntimeException ex) {
 			// Ratis would only close this division and leave the process running: stop the node for good instead.
@@ -760,6 +812,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 			applyThread.join();
 			completer.shutdown();
 			completer.awaitTermination(1, java.util.concurrent.TimeUnit.MINUTES);
+			awaitSnapshot();
+			snapshotter.shutdown();
 		} catch (InterruptedException ex) {
 			Thread.currentThread().interrupt();
 		}

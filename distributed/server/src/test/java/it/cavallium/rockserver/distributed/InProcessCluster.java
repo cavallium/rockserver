@@ -53,9 +53,19 @@ final class InProcessCluster implements AutoCloseable {
 		}
 	}
 
+	/** Starts every node; if one fails to start, stops the others, so that a failed test leaks no running node. */
 	InProcessCluster startAll() throws IOException {
-		for (String id : configs.keySet()) {
-			start(id);
+		try {
+			for (String id : configs.keySet()) {
+				start(id);
+			}
+		} catch (IOException | RuntimeException ex) {
+			try {
+				close();
+			} catch (Exception closeError) {
+				ex.addSuppressed(closeError);
+			}
+			throw ex;
 		}
 		return this;
 	}

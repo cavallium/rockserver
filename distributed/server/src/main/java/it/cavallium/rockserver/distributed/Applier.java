@@ -244,6 +244,17 @@ final class Applier {
 	}
 
 	private ApplyResult applyAlone(Request request, TermIndex position) {
+		// Its writes may go through the WAL: not while a checkpoint copies the database.
+		var loggedWrites = store.loggedWrites();
+		loggedWrites.lock();
+		try {
+			return applyAloneLocked(request, position);
+		} finally {
+			loggedWrites.unlock();
+		}
+	}
+
+	private ApplyResult applyAloneLocked(Request request, TermIndex position) {
 		var records = records(request.proposerId());
 		long floor = records.floor;
 		if (request.sequence() < floor) {

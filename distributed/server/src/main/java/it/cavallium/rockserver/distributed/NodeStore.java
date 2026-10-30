@@ -261,6 +261,23 @@ final class NodeStore implements Closeable {
 	 * checkpoint's own marker, and if that guarantee were broken it could only be lower (Raft then re-sends
 	 * entries that are skipped), never higher.</p>
 	 */
+	/**
+	 * Held by writes that go through the WAL (schema changes and the like, see {@code Applier}) and by
+	 * {@link #checkpoint}: a checkpoint taken while the apply goes on lists the flushed files and copies the WAL,
+	 * which a logged write in between could make disagree.
+	 */
+	private final java.util.concurrent.locks.ReentrantLock loggedWrites = new java.util.concurrent.locks.ReentrantLock();
+
+	java.util.concurrent.locks.ReentrantLock loggedWrites() {
+		return loggedWrites;
+	}
+
+	/**
+	 * Copies a consistent point of the database to {@code target} and returns its applied position. The apply may go
+	 * on meanwhile: the copy then holds a later point, whose own applied position (in its meta column, written
+	 * atomically with the data) is the one that counts when it is opened. The returned position is never ahead of
+	 * the copy.
+	 */
 	TermIndex checkpoint(Path target) throws IOException {
 		target = target.toAbsolutePath();
 		if (Files.exists(target)) {
@@ -271,6 +288,7 @@ final class NodeStore implements Closeable {
 		Files.createDirectories(building);
 		TermIndex applied = applied();
 		RocksDB rocksDB = db().getDb().get();
+		loggedWrites.lock();
 		try {
 			rocksDB.disableFileDeletions();
 			try {
@@ -280,6 +298,8 @@ final class NodeStore implements Closeable {
 			}
 		} catch (org.rocksdb.RocksDBException e) {
 			throw new IOException("Failed to checkpoint " + dbDir + " into " + target, e);
+		} finally {
+			loggedWrites.unlock();
 		}
 		syncTree(building);
 		Files.move(building, target);
