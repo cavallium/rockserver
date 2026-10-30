@@ -3700,6 +3700,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public void deleteRange(long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive) throws RocksDBException {
+		deleteRange(columnId, startKeysInclusive, endKeysExclusive, false);
+	}
+
+	/**
+	 * Like {@link #deleteRange(long, Keys, Keys)}, but the write skips the WAL, so it survives a crash only once
+	 * flushed. Only for replication, which replays the writes lost by a crash from its own log.
+	 */
+	public void deleteRangeUnlogged(long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive) throws RocksDBException {
+		deleteRange(columnId, startKeysInclusive, endKeysExclusive, true);
+	}
+
+	private void deleteRange(long columnId,
+			@Nullable Keys startKeysInclusive,
+			@Nullable Keys endKeysExclusive,
+			boolean disableWal) throws RocksDBException {
 		var start = System.nanoTime();
 		actionLogger.logAction("DeleteRange",
 				start,
@@ -3721,7 +3738,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				return;
 			}
 			try {
-				deleteRangeNative(col, beginKey, endKey);
+				deleteRangeNative(col, beginKey, endKey, disableWal);
 			} catch (org.rocksdb.RocksDBException e) {
 				if (!isDeleteRangeUnsupported(e)) {
 					throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
@@ -3729,7 +3746,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (nativeDeleteRangeFallbackLogged.compareAndSet(false, true)) {
 					logger.warn("Native RocksDB range delete is not supported by this database handle; falling back to batched point deletes. Further deleteRange fallback messages are suppressed");
 				}
-				deleteRangeByIterating(col, beginKey, endKey);
+				deleteRangeByIterating(col, beginKey, endKey, disableWal);
 			}
 		} catch (RocksDBException ex) {
 			throw ex;
@@ -3755,18 +3772,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				&& (message.contains("not implemented") || message.contains("NotSupported"));
 	}
 
-	private void deleteRangeNative(ColumnInstance col, byte[] beginKey, byte[] endKey) throws org.rocksdb.RocksDBException {
+	private void deleteRangeNative(ColumnInstance col, byte[] beginKey, byte[] endKey, boolean disableWal)
+			throws org.rocksdb.RocksDBException {
 		var rocks = db.get();
 		if (rocks instanceof OptimisticTransactionDB optimisticTransactionDB) {
 			rocks = optimisticTransactionDB.getBaseDB();
 		}
 		try (var w = new LeakSafeWriteOptions(null); var wb = new LeakSafeWriteBatch()) {
+			w.setDisableWAL(disableWal);
 			wb.deleteRange(col.cfh(), beginKey, endKey);
 			rocks.write(w, wb);
 		}
 	}
 
-	private void deleteRangeByIterating(ColumnInstance col, byte[] beginKey, byte[] endKey) throws RocksDBException {
+	private void deleteRangeByIterating(ColumnInstance col, byte[] beginKey, byte[] endKey, boolean disableWal)
+			throws RocksDBException {
 		var snapshot = db.get().getSnapshot();
 		try (var ro = newReadOptions("delete-range-fallback-read-options");
 				var startKeySlice = new Slice(beginKey);
@@ -3781,14 +3801,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					wb.delete(col.cfh(), it.key());
 					pendingDeletes++;
 					if (pendingDeletes >= 10_000) {
-						writeDeleteRangeFallbackBatch(wb);
+						writeDeleteRangeFallbackBatch(wb, disableWal);
 						wb.clear();
 						pendingDeletes = 0;
 					}
 					it.next();
 				}
 				if (pendingDeletes > 0) {
-					writeDeleteRangeFallbackBatch(wb);
+					writeDeleteRangeFallbackBatch(wb, disableWal);
 				}
 			} catch (org.rocksdb.RocksDBException e) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
@@ -3798,8 +3818,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private void writeDeleteRangeFallbackBatch(LeakSafeWriteBatch wb) throws org.rocksdb.RocksDBException {
+	private void writeDeleteRangeFallbackBatch(LeakSafeWriteBatch wb, boolean disableWal)
+			throws org.rocksdb.RocksDBException {
 		try (var w = new LeakSafeWriteOptions(null)) {
+			w.setDisableWAL(disableWal);
 			db.get().write(w, wb);
 		}
 	}

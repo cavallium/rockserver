@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
@@ -36,6 +37,8 @@ import org.apache.ratis.protocol.exceptions.StateMachineException;
 import org.apache.ratis.retry.RetryPolicies;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
+import org.apache.ratis.thirdparty.io.grpc.Status;
+import org.apache.ratis.thirdparty.io.grpc.StatusRuntimeException;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -71,6 +74,12 @@ final class Proposer implements Closeable {
 	private static final int MAX_BATCH_REQUESTS = 4096;
 	/** Bytes of entry bodies per batch; a single larger request goes alone. */
 	private static final int MAX_BATCH_BYTES = 8 * 1024 * 1024;
+	/**
+	 * Requests per batch whose result can hold stored values (see {@link #returnsValues}): the results of a batch
+	 * come back in one reply, which has a size limit ({@link ResultCodec#MAX_REPLY_BYTES}), whereas a request's
+	 * size says nothing about the size of the value it returns.
+	 */
+	private static final int MAX_BATCH_VALUE_RESULTS = 16;
 	/**
 	 * A request with less time left than this when its batch is formed is failed without being sent: it would get at
 	 * most one hurried attempt, and its outcome would then be unknown instead of a clean "not applied".
@@ -155,6 +164,8 @@ final class Proposer implements Closeable {
 		final long sequence;
 		final byte[] body;
 		final boolean batchable;
+		/** See {@link #returnsValues}. */
+		final boolean returnsValues;
 		final long deadlineNanos;
 		/** Leader epoch of a transaction commit, -1 otherwise: commits of different epochs never share an entry. */
 		final long epoch;
@@ -162,10 +173,11 @@ final class Proposer implements Closeable {
 		/** Completed only by the proposer; callers get a copy, so that cancelling theirs cannot complete this one. */
 		final CompletableFuture<Object> result = new CompletableFuture<>();
 
-		Pending(long sequence, byte[] body, boolean batchable, long deadlineNanos, long epoch) {
+		Pending(long sequence, byte[] body, boolean batchable, boolean returnsValues, long deadlineNanos, long epoch) {
 			this.sequence = sequence;
 			this.body = body;
 			this.batchable = batchable;
+			this.returnsValues = returnsValues;
 			this.deadlineNanos = deadlineNanos;
 			this.epoch = epoch;
 		}
@@ -194,7 +206,8 @@ final class Proposer implements Closeable {
 			sequence = nextSequence++;
 			inFlight.add(sequence);
 		}
-		var pending = new Pending(sequence, body, Applier.isBatchable(entry), System.nanoTime() + requestTimeoutNanos,
+		var pending = new Pending(sequence, body, Applier.isBatchable(entry), returnsValues(entry),
+				System.nanoTime() + requestTimeoutNanos,
 				entry instanceof LogEntry.Guarded guarded ? guarded.leaderEpoch() : -1);
 		live.add(pending);
 		pending.result.whenComplete((_, _) -> {
@@ -210,6 +223,30 @@ final class Proposer implements Closeable {
 					"The node is stopping"));
 		}
 		return pending.result.copy();
+	}
+
+	/**
+	 * True if the result of {@code entry} can hold stored values (previous, delta or merged values), rather than
+	 * nothing, a flag or a column id. Unknown request types count as returning values.
+	 */
+	static boolean returnsValues(LogEntry entry) {
+		return switch (entry) {
+			case LogEntry.Put put -> returnsValues(put.requestType());
+			case LogEntry.PutMulti put -> returnsValues(put.requestType());
+			case LogEntry.Delete delete -> returnsValues(delete.requestType());
+			case LogEntry.DeleteMulti delete -> returnsValues(delete.requestType());
+			case LogEntry.Merge merge -> returnsValues(merge.requestType());
+			case LogEntry.MergeMulti merge -> returnsValues(merge.requestType());
+			case LogEntry.Guarded guarded -> guarded.singleResult() && returnsValues(guarded.writes().getFirst());
+			default -> false;
+		};
+	}
+
+	private static boolean returnsValues(RequestTypeId type) {
+		return switch (type) {
+			case NOTHING, EXISTS, CHANGED, PREVIOUS_PRESENCE, ENSURE -> false;
+			default -> true;
+		};
 	}
 
 	/** Every request numbered below this has its final answer: no copy of it will ever be sent again. */
@@ -291,6 +328,7 @@ final class Proposer implements Closeable {
 			var batch = new ArrayList<Pending>();
 			long now = System.nanoTime();
 			int bytes = 0;
+			int valueResults = 0;
 			while (!queue.isEmpty()) {
 				var next = queue.peekFirst();
 				if (next.result.isDone()) {
@@ -304,12 +342,16 @@ final class Proposer implements Closeable {
 					continue;
 				}
 				if (!batch.isEmpty() && (!next.batchable || !batch.getFirst().batchable || next.epoch != batch.getFirst().epoch
-						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES)) {
+						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES
+						|| (next.returnsValues && valueResults >= MAX_BATCH_VALUE_RESULTS))) {
 					break;
 				}
 				queue.pollFirst();
 				batch.add(next);
 				bytes += next.body.length + Long.BYTES;
+				if (next.returnsValues) {
+					valueResults++;
+				}
 				if (!next.batchable) {
 					break;
 				}
@@ -366,7 +408,8 @@ final class Proposer implements Closeable {
 					var refusal = error != null ? stateMachineException(error)
 							: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
 					boolean retryable = !closed && System.nanoTime() - deadlineNanos < 0
-							&& (refusal != null ? isNotReady(refusal) : error != null || !answer.isSuccess());
+							&& (refusal != null ? isNotReady(refusal) : error != null || !answer.isSuccess())
+							&& !isReplyTooLarge(error);
 					if (retryable) {
 						// No answer yet (no leader, unreachable, refused before append): send the same batch again. If
 						// an earlier copy took effect, applying this one returns its recorded results.
@@ -397,6 +440,8 @@ final class Proposer implements Closeable {
 							fail(batch, unavailable(refusal));
 						} else if (refusal != null) {
 							fail(batch, refusal(refusal));
+						} else if (isReplyTooLarge(error)) {
+							fail(batch, replyTooLarge(error));
 						} else if (error != null) {
 							fail(batch, unavailable(error));
 						} else {
@@ -504,6 +549,31 @@ final class Proposer implements Closeable {
 		return error instanceof LeaderNotReadyException
 				|| (error instanceof ResourceUnavailableException
 						&& String.valueOf(error.getMessage()).contains("acquire a pending write request"));
+	}
+
+	/**
+	 * True if gRPC refused to deliver the reply because it is larger than the client's message limit. Only replies
+	 * can be that large (requests are smaller than {@link RaftSettings#MAX_ENTRY_BYTES}), so the entry was applied:
+	 * resending it would only get the same reply again until the deadline. {@link ResultCodec#encodeAll} keeps
+	 * replies under the limit, so this is a last resort.
+	 */
+	private static boolean isReplyTooLarge(@Nullable Throwable error) {
+		for (Throwable t = error; t != null; t = t.getCause()) {
+			if (t instanceof StatusRuntimeException exception
+					&& exception.getStatus().getCode() == Status.Code.RESOURCE_EXHAUSTED) {
+				return true;
+			}
+			if (t.getCause() == t) {
+				break;
+			}
+		}
+		return false;
+	}
+
+	private static RocksDBException replyTooLarge(Throwable error) {
+		return RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
+				"The reply to the replicated write is too large to receive; the write was applied: "
+						+ ReplicatedConnection.unwrap(error));
 	}
 
 	private static StateMachineException stateMachineException(Throwable error) {

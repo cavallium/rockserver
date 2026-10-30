@@ -321,6 +321,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (failed) {
 			return CompletableFuture.failedFuture(new IllegalStateException("Replica failed"));
 		}
+		List<ApplyResult> results;
 		try {
 			var proposal = trx.getStateMachineContext() instanceof Proposal p ? p : null;
 			var requests = proposal != null ? proposal.requests
@@ -328,33 +329,35 @@ final class RockserverStateMachine extends BaseStateMachine {
 			if (position.getIndex() <= applied.get()) {
 				// Already applied before a restart: the database holds its effects and, unless its proposer already
 				// reported it complete, its result.
-				var results = new java.util.ArrayList<ApplyResult>(requests.size());
+				var recordedResults = new java.util.ArrayList<ApplyResult>(requests.size());
 				for (var request : requests) {
 					var recorded = applier.recordedResult(request);
-					results.add(recorded != null ? recorded
+					recordedResults.add(recorded != null ? recorded
 							: new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR, "Result no longer available"));
 				}
-				return CompletableFuture.completedFuture(Message.valueOf(UnsafeByteOperations.unsafeWrap(
-						ResultCodec.encodeAll(results))));
+				results = recordedResults;
+			} else {
+				long applyStart = System.nanoTime();
+				if (proposal != null && proposal.appendedNanos != 0) {
+					commitWait.record(applyStart - proposal.appendedNanos);
+				}
+				results = applier.applyBatch(requests, position);
+				applyTime.since(applyStart);
+				applyRequests.record(requests.size());
+				if (proposal != null && proposal.token != null && proposal.session != null) {
+					proposal.session.tracker().resolve(proposal.token, position.getIndex());
+					proposal.session.afterApply();
+				}
+				updateLastAppliedTermIndex(position);
+				applied.advance(position.getIndex());
 			}
-			long applyStart = System.nanoTime();
-			if (proposal != null && proposal.appendedNanos != 0) {
-				commitWait.record(applyStart - proposal.appendedNanos);
-			}
-			var results = applier.applyBatch(requests, position);
-			applyTime.since(applyStart);
-			applyRequests.record(requests.size());
-			if (proposal != null && proposal.token != null && proposal.session != null) {
-				proposal.session.tracker().resolve(proposal.token, position.getIndex());
-				proposal.session.afterApply();
-			}
-			updateLastAppliedTermIndex(position);
-			applied.advance(position.getIndex());
-			return CompletableFuture.completedFuture(Message.valueOf(UnsafeByteOperations.unsafeWrap(
-					ResultCodec.encodeAll(results))));
 		} catch (RuntimeException ex) {
 			return CompletableFuture.failedFuture(fail("apply entry " + position, ex));
 		}
+		// The entry is applied: building its reply must not stop the replica, and encodeAll never fails (results that
+		// do not fit become failures, the same on every replica).
+		return CompletableFuture.completedFuture(Message.valueOf(UnsafeByteOperations.unsafeWrap(
+				ResultCodec.encodeAll(results))));
 	}
 
 	/** Configuration entries and leader no-ops: record the position so restarts resume after them. */

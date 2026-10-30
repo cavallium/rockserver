@@ -94,11 +94,16 @@ final class NodeStore implements Closeable {
 	 *   <li>{@code atomic-flush = true}: entries are applied without the WAL (see {@link Applier}), so after a crash
 	 *   only flushed data survives; flushing every column together keeps that a consistent point, where the applied
 	 *   position matches the data.</li>
+	 *   <li>{@code optimistic = true}: on the leader, native transactions and updates only stage writes and serve
+	 *   reads; they are never committed, and the apply transaction writes the same keys when their commit is applied.
+	 *   A pessimistic database would make them hold row locks that the apply waits on, until it times out and the
+	 *   leader stops.</li>
 	 * </ul>
 	 */
 	private static final String REPLICA_OVERRIDES = """
 			database.global.absolute-consistency = false
 			database.global.atomic-flush = true
+			database.global.optimistic = true
 			""";
 
 	private final Path dbDir;

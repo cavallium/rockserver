@@ -79,22 +79,43 @@ class ApplierTest {
 	}
 
 	@Test
-	void recordsOfCompletedRequestsAreDeleted() throws Exception {
+	void recordsOfCompletedRequestsAreDeletedInBulk() throws Exception {
+		long column;
 		try (var store = open()) {
-			var applier = new Applier(store);
-			long column = store.db().createColumn("c", SCHEMA);
+			var applier = new Applier(store, null, 100);
+			column = store.db().createColumn("c", SCHEMA);
 			for (long sequence = 0; sequence <= 256; sequence++) {
 				long completedBelow = sequence;
 				applier.apply(new Request(5, sequence, completedBelow,
 						new LogEntry.Put(column, key(sequence), text("v"), RequestTypeId.NOTHING)),
 						TermIndex.valueOf(1, sequence + 1));
 			}
-			// Sequence 256 reported everything below it complete: those records are gone, its own is kept.
-			assertNull(applier.recordedResult(new Request(5, 0, 0, new LogEntry.Genesis("x", false))));
-			assertNull(applier.recordedResult(new Request(5, 255, 0, new LogEntry.Genesis("x", false))));
-			assertInstanceOf(ApplyResult.Ok.class,
-					applier.recordedResult(new Request(5, 256, 0, new LogEntry.Genesis("x", false))));
+			// The floor reached 100 and then 200: the records below 200 are gone. Those from 200 to 255 are below the
+			// floor (256) too, and wait for the next deletion; the record of 256 is kept.
+			assertNull(applier.recordedResult(record(5, 0)));
+			assertNull(applier.recordedResult(record(5, 199)));
+			assertInstanceOf(ApplyResult.Ok.class, applier.recordedResult(record(5, 200)));
+			assertInstanceOf(ApplyResult.Ok.class, applier.recordedResult(record(5, 256)));
 		}
+		// After a restart, the records left below the floor are not loaded and never used: a copy is refused.
+		try (var store = open()) {
+			var applier = new Applier(store, null, 100);
+			var late = applier.apply(new Request(5, 230, 230,
+					new LogEntry.Put(column, key(230), text("late"), RequestTypeId.NOTHING)), TermIndex.valueOf(1, 258));
+			assertInstanceOf(ApplyResult.Failed.class, late);
+			assertEquals("v", value(store, column, 230));
+			// The first entry of this run deleted what the previous run left below the floor.
+			assertNull(applier.recordedResult(record(5, 230)));
+			var retried = applier.apply(new Request(5, 256, 256,
+					new LogEntry.Put(column, key(256), text("again"), RequestTypeId.NOTHING)), TermIndex.valueOf(1, 259));
+			assertEquals(ApplyResult.OK_NULL, retried);
+			assertEquals("v", value(store, column, 256));
+		}
+	}
+
+	/** A request that names the record of {@code sequence} of {@code proposerId}, for {@link Applier#recordedResult}. */
+	private static Request record(long proposerId, long sequence) {
+		return new Request(proposerId, sequence, 0, new LogEntry.Genesis("x", false));
 	}
 
 	@Test
@@ -104,11 +125,11 @@ class ApplierTest {
 			long column = store.db().createColumn("c", SCHEMA);
 			var merge = new Request(9, 3, 3, new LogEntry.Merge(column, key(1), text("x"), RequestTypeId.NOTHING));
 			applier.apply(merge, TermIndex.valueOf(1, 1));
-			// The proposer finished with 3 and reported it: records below 512 are deleted.
+			// The proposer finished with 3 and reported it. The record of 3 is deleted only later, in bulk.
 			applier.apply(new Request(9, 512, 512, new LogEntry.Put(column, key(2), text("y"), RequestTypeId.NOTHING)),
 					TermIndex.valueOf(1, 2));
-			assertNull(applier.recordedResult(merge));
-			// A copy of 3 that was still in flight is appended afterwards: it must not run again.
+			assertInstanceOf(ApplyResult.Ok.class, applier.recordedResult(merge));
+			// A copy of 3 that was still in flight is appended afterwards: it must not run again, nor get the record.
 			var late = applier.apply(merge, TermIndex.valueOf(1, 3));
 			assertInstanceOf(ApplyResult.Failed.class, late);
 			assertEquals("x", value(store, column, 1));
@@ -245,6 +266,39 @@ class ApplierTest {
 						TermIndex.valueOf(1, i));
 			}
 			assertEquals("v20", value(store, column, 20));
+		}
+	}
+
+	@Test
+	void aCrashKeepsRecordDeletionsOnlyWithTheFloorThatCoversThem() throws Exception {
+		long column;
+		try (var store = open()) {
+			column = store.db().createColumn("c", SCHEMA);
+		}
+		var crashed = open();
+		var applier = new Applier(crashed, null, 4);
+		for (int i = 1; i <= 10; i++) {
+			applier.apply(new Request(8, i, i, new LogEntry.Put(column, key(i), text("v" + i), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, i));
+			if (i == 5) {
+				crashed.db().flush();
+			}
+		}
+		crashed.connection().close();
+		try (var store = open()) {
+			// The flush kept entries 1 to 5, the floor 5 and the deletion of the records below 4.
+			assertEquals(5, store.applied().getIndex());
+			var replay = new Applier(store, null, 4);
+			assertNull(replay.recordedResult(record(8, 3)));
+			assertInstanceOf(ApplyResult.Ok.class, replay.recordedResult(record(8, 5)));
+			for (int i = 6; i <= 10; i++) {
+				replay.apply(new Request(8, i, i, new LogEntry.Put(column, key(i), text("v" + i), RequestTypeId.NOTHING)),
+						TermIndex.valueOf(1, i));
+			}
+			assertEquals("v10", value(store, column, 10));
+			assertInstanceOf(ApplyResult.Failed.class, replay.apply(new Request(8, 7, 7,
+					new LogEntry.Put(column, key(7), text("late"), RequestTypeId.NOTHING)), TermIndex.valueOf(1, 11)));
+			assertEquals("v7", value(store, column, 7));
 		}
 	}
 

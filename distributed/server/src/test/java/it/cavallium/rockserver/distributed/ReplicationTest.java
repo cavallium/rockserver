@@ -104,6 +104,38 @@ class ReplicationTest {
 		assertEquals("x,y", text(api.merge(0, column, key(2), text("y"), RequestType.merged())));
 	}
 
+	/**
+	 * The results of a batch come back in one reply, which a follower receives through gRPC with a size limit: many
+	 * concurrent writes through a follower, each returning a large previous value, all get their results.
+	 */
+	@Test
+	void manyLargeResultsThroughAFollowerAreAllReceived() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var api = api(cluster.anyFollower());
+		long column = api.createColumn("c", SCHEMA);
+		int writes = 128;
+		var large = Buf.wrap(new byte[768 * 1024]);
+		try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+			var puts = new ArrayList<java.util.concurrent.Future<?>>();
+			for (int i = 0; i < writes; i++) {
+				long key = i;
+				puts.add(executor.submit(() -> api.put(0, column, key(key), large, RequestType.none())));
+			}
+			for (var put : puts) {
+				put.get();
+			}
+			var previous = new ArrayList<java.util.concurrent.Future<Buf>>();
+			for (int i = 0; i < writes; i++) {
+				long key = i;
+				previous.add(executor.submit(() -> api.put(0, column, key(key), text("small"), RequestType.previous())));
+			}
+			for (var result : previous) {
+				assertEquals(large.size(), result.get().size());
+			}
+		}
+	}
+
 	@Test
 	void writesContinueAfterLeaderLossAndTheOldLeaderCatchesUp() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();

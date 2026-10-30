@@ -71,6 +71,18 @@ class NodeStoreTest {
 		}
 	}
 
+	/** The leader's native transactions must not hold locks that the apply waits on, whatever the config says. */
+	@Test
+	void theDatabaseIsOptimisticEvenIfTheConfigSaysOtherwise() throws Exception {
+		Path config = tempDir.resolve("pessimistic.conf");
+		Files.writeString(config, "database.global.optimistic = false\n");
+		try (var store = NodeStore.open(tempDir.resolve("db"), config, "pessimistic")) {
+			assertTrue(store.db().getConfig().global().optimistic());
+			assertTrue(store.db().getDb().get() instanceof org.rocksdb.OptimisticTransactionDB,
+					"opened as " + store.db().getDb().get().getClass().getName());
+		}
+	}
+
 	/** A crash can tear the tail of the un-synced WAL: the replica opens the prefix and Raft replays the rest. */
 	@Test
 	void openRecoversThePrefixOfAWalWithATornTail() throws Exception {

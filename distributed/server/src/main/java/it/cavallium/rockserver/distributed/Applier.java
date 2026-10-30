@@ -15,6 +15,8 @@ import java.io.UncheckedIOException;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
+import it.unimi.dsi.fastutil.longs.LongSortedSet;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -55,14 +57,23 @@ final class Applier {
 	 */
 	private static final long APPLY_TRANSACTION_TIMEOUT_MS = 24L * 60 * 60 * 1000;
 
+	/** How far a proposer's floor moves between two deletions of the records below it, see {@link #purge}. */
+	static final long PURGE_EVERY_SEQUENCES = 1 << 16;
+
 	private final NodeStore store;
+	private final long purgeEverySequences;
 
 	Applier(NodeStore store) {
 		this(store, null);
 	}
 
 	Applier(NodeStore store, @Nullable NodeMetrics metrics) {
+		this(store, metrics, PURGE_EVERY_SEQUENCES);
+	}
+
+	Applier(NodeStore store, @Nullable NodeMetrics metrics, long purgeEverySequences) {
 		this.store = store;
+		this.purgeEverySequences = purgeEverySequences;
 		this.openTime = metrics == null ? null : metrics.duration("apply.open");
 		this.executeTime = metrics == null ? null : metrics.duration("apply.execute");
 		this.commitTime = metrics == null ? null : metrics.duration("apply.commit");
@@ -85,7 +96,9 @@ final class Applier {
 	 */
 	private static final class ProposerRecords {
 		long floor;
-		final LongOpenHashSet recorded = new LongOpenHashSet();
+		/** Records below this were deleted from the database by this applier, see {@link #purge}. */
+		long purgedBelow;
+		final LongSortedSet recorded = new LongRBTreeSet();
 	}
 
 	private final Long2ObjectOpenHashMap<ProposerRecords> proposers = new Long2ObjectOpenHashMap<>();
@@ -218,6 +231,7 @@ final class Applier {
 			ApplyResult outcome = new ApplyResult.Ok(existingId);
 			inApplyTransaction(position, tx -> finish(tx, request, floor, outcome, position, true));
 			committed(request.proposerId(), records, List.of(request), request.completedBelow());
+			purge(request.proposerId(), records);
 			return outcome;
 		}
 		// Schema changes write the RocksDB MANIFEST synchronously, while their schema rows, record and position go to
@@ -230,10 +244,11 @@ final class Applier {
 		} else {
 			outcome = applyLogical(() -> execute(0L, entry));
 		}
-		// Record, floor, record deletions and position in one logged write: all or none of them survive a crash.
+		// Record, floor and position in one logged write: all or none of them survive a crash.
 		inLoggedTransaction(position, tx -> finish(tx, request, floor, outcome, position, true));
 		syncWal();
 		committed(request.proposerId(), records, List.of(request), request.completedBelow());
+		purge(request.proposerId(), records);
 		return outcome;
 	}
 
@@ -321,6 +336,7 @@ final class Applier {
 			}
 		}
 		committed(proposerId, records, toRun, completedBelow);
+		purge(proposerId, records);
 		for (int i = 0; i < results.length; i++) {
 			if (results[i] == null) {
 				results[i] = requireRecorded(requests.get(i));
@@ -342,7 +358,10 @@ final class Applier {
 		return results;
 	}
 
-	/** The in-memory view of the meta column for {@code proposerId}, loaded on first use. */
+	/**
+	 * The in-memory view of the meta column for {@code proposerId}, loaded on first use. Records below the floor are
+	 * left out: they may still be in the database (see {@link #purge}), but are never read.
+	 */
 	private ProposerRecords records(long proposerId) {
 		var records = proposers.get(proposerId);
 		if (records == null) {
@@ -365,8 +384,31 @@ final class Applier {
 		}
 		if (completedBelow > records.floor) {
 			records.floor = completedBelow;
-			records.recorded.removeIf(sequence -> sequence < completedBelow);
+			records.recorded.headSet(completedBelow).clear();
 		}
+	}
+
+	/**
+	 * Deletes the records below the proposer's floor from the database, with one range deletion, once the floor
+	 * moved {@link #purgeEverySequences} past the last one. Records below the floor are never read: a copy below the
+	 * floor is refused before any lookup, and {@link #records} does not load them. So they need not be deleted in the
+	 * apply transaction, which would cost a write per request.
+	 *
+	 * <p>The deletion skips the WAL, like the apply transactions (see {@link #beginApply}), and runs after the
+	 * transaction that wrote the floor committed. With atomic flush, a crash keeps a prefix of the writes made
+	 * without the WAL: if the deletion survives, so does the floor that covers it, together with every entry applied
+	 * before it, so no entry that could look up one of those records is replayed. If it is lost, the records come
+	 * back below a floor that covers them, and stay unread until a later deletion. It must not go through the WAL:
+	 * it could then survive without the floor, and a replayed copy of a request whose record it deleted would run
+	 * again.</p>
+	 */
+	private void purge(long proposerId, ProposerRecords records) {
+		if (records.floor - records.purgedBelow < purgeEverySequences) {
+			return;
+		}
+		store.db().deleteRangeUnlogged(store.metaColumnId(), NodeStore.requestKey(proposerId, records.purgedBelow),
+				NodeStore.requestKey(proposerId, records.floor));
+		records.purgedBelow = records.floor;
 	}
 
 	private ApplyResult requireRecorded(Request request) {
@@ -601,9 +643,9 @@ final class Applier {
 	}
 
 	/**
-	 * Writes the proposer's new floor, if it moved, deleting the records it passed, and the applied position. Those
-	 * records are never read again (copies below the floor are refused before any lookup); deleting them in the same
-	 * write keeps every apply write in one atomic, unlogged transaction (see {@link #beginApply}).
+	 * Writes the proposer's new floor, if it moved, and the applied position. The records the floor passed are never
+	 * read again (copies below the floor are refused before any lookup); they are deleted later, in bulk, by
+	 * {@link #purge}.
 	 */
 	private void finishBatch(long tx, long proposerId, long completedBelow, long floor, TermIndex position,
 			boolean markPosition) {
@@ -611,17 +653,6 @@ final class Applier {
 			store.db().put(tx, store.metaColumnId(), NodeStore.floorKey(proposerId),
 					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(completedBelow).array()),
 					RequestType.none());
-			var records = proposers.get(proposerId);
-			if (records != null) {
-				var iterator = records.recorded.iterator();
-				while (iterator.hasNext()) {
-					long sequence = iterator.nextLong();
-					if (sequence < completedBelow) {
-						store.db().delete(tx, store.metaColumnId(), NodeStore.requestKey(proposerId, sequence),
-								RequestType.none());
-					}
-				}
-			}
 		}
 		if (markPosition) {
 			markApplied(tx, position);

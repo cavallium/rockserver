@@ -78,8 +78,8 @@ with 11–18 s write latency. In order of discovery:
    appended meanwhile. 8 clients: 0.8k → 3k writes/s.
 3. **One Raft entry per write.** Every entry costs the Ratis append lock, a log write, its replication and an
    apply transaction. The `Proposer` now batches the requests that arrive together into one entry (up to 4096
-   requests or 8 MiB, at most 32 batches in flight per queue), sent straight to the local Raft server on the
-   leader. 29k → 93k writes/s (closed loop, `ensure` puts).
+   requests or 8 MiB, at most 16 of them returning stored values, at most 32 batches in flight per queue), sent
+   straight to the local Raft server on the leader. 29k → 93k writes/s (closed loop, `ensure` puts).
 4. **Hot-key update conflicts.** With a 10–30 ms window between `getForUpdate` and its commit, concurrent
    updates of a popular post kept conflicting (1.08M retries in a minute at 4×), and Yotsuba backs off 10–250
    ms each time. Single-key updates now queue per key on the leader: each reads what the previous one
@@ -95,6 +95,12 @@ with 11–18 s write latency. In order of discovery:
 8. **Failover of forwarded requests.** A follower forwarding to a dead leader kept failing (or hanging in gRPC
    retries for up to 9 s) until the election. Reads and transaction opens are now re-sent to whichever node
    leads, over connections without gRPC's own retries that probe the port first.
+9. **Dedupe records on the apply thread.** Each applied request wrote its record and, once the floor passed it,
+   a point delete in a later entry's transaction: two of every three writes of a single put, each through the
+   full `EmbeddedDB` path. In the fs1 profile, writing records and finishing entries (the deletes, the floor and
+   position writes, two scans of a hash set of recorded sequences) took about a fifth of the apply thread's Java
+   samples. Records below the floor are now deleted with one range deletion per 65536 sequences, and the
+   recorded sequences are kept in a sorted set.
 
 ## Results
 

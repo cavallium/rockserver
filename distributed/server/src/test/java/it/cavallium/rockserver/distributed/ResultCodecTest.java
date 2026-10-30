@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -103,6 +104,60 @@ class ResultCodecTest {
 		for (Object value : unsupported) {
 			assertThrows(IllegalArgumentException.class, () -> ResultCodec.encode(new Ok(value)), value::toString);
 		}
+	}
+
+	@ParameterizedTest
+	@MethodSource("results")
+	void encodedSizeIsTheLengthOfTheEncoding(ApplyResult result) {
+		assertEquals(ResultCodec.encode(result).length, ResultCodec.encodedSize(result));
+	}
+
+	@Test
+	void encodedSizeOfAFailureCountsMessagesThatAreNotValidUnicodeAsEncoded() {
+		var failed = new Failed(RocksDBErrorType.INTERNAL_ERROR, "bad \uD800 surrogate \uDC00 è");
+		assertEquals(ResultCodec.encode(failed).length, ResultCodec.encodedSize(failed));
+	}
+
+	@Test
+	void resultsThatFitInAReplyAreKept() {
+		var results = List.<ApplyResult>of(new Ok(Buf.wrap(new byte[1000])), ApplyResult.OK_NULL);
+		byte[] encoded = ResultCodec.encodeAll(results);
+		assertEquals(results, ResultCodec.decodeAll(encoded));
+		assertEquals(encoded.length, ResultCodec.encodeAll(results, encoded.length).length);
+		assertEquals(results, ResultCodec.decodeAll(ResultCodec.encodeAll(results, encoded.length)));
+	}
+
+	@Test
+	void theLargestResultsThatDoNotFitInAReplyBecomeFailures() {
+		var small = new Ok(buf("small"));
+		var large = new Ok(Buf.wrap(new byte[1000]));
+		var larger = new Ok(Buf.wrap(new byte[1500]));
+		var results = List.<ApplyResult>of(small, large, larger, large, ApplyResult.OK_NULL);
+		long largeSize = ResultCodec.encodedSize(large);
+		long largerSize = ResultCodec.encodedSize(larger);
+		// Room for the small results and one large one: the larger one goes, then the first of the equal ones.
+		byte[] encoded = ResultCodec.encodeAll(results, 2000);
+		assertTrue(encoded.length <= 2000, "reply of " + encoded.length + " bytes");
+		assertEquals(List.of(small, ResultCodec.tooLarge(largeSize), ResultCodec.tooLarge(largerSize), large,
+				ApplyResult.OK_NULL), ResultCodec.decodeAll(encoded));
+		assertArrayEquals(encoded, ResultCodec.encodeAll(results, 2000), "the choice is not deterministic");
+	}
+
+	@Test
+	void aResultLargerThanAReplyIsReplacedWithoutEncodingIt() {
+		// 2 GiB of results would not even fit in a byte array.
+		var huge = new Ok(Collections.nCopies(1 << 16, Buf.wrap(new byte[1 << 15])));
+		var results = List.<ApplyResult>of(ApplyResult.OK_NULL, huge);
+		var decoded = ResultCodec.decodeAll(ResultCodec.encodeAll(results));
+		assertEquals(ApplyResult.OK_NULL, decoded.getFirst());
+		assertEquals(ResultCodec.tooLarge(ResultCodec.encodedSize(huge)), decoded.get(1));
+	}
+
+	@Test
+	void aResultThatCannotBeEncodedBecomesAFailureInsteadOfFailingTheReply() {
+		var decoded = ResultCodec.decodeAll(ResultCodec.encodeAll(List.of(new Ok("string"), ApplyResult.OK_NULL)));
+		assertInstanceOf(Failed.class, decoded.getFirst());
+		assertEquals(ApplyResult.OK_NULL, decoded.get(1));
 	}
 
 	@Test

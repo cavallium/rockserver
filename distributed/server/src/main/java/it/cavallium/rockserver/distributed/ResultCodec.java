@@ -69,20 +69,114 @@ final class ResultCodec {
 		return bytes.toByteArray();
 	}
 
-	/** Encodes the results of a batch, in order: their count, then each one's length and {@link #encode} bytes. */
+	/**
+	 * Largest reply {@link #encodeAll} builds. A node that is not the leader receives it through gRPC, whose message
+	 * limit is {@code MAX_ENTRY_BYTES} + 2 MiB (see {@link RaftSettings}): the last MiB is room for the Raft reply
+	 * around it. A single result as large as the largest value a write can store still fits.
+	 */
+	static final int MAX_REPLY_BYTES = RaftSettings.MAX_ENTRY_BYTES + (1 << 20);
+
+	/** {@link #encodeAll(List, int)} with {@link #MAX_REPLY_BYTES}. */
 	static byte[] encodeAll(List<ApplyResult> results) {
-		var encoded = new ArrayList<byte[]>(results.size());
-		int size = Integer.BYTES;
-		for (var result : results) {
-			byte[] bytes = encode(result);
-			encoded.add(bytes);
-			size = Math.addExact(size, Integer.BYTES + bytes.length);
+		return encodeAll(results, MAX_REPLY_BYTES);
+	}
+
+	/**
+	 * Encodes the results of a batch, in order: their count, then each one's length and {@link #encode} bytes.
+	 *
+	 * <p>It never fails: every replica runs it after the entry was applied, and an exception would stop the
+	 * replica. When the results do not fit in {@code maxBytes}, the largest ones (the first of equal ones) are
+	 * replaced by a failure saying that the write was applied, until they fit; a result that cannot be encoded is
+	 * replaced too. The choice depends only on the results, so every replica builds the same reply: Ratis can answer
+	 * a client's retry with the reply a replica computed before it became the leader.</p>
+	 */
+	static byte[] encodeAll(List<ApplyResult> results, int maxBytes) {
+		int count = results.size();
+		var chosen = new ApplyResult[count];
+		var sizes = new long[count];
+		long total = Integer.BYTES;
+		for (int i = 0; i < count; i++) {
+			chosen[i] = results.get(i);
+			try {
+				sizes[i] = encodedSize(chosen[i]);
+			} catch (IllegalArgumentException ex) {
+				chosen[i] = new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR,
+						"The result cannot be encoded; the write was applied");
+				sizes[i] = encodedSize(chosen[i]);
+			}
+			total += Integer.BYTES + sizes[i];
 		}
-		var buffer = java.nio.ByteBuffer.allocate(size).putInt(encoded.size());
-		for (byte[] bytes : encoded) {
+		if (total > maxBytes) {
+			var largestFirst = new Integer[count];
+			for (int i = 0; i < count; i++) {
+				largestFirst[i] = i;
+			}
+			java.util.Arrays.sort(largestFirst, (a, b) -> sizes[a] != sizes[b] ? Long.compare(sizes[b], sizes[a])
+					: Integer.compare(a, b));
+			for (int i : largestFirst) {
+				var failure = tooLarge(sizes[i]);
+				long size = encodedSize(failure);
+				if (total <= maxBytes || size >= sizes[i]) {
+					break;
+				}
+				chosen[i] = failure;
+				total -= sizes[i] - size;
+				sizes[i] = size;
+			}
+		}
+		// Fits in an int: it is at most maxBytes, or every result is now as small as a failure.
+		var buffer = java.nio.ByteBuffer.allocate((int) total).putInt(count);
+		for (var result : chosen) {
+			byte[] bytes = encode(result);
 			buffer.putInt(bytes.length).put(bytes);
 		}
 		return buffer.array();
+	}
+
+	/** The result that replaces one of {@code size} bytes that does not fit in a reply. */
+	static ApplyResult.Failed tooLarge(long size) {
+		return new ApplyResult.Failed(RocksDBErrorType.INVALID_REQUEST,
+				"The result (" + size + " bytes) is too large for a reply; the write was applied");
+	}
+
+	/**
+	 * The length of {@link #encode}'s bytes for {@code result}, computed without encoding it.
+	 *
+	 * @throws IllegalArgumentException if {@link #encode} would reject it
+	 */
+	static long encodedSize(ApplyResult result) {
+		return switch (result) {
+			case ApplyResult.Ok(Object value) -> 1 + valueSize(value, 0);
+			// The error type name is ASCII.
+			case ApplyResult.Failed(RocksDBErrorType type, String message) ->
+					1 + Integer.BYTES + type.name().length() + Integer.BYTES + message.getBytes(UTF_8).length;
+		};
+	}
+
+	private static long valueSize(@Nullable Object value, int depth) {
+		return switch (value) {
+			case null -> 1;
+			case Buf buf -> 1 + Integer.BYTES + buf.size();
+			case Boolean _ -> 1;
+			case Long _ -> 1 + Long.BYTES;
+			case Delta<?>(Object previous, Object current) ->
+					1 + nullableBufSize(deltaSide(previous)) + nullableBufSize(deltaSide(current));
+			case List<?> list -> {
+				if (depth >= MAX_LIST_DEPTH) {
+					throw new IllegalArgumentException("Result lists are nested deeper than " + MAX_LIST_DEPTH);
+				}
+				long size = 1 + Integer.BYTES;
+				for (Object element : list) {
+					size += valueSize(element, depth + 1);
+				}
+				yield size;
+			}
+			default -> throw new IllegalArgumentException("Unsupported result type: " + value.getClass().getName());
+		};
+	}
+
+	private static long nullableBufSize(@Nullable Buf buf) {
+		return Integer.BYTES + (buf == null ? 0 : buf.size());
 	}
 
 	/** @throws IllegalArgumentException on malformed input */

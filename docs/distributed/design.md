@@ -53,8 +53,9 @@ forwards to a non-embedded connection:
 - `GrpcServer` runs requests to a non-embedded connection on virtual threads of their own (a proxy scheduler,
   at most 16384 at once, beyond which requests get `SERVER_OVERLOADED`); rollbacks and maintenance keep the
   workload scheduler's isolated pools (`RWScheduler.withVirtualWorkers`, `WorkloadSettings.proxy`).
-- `EmbeddedDB.openUnloggedTransaction` (a transaction without snapshot, optionally without the WAL) and the
-  `atomic-flush` global option (off by default; it turns pipelined writes off).
+- `EmbeddedDB.openUnloggedTransaction` (a transaction without snapshot, optionally without the WAL),
+  `EmbeddedDB.deleteRangeUnlogged` (a range deletion without the WAL) and the `atomic-flush` global option (off
+  by default; it turns pipelined writes off).
 - `GrpcConnection.forHostAndPortWithoutRetry`, for callers that retry on their own.
 
 | Class | Role |
@@ -98,7 +99,8 @@ and the `LogEntry`.
 
 - **Batches.** Requests that arrive while 32 batches are in flight wait, then go together as one log entry
   (`LogEntryCodec.encodeBatch`: the proposer id and `completedBelow` once, then each sequence and entry; up to
-  4096 requests or 8 MiB; schema changes, `deleteRange` and genesis always alone). One entry costs one Ratis
+  4096 requests or 8 MiB, and at most 16 requests whose result can hold stored values, such as previous, delta
+  or merged values; schema changes, `deleteRange` and genesis always alone). One entry costs one Ratis
   append, one place in a group fsync and one apply transaction, whatever it holds. Transaction commits have a
   queue of their own, and commits of different leader terms never share an entry.
 - **Retries.** A batch is resent with the same bytes across leader changes until the latest deadline of its
@@ -117,8 +119,11 @@ and the `LogEntry`.
   example an attempt that was still queued when the proposer gave up on it, is refused without being executed
   and without reading any record. Sequence numbers are allocated and registered atomically, so
   `completedBelow` never passes a request that is still in flight.
-- **Records are deleted** as soon as the floor passes them, with point deletes in the same write as the entry.
-  They are never read again, so this cannot change any result.
+- **Records are deleted in bulk.** Records below the floor are never read again, so they are not deleted in
+  the entry's write. Once a proposer's floor has moved 65536 sequences, one range deletion without the WAL
+  removes everything below it, after the entry that moved the floor. With atomic flush a crash keeps that
+  deletion only together with the floor that covers it; if it loses it, the records come back below the floor,
+  unread, until the next one. Loading a proposer's records skips those below its floor.
 - **Duplicates are found in memory.** Each replica keeps, per proposer, its floor and the sequences recorded
   at or above it, loaded from the internal column the first time the proposer is seen: checking a request for
   an earlier copy costs no read.
@@ -127,10 +132,9 @@ and the `LogEntry`.
 API.
 
 - **Data writes** (puts, deletes, merges, transaction commits) of one entry run in one local transaction
-  without the RocksDB WAL. It also writes their result records, the proposer's floor (deleting the records it
-  passed) and the applied position, so a crash keeps all of the entry or none of it. If one request is rejected
-  for a logical reason, the entry is applied again one request at a time, and only its last request records
-  the position.
+  without the RocksDB WAL. It also writes their result records, the proposer's floor and the applied position,
+  so a crash keeps all of the entry or none of it. If one request is rejected for a logical reason, the entry
+  is applied again one request at a time, and only its last request records the position.
 - **Schema changes and `deleteRange`** cannot run in a transaction. All memtables are flushed first, so that
   everything applied without the WAL is on disk before a logged write follows it; their record and position
   are then written in one logged transaction, and the WAL is synced, because RocksDB writes column family
@@ -139,7 +143,10 @@ API.
   give the same result as on the other replicas. Creating a column that exists with the same schema changes
   nothing and is recorded without the flush.
 - **Return values** (previous value, delta, merged value...) are computed by apply, so they are the same on
-  every replica.
+  every replica. The results of an entry go back in one reply of at most 17 MiB (the Raft client's gRPC limit
+  is 18 MiB). If they do not fit, the largest ones become an `INVALID_REQUEST` failure saying that the write
+  was applied, the same on every replica; building the reply never fails. A reply too large to receive anyway
+  fails its requests the same way instead of being resent.
 
 **Failures during apply.**
 
@@ -191,7 +198,9 @@ trip, with no fsync, and it serves every read that arrived before it started.
 
 ## Transactions
 
-Production uses `OptimisticTransactionDB`. Yotsuba relies on conflicts spanning several columns,
+Production uses `OptimisticTransactionDB`, and replicas force it (`optimistic` on, whatever the config says): the
+leader's native transactions only stage writes and serve reads, and with a pessimistic database their row locks
+would block the apply of their own commits. Yotsuba relies on conflicts spanning several columns,
 `getForUpdate` fences, `false` from commit meaning "conflict", and retrying `UPDATE_RETRY` and
 `TRANSACTION_NOT_FOUND`.
 
