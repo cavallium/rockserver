@@ -121,14 +121,26 @@ including a frozen process, whose kernel accepts the connection. See the
 
 `pick_first` reacts only to the transport, so a node that stays reachable but cannot serve has to shed its clients
 itself. A node cut off from the Raft majority answers HTTP/2 and keepalive while every request fails. So a node that
-once knew a leader and has had none for 3 maximum election timeouts, and at least 6 s, stops serving its API
+has known a leader and has had none for 3 maximum election timeouts, and at least 6 s, stops serving its API
 (`ApiGate`, checked by the maintenance loop of `ReplicatedNode`): `GrpcServer.pause` closes the port and sends GOAWAY
 to every connection, and running calls end as they do. Clients move on, because the port refuses them. The bound
 leaves room for two more voting rounds lost to a split vote, so it is not reached by an election, and an isolated
 leader first has to step down, about one more election timeout. The minimum is for a node that stopped for a moment:
-a leader that got no answer from it for a while waits up to 5 s before it tries again (Ratis' appender retry policy),
-and the node has no leader until then. Raft has its own port, so a paused node keeps voting. Once it has known a
-leader for one maximum election timeout, long enough for a heartbeat to have confirmed it, `GrpcServer.resume` builds
+a leader that got no answer from it sleeps before it tries again, and the node has no leader until then. Ratis
+multiplies each step of the appender retry policy by a random number from 0.5 to 1.5, so the last step of its default
+policy, `1ms,10, 1s,20, 5s,1000`, sleeps 2.5 to 7.5 s. `RaftSettings.APPENDER_RETRY_POLICY` lowers that step to 2 s,
+at most 3 s of sleep, and the minimum is twice that, which leaves room for one more try if the first is lost. The
+count of the last step is about a billion because past the end of the policy Ratis no longer sleeps at all: with the
+default policy a follower down for about 80 minutes would then get an attempt at every heartbeat interval.
+
+The gate lives in memory, so a node that restarts learns from its disk that a leader existed: its database has a
+cluster id or its Raft log has an entry (neither alone is enough: a kill can lose a recent cluster id, and a purge can
+empty a log). Such a node has known a leader, and the bound counts from its start, or a restart while cut off from the
+majority would keep clients on a node that cannot serve them. Raft has its own port, so a paused node keeps voting,
+and elections, genesis and the read barrier's term checks use only Raft ports: a whole cluster that starts together
+pauses until it elects a leader, which costs nothing because none of its nodes can serve before that, and it then
+serves by itself. A member of a new cluster has neither, and is not judged until it first knows a leader. Once a node
+has known a leader for one maximum election timeout, long enough for a heartbeat to have confirmed it, `GrpcServer.resume` builds
 a new gRPC server on the same port. Both conditions must hold without a break, so a short election never pauses a
 node, and a pause and the next are at least 4 maximum election timeouts apart. A cluster where no node has a leader
 pauses every node and recovers by itself: elections go on, and every node resumes after the new leader appears. A
@@ -136,9 +148,14 @@ single-node embedded server never pauses.
 
 Placement is deliberately simple, and the client knows nothing about the leader. All the clients with the same list
 sit on its first node. After a leader change they stay on what is now a follower, and calls that need the leader
-take a forwarding hop, until the connection is lost. To bring them back, a replicated node ends each connection after
-about 30 minutes (`maxConnectionAge`, gRPC adds +/-10%, with 10 minutes of grace for running calls), and the client
-starts again from the top of its list. A node that returns gets its clients back the same way, not at once.
+take a forwarding hop, until the connection is lost. A node that returns gets its clients back the same way, not at
+once: a client stays on the node it failed over to until that node goes away.
+
+A maximum connection age (`maxConnectionAge`, off by default, gRPC adds +/-10%, with 10 minutes of grace for running
+calls) would bring clients back, because after the GOAWAY a client starts again from the top of its list. That is its
+only benefit, and it is off because of its two costs. A silent first address then costs the connect timeout at every
+age cycle, for every client, so a one-time cost becomes a recurring stall. And the grace cuts any call longer than it,
+including `Compact` and long scans, on a healthy cluster too.
 
 A hung disk is not detected: the process still answers HTTP/2 and keepalive, and calls wait for their deadline. It
 would take a probe through the request path.
@@ -523,7 +540,7 @@ failover" below).
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `ClientFailoverTest` | One client connection listing all three nodes, while the node it uses is killed (the leader, or a follower): only retryable errors, new calls succeed on another node of the same connection (about 1 s with an election, under 200 ms without), a new connection skips the dead node, and a transaction opened through a dead follower still commits. |
-| `IsolatedNodeTest` | A client listing every node, connected to a node that gets isolated (the leader, or a follower), moves to the majority and keeps working, and the isolated node listens and serves again after the heal. With every node isolated all pause, and after the heal all resume and the client recovers by itself. An election shorter than the bound pauses no node. |
+| `IsolatedNodeTest` | A client listing every node, connected to a node that gets isolated (the leader, or a follower), moves to the majority and keeps working, and the isolated node listens and serves again after the heal. With every node isolated all pause, and after the heal all resume and the client recovers by itself. An election shorter than the bound pauses no node. A follower restarted while cut off pauses too, and the client that lists it first moves. A cluster killed or stopped as a whole and restarted at once serves again, a paused node takes part in the election, and a node of a new cluster does not pause. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history is linearizable. |
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |

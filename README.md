@@ -119,17 +119,19 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 - It uses the first address that accepts a connection, never shuffling the list, so all the clients with the same
   list sit on the first node. List the expected leader first, so that their calls do not take a forwarding hop
   through a follower. After a leader change they stay where they are, and every call that needs the leader takes
-  that hop, until their connection is lost or ends with age (below).
+  that hop, until their connection is lost.
 - When the connection to its node is lost, calls in flight fail as they do with one address: the reads that the
   automatic retry policy allows run again, on the next node, and the others surface `UNAVAILABLE`, because a write
   may already have been applied. New calls wait for the next connection, which starts from the top of the list.
-- It stays on its node when an earlier one comes back, until that connection is lost, the channel goes idle (30
-  minutes without calls), or the node ends it. A replicated node ends each connection after about 30 minutes (+/-10%),
-  so clients return to the first address over time. Calls still running on that connection get 10 more minutes,
-  and a longer stream fails then with `UNAVAILABLE`.
+- It stays on its node when an earlier one comes back, until that connection is lost or the channel goes idle (30
+  minutes without calls). So a client that failed over stays on that node until the node goes away, even if the
+  first address returned long before. A server can end connections at a maximum age instead, which brings clients
+  back to the first address, but that is off by default because of what it costs (see the table of properties).
 - With every node down, calls wait for one full pass over the list, which takes up to the connect timeout for each
   node that does not answer, and from then on they fail with `UNAVAILABLE` at once. The reads that the retry policy
-  allows also spend its backoff. The connection keeps trying the list, at least every 2 s, each client at its own pace.
+  allows also spend its backoff. The connection keeps trying the list, at least every 2 s, each client at its own
+  pace. One address works the same way. Those attempts run only while calls fail: a connection that works or is idle
+  has nothing scheduled.
 - Names are resolved again when a connection is lost. A name that stops resolving keeps its last addresses, and one
   whose lookup hangs does not hold back the others for more than 1 s: its host joins when the lookup answers.
 
@@ -137,7 +139,7 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 |---|---|---|
 | Dies, its host stays up (crash, SIGKILL) | At once: the connection is reset | In milliseconds: the port refuses connections |
 | Stops answering with its host down, cut off from the client or frozen (power loss, SIGSTOP) | By keepalive, in at most 15 s | After that, plus one connect timeout for each such node listed before the one that works |
-| Is cut off from the Raft majority, and the client still reaches it | The node stops serving: it loses its leader within one election timeout, and after 3 maximum election timeouts without one, at least 6 s (about 8 s in all by default), it stops listening and sends GOAWAY. Calls running on it end as they do | In milliseconds. Until then calls fail with the errors of a node without a leader |
+| Is cut off from the Raft majority, and the client still reaches it | The node stops serving: it loses its leader within one election timeout, and after 3 maximum election timeouts without one, at least 6 s (about 8 s in all by default), it stops listening and sends GOAWAY. A node that restarts while cut off does the same, counted from its start. Calls running on it end as they do | In milliseconds. Until then calls fail with the errors of a node without a leader |
 | Has a hung disk | **Not detected**: the process still answers the connection handshake and keepalive. Calls wait for their deadline, and calls without one wait for the node | Never: the client stays on this node |
 
 | System property | Default | Effect |
@@ -145,16 +147,19 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 | `it.cavallium.rockserver.grpc.client.connect-timeout-ms` | `3000` | With several addresses, the limit for connecting to one address and, separately, for hearing the first bytes from it. |
 | `it.cavallium.rockserver.grpc.client.keep-alive-time-ms` | `10000` | Silence on a connection before a ping, with one address too. gRPC raises values below 10 s to 10 s. |
 | `it.cavallium.rockserver.grpc.client.keep-alive-timeout-ms` | `5000` | Wait for the answer to a ping, with one address too. |
-| `it.cavallium.rockserver.grpc.client.max-reconnect-delay-ms` | `2000` | With several addresses, the longest wait between two attempts on the list while every address fails. Each client picks a period between half of this and this. |
-| `it.cavallium.rockserver.grpc.server.max-connection-age-ms` | `1800000` | On a server in front of another connection, such as a replicated node, the age at which a connection ends, +/-10%. |
-| `it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms` | `600000` | The time left to the calls running on a connection that reached its age. |
+| `it.cavallium.rockserver.grpc.client.max-reconnect-delay-ms` | `2000` | The longest wait between two attempts on the list, or on the only address, while they all fail. Each client picks a period between half of this and this. |
+| `it.cavallium.rockserver.grpc.server.max-connection-age-ms` | `0` (off) | On a server in front of another connection, such as a replicated node, the age at which a connection ends, +/-10%. The client then starts again from the top of its list, which is what brings it back to the first address. It has two costs: a silent first address costs every client the connect timeout at every cycle, not once, and calls that outlive the grace below fail with `UNAVAILABLE`, which includes `Compact` and long scans, on a healthy cluster too. Left off, a client stays on the node it failed over to until that node goes away. |
+| `it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms` | `600000` | With a maximum age, the time left to the calls running on a connection that reached it. |
 
 On a replicated cluster, when the node that died was the leader, the new calls also wait for the election.
 
 A replicated node without a leader for that long serves again by itself: once it has known a leader for one maximum
 election timeout it listens again, on its own or with every other node after a period when the whole cluster had no
 leader. An election shorter than the bound stops nothing. A client with a single address has nowhere to go: while
-its node does not listen its calls fail with `UNAVAILABLE`, and it reconnects with gRPC's own delay, up to 2 minutes.
+its node does not listen its calls fail with `UNAVAILABLE`, and it reconnects within the 2 s above once the node
+listens again. A node that restarts with a whole cluster that is down can stop listening too, until the cluster
+elects a leader, when no node could serve anyway. Only a node of a new cluster, which has never known a leader, keeps
+listening while the cluster forms.
 
 Shorter keepalive times find a dead node sooner, but a pause of the server or of the client that outlasts the
 timeout ends a working connection, with its calls in flight. Pings cost next to nothing, and a server accepts them
