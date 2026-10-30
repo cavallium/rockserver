@@ -157,8 +157,9 @@ API.
   is recorded, the same on every replica: by an `INVALID_REQUEST` failure saying that the write was applied
   (an `INTERNAL_ERROR` one if it cannot be encoded). That failure is both the record and the reply. If the
   results of an entry do not fit together, the largest ones are replaced in the reply by a "resend alone"
-  marker. The proposer then sends each of those requests again in an entry of its own: its sequence is still
-  in flight, so the copy does not run and gets the recorded result, which fits in a reply by itself. A
+  marker. The proposer then sends those requests again, in entries that hold only such copies: their
+  sequences are still in flight, so the copies do not run and get their recorded results, each of which fits in
+  a reply by itself (a reply that cannot hold them all carries at least one and marks the others again). A
   transaction commit is not sent again (the copy would conflict with itself); the leader that answered is
   this node, which applied it, so its record is read locally. Building the reply never fails. A reply too
   large to receive anyway fails its requests with an "applied" `INVALID_REQUEST` instead of being resent.

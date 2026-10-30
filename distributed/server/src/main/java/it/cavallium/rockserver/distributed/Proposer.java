@@ -165,8 +165,9 @@ final class Proposer implements Closeable {
 		volatile long queuedNanos = System.nanoTime();
 		/**
 		 * Set when its batch's reply had no room for its result ({@link ApplyResult#RESEND_ALONE}): it took effect, and
-		 * its recorded result is fetched instead, see {@link Lane#complete}. A data write is sent again alone, and
-		 * never shares a batch again.
+		 * its recorded result is fetched instead, see {@link Lane#complete}. A data write is sent again, sharing its
+		 * batch only with other such copies: each of them only reads back its record, and a reply that cannot hold
+		 * them all carries at least one, marking the others again.
 		 */
 		volatile boolean resentAlone;
 		/** Completed only by the proposer; callers get a copy, so that cancelling theirs cannot complete this one. */
@@ -182,7 +183,7 @@ final class Proposer implements Closeable {
 
 		/** True if it goes in a batch of its own. */
 		boolean alone() {
-			return !batchable || resentAlone;
+			return !batchable;
 		}
 
 		/** Completes it with {@code result}, its final answer. */
@@ -343,7 +344,8 @@ final class Proposer implements Closeable {
 					continue;
 				}
 				if (!batch.isEmpty() && (next.alone() || batch.getFirst().alone()
-						|| next.epoch != batch.getFirst().epoch || batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES)) {
+						|| next.resentAlone != batch.getFirst().resentAlone || next.epoch != batch.getFirst().epoch
+						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES)) {
 					break;
 				}
 				queue.pollFirst();
@@ -504,8 +506,8 @@ final class Proposer implements Closeable {
 		/**
 		 * Completes each request of {@code batch} with its own result from {@code reply}. A request whose result did
 		 * not fit in the reply ({@link ApplyResult#RESEND_ALONE}) took effect, and its sequence is still in flight, so
-		 * its record is kept: a data write is sent again alone, and applying that copy returns the record, which fits
-		 * in a reply by itself. A transaction commit cannot be sent again (a copy would conflict with itself, or reach
+		 * its record is kept: a data write is sent again in a batch of such copies only, and applying a copy returns
+		 * its record, which fits in a reply by itself. A transaction commit cannot be sent again (a copy would conflict with itself, or reach
 		 * another leader), but this node's own Raft server applied it before answering: its record is read here.
 		 */
 		private void complete(List<Pending> batch, RaftClientReply reply) {
