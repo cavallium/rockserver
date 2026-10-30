@@ -2030,15 +2030,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					continue;
 				}
 				try (var arena = Arena.ofConfined()) {
-					var nativeKeys = new MemorySegment[indexes.size()];
-					var nativeValues = new MemorySegment[indexes.size()];
+					var keyBytes = new byte[indexes.size()][];
+					// Each value slot is exactly the requested size, so a longer stored value reports its requiredSize
+					var valueSizes = new long[indexes.size()];
 					for (int i = 0; i < indexes.size(); i++) {
 						int logicalIndex = indexes.get(i);
-						nativeKeys[i] = copyToNativeSegment(arena, physicalKeys[logicalIndex].bytes);
-						nativeValues[i] = arena.allocate(col.schema().hasValue()
-								? requestedValues.get(logicalIndex).size()
-								: 0);
+						keyBytes[i] = physicalKeys[logicalIndex].bytes;
+						valueSizes[i] = col.schema().hasValue() ? requestedValues.get(logicalIndex).size() : 0;
 					}
+					var nativeKeys = NativeStaging.stageKeys(arena, keyBytes);
+					var nativeValues = NativeStaging.allocateSlices(arena, valueSizes);
 					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
 					for (int i = 0; i < statuses.size(); i++) {
 						int logicalIndex = indexes.get(i);
@@ -2046,7 +2047,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						decisions[logicalIndex] = switch (status.status.getCode()) {
 							case Ok -> !col.schema().hasValue()
 									|| status.requiredSize == requestedValues.get(logicalIndex).size()
-									&& memorySegmentEquals(nativeValues[i],
+									&& NativeStaging.contentEquals(nativeValues[i],
 									requestedValues.get(logicalIndex), status.requiredSize)
 									? WriteElisionDecision.ELIDED
 									: WriteElisionDecision.FALLBACK_DIFFERENT;
@@ -2103,12 +2104,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					continue;
 				}
 				try (var arena = Arena.ofConfined()) {
-					var nativeKeys = new MemorySegment[chunk.size()];
-					var nativeValues = new MemorySegment[chunk.size()];
+					var keyBytes = new byte[chunk.size()][];
 					for (int i = 0; i < chunk.size(); i++) {
-						nativeKeys[i] = copyToNativeSegment(arena, chunk.get(i).physicalKey.bytes);
-						nativeValues[i] = arena.allocate(0);
+						keyBytes[i] = chunk.get(i).physicalKey.bytes;
 					}
+					var nativeKeys = NativeStaging.stageKeys(arena, keyBytes);
+					// Size-only pass: one shared zero-capacity value segment
+					var nativeValues = new MemorySegment[chunk.size()];
+					Arrays.fill(nativeValues, arena.allocate(0));
 					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
 					for (int i = 0; i < statuses.size(); i++) {
 						var group = chunk.get(i);
@@ -2148,13 +2151,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					offset++;
 				}
 				try (var arena = Arena.ofConfined()) {
-					var nativeKeys = new MemorySegment[chunk.size()];
-					var nativeValues = new MemorySegment[chunk.size()];
+					var keyBytes = new byte[chunk.size()][];
+					var valueSizes = new long[chunk.size()];
 					for (int i = 0; i < chunk.size(); i++) {
 						var group = chunk.get(i);
-						nativeKeys[i] = copyToNativeSegment(arena, group.physicalKey.bytes);
-						nativeValues[i] = arena.allocate(group.requiredSize);
+						keyBytes[i] = group.physicalKey.bytes;
+						valueSizes[i] = group.requiredSize;
 					}
+					var nativeKeys = NativeStaging.stageKeys(arena, keyBytes);
+					var nativeValues = NativeStaging.allocateSlices(arena, valueSizes);
 					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
 					for (int i = 0; i < statuses.size(); i++) {
 						var group = chunk.get(i);
@@ -2224,22 +2229,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private static MemorySegment copyToNativeSegment(Arena arena, byte[] value) {
-		return arena.allocateFrom(ValueLayout.JAVA_BYTE, value);
-	}
-
-	private static MemorySegment copyToNativeSegment(Arena arena, Buf value) {
-		var segment = arena.allocate(value.size());
-		byte[] array = value.getBackingByteArrayStrict();
-		if (array != null) {
-			MemorySegment.copy(array, value.getBackingByteArrayOffset(), segment,
-					ValueLayout.JAVA_BYTE, 0, value.size());
-		} else {
-			MemorySegment.copy(value.asMemorySegment(), 0, segment, 0, value.size());
-		}
-		return segment;
-	}
-
 	/**
 	 * The bytes of {@code value} for a JNI call that only reads them during the call: the backing array itself when
 	 * it is exact, a copy otherwise. Never store the result, since it may alias the caller's buffer.
@@ -2247,18 +2236,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private static byte[] jniArray(Buf value) {
 		byte[] array = value.asArrayStrict();
 		return array != null ? array : value.toByteArray();
-	}
-
-	private static boolean memorySegmentEquals(MemorySegment actual, Buf expected, int length) {
-		if (length != expected.size() || actual.byteSize() < length) {
-			return false;
-		}
-		for (int i = 0; i < length; i++) {
-			if (actual.get(ValueLayout.JAVA_BYTE, i) != expected.getByte(i)) {
-				return false;
-			}
-		}
-		return true;
 	}
 
 	private static byte[] copyMemorySegment(MemorySegment source, int length) {
@@ -6800,14 +6777,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (arenaObserver != null) {
 				arenaObserver.accept(true);
 			}
-			var nativeKeys = new MemorySegment[calculatedKeys.size()];
+			// One native block for all keys, sliced per key
+			var nativeKeys = NativeStaging.stageKeys(arena, calculatedKeys);
 			var emptyValues = new MemorySegment[calculatedKeys.size()];
 			// The MemorySegment overload creates a distinct ByteBuffer per entry; zero capacity prevents writes.
-			var emptyValue = arena.allocate(0);
-			for (int i = 0; i < calculatedKeys.size(); i++) {
-				nativeKeys[i] = copyToNativeSegment(arena, calculatedKeys.get(i));
-				emptyValues[i] = emptyValue;
-			}
+			Arrays.fill(emptyValues, arena.allocate(0));
 
 			var nativeDb = db.get();
 			var columnHandles = List.of(col.cfh());

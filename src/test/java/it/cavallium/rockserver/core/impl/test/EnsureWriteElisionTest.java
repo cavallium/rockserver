@@ -27,7 +27,9 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.SplittableRandom;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -321,6 +323,60 @@ class EnsureWriteElisionTest {
 	}
 
 	@Test
+	void multiProbeComparesWholeValuesInAdjacentStagingSlots() {
+		long columnId = api.createColumn("adjacent-slots", fixedSchema(true));
+		var random = new SplittableRandom(11);
+		var keys = new ArrayList<Keys>();
+		var stored = new ArrayList<Buf>();
+		var requested = new ArrayList<Buf>();
+		int expectedElided = 0;
+		int expectedDifferent = 0;
+		int keyId = 0;
+		for (int size : new int[] {0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 512, 1536, 3072}) {
+			byte[] bytes = randomBytes(random, size);
+			// Equal
+			keys.add(intKey(keyId++));
+			stored.add(Buf.wrap(bytes.clone()));
+			requested.add(Buf.wrap(bytes.clone()));
+			expectedElided++;
+			// The stored value is longer than its slot: the requiredSize mismatch must not bleed into the next slot
+			keys.add(intKey(keyId++));
+			stored.add(Buf.wrap(Arrays.copyOf(bytes, size + 1)));
+			requested.add(Buf.wrap(bytes.clone()));
+			expectedDifferent++;
+			if (size > 0) {
+				// Same length, differs only in the last byte or only in the first byte
+				for (int position : new int[] {size - 1, 0}) {
+					var different = bytes.clone();
+					different[position] ^= 0x5A;
+					keys.add(intKey(keyId++));
+					stored.add(Buf.wrap(different));
+					requested.add(Buf.wrap(bytes.clone()));
+					expectedDifferent++;
+				}
+				// The stored value is shorter than the requested one
+				keys.add(intKey(keyId++));
+				stored.add(Buf.wrap(Arrays.copyOf(bytes, size - 1)));
+				requested.add(Buf.wrap(bytes.clone()));
+				expectedDifferent++;
+			}
+		}
+		for (int i = 0; i < keys.size(); i++) {
+			api.put(0, columnId, keys.get(i), stored.get(i), RequestType.none());
+		}
+		var probeCalls = new ArrayList<ProbeCall>();
+		embeddedDB.setWriteElisionMultiGetObserverForTesting((count, bytes) -> probeCalls.add(new ProbeCall(count, bytes)));
+
+		assertTrue(api.putMulti(0, columnId, keys, requested, RequestType.ensure()).isEmpty());
+		assertEquals(1, probeCalls.size(), "every entry must be probed in a single native call");
+		assertEquals(expectedElided, decisionCount("ensure", "elided"));
+		assertEquals(expectedDifferent, decisionCount("ensure", "fallback_different"));
+		for (int i = 0; i < keys.size(); i++) {
+			assertValue(requested.get(i), api.get(0, columnId, keys.get(i), RequestType.current()));
+		}
+	}
+
+	@Test
 	void previousPresenceUsesTheSameHotEqualityElision() {
 		long columnId = api.createColumn("previous-presence", fixedSchema(true));
 		var key = intKey(1);
@@ -360,6 +416,14 @@ class EnsureWriteElisionTest {
 	private static Keys bucketKey(int fixed, String variable) {
 		return new Keys(Buf.wrap(new byte[]{(byte) fixed}),
 				Buf.wrap(variable.getBytes(StandardCharsets.UTF_8)));
+	}
+
+	private static byte[] randomBytes(SplittableRandom random, int length) {
+		var bytes = new byte[length];
+		for (int i = 0; i < length; i++) {
+			bytes[i] = (byte) random.nextInt(256);
+		}
+		return bytes;
 	}
 
 	private static Buf value(String value) {
