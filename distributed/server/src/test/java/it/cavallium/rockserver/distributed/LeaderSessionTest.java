@@ -202,7 +202,7 @@ class LeaderSessionTest {
 
 	/** Admits the commit of {@code update} that writes {@code write} and returns its link, null if it gave none. */
 	private LeaderSession.ChainLink admit(LeaderSession.OpenTransaction update, LogEntry.Write write) {
-		var entry = update.updateEntry(3, write, List.of(CHAIN_KEY));
+		var entry = update.updateEntry(3, write, List.of(CHAIN_KEY), true);
 		var token = chain.tracker().register(entry);
 		var links = chain.admitted(List.of(new Request(1, 1, 0, entry)), token);
 		return links == null ? null : links.getFirst();
@@ -492,7 +492,7 @@ class LeaderSessionTest {
 		var link = admit(open(lock().join()), "one");
 		var chained = open(lock().join());
 		var entry = chained.updateEntry(3, new LogEntry.Put(1, CHAIN_KEY, text("two"), RequestTypeId.NOTHING),
-				List.of(CHAIN_KEY));
+				List.of(CHAIN_KEY), true);
 		assertEquals(link.guard().length(), entry.guard().length());
 		assertEquals(new ConflictTracker.ChainCheck(1, HASH, link.token), chain.chainCheck(entry));
 		assertTrue(chain.tracker().conflicts(List.of((LogEntry) entry), chain::chainCheck).isEmpty());
@@ -508,7 +508,7 @@ class LeaderSessionTest {
 		admit(open(lock().join()), "one");
 		var chained = open(lock().join());
 		var entry = chained.updateEntry(3, new LogEntry.Put(1, CHAIN_KEY, text("two"), RequestTypeId.NOTHING),
-				List.of(CHAIN_KEY));
+				List.of(CHAIN_KEY), true);
 		chain.remove(chained);
 		assertEquals(null, chain.chainCheck(entry));
 	}
@@ -603,7 +603,8 @@ class LeaderSessionTest {
 		var lock = session.lockKey(KEY).join();
 		var update = session.register(session.reserve(applied), -5, true, lock, LEASE_NANOS);
 		var next = session.lockKey(KEY);
-		var entry = update.updateEntry(3, new LogEntry.Put(1, key("x"), text("v"), RequestTypeId.NOTHING), List.of(key("x")));
+		var entry = update.updateEntry(3, new LogEntry.Put(1, key("x"), text("v"), RequestTypeId.NOTHING), List.of(key("x")),
+				true);
 		assertEquals(-5, entry.updateId());
 		assertEquals(null, session.admitted(List.of(new Request(1, 1, 0, entry)), session.tracker().register(entry)));
 		assertFalse(next.isDone(), "the key waits for the end of the update");

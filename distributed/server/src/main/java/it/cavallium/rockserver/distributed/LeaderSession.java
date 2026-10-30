@@ -215,8 +215,11 @@ final class LeaderSession {
 					writes, false);
 		}
 
-		/** The commit entry of an update: its single final write, returning that write's result. */
-		synchronized LogEntry.Guarded updateEntry(long term, LogEntry.Write write, List<Keys> keys) {
+		/**
+		 * The commit entry of an update: its single final write, returning that write's result. Only a {@code pipelined}
+		 * leader needs the entry to carry the update's id, in {@link #admitted}.
+		 */
+		synchronized LogEntry.Guarded updateEntry(long term, LogEntry.Write write, List<Keys> keys, boolean pipelined) {
 			var columns = new LongArrayList(conflictColumns);
 			var hashes = new LongArrayList(conflictHashes);
 			for (Keys key : keys) {
@@ -224,7 +227,7 @@ final class LeaderSession {
 				hashes.add(ConflictTracker.keyHash(write.columnId(), key));
 			}
 			return new LogEntry.Guarded(term, snapshotIndex, columns.toLongArray(), hashes.toLongArray(), List.of(write),
-					true, id, base != null ? base.guard() : null);
+					true, pipelined ? id : 0, base != null ? base.guard() : null);
 		}
 
 		boolean isExpired(long nowNanos) {

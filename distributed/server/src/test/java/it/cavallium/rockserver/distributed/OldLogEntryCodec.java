@@ -313,10 +313,12 @@ final class OldLogEntryCodec {
 		for (LogEntry.Write write : guarded.writes()) {
 			writeWrite(out, write);
 		}
-		out.writeBoolean(guarded.singleResult());
-		out.writeLong(guarded.updateId());
+		long updateId = guarded.updateId();
 		var guard = guarded.guard();
-		out.writeBoolean(guard != null);
+		out.writeByte((guarded.singleResult() ? 1 : 0) | (updateId != 0 ? 2 : 0) | (guard != null ? 4 : 0));
+		if (updateId != 0) {
+			out.writeLong(updateId);
+		}
 		if (guard != null) {
 			out.writeLong(guard.columnId());
 			writeKeys(out, guard.keys());
@@ -327,8 +329,8 @@ final class OldLogEntryCodec {
 		}
 	}
 
-	/** Encoded size of a {@link LogEntry.Guarded} body without conflict keys, writes and guard. */
-	static final int GUARDED_BASE_BYTES = 1 + 2 * Long.BYTES + 2 * Integer.BYTES + 1 + Long.BYTES + 1;
+	/** Encoded size of a {@link LogEntry.Guarded} body without conflict keys, writes, update id and guard. */
+	static final int GUARDED_BASE_BYTES = 1 + 2 * Long.BYTES + 2 * Integer.BYTES + 1;
 	/** Encoded size of one conflict key of a {@link LogEntry.Guarded}: its column id and key hash. */
 	static final int CONFLICT_KEY_BYTES = 2 * Long.BYTES;
 
@@ -525,10 +527,14 @@ final class OldLogEntryCodec {
 		for (int i = 0; i < writeCount; i++) {
 			writes.add(readWrite(in, in.readByte()));
 		}
-		boolean singleResult = in.readBoolean();
-		long updateId = in.readLong();
+		int flags = in.readByte() & 0xFF;
+		if ((flags & ~7) != 0) {
+			throw new IllegalArgumentException("Unknown guarded entry flags: " + flags);
+		}
+		boolean singleResult = (flags & 1) != 0;
+		long updateId = (flags & 2) != 0 ? in.readLong() : 0;
 		LogEntry.Guard guard = null;
-		if (in.readBoolean()) {
+		if ((flags & 4) != 0) {
 			long columnId = in.readLong();
 			var keys = readKeys(in);
 			int length = in.readInt();

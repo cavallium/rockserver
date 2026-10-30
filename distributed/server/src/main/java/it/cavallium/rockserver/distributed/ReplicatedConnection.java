@@ -919,7 +919,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 				session.remove(transaction);
 				throw new RocksDBRetryException();
 			}
-			var entry = transaction.updateEntry(session.term(), write, keys);
+			var entry = transaction.updateEntry(session.term(), write, keys, session.pipelined());
 			return commit(context, session, transaction, entry).handle((result, error) -> {
 				session.remove(transaction);
 				rollBackNativeQuietly(transaction.id, true);

@@ -150,6 +150,9 @@ class LogEntryCodecTest {
 				for (LogEntry.Write write : guarded.writes()) {
 					size += LogEntryCodec.writeSize(write);
 				}
+				if (guarded.updateId() != 0) {
+					size += Long.BYTES;
+				}
 				if (guarded.guard() != null) {
 					size += LogEntryCodec.guardSize(guarded.guard());
 				}
@@ -316,8 +319,7 @@ class LogEntryCodecTest {
 		byte[] keyList = LogEntryCodec.encode(new DeleteMulti(1, List.of(), RequestTypeId.NOTHING));
 		// version, tag, column id (8), key segment count (4), request type
 		byte[] segments = LogEntryCodec.encode(new Delete(1, new Keys(), RequestTypeId.NOTHING));
-		// version, tag, epoch (8), snapshot index (8), conflict count (4), write count (4), single result, update id
-		// (8), guard flag
+		// version, tag, epoch (8), snapshot index (8), conflict count (4), write count (4), flags
 		byte[] guarded = LogEntryCodec.encode(new Guarded(1, 2, new long[0], new long[0], List.of(), false));
 		for (int size : new int[] {-1, 1, Integer.MAX_VALUE, Integer.MIN_VALUE}) {
 			assertRejected(withInt(keyList, 10, size), "key list size " + size);
@@ -332,9 +334,8 @@ class LogEntryCodecTest {
 		var write = new DeleteMulti(1, List.of(new Keys()), RequestTypeId.NOTHING);
 		byte[] encoded = LogEntryCodec.encode(new Guarded(1, 2, new long[0], new long[0], List.of(write), false));
 		// version, tag, epoch (8), snapshot index (8), conflict count (4), write count (4), write tag,
-		// column id (8), key list size (4), key segment count (4), request type, single result, update id (8), guard
-		// flag
-		assertEquals(54, encoded.length);
+		// column id (8), key list size (4), key segment count (4), request type, flags
+		assertEquals(45, encoded.length);
 		int size = 1 << 22;
 		var buffer = ByteBuffer.allocate(size);
 		buffer.put(encoded, 0, 43);
@@ -504,10 +505,36 @@ class LogEntryCodecTest {
 
 		// A decoder never returns one of those either: a guard without an update id is malformed.
 		byte[] encoded = LogEntryCodec.encode(new Guarded(1, 2, new long[0], new long[0], List.of(write), true, 7, guard));
-		int updateIdAt = encoded.length - (int) LogEntryCodec.guardSize(guard) - 1 - Long.BYTES;
+		int updateIdAt = encoded.length - (int) LogEntryCodec.guardSize(guard) - Long.BYTES;
 		byte[] noId = encoded.clone();
 		ByteBuffer.wrap(noId).putLong(updateIdAt, 0);
-		assertRejected(noId, "guard without an update id");
+		assertRejected(noId, "an explicit update id of 0");
+		byte[] guardWithoutId = encoded.clone();
+		guardWithoutId[updateIdAt - 1] &= ~2;
+		assertRejected(guardWithoutId, "the flag of a guard, without an update id");
+		byte[] unknown = encoded.clone();
+		unknown[updateIdAt - 1] |= 8;
+		assertRejected(unknown, "unknown flags");
+	}
+
+	/** What a cluster with pipelined updates off writes keeps its bytes, so a log from before them still reads. */
+	@Test
+	void anEntryWithoutUpdateIdOrGuardEndsWithTheSingleResultBoolean() {
+		var write = new Put(1, keys("k"), buf("v"), RequestTypeId.NOTHING);
+		for (boolean singleResult : new boolean[] {false, true}) {
+			var entry = new Guarded(1, 2, new long[0], new long[0], List.of(write), singleResult);
+			byte[] encoded = LogEntryCodec.encodeEntryBody(entry);
+			assertEquals(singleResult ? 1 : 0, encoded[encoded.length - 1]);
+			assertEquals(LogEntryCodec.GUARDED_BASE_BYTES + LogEntryCodec.writeSize(write), encoded.length);
+		}
+	}
+
+	@Test
+	void anUpdateIdTakesItsBytesOnlyWhereItIsSet() {
+		var write = new Put(1, keys("k"), buf("v"), RequestTypeId.NOTHING);
+		long without = LogEntryCodec.entrySize(new Guarded(1, 2, new long[0], new long[0], List.of(write), true));
+		long with = LogEntryCodec.entrySize(new Guarded(1, 2, new long[0], new long[0], List.of(write), true, 5, null));
+		assertEquals(Long.BYTES, with - without);
 	}
 
 	@Test

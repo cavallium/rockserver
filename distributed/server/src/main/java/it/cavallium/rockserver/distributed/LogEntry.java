@@ -127,8 +127,8 @@ public sealed interface LogEntry {
 	 * @param conflictHashes {@link ConflictTracker#keyHash} of each conflict key
 	 * @param writes the writes, applied in order
 	 * @param singleResult true to return the result of the only write (update commit), false to return true
-	 * @param updateId the update's id on its leader, non-zero on every update commit, 0 otherwise. Only that leader
-	 *                 uses it: apply ignores it
+	 * @param updateId the update's id on its leader, on the update commits of a leader with pipelined updates, and 0
+	 *                 otherwise. Only that leader uses it, to find the update once the commit is admitted: apply ignores it
 	 * @param guard what a chained update read, null for every other entry
 	 */
 	record Guarded(long leaderEpoch,

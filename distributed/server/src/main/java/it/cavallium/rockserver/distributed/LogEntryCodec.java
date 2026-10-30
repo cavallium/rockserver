@@ -31,6 +31,12 @@ import org.jetbrains.annotations.Nullable;
  * Numbers are big-endian and fixed width, as written by {@link java.io.DataOutputStream}. A byte string is an int
  * length followed by the bytes; a nullable value uses length -1 for null. A string is a byte string of UTF-8. A list
  * is an int count followed by the elements. A nullable non-byte-string field is preceded by a presence boolean.</p>
+ *
+ * <p>A {@link LogEntry.Guarded} ends with one flags byte, then its optional fields. Without an update id and a guard,
+ * so on every entry of a cluster with pipelined updates off, that byte is what used to be a boolean, 0 or 1: such
+ * entries, and logs written before the flags existed, keep their bytes, and the version did not change. A node that
+ * does not know these flags fails on an entry that has them, so every node must run a version that does before the
+ * option is turned on anywhere.</p>
  */
 final class LogEntryCodec {
 
@@ -50,6 +56,14 @@ final class LogEntryCodec {
 	private static final byte GUARDED = 12;
 	private static final byte GENESIS = 13;
 	private static final byte VERIFY_COLUMN = 14;
+
+	/** Flags of a {@link LogEntry.Guarded}: {@link LogEntry.Guarded#singleResult()}. */
+	private static final int GUARDED_SINGLE_RESULT = 1;
+	/** Flags of a {@link LogEntry.Guarded}: a {@link LogEntry.Guarded#updateId()} follows; it is not 0. */
+	private static final int GUARDED_UPDATE_ID = 1 << 1;
+	/** Flags of a {@link LogEntry.Guarded}: a {@link LogEntry.Guard} follows. */
+	private static final int GUARDED_GUARD = 1 << 2;
+	private static final int GUARDED_FLAGS = GUARDED_SINGLE_RESULT | GUARDED_UPDATE_ID | GUARDED_GUARD;
 
 	/**
 	 * Request type of each code: the code is the index. Append only; never reorder. An explicit table instead of
@@ -336,10 +350,14 @@ final class LogEntryCodec {
 		for (LogEntry.Write write : guarded.writes()) {
 			writeWrite(out, write);
 		}
-		out.writeBoolean(guarded.singleResult());
-		out.writeLong(guarded.updateId());
+		long updateId = guarded.updateId();
 		var guard = guarded.guard();
-		out.writeBoolean(guard != null);
+		out.writeByte((guarded.singleResult() ? GUARDED_SINGLE_RESULT : 0)
+				| (updateId != 0 ? GUARDED_UPDATE_ID : 0)
+				| (guard != null ? GUARDED_GUARD : 0));
+		if (updateId != 0) {
+			out.writeLong(updateId);
+		}
 		if (guard != null) {
 			out.writeLong(guard.columnId());
 			writeKeys(out, guard.keys());
@@ -350,8 +368,8 @@ final class LogEntryCodec {
 		}
 	}
 
-	/** Encoded size of a {@link LogEntry.Guarded} body without conflict keys, writes and guard. */
-	static final int GUARDED_BASE_BYTES = 1 + 2 * Long.BYTES + 2 * Integer.BYTES + 1 + Long.BYTES + 1;
+	/** Encoded size of a {@link LogEntry.Guarded} body without conflict keys, writes, update id and guard. */
+	static final int GUARDED_BASE_BYTES = 1 + 2 * Long.BYTES + 2 * Integer.BYTES + 1;
 	/** Encoded size of one conflict key of a {@link LogEntry.Guarded}: its column id and key hash. */
 	static final int CONFLICT_KEY_BYTES = 2 * Long.BYTES;
 
@@ -372,6 +390,9 @@ final class LogEntryCodec {
 				long size = GUARDED_BASE_BYTES + (long) guarded.conflictColumns().length * CONFLICT_KEY_BYTES;
 				for (LogEntry.Write write : guarded.writes()) {
 					size += writeSize(write);
+				}
+				if (guarded.updateId() != 0) {
+					size += Long.BYTES;
 				}
 				if (guarded.guard() != null) {
 					size += guardSize(guarded.guard());
@@ -587,9 +608,20 @@ final class LogEntryCodec {
 		for (int i = 0; i < writeCount; i++) {
 			writes.add(readWrite(in, in.readByte()));
 		}
-		boolean singleResult = in.readBoolean();
-		long updateId = in.readLong();
-		var guard = in.readBoolean() ? readGuard(in) : null;
+		int flags = in.readByte() & 0xFF;
+		if ((flags & ~GUARDED_FLAGS) != 0) {
+			throw new IllegalArgumentException("Unknown guarded entry flags: " + flags + ", from a newer version?");
+		}
+		long updateId = 0;
+		if ((flags & GUARDED_UPDATE_ID) != 0) {
+			updateId = in.readLong();
+			if (updateId == 0) {
+				// Equal entries encode to equal bytes: 0 has only one encoding.
+				throw new IllegalArgumentException("Explicit update id 0");
+			}
+		}
+		boolean singleResult = (flags & GUARDED_SINGLE_RESULT) != 0;
+		var guard = (flags & GUARDED_GUARD) != 0 ? readGuard(in) : null;
 		// The constructor rejects inconsistent combinations with IllegalArgumentException
 		return new LogEntry.Guarded(leaderEpoch, snapshotIndex, columns, hashes, writes, singleResult, updateId, guard);
 	}
