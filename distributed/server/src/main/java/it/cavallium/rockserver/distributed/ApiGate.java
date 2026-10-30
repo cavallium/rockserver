@@ -6,7 +6,7 @@ import java.time.Duration;
  * Decides whether a node serves its API, from whether it knows a leader.
  *
  * <p>A client leaves a node only when its transport is lost, and a node cut off from the Raft majority still answers
- * HTTP/2 and keepalive while every request fails. So a node that once knew a leader and has had none for
+ * HTTP/2 and keepalive while every request fails. So a node that has known a leader and has had none for
  * {@value #ELECTION_TIMEOUTS_TO_PAUSE} maximum election timeouts, and at least {@link #MIN_PAUSE_AFTER}, stops serving: its
  * clients move to their next address. Raft runs on its own port, so the node keeps taking part in elections, and it serves again by itself once it knows a
  * leader, also after a period when no node of the cluster had one.</p>
@@ -14,9 +14,16 @@ import java.time.Duration;
  * <p>A node without a leader for that long is not in a normal election. A node loses its leader when its election timer
  * fires, and a round of voting lasts at most one election timeout, so the bound leaves room for three rounds, two of them
  * lost to a split vote. The minimum is for a node that stopped for a moment (a long GC pause, SIGSTOP): a leader that got
- * no answer from a follower for that long waits up to 5 s before it tries again (Ratis' default appender retry policy,
- * {@code 1ms,10, 1s,20, 5s,1000}), and the node has no leader until then. A node that only just started has never known
- * a leader, and is not judged by this: a cluster that is still forming has nothing better to offer its clients.</p>
+ * no answer from a follower for that long sleeps before it tries again, up to
+ * {@link RaftSettings#APPENDER_RETRY_LONGEST_SLEEP}, and the node has no leader until then. The minimum is twice that
+ * sleep, so that one more try fits in it if the first one is lost.</p>
+ *
+ * <p>The state of the gate is in memory, but whether a leader existed is not: a node that restarts with what a leader
+ * left behind has known one, and it is judged from its start, or a restart while cut off from the majority would keep
+ * its clients on a node that cannot serve them. Then a whole cluster that starts together pauses until it elects a
+ * leader, which costs nothing: none of its nodes can serve before that, and elections and everything else that forms the
+ * cluster use the Raft ports. Only a node that never had any of that, the member of a new cluster, is not judged: a
+ * cluster that is still forming has nothing better to offer its clients.</p>
  *
  * <p>A node must keep knowing a leader for {@value #ELECTION_TIMEOUTS_TO_RESUME} maximum election timeout to serve
  * again. Its leader was then confirmed by a heartbeat: without one, its election timer would have fired and cleared it.
@@ -26,8 +33,8 @@ import java.time.Duration;
 final class ApiGate {
 
 	static final int ELECTION_TIMEOUTS_TO_PAUSE = 3;
-	/** The longest wait of Ratis' appender retry policy, and a margin for a loaded machine. */
-	static final Duration MIN_PAUSE_AFTER = Duration.ofSeconds(6);
+	/** The longest sleep of the leader before it tries a stopped follower again, and the same again as a margin. */
+	static final Duration MIN_PAUSE_AFTER = RaftSettings.APPENDER_RETRY_LONGEST_SLEEP.multipliedBy(2);
 	static final int ELECTION_TIMEOUTS_TO_RESUME = 1;
 
 	private final long pauseAfterNanos;
@@ -37,15 +44,21 @@ final class ApiGate {
 	private boolean knowsLeader;
 	private long sinceNanos;
 
-	ApiGate(Duration pauseAfter, Duration resumeAfter) {
+	/**
+	 * @param knewLeader whether a leader existed before this start
+	 * @param startNanos the time of this start, from which the bound counts until the first observation of a leader
+	 */
+	ApiGate(Duration pauseAfter, Duration resumeAfter, boolean knewLeader, long startNanos) {
 		this.pauseAfterNanos = pauseAfter.toNanos();
 		this.resumeAfterNanos = resumeAfter.toNanos();
+		this.everKnewLeader = knewLeader;
+		this.sinceNanos = startNanos;
 	}
 
-	static ApiGate forElectionTimeout(Duration electionTimeoutMax) {
+	static ApiGate forElectionTimeout(Duration electionTimeoutMax, boolean knewLeader, long startNanos) {
 		var pauseAfter = electionTimeoutMax.multipliedBy(ELECTION_TIMEOUTS_TO_PAUSE);
 		return new ApiGate(pauseAfter.compareTo(MIN_PAUSE_AFTER) < 0 ? MIN_PAUSE_AFTER : pauseAfter,
-				electionTimeoutMax.multipliedBy(ELECTION_TIMEOUTS_TO_RESUME));
+				electionTimeoutMax.multipliedBy(ELECTION_TIMEOUTS_TO_RESUME), knewLeader, startNanos);
 	}
 
 	/** Takes the current observation and tells whether the node should serve now. */

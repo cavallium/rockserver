@@ -20,6 +20,20 @@ final class RaftSettings {
 	 * size); {@link RaftLogRepair} reads with the same limit.
 	 */
 	static final SizeInBytes LOG_ENTRY_SIZE_MAX = SizeInBytes.valueOf(MAX_ENTRY_BYTES + (1 << 20));
+	/** The last and longest step of {@link #APPENDER_RETRY_POLICY}. */
+	private static final Duration APPENDER_RETRY_LAST_STEP = Duration.ofSeconds(2);
+	/**
+	 * What the leader's appender sleeps after failures to reach a follower: pairs of a step and how many failures use
+	 * it, in the format of Ratis' MultipleLinearRandomRetry. Ratis' default, {@code 1ms,10, 1s,20, 5s,1000}, can leave a
+	 * follower that stopped for a moment without a leader for 7.5 s, and {@link ApiGate} must wait out that sleep.
+	 *
+	 * <p>The count of the last step is that high on purpose: a follower must not reach the end of the policy, where Ratis
+	 * no longer sleeps and retries a dead follower with only the heartbeat wait between attempts. With its default
+	 * policy that happens to a follower down for about 80 minutes.</p>
+	 */
+	static final String APPENDER_RETRY_POLICY = "1ms,10, 1s,20, " + APPENDER_RETRY_LAST_STEP.toSeconds() + "s,1000000000";
+	/** Ratis multiplies each step by a random number from 0.5 to 1.5, so a sleep can reach 1.5 times the step. */
+	static final Duration APPENDER_RETRY_LONGEST_SLEEP = APPENDER_RETRY_LAST_STEP.multipliedBy(3).dividedBy(2);
 
 	private RaftSettings() {}
 
@@ -96,6 +110,7 @@ final class RaftSettings {
 		RaftServerConfigKeys.Log.setPurgePreservationLogNum(properties, config.snapshotEveryEntries());
 		// Allow the snapshot requested right after a seeded genesis, whatever the gap since the last one.
 		RaftServerConfigKeys.Snapshot.setCreationGap(properties, 1);
+		RaftServerConfigKeys.Log.Appender.setRetryPolicy(properties, APPENDER_RETRY_POLICY);
 		RaftServerConfigKeys.Log.Appender.setInstallSnapshotEnabled(properties, true);
 		RaftServerConfigKeys.Log.Appender.setSnapshotChunkSizeMax(properties, SizeInBytes.valueOf("8MB"));
 		return properties;

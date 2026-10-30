@@ -105,7 +105,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			started.add(apiServer);
 			this.maintenance = Executors.newSingleThreadScheduledExecutor(
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-maintenance").factory());
-			this.apiGate = ApiGate.forElectionTimeout(config.electionTimeoutMax());
+			this.apiGate = ApiGate.forElectionTimeout(config.electionTimeoutMax(), hadLeaderBeforeStart(), System.nanoTime());
 			maintenance.scheduleWithFixedDelay(this::initializeCluster, 0, MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 			maintenance.scheduleWithFixedDelay(this::gateApi, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
@@ -185,6 +185,18 @@ public final class ReplicatedNode implements AutoCloseable {
 		} catch (Exception ex) {
 			LOG.warn("{}: cluster initialization attempt failed, retrying", config.nodeId(), ex);
 		}
+	}
+
+	/**
+	 * Whether this node holds what a leader left: only a leader writes the Raft log, and it starts its term with an
+	 * entry. The cluster id alone does not tell: a node killed soon after genesis can lose it from its database (the
+	 * WAL is buffered), and gets it back from the log only once it knows a leader. The log alone does not either: it can
+	 * be empty after a purge, on a node that holds a snapshot.
+	 */
+	private boolean hadLeaderBeforeStart() {
+		var division = stateMachine.division();
+		return stateMachine.store().clusterId() != null
+				|| (division != null && division.getRaftLog().getNextIndex() > 0);
 	}
 
 	/** Stops serving clients while the node is cut off from a leader (see {@link ApiGate}). */

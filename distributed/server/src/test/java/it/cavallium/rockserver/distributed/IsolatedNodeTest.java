@@ -26,6 +26,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -75,6 +76,115 @@ class IsolatedNodeTest {
 		runIsolating(MEMBERS.stream().filter(id -> !id.equals(leader)).findFirst().orElseThrow());
 	}
 
+	/**
+	 * A node restarted while cut off from the majority has seen no leader since it started, and its port accepts
+	 * connections: it pauses all the same, and the client that lists it first moves to a node that works.
+	 */
+	@Test
+	void aClientLeavesAFollowerRestartedWhileCutOff() throws Exception {
+		startCluster(SERVER_ARGS);
+		var leader = awaitLeader(cluster);
+		var victim = MEMBERS.stream().filter(id -> !id.equals(leader)).findFirst().orElseThrow();
+		var order = new ArrayList<>(List.of(victim));
+		MEMBERS.stream().filter(id -> !id.equals(victim)).forEach(order::add);
+		var addresses = order.stream().map(cluster::apiAddress).toList();
+		int victimPort = cluster.apiAddress(victim).port();
+
+		long column;
+		try (var setup = GrpcConnection.forHostsAndPorts("restarted-setup-client", addresses)) {
+			column = setup.getAsyncApi(SETUP).createColumnAsync("data", SCHEMA).join();
+		}
+		cluster.kill(victim);
+		cluster.network().isolate(victim);
+		cluster.start(victim);
+		cluster.waitReady(victim, READY_TIMEOUT);
+
+		try (var connection = GrpcConnection.forHostsAndPorts("restarted-client", addresses)) {
+			var api = connection.getAsyncApi(CONTEXT);
+			awaitWorks(api, column);
+			assertNotEquals(victimPort, remotePort(connection));
+			assertFalse(serves(victim), "the isolated node still listens");
+
+			cluster.network().heal();
+			await(() -> serves(victim), "the node to serve again");
+		}
+	}
+
+	/** Every node goes away at once, and comes back at once: it has no leader for a while, and must serve again. */
+	@Test
+	void aKilledClusterRestartedAtOnceServesAgain() throws Exception {
+		restartWholeCluster(ProcessCluster::killAll);
+	}
+
+	@Test
+	void aStoppedClusterRestartedAtOnceServesAgain() throws Exception {
+		restartWholeCluster(stopped -> MEMBERS.forEach(stopped::stop));
+	}
+
+	private void restartWholeCluster(Consumer<ProcessCluster> stop) throws Exception {
+		startCluster(SERVER_ARGS);
+		awaitLeader(cluster);
+		var addresses = MEMBERS.stream().map(cluster::apiAddress).toList();
+		long column;
+		try (var setup = GrpcConnection.forHostsAndPorts("restart-setup-client", addresses)) {
+			column = setup.getAsyncApi(SETUP).createColumnAsync("data", SCHEMA).join();
+			setup.getAsyncApi(CONTEXT).putAsync(0, column, key(1), Buf.wrap(new byte[] {1}), RequestType.none()).join();
+		}
+		stop.accept(cluster);
+		for (var id : MEMBERS) {
+			cluster.start(id);
+		}
+		cluster.waitReady(READY_TIMEOUT);
+		await(() -> MEMBERS.stream().allMatch(this::serves), "every node to serve");
+		try (var connection = GrpcConnection.forHostsAndPorts("restart-client", addresses)) {
+			var api = connection.getAsyncApi(CONTEXT);
+			awaitWorks(api, column);
+			assertEquals(Buf.wrap(new byte[] {1}), api.getAsync(0, column, key(1), RequestType.current()).join());
+		}
+	}
+
+	/**
+	 * Node 1 restarts alone and pauses, with no majority to find. A second node is then needed for a leader, and the
+	 * first takes part in that election and serves again: nothing that forms a cluster uses the API port.
+	 */
+	@Test
+	void aPausedNodeTakesPartInTheElection() throws Exception {
+		startCluster(SERVER_ARGS);
+		awaitLeader(cluster);
+		cluster.killAll();
+		cluster.start("1");
+		cluster.waitReady("1", READY_TIMEOUT);
+		await(() -> !serves("1"), "the node alone to pause");
+
+		cluster.start("2");
+		cluster.waitReady("2", READY_TIMEOUT);
+		awaitLeader(cluster, List.of("1", "2"));
+		await(() -> serves("1"), "the node to serve again");
+	}
+
+	/** A member of a cluster that never formed has known no leader: it does not pause, however long it waits. */
+	@Test
+	void aNodeOfANewClusterDoesNotPause() throws Exception {
+		cluster = ProcessCluster.create(root.resolve("cluster"), 3, 0, SERVER_ARGS);
+		cluster.start("1");
+		cluster.waitReady("1", READY_TIMEOUT);
+		long end = System.nanoTime() + ApiGate.MIN_PAUSE_AFTER.plusSeconds(2).toNanos();
+		while (System.nanoTime() - end < 0) {
+			assertTrue(serves("1"), "the node paused");
+			Thread.sleep(50);
+		}
+
+		cluster.start("2");
+		cluster.start("3");
+		cluster.waitReady(READY_TIMEOUT);
+		awaitLeader(cluster);
+		try (var connection = GrpcConnection.forHostsAndPorts("new-cluster-client",
+				MEMBERS.stream().map(cluster::apiAddress).toList())) {
+			awaitWorks(connection.getAsyncApi(CONTEXT),
+					connection.getAsyncApi(SETUP).createColumnAsync("data", SCHEMA).join());
+		}
+	}
+
 	/** Every node pauses, a leader appears, every node resumes, and the client's connection recovers by itself. */
 	@Test
 	void aClusterThatLostItsLeaderForLongRecoversByItself() throws Exception {
@@ -114,8 +224,8 @@ class IsolatedNodeTest {
 			}
 		});
 
-		// Past the end of the election, and past the bound of 6 s counted from the kill.
-		long end = killedAt + Duration.ofSeconds(8).toNanos();
+		// Past the end of the election, and past the bound counted from the kill.
+		long end = killedAt + ApiGate.MIN_PAUSE_AFTER.plusSeconds(2).toNanos();
 		while (System.nanoTime() - end < 0) {
 			for (var id : survivors) {
 				assertTrue(serves(id), () -> "node " + id + " stopped serving during the election");
