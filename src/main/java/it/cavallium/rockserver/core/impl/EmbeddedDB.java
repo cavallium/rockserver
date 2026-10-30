@@ -4293,14 +4293,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		Mono<Void> operation = Mono.using(
 				() -> new PutBatchState(columnId, mode, start),
-				state -> Flux.from(batchPublisher)
-						.publishOn(workloadScheduler)
+				state -> RWScheduler.publishOn(Flux.from(batchPublisher), workloadScheduler)
 						.doOnNext(state::write)
 						.then(Mono.fromRunnable(state::writePending)),
 				BatchWriteState::close,
 				true
 			);
-		return operation.subscribeOn(workloadScheduler)
+		// A queued task dropped by the view, or its deadline, ends the batch with an error instead of a stall
+		return RWScheduler.subscribeOn(operation, workloadScheduler)
 				.onErrorMap(EmbeddedDB::mapBatchWriteFailure)
 				.doFinally(ignored -> putBatchTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS))
 				.toFuture();
@@ -4337,18 +4337,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		Mono<Void> operation = Mono.using(
 				() -> new MergeBatchState(columnId, mode, ingestBehindEnabled, start),
-				state -> AdaptiveBatcher.buffer(
-							Flux.from(batchPublisher).publishOn(workloadScheduler),
-							128,
-							4096,
-							Duration.ofMillis(10)
-						)
+				// The batcher flushes partial batches from a timer of another scheduler, so the writes move
+				// onto the workload scheduler after batching, one batch at a time
+				state -> RWScheduler.publishOn(AdaptiveBatcher.buffer(
+									Flux.from(batchPublisher),
+									128,
+									4096,
+									Duration.ofMillis(10)
+								), workloadScheduler, 1)
 						.doOnNext(state::write)
 						.then(Mono.fromRunnable(state::writePending)),
 				BatchWriteState::close,
 				true
 			);
-		return operation.subscribeOn(workloadScheduler)
+		// A queued task dropped by the view, or its deadline, ends the batch with an error instead of a stall
+		return RWScheduler.subscribeOn(operation, workloadScheduler)
 				.onErrorMap(EmbeddedDB::mapBatchWriteFailure)
 				.toFuture();
 	}

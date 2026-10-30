@@ -22,6 +22,7 @@ import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
+import reactor.util.concurrent.Queues;
 
 /**
  * Workload-aware shared read/write admission for one database.
@@ -313,11 +314,16 @@ public final class RWScheduler {
 	 * A drop fails every stream published on the same view, so give each stream its own view.
 	 */
 	public static <T> Flux<T> publishOn(Flux<T> source, Scheduler scheduler) {
+		return publishOn(source, scheduler, Queues.SMALL_BUFFER_SIZE);
+	}
+
+	/** {@link #publishOn(Flux, Scheduler)} that prefetches at most {@code prefetch} elements. */
+	public static <T> Flux<T> publishOn(Flux<T> source, Scheduler scheduler, int prefetch) {
 		if (scheduler instanceof IndexedWorkloadScheduler indexedScheduler) {
 			// takeUntilOther cancels the source only when the other publisher emits a value, not an error
 			return Flux.defer(() -> {
 				var failure = new AtomicReference<RuntimeException>();
-				return source.publishOn(indexedScheduler)
+				return source.publishOn(indexedScheduler, prefetch)
 						.takeUntilOther(indexedScheduler.streamFailure().doOnNext(failure::set))
 						.concatWith(Mono.defer(() -> {
 							var error = failure.get();
@@ -325,7 +331,24 @@ public final class RWScheduler {
 						}));
 			});
 		}
-		return source.publishOn(scheduler);
+		return source.publishOn(scheduler, prefetch);
+	}
+
+	/**
+	 * {@code source.subscribeOn(scheduler)} that also ends with an error when a workload view drops
+	 * the queued subscription, or any later task of the source, after admitting it (deadline
+	 * expired while queued, shutdown), or when the view's deadline passes. subscribeOn is never
+	 * told about such a drop, so without this the source is never subscribed and never terminates. On failure the source is cancelled, which
+	 * removes a still queued subscription without running it and releases the resources of a
+	 * subscribed one. A drop fails every source on the same view, so give each source its own view.
+	 */
+	public static <T> Mono<T> subscribeOn(Mono<T> source, Scheduler scheduler) {
+		if (scheduler instanceof IndexedWorkloadScheduler indexedScheduler) {
+			// The first signal wins: the source's own termination, or the view's failure
+			return Mono.firstWithSignal(source.subscribeOn(indexedScheduler),
+					indexedScheduler.streamFailure().flatMap(Mono::<T>error));
+		}
+		return source.subscribeOn(scheduler);
 	}
 
 	/** Resolve and validate the caller context, then return its resource-specific view. */

@@ -37,6 +37,7 @@ import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 class RWSchedulerIndexedQueueTest {
@@ -279,6 +280,72 @@ class RWSchedulerIndexedQueueTest {
 			releaseBlocker.countDown();
 			assertReadPoolDrained(scheduler);
 			assertEquals(0, drained.get());
+		} finally {
+			releaseBlocker.countDown();
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void subscribeOnEndsWhenItsQueuedSubscriptionIsDroppedOnShutdown() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-subscribe-on-shutdown");
+		var blockerStarted = new CountDownLatch(1);
+		var view = scheduler.scheduler(
+				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
+		var subscribed = new AtomicInteger();
+		try {
+			view.schedule(() -> {
+				blockerStarted.countDown();
+				try {
+					new CountDownLatch(1).await();
+				} catch (InterruptedException expected) {
+					Thread.currentThread().interrupt();
+				}
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			var operation = RWScheduler.subscribeOn(Mono.fromRunnable(subscribed::incrementAndGet), view)
+					.toFuture();
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
+
+			scheduler.disposeNow();
+
+			var completion = assertThrows(ExecutionException.class, () -> operation.get(5, SECONDS));
+			assertInstanceOf(RejectedExecutionException.class, completion.getCause());
+			assertEquals(0, subscribed.get());
+		} finally {
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void subscribeOnEndsAtItsDeadlineWhileEveryWorkerIsBusyWithoutAcquiringResources() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-subscribe-on-deadline");
+		var blockerStarted = new CountDownLatch(1);
+		var releaseBlocker = new CountDownLatch(1);
+		long deadline = scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(50L));
+		var view = scheduler.scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, deadline);
+		var acquired = new AtomicInteger();
+		try {
+			scheduler.executor(WorkloadProfile.BATCH,
+					OperationFamily.RANGE_PAGE,
+					Long.MAX_VALUE).execute(() -> {
+				blockerStarted.countDown();
+				awaitUninterruptibly(releaseBlocker);
+			});
+			assertTrue(blockerStarted.await(5, SECONDS));
+			var operation = RWScheduler.subscribeOn(Mono.using(acquired::incrementAndGet,
+							_ -> Mono.empty(),
+							_ -> acquired.decrementAndGet()), view)
+					.toFuture();
+
+			// The only worker is busy, so the executor cannot expire the queued subscription itself
+			assertDeadlineFailure(assertThrows(ExecutionException.class, () -> operation.get(5, SECONDS)));
+			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 0);
+			releaseBlocker.countDown();
+			assertReadPoolDrained(scheduler);
+			assertEquals(0, acquired.get());
 		} finally {
 			releaseBlocker.countDown();
 			view.dispose();
