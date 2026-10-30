@@ -664,8 +664,9 @@ class ReplicationTest {
 		// Already stopped: the cluster only forgets it.
 		cluster.halt(leader.config().nodeId());
 		var newLeader = cluster.awaitLeader(TIMEOUT);
-		cluster.awaitConverged(TIMEOUT);
+		// A new leader's applied index can still be behind the write: wait for the write itself.
 		for (ReplicatedNode node : cluster.runningNodes()) {
+			InProcessCluster.await(TIMEOUT, () -> localValue(node, column, 1) != null);
 			assertEquals("written", localValue(node, column, 1));
 		}
 		api(through).put(0, column, key(2), text("after"), RequestType.none());

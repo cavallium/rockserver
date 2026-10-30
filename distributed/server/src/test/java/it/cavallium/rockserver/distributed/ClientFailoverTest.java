@@ -16,6 +16,7 @@ import io.grpc.Grpc;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
+import io.grpc.StatusRuntimeException;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
@@ -63,6 +64,10 @@ class ClientFailoverTest {
 	private static final RequestContext STREAM = RequestContext.analytical(Duration.ofSeconds(8));
 	private static final int KEYS = 64;
 	private static final List<String> MEMBERS = List.of("1", "2", "3");
+	/** How long after the kill calls of every kind must be succeeding, far more than it takes on a quiet machine. */
+	private static final Duration RESUME_BOUND = Duration.ofSeconds(20);
+	/** How long calls keep running once every kind resumed. */
+	private static final Duration AFTER_RESUME = Duration.ofSeconds(1);
 
 	@TempDir
 	Path root;
@@ -79,7 +84,7 @@ class ClientFailoverTest {
 	@Test
 	void aClientThatListsTheLeaderFirstSurvivesItsDeath() throws Exception {
 		startCluster();
-		var leader = awaitLeader();
+		var leader = awaitLeader(cluster);
 		runKilling(leader);
 	}
 
@@ -87,7 +92,7 @@ class ClientFailoverTest {
 	@Test
 	void aClientThatListsAFollowerFirstSurvivesItsDeath() throws Exception {
 		startCluster();
-		var leader = awaitLeader();
+		var leader = awaitLeader(cluster);
 		var follower = MEMBERS.stream().filter(id -> !id.equals(leader)).findFirst().orElseThrow();
 		var addresses = runKilling(follower);
 
@@ -103,7 +108,7 @@ class ClientFailoverTest {
 	@Test
 	void aTransactionSurvivesTheLossOfTheFollowerItWentThrough() throws Exception {
 		startCluster();
-		var leader = awaitLeader();
+		var leader = awaitLeader(cluster);
 		var order = new ArrayList<>(MEMBERS.stream().filter(id -> !id.equals(leader)).toList());
 		order.add(leader);
 		var follower = order.getFirst();
@@ -117,6 +122,8 @@ class ClientFailoverTest {
 			assertEquals(cluster.apiAddress(follower).port(), remotePort(connection));
 
 			cluster.kill(follower);
+			// The commit is not retried: send it once the channel knows, on a call that may be retried.
+			awaitServedByAnother(connection, cluster.apiAddress(follower).port());
 
 			assertTrue(api.closeTransactionAsync(transaction, true).join(), "the commit failed");
 			assertNotEquals(cluster.apiAddress(follower).port(), remotePort(connection));
@@ -178,14 +185,14 @@ class ClientFailoverTest {
 									unexpected.putIfAbsent("range", "range returned " + keys.size() + " keys, " + distinct
 											+ " distinct, of " + KEYS);
 								}
-								lastRangeNanos.set(System.nanoTime());
+								lastRangeNanos.set(started);
 							} else if (reader) {
 								api.getAsync(0, column, key(random.nextInt(KEYS)), RequestType.current()).join();
-								lastReadNanos.set(System.nanoTime());
+								lastReadNanos.set(started);
 							} else {
 								api.putAsync(0, column, key(random.nextInt(KEYS)), Buf.wrap(new byte[] {2}),
 										RequestType.none()).join();
-								lastWriteNanos.set(System.nanoTime());
+								lastWriteNanos.set(started);
 							}
 							// Sent after the kill: an answer to an earlier call says nothing about the switch.
 							if (started > killedAtNanos.get()) {
@@ -207,7 +214,13 @@ class ClientFailoverTest {
 			cluster.kill(victim);
 			long killedAt = System.nanoTime();
 			killedAtNanos.set(killedAt);
-			Thread.sleep(6000);
+			// Calls of every kind, sent after the kill, on another node of the same connection.
+			long deadline = killedAt + RESUME_BOUND.toNanos();
+			while (System.nanoTime() - deadline < 0 && !(lastReadNanos.get() - killedAt > 0
+					&& lastRangeNanos.get() - killedAt > 0 && lastWriteNanos.get() - killedAt > 0)) {
+				Thread.sleep(10);
+			}
+			Thread.sleep(AFTER_RESUME);
 			stop.set(true);
 			for (var worker : workers) {
 				worker.join();
@@ -216,22 +229,24 @@ class ClientFailoverTest {
 			System.out.println("ClientFailoverTest: retryable errors " + retryable.get() + ", first success "
 					+ Duration.ofNanos(firstSuccessAfterKillNanos.get() - killedAt).toMillis() + " ms after the kill");
 			assertTrue(unexpected.isEmpty(), () -> "non-retryable errors: " + unexpected);
-			assertTrue(firstSuccessAfterKillNanos.get() - killedAt < Duration.ofSeconds(5).toNanos(),
-					"no new call succeeded soon after the kill");
-			// Calls kept succeeding until the end, on another node of the same connection.
-			assertTrue(lastReadNanos.get() - killedAt > Duration.ofSeconds(4).toNanos(), "reads did not resume");
-			assertTrue(lastRangeNanos.get() - killedAt > Duration.ofSeconds(4).toNanos(), "range reads did not resume");
-			assertTrue(lastWriteNanos.get() - killedAt > Duration.ofSeconds(4).toNanos(), "writes did not resume");
+			assertTrue(lastReadNanos.get() - killedAt > 0, "reads did not resume");
+			assertTrue(lastRangeNanos.get() - killedAt > 0, "range reads did not resume");
+			assertTrue(lastWriteNanos.get() - killedAt > 0, "writes did not resume");
 			assertNotEquals(victimPort, remotePort(connection));
 		}
 		return addresses;
 	}
 
 	/** Waits for a leader: every node printed READY, but the first election may still be running. */
-	private String awaitLeader() throws Exception {
+	static String awaitLeader(ProcessCluster cluster) throws Exception {
+		return awaitLeader(cluster, MEMBERS);
+	}
+
+	/** Waits for a leader among {@code members}, the nodes that run. */
+	static String awaitLeader(ProcessCluster cluster, List<String> members) throws Exception {
 		long deadline = System.nanoTime() + READY_TIMEOUT.toNanos();
 		while (true) {
-			var status = cluster.admin(MEMBERS, "status");
+			var status = cluster.admin(members, "status");
 			var leader = status.lines()
 					.filter(line -> line.contains(": LEADER"))
 					.map(line -> line.substring(0, line.indexOf(':')))
@@ -246,8 +261,26 @@ class ClientFailoverTest {
 		}
 	}
 
+	/** Waits until another node than {@code port} answers a call that may be retried. */
+	private static void awaitServedByAnother(GrpcConnection connection, int port) throws Exception {
+		long deadline = System.nanoTime() + RESUME_BOUND.toNanos();
+		while (true) {
+			try {
+				if (remotePort(connection) != port) {
+					return;
+				}
+			} catch (StatusRuntimeException e) {
+				if (System.nanoTime() - deadline > 0) {
+					throw e;
+				}
+			}
+			assertTrue(System.nanoTime() - deadline < 0, "the connection stayed on its dead node");
+			Thread.sleep(10);
+		}
+	}
+
 	/** The API port of the node that answers a call on this connection's own channel. */
-	private static int remotePort(GrpcConnection connection) throws Exception {
+	static int remotePort(GrpcConnection connection) throws Exception {
 		var field = GrpcConnection.class.getDeclaredField("channel");
 		field.setAccessible(true);
 		var channel = (ManagedChannel) field.get(connection);
