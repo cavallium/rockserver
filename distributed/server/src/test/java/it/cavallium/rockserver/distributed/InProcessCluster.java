@@ -158,7 +158,10 @@ final class InProcessCluster implements AutoCloseable {
 
 	/** Waits until every running node applied at least the leader's applied index at call time. */
 	void awaitConverged(Duration timeout) {
-		long target = awaitLeader(timeout).appliedIndex();
+		var leader = awaitLeader(timeout);
+		// Its log, not what it applied: a new leader may still be applying what the previous one committed.
+		var last = leader.stateMachine().division().getRaftLog().getLastEntryTermIndex();
+		long target = Math.max(leader.appliedIndex(), last != null ? last.getIndex() : -1);
 		await(timeout, () -> running.values().stream().allMatch(n -> n.appliedIndex() >= target));
 	}
 
