@@ -108,10 +108,11 @@ with 11–18 s write latency. In order of discovery:
     although the apply thread is the only writer of those keys. Apply transactions now write untracked and read
     with `get` instead of `getForUpdate`: per entry, commit 0.22 → 0.12 ms and execute 0.40 → 0.35 ms.
 11. **The embedded scheduler on the leader's reads.** The leader's local reads (a get, the read of an update, a
-    transactional put, opening and closing native transactions) went through the embedded workload scheduler,
+    single-key transactional write, opening native transactions) went through the embedded workload scheduler,
     whose queues cost 2.6–8.6 ms per request on average at 2–4×, and up to 1.4 s. Those requests were admitted
-    by `GrpcServer` already: they now run straight on the database. Ranges, multi-key reads and rollbacks keep
-    the scheduler (rollbacks its control pool). Local time 0.8–1.4 ms; `UPDATE` p99 at 2× from 876 to 232 ms.
+    by `GrpcServer` already: they now run straight on the database. Ranges, multi-key reads, multi-key
+    transactional writes and iterator calls keep the scheduler; rollbacks run at once on the caller's thread.
+    Local time 0.8–1.4 ms; `UPDATE` p99 at 2× from 876 to 232 ms.
     They run on virtual threads. A pool of four platform threads per core, tried to keep RocksDB calls (which
     pin a virtual thread's carrier) off the carriers, gave mixed results in back-to-back pairs: better tails
     with the leader on an NVMe disk, but with the leader on the SATA disk its local commands stalled for 2–3.6 s
@@ -170,9 +171,10 @@ at 2×, and served 33.2k operations/s at 4× with 2048 in flight; before batchin
 
 Other results:
 
-- **Failover.** With clients spread over all nodes at 2×, a leader killed with SIGKILL leaves about 3 s with
-  no successful operation, then the new leader serves. The errors that remain are the dead node's share of
-  the client connections (the benchmark's client does not fail over between addresses).
+- **Failover.** With clients spread over all nodes at 2× and the default election timeouts (1000:2000 ms), a
+  leader killed with SIGKILL leaves about 3 s with no successful operation, then the new leader serves. The
+  errors that remain are the dead node's share of the client connections (the benchmark's client does not fail
+  over between addresses).
 - **Bandwidth.** Sixteen clients writing 1 MiB `putMulti` calls: 183 MiB/s on one node, 103 MiB/s
   replicated, where each device writes 280–390 MiB/s (Raft log, flushes and compactions).
 
@@ -180,8 +182,12 @@ Other results:
 
 - **Disks.** Every write waits for an fsync of the Raft log on the leader and on one follower. Consumer SSDs
   without power-loss protection take 1–3 ms per fdatasync when idle and 10–30 ms when RocksDB compaction writes
-  heavily to the same disk. Prefer SSDs with power-loss protection, or a separate disk for the Raft log
-  (`data/raft`) and the database (`data/db`).
+  heavily to the same disk. Prefer SSDs with power-loss protection. Do not split the data directory over
+  several disks: a node refuses to start if `data/db` or a column volume is on another file system, and with
+  `data/raft` on another disk every snapshot copies the whole database (instead of hard-linking it) while the
+  apply waits. Keep `data/raft`, `data/db`, every column volume and the RocksDB WAL on one file system.
+- **Disk space.** Each retained snapshot keeps the table files it links, also after compaction replaced them.
+  Budget the database plus at least one older snapshot's compacted-away files, more while installs run.
 - **Client concurrency.** Throughput is in-flight requests divided by latency. A replicated write takes
   5–15 ms instead of a fraction of one, so Yotsuba's 256 writes in flight cap it near 2× today's mean (512
   reach about 2.3×, 2048 about 3.5×). Raise `maxConcurrentWriteRequests` (and the read limit) for the cluster.
@@ -191,5 +197,13 @@ Other results:
   requests with it (a third, when clients are spread over three nodes).
 - **Snapshots.** One every 500k entries (`--snapshot-every`), about every 100 s at 2×. A snapshot flushes the
   memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.
-- **Memory.** In a 10-minute run at 2× the leader's heap stayed between 1.3 and 2.8 GiB (4 GiB heap); at most
-  256 MiB of committed entries wait for the apply thread.
+- **Memory.** In a 10-minute run at 2× the leader's heap stayed between 1.3 and 2.8 GiB (4 GiB heap). The
+  bounds are larger: at most 256 MiB of committed entries wait for the apply thread, the leader holds up to
+  65536 pending client writes or 1 GiB of them, the Raft log write queue 64 MiB, every replica keeps every reply
+  (up to 17 MiB each) in Ratis' retry cache for 8 s by default, and each node admits 16384 requests at once,
+  with messages up to 512 MiB. Size the heap for bursts of large `putMulti` calls and large results: an
+  `OutOfMemoryError` on the apply thread stops the replica.
+- **Metrics.** On a cluster, `rocksdb_operation_timer` counts the calls made on each node's own database: the
+  apply's writes on every node (with the internal result, floor and position puts, and one `closeTransaction`
+  per applied group) and the leader's local reads, opens and rollbacks. It no longer measures client requests
+  or their latency. The replication timers (`NodeMetrics`) are only in the log, every 10 s.

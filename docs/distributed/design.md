@@ -45,6 +45,13 @@ only as published. Each replica is an ordinary `EmbeddedDB` with the same column
 bucket hashing, workload scheduler and native JNI as a single node. Every node must run the same Rockserver
 config file.
 
+**Disk layout.** A node's data directory holds `db/` (the database) and `raft/` (the Raft log and snapshots).
+Keep all of it on one file system and mount the data directory itself, not `db/`, `raft/` or a column volume.
+A node refuses to start if the RocksDB `wal-path` is outside `db/`, or if anything under `db/` (column volumes
+included, also through symbolic links) is on another file system. A column volume (`cf_paths`) outside `db/`
+makes every snapshot fail. If `raft/` is on another file system, every snapshot copies the whole database
+instead of hard-linking its files, and the apply waits for the copy; restoring a snapshot copies it too.
+
 **What this module needs from core.** Single-node behavior and the wire contract are unchanged, apart from the
 separate removal of CDC from Rockserver. The core additions are used only by replicas or by a server that
 forwards to a non-embedded connection:
@@ -68,7 +75,7 @@ forwards to a non-embedded connection:
 | `ReplicatedNode` | Wiring and lifecycle: database, Raft server, API server, cluster initialization, graceful hand-off. |
 | `ReplicatedConnection` | Routes each `RocksDBAPICommand` (see below). |
 | `Proposer` | Batches numbered requests into log entries and submits them to the leader: straight to the local Raft server on the leader, through a Ratis client elsewhere. |
-| `RockserverStateMachine` | Ratis state machine. Leader admission in `startTransaction`/`preAppendTransaction`, synchronous apply, snapshots. |
+| `RockserverStateMachine` | Ratis state machine. Leader admission in `startTransaction`/`preAppendTransaction`; entries are queued to an apply thread of its own, which applies them in groups; snapshots. |
 | `Applier` | Applies the requests of log entries to the local database, a group of entries in one transaction without the WAL, with their result records and the applied position. |
 | `LeaderSession`, `ConflictTracker` | Transactions bound to the leader's term, per-key queues of single-key updates, and conflict validation. |
 | `NodeMetrics` | Timers and gauges of the replication path, logged every 10 s. |
@@ -113,16 +120,23 @@ and the `LogEntry`.
   queue of their own, and commits of different leader terms never share an entry.
 - **Retries.** A batch is resent with the same bytes across leader changes until the latest deadline of its
   requests (at most one attempt past the oldest one's, and never past a member's caller deadline). A resend
-  goes out only if it can start before that deadline. On the leader an attempt goes straight to the local Raft
-  server. Elsewhere it is an independent blocking call on a virtual thread, through the Ratis client's RPC layer,
-  to the leader that the node's own Raft server knows. Ratis' ordered async stream closes for good after one
-  exhausted request, so it is not used. Every attempt of a batch is the same Ratis invocation (client id and call
-  id). A leader that has an earlier attempt pending, or applied it, answers from its retry cache, for as long as
-  the cache keeps the entry (`RaftSettings`), instead of appending the batch again. Every replica fills that
-  cache when it applies an entry, and every replica computes the same results, so a new leader answers the same
-  way. A node that never saw the batch appends it again, and the apply deduplicates it. A batch whose attempt
-  ended without saying whether it was appended can only end with its results or an unknown outcome, never "not
-  applied".
+  goes out only if it can start before that deadline: 50 ms after a "not ready", "not leader" or busy answer,
+  100 ms after other failures. On the leader an attempt goes straight to the local Raft server. Elsewhere it is
+  an independent blocking call on a virtual thread, through the Ratis client's RPC layer, to the leader that the
+  node's own Raft server knows. Ratis' ordered async stream closes for good after one exhausted request, so it
+  is not used. An attempt already sent is waited for at least one attempt timeout (the larger of 3 s and twice
+  the maximum election timeout, 4 s by default), even past the deadline. Every attempt of a batch is the same
+  Ratis invocation (client id and call id). A leader that has an earlier attempt pending, or applied it, answers
+  from its retry cache, for as long as the cache keeps the entry (`RaftSettings`), instead of appending the
+  batch again. Every replica fills that cache when it applies an entry, and every replica computes the same
+  results, so a new leader answers the same way. A node that never saw the batch appends it again, and the apply
+  deduplicates it.
+- **When resends stop** without an answer, and no copy can have been appended (every attempt was refused
+  before the append, as during an election), every request of the batch fails as not applied. A batch whose
+  attempt ended without saying whether it was appended can only end with its results or an unknown outcome,
+  never "not applied". Since the batch stops at its earliest caller deadline, one request with a short caller
+  deadline stops the resends of every request batched with it: if nothing was appended, the requests with a
+  caller deadline then fail with `READ_DEADLINE_EXCEEDED`, even if their own deadline is later.
 - **Caller deadlines.** When the caller's request-context timeout ends before the node's request timeout, a
   write is resent only until the caller's deadline, less a margin of 20 ms (at most a tenth of the timeout). A
   write still queued at that point, or whose caller cancelled it before it was sent, is never sent; nor is one
@@ -130,8 +144,10 @@ and the `LogEntry`.
   `READ_DEADLINE_EXCEEDED` and a message that says it was not applied, as on a single node, where a command that
   waited past its deadline fails without running. A write already sent cannot be withdrawn. The synchronous API,
   which `GrpcServer` uses for writes, returns at the caller's deadline with `READ_DEADLINE_EXCEEDED` and "outcome
-  unknown", and the write may still be applied later. Transaction commits follow the same rules. The chunks of a
-  `putBatch` or `mergeBatch` share one deadline, counted from the start of the call.
+  unknown", and the write may still be applied later. A transaction commit (or the write that ends an update)
+  still queued at its caller's deadline is not sent either, but the synchronous API does not return at the
+  caller's deadline for it: once submitted, its single attempt is waited for at least one attempt timeout. The
+  chunks of a `putBatch` or `mergeBatch` share one deadline, counted from the start of the call.
 - **Results are recorded.** Applying a request writes its encoded result under
   `(proposerId, sequence)` in the internal column, in the same local transaction as its effects. If a
   later copy of the same request reaches the log (a retry that went to a new leader, or to a restarted node
@@ -327,7 +343,8 @@ against an incomplete history.
 - **Building it.** `takeSnapshot` builds a checkpoint from RocksDB's live-file APIs, with file deletions
   disabled:
   - memtables are flushed;
-  - SST and blob files are hard-linked (copied across file systems);
+  - SST and blob files are hard-linked (copied, while the apply waits, if `raft/` is on another file system;
+    see Disk layout);
   - the MANIFEST prefix is copied and `CURRENT` written;
   - the WALs still needed are copied.
 - **Why not `org.rocksdb.Checkpoint`.** It refuses the column volumes (`cf_paths`) that the default config
@@ -352,6 +369,10 @@ against an incomplete history.
   database is already ahead of the installed snapshot, it is kept.
 - **Leader-side retention.** The leader keeps the previous snapshot, and any snapshot whose file list was read
   in the last 10 minutes, so a long install is not cut short by newer snapshots.
+- **Disk cost of snapshots.** A retained snapshot keeps the table files it links, also after compaction
+  replaced them in the database. Budget disk space for the database plus at least one older snapshot's
+  compacted-away files, more while installs run. On a follower, a failed install leaves its partial copy until
+  the server restarts or a newer install starts.
 - **Damaged installs.** A snapshot that a crash damaged during install makes the replica fail loudly; it is not
   silently ignored.
 
@@ -361,9 +382,14 @@ against an incomplete history.
   binds every replica's database to the cluster and records whether the cluster was seeded from an existing
   database.
 - **Migrating from a single node.** Stop it and copy its database directory to every node. A seeded cluster
-  takes a snapshot right away. Before the log is purged, a node that joins with an empty database stops at
-  `Genesis` instead of diverging.
-- **Replacing a node.** `ReplicatedServerMain admin ... add-peer / remove-peer` (Ratis `setConfiguration`).
+  takes a snapshot right away, and a member added later through `add-peer` receives the leader's latest snapshot
+  before any log entry, so it gets the seed. A node that replays the seeded `Genesis` with an empty database (an
+  initial member without the copy, before the log is purged, or a new member while the leader has no snapshot
+  because that one attempt failed) stops instead of diverging.
+- **Replacing a node.** Start the new member first, under a new id, with an empty data directory and a peer
+  list that includes itself. Then run `ReplicatedServerMain admin --peer ... add-peer` and `remove-peer` (Ratis
+  `setConfiguration`). `admin` does not read the current configuration: it sets it to exactly its own `--peer`
+  list plus or minus one peer, so `--peer` must list every current member, or the ones left out are removed.
   New members catch up from a snapshot. A node that lost its Raft state but kept its id refuses to start,
   because it could vote twice in one term. Replace it under a new id.
 - **Graceful stop.** On SIGTERM a leader hands leadership to the most up-to-date live follower before
@@ -372,10 +398,12 @@ against an incomplete history.
 ## Behavior differences from a single node
 
 - **Leader changes.** Transactions, update ids and iterators do not survive one. Clients get `UPDATE_RETRY`.
-- **Outcome unknown.** When no leader answers within the request timeout, the error is `SERVER_OVERLOADED`
-  with "outcome unknown", and the write may still take effect later. Internal retries are exactly once, but
-  a client that resends the same write after such an error can apply it twice. A `DEADLINE_EXCEEDED` on a
-  replicated write also has an unknown outcome, unless its message says that the write was not applied.
+- **Outcome unknown.** When no leader answers within the request timeout, the error is `SERVER_OVERLOADED`.
+  Its outcome is unknown, and the write may still take effect later, unless its message says that the write
+  was not applied (no copy was ever appended). Internal retries are exactly once, but a client that resends the
+  same write after an unknown outcome can apply it twice. A deadline error (`READ_DEADLINE_EXCEEDED`, or gRPC's
+  `DEADLINE_EXCEEDED`) on a replicated write also has an unknown outcome, unless its message says that the write
+  was not applied.
 - **`putBatch`/`mergeBatch`** run as ordered replicated write batches, whatever the requested SST mode. They
   are not atomic in any mode: each chunk of at most 4 MiB is applied on its own, and the chunks applied before a
   failure stay applied. When a chunk fails after an earlier one was applied, the call fails with
@@ -393,9 +421,10 @@ against an incomplete history.
 - **Maintenance.** `flush` and `compact` act only on the node that receives them.
 - **Workload limits.** The replicated server's `GrpcServer` runs requests on virtual threads of their own (at
   most 16384 waiting on the leader), not through each column's workload scheduler. Streamed mutations run at
-  most 256 at once. On the leader, point reads, staged writes and transaction opens run each on a virtual
-  thread of their own (one that waited past its deadline fails without running); rollbacks, ranges and
-  multi-key reads use the embedded workload scheduler.
+  most 256 at once. On the leader, point reads, single-key writes staged in a transaction and transaction
+  opens run each on a virtual thread of their own (one that waited past its deadline fails without running).
+  Rollbacks (`closeTransaction` without commit, `closeFailedUpdate`) run at once on the thread that received
+  them. Ranges, multi-key reads, multi-key staged writes and iterator calls use the embedded workload scheduler.
 - **Updates of one key run one at a time** on the leader. Nested or crossed updates of the same keys by one
   client block (up to 12 s) instead of conflicting at once.
 - **After a kill** (not a graceful stop), a replica's database files are an older consistent point until it
@@ -405,19 +434,21 @@ against an incomplete history.
 
 All tests use real Ratis servers over real sockets. The multi-process tests start separate JVMs, each with its
 own hosts file. Every directed link between two nodes goes through its own TCP proxy on a distinct loopback
-address, so a test can partition any set of links.
+address, so a test can partition any set of links. The cluster tests run with 400:800 ms election timeouts
+(`--election-timeout-ms`); the default is 1000:2000 ms, so failover takes longer in production (see "Write
+failover" below).
 
 | Test | What it proves |
 |---|---|
 | `ReplicationTest` (in-process) | Replication through any node; results; leader loss, including a new leader that has not applied what the old one acknowledged yet; snapshot catch-up; batches; transactions, conflicts and updates; a transaction write too large for the commit refused at once; the capped transaction lease; updates whose caller timed out or cancelled while queued, or cancelled while the update opened, do not keep the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups. |
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); history kept for open transactions and in-flight commits, up to the key cap; the commit size limit of staged writes. |
-| `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Failover takes about 1 s. |
+| `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history is linearizable. |
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
-| `MembershipTest` | A node replaced through `add-peer`/`remove-peer` catches up from a snapshot. Seeded bootstrap works. An empty node joining a seeded cluster stops at `Genesis`. |
+| `MembershipTest` | A node replaced through `add-peer`/`remove-peer` catches up from a snapshot. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories are linearizable, and the transactional bank-transfer invariant holds. |
 | Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. |
@@ -447,18 +478,26 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
    time at 171 GB and at the multi-TB datasets, and log retention in bytes. Raise Yotsuba's in-flight request
    limits for the cluster (see performance.md).
 4. **Write failover after a frozen leader.** When the leader freezes (SIGSTOP, a long GC pause, a hung disk),
-   writes resume about 4 s later, although the election takes about 1 s and reads resume sooner. The cause is
-   Ratis' client closing the channel to the frozen leader, which waits a hard-coded 3 s
-   (`GrpcUtil.shutdownManagedChannel`). Crashes and graceful restarts are not affected (failover about 1 s,
-   hand-off about 250 ms). Fix by keeping per-peer clients or by reporting it upstream.
+   writes resume about 4 s later in the tests, although the election takes about 1 s there and reads resume
+   sooner. The cause is Ratis' client closing the channel to the frozen leader, which waits a hard-coded 3 s
+   (`GrpcUtil.shutdownManagedChannel`). Crashes and graceful restarts are not affected (in the tests, failover
+   about 1 s, hand-off about 250 ms). Fix by keeping per-peer clients or by reporting it upstream. These figures
+   are for 400:800 ms election timeouts. With the defaults (`--election-timeout-ms 1000:2000`,
+   `--request-timeout-ms 10000`), the benchmark saw about 3 s without a successful operation after a SIGKILL
+   of the leader (performance.md), and an attempt sent to a frozen leader waits 4 s instead of 3 s before it
+   is resent.
 5. **Snapshot transfer at TB scale.** Ratis installs restart from scratch after a failure, and are not rate
    limited. If that proves too slow, switch to install notifications plus a resumable pull of checkpoint
    files.
 6. **Operations.**
    - Metrics and alerts: role, term, commit and apply lag, snapshot age, follower lag, replica failure exit.
+     Today the replication timers (`NodeMetrics`) are only logged. The existing `rocksdb_operation_timer`
+     changes meaning on a cluster: every node records the calls made on its own `EmbeddedDB`, which are the
+     apply's (each write, the internal result, floor and position puts, one `closeTransaction` per applied
+     group) and the leader's local reads, opens and rollbacks, not client requests.
    - A seeding runbook (copy the single-node database to all nodes before the first start).
    - A node replacement runbook.
-   - Placement on separate hosts and disks.
+   - Placement on separate hosts, each node's data directory on one file system (see Disk layout).
    - The same Rockserver config file on every node.
 7. **Known limits to decide on.**
    - `deleteColumn` waits for open iterators on the leader, which stalls apply there until they close or

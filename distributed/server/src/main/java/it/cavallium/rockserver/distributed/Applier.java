@@ -26,14 +26,14 @@ import org.apache.ratis.server.protocol.TermIndex;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Applies log entries to the local database. Called only by the Raft apply thread.
+ * Applies log entries to the local database. Called only by the state machine's apply thread, apart from the static
+ * {@link #recordedResult(NodeStore, long, long)}.
  *
  * <p>Applying a {@link Request} makes three things durable together: the entry's effects, its result (recorded under
- * the request's identity, see {@link Request}) and the new applied position. Data writes run inside one short local
- * transaction that writes all three, so a crash keeps all or none of them. Schema changes and {@code deleteRange}
- * cannot run in a transaction; they are idempotent at their log position, so their record and position are written
- * right after them: RocksDB recovers a prefix of its WAL, and a crash between the two writes only makes that one
- * entry run again on the same state.</p>
+ * the request's identity, see {@link Request}) and the new applied position. The data writes of a group of entries
+ * run inside one local transaction without the WAL that writes all three (see {@link #beginGroup}), so a crash keeps
+ * all or none of them. Schema changes and {@code deleteRange} cannot run in a transaction: the memtables are flushed
+ * first, then their record and position are written in one logged write and the WAL is synced.</p>
  *
  * <p>An entry that the database rejects for a logical reason (missing column, malformed keys...) is rejected the
  * same way on every replica: that becomes an {@link ApplyResult.Failed} and the log moves on. A storage or native

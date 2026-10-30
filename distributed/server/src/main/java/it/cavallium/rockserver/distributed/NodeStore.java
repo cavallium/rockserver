@@ -61,7 +61,8 @@ import org.slf4j.LoggerFactory;
  * (such as the default {@code ./volume} and {@code ./wal}) are supported, directories elsewhere are not. The
  * database directory and everything under it must be on the same file system as its parent directory, because
  * {@link #restore} swaps it by renaming: mount the node's data directory, not the database directory or a volume
- * inside it. {@link #open} refuses other layouts.</p>
+ * inside it. {@link #open} refuses a WAL directory outside the database directory and anything under it on another
+ * file system; a live file outside it makes {@link #checkpoint} fail.</p>
  *
  * <p>The database is opened with the node's Rockserver config plus {@link #REPLICA_OVERRIDES}, settings that every
  * replica needs whatever that config says.</p>

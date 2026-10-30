@@ -30,7 +30,8 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Leader-side admission happens in {@link #startTransaction} (decode, reject stale transactions) and
  * {@link #preAppendTransaction} (conflict validation and tracking, in log order under Ratis' append lock).
- * Every replica then applies entries synchronously, in order, on the Ratis apply thread.</p>
+ * Every replica then applies entries in log order on an apply thread of its own, in groups (see
+ * {@link #applyTransaction}).</p>
  */
 final class RockserverStateMachine extends BaseStateMachine {
 

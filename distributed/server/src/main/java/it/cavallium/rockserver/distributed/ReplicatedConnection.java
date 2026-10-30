@@ -500,14 +500,15 @@ final class ReplicatedConnection implements RocksDBConnection {
 	}
 
 	/**
-	 * Runs a command on the local database. Point reads, staged writes and the opening of native transactions run
-	 * each on a virtual thread of its own ({@link #INLINE}), straight on the database: the requests were admitted
-	 * already ({@code GrpcServer}'s proxy scheduler), and the embedded workload scheduler's queues cost
+	 * Runs a command on the local database. Point reads, single-key staged writes and the opening of native
+	 * transactions run each on a virtual thread of its own ({@link #INLINE}), straight on the database: the requests
+	 * were admitted already ({@code GrpcServer}'s proxy scheduler), and the embedded workload scheduler's queues cost
 	 * milliseconds per request under load. (A pool of 4 platform threads per core, tried instead to keep RocksDB
 	 * calls off the virtual threads' carriers, stalled for seconds once slow disk reads blocked all its threads.)
 	 * The command's timeout counts from here: one that waited past its deadline fails instead of running. Longer
-	 * commands (ranges, multi-key reads) and rollbacks keep the workload scheduler: its admission and fairness, and
-	 * for rollbacks the control pool, which data requests cannot fill.
+	 * commands (ranges, multi-key reads and staged writes, iterator calls) and maintenance keep the workload
+	 * scheduler, for its admission and fairness. Rollbacks never come here: {@link #closeTransaction} and
+	 * {@link #closeFailedUpdate} roll back at once, on the caller's thread.
 	 */
 	private CompletableFuture<?> local(RequestContext context, RocksDBAPICommandSingle<?> command) {
 		long start = System.nanoTime();
@@ -525,7 +526,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private static boolean isShort(RocksDBAPICommandSingle<?> command) {
 		return switch (command) {
 			case Get<?> _, Put<?> _, Delete<?> _, Merge<?> _, OpenTransaction _ -> true;
-			// Includes CloseTransaction, which runs locally only as a rollback, and CloseFailedUpdate.
+			// CloseTransaction and CloseFailedUpdate never come here: rollbacks run at once on the caller's thread.
 			default -> false;
 		};
 	}
