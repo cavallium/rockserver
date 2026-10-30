@@ -12,7 +12,7 @@
     <revision>2.0.3-SNAPSHOT</revision>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-    <maven.compiler.release>25</maven.compiler.release>
+    <maven.compiler.release>27</maven.compiler.release>
     <native.maven.plugin.version>0.10.6</native.maven.plugin.version>
     <gestalt.version>0.37.2</gestalt.version>
     <jazzer.version>0.30.0</jazzer.version>
@@ -444,7 +444,7 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
         <configuration>
-          <argLine>-XX:+EnableDynamicAgentLoading --enable-native-access=ALL-UNNAMED</argLine>
+          <argLine>-XX:+EnableDynamicAgentLoading --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector</argLine>
           <systemPropertyVariables>
             <jazzer.instrument>it.cavallium.rockserver.**</jazzer.instrument>
           </systemPropertyVariables>
@@ -484,7 +484,7 @@
         <artifactId>maven-failsafe-plugin</artifactId>
         <version>3.5.3</version>
         <configuration>
-          <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+          <argLine>--enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector</argLine>
         </configuration>
       </plugin>
 

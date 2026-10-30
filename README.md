@@ -186,7 +186,7 @@ It includes the server/client code, standalone logging, and the desktop UI in a 
 
 ```shell
 mvn -Pdesktop -DskipTests package
-java --enable-native-access=ALL-UNNAMED -jar target/rockserver-core-1.0.0-SNAPSHOT-desktop.jar
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -jar target/rockserver-core-1.0.0-SNAPSHOT-desktop.jar
 ```
 
 GUI sources and tests live under `src/desktop/java` and `src/desktop-test/java`.

@@ -8,7 +8,7 @@
 
   <properties>
     <revision>2.0.3-SNAPSHOT</revision>
-    <maven.compiler.release>25</maven.compiler.release>
+    <maven.compiler.release>27</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <ratis.version>3.3.1</ratis.version>
     <junit.version>5.14.3</junit.version>
@@ -41,6 +41,12 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
         <version>3.14.0</version>
+        <configuration>
+          <compilerArgs>
+            <arg>--add-modules</arg>
+            <arg>jdk.incubator.vector</arg>
+          </compilerArgs>
+        </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -49,7 +55,7 @@
         <configuration>
           <!-- Ratis jars are automatic modules with split packages: run on the classpath. -->
           <useModulePath>false</useModulePath>
-          <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+          <argLine>--enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector</argLine>
           <systemPropertyVariables>
             <org.slf4j.simpleLogger.defaultLogLevel>warn</org.slf4j.simpleLogger.defaultLogLevel>
             <org.slf4j.simpleLogger.log.it.cavallium.rockserver.distributed>info</org.slf4j.simpleLogger.log.it.cavallium.rockserver.distributed>

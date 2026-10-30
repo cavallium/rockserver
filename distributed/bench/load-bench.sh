@@ -13,6 +13,6 @@ fi
 deps="$(tr ':' '\n' < "$cpfile" | grep -v '/rockserver-core/' | paste -sd:)"
 core="$here/target/library/classes"
 [[ -d "$core/it" ]] || core="$(ls "$here"/target/rockserver-core-*.jar | head -1)"
-exec java --enable-native-access=ALL-UNNAMED -Xms2g -Xmx2g \
+exec "${JAVA_HOME:+$JAVA_HOME/bin/}java" --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms2g -Xmx2g \
 	-cp "$server/target/test-classes:$server/target/classes:$core:$deps" \
 	it.cavallium.rockserver.distributed.bench.LoadBench "$@"

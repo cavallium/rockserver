@@ -35,6 +35,8 @@ module rockserver.core {
 	requires micrometer.registry.jmx;
 	requires micrometer.registry.influx;
 	requires java.net.http;
+	// Optional: the Vector API is used when the JVM was started with --add-modules jdk.incubator.vector.
+	requires static jdk.incubator.vector;
 	requires io.vertx.core;
 	requires vertx.rx.java3;
 	requires io.reactivex.rxjava3;

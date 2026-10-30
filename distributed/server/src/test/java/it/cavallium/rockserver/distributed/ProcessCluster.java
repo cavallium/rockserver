@@ -196,6 +196,7 @@ public final class ProcessCluster implements AutoCloseable {
 		args.add("-cp");
 		args.add(System.getProperty("java.class.path"));
 		args.add("--enable-native-access=ALL-UNNAMED");
+		args.add("--add-modules=jdk.incubator.vector");
 		args.add("-Djdk.net.hosts.file=" + network.directHostsFile());
 		args.add(MAIN_CLASS);
 		args.add("admin");
@@ -470,6 +471,7 @@ public final class ProcessCluster implements AutoCloseable {
 		command.add("-cp");
 		command.add(System.getProperty("java.class.path"));
 		command.add("--enable-native-access=ALL-UNNAMED");
+		command.add("--add-modules=jdk.incubator.vector");
 		command.add("-Djdk.net.hosts.file=" + network.hostsFile(node.id));
 		// Same logging configuration as the test JVM (surefire sets the slf4j-simple levels).
 		System.getProperties().stringPropertyNames().stream()

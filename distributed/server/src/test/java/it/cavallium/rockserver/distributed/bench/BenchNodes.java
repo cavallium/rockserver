@@ -140,6 +140,7 @@ final class BenchNodes implements AutoCloseable {
 		command.add("-cp");
 		command.add(System.getProperty("java.class.path"));
 		command.add("--enable-native-access=ALL-UNNAMED");
+		command.add("--add-modules=jdk.incubator.vector");
 		command.add("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn");
 		command.add("-Dorg.slf4j.simpleLogger.log.it.cavallium.rockserver.distributed=info");
 		for (var option : jvmOptions) {
@@ -221,6 +222,7 @@ final class BenchNodes implements AutoCloseable {
 		command.add("-cp");
 		command.add(System.getProperty("java.class.path"));
 		command.add("--enable-native-access=ALL-UNNAMED");
+		command.add("--add-modules=jdk.incubator.vector");
 		command.add("-Dorg.slf4j.simpleLogger.defaultLogLevel=error");
 		command.add(REPLICATED_MAIN);
 		command.add("admin");
