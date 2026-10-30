@@ -203,6 +203,11 @@ class ProcessClusterTest {
 			String apiBindHost = null;
 			var peers = new ArrayList<PeerConfig>();
 			for (int i = 1; i < args.length; i += 2) {
+				if (args[i].equals("--pipelined-updates")) {
+					// The one option without a value.
+					i--;
+					continue;
+				}
 				switch (args[i]) {
 					case "--node-id" -> nodeId = args[i + 1];
 					case "--data-dir" -> dataDir = args[i + 1];
