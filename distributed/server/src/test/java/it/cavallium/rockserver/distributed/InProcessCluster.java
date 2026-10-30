@@ -1,8 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -40,8 +38,11 @@ final class InProcessCluster implements AutoCloseable {
 		var rockserverConfig = root.resolve("rockserver.conf");
 		Files.writeString(rockserverConfig, MERGE_CONFIG);
 		var peers = new ArrayList<PeerConfig>();
+		// Not ports from the system: those are ephemeral, and the same one can come back twice, or go to a connection of
+		// another process between here and the bind. Ratis then ends the JVM, with every test of the run.
+		var ports = ProcessCluster.freePorts(2 * size, List.of());
 		for (int i = 0; i < size; i++) {
-			peers.add(new PeerConfig("n" + i, "127.0.0.1", freePort(), "127.0.0.1", freePort()));
+			peers.add(new PeerConfig("n" + i, "127.0.0.1", ports.get(2 * i), "127.0.0.1", ports.get(2 * i + 1)));
 		}
 		for (PeerConfig peer : peers) {
 			var config = NodeConfig.defaults(peer.id(), peers, root.resolve(peer.id()))
@@ -165,15 +166,6 @@ final class InProcessCluster implements AutoCloseable {
 				Thread.currentThread().interrupt();
 				throw new AssertionError(e);
 			}
-		}
-	}
-
-	static int freePort() {
-		try (var socket = new ServerSocket(0)) {
-			socket.setReuseAddress(true);
-			return socket.getLocalPort();
-		} catch (IOException e) {
-			throw new UncheckedIOException(e);
 		}
 	}
 

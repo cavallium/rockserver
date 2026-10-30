@@ -582,7 +582,7 @@ public final class ProcessCluster implements AutoCloseable {
 	 * proxies keep those addresses bound. Another process could still bind a port between this check and the
 	 * node's first start; that is unlikely enough for tests.</p>
 	 */
-	private static List<Integer> freePorts(int count, List<InetAddress> linkAddresses) throws IOException {
+	static List<Integer> freePorts(int count, List<InetAddress> linkAddresses) throws IOException {
 		var addresses = new ArrayList<InetAddress>();
 		addresses.add(InetAddress.getByName(LOOPBACK));
 		addresses.addAll(linkAddresses);
