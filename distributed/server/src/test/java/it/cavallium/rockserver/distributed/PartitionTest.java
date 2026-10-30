@@ -71,11 +71,11 @@ class PartitionTest {
 	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);
 	private static final Duration WAIT_TIMEOUT = Duration.ofSeconds(30);
 	private static final Duration POLL_INTERVAL = Duration.ofMillis(20);
+	private static final int MINIMUM_HOT_INCREMENTS = 20;
 	/**
 	 * Nodes give up on a request after 3 seconds, well within a fault: the test also covers nodes whose Raft client
 	 * ran out of retries while cut off.
 	 */
-	private static final int MINIMUM_HOT_INCREMENTS = 20;
 	private static final List<String> SERVER_ARGS = List.of("--election-timeout-ms", "400:800",
 			"--request-timeout-ms", "3000");
 	/** One attempt of a register operation. */
@@ -291,6 +291,7 @@ class PartitionTest {
 	}
 
 	private static void checkHotCounters(ProcessCluster cluster, HotCounters hot) throws InterruptedException {
+		hot.awaitChainAfterFault(cluster.pipelinedUpdates());
 		hot.stop();
 		try (var client = new ClusterClient(cluster.apiAddresses(), WAIT_TIMEOUT, true)) {
 			long column = client.getColumnId(HOT_COLUMN, SETUP_CONTEXT).valueOrThrow();

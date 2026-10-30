@@ -321,9 +321,13 @@ public class GrpcServer extends Server {
 	private void recordLateProtectedOperationFailure(String operation,
 			Throwable error,
 			ContextView context) {
+		countLateProtectedOperationFailure(operation);
+		GrpcServerImpl.lateErrorHandler(context).accept(error);
+	}
+
+	private void countLateProtectedOperationFailure(String operation) {
 		lateProtectedOperationFailures.computeIfAbsent(operation, _ -> new LongAdder()).increment();
 		metricsRegistry.counter(LATE_PROTECTED_OPERATION_FAILURE_METRIC, "operation", operation).increment();
-		GrpcServerImpl.lateErrorHandler(context).accept(error);
 	}
 
 	private static final class LateReadDeadlineLogState {
@@ -1535,6 +1539,7 @@ public class GrpcServer extends Server {
 			}
 			protectedAsyncApi().closeFailedUpdateAsync(updateId).whenComplete((_, error) -> {
 				if (error != null && !isRetryOfGoneCaller(error)) {
+					countLateProtectedOperationFailure("closeAbandonedUpdate");
 					LOG.warn("Failed to close the update {} of a cancelled request", updateId, error);
 				}
 			});

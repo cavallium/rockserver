@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -559,8 +560,12 @@ class PipelinedUpdatesTest {
 
 	/** An update of key 1 that gives up long before an update nobody closes would let the key go. */
 	private CompletableFuture<UpdateContext<Buf>> soonAfterTheKeyIsFree() {
+		return soonAfterTheKeyIsFree(1);
+	}
+
+	private CompletableFuture<UpdateContext<Buf>> soonAfterTheKeyIsFree(long key) {
 		return leader.connection().getAsyncApi(RequestContext.latency(Duration.ofSeconds(3)))
-				.getAsync(0, column, key(1), RequestType.<Buf>forUpdate());
+				.getAsync(0, column, key(key), RequestType.<Buf>forUpdate());
 	}
 
 	/** Bounded by the applied index, not by the chain: a snapshot may fall anywhere in one. */
@@ -765,12 +770,14 @@ class PipelinedUpdatesTest {
 	}
 
 	/**
-	 * With the apply stopped, more closes wait for their base than a server's CONTROL workers (256) and queue (1024)
-	 * hold. Nothing refuses them, not even the other requests of that scheduler, and no key stays held.
+	 * With the apply stopped, more closes wait for their base at once than a server's CONTROL workers (256) and queue
+	 * (1024) hold. Nothing refuses them, not even the other requests of that scheduler, and no key stays held. The closes
+	 * wait longer here than a real one does: on a busy machine, the first ones would give up before the last ones start.
 	 */
 	@Test
 	void closesThatWaitForTheirBaseHoldNoWorkerOfTheServer() throws Exception {
 		start();
+		connection().chainedCloseWaitForTesting = TIMEOUT.multipliedBy(2);
 		var self = leader.config().self();
 		try (var client = GrpcConnection.forHostAndPort("closes", new HostAndPort(self.apiHost(), self.apiPort()))) {
 			var grpc = client.getAsyncApi(CONTEXT);
@@ -796,18 +803,133 @@ class PipelinedUpdatesTest {
 				}
 			}
 			assertTrue(closes.size() > 1280);
+			assertTrue(closes.stream().noneMatch(CompletableFuture::isDone), "every close waits for its base");
 			long transaction = api(leader).openTransaction(Duration.ofSeconds(30));
 			assertTrue(await(grpc.closeTransactionAsync(transaction, false)), "a rollback still runs");
+			assertTrue(closes.stream().noneMatch(CompletableFuture::isDone), "every close waits for its base");
 			openGate();
 			for (var close : closes) {
-				try {
-					await(close);
-				} catch (ExecutionException ex) {
-					// Its wait ended before the apply came back, which tells the client to retry. Anything else is a refusal.
-					assertTrue(ex.getCause() instanceof RuntimeException retry && HotCounters.isRetry(retry), ex::toString);
+				await(close);
+			}
+			for (int i = 0; i < keys; i++) {
+				await(async(leader).closeFailedUpdateAsync(await(soonAfterTheKeyIsFree(100 + i)).updateId()));
+			}
+		}
+	}
+
+	private ReplicatedConnection connection() {
+		return (ReplicatedConnection) leader.connection();
+	}
+
+	/**
+	 * A commit that may be applying, and whose caller's deadline ended it: its outcome is unknown, which must count as a
+	 * failure at once, not when the apply comes back. It is admitted, so an update chains on it first.
+	 */
+	@Test
+	void aCommitThatEndsWithoutAnOutcomeFailsItsLink() throws Exception {
+		start();
+		connection().chainedCloseWaitForTesting = TIMEOUT.multipliedBy(2);
+		closeGate(leader);
+		var head = forUpdate(1);
+		var shortCaller = leader.connection().getAsyncApi(RequestContext.latency(Duration.ofMillis(1500)));
+		var headPut = shortCaller.putAsync(head.updateId(), column, key(1), text("v1"), RequestType.none());
+		var chained = forUpdate(1);
+		assertTrue(chained(chained));
+		assertEquals("v1", text(chained.previous()));
+		var error = assertThrows(ExecutionException.class, () -> headPut.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		assertFalse(error.getCause() instanceof RuntimeException retry && HotCounters.isRetry(retry),
+				"it was sent, so this is no clean refusal: " + error.getCause());
+		assertRetry(async(leader).closeFailedUpdateAsync(chained.updateId()));
+		// With no link left, the next update is a head while the commit is still in the log, and may read what came before
+		// it. Its own commit conflicts with that one, so no update is lost.
+		var update = await(forUpdateLater(1));
+		assertFalse(chained(update));
+		assertEquals("v0", text(update.previous()));
+		assertRetry(put(update, 1, "v0 again"));
+		openGate();
+		var after = forUpdate(1);
+		assertFalse(chained(after));
+		assertEquals("v1", text(after.previous()), "the commit did apply");
+		await(async(leader).closeFailedUpdateAsync(after.updateId()));
+		assertReplicasHold(1, "v1");
+	}
+
+	/** The data of the log entries after {@code index} that hold a commit. */
+	private List<byte[]> commitsAfter(long index) throws Exception {
+		var log = leader.stateMachine().division().getRaftLog();
+		var commits = new ArrayList<byte[]>();
+		for (long i = index + 1; i <= lastLogIndex(leader); i++) {
+			var entry = log.get(i);
+			if (entry.hasStateMachineLogEntry()) {
+				var data = entry.getStateMachineLogEntry().getLogData().toByteArray();
+				if (LogEntryCodec.decodeBatch(data).stream().anyMatch(r -> r.entry() instanceof LogEntry.Guarded)) {
+					commits.add(data);
 				}
 			}
 		}
+		return commits;
+	}
+
+	@Test
+	void theFlagIsOffByDefault() {
+		var peers = List.of(new PeerConfig("n", "127.0.0.1", 1, "127.0.0.1", 2));
+		assertFalse(NodeConfig.defaults("n", peers, temp).pipelinedUpdates());
+	}
+
+	/**
+	 * What a leader with the flag off writes for an update, read back from its Raft log: the bytes of a log from before
+	 * pipelined updates, which is why they need no new log version and a flag-off rolling upgrade works.
+	 */
+	@Test
+	void anUpdateOfALeaderWithTheFlagOffWritesTheOldBytes() throws Exception {
+		start(c -> c.withPipelinedUpdates(false));
+		long before = lastLogIndex(leader);
+		var update = forUpdate(1);
+		await(put(update, 1, "v1"));
+		var commits = commitsAfter(before);
+		assertEquals(1, commits.size());
+		var data = commits.getFirst();
+		var requests = LogEntryCodec.decodeBatch(data);
+		assertEquals(1, requests.size());
+		var commit = assertInstanceOf(LogEntry.Guarded.class, requests.getFirst().entry());
+		assertEquals(0, commit.updateId());
+		assertNull(commit.guard());
+		assertEquals(1, data[data.length - 1], "the entry ends with the boolean it always ended with");
+		byte[] body = LogEntryCodec.encodeEntryBody(commit);
+		assertArrayEquals(body, java.util.Arrays.copyOfRange(data, data.length - body.length, data.length));
+		assertEquals(LogEntryCodec.GUARDED_BASE_BYTES + LogEntryCodec.writeSize(commit.writes().getFirst())
+				+ commit.conflictHashes().length * LogEntryCodec.CONFLICT_KEY_BYTES, body.length);
+	}
+
+	/** Without the flag an update has no single commit to protect: its writes go to the log as they always did. */
+	@Test
+	void aSecondWriteOnAnUpdateWithTheFlagOffGoesToTheLog() throws Exception {
+		start(c -> c.withPipelinedUpdates(false));
+		closeGate(leader);
+		var update = forUpdate(1);
+		var first = appended(() -> put(update, 2, "a"));
+		var second = put(update, 3, "b");
+		openGate();
+		await(first);
+		await(second);
+		assertReplicasHold(2, "a");
+		assertReplicasHold(3, "b");
+	}
+
+	/** The write conflicts with the first one in the log, and the conflict ends the update. */
+	@Test
+	void aConflictingSecondWriteEndsAnUpdateWithTheFlagOff() throws Exception {
+		start(c -> c.withPipelinedUpdates(false));
+		closeGate(leader);
+		var update = forUpdate(1);
+		var first = appended(() -> put(update, 1, "v1"));
+		assertRetry(put(update, 1, "resent"));
+		var session = leader.stateMachine().leaderSession(leader.stateMachine().division().getInfo().getCurrentTerm());
+		assertNull(session.get(update.updateId()));
+		assertEquals(0, session.lockedKeys());
+		openGate();
+		await(first);
+		assertReplicasHold(1, "v1");
 	}
 
 	/** Many clients, one key, retrying as real clients do: nothing is lost, and the replicas agree. */

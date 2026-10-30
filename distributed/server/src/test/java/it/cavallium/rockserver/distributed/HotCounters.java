@@ -42,6 +42,8 @@ final class HotCounters {
 	private static final Duration LEASE = Duration.ofSeconds(11);
 	/** Well under a lease: a counter that takes longer has a wedged key. */
 	private static final Duration MAX_UPDATE_TIME = Duration.ofSeconds(5);
+	/** Many chains' worth of time on a cluster that is well again, and well under what a fault test may take. */
+	private static final Duration MAX_CHAIN_WAIT = Duration.ofSeconds(30);
 
 	private final Map<String, HostAndPort> addresses;
 	private final long columnId;
@@ -183,6 +185,26 @@ final class HotCounters {
 		}
 	}
 
+	/**
+	 * With pipelined updates, waits for an update chained from now on. For after a fault: workers start before the first
+	 * one, so the chains {@link #check} counts could all come from before it.
+	 *
+	 * @param pipelined whether the cluster has pipelined updates; if not, this does nothing
+	 */
+	void awaitChainAfterFault(boolean pipelined) {
+		if (!pipelined) {
+			return;
+		}
+		long before = chained.get();
+		long deadline = System.nanoTime() + MAX_CHAIN_WAIT.toNanos();
+		while (chained.get() == before) {
+			if (System.nanoTime() > deadline) {
+				throw new AssertionError("No update chained in the " + MAX_CHAIN_WAIT + " after a fault: " + this);
+			}
+			pause();
+		}
+	}
+
 	/** Stops the workers. */
 	void stop() throws InterruptedException {
 		running = false;
@@ -235,7 +257,8 @@ final class HotCounters {
 	 *
 	 * @param finalValue the database value of a key, read once the cluster settled
 	 * @param minimumAcknowledged how many increments must have gone through for this to prove anything
-	 * @param pipelined whether the cluster has pipelined updates, so that some update must have been chained
+	 * @param pipelined whether the cluster has pipelined updates: some update must have been chained if so, and none if
+	 *                  not, so that a node started without the option is seen to run the plain per-key queue
 	 */
 	void check(LongFunction<@Nullable Buf> finalValue, long minimumAcknowledged, boolean pipelined)
 			throws InterruptedException {
@@ -243,6 +266,7 @@ final class HotCounters {
 		assertTrue(acknowledged() >= minimumAcknowledged,
 				() -> "Only " + acknowledged() + " increments acknowledged, " + this);
 		assertTrue(!pipelined || chained.get() > 0, () -> "Pipelined updates, but no update was chained: " + this);
+		assertTrue(pipelined || chained.get() == 0, () -> "An update was chained with pipelined updates off: " + this);
 		assertKeysAreFree();
 		for (int i = 0; i < counters; i++) {
 			long value = count(finalValue.apply(firstKey + i));

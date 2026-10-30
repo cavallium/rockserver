@@ -158,6 +158,7 @@ class RandomFaultTest {
 			try {
 				for (var step : schedule) {
 					executed.add(step.run(cluster, probe));
+					hot.awaitChainAfterFault(cluster.pipelinedUpdates());
 				}
 			} finally {
 				cluster.network().heal();

@@ -153,6 +153,7 @@ class LeaderKillTest {
 				cluster.waitReady(leader, READY_TIMEOUT);
 				awaitAcknowledged(workload, WRITES_PER_PHASE);
 				awaitCaughtUp(leader);
+				hot.awaitChainAfterFault(cluster.pipelinedUpdates());
 			}
 			awaitAcknowledged(workload, WRITES_PER_PHASE);
 		} finally {

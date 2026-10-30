@@ -83,6 +83,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 	 * worker waits this long; how many closes can wait for one commit is {@link LeaderSession#MAX_LINK_READERS}.
 	 */
 	private static final Duration CHAINED_CLOSE_WAIT = Duration.ofSeconds(2);
+	/** Tests only: replaces {@link #CHAINED_CLOSE_WAIT}. */
+	volatile Duration chainedCloseWaitForTesting = CHAINED_CLOSE_WAIT;
 	/** Bytes of keys and values per replicated chunk of a batch write. */
 	private static final long BATCH_CHUNK_BYTES = 4L * 1024 * 1024;
 	/** Encoding overhead counted per key segment and per value, so many tiny items still fit in one entry. */
@@ -1068,7 +1070,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 			return CompletableFuture.failedFuture(new RocksDBRetryException());
 		}
 		session.remove(transaction);
-		long wait = Math.min(CHAINED_CLOSE_WAIT.toNanos(), remainingNanos(context, start));
+		long wait = Math.min(chainedCloseWaitForTesting.toNanos(), remainingNanos(context, start));
 		// A copy: the timeout would otherwise complete the future every waiter shares.
 		return transaction.base.settled.copy().orTimeout(wait, TimeUnit.NANOSECONDS).handleAsync((ok, error) -> {
 			closeWaitTime.since(start);
