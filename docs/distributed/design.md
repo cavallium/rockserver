@@ -108,6 +108,16 @@ member that joined later from that member's `TermService`. The internal column
 `__rockserver_replication` is hidden from `getAllColumnDefinitions`, and every command that names it is
 rejected.
 
+A client survives the loss of its node by listing every node (`GrpcConnection.forHostsAndPorts`, or
+`http://a:5333,b:5333,c:5333`). One gRPC channel holds the whole list: a static name resolver hands it to the
+`pick_first` policy unshuffled, so the channel uses the first address that works and, when that connection is lost,
+starts again from the top. Nothing above the channel changes: a call in flight on the lost connection fails with
+`UNAVAILABLE`, the reads allowed by the retry policy run again on the next node, and writes reach the caller, whose
+outcome is unknown as it is for any lost call. Transactions and updates live on the leader, so a client that moves
+between followers keeps them. A connection attempt to a node that does not answer ends at the connect timeout,
+including a frozen process, whose kernel accepts the connection. See the
+[README](../../README.md#client-connections) for timings and settings.
+
 ## Writes, exactly once
 
 A proposal is a `Request`: a random proposer id (one per node process), a sequence number, `completedBelow`,
@@ -450,6 +460,7 @@ failover" below).
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); history kept for open transactions and in-flight commits, up to the key cap; the commit size limit of staged writes. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
+| `ClientFailoverTest` | One client connection listing all three nodes, while the node it uses is killed (the leader, or a follower): only retryable errors, new calls succeed on another node of the same connection (about 1 s with an election, under 200 ms without), a new connection skips the dead node, and a transaction opened through a dead follower still commits. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history is linearizable. |
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
@@ -471,10 +482,10 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
      `server/source/api/src/main/java/org/yotsuba/database/RockserverAsyncApiViews.java:133` still overrides
      `cdcPollBatchAsync` (and imports `it.cavallium.rockserver.core.common.cdc.CdcBatch`). It is a pass-through
      that nothing calls: delete it, and the few Yotsuba tests that mention it. telegramdb has no CDC references.
-   - Yotsuba must use several node addresses and fail over between them. Today `GrpcConnection` takes a
-     single address.
-   - The core client's automatic gRPC retry of reads holds requests against a stopping node for up to its
-     backoff. Tune or disable it for cluster use.
+   - Yotsuba must create its connection with every node's address (`GrpcConnection.forHostsAndPorts`, see
+     "Routing"): the core client fails over between them, but Yotsuba passes a single address today.
+   - The core client's automatic gRPC retry of reads waits for its backoff (0.5 s, then growing) before it sends
+     a read to the next node. Tune it for cluster use if that matters.
 2. **Exactly-once for client retries.** A client request id in `RequestContext`, mapped onto `Request`
    identities, would make a client-level retry after an "outcome unknown" error safe. Also consider a
    dedicated error type for unknown outcomes instead of `SERVER_OVERLOADED`, which Yotsuba retries.

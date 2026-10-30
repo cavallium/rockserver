@@ -33,7 +33,7 @@ import java.util.concurrent.locks.LockSupport;
  *
  * <pre>
  * java -cp ... LoadBench --target replicated|single --root DIR [--scales 1,2,4] [--closed 64,256]
- *     [--step-seconds 30] [--warmup-seconds 10] [--route leader|all] [--connections 4]
+ *     [--step-seconds 30] [--warmup-seconds 10] [--route leader|all|failover] [--connections 4]
  *     [--chats 20000] [--messages-per-chat 50] [--value-bytes 600] [--skew 0.5] [--max-in-flight 512]
  *     [--only UPDATE,GET] [--jvm "-Xmx4g -XX:+UseZGC"] [--server-arg "--snapshot-every 100000"] [--label text]
  * </pre>
@@ -108,20 +108,29 @@ public final class LoadBench {
 				StandardOpenOption.APPEND);
 	}
 
-	/** Connections to the leader only, or spread over every node. */
+	/**
+	 * Connections to the leader only, or spread over every node. With {@code failover} they are spread too, each
+	 * listing every node starting from a different one, so that a connection moves on when its node dies.
+	 */
 	private List<GrpcConnection> connect(BenchNodes nodes, boolean replicated) throws Exception {
 		int perNode = Integer.parseInt(option("--connections", "4"));
+		var route = option("--route", "leader");
 		var targets = new ArrayList<BenchNodes.Node>();
-		if (!replicated || option("--route", "leader").equals("all")) {
+		if (!replicated || route.equals("all") || route.equals("failover")) {
 			targets.addAll(nodes.nodes());
 		} else {
 			targets.add(leader(nodes));
 		}
 		var connections = new ArrayList<GrpcConnection>();
+		var addresses = new ArrayList<>(targets.stream().map(BenchNodes.Node::api).toList());
 		for (var node : targets) {
 			for (int i = 0; i < perNode; i++) {
-				connections.add(GrpcConnection.forHostAndPort("bench-" + node.id() + "-" + i, node.api()));
+				var name = "bench-" + node.id() + "-" + i;
+				connections.add(replicated && route.equals("failover")
+						? GrpcConnection.forHostsAndPorts(name, addresses)
+						: GrpcConnection.forHostAndPort(name, node.api()));
 			}
+			java.util.Collections.rotate(addresses, -1);
 		}
 		line("connections: " + connections.size() + " to nodes " + targets.stream().map(BenchNodes.Node::id).toList());
 		return connections;

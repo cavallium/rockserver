@@ -19,6 +19,7 @@ import io.grpc.Status;
 import io.grpc.Status.Code;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
+import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.epoll.EpollDomainSocketChannel;
 import io.netty.channel.epoll.EpollEventLoopGroup;
@@ -120,8 +121,12 @@ public final class GrpcConnection extends BaseConnection {
 	}
 
 	private GrpcConnection(String name, SocketAddress socketAddress, URI address, boolean automaticRetry) {
+		this(name, new GrpcConnectionDelegate(name, socketAddress, address, automaticRetry));
+	}
+
+	private GrpcConnection(String name, GrpcConnectionDelegate delegate) {
 		super(name);
-		this.delegate = new GrpcConnectionDelegate(name, socketAddress, address, automaticRetry);
+		this.delegate = delegate;
 		this.channel = delegate.channel;
 		this.callbackExecutor = delegate.callbackExecutor;
 		this.eventLoopGroup = delegate.eventLoopGroup;
@@ -146,6 +151,48 @@ public final class GrpcConnection extends BaseConnection {
 				new InetSocketAddress(address.host(), address.port()),
 				URI.create("http://" + address.host() + ":" + address.port()),
 				false);
+	}
+
+	/**
+	 * A connection to any of several Rockserver nodes, such as the nodes of a replicated cluster, which all serve
+	 * every request. It uses one node at a time: the first in the list that accepts a connection (list the expected
+	 * leader first, to save followers a forwarding hop). When the connection to that node is lost, calls in flight
+	 * fail as with a single address (reads that gRPC may retry are retried, on the next node), and new calls go to
+	 * the first node of the list that accepts a connection, within about one connect timeout per dead node before it.
+	 * The connection does not move back to an earlier node while the current one works. One address is the same as
+	 * {@link #forHostAndPort(String, HostAndPort)}.
+	 */
+	public static GrpcConnection forHostsAndPorts(String name, List<HostAndPort> addresses) {
+		return forHostsAndPorts(name, addresses, true);
+	}
+
+	/**
+	 * Like {@link #forHostsAndPorts(String, List)}, without gRPC's automatic retry of reads after a transport loss.
+	 */
+	public static GrpcConnection forHostsAndPortsWithoutRetry(String name, List<HostAndPort> addresses) {
+		return forHostsAndPorts(name, addresses, false);
+	}
+
+	private static GrpcConnection forHostsAndPorts(String name, List<HostAndPort> addresses, boolean automaticRetry) {
+		if (addresses.isEmpty()) {
+			throw new IllegalArgumentException("At least one address is required");
+		}
+		if (addresses.size() == 1) {
+			return automaticRetry
+					? forHostAndPort(name, addresses.getFirst())
+					: forHostAndPortWithoutRetry(name, addresses.getFirst());
+		}
+		var copy = List.copyOf(addresses);
+		return new GrpcConnection(name, new GrpcConnectionDelegate(name, copy, httpUrl(copy), automaticRetry));
+	}
+
+	/** The URL of a connection to these addresses: {@code http://host1:port1,host2:port2}. */
+	static URI httpUrl(List<HostAndPort> addresses) {
+		try {
+			return Utils.parseConnectionUrl("http://" + Utils.formatHostAndPorts(addresses));
+		} catch (java.net.URISyntaxException e) {
+			throw new IllegalArgumentException("Invalid addresses: " + addresses, e);
+		}
 	}
 
 	public static GrpcConnection forPath(String name, Path unixSocketPath) {
@@ -195,6 +242,18 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			= "it.cavallium.rockserver.grpc.client.max-retry-backoff";
 	private static final String RETRY_BACKOFF_MULTIPLIER_PROPERTY
 			= "it.cavallium.rockserver.grpc.client.retry-backoff-multiplier";
+	static final String CONNECT_TIMEOUT_PROPERTY = "it.cavallium.rockserver.grpc.client.connect-timeout-ms";
+	static final int DEFAULT_CONNECT_TIMEOUT_MILLIS = 3_000;
+	static final String KEEP_ALIVE_TIME_PROPERTY = "it.cavallium.rockserver.grpc.client.keep-alive-time-ms";
+	static final int DEFAULT_KEEP_ALIVE_TIME_MILLIS = 10_000;
+	static final String KEEP_ALIVE_TIMEOUT_PROPERTY = "it.cavallium.rockserver.grpc.client.keep-alive-timeout-ms";
+	static final int DEFAULT_KEEP_ALIVE_TIMEOUT_MILLIS = 5_000;
+	/**
+	 * One node at a time, the first of the list that accepts a connection: gRPC's default policy, written out so
+	 * that the address order is a contract (never shuffled).
+	 */
+	private static final List<Map<String, ?>> PICK_FIRST_IN_ORDER =
+			List.of(Map.of("pick_first", Map.of("shuffleAddressList", false)));
 	private static final int PUT_MULTI_LIST_MAX_ITEMS = 65_536;
 	private static final long PUT_MULTI_LIST_MAX_LOGICAL_BYTES =
 			it.cavallium.rockserver.core.common.RangeBudget.DEFAULT_MAX_BYTES;
@@ -258,27 +317,49 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	GrpcConnectionDelegate(String name, SocketAddress socketAddress, URI address, boolean automaticRetry) {
+		this(name,
+				socketAddress instanceof InetSocketAddress inetSocketAddress
+						? NettyChannelBuilder.forAddress(inetSocketAddress.getHostString(), inetSocketAddress.getPort())
+						: NettyChannelBuilder.forAddress(socketAddress),
+				socketAddress instanceof DomainSocketAddress,
+				false,
+				address,
+				automaticRetry);
+	}
+
+	/** Several nodes, tried in order by {@code pick_first} (see {@link MultiAddressNameResolver}). */
+	GrpcConnectionDelegate(String name, List<HostAndPort> addresses, URI address, boolean automaticRetry) {
+		this(name, NettyChannelBuilder.forTarget(MultiAddressNameResolver.target(addresses)), false, true, address,
+				automaticRetry);
+	}
+
+	private GrpcConnectionDelegate(String name,
+			NettyChannelBuilder channelBuilder,
+			boolean domainSocket,
+			boolean severalAddresses,
+			URI address,
+			boolean automaticRetry) {
 		super(name);
 		int maxInboundMessageSize = configuredMaxInboundMessageSize();
-		NettyChannelBuilder channelBuilder;
-		if (socketAddress instanceof InetSocketAddress inetSocketAddress) {
-			channelBuilder = NettyChannelBuilder
-					.forAddress(inetSocketAddress.getHostString(), inetSocketAddress.getPort());
-		} else {
-			channelBuilder = NettyChannelBuilder
-					.forAddress(socketAddress);
-		}
 
+		// A node that dies without closing its connections (power loss, partition, a frozen process) is noticed by
+		// keepalive within its time plus its timeout: calls in flight then fail, and new calls find another address.
+		// A shorter time would close the connection during a long pause of a node or of this client; 10 s is the
+		// shortest gRPC's client allows, and the server permits a ping every 5 s.
 		channelBuilder
 				.usePlaintext()
 				.maxInboundMessageSize(maxInboundMessageSize)
-				.keepAliveTime(30, TimeUnit.SECONDS)
-				.keepAliveTimeout(5, TimeUnit.SECONDS)
+				.keepAliveTime(intProperty(KEEP_ALIVE_TIME_PROPERTY, DEFAULT_KEEP_ALIVE_TIME_MILLIS, 1),
+						TimeUnit.MILLISECONDS)
+				.keepAliveTimeout(intProperty(KEEP_ALIVE_TIMEOUT_PROPERTY, DEFAULT_KEEP_ALIVE_TIMEOUT_MILLIS, 1),
+						TimeUnit.MILLISECONDS)
 				.keepAliveWithoutCalls(true);
 		if (automaticRetry) {
 			configureRetry(channelBuilder);
 		} else {
-			channelBuilder.disableRetry();
+			channelBuilder
+					.disableRetry()
+					.defaultServiceConfig(Map.of("loadBalancingConfig", PICK_FIRST_IN_ORDER));
 		}
 
 		// Keep reactive-gRPC's bounded adapters off the transport loop: a backpressured
@@ -290,16 +371,29 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		ManagedChannel channel;
 		try {
 			channelBuilder.executor(callbackExecutor);
-			if (socketAddress instanceof DomainSocketAddress _) {
+			if (domainSocket) {
 				eventLoopGroup = new EpollEventLoopGroup(EVENT_LOOP_THREADS_PER_CONNECTION);
 				channelBuilder
 						.eventLoopGroup(eventLoopGroup)
 						.channelType(EpollDomainSocketChannel.class);
 			} else {
 				eventLoopGroup = new NioEventLoopGroup(EVENT_LOOP_THREADS_PER_CONNECTION);
-				channelBuilder
-						.eventLoopGroup(eventLoopGroup)
-						.channelType(NioSocketChannel.class);
+				channelBuilder.eventLoopGroup(eventLoopGroup);
+				if (severalAddresses) {
+					// A host that is down does not refuse the connection, and a frozen process accepts it and stays
+					// silent: give up on either after this long and try the next address, instead of waiting for
+					// Netty's 30 s or for keepalive. One address has nowhere else to go, and keeps waiting.
+					int connectTimeoutMillis = intProperty(CONNECT_TIMEOUT_PROPERTY, DEFAULT_CONNECT_TIMEOUT_MILLIS, 1);
+					channelBuilder
+							.withOption(ChannelOption.CONNECT_TIMEOUT_MILLIS, connectTimeoutMillis)
+							.channelFactory(() -> {
+								var socket = new NioSocketChannel();
+								socket.pipeline().addLast(new ServerGreetingTimeoutHandler(connectTimeoutMillis));
+								return socket;
+							});
+				} else {
+					channelBuilder.channelType(NioSocketChannel.class);
+				}
 			}
 			channelBuilder.intercept(new RetryLoggingInterceptor());
 			channel = channelBuilder.build();
@@ -391,7 +485,9 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private static void configureRetry(NettyChannelBuilder channelBuilder) {
 		int maxAttempts = intProperty(MAX_RETRY_ATTEMPTS_PROPERTY, 5, 1);
 		if (maxAttempts <= 1) {
-			channelBuilder.disableRetry();
+			channelBuilder
+					.disableRetry()
+					.defaultServiceConfig(Map.of("loadBalancingConfig", PICK_FIRST_IN_ORDER));
 			return;
 		}
 
@@ -399,6 +495,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				.enableRetry()
 				.maxRetryAttempts(maxAttempts)
 				.defaultServiceConfig(Map.of(
+						"loadBalancingConfig", PICK_FIRST_IN_ORDER,
 						"methodConfig", List.of(Map.of(
 								"name", AUTOMATIC_RETRY_METHOD_CONFIG_NAMES,
 								"retryPolicy", Map.of(

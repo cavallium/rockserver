@@ -39,7 +39,8 @@ public class Main {
 		parser.addArgument("-u", "--database-url")
 				.type(String.class)
 				.setDefault(PRIVATE_MEMORY_URL.toString())
-				.help("Specify database rocksdb://hostname:port, or unix://<path>, or file://<path>");
+				.help("Specify database http://host:port (gRPC; a comma-separated list http://host1:port1,host2:port2 for the"
+						+ " nodes of a cluster), or rocksdb://hostname:port, or unix://<path>, or file://<path>");
 		parser.addArgument("-l", "--thrift-listen-url")
 				.type(String.class)
 				.setDefault("http://127.0.0.1:5332")
@@ -87,7 +88,7 @@ public class Main {
 		var name = ns.getString("name");
 		var config = ns.getString("config");
 
-		var databaseUrl = new URI(rawDatabaseUrl);
+		var databaseUrl = Utils.parseConnectionUrl(rawDatabaseUrl);
 		var thriftListenUrl = new URI(rawThriftListenUrl);
 		var grpcListenUrl = new URI(rawGrpcListenUrl);
 
@@ -107,7 +108,7 @@ public class Main {
 			case "file" -> clientBuilder.setEmbeddedPath(Path.of((databaseUrl.getAuthority() != null ? databaseUrl.getAuthority() : "") + databaseUrl.getPath()).normalize());
 			case "memory" -> clientBuilder.setEmbeddedInMemory(true);
 			case "http" -> {
-				clientBuilder.setHttpAddress(Utils.parseHostAndPort(databaseUrl));
+				clientBuilder.setHttpAddresses(Utils.parseHostAndPorts(databaseUrl));
 				clientBuilder.setUseThrift(false);
 			}
 			case "rocksdb" -> clientBuilder.setAddress(Utils.parseHostAndPort(databaseUrl));

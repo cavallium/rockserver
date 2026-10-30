@@ -1,0 +1,284 @@
+package it.cavallium.rockserver.distributed;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.grpc.CallOptions;
+import io.grpc.Channel;
+import io.grpc.ClientCall;
+import io.grpc.ClientInterceptor;
+import io.grpc.ClientInterceptors;
+import io.grpc.ForwardingClientCall;
+import io.grpc.ForwardingClientCallListener;
+import io.grpc.Grpc;
+import io.grpc.ManagedChannel;
+import io.grpc.Metadata;
+import io.grpc.MethodDescriptor;
+import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.client.GrpcConnection;
+import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.KV;
+import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest;
+import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
+import it.unimi.dsi.fastutil.ints.IntList;
+import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
+import reactor.core.publisher.Flux;
+
+/**
+ * One {@link GrpcConnection} created with the addresses of all three nodes, while the node it uses is killed
+ * (SIGKILL): the client only sees errors it may retry, and keeps working on another node without a new connection.
+ */
+@Timeout(180)
+class ClientFailoverTest {
+
+	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);
+	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
+	private static final RequestContext CONTEXT = RequestContext.latency(Duration.ofSeconds(8));
+	private static final RequestContext SETUP = RequestContext.batch(Duration.ofSeconds(30));
+	/** Range streams are not latency work. */
+	private static final RequestContext STREAM = RequestContext.analytical(Duration.ofSeconds(8));
+	private static final int KEYS = 64;
+	private static final List<String> MEMBERS = List.of("1", "2", "3");
+
+	@TempDir
+	Path root;
+	private ProcessCluster cluster;
+
+	@AfterEach
+	void tearDown() {
+		if (cluster != null) {
+			cluster.close();
+		}
+	}
+
+	/** The expected deployment: the leader is listed first, and it dies, so the client also waits for an election. */
+	@Test
+	void aClientThatListsTheLeaderFirstSurvivesItsDeath() throws Exception {
+		startCluster();
+		var leader = awaitLeader();
+		runKilling(leader);
+	}
+
+	/** No election here: only the client moves. A connection made after the kill skips the dead node at once. */
+	@Test
+	void aClientThatListsAFollowerFirstSurvivesItsDeath() throws Exception {
+		startCluster();
+		var leader = awaitLeader();
+		var follower = MEMBERS.stream().filter(id -> !id.equals(leader)).findFirst().orElseThrow();
+		var addresses = runKilling(follower);
+
+		try (var late = GrpcConnection.forHostsAndPorts("late-client", addresses)) {
+			var api = late.getAsyncApi(SETUP);
+			long column = api.getColumnIdAsync("data").join();
+			assertNotEquals(cluster.apiAddress(follower).port(), remotePort(late));
+			api.putAsync(0, column, key(0), Buf.wrap(new byte[] {3}), RequestType.none()).join();
+		}
+	}
+
+	/** A transaction lives on the leader: losing the follower that carried its calls does not lose it. */
+	@Test
+	void aTransactionSurvivesTheLossOfTheFollowerItWentThrough() throws Exception {
+		startCluster();
+		var leader = awaitLeader();
+		var order = new ArrayList<>(MEMBERS.stream().filter(id -> !id.equals(leader)).toList());
+		order.add(leader);
+		var follower = order.getFirst();
+
+		try (var connection = GrpcConnection.forHostsAndPorts("transaction-client",
+				order.stream().map(cluster::apiAddress).toList())) {
+			var api = connection.getAsyncApi(SETUP);
+			long column = api.createColumnAsync("data", SCHEMA).join();
+			long transaction = api.openTransactionAsync(Duration.ofSeconds(60)).join();
+			api.putAsync(transaction, column, key(1), Buf.wrap(new byte[] {7}), RequestType.none()).join();
+			assertEquals(cluster.apiAddress(follower).port(), remotePort(connection));
+
+			cluster.kill(follower);
+
+			assertTrue(api.closeTransactionAsync(transaction, true).join(), "the commit failed");
+			assertNotEquals(cluster.apiAddress(follower).port(), remotePort(connection));
+			var value = api.getAsync(0, column, key(1), RequestType.current()).join();
+			assertNotNull(value, "the committed value is missing");
+			assertEquals(Buf.wrap(new byte[] {7}), value);
+		}
+	}
+
+	private void startCluster() throws Exception {
+		cluster = ProcessCluster.start(root.resolve("cluster"), 3, List.of(
+				"--election-timeout-ms", "400:800",
+				"--request-timeout-ms", "5000"));
+		cluster.waitReady(READY_TIMEOUT);
+	}
+
+	/** Runs a mixed load through a client that lists {@code victim} first, and kills it. Returns the list. */
+	private List<HostAndPort> runKilling(String victim) throws Exception {
+		var order = new ArrayList<>(List.of(victim));
+		MEMBERS.stream().filter(id -> !id.equals(victim)).forEach(order::add);
+		var addresses = order.stream().map(cluster::apiAddress).toList();
+		int victimPort = cluster.apiAddress(victim).port();
+
+		try (var connection = GrpcConnection.forHostsAndPorts("failover-client", addresses)) {
+			var api = connection.getAsyncApi(CONTEXT);
+			var streamApi = connection.getAsyncApi(STREAM);
+			long column = connection.getAsyncApi(SETUP).createColumnAsync("data", SCHEMA).join();
+			for (int key = 0; key < KEYS; key++) {
+				api.putAsync(0, column, key(key), Buf.wrap(new byte[] {1}), RequestType.none()).join();
+			}
+			assertEquals(victimPort, remotePort(connection), "the first address is preferred");
+
+			var stop = new AtomicBoolean();
+			var unexpected = new ConcurrentHashMap<String, String>();
+			var retryable = new AtomicLong();
+			var killedAtNanos = new AtomicLong(Long.MAX_VALUE);
+			var firstSuccessAfterKillNanos = new AtomicLong(Long.MAX_VALUE);
+			var lastReadNanos = new AtomicLong();
+			var lastRangeNanos = new AtomicLong();
+			var lastWriteNanos = new AtomicLong();
+			var workers = new ArrayList<Thread>();
+			for (int i = 0; i < 8; i++) {
+				boolean reader = i % 4 == 0;
+				boolean rangeReader = i % 4 == 2;
+				workers.add(Thread.ofVirtual().start(() -> {
+					var random = ThreadLocalRandom.current();
+					while (!stop.get()) {
+						long started = System.nanoTime();
+						try {
+							if (rangeReader) {
+								var keys = Flux.from(streamApi.getRangeAsync(0, column, null, null, false,
+												RequestType.<KV>allInRange()))
+										.map(kv -> ByteBuffer.wrap(kv.keys().keys()[0].toByteArray()).getLong())
+										.collectList()
+										.block();
+								// Writes only overwrite the keys written before: a complete read returns each once.
+								long distinct = keys.stream().distinct().count();
+								if (keys.size() != KEYS || distinct != KEYS) {
+									unexpected.putIfAbsent("range", "range returned " + keys.size() + " keys, " + distinct
+											+ " distinct, of " + KEYS);
+								}
+								lastRangeNanos.set(System.nanoTime());
+							} else if (reader) {
+								api.getAsync(0, column, key(random.nextInt(KEYS)), RequestType.current()).join();
+								lastReadNanos.set(System.nanoTime());
+							} else {
+								api.putAsync(0, column, key(random.nextInt(KEYS)), Buf.wrap(new byte[] {2}),
+										RequestType.none()).join();
+								lastWriteNanos.set(System.nanoTime());
+							}
+							// Sent after the kill: an answer to an earlier call says nothing about the switch.
+							if (started > killedAtNanos.get()) {
+								firstSuccessAfterKillNanos.accumulateAndGet(System.nanoTime(), Math::min);
+							}
+						} catch (RuntimeException e) {
+							var cause = e instanceof CompletionException && e.getCause() != null ? e.getCause() : e;
+							if (ClusterClient.isRetryable(cause)) {
+								retryable.incrementAndGet();
+							} else {
+								unexpected.putIfAbsent(String.valueOf(cause), String.valueOf(cause.getMessage()));
+							}
+						}
+					}
+				}));
+			}
+
+			Thread.sleep(1000);
+			cluster.kill(victim);
+			long killedAt = System.nanoTime();
+			killedAtNanos.set(killedAt);
+			Thread.sleep(6000);
+			stop.set(true);
+			for (var worker : workers) {
+				worker.join();
+			}
+
+			System.out.println("ClientFailoverTest: retryable errors " + retryable.get() + ", first success "
+					+ Duration.ofNanos(firstSuccessAfterKillNanos.get() - killedAt).toMillis() + " ms after the kill");
+			assertTrue(unexpected.isEmpty(), () -> "non-retryable errors: " + unexpected);
+			assertTrue(firstSuccessAfterKillNanos.get() - killedAt < Duration.ofSeconds(5).toNanos(),
+					"no new call succeeded soon after the kill");
+			// Calls kept succeeding until the end, on another node of the same connection.
+			assertTrue(lastReadNanos.get() - killedAt > Duration.ofSeconds(4).toNanos(), "reads did not resume");
+			assertTrue(lastRangeNanos.get() - killedAt > Duration.ofSeconds(4).toNanos(), "range reads did not resume");
+			assertTrue(lastWriteNanos.get() - killedAt > Duration.ofSeconds(4).toNanos(), "writes did not resume");
+			assertNotEquals(victimPort, remotePort(connection));
+		}
+		return addresses;
+	}
+
+	/** Waits for a leader: every node printed READY, but the first election may still be running. */
+	private String awaitLeader() throws Exception {
+		long deadline = System.nanoTime() + READY_TIMEOUT.toNanos();
+		while (true) {
+			var status = cluster.admin(MEMBERS, "status");
+			var leader = status.lines()
+					.filter(line -> line.contains(": LEADER"))
+					.map(line -> line.substring(0, line.indexOf(':')))
+					.findFirst();
+			if (leader.isPresent()) {
+				return leader.get();
+			}
+			if (System.nanoTime() - deadline > 0) {
+				throw new AssertionError("No leader in status:\n" + status);
+			}
+			Thread.sleep(100);
+		}
+	}
+
+	/** The API port of the node that answers a call on this connection's own channel. */
+	private static int remotePort(GrpcConnection connection) throws Exception {
+		var field = GrpcConnection.class.getDeclaredField("channel");
+		field.setAccessible(true);
+		var channel = (ManagedChannel) field.get(connection);
+		var remote = new AtomicReference<SocketAddress>();
+		var observer = new ClientInterceptor() {
+			@Override
+			public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(MethodDescriptor<ReqT, RespT> method,
+					CallOptions callOptions, Channel next) {
+				var call = next.newCall(method, callOptions);
+				return new ForwardingClientCall.SimpleForwardingClientCall<>(call) {
+					@Override
+					public void start(Listener<RespT> listener, Metadata headers) {
+						super.start(new ForwardingClientCallListener.SimpleForwardingClientCallListener<>(listener) {
+							@Override
+							public void onHeaders(Metadata responseHeaders) {
+								remote.set(call.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR));
+								super.onHeaders(responseHeaders);
+							}
+						}, headers);
+					}
+				};
+			}
+		};
+		RocksDBServiceGrpc.newBlockingStub(ClientInterceptors.intercept(channel, observer))
+				.withDeadlineAfter(10, TimeUnit.SECONDS)
+				.getCapabilities(CapabilitiesRequest.getDefaultInstance());
+		assertNotNull(remote.get(), "the call had no transport address");
+		return ((InetSocketAddress) remote.get()).getPort();
+	}
+
+	private static Keys key(long value) {
+		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(value).array()));
+	}
+}

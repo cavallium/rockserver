@@ -96,6 +96,55 @@ Both read gates and the paired seven-profile gate share the v1.3.11 Pareto rules
 versioned result schemas documented in
 [`docs/v1.3.11-performance-contract.md`](docs/v1.3.11-performance-contract.md).
 
+## Client connections
+
+`GrpcConnection` connects to a server over gRPC: `forHostAndPort` for one address, `forPath` for a Unix socket, and
+`forHostsAndPorts` for several nodes serving the same database, such as a [replicated
+cluster](docs/distributed/design.md), where any node serves any request.
+
+```java
+var connection = GrpcConnection.forHostsAndPorts("my-client", List.of(
+		new HostAndPort("node-1", 5333),
+		new HostAndPort("node-2", 5333),
+		new HostAndPort("node-3", 5333)));
+```
+
+`Utils.parseHostAndPorts("node-1:5333,node-2:5333,node-3:5333")` gives that list from a string,
+`ClientBuilder.setHttpAddresses` takes it, and `--database-url` accepts the same list:
+`http://node-1:5333,node-2:5333,node-3:5333`. A host without a port uses 5333, and an IPv6 literal goes in brackets
+(`[::1]:5333`). One address works as before.
+
+The connection uses one node at a time, and moves within the one gRPC channel, so nothing has to be recreated:
+
+- It uses the first address that accepts a connection, never shuffling the list: list the expected leader first, so
+  that calls do not take a forwarding hop through a follower.
+- When the connection to its node is lost, calls in flight fail as they do with one address: the reads that the
+  automatic retry policy allows run again, on the next node, and the others surface `UNAVAILABLE`, because a write
+  may already have been applied. New calls wait for the next connection, which starts from the top of the list.
+- It stays on its node when an earlier one comes back, until that connection is lost or the channel goes idle (30
+  minutes without calls).
+- With every node down, calls fail with `UNAVAILABLE` at once, and gRPC keeps reconnecting with a growing backoff (up
+  to 2 minutes).
+
+| When a node | The client notices | New calls run on another node |
+|---|---|---|
+| Dies, its host stays up (crash, SIGKILL) | At once: the connection is reset | In milliseconds: the port refuses connections |
+| Stops answering with its host down, partitioned or frozen (power loss, SIGSTOP, a hung disk) | By keepalive, in at most 15 s | After that, plus one connect timeout for each such node listed before the one that works |
+
+| System property | Default | Effect |
+|---|---|---|
+| `it.cavallium.rockserver.grpc.client.connect-timeout-ms` | `3000` | With several addresses, the limit for connecting to one address and, separately, for hearing the first bytes from it. |
+| `it.cavallium.rockserver.grpc.client.keep-alive-time-ms` | `10000` | Silence on a connection before a ping, with one address too. gRPC raises values below 10 s to 10 s. |
+| `it.cavallium.rockserver.grpc.client.keep-alive-timeout-ms` | `5000` | Wait for the answer to a ping, with one address too. |
+
+On a replicated cluster, when the node that died was the leader, the new calls also wait for the election.
+
+Shorter keepalive times find a dead node sooner, but a pause of the server or of the client that outlasts the
+timeout ends a working connection, with its calls in flight. Pings cost next to nothing, and a server accepts them
+every 5 s. A short connect timeout moves past a dead node sooner, but one that is just slow to accept a connection
+is skipped too. The connection handshake waits 10 s, so with the default connect timeout a list can start with at
+most three silent nodes.
+
 ## Merge operators
 
 Columns can use a server-side `MergeOperator` instead of client-side

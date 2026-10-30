@@ -124,6 +124,120 @@ public class Utils {
 		return new HostAndPort(uri.getHost(), parsePort(uri));
 	}
 
+	/**
+	 * The hosts of a connection URL such as {@code http://host1:5333,host2:5333}: one or more, in order. A URL
+	 * with a single host gives the same address as {@link #parseHostAndPort(URI)}. Parse the URL with
+	 * {@link #parseConnectionUrl(String)}, which also accepts IPv6 literals in a list.
+	 */
+	public static List<HostAndPort> parseHostAndPorts(URI uri) {
+		if (uri.getHost() != null) {
+			return List.of(parseHostAndPort(uri));
+		}
+		var authority = uri.getAuthority();
+		if (authority == null || authority.isBlank()) {
+			throw new IllegalArgumentException("The URL has no host: " + uri);
+		}
+		return parseHostAndPorts(authority);
+	}
+
+	/**
+	 * Parses a comma-separated list of {@code host[:port]}, where an IPv6 literal is written in brackets
+	 * ({@code [::1]:5333}). A missing port is {@link #DEFAULT_PORT}. The order is kept: it is the order a client
+	 * tries the hosts in.
+	 */
+	public static List<HostAndPort> parseHostAndPorts(String hosts) {
+		var result = new ArrayList<HostAndPort>();
+		for (var rawEntry : hosts.split(",", -1)) {
+			var entry = rawEntry.strip();
+			if (entry.isEmpty()) {
+				throw new IllegalArgumentException("Empty host in the host list \"" + hosts + "\"");
+			}
+			String host;
+			String port;
+			if (entry.startsWith("[")) {
+				int close = entry.indexOf(']');
+				if (close < 0) {
+					throw new IllegalArgumentException("Unclosed IPv6 bracket in \"" + entry + "\"");
+				}
+				host = entry.substring(1, close);
+				var rest = entry.substring(close + 1);
+				if (rest.isEmpty()) {
+					port = null;
+				} else if (rest.startsWith(":")) {
+					port = rest.substring(1);
+				} else {
+					throw new IllegalArgumentException("Invalid host \"" + entry + "\"");
+				}
+			} else {
+				int colon = entry.indexOf(':');
+				if (colon >= 0 && entry.indexOf(':', colon + 1) >= 0) {
+					throw new IllegalArgumentException("Write the IPv6 address in brackets: \"" + entry + "\"");
+				}
+				host = colon >= 0 ? entry.substring(0, colon) : entry;
+				port = colon >= 0 ? entry.substring(colon + 1) : null;
+			}
+			if (host.isEmpty()) {
+				throw new IllegalArgumentException("Empty host name in \"" + entry + "\"");
+			}
+			result.add(new HostAndPort(host, port == null ? DEFAULT_PORT : parsePort(port, entry)));
+		}
+		return List.copyOf(result);
+	}
+
+	private static int parsePort(String port, String entry) {
+		final int parsed;
+		try {
+			parsed = Integer.parseInt(port);
+		} catch (NumberFormatException ex) {
+			throw new IllegalArgumentException("Invalid port in \"" + entry + "\"", ex);
+		}
+		if (parsed < 1 || parsed > 65535) {
+			throw new IllegalArgumentException("Port out of range in \"" + entry + "\"");
+		}
+		return parsed;
+	}
+
+	/**
+	 * Parses a connection URL like {@link URI#URI(String)}, and also accepts a list of hosts whose IPv6 literals
+	 * are in brackets ({@code http://[::1]:5333,[::2]:5333}), which {@code URI} refuses: their brackets are
+	 * percent-encoded, and {@link #parseHostAndPorts(URI)} reads them back.
+	 */
+	public static URI parseConnectionUrl(String url) throws java.net.URISyntaxException {
+		int authorityStart = url.indexOf("://");
+		if (authorityStart > 0) {
+			authorityStart += 3;
+			int authorityEnd = authorityStart;
+			while (authorityEnd < url.length() && "/?#".indexOf(url.charAt(authorityEnd)) < 0) {
+				authorityEnd++;
+			}
+			var authority = url.substring(authorityStart, authorityEnd);
+			if (authority.indexOf(',') >= 0) {
+				url = url.substring(0, authorityStart)
+						+ authority.replace("[", "%5B").replace("]", "%5D")
+						+ url.substring(authorityEnd);
+			}
+		}
+		return new URI(url);
+	}
+
+	/** The inverse of {@link #parseHostAndPorts(String)}. */
+	public static String formatHostAndPorts(List<HostAndPort> addresses) {
+		var result = new StringBuilder();
+		for (var address : addresses) {
+			if (!result.isEmpty()) {
+				result.append(',');
+			}
+			var host = address.host();
+			if (host.indexOf(':') >= 0 && !host.startsWith("[")) {
+				result.append('[').append(host).append(']');
+			} else {
+				result.append(host);
+			}
+			result.append(':').append(address.port());
+		}
+		return result.toString();
+	}
+
 	public static int parsePort(URI uri) {
 		var port = uri.getPort();
 		if (port == -1) {

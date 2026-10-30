@@ -54,7 +54,8 @@ distributed/bench/load-bench.sh --target replicated --root /path/on/a/real/disk/
 
 Other options: `--target single`, `--closed 64,512`, `--only UPDATE,GET` (or `BULK_PUT`, 1 MiB `putMulti`
 calls for bandwidth), `--max-in-flight N`, `--route all` (clients spread over every node, so most requests are
-forwarded), `--kill-leader-after S` (SIGKILL of the leader during the step, with a per-second timeline), `--jfr
+forwarded), `--route failover` (spread over every node too, each connection listing every node, starting from a
+different one), `--kill-leader-after S` (SIGKILL of the leader during the step, with a per-second timeline), `--jfr
 profile` (or a `.jfc` file) to record every node. Each node logs its own timers every 10 s (`NodeMetrics`:
 proposer queue and batch round trip, append-to-apply, apply phases, read barrier, update lock wait, log lags,
 tracked keys, heap).
@@ -172,9 +173,11 @@ at 2×, and served 33.2k operations/s at 4× with 2048 in flight; before batchin
 Other results:
 
 - **Failover.** With clients spread over all nodes at 2× and the default election timeouts (1000:2000 ms), a
-  leader killed with SIGKILL leaves about 3 s with no successful operation, then the new leader serves. The
-  errors that remain are the dead node's share of the client connections (the benchmark's client does not fail
-  over between addresses).
+  leader killed with SIGKILL leaves about 3 s with no successful operation, then the new leader serves. With
+  `--route all` the dead node's share of the client connections then keeps failing, a third of all requests.
+  With `--route failover` those connections move to another node: in one short run on tmpfs on a loaded PC (1×,
+  6 connections, a small dataset, not a throughput measurement) the second of the kill had 289 errors and the
+  11 s after the 4 s gap had 1 error in 58k requests, against a third of the requests with `--route all`.
 - **Bandwidth.** Sixteen clients writing 1 MiB `putMulti` calls: 183 MiB/s on one node, 103 MiB/s
   replicated, where each device writes 280–390 MiB/s (Raft log, flushes and compactions).
 
@@ -194,8 +197,13 @@ Other results:
   reach about 2.3×, 2048 about 3.5×). Raise `maxConcurrentWriteRequests` (and the read limit) for the cluster.
 - **Talk to the leader.** A client connected to a follower has every update forwarded (its open and its
   commit), one more hop each. One connection is enough: its calls no longer share one event loop thread.
-- **Client failover.** Until Yotsuba's client fails over between node addresses, a dead node takes its share of
-  requests with it (a third, when clients are spread over three nodes).
+- **Client failover.** Create clients with every node's address (`GrpcConnection.forHostsAndPorts`, or
+  `http://node-1:5333,node-2:5333,node-3:5333`), the expected leader first: without it, a dead node takes the
+  clients pinned to it down with it. A client that moved stays on its new node, so after a leader change it may
+  talk to a follower until its connection is lost. A crash is noticed at once. A host that goes down or a process
+  that freezes is noticed by keepalive, in at most 15 s (10 s of silence, 5 s for the answer), which is the
+  price of not closing connections on shorter pauses; each such node before the first live one in the list then
+  costs 3 s (the connect timeout) when the client reconnects. See the [README](../../README.md#client-connections).
 - **Snapshots.** One every 500k entries (`--snapshot-every`), about every 100 s at 2×. A snapshot flushes the
   memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.
 - **Memory.** In a 10-minute run at 2× the leader's heap stayed between 1.3 and 2.8 GiB (4 GiB heap). The
