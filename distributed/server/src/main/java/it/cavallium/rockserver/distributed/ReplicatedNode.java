@@ -41,6 +41,7 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	private static final Logger LOG = LoggerFactory.getLogger(ReplicatedNode.class);
 	private static final long LEADERSHIP_TRANSFER_TIMEOUT_MS = 5_000;
+	private static final long MAINTENANCE_INTERVAL_MS = 200;
 
 	private final NodeConfig config;
 	private final RaftGroup group;
@@ -52,6 +53,10 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final ReplicatedConnection connection;
 	private final GrpcServer apiServer;
 	private final ScheduledExecutorService maintenance;
+	/** Only used on the maintenance thread. */
+	private final ApiGate apiGate;
+	/** Only used on the maintenance thread. */
+	private boolean clusterInitialized;
 	private final AtomicBoolean closed = new AtomicBoolean();
 	private final CompletableFuture<@Nullable Throwable> stopped = new CompletableFuture<>();
 	private final NodeMetrics metrics;
@@ -100,7 +105,10 @@ public final class ReplicatedNode implements AutoCloseable {
 			started.add(apiServer);
 			this.maintenance = Executors.newSingleThreadScheduledExecutor(
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-maintenance").factory());
-			maintenance.scheduleWithFixedDelay(this::initializeCluster, 0, 200, TimeUnit.MILLISECONDS);
+			this.apiGate = ApiGate.forElectionTimeout(config.electionTimeoutMax());
+			maintenance.scheduleWithFixedDelay(this::initializeCluster, 0, MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
+			maintenance.scheduleWithFixedDelay(this::gateApi, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
+					TimeUnit.MILLISECONDS);
 			var appendLag = metrics.amount("lag.uncommitted");
 			var applyLag = metrics.amount("lag.unapplied");
 			var flushLag = metrics.amount("lag.unflushed");
@@ -153,10 +161,13 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * the data as a snapshot rather than by replaying a log that does not contain it.
 	 */
 	private void initializeCluster() {
+		if (clusterInitialized) {
+			return;
+		}
 		try {
 			var store = stateMachine.store();
 			if (store.clusterId() != null) {
-				maintenance.shutdown();
+				clusterInitialized = true;
 				return;
 			}
 			var division = stateMachine.division();
@@ -174,6 +185,30 @@ public final class ReplicatedNode implements AutoCloseable {
 		} catch (Exception ex) {
 			LOG.warn("{}: cluster initialization attempt failed, retrying", config.nodeId(), ex);
 		}
+	}
+
+	/** Stops serving clients while the node is cut off from a leader (see {@link ApiGate}). */
+	private void gateApi() {
+		try {
+			if (apiGate.shouldServe(knowsLeader(), System.nanoTime())) {
+				apiServer.resume();
+			} else {
+				apiServer.pause();
+			}
+		} catch (IOException | RuntimeException ex) {
+			LOG.warn("{}: failed to pause or resume the API, retrying", config.nodeId(), ex);
+		}
+	}
+
+	/** A former leader that stepped down may keep its own id as leader: it does not count. */
+	private boolean knowsLeader() {
+		var division = stateMachine.division();
+		if (division == null) {
+			return false;
+		}
+		var info = division.getInfo();
+		var leader = info.getLeaderId();
+		return leader != null && (info.isLeader() || !leader.toString().equals(config.nodeId()));
 	}
 
 	/**
