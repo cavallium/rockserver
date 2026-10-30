@@ -8,15 +8,15 @@ import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.io.UncheckedIOException;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
@@ -28,9 +28,9 @@ import org.jetbrains.annotations.Nullable;
  * Must be deterministic: equal entries encode to equal bytes.
  *
  * <p>Layout: the version byte, then one tag byte for the entry type, then its fields in declaration order.
- * Numbers are big-endian and fixed width, as written by {@link DataOutputStream}. A byte string is an int length
- * followed by the bytes; a nullable value uses length -1 for null. A string is a byte string of UTF-8. A list is
- * an int count followed by the elements. A nullable non-byte-string field is preceded by a presence boolean.</p>
+ * Numbers are big-endian and fixed width, as written by {@link java.io.DataOutputStream}. A byte string is an int
+ * length followed by the bytes; a nullable value uses length -1 for null. A string is a byte string of UTF-8. A list
+ * is an int count followed by the elements. A nullable non-byte-string field is preceded by a presence boolean.</p>
  */
 final class LogEntryCodec {
 
@@ -90,15 +90,10 @@ final class LogEntryCodec {
 
 	static byte[] encode(LogEntry entry) {
 		Objects.requireNonNull(entry, "entry");
-		var bytes = new ByteArrayOutputStream();
-		try (var out = new DataOutputStream(bytes)) {
-			out.writeByte(VERSION);
-			writeEntry(out, entry);
-		} catch (IOException e) {
-			// ByteArrayOutputStream never throws
-			throw new UncheckedIOException(e);
-		}
-		return bytes.toByteArray();
+		var out = new Output(1 + entrySize(entry));
+		out.writeByte(VERSION);
+		writeEntry(out, entry);
+		return out.finish();
 	}
 
 	/**
@@ -110,15 +105,13 @@ final class LogEntryCodec {
 	/** The body of {@code entry} (its tag and fields, no version byte), to be put in a batch by {@link #encodeBatch}. */
 	static byte[] encodeEntryBody(LogEntry entry) {
 		Objects.requireNonNull(entry, "entry");
-		var bytes = new ByteArrayOutputStream(64);
-		try (var out = new DataOutputStream(bytes)) {
-			writeEntry(out, entry);
-		} catch (IOException e) {
-			// ByteArrayOutputStream never throws
-			throw new UncheckedIOException(e);
-		}
-		return bytes.toByteArray();
+		var out = new Output(entrySize(entry));
+		writeEntry(out, entry);
+		return out.finish();
 	}
+
+	/** Size of a batch header: {@link #BATCH_VERSION}, proposer id, {@code completedBelow} and request count. */
+	private static final int BATCH_HEADER_BYTES = 1 + 2 * Long.BYTES + Integer.BYTES;
 
 	/**
 	 * Encodes requests of one proposer as one log entry: {@link #BATCH_VERSION}, the proposer id, the batch's
@@ -129,40 +122,73 @@ final class LogEntryCodec {
 		if (sequences.length != entryBodies.size() || sequences.length == 0) {
 			throw new IllegalArgumentException("A batch needs one entry per sequence, and at least one");
 		}
-		int size = 1 + 2 * Long.BYTES + Integer.BYTES;
+		long size = BATCH_HEADER_BYTES;
 		for (byte[] body : entryBodies) {
-			size = Math.addExact(size, Long.BYTES + body.length);
+			size += Long.BYTES + body.length;
 		}
-		var buffer = ByteBuffer.allocate(size);
-		buffer.put(BATCH_VERSION).putLong(proposerId).putLong(completedBelow).putInt(sequences.length);
+		var out = new Output(size);
+		writeBatchHeader(out, proposerId, completedBelow, sequences.length);
 		for (int i = 0; i < sequences.length; i++) {
-			if (completedBelow > sequences[i]) {
-				throw new IllegalArgumentException("Sequence " + sequences[i] + " is below completedBelow " + completedBelow);
-			}
-			buffer.putLong(sequences[i]).put(entryBodies.get(i));
+			checkSequence(completedBelow, sequences[i]);
+			byte[] body = entryBodies.get(i);
+			out.writeLong(sequences[i]);
+			out.write(body, 0, body.length);
 		}
-		return buffer.array();
+		return out.finish();
 	}
 
-	/** Encodes requests of one proposer as one log entry, see {@link #encodeBatch(long, long, long[], List)}. */
+	/**
+	 * Encodes requests of one proposer as one log entry, see {@link #encodeBatch(long, long, long[], List)}. Each
+	 * entry is written in place, with no body of its own.
+	 */
 	static byte[] encodeBatch(List<Request> requests) {
 		var first = requests.getFirst();
-		var sequences = new long[requests.size()];
-		var bodies = new ArrayList<byte[]>(requests.size());
-		for (int i = 0; i < sequences.length; i++) {
-			var request = requests.get(i);
+		long size = BATCH_HEADER_BYTES;
+		for (var request : requests) {
 			if (request.proposerId() != first.proposerId() || request.completedBelow() != first.completedBelow()) {
 				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
 			}
-			sequences[i] = request.sequence();
-			bodies.add(encodeEntryBody(request.entry()));
+			checkSequence(first.completedBelow(), request.sequence());
+			size += Long.BYTES + entrySize(Objects.requireNonNull(request.entry(), "entry"));
 		}
-		return encodeBatch(first.proposerId(), first.completedBelow(), sequences, bodies);
+		var out = new Output(size);
+		writeBatchHeader(out, first.proposerId(), first.completedBelow(), requests.size());
+		for (var request : requests) {
+			out.writeLong(request.sequence());
+			writeEntry(out, request.entry());
+		}
+		return out.finish();
+	}
+
+	private static void writeBatchHeader(Output out, long proposerId, long completedBelow, int count) {
+		out.writeByte(BATCH_VERSION);
+		out.writeLong(proposerId);
+		out.writeLong(completedBelow);
+		out.writeInt(count);
+	}
+
+	private static void checkSequence(long completedBelow, long sequence) {
+		if (completedBelow > sequence) {
+			throw new IllegalArgumentException("Sequence " + sequence + " is below completedBelow " + completedBelow);
+		}
 	}
 
 	/** @throws IllegalArgumentException on malformed input or unknown version */
 	static List<Request> decodeBatch(byte[] data) {
-		var in = new Input(data);
+		return decodeBatch(new Input(data));
+	}
+
+	/**
+	 * Decodes a batch read from {@code data}'s remaining bytes, such as a read-only view of a Raft log entry's
+	 * payload: nothing of the whole batch is copied, only each field into its own array.
+	 *
+	 * @throws IllegalArgumentException on malformed input or unknown version
+	 */
+	static List<Request> decodeBatch(ByteBuffer data) {
+		return decodeBatch(new Input(data));
+	}
+
+	private static List<Request> decodeBatch(Input in) {
 		byte version = in.readByte();
 		if (version != BATCH_VERSION) {
 			throw new IllegalArgumentException("Unknown log entry version: " + version);
@@ -174,13 +200,13 @@ final class LogEntryCodec {
 		if (count == 0) {
 			throw new IllegalArgumentException("Empty batch");
 		}
-		var requests = new ArrayList<Request>(count);
+		var requests = new Request[count];
 		for (int i = 0; i < count; i++) {
 			long sequence = in.readLong();
-			requests.add(new Request(proposerId, sequence, completedBelow, readEntry(in)));
+			requests[i] = new Request(proposerId, sequence, completedBelow, readEntry(in));
 		}
 		in.finish();
-		return List.copyOf(requests);
+		return List.of(requests);
 	}
 
 	/** @throws IllegalArgumentException on malformed input or unknown version */
@@ -195,7 +221,7 @@ final class LogEntryCodec {
 		return entry;
 	}
 
-	private static void writeEntry(DataOutputStream out, LogEntry entry) throws IOException {
+	private static void writeEntry(Output out, LogEntry entry) {
 		switch (entry) {
 			case LogEntry.Write write -> writeWrite(out, write);
 			case LogEntry.CreateColumn(String name, ColumnSchema schema) -> {
@@ -215,7 +241,7 @@ final class LogEntryCodec {
 				out.writeByte(UPLOAD_MERGE_OPERATOR);
 				writeString(out, name);
 				writeString(out, className);
-				writeBytes(out, jarData);
+				out.writeBytes(jarData);
 			}
 			case LogEntry.Guarded guarded -> writeGuarded(out, guarded);
 			case LogEntry.VerifyColumn(String name, long columnId) -> {
@@ -231,7 +257,7 @@ final class LogEntryCodec {
 		}
 	}
 
-	private static void writeWrite(DataOutputStream out, LogEntry.Write write) throws IOException {
+	private static void writeWrite(Output out, LogEntry.Write write) {
 		switch (write) {
 			case LogEntry.Put(long columnId, Keys keys, Buf value, RequestTypeId requestType) ->
 					writeSingle(out, PUT, columnId, keys, value, requestType);
@@ -265,37 +291,37 @@ final class LogEntryCodec {
 		}
 	}
 
-	private static void writeSingle(DataOutputStream out,
+	private static void writeSingle(Output out,
 			byte tag,
 			long columnId,
 			Keys keys,
 			@Nullable Buf value,
-			RequestTypeId requestType) throws IOException {
+			RequestTypeId requestType) {
 		out.writeByte(tag);
 		out.writeLong(columnId);
 		writeKeys(out, keys);
-		writeNullableBuf(out, value);
+		out.writeNullableBuf(value);
 		writeRequestType(out, requestType);
 	}
 
 	/** Keys and values are written as pairs, so a decoded entry always has matching sizes. Values are non-null. */
-	private static void writeMulti(DataOutputStream out,
+	private static void writeMulti(Output out,
 			byte tag,
 			long columnId,
 			List<Keys> keys,
 			List<Buf> values,
-			RequestTypeId requestType) throws IOException {
+			RequestTypeId requestType) {
 		out.writeByte(tag);
 		out.writeLong(columnId);
 		out.writeInt(keys.size());
 		for (int i = 0; i < keys.size(); i++) {
 			writeKeys(out, keys.get(i));
-			writeBuf(out, values.get(i));
+			out.writeBuf(values.get(i));
 		}
 		writeRequestType(out, requestType);
 	}
 
-	private static void writeGuarded(DataOutputStream out, LogEntry.Guarded guarded) throws IOException {
+	private static void writeGuarded(Output out, LogEntry.Guarded guarded) {
 		out.writeByte(GUARDED);
 		out.writeLong(guarded.leaderEpoch());
 		out.writeLong(guarded.snapshotIndex());
@@ -317,6 +343,31 @@ final class LogEntryCodec {
 	static final int GUARDED_BASE_BYTES = 1 + 2 * Long.BYTES + 2 * Integer.BYTES + 1;
 	/** Encoded size of one conflict key of a {@link LogEntry.Guarded}: its column id and key hash. */
 	static final int CONFLICT_KEY_BYTES = 2 * Long.BYTES;
+
+	/**
+	 * Encoded size of {@code entry}'s body as {@link #writeEntry} writes it, computed without encoding it.
+	 *
+	 * @throws IllegalArgumentException if a string of it is not valid Unicode
+	 */
+	static long entrySize(LogEntry entry) {
+		return switch (entry) {
+			case LogEntry.Write write -> writeSize(write);
+			case LogEntry.CreateColumn(String name, ColumnSchema schema) -> 1 + stringSize(name) + schemaSize(schema);
+			case LogEntry.DeleteColumn _ -> 1 + Long.BYTES;
+			case LogEntry.DeleteColumnIfExists(String name) -> 1 + stringSize(name);
+			case LogEntry.UploadMergeOperator(String name, String className, byte[] jarData) ->
+					1 + stringSize(name) + stringSize(className) + Integer.BYTES + jarData.length;
+			case LogEntry.Guarded guarded -> {
+				long size = GUARDED_BASE_BYTES + (long) guarded.conflictColumns().length * CONFLICT_KEY_BYTES;
+				for (LogEntry.Write write : guarded.writes()) {
+					size += writeSize(write);
+				}
+				yield size;
+			}
+			case LogEntry.VerifyColumn(String name, long _) -> 1 + stringSize(name) + Long.BYTES;
+			case LogEntry.Genesis(String clusterId, boolean _) -> 1 + stringSize(clusterId) + 1;
+		};
+	}
 
 	/** Encoded size of {@code write} as {@link #writeWrite} writes it, inside a {@link LogEntry.Guarded}. */
 	static long writeSize(LogEntry.Write write) {
@@ -361,22 +412,40 @@ final class LogEntryCodec {
 		return Integer.BYTES + (buf != null ? buf.size() : 0);
 	}
 
-	private static void writeKeys(DataOutputStream out, Keys keys) throws IOException {
+	private static long schemaSize(ColumnSchema schema) {
+		return Integer.BYTES + (long) schema.keys().size() * Integer.BYTES
+				+ Integer.BYTES + schema.variableTailKeys().size()
+				+ 1
+				+ nullableStringSize(schema.mergeOperatorName())
+				+ 1 + (schema.mergeOperatorVersion() != null ? Long.BYTES : 0)
+				+ nullableStringSize(schema.mergeOperatorClass());
+	}
+
+	/** Strings are rare (column and operator names): they are encoded once to be measured, then again to be written. */
+	private static long stringSize(String value) {
+		return Integer.BYTES + utf8(value).length;
+	}
+
+	private static long nullableStringSize(@Nullable String value) {
+		return 1 + (value != null ? stringSize(value) : 0);
+	}
+
+	private static void writeKeys(Output out, Keys keys) {
 		Buf[] segments = keys.keys();
 		out.writeInt(segments.length);
 		for (Buf segment : segments) {
-			writeBuf(out, segment);
+			out.writeBuf(segment);
 		}
 	}
 
-	private static void writeNullableKeys(DataOutputStream out, @Nullable Keys keys) throws IOException {
+	private static void writeNullableKeys(Output out, @Nullable Keys keys) {
 		out.writeBoolean(keys != null);
 		if (keys != null) {
 			writeKeys(out, keys);
 		}
 	}
 
-	private static void writeRequestType(DataOutputStream out, RequestTypeId requestType) throws IOException {
+	private static void writeRequestType(Output out, RequestTypeId requestType) {
 		Byte code = REQUEST_TYPE_CODES.get(Objects.requireNonNull(requestType, "requestType"));
 		if (code == null) {
 			throw new IllegalArgumentException("Request type has no log code: " + requestType);
@@ -384,7 +453,7 @@ final class LogEntryCodec {
 		out.writeByte(code);
 	}
 
-	private static void writeSchema(DataOutputStream out, ColumnSchema schema) throws IOException {
+	private static void writeSchema(Output out, ColumnSchema schema) {
 		out.writeInt(schema.keys().size());
 		for (int i = 0; i < schema.keys().size(); i++) {
 			out.writeInt(schema.keys().getInt(i));
@@ -402,36 +471,23 @@ final class LogEntryCodec {
 		writeNullableString(out, schema.mergeOperatorClass());
 	}
 
-	static void writeBytes(DataOutputStream out, byte[] bytes) throws IOException {
-		out.writeInt(bytes.length);
-		out.write(bytes);
-	}
-
-	static void writeBuf(DataOutputStream out, Buf buf) throws IOException {
-		writeBytes(out, buf.toByteArray());
-	}
-
-	static void writeNullableBuf(DataOutputStream out, @Nullable Buf buf) throws IOException {
-		if (buf == null) {
-			out.writeInt(-1);
-		} else {
-			writeBuf(out, buf);
-		}
-	}
-
 	/** Strict UTF-8: a string with unpaired surrogates is rejected instead of silently altered. */
-	static void writeString(DataOutputStream out, String value) throws IOException {
+	static byte[] utf8(String value) {
 		ByteBuffer encoded;
 		try {
 			encoded = StandardCharsets.UTF_8.newEncoder().encode(CharBuffer.wrap(value));
 		} catch (CharacterCodingException e) {
 			throw new IllegalArgumentException("String is not valid Unicode", e);
 		}
-		out.writeInt(encoded.remaining());
-		out.write(encoded.array(), encoded.arrayOffset() + encoded.position(), encoded.remaining());
+		return Arrays.copyOfRange(encoded.array(), encoded.arrayOffset() + encoded.position(),
+				encoded.arrayOffset() + encoded.limit());
 	}
 
-	private static void writeNullableString(DataOutputStream out, @Nullable String value) throws IOException {
+	static void writeString(Output out, String value) {
+		out.writeBytes(utf8(value));
+	}
+
+	private static void writeNullableString(Output out, @Nullable String value) {
 		out.writeBoolean(value != null);
 		if (value != null) {
 			writeString(out, value);
@@ -568,6 +624,91 @@ final class LogEntryCodec {
 		}
 	}
 
+	/**
+	 * Writer of an encoding into an array of exactly its size, computed beforehand, so that nothing is copied but
+	 * the fields themselves. Numbers are big-endian and fixed width, the bytes {@link java.io.DataOutputStream}
+	 * would write.
+	 */
+	static final class Output {
+
+		private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+		private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+		/** Largest array length every JVM allocates. */
+		private static final int MAX_LENGTH = Integer.MAX_VALUE - 8;
+
+		private final byte[] array;
+		private final MemorySegment segment;
+		private int position;
+
+		/** @throws IllegalArgumentException if {@code size} is too large for an array */
+		Output(long size) {
+			if (size > MAX_LENGTH) {
+				throw new IllegalArgumentException("Encoding too large: " + size + " bytes");
+			}
+			this.array = new byte[(int) size];
+			this.segment = MemorySegment.ofArray(array);
+		}
+
+		void writeByte(int value) {
+			array[position] = (byte) value;
+			position++;
+		}
+
+		void writeBoolean(boolean value) {
+			writeByte(value ? 1 : 0);
+		}
+
+		void writeInt(int value) {
+			segment.set(INT, position, value);
+			position += Integer.BYTES;
+		}
+
+		void writeLong(long value) {
+			segment.set(LONG, position, value);
+			position += Long.BYTES;
+		}
+
+		void write(byte[] bytes, int offset, int length) {
+			System.arraycopy(bytes, offset, array, position, length);
+			position += length;
+		}
+
+		/** A byte string: the length, then the bytes. */
+		void writeBytes(byte[] bytes) {
+			writeInt(bytes.length);
+			write(bytes, 0, bytes.length);
+		}
+
+		/** A byte string, copied straight from the buffer's backing array or segment. */
+		void writeBuf(Buf buf) {
+			int size = buf.size();
+			writeInt(size);
+			byte[] backing = buf.getBackingByteArrayStrict();
+			if (backing != null) {
+				System.arraycopy(backing, buf.getBackingByteArrayOffset(), array, position, size);
+			} else {
+				MemorySegment.copy(buf.asMemorySegment(), 0, segment, position, size);
+			}
+			position += size;
+		}
+
+		void writeNullableBuf(@Nullable Buf buf) {
+			if (buf == null) {
+				writeInt(-1);
+			} else {
+				writeBuf(buf);
+			}
+		}
+
+		/** The encoding. @throws IllegalStateException if fewer bytes were written than the computed size */
+		byte[] finish() {
+			if (position != array.length) {
+				throw new IllegalStateException("Wrote " + position + " bytes, computed " + array.length);
+			}
+			return array;
+		}
+	}
+
 	/** Bounds-checked reader of an encoding: every malformation is reported as {@link IllegalArgumentException}. */
 	static final class Input {
 
@@ -575,6 +716,11 @@ final class LogEntryCodec {
 
 		Input(byte[] data) {
 			this.buffer = ByteBuffer.wrap(Objects.requireNonNull(data, "data"));
+		}
+
+		/** Reads the remaining bytes of {@code data}, which may be a read-only view; {@code data} is not moved. */
+		Input(ByteBuffer data) {
+			this.buffer = data.slice().order(ByteOrder.BIG_ENDIAN);
 		}
 
 		private void require(int length) {
@@ -621,6 +767,16 @@ final class LogEntryCodec {
 
 		byte[] readBytes() {
 			return readBytes(readCount(1));
+		}
+
+		/**
+		 * A reader of the next byte string, which it skips: its bytes are read in place, without being copied first.
+		 */
+		Input readNested() {
+			int length = readCount(1);
+			var nested = new Input(buffer.slice(buffer.position(), length));
+			buffer.position(buffer.position() + length);
+			return nested;
 		}
 
 		Buf readBuf() {

@@ -1,18 +1,14 @@
 package it.cavallium.rockserver.distributed;
 
-import static it.cavallium.rockserver.distributed.LogEntryCodec.writeBuf;
-import static it.cavallium.rockserver.distributed.LogEntryCodec.writeBytes;
-import static it.cavallium.rockserver.distributed.LogEntryCodec.writeNullableBuf;
 import static it.cavallium.rockserver.distributed.LogEntryCodec.writeString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.Delta;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.io.UncheckedIOException;
+import it.cavallium.rockserver.distributed.LogEntryCodec.Input;
+import it.cavallium.rockserver.distributed.LogEntryCodec.Output;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -50,25 +46,25 @@ final class ResultCodec {
 	/** @throws IllegalArgumentException if the value of an {@code Ok} result has an unsupported type */
 	static byte[] encode(ApplyResult result) {
 		Objects.requireNonNull(result, "result");
-		var bytes = new ByteArrayOutputStream();
-		try (var out = new DataOutputStream(bytes)) {
-			switch (result) {
-				case ApplyResult.Ok(Object value) -> {
-					out.writeByte(OK);
-					writeValue(out, value, 0);
-				}
-				case ApplyResult.Failed(RocksDBErrorType type, String message) -> {
-					out.writeByte(FAILED);
-					writeString(out, type.name());
-					writeBytes(out, message.getBytes(UTF_8));
-				}
-				case ApplyResult.ResendAlone _ -> out.writeByte(RESEND_ALONE);
+		var out = new Output(encodedSize(result));
+		writeResult(out, result);
+		return out.finish();
+	}
+
+	/** Writes the {@link #encodedSize} bytes of {@code result}. */
+	private static void writeResult(Output out, ApplyResult result) {
+		switch (result) {
+			case ApplyResult.Ok(Object value) -> {
+				out.writeByte(OK);
+				writeValue(out, value, 0);
 			}
-		} catch (IOException e) {
-			// ByteArrayOutputStream never throws
-			throw new UncheckedIOException(e);
+			case ApplyResult.Failed(RocksDBErrorType type, String message) -> {
+				out.writeByte(FAILED);
+				writeString(out, type.name());
+				out.writeBytes(message.getBytes(UTF_8));
+			}
+			case ApplyResult.ResendAlone _ -> out.writeByte(RESEND_ALONE);
 		}
-		return bytes.toByteArray();
 	}
 
 	/**
@@ -125,13 +121,15 @@ final class ResultCodec {
 				sizes[i] = resendSize;
 			}
 		}
-		// Fits in an int: it is at most maxBytes, or every result is now as small as RESEND_ALONE.
-		var buffer = java.nio.ByteBuffer.allocate((int) total).putInt(count);
-		for (var result : chosen) {
-			byte[] bytes = encode(result);
-			buffer.putInt(bytes.length).put(bytes);
+		// Fits in an int: it is at most maxBytes, or every result is now as small as RESEND_ALONE. Each result is
+		// written in place, with the size measured above.
+		var out = new Output(total);
+		out.writeInt(count);
+		for (int i = 0; i < count; i++) {
+			out.writeInt((int) sizes[i]);
+			writeResult(out, chosen[i]);
 		}
-		return buffer.array();
+		return out.finish();
 	}
 
 	/** {@link #bounded(ApplyResult, long)} with {@link #MAX_RESULT_BYTES}. */
@@ -212,11 +210,24 @@ final class ResultCodec {
 
 	/** @throws IllegalArgumentException on malformed input */
 	static List<ApplyResult> decodeAll(byte[] data) {
-		var in = new LogEntryCodec.Input(data);
+		return decodeAll(new Input(data));
+	}
+
+	/**
+	 * Decodes the results in {@code data}'s remaining bytes, such as a read-only view of a Raft reply, without
+	 * copying them first.
+	 *
+	 * @throws IllegalArgumentException on malformed input
+	 */
+	static List<ApplyResult> decodeAll(ByteBuffer data) {
+		return decodeAll(new Input(data));
+	}
+
+	private static List<ApplyResult> decodeAll(Input in) {
 		int count = in.readCount(Integer.BYTES + 1);
 		var results = new ArrayList<ApplyResult>(count);
 		for (int i = 0; i < count; i++) {
-			results.add(decode(in.readBytes()));
+			results.add(decode(in.readNested()));
 		}
 		in.finish();
 		return results;
@@ -224,7 +235,10 @@ final class ResultCodec {
 
 	/** @throws IllegalArgumentException on malformed input */
 	static ApplyResult decode(byte[] data) {
-		var in = new LogEntryCodec.Input(data);
+		return decode(new Input(data));
+	}
+
+	private static ApplyResult decode(Input in) {
 		byte tag = in.readByte();
 		ApplyResult result = switch (tag) {
 			case OK -> new ApplyResult.Ok(readValue(in, 0));
@@ -236,12 +250,12 @@ final class ResultCodec {
 		return result;
 	}
 
-	private static void writeValue(DataOutputStream out, @Nullable Object value, int depth) throws IOException {
+	private static void writeValue(Output out, @Nullable Object value, int depth) {
 		switch (value) {
 			case null -> out.writeByte(NULL);
 			case Buf buf -> {
 				out.writeByte(BUF);
-				writeBuf(out, buf);
+				out.writeBuf(buf);
 			}
 			case Boolean bool -> out.writeByte(bool ? TRUE : FALSE);
 			case Long number -> {
@@ -250,8 +264,8 @@ final class ResultCodec {
 			}
 			case Delta<?>(Object previous, Object current) -> {
 				out.writeByte(DELTA);
-				writeNullableBuf(out, deltaSide(previous));
-				writeNullableBuf(out, deltaSide(current));
+				out.writeNullableBuf(deltaSide(previous));
+				out.writeNullableBuf(deltaSide(current));
 			}
 			case List<?> list -> {
 				if (depth >= MAX_LIST_DEPTH) {
@@ -274,7 +288,7 @@ final class ResultCodec {
 		throw new IllegalArgumentException("Unsupported delta value type: " + value.getClass().getName());
 	}
 
-	private static @Nullable Object readValue(LogEntryCodec.Input in, int depth) {
+	private static @Nullable Object readValue(Input in, int depth) {
 		byte type = in.readByte();
 		return switch (type) {
 			case NULL -> null;
@@ -299,7 +313,7 @@ final class ResultCodec {
 		};
 	}
 
-	private static RocksDBErrorType readErrorType(LogEntryCodec.Input in) {
+	private static RocksDBErrorType readErrorType(Input in) {
 		String name = in.readString();
 		try {
 			return RocksDBErrorType.valueOf(name);

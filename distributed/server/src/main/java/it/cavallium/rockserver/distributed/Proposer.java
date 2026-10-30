@@ -766,7 +766,7 @@ final class Proposer implements Closeable {
 			}
 			List<ApplyResult> results;
 			try {
-				results = ResultCodec.decodeAll(reply.getMessage().getContent().toByteArray());
+				results = ResultCodec.decodeAll(reply.getMessage().getContent().asReadOnlyByteBuffer());
 			} catch (IllegalArgumentException ex) {
 				fail(batch, unavailable(ex));
 				return;

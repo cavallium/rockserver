@@ -309,7 +309,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 				.setStateMachine(this)
 				.setClientRequest(request);
 		try {
-			var decoded = LogEntryCodec.decodeBatch(request.getMessage().getContent().toByteArray());
+			var decoded = LogEntryCodec.decodeBatch(request.getMessage().getContent().asReadOnlyByteBuffer());
 			if (decoded.size() > 1 && !decoded.stream().allMatch(r -> Applier.isBatchable(r.entry()))) {
 				throw new IllegalArgumentException("Only data writes can share a log entry");
 			}
@@ -395,7 +395,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var data = logEntry.getStateMachineLogEntry().getLogData();
 		List<Request> requests;
 		try {
-			requests = proposal != null ? proposal.requests : LogEntryCodec.decodeBatch(data.toByteArray());
+			requests = proposal != null ? proposal.requests : LogEntryCodec.decodeBatch(data.asReadOnlyByteBuffer());
 		} catch (RuntimeException ex) {
 			return CompletableFuture.failedFuture(fail("decode entry " + position, ex));
 		}
