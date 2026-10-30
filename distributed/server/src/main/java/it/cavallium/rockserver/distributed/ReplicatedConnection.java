@@ -915,6 +915,10 @@ final class ReplicatedConnection implements RocksDBConnection {
 			throw new RocksDBRetryException();
 		}
 		if (transaction.update) {
+			if (session.pipelined() && !transaction.startCommit()) {
+				// A second write on this id: the first commit stays in flight, and the update with it.
+				throw new RocksDBRetryException();
+			}
 			if (transaction.chained() && transaction.base.failed()) {
 				// It read a value that was never written: its guard would reject it.
 				session.remove(transaction);
@@ -924,7 +928,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 			return commit(context, session, transaction, entry).handle((result, error) -> {
 				session.remove(transaction);
 				rollBackNativeQuietly(transaction.id, true);
-				// After remove: the commit can be admitted up to the moment its key is released.
+				// After remove: the commit can be admitted up to the moment its key is released. The link can only be this
+				// commit's own, see startCommit.
 				var link = transaction.link();
 				if (link != null && error != null) {
 					session.linkFailed(link);
@@ -974,8 +979,9 @@ final class ReplicatedConnection implements RocksDBConnection {
 		var session = currentSession();
 		var transaction = session.get(command.transactionId());
 		if (transaction == null) {
-			if (command.commit()) {
-				// Expired, or opened by a previous leader: the client must run the transaction again.
+			if (command.commit() || command.transactionId() > 0) {
+				// Expired, or opened by a previous leader: the client must run the transaction again. A positive id is a
+				// chained update, and a clean end of one would confirm a value that may never be written.
 				throw new RocksDBRetryException();
 			}
 			return CompletableFuture.completedFuture(true);

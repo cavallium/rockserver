@@ -143,6 +143,7 @@ final class LeaderSession {
 		final @Nullable ChainLink base;
 		/** Its own commit, once admitted to the log and passed its key on. */
 		private volatile @Nullable ChainLink link;
+		private final AtomicBoolean commitStarted = new AtomicBoolean();
 		private final long deadlineNanos;
 		private final List<LogEntry.Write> writes = new ArrayList<>();
 		private final LongArrayList conflictColumns = new LongArrayList();
@@ -170,6 +171,15 @@ final class LeaderSession {
 
 		@Nullable ChainLink link() {
 			return link;
+		}
+
+		/**
+		 * Claims the only commit of this update, false if it was claimed already. So a link has one commit behind it, and
+		 * that commit's failure is the only one that can fail the link: a resend of the write must not take down a commit
+		 * that may be applying, nor the updates chained on it.
+		 */
+		boolean startCommit() {
+			return commitStarted.compareAndSet(false, true);
 		}
 
 		/** What a write with {@code keyCount} keys adds to the commit entry: the write and its conflict keys. */
