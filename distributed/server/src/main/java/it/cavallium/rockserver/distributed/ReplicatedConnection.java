@@ -830,14 +830,18 @@ final class ReplicatedConnection implements RocksDBConnection {
 			}
 			return CompletableFuture.completedFuture(true);
 		}
+		// Rollbacks run here, at once: an optimistic rollback does no I/O, and once the transaction left the session
+		// nothing else would close it if a scheduler refused or expired the rollback.
 		if (!command.commit()) {
 			session.remove(transaction);
-			return local(context, command);
+			rollBackNativeQuietly(transaction.id, false);
+			return CompletableFuture.completedFuture(true);
 		}
 		var entry = transaction.commitEntry(session.term());
 		if (entry.writes().isEmpty() && entry.conflictHashes().length == 0) {
 			session.remove(transaction);
-			return local(context, new CloseTransaction(command.transactionId(), false));
+			rollBackNativeQuietly(transaction.id, false);
+			return CompletableFuture.completedFuture(true);
 		}
 		return commit(session, transaction, entry).handle((_, error) -> {
 			if (error != null && unwrap(error) instanceof Proposer.ConflictException) {
@@ -874,7 +878,9 @@ final class ReplicatedConnection implements RocksDBConnection {
 		if (transaction != null) {
 			session.remove(transaction);
 		}
-		return local(context, command);
+		// At once, like the rollbacks of closeTransaction.
+		rollBackNativeQuietly(command.updateId(), true);
+		return CompletableFuture.completedFuture(null);
 	}
 
 	private CompletableFuture<?> inTransaction(RequestContext context, RocksDBAPICommandSingle<?> command, long id) {

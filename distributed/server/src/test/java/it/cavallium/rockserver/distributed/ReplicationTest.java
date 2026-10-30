@@ -94,6 +94,45 @@ class ReplicationTest {
 		assertEquals(List.of("users"), List.copyOf(api(follower).getAllColumnDefinitions().keySet()));
 	}
 
+	/**
+	 * A new leader may still be applying the entries of earlier leaders when Ratis counts it ready: its reads wait
+	 * for them, and never miss a write the previous leader acknowledged.
+	 */
+	@Test
+	void aNewLeaderDoesNotServeReadsBeforeApplyingWhatTheOldOneAcknowledged() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var oldLeader = cluster.awaitLeader(TIMEOUT);
+		long column = api(oldLeader).createColumn("c", SCHEMA);
+		api(oldLeader).put(0, column, key(1), text("old"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		var gate = new java.util.concurrent.CountDownLatch(1);
+		var followers = cluster.runningNodes().stream().filter(node -> node != oldLeader).toList();
+		try {
+			for (var follower : followers) {
+				follower.stateMachine().applyGateForTesting = gate;
+			}
+			// Acknowledged by the leader once a follower logged it; neither follower can apply it.
+			api(oldLeader).put(0, column, key(1), text("new"), RequestType.none());
+			cluster.stop(oldLeader.config().nodeId());
+			var newLeader = cluster.awaitLeader(TIMEOUT);
+			var read = newLeader.connection().getAsyncApi(RequestContext.batch(Duration.ofSeconds(20)))
+					.getAsync(0, column, key(1), RequestType.current());
+			try {
+				var value = read.get(1, java.util.concurrent.TimeUnit.SECONDS);
+				assertEquals("new", text(value), "read served before the acknowledged write was applied");
+			} catch (java.util.concurrent.TimeoutException | java.util.concurrent.ExecutionException expected) {
+				// Still waiting for the apply, or failed in time: either way not stale.
+			}
+		} finally {
+			gate.countDown();
+			for (var follower : followers) {
+				follower.stateMachine().applyGateForTesting = null;
+			}
+		}
+		var newLeader = cluster.awaitLeader(TIMEOUT);
+		assertEquals("new", text(api(newLeader).get(0, column, key(1), RequestType.current())));
+	}
+
 	@Test
 	void writeResultsAreComputedByApply() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();

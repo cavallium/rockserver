@@ -131,6 +131,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private record Readiness(long term, long index) {}
 
 	private volatile Readiness readiness = new Readiness(-1, -1);
+	/** The highest log index handed to the apply thread (data entries and positions alike). */
+	private volatile long handedOver = -1;
 	private final Thread applyThread;
 	/**
 	 * Runs what follows the commit of each group, in log order: replies (Ratis replies to clients and advances its
@@ -405,6 +407,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 		var reply = new CompletableFuture<Message>();
 		applyQueue.add(new ApplyEntry(position, requests, proposal, data.size(), kib, reply));
+		handedOver = position.getIndex();
 		return reply;
 	}
 
@@ -418,8 +421,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	public void notifyLeaderReady() {
 		var division = division();
 		if (division != null) {
-			var info = division.getInfo();
-			readiness = new Readiness(info.getCurrentTerm(), info.getLastAppliedIndex());
+			// Not info.getLastAppliedIndex(): that is the state machine's own applied index, which lags behind.
+			readiness = new Readiness(division.getInfo().getCurrentTerm(), handedOver);
 		}
 	}
 
@@ -441,6 +444,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	public void notifyTermIndexUpdated(long term, long index) {
 		if (!failed) {
 			applyQueue.add(new MarkPosition(TermIndex.valueOf(term, index)));
+			handedOver = index;
 		}
 	}
 
@@ -495,11 +499,17 @@ final class RockserverStateMachine extends BaseStateMachine {
 			try {
 				applyGroup(group);
 			} catch (Throwable error) {
-				// An Error (out of memory...): stop the replica, and keep answering whatever is queued, failed.
-				applier.abortGroup();
-				var failure = fail("apply entries up to " + positionOf(group.getLast()), error);
-				failAll(group, failure);
-				failQueued(failure);
+				// An Error (out of memory...): stop the replica, and keep answering whatever is queued, failed. The
+				// futures first: reporting the failure may itself fail.
+				failed = true;
+				failAll(group, error);
+				failQueued(error);
+				try {
+					applier.abortGroup();
+					fail("apply entries up to " + positionOf(group.getLast()), error);
+				} catch (Throwable secondary) {
+					error.addSuppressed(secondary);
+				}
 			} finally {
 				releaseQueued(group);
 			}
@@ -522,7 +532,18 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * Applies {@code group} in one local transaction, then has {@link #completer} make each entry count as applied
 	 * and complete its reply, in log order. A failure stops the replica: no entry of the group, nor any queued after it, is answered.
 	 */
+	/** Tests only: while set, the apply thread waits for it before each group. */
+	volatile java.util.concurrent.@Nullable CountDownLatch applyGateForTesting;
+
 	private void applyGroup(List<Applying> group) {
+		var gate = applyGateForTesting;
+		if (gate != null) {
+			try {
+				gate.await();
+			} catch (InterruptedException ex) {
+				Thread.currentThread().interrupt();
+			}
+		}
 		if (failed) {
 			failAll(group, new IllegalStateException("Replica failed"));
 			return;

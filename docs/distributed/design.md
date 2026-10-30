@@ -220,9 +220,10 @@ leader can therefore serve stale reads. `ReadBarrier` does the check itself, wit
    leaders: every write is acknowledged only after the leader applied it (the result comes from the leader's
    apply), so once the entries of earlier terms are applied, whatever a client saw acknowledged is in the
    leader's database. Ratis counts a leader ready when it hands its first entry to the state machine, which
-   only queues it for the apply thread; the state machine records, in `notifyLeaderReady`, the index handed
-   over until then, and `awaitLeadership` waits for the applied index to reach it (the commit index, if Ratis
-   has not reported the term ready yet). A new leader session also treats any transaction snapshot older than
+   only queues it for the apply thread; the state machine records, in `notifyLeaderReady`, the last index it
+   handed to the apply thread until then (not Ratis' `getLastAppliedIndex`, which is the state machine's own,
+   lagging, applied index), and `awaitLeadership` waits, at most a round timeout, for the applied index to
+   reach it (the commit index, if Ratis has not reported the term ready yet). A new leader session also treats any transaction snapshot older than
    that index as conflicting, so no commit validates against a snapshot that misses those entries.
 
 **Why this is safe.** Suppose a leader with a higher term had committed something before the read arrived.

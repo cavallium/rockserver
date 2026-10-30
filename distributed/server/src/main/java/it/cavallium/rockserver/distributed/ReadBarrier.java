@@ -231,7 +231,15 @@ final class ReadBarrier implements Closeable {
 			} else if (waiter.commitIndex < 0) {
 				execute(() -> waiter.future.complete(null));
 			} else {
-				applied.await(waiter.commitIndex).thenRunAsync(() -> waiter.future.complete(null), this::execute);
+				// Bounded like the round: a new leader far behind in applying earlier terms fails its reads in time.
+				applied.await(waiter.commitIndex).orTimeout(roundTimeout.toNanos(), TimeUnit.NANOSECONDS)
+						.whenCompleteAsync((_, applyError) -> {
+							if (applyError == null) {
+								waiter.future.complete(null);
+							} else {
+								waiter.future.completeExceptionally(applyError);
+							}
+						}, this::execute);
 			}
 		}
 	}
