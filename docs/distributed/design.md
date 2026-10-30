@@ -143,7 +143,10 @@ thread takes everything queued (up to 256 entries or about 16 MiB) and applies i
 thread then completes the group's futures, in log order. Ratis replies to a client, or counts an entry applied,
 only when its future completes, after the group commits,
 and it waits for these futures before it takes a snapshot; replacing the database with an installed snapshot,
-taking a snapshot and closing first wait until the apply thread is idle.
+taking a snapshot and closing first wait until the apply thread is idle. At most 256 MiB of entries wait for
+the apply thread: beyond that, Ratis' thread waits, so a replica that falls behind keeps its backlog in the
+Raft log on disk instead of decoded on the heap. Any error on the apply or completion thread, an
+`OutOfMemoryError` included, stops the replica and fails every waiting reply.
 
 - **Data writes** (puts, deletes, merges, transaction commits) of a group run in one local transaction
   without the RocksDB WAL. It also writes their result records, each proposer's floor and the applied
@@ -211,9 +214,14 @@ leader can therefore serve stale reads. `ReadBarrier` does the check itself, wit
    a majority of the current configuration reports the leader's term, counting the leader itself. During a
    membership change, a majority of the previous configuration is needed too. A higher term fails the read.
 3. The read then runs against the local database. `ReadBarrier.await` also waits until the local applied
-   index reaches `c`; replicated reads use `awaitLeadership`, which does not: every write is acknowledged only
-   after the leader applied it (the result comes from the leader's apply), and a ready leader has applied
-   every entry of earlier terms, so whatever a client saw acknowledged is already in the leader's database.
+   index reaches `c`; replicated reads use `awaitLeadership`, which waits only for the entries of earlier
+   leaders: every write is acknowledged only after the leader applied it (the result comes from the leader's
+   apply), so once the entries of earlier terms are applied, whatever a client saw acknowledged is in the
+   leader's database. Ratis counts a leader ready when it hands its first entry to the state machine, which
+   only queues it for the apply thread; the state machine records, in `notifyLeaderReady`, the index handed
+   over until then, and `awaitLeadership` waits for the applied index to reach it (the commit index, if Ratis
+   has not reported the term ready yet). A new leader session also treats any transaction snapshot older than
+   that index as conflicting, so no commit validates against a snapshot that misses those entries.
 
 **Why this is safe.** Suppose a leader with a higher term had committed something before the read arrived.
 Then a majority had already moved to that higher term, and terms never decrease. A majority answering after

@@ -85,7 +85,8 @@ public final class ReplicatedNode implements AutoCloseable {
 		try {
 			server.start();
 			started.add(server);
-			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout());
+			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout(),
+					stateMachine::leaderReadyIndex);
 			started.add(barrier);
 			this.proposer = new Proposer(group, RaftSettings.client(config), config, this::raftServer, metrics);
 			started.add(proposer);

@@ -57,7 +57,7 @@ final class ReadBarrier implements Closeable {
 		}
 	}
 
-	/** A caller of the next round; {@code commitIndex} is -1 when it does not wait for the apply. */
+	/** A caller of the next round; {@code commitIndex} is the applied index it waits for, -1 for none. */
 	private record Waiter(long term, long commitIndex, CompletableFuture<Void> future) {}
 
 	private final RaftServer server;
@@ -83,11 +83,24 @@ final class ReadBarrier implements Closeable {
 	private volatile boolean closed;
 
 	ReadBarrier(RaftServer server, RaftGroupId groupId, AppliedIndex applied, Duration roundTimeout) {
+		this(server, groupId, applied, roundTimeout, _ -> -1);
+	}
+
+	/**
+	 * @param readyIndex for a term this node leads, the log index it must have applied before it serves as its
+	 *                   leader: Ratis counts a leader ready once it handed over the entries of earlier leaders, not
+	 *                   once the state machine applied them
+	 */
+	ReadBarrier(RaftServer server, RaftGroupId groupId, AppliedIndex applied, Duration roundTimeout,
+			java.util.function.LongUnaryOperator readyIndex) {
 		this.server = server;
 		this.groupId = groupId;
 		this.applied = applied;
 		this.roundTimeout = roundTimeout;
+		this.readyIndex = readyIndex;
 	}
+
+	private final java.util.function.LongUnaryOperator readyIndex;
 
 	/**
 	 * Completes when every write committed before this call is visible in the local database and this node was
@@ -99,9 +112,9 @@ final class ReadBarrier implements Closeable {
 
 	/**
 	 * Completes when this node was the ready leader after this call; unlike {@link #await()}, it does not wait for
-	 * the entries committed before this call to be applied. That is enough when the state machine acknowledges a
-	 * write only after this leader applied it, and the caller reads only acknowledged writes: being the ready leader
-	 * means its own first entry, and so every entry of earlier leaders, is applied, and any write acknowledged in
+	 * the entries committed before this call to be applied, only for those of earlier leaders (see the constructor).
+	 * That is enough when the state machine acknowledges a write only after this leader applied it, and the caller
+	 * reads only acknowledged writes: every entry of earlier leaders is then applied, and any write acknowledged in
 	 * its term was applied before its acknowledgement.
 	 */
 	CompletableFuture<Void> awaitLeadership() {
@@ -133,7 +146,8 @@ final class ReadBarrier implements Closeable {
 				return CompletableFuture.failedFuture(new NotLeaderException("Read barrier closed"));
 			}
 			outstanding.add(future);
-			nextRound.add(new Waiter(term, waitForApply ? commitIndex : -1, future));
+			nextRound.add(new Waiter(term, waitForApply ? commitIndex : Math.min(commitIndex, readyIndex.applyAsLong(term)),
+					future));
 			round = takeNextRoundIfIdle();
 		}
 		future.whenComplete((_, _) -> outstanding.remove(future));

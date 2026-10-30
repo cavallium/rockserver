@@ -139,6 +139,33 @@ class ReadBarrierTest {
 	}
 
 	@Test
+	void leadershipWaitsForTheEntriesOfEarlierLeadersToBeApplied() throws Exception {
+		startCluster();
+		var leader = awaitLeader();
+		var client = client();
+		long commitBefore = leader.commitIndex();
+		var gate = new CountDownLatch(1);
+		leader.stateMachine.applyGate = gate;
+		try {
+			var write = client.async().send(Message.valueOf("inc"));
+			waitUntil(() -> leader.commitIndex() > commitBefore, "write committed");
+			long readyIndex = leader.commitIndex();
+			// As if that entry were an earlier leader's, still waiting for this node's apply thread.
+			var barrier = new ReadBarrier(leader.server, groupId, leader.stateMachine.applied, ROUND_TIMEOUT,
+					_ -> readyIndex);
+			barriers.add(barrier);
+			var writesSeenByRead = barrier.awaitLeadership().thenApply(_ -> leader.stateMachine.writes.get());
+			Thread.sleep(300);
+			assertFalse(writesSeenByRead.isDone(), "leadership confirmed before the earlier entries were applied");
+			gate.countDown();
+			assertEquals(1, writesSeenByRead.get(10, TimeUnit.SECONDS));
+			assertTrue(write.get(10, TimeUnit.SECONDS).isSuccess());
+		} finally {
+			gate.countDown();
+		}
+	}
+
+	@Test
 	void followersRejectBarrier() throws Exception {
 		startCluster();
 		var leader = awaitLeader();

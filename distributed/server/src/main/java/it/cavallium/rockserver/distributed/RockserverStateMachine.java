@@ -117,6 +117,20 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	/** Entries waiting for the apply thread, in log order; see {@link #applyTransaction}. */
 	private final LinkedBlockingQueue<Applying> applyQueue = new LinkedBlockingQueue<>();
+	/**
+	 * KiB of queued entries: Ratis' thread waits in {@link #applyTransaction} while the apply thread is this far
+	 * behind, so that a lagging replica keeps its backlog in the Raft log on disk, not decoded on the heap.
+	 */
+	private final java.util.concurrent.Semaphore queuedKiB = new java.util.concurrent.Semaphore(MAX_QUEUED_KIB);
+	private static final int MAX_QUEUED_KIB = 256 << 10;
+
+	/**
+	 * The log index up to which this node must have applied before it serves as the leader of {@code term}: the
+	 * entries of earlier leaders. See {@link #notifyLeaderReady}.
+	 */
+	private record Readiness(long term, long index) {}
+
+	private volatile Readiness readiness = new Readiness(-1, -1);
 	private final Thread applyThread;
 	/**
 	 * Runs what follows the commit of each group, in log order: replies (Ratis replies to clients and advances its
@@ -131,9 +145,9 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/** Work for the apply thread. */
 	private sealed interface Applying {}
 
-	/** A data entry to apply; {@code reply} completes once it is committed. */
+	/** A data entry to apply; {@code reply} completes once it is committed. It holds {@code kib} of {@link #queuedKiB}. */
 	private record ApplyEntry(TermIndex position, List<Request> requests, @Nullable Proposal proposal, long bytes,
-			CompletableFuture<Message> reply) implements Applying {}
+			int kib, CompletableFuture<Message> reply) implements Applying {}
 
 	/** A position without data (configuration entries, leader no-ops) to record. */
 	private record MarkPosition(TermIndex position) implements Applying {}
@@ -264,6 +278,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 				current.close(store.db());
 			}
 			var created = new LeaderSession(term, applied);
+			// The session tracks writes from this term on: a transaction whose snapshot misses an earlier leader's
+			// entries would not see them conflict. Reads wait for those entries (see leaderReadyIndex); this makes
+			// sure no commit validates against such a snapshot anyway.
+			created.tracker().prune(leaderReadyIndex(term));
 			leaderSession = created;
 			LOG.info("{}: leading term {}", config.nodeId(), term);
 			return created;
@@ -378,9 +396,44 @@ final class RockserverStateMachine extends BaseStateMachine {
 		} catch (RuntimeException ex) {
 			return CompletableFuture.failedFuture(fail("decode entry " + position, ex));
 		}
+		int kib = (int) Math.min(MAX_QUEUED_KIB, Math.max(1, data.size() >> 10));
+		try {
+			queuedKiB.acquire(kib);
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
+			return CompletableFuture.failedFuture(ex);
+		}
 		var reply = new CompletableFuture<Message>();
-		applyQueue.add(new ApplyEntry(position, requests, proposal, data.size(), reply));
+		applyQueue.add(new ApplyEntry(position, requests, proposal, data.size(), kib, reply));
 		return reply;
+	}
+
+	/**
+	 * Called by Ratis on its apply thread when it hands over the first entry of this node's term as leader, which
+	 * makes it a ready leader: every entry before it was handed over, but may still wait for the apply thread.
+	 * Reads and the snapshots of transactions must wait for them (see {@link #leaderReadyIndex}): before the apply
+	 * moved to a thread of its own, being the ready leader meant they were applied.
+	 */
+	@Override
+	public void notifyLeaderReady() {
+		var division = division();
+		if (division != null) {
+			var info = division.getInfo();
+			readiness = new Readiness(info.getCurrentTerm(), info.getLastAppliedIndex());
+		}
+	}
+
+	/**
+	 * The log index this node must have applied before it serves reads, or opens transactions, as the leader of
+	 * {@code term}; the commit index if Ratis did not report this term ready yet, which covers it too.
+	 */
+	long leaderReadyIndex(long term) {
+		var current = readiness;
+		if (current.term() == term) {
+			return current.index();
+		}
+		var division = division();
+		return division == null ? Long.MAX_VALUE : division.getRaftLog().getLastCommittedIndex();
 	}
 
 	/** Configuration entries and leader no-ops: record the position so restarts resume after them. */
@@ -439,7 +492,29 @@ final class RockserverStateMachine extends BaseStateMachine {
 				group.add(next);
 				bytes += next instanceof ApplyEntry entry ? entry.bytes() : 0;
 			}
-			applyGroup(group);
+			try {
+				applyGroup(group);
+			} catch (Throwable error) {
+				// An Error (out of memory...): stop the replica, and keep answering whatever is queued, failed.
+				applier.abortGroup();
+				var failure = fail("apply entries up to " + positionOf(group.getLast()), error);
+				failAll(group, failure);
+				failQueued(failure);
+			} finally {
+				releaseQueued(group);
+			}
+		}
+	}
+
+	private void releaseQueued(List<Applying> items) {
+		int kib = 0;
+		for (var item : items) {
+			if (item instanceof ApplyEntry entry) {
+				kib += entry.kib();
+			}
+		}
+		if (kib > 0) {
+			queuedKiB.release(kib);
 		}
 	}
 
@@ -484,8 +559,13 @@ final class RockserverStateMachine extends BaseStateMachine {
 		applyTime.since(start);
 		applyGroupEntries.record(group.size());
 		completer.execute(() -> {
-			for (var completion : completions) {
-				completion.run();
+			try {
+				for (var completion : completions) {
+					completion.run();
+				}
+			} catch (Throwable error) {
+				var failure = fail("complete entries up to " + positionOf(group.getLast()), error);
+				failAll(group, failure);
 			}
 		});
 	}
@@ -551,6 +631,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var rest = new java.util.ArrayList<Applying>();
 		applyQueue.drainTo(rest);
 		failAll(rest, failure);
+		releaseQueued(rest);
 	}
 
 	@Override
@@ -629,9 +710,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 	}
 
-	private RuntimeException fail(String what, RuntimeException ex) {
+	private RuntimeException fail(String what, Throwable error) {
 		failed = true;
-		LOG.error("{}: replica failed to {}; it stops serving and must be repaired", config.nodeId(), what, ex);
+		var ex = error instanceof RuntimeException runtime ? runtime : new IllegalStateException(error);
+		LOG.error("{}: replica failed to {}; it stops serving and must be repaired", config.nodeId(), what, error);
 		onReplicaFailure.accept(ex);
 		return ex;
 	}
