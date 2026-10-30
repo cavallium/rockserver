@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.client;
 
+import it.cavallium.rockserver.core.common.RequestContext;
+
 import it.cavallium.rockserver.core.common.SstMaintenance;
 
 import it.cavallium.buffer.Buf;
@@ -104,6 +106,14 @@ public final class EmbeddedConnection extends BaseConnection implements Internal
 	@Override
 	<R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestAsync(context, request);
+	}
+
+	/**
+	 * Runs a command on the calling thread, without the workload scheduler's admission and queues. Only for callers
+	 * that admit and schedule requests themselves, such as a replicated server, and only for short commands.
+	 */
+	public <R, RS, RA> RS requestInline(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+		return delegate.requestInline(BoundRequestContext.bind(context), request);
 	}
 }
 
@@ -253,6 +263,11 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			}
 			throw new IllegalStateException("Unsupported async result for " + req.getClass().getName());
 		});
+	}
+
+	<R, RS, RA> RS requestInline(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> req) {
+		resolveCommand(context.value(), req);
+		return withEmbeddedContext(context, () -> req.handleSync(this));
 	}
 
 	@SuppressWarnings("unchecked")

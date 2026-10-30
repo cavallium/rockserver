@@ -93,6 +93,10 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private final NodeMetrics.Series commitTime;
 	private final NodeMetrics.Series forwardTime;
 	private final NodeMetrics.Series lockWaitTime;
+	private final NodeMetrics.Series localTime;
+	/** Runs short local commands; see {@link #local}. */
+	private static final java.util.concurrent.Executor INLINE = java.util.concurrent.Executors.newThreadPerTaskExecutor(
+			Thread.ofVirtual().name("replicated-local-", 0).factory());
 
 	ReplicatedConnection(NodeConfig config,
 			RockserverStateMachine stateMachine,
@@ -106,6 +110,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		this.commitTime = metrics.duration("commit");
 		this.forwardTime = metrics.duration("forward");
 		this.lockWaitTime = metrics.duration("update.lockWait");
+		this.localTime = metrics.duration("local");
 		this.stateMachine = stateMachine;
 		this.proposer = proposer;
 		this.barrier = barrier;
@@ -481,8 +486,29 @@ final class ReplicatedConnection implements RocksDBConnection {
 		return command instanceof RocksDBAPICommandStream.GetRange<?> range && range.transactionId() != 0;
 	}
 
+	/**
+	 * Runs a command on the local database. Point reads and the commands of native transactions run on a virtual
+	 * thread of their own, straight on the database: the requests were admitted already ({@code GrpcServer}'s proxy
+	 * scheduler), and the embedded workload scheduler's queues cost milliseconds per request under load. Longer
+	 * commands (ranges, multi-key reads) keep its admission and fairness.
+	 */
 	private CompletableFuture<?> local(RequestContext context, RocksDBAPICommandSingle<?> command) {
-		return (CompletableFuture<?>) stateMachine.store().connection().getAsyncApi(context).requestAsync(command);
+		long start = System.nanoTime();
+		var connection = stateMachine.store().connection();
+		CompletableFuture<?> result = isShort(command)
+				? CompletableFuture.supplyAsync(() -> connection.requestInline(context, command), INLINE)
+				: (CompletableFuture<?>) connection.getAsyncApi(context).requestAsync(command);
+		result.whenComplete((_, _) -> localTime.since(start));
+		return result;
+	}
+
+	private static boolean isShort(RocksDBAPICommandSingle<?> command) {
+		return switch (command) {
+			case Get<?> _, Put<?> _, Delete<?> _, Merge<?> _ -> true;
+			case RocksDBAPICommandSingle.OpenTransaction _, RocksDBAPICommandSingle.CloseTransaction _,
+					RocksDBAPICommandSingle.CloseFailedUpdate _ -> true;
+			default -> false;
+		};
 	}
 
 	@SuppressWarnings("unchecked")
