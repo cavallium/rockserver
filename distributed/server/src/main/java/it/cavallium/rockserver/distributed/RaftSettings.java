@@ -35,6 +35,11 @@ final class RaftSettings {
 		// configuration entry, which keeps the applied-index bookkeeping simple.
 		RaftServerConfigKeys.Log.setLogMetadataEnabled(properties, false);
 		RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf("64MB"));
+		// The open segment is preallocated with zeros, so after a power loss in the middle of a group commit its tail
+		// reads back as a bad checksum or terminator rather than as its end, and the default policy (EXCEPTION) keeps
+		// the node from starting. Those entries were never fsynced, so they never counted toward a quorum or an
+		// acknowledgement: drop them and start. Closed segments are still checked and fail loudly.
+		RaftServerConfigKeys.Log.setCorruptionPolicy(properties, RaftServerConfigKeys.Log.CorruptionPolicy.WARN_AND_RETURN);
 		RaftServerConfigKeys.Log.Appender.setBufferByteLimit(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (1 << 20)));
 		RaftServerConfigKeys.Log.setWriteBufferSize(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (2 << 20)));
 		RaftServerConfigKeys.Log.setQueueByteLimit(properties, SizeInBytes.valueOf(4L * MAX_ENTRY_BYTES));
@@ -69,6 +74,10 @@ final class RaftSettings {
 		// Snapshots are RocksDB checkpoints; the log is purged up to the latest one.
 		RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(properties, true);
 		RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(properties, config.snapshotEveryEntries());
+		// Not at every stop or removal (the defaults): a graceful stop flushes the database, and a restart resumes from
+		// its own applied position, so a snapshot then would only delay the exit.
+		RaftServerConfigKeys.Snapshot.setTriggerWhenStopEnabled(properties, false);
+		RaftServerConfigKeys.Snapshot.setTriggerWhenRemoveEnabled(properties, false);
 		// Purge only what every member already committed: a follower that is restarting or installing a snapshot
 		// can then catch up from the log afterwards, instead of needing a new snapshot install forever. A member
 		// that is gone for good holds the log back until it is removed from the configuration.

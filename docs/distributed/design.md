@@ -197,6 +197,9 @@ opened, before any entry is applied, and no other column is ever created locally
 
 - **Raft log.** It is synced (`fsync`) on a majority before a write is acknowledged. It is the only log of
   data writes: they are applied without the RocksDB WAL, which would only write everything a second time.
+  After a power loss, the unsynced tail of the open segment (preallocated with zeros) is dropped at start
+  (`CorruptionPolicy.WARN_AND_RETURN`) instead of keeping the node down: those entries never counted toward a
+  quorum. Closed segments are still checked strictly.
 - **RocksDB.** Replicas open it with `atomic-flush` (every column flushed together) and point-in-time WAL
   recovery (`absolute-consistency` forced off). After a crash or power loss the database is the last flushed
   state, a consistent point where the applied position matches the data, and Raft replays the rest: the log
@@ -302,8 +305,14 @@ against an incomplete history.
   - the WALs still needed are copied.
 - **Why not `org.rocksdb.Checkpoint`.** It refuses the column volumes (`cf_paths`) that the default config
   uses.
-- **When.** Every `snapshotEveryEntries` applied entries (default 500k). Taking one flushes the memtables and
-  stops the apply for about 100–300 ms. Files that are hard links of durable files are not fsynced again.
+- **When.** Every `snapshotEveryEntries` applied entries (default 500k), not at stops (a graceful stop flushes
+  the database instead). Taking one flushes the memtables and copies the live files, 100–300 ms, on a thread of
+  its own: Ratis asks for a snapshot on its apply thread and hands over no entry until it gets an answer, so
+  `takeSnapshot` starts the copy and answers with the latest finished snapshot, until the new one is done. The
+  apply goes on meanwhile, so a snapshot may hold entries past its index; its database records its own applied
+  position, and entries at or below it are not applied again. Writes that go through the WAL (schema changes)
+  wait while a copy lists the files and copies the WAL. Files that are hard links of durable files are not
+  fsynced again.
 - **Log retention.** The Raft log is purged only up to the snapshot index and the lowest commit index of any
   member, and keeps `snapshotEveryEntries` entries more. A node restarted during a deploy, or one that just
   installed a snapshot, therefore catches up from the log. A member that is gone for good holds the log back,
