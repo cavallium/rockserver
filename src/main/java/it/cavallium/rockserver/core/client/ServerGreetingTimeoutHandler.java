@@ -10,10 +10,13 @@ import org.slf4j.LoggerFactory;
 /**
  * Closes a connection when the server sends nothing for this long after it was established.
  *
- * <p>The kernel completes the connections of a frozen process (SIGSTOP, a long pause, a hung disk) that still listens,
- * so the connect timeout does not see it, and gRPC would wait for the HTTP/2 settings of the server until keepalive
- * gives up. The channel then moves to its next address at once, instead of after keepalive's time and timeout. This
- * handler sits at the head of the pipeline and removes itself on the first bytes received.</p>
+ * <p>The kernel completes the connections of a frozen process (SIGSTOP, a long pause) that still listens, so the
+ * connect timeout does not see it, and gRPC would wait for the HTTP/2 settings of the server until keepalive gives up.
+ * The channel then moves to its next address at once, instead of after keepalive's time and timeout. This handler sits
+ * at the head of the pipeline and removes itself on the first bytes received.</p>
+ *
+ * <p>A hung disk is not detected: the process stops serving its database, but its event loops still answer the HTTP/2
+ * handshake and keepalive.</p>
  */
 final class ServerGreetingTimeoutHandler extends ChannelInboundHandlerAdapter {
 

@@ -10,6 +10,7 @@ import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
 import io.grpc.ClientInterceptor;
+import io.grpc.ConnectivityState;
 import io.grpc.ForwardingClientCall;
 import io.grpc.ForwardingClientCallListener;
 import io.grpc.ManagedChannel;
@@ -68,6 +69,7 @@ import java.net.URI;
 import java.time.Duration;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -82,6 +84,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -248,6 +252,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	static final int DEFAULT_KEEP_ALIVE_TIME_MILLIS = 10_000;
 	static final String KEEP_ALIVE_TIMEOUT_PROPERTY = "it.cavallium.rockserver.grpc.client.keep-alive-timeout-ms";
 	static final int DEFAULT_KEEP_ALIVE_TIMEOUT_MILLIS = 5_000;
+	static final String MAX_RECONNECT_DELAY_PROPERTY = "it.cavallium.rockserver.grpc.client.max-reconnect-delay-ms";
+	static final int DEFAULT_MAX_RECONNECT_DELAY_MILLIS = 2_000;
 	/**
 	 * One node at a time, the first of the list that accepts a connection: gRPC's default policy, written out so
 	 * that the address order is a contract (never shuffled).
@@ -296,6 +302,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private final URI address;
 	private final int maxInboundMessageSize;
 	private final RockserverCapabilities capabilities;
+	private final @Nullable ScheduledFuture<?> reconnectTimer;
 
 	private static it.cavallium.rockserver.core.common.api.proto.RequestContext[] createNoDeadlineWireContexts() {
 		var contexts = new it.cavallium.rockserver.core.common.api.proto.RequestContext[WorkloadProfile.values().length];
@@ -329,7 +336,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	/** Several nodes, tried in order by {@code pick_first} (see {@link MultiAddressNameResolver}). */
 	GrpcConnectionDelegate(String name, List<HostAndPort> addresses, URI address, boolean automaticRetry) {
-		this(name, NettyChannelBuilder.forTarget(MultiAddressNameResolver.target(addresses)), false, true, address,
+		this(name,
+				NettyChannelBuilder.forTarget(MultiAddressNameResolver.target(addresses))
+						.setNameResolverArg(MultiAddressNameResolver.LAST_GOOD_ADDRESSES, new HashMap<>()),
+				false,
+				true,
+				address,
 				automaticRetry);
 	}
 
@@ -444,6 +456,23 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		this.address = address;
 		this.maxInboundMessageSize = maxInboundMessageSize;
 		this.capabilities = capabilities;
+		this.reconnectTimer = severalAddresses ? startReconnectTimer(channel, eventLoopGroup) : null;
+	}
+
+	/**
+	 * With every address failing, gRPC retries after a delay that grows up to 2 minutes, and failing calls do not start
+	 * a connection: a client could lag behind a cluster that returned. This timer skips the rest of that delay, so a
+	 * client reconnects within the configured maximum. Each client has its own period, which keeps the clients of a
+	 * cluster that returned from reconnecting together.
+	 */
+	private static ScheduledFuture<?> startReconnectTimer(ManagedChannel channel, EventLoopGroup eventLoopGroup) {
+		int maxDelayMillis = intProperty(MAX_RECONNECT_DELAY_PROPERTY, DEFAULT_MAX_RECONNECT_DELAY_MILLIS, 2);
+		long periodMillis = ThreadLocalRandom.current().nextLong(maxDelayMillis / 2, maxDelayMillis + 1L);
+		return eventLoopGroup.scheduleWithFixedDelay(() -> {
+			if (channel.getState(false) == ConnectivityState.TRANSIENT_FAILURE) {
+				channel.resetConnectBackoff();
+			}
+		}, periodMillis, periodMillis, TimeUnit.MILLISECONDS);
 	}
 
 	@Override
@@ -1937,6 +1966,9 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	@Override
 	public void close() {
+		if (this.reconnectTimer != null) {
+			this.reconnectTimer.cancel(false);
+		}
 		try {
 			this.channel.shutdown();
 		} catch (Exception ex) {

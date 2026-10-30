@@ -7,6 +7,7 @@ import io.grpc.NameResolverRegistry;
 import io.grpc.Status;
 import io.grpc.StatusOr;
 import io.grpc.SynchronizationContext;
+import io.grpc.SynchronizationContext.ScheduledHandle;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.net.InetAddress;
@@ -15,10 +16,16 @@ import java.net.SocketAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnknownHostException;
-import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,13 +35,27 @@ import org.slf4j.LoggerFactory;
  *
  * <p>The target is {@code rockserver-hosts:///host1:port1,host2:port2}. Each host gives one address group, with
  * every address its name resolves to; with the {@code pick_first} policy the channel connects to the first address
- * that accepts a connection and keeps it until that connection is lost, then starts again from the first. A host
- * that does not resolve is left out of that resolution; when no host resolves, the channel sees UNAVAILABLE. Names
- * are resolved again when the load balancer asks for it (after the connection is lost or every address failed).</p>
+ * that accepts a connection and keeps it until that connection is lost, then starts again from the first. Names are
+ * resolved again when the load balancer asks for it (after the connection is lost or every address failed).</p>
+ *
+ * <p>A failed lookup must not take down what works, and the channel asks for a resolution exactly when it is moving
+ * to another node, so: a host whose lookup fails keeps its last good addresses, one that never resolved is left out,
+ * and the channel sees an error only while no host ever resolved. Hosts are looked up concurrently, and a lookup that
+ * takes longer than {@link #LOOKUP_WAIT_MILLIS} does not hold back the others: what resolved so far is published, and
+ * the slow host follows with an update if it ever answers. Each host has at most one lookup running, so a hung name
+ * holds one thread.</p>
  */
 final class MultiAddressNameResolver extends NameResolver {
 
 	static final String SCHEME = "rockserver-hosts";
+	/**
+	 * The last good addresses of each host, set by the channel's builder: a channel creates a new resolver whenever it
+	 * leaves idle mode, and the addresses must outlive it. Only used in the channel's synchronization context.
+	 */
+	static final Args.Key<Map<HostAndPort, List<SocketAddress>>> LAST_GOOD_ADDRESSES
+			= Args.Key.create("rockserver-last-good-addresses");
+	/** Short enough for the capability handshake to still reach nodes after a resolution that waited this long. */
+	private static final long LOOKUP_WAIT_MILLIS = 1_000;
 	private static final Logger LOG = LoggerFactory.getLogger(MultiAddressNameResolver.class);
 
 	static {
@@ -45,11 +66,20 @@ final class MultiAddressNameResolver extends NameResolver {
 	private final List<HostAndPort> addresses;
 	private final String authority;
 	private final SynchronizationContext syncContext;
+	private final ScheduledExecutorService scheduledExecutor;
 	private final @Nullable Executor offloadExecutor;
 	/** Guarded by syncContext. */
-	private Listener2 listener;
+	private final Map<HostAndPort, List<SocketAddress>> lastGood;
+	/** The hosts with a lookup running. Guarded by syncContext. */
+	private final Set<HostAndPort> lookups = new HashSet<>();
+	/** The hosts whose latest lookup failed, with why. Guarded by syncContext. */
+	private final Map<HostAndPort, String> failures = new HashMap<>();
 	/** Guarded by syncContext. */
-	private boolean resolving;
+	private Listener2 listener;
+	/** The wait for the lookups of the current resolution, null once it ended. Guarded by syncContext. */
+	private @Nullable ScheduledHandle lookupWait;
+	/** The last result given to the listener. Guarded by syncContext. */
+	private @Nullable List<EquivalentAddressGroup> published;
 	/** Guarded by syncContext. */
 	private boolean shutdown;
 
@@ -57,7 +87,9 @@ final class MultiAddressNameResolver extends NameResolver {
 		this.addresses = addresses;
 		this.authority = Utils.formatHostAndPorts(List.of(addresses.getFirst()));
 		this.syncContext = args.getSynchronizationContext();
+		this.scheduledExecutor = args.getScheduledExecutorService();
 		this.offloadExecutor = args.getOffloadExecutor();
+		this.lastGood = Objects.requireNonNullElseGet(args.getArg(LAST_GOOD_ADDRESSES), HashMap::new);
 	}
 
 	/** The channel target naming these addresses, in order. */
@@ -92,47 +124,87 @@ final class MultiAddressNameResolver extends NameResolver {
 	@Override
 	public void shutdown() {
 		shutdown = true;
+		if (lookupWait != null) {
+			lookupWait.cancel();
+			lookupWait = null;
+		}
 	}
 
 	private void resolve() {
-		if (resolving || shutdown) {
+		if (lookupWait != null || shutdown) {
 			return;
 		}
-		resolving = true;
-		Runnable lookup = () -> {
-			var groups = new ArrayList<EquivalentAddressGroup>(addresses.size());
-			var failures = new ArrayList<String>();
-			for (var address : addresses) {
-				try {
-					var resolved = Arrays.stream(InetAddress.getAllByName(address.host()))
-							.<SocketAddress>map(inet -> new InetSocketAddress(inet, address.port()))
-							.toList();
-					groups.add(new EquivalentAddressGroup(resolved));
-				} catch (UnknownHostException | RuntimeException e) {
-					failures.add(address.host() + ": " + e);
-				}
+		for (var address : addresses) {
+			if (lookups.add(address)) {
+				startLookup(address);
 			}
-			syncContext.execute(() -> {
-				resolving = false;
-				if (shutdown) {
-					return;
-				}
-				if (!failures.isEmpty()) {
-					LOG.warn("Rockserver hosts not resolved, left out until the next resolution: {}", failures);
-				}
-				if (groups.isEmpty()) {
-					listener.onError(Status.UNAVAILABLE.withDescription("No Rockserver host resolved: " + failures));
-				} else {
-					listener.onResult2(ResolutionResult.newBuilder()
-							.setAddressesOrError(StatusOr.fromValue(List.copyOf(groups)))
-							.build());
-				}
-			});
+		}
+		lookupWait = syncContext.schedule(this::endLookupWait, LOOKUP_WAIT_MILLIS, TimeUnit.MILLISECONDS,
+				scheduledExecutor);
+	}
+
+	private void startLookup(HostAndPort address) {
+		Runnable lookup = () -> {
+			List<SocketAddress> resolved = null;
+			String failure = null;
+			try {
+				resolved = Arrays.stream(InetAddress.getAllByName(address.host()))
+						.<SocketAddress>map(inet -> new InetSocketAddress(inet, address.port()))
+						.toList();
+			} catch (UnknownHostException | RuntimeException e) {
+				failure = e.toString();
+			}
+			var result = resolved;
+			var error = failure;
+			syncContext.execute(() -> lookupEnded(address, result, error));
 		};
 		if (offloadExecutor != null) {
 			offloadExecutor.execute(lookup);
 		} else {
-			lookup.run();
+			Thread.ofPlatform().daemon().name("rockserver-hosts-lookup").start(lookup);
+		}
+	}
+
+	private void lookupEnded(HostAndPort address, @Nullable List<SocketAddress> resolved, @Nullable String failure) {
+		lookups.remove(address);
+		if (shutdown) {
+			return;
+		}
+		if (resolved != null) {
+			lastGood.put(address, resolved);
+			failures.remove(address);
+		} else {
+			failures.put(address, failure);
+			LOG.warn("Rockserver host {} not resolved, {}: {}", address.host(),
+					lastGood.containsKey(address) ? "using its last addresses" : "left out", failure);
+		}
+		if (lookupWait != null && lookups.isEmpty()) {
+			lookupWait.cancel();
+			lookupWait = null;
+		}
+		if (lookupWait == null) {
+			publish();
+		}
+	}
+
+	private void endLookupWait() {
+		lookupWait = null;
+		publish();
+	}
+
+	private void publish() {
+		var groups = addresses.stream()
+				.map(lastGood::get)
+				.filter(Objects::nonNull)
+				.map(EquivalentAddressGroup::new)
+				.toList();
+		if (groups.isEmpty()) {
+			listener.onError(Status.UNAVAILABLE.withDescription("No Rockserver host resolved: " + failures));
+		} else if (!groups.equals(published)) {
+			published = groups;
+			listener.onResult2(ResolutionResult.newBuilder()
+					.setAddressesOrError(StatusOr.fromValue(groups))
+					.build());
 		}
 	}
 

@@ -86,6 +86,13 @@ class GrpcConnectionFailoverTest {
 	private static final String CONNECT_TIMEOUT_PROPERTY = "it.cavallium.rockserver.grpc.client.connect-timeout-ms";
 	private static final String KEEP_ALIVE_TIMEOUT_PROPERTY = "it.cavallium.rockserver.grpc.client.keep-alive-timeout-ms";
 	private static final String MAX_ATTEMPTS_PROPERTY = "it.cavallium.rockserver.grpc.client.max-retry-attempts";
+	private static final String MAX_RECONNECT_DELAY_PROPERTY
+			= "it.cavallium.rockserver.grpc.client.max-reconnect-delay-ms";
+	private static final String MAX_CONNECTION_AGE_PROPERTY = "it.cavallium.rockserver.grpc.server.max-connection-age-ms";
+	private static final String MAX_CONNECTION_AGE_GRACE_PROPERTY
+			= "it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms";
+	/** A slow failure: an answer of the resolver that arrives after the channel moved on. */
+	private static final Duration SLOW_FAILURE = Duration.ofMillis(300);
 
 	@TempDir
 	Path tempDir;
@@ -99,6 +106,9 @@ class GrpcConnectionFailoverTest {
 		System.clearProperty(CONNECT_TIMEOUT_PROPERTY);
 		System.clearProperty(KEEP_ALIVE_TIMEOUT_PROPERTY);
 		System.clearProperty(MAX_ATTEMPTS_PROPERTY);
+		System.clearProperty(MAX_RECONNECT_DELAY_PROPERTY);
+		System.clearProperty(MAX_CONNECTION_AGE_PROPERTY);
+		System.clearProperty(MAX_CONNECTION_AGE_GRACE_PROPERTY);
 	}
 
 	/** The first address serves as long as it is up; once it stops, new calls run on the second. */
@@ -237,6 +247,180 @@ class GrpcConnectionFailoverTest {
 				new HostAndPort("no-such-host.invalid", 1),
 				new HostAndPort("no-such-other-host.invalid", 2))));
 		assertEquals(Status.Code.UNAVAILABLE, error.getStatus().getCode());
+	}
+
+	/** A resolver outage while the connection moves: the new connection is kept, on the last addresses known. */
+	@Test
+	void aResolverOutageDoesNotDropTheNodeTheConnectionMovedTo() throws Exception {
+		var first = new FakeNode(FIRST_NODE_COLUMN_ID);
+		var second = new FakeNode(SECOND_NODE_COLUMN_ID);
+		resources.add(first);
+		resources.add(second);
+		var client = connect(List.of(fakeHost("outage-1.test", first), fakeHost("outage-2.test", second)));
+		assertEquals(first.port(), remotePort(client));
+
+		FakeHosts.fail("outage-1.test", SLOW_FAILURE);
+		FakeHosts.fail("outage-2.test", SLOW_FAILURE);
+		first.stop();
+
+		assertEquals(second.port(), awaitServedBy(client, second));
+		assertStaysOn(client, second);
+	}
+
+	/** One name failing is not that host leaving the cluster: the connection to it stays. */
+	@Test
+	void aHostWhoseLookupFailsKeepsItsConnection() throws Exception {
+		var first = new FakeNode(FIRST_NODE_COLUMN_ID);
+		var second = new FakeNode(SECOND_NODE_COLUMN_ID);
+		var third = new FakeNode(3);
+		resources.add(first);
+		resources.add(second);
+		resources.add(third);
+		var client = connect(List.of(fakeHost("partial-1.test", first), fakeHost("partial-2.test", second),
+				fakeHost("partial-3.test", third)));
+		assertEquals(first.port(), remotePort(client));
+
+		FakeHosts.fail("partial-2.test", SLOW_FAILURE);
+		first.stop();
+
+		assertEquals(second.port(), awaitServedBy(client, second));
+		assertStaysOn(client, second);
+	}
+
+	/** A lookup that hangs does not keep the channel from the others, and its host joins when it answers. */
+	@Test
+	void aHungNameDoesNotHoldBackTheOtherHosts() throws Exception {
+		var first = new FakeNode(FIRST_NODE_COLUMN_ID);
+		var second = new FakeNode(SECOND_NODE_COLUMN_ID);
+		resources.add(first);
+		resources.add(second);
+		var hung = FakeHosts.hang("hung-1.test");
+		resources.add(hung::countDown);
+		FakeHosts.serve("hung-2.test");
+
+		long startedAt = System.nanoTime();
+		var client = connect(List.of(new HostAndPort("hung-1.test", first.port()),
+				new HostAndPort("hung-2.test", second.port())));
+		long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+		assertEquals(second.port(), remotePort(client));
+		assertTrue(elapsedMillis < 5_000, () -> "the connection took " + elapsedMillis + " ms");
+
+		// From now on the name only fails: the first host can only come from the lookup that was hanging.
+		FakeHosts.fail("hung-1.test", Duration.ZERO);
+		hung.countDown();
+		Thread.sleep(500);
+		second.stop();
+		assertEquals(first.port(), awaitServedBy(client, first));
+	}
+
+	/** A channel gets a new resolver when it leaves idle mode: the last addresses are still there. */
+	@Test
+	void aChannelLeavingIdleModeDuringAnOutageKeepsItsAddresses() throws Exception {
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		var other = new FakeNode(SECOND_NODE_COLUMN_ID);
+		resources.add(node);
+		resources.add(other);
+		var client = connect(List.of(fakeHost("idle-1.test", node), fakeHost("idle-2.test", other)));
+		assertEquals(node.port(), remotePort(client));
+
+		FakeHosts.fail("idle-1.test", Duration.ZERO);
+		FakeHosts.fail("idle-2.test", Duration.ZERO);
+		channel(client).enterIdle();
+
+		assertEquals(node.port(), remotePort(client));
+	}
+
+	/** With every address failing, attempts follow the configured delay instead of gRPC's growing one. */
+	@Test
+	void reconnectingDoesNotWaitForTheGrowingBackoff() throws Exception {
+		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
+		System.setProperty(MAX_RECONNECT_DELAY_PROPERTY, "200");
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(node);
+		var client = GrpcConnection.forHostsAndPorts("reconnect-client",
+				List.of(node.address(), new HostAndPort("127.0.0.1", unusedPort())));
+		try {
+			assertEquals(node.port(), remotePort(client));
+			node.stopNow();
+			try (var attempts = new ConnectionCounter(node.port())) {
+				assertThrows(StatusRuntimeException.class, () -> remotePort(client));
+				Thread.sleep(3_000);
+				// gRPC alone would try 3 times in this time: at about 1 s, 2.6 s and 5.2 s.
+				int counted = attempts.count();
+				assertTrue(counted >= 6, () -> counted + " connection attempts");
+
+				client.close();
+				Thread.sleep(100);
+				int atClose = attempts.count();
+				Thread.sleep(500);
+				assertEquals(atClose, attempts.count(), "a closed connection kept reconnecting");
+			}
+		} finally {
+			client.close();
+		}
+	}
+
+	/** A paused server stops listening and its clients move, while what it was running ends normally. */
+	@Test
+	void aPausedServerMovesItsClientsAndEndsItsCalls() throws Exception {
+		var backend = new FakeNode(FIRST_NODE_COLUMN_ID);
+		var second = new FakeNode(SECOND_NODE_COLUMN_ID);
+		resources.add(backend);
+		resources.add(second);
+		var proxy = proxyOf(backend);
+		var client = connect(List.of(new HostAndPort("127.0.0.1", proxy.getPort()), second.address()));
+		var api = client.getAsyncApi(CONTEXT);
+		assertEquals(proxy.getPort(), remotePort(client));
+
+		backend.service.holdCalls = true;
+		var held = api.getColumnIdAsync("x");
+		assertTrue(backend.service.heldReads.await(5, TimeUnit.SECONDS));
+
+		proxy.pause();
+
+		assertEquals(second.port(), awaitServedBy(client, second.port()));
+		assertTrue(!held.isDone(), "the running call ended with the pause");
+		backend.service.releaseHeldReads();
+		assertEquals(FIRST_NODE_COLUMN_ID, held.get(5, TimeUnit.SECONDS));
+		assertThrows(IOException.class, () -> new Socket("127.0.0.1", proxy.getPort()).close());
+
+		// Pausing twice changes nothing, and it serves again on the same port.
+		proxy.pause();
+		proxy.resume();
+		proxy.resume();
+		var late = connect(List.of(new HostAndPort("127.0.0.1", proxy.getPort()), second.address()));
+		assertEquals(proxy.getPort(), remotePort(late));
+		proxy.pause();
+		proxy.resume();
+		assertEquals(proxy.getPort(), awaitServedBy(late, proxy.getPort()));
+	}
+
+	/** Connections end with age, so a client that moved away returns to the first address of its list. */
+	@Test
+	void aClientReturnsToTheFirstAddressWhenItsConnectionGetsOld() throws Exception {
+		System.setProperty(MAX_CONNECTION_AGE_PROPERTY, "1000");
+		System.setProperty(MAX_CONNECTION_AGE_GRACE_PROPERTY, "1000");
+		var firstBackend = new FakeNode(FIRST_NODE_COLUMN_ID);
+		var secondBackend = new FakeNode(SECOND_NODE_COLUMN_ID);
+		resources.add(firstBackend);
+		resources.add(secondBackend);
+		var first = proxyOf(firstBackend);
+		var second = proxyOf(secondBackend);
+		var client = connect(List.of(new HostAndPort("127.0.0.1", first.getPort()),
+				new HostAndPort("127.0.0.1", second.getPort())));
+		first.pause();
+		assertEquals(second.getPort(), awaitServedBy(client, second.getPort()));
+
+		first.resume();
+
+		assertEquals(first.getPort(), awaitServedBy(client, first.getPort()));
+	}
+
+	@Test
+	void aServerOverAnEmbeddedDatabaseDoesNotPause() throws Exception {
+		var node = startNode("embedded");
+		assertThrows(IllegalStateException.class, node.server::pause);
+		assertThrows(IllegalStateException.class, node.server::resume);
 	}
 
 	/** With every node down calls fail fast with UNAVAILABLE, and the same connection recovers when one returns. */
@@ -401,6 +585,21 @@ class GrpcConnectionFailoverTest {
 		return client;
 	}
 
+	private static HostAndPort fakeHost(String name, FakeNode node) {
+		FakeHosts.serve(name);
+		return new HostAndPort(name, node.port());
+	}
+
+	/** A server in front of another connection, as a replicated node is. */
+	private GrpcServer proxyOf(FakeNode backend) throws IOException {
+		var connection = GrpcConnection.forHostAndPort("proxy-client", backend.address());
+		resources.add(connection);
+		var server = new GrpcServer(connection, new InetSocketAddress("127.0.0.1", 0));
+		resources.add(server);
+		server.start();
+		return server;
+	}
+
 	private EmbeddedNode startNode(String name) throws Exception {
 		Path config = Files.createTempFile(tempDir, name, ".conf");
 		Files.writeString(config, "database: { global: { ingest-behind: false, optimistic: false } }");
@@ -441,11 +640,15 @@ class GrpcConnectionFailoverTest {
 
 	/** Waits until a call reaches {@code expected}; the calls before it may see the loss of the previous node. */
 	private static int awaitServedBy(GrpcConnection client, FakeNode expected) throws Exception {
+		return awaitServedBy(client, expected.port());
+	}
+
+	private static int awaitServedBy(GrpcConnection client, int expectedPort) throws Exception {
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
 		while (true) {
 			try {
 				int port = remotePort(client);
-				if (port == expected.port() || System.nanoTime() > deadline) {
+				if (port == expectedPort || System.nanoTime() > deadline) {
 					return port;
 				}
 			} catch (StatusRuntimeException e) {
@@ -457,11 +660,24 @@ class GrpcConnectionFailoverTest {
 		}
 	}
 
-	/** The port of the server that answers a call on this connection's own channel. */
-	private static int remotePort(GrpcConnection client) throws Exception {
+	/** Every call for a while, long after the lookups of the move ended, stays on {@code node} and succeeds. */
+	private static void assertStaysOn(GrpcConnection client, FakeNode node) throws Exception {
+		long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+		while (System.nanoTime() < end) {
+			assertEquals(node.port(), remotePort(client));
+			Thread.sleep(20);
+		}
+	}
+
+	private static ManagedChannel channel(GrpcConnection client) throws Exception {
 		var field = GrpcConnection.class.getDeclaredField("channel");
 		field.setAccessible(true);
-		var channel = (ManagedChannel) field.get(client);
+		return (ManagedChannel) field.get(client);
+	}
+
+	/** The port of the server that answers a call on this connection's own channel. */
+	private static int remotePort(GrpcConnection client) throws Exception {
+		var channel = channel(client);
 		var remote = new AtomicReference<SocketAddress>();
 		var observer = new ClientInterceptor() {
 			@Override
@@ -591,6 +807,7 @@ class GrpcConnectionFailoverTest {
 		private final AtomicInteger openTransactionCalls = new AtomicInteger();
 		private final CountDownLatch heldReads = new CountDownLatch(1);
 		private final CountDownLatch heldWrites = new CountDownLatch(1);
+		private final List<StreamObserver<GetColumnIdResponse>> heldReadObservers = new CopyOnWriteArrayList<>();
 		private volatile boolean holdCalls;
 
 		ScriptedService(long columnId) {
@@ -609,11 +826,20 @@ class GrpcConnectionFailoverTest {
 		@Override
 		public void getColumnId(GetColumnIdRequest request, StreamObserver<GetColumnIdResponse> responseObserver) {
 			if (holdCalls) {
+				heldReadObservers.add(responseObserver);
 				heldReads.countDown();
 				return;
 			}
 			responseObserver.onNext(GetColumnIdResponse.newBuilder().setColumnId(columnId).build());
 			responseObserver.onCompleted();
+		}
+
+		void releaseHeldReads() {
+			holdCalls = false;
+			for (var observer : heldReadObservers) {
+				observer.onNext(GetColumnIdResponse.newBuilder().setColumnId(columnId).build());
+				observer.onCompleted();
+			}
 		}
 
 		@Override
@@ -661,6 +887,36 @@ class GrpcConnectionFailoverTest {
 			for (var filler : queueFillers) {
 				filler.close();
 			}
+			listener.close();
+		}
+	}
+
+	/** Counts the connection attempts on a port, and closes each. */
+	private static final class ConnectionCounter implements AutoCloseable {
+
+		private final ServerSocket listener;
+		private final AtomicInteger count = new AtomicInteger();
+
+		ConnectionCounter(int port) throws IOException {
+			listener = new ServerSocket(port, 16, InetAddress.getByName("127.0.0.1"));
+			Thread.ofVirtual().start(() -> {
+				try {
+					while (true) {
+						listener.accept().close();
+						count.incrementAndGet();
+					}
+				} catch (IOException closed) {
+					// Closed by the test.
+				}
+			});
+		}
+
+		int count() {
+			return count.get();
+		}
+
+		@Override
+		public void close() throws IOException {
 			listener.close();
 		}
 	}

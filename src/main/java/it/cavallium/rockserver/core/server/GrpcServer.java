@@ -146,7 +146,20 @@ public class GrpcServer extends Server {
 
 	private final GrpcServerImpl grpc;
 	private final EventLoopGroup elg;
-	private final io.grpc.Server server;
+	private final Class<? extends ServerChannel> channelType;
+	private final ServerServiceDefinition service;
+	/** Guards the replacement of {@link #server}: {@link #pause()}, {@link #resume()} and {@link #close()}. */
+	private final Object transportLock = new Object();
+	/** Where this server listens, with the port it actually got once started. */
+	private volatile SocketAddress listenAddress;
+	/** Replaced by {@link #resume()}: a gRPC server cannot start again. */
+	private volatile io.grpc.Server server;
+	/** Stopped by {@link #pause()}, and still finishing the calls they were running. Guarded by transportLock. */
+	private final List<io.grpc.Server> draining = new ArrayList<>();
+	/** Guarded by transportLock. */
+	private boolean paused;
+	/** Guarded by transportLock. */
+	private boolean closed;
 	private final RWScheduler scheduler;
 	private final boolean ownsScheduler;
 	/**
@@ -339,6 +352,11 @@ public class GrpcServer extends Server {
 	 * non-embedded connection at once.
 	 */
 	private static final int PROXY_STREAM_PARALLELISM = 256;
+	private static final String MAX_CONNECTION_AGE_PROPERTY = "it.cavallium.rockserver.grpc.server.max-connection-age-ms";
+	private static final Duration DEFAULT_MAX_CONNECTION_AGE = Duration.ofMinutes(30);
+	private static final String MAX_CONNECTION_AGE_GRACE_PROPERTY
+			= "it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms";
+	private static final Duration DEFAULT_MAX_CONNECTION_AGE_GRACE = Duration.ofMinutes(10);
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
@@ -373,22 +391,38 @@ public class GrpcServer extends Server {
 			channelType = NioServerSocketChannel.class;
 		}
 		this.elg = elg;
-		ServerServiceDefinition service = bindReadService();
+		this.channelType = channelType;
+		this.service = bindReadService();
+		// Calls to another connection: their callbacks run off the event loop, so that one client connection
+		// (one event loop thread) is not limited to what a single thread can decode, dispatch and answer.
+		this.callExecutor = proxyScheduler != null
+				? java.util.concurrent.Executors.newThreadPerTaskExecutor(
+						Thread.ofVirtual().name("grpc-call-", 0).factory())
+				: null;
+		this.listenAddress = socketAddress;
+		this.server = newTransport(socketAddress);
+		LOG.info("GRPC RocksDB server is listening at " + socketAddress);
+	}
+
+	private io.grpc.Server newTransport(SocketAddress socketAddress) {
 		var builder = NettyServerBuilder
 				.forAddress(socketAddress)
 				.bossEventLoopGroup(elg)
 				.workerEventLoopGroup(elg);
 		if (proxyScheduler != null) {
-			// Calls to another connection: their callbacks run off the event loop, so that one client connection
-			// (one event loop thread) is not limited to what a single thread can decode, dispatch and answer.
-			this.callExecutor = java.util.concurrent.Executors.newThreadPerTaskExecutor(
-					Thread.ofVirtual().name("grpc-call-", 0).factory());
-			builder.executor(callExecutor);
+			// Clients that moved away (the node they used was lost, or it paused) come back to the first address of
+			// their list only with a new connection, so connections end after a while. gRPC adds a jitter of +/-10%
+			// to the age, and the grace leaves long streams running: only those that outlive it are cut.
+			builder.executor(callExecutor)
+					.maxConnectionAge(durationProperty(MAX_CONNECTION_AGE_PROPERTY, DEFAULT_MAX_CONNECTION_AGE).toNanos(),
+							TimeUnit.NANOSECONDS)
+					.maxConnectionAgeGrace(
+							durationProperty(MAX_CONNECTION_AGE_GRACE_PROPERTY, DEFAULT_MAX_CONNECTION_AGE_GRACE).toNanos(),
+							TimeUnit.NANOSECONDS);
 		} else {
-			this.callExecutor = null;
 			builder.directExecutor();
 		}
-		this.server = builder
+		return builder
 				.channelType(channelType)
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
 				.maxInboundMessageSize(512 * 1024 * 1024)
@@ -397,16 +431,62 @@ public class GrpcServer extends Server {
 				.permitKeepAliveTime(5, TimeUnit.SECONDS)
 				.intercept(new AdaptiveCompressionInterceptor())
 				.build();
-		LOG.info("GRPC RocksDB server is listening at " + socketAddress);
 	}
 
 	@Override
 	public void start() throws IOException {
 		server.start();
+		// A port chosen by the system stays the same when the server resumes.
+		if (listenAddress instanceof InetSocketAddress inet) {
+			listenAddress = new InetSocketAddress(inet.getAddress(), server.getPort());
+		}
 	}
 
 	public int getPort() {
-		return server.getPort();
+		return listenAddress instanceof InetSocketAddress inet ? inet.getPort() : server.getPort();
+	}
+
+	/**
+	 * Stops serving, for a server in front of another connection (not an embedded database): the port stops listening
+	 * and every connection gets a GOAWAY, so that clients with other addresses move to them. Calls already running go
+	 * on until they end. {@link #resume()} serves again. Does nothing if already paused.
+	 */
+	public void pause() {
+		requireProxyMode();
+		synchronized (transportLock) {
+			if (paused || closed) {
+				return;
+			}
+			paused = true;
+			draining.removeIf(io.grpc.Server::isTerminated);
+			draining.add(server);
+			server.shutdown();
+		}
+		LOG.warn("GRPC server at {} paused: not listening until it resumes", listenAddress);
+	}
+
+	/**
+	 * Listens again on the same address after {@link #pause()}, with a new gRPC server. If that fails the server stays
+	 * paused, and this can be called again. Does nothing if not paused.
+	 */
+	public void resume() throws IOException {
+		requireProxyMode();
+		synchronized (transportLock) {
+			if (!paused || closed) {
+				return;
+			}
+			var resumed = newTransport(listenAddress);
+			resumed.start();
+			server = resumed;
+			paused = false;
+		}
+		LOG.info("GRPC server at {} resumed", listenAddress);
+	}
+
+	private void requireProxyMode() {
+		if (proxyScheduler == null) {
+			throw new IllegalStateException("A server over an embedded database does not pause");
+		}
 	}
 
 	@VisibleForTesting
@@ -4453,15 +4533,23 @@ public class GrpcServer extends Server {
 				Duration.ofMinutes(2));
 		boolean interrupted = false;
 		IOException closeFailure = null;
-		server.shutdown();
-		var gracefulTermination = awaitTerminationUninterruptibly(server, gracefulShutdownTimeout);
-		interrupted |= gracefulTermination.interrupted();
-		if (!gracefulTermination.terminated()) {
-			server.shutdownNow();
-			var forcedTermination = awaitTerminationUninterruptibly(server, forcedShutdownTimeout);
-			interrupted |= forcedTermination.interrupted();
-			if (!forcedTermination.terminated()) {
-				LOG.error("GRPC server did not terminate after forced shutdown");
+		var servers = new ArrayList<io.grpc.Server>();
+		synchronized (transportLock) {
+			closed = true;
+			servers.addAll(draining);
+			servers.add(server);
+			server.shutdown();
+		}
+		for (var stopping : servers) {
+			var gracefulTermination = awaitTerminationUninterruptibly(stopping, gracefulShutdownTimeout);
+			interrupted |= gracefulTermination.interrupted();
+			if (!gracefulTermination.terminated()) {
+				stopping.shutdownNow();
+				var forcedTermination = awaitTerminationUninterruptibly(stopping, forcedShutdownTimeout);
+				interrupted |= forcedTermination.interrupted();
+				if (!forcedTermination.terminated()) {
+					LOG.error("GRPC server did not terminate after forced shutdown");
+				}
 			}
 		}
 		var protectedDrain = mustCompleteOperations.stopAcceptingAndAwait(schedulerShutdownTimeout);
