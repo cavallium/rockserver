@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestContext;
@@ -17,6 +18,7 @@ import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.UpdateContext;
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
@@ -28,6 +30,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -35,6 +38,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import org.junit.jupiter.api.AfterEach;
@@ -133,6 +137,24 @@ class PipelinedUpdatesTest {
 		return update.updateId() > 0;
 	}
 
+	private static long count(ReplicatedNode node, String metric) {
+		return node.metrics().amount(metric).count();
+	}
+
+	/** {@code id} goes down with its apply stopped, as a crash would leave it, and a new leader takes over. */
+	private void haltAndAwaitLeader(String id) throws Exception {
+		var halt = Thread.ofPlatform().start(() -> {
+			try {
+				cluster.halt(id);
+			} catch (IOException ex) {
+				throw new UncheckedIOException(ex);
+			}
+		});
+		openGate();
+		halt.join();
+		leader = cluster.awaitLeader(TIMEOUT);
+	}
+
 	private static long lastLogIndex(ReplicatedNode node) {
 		return node.stateMachine().division().getRaftLog().getLastEntryTermIndex().getIndex();
 	}
@@ -219,11 +241,18 @@ class PipelinedUpdatesTest {
 	@Test
 	void aFollowerClientRunsAChainToo() throws Exception {
 		start();
-		var api = api(cluster.anyFollower());
+		var client = async(cluster.anyFollower());
+		closeGate(leader);
+		var puts = new ArrayList<CompletableFuture<?>>();
 		for (int i = 1; i <= 20; i++) {
-			var update = api.get(0, column, key(1), RequestType.<Buf>forUpdate());
+			var update = await(client.getAsync(0, column, key(1), RequestType.<Buf>forUpdate()));
 			assertEquals("v" + (i - 1), text(update.previous()));
-			api.put(update.updateId(), column, key(1), text("v" + i), RequestType.none());
+			assertEquals(i > 1, chained(update), "only the first one reads the database");
+			puts.add(client.putAsync(update.updateId(), column, key(1), text("v" + i), RequestType.none()));
+		}
+		openGate();
+		for (var put : puts) {
+			await(put);
 		}
 		assertReplicasHold(1, "v20");
 	}
@@ -284,7 +313,10 @@ class PipelinedUpdatesTest {
 		aWriteStopsTheChain(api -> api.putAsync(0, column, key(1), text("plain"), RequestType.none()), "plain");
 	}
 
-	/** No pending write leaves a transaction's snapshot valid: this one conflicts, and the chain goes on. */
+	/**
+	 * No pending write leaves a transaction's snapshot valid: this one conflicts. The update that holds the key goes on,
+	 * but the chain ends there, so that the next try of the transaction finds a key with no unsettled links.
+	 */
 	@Test
 	void aTransactionOnAKeyInAChainConflicts() throws Exception {
 		start();
@@ -294,10 +326,15 @@ class PipelinedUpdatesTest {
 		var headPut = put(forUpdate(1), 1, "v1");
 		var chained = forUpdate(1);
 		assertFalse(await(async(leader).closeTransactionAsync(transaction, true)));
+		assertEquals(1, count(leader, "transaction.chainConflict"));
 		var chainedPut = put(chained, 1, "v2");
+		var next = forUpdateLater(1);
+		assertStaysPending(next);
 		openGate();
 		await(headPut);
 		await(chainedPut);
+		assertFalse(chained(await(next)));
+		await(async(leader).closeFailedUpdateAsync(next.get().updateId()));
 		assertTrue(api(leader).closeTransaction(transaction, false));
 		assertReplicasHold(1, "v2");
 	}
@@ -384,6 +421,8 @@ class PipelinedUpdatesTest {
 	void aCloseOfAnUnknownChainedUpdateIsARetryAlsoOnANewLeader() throws Exception {
 		start();
 		assertThrows(RocksDBRetryException.class, () -> api(leader).closeFailedUpdate(123456789L));
+		assertThrows(RocksDBRetryException.class, () -> api(leader).closeTransaction(123456789L, false));
+		assertTrue(api(leader).closeTransaction(-123456789L, false), "a native rollback has nothing to confirm");
 		closeGate(leader);
 		var headPut = put(forUpdate(1), 1, "v1");
 		var chained = forUpdate(1);
@@ -392,8 +431,10 @@ class PipelinedUpdatesTest {
 		await(headPut);
 		cluster.stop(leader.config().nodeId());
 		leader = cluster.awaitLeader(TIMEOUT);
-		assertThrows(RocksDBRetryException.class, () -> api(leader).closeFailedUpdate(chained.updateId()));
-		assertThrows(RocksDBRetryException.class, () -> api(cluster.anyFollower()).closeFailedUpdate(chained.updateId()));
+		for (var api : List.of(api(leader), api(cluster.anyFollower()))) {
+			assertThrows(RocksDBRetryException.class, () -> api.closeFailedUpdate(chained.updateId()));
+			assertThrows(RocksDBRetryException.class, () -> api.closeTransaction(chained.updateId(), false));
+		}
 	}
 
 	@Test
@@ -412,8 +453,9 @@ class PipelinedUpdatesTest {
 			assertThrows(RocksDBRetryException.class, () -> operation.accept(chained));
 			var next = forUpdateLater(1);
 			assertStaysPending(next);
-			// The update ended, and its id with it.
+			// The update ended, and its id with it: a repeated rollback must not confirm what it read.
 			assertRetry(put(chained, 1, "too late"));
+			assertThrows(RocksDBRetryException.class, () -> api(leader).closeTransaction(chained.updateId(), false));
 			openGate();
 			await(headPut);
 			var update = await(next);
@@ -490,8 +532,9 @@ class PipelinedUpdatesTest {
 		assertRetry(timedOut);
 		cancelled.cancel(true);
 		var closed = async(leader).closeFailedUpdateAsync(holder.updateId());
-		var next = forUpdate(1);
-		assertEquals("v1", text(next.previous()), "neither gone caller opened an update that nobody can close");
+		// The key is free at once, well before a lease ends: neither gone caller opened an update that nobody can close.
+		var next = await(soonAfterTheKeyIsFree());
+		assertEquals("v1", text(next.previous()));
 		var close = async(leader).closeFailedUpdateAsync(next.updateId());
 		openGate();
 		await(headPut);
@@ -502,14 +545,22 @@ class PipelinedUpdatesTest {
 	@Test
 	void updatesCancelledWhileTheyOpenDoNotKeepTheKey() throws Exception {
 		start();
-		for (int i = 0; i < 200; i++) {
+		// Cancelled at varying points of the open: some land after the update registered, before its id is returned.
+		for (int i = 0; i < 300; i++) {
 			var update = forUpdateLater(1);
+			LockSupport.parkNanos((i % 100) * 100_000L);
 			if (!update.cancel(true)) {
 				await(async(leader).closeFailedUpdateAsync(update.get(5, TimeUnit.SECONDS).updateId()));
 			}
 		}
-		var next = forUpdate(1);
-		await(async(leader).closeFailedUpdateAsync(next.updateId()));
+		// The key is free well before the update lease ends: every cancelled update was closed.
+		await(async(leader).closeFailedUpdateAsync(await(soonAfterTheKeyIsFree()).updateId()));
+	}
+
+	/** An update of key 1 that gives up long before an update nobody closes would let the key go. */
+	private CompletableFuture<UpdateContext<Buf>> soonAfterTheKeyIsFree() {
+		return leader.connection().getAsyncApi(RequestContext.latency(Duration.ofSeconds(3)))
+				.getAsync(0, column, key(1), RequestType.<Buf>forUpdate());
 	}
 
 	/** Bounded by the applied index, not by the chain: a snapshot may fall anywhere in one. */
@@ -521,13 +572,11 @@ class PipelinedUpdatesTest {
 		closeGate(follower);
 		var puts = new ArrayList<CompletableFuture<?>>();
 		for (int i = 1; i <= 40; i++) {
-			var update = forUpdate(1);
 			if (i == 20) {
-				var rejected = commitWithWrongGuard(update, "wrong", "crafted");
-				assertRetry(rejected);
-				update = forUpdate(1);
+				puts.add(aRejectedEntry());
+				continue;
 			}
-			puts.add(put(update, 1, "v" + i));
+			puts.add(put(forUpdate(1), 1, "v" + i));
 			if (i % 3 == 0) {
 				await(puts.getLast());
 			}
@@ -535,15 +584,7 @@ class PipelinedUpdatesTest {
 		for (var put : puts) {
 			await(put);
 		}
-		var halt = Thread.ofPlatform().start(() -> {
-			try {
-				cluster.halt(id);
-			} catch (IOException ex) {
-				throw new UncheckedIOException(ex);
-			}
-		});
-		openGate();
-		halt.join();
+		haltAndAwaitLeader(id);
 		cluster.start(id);
 		leader = cluster.awaitLeader(TIMEOUT);
 		assertReplicasHold(1, "v40");
@@ -553,6 +594,28 @@ class PipelinedUpdatesTest {
 		cluster.startAll();
 		leader = cluster.awaitLeader(TIMEOUT);
 		assertReplicasHold(1, "v40");
+	}
+
+	/**
+	 * Puts a rejected entry in the log, by stopping the leader's apply for a moment: the commit before it stays unsettled,
+	 * so the update after that one is chained and its commit gets past the leader's own checks.
+	 *
+	 * @return the commit before the rejected entry, which writes v20
+	 */
+	private CompletableFuture<?> aRejectedEntry() throws Exception {
+		var stopped = new CountDownLatch(1);
+		leader.stateMachine().applyGateForTesting = stopped;
+		var commit = put(forUpdate(1), 1, "v20");
+		var chained = forUpdate(1);
+		assertTrue(chained(chained));
+		long rejections = count(leader, "update.guardRejected");
+		var rejected = appended(() -> commitWithWrongGuard(chained, "wrong", "crafted"));
+		stopped.countDown();
+		leader.stateMachine().applyGateForTesting = null;
+		assertRetry(rejected);
+		assertEquals(rejections + 1, count(leader, "update.guardRejected"), "the log holds a rejection");
+		await(async(leader).closeFailedUpdateAsync(chained.updateId()));
+		return commit;
 	}
 
 	/** The leader dies with a chain in flight: what survives is a prefix, in order, and updates go on from there. */
@@ -567,16 +630,7 @@ class PipelinedUpdatesTest {
 			put(update, 1, "v" + i);
 		}
 		var oldLeader = leader.config().nodeId();
-		var halt = Thread.ofPlatform().start(() -> {
-			try {
-				cluster.halt(oldLeader);
-			} catch (IOException ex) {
-				throw new UncheckedIOException(ex);
-			}
-		});
-		openGate();
-		halt.join();
-		leader = cluster.awaitLeader(TIMEOUT);
+		haltAndAwaitLeader(oldLeader);
 		var update = api(leader).get(0, column, key(1), RequestType.<Buf>forUpdate());
 		assertFalse(chained(update), "a new session has no chains");
 		var survived = text(update.previous());
@@ -587,57 +641,171 @@ class PipelinedUpdatesTest {
 	}
 
 	/**
+	 * With the apply stopped, the second update of a key chains if the leader has the flag, and otherwise waits for the
+	 * apply and is a head.
+	 *
+	 * @return how many values key 1 has gone through
+	 */
+	private long aChainOnlyWithTheFlag(boolean pipelined, long written) throws Exception {
+		closeGate(leader);
+		var head = forUpdate(1);
+		assertFalse(chained(head));
+		assertEquals("v" + written, text(head.previous()));
+		var headPut = put(head, 1, "v" + (written + 1));
+		var next = forUpdateLater(1);
+		if (pipelined) {
+			assertTrue(chained(await(next)), "chained with the flag on");
+		} else {
+			assertStaysPending(next);
+		}
+		openGate();
+		await(headPut);
+		var update = await(next);
+		assertEquals(pipelined, chained(update));
+		assertEquals("v" + (written + 1), text(update.previous()));
+		await(put(update, 1, "v" + (written + 2)));
+		assertReplicasHold(1, "v" + (written + 2));
+		return written + 2;
+	}
+
+	/**
 	 * The flag only changes how a leader behaves: entries a pipelined leader wrote, guards included, apply the same with
 	 * the flag off, and the cluster goes on through a mix of the two.
 	 */
 	@Test
 	void thePipelineCanBeSwitchedOnAndOffAtARestart() throws Exception {
 		start();
-		long written = 0;
-		for (boolean pipelined : new boolean[] {false, true, false}) {
-			for (var update = forUpdate(1); ; update = forUpdate(1)) {
-				written++;
-				var previous = text(update.previous());
-				assertEquals("v" + (written - 1), previous);
-				if (written % 10 == 0) {
-					await(put(update, 1, "v" + written));
-					break;
-				}
-				put(update, 1, "v" + written);
-			}
-			assertReplicasHold(1, "v" + written);
+		// A chain in the log, for what comes next to replay.
+		closeGate(leader);
+		var headPut = put(forUpdate(1), 1, "v1");
+		var chainedPut = put(forUpdate(1), 1, "v2");
+		var other = forUpdate(1);
+		assertTrue(chained(other));
+		var rejected = commitWithWrongGuard(other, "wrong", "crafted");
+		openGate();
+		await(headPut);
+		await(chainedPut);
+		assertRetry(rejected);
+		await(async(leader).closeFailedUpdateAsync(other.updateId()));
+		long written = 2;
+
+		boolean pipelined = true;
+		for (int phase = 0; phase < 3; phase++) {
+			written = aChainOnlyWithTheFlag(pipelined, written);
+			pipelined = !pipelined;
 			for (var id : cluster.ids()) {
 				cluster.stop(id);
-				cluster.reconfigure(id, c -> c.withPipelinedUpdates(pipelined));
+				boolean flag = pipelined;
+				cluster.reconfigure(id, c -> c.withPipelinedUpdates(flag));
 			}
 			cluster.startAll();
 			leader = cluster.awaitLeader(TIMEOUT);
 			assertReplicasHold(1, "v" + written);
 		}
-		var last = forUpdate(1);
-		assertFalse(chained(last));
-		await(async(leader).closeFailedUpdateAsync(last.updateId()));
 
-		// One node with it on, two with it off: a hand-over of the leadership changes nothing for clients.
-		for (var id : cluster.ids()) {
-			cluster.stop(id);
-		}
-		var first = cluster.ids().getFirst();
-		cluster.reconfigure(first, c -> c.withPipelinedUpdates(true));
-		cluster.startAll();
-		leader = cluster.awaitLeader(TIMEOUT);
-		for (int i = 0; i < 2; i++) {
-			var api = api(leader);
-			var update = api.get(0, column, key(1), RequestType.<Buf>forUpdate());
-			api.put(update.updateId(), column, key(1), text("v" + ++written), RequestType.none());
-			cluster.stop(leader.config().nodeId());
-			var stopped = cluster.ids().stream().filter(id -> cluster.runningNodes().stream()
-					.noneMatch(node -> node.config().nodeId().equals(id))).findFirst().orElseThrow();
-			leader = cluster.awaitLeader(TIMEOUT);
-			cluster.start(stopped);
-			leader = cluster.awaitLeader(TIMEOUT);
-		}
+		// One leader with it on, two followers with it off.
+		var on = cluster.ids().getFirst();
+		leaderWithTheFlag(on);
 		assertReplicasHold(1, "v" + written);
+		written = aChainOnlyWithTheFlag(true, written);
+
+		// A hand-over with a chain in flight: the new leader knows nothing of the chained id.
+		closeGate(leader);
+		put(forUpdate(1), 1, "lost or not");
+		var chained = forUpdate(1);
+		assertTrue(chained(chained));
+		haltAndAwaitLeader(on);
+		assertFalse(leader.config().pipelinedUpdates());
+		assertThrows(RocksDBRetryException.class, () -> api(leader).closeFailedUpdate(chained.updateId()));
+		assertThrows(RocksDBRetryException.class, () -> api(leader).closeTransaction(chained.updateId(), false));
+		var update = forUpdate(1);
+		assertFalse(chained(update));
+		await(put(update, 1, "after"));
+		cluster.start(on);
+		assertReplicasHold(1, "after");
+	}
+
+	/** Turns the flag on on the node {@code on} alone, and makes it the leader. */
+	private void leaderWithTheFlag(String on) throws Exception {
+		cluster.stop(on);
+		cluster.reconfigure(on, c -> c.withPipelinedUpdates(true));
+		cluster.start(on);
+		leader = cluster.awaitLeader(TIMEOUT);
+		while (!leader.config().nodeId().equals(on)) {
+			var id = leader.config().nodeId();
+			cluster.stop(id);
+			leader = cluster.awaitLeader(TIMEOUT);
+			cluster.start(id);
+			leader = cluster.awaitLeader(TIMEOUT);
+		}
+	}
+
+	/** A second write on an update, such as a resend: it fails alone, and the commit and its chain go on. */
+	@Test
+	void aSecondWriteOnAnUpdateLeavesItsCommitAlone() throws Exception {
+		start();
+		closeGate(leader);
+		var head = forUpdate(1);
+		var headPut = put(head, 1, "v1");
+		var chained = forUpdate(1);
+		assertTrue(chained(chained));
+		assertRetry(put(head, 1, "resent"));
+		var chainedPut = put(chained, 1, "v2");
+		var closing = forUpdate(1);
+		assertTrue(chained(closing), "the chain is not broken");
+		assertEquals("v2", text(closing.previous()));
+		var close = async(leader).closeFailedUpdateAsync(closing.updateId());
+		openGate();
+		await(headPut);
+		await(chainedPut);
+		await(close);
+		assertReplicasHold(1, "v2");
+	}
+
+	/**
+	 * With the apply stopped, more closes wait for their base than a server's CONTROL workers (256) and queue (1024)
+	 * hold. Nothing refuses them, not even the other requests of that scheduler, and no key stays held.
+	 */
+	@Test
+	void closesThatWaitForTheirBaseHoldNoWorkerOfTheServer() throws Exception {
+		start();
+		var self = leader.config().self();
+		try (var client = GrpcConnection.forHostAndPort("closes", new HostAndPort(self.apiHost(), self.apiPort()))) {
+			var grpc = client.getAsyncApi(CONTEXT);
+			closeGate(leader);
+			int keys = 32;
+			var closes = new ConcurrentLinkedQueue<CompletableFuture<Void>>();
+			try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+				var workers = new ArrayList<Future<?>>();
+				for (int i = 0; i < keys; i++) {
+					long key = 100 + i;
+					workers.add(executor.submit(() -> {
+						put(forUpdate(key), key, "v");
+						for (int reader = 0; reader < LeaderSession.MAX_LINK_READERS; reader++) {
+							var update = forUpdate(key);
+							assertTrue(chained(update));
+							closes.add(grpc.closeFailedUpdateAsync(update.updateId()));
+						}
+						return null;
+					}));
+				}
+				for (var worker : workers) {
+					worker.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+				}
+			}
+			assertTrue(closes.size() > 1280);
+			long transaction = api(leader).openTransaction(Duration.ofSeconds(30));
+			assertTrue(await(grpc.closeTransactionAsync(transaction, false)), "a rollback still runs");
+			openGate();
+			for (var close : closes) {
+				try {
+					await(close);
+				} catch (ExecutionException ex) {
+					// Its wait ended before the apply came back, which tells the client to retry. Anything else is a refusal.
+					assertTrue(ex.getCause() instanceof RuntimeException retry && HotCounters.isRetry(retry), ex::toString);
+				}
+			}
+		}
 	}
 
 	/** Many clients, one key, retrying as real clients do: nothing is lost, and the replicas agree. */

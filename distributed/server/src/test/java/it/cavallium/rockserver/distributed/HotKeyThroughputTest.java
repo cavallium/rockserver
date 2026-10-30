@@ -46,24 +46,78 @@ class HotKeyThroughputTest {
 
 	@Test
 	void aHotKeySustainsMoreUpdatesWithThePipeline() throws Exception {
-		double off = updatesPerSecond(temp.resolve("off"), false);
-		double on = updatesPerSecond(temp.resolve("on"), true);
+		double off = updatesPerSecond(temp.resolve("off"), false, CLIENTS, null);
+		double on = updatesPerSecond(temp.resolve("on"), true, CLIENTS, null);
 		System.out.printf("Updates of one key per second: %.0f off, %.0f on, ratio %.1f%n", off, on, on / off);
 		assertTrue(on / off >= MINIMUM_RATIO, () -> "off " + off + "/s, on " + on + "/s");
 	}
 
-	private static double updatesPerSecond(Path root, boolean pipelined) throws Exception {
+	/**
+	 * How much room a client that runs transactions on a key in a tight loop gets from the updates of that key, and what
+	 * it costs them, a number and no check: a transaction conflicts with every commit of the key after its snapshot, and
+	 * with a chain there are more of them.
+	 */
+	@Test
+	void transactionsOnAHotKey() throws Exception {
+		for (int clients : new int[] {1, 4, CLIENTS}) {
+			for (boolean pipelined : new boolean[] {false, true}) {
+				var result = new Transactions();
+				double updates = updatesPerSecond(temp.resolve("tx-" + clients + "-" + pipelined), pipelined, clients, result);
+				System.out.printf("Transactions on a key beside %d update clients, pipelined %s: %.0f updates/s, %.1f commits/s,"
+								+ " %.1f failures/s, %.1f conflicts on unsettled links/s%n", clients, pipelined, updates,
+						result.commits.get() / MEASURED_SECONDS, result.failures.get() / MEASURED_SECONDS,
+						result.chainConflicts / MEASURED_SECONDS);
+			}
+		}
+	}
+
+	private static final double MEASURED_SECONDS = MEASURED.toMillis() / 1000.0;
+
+	/** What one client running transactions on the hot key got. */
+	private static final class Transactions {
+		final AtomicLong commits = new AtomicLong();
+		final AtomicLong failures = new AtomicLong();
+		long chainConflicts;
+	}
+
+	/** Runs {@code clients} clients updating one key, and one client of {@code transactions} if it is not null. */
+	private static double updatesPerSecond(Path root, boolean pipelined, int clients, Transactions transactions)
+			throws Exception {
 		java.nio.file.Files.createDirectories(root);
 		try (var cluster = new InProcessCluster(root, 3, c -> c.withPipelinedUpdates(pipelined)).startAll()) {
-			var api = cluster.awaitLeader(Duration.ofSeconds(30)).connection().getSyncApi(CONTEXT);
+			var leader = cluster.awaitLeader(Duration.ofSeconds(30));
+			var api = leader.connection().getSyncApi(CONTEXT);
 			long column = api.createColumn("c", SCHEMA);
 			var key = new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(1).array()));
 			var value = Buf.wrap("0".repeat(600).getBytes(StandardCharsets.UTF_8));
 			var stop = new AtomicBoolean();
 			var done = new AtomicLong();
+			var measuring = new AtomicBoolean();
+			var chainConflicts = leader.metrics().amount("transaction.chainConflict");
 			try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
 				var workers = new ArrayList<Future<?>>();
-				for (int i = 0; i < CLIENTS; i++) {
+				if (transactions != null) {
+					workers.add(executor.submit(() -> {
+						while (!stop.get()) {
+							long transaction = api.openTransaction(Duration.ofSeconds(10));
+							boolean committed;
+							try {
+								api.put(transaction, column, key, value, RequestType.none());
+								committed = api.closeTransaction(transaction, true);
+							} catch (RocksDBRetryException refused) {
+								// Commits this fast also fill Ratis' queue of pending requests.
+								committed = false;
+							}
+							if (!committed) {
+								api.closeTransaction(transaction, false);
+							}
+							if (measuring.get()) {
+								(committed ? transactions.commits : transactions.failures).incrementAndGet();
+							}
+						}
+					}));
+				}
+				for (int i = 0; i < clients; i++) {
 					workers.add(executor.submit(() -> {
 						while (!stop.get()) {
 							try {
@@ -78,9 +132,15 @@ class HotKeyThroughputTest {
 				}
 				Thread.sleep(WARMUP);
 				long before = done.get();
+				long chainConflictsBefore = chainConflicts.count();
 				long start = System.nanoTime();
+				measuring.set(true);
 				Thread.sleep(MEASURED);
+				measuring.set(false);
 				double rate = (done.get() - before) / ((System.nanoTime() - start) / 1e9);
+				if (transactions != null) {
+					transactions.chainConflicts = chainConflicts.count() - chainConflictsBefore;
+				}
 				stop.set(true);
 				for (var worker : workers) {
 					worker.get();

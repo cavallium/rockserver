@@ -528,7 +528,6 @@ class LeaderSessionTest {
 		var link = admit(open(lock().join()), "one");
 		var chained = open(lock().join());
 		var waiter = lock();
-		// A chained update has no native transaction: closing it never reaches the database.
 		chain.close(null);
 		assertFalse(link.settled.join());
 		var error = assertThrows(CompletionException.class, waiter::join);
@@ -538,6 +537,85 @@ class LeaderSessionTest {
 		assertEquals(null, admit(chained, "two"), "nothing is admitted after the end of leadership");
 		applied(link, 101);
 		assertFalse(link.settled.join());
+	}
+
+	/** A chained update has no native transaction: the end of leadership rolls back only the native one. */
+	@Test
+	void theEndOfLeadershipRollsBackOnlyNativeTransactions() {
+		var head = open(lock().join());
+		admit(head, "one");
+		var chained = open(lock().join());
+		assertTrue(chained.chained());
+		var updates = new ArrayList<Long>();
+		var transactions = new ArrayList<Long>();
+		chain.close(updates::add, transactions::add);
+		assertEquals(List.of(head.id), updates);
+		assertEquals(List.of(), transactions);
+	}
+
+	/** Each of them means a close waiting for the link, and a close that ended gave the key on already. */
+	@Test
+	void aLinkIsReadByABoundedNumberOfUpdates() {
+		var link = admit(open(lock().join()), "one");
+		for (int i = 0; i < LeaderSession.MAX_LINK_READERS; i++) {
+			var update = open(lock().join());
+			assertEquals(link, update.base);
+			chain.remove(update);
+		}
+		var waiter = lock();
+		assertFalse(waiter.isDone(), "the link has all the readers it may have");
+		assertEquals(0, chain.lockedKeys(), "and nobody holds the key");
+		applied(link, 101);
+		assertEquals(null, waiter.join().base, "a head, once the link settled");
+		assertEquals(1, chain.lockedKeys());
+	}
+
+	@Test
+	void aKeyThatOnlyWaitsForItsLinksIsNotLocked() {
+		var link = admit(open(lock().join()), "one");
+		assertEquals(1, chain.chainLinks());
+		assertEquals(0, chain.lockedKeys());
+		var update = lock().join();
+		assertEquals(1, chain.lockedKeys());
+		chain.unlockKey(update);
+		assertEquals(0, chain.lockedKeys());
+		applied(link, 101);
+		assertEquals(0, chain.chainLinks());
+	}
+
+	@Test
+	void anUpdateCommitsOnce() {
+		var update = open(lock().join());
+		assertTrue(update.startCommit());
+		assertFalse(update.startCommit());
+	}
+
+	@Test
+	void aCommitNamesItsUpdateOnlyWhenPipelined() {
+		var update = open(lock().join());
+		var write = new LogEntry.Put(1, CHAIN_KEY, text("v"), RequestTypeId.NOTHING);
+		assertEquals(update.id, update.updateEntry(3, write, List.of(CHAIN_KEY), true).updateId());
+		assertEquals(0, update.updateEntry(3, write, List.of(CHAIN_KEY), false).updateId());
+	}
+
+	@Test
+	void aConflictingTransactionPausesTheChainsOfItsKeys() {
+		var link = admit(open(lock().join()), "one");
+		long hash = ConflictTracker.keyHash(1, CHAIN_KEY);
+		var conflicting = new LogEntry.Guarded(3, 0, new long[] {1}, new long[] {hash}, List.of(), false);
+		var other = new LogEntry.Guarded(3, 0, new long[] {1}, new long[] {hash + 1}, List.of(), false);
+		assertFalse(chain.yieldChainsTo(other));
+		var update = lock().join();
+		assertEquals(link, update.base, "a transaction on another key changes nothing");
+		chain.unlockKey(update);
+		assertTrue(chain.yieldChainsTo(conflicting));
+		var waiter = lock();
+		assertFalse(waiter.isDone(), "no more links until those there are settle");
+		applied(link, 101);
+		var head = waiter.join();
+		assertEquals(null, head.base);
+		assertFalse(chain.yieldChainsTo(conflicting), "no links left");
+		chain.unlockKey(head);
 	}
 
 	@Test
