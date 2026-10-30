@@ -156,6 +156,8 @@ public class GrpcServer extends Server {
 	 * they use {@link #scheduler} instead. Null for an embedded database.
 	 */
 	private final reactor.core.scheduler.@Nullable Scheduler proxyScheduler;
+	/** Runs the calls' callbacks in proxy mode; null when they run on the event loop. */
+	private final java.util.concurrent.@Nullable ExecutorService callExecutor;
 	private final @Nullable EmbeddedDB embeddedDatabase;
 	private final MeterRegistry metricsRegistry;
 	private final GrpcGetStrategy grpcGetStrategy;
@@ -372,11 +374,21 @@ public class GrpcServer extends Server {
 		}
 		this.elg = elg;
 		ServerServiceDefinition service = bindReadService();
-		this.server = NettyServerBuilder
+		var builder = NettyServerBuilder
 				.forAddress(socketAddress)
 				.bossEventLoopGroup(elg)
-				.workerEventLoopGroup(elg)
-				.directExecutor()
+				.workerEventLoopGroup(elg);
+		if (proxyScheduler != null) {
+			// Calls to another connection: their callbacks run off the event loop, so that one client connection
+			// (one event loop thread) is not limited to what a single thread can decode, dispatch and answer.
+			this.callExecutor = java.util.concurrent.Executors.newThreadPerTaskExecutor(
+					Thread.ofVirtual().name("grpc-call-", 0).factory());
+			builder.executor(callExecutor);
+		} else {
+			this.callExecutor = null;
+			builder.directExecutor();
+		}
+		this.server = builder
 				.channelType(channelType)
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
 				.maxInboundMessageSize(512 * 1024 * 1024)
@@ -4467,6 +4479,9 @@ public class GrpcServer extends Server {
 			interrupted = true;
 			LOG.warn("Grpc server event loop shutdown interrupted; continuing to wait", e);
 			elg.terminationFuture().syncUninterruptibly();
+		}
+		if (callExecutor != null) {
+			callExecutor.shutdown();
 		}
 		if (proxyScheduler != null) {
 			proxyScheduler.dispose();

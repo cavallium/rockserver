@@ -121,6 +121,13 @@ with 11–18 s write latency. In order of discovery:
     whatever queued up meanwhile, up to 256 entries, in one transaction, with a savepoint per entry for
     rejections; Ratis' thread only decodes and queues them, and a third thread completes the replies. Groups
     hold about 15 entries at 4×: 29.2k → 38.9k operations/s with 2048 writes in flight.
+13. **One client connection, one event loop.** Yotsuba uses one gRPC channel, so one connection, which Netty
+    serves on one event loop thread. With `directExecutor` that thread also ran every call's handler and
+    started its virtual thread; against a replicated node, whose calls last milliseconds, one connection
+    reached only about 21k operations/s, with an `UPDATE` p99 of 112 ms already at 1× (20 ms over four
+    connections). In proxy mode the calls' callbacks now run on virtual threads: one connection at 1× has a
+    p99 of 20 ms, at 2× 167 ms instead of 984 ms, and at 3× it serves 24.2k instead of 20.7k, limited by
+    the client's 512 writes in flight like several connections. Single-node servers keep `directExecutor`.
 
 ## Results
 

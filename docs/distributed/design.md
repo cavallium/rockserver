@@ -50,7 +50,9 @@ separate removal of CDC from Rockserver. The core additions are used only by rep
 forwards to a non-embedded connection:
 
 - `MergeOperatorRegistry.upload` is atomic, and validates the operator before writing anything.
-- `GrpcServer` runs requests to a non-embedded connection on virtual threads of their own (a proxy scheduler,
+- `GrpcServer`, for a non-embedded connection, runs the calls' callbacks on virtual threads instead of the
+  Netty event loop (so one client connection is not limited to one thread), and runs requests on virtual
+  threads of their own (a proxy scheduler,
   at most 16384 at once, beyond which requests get `SERVER_OVERLOADED`); streamed `putMulti`, `deleteMulti`
   and `mergeMulti` calls, rollbacks and maintenance use the workload scheduler instead
   (`RWScheduler.withVirtualWorkers`, `WorkloadSettings.proxy`), which runs at most 256 of these streams at
