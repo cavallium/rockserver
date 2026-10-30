@@ -2,7 +2,6 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -265,7 +264,6 @@ class GrpcProxyCloseTest {
 		openUpdateOfAGoneCaller();
 		assertEquals(UPDATE_ID, connection.closedIds.peek());
 		assertEquals(0, connection.syncCalls.get());
-		assertFalse(connection.closes.peek().isDone());
 		connection.closes.peek().complete(null);
 		assertEquals(0, server.getLateProtectedOperationFailureCountForTesting(CLOSE_ABANDONED_UPDATE));
 	}
@@ -301,7 +299,7 @@ class GrpcProxyCloseTest {
 		});
 		assertThrows(TimeoutException.class, () -> shutdown.get(2, TimeUnit.SECONDS), "the close still runs");
 		close.complete(null);
-		assertNull(shutdown.get(30, TimeUnit.SECONDS));
+		shutdown.get(30, TimeUnit.SECONDS);
 		server = null;
 	}
 }

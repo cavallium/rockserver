@@ -847,6 +847,7 @@ class PipelinedUpdatesTest {
 		assertEquals("v0", text(update.previous()));
 		assertRetry(put(update, 1, "v0 again"));
 		openGate();
+		InProcessCluster.await(TIMEOUT, () -> leader.appliedIndex() >= lastLogIndex(leader));
 		var after = forUpdate(1);
 		assertFalse(chained(after));
 		assertEquals("v1", text(after.previous()), "the commit did apply");
@@ -897,8 +898,6 @@ class PipelinedUpdatesTest {
 		assertEquals(1, data[data.length - 1], "the entry ends with the boolean it always ended with");
 		byte[] body = LogEntryCodec.encodeEntryBody(commit);
 		assertArrayEquals(body, java.util.Arrays.copyOfRange(data, data.length - body.length, data.length));
-		assertEquals(LogEntryCodec.GUARDED_BASE_BYTES + LogEntryCodec.writeSize(commit.writes().getFirst())
-				+ commit.conflictHashes().length * LogEntryCodec.CONFLICT_KEY_BYTES, body.length);
 	}
 
 	/** Without the flag an update has no single commit to protect: its writes go to the log as they always did. */

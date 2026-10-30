@@ -34,6 +34,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Random;
 import java.util.stream.Stream;
@@ -527,6 +528,19 @@ class LogEntryCodecTest {
 			assertEquals(singleResult ? 1 : 0, encoded[encoded.length - 1]);
 			assertEquals(LogEntryCodec.GUARDED_BASE_BYTES + LogEntryCodec.writeSize(write), encoded.length);
 		}
+	}
+
+	/**
+	 * The bytes come from the encoder of 5d415ba, before update ids and guards. They must never change: a log written by
+	 * a node of that version has to stay readable, and a flag-off rolling upgrade relies on it.
+	 */
+	@Test
+	void aGuardedEntryWithoutUpdateIdOrGuardKeepsTheBytesOfOldLogs() {
+		var write = new Put(0x0102, keys("k"), buf("v"), RequestTypeId.NOTHING);
+		var entry = new Guarded(3, 4, new long[] {5}, new long[] {6}, List.of(write), true);
+		var bytes = HexFormat.of().parseHex("0c0000000000000003000000000000000400000001000000000000000500000000000000060000000"
+				+ "101000000000000010200000001000000016b00000001760001");
+		assertArrayEquals(bytes, LogEntryCodec.encodeEntryBody(entry));
 	}
 
 	@Test
