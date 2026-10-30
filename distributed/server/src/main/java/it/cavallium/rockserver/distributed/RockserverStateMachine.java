@@ -534,6 +534,23 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 */
 	/** Tests only: while set, the apply thread waits for it before each group. */
 	volatile java.util.concurrent.@Nullable CountDownLatch applyGateForTesting;
+	/** Tests only: while set, applying a group throws it, as a failing apply would. */
+	volatile @Nullable RuntimeException applyFailureForTesting;
+
+	/** Tests only: lowers the limit of {@link #queuedKiB} to {@code kib}; it waits until that much is free. */
+	void limitApplyQueueForTesting(int kib) {
+		queuedKiB.acquireUninterruptibly(MAX_QUEUED_KIB - kib);
+	}
+
+	/** Tests only: the KiB of {@link #queuedKiB} that no queued entry holds. */
+	int freeQueuedKiBForTesting() {
+		return queuedKiB.availablePermits();
+	}
+
+	/** Tests only: the highest log index handed to the apply thread. */
+	long handedOverForTesting() {
+		return handedOver;
+	}
 
 	private void applyGroup(List<Applying> group) {
 		var gate = applyGateForTesting;
@@ -553,6 +570,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var applier = this.applier;
 		applier.beginGroup();
 		try {
+			var injected = applyFailureForTesting;
+			if (injected != null) {
+				throw injected;
+			}
 			for (var item : group) {
 				switch (item) {
 					case ApplyEntry entry -> completions.add(applyEntry(applier, entry));

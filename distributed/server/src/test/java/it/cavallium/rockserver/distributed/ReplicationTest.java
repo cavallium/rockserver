@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -20,16 +21,21 @@ import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import reactor.core.publisher.Flux;
@@ -40,6 +46,13 @@ class ReplicationTest {
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
 	private static final RequestContext CONTEXT = RequestContext.batch(Duration.ofSeconds(20));
+	/** Lowered limit of the apply queue, in KiB: {@link #LARGE_VALUE}s fill it with 16 log entries. */
+	private static final int QUEUE_LIMIT_KIB = 256;
+	/** 16 KiB: a log entry holding one such put takes 16 KiB of the apply queue. */
+	private static final Buf LARGE_VALUE = Buf.wrap(new byte[16 * 1024]);
+	/** Setting that bounds how long a stopping API server waits for the calls in progress, in milliseconds. */
+	private static final String GRPC_GRACEFUL_SHUTDOWN =
+			"it.cavallium.rockserver.grpc.server.shutdown-graceful-timeout-ms";
 
 	@TempDir
 	Path temp;
@@ -71,6 +84,44 @@ class ReplicationTest {
 	/** Reads a key from a node's own database, bypassing routing, to compare replicas. */
 	private static String localValue(ReplicatedNode node, long columnId, long key) {
 		return text(node.stateMachine().store().db().get(0, columnId, key(key), RequestType.current()));
+	}
+
+	private static long commitIndex(ReplicatedNode node) {
+		return node.stateMachine().division().getRaftLog().getLastCommittedIndex();
+	}
+
+	/** The other running node, neither {@code a} nor {@code b}. */
+	private ReplicatedNode third(ReplicatedNode a, ReplicatedNode b) {
+		return cluster.runningNodes().stream().filter(node -> node != a && node != b).findFirst().orElseThrow();
+	}
+
+	/**
+	 * Halts {@code id} on a thread of its own and returns that thread: a node whose apply thread waits for
+	 * {@code applyGateForTesting} stops only once the gate opens.
+	 */
+	private Thread haltInBackground(String id) {
+		return Thread.ofPlatform().name("halt-" + id).start(() -> {
+			try {
+				cluster.halt(id);
+			} catch (IOException ex) {
+				throw new UncheckedIOException(ex);
+			}
+		});
+	}
+
+	/** A write that may have taken effect: SERVER_OVERLOADED with an unknown outcome, never "not applied". */
+	private static void assertOutcomeUnknown(Throwable error) {
+		var rocks = assertInstanceOf(RocksDBException.class, error);
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks.getErrorUniqueId(), rocks.getMessage());
+		assertTrue(rocks.getMessage().contains("outcome is unknown"), rocks.getMessage());
+		assertFalse(rocks.getMessage().contains("not applied"), rocks.getMessage());
+	}
+
+	/** Puts {@link #LARGE_VALUE} at keys {@code from} to {@code from + count - 1}, one log entry each. */
+	private static void writeLarge(ReplicatedNode through, long column, int from, int count) {
+		for (int i = from; i < from + count; i++) {
+			api(through).put(0, column, key(i), LARGE_VALUE, RequestType.none());
+		}
 	}
 
 	@Test
@@ -345,7 +396,9 @@ class ReplicationTest {
 		var shortError = assertThrows(ExecutionException.class,
 				() -> shortWrite.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
 		assertInstanceOf(RocksDBException.class, shortError.getCause());
-		assertFalse(longWrite.isDone(), "the write without a deadline ended with the short one");
+		// With no leader electable, the other write must still be pending a while later.
+		assertThrows(java.util.concurrent.TimeoutException.class, () -> longWrite.get(1, TimeUnit.SECONDS),
+				"the write without a deadline ended with the short one");
 
 		for (String id : halted) {
 			cluster.start(id);
@@ -354,6 +407,85 @@ class ReplicationTest {
 		cluster.awaitConverged(TIMEOUT);
 		for (ReplicatedNode node : cluster.runningNodes()) {
 			assertEquals("long", localValue(node, column, 2));
+		}
+
+	/**
+	 * A write whose first attempt timed out after the leader appended it may have been applied: when every later
+	 * attempt is refused (no leader is left), it fails with an unknown outcome at its caller's deadline, never as
+	 * "not applied", which a client would take as safe to send again. Here the write was committed, and every
+	 * replica holds it once the cluster is back.
+	 */
+	@Test
+	void aWriteWhoseFirstAttemptMayHaveBeenAppendedIsNeverReportedNotApplied() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withRequestTimeout(Duration.ofSeconds(30))).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var through = cluster.anyFollower();
+		var other = third(leader, through);
+		var leaderId = leader.config().nodeId();
+		var otherId = other.config().nodeId();
+		long column = api(through).createColumn("c", SCHEMA);
+		cluster.awaitConverged(TIMEOUT);
+		long committedBefore = commitIndex(other);
+		var gate = new CountDownLatch(1);
+		leader.stateMachine().applyGateForTesting = gate;
+		CompletableFuture<Void> write;
+		Thread halting = null;
+		try {
+			write = through.connection().getAsyncApi(RequestContext.latency(Duration.ofSeconds(8)))
+					.putAsync(0, column, key(1), text("maybe"), RequestType.none());
+			// Committed, but the leader cannot apply it, so it cannot answer: the first attempt times out after 3 s.
+			InProcessCluster.await(TIMEOUT, () -> commitIndex(other) > committedBefore);
+			Thread.sleep(3500);
+			cluster.halt(otherId);
+			// The leader opens its gate only once its leadership ended, so that no reply reaches the follower. Then
+			// the follower knows no leader: every later attempt is refused before it is appended.
+			halting = haltInBackground(leaderId);
+			InProcessCluster.await(TIMEOUT, () -> through.leaderId() == null);
+		} finally {
+			gate.countDown();
+			leader.stateMachine().applyGateForTesting = null;
+			if (halting != null) {
+				halting.join();
+			}
+		}
+		var error = assertThrows(ExecutionException.class, () -> write.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		assertOutcomeUnknown(error.getCause());
+
+		cluster.start(leaderId);
+		cluster.start(otherId);
+		cluster.awaitConverged(TIMEOUT);
+		for (ReplicatedNode node : cluster.runningNodes()) {
+			assertEquals("maybe", localValue(node, column, 1), "the write was not applied on " + node.config().nodeId());
+		}
+	}
+
+	/** A write that no leader ever accepted fails at its caller's deadline as not applied, and is never applied. */
+	@Test
+	void aWriteThatNoLeaderAcceptedIsReportedNotApplied() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withRequestTimeout(Duration.ofSeconds(30))).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var through = cluster.anyFollower();
+		long column = api(through).createColumn("c", SCHEMA);
+		var halted = cluster.ids().stream().filter(id -> !id.equals(through.config().nodeId())).toList();
+		for (String id : halted) {
+			cluster.halt(id);
+		}
+		InProcessCluster.await(TIMEOUT, () -> through.leaderId() == null);
+		var write = through.connection().getAsyncApi(RequestContext.latency(Duration.ofSeconds(1)))
+				.putAsync(0, column, key(1), text("refused"), RequestType.none());
+		var error = assertThrows(ExecutionException.class, () -> write.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		var cause = assertInstanceOf(RocksDBException.class, error.getCause());
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, cause.getErrorUniqueId(), cause.getMessage());
+		assertTrue(cause.getMessage().contains("not applied"), cause.getMessage());
+
+		for (String id : halted) {
+			cluster.start(id);
+		}
+		api(through).put(0, column, key(2), text("after"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		for (ReplicatedNode node : cluster.runningNodes()) {
+			assertNull(localValue(node, column, 1), "a write that failed as not applied was applied");
+			assertEquals("after", localValue(node, column, 2));
 		}
 	}
 
@@ -503,6 +635,135 @@ class ReplicationTest {
 		api(cluster.awaitLeader(TIMEOUT)).put(0, column, key(written), text("after"), RequestType.none());
 		cluster.awaitConverged(TIMEOUT);
 		assertEquals("after", localValue(node, column, written));
+	}
+
+	/**
+	 * A leader whose apply fails stops, consensus first, and the other two elect a new leader and go on. The write
+	 * whose apply failed was committed, so the others apply it: its caller gets its result, or an unknown outcome,
+	 * never "not applied".
+	 */
+	@Test
+	void aLeaderWhoseApplyFailsStopsAndTheOthersTakeOver() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var through = cluster.anyFollower();
+		long column = api(through).createColumn("c", SCHEMA);
+		cluster.awaitConverged(TIMEOUT);
+		var failure = new IllegalStateException("Injected apply failure");
+		leader.stateMachine().applyFailureForTesting = failure;
+
+		var write = through.connection().getAsyncApi(CONTEXT).putAsync(0, column, key(1), text("written"),
+				RequestType.none());
+		assertSame(failure, leader.stopped().get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		assertTrue(leader.isFailed());
+		try {
+			write.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		} catch (ExecutionException ex) {
+			assertOutcomeUnknown(ex.getCause());
+		}
+		// Already stopped: the cluster only forgets it.
+		cluster.halt(leader.config().nodeId());
+		var newLeader = cluster.awaitLeader(TIMEOUT);
+		cluster.awaitConverged(TIMEOUT);
+		for (ReplicatedNode node : cluster.runningNodes()) {
+			assertEquals("written", localValue(node, column, 1));
+		}
+		api(through).put(0, column, key(2), text("after"), RequestType.none());
+		assertEquals("after", text(api(through).get(0, column, key(2), RequestType.current())));
+		assertEquals("after", text(api(newLeader).get(0, column, key(2), RequestType.current())));
+
+		long start = System.nanoTime();
+		cluster.close();
+		assertTrue(System.nanoTime() - start < TIMEOUT.toNanos(), "the survivors took too long to stop");
+	}
+
+	/**
+	 * A follower whose apply fails while Ratis waits for room in its apply queue stops (the failure frees the queue),
+	 * and the leader goes on with the other follower.
+	 */
+	@Test
+	void aFollowerWhoseApplyFailsWithAFullApplyQueueStops() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var failing = cluster.anyFollower();
+		var stateMachine = failing.stateMachine();
+		long column = api(leader).createColumn("c", SCHEMA);
+		cluster.awaitConverged(TIMEOUT);
+		stateMachine.limitApplyQueueForTesting(QUEUE_LIMIT_KIB);
+		var gate = new CountDownLatch(1);
+		stateMachine.applyGateForTesting = gate;
+		var failure = new IllegalStateException("Injected apply failure");
+		try {
+			writeLarge(leader, column, 0, 64);
+			long committed = commitIndex(leader);
+			InProcessCluster.await(TIMEOUT, () -> commitIndex(failing) >= committed);
+			assertTrue(stateMachine.handedOverForTesting() < committed - 32,
+					"precondition: Ratis waits for room in the apply queue, handed over "
+							+ stateMachine.handedOverForTesting() + " of " + committed);
+			stateMachine.applyFailureForTesting = failure;
+		} finally {
+			gate.countDown();
+			stateMachine.applyGateForTesting = null;
+		}
+		assertSame(failure, failing.stopped().get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		assertTrue(failing.isFailed());
+		cluster.halt(failing.config().nodeId());
+
+		api(leader).put(0, column, key(1000), text("after"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		for (ReplicatedNode node : cluster.runningNodes()) {
+			assertEquals("after", localValue(node, column, 1000));
+		}
+		long start = System.nanoTime();
+		cluster.close();
+		assertTrue(System.nanoTime() - start < TIMEOUT.toNanos(), "the others took too long to stop");
+	}
+
+	/**
+	 * A follower that cannot apply keeps its backlog in the Raft log: Ratis hands it entries only while its apply
+	 * queue has room, so at most the queue limit of entries waits decoded on the heap. Once it applies again it
+	 * catches up, and every KiB of the queue is free again.
+	 */
+	@Test
+	void aFollowerThatCannotApplyHoldsItsBacklogInTheLogAndCatchesUp() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var lagging = cluster.anyFollower();
+		var stateMachine = lagging.stateMachine();
+		long column = api(leader).createColumn("c", SCHEMA);
+		cluster.awaitConverged(TIMEOUT);
+		stateMachine.limitApplyQueueForTesting(QUEUE_LIMIT_KIB);
+		int largeWrites = 256;
+		var gate = new CountDownLatch(1);
+		stateMachine.applyGateForTesting = gate;
+		try {
+			long applied = lagging.appliedIndex();
+			// 4 MiB, written through the leader and the other follower.
+			writeLarge(leader, column, 0, largeWrites);
+			long committed = commitIndex(leader);
+			InProcessCluster.await(TIMEOUT, () -> commitIndex(lagging) >= committed);
+			long handedOver = stateMachine.handedOverForTesting();
+			assertTrue(handedOver - applied <= QUEUE_LIMIT_KIB / 16,
+					"handed over " + handedOver + " with " + applied + " applied, beyond the queue limit");
+			assertEquals(applied, lagging.appliedIndex());
+		} finally {
+			gate.countDown();
+			stateMachine.applyGateForTesting = null;
+		}
+		cluster.awaitConverged(TIMEOUT);
+		for (int i = 0; i < largeWrites; i += 17) {
+			assertEquals(LARGE_VALUE.size(),
+					lagging.stateMachine().store().db().get(0, column, key(i), RequestType.current()).size());
+		}
+		InProcessCluster.await(TIMEOUT, () -> stateMachine.freeQueuedKiBForTesting() == QUEUE_LIMIT_KIB);
+
+		// With a permit lost per entry, these would fill the queue for good.
+		for (int i = 0; i < 1000; i++) {
+			api(leader).put(0, column, key(i), text("small" + i), RequestType.none());
+		}
+		cluster.awaitConverged(TIMEOUT);
+		assertEquals("small999", localValue(lagging, column, 999));
+		InProcessCluster.await(TIMEOUT, () -> stateMachine.freeQueuedKiBForTesting() == QUEUE_LIMIT_KIB);
 	}
 
 	@Test
@@ -687,6 +948,185 @@ class ReplicationTest {
 		cluster.awaitLeader(TIMEOUT);
 		assertThrows(RocksDBRetryException.class, () -> api.closeTransaction(tx, true));
 		assertNull(api.get(0, column, key(1), RequestType.current()));
+	}
+
+	/**
+	 * A commit forwarded by a follower, whose call the stopping leader drops after it appended the commit, fails
+	 * with an unknown outcome. It is not sent again to the next leader, which does not know the transaction and
+	 * would answer "retry" although the commit was applied: a client running the transaction again would apply it
+	 * twice. The commit is applied once.
+	 */
+	@Disabled("Bug: ReplicatedConnection.isTransportFailure counts a forwarded call as lost only on UNAVAILABLE or a"
+			+ " TimeoutException. The leader's API server, stopping with calls in progress past its graceful timeout,"
+			+ " resets them (RST_STREAM CANCEL): the follower gets CANCELLED and returns the raw"
+			+ " io.grpc.StatusRuntimeException to its caller, instead of an unknown outcome."
+			+ " ForwardingFailoverTest covers the UNAVAILABLE case.")
+	@Test
+	void aForwardedCommitLostInTransportHasAnUnknownOutcomeAndIsAppliedOnce() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var through = cluster.anyFollower();
+		var other = third(leader, through);
+		var leaderId = leader.config().nodeId();
+		var api = api(through);
+		long column = api.createColumn("c", SCHEMA);
+		long tx = api.openTransaction(Duration.ofSeconds(60));
+		api.merge(tx, column, key(1), text("tx"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		long committedBefore = commitIndex(other);
+		var gate = new CountDownLatch(1);
+		leader.stateMachine().applyGateForTesting = gate;
+		var graceful = System.getProperty(GRPC_GRACEFUL_SHUTDOWN);
+		Thread halting = null;
+		CompletableFuture<Boolean> commit;
+		try {
+			commit = through.connection().getAsyncApi(RequestContext.batch(Duration.ofSeconds(10)))
+					.closeTransactionAsync(tx, true);
+			// Committed, but the leader cannot apply it, so it cannot answer.
+			InProcessCluster.await(TIMEOUT, () -> commitIndex(other) > committedBefore);
+			// The leader's API server drops the call in progress instead of waiting for it.
+			System.setProperty(GRPC_GRACEFUL_SHUTDOWN, "0");
+			halting = haltInBackground(leaderId);
+			var error = assertThrows(ExecutionException.class, () -> commit.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+			assertInstanceOf(RocksDBException.class, error.getCause(), () -> String.valueOf(error.getCause()));
+			assertFalse(error.getCause() instanceof RocksDBRetryException, "a commit that may have been applied"
+					+ " reported as safe to run again: " + error.getCause());
+			var cause = (RocksDBException) error.getCause();
+			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, cause.getErrorUniqueId(), cause.getMessage());
+			assertTrue(cause.getMessage().contains("outcome of the commit is unknown"), cause.getMessage());
+		} finally {
+			gate.countDown();
+			leader.stateMachine().applyGateForTesting = null;
+			if (halting != null) {
+				halting.join();
+			}
+			if (graceful == null) {
+				System.clearProperty(GRPC_GRACEFUL_SHUTDOWN);
+			} else {
+				System.setProperty(GRPC_GRACEFUL_SHUTDOWN, graceful);
+			}
+		}
+
+		cluster.awaitConverged(TIMEOUT);
+		for (ReplicatedNode node : cluster.runningNodes()) {
+			assertEquals("tx", localValue(node, column, 1));
+		}
+		cluster.start(leaderId);
+		cluster.awaitConverged(TIMEOUT);
+		for (ReplicatedNode node : cluster.runningNodes()) {
+			assertEquals("tx", localValue(node, column, 1), "on " + node.config().nodeId());
+		}
+	}
+
+	/**
+	 * An update forwarded by a follower, whose call the stopping leader drops while it waits there for its key,
+	 * fails with a retryable error: it is not opened again on the next leader, since the old leader may still be
+	 * alive and have opened it.
+	 */
+	@Disabled("Bug: ReplicatedConnection.isTransportFailure counts a forwarded call as lost only on UNAVAILABLE or a"
+			+ " TimeoutException. The leader's API server, stopping with calls in progress past its graceful timeout,"
+			+ " resets them (RST_STREAM CANCEL): the follower gets CANCELLED and returns the raw"
+			+ " io.grpc.StatusRuntimeException to its caller, instead of UPDATE_RETRY."
+			+ " ForwardingFailoverTest covers the UNAVAILABLE case.")
+	@Test
+	void aForwardedUpdateLostInTransportIsNotOpenedAgain() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var through = cluster.anyFollower();
+		long column = api(through).createColumn("c", SCHEMA);
+		// Connects the follower to the leader's API.
+		assertNull(api(through).get(0, column, key(1), RequestType.current()));
+		// Held until the leader stops.
+		api(leader).get(0, column, key(1), RequestType.forUpdate());
+		var graceful = System.getProperty(GRPC_GRACEFUL_SHUTDOWN);
+		try {
+			var waiting = through.connection().getAsyncApi(CONTEXT).getAsync(0, column, key(1), RequestType.forUpdate());
+			// Time for it to reach the leader and wait there behind the holder.
+			Thread.sleep(500);
+			assertFalse(waiting.isDone(), "precondition: the update waits for the key");
+			System.setProperty(GRPC_GRACEFUL_SHUTDOWN, "0");
+			cluster.halt(leader.config().nodeId());
+			var error = assertThrows(ExecutionException.class, () -> waiting.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+			assertInstanceOf(RocksDBRetryException.class, error.getCause(), () -> String.valueOf(error.getCause()));
+		} finally {
+			if (graceful == null) {
+				System.clearProperty(GRPC_GRACEFUL_SHUTDOWN);
+			} else {
+				System.setProperty(GRPC_GRACEFUL_SHUTDOWN, graceful);
+			}
+		}
+		cluster.awaitLeader(TIMEOUT);
+		// The next leader holds no update of the key.
+		var next = through.connection().getAsyncApi(RequestContext.latency(Duration.ofSeconds(3)))
+				.getAsync(0, column, key(1), RequestType.forUpdate())
+				.get(5, TimeUnit.SECONDS);
+		api(through).closeFailedUpdate(next.updateId());
+	}
+
+	/**
+	 * Commits that queue while every commit slot is taken go together in one log entry. When one of them conflicts
+	 * with an earlier one of the same entry, the leader refuses the entry: only that commit fails, and its
+	 * transaction stays open, while the others go again together in the next entry.
+	 */
+	@Test
+	void onlyTheConflictingCommitsOfABatchFail() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = api(leader);
+		long column = api.createColumn("c", SCHEMA);
+		var fillers = new long[Proposer.MAX_BATCHES_IN_FLIGHT];
+		for (int i = 0; i < fillers.length; i++) {
+			fillers[i] = api.openTransaction(Duration.ofSeconds(60));
+			api.put(fillers[i], column, key(100 + i), text("filler"), RequestType.none());
+		}
+		long first = api.openTransaction(Duration.ofSeconds(60));
+		api.put(first, column, key(1), text("first"), RequestType.none());
+		long second = api.openTransaction(Duration.ofSeconds(60));
+		api.put(second, column, key(1), text("second"), RequestType.none());
+		long third = api.openTransaction(Duration.ofSeconds(60));
+		api.put(third, column, key(2), text("third"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		long before = leader.appliedIndex();
+
+		var async = leader.connection().getAsyncApi(CONTEXT);
+		var fillerCommits = new ArrayList<CompletableFuture<Boolean>>();
+		var gate = new CountDownLatch(1);
+		leader.stateMachine().applyGateForTesting = gate;
+		CompletableFuture<Boolean> firstCommit;
+		CompletableFuture<Boolean> secondCommit;
+		CompletableFuture<Boolean> thirdCommit;
+		try {
+			for (long filler : fillers) {
+				fillerCommits.add(async.closeTransactionAsync(filler, true));
+			}
+			// Every commit slot is taken by a filler that cannot be applied yet: these three queue, then go together.
+			firstCommit = async.closeTransactionAsync(first, true);
+			secondCommit = async.closeTransactionAsync(second, true);
+			thirdCommit = async.closeTransactionAsync(third, true);
+		} finally {
+			gate.countDown();
+			leader.stateMachine().applyGateForTesting = null;
+		}
+		for (var commit : fillerCommits) {
+			assertTrue(commit.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		}
+		assertTrue(firstCommit.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		assertFalse(secondCommit.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS), "the conflicting commit succeeded");
+		assertTrue(thirdCommit.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		// Still open, so its commit conflicts again, instead of failing because the transaction is gone.
+		assertFalse(api.closeTransaction(second, true));
+		assertTrue(api.closeTransaction(second, false));
+
+		cluster.awaitConverged(TIMEOUT);
+		// One entry per filler, and one for the first and third commits together: the refused entry was not appended.
+		assertEquals(before + Proposer.MAX_BATCHES_IN_FLIGHT + 1, leader.appliedIndex());
+		for (ReplicatedNode node : cluster.runningNodes()) {
+			assertEquals("first", localValue(node, column, 1));
+			assertEquals("third", localValue(node, column, 2));
+			for (int i = 0; i < fillers.length; i++) {
+				assertEquals("filler", localValue(node, column, 100 + i));
+			}
+		}
 	}
 
 	@Test

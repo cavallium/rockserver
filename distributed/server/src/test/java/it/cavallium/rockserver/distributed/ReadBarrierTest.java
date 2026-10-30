@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import it.cavallium.rockserver.distributed.ReadBarrier.ApplyLagException;
 import it.cavallium.rockserver.distributed.ReadBarrier.NotLeaderException;
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -160,6 +161,47 @@ class ReadBarrierTest {
 			gate.countDown();
 			assertEquals(1, writesSeenByRead.get(10, TimeUnit.SECONDS));
 			assertTrue(write.get(10, TimeUnit.SECONDS).isSuccess());
+		} finally {
+			gate.countDown();
+		}
+	}
+
+	/**
+	 * A leader that cannot apply a committed entry within a round timeout fails the barrier with
+	 * {@link ApplyLagException}: it neither serves the read without that entry nor keeps the caller waiting.
+	 */
+	@Test
+	void leaderThatCannotApplyFailsReadsWithApplyLag() throws Exception {
+		startCluster();
+		var leader = awaitLeader();
+		var client = client();
+		long commitBefore = leader.commitIndex();
+		var gate = new CountDownLatch(1);
+		leader.stateMachine.applyGate = gate;
+		try {
+			var write = client.async().send(Message.valueOf("inc"));
+			waitUntil(() -> leader.commitIndex() > commitBefore, "write committed");
+			long readyIndex = leader.commitIndex();
+			// As if that entry were an earlier leader's, still waiting for this node's apply thread.
+			var leadershipBarrier = new ReadBarrier(leader.server, groupId, leader.stateMachine.applied, ROUND_TIMEOUT,
+					_ -> readyIndex);
+			barriers.add(leadershipBarrier);
+
+			long start = System.nanoTime();
+			var read = barrier(leader).await();
+			var leadership = leadershipBarrier.awaitLeadership();
+			assertInstanceOf(ApplyLagException.class, failure(read));
+			assertInstanceOf(ApplyLagException.class, failure(leadership));
+			// Leadership was confirmed, then the apply wait ran for a whole round timeout.
+			assertTrue(System.nanoTime() - start >= ROUND_TIMEOUT.toNanos(),
+					"failed after " + Duration.ofNanos(System.nanoTime() - start).toMillis() + " ms");
+			assertEquals(0, leader.stateMachine.writes.get());
+
+			gate.countDown();
+			assertTrue(write.get(10, TimeUnit.SECONDS).isSuccess());
+			barrier(leader).await().get(10, TimeUnit.SECONDS);
+			leadershipBarrier.awaitLeadership().get(10, TimeUnit.SECONDS);
+			assertEquals(1, leader.stateMachine.writes.get());
 		} finally {
 			gate.countDown();
 		}
