@@ -224,15 +224,25 @@ final class YotsubaWorkload {
 
 	/**
 	 * The message update of {@code MessagesImpl}: {@code get(forUpdate)}, then the commit {@code put(updateId)} or,
-	 * when nothing changed (about 5%), {@code closeFailedUpdate}; conflicts are retried with 10-250 ms backoff.
+	 * when nothing changed (about 5%), {@code closeFailedUpdate}; conflicts are retried with 10-250 ms backoff, like a
+	 * no-change close told to retry, which needs pipelined updates. A failed {@code get}, such as the lock wait of a hot
+	 * key timing out, is a failed operation, as it always was here, so that runs stay comparable: {@code lockWaitRetries}
+	 * counts the ones that say to retry.
 	 */
 	private long update(RocksDBAsyncAPI api, BenchStats.Op stats, ThreadLocalRandom random) {
 		var key = updateKey(random);
 		long backoffMs = 10;
 		for (int attempt = 0; ; attempt++) {
+			UpdateContext<Buf> context;
 			try {
-				// All in here: with pipelined updates, a no-change close can be told to retry too.
-				UpdateContext<Buf> context = api.<UpdateContext<Buf>>getAsync(0, messages, key, RequestType.forUpdate()).join();
+				context = api.<UpdateContext<Buf>>getAsync(0, messages, key, RequestType.forUpdate()).join();
+			} catch (CompletionException | RocksDBException e) {
+				if (isRetry(e)) {
+					stats.lockWaitRetries.increment();
+				}
+				throw e;
+			}
+			try {
 				boolean unchanged = random.nextInt(20) == 0;
 				if (unchanged) {
 					api.closeFailedUpdateAsync(context.updateId()).join();
@@ -242,10 +252,7 @@ final class YotsubaWorkload {
 				api.putAsync(context.updateId(), messages, key, value, RequestType.none()).join();
 				return 12 + value.size();
 			} catch (CompletionException | RocksDBException e) {
-				var cause = e instanceof CompletionException && e.getCause() != null ? e.getCause() : e;
-				boolean retry = cause instanceof RocksDBRetryException
-						|| (cause instanceof RocksDBException r && r.getErrorUniqueId() == RocksDBErrorType.UPDATE_RETRY);
-				if (!retry || attempt + 1 >= UPDATE_RETRY_ATTEMPTS) {
+				if (!isRetry(e) || attempt + 1 >= UPDATE_RETRY_ATTEMPTS) {
 					throw e;
 				}
 				stats.retries.increment();
@@ -253,6 +260,12 @@ final class YotsubaWorkload {
 				backoffMs *= 2;
 			}
 		}
+	}
+
+	private static boolean isRetry(RuntimeException error) {
+		var cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+		return cause instanceof RocksDBRetryException
+				|| (cause instanceof RocksDBException r && r.getErrorUniqueId() == RocksDBErrorType.UPDATE_RETRY);
 	}
 
 	/** The key of one update: a hot one, or one of the skewed chats. */

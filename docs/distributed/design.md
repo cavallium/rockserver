@@ -328,15 +328,32 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
     (`broken`, only ever true while links are unsettled) stops chaining until the links drain.
   - **Chained close.** `closeFailedUpdate` of a chained update writes no log entry. It hands the key on at once,
     then waits at most 2 s for the commit it read from, on a copy of that link's future. It succeeds only if that
-    commit applied; a dead base, a timeout, or an unknown positive id (after a leader change) is `UPDATE_RETRY`.
+    commit applied; a dead base, a timeout, or an unknown positive id (after a leader change, or a lease that ended)
+    is `UPDATE_RETRY`, and so is `closeTransaction` of such an id, a rollback included: a clean end would confirm a
+    value that may never be written. A no-change close hands the key on without making a link, so the next update
+    reads the same one: 64 updates may read a link, and more queue for the key until it settles, like with the flag
+    off. A proxy `GrpcServer` serves `closeFailedUpdate` on the async API, on the call's own virtual thread, with
+    must-complete semantics: the wait holds no CONTROL worker, and no queue can refuse a close, since a refused close
+    would keep its key for the whole lease.
     It linearizes right after that commit: every writer ordered after it was registered after the grant, which
     came after the read barrier, so after the close's update was invoked. That is why the barrier stays on both
     paths, and why the grant check is needed for this and not only as an optimisation.
   - **What falls back.** A commit that is not one put or delete of the locked key (a merge, several keys, another
     key) or a value over 1 MiB gives no link: the key is held until the reply, as with the flag off. Any operation
     that needs a snapshot on a chained id (`get` with the id, ranges, iterators, a second `getForUpdate`,
-    `closeTransaction`) ends the update with `UPDATE_RETRY` and makes the next one a head. A cold key costs only
-    the bookkeeping.
+    `closeTransaction`) ends the update with `UPDATE_RETRY` and makes the next one a head. A second write on an update
+    whose commit is in flight fails alone with `UPDATE_RETRY`: an update has one commit, so a failed commit can only
+    fail the link it made itself. A cold key costs only the bookkeeping.
+  - **Transactions.** A transaction that touches a key with an unsettled link conflicts at commit, whatever it waits
+    for: its snapshot is fixed when it opens, and a link that is unsettled after that is newer than the snapshot even
+    once applied, so only a new transaction can pass. What it needs is a moment with no unsettled links, and a key
+    that chains without a pause has none. So a commit that conflicts on such a key also stops the chain there until
+    its links settle (`LeaderSession.yieldChainsTo`, counted by `transaction.chainConflict`, among
+    `transaction.conflict`), and the transaction's retry finds room, as it does with the flag off. A key's updates pay
+    for that only while transactions collide with them. In `HotKeyThroughputTest`, in-process, with one client
+    running transactions on the key in a tight loop beside 32 update clients: 106 commits/s with the flag off, 0.2
+    without the pause, 31 with it; updates of the key 690/s off, 13400/s without the pause, 1690/s with it. Beside
+    4 update clients, 66 off, 13 without the pause, 30 with it. Those are ratios from one run on a busy machine.
 - **Staged writes** happen natively. The leader also records them, with their conflict keys: the written keys
   plus the `getForUpdate` keys. It counts the encoded size of the commit entry as they arrive. A write or
   `getForUpdate` that would take it past the 16 MiB entry limit fails at once with `INVALID_REQUEST` and is not
@@ -494,6 +511,7 @@ failover" below).
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups. |
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); chains (handoff at admission, the cap, breaks and their end, duplicates, expiry, close, no session monitor under the log lock); history kept for open transactions and in-flight commits, up to the key cap; the commit size limit of staged writes. |
 | `PipelinedUpdatesTest` (in-process, flag on) | With the leader's apply stopped: chained updates see each other's values and nothing is acknowledged; wrong guards; plain writes, transactions and `deleteRange` against a chain; closes in mid-chain; refused operations on chained ids; merges and multi-key commits; caller gone, abandon; a snapshot and a restart inside a chain; a leader change with a chain in flight; concurrent counters. |
+| `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. Only these three chain in a default run: the suites below run the plain per-key queue unless the property below is set. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, no acknowledged increment of a hot counter is lost, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history, hot counters included, is linearizable. |
@@ -510,14 +528,18 @@ Run them all (about 10 minutes):
 mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockserver.distributed.**' -Dsurefire.failIfNoSpecifiedTests=false
 ```
 
-`-Drockserver.test.pipelinedUpdates=true` runs every test cluster with pipelined updates on.
+`-Drockserver.test.pipelinedUpdates=true` runs every test cluster with pipelined updates on. Hot counters also
+require, in both modes, that every key takes a new update well within a lease once the cluster settled, and, with the
+flag on, that some update was chained. `HotKeyThroughputTest` runs only with `-Drockserver.test.slow=true`.
 
 ## Left before a first deployment
 
 0. **Pipelined updates** stay off until the benchmark on hot keys (see [performance.md](performance.md)) and a full
    review of the Yotsuba call sites: a chained value must not be acted on before the update ended well, and
-   `UPDATE_RETRY` from a no-change close must be retried. Watch `update.guardRejected`, `update.chainConflict` and
-   `transaction.conflict`.
+   `UPDATE_RETRY` from a no-change close must be retried. Watch `update.guardRejected`, `update.chainConflict`,
+   `transaction.conflict` and `transaction.chainConflict`. Every node must run a version with the flags of `Guarded`
+   entries before any node turns the option on: an older one would fail on the entries of a pipelined leader. With the
+   option off, entries keep the bytes they always had, and logs written before these flags stay readable.
 1. **Client side.**
    - Yotsuba does not compile against this version as is: CDC was removed from the client API, and
      `server/source/api/src/main/java/org/yotsuba/database/RockserverAsyncApiViews.java:133` still overrides
