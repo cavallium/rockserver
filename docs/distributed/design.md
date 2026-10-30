@@ -116,6 +116,14 @@ and the `LogEntry`.
   server; elsewhere it is an independent blocking Ratis client call on a virtual thread. Ratis' ordered async
   stream closes for good after one exhausted request, so it is not used. A batch whose attempt ended without
   saying whether it was appended can only end with its results or an unknown outcome, never "not applied".
+- **Caller deadlines.** When the caller's request-context timeout ends before the node's request timeout, a
+  write is resent only until the caller's deadline, less a margin of 20 ms (at most a tenth of the timeout). A
+  write still queued at that point, or whose caller cancelled it before it was sent, is never sent. It fails with
+  `READ_DEADLINE_EXCEEDED` and a message that says it was not applied, as on a single node, where a command that
+  waited past its deadline fails without running. A write already sent cannot be withdrawn. The synchronous API,
+  which `GrpcServer` uses for writes, returns at the caller's deadline with `READ_DEADLINE_EXCEEDED` and "outcome
+  unknown", and the write may still be applied later. Transaction commits follow the same rules. The chunks of a
+  `putBatch` or `mergeBatch` share one deadline, counted from the start of the call.
 - **Results are recorded.** Applying a request writes its encoded result under
   `(proposerId, sequence)` in the internal column, in the same local transaction as its effects. If a
   later copy of the same request reaches the log (a retry that went to a new leader, or to a restarted node
@@ -348,7 +356,8 @@ against an incomplete history.
 - **Leader changes.** Transactions, update ids and iterators do not survive one. Clients get `UPDATE_RETRY`.
 - **Outcome unknown.** When no leader answers within the request timeout, the error is `SERVER_OVERLOADED`
   with "outcome unknown", and the write may still take effect later. Internal retries are exactly once, but
-  a client that resends the same write after such an error can apply it twice.
+  a client that resends the same write after such an error can apply it twice. A `DEADLINE_EXCEEDED` on a
+  replicated write also has an unknown outcome, unless its message says that the write was not applied.
 - **`putBatch`/`mergeBatch`** run as ordered replicated write batches, whatever the requested SST mode.
 - **Size limit.** One replicated entry (one write, multi-write or transaction commit) is limited to 16 MiB.
 - **`scanRaw` SST tokens** describe the leader's own files, so a leader change invalidates them.

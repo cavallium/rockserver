@@ -15,6 +15,7 @@ import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -242,6 +243,74 @@ class ReplicationTest {
 			var received = delta.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
 			assertEquals(previous.size(), received.previous().size());
 			assertEquals(current.size(), received.current().size());
+		}
+	}
+
+	/** Without a majority, a write returns at its caller's deadline, not at the node's request timeout. */
+	@Test
+	void aWriteWithoutMajorityReturnsAtItsCallersDeadline() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withRequestTimeout(Duration.ofSeconds(30))).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var through = cluster.anyFollower();
+		long column = api(through).createColumn("c", SCHEMA);
+		for (String id : cluster.ids()) {
+			if (!id.equals(through.config().nodeId())) {
+				cluster.halt(id);
+			}
+		}
+		var shortDeadline = through.connection().getSyncApi(RequestContext.latency(Duration.ofSeconds(1)));
+		long start = System.nanoTime();
+		assertThrows(RocksDBException.class, () -> shortDeadline.put(0, column, key(1), text("sent"),
+				RequestType.none()));
+		assertTrue(System.nanoTime() - start < Duration.ofSeconds(3).toNanos(),
+				"the write waited past its caller's deadline");
+	}
+
+	/**
+	 * A write still queued at its caller's deadline (every batch slot taken by writes no majority answers) fails
+	 * then as not applied, and so does one whose caller cancelled it: neither is ever applied, also once the writes
+	 * ahead of them go through.
+	 */
+	@Test
+	void aWriteQueuedPastItsCallersDeadlineIsNeverApplied() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withRequestTimeout(Duration.ofSeconds(30))).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var through = cluster.anyFollower();
+		var api = api(through);
+		long column = api.createColumn("c", SCHEMA);
+		var halted = cluster.ids().stream().filter(id -> !id.equals(through.config().nodeId())).toList();
+		for (String id : halted) {
+			cluster.halt(id);
+		}
+		var async = through.connection().getAsyncApi(CONTEXT);
+		var fillers = new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+		for (int i = 0; i < Proposer.MAX_BATCHES_IN_FLIGHT; i++) {
+			fillers.add(async.putAsync(0, column, key(100 + i), text("filler"), RequestType.none()));
+		}
+		var shortDeadline = through.connection().getSyncApi(RequestContext.latency(Duration.ofSeconds(1)));
+		long start = System.nanoTime();
+		var error = assertThrows(RocksDBException.class, () -> shortDeadline.put(0, column, key(2), text("queued"),
+				RequestType.none()));
+		assertTrue(System.nanoTime() - start < Duration.ofSeconds(3).toNanos(),
+				"the queued write waited past its caller's deadline");
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, error.getErrorUniqueId());
+		assertTrue(error.getMessage().contains("not applied"), error.getMessage());
+		var cancelled = async.putAsync(0, column, key(3), text("cancelled"), RequestType.none());
+		assertTrue(cancelled.cancel(true));
+
+		for (String id : halted) {
+			cluster.start(id);
+		}
+		for (var filler : fillers) {
+			filler.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		}
+		api.put(0, column, key(4), text("after"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		for (ReplicatedNode node : cluster.runningNodes()) {
+			assertEquals("filler", localValue(node, column, 100));
+			assertNull(localValue(node, column, 2), "a write that failed as not applied was applied");
+			assertNull(localValue(node, column, 3), "a write cancelled before it was sent was applied");
+			assertEquals("after", localValue(node, column, 4));
 		}
 	}
 

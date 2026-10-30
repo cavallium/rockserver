@@ -12,11 +12,15 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import org.apache.ratis.client.RaftClient;
@@ -60,6 +64,11 @@ import org.jetbrains.annotations.Nullable;
  * <p>Transaction commits ({@link #proposeOnce}) have their own queue: they are only ever sent once, to this node's
  * own Raft server, and a conflict rejects only the commits that conflict: the others are sent again in the next
  * batch.</p>
+ *
+ * <p>A request whose caller has less time left than the request timeout is resent only until its caller's deadline,
+ * minus {@link #CALLER_MARGIN_NANOS}. If it is still queued then, or its caller cancelled it before it was sent, it
+ * leaves the queue without being sent: the caller gets {@code READ_DEADLINE_EXCEEDED}, and the write was not
+ * applied.</p>
  */
 final class Proposer implements Closeable {
 
@@ -79,6 +88,14 @@ final class Proposer implements Closeable {
 	 * most one hurried attempt, and its outcome would then be unknown instead of a clean "not applied".
 	 */
 	private static final long MIN_TIME_LEFT_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+	/**
+	 * Taken off the time left to a caller (at most a tenth of it): a request still queued this long before its
+	 * caller's deadline fails at once, so that the caller gets the clean "not applied" answer before its own deadline
+	 * ends the call with an unknown outcome.
+	 */
+	private static final long CALLER_MARGIN_NANOS = TimeUnit.MILLISECONDS.toNanos(20);
+	/** Time left to a caller without a deadline of its own: the request gets the node's request timeout. */
+	static final long NO_CALLER_DEADLINE = Long.MAX_VALUE;
 	/** Batch header, plus a sequence per request. */
 	private static final int BATCH_HEADER_BYTES = 1 + 2 * Long.BYTES + Integer.BYTES;
 
@@ -96,6 +113,9 @@ final class Proposer implements Closeable {
 	private final AtomicLong localCallIds = new AtomicLong();
 	private final ExecutorService sender = Executors.newThreadPerTaskExecutor(
 			Thread.ofVirtual().name("rockserver-propose-", 0).factory());
+	/** Fails queued requests at their caller's deadline, also while no batch slot frees up to look at the queue. */
+	private final ScheduledThreadPoolExecutor expiries = new ScheduledThreadPoolExecutor(1,
+			Thread.ofPlatform().daemon().name("rockserver-propose-expiry").factory());
 	private final long requestTimeoutNanos;
 	/** How long one client attempt waits for its reply. */
 	private final long attemptTimeoutNanos;
@@ -110,6 +130,7 @@ final class Proposer implements Closeable {
 		this.anyLeader = new Lane(false);
 		this.localCommits = new Lane(true);
 		this.requestTimeoutNanos = config.requestTimeout().toNanos();
+		this.expiries.setRemoveOnCancelPolicy(true);
 		this.localServer = localServer;
 		this.groupId = group.getGroupId();
 		this.self = RaftPeerId.valueOf(config.nodeId());
@@ -134,31 +155,47 @@ final class Proposer implements Closeable {
 		return client;
 	}
 
-	/**
-	 * Proposes {@code entry} and completes with its result. Fails with a {@link RocksDBException}: the result's own
-	 * error, {@link RocksDBRetryException} if the leader refused it (stale transaction), or {@code SERVER_OVERLOADED}
-	 * when no leader answered in time; then the outcome is unknown.
-	 */
+	/** {@link #propose(LogEntry, long)} for a request without a caller deadline. */
 	CompletableFuture<Object> propose(LogEntry entry) {
-		return submit(entry, anyLeader);
+		return propose(entry, NO_CALLER_DEADLINE);
+	}
+
+	/**
+	 * Proposes {@code entry} and completes with its result. {@code callerTimeLeftNanos} is what is left of the
+	 * caller's timeout ({@link #NO_CALLER_DEADLINE} if none). Fails with a {@link RocksDBException}: the result's own
+	 * error, {@link RocksDBRetryException} if the leader refused it (stale transaction), {@code READ_DEADLINE_EXCEEDED}
+	 * if the caller's deadline came before it was sent (not applied), or {@code SERVER_OVERLOADED} when no leader
+	 * answered in time; then the outcome is unknown, unless the message says it was not applied.
+	 */
+	CompletableFuture<Object> propose(LogEntry entry, long callerTimeLeftNanos) {
+		return submit(entry, anyLeader, callerTimeLeftNanos);
 	}
 
 	/**
 	 * Proposes a transaction commit to this node's own Raft server, which must be the leader that opened it, in a
 	 * single attempt: a resend could reach another leader, which would refuse it although the first attempt may
 	 * have been committed. Fails with {@link ConflictException} on a conflict, {@link RocksDBRetryException} if it
-	 * was refused before being appended, and {@code SERVER_OVERLOADED} if its outcome is unknown.
+	 * was refused before being appended, {@code READ_DEADLINE_EXCEEDED} if the caller's deadline came before it was
+	 * sent, and {@code SERVER_OVERLOADED} if its outcome is unknown.
 	 */
-	CompletableFuture<Object> proposeOnce(LogEntry.Guarded entry) {
-		return submit(entry, localCommits);
+	CompletableFuture<Object> proposeOnce(LogEntry.Guarded entry, long callerTimeLeftNanos) {
+		return submit(entry, localCommits, callerTimeLeftNanos);
 	}
 
 	/** A request waiting for its answer. */
 	private static final class Pending {
+
+		private static final int QUEUED = 0;
+		private static final int SENT = 1;
+		private static final int ABANDONED = 2;
+
 		final long sequence;
 		final byte[] body;
 		final boolean batchable;
+		/** When resends stop: the node's request timeout, or the caller's deadline if earlier. */
 		final long deadlineNanos;
+		/** The deadline is the caller's: a request still queued then fails as not applied, with no time minimum. */
+		final boolean callerDeadline;
 		/** Leader epoch of a transaction commit, -1 otherwise: commits of different epochs never share an entry. */
 		final long epoch;
 		/** When it last entered the queue. */
@@ -178,13 +215,35 @@ final class Proposer implements Closeable {
 		volatile int copyBatchLimit = 1;
 		/** Completed only by the proposer; callers get a copy, so that cancelling theirs cannot complete this one. */
 		final CompletableFuture<Object> result = new CompletableFuture<>();
+		/** QUEUED until it is taken into a batch (SENT), or until its caller gives up on it first (ABANDONED). */
+		private final AtomicInteger state = new AtomicInteger(QUEUED);
 
-		Pending(long sequence, byte[] body, boolean batchable, long deadlineNanos, long epoch) {
+		Pending(long sequence, byte[] body, boolean batchable, long deadlineNanos, boolean callerDeadline, long epoch) {
 			this.sequence = sequence;
 			this.body = body;
 			this.batchable = batchable;
 			this.deadlineNanos = deadlineNanos;
+			this.callerDeadline = callerDeadline;
 			this.epoch = epoch;
+		}
+
+		boolean isQueued() {
+			return state.get() == QUEUED;
+		}
+
+		/** Marks it as taken into a batch; false if it was abandoned, and must then not be sent. */
+		boolean markSent() {
+			return state.get() == SENT || state.compareAndSet(QUEUED, SENT);
+		}
+
+		/**
+		 * Fails it with {@code error} if it was never sent, so that it never will be; does nothing once it was sent,
+		 * since it may then take effect. It stays in its queue until a batch is formed, which skips it.
+		 */
+		void abandon(Throwable error) {
+			if (state.compareAndSet(QUEUED, ABANDONED)) {
+				result.completeExceptionally(error);
+			}
 		}
 
 		/** True if it goes in a batch of its own. */
@@ -217,7 +276,7 @@ final class Proposer implements Closeable {
 	/** Every request submitted and not answered yet, so that close() can answer them all. */
 	private final java.util.Set<Pending> live = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-	private CompletableFuture<Object> submit(LogEntry entry, Lane lane) {
+	private CompletableFuture<Object> submit(LogEntry entry, Lane lane, long callerTimeLeftNanos) {
 		byte[] body;
 		try {
 			body = LogEntryCodec.encodeEntryBody(entry);
@@ -232,12 +291,20 @@ final class Proposer implements Closeable {
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
 					"The node is stopping"));
 		}
+		if (callerTimeLeftNanos <= 0) {
+			return CompletableFuture.failedFuture(callerDeadlinePassed());
+		}
+		long now = System.nanoTime();
+		boolean callerDeadline = callerTimeLeftNanos < requestTimeoutNanos;
+		long deadlineNanos = callerDeadline
+				? now + callerTimeLeftNanos - Math.min(CALLER_MARGIN_NANOS, callerTimeLeftNanos / 10)
+				: now + requestTimeoutNanos;
 		long sequence;
 		synchronized (numbering) {
 			sequence = nextSequence++;
 			inFlight.add(sequence);
 		}
-		var pending = new Pending(sequence, body, Applier.isBatchable(entry), System.nanoTime() + requestTimeoutNanos,
+		var pending = new Pending(sequence, body, Applier.isBatchable(entry), deadlineNanos, callerDeadline,
 				entry instanceof LogEntry.Guarded guarded ? guarded.leaderEpoch() : -1);
 		live.add(pending);
 		pending.result.whenComplete((_, _) -> {
@@ -252,7 +319,32 @@ final class Proposer implements Closeable {
 			pending.result.completeExceptionally(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
 					"The node is stopping"));
 		}
-		return pending.result.copy();
+		if (callerDeadline && pending.isQueued()) {
+			// It waits for a batch slot: fail it at its deadline even if no slot frees up by then.
+			expireWhenQueued(pending);
+		}
+		var copy = pending.result.copy();
+		copy.whenComplete((_, _) -> {
+			if (copy.isCancelled()) {
+				pending.abandon(new CancellationException("The caller cancelled the write before it was sent"));
+			}
+		});
+		return copy;
+	}
+
+	private void expireWhenQueued(Pending pending) {
+		try {
+			var expiry = expiries.schedule(() -> pending.abandon(callerDeadlinePassed()),
+					pending.deadlineNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
+			pending.result.whenComplete((_, _) -> expiry.cancel(false));
+		} catch (RejectedExecutionException stopping) {
+			// close() answers every request.
+		}
+	}
+
+	private static RocksDBException callerDeadlinePassed() {
+		return RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+				"The request deadline came before the write was sent; it was not applied");
 	}
 
 	/** Every request numbered below this has its final answer: no copy of it will ever be sent again. */
@@ -330,8 +422,9 @@ final class Proposer implements Closeable {
 
 		/**
 		 * The next batch: the first queued request and, if it is a data write, the data writes behind it, up to the
-		 * batch limits. Requests already past their deadline were never sent, so they fail without taking effect
-		 * (except those resent alone, see {@link Pending#fail}).
+		 * batch limits. Requests past their deadline, or with less than {@link #MIN_TIME_LEFT_NANOS} left before the
+		 * node's own deadline, were never sent, so they fail without taking effect (except those resent alone, see
+		 * {@link Pending#fail}). Abandoned requests are dropped.
 		 */
 		private List<Pending> take() {
 			var batch = new ArrayList<Pending>();
@@ -345,10 +438,12 @@ final class Proposer implements Closeable {
 					queue.pollFirst();
 					continue;
 				}
-				if (closed || next.deadlineNanos - now < MIN_TIME_LEFT_NANOS) {
+				if (closed || next.deadlineNanos - now < (next.callerDeadline ? 0 : MIN_TIME_LEFT_NANOS)) {
 					queue.pollFirst();
-					next.fail(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
-							closed ? "The node is stopping" : "No leader accepted the write in time; it was not applied"));
+					next.fail(closed ? RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping")
+							: next.callerDeadline ? callerDeadlinePassed()
+							: RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+									"No leader accepted the write in time; it was not applied"));
 					continue;
 				}
 				if (!batch.isEmpty() && (next.alone() || batch.getFirst().alone()
@@ -358,6 +453,10 @@ final class Proposer implements Closeable {
 					break;
 				}
 				queue.pollFirst();
+				if (!next.markSent()) {
+					// Abandoned just now.
+					continue;
+				}
 				batch.add(next);
 				bytes += next.body.length + Long.BYTES;
 				if (next.resentAlone) {
@@ -389,7 +488,7 @@ final class Proposer implements Closeable {
 				latest = Math.max(latest, batch.get(i).deadlineNanos);
 			}
 			// Resent until the newest member's deadline, but at most one attempt beyond the oldest one's: its caller
-			// should not wait twice its timeout. The oldest has MIN_TIME_LEFT_NANOS left at least (see take()).
+			// should not wait twice its timeout. The oldest is not past its deadline (see take()).
 			long deadline = Math.min(latest, earliest + attemptTimeoutNanos);
 			var message = Message.valueOf(UnsafeByteOperations.unsafeWrap(
 					LogEntryCodec.encodeBatch(proposerId, completedBelow(), sequences, bodies)));
@@ -399,7 +498,7 @@ final class Proposer implements Closeable {
 			}
 			batchSize.record(batch.size());
 			if (commits) {
-				sendCommits(batch, message, now);
+				sendCommits(batch, message, deadline, now);
 			} else {
 				attempt(batch, message, deadline, now, false);
 			}
@@ -472,8 +571,8 @@ final class Proposer implements Closeable {
 		 * The single attempt at a batch of transaction commits. A conflict rejects the whole log entry before it is
 		 * appended: the commits that conflict fail, the others go again with the next batch.
 		 */
-		private void sendCommits(List<Pending> batch, Message message, long sentNanos) {
-			submitLocal(message, System.nanoTime() + requestTimeoutNanos).handleAsync((answer, error) -> {
+		private void sendCommits(List<Pending> batch, Message message, long deadlineNanos, long sentNanos) {
+			submitLocal(message, deadlineNanos).handleAsync((answer, error) -> {
 				roundTrip.since(sentNanos);
 				try {
 					var refusal = error != null ? stateMachineException(error)
@@ -725,6 +824,7 @@ final class Proposer implements Closeable {
 			fail(queued, RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping"));
 		}
 		try (client) {
+			expiries.shutdownNow();
 			sender.shutdownNow();
 		} finally {
 			// Batches in flight lose their reply handlers with the executor: their outcome is unknown.

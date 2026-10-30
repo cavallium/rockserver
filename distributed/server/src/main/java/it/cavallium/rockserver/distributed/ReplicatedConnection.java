@@ -152,12 +152,21 @@ final class ReplicatedConnection implements RocksDBConnection {
 			this.context = context;
 		}
 
+		/**
+		 * A replicated write waits at most until its caller's deadline: the proposer may keep resending it longer (at
+		 * most one attempt past that deadline), and the caller's thread (in {@code GrpcServer}, a proxy permit) would
+		 * be held meanwhile.
+		 */
 		@Override
 		@SuppressWarnings("unchecked")
 		public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
+			long start = System.nanoTime();
 			RA result = requestAsync(request);
 			if (request instanceof RocksDBAPICommandStream<?>) {
 				return (RS) Flux.from((Publisher<R>) result).toStream();
+			}
+			if (context.hasTimeout() && isSingleReplicatedWrite(request)) {
+				return (RS) join((CompletableFuture<R>) result, remainingNanos(context, start));
 			}
 			return (RS) join((CompletableFuture<R>) result);
 		}
@@ -176,20 +185,21 @@ final class ReplicatedConnection implements RocksDBConnection {
 	// Routing
 
 	private CompletableFuture<?> single(RequestContext context, RocksDBAPICommandSingle<?> command) {
+		long start = System.nanoTime();
 		try {
 			requireUserColumn(command);
 			return switch (command) {
-				case Put<?> c when c.transactionOrUpdateId() == 0 ->
-						proposer.propose(new LogEntry.Put(c.columnId(), c.keys(), c.value(), id(c.requestType())));
-				case PutMulti<?> c when c.transactionOrUpdateId() == 0 -> proposer.propose(
+				case Put<?> c when c.transactionOrUpdateId() == 0 -> propose(context, start,
+						new LogEntry.Put(c.columnId(), c.keys(), c.value(), id(c.requestType())));
+				case PutMulti<?> c when c.transactionOrUpdateId() == 0 -> propose(context, start,
 						new LogEntry.PutMulti(c.columnId(), c.keys(), c.values(), id(c.requestType())));
-				case Delete<?> c when c.transactionOrUpdateId() == 0 ->
-						proposer.propose(new LogEntry.Delete(c.columnId(), c.keys(), id(c.requestType())));
-				case DeleteMulti<?> c when c.transactionOrUpdateId() == 0 ->
-						proposer.propose(new LogEntry.DeleteMulti(c.columnId(), c.keys(), id(c.requestType())));
-				case Merge<?> c when c.transactionOrUpdateId() == 0 ->
-						proposer.propose(new LogEntry.Merge(c.columnId(), c.keys(), c.value(), id(c.requestType())));
-				case MergeMulti<?> c when c.transactionOrUpdateId() == 0 -> proposer.propose(
+				case Delete<?> c when c.transactionOrUpdateId() == 0 -> propose(context, start,
+						new LogEntry.Delete(c.columnId(), c.keys(), id(c.requestType())));
+				case DeleteMulti<?> c when c.transactionOrUpdateId() == 0 -> propose(context, start,
+						new LogEntry.DeleteMulti(c.columnId(), c.keys(), id(c.requestType())));
+				case Merge<?> c when c.transactionOrUpdateId() == 0 -> propose(context, start,
+						new LogEntry.Merge(c.columnId(), c.keys(), c.value(), id(c.requestType())));
+				case MergeMulti<?> c when c.transactionOrUpdateId() == 0 -> propose(context, start,
 						new LogEntry.MergeMulti(c.columnId(), c.keys(), c.values(), id(c.requestType())));
 				case Put<?> c -> leaderBound(context, c, () -> stagedWrite(context, c, c.transactionOrUpdateId(),
 						new LogEntry.Put(c.columnId(), c.keys(), c.value(), id(c.requestType())), List.of(c.keys())));
@@ -203,16 +213,17 @@ final class ReplicatedConnection implements RocksDBConnection {
 						new LogEntry.Merge(c.columnId(), c.keys(), c.value(), id(c.requestType())), List.of(c.keys())));
 				case MergeMulti<?> c -> leaderBound(context, c, () -> stagedWrite(context, c, c.transactionOrUpdateId(),
 						new LogEntry.MergeMulti(c.columnId(), c.keys(), c.values(), id(c.requestType())), c.keys()));
-				case RocksDBAPICommandSingle.DeleteRange c ->
-						proposer.propose(new LogEntry.DeleteRange(c.columnId(), c.startKeysInclusive(), c.endKeysExclusive()));
-				case RocksDBAPICommandSingle.PutBatch c -> batch(c.columnId(), c.batchPublisher(), false);
-				case RocksDBAPICommandSingle.MergeBatch c -> batch(c.columnId(), c.batchPublisher(), true);
-				case RocksDBAPICommandSingle.CreateColumn c -> createColumn(c.name(), c.schema());
-				case RocksDBAPICommandSingle.DeleteColumn c -> proposer.propose(new LogEntry.DeleteColumn(c.columnId()));
+				case RocksDBAPICommandSingle.DeleteRange c -> propose(context, start,
+						new LogEntry.DeleteRange(c.columnId(), c.startKeysInclusive(), c.endKeysExclusive()));
+				case RocksDBAPICommandSingle.PutBatch c -> batch(context, c.columnId(), c.batchPublisher(), false);
+				case RocksDBAPICommandSingle.MergeBatch c -> batch(context, c.columnId(), c.batchPublisher(), true);
+				case RocksDBAPICommandSingle.CreateColumn c -> createColumn(context, start, c.name(), c.schema());
+				case RocksDBAPICommandSingle.DeleteColumn c ->
+						propose(context, start, new LogEntry.DeleteColumn(c.columnId()));
 				case RocksDBAPICommandSingle.DeleteColumnIfExists c ->
-						proposer.propose(new LogEntry.DeleteColumnIfExists(c.name()));
-				case RocksDBAPICommandSingle.UploadMergeOperator c ->
-						proposer.propose(new LogEntry.UploadMergeOperator(c.name(), c.className(), c.jarData()));
+						propose(context, start, new LogEntry.DeleteColumnIfExists(c.name()));
+				case RocksDBAPICommandSingle.UploadMergeOperator c -> propose(context, start,
+						new LogEntry.UploadMergeOperator(c.name(), c.className(), c.jarData()));
 
 				case OpenTransaction c -> leaderBound(context, c, () -> openTransaction(context, c));
 				case CloseTransaction c -> leaderBound(context, c, () -> closeTransaction(context, c));
@@ -566,22 +577,36 @@ final class ReplicatedConnection implements RocksDBConnection {
 	// ---------------------------------------------------------------------------------------------------------
 	// Writes
 
-	private CompletableFuture<?> createColumn(String name, ColumnSchema schema) {
+	/**
+	 * Proposes a replicated write of a request that arrived at {@code startNanos}: it is resent only until the
+	 * caller's deadline, and is not sent at all once that passed.
+	 */
+	private CompletableFuture<Object> propose(RequestContext context, long startNanos, LogEntry entry) {
+		return proposer.propose(entry, remainingNanos(context, startNanos));
+	}
+
+	private CompletableFuture<?> createColumn(RequestContext context, long startNanos, String name,
+			ColumnSchema schema) {
 		if (NodeStore.META_COLUMN.equals(name)) {
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
 					"Reserved column name: " + name));
 		}
-		return proposer.propose(new LogEntry.CreateColumn(name, schema)).thenCompose(id ->
+		return propose(context, startNanos, new LogEntry.CreateColumn(name, schema)).thenCompose(id ->
 				// Every replica checks that it assigned the same id; the leader's apply produced this one.
 				proposer.propose(new LogEntry.VerifyColumn(name, (Long) id)).handle((_, _) -> id));
 	}
 
-	/** Splits a batch stream into bounded replicated entries, applied in order. */
-	private CompletableFuture<Void> batch(long columnId, Publisher<? extends KVBatch> batches, boolean merge) {
+	/**
+	 * Splits a batch stream into bounded replicated entries, applied in order. The caller's deadline counts from
+	 * the start of the call for every chunk.
+	 */
+	private CompletableFuture<Void> batch(RequestContext context, long columnId, Publisher<? extends KVBatch> batches,
+			boolean merge) {
+		long start = System.nanoTime();
 		return Flux.from(batches)
 				.concatMapIterable(ReplicatedConnection::chunks)
 				// One chunk at a time: a later chunk must not overtake an earlier one writing the same key.
-				.concatMap(chunk -> Mono.fromFuture(() -> proposer.propose(merge
+				.concatMap(chunk -> Mono.fromFuture(() -> propose(context, start, merge
 						? new LogEntry.MergeMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING)
 						: new LogEntry.PutMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING))))
 				.then()
@@ -801,7 +826,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		}
 		if (transaction.update) {
 			var entry = transaction.updateEntry(session.term(), write, keys);
-			return commit(session, transaction, entry).handle((result, error) -> {
+			return commit(context, session, transaction, entry).handle((result, error) -> {
 				session.remove(transaction);
 				rollBackNativeQuietly(transaction.id, true);
 				if (error == null) {
@@ -843,7 +868,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 			rollBackNativeQuietly(transaction.id, false);
 			return CompletableFuture.completedFuture(true);
 		}
-		return commit(session, transaction, entry).handle((_, error) -> {
+		return commit(context, session, transaction, entry).handle((_, error) -> {
 			if (error != null && unwrap(error) instanceof Proposer.ConflictException) {
 				// Same contract as a single node: false, and the transaction stays open.
 				return false;
@@ -859,14 +884,15 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	/**
 	 * Proposes a commit entry, keeping its snapshot's write history pinned until the leader validated it, whatever
-	 * happens to the transaction meanwhile.
+	 * happens to the transaction meanwhile. A commit still queued at its caller's deadline is not sent.
 	 */
-	private CompletableFuture<Object> commit(LeaderSession session,
+	private CompletableFuture<Object> commit(RequestContext context,
+			LeaderSession session,
 			LeaderSession.OpenTransaction transaction,
 			LogEntry.Guarded entry) {
 		var pin = session.pin(transaction.snapshotIndex);
 		long start = System.nanoTime();
-		return proposer.proposeOnce(entry).whenComplete((_, _) -> {
+		return proposer.proposeOnce(entry, remainingNanos(context, start)).whenComplete((_, _) -> {
 			commitTime.since(start);
 			session.unpin(pin);
 		});
@@ -994,6 +1020,50 @@ final class ReplicatedConnection implements RocksDBConnection {
 			error = error.getCause();
 		}
 		return error;
+	}
+
+	/**
+	 * Commands proposed from this node to the log as one request, as opposed to served or forwarded to the leader.
+	 * Not batches: their chunks stop at the caller's deadline on their own, and their failure tells which chunks were
+	 * applied.
+	 */
+	private static boolean isSingleReplicatedWrite(RocksDBAPICommand<?, ?, ?> command) {
+		return switch (command) {
+			case Put<?> c -> c.transactionOrUpdateId() == 0;
+			case PutMulti<?> c -> c.transactionOrUpdateId() == 0;
+			case Delete<?> c -> c.transactionOrUpdateId() == 0;
+			case DeleteMulti<?> c -> c.transactionOrUpdateId() == 0;
+			case Merge<?> c -> c.transactionOrUpdateId() == 0;
+			case MergeMulti<?> c -> c.transactionOrUpdateId() == 0;
+			case RocksDBAPICommandSingle.DeleteRange _, RocksDBAPICommandSingle.CreateColumn _,
+					RocksDBAPICommandSingle.DeleteColumn _, RocksDBAPICommandSingle.DeleteColumnIfExists _,
+					RocksDBAPICommandSingle.UploadMergeOperator _ -> true;
+			default -> false;
+		};
+	}
+
+	/**
+	 * {@link #join(CompletableFuture)}, but waits at most {@code timeoutNanos}. Then the caller's copy is cancelled
+	 * (a write not sent yet is then never sent) and the call fails with {@code READ_DEADLINE_EXCEEDED}: a write
+	 * still queued before that deadline already failed as not applied, so this one was sent and its outcome is
+	 * unknown.
+	 */
+	static <T> T join(CompletableFuture<T> future, long timeoutNanos) {
+		try {
+			future.get(Math.max(0, timeoutNanos), TimeUnit.NANOSECONDS);
+		} catch (TimeoutException ex) {
+			future.cancel(false);
+			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					"The request deadline passed before the replicated write was acknowledged; its outcome is unknown");
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
+			future.cancel(false);
+			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
+					"Interrupted while waiting for a replicated write; its outcome is unknown");
+		} catch (ExecutionException | CancellationException ex) {
+			// Rethrown as join() does.
+		}
+		return join(future);
 	}
 
 	static <T> T join(CompletableFuture<T> future) {
