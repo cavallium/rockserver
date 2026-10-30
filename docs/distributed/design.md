@@ -53,8 +53,9 @@ forwards to a non-embedded connection:
 - `GrpcServer` runs requests to a non-embedded connection on virtual threads of their own (a proxy scheduler,
   at most 16384 at once, beyond which requests get `SERVER_OVERLOADED`); streamed `putMulti`, `deleteMulti`
   and `mergeMulti` calls, rollbacks and maintenance use the workload scheduler instead
-  (`RWScheduler.withVirtualWorkers`, `WorkloadSettings.proxy`), which runs at most 256 streams of each kind at
-  once and refuses more once its queues are full.
+  (`RWScheduler.withVirtualWorkers`, `WorkloadSettings.proxy`), which runs at most 256 of these streams at
+  once and refuses more once its queues are full. A stream that waits in a queue past its request-context
+  timeout ends with `DEADLINE_EXCEEDED`, even when the client set no gRPC deadline.
 - `EmbeddedDB.openUnloggedTransaction` (a transaction without snapshot, untracked, optionally without the WAL),
   `EmbeddedDB.deleteRangeUnlogged` (a range deletion without the WAL) and the `atomic-flush` global option (off
   by default; it turns pipelined writes off).
@@ -322,7 +323,7 @@ against an incomplete history.
 - **Maintenance.** `flush` and `compact` act only on the node that receives them.
 - **Workload limits.** The replicated server's `GrpcServer` runs requests on virtual threads of their own (at
   most 16384 waiting on the leader), not through each column's workload scheduler. Streamed mutations run at
-  most 256 of each kind at once.
+  most 256 at once.
 - **Updates of one key run one at a time** on the leader. Nested or crossed updates of the same keys by one
   client block (up to 12 s) instead of conflicting at once.
 - **After a kill** (not a graceful stop), a replica's database files are an older consistent point until it

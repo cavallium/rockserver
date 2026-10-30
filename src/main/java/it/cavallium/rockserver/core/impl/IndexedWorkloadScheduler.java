@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
@@ -9,6 +10,8 @@ import org.jetbrains.annotations.Nullable;
 import reactor.core.Disposable;
 import reactor.core.Disposables;
 import reactor.core.Exceptions;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
@@ -19,6 +22,13 @@ import reactor.core.scheduler.Schedulers;
  * task when it eventually runs, but it cannot remove that wrapper from an arbitrary executor.
  * Keeping the exact submitted wrapper here lets cancellation use the scheduler's identity index
  * immediately instead of waiting for a blocked workload lane to dispatch it.</p>
+ *
+ * <p>The executor can also drop a task after accepting it: its deadline expires while queued or
+ * right before execution, or the pool shuts down. Reactor operators such as {@code publishOn}
+ * are never told about that drop, so their drain stops for good. Such a drop is published on
+ * {@link #streamFailure()}, which a stream can follow to end with the failure. Queued tasks
+ * expire only when a worker of the pool is free, so it also emits when the view's deadline
+ * passes.</p>
  */
 final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadExecutor {
 
@@ -28,6 +38,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 	private final long monotonicDeadlineNanos;
 	private final Set<IndexedWorker> workers = new HashSet<>();
 	private volatile boolean disposed;
+	private @Nullable Sinks.One<RuntimeException> droppedTaskFailure;
 
 	IndexedWorkloadScheduler(ProfiledWorkloadExecutor executor,
 			it.cavallium.rockserver.core.common.WorkloadProfile profile,
@@ -86,6 +97,34 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 
 	private boolean removeQueuedTask(Runnable command) {
 		return executor.remove(profile, family, command);
+	}
+
+	/**
+	 * Emits the executor's failure the first time this view drops an accepted task that has no
+	 * rejection hook of its own, or a {@code READ_DEADLINE_EXCEEDED} failure when the view's
+	 * deadline passes. It never completes otherwise.
+	 */
+	Mono<RuntimeException> streamFailure() {
+		var dropped = droppedTaskFailureSink().asMono();
+		if (monotonicDeadlineNanos == Long.MAX_VALUE) {
+			return dropped;
+		}
+		return dropped.or(Mono.defer(() -> Mono.delay(Duration.ofNanos(
+						executor.remainingDeadlineNanos(monotonicDeadlineNanos))))
+				.map(_ -> ProfiledWorkloadExecutor.deadlineFailure("Workload deadline expired while streaming")));
+	}
+
+	private void taskDropped(RuntimeException failure) {
+		droppedTaskFailureSink().tryEmitValue(failure);
+	}
+
+	private synchronized Sinks.One<RuntimeException> droppedTaskFailureSink() {
+		var sink = droppedTaskFailure;
+		if (sink == null) {
+			sink = Sinks.one();
+			droppedTaskFailure = sink;
+		}
+		return sink;
 	}
 
 	@Override
@@ -229,6 +268,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 		private volatile int state = QUEUED;
 		private volatile int dispatchState = DISPATCH_PENDING;
 		private volatile int terminalFailurePublished;
+		private volatile @Nullable Thread submittingThread;
 		private boolean submitted;
 
 		private IndexedScheduledTask(IndexedWorkloadScheduler scheduler,
@@ -257,6 +297,10 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 			finishRejectedState();
 			if (rejectionAwareTask != null) {
 				rejectionAwareTask.reject(failure);
+			} else if (submittingThread != Thread.currentThread() && !workloadCancellationRequested()) {
+				// A refused submission already throws to its caller, and a cancelled one has no
+				// subscriber left; anything else is an accepted task dropped on its own.
+				scheduler.taskDropped(failure);
 			}
 		}
 
@@ -274,6 +318,7 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 			if (state != QUEUED) {
 				return;
 			}
+			submittingThread = Thread.currentThread();
 			try {
 				scheduler.execute(this);
 				submitted = true;
@@ -282,6 +327,8 @@ final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadE
 				deleteFromParent();
 				Exceptions.throwIfFatal(failure);
 				throw Exceptions.failWithRejected(failure);
+			} finally {
+				submittingThread = null;
 			}
 		}
 

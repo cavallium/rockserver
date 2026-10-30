@@ -1360,6 +1360,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 				|| pressureController.canStartBatch(shutdown, resourcePool, System.nanoTime());
 	}
 
+	/** Remaining time before a monotonic deadline of this executor's clock, saturated at zero. */
+	long remainingDeadlineNanos(long monotonicDeadlineNanos) {
+		return deadlineClock.remainingNanos(monotonicDeadlineNanos);
+	}
+
 	boolean remove(Executor view, Runnable command) {
 		if (!(view instanceof WorkloadExecutorView workloadView) || workloadView.owner() != this) {
 			return false;
@@ -2085,7 +2090,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		}
 	}
 
-	private static RocksDBException deadlineFailure(String message) {
+	static RocksDBException deadlineFailure(String message) {
 		return RocksDBException.of(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED, message);
 	}
 

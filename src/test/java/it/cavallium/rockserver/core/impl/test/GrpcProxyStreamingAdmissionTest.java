@@ -1,11 +1,15 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import io.grpc.ManagedChannel;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.RequestContext;
@@ -24,6 +28,7 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -78,11 +83,60 @@ class GrpcProxyStreamingAdmissionTest {
 		}
 	}
 
+	/**
+	 * A stream whose drain expires while queued behind blocked streams must end with an error, even when the
+	 * client set only a request-context timeout and no gRPC deadline.
+	 */
+	@Test
+	void streamingPutMultiQueuedPastItsContextTimeoutEndsWithDeadlineExceeded() throws Exception {
+		var backend = new BlockingPutBackend();
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			ManagedChannel channel = NettyChannelBuilder.forAddress("127.0.0.1", server.getPort())
+					.usePlaintext()
+					.build();
+			try {
+				// No gRPC deadline on any call
+				var stub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
+				var responses = new ArrayList<CompletableFuture<Empty>>(STREAM_PARALLELISM);
+				try {
+					for (int i = 0; i < STREAM_PARALLELISM; i++) {
+						responses.add(stub.putMulti(putMulti(i)).toFuture());
+					}
+					long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+					while (backend.running.get() < STREAM_PARALLELISM && System.nanoTime() < end) {
+						Thread.sleep(10);
+					}
+					assertEquals(STREAM_PARALLELISM, backend.running.get(), "blocked streams");
+
+					var queued = stub.putMulti(putMulti(STREAM_PARALLELISM, TimeUnit.SECONDS.toNanos(1))).toFuture();
+					var failure = assertThrows(ExecutionException.class, () -> queued.get(15, TimeUnit.SECONDS));
+					var status = assertInstanceOf(StatusRuntimeException.class, failure.getCause()).getStatus();
+					assertEquals(Status.Code.DEADLINE_EXCEEDED, status.getCode(), status.toString());
+					assertEquals(STREAM_PARALLELISM, backend.running.get(), "the expired drain must not run");
+				} finally {
+					backend.release.countDown();
+				}
+				for (var response : responses) {
+					response.get(20, TimeUnit.SECONDS);
+				}
+				assertEquals(STREAM_PARALLELISM, backend.puts.get());
+			} finally {
+				channel.shutdownNow();
+				assertTrue(channel.awaitTermination(5, TimeUnit.SECONDS));
+			}
+		}
+	}
+
 	private static Flux<PutMultiRequest> putMulti(int index) {
+		return putMulti(index, TimeUnit.SECONDS.toNanos(40));
+	}
+
+	private static Flux<PutMultiRequest> putMulti(int index, long timeoutNanos) {
 		var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfile(WorkloadProfile.BATCH)
 				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
-				.setTimeoutNanos(TimeUnit.SECONDS.toNanos(40));
+				.setTimeoutNanos(timeoutNanos);
 		return Flux.just(PutMultiRequest.newBuilder()
 						.setInitialRequest(PutMultiInitialRequest.newBuilder().setColumnId(1L).setContext(context))
 						.build(),

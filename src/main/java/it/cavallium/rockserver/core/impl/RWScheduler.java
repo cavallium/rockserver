@@ -13,11 +13,13 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 
@@ -301,6 +303,29 @@ public final class RWScheduler {
 				name,
 				false,
 				SchedulerDeadlineClock.testing(nanoTimeSource));
+	}
+
+	/**
+	 * {@code source.publishOn(scheduler)} that also ends with an error when a workload view drops a
+	 * queued drain after admitting it (deadline expired while queued, shutdown), or when the view's
+	 * deadline passes. publishOn is never told about such a drop, so without this the stream stops
+	 * without a terminal signal; and a queued drain expires only when a worker of the pool is free.
+	 * A drop fails every stream published on the same view, so give each stream its own view.
+	 */
+	public static <T> Flux<T> publishOn(Flux<T> source, Scheduler scheduler) {
+		if (scheduler instanceof IndexedWorkloadScheduler indexedScheduler) {
+			// takeUntilOther cancels the source only when the other publisher emits a value, not an error
+			return Flux.defer(() -> {
+				var failure = new AtomicReference<RuntimeException>();
+				return source.publishOn(indexedScheduler)
+						.takeUntilOther(indexedScheduler.streamFailure().doOnNext(failure::set))
+						.concatWith(Mono.defer(() -> {
+							var error = failure.get();
+							return error != null ? Mono.error(error) : Mono.empty();
+						}));
+			});
+		}
+		return source.publishOn(scheduler);
 	}
 
 	/** Resolve and validate the caller context, then return its resource-specific view. */

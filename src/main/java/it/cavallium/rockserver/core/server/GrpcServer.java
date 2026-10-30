@@ -1375,15 +1375,17 @@ public class GrpcServer extends Server {
 		}
 
 		/**
-		 * The scheduler of a streaming path ({@code publishOn}): always a view of the column's workload scheduler,
-		 * never the proxy scheduler, whose workers bypass its permits.
+		 * Moves a streaming path onto a new view of the column's workload scheduler, never the proxy scheduler,
+		 * whose workers bypass its permits. The stream ends with an error when the context deadline passes or the
+		 * view drops a queued drain (shutdown), instead of stopping without a terminal signal.
 		 */
-		private reactor.core.scheduler.Scheduler streamingScheduler(
+		private <T> Function<Flux<T>, Flux<T>> publishOnStreamingScheduler(
 				ResolvedRequestContext context,
 				OperationFamily family, long columnId) {
-			return columnWorkloadScheduler(columnId).scheduler(context.profile(),
+			var streamingScheduler = columnWorkloadScheduler(columnId).scheduler(context.profile(),
 					family,
 					context.localMonotonicDeadlineNanos());
+			return source -> RWScheduler.publishOn(source, streamingScheduler);
 		}
 
 		private RocksDBSyncAPI syncApi(it.cavallium.rockserver.core.common.RequestContext context) {
@@ -1843,7 +1845,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+					.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 							initialRequest.getColumnId(),
 							mapKeys(data.getKeysList()),
@@ -1894,7 +1896,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+							.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 							.map(data -> mapper.apply(contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysList()),
@@ -2016,7 +2018,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+							.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 							.map(data -> {
 								var merged = contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 										initialRequest.getColumnId(),
@@ -2055,7 +2057,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+					.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> {
 						contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
@@ -2206,7 +2208,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+							.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 							.map(data -> mapper.apply(contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysList()),
@@ -2240,7 +2242,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+					.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> {
 						contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
@@ -2274,7 +2276,7 @@ public class GrpcServer extends Server {
 			var contextualApi = syncApi(context);
 			return dataFlux
 					.buffer(WRITE_ELISION_MULTI_STEP_SIZE)
-					.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+					.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> {
 						var batch = mapKVBatch(data);
 						contextualApi.putMulti(initialRequest.getTransactionOrUpdateId(),
