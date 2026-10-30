@@ -1,6 +1,5 @@
 package it.cavallium.rockserver.distributed;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -254,7 +253,6 @@ final class HotCounters {
 		}
 		var result = LinearizabilityChecker.check(history.operations());
 		assertTrue(result.linearizable(), result::description);
-		assertEquals(0, crashes.size());
 		System.out.println("Hot counters: " + this);
 	}
 

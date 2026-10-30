@@ -647,6 +647,8 @@ class PipelinedUpdatesTest {
 	 * @return how many values key 1 has gone through
 	 */
 	private long aChainOnlyWithTheFlag(boolean pipelined, long written) throws Exception {
+		// A new leader's first entry must be applied, or no read barrier passes with the apply stopped.
+		InProcessCluster.await(TIMEOUT, () -> leader.appliedIndex() >= lastLogIndex(leader));
 		closeGate(leader);
 		var head = forUpdate(1);
 		assertFalse(chained(head));
