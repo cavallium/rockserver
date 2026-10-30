@@ -241,6 +241,50 @@ public record WorkloadSettings(
 		return defaults(readParallelism, writeParallelism, 1, 4_096, 512, true);
 	}
 
+	/**
+	 * Settings for a server that forwards requests to another connection (a remote or replicated database) instead
+	 * of running them against local storage: {@code parallelism} requests of each kind, rollbacks included, may wait
+	 * on that connection at once. Use with {@code RWScheduler.withVirtualWorkers}.
+	 */
+	public static WorkloadSettings proxy(int parallelism) {
+		var base = defaults(parallelism, parallelism, parallelism, 4 * parallelism, parallelism, true);
+		return new WorkloadSettings(base.readParallelism(),
+				base.writeParallelism(),
+				base.latencyQueueCapacity(),
+				base.ingestQueueCapacity(),
+				base.analyticalQueueCapacity(),
+				base.batchQueueCapacity(),
+				4 * parallelism,
+				base.physicalMaintenanceQueueCapacity(),
+				base.readLatencyReservation(),
+				base.readIngestReservation(),
+				base.writeLatencyReservation(),
+				base.writeIngestReservation(),
+				parallelism,
+				base.physicalConcurrency(),
+				base.analyticalActiveLimit(),
+				base.retainedAnalyticalSnapshots(),
+				base.retainedSnapshotMaximumAge(),
+				base.latencyBurst(),
+				base.ingestDrrWeight(),
+				base.analyticalDrrWeight(),
+				base.batchDrrWeight(),
+				parallelism,
+				parallelism,
+				base.competingBatchWriteInterval(),
+				parallelism,
+				base.pressuredBatchInterval(),
+				base.rangeQuantumMaxItems(),
+				base.rangeQuantumMaxBytes(),
+				base.rangeQuantumMaxDuration(),
+				base.rawScanFileConcurrency(),
+				base.rawScanReadaheadBytes(),
+				base.latencyRangeMaxItems(),
+				base.latencyRangeMaxBytes(),
+				base.latencyFanOutMaxItems(),
+				base.latencyFanOutMaxBytes());
+	}
+
 	public static WorkloadSettings testingDefaults(int readParallelism,
 			int writeParallelism,
 			int analyticalActiveLimit,

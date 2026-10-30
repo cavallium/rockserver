@@ -2,10 +2,16 @@ package it.cavallium.rockserver.distributed;
 
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.common.RocksDBRetryException;
+import it.unimi.dsi.fastutil.longs.Long2IntRBTreeMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,20 +28,37 @@ final class LeaderSession {
 
 	private static final Logger LOG = LoggerFactory.getLogger(LeaderSession.class);
 
+	/**
+	 * The right to update one key with {@code getForUpdate}, held from before the read until the update's commit is
+	 * applied or the update is closed. Released at most once.
+	 */
+	static final class KeyLock {
+		final long key;
+		private final AtomicBoolean released = new AtomicBoolean();
+
+		private KeyLock(long key) {
+			this.key = key;
+		}
+	}
+
 	/** One open transaction or update. */
 	static final class OpenTransaction {
 		final long id;
 		final boolean update;
 		final long snapshotIndex;
+		/** The key lock of a single-key update, released when the update is removed. */
+		final @Nullable KeyLock keyLock;
 		private final long deadlineNanos;
 		private final List<LogEntry.Write> writes = new ArrayList<>();
 		private final LongArrayList conflictColumns = new LongArrayList();
 		private final LongArrayList conflictHashes = new LongArrayList();
 
-		private OpenTransaction(long id, boolean update, long snapshotIndex, long deadlineNanos) {
+		private OpenTransaction(long id, boolean update, long snapshotIndex, @Nullable KeyLock keyLock,
+				long deadlineNanos) {
 			this.id = id;
 			this.update = update;
 			this.snapshotIndex = snapshotIndex;
+			this.keyLock = keyLock;
 			this.deadlineNanos = deadlineNanos;
 		}
 
@@ -85,7 +108,19 @@ final class LeaderSession {
 	private final ConflictTracker tracker = new ConflictTracker();
 	private final ConcurrentHashMap<Long, OpenTransaction> transactions = new ConcurrentHashMap<>();
 	private final ConcurrentHashMap<Object, Long> pins = new ConcurrentHashMap<>();
+	/**
+	 * How many open transactions and pins hold each snapshot index, so that the oldest one is found without a scan.
+	 * Guarded by this.
+	 */
+	private final Long2IntRBTreeMap snapshots = new Long2IntRBTreeMap();
+	/**
+	 * Single-key updates by key hash ({@link ConflictTracker#keyHash}): a key is in the map while an update holds it,
+	 * with the updates waiting for it in arrival order. Guarded by this.
+	 */
+	private final Long2ObjectOpenHashMap<ArrayDeque<CompletableFuture<KeyLock>>> keyQueues = new Long2ObjectOpenHashMap<>();
 	private long appliesSincePrune;
+	/** When {@link #expireIfDue} last expired transactions, in {@link System#nanoTime()} units. */
+	private volatile long lastExpireNanos = System.nanoTime();
 	private volatile boolean closed;
 
 	LeaderSession(long term, AppliedIndex applied) {
@@ -123,31 +158,93 @@ final class LeaderSession {
 	synchronized Object pin(long snapshotIndex) {
 		var pin = new Object();
 		pins.put(pin, snapshotIndex);
+		hold(snapshotIndex);
 		return pin;
 	}
 
 	synchronized void unpin(Object pin) {
-		pins.remove(pin);
+		var snapshotIndex = pins.remove(pin);
+		if (snapshotIndex != null) {
+			release(snapshotIndex);
+		}
 		tracker.prune(minSnapshotIndex());
+	}
+
+	private void hold(long snapshotIndex) {
+		snapshots.addTo(snapshotIndex, 1);
+	}
+
+	private void release(long snapshotIndex) {
+		int holders = snapshots.get(snapshotIndex);
+		if (holders > 1) {
+			snapshots.put(snapshotIndex, holders - 1);
+		} else {
+			// Also after close(), which drops every hold at once.
+			snapshots.remove(snapshotIndex);
+		}
 	}
 
 	/**
 	 * Turns a reservation into an open transaction once the native transaction exists. Fails if leadership ended
 	 * meanwhile: the caller must then roll the native transaction back itself.
 	 */
-	synchronized OpenTransaction register(Object reservation, long id, boolean update, long leaseNanos) {
+	/**
+	 * Waits for the right to update {@code key}: single-key updates of one key run one after the other, each reading
+	 * what the previous one committed, instead of all reading the same value and all but one failing to commit. The
+	 * future completes on the thread that released the key, or here: chain work to it with an async stage. Fails with
+	 * {@link RocksDBRetryException} if leadership ends first.
+	 */
+	synchronized CompletableFuture<KeyLock> lockKey(long key) {
 		if (closed) {
-			pins.remove(reservation);
+			return CompletableFuture.failedFuture(new RocksDBRetryException());
+		}
+		var queue = keyQueues.get(key);
+		if (queue == null) {
+			keyQueues.put(key, new ArrayDeque<>());
+			return CompletableFuture.completedFuture(new KeyLock(key));
+		}
+		var waiter = new CompletableFuture<KeyLock>();
+		queue.addLast(waiter);
+		return waiter;
+	}
+
+	/** Releases {@code lock}, passing the key to the next waiting update that still waits. */
+	synchronized void unlockKey(KeyLock lock) {
+		if (!lock.released.compareAndSet(false, true)) {
+			return;
+		}
+		var queue = keyQueues.get(lock.key);
+		if (queue == null) {
+			return;
+		}
+		while (true) {
+			var next = queue.pollFirst();
+			if (next == null) {
+				keyQueues.remove(lock.key);
+				return;
+			}
+			// A waiter that timed out or was cancelled is already complete: skip it.
+			if (next.complete(new KeyLock(lock.key))) {
+				return;
+			}
+		}
+	}
+
+	synchronized OpenTransaction register(Object reservation, long id, boolean update, @Nullable KeyLock keyLock,
+			long leaseNanos) {
+		if (closed) {
+			unpin(reservation);
 			throw new IllegalStateException("Leadership of term " + term + " ended");
 		}
 		Long snapshotIndex = pins.get(reservation);
 		if (snapshotIndex == null) {
 			throw new IllegalStateException("Unknown reservation");
 		}
-		var transaction = new OpenTransaction(id, update, snapshotIndex, System.nanoTime() + leaseNanos);
+		var transaction = new OpenTransaction(id, update, snapshotIndex, keyLock, System.nanoTime() + leaseNanos);
 		if (transactions.putIfAbsent(id, transaction) != null) {
 			throw new IllegalStateException("Transaction id reused: " + id);
 		}
+		// The reservation's hold on the snapshot index passes to the transaction.
 		pins.remove(reservation);
 		return transaction;
 	}
@@ -163,7 +260,12 @@ final class LeaderSession {
 
 	/** Forgets a finished transaction and the write history no open transaction needs any more. */
 	synchronized void remove(OpenTransaction transaction) {
-		transactions.remove(transaction.id, transaction);
+		if (transactions.remove(transaction.id, transaction)) {
+			release(transaction.snapshotIndex);
+		}
+		if (transaction.keyLock != null) {
+			unlockKey(transaction.keyLock);
+		}
 		tracker.prune(minSnapshotIndex());
 	}
 
@@ -181,18 +283,31 @@ final class LeaderSession {
 	/** Drops expired transactions (their native transaction expires on its own) and prunes the tracker. */
 	synchronized void expire() {
 		long now = System.nanoTime();
-		transactions.values().removeIf(transaction -> transaction.isExpired(now));
+		lastExpireNanos = now;
+		transactions.values().removeIf(transaction -> {
+			if (transaction.isExpired(now)) {
+				release(transaction.snapshotIndex);
+				if (transaction.keyLock != null) {
+					unlockKey(transaction.keyLock);
+				}
+				return true;
+			}
+			return false;
+		});
 		tracker.prune(minSnapshotIndex());
 	}
 
+	/** {@link #expire()}, at most every {@link #EXPIRE_EVERY_NANOS}: callers on the request path use this. */
+	void expireIfDue() {
+		if (System.nanoTime() - lastExpireNanos > EXPIRE_EVERY_NANOS) {
+			expire();
+		}
+	}
+
+	private static final long EXPIRE_EVERY_NANOS = 100_000_000L;
+
 	private long minSnapshotIndex() {
-		long min = Long.MAX_VALUE;
-		for (OpenTransaction transaction : transactions.values()) {
-			min = Math.min(min, transaction.snapshotIndex);
-		}
-		for (long pinned : pins.values()) {
-			min = Math.min(min, pinned);
-		}
+		long min = snapshots.isEmpty() ? Long.MAX_VALUE : snapshots.firstLongKey();
 		// Writes at or below the oldest snapshot can no longer conflict with anything. Never beyond what is applied:
 		// a transaction opened next takes its snapshot at the applied index.
 		return Math.min(min, applied.get());
@@ -215,5 +330,14 @@ final class LeaderSession {
 			}
 		}
 		transactions.clear();
+		List<CompletableFuture<KeyLock>> waiters = new ArrayList<>();
+		synchronized (this) {
+			snapshots.clear();
+			keyQueues.values().forEach(waiters::addAll);
+			keyQueues.clear();
+		}
+		for (var waiter : waiters) {
+			waiter.completeExceptionally(new RocksDBRetryException());
+		}
 	}
 }

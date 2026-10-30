@@ -755,7 +755,9 @@ public class RocksDBLoader {
                 }
             }
 
-            if (!databaseOptions.global().unorderedWrite()) {
+            // RocksDB refuses pipelined writes with atomic flush; atomic flush is for single-writer replicas, which
+            // gain nothing from pipelining.
+            if (!databaseOptions.global().unorderedWrite() && !databaseOptions.global().atomicFlush()) {
                 options.setEnablePipelinedWrite(true);
             }
             var maxSubcompactions = databaseOptions.global().maxSubcompactions();
@@ -790,6 +792,7 @@ public class RocksDBLoader {
 
             options.setAvoidFlushDuringShutdown(true); // Do not start memtable flush work from DB close; WAL is flushed explicitly.
             options.setAvoidFlushDuringRecovery(false); // Flush replayed WAL data to SST during open/recovery.
+            options.setAtomicFlush(databaseOptions.global().atomicFlush());
             options.setWalRecoveryMode(databaseOptions.global().absoluteConsistency()
                     ? WALRecoveryMode.AbsoluteConsistency
                     : WALRecoveryMode.PointInTimeRecovery); // Crash if the WALs are corrupted.Default: TolerateCorruptedTailRecords

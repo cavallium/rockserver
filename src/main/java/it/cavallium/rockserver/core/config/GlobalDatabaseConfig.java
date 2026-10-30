@@ -60,6 +60,12 @@ public interface GlobalDatabaseConfig {
 
 	boolean absoluteConsistency() throws GestaltException;
 
+	/**
+	 * Flush every column family together (RocksDB {@code atomic_flush}), so that the flushed state is always a
+	 * consistent point across column families. Needed by writers that skip the WAL for some writes.
+	 */
+	boolean atomicFlush() throws GestaltException;
+
 	boolean enableFastGet() throws GestaltException;
 
 	boolean ingestBehind() throws GestaltException;

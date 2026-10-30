@@ -29,7 +29,7 @@ final class RaftSettings {
 
 		// Durability: an entry counts toward a quorum only after it is fsynced to the local Raft log.
 		RaftServerConfigKeys.Log.setUseMemory(properties, false);
-		RaftServerConfigKeys.Log.setUnsafeFlushEnabled(properties, false);
+		RaftServerConfigKeys.Log.setUnsafeFlushEnabled(properties, Boolean.getBoolean("rockserver.raft.unsafe-flush"));
 		RaftServerConfigKeys.Log.setAsyncFlushEnabled(properties, false);
 		// Commit metadata entries only speed up restarts; without them every log entry is a data or
 		// configuration entry, which keeps the applied-index bookkeeping simple.
@@ -38,7 +38,27 @@ final class RaftSettings {
 		RaftServerConfigKeys.Log.Appender.setBufferByteLimit(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (1 << 20)));
 		RaftServerConfigKeys.Log.setWriteBufferSize(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (2 << 20)));
 		RaftServerConfigKeys.Log.setQueueByteLimit(properties, SizeInBytes.valueOf(4L * MAX_ENTRY_BYTES));
+		// Group commit: entries that queue up during an fsync are written and synced together by the next one. Raise
+		// the cap on one such group (default 128) and on the queue (default 4096): a full queue blocks appends while
+		// holding the server lock. Async flush stays off: in Ratis 3.3.1 it marks as flushed the entries written while
+		// the fsync ran, which it did not cover.
+		RaftServerConfigKeys.Log.setForceSyncNum(properties, 4096);
+		RaftServerConfigKeys.Log.setPreallocatedSize(properties,
+				SizeInBytes.valueOf(System.getProperty("rockserver.raft.preallocate", "4MB")));
+		RaftServerConfigKeys.Log.setQueueElementLimit(properties, 65536);
+		// Pending client requests on the leader (defaults 4096 and 64MB): with thousands of writers in flight, a full
+		// queue fails writes with ResourceUnavailable instead of letting them join the next group commit.
+		RaftServerConfigKeys.Write.setElementLimit(properties, 65536);
+		RaftServerConfigKeys.Write.setByteLimit(properties, SizeInBytes.valueOf(64L * MAX_ENTRY_BYTES));
+		// Every resend carries a new call id and Rockserver deduplicates requests itself (see Request), so the Ratis
+		// retry cache only holds replies nobody asks for again: keep them briefly instead of 60s.
+		RaftServerConfigKeys.RetryCache.setExpiryTime(properties, TimeDuration.valueOf(5, TimeUnit.SECONDS));
 		GrpcConfigKeys.setMessageSizeMax(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (2 << 20)));
+		// AppendEntries calls in flight to each follower (default 8). A follower fsyncs once per call it processes, so
+		// with many calls of one entry each its fsync rate caps the commit rate; with fewer calls in flight, the next
+		// call carries every entry appended meanwhile, and they cost one fsync together.
+		GrpcConfigKeys.Server.setLeaderOutstandingAppendsMax(properties,
+				Integer.getInteger("rockserver.raft.outstanding-appends", 2));
 
 		// Reads use ReadBarrier, not Ratis ReadIndex (see ReadBarrier). Keep Ratis' own read path strict anyway.
 		RaftServerConfigKeys.Read.setOption(properties, RaftServerConfigKeys.Read.Option.LINEARIZABLE);

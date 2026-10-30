@@ -3,49 +3,60 @@ package it.cavallium.rockserver.distributed;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
+import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
+import it.unimi.dsi.fastutil.longs.LongSortedSet;
 import java.io.Closeable;
 import java.io.IOException;
 import java.security.SecureRandom;
 import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
-import java.util.function.Supplier;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
-import org.apache.ratis.protocol.exceptions.LeaderNotReadyException;
-import org.apache.ratis.protocol.exceptions.ResourceUnavailableException;
-import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.protocol.exceptions.LeaderNotReadyException;
+import org.apache.ratis.protocol.exceptions.NotLeaderException;
+import org.apache.ratis.protocol.exceptions.ResourceUnavailableException;
 import org.apache.ratis.protocol.exceptions.StateMachineException;
 import org.apache.ratis.retry.RetryPolicies;
-import org.apache.ratis.retry.RetryPolicy;
-import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Submits log entries to the current leader through a Ratis client, from any node.
+ * Submits log entries to the current leader, from any node, batching the requests that arrive together.
  *
- * <p>Every proposal is a numbered {@link Request}. It is resent (leader changes, unreachable nodes, timeouts) with
- * the same number until it gets an answer or the request timeout passes, and applying a copy of a request that
- * already took effect returns the recorded result instead of executing it again. So a write takes effect at most
- * once even when copies reach a new leader or a restarted node. Each attempt is a single Ratis call, which follows
- * the leader hints Ratis returns; the deadline bounds the whole proposal.</p>
+ * <p>Every proposal is a numbered {@link Request}. Requests wait in a queue while {@link #MAX_BATCHES_IN_FLIGHT}
+ * batches are in flight, and then go together as one log entry (see {@link LogEntryCodec#encodeBatch}): the Raft
+ * log, its fsync and the apply then cost one entry for the whole batch. A batch is resent (leader changes,
+ * unreachable nodes, timeouts) with the same bytes until it gets an answer or the request timeout passes, and
+ * applying a copy of a request that already took effect returns the recorded result instead of executing it again.
+ * So a write takes effect at most once even when copies reach a new leader or a restarted node. When this node is
+ * the leader, an attempt goes straight to its own Raft server; otherwise it is a single Ratis client call, which
+ * follows the leader hints Ratis returns.</p>
  *
- * <p>Each proposal is an independent blocking call on its own virtual thread, not a request of the client's
+ * <p>Each client attempt is an independent blocking call on its own virtual thread, not a request of the client's
  * ordered async stream: once one request of that stream runs out of retries, Ratis closes the stream for good, and
  * every later proposal of this node would fail without being sent.</p>
+ *
+ * <p>Transaction commits ({@link #proposeOnce}) have their own queue: they are only ever sent once, to this node's
+ * own Raft server, and a conflict rejects only the commits that conflict: the others are sent again in the next
+ * batch.</p>
  */
 final class Proposer implements Closeable {
 
@@ -55,10 +66,20 @@ final class Proposer implements Closeable {
 	private static final long NOT_READY_RETRY_MS = 50;
 	private static final Duration MIN_ATTEMPT_TIMEOUT = Duration.ofSeconds(3);
 	private static final long ATTEMPT_SLEEP_MS = 100;
+	/** Batches of one queue in flight at once: later requests wait for one of them to finish, and then go together. */
+	static final int MAX_BATCHES_IN_FLIGHT = Integer.getInteger("rockserver.raft.batches-in-flight", 32);
+	private static final int MAX_BATCH_REQUESTS = 4096;
+	/** Bytes of entry bodies per batch; a single larger request goes alone. */
+	private static final int MAX_BATCH_BYTES = 8 * 1024 * 1024;
+	/** Batch header, plus a sequence per request. */
+	private static final int BATCH_HEADER_BYTES = 1 + 2 * Long.BYTES + Integer.BYTES;
 
 	private final long proposerId = new SecureRandom().nextLong();
-	private final AtomicLong nextSequence = new AtomicLong();
-	private final ConcurrentSkipListSet<Long> inFlight = new ConcurrentSkipListSet<>();
+	/** Guards {@link #nextSequence} and {@link #inFlight}. */
+	private final Object numbering = new Object();
+	private long nextSequence;
+	/** Requests that have no final answer yet. */
+	private final LongSortedSet inFlight = new LongRBTreeSet();
 	private final RaftClient client;
 	private final Supplier<RaftServer> localServer;
 	private final RaftGroupId groupId;
@@ -68,8 +89,16 @@ final class Proposer implements Closeable {
 	private final ExecutorService sender = Executors.newThreadPerTaskExecutor(
 			Thread.ofVirtual().name("rockserver-propose-", 0).factory());
 	private final long requestTimeoutNanos;
+	private final NodeMetrics metrics;
+	private final Lane anyLeader;
+	private final Lane localCommits;
+	private volatile boolean closed;
 
-	Proposer(RaftGroup group, RaftProperties properties, NodeConfig config, Supplier<RaftServer> localServer) {
+	Proposer(RaftGroup group, RaftProperties properties, NodeConfig config, Supplier<RaftServer> localServer,
+			NodeMetrics metrics) {
+		this.metrics = metrics;
+		this.anyLeader = new Lane(false);
+		this.localCommits = new Lane(true);
 		this.requestTimeoutNanos = config.requestTimeout().toNanos();
 		this.localServer = localServer;
 		this.groupId = group.getGroupId();
@@ -79,7 +108,7 @@ final class Proposer implements Closeable {
 		var attemptTimeout = config.electionTimeoutMax().multipliedBy(2);
 		RaftClientConfigKeys.Rpc.setRequestTimeout(attemptProperties,
 				RaftSettings.duration(attemptTimeout.compareTo(MIN_ATTEMPT_TIMEOUT) > 0 ? attemptTimeout : MIN_ATTEMPT_TIMEOUT));
-		// One Ratis call per attempt; send() resends until the deadline.
+		// One Ratis call per attempt; the batch is resent until its deadline.
 		this.client = RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
 				.setRaftGroup(group)
@@ -98,7 +127,7 @@ final class Proposer implements Closeable {
 	 * when no leader answered in time; then the outcome is unknown.
 	 */
 	CompletableFuture<Object> propose(LogEntry entry) {
-		return propose(entry, true);
+		return submit(entry, anyLeader);
 	}
 
 	/**
@@ -108,41 +137,275 @@ final class Proposer implements Closeable {
 	 * was refused before being appended, and {@code SERVER_OVERLOADED} if its outcome is unknown.
 	 */
 	CompletableFuture<Object> proposeOnce(LogEntry.Guarded entry) {
-		return propose(entry, false);
+		return submit(entry, localCommits);
 	}
 
-	private CompletableFuture<Object> propose(LogEntry entry, boolean anyLeader) {
-		long sequence;
-		long completedBelow;
-		synchronized (inFlight) {
-			// Allocate and register together: completedBelow must never pass a number that is taken but not done.
-			sequence = nextSequence.getAndIncrement();
-			inFlight.add(sequence);
-			completedBelow = inFlight.first();
+	/** A request waiting for its answer. */
+	private static final class Pending {
+		final long sequence;
+		final byte[] body;
+		final boolean batchable;
+		final long deadlineNanos;
+		final long queuedNanos = System.nanoTime();
+		final CompletableFuture<Object> result = new CompletableFuture<>();
+
+		Pending(long sequence, byte[] body, boolean batchable, long deadlineNanos) {
+			this.sequence = sequence;
+			this.body = body;
+			this.batchable = batchable;
+			this.deadlineNanos = deadlineNanos;
 		}
-		byte[] data;
+	}
+
+	private CompletableFuture<Object> submit(LogEntry entry, Lane lane) {
+		byte[] body;
 		try {
-			data = LogEntryCodec.encodeRequest(new Request(proposerId, sequence, completedBelow, entry));
+			body = LogEntryCodec.encodeEntryBody(entry);
 		} catch (IllegalArgumentException ex) {
-			inFlight.remove(sequence);
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST, ex.getMessage()));
 		}
-		if (data.length > RaftSettings.MAX_ENTRY_BYTES) {
-			inFlight.remove(sequence);
+		if (BATCH_HEADER_BYTES + Long.BYTES + (long) body.length > RaftSettings.MAX_ENTRY_BYTES) {
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
-					"Write too large for one replicated entry: " + data.length + " bytes"));
+					"Write too large for one replicated entry: " + body.length + " bytes"));
 		}
-		var message = Message.valueOf(ByteString.copyFrom(data));
-		var result = anyLeader ? send(client, message, System.nanoTime() + requestTimeoutNanos) : sendLocal(message);
-		return result.whenComplete((_, _) -> {
-			synchronized (inFlight) {
+		if (closed) {
+			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+					"The node is stopping"));
+		}
+		long sequence;
+		synchronized (numbering) {
+			sequence = nextSequence++;
+			inFlight.add(sequence);
+		}
+		var pending = new Pending(sequence, body, Applier.isBatchable(entry), System.nanoTime() + requestTimeoutNanos);
+		pending.result.whenComplete((_, _) -> {
+			synchronized (numbering) {
 				inFlight.remove(sequence);
 			}
 		});
+		lane.enqueue(pending);
+		return pending.result;
+	}
+
+	/** Every request numbered below this has its final answer: no copy of it will ever be sent again. */
+	private long completedBelow() {
+		synchronized (numbering) {
+			return inFlight.isEmpty() ? nextSequence : inFlight.firstLong();
+		}
+	}
+
+	/** One queue of requests, sent as batches with at most {@link #MAX_BATCHES_IN_FLIGHT} in flight. */
+	private final class Lane {
+
+		/** Sends transaction commits once to this node's Raft server, instead of to any leader until answered. */
+		private final boolean commits;
+		/** Guarded by this. */
+		private final ArrayDeque<Pending> queue = new ArrayDeque<>();
+		/** Guarded by this. */
+		private int batchesInFlight;
+
+		private final NodeMetrics.Series queueTime;
+		private final NodeMetrics.Series roundTrip;
+		private final NodeMetrics.Series batchSize;
+		private final NodeMetrics.Series resends;
+
+		Lane(boolean commits) {
+			this.commits = commits;
+			var name = commits ? "commits" : "writes";
+			this.queueTime = metrics.duration(name + ".queue");
+			this.roundTrip = metrics.duration(name + ".batch");
+			this.batchSize = metrics.amount(name + ".batchSize");
+			this.resends = metrics.amount(name + ".resends");
+		}
+
+		void enqueue(Pending pending) {
+			synchronized (this) {
+				queue.addLast(pending);
+			}
+			dispatch();
+		}
+
+		/** Puts requests back at the head of the queue, in their order, to be sent in the next batch. */
+		void requeue(List<Pending> pendings) {
+			synchronized (this) {
+				for (int i = pendings.size() - 1; i >= 0; i--) {
+					queue.addFirst(pendings.get(i));
+				}
+			}
+			dispatch();
+		}
+
+		/** Sends batches while there are queued requests and room in flight. */
+		void dispatch() {
+			while (true) {
+				List<Pending> batch;
+				synchronized (this) {
+					if (queue.isEmpty() || batchesInFlight >= MAX_BATCHES_IN_FLIGHT) {
+						return;
+					}
+					batch = take();
+					if (batch.isEmpty()) {
+						continue;
+					}
+					batchesInFlight++;
+				}
+				try {
+					send(batch);
+				} catch (RuntimeException ex) {
+					fail(batch, ex instanceof RocksDBException rocks ? rocks : Proposer.unavailable(ex));
+					finished();
+				}
+			}
+		}
+
+		/**
+		 * The next batch: the first queued request and, if it is a data write, the data writes behind it, up to the
+		 * batch limits. Requests already past their deadline were never sent, so they fail without taking effect.
+		 */
+		private List<Pending> take() {
+			var batch = new ArrayList<Pending>();
+			long now = System.nanoTime();
+			int bytes = 0;
+			while (!queue.isEmpty()) {
+				var next = queue.peekFirst();
+				if (closed || now - next.deadlineNanos > 0) {
+					queue.pollFirst();
+					next.result.completeExceptionally(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+							closed ? "The node is stopping" : "No leader accepted the write in time; it was not applied"));
+					continue;
+				}
+				if (!batch.isEmpty() && (!next.batchable || !batch.getFirst().batchable
+						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES)) {
+					break;
+				}
+				queue.pollFirst();
+				batch.add(next);
+				bytes += next.body.length + Long.BYTES;
+				if (!next.batchable) {
+					break;
+				}
+			}
+			return batch;
+		}
+
+		private void finished() {
+			synchronized (this) {
+				batchesInFlight--;
+			}
+			dispatch();
+		}
+
+		private void send(List<Pending> batch) {
+			var sequences = new long[batch.size()];
+			var bodies = new ArrayList<byte[]>(batch.size());
+			long deadline = batch.getFirst().deadlineNanos;
+			for (int i = 0; i < sequences.length; i++) {
+				sequences[i] = batch.get(i).sequence;
+				bodies.add(batch.get(i).body);
+				deadline = Math.min(deadline, batch.get(i).deadlineNanos);
+			}
+			var message = Message.valueOf(UnsafeByteOperations.unsafeWrap(
+					LogEntryCodec.encodeBatch(proposerId, completedBelow(), sequences, bodies)));
+			long now = System.nanoTime();
+			for (var pending : batch) {
+				queueTime.record(now - pending.queuedNanos);
+			}
+			batchSize.record(batch.size());
+			if (commits) {
+				sendCommits(batch, message, now);
+			} else {
+				attempt(batch, message, deadline, now);
+			}
+		}
+
+		/** One attempt at a batch of data writes, then resends until answered or {@code deadlineNanos}. */
+		private void attempt(List<Pending> batch, Message message, long deadlineNanos, long sentNanos) {
+			var reply = isLocalLeader() ? submitLocal(message, deadlineNanos)
+					: CompletableFuture.supplyAsync(() -> sendBlocking(message), sender);
+			reply.handleAsync((answer, error) -> {
+				var refusal = error != null ? stateMachineException(error)
+						: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
+				boolean retryable = System.nanoTime() - deadlineNanos < 0
+						&& (refusal != null ? isNotReady(refusal) : error != null || !answer.isSuccess());
+				if (retryable) {
+					// No answer yet (no leader, unreachable, refused before append): send the same batch again. If an
+					// earlier copy took effect, applying this one returns its recorded results.
+					long delay = refusal != null || isRefusedBeforeAppend(error != null ? ReplicatedConnection.unwrap(error)
+							: answer.getException()) ? NOT_READY_RETRY_MS : ATTEMPT_SLEEP_MS;
+					resends.record(1);
+					CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS, sender)
+							.execute(() -> attempt(batch, message, deadlineNanos, sentNanos));
+					return null;
+				}
+				roundTrip.since(sentNanos);
+				try {
+					if (refusal != null) {
+						fail(batch, refusal(refusal));
+					} else if (error != null) {
+						fail(batch, unavailable(error));
+					} else {
+						complete(batch, answer);
+					}
+				} finally {
+					finished();
+				}
+				return null;
+			}, sender);
+		}
+
+		/**
+		 * The single attempt at a batch of transaction commits. A conflict rejects the whole log entry before it is
+		 * appended: the commits that conflict fail, the others go again with the next batch.
+		 */
+		private void sendCommits(List<Pending> batch, Message message, long sentNanos) {
+			submitLocal(message, System.nanoTime() + requestTimeoutNanos).handleAsync((answer, error) -> {
+				roundTrip.since(sentNanos);
+				try {
+					var refusal = error != null ? stateMachineException(error)
+							: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
+					if (refusal != null && isCause(refusal, RockserverStateMachine.ConflictException.class)) {
+						var positions = RockserverStateMachine.ConflictException.positions(
+								refusal.getCause().getMessage());
+						if (positions == null) {
+							fail(batch, new ConflictException());
+						} else {
+							var rest = new ArrayList<>(batch);
+							for (int position : positions) {
+								batch.get(position).result.completeExceptionally(new ConflictException());
+								rest.set(position, null);
+							}
+							rest.removeIf(java.util.Objects::isNull);
+							requeue(rest);
+						}
+					} else if (refusal != null) {
+						fail(batch, refusal(refusal));
+					} else if (error == null ? !answer.isSuccess() && isRefusedBeforeAppend(answer.getException())
+							: isRefusedBeforeAppend(ReplicatedConnection.unwrap(error))) {
+						fail(batch, new RocksDBRetryException());
+					} else if (error != null) {
+						fail(batch, unavailable(error));
+					} else {
+						complete(batch, answer);
+					}
+				} finally {
+					finished();
+				}
+				return null;
+			}, sender);
+		}
+	}
+
+	private boolean isLocalLeader() {
+		try {
+			var info = localServer.get().getDivision(groupId).getInfo();
+			return info.isLeader() && info.isLeaderReady();
+		} catch (IOException | RuntimeException ex) {
+			return false;
+		}
 	}
 
 	/** Submits straight to the local Raft server, with no client in between that could redirect it elsewhere. */
-	private CompletableFuture<Object> sendLocal(Message message) {
+	private CompletableFuture<RaftClientReply> submitLocal(Message message, long deadlineNanos) {
 		var request = RaftClientRequest.newBuilder()
 				.setClientId(localClientId)
 				.setServerId(self)
@@ -151,63 +414,26 @@ final class Proposer implements Closeable {
 				.setMessage(message)
 				.setType(RaftClientRequest.writeRequestType())
 				.build();
-		CompletableFuture<RaftClientReply> reply;
 		try {
-			reply = localServer.get().submitClientRequestAsync(request);
+			return localServer.get().submitClientRequestAsync(request)
+					.orTimeout(Math.max(1, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
 		} catch (IOException ex) {
-			return CompletableFuture.failedFuture(new RocksDBRetryException());
+			return CompletableFuture.failedFuture(ex);
 		}
-		return reply.orTimeout(requestTimeoutNanos, TimeUnit.NANOSECONDS).handle((answer, error) -> {
-			var refusal = error != null ? stateMachineException(error)
-					: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
-			if (refusal != null) {
-				throw new CompletionException(refusal(refusal));
-			}
-			if (error == null && !answer.isSuccess() && isRefusedBeforeAppend(answer.getException())) {
-				throw new CompletionException(new RocksDBRetryException());
-			}
-			if (error != null) {
-				throw new CompletionException(unavailable(error));
-			}
-			return toResult(answer);
-		});
 	}
 
-	/** Errors Ratis returns only before appending: not ready to lead yet, or no room for another pending request. */
-	private static boolean isRefusedBeforeAppend(@Nullable Throwable error) {
-		return error instanceof LeaderNotReadyException || error instanceof ResourceUnavailableException;
-	}
-
-	private CompletableFuture<Object> send(RaftClient via, Message message, long deadlineNanos) {
-		return CompletableFuture.supplyAsync(() -> sendBlocking(via, message), sender).handle((reply, error) -> {
-			// Ratis reports state machine refusals either in the reply or as the future's failure.
-			var refusal = error != null ? stateMachineException(error)
-					: !reply.isSuccess() && reply.getException() instanceof StateMachineException e ? e : null;
-			boolean retryable = System.nanoTime() - deadlineNanos < 0
-					&& (refusal != null ? isNotReady(refusal) : error != null || !reply.isSuccess());
-			if (retryable) {
-				// No answer yet (no leader, unreachable, refused before append): send the same request again. If an
-				// earlier copy took effect, applying this one returns its recorded result.
-				long delay = refusal != null ? NOT_READY_RETRY_MS : ATTEMPT_SLEEP_MS;
-				return CompletableFuture.supplyAsync(() -> send(via, message, deadlineNanos),
-						CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS)).thenCompose(f -> f);
-			}
-			if (refusal != null) {
-				throw new CompletionException(refusal(refusal));
-			}
-			if (error != null) {
-				throw new CompletionException(unavailable(error));
-			}
-			return CompletableFuture.completedFuture(toResult(reply));
-		}).thenCompose(f -> f);
-	}
-
-	private static RaftClientReply sendBlocking(RaftClient via, Message message) {
+	private RaftClientReply sendBlocking(Message message) {
 		try {
-			return via.io().send(message);
+			return client.io().send(message);
 		} catch (IOException ex) {
 			throw new CompletionException(ex);
 		}
+	}
+
+	/** Errors Ratis returns only before appending: not the (ready) leader, or no room for another request. */
+	private static boolean isRefusedBeforeAppend(@Nullable Throwable error) {
+		return error instanceof LeaderNotReadyException || error instanceof NotLeaderException
+				|| error instanceof ResourceUnavailableException;
 	}
 
 	private static StateMachineException stateMachineException(Throwable error) {
@@ -228,21 +454,35 @@ final class Proposer implements Closeable {
 		return exception.getCause() != null && exception.getCause().getClass().getName().equals(type.getName());
 	}
 
-	private static Object toResult(RaftClientReply reply) {
-		if (!reply.isSuccess()) {
-			var exception = reply.getException();
-			if (exception instanceof StateMachineException stateMachineException) {
-				throw new CompletionException(refusal(stateMachineException));
-			}
-			throw new CompletionException(unavailable(exception));
+	/** Completes each request of {@code batch} with its own result from {@code reply}. */
+	private static void complete(List<Pending> batch, RaftClientReply reply) {
+		List<ApplyResult> results;
+		try {
+			results = ResultCodec.decodeAll(reply.getMessage().getContent().toByteArray());
+		} catch (IllegalArgumentException ex) {
+			fail(batch, unavailable(ex));
+			return;
 		}
-		var result = ResultCodec.decode(reply.getMessage().getContent().toByteArray());
-		return switch (result) {
-			case ApplyResult.Ok ok -> ok.value();
-			case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.UPDATE_RETRY ->
-					throw new CompletionException(new RocksDBRetryException());
-			case ApplyResult.Failed failed -> throw new CompletionException(failed.toException());
-		};
+		if (results.size() != batch.size()) {
+			fail(batch, unavailable(new IllegalStateException(
+					"Expected " + batch.size() + " results, got " + results.size())));
+			return;
+		}
+		for (int i = 0; i < results.size(); i++) {
+			var result = batch.get(i).result;
+			switch (results.get(i)) {
+				case ApplyResult.Ok ok -> result.complete(ok.value());
+				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.UPDATE_RETRY ->
+						result.completeExceptionally(new RocksDBRetryException());
+				case ApplyResult.Failed failed -> result.completeExceptionally(failed.toException());
+			}
+		}
+	}
+
+	private static void fail(List<Pending> batch, RocksDBException error) {
+		for (var pending : batch) {
+			pending.result.completeExceptionally(error);
+		}
 	}
 
 	/**
@@ -268,6 +508,15 @@ final class Proposer implements Closeable {
 
 	@Override
 	public void close() throws IOException {
+		closed = true;
+		for (var lane : List.of(anyLeader, localCommits)) {
+			List<Pending> queued;
+			synchronized (lane) {
+				queued = new ArrayList<>(lane.queue);
+				lane.queue.clear();
+			}
+			fail(queued, RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping"));
+		}
 		try (client) {
 			sender.shutdownNow();
 		}

@@ -73,13 +73,15 @@ class NodeStoreTest {
 
 	/** A crash can tear the tail of the un-synced WAL: the replica opens the prefix and Raft replays the rest. */
 	@Test
-	void openRecoversThePrefixOfAWalWithATornTail() throws IOException {
+	void openRecoversThePrefixOfAWalWithATornTail() throws Exception {
 		Path dbDir = tempDir.resolve("db");
-		try (var store = NodeStore.open(dbDir, null, "first")) {
-			for (int index = 1; index <= 10; index++) {
-				setApplied(store, TermIndex.valueOf(1, index));
-			}
+		var crashed = NodeStore.open(dbDir, null, "first");
+		for (int index = 1; index <= 10; index++) {
+			setApplied(crashed, TermIndex.valueOf(1, index));
 		}
+		// Stop like a crash after the WAL write: NodeStore.close() would flush the memtables, and with them the WAL.
+		crashed.db().getDb().get().flushWal(true);
+		crashed.connection().close();
 		Path wal;
 		try (Stream<Path> files = Files.walk(dbDir)) {
 			wal = files.filter(file -> file.getFileName().toString().matches("\\d+\\.log"))

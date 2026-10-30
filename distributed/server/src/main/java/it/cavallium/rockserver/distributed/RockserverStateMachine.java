@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.distributed;
 
 import java.io.IOException;
+import it.unimi.dsi.fastutil.ints.IntList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -16,7 +18,7 @@ import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
-import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
 import org.apache.ratis.util.LifeCycle;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -33,10 +35,37 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	private static final Logger LOG = LoggerFactory.getLogger(RockserverStateMachine.class);
 
-	/** A transaction commit was rejected because one of its keys changed after its snapshot. */
+	/**
+	 * Transaction commits of a log entry were rejected because one of their keys changed after their snapshot. The
+	 * message lists their positions in the entry, after {@link #POSITIONS}; the entry was not appended.
+	 */
 	public static final class ConflictException extends IOException {
+		static final String POSITIONS = "conflicting positions: ";
+
 		public ConflictException(String message) {
 			super(message);
+		}
+
+		static ConflictException of(IntList positions) {
+			var text = new StringBuilder("Transaction conflict, ").append(POSITIONS);
+			for (int i = 0; i < positions.size(); i++) {
+				text.append(i == 0 ? "" : ",").append(positions.getInt(i));
+			}
+			return new ConflictException(text.toString());
+		}
+
+		/** The positions listed in {@code message}, or null if it lists none. */
+		static int @Nullable [] positions(@Nullable String message) {
+			int at = message == null ? -1 : message.indexOf(POSITIONS);
+			if (at < 0) {
+				return null;
+			}
+			try {
+				return java.util.Arrays.stream(message.substring(at + POSITIONS.length()).strip().split(","))
+						.mapToInt(Integer::parseInt).toArray();
+			} catch (NumberFormatException ex) {
+				return null;
+			}
 		}
 	}
 
@@ -57,14 +86,20 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 	}
 
-	/** State attached to a request on the leader between admission and apply. */
+	/** State attached to a log entry on the leader between admission and apply. */
 	private static final class Proposal {
-		final Request request;
+		final List<Request> requests;
+		final long startedNanos = System.nanoTime();
+		long appendedNanos;
 		@Nullable LeaderSession session;
 		@Nullable ConflictTracker.Token token;
 
-		Proposal(Request request) {
-			this.request = request;
+		Proposal(List<Request> requests) {
+			this.requests = requests;
+		}
+
+		List<LogEntry> entries() {
+			return requests.stream().map(Request::entry).toList();
 		}
 	}
 
@@ -79,10 +114,23 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private volatile @Nullable LeaderSession leaderSession;
 	private volatile boolean failed;
 
-	RockserverStateMachine(NodeConfig config, Consumer<Throwable> onReplicaFailure) {
+	RockserverStateMachine(NodeConfig config, Consumer<Throwable> onReplicaFailure, NodeMetrics metrics) {
 		this.config = config;
 		this.onReplicaFailure = onReplicaFailure;
+		this.applyTime = metrics.duration("apply");
+		this.applyRequests = metrics.amount("apply.requests");
+		this.admitTime = metrics.duration("raft.admit");
+		this.commitWait = metrics.duration("raft.appendToApply");
+		this.snapshotTime = metrics.duration("snapshot");
 	}
+
+	private final NodeMetrics.Series snapshotTime;
+
+	private final NodeMetrics.Series admitTime;
+	private final NodeMetrics.Series commitWait;
+
+	private final NodeMetrics.Series applyTime;
+	private final NodeMetrics.Series applyRequests;
 
 	@Override
 	public void initialize(RaftServer server, RaftGroupId groupId, RaftStorage raftStorage) throws IOException {
@@ -183,16 +231,23 @@ final class RockserverStateMachine extends BaseStateMachine {
 				.setStateMachine(this)
 				.setClientRequest(request);
 		try {
-			var decoded = LogEntryCodec.decodeRequest(request.getMessage().getContent().toByteArray());
-			var entry = decoded.entry();
-			if (!(entry instanceof LogEntry.Genesis) && store.clusterId() == null) {
+			var decoded = LogEntryCodec.decodeBatch(request.getMessage().getContent().toByteArray());
+			if (decoded.size() > 1 && !decoded.stream().allMatch(r -> Applier.isBatchable(r.entry()))) {
+				throw new IllegalArgumentException("Only data writes can share a log entry");
+			}
+			if (!(decoded.getFirst().entry() instanceof LogEntry.Genesis) && store.clusterId() == null) {
 				throw new NotReadyException("The cluster is not initialized yet");
 			}
-			if (entry instanceof LogEntry.Guarded guarded) {
-				var division = division();
-				long term = division != null ? division.getInfo().getCurrentTerm() : -1;
-				if (guarded.leaderEpoch() != term) {
-					throw new RetryableException("The transaction was opened by another leader");
+			long term = -2;
+			for (var decodedRequest : decoded) {
+				if (decodedRequest.entry() instanceof LogEntry.Guarded guarded) {
+					if (term == -2) {
+						var division = division();
+						term = division != null ? division.getInfo().getCurrentTerm() : -1;
+					}
+					if (guarded.leaderEpoch() != term) {
+						throw new RetryableException("The transaction was opened by another leader");
+					}
 				}
 			}
 			return builder.setLogData(request.getMessage().getContent())
@@ -219,17 +274,28 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (session == null) {
 			throw new StateMachineException("Not the leader", new NotReadyException("Not the leader"), false);
 		}
-		if (proposal.request.entry() instanceof LogEntry.Guarded guarded) {
-			if (guarded.leaderEpoch() != session.term()) {
-				throw new StateMachineException("Stale transaction",
-						new RetryableException("The transaction was opened by another leader"), false);
+		var entries = proposal.entries();
+		boolean guarded = false;
+		for (var entry : entries) {
+			if (entry instanceof LogEntry.Guarded commit) {
+				guarded = true;
+				if (commit.leaderEpoch() != session.term()) {
+					throw new StateMachineException("Stale transaction",
+							new RetryableException("The transaction was opened by another leader"), false);
+				}
 			}
-			if (session.tracker().conflicts(guarded)) {
-				throw new StateMachineException("Transaction conflict", new ConflictException("Transaction conflict"), false);
+		}
+		if (guarded) {
+			var conflicting = session.tracker().conflicts(entries);
+			if (!conflicting.isEmpty()) {
+				var conflict = ConflictException.of(conflicting);
+				throw new StateMachineException(conflict.getMessage(), conflict, false);
 			}
 		}
 		proposal.session = session;
-		proposal.token = session.tracker().register(proposal.request.entry());
+		proposal.token = session.tracker().register(entries);
+		proposal.appendedNanos = System.nanoTime();
+		admitTime.record(proposal.appendedNanos - proposal.startedNanos);
 		return trx;
 	}
 
@@ -242,24 +308,35 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 		try {
 			var proposal = trx.getStateMachineContext() instanceof Proposal p ? p : null;
-			var request = proposal != null ? proposal.request
-					: LogEntryCodec.decodeRequest(logEntry.getStateMachineLogEntry().getLogData().toByteArray());
+			var requests = proposal != null ? proposal.requests
+					: LogEntryCodec.decodeBatch(logEntry.getStateMachineLogEntry().getLogData().toByteArray());
 			if (position.getIndex() <= applied.get()) {
 				// Already applied before a restart: the database holds its effects and, unless its proposer already
 				// reported it complete, its result.
-				var recorded = applier.recordedResult(request);
-				return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(ResultCodec.encode(
-						recorded != null ? recorded : new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR,
-								"Result no longer available")))));
+				var results = new java.util.ArrayList<ApplyResult>(requests.size());
+				for (var request : requests) {
+					var recorded = applier.recordedResult(request);
+					results.add(recorded != null ? recorded
+							: new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR, "Result no longer available"));
+				}
+				return CompletableFuture.completedFuture(Message.valueOf(UnsafeByteOperations.unsafeWrap(
+						ResultCodec.encodeAll(results))));
 			}
-			var result = applier.apply(request, position);
+			long applyStart = System.nanoTime();
+			if (proposal != null && proposal.appendedNanos != 0) {
+				commitWait.record(applyStart - proposal.appendedNanos);
+			}
+			var results = applier.applyBatch(requests, position);
+			applyTime.since(applyStart);
+			applyRequests.record(requests.size());
 			if (proposal != null && proposal.token != null && proposal.session != null) {
 				proposal.session.tracker().resolve(proposal.token, position.getIndex());
 				proposal.session.afterApply();
 			}
 			updateLastAppliedTermIndex(position);
 			applied.advance(position.getIndex());
-			return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(ResultCodec.encode(result))));
+			return CompletableFuture.completedFuture(Message.valueOf(UnsafeByteOperations.unsafeWrap(
+					ResultCodec.encodeAll(results))));
 		} catch (RuntimeException ex) {
 			return CompletableFuture.failedFuture(fail("apply entry " + position, ex));
 		}
@@ -286,8 +363,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (failed) {
 			throw new IOException("Replica failed, not taking a snapshot");
 		}
+		long start = System.nanoTime();
 		var position = storage.take(store);
-		LOG.info("{}: snapshot taken at {}", config.nodeId(), position);
+		snapshotTime.since(start);
+		LOG.info("{}: snapshot taken at {} in {} ms", config.nodeId(), position, (System.nanoTime() - start) / 1_000_000);
 		return position.getIndex();
 	}
 

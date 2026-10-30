@@ -101,16 +101,18 @@ final class LogEntryCodec {
 		return bytes.toByteArray();
 	}
 
-	/** Encodes a proposed request: version, proposer id, sequence, completedBelow, then the entry. */
-	static byte[] encodeRequest(Request request) {
-		Objects.requireNonNull(request, "request");
-		var bytes = new ByteArrayOutputStream();
+	/**
+	 * Leading byte of a batch: the payload of every Raft log entry is a batch of requests of one proposer, see
+	 * {@link #encodeBatch}.
+	 */
+	static final byte BATCH_VERSION = 2;
+
+	/** The body of {@code entry} (its tag and fields, no version byte), to be put in a batch by {@link #encodeBatch}. */
+	static byte[] encodeEntryBody(LogEntry entry) {
+		Objects.requireNonNull(entry, "entry");
+		var bytes = new ByteArrayOutputStream(64);
 		try (var out = new DataOutputStream(bytes)) {
-			out.writeByte(VERSION);
-			out.writeLong(request.proposerId());
-			out.writeLong(request.sequence());
-			out.writeLong(request.completedBelow());
-			writeEntry(out, request.entry());
+			writeEntry(out, entry);
 		} catch (IOException e) {
 			// ByteArrayOutputStream never throws
 			throw new UncheckedIOException(e);
@@ -118,19 +120,67 @@ final class LogEntryCodec {
 		return bytes.toByteArray();
 	}
 
+	/**
+	 * Encodes requests of one proposer as one log entry: {@link #BATCH_VERSION}, the proposer id, the batch's
+	 * {@code completedBelow} (see {@link Request}), the request count, then each request's sequence followed by its
+	 * entry body ({@link #encodeEntryBody}).
+	 */
+	static byte[] encodeBatch(long proposerId, long completedBelow, long[] sequences, List<byte[]> entryBodies) {
+		if (sequences.length != entryBodies.size() || sequences.length == 0) {
+			throw new IllegalArgumentException("A batch needs one entry per sequence, and at least one");
+		}
+		int size = 1 + 2 * Long.BYTES + Integer.BYTES;
+		for (byte[] body : entryBodies) {
+			size = Math.addExact(size, Long.BYTES + body.length);
+		}
+		var buffer = ByteBuffer.allocate(size);
+		buffer.put(BATCH_VERSION).putLong(proposerId).putLong(completedBelow).putInt(sequences.length);
+		for (int i = 0; i < sequences.length; i++) {
+			if (completedBelow > sequences[i]) {
+				throw new IllegalArgumentException("Sequence " + sequences[i] + " is below completedBelow " + completedBelow);
+			}
+			buffer.putLong(sequences[i]).put(entryBodies.get(i));
+		}
+		return buffer.array();
+	}
+
+	/** Encodes requests of one proposer as one log entry, see {@link #encodeBatch(long, long, long[], List)}. */
+	static byte[] encodeBatch(List<Request> requests) {
+		var first = requests.getFirst();
+		var sequences = new long[requests.size()];
+		var bodies = new ArrayList<byte[]>(requests.size());
+		for (int i = 0; i < sequences.length; i++) {
+			var request = requests.get(i);
+			if (request.proposerId() != first.proposerId() || request.completedBelow() != first.completedBelow()) {
+				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
+			}
+			sequences[i] = request.sequence();
+			bodies.add(encodeEntryBody(request.entry()));
+		}
+		return encodeBatch(first.proposerId(), first.completedBelow(), sequences, bodies);
+	}
+
 	/** @throws IllegalArgumentException on malformed input or unknown version */
-	static Request decodeRequest(byte[] data) {
+	static List<Request> decodeBatch(byte[] data) {
 		var in = new Input(data);
 		byte version = in.readByte();
-		if (version != VERSION) {
+		if (version != BATCH_VERSION) {
 			throw new IllegalArgumentException("Unknown log entry version: " + version);
 		}
 		long proposerId = in.readLong();
-		long sequence = in.readLong();
 		long completedBelow = in.readLong();
-		LogEntry entry = readEntry(in);
+		// A request takes at least its sequence and an entry tag.
+		int count = in.readCount(Long.BYTES + 1);
+		if (count == 0) {
+			throw new IllegalArgumentException("Empty batch");
+		}
+		var requests = new ArrayList<Request>(count);
+		for (int i = 0; i < count; i++) {
+			long sequence = in.readLong();
+			requests.add(new Request(proposerId, sequence, completedBelow, readEntry(in)));
+		}
 		in.finish();
-		return new Request(proposerId, sequence, completedBelow, entry);
+		return List.copyOf(requests);
 	}
 
 	/** @throws IllegalArgumentException on malformed input or unknown version */

@@ -36,6 +36,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 import org.jetbrains.annotations.Nullable;
@@ -59,6 +60,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	/** Default lease of {@code getForUpdate} updates; the native update transaction expires on its own. */
 	private static final Duration UPDATE_LEASE = Duration.ofSeconds(15);
+	/** How long an update waits for earlier updates of the same key before the client is told to retry. */
+	private static final Duration UPDATE_LOCK_WAIT = Duration.ofSeconds(10);
 	/** Bytes of keys and values per replicated chunk of a batch write. */
 	private static final long BATCH_CHUNK_BYTES = 4L * 1024 * 1024;
 	/** Encoding overhead counted per key segment and per value, so many tiny items still fit in one entry. */
@@ -71,13 +74,24 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private final ReadBarrier barrier;
 	private final LeaderForwarder forwarder;
 	private final URI url;
+	private final NodeMetrics.Series barrierTime;
+	private final NodeMetrics.Series updateOpenTime;
+	private final NodeMetrics.Series commitTime;
+	private final NodeMetrics.Series forwardTime;
+	private final NodeMetrics.Series lockWaitTime;
 
 	ReplicatedConnection(NodeConfig config,
 			RockserverStateMachine stateMachine,
 			Proposer proposer,
 			ReadBarrier barrier,
-			LeaderForwarder forwarder) {
+			LeaderForwarder forwarder,
+			NodeMetrics metrics) {
 		this.config = config;
+		this.barrierTime = metrics.duration("read.barrier");
+		this.updateOpenTime = metrics.duration("update.open");
+		this.commitTime = metrics.duration("commit");
+		this.forwardTime = metrics.duration("forward");
+		this.lockWaitTime = metrics.duration("update.lockWait");
 		this.stateMachine = stateMachine;
 		this.proposer = proposer;
 		this.barrier = barrier;
@@ -275,7 +289,9 @@ final class ReplicatedConnection implements RocksDBConnection {
 		if (!isLeader()) {
 			return forward(context, command);
 		}
+		long start = System.nanoTime();
 		return barrier.await().handle((_, error) -> {
+			barrierTime.since(start);
 			if (error == null) {
 				return local(context, command);
 			}
@@ -300,8 +316,10 @@ final class ReplicatedConnection implements RocksDBConnection {
 				// We became the leader meanwhile.
 				return (CompletableFuture<Object>) single(context, command);
 			}
+			long start = System.nanoTime();
 			return forwarder.api(leader, stateMachine, context)
-					.thenCompose(api -> (CompletableFuture<Object>) api.requestAsync(command));
+					.thenCompose(api -> (CompletableFuture<Object>) api.requestAsync(command))
+					.whenComplete((_, _) -> forwardTime.since(start));
 		});
 	}
 
@@ -432,7 +450,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 				throw new CompletionException(barrierFailure(unwrap(error)));
 			}
 			return openNative(context, command, term, false, command.transactionLeaseTtl(), result -> (Long) result,
-					null);
+					null, null, null);
 		}).thenCompose(f -> f);
 	}
 
@@ -449,14 +467,27 @@ final class ReplicatedConnection implements RocksDBConnection {
 				return result;
 			});
 		}
-		long term = currentTerm();
-		return barrier.await().handle((_, error) -> {
-			if (error != null) {
-				throw new CompletionException(barrierFailure(unwrap(error)));
-			}
-			return openNative(context, command, term, true, UPDATE_LEASE,
-					result -> ((UpdateContext<?>) result).updateId(), command);
-		}).thenCompose(f -> f);
+		// Updates of one key queue up here instead of conflicting: each one reads what the previous one committed.
+		var session = currentSession();
+		long start = System.nanoTime();
+		return session.lockKey(ConflictTracker.keyHash(command.columnId(), command.keys()))
+				.orTimeout(UPDATE_LOCK_WAIT.toNanos(), TimeUnit.NANOSECONDS)
+				.exceptionallyCompose(error -> CompletableFuture.failedFuture(
+						unwrap(error) instanceof TimeoutException ? new RocksDBRetryException() : unwrap(error)))
+				.thenComposeAsync(lock -> {
+					lockWaitTime.since(start);
+					long term = currentTerm();
+					long barrierStart = System.nanoTime();
+					return barrier.await().handle((_, error) -> {
+						barrierTime.since(barrierStart);
+						if (error != null) {
+							session.unlockKey(lock);
+							throw new CompletionException(barrierFailure(unwrap(error)));
+						}
+						return openNative(context, command, term, true, UPDATE_LEASE,
+								result -> ((UpdateContext<?>) result).updateId(), command, session, lock);
+					}).thenCompose(f -> f);
+				}).whenComplete((_, _) -> updateOpenTime.since(start));
 	}
 
 	/**
@@ -471,10 +502,20 @@ final class ReplicatedConnection implements RocksDBConnection {
 			boolean update,
 			Duration lease,
 			java.util.function.Function<Object, Long> idOf,
-			@Nullable Get<?> forUpdate) {
-		var session = currentSession();
-		if (session.term() != confirmedTerm) {
-			throw new RocksDBRetryException();
+			@Nullable Get<?> forUpdate,
+			@Nullable LeaderSession lockSession,
+			@Nullable LeaderSession.KeyLock keyLock) {
+		LeaderSession session;
+		try {
+			session = currentSession();
+			if (session.term() != confirmedTerm || (lockSession != null && lockSession != session)) {
+				throw new RocksDBRetryException();
+			}
+		} catch (RuntimeException ex) {
+			if (keyLock != null) {
+				lockSession.unlockKey(keyLock);
+			}
+			throw ex;
 		}
 		var reservation = session.reserve(stateMachine.appliedIndex());
 		CompletableFuture<?> opened;
@@ -482,18 +523,27 @@ final class ReplicatedConnection implements RocksDBConnection {
 			opened = local(context, command);
 		} catch (RuntimeException ex) {
 			session.cancel(reservation);
+			if (keyLock != null) {
+				session.unlockKey(keyLock);
+			}
 			throw ex;
 		}
 		return opened.handle((result, openError) -> {
 			if (openError != null) {
 				session.cancel(reservation);
+				if (keyLock != null) {
+					session.unlockKey(keyLock);
+				}
 				throw new CompletionException(unwrap(openError));
 			}
 			long id = idOf.apply(result);
 			LeaderSession.OpenTransaction transaction;
 			try {
-				transaction = session.register(reservation, id, update, lease.toNanos());
+				transaction = session.register(reservation, id, update, keyLock, lease.toNanos());
 			} catch (IllegalStateException leadershipEnded) {
+				if (keyLock != null) {
+					session.unlockKey(keyLock);
+				}
 				rollBackNativeQuietly(id, update);
 				throw new CompletionException(new RocksDBRetryException());
 			}
@@ -577,7 +627,11 @@ final class ReplicatedConnection implements RocksDBConnection {
 			LeaderSession.OpenTransaction transaction,
 			LogEntry.Guarded entry) {
 		var pin = session.pin(transaction.snapshotIndex);
-		return proposer.proposeOnce(entry).whenComplete((_, _) -> session.unpin(pin));
+		long start = System.nanoTime();
+		return proposer.proposeOnce(entry).whenComplete((_, _) -> {
+			commitTime.since(start);
+			session.unpin(pin);
+		});
 	}
 
 	private CompletableFuture<?> closeFailedUpdate(RequestContext context, CloseFailedUpdate command) {
@@ -612,7 +666,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		if (session == null) {
 			throw new NotLeader();
 		}
-		session.expire();
+		session.expireIfDue();
 		return session;
 	}
 

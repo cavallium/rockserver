@@ -87,17 +87,26 @@ public final class RWScheduler {
 			String databaseName,
 			boolean productionCapacities,
 			SchedulerDeadlineClock deadlineClock) {
-		this(settings, name, registry, databaseName, productionCapacities, deadlineClock, "default");
+		this(settings, name, registry, databaseName, productionCapacities, deadlineClock, "default", false);
 	}
 
 	public RWScheduler(WorkloadSettings settings, String name, @Nullable MeterRegistry registry,
 			String databaseName, String workloadGroup) {
-		this(settings, name, registry, databaseName, true, SchedulerDeadlineClock.system(), workloadGroup);
+		this(settings, name, registry, databaseName, true, SchedulerDeadlineClock.system(), workloadGroup, false);
+	}
+
+	/**
+	 * A scheduler whose workers are virtual threads, for a server that forwards every request to another
+	 * connection and mostly waits on it: a blocked worker then costs no platform thread, so {@code settings} can
+	 * allow thousands of requests in flight.
+	 */
+	public static RWScheduler withVirtualWorkers(WorkloadSettings settings, String name) {
+		return new RWScheduler(settings, name, null, name, true, SchedulerDeadlineClock.system(), "default", true);
 	}
 
 	private RWScheduler(WorkloadSettings settings, String name, @Nullable MeterRegistry registry,
 			String databaseName, boolean productionCapacities, SchedulerDeadlineClock deadlineClock,
-			String workloadGroup) {
+			String workloadGroup, boolean virtualWorkers) {
 		Objects.requireNonNull(settings, "settings");
 		Objects.requireNonNull(name, "name");
 		Objects.requireNonNull(databaseName, "databaseName");
@@ -130,7 +139,7 @@ public final class RWScheduler {
 				pressureController,
 				deadlineClock,
 				registry,
-				databaseName, workloadGroup);
+				databaseName, workloadGroup, virtualWorkers);
 		this.writePool = new ProfiledWorkloadExecutor(settings.writeParallelism(),
 				1,
 				writeCapacities,
@@ -143,7 +152,7 @@ public final class RWScheduler {
 				pressureController,
 				deadlineClock,
 				registry,
-				databaseName, workloadGroup);
+				databaseName, workloadGroup, virtualWorkers);
 		this.controlPool = new ProfiledWorkloadExecutor(settings.controlThreads(),
 				settings.controlThreads(),
 				Map.of(WorkloadProfile.CONTROL, settings.controlQueueCapacity()),
@@ -156,7 +165,7 @@ public final class RWScheduler {
 				pressureController,
 				deadlineClock,
 				registry,
-				databaseName, workloadGroup);
+				databaseName, workloadGroup, virtualWorkers);
 		this.physicalPool = new ProfiledWorkloadExecutor(settings.physicalConcurrency(),
 				settings.physicalConcurrency(),
 				Map.of(WorkloadProfile.PHYSICAL_MAINTENANCE, settings.physicalMaintenanceQueueCapacity()),
@@ -169,7 +178,7 @@ public final class RWScheduler {
 				pressureController,
 				deadlineClock,
 				registry,
-				databaseName, workloadGroup);
+				databaseName, workloadGroup, virtualWorkers);
 		this.pools = List.of(readPool, writePool, controlPool, physicalPool);
 		this.ownedPools = pools;
 		this.noDeadlineExecutors = createNoDeadlineExecutors();

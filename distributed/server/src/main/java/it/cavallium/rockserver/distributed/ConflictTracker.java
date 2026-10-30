@@ -7,6 +7,10 @@ import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Set;
+import java.util.HashSet;
+import it.unimi.dsi.fastutil.ints.IntList;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -116,15 +120,22 @@ final class ConflictTracker {
 	 * Entries that write no data (e.g. {@link LogEntry.Genesis}) return a token that resolves nothing.
 	 */
 	synchronized Token register(LogEntry entry) {
+		return register(List.of(entry));
+	}
+
+	/** Records every key written by {@code entries}, the requests of one log entry, as one pending token. */
+	synchronized Token register(List<LogEntry> entries) {
 		var keys = new ArrayList<KeyId>();
 		var columns = new ArrayList<Long>();
 		boolean global = false;
-		switch (entry) {
-			case LogEntry.Write write -> collectWrite(write, keys, columns);
-			case LogEntry.Guarded guarded -> guarded.writes().forEach(write -> collectWrite(write, keys, columns));
-			case LogEntry.DeleteColumn deleteColumn -> columns.add(deleteColumn.columnId());
-			case LogEntry.CreateColumn _, LogEntry.DeleteColumnIfExists _ -> global = true;
-			case LogEntry.UploadMergeOperator _, LogEntry.Genesis _, LogEntry.VerifyColumn _ -> {}
+		for (var entry : entries) {
+			switch (entry) {
+				case LogEntry.Write write -> collectWrite(write, keys, columns);
+				case LogEntry.Guarded guarded -> guarded.writes().forEach(write -> collectWrite(write, keys, columns));
+				case LogEntry.DeleteColumn deleteColumn -> columns.add(deleteColumn.columnId());
+				case LogEntry.CreateColumn _, LogEntry.DeleteColumnIfExists _ -> global = true;
+				case LogEntry.UploadMergeOperator _, LogEntry.Genesis _, LogEntry.VerifyColumn _ -> {}
+			}
 		}
 		var token = new Token(keys, columns, global);
 		for (KeyId key : keys) {
@@ -176,6 +187,50 @@ final class ConflictTracker {
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * The positions of the {@link LogEntry.Guarded} entries among {@code entries} (the requests of one log entry, in
+	 * order) that conflict: with a write tracked here, or with a write of an earlier entry of the same log entry that
+	 * does not conflict itself, since that one is applied first. Without such a position, every entry can be
+	 * appended and registered as one; with one, nothing is registered.
+	 */
+	synchronized IntList conflicts(List<LogEntry> entries) {
+		var conflicting = new IntArrayList();
+		Set<KeyId> written = null;
+		for (int i = 0; i < entries.size(); i++) {
+			var entry = entries.get(i);
+			if (entry instanceof LogEntry.Guarded guarded) {
+				boolean conflict = conflicts(guarded);
+				if (!conflict && written != null) {
+					long[] columns = guarded.conflictColumns();
+					long[] hashes = guarded.conflictHashes();
+					for (int k = 0; k < columns.length && !conflict; k++) {
+						conflict = written.contains(new KeyId(columns[k], hashes[k]));
+					}
+				}
+				if (conflict) {
+					conflicting.add(i);
+					continue;
+				}
+			}
+			if (i + 1 < entries.size()) {
+				// Only data writes share a log entry (see Applier.isBatchable), so keys cover everything they write.
+				var keys = new ArrayList<KeyId>();
+				switch (entry) {
+					case LogEntry.Write write -> collectWrite(write, keys, new ArrayList<>());
+					case LogEntry.Guarded guarded -> guarded.writes().forEach(w -> collectWrite(w, keys, new ArrayList<>()));
+					default -> {}
+				}
+				if (!keys.isEmpty()) {
+					if (written == null) {
+						written = new HashSet<>();
+					}
+					written.addAll(keys);
+				}
+			}
+		}
+		return conflicting;
 	}
 
 	private static boolean isNewer(@Nullable Token writer, long snapshotIndex) {

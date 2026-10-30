@@ -69,6 +69,34 @@ final class ResultCodec {
 		return bytes.toByteArray();
 	}
 
+	/** Encodes the results of a batch, in order: their count, then each one's length and {@link #encode} bytes. */
+	static byte[] encodeAll(List<ApplyResult> results) {
+		var encoded = new ArrayList<byte[]>(results.size());
+		int size = Integer.BYTES;
+		for (var result : results) {
+			byte[] bytes = encode(result);
+			encoded.add(bytes);
+			size = Math.addExact(size, Integer.BYTES + bytes.length);
+		}
+		var buffer = java.nio.ByteBuffer.allocate(size).putInt(encoded.size());
+		for (byte[] bytes : encoded) {
+			buffer.putInt(bytes.length).put(bytes);
+		}
+		return buffer.array();
+	}
+
+	/** @throws IllegalArgumentException on malformed input */
+	static List<ApplyResult> decodeAll(byte[] data) {
+		var in = new LogEntryCodec.Input(data);
+		int count = in.readCount(Integer.BYTES + 1);
+		var results = new ArrayList<ApplyResult>(count);
+		for (int i = 0; i < count; i++) {
+			results.add(decode(in.readBytes()));
+		}
+		in.finish();
+		return results;
+	}
+
 	/** @throws IllegalArgumentException on malformed input */
 	static ApplyResult decode(byte[] data) {
 		var in = new LogEntryCodec.Input(data);

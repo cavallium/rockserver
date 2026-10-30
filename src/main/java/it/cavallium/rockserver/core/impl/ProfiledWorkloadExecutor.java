@@ -145,7 +145,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	                         WorkloadPressureController pressureController,
 	                         SchedulerDeadlineClock deadlineClock,
 	                         @Nullable MeterRegistry registry,
-	                         String databaseName, String workloadGroup) {
+	                         String databaseName, String workloadGroup,
+	                         boolean virtualWorkers) {
 		if (workerCount < 1) {
 			throw new IllegalArgumentException("workerCount must be positive");
 		}
@@ -193,11 +194,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		if (reservationTotal > workerCount) {
 			throw new IllegalArgumentException("Reservation sum exceeds workerCount");
 		}
-		this.threadFactory = new ThreadFactoryBuilder()
-				.setDaemon(false)
-				.setNameFormat(poolName + "-%d")
-				.setUncaughtExceptionHandler(this::uncaughtWorkerFailure)
-				.build();
+		// Virtual workers suit pools whose tasks mostly wait on another server (a proxy), not on local storage.
+		this.threadFactory = virtualWorkers
+				? Thread.ofVirtual().name(poolName + "-", 0).uncaughtExceptionHandler(this::uncaughtWorkerFailure).factory()
+				: new ThreadFactoryBuilder()
+						.setDaemon(false)
+						.setNameFormat(poolName + "-%d")
+						.setUncaughtExceptionHandler(this::uncaughtWorkerFailure)
+						.build();
 		this.taskMetrics = registry == null ? null : registerTaskMetrics(registry);
 		this.workerFailureMetric = registerCounter(registry,
 				"rockserver.workload.worker.failures",

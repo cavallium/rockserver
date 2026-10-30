@@ -80,13 +80,23 @@ final class NodeStore implements Closeable {
 	private static final int TERM_INDEX_BYTES = 2 * Long.BYTES;
 
 	/**
-	 * The RocksDB WAL is not synced, so a crash can tear its tail: a power loss keeps an arbitrary prefix of what was
-	 * written, and with a delayed WAL flush ({@code delay-wal-flush-duration}) even a killed process loses its
-	 * buffer. A replica then needs the consistent prefix that RocksDB's point-in-time recovery opens, and replays the
-	 * rest from the Raft log. Rockserver's {@code absolute-consistency} (on by default) would refuse to open such a
-	 * database, so the replica could not restart without being repaired.
+	 * Settings every replica needs:
+	 * <ul>
+	 *   <li>{@code absolute-consistency = false}: the RocksDB WAL is not synced, so a crash can tear its tail: a power
+	 *   loss keeps an arbitrary prefix of what was written, and with a delayed WAL flush
+	 *   ({@code delay-wal-flush-duration}) even a killed process loses its buffer. A replica then needs the consistent
+	 *   prefix that RocksDB's point-in-time recovery opens, and replays the rest from the Raft log. Rockserver's
+	 *   {@code absolute-consistency} (on by default) would refuse to open such a database, so the replica could not
+	 *   restart without being repaired.</li>
+	 *   <li>{@code atomic-flush = true}: entries are applied without the WAL (see {@link Applier}), so after a crash
+	 *   only flushed data survives; flushing every column together keeps that a consistent point, where the applied
+	 *   position matches the data.</li>
+	 * </ul>
 	 */
-	private static final String REPLICA_OVERRIDES = "database.global.absolute-consistency = false\n";
+	private static final String REPLICA_OVERRIDES = """
+			database.global.absolute-consistency = false
+			database.global.atomic-flush = true
+			""";
 
 	private final Path dbDir;
 	/** RocksDB WAL directory: {@code dbDir} itself or the configured {@code wal-path} (default {@code ./wal}). */
@@ -390,11 +400,11 @@ final class NodeStore implements Closeable {
 			return;
 		}
 		try {
-			// With a delayed WAL flush (the default config), the last applied entries may still be in RocksDB's
-			// in-process WAL buffer: write them out, so a cleanly stopped replica has its whole applied state on disk.
-			db().getDb().get().flushWal(true);
-		} catch (org.rocksdb.RocksDBException | RuntimeException e) {
-			LOG.warn("Failed to flush the WAL of {} before closing; Raft replays the missing entries", dbDir, e);
+			// Entries are applied without the WAL (see Applier): flush them, so a cleanly stopped replica has its
+			// whole applied state on disk and restarts without replaying them. This also writes out the WAL buffer.
+			db().flush();
+		} catch (RuntimeException e) {
+			LOG.warn("Failed to flush {} before closing; Raft replays the missing entries", dbDir, e);
 		} finally {
 			connection.close();
 		}
@@ -486,6 +496,11 @@ final class NodeStore implements Closeable {
 		return metaKey(REQUEST, proposerId, sequence);
 	}
 
+	/** The sequence in a key made by {@link #requestKey}. */
+	static long requestSequence(Keys key) {
+		return java.nio.ByteBuffer.wrap(key.keys()[0].toByteArray()).getLong(1 + Long.BYTES);
+	}
+
 	private static Keys metaKey(byte kind, long first, long second) {
 		var key = java.nio.ByteBuffer.allocate(META_KEY_BYTES).put(kind).putLong(first).putLong(second).array();
 		return new Keys(Buf.wrap(key));
@@ -516,7 +531,21 @@ final class NodeStore implements Closeable {
 			paths = walk.sorted(Comparator.reverseOrder()).toList();
 		}
 		for (Path path : paths) {
+			// A file with another hard link was linked from a file that is already durable (an SST that RocksDB
+			// synced, a checkpoint or snapshot file synced when it was made): its directory entry is synced below. A
+			// large database has thousands of such files, and fsyncing each one would stall the apply thread.
+			if (!Files.isDirectory(path) && hardLinks(path) > 1) {
+				continue;
+			}
 			syncFile(path);
+		}
+	}
+
+	private static int hardLinks(Path file) {
+		try {
+			return (Integer) Files.getAttribute(file, "unix:nlink");
+		} catch (IOException | UnsupportedOperationException | IllegalArgumentException e) {
+			return 1;
 		}
 	}
 

@@ -2477,6 +2477,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	/**
+	 * Opens a transaction for a caller that is the only writer of the keys it writes and does its own recovery: no
+	 * snapshot is taken and, if {@code disableWal}, its commit skips the WAL, so it survives a crash only once
+	 * flushed. Only for replication, which replays the writes lost by a crash from its own log.
+	 */
+	public long openUnloggedTransaction(long timeoutMs, WorkloadProfile workloadProfile, boolean disableWal) {
+		ops.beginOp();
+		try {
+			return allocateTransactionInternal(openTransactionInternal(timeoutMs, false, workloadProfile, false,
+					disableWal));
+		} finally {
+			ops.endOp();
+		}
+	}
+
 	private long allocateTransactionInternal(Tx tx) {
 		try {
 			return FastRandomUtils.allocateNewValue(txs, tx, Long.MIN_VALUE, -2);
@@ -2498,6 +2513,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean isFromGetForUpdate,
 			WorkloadProfile workloadProfile,
 			boolean captureSnapshot) {
+		return openTransactionInternal(timeoutMs, isFromGetForUpdate, workloadProfile, captureSnapshot, false);
+	}
+
+	private Tx openTransactionInternal(long timeoutMs,
+			boolean isFromGetForUpdate,
+			WorkloadProfile workloadProfile,
+			boolean captureSnapshot,
+			boolean disableWal) {
 		Objects.requireNonNull(workloadProfile, "workloadProfile");
 		if (timeoutMs < 0L) {
 			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
@@ -2506,6 +2529,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var expirationTimestamp = saturatingAdd(System.currentTimeMillis(), timeoutMs);
 		TransactionalOptions txOpts = db.createTransactionalOptions(timeoutMs);
 		var writeOpts = new LeakSafeWriteOptions("open-transaction-internal-write-options");
+		if (disableWal) {
+			writeOpts.setDisableWAL(true);
+		}
 		var rocksObjects = new RocksDBObjects(writeOpts, txOpts);
 		org.rocksdb.Transaction transaction = null;
 		try {

@@ -59,6 +59,7 @@ import it.cavallium.rockserver.core.common.api.proto.FirstAndLast;
 import it.cavallium.rockserver.core.common.api.proto.KV;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.config.WorkloadSettings;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.ReactorResultOwnership;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
@@ -321,6 +322,9 @@ public class GrpcServer extends Server {
 		private final AtomicLong suppressed = new AtomicLong();
 	}
 
+	/** Requests of each kind that may wait on a non-embedded connection at once. */
+	private static final int PROXY_PARALLELISM = 4096;
+
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
 		ExpectedGrpcStreamCloseLogFilter.install();
@@ -329,10 +333,9 @@ public class GrpcServer extends Server {
 			this.ownsScheduler = false;
 			this.embeddedDatabase = internalConnection.getEmbeddedDB();
 		} else {
-			this.scheduler = new RWScheduler(Runtime.getRuntime().availableProcessors(),
-					Runtime.getRuntime().availableProcessors(),
-					"grpc-db"
-			);
+			// Every request waits on the other connection (a remote or replicated database) for a whole round trip:
+			// with one platform thread per core, the round trip latency would cap the throughput.
+			this.scheduler = RWScheduler.withVirtualWorkers(WorkloadSettings.proxy(PROXY_PARALLELISM), "grpc-db");
 			this.ownsScheduler = true;
 			this.embeddedDatabase = null;
 		}

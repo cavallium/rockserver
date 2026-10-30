@@ -26,6 +26,7 @@ import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.TransferLeadershipRequest;
 import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.server.raftlog.RaftLog;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -53,6 +54,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final ScheduledExecutorService maintenance;
 	private final AtomicBoolean closed = new AtomicBoolean();
 	private final CompletableFuture<@Nullable Throwable> stopped = new CompletableFuture<>();
+	private final NodeMetrics metrics;
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
 		this.config = config;
@@ -60,7 +62,8 @@ public final class ReplicatedNode implements AutoCloseable {
 		Files.createDirectories(config.raftDir());
 		var groupId = RaftGroupId.valueOf(UUID.fromString(config.groupId()));
 		this.group = RaftGroup.valueOf(groupId, raftPeers(config));
-		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure);
+		this.metrics = new NodeMetrics(config.nodeId());
+		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure, metrics);
 
 		var parameters = new Parameters();
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
@@ -84,11 +87,11 @@ public final class ReplicatedNode implements AutoCloseable {
 			started.add(server);
 			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout());
 			started.add(barrier);
-			this.proposer = new Proposer(group, RaftSettings.client(config), config, this::raftServer);
+			this.proposer = new Proposer(group, RaftSettings.client(config), config, this::raftServer, metrics);
 			started.add(proposer);
 			this.forwarder = new LeaderForwarder(config);
 			started.add(forwarder);
-			this.connection = new ReplicatedConnection(config, stateMachine, proposer, barrier, forwarder);
+			this.connection = new ReplicatedConnection(config, stateMachine, proposer, barrier, forwarder, metrics);
 			var self = config.self();
 			var apiHost = config.apiBindHost() != null ? config.apiBindHost() : self.apiHost();
 			this.apiServer = new GrpcServer(connection, new InetSocketAddress(apiHost, self.apiPort()));
@@ -97,6 +100,23 @@ public final class ReplicatedNode implements AutoCloseable {
 			this.maintenance = Executors.newSingleThreadScheduledExecutor(
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-maintenance").factory());
 			maintenance.scheduleWithFixedDelay(this::initializeCluster, 0, 200, TimeUnit.MILLISECONDS);
+			var appendLag = metrics.amount("lag.uncommitted");
+			var applyLag = metrics.amount("lag.unapplied");
+			var flushLag = metrics.amount("lag.unflushed");
+			metrics.sampleEveryMillisecond(() -> {
+				RaftLog log;
+				try {
+					log = server.getDivision(group.getGroupId()).getRaftLog();
+				} catch (IOException e) {
+					return;
+				}
+				var lastEntry = log.getLastEntryTermIndex();
+				long last = lastEntry == null ? 0 : lastEntry.getIndex();
+				long committed = log.getLastCommittedIndex();
+				appendLag.record(last - committed);
+				flushLag.record(last - log.getFlushIndex());
+				applyLag.record(committed - stateMachine.appliedIndex().get());
+			});
 		} catch (IOException | RuntimeException ex) {
 			for (int i = started.size() - 1; i >= 0; i--) {
 				try {
@@ -296,6 +316,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		if (maintenance != null) {
 			maintenance.shutdownNow();
 		}
+		metrics.close();
 		IOException failure = null;
 		// A replica can fail while the constructor is still starting the rest: skip what does not exist yet.
 		var order = (consensusFirst
