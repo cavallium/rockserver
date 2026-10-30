@@ -1047,8 +1047,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 	 * tells whether what the update read was real. Its read counts only if the commit it read from applied: the read
 	 * then linearizes right after that commit (see {@link LeaderSession#admitted}, and the leadership confirmed before
 	 * the grant). Otherwise, or if that is not known in time, or the update is unknown here (expired, or opened by a
-	 * previous leader), the client must run the update again. Not on a pool: {@code settled} completes on the thread
-	 * that completes every applied entry.
+	 * previous leader), the client must run the update again. The answer goes on a pool: {@code settled} completes on
+	 * the thread that completes every applied entry.
 	 */
 	private CompletableFuture<?> closeChained(RequestContext context, long start, LeaderSession session,
 			LeaderSession.@Nullable OpenTransaction transaction) {
