@@ -96,36 +96,43 @@ public record NodeConfig(String nodeId,
 
 	public NodeConfig withRockserverConfig(@Nullable Path value) {
 		return new NodeConfig(nodeId, peers, dataDir, value, raftBindHost, apiBindHost, groupId,
-				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease, pipelinedUpdates);
+				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,
+				pipelinedUpdates);
 	}
 
 	public NodeConfig withBindHosts(@Nullable String raft, @Nullable String api) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raft, api, groupId,
-				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease, pipelinedUpdates);
+				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,
+				pipelinedUpdates);
 	}
 
 	public NodeConfig withSnapshotEveryEntries(long value) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
-				electionTimeoutMin, electionTimeoutMax, value, requestTimeout, maxTransactionLease, pipelinedUpdates);
+				electionTimeoutMin, electionTimeoutMax, value, requestTimeout, maxTransactionLease,
+				pipelinedUpdates);
 	}
 
 	public NodeConfig withElectionTimeouts(Duration min, Duration max) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
-				min, max, snapshotEveryEntries, requestTimeout, maxTransactionLease, pipelinedUpdates);
+				min, max, snapshotEveryEntries, requestTimeout, maxTransactionLease,
+				pipelinedUpdates);
 	}
 
 	public NodeConfig withRequestTimeout(Duration value) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
-				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, value, maxTransactionLease, pipelinedUpdates);
+				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, value, maxTransactionLease,
+				pipelinedUpdates);
 	}
 
 	public NodeConfig withMaxTransactionLease(Duration value) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
-				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, value, pipelinedUpdates);
+				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, value,
+				pipelinedUpdates);
 	}
 
 	public NodeConfig withPipelinedUpdates(boolean value) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
-				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease, value);
+				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,
+				value);
 	}
 }

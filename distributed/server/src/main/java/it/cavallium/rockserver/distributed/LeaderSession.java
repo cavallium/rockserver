@@ -45,6 +45,18 @@ final class LeaderSession {
 		}
 	}
 
+	/** Who holds one key, and who waits for it in arrival order. Guarded by {@link #chainLock}. */
+	private static final class KeyState {
+		final long columnId;
+		final ArrayDeque<CompletableFuture<KeyLock>> waiters = new ArrayDeque<>();
+		/** An update owns the key. */
+		boolean held;
+
+		KeyState(long columnId) {
+			this.columnId = columnId;
+		}
+	}
+
 	/** One open transaction or update. */
 	static final class OpenTransaction {
 		final long id;
@@ -150,15 +162,21 @@ final class LeaderSession {
 	 */
 	private final Long2IntRBTreeMap snapshots = new Long2IntRBTreeMap();
 	/**
-	 * Single-key updates by key hash ({@link ConflictTracker#keyHash}): a key is in the map while an update holds it,
-	 * with the updates waiting for it in arrival order. Guarded by this.
+	 * Guards the key locks. Separate from this object's monitor, which {@link #expire} holds for a whole scan, so that
+	 * what runs under Ratis' log lock never waits for that scan. Lock order: this, then this lock, then the tracker's
+	 * monitor; Ratis' log lock may come before this one. Nothing holding this lock takes this object's monitor.
 	 */
-	private final Long2ObjectOpenHashMap<ArrayDeque<CompletableFuture<KeyLock>>> keyQueues = new Long2ObjectOpenHashMap<>();
+	private final Object chainLock = new Object();
+	/**
+	 * Single-key updates by key hash ({@link ConflictTracker#keyHash}): a key is in the map while an update holds it.
+	 * Guarded by {@link #chainLock}.
+	 */
+	private final Long2ObjectOpenHashMap<KeyState> keys = new Long2ObjectOpenHashMap<>();
 	private long appliesSincePrune;
 	/**
 	 * Whether {@link #expiryTick} is scheduled: it runs while some key is held after an update queued behind it, so
 	 * that an abandoned update releases its key at the end of its lease even when no other request comes. Guarded by
-	 * this.
+	 * {@link #chainLock}.
 	 */
 	private boolean expiryScheduled;
 	/** When {@link #expireIfDue} last expired transactions, in {@link System#nanoTime()} units. */
@@ -253,7 +271,7 @@ final class LeaderSession {
 	 */
 	CompletableFuture<KeyLock> lockKey(long key) {
 		var waiter = new CompletableFuture<KeyLock>();
-		lockKey(key, waiter);
+		lockKey(key, 0, waiter);
 		return waiter;
 	}
 
@@ -261,35 +279,50 @@ final class LeaderSession {
 	 * {@link #lockKey(long)} with the caller's own future, which it may have made depend on a timeout or a cancellation
 	 * before the key is asked for. A future that is complete by the time its turn comes is skipped.
 	 */
-	synchronized void lockKey(long key, CompletableFuture<KeyLock> waiter) {
-		if (closed) {
-			waiter.completeExceptionally(new RocksDBRetryException());
-			return;
-		}
-		if (waiter.isDone()) {
-			return;
-		}
-		var queue = keyQueues.get(key);
-		if (queue == null) {
-			keyQueues.put(key, new ArrayDeque<>());
-			var lock = new KeyLock(key);
-			if (!waiter.complete(lock)) {
-				unlockKey(lock);
+	void lockKey(long key, long columnId, CompletableFuture<KeyLock> waiter) {
+		synchronized (chainLock) {
+			if (closed) {
+				waiter.completeExceptionally(new RocksDBRetryException());
+				return;
 			}
+			if (waiter.isDone()) {
+				return;
+			}
+			var state = keys.computeIfAbsent(key, _ -> new KeyState(columnId));
+			state.waiters.addLast(waiter);
+			grantNext(key, state);
+			if (!waiter.isDone() && !expiryScheduled) {
+				expiryScheduled = true;
+				EXPIRY_DELAY.execute(this::expiryTick);
+			}
+		}
+	}
+
+	/**
+	 * The only way a key is granted: to the oldest update that still waits, if nobody holds it. The grant runs under
+	 * {@link #chainLock}, so a waiter's dependent stages must be cheap: {@link ReplicatedConnection} has only its
+	 * timeout's cancellation and an async stage there.
+	 */
+	private void grantNext(long key, KeyState state) {
+		if (state.held) {
 			return;
 		}
-		queue.addLast(waiter);
-		if (!expiryScheduled) {
-			expiryScheduled = true;
-			EXPIRY_DELAY.execute(this::expiryTick);
+		CompletableFuture<KeyLock> next;
+		while ((next = state.waiters.pollFirst()) != null) {
+			// A waiter that timed out or was cancelled is already complete: skip it.
+			if (next.complete(new KeyLock(key))) {
+				state.held = true;
+				return;
+			}
 		}
+		keys.remove(key);
 	}
 
 	/** Expires what is due, and runs again later while a key is held and leadership lasts. */
 	private void expiryTick() {
 		expireIfDue();
-		synchronized (this) {
-			if (closed || keyQueues.isEmpty()) {
+		synchronized (chainLock) {
+			if (closed || keys.isEmpty()) {
 				expiryScheduled = false;
 				return;
 			}
@@ -303,29 +336,24 @@ final class LeaderSession {
 	}
 
 	/** Keys held by an update, for metrics. */
-	synchronized int lockedKeys() {
-		return keyQueues.size();
+	int lockedKeys() {
+		synchronized (chainLock) {
+			return keys.size();
+		}
 	}
 
 	/** Releases {@code lock}, passing the key to the next waiting update that still waits. */
-	synchronized void unlockKey(KeyLock lock) {
-		if (!lock.released.compareAndSet(false, true)) {
-			return;
-		}
-		var queue = keyQueues.get(lock.key);
-		if (queue == null) {
-			return;
-		}
-		while (true) {
-			var next = queue.pollFirst();
-			if (next == null) {
-				keyQueues.remove(lock.key);
+	void unlockKey(KeyLock lock) {
+		synchronized (chainLock) {
+			if (!lock.released.compareAndSet(false, true)) {
 				return;
 			}
-			// A waiter that timed out or was cancelled is already complete: skip it.
-			if (next.complete(new KeyLock(lock.key))) {
+			var state = keys.get(lock.key);
+			if (state == null) {
 				return;
 			}
+			state.held = false;
+			grantNext(lock.key, state);
 		}
 	}
 
@@ -433,11 +461,13 @@ final class LeaderSession {
 			}
 		}
 		transactions.clear();
-		List<CompletableFuture<KeyLock>> waiters = new ArrayList<>();
 		synchronized (this) {
 			snapshots.clear();
-			keyQueues.values().forEach(waiters::addAll);
-			keyQueues.clear();
+		}
+		List<CompletableFuture<KeyLock>> waiters = new ArrayList<>();
+		synchronized (chainLock) {
+			keys.values().forEach(state -> waiters.addAll(state.waiters));
+			keys.clear();
 		}
 		for (var waiter : waiters) {
 			waiter.completeExceptionally(new RocksDBRetryException());

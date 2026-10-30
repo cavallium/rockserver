@@ -718,13 +718,13 @@ final class ReplicatedConnection implements RocksDBConnection {
 			// The key is asked for once leadership is confirmed: its next holder may be running one round trip behind.
 			leadership.whenComplete((_, error) -> {
 				if (error == null) {
-					session.lockKey(hash, waiter);
+					session.lockKey(hash, command.columnId(), waiter);
 				} else {
 					waiter.completeExceptionally(barrierFailure(error));
 				}
 			});
 		} else {
-			session.lockKey(hash, waiter);
+			session.lockKey(hash, command.columnId(), waiter);
 		}
 		var result = new CompletableFuture<Object>();
 		// The caller is gone once its deadline passed or it cancelled: an update it cannot learn the id of would keep
