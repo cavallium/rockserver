@@ -139,6 +139,11 @@ public final class Network implements AutoCloseable {
 		link(src, dst).proxies().forEach(LinkProxy::block);
 	}
 
+	/** Drops what {@code dst} answers on the connections {@code src} opens to it, until {@link #heal()}. */
+	public void dropReplies(String src, String dst) {
+		link(src, dst).proxies().forEach(LinkProxy::dropReplies);
+	}
+
 	/** Cuts every link from and to {@code nodeId}. Clients connecting directly to the node are not affected. */
 	public void isolate(String nodeId) {
 		partition(Set.of(nodeId), difference(nodeIds, Set.of(nodeId)));

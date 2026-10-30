@@ -39,7 +39,7 @@ import java.util.concurrent.TimeUnit;
 public final class ProcessCluster implements AutoCloseable {
 
 	private static final String MAIN_CLASS = "it.cavallium.rockserver.distributed.ReplicatedServerMain";
-	private static final Duration ADMIN_TIMEOUT = Duration.ofSeconds(60);
+	private static final Duration COMMAND_TIMEOUT = Duration.ofSeconds(60);
 	private static final String LOOPBACK = "127.0.0.1";
 	private static final Duration GRACEFUL_STOP_TIMEOUT = Duration.ofSeconds(60);
 	private static final Duration READY_POLL_INTERVAL = Duration.ofMillis(50);
@@ -148,7 +148,7 @@ public final class ProcessCluster implements AutoCloseable {
 		for (int i = 0; i < total; i++) {
 			var id = String.valueOf(i + 1);
 			var node = new Node(id, freePorts.get(2 * i), freePorts.get(2 * i + 1), root.resolve(Network.hostname(id)));
-			Files.createDirectories(node.dir);
+			Files.createDirectories(node.dir.resolve("tmp"));
 			nodes.put(id, node);
 			ports.put(id, List.of(node.raftPort, node.apiPort));
 		}
@@ -192,20 +192,41 @@ public final class ProcessCluster implements AutoCloseable {
 	 */
 	public String admin(List<String> peerIds, String... command) throws IOException {
 		var args = new ArrayList<String>();
-		args.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
-		args.add("-cp");
-		args.add(System.getProperty("java.class.path"));
-		args.add("--enable-native-access=ALL-UNNAMED");
-		args.add("--add-modules=jdk.incubator.vector");
-		args.add("-Djdk.net.hosts.file=" + network.directHostsFile());
-		args.add(MAIN_CLASS);
 		args.add("admin");
 		for (var id : peerIds) {
 			args.add("--peer");
 			args.add(peer(id).format());
 		}
 		args.addAll(List.of(command));
-		var process = new ProcessBuilder(args).redirectErrorStream(true).start();
+		var result = runMain(args);
+		if (result.exitCode() != 0) {
+			throw new IllegalStateException("admin " + String.join(" ", command) + " exited with code "
+					+ result.exitCode() + ":\n" + result.output());
+		}
+		return result.output();
+	}
+
+	/** Exit code and merged stdout and stderr of a {@link ReplicatedServerMain} command. */
+	public record CommandResult(int exitCode, String output) {}
+
+	/** Runs {@code ReplicatedServerMain repair-log --data-dir <the node's> <options...>} in its own JVM. */
+	public CommandResult repairLog(String id, String... options) throws IOException {
+		var args = new ArrayList<>(List.of("repair-log", "--data-dir", dataDir(id).toString()));
+		args.addAll(List.of(options));
+		return runMain(args);
+	}
+
+	private CommandResult runMain(List<String> mainArgs) throws IOException {
+		var command = new ArrayList<String>();
+		command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
+		command.add("-cp");
+		command.add(System.getProperty("java.class.path"));
+		command.add("--enable-native-access=ALL-UNNAMED");
+		command.add("--add-modules=jdk.incubator.vector");
+		command.add("-Djdk.net.hosts.file=" + network.directHostsFile());
+		command.add(MAIN_CLASS);
+		command.addAll(mainArgs);
+		var process = new ProcessBuilder(command).redirectErrorStream(true).start();
 		var output = new StringBuilder();
 		var reader = Thread.ofVirtual().start(() -> {
 			try (var in = process.getInputStream()) {
@@ -215,24 +236,20 @@ public final class ProcessCluster implements AutoCloseable {
 			}
 		});
 		try {
-			if (!process.waitFor(ADMIN_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS)) {
+			if (!process.waitFor(COMMAND_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS)) {
 				process.destroyForcibly();
 				process.waitFor();
 				reader.join();
-				throw new IllegalStateException("admin " + String.join(" ", command) + " did not finish within "
-						+ ADMIN_TIMEOUT + ":\n" + output);
+				throw new IllegalStateException(String.join(" ", mainArgs) + " did not finish within "
+						+ COMMAND_TIMEOUT + ":\n" + output);
 			}
 			reader.join();
 		} catch (InterruptedException e) {
 			process.destroyForcibly();
 			Thread.currentThread().interrupt();
-			throw new IllegalStateException("Interrupted while running admin " + String.join(" ", command), e);
+			throw new IllegalStateException("Interrupted while running " + String.join(" ", mainArgs), e);
 		}
-		if (process.exitValue() != 0) {
-			throw new IllegalStateException("admin " + String.join(" ", command) + " exited with code "
-					+ process.exitValue() + ":\n" + output);
-		}
-		return output.toString();
+		return new CommandResult(process.exitValue(), output.toString());
 	}
 
 	public Network network() {
@@ -473,6 +490,8 @@ public final class ProcessCluster implements AutoCloseable {
 		command.add("--enable-native-access=ALL-UNNAMED");
 		command.add("--add-modules=jdk.incubator.vector");
 		command.add("-Djdk.net.hosts.file=" + network.hostsFile(node.id));
+		// Inside the test's directory: a killed JVM leaves its copy of the RocksDB library behind (17 MB each time).
+		command.add("-Djava.io.tmpdir=" + node.dir.resolve("tmp"));
 		// Same logging configuration as the test JVM (surefire sets the slf4j-simple levels).
 		System.getProperties().stringPropertyNames().stream()
 				.filter(name -> name.startsWith("org.slf4j.simpleLogger."))
