@@ -21,12 +21,16 @@ import org.apache.ratis.protocol.RaftPeerId;
  * run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT (repeat per member) --data-dir DIR
  *       [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
  *       [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
- *       [--max-transaction-lease-ms N] [--pipelined-updates]
+ *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates]
  * admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
+ * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
  * </pre>
  *
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
- * (leadership hand-off) on SIGTERM. For {@code add-peer} the new member must already run with the new peer list.</p>
+ * (leadership hand-off) on SIGTERM. For {@code add-peer} the new member must already run with the new peer list.
+ * {@code repair-log} runs on a stopped node, after a power loss left it unable to read its Raft log: see
+ * {@link RaftLogRepair}. It exits with 0 if the log is valid or was repaired (with {@code --dry-run}: could be) and
+ * with 1 if it refuses.</p>
  *
  * <p>{@code --pipelined-updates}, off by default, lets a leader pass a key to its next {@code getForUpdate} update as
  * soon as the previous update's commit is admitted to the log: see "Transactions" in the design document, which also
@@ -49,6 +53,7 @@ public final class ReplicatedServerMain {
 		switch (args[0]) {
 			case "run" -> run(new Options(rest));
 			case "admin" -> admin(new Options(rest));
+			case "repair-log" -> repairLog(new Options(rest));
 			default -> usage("unknown command " + args[0]);
 		}
 	}
@@ -67,6 +72,7 @@ public final class ReplicatedServerMain {
 				Duration.ofMillis(Long.parseLong(options.value("--request-timeout-ms", "10000"))),
 				Duration.ofMillis(Long.parseLong(options.value("--max-transaction-lease-ms",
 						String.valueOf(NodeConfig.DEFAULT_MAX_TRANSACTION_LEASE.toMillis())))),
+				Long.parseLong(options.value("--log-segment-bytes", String.valueOf(NodeConfig.DEFAULT_LOG_SEGMENT_BYTES))),
 				options.flag("--pipelined-updates"));
 		options.requireConsumed();
 		ReplicatedNode node;
@@ -152,6 +158,18 @@ public final class ReplicatedServerMain {
 		}
 	}
 
+	private static void repairLog(Options options) throws IOException {
+		var dataDir = Path.of(options.required("--data-dir"));
+		var groupId = options.value("--group-id", NodeConfig.DEFAULT_GROUP_ID);
+		var dryRun = options.flag("--dry-run");
+		options.requireConsumed();
+		var report = RaftLogRepair.run(dataDir, groupId, dryRun);
+		report.lines().forEach(System.out::println);
+		if (!report.success()) {
+			System.exit(1);
+		}
+	}
+
 	private static String arg(List<String> command) {
 		if (command.size() != 2) {
 			usage(command.getFirst() + " takes exactly one argument");
@@ -170,14 +188,15 @@ public final class ReplicatedServerMain {
 				  run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT ... --data-dir DIR
 				        [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
 				        [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
-				        [--max-transaction-lease-ms N] [--pipelined-updates]
-				  admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID""");
+				        [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates]
+				  admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
+				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]""");
 		System.exit(2);
 	}
 
 	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
 	private static final class Options {
-		private static final List<String> FLAGS = List.of("--pipelined-updates");
+		private static final List<String> FLAGS = List.of("--pipelined-updates", "--dry-run");
 
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();
@@ -199,10 +218,6 @@ public final class ReplicatedServerMain {
 			}
 		}
 
-		boolean flag(String name) {
-			return value(name) != null;
-		}
-
 		String value(String name) {
 			consumed.add(name);
 			String result = null;
@@ -217,6 +232,10 @@ public final class ReplicatedServerMain {
 		String value(String name, String fallback) {
 			var result = value(name);
 			return result != null ? result : fallback;
+		}
+
+		boolean flag(String name) {
+			return value(name) != null;
 		}
 
 		String required(String name) {
