@@ -351,9 +351,10 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
     is `UPDATE_RETRY`, and so is `closeTransaction` of such an id, a rollback included: a clean end would confirm a
     value that may never be written. A no-change close hands the key on without making a link, so the next update
     reads the same one: 64 updates may read a link, and more queue for the key until it settles, like with the flag
-    off. A proxy `GrpcServer` serves `closeFailedUpdate` on the async API, on the call's own virtual thread, with
-    must-complete semantics: the wait holds no CONTROL worker, and no queue can refuse a close, since a refused close
-    would keep its key for the whole lease.
+    off. A proxy `GrpcServer`, with the flag on or off, serves `closeFailedUpdate` on the async API, on the call's own
+    virtual thread, with must-complete semantics: the wait holds no CONTROL worker, and no queue can refuse a close,
+    since a refused close would keep its key for the whole lease. So does its close of an update whose caller was gone
+    by the time it opened.
     It linearizes right after that commit: every writer ordered after it was registered after the grant, which
     came after the read barrier, so after the close's update was invoked. That is why the barrier stays on both
     paths, and why the grant check is needed for this and not only as an optimisation.
@@ -370,10 +371,11 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
     its links settle (`LeaderSession.yieldChainsTo`, counted by `transaction.chainConflict`, among
     `transaction.conflict`), and the transaction's retry finds room, as it does with the flag off. A key's updates pay
     for that only while transactions collide with them. In `HotKeyThroughputTest`, in-process, with one client
-    running transactions on the key in a tight loop beside 32 update clients: 106 commits/s with the flag off, 0.2
-    without the pause, 31 with it; updates of the key 690/s off, 13400/s without the pause, 1690/s with it. Beside
-    4 update clients, 66 off, 13 without the pause, 30 with it. These come from two runs on a busy machine (the run
-    without the pause had 135 and 133 commits/s off): read them as orders of magnitude.
+    running transactions on the key in a tight loop, four runs of one commit on a busy machine (load 8 to 15) gave,
+    beside 32 update clients, 42–137 commits/s with the flag off and 27–39 with it, and updates of the key at 268–767/s
+    off and 1455–1981/s on. Beside 4 update clients, 68–129 commits/s off and 30–42 on, and updates at 387–799/s off
+    and 960–1250/s on. Without the pause, in one earlier run, 0.2 commits/s and 13400 updates/s beside 32 clients, and
+    13 commits/s beside 4. Single runs differ by up to three times: read these as orders of magnitude.
 - **Staged writes** happen natively. The leader also records them, with their conflict keys: the written keys
   plus the `getForUpdate` keys. It counts the encoded size of the commit entry as they arrive. A write or
   `getForUpdate` that would take it past the 16 MiB entry limit fails at once with `INVALID_REQUEST` and is not
@@ -549,8 +551,8 @@ failover" below).
 | `ReplicationTest` (in-process) | Replication through any node; results; leader loss, including a new leader that has not applied what the old one acknowledged yet; snapshot catch-up; batches; transactions, conflicts and updates; a transaction write too large for the commit refused at once; the capped transaction lease; updates whose caller timed out or cancelled while queued, or cancelled while the update opened, do not keep the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups. |
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); chains (handoff at admission, the caps on links and on the readers of one, breaks and their end, a pause for a conflicting transaction, duplicates, expiry, close, no session monitor under the log lock); history kept for open transactions and in-flight commits, up to the key cap; the commit size limit of staged writes. |
-| `PipelinedUpdatesTest` (in-process, flag on) | With the leader's apply stopped: chained updates see each other's values and nothing is acknowledged; wrong guards; plain writes, transactions and `deleteRange` against a chain; closes in mid-chain, and more of them waiting than a server's CONTROL workers and queue hold; refused operations on chained ids; second writes; merges and multi-key commits; caller gone, abandon; a snapshot and a restart inside a chain, around a rejected entry; a leader change with a chain in flight; the flag on and off at restarts, and a chained id handed to a leader without it; concurrent counters. |
-| `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. Only these three chain in a default run: the suites below run the plain per-key queue unless the property below is set. |
+| `PipelinedUpdatesTest` (in-process, flag on) | With the leader's apply stopped: chained updates see each other's values and nothing is acknowledged; wrong guards; plain writes, transactions and `deleteRange` against a chain; closes in mid-chain, and more of them waiting than a server's CONTROL workers and queue hold; refused operations on chained ids; second writes; merges and multi-key commits; caller gone, abandon; a snapshot and a restart inside a chain, around a rejected entry; a leader change with a chain in flight; a commit that ends without an outcome; the flag on and off at restarts, and a chained id handed to a leader without it; concurrent counters. With the flag off: the commit of an update, read back from the Raft log, has the old bytes, and a second write goes to the log. |
+| `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. With `PipelinedUpdatesTest`, the only tests that chain in a default run: the suites below run the plain per-key queue unless the property below is set, and fail if an update chains there. After each fault these three wait for an update that chains. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, no acknowledged increment of a hot counter is lost, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history, hot counters included, is linearizable. |
@@ -560,7 +562,7 @@ failover" below).
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories, with read-modify-write updates and hot counters in them, are linearizable, and the transactional bank-transfer invariant holds. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
-| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown. |
+| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
 
 Run them all (about 15 minutes):
 
@@ -570,7 +572,7 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
 
 `-Drockserver.test.pipelinedUpdates=true` runs every test cluster with pipelined updates on. Hot counters also
 require, in both modes, that every key takes a new update well within a lease once the cluster settled, and, with the
-flag on, that some update was chained. `HotKeyThroughputTest` runs only with `-Drockserver.test.slow=true`.
+flag on, that an update chained after each fault, and with the flag off that none did. `HotKeyThroughputTest` runs only with `-Drockserver.test.slow=true`.
 
 ## Left before a first deployment
 
