@@ -130,7 +130,7 @@ final class LeaderSession {
 				hashes.add(ConflictTracker.keyHash(write.columnId(), key));
 			}
 			return new LogEntry.Guarded(term, snapshotIndex, columns.toLongArray(), hashes.toLongArray(), List.of(write),
-					true);
+					true, id, null);
 		}
 
 		boolean isExpired(long nowNanos) {

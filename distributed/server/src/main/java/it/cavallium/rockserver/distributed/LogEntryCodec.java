@@ -337,10 +337,21 @@ final class LogEntryCodec {
 			writeWrite(out, write);
 		}
 		out.writeBoolean(guarded.singleResult());
+		out.writeLong(guarded.updateId());
+		var guard = guarded.guard();
+		out.writeBoolean(guard != null);
+		if (guard != null) {
+			out.writeLong(guard.columnId());
+			writeKeys(out, guard.keys());
+			out.writeInt(guard.length());
+			if (guard.sha256() != null) {
+				out.write(guard.sha256(), 0, LogEntry.Guard.DIGEST_BYTES);
+			}
+		}
 	}
 
-	/** Encoded size of a {@link LogEntry.Guarded} body without conflict keys and writes. */
-	static final int GUARDED_BASE_BYTES = 1 + 2 * Long.BYTES + 2 * Integer.BYTES + 1;
+	/** Encoded size of a {@link LogEntry.Guarded} body without conflict keys, writes and guard. */
+	static final int GUARDED_BASE_BYTES = 1 + 2 * Long.BYTES + 2 * Integer.BYTES + 1 + Long.BYTES + 1;
 	/** Encoded size of one conflict key of a {@link LogEntry.Guarded}: its column id and key hash. */
 	static final int CONFLICT_KEY_BYTES = 2 * Long.BYTES;
 
@@ -362,11 +373,20 @@ final class LogEntryCodec {
 				for (LogEntry.Write write : guarded.writes()) {
 					size += writeSize(write);
 				}
+				if (guarded.guard() != null) {
+					size += guardSize(guarded.guard());
+				}
 				yield size;
 			}
 			case LogEntry.VerifyColumn(String name, long _) -> 1 + stringSize(name) + Long.BYTES;
 			case LogEntry.Genesis(String clusterId, boolean _) -> 1 + stringSize(clusterId) + 1;
 		};
+	}
+
+	/** Encoded size of the fields {@code guard} adds to a {@link LogEntry.Guarded}. */
+	static long guardSize(LogEntry.Guard guard) {
+		return Long.BYTES + keysSize(guard.keys()) + Integer.BYTES
+				+ (guard.sha256() != null ? LogEntry.Guard.DIGEST_BYTES : 0);
 	}
 
 	/** Encoded size of {@code write} as {@link #writeWrite} writes it, inside a {@link LogEntry.Guarded}. */
@@ -567,8 +587,18 @@ final class LogEntryCodec {
 		for (int i = 0; i < writeCount; i++) {
 			writes.add(readWrite(in, in.readByte()));
 		}
+		boolean singleResult = in.readBoolean();
+		long updateId = in.readLong();
+		var guard = in.readBoolean() ? readGuard(in) : null;
 		// The constructor rejects inconsistent combinations with IllegalArgumentException
-		return new LogEntry.Guarded(leaderEpoch, snapshotIndex, columns, hashes, writes, in.readBoolean());
+		return new LogEntry.Guarded(leaderEpoch, snapshotIndex, columns, hashes, writes, singleResult, updateId, guard);
+	}
+
+	private static LogEntry.Guard readGuard(Input in) {
+		long columnId = in.readLong();
+		var keys = readKeys(in);
+		int length = in.readInt();
+		return new LogEntry.Guard(columnId, keys, length, length >= 0 ? in.readFixed(LogEntry.Guard.DIGEST_BYTES) : null);
 	}
 
 	private static Keys readKeys(Input in) {
@@ -767,6 +797,12 @@ final class LogEntryCodec {
 
 		byte[] readBytes() {
 			return readBytes(readCount(1));
+		}
+
+		/** Exactly {@code length} bytes, with no length before them. */
+		byte[] readFixed(int length) {
+			require(length);
+			return readBytes(length);
 		}
 
 		/**

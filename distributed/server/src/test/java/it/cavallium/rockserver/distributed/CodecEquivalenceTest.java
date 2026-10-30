@@ -279,13 +279,20 @@ class CodecEquivalenceTest {
 				for (int i = 0; i < writeCount; i++) {
 					writes.add(randomWrite(random));
 				}
+				boolean singleResult = writeCount == 1 && random.nextBoolean();
+				long updateId = singleResult && random.nextBoolean() ? random.nextLong() | 1 : 0;
+				var guard = updateId != 0 && random.nextBoolean() ? randomGuard(random) : null;
 				yield new LogEntry.Guarded(random.nextLong(), random.nextLong(),
 						random.longs(conflicts).toArray(), random.longs(conflicts).toArray(), writes,
-						writeCount == 1 && random.nextBoolean());
+						singleResult, updateId, guard);
 			}
 			default -> random.nextBoolean() ? new LogEntry.Genesis(randomString(random), random.nextBoolean())
 					: new LogEntry.VerifyColumn(randomString(random), random.nextLong());
 		};
+	}
+
+	private static LogEntry.Guard randomGuard(Random random) {
+		return LogEntry.Guard.of(random.nextLong(), randomKeys(random), random.nextBoolean() ? null : randomBuf(random));
 	}
 
 	private static ApplyResult randomResult(Random random, int depth) {
