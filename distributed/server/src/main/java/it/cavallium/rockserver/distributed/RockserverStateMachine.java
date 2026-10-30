@@ -543,6 +543,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 */
 	/** Tests only: while set, the apply thread waits for it before each group. */
 	volatile java.util.concurrent.@Nullable CountDownLatch applyGateForTesting;
+	private final java.util.concurrent.CountDownLatch closed = new java.util.concurrent.CountDownLatch(1);
 	/** Tests only: while set, applying a group throws it, as a failing apply would. */
 	volatile @Nullable RuntimeException applyFailureForTesting;
 
@@ -831,12 +832,21 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var session = leaderSession;
 		leaderSession = null;
 		var store = this.store;
-		if (store != null) {
-			if (session != null) {
-				session.close(store.db());
+		try {
+			if (store != null) {
+				if (session != null) {
+					session.close(store.db());
+				}
+				store.close();
 			}
-			store.close();
+			super.close();
+		} finally {
+			closed.countDown();
 		}
-		super.close();
+	}
+
+	/** Waits until {@link #close()} ended, on whichever thread Ratis runs it; returns false if it did not in time. */
+	boolean awaitClosed(java.time.Duration timeout) throws InterruptedException {
+		return closed.await(timeout.toNanos(), java.util.concurrent.TimeUnit.NANOSECONDS);
 	}
 }

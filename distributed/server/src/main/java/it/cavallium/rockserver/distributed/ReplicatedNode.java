@@ -7,6 +7,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -43,6 +44,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	private static final Logger LOG = LoggerFactory.getLogger(ReplicatedNode.class);
 	private static final long LEADERSHIP_TRANSFER_TIMEOUT_MS = 5_000;
 	private static final long MAINTENANCE_INTERVAL_MS = 200;
+	private static final Duration DATABASE_CLOSE_TIMEOUT = Duration.ofMinutes(1);
 
 	private final NodeConfig config;
 	private final RaftGroup group;
@@ -479,12 +481,28 @@ public final class ReplicatedNode implements AutoCloseable {
 				.toList();
 		try {
 			failure = closeAll(order);
+			awaitDatabaseClosed();
 		} finally {
 			stopped.complete(cause);
 		}
 		LOG.info("{}: stopped", config.nodeId());
 		if (failure != null) {
 			throw failure;
+		}
+	}
+
+	/**
+	 * If Ratis closed by itself the database can still be closing on one of its threads, and closing Raft again does not
+	 * wait for that. A JVM that exits meanwhile does not end: its exit runs the destructors of RocksDB, which wait for
+	 * background threads that wait for the JVM to detach them.
+	 */
+	private void awaitDatabaseClosed() {
+		try {
+			if (!stateMachine.awaitClosed(DATABASE_CLOSE_TIMEOUT)) {
+				LOG.error("{}: the database did not close within {}", config.nodeId(), DATABASE_CLOSE_TIMEOUT);
+			}
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
 		}
 	}
 

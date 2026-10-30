@@ -571,7 +571,9 @@ against an incomplete history.
   port refuses connections, and a closed division still reports its last leader, which it can no longer follow. So
   the maintenance loop of `ReplicatedNode` watches the division, and a node whose Raft closed while it was running
   stops like a failed replica: it exits with code 3, with `Raft closed` in its error, so that a supervisor restarts it.
-  Its clients then move at once, and it comes back from its disk like any restart. The limit stays at Ratis' 60 s, set
+  It waits for the database first, which Ratis closes on a thread of its own: a JVM that exits during that close does
+  not end, because the destructors of RocksDB join background threads that wait for the JVM to detach them (seen in a
+  thread dump, in about 1 run in 10). Its clients then move at once, and it comes back from its disk like any restart. The limit stays at Ratis' 60 s, set
   by `--jvm-pause-limit-ms`: a pause that long comes from a machine in trouble (swap, a stuck disk, a stopped VM), and
   a restart is the recovery path that every test covers. Raft stays safe through any pause, so a higher limit is safe
   too: it trades that restart for a node that resumes by itself. Without a supervisor the node stays down until an
