@@ -70,6 +70,11 @@ class PartitionTest {
 
 	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);
 	private static final Duration WAIT_TIMEOUT = Duration.ofSeconds(30);
+	/**
+	 * Clients here have one address, and the cut-off node stops listening: they come back with gRPC's reconnect delay,
+	 * which grew during the fault. It took 22 s in a test run, on a delay that keeps growing if an attempt is missed.
+	 */
+	private static final Duration SERVED_AGAIN_TIMEOUT = Duration.ofSeconds(60);
 	private static final Duration POLL_INTERVAL = Duration.ofMillis(20);
 	/**
 	 * Nodes give up on a request after 3 seconds, well within a fault: the test also covers nodes whose Raft client
@@ -449,7 +454,7 @@ class PartitionTest {
 		 * {@code from}; returns when the last of them completed.
 		 */
 		long awaitServedByEveryNode(long from) {
-			await(WAIT_TIMEOUT, () -> "every node acknowledges a write and a read again\n" + progress(from),
+			await(SERVED_AGAIN_TIMEOUT, () -> "every node acknowledges a write and a read again\n" + progress(from),
 					() -> clients.keySet().stream().allMatch(id -> Stream.of(Operation.Kind.values())
 							.allMatch(kind -> firstAcknowledged(id, kind, from).isPresent())));
 			return clients.keySet().stream()
