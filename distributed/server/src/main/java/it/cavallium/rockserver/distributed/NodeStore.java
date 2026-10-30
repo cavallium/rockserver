@@ -246,8 +246,7 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * Writes a consistent checkpoint of the live database to {@code target} (must not exist): memtables are
-	 * flushed and SST files hard-linked. The caller guarantees that no entry is being applied concurrently. Returns
-	 * the applied position contained in the checkpoint.
+	 * flushed and SST files hard-linked. Returns the applied position contained in the checkpoint.
 	 *
 	 * <p>RocksDB's own {@code Checkpoint} refuses databases whose SST files live in column volumes
 	 * ({@code cf_paths}, which the default Rockserver config uses), so the checkpoint is built from the public
@@ -257,25 +256,11 @@ final class NodeStore implements Closeable {
 	 * still needs after the flush are copied. It is built in {@code <target>.tmp}, fsynced and renamed into
 	 * place.</p>
 	 *
-	 * <p>The applied position is read before the live files are listed: without concurrent applies it equals the
-	 * checkpoint's own marker, and if that guarantee were broken it could only be lower (Raft then re-sends
-	 * entries that are skipped), never higher.</p>
-	 */
-	/**
-	 * Held by writes that go through the WAL (schema changes and the like, see {@code Applier}) and by
-	 * {@link #checkpoint}: a checkpoint lists the flushed files and copies the WAL, which a logged write in between
-	 * could make disagree. Snapshots are taken while the apply is idle, so this only guards other callers.
-	 */
-	private final java.util.concurrent.locks.ReentrantLock loggedWrites = new java.util.concurrent.locks.ReentrantLock();
-
-	java.util.concurrent.locks.ReentrantLock loggedWrites() {
-		return loggedWrites;
-	}
-
-	/**
-	 * Copies a consistent point of the database to {@code target} and returns its applied position. If writes go on
-	 * meanwhile, the copy holds a later point, whose own applied position (in its meta column, written atomically
-	 * with the data) is the one that counts when it is opened; the returned position is never ahead of the copy.
+	 * <p>The caller guarantees that no entry is applied while this runs: {@code takeSnapshot} calls it on Ratis'
+	 * updater thread, which is the thread that queues entries for the apply, after draining the apply queue. The
+	 * applied position is read before the live files are listed, so it equals the checkpoint's own marker. An entry
+	 * applied meanwhile would break this: the copy could hold a later point than the returned position, and a write
+	 * that goes through the WAL could make the file list and the WAL copy disagree.</p>
 	 */
 	TermIndex checkpoint(Path target) throws IOException {
 		target = target.toAbsolutePath();
@@ -287,7 +272,6 @@ final class NodeStore implements Closeable {
 		Files.createDirectories(building);
 		TermIndex applied = applied();
 		RocksDB rocksDB = db().getDb().get();
-		loggedWrites.lock();
 		try {
 			rocksDB.disableFileDeletions();
 			try {
@@ -297,8 +281,6 @@ final class NodeStore implements Closeable {
 			}
 		} catch (org.rocksdb.RocksDBException e) {
 			throw new IOException("Failed to checkpoint " + dbDir + " into " + target, e);
-		} finally {
-			loggedWrites.unlock();
 		}
 		syncTree(building);
 		Files.move(building, target);
