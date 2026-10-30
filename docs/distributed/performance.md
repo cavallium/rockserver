@@ -112,6 +112,11 @@ with 11–18 s write latency. In order of discovery:
     whose queues cost 2.6–8.6 ms per request on average at 2–4×, and up to 1.4 s. Those requests were admitted
     by `GrpcServer` already: they now run on a virtual thread of their own, straight on the database. Ranges
     and multi-key reads keep the scheduler. Local time 0.8–1.4 ms; `UPDATE` p99 at 2× from 876 to 232 ms.
+12. **One commit per entry.** Each entry paid its own local transaction: open, commit (0.12 ms) and the floor
+    and position writes. Entries are now handed to an apply thread of the state machine's own, which applies
+    whatever queued up meanwhile, up to 256 entries, in one transaction, with a savepoint per entry for
+    rejections; Ratis' thread only decodes and queues them, and a third thread completes the replies. Groups
+    hold about 15 entries at 4×: 29.2k → 38.9k operations/s with 2048 writes in flight.
 
 ## Results
 

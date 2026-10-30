@@ -118,6 +118,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/** Entries waiting for the apply thread, in log order; see {@link #applyTransaction}. */
 	private final LinkedBlockingQueue<Applying> applyQueue = new LinkedBlockingQueue<>();
 	private final Thread applyThread;
+	/**
+	 * Runs what follows the commit of each group, in log order: replies (Ratis replies to clients and advances its
+	 * applied index inline when a future completes), leader bookkeeping and the applied index, so that the apply
+	 * thread can go on with the next group meanwhile.
+	 */
+	private final java.util.concurrent.ExecutorService completer;
 	/** At most this many entries, and about this many bytes of entries, are applied in one local transaction. */
 	private static final int MAX_GROUP_ENTRIES = 256;
 	private static final long MAX_GROUP_BYTES = 16L << 20;
@@ -161,6 +167,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 		});
 		metrics.gauge("heapUsedMiB", () -> (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) >> 20);
 		this.applyGroupEntries = metrics.amount("apply.groupEntries");
+		this.completer = java.util.concurrent.Executors.newSingleThreadExecutor(
+				Thread.ofPlatform().name(config.nodeId() + "-applied").daemon().factory());
 		this.applyThread = Thread.ofPlatform().name(config.nodeId() + "-apply").daemon().unstarted(this::applyLoop);
 		applyThread.start();
 	}
@@ -412,7 +420,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 					return;
 				}
 				case Drain drain -> {
-					drain.done().complete(null);
+					// After the completions of everything before it.
+					completer.execute(() -> drain.done().complete(null));
 					continue;
 				}
 				default -> {
@@ -435,8 +444,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	}
 
 	/**
-	 * Applies {@code group} in one local transaction, then, in log order, makes each entry count as applied and
-	 * completes its reply. A failure stops the replica: no entry of the group, nor any queued after it, is answered.
+	 * Applies {@code group} in one local transaction, then has {@link #completer} make each entry count as applied
+	 * and complete its reply, in log order. A failure stops the replica: no entry of the group, nor any queued after it, is answered.
 	 */
 	private void applyGroup(List<Applying> group) {
 		if (failed) {
@@ -474,9 +483,11 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 		applyTime.since(start);
 		applyGroupEntries.record(group.size());
-		for (var completion : completions) {
-			completion.run();
-		}
+		completer.execute(() -> {
+			for (var completion : completions) {
+				completion.run();
+			}
+		});
 	}
 
 	/** Applies one entry into the group; returns what to do once the group is committed. */
@@ -631,6 +642,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 		applyQueue.add(new Stop());
 		try {
 			applyThread.join();
+			completer.shutdown();
+			completer.awaitTermination(1, java.util.concurrent.TimeUnit.MINUTES);
 		} catch (InterruptedException ex) {
 			Thread.currentThread().interrupt();
 		}

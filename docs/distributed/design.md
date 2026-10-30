@@ -139,8 +139,9 @@ and the `LogEntry`.
 
 **Apply.** Every replica applies entries in log order, through the `EmbeddedDB` API, on an apply thread of
 its own. `applyTransaction` decodes the entry on the Ratis thread, queues it and returns a future; the apply
-thread takes everything queued (up to 256 entries or about 16 MiB) and applies it as one group. Ratis
-replies to a client, or counts an entry applied, only when its future completes, after the group commits,
+thread takes everything queued (up to 256 entries or about 16 MiB) and applies it as one group; a third
+thread then completes the group's futures, in log order. Ratis replies to a client, or counts an entry applied,
+only when its future completes, after the group commits,
 and it waits for these futures before it takes a snapshot; replacing the database with an installed snapshot,
 taking a snapshot and closing first wait until the apply thread is idle.
 
