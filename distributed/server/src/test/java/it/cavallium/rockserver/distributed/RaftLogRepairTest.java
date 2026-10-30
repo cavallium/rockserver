@@ -20,6 +20,7 @@ import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -44,11 +45,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
+import java.util.stream.IntStream;
+import java.util.stream.LongStream;
 import java.util.stream.Stream;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.proto.RaftProtos.LogEntryProto;
+import org.apache.ratis.proto.RaftProtos.MetadataProto;
 import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
 import org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto;
 import org.apache.ratis.protocol.ClientId;
@@ -142,7 +146,6 @@ class RaftLogRepairTest {
 
 		assertEquals(Outcome.OK, report.outcome(), report.lines().toString());
 		assertArrayEquals(before, Files.readAllBytes(open));
-		assertNoLockFile();
 	}
 
 	@Test
@@ -202,7 +205,6 @@ class RaftLogRepairTest {
 		assertTrue(text(report).contains("at offset " + start), text(report));
 		assertEquals(start, Files.size(open));
 		assertEquals(9, ratisEntries(open));
-		assertNoLockFile();
 		assertEquals(Outcome.OK, repair().outcome(), "a repaired log needs nothing more");
 	}
 
@@ -356,6 +358,71 @@ class RaftLogRepairTest {
 		assertRefused(open, "no sector of it");
 	}
 
+	/** The zeros after the last entry look like a lost sector of it, but its first fields still give its real size. */
+	@ParameterizedTest
+	@ValueSource(longs = {0, 9})
+	void sizeInflatedOverTheZerosIsRefused(long index) throws IOException {
+		var open = writeOpenSegment(0, index);
+		long start = entryStart(0, index);
+		assertEquals(2, CodedOutputStream.computeUInt32SizeNoTag(entry(index).getSerializedSize()));
+		assertEquals(0, entry(index).getSerializedSize() & (0x20 << (Byte.SIZE - 1)), "the flip must make the size larger");
+		flipBit(open, start + 1, 0x20);
+
+		assertRefused(open, "the fields at its start");
+	}
+
+	@Test
+	void sizeOfAMetadataEntryInflatedOverTheZerosIsRefused() throws IOException {
+		var entry = LogEntryProto.newBuilder()
+				.setTerm(1)
+				.setIndex(1)
+				.setMetadataEntry(MetadataProto.newBuilder().setCommitIndex(1))
+				.build();
+		var open = writeOpenSegmentEndingAt(SECTOR - 2, entry);
+		flipBit(open, SECTOR - 2 - entrySize(entry), 0x40);
+
+		assertRefused(open, "the fields at its start");
+	}
+
+	/** The fields that give the size of the proto, cut in the middle of the size of the body by a lost sector. */
+	@Test
+	void entryTornInsideTheFieldsAtItsStartIsDropped() throws IOException {
+		int fieldsBeforeBodySize = 7;
+		var entry = entry(1);
+		long start = SECTOR - fieldsBeforeBodySize - 1;
+		var open = writeOpenSegmentEndingAt(start + entrySize(entry), entry);
+		zero(open, SECTOR, start + entrySize(entry));
+
+		assertEquals(Outcome.REPAIRED, repair().outcome());
+		assertEquals(start, Files.size(open));
+	}
+
+	/** Only the end of the checksum is lost, which leaves the entry whole: the bytes of the checksum before it match. */
+	@ParameterizedTest
+	@ValueSource(ints = {1, 2, 3, 4})
+	void entryThatLostOnlyPartOfItsChecksumIsDropped(int lost) throws IOException {
+		var entry = entry(1);
+		long end = 2L * PAGE + lost;
+		var open = writeOpenSegmentEndingAt(end, entry);
+		zero(open, end - lost, end);
+
+		assertEquals(Outcome.REPAIRED, repair().outcome());
+		assertEquals(end - entrySize(entry), Files.size(open));
+	}
+
+	/** Zeros at the end of a checksum, in a sector of their own, do not excuse damage to the entry. */
+	@Test
+	void damagedEntryWhoseChecksumEndsInAZeroAloneInASectorIsRefused() throws IOException {
+		var entry = LongStream.range(1, 1 << 16).mapToObj(RaftLogRepairTest::entry)
+				.filter(candidate -> (crc32c(candidate) & 0xFF) == 0)
+				.findFirst().orElseThrow();
+		long end = 2L * PAGE + 1;
+		var open = writeOpenSegmentEndingAt(end, entry);
+		flipBit(open, end - entrySize(entry) + 100, 0x01);
+
+		assertRefused(open, "no sector of it");
+	}
+
 	/** A write of less than a sector is either on disk or not. */
 	@Test
 	void damagedEntryInsideOneSectorIsRefused() throws IOException {
@@ -382,7 +449,7 @@ class RaftLogRepairTest {
 
 	/**
 	 * Damage to the size of an entry makes it claim the next one, whole and valid, and the zeros after that, so that
-	 * only the bytes inside it show that this is no torn write.
+	 * only the bytes inside it show that this is no torn write, if the size of its body too agrees with that.
 	 */
 	@Test
 	void sizeInflatedOverAValidEntryIsRefused() throws IOException {
@@ -395,7 +462,10 @@ class RaftLogRepairTest {
 		assertTrue(start + entrySize(8) + inflation > next + entrySize(9), "the size must reach past the next entry");
 		flipBit(open, start + 1, 0x20);
 		assertThrows(IOException.class, () -> ratisEntries(open));
+		assertRefused(open, "the fields at its start");
 
+		int bodySizeSecondByte = 2 + 2 + 2 + 1 + 1;
+		flipBit(open, start + bodySizeSecondByte, 0x20);
 		assertRefused(open, "a frame with a valid checksum at offset " + next);
 	}
 
@@ -611,16 +681,16 @@ class RaftLogRepairTest {
 		assertTrue(Files.exists(lockFile), "someone else's lock file stays");
 	}
 
-	/** The lock file is removed under the lock, whatever the verdict, by the process that created it, and only then. */
+	/** As after a killed node, which Ratis accepts: deleting the file could leave two processes with a lock. */
 	@Test
-	void refusingALogLeavesNoLockFile() throws IOException {
+	void theLockFileIsNeverDeleted() throws IOException {
 		var open = writeOpenSegment(0, 9);
 		long start = entryStart(0, 8);
 		tear(open, start, start + entrySize(8));
 
 		assertRefused(open, "non-zero data");
 
-		assertNoLockFile();
+		assertTrue(Files.exists(current().resolveSibling("in_use.lock")));
 	}
 
 	@Test
@@ -1230,6 +1300,30 @@ class RaftLogRepairTest {
 			offset += entrySize(i);
 		}
 		return offset;
+	}
+
+	/** An open segment whose last entry ends at {@code end}, with one entry before it to fill the space. */
+	private Path writeOpenSegmentEndingAt(long end, LogEntryProto last) throws IOException {
+		long fill = end - SegmentedRaftLogFormat.getHeaderLength() - entrySize(last);
+		var filler = IntStream.rangeClosed(0, Math.toIntExact(fill)).mapToObj(payload -> entry(0, payload))
+				.filter(entry -> entrySize(entry) == fill)
+				.findFirst().orElseThrow();
+		var bytes = new ByteArrayOutputStream();
+		bytes.write(header());
+		bytes.write(framed(filler.toByteArray()));
+		bytes.write(framed(last.toByteArray()));
+		bytes.write(new byte[PREALLOCATED_BYTES]);
+		Files.createDirectories(current());
+		return Files.write(current().resolve("log_inprogress_0"), bytes.toByteArray());
+	}
+
+	private static long crc32c(LogEntryProto entry) {
+		try {
+			var framed = framed(entry.toByteArray());
+			return ByteBuffer.wrap(framed, framed.length - Integer.BYTES, Integer.BYTES).getInt();
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
 	}
 
 	/** The bytes of an entry as the output stream writes them, around a proto of any content. */

@@ -240,9 +240,10 @@ opened, before any entry is applied, and no other column is ever created locally
   `WARN_AND_RETURN` would drop the tail, but in Ratis 3.3.1 it also truncates closed segments, which can hold
   committed entries. Instead, `ReplicatedServerMain repair-log --data-dir DIR [--dry-run]`, run on the stopped
   node, truncates the open segment at the first invalid entry. It does so only if that entry looks like a torn
-  last write: every byte after the end it declares is zero; the end of the file cuts it, or one of its 512-byte
-  sectors (aligned in the file) is all zeros, since a torn write misses at least one whole sector and a complete
-  entry that fails its checksum is damaged media; and no frame with a valid checksum starts inside it. It checks
+  last write: every byte after the end it declares is zero; the size it declares agrees with the first fields of
+  its proto, unless a lost sector took those; the end of the file cuts it, or one of its 512-byte sectors (aligned
+  in the file) is all zeros, since a torn write misses at least one whole sector and a complete entry that fails
+  its checksum is damaged media; and no frame with a valid checksum starts inside it. It checks
   every closed segment and that each segment starts right after the one before it, before it changes anything. It
   refuses and changes nothing (exit code 1) otherwise: replace such a node, or see "No quorum" under Membership
   if no leader is left to do that.
@@ -250,8 +251,7 @@ opened, before any entry is applied, and no other column is ever created locally
   The repair's safety rests on one assumption, which the bytes cannot prove and which its output states: the
   dropped entry was never fsynced, so this node never acknowledged it. The repair removes this node's copy from
   whatever quorum counted it. If the storage lost an entry it had reported as synced, or damage passed the checks
-  (a payload that holds a zero sector, or the size of the last entry inflated over the zeros after it), a committed
-  entry has one copy less. With three nodes it can be left on the leader alone, and if that leader then fails, or
+  (a damaged entry whose payload holds a zero sector), a committed entry has one copy less. With three nodes it can be left on the leader alone, and if that leader then fails, or
   loses its memory of the acknowledgement in the same power cut, the other two can elect a leader without it: an
   acknowledged write is gone, with no error. A repaired node stuck behind a leader that remembers its match index
   shows this fault, but only while that leader lives, so a node that catches up proves nothing. Without the repair

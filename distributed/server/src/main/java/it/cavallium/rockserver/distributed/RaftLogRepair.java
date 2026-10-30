@@ -5,11 +5,11 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.OverlappingFileLockException;
-import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.regex.Pattern;
@@ -20,6 +20,7 @@ import org.apache.ratis.server.raftlog.segmented.LogSegmentPath;
 import org.apache.ratis.server.raftlog.segmented.SegmentedRaftLogFormat;
 import org.apache.ratis.thirdparty.com.google.protobuf.CodedInputStream;
 import org.apache.ratis.thirdparty.com.google.protobuf.CodedOutputStream;
+import org.apache.ratis.thirdparty.com.google.protobuf.WireFormat;
 import org.apache.ratis.util.PureJavaCrc32C;
 import org.jetbrains.annotations.Nullable;
 
@@ -50,11 +51,13 @@ import org.jetbrains.annotations.Nullable;
  * so that it looks like a torn last write followed by preallocated zeros:</p>
  * <ul>
  *   <li>every byte after the place where that entry says it ends is zero;</li>
+ *   <li>its size agrees with the first fields of its proto, unless a lost sector took those: a torn write does not
+ *       change a size, damage can, and then the zeros after the entry would pass for a lost sector;</li>
  *   <li>the end of the file cuts it, or one of its sectors ({@value #SECTOR_BYTES} bytes, aligned to the offset in the
  *       file) is all zeros. Ratis' {@code BufferedWriteChannel} flushes only between whole entries and a device loses
  *       whole sectors, so a torn entry misses at least one. A complete entry that fails its checksum is damaged
- *       media. This tells the two apart unless the payload itself holds a sector of zeros, or damage inflated the size
- *       of the last entry over the zeros after it;</li>
+ *       media. This tells the two apart unless the payload itself holds a sector of zeros. A zero sector with nothing
+ *       but checksum bytes in it leaves the proto whole, so the checksum bytes before it must match the proto;</li>
  *   <li>no frame with a valid checksum starts within the bytes it claims: a size inflated by corruption would hide
  *       whole entries behind it.</li>
  * </ul>
@@ -181,33 +184,17 @@ final class RaftLogRepair {
 		if (dryRun && !Files.exists(lockFile)) {
 			return inspect(currentDir, true, lines);
 		}
-		boolean createdLockFile = createIfMissing(lockFile);
-		try (var lockChannel = FileChannel.open(lockFile, StandardOpenOption.WRITE)) {
+		// The file stays, as a killed node leaves it, which Ratis accepts. If it were deleted here, a node that had opened
+		// it meanwhile would hold a lock on a file without a name, and a second process could lock a new one.
+		try (var lockChannel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
 			try (var lock = lockChannel.tryLock()) {
 				if (lock == null) {
 					return nodeRunning(lockFile, lines);
 				}
-				try {
-					return inspect(currentDir, dryRun, lines);
-				} finally {
-					// While holding the lock: a node that opened this file meanwhile fails to get it.
-					if (createdLockFile) {
-						Files.deleteIfExists(lockFile);
-					}
-				}
+				return inspect(currentDir, dryRun, lines);
 			} catch (OverlappingFileLockException e) {
 				return nodeRunning(lockFile, lines);
 			}
-		}
-	}
-
-	/** Atomic, so that a lock file created by a node that is just starting is never taken for this process' own. */
-	private static boolean createIfMissing(Path file) throws IOException {
-		try {
-			Files.createFile(file);
-			return true;
-		} catch (FileAlreadyExistsException e) {
-			return false;
 		}
 	}
 
@@ -340,6 +327,10 @@ final class RaftLogRepair {
 		if (nonZero >= 0) {
 			return "non-zero data at offset " + (end + nonZero) + ", after the end of the invalid entry";
 		}
+		var sizeDamage = sizeDamage(invalid, bytes);
+		if (sizeDamage != null) {
+			return sizeDamage;
+		}
 		if (!invalid.cut() && !hasZeroSector(invalid, bytes)) {
 			return "the entry is complete on disk and damaged: the file does not cut it and no sector of it is all zeros, "
 					+ "while a torn write misses at least one";
@@ -349,18 +340,84 @@ final class RaftLogRepair {
 	}
 
 	/**
+	 * Why the size of the entry cannot be right, null if nothing shows that. A proto is its term, its index unless that
+	 * is 0, and one body, whose own size ends the first bytes of the entry: if those are there, they give the size of
+	 * the proto, with no need for its checksum.
+	 */
+	private static @Nullable String sizeDamage(InvalidEntry invalid, byte[] bytes) {
+		int offset = (int) invalid.offset();
+		var in = CodedInputStream.newInstance(bytes, offset, bytes.length - offset);
+		try {
+			int size = in.readUInt32();
+			int protoStart = in.getTotalBytesRead();
+			if (WireFormat.getTagFieldNumber(in.readTag()) != LogEntryProto.TERM_FIELD_NUMBER) {
+				return null;
+			}
+			in.readUInt64();
+			int tag = in.readTag();
+			if (WireFormat.getTagFieldNumber(tag) == LogEntryProto.INDEX_FIELD_NUMBER) {
+				in.readUInt64();
+				tag = in.readTag();
+			}
+			if (!isEntryBody(tag)) {
+				return null;
+			}
+			long bodySize = Integer.toUnsignedLong(in.readUInt32());
+			int read = in.getTotalBytesRead();
+			long fieldsSize = read - protoStart + bodySize;
+			// The zeros of a lost sector read as a valid end of a varint, so such fields say nothing.
+			return fieldsSize == size || touchesZeroSector(bytes, offset, read) ? null
+					: "its size " + size + " disagrees with the " + fieldsSize + " bytes that the fields at its start add up "
+					+ "to, which a torn write cannot do";
+		} catch (IOException e) {
+			return null;
+		}
+	}
+
+	private static boolean isEntryBody(int tag) {
+		return WireFormat.getTagWireType(tag) == WireFormat.WIRETYPE_LENGTH_DELIMITED
+				&& switch (WireFormat.getTagFieldNumber(tag)) {
+					case LogEntryProto.STATEMACHINELOGENTRY_FIELD_NUMBER, LogEntryProto.CONFIGURATIONENTRY_FIELD_NUMBER,
+							LogEntryProto.METADATAENTRY_FIELD_NUMBER -> true;
+					default -> false;
+				};
+	}
+
+	private static boolean touchesZeroSector(byte[] bytes, int offset, int length) {
+		int lastSector = (offset + length - 1) / SECTOR_BYTES;
+		for (int sector = offset / SECTOR_BYTES + 1; sector <= lastSector; sector++) {
+			int start = sector * SECTOR_BYTES;
+			if (SegmentedRaftLogFormat.indexOfNonTerminator(bytes, start, Math.min(SECTOR_BYTES, bytes.length - start)) < 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * Whether a sector that holds bytes of the entry is all zeros. The one it starts in holds its first byte, which is
 	 * not zero. The last one can go past the end of the entry, where everything is known to be zero already.
 	 */
 	private static boolean hasZeroSector(InvalidEntry invalid, byte[] bytes) {
 		long firstSector = (invalid.offset() / SECTOR_BYTES + 1) * SECTOR_BYTES;
+		long checksumStart = invalid.end() - CHECKSUM_BYTES;
 		for (long sector = firstSector; sector < invalid.end(); sector += SECTOR_BYTES) {
 			int length = (int) Math.min(SECTOR_BYTES, bytes.length - sector);
 			if (SegmentedRaftLogFormat.indexOfNonTerminator(bytes, (int) sector, length) < 0) {
-				return true;
+				return sector < checksumStart || checksumBeforeMatches(invalid, bytes, (int) sector);
 			}
 		}
 		return false;
+	}
+
+	/** Whether the bytes of the stored checksum before {@code end} match the proto, as they do if only the rest is lost. */
+	private static boolean checksumBeforeMatches(InvalidEntry invalid, byte[] bytes, int end) {
+		int offset = (int) invalid.offset();
+		int checksumStart = (int) invalid.end() - CHECKSUM_BYTES;
+		var checksum = new PureJavaCrc32C();
+		checksum.update(bytes, offset, checksumStart - offset);
+		var computed = ByteBuffer.allocate(CHECKSUM_BYTES).putInt((int) checksum.getValue()).array();
+		return Arrays.equals(bytes, checksumStart, end, computed, 0, end - checksumStart);
 	}
 
 	/** Where the first entry with a valid checksum starts inside the invalid entry, -1 if none does. */
