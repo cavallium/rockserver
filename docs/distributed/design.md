@@ -353,7 +353,8 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
     for that only while transactions collide with them. In `HotKeyThroughputTest`, in-process, with one client
     running transactions on the key in a tight loop beside 32 update clients: 106 commits/s with the flag off, 0.2
     without the pause, 31 with it; updates of the key 690/s off, 13400/s without the pause, 1690/s with it. Beside
-    4 update clients, 66 off, 13 without the pause, 30 with it. Those are ratios from one run on a busy machine.
+    4 update clients, 66 off, 13 without the pause, 30 with it. These come from two runs on a busy machine (the run
+    without the pause had 135 and 133 commits/s off): read them as orders of magnitude.
 - **Staged writes** happen natively. The leader also records them, with their conflict keys: the written keys
   plus the `getForUpdate` keys. It counts the encoded size of the commit entry as they arrive. A write or
   `getForUpdate` that would take it past the 16 MiB entry limit fails at once with `INVALID_REQUEST` and is not
