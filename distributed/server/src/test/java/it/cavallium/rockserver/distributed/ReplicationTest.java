@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -355,6 +356,28 @@ class ReplicationTest {
 
 		api.closeFailedUpdate(holder.updateId());
 		// The key is free at once: neither gone caller opened an update that nobody can close.
+		var next = leader.connection().getAsyncApi(RequestContext.latency(Duration.ofSeconds(3)))
+				.getAsync(0, column, key(1), RequestType.forUpdate())
+				.get(5, TimeUnit.SECONDS);
+		api.closeFailedUpdate(next.updateId());
+	}
+
+	@Test
+	void anUpdateCancelledWhileItOpensDoesNotKeepTheKey() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = api(leader);
+		long column = api.createColumn("c", SCHEMA);
+		var async = leader.connection().getAsyncApi(CONTEXT);
+		// Cancelled at varying points of the open: some land after the update registered, before its id is returned.
+		for (int i = 0; i < 300; i++) {
+			var update = async.getAsync(0, column, key(1), RequestType.forUpdate());
+			LockSupport.parkNanos((i % 100) * 100_000L);
+			if (!update.cancel(true)) {
+				api.closeFailedUpdate(update.get(5, TimeUnit.SECONDS).updateId());
+			}
+		}
+		// The key is free well before the update lease ends: every cancelled update was closed.
 		var next = leader.connection().getAsyncApi(RequestContext.latency(Duration.ofSeconds(3)))
 				.getAsync(0, column, key(1), RequestType.forUpdate())
 				.get(5, TimeUnit.SECONDS);

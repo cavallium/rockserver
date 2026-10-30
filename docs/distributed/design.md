@@ -228,7 +228,9 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
   expires after its 10 s lease; a waiter gives up after 12 s, or at its caller's deadline, with `UPDATE_RETRY`).
   It then reads what the previous one committed, instead of every concurrent update of a hot key reading the
   same value and all but one conflicting. An update whose caller is gone (its deadline passed, or it cancelled)
-  when it gets the key releases the key at once, without opening the native update. While an update waits, the
+  when it gets the key releases the key at once, without opening the native update. If the caller cancels after
+  the update opened but before the id reached it, the leader closes the update and releases the key at once
+  instead of holding it for the lease. While an update waits, the
   leader expires abandoned updates every 100 ms, so the waiter gets the key at the end of the lease even when no
   other request comes.
 - **Staged writes** happen natively. The leader also records them, with their conflict keys: the written keys
@@ -334,7 +336,7 @@ address, so a test can partition any set of links.
 
 | Test | What it proves |
 |---|---|
-| `ReplicationTest` (in-process) | Replication through any node; results; leader loss; snapshot catch-up; batches; transactions, conflicts and updates; updates whose caller timed out or cancelled while queued do not take the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
+| `ReplicationTest` (in-process) | Replication through any node; results; leader loss; snapshot catch-up; batches; transactions, conflicts and updates; updates whose caller timed out or cancelled while queued, or cancelled while the update opened, do not keep the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; crash consistency of applies without the WAL. |
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); history kept for open transactions and in-flight commits. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Failover takes about 1 s. |

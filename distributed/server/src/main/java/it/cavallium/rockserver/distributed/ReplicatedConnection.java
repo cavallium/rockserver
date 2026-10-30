@@ -674,8 +674,10 @@ final class ReplicatedConnection implements RocksDBConnection {
 					updateOpenTime.since(start);
 					if (error != null) {
 						result.completeExceptionally(unwrap(error));
-					} else {
-						result.complete(value);
+					} else if (!result.complete(value)) {
+						// The caller cancelled after the update registered: nobody learns its id, so close it here
+						// instead of keeping the key locked for the whole lease.
+						closeAbandonedUpdate(session, ((UpdateContext<?>) value).updateId());
 					}
 				});
 		// A queued update whose caller cancelled leaves the queue.
@@ -888,6 +890,15 @@ final class ReplicatedConnection implements RocksDBConnection {
 		}
 		session.expireIfDue();
 		return session;
+	}
+
+	/** Closes an update that registered in {@code session} but whose caller is gone: releases its key and rolls it back. */
+	private void closeAbandonedUpdate(LeaderSession session, long updateId) {
+		var transaction = session.get(updateId);
+		if (transaction != null) {
+			session.remove(transaction);
+		}
+		rollBackNativeQuietly(updateId, true);
 	}
 
 	private void rollBackNativeQuietly(long id, boolean update) {
