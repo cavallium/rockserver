@@ -241,6 +241,8 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
 - **Open.** `openTransaction` and `getForUpdate` wait for the read barrier, then open a native transaction or
   update on the leader's `EmbeddedDB`. That gives the same snapshot and read-your-writes behavior as on one
   node. A `getForUpdate` starts the barrier when it arrives, so the barrier runs while it waits for its key.
+  The caller's timeout counts from the request's arrival, barrier included: a transaction that finishes opening
+  after its caller's deadline is rolled back at once instead of being held for its lease.
 - **Single-key updates queue.** A `getForUpdate` without a transaction first waits for the earlier updates of
   the same key (a FIFO lock per key hash, held until the update's commit is applied or the update is closed or
   expires after its 10 s lease; a waiter gives up after 12 s, or at its caller's deadline, with `UPDATE_RETRY`).
@@ -340,7 +342,10 @@ against an incomplete history.
 - **Maintenance.** `flush` and `compact` act only on the node that receives them.
 - **Workload limits.** The replicated server's `GrpcServer` runs requests on virtual threads of their own (at
   most 16384 waiting on the leader), not through each column's workload scheduler. Streamed mutations run at
-  most 256 at once.
+  most 256 at once. On the leader, point reads, staged writes and transaction opens run on a pool of four
+  platform threads per core, with at most 4096 waiting (more get `SERVER_OVERLOADED`, and one that waited past
+  its deadline fails without running); rollbacks, ranges and multi-key reads use the embedded workload
+  scheduler.
 - **Updates of one key run one at a time** on the leader. Nested or crossed updates of the same keys by one
   client block (up to 12 s) instead of conflicting at once.
 - **After a kill** (not a graceful stop), a replica's database files are an older consistent point until it

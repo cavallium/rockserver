@@ -115,6 +115,18 @@ public final class EmbeddedConnection extends BaseConnection implements Internal
 	public <R, RS, RA> RS requestInline(RequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		return delegate.requestInline(BoundRequestContext.bind(context), request);
 	}
+
+	/**
+	 * As {@link #requestInline(RequestContext, RocksDBAPICommand)}, with {@code context}'s timeout counted from
+	 * {@code startedNanos} ({@link System#nanoTime()}) instead of from now: a caller that hands the command to
+	 * another thread passes the time it did so, and a command that waited past its deadline fails with
+	 * {@code READ_DEADLINE_EXCEEDED} instead of running.
+	 */
+	public <R, RS, RA> RS requestInline(RequestContext context,
+			long startedNanos,
+			RocksDBAPICommand<R, RS, RA> request) {
+		return delegate.requestInline(BoundRequestContext.bindAt(context, startedNanos), request);
+	}
 }
 
 /** Package-private raw implementation behind {@link EmbeddedConnection}. */

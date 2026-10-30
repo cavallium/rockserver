@@ -110,8 +110,13 @@ with 11–18 s write latency. In order of discovery:
 11. **The embedded scheduler on the leader's reads.** The leader's local reads (a get, the read of an update, a
     transactional put, opening and closing native transactions) went through the embedded workload scheduler,
     whose queues cost 2.6–8.6 ms per request on average at 2–4×, and up to 1.4 s. Those requests were admitted
-    by `GrpcServer` already: they now run on a virtual thread of their own, straight on the database. Ranges
-    and multi-key reads keep the scheduler. Local time 0.8–1.4 ms; `UPDATE` p99 at 2× from 876 to 232 ms.
+    by `GrpcServer` already: they now run straight on the database. Ranges, multi-key reads and rollbacks keep
+    the scheduler (rollbacks its control pool). Local time 0.8–1.4 ms; `UPDATE` p99 at 2× from 876 to 232 ms.
+    They first ran on virtual threads, but a RocksDB call pins its carrier, which the proposals, the read
+    barrier and the gRPC proxy also need; they now run on a pool of four platform threads per core. In two
+    back-to-back pairs at 2–4× (512 in flight, leader on the same disk), the leader's read barrier went from
+    0.5–2.4 ms to 0.2–0.6 ms on average and `GET` p99 from 46–134 ms to 12–15 ms; throughput stayed within
+    the noise (21–23k operations/s either way).
 12. **One commit per entry.** Each entry paid its own local transaction: open, commit (0.12 ms) and the floor
     and position writes. Entries are now handed to an apply thread of the state machine's own, which applies
     whatever queued up meanwhile, up to 256 entries, in one transaction, with a savepoint per entry for
