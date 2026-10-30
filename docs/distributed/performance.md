@@ -131,7 +131,48 @@ with 11–18 s write latency. In order of discovery:
 
 ## Results
 
-<!-- RESULTS -->
+Suite `s2` (commit `cdca0b2`), 2026-10-30, on the PC described above, with other workloads on it at times;
+the rows marked * come from later runs that include the last changes (`cd8904b`). Open loop, 30 s steps
+after 10 s of warmup, 512 reads and 512 writes in flight unless noted, four client connections. Latencies are
+from the planned start of each operation, so a client queue shows up as latency. `UPDATE` is the whole
+`get(forUpdate)` plus commit.
+
+| Setup | Load | Served ops/s | `UPDATE` p50 / p99 | `GET` p50 / p99 |
+|---|---|---|---|---|
+| Single node | 1× | 10.6k | 0.19 / 2.8 ms | 0.15 / 2.9 ms |
+| Single node | 2× | 21.2k | 0.21 / 37 ms | 0.14 / 4.0 ms |
+| Single node | 4× | 42.5k | 0.33 / 127 ms | 0.21 / 24 ms |
+| Single node | 8× | 54.6k (saturated) | queued | 2.6 / 19 ms |
+| Replicated, leader | 1× | 10.6k | 4.4 / 19 ms | 0.28 / 1.8 ms |
+| Replicated, leader | 2× | 21.2k | 11.9 / 105 ms (9.1 / 28 ms*) | 0.33 / 5.4 ms |
+| Replicated, leader | 4× | 24.7k (512 writes in flight) | queued | 1.1 / 8.8 ms |
+| Replicated, leader, 2048 in flight | 4× | 37.4k (38.6k*) | queued | 1.8 / 21 ms |
+| Replicated, leader, 2048 in flight | 8× | 36.7k | queued | 2.7 / 19 ms |
+| Replicated, one connection* | 1× | 10.6k | 5.9 / 20 ms | 0.27 / 2.9 ms |
+| Replicated, one connection* | 2× | 21.2k | 13.3 / 167 ms | 0.45 / 5.8 ms |
+| Replicated, one connection* | 3× | 24.2k (512 writes in flight) | queued | 1.9 / 12 ms |
+| Replicated, all nodes, 2 connections each | 2× | 24.5k (draining a backlog) | 1.7 s / 6.1 s | 1.4 / 8.0 ms |
+| Replicated on tmpfs (no fsync cost) | 1× | 10.6k | 2.1 / 8.3 ms | |
+
+Where a replicated write's time goes at 2× (leader metrics): the commit round trip (append, replication, the
+fsync of the Raft log on the leader and one follower, the apply) is 10–16 ms on these consumer SSDs, which
+write 80–100 MiB/s each meanwhile; on tmpfs it is about 2 ms. The read barrier costs 0.3–0.7 ms and the local
+read of an update about 1 ms. Throughput is then in-flight writes divided by that latency: with 512 writes in
+flight the cluster serves about 2.3× today's production mean, with 2048 about 3.5×, and the apply thread
+(about 70% busy at 38k operations/s) is the next limit. Routing through followers adds a hop to each call
+and the commit's forwarding, so with 512 writes in flight it saturates near 2×: clients should talk to the
+leader, or have more writes in flight.
+
+Before this work (commit `7493365`, suite `s1`), the replicated cluster had a p99 of 129 ms at 1× and 405 ms
+at 2×, and served 33.2k operations/s at 4× with 2048 in flight; before batching, about 1k operations/s.
+
+Other results:
+
+- **Failover.** With clients spread over all nodes at 2×, a leader killed with SIGKILL leaves about 3 s with
+  no successful operation, then the new leader serves. The errors that remain are the dead node's share of
+  the client connections (the benchmark's client does not fail over between addresses).
+- **Bandwidth.** Sixteen clients writing 1 MiB `putMulti` calls: 183 MiB/s on one node, 103 MiB/s
+  replicated, where each device writes 280–390 MiB/s (Raft log, flushes and compactions).
 
 ## Deployment notes
 
@@ -139,11 +180,14 @@ with 11–18 s write latency. In order of discovery:
   without power-loss protection take 1–3 ms per fdatasync when idle and 10–30 ms when RocksDB compaction writes
   heavily to the same disk. Prefer SSDs with power-loss protection, or a separate disk for the Raft log
   (`data/raft`) and the database (`data/db`).
-- **Client concurrency.** Throughput is in-flight requests divided by latency. A replicated write takes a few
-  milliseconds instead of a fraction of one, so Yotsuba's 256 writes in flight cap it near 2–3× today's mean.
-  Raise `maxConcurrentWriteRequests` (and the read limit) for the cluster; 2048 still keeps latency in the tens
-  of milliseconds.
+- **Client concurrency.** Throughput is in-flight requests divided by latency. A replicated write takes
+  5–15 ms instead of a fraction of one, so Yotsuba's 256 writes in flight cap it near 2× today's mean (512
+  reach about 2.3×, 2048 about 3.5×). Raise `maxConcurrentWriteRequests` (and the read limit) for the cluster.
+- **Talk to the leader.** A client connected to a follower has every update forwarded (its open and its
+  commit), one more hop each. One connection is enough: its calls no longer share one event loop thread.
 - **Client failover.** Until Yotsuba's client fails over between node addresses, a dead node takes its share of
   requests with it (a third, when clients are spread over three nodes).
-- **Snapshots.** One every 500k entries (`--snapshot-every`). A snapshot flushes the memtables and stops the
-  apply for about 200 ms; the Raft log keeps up to twice the interval.
+- **Snapshots.** One every 500k entries (`--snapshot-every`), about every 100 s at 2×. A snapshot flushes the
+  memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.
+- **Memory.** In a 10-minute run at 2× the leader's heap stayed between 1.3 and 2.8 GiB (4 GiB heap); at most
+  256 MiB of committed entries wait for the apply thread.
