@@ -337,6 +337,8 @@ final class Proposer implements Closeable {
 			var batch = new ArrayList<Pending>();
 			long now = System.nanoTime();
 			int bytes = 0;
+			// The smallest copyBatchLimit of the copies taken: each was marked by a reply that could carry that many.
+			int copyLimit = Integer.MAX_VALUE;
 			while (!queue.isEmpty()) {
 				var next = queue.peekFirst();
 				if (next.result.isDone()) {
@@ -351,13 +353,16 @@ final class Proposer implements Closeable {
 				}
 				if (!batch.isEmpty() && (next.alone() || batch.getFirst().alone()
 						|| next.resentAlone != batch.getFirst().resentAlone || next.epoch != batch.getFirst().epoch
-						|| (next.resentAlone && batch.size() >= batch.getFirst().copyBatchLimit)
+						|| (next.resentAlone && batch.size() >= Math.min(copyLimit, next.copyBatchLimit))
 						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES)) {
 					break;
 				}
 				queue.pollFirst();
 				batch.add(next);
 				bytes += next.body.length + Long.BYTES;
+				if (next.resentAlone) {
+					copyLimit = Math.min(copyLimit, next.copyBatchLimit);
+				}
 				if (next.alone()) {
 					break;
 				}

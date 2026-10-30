@@ -37,9 +37,6 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -97,11 +94,9 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private final NodeMetrics.Series forwardTime;
 	private final NodeMetrics.Series lockWaitTime;
 	private final NodeMetrics.Series localTime;
-	/** Threads that run short local commands; see {@link #local}. */
-	private static final int INLINE_THREADS = 4 * Runtime.getRuntime().availableProcessors();
-	/** Short local commands that may wait for a thread; more get {@code SERVER_OVERLOADED}. */
-	private static final int INLINE_QUEUE = 4096;
-	private static final ThreadPoolExecutor INLINE = inlineExecutor();
+	/** Runs short local commands, each on a virtual thread of its own; see {@link #local}. */
+	private static final java.util.concurrent.ExecutorService INLINE = java.util.concurrent.Executors
+			.newThreadPerTaskExecutor(Thread.ofVirtual().name("replicated-local-", 0).factory());
 
 	ReplicatedConnection(NodeConfig config,
 			RockserverStateMachine stateMachine,
@@ -494,25 +489,20 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	/**
 	 * Runs a command on the local database. Point reads, staged writes and the opening of native transactions run
-	 * on a pool of platform threads of their own ({@link #INLINE}), straight on the database: the requests were
-	 * admitted already ({@code GrpcServer}'s proxy scheduler), and the embedded workload scheduler's queues cost
-	 * milliseconds per request under load. Platform threads, because a RocksDB call pins a virtual thread to its
-	 * carrier, and the carriers also run the proposals, the read barrier and the gRPC proxy. The command's timeout
-	 * counts from here: one that waited for a thread past its deadline fails instead of running. Longer commands
-	 * (ranges, multi-key reads) and rollbacks keep the workload scheduler: its admission and fairness, and for
-	 * rollbacks the control pool, which data requests cannot fill.
+	 * each on a virtual thread of its own ({@link #INLINE}), straight on the database: the requests were admitted
+	 * already ({@code GrpcServer}'s proxy scheduler), and the embedded workload scheduler's queues cost
+	 * milliseconds per request under load. (A pool of 4 platform threads per core, tried instead to keep RocksDB
+	 * calls off the virtual threads' carriers, stalled for seconds once slow disk reads blocked all its threads.)
+	 * The command's timeout counts from here: one that waited past its deadline fails instead of running. Longer
+	 * commands (ranges, multi-key reads) and rollbacks keep the workload scheduler: its admission and fairness, and
+	 * for rollbacks the control pool, which data requests cannot fill.
 	 */
 	private CompletableFuture<?> local(RequestContext context, RocksDBAPICommandSingle<?> command) {
 		long start = System.nanoTime();
 		var connection = stateMachine.store().connection();
 		CompletableFuture<?> result;
 		if (isShort(command)) {
-			try {
-				result = CompletableFuture.supplyAsync(() -> connection.requestInline(context, start, command), INLINE);
-			} catch (RejectedExecutionException ex) {
-				return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
-						"Too many local commands waiting"));
-			}
+			result = CompletableFuture.supplyAsync(() -> connection.requestInline(context, start, command), INLINE);
 		} else {
 			result = (CompletableFuture<?>) connection.getAsyncApi(context).requestAsync(command);
 		}
@@ -528,13 +518,6 @@ final class ReplicatedConnection implements RocksDBConnection {
 		};
 	}
 
-	private static ThreadPoolExecutor inlineExecutor() {
-		var executor = new ThreadPoolExecutor(INLINE_THREADS, INLINE_THREADS, 30, TimeUnit.SECONDS,
-				new LinkedBlockingQueue<>(INLINE_QUEUE),
-				Thread.ofPlatform().name("replicated-local-", 0).daemon().factory());
-		executor.allowCoreThreadTimeOut(true);
-		return executor;
-	}
 
 	@SuppressWarnings("unchecked")
 	private Flux<Object> localStream(RequestContext context, RocksDBAPICommandStream<?> command) {

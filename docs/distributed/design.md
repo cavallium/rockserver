@@ -344,10 +344,9 @@ against an incomplete history.
 - **Maintenance.** `flush` and `compact` act only on the node that receives them.
 - **Workload limits.** The replicated server's `GrpcServer` runs requests on virtual threads of their own (at
   most 16384 waiting on the leader), not through each column's workload scheduler. Streamed mutations run at
-  most 256 at once. On the leader, point reads, staged writes and transaction opens run on a pool of four
-  platform threads per core, with at most 4096 waiting (more get `SERVER_OVERLOADED`, and one that waited past
-  its deadline fails without running); rollbacks, ranges and multi-key reads use the embedded workload
-  scheduler.
+  most 256 at once. On the leader, point reads, staged writes and transaction opens run each on a virtual
+  thread of their own (one that waited past its deadline fails without running); rollbacks, ranges and
+  multi-key reads use the embedded workload scheduler.
 - **Updates of one key run one at a time** on the leader. Nested or crossed updates of the same keys by one
   client block (up to 12 s) instead of conflicting at once.
 - **After a kill** (not a graceful stop), a replica's database files are an older consistent point until it
