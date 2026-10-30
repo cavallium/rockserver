@@ -339,37 +339,46 @@ final class ReplicatedConnection implements RocksDBConnection {
 				return (CompletableFuture<Object>) single(context, command);
 			}
 			long start = System.nanoTime();
-			return forwarder.api(leader, stateMachine, context)
-					.thenCompose(api -> (CompletableFuture<Object>) api.requestAsync(command))
-					.whenComplete((_, _) -> forwardTime.since(start))
-					.exceptionallyCompose(error -> {
-						var cause = unwrap(error);
-						boolean unreachable = isUnreachable(cause);
-						if (unreachable) {
-							forwarder.invalidate(leader);
-						}
-						if (!(unreachable || cause instanceof RocksDBRetryException) || !isReplayable(command)) {
-							return CompletableFuture.failedFuture(unreachable ? unreachableFailure(command, cause) : cause);
-						}
-						if (System.nanoTime() - deadlineNanos > 0) {
-							return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
-									"No leader could serve the request in time: " + cause));
-						}
-						return CompletableFuture.supplyAsync(() -> null,
-										CompletableFuture.delayedExecutor(FORWARD_RETRY_MS, TimeUnit.MILLISECONDS))
-								.thenCompose(_ -> (CompletableFuture<Object>) forward(context, command, deadlineNanos));
-					});
+			return forwarder.target(leader, stateMachine).thenCompose(target -> {
+				var call = (CompletableFuture<Object>) target.connection().getAsyncApi(context).requestAsync(command);
+				if (isCleanup(command)) {
+					// Rollbacks carry no deadline of their own: bound them, so a frozen leader cannot hold them.
+					call = call.orTimeout(config.requestTimeout().toNanos(), TimeUnit.NANOSECONDS);
+				}
+				return call.whenComplete((_, error) -> {
+					forwardTime.since(start);
+					if (error != null && isTransportFailure(unwrap(error))) {
+						forwarder.invalidate(target);
+					}
+				});
+			}).exceptionallyCompose(error -> {
+				var cause = unwrap(error);
+				boolean notSent = cause instanceof LeaderForwarder.NotConnectedException;
+				boolean lost = !notSent && isTransportFailure(cause);
+				if (!(notSent || lost || cause instanceof RocksDBRetryException) || (!isReplayable(command) && !notSent)) {
+					return CompletableFuture.failedFuture(lost ? unreachableFailure(command, cause) : cause);
+				}
+				if (System.nanoTime() - deadlineNanos > 0) {
+					// A retry signal from the leader (or a request never sent) is still the right answer.
+					return CompletableFuture.failedFuture(lost ? RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+							"No leader could serve the request in time: " + cause) : cause);
+				}
+				return CompletableFuture.supplyAsync(() -> null,
+								CompletableFuture.delayedExecutor(FORWARD_RETRY_MS, TimeUnit.MILLISECONDS))
+						.thenCompose(_ -> (CompletableFuture<Object>) forward(context, command, deadlineNanos));
+			});
 		});
 	}
 
-	/** The leader could not be reached: its process is gone or the connection broke. */
-	private static boolean isUnreachable(Throwable cause) {
-		if (cause instanceof RocksDBException rocks) {
-			// Raised by LeaderForwarder when it cannot connect.
-			return rocks.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED
-					&& String.valueOf(rocks.getMessage()).contains("Cannot reach the API of leader");
-		}
-		return io.grpc.Status.fromThrowable(cause).getCode() == io.grpc.Status.Code.UNAVAILABLE;
+	/** The call reached the leader, or may have, and its connection then failed or the call timed out. */
+	private static boolean isTransportFailure(Throwable cause) {
+		return cause instanceof TimeoutException
+				|| io.grpc.Status.fromThrowable(cause).getCode() == io.grpc.Status.Code.UNAVAILABLE;
+	}
+
+	/** Rollbacks, sent without a deadline. */
+	private static boolean isCleanup(RocksDBAPICommandSingle<?> command) {
+		return command instanceof CloseFailedUpdate || (command instanceof CloseTransaction c && !c.commit());
 	}
 
 	/**
@@ -418,8 +427,9 @@ final class ReplicatedConnection implements RocksDBConnection {
 				}
 				return Flux.from(stream(context, command));
 			}
-			return Mono.fromFuture(forwarder.api(leader, stateMachine, context))
-					.flatMapMany(api -> Flux.from((Publisher<Object>) api.requestAsync(command)));
+			return Mono.fromFuture(forwarder.target(leader, stateMachine))
+					.flatMapMany(target -> Flux.from((Publisher<Object>) target.connection().getAsyncApi(context)
+							.requestAsync(command)));
 		});
 	}
 

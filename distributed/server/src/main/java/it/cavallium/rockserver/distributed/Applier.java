@@ -133,7 +133,8 @@ final class Applier {
 	 * Deletes a column so that running the deletion again at the same position gives the result of the first run. A
 	 * crash between the deletion (written to the MANIFEST at once) and its record (written to the WAL after it) makes
 	 * the entry run again, and the column is then gone already: whether it existed is decided before the first run
-	 * and kept, synced, until the record is written ({@link NodeStore#DELETION}).
+	 * and kept, synced ({@link NodeStore#DELETION}). The marker is never deleted: it names its log index, and the
+	 * next deletion overwrites it; one left behind is never read again, since no later entry has its index.
 	 */
 	private ApplyResult deleteColumn(LogEntry entry, TermIndex position) {
 		var db = store.db();
@@ -156,12 +157,27 @@ final class Applier {
 			syncWal();
 		}
 		var outcome = applyLogical(() -> execute(0L, entry));
-		db.delete(0L, store.metaColumnId(), markerKey, RequestType.none());
 		if (!existed) {
 			// Not found, now as on the first run.
 			return outcome;
 		}
 		return entry instanceof LogEntry.DeleteColumnIfExists ? new ApplyResult.Ok(true) : ApplyResult.OK_NULL;
+	}
+
+	/** The id of the column a {@code CreateColumn} names, if it exists with the same schema; null otherwise. */
+	private @Nullable Long existingColumn(LogEntry entry) {
+		if (!(entry instanceof LogEntry.CreateColumn create) || NodeStore.META_COLUMN.equals(create.name())) {
+			return null;
+		}
+		var schema = store.db().getAllColumnDefinitions().get(create.name());
+		if (schema == null || !schema.equals(create.schema())) {
+			return null;
+		}
+		try {
+			return store.db().getColumnId(create.name());
+		} catch (RocksDBException ex) {
+			return null;
+		}
 	}
 
 	private boolean columnExists(long columnId) {
@@ -181,7 +197,7 @@ final class Applier {
 	/** True for entries that may share a log entry, and a local transaction, with others. */
 	static boolean isBatchable(LogEntry entry) {
 		return (entry instanceof LogEntry.Write && !(entry instanceof LogEntry.DeleteRange))
-				|| entry instanceof LogEntry.Guarded;
+				|| entry instanceof LogEntry.Guarded || entry instanceof LogEntry.VerifyColumn;
 	}
 
 	private ApplyResult applyAlone(Request request, TermIndex position) {
@@ -195,18 +211,27 @@ final class Applier {
 			inApplyTransaction(position, tx -> markApplied(tx, position));
 			return requireRecorded(request);
 		}
+		var entry = request.entry();
+		var existingId = existingColumn(entry);
+		if (existingId != null) {
+			// Creating a column that exists with the same schema changes nothing: it needs no flush nor fsync.
+			ApplyResult outcome = new ApplyResult.Ok(existingId);
+			inApplyTransaction(position, tx -> finish(tx, request, floor, outcome, position, true));
+			committed(request.proposerId(), records, List.of(request), request.completedBelow());
+			return outcome;
+		}
 		// Schema changes write the RocksDB MANIFEST synchronously, while their schema rows, record and position go to
 		// the WAL. Make everything before them durable first (the data writes applied without the WAL included) and
 		// everything after them durable at once, so a crash cannot keep one without the other.
 		makeDurable();
-		var entry = request.entry();
 		ApplyResult outcome;
 		if (entry instanceof LogEntry.DeleteColumn || entry instanceof LogEntry.DeleteColumnIfExists) {
 			outcome = deleteColumn(entry, position);
 		} else {
 			outcome = applyLogical(() -> execute(0L, entry));
 		}
-		finish(0L, request, floor, outcome, position, true);
+		// Record, floor, record deletions and position in one logged write: all or none of them survive a crash.
+		inLoggedTransaction(position, tx -> finish(tx, request, floor, outcome, position, true));
 		syncWal();
 		committed(request.proposerId(), records, List.of(request), request.completedBelow());
 		return outcome;
@@ -382,8 +407,18 @@ final class Applier {
 
 	/** Runs {@code writes} in an apply transaction ({@link #beginApply}) and commits it. */
 	private void inApplyTransaction(TermIndex position, TransactionWrites writes) {
+		inTransaction(position, writes, true);
+	}
+
+	/** Like {@link #inApplyTransaction}, through the WAL: only after {@link #makeDurable}. */
+	private void inLoggedTransaction(TermIndex position, TransactionWrites writes) {
+		inTransaction(position, writes, false);
+	}
+
+	private void inTransaction(TermIndex position, TransactionWrites writes, boolean unlogged) {
 		var db = store.db();
-		long tx = beginApply();
+		long tx = unlogged ? beginApply()
+				: db.openUnloggedTransaction(APPLY_TRANSACTION_TIMEOUT_MS, WorkloadProfile.BATCH, false);
 		boolean open = true;
 		try {
 			writes.write(tx);

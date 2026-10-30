@@ -53,7 +53,7 @@ public final class ReplicatedServerMain {
 				options.value("--group-id", NodeConfig.DEFAULT_GROUP_ID),
 				Duration.ofMillis(Long.parseLong(options.value("--election-timeout-ms", "1000:2000").split(":")[0])),
 				Duration.ofMillis(Long.parseLong(options.value("--election-timeout-ms", "1000:2000").split(":")[1])),
-				Long.parseLong(options.value("--snapshot-every", "100000")),
+				Long.parseLong(options.value("--snapshot-every", String.valueOf(NodeConfig.DEFAULT_SNAPSHOT_EVERY_ENTRIES))),
 				Duration.ofMillis(Long.parseLong(options.value("--request-timeout-ms", "10000"))));
 		options.requireConsumed();
 		ReplicatedNode node;

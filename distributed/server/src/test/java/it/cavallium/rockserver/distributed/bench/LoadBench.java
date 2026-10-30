@@ -327,7 +327,7 @@ public final class LoadBench {
 			var map = new LinkedHashMap<Kind, RocksDBAsyncAPI>();
 			for (var kind : Kind.values()) {
 				map.put(kind, switch (kind) {
-					case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI -> ingest;
+					case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, BULK_PUT -> ingest;
 					case GET, EXISTS_MULTI -> latency;
 					case FIRST_LAST, RANGE_PAGE -> analytical;
 					case MONITOR_TX -> batch;
@@ -340,7 +340,7 @@ public final class LoadBench {
 
 	private static boolean isWrite(Kind kind) {
 		return switch (kind) {
-			case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, MONITOR_TX -> true;
+			case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, MONITOR_TX, BULK_PUT -> true;
 			case GET, EXISTS_MULTI, FIRST_LAST, RANGE_PAGE -> false;
 		};
 	}
@@ -350,7 +350,8 @@ public final class LoadBench {
 		var only = option("--only", "");
 		if (!only.isBlank()) {
 			var keep = List.of(only.split(","));
-			mix.replaceAll((kind, rate) -> keep.contains(kind.name()) ? rate : 0.0);
+			// A kind outside the production mix (rate 0) gets a nominal rate of 100/s at scale 1.
+			mix.replaceAll((kind, rate) -> keep.contains(kind.name()) ? (rate > 0 ? rate : 100.0) : 0.0);
 		}
 		return mix;
 	}

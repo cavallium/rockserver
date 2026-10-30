@@ -114,6 +114,7 @@ import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 import reactor.util.context.ContextView;
 
 public class GrpcServer extends Server {
@@ -148,6 +149,12 @@ public class GrpcServer extends Server {
 	private final io.grpc.Server server;
 	private final RWScheduler scheduler;
 	private final boolean ownsScheduler;
+	/**
+	 * For a non-embedded connection: every request waits on that connection for a whole round trip and its admission
+	 * happens there, so each runs on a virtual thread of its own, at most {@link #PROXY_PARALLELISM} at once, without
+	 * this server's workload queues. Null for an embedded database.
+	 */
+	private final reactor.core.scheduler.@Nullable Scheduler proxyScheduler;
 	private final @Nullable EmbeddedDB embeddedDatabase;
 	private final MeterRegistry metricsRegistry;
 	private final GrpcGetStrategy grpcGetStrategy;
@@ -322,8 +329,10 @@ public class GrpcServer extends Server {
 		private final AtomicLong suppressed = new AtomicLong();
 	}
 
-	/** Requests of each kind that may wait on a non-embedded connection at once. */
-	private static final int PROXY_PARALLELISM = 4096;
+	/** Requests that may wait on a non-embedded connection at once; more are refused as overload. */
+	private static final int PROXY_PARALLELISM = 16384;
+	/** Streaming requests (iterators) of each kind that may wait on a non-embedded connection at once. */
+	private static final int PROXY_STREAM_PARALLELISM = 256;
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
@@ -332,12 +341,15 @@ public class GrpcServer extends Server {
 			this.scheduler = internalConnection.getScheduler();
 			this.ownsScheduler = false;
 			this.embeddedDatabase = internalConnection.getEmbeddedDB();
+			this.proxyScheduler = null;
 		} else {
 			// Every request waits on the other connection (a remote or replicated database) for a whole round trip:
-			// with one platform thread per core, the round trip latency would cap the throughput.
-			this.scheduler = RWScheduler.withVirtualWorkers(WorkloadSettings.proxy(PROXY_PARALLELISM), "grpc-db");
+			// with one platform thread per core, the round trip latency would cap the throughput. The workload
+			// scheduler only serves the rare streaming paths; requests use the proxy scheduler.
+			this.scheduler = RWScheduler.withVirtualWorkers(WorkloadSettings.proxy(PROXY_STREAM_PARALLELISM), "grpc-db");
 			this.ownsScheduler = true;
 			this.embeddedDatabase = null;
+			this.proxyScheduler = new ProxyScheduler(PROXY_PARALLELISM);
 		}
 		this.metricsRegistry = embeddedDatabase != null
 				? embeddedDatabase.getMetricsRegistry()
@@ -536,7 +548,7 @@ public class GrpcServer extends Server {
 				if (isCancelled()) {
 					return;
 				}
-				var task = commandWorkloadScheduler(command).scheduler(profile, command.operationFamily(),
+				var task = workloadScheduler(commandWorkloadScheduler(command), profile, command.operationFamily(),
 						context.localMonotonicDeadlineNanos()).schedule(this);
 				scheduled = task;
 				if (isCancelled()) {
@@ -821,7 +833,7 @@ public class GrpcServer extends Server {
 							RequestType.current());
 					var profile = grpc.preAdmit(requestContext, OperationFamily.POINT_LOOKUP, command);
 					estimatedBytes = command.estimatedBytes();
-					scheduled = commandWorkloadScheduler(command).scheduler(profile,
+					scheduled = workloadScheduler(commandWorkloadScheduler(command), profile,
 							command.operationFamily(),
 							requestContext.localMonotonicDeadlineNanos())
 							.schedule(this);
@@ -1168,6 +1180,23 @@ public class GrpcServer extends Server {
 	}
 
 
+	/**
+	 * The scheduler of one task of {@code profile} and {@code family}: the proxy scheduler when this server forwards
+	 * every request to a non-embedded connection (see {@link #proxyScheduler}), otherwise a view of {@code rw}.
+	 */
+	private reactor.core.scheduler.Scheduler workloadScheduler(RWScheduler rw,
+			WorkloadProfile profile,
+			OperationFamily family,
+			long localMonotonicDeadlineNanos) {
+		var proxy = proxyScheduler;
+		// Rollbacks, closeFailedUpdate and maintenance keep the scheduler's isolated pools: they must run even when
+		// data requests fill the proxy's permits.
+		if (proxy != null && profile != WorkloadProfile.CONTROL && profile != WorkloadProfile.PHYSICAL_MAINTENANCE) {
+			return proxy;
+		}
+		return rw.scheduler(profile, family, localMonotonicDeadlineNanos);
+	}
+
 	private RWScheduler columnWorkloadScheduler(long columnId) {
 		return embeddedDatabase == null ? scheduler : embeddedDatabase.getSchedulerForColumn(columnId);
 	}
@@ -1343,7 +1372,7 @@ public class GrpcServer extends Server {
 		private reactor.core.scheduler.Scheduler contextualScheduler(
 				ResolvedRequestContext context,
 				OperationFamily family, long columnId) {
-			return columnWorkloadScheduler(columnId).scheduler(context.profile(),
+			return workloadScheduler(columnWorkloadScheduler(columnId), context.profile(),
 					family,
 					context.localMonotonicDeadlineNanos());
 		}
@@ -1448,7 +1477,7 @@ public class GrpcServer extends Server {
 							var rolledBack = protectedApi().closeTransaction(request.getTransactionId(), false);
 							return CloseTransactionResponse.newBuilder().setSuccessful(rolledBack).build();
 						},
-						scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL,
+						workloadScheduler(scheduler, WorkloadProfile.CONTROL, OperationFamily.CONTROL,
 								Long.MAX_VALUE));
 			}).transform(this.onErrorMapMonoWithRequestInfo("closeTransaction", request));
 		}
@@ -1459,7 +1488,7 @@ public class GrpcServer extends Server {
 			return executeMustComplete("closeFailedUpdate", () -> {
 				protectedApi().closeFailedUpdate(request.getUpdateId());
 				return Empty.getDefaultInstance();
-			}, scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
+			}, workloadScheduler(scheduler, WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("closeFailedUpdate", request));
 		}
 
@@ -2474,7 +2503,7 @@ public class GrpcServer extends Server {
 				if (request.getTransactionOrUpdateId() == 0L) {
 					protectedApi().closeFailedUpdate(response.getUpdateId());
 				}
-			}, scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
+			}, workloadScheduler(scheduler, WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("getForUpdate", request));
 		}
 
@@ -2504,7 +2533,7 @@ public class GrpcServer extends Server {
 			}, response -> {
 				long iteratorId = response.getIteratorId();
 				protectedApi().closeIterator(iteratorId);
-			}, scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
+			}, workloadScheduler(scheduler, WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("openIterator", request));
 		}
 
@@ -2514,7 +2543,7 @@ public class GrpcServer extends Server {
 			return executeMustComplete("closeIterator", () -> {
 					protectedApi().closeIterator(request.getIteratorId());
 					return Empty.getDefaultInstance();
-				}, scheduler.scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
+				}, workloadScheduler(scheduler, WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("closeIterator", request));
 		}
 
@@ -2776,7 +2805,7 @@ public class GrpcServer extends Server {
 			return executeScheduled(() -> {
 				if (request.getWalOnly()) protectedApi().flushWal(); else protectedApi().flush();
 				return Empty.getDefaultInstance();
-			}, scheduler.scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.FLUSH, Long.MAX_VALUE))
+			}, workloadScheduler(scheduler, WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.FLUSH, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("flush", request));
 		}
 
@@ -2818,7 +2847,7 @@ public class GrpcServer extends Server {
                             .setValidatedInputBytes(result.validatedInputBytes()).setOutputBytes(result.outputBytes())
                             .setElapsedNanos(result.elapsedNanos()).build();
                 },
-                        columnWorkloadScheduler(request.getColumnId()).scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE));
+                        workloadScheduler(columnWorkloadScheduler(request.getColumnId()), WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE));
             }).transform(this.onErrorMapMonoWithRequestInfo("compactFiles", request));
         }
 
@@ -2828,7 +2857,7 @@ public class GrpcServer extends Server {
 			return executeScheduled(() -> {
 				protectedApi().compact();
 				return Empty.getDefaultInstance();
-			}, scheduler.scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE))
+			}, workloadScheduler(scheduler, WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("compact", request));
 		}
 
@@ -2883,7 +2912,7 @@ public class GrpcServer extends Server {
 				var command = captureCommand(operation);
 					var profile = preAdmit(context, family, command);
 					return executeScheduled(() -> operation.apply(syncApi(context)),
-							commandWorkloadScheduler(command).scheduler(profile,
+							workloadScheduler(commandWorkloadScheduler(command), profile,
 									command.operationFamily(),
 									context.localMonotonicDeadlineNanos()),
 						command.estimatedBytes());
@@ -2901,7 +2930,7 @@ public class GrpcServer extends Server {
 				var command = captureCommand(operation);
 					var profile = preAdmit(context, family, command);
 					return executeScheduled(() -> operation.apply(syncApi(context)),
-							commandWorkloadScheduler(command).scheduler(profile,
+							workloadScheduler(commandWorkloadScheduler(command), profile,
 									command.operationFamily(),
 									context.localMonotonicDeadlineNanos()),
 						lateSuccessCleanup,
@@ -4428,6 +4457,9 @@ public class GrpcServer extends Server {
 			LOG.warn("Grpc server event loop shutdown interrupted; continuing to wait", e);
 			elg.terminationFuture().syncUninterruptibly();
 		}
+		if (proxyScheduler != null) {
+			proxyScheduler.dispose();
+		}
 		if (ownsScheduler && protectedDrain.drained()) {
 			try {
 				scheduler.disposeGracefully().timeout(schedulerShutdownTimeout).onErrorResume(ex -> {
@@ -4516,6 +4548,81 @@ public class GrpcServer extends Server {
 		} catch (NumberFormatException ex) {
 			LOG.warn("Invalid duration in milliseconds for system property {}: {}", name, value);
 			return defaultValue;
+		}
+	}
+
+	/**
+	 * Runs each task on a virtual thread of its own, at most {@code limit} at once. Beyond that a task is refused
+	 * with a retryable {@code SERVER_OVERLOADED}: the caller maps it like any database error, instead of the generic
+	 * rejection (and the stack trace on the event loop) of Reactor's executor scheduler.
+	 */
+	private static final class ProxyScheduler implements reactor.core.scheduler.Scheduler {
+
+		private final java.util.concurrent.Semaphore permits;
+		private final java.util.concurrent.ThreadFactory threads = Thread.ofVirtual().name("grpc-proxy-", 0).factory();
+		/** For Reactor operators that need a worker; requests themselves go through {@link #schedule}. */
+		private final reactor.core.scheduler.Scheduler workers = Schedulers.fromExecutor(
+				command -> threads.newThread(command).start());
+
+		ProxyScheduler(int limit) {
+			this.permits = new java.util.concurrent.Semaphore(limit);
+		}
+
+		@Override
+		public reactor.core.Disposable schedule(Runnable task) {
+			if (!permits.tryAcquire()) {
+				throw RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "Too many requests in flight");
+			}
+			var scheduled = new ProxyTask(task);
+			try {
+				threads.newThread(scheduled).start();
+			} catch (RuntimeException | Error e) {
+				permits.release();
+				throw e;
+			}
+			return scheduled;
+		}
+
+		@Override
+		public Worker createWorker() {
+			return workers.createWorker();
+		}
+
+		@Override
+		public void dispose() {
+			workers.dispose();
+		}
+
+		/** A task that does not run if it is disposed before it starts. */
+		private final class ProxyTask implements Runnable, reactor.core.Disposable {
+
+			private final Runnable task;
+			private final java.util.concurrent.atomic.AtomicBoolean claimed = new java.util.concurrent.atomic.AtomicBoolean();
+
+			ProxyTask(Runnable task) {
+				this.task = task;
+			}
+
+			@Override
+			public void run() {
+				try {
+					if (claimed.compareAndSet(false, true)) {
+						task.run();
+					}
+				} finally {
+					permits.release();
+				}
+			}
+
+			@Override
+			public void dispose() {
+				claimed.compareAndSet(false, true);
+			}
+
+			@Override
+			public boolean isDisposed() {
+				return claimed.get();
+			}
 		}
 	}
 }

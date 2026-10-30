@@ -208,6 +208,16 @@ final class LeaderSession {
 		return waiter;
 	}
 
+	/** Open transactions and updates, for metrics. */
+	int openTransactions() {
+		return transactions.size();
+	}
+
+	/** Keys held by an update, for metrics. */
+	synchronized int lockedKeys() {
+		return keyQueues.size();
+	}
+
 	/** Releases {@code lock}, passing the key to the next waiting update that still waits. */
 	synchronized void unlockKey(KeyLock lock) {
 		if (!lock.released.compareAndSet(false, true)) {

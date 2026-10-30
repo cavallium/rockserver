@@ -19,7 +19,9 @@ import org.jetbrains.annotations.Nullable;
  * @param groupId Raft group id (a UUID) shared by the whole cluster
  * @param electionTimeoutMin minimum Raft election timeout
  * @param electionTimeoutMax maximum Raft election timeout
- * @param snapshotEveryEntries take a checkpoint snapshot after this many applied entries
+ * @param snapshotEveryEntries take a checkpoint snapshot after this many applied log entries (each holds a batch
+ *                             of requests); a snapshot flushes the memtables and briefly stops the apply, and
+ *                             the log is kept for up to twice this many entries
  * @param requestTimeout how long a node waits for a leader or a Raft reply before failing a request as retryable
  */
 public record NodeConfig(String nodeId,
@@ -35,6 +37,8 @@ public record NodeConfig(String nodeId,
 		Duration requestTimeout) {
 
 	public static final String DEFAULT_GROUP_ID = "5e3b8c1a-7a52-4b8e-9d2c-0c9f6a3d4e71";
+	/** One snapshot every minute or two at a few thousand entries per second. */
+	public static final long DEFAULT_SNAPSHOT_EVERY_ENTRIES = 500_000;
 
 	public NodeConfig {
 		Objects.requireNonNull(nodeId, "nodeId");
@@ -57,7 +61,7 @@ public record NodeConfig(String nodeId,
 
 	public static NodeConfig defaults(String nodeId, List<PeerConfig> peers, Path dataDir) {
 		return new NodeConfig(nodeId, peers, dataDir, null, null, null, DEFAULT_GROUP_ID,
-				Duration.ofMillis(1000), Duration.ofMillis(2000), 100_000, Duration.ofSeconds(10));
+				Duration.ofMillis(1000), Duration.ofMillis(2000), DEFAULT_SNAPSHOT_EVERY_ENTRIES, Duration.ofSeconds(10));
 	}
 
 	public PeerConfig self() {

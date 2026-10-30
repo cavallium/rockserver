@@ -94,6 +94,8 @@ final class Proposer implements Closeable {
 	private final ExecutorService sender = Executors.newThreadPerTaskExecutor(
 			Thread.ofVirtual().name("rockserver-propose-", 0).factory());
 	private final long requestTimeoutNanos;
+	/** How long one client attempt waits for its reply. */
+	private final long attemptTimeoutNanos;
 	private final NodeMetrics metrics;
 	private final Lane anyLeader;
 	private final Lane localCommits;
@@ -111,8 +113,11 @@ final class Proposer implements Closeable {
 		var attemptProperties = new RaftProperties(properties);
 		// Long enough that a slow but healthy commit is not resent: a resend is safe, but re-replicates the entry.
 		var attemptTimeout = config.electionTimeoutMax().multipliedBy(2);
-		RaftClientConfigKeys.Rpc.setRequestTimeout(attemptProperties,
-				RaftSettings.duration(attemptTimeout.compareTo(MIN_ATTEMPT_TIMEOUT) > 0 ? attemptTimeout : MIN_ATTEMPT_TIMEOUT));
+		if (attemptTimeout.compareTo(MIN_ATTEMPT_TIMEOUT) < 0) {
+			attemptTimeout = MIN_ATTEMPT_TIMEOUT;
+		}
+		this.attemptTimeoutNanos = attemptTimeout.toNanos();
+		RaftClientConfigKeys.Rpc.setRequestTimeout(attemptProperties, RaftSettings.duration(attemptTimeout));
 		// One Ratis call per attempt; the batch is resent until its deadline.
 		this.client = RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
@@ -322,13 +327,17 @@ final class Proposer implements Closeable {
 		private void send(List<Pending> batch) {
 			var sequences = new long[batch.size()];
 			var bodies = new ArrayList<byte[]>(batch.size());
-			long deadline = batch.getFirst().deadlineNanos;
+			long earliest = batch.getFirst().deadlineNanos;
+			long latest = earliest;
 			for (int i = 0; i < sequences.length; i++) {
 				sequences[i] = batch.get(i).sequence;
 				bodies.add(batch.get(i).body);
-				// The latest: the oldest member has at least MIN_TIME_LEFT_NANOS left (see take()), the newest a full timeout.
-				deadline = Math.max(deadline, batch.get(i).deadlineNanos);
+				earliest = Math.min(earliest, batch.get(i).deadlineNanos);
+				latest = Math.max(latest, batch.get(i).deadlineNanos);
 			}
+			// Resent until the newest member's deadline, but at most one attempt beyond the oldest one's: its caller
+			// should not wait twice its timeout. The oldest has MIN_TIME_LEFT_NANOS left at least (see take()).
+			long deadline = Math.min(latest, earliest + attemptTimeoutNanos);
 			var message = Message.valueOf(UnsafeByteOperations.unsafeWrap(
 					LogEntryCodec.encodeBatch(proposerId, completedBelow(), sequences, bodies)));
 			long now = System.nanoTime();
@@ -339,12 +348,17 @@ final class Proposer implements Closeable {
 			if (commits) {
 				sendCommits(batch, message, now);
 			} else {
-				attempt(batch, message, deadline, now);
+				attempt(batch, message, deadline, now, false);
 			}
 		}
 
-		/** One attempt at a batch of data writes, then resends until answered or {@code deadlineNanos}. */
-		private void attempt(List<Pending> batch, Message message, long deadlineNanos, long sentNanos) {
+		/**
+		 * One attempt at a batch of data writes, then resends until answered or {@code deadlineNanos}. Once an attempt
+		 * ended without telling whether the entry was appended ({@code ambiguous}), a later refusal no longer means
+		 * "not applied": the batch can only end with its results or an unknown outcome.
+		 */
+		private void attempt(List<Pending> batch, Message message, long deadlineNanos, long sentNanos,
+				boolean ambiguous) {
 			var reply = isLocalLeader() ? submitLocal(message, deadlineNanos)
 					: CompletableFuture.supplyAsync(() -> sendBlocking(message), sender);
 			reply.handleAsync((answer, error) -> {
@@ -360,9 +374,10 @@ final class Proposer implements Closeable {
 						long delay = refusal != null || cause instanceof LeaderNotReadyException
 								|| cause instanceof NotLeaderException || cause instanceof ResourceUnavailableException
 								? NOT_READY_RETRY_MS : ATTEMPT_SLEEP_MS;
+						boolean nowAmbiguous = ambiguous || (refusal == null && !isRefusedBeforeAppend(cause));
 						resends.record(1);
 						CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS, sender)
-								.execute(() -> attempt(batch, message, deadlineNanos, sentNanos));
+								.execute(() -> attempt(batch, message, deadlineNanos, sentNanos, nowAmbiguous));
 						return null;
 					}
 				} catch (Throwable unexpected) {
@@ -377,7 +392,10 @@ final class Proposer implements Closeable {
 					} else {
 						var refusal = error != null ? stateMachineException(error)
 								: !answer.isSuccess() ? (StateMachineException) answer.getException() : null;
-						if (refusal != null) {
+						if (refusal != null && ambiguous) {
+							// This copy was refused, but an earlier one may have been appended.
+							fail(batch, unavailable(refusal));
+						} else if (refusal != null) {
 							fail(batch, refusal(refusal));
 						} else if (error != null) {
 							fail(batch, unavailable(error));

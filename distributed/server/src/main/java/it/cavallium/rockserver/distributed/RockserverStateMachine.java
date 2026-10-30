@@ -123,6 +123,19 @@ final class RockserverStateMachine extends BaseStateMachine {
 		this.admitTime = metrics.duration("raft.admit");
 		this.commitWait = metrics.duration("raft.appendToApply");
 		this.snapshotTime = metrics.duration("snapshot");
+		metrics.gauge("leader.trackedKeys", () -> {
+			var session = leaderSession;
+			return session == null ? -1 : session.tracker().size();
+		});
+		metrics.gauge("leader.openTransactions", () -> {
+			var session = leaderSession;
+			return session == null ? -1 : session.openTransactions();
+		});
+		metrics.gauge("leader.lockedKeys", () -> {
+			var session = leaderSession;
+			return session == null ? -1 : session.lockedKeys();
+		});
+		metrics.gauge("heapUsedMiB", () -> (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) >> 20);
 	}
 
 	private final NodeMetrics.Series snapshotTime;

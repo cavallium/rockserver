@@ -2,7 +2,8 @@
 
 Status: implemented on `claude/distributed-rockserver-rewrite-e46da4`, never deployed. It replaces the Codex
 design; [review.md](review.md) explains why. Code: `distributed/server`, package
-`it.cavallium.rockserver.distributed`.
+`it.cavallium.rockserver.distributed`. Throughput work, measurements and the load benchmark:
+[performance.md](performance.md).
 
 ## Goal and non-goals
 
@@ -44,18 +45,27 @@ only as published. Each replica is an ordinary `EmbeddedDB` with the same column
 bucket hashing, workload scheduler and native JNI as a single node. Every node must run the same Rockserver
 config file.
 
-**What core needs from this module.** Nothing changed in core except
-`MergeOperatorRegistry.upload`, which was made atomic. Single-node behavior and the wire contract are
-unchanged, apart from the separate removal of CDC from Rockserver.
+**What this module needs from core.** Single-node behavior and the wire contract are unchanged, apart from the
+separate removal of CDC from Rockserver. The core additions are used only by replicas or by a server that
+forwards to a non-embedded connection:
+
+- `MergeOperatorRegistry.upload` is atomic, and validates the operator before writing anything.
+- `GrpcServer` runs requests to a non-embedded connection on virtual threads of their own (a proxy scheduler,
+  at most 16384 at once, beyond which requests get `SERVER_OVERLOADED`); rollbacks and maintenance keep the
+  workload scheduler's isolated pools (`RWScheduler.withVirtualWorkers`, `WorkloadSettings.proxy`).
+- `EmbeddedDB.openUnloggedTransaction` (a transaction without snapshot, optionally without the WAL) and the
+  `atomic-flush` global option (off by default; it turns pipelined writes off).
+- `GrpcConnection.forHostAndPortWithoutRetry`, for callers that retry on their own.
 
 | Class | Role |
 |---|---|
 | `ReplicatedNode` | Wiring and lifecycle: database, Raft server, API server, cluster initialization, graceful hand-off. |
 | `ReplicatedConnection` | Routes each `RocksDBAPICommand` (see below). |
-| `Proposer` | Submits numbered requests to the leader through a Ratis client. |
+| `Proposer` | Batches numbered requests into log entries and submits them to the leader: straight to the local Raft server on the leader, through a Ratis client elsewhere. |
 | `RockserverStateMachine` | Ratis state machine. Leader admission in `startTransaction`/`preAppendTransaction`, synchronous apply, snapshots. |
-| `Applier` | Applies one request to the local database, with its result record and applied position. |
-| `LeaderSession`, `ConflictTracker` | Transactions bound to the leader's term, and their conflict validation. |
+| `Applier` | Applies the requests of one log entry to the local database in one transaction without the WAL, with their result records and the applied position. |
+| `LeaderSession`, `ConflictTracker` | Transactions bound to the leader's term, per-key queues of single-key updates, and conflict validation. |
+| `NodeMetrics` | Timers and gauges of the replication path, logged every 10 s. |
 | `ReadBarrier`, `TermService` | Linearizable reads. |
 | `NodeStore`, `CheckpointStorage` | Local database, internal metadata, checkpoint snapshots, restore. |
 | `LeaderForwarder` | Finds the leader's API and forwards to it. |
@@ -73,8 +83,11 @@ unchanged, apart from the separate removal of CDC from Rockserver.
 | Leader-bound | `openTransaction`, `getForUpdate`, writes and reads with a transaction or update id, `closeTransaction`, `closeFailedUpdate`, iterator seek, next and close | Served by the leader of the current term. Forwarded to it from the other nodes. |
 | Local | `flush`, `compact`, `compactFiles`, `getSstMetadata`, `getTableProperties` | The node that received the request does it on its own database. |
 
-Forwarding uses the leader's ordinary Rockserver API through the core `GrpcConnection`. A node learns the API
-address of a member that joined later from that member's `TermService`. The internal column
+Forwarding uses the leader's ordinary Rockserver API through the core `GrpcConnection` (4 connections per
+peer, without gRPC's own retries; a port probe first, so a dead peer fails in milliseconds). When the leader
+cannot be reached, reads and transaction or update opens are sent again to whichever node leads then, until the
+request timeout; a request that was never sent can always be retried; a commit whose connection broke has an
+unknown outcome. A node learns the API address of a member that joined later from that member's `TermService`. The internal column
 `__rockserver_replication` is hidden from `getAllColumnDefinitions`, and every command that names it is
 rejected.
 
@@ -83,9 +96,16 @@ rejected.
 A proposal is a `Request`: a random proposer id (one per node process), a sequence number, `completedBelow`,
 and the `LogEntry`.
 
-- **Retries.** The Ratis client retries a proposal across leader changes until the request timeout, always
-  with the same number. Each attempt is an independent blocking call on a virtual thread. Ratis' ordered
-  async stream closes for good after one exhausted request, so it is not used.
+- **Batches.** Requests that arrive while 32 batches are in flight wait, then go together as one log entry
+  (`LogEntryCodec.encodeBatch`: the proposer id and `completedBelow` once, then each sequence and entry; up to
+  4096 requests or 8 MiB; schema changes, `deleteRange` and genesis always alone). One entry costs one Ratis
+  append, one place in a group fsync and one apply transaction, whatever it holds. Transaction commits have a
+  queue of their own, and commits of different leader terms never share an entry.
+- **Retries.** A batch is resent with the same bytes across leader changes until the latest deadline of its
+  requests (at most one attempt past the oldest one's). On the leader an attempt goes straight to the local Raft
+  server; elsewhere it is an independent blocking Ratis client call on a virtual thread. Ratis' ordered async
+  stream closes for good after one exhausted request, so it is not used. A batch whose attempt ended without
+  saying whether it was appended can only end with its results or an unknown outcome, never "not applied".
 - **Results are recorded.** Applying a request writes its encoded result under
   `(proposerId, sequence)` in the internal column, in the same local transaction as its effects. If a
   later copy of the same request reaches the log (a retry that went to a new leader, or to a restarted node
@@ -97,20 +117,27 @@ and the `LogEntry`.
   example an attempt that was still queued when the proposer gave up on it, is refused without being executed
   and without reading any record. Sequence numbers are allocated and registered atomically, so
   `completedBelow` never passes a request that is still in flight.
-- **Records are deleted.** Each time a floor crosses a multiple of 256, apply deletes the records below it. They
-  are never read again, so this cannot change any result.
+- **Records are deleted** as soon as the floor passes them, with point deletes in the same write as the entry.
+  They are never read again, so this cannot change any result.
+- **Duplicates are found in memory.** Each replica keeps, per proposer, its floor and the sequences recorded
+  at or above it, loaded from the internal column the first time the proposer is seen: checking a request for
+  an earlier copy costs no read.
 
 **Apply.** Every replica applies entries in log order on the Ratis apply thread, through the `EmbeddedDB`
 API.
 
-- **Data writes** (puts, deletes, merges, transaction commits) run in one short local transaction. That
-  transaction also writes the result record and the applied position, so a crash keeps either all three or
-  none.
-- **Schema changes and `deleteRange`** cannot run in a transaction. Their record and position are written right
-  after them. Schema changes are also wrapped in two WAL syncs, because RocksDB writes their column family
-  changes to the MANIFEST synchronously while their schema rows go to the (delayed) WAL: a crash cannot keep
-  one without the other. A crash between a `deleteColumn` and its record makes the replayed entry answer "not
-  found" on that replica only; the database contents still match.
+- **Data writes** (puts, deletes, merges, transaction commits) of one entry run in one local transaction
+  without the RocksDB WAL. It also writes their result records, the proposer's floor (deleting the records it
+  passed) and the applied position, so a crash keeps all of the entry or none of it. If one request is rejected
+  for a logical reason, the entry is applied again one request at a time, and only its last request records
+  the position.
+- **Schema changes and `deleteRange`** cannot run in a transaction. All memtables are flushed first, so that
+  everything applied without the WAL is on disk before a logged write follows it; their record and position
+  are then written in one logged transaction, and the WAL is synced, because RocksDB writes column family
+  changes to the MANIFEST synchronously: a crash cannot keep one without the other. A column deletion first
+  records, synced, whether the column existed, so that a crash before its record makes the replayed entry
+  give the same result as on the other replicas. Creating a column that exists with the same schema changes
+  nothing and is recorded without the flush.
 - **Return values** (previous value, delta, merged value...) are computed by apply, so they are the same on
   every replica.
 
@@ -130,10 +157,13 @@ opened, before any entry is applied, and no other column is ever created locally
 
 **Durability.**
 
-- **Raft log.** It is synced (`fsync`) on a majority before a write is acknowledged.
-- **RocksDB WAL.** It stays enabled but unsynced. Replicas open RocksDB with point-in-time WAL recovery
-  (`absolute-consistency` forced off): after a crash or power loss they recover a consistent prefix, and
-  Raft replays the rest.
+- **Raft log.** It is synced (`fsync`) on a majority before a write is acknowledged. It is the only log of
+  data writes: they are applied without the RocksDB WAL, which would only write everything a second time.
+- **RocksDB.** Replicas open it with `atomic-flush` (every column flushed together) and point-in-time WAL
+  recovery (`absolute-consistency` forced off). After a crash or power loss the database is the last flushed
+  state, a consistent point where the applied position matches the data, and Raft replays the rest: the log
+  is purged only up to a snapshot, and a snapshot flushes. So after a kill, a replica's files are behind until
+  it starts again; a graceful stop flushes.
 - **Restart.** Ratis feeds entries from the last snapshot onwards. Entries already applied are skipped, and
   their recorded results are returned.
 
@@ -149,7 +179,10 @@ leader can therefore serve stale reads. `ReadBarrier` does the check itself, wit
    voting peer for its current term, using `TermService` on the Ratis gRPC port. The read may proceed once
    a majority of the current configuration reports the leader's term, counting the leader itself. During a
    membership change, a majority of the previous configuration is needed too. A higher term fails the read.
-3. The read then waits until the local applied index reaches `c`, and runs against the local database.
+3. The read then runs against the local database. `ReadBarrier.await` also waits until the local applied
+   index reaches `c`; replicated reads use `awaitLeadership`, which does not: every write is acknowledged only
+   after the leader applied it (the result comes from the leader's apply), and a ready leader has applied
+   every entry of earlier terms, so whatever a client saw acknowledged is already in the leader's database.
 
 **Why this is safe.** Suppose a leader with a higher term had committed something before the read arrived.
 Then a majority had already moved to that higher term, and terms never decrease. A majority answering after
@@ -167,6 +200,11 @@ Production uses `OptimisticTransactionDB`. Yotsuba relies on conflicts spanning 
 - **Open.** `openTransaction` and `getForUpdate` wait for the read barrier, then open a native transaction or
   update on the leader's `EmbeddedDB`. That gives the same snapshot and read-your-writes behavior as on one
   node.
+- **Single-key updates queue.** A `getForUpdate` without a transaction first waits for the earlier updates of
+  the same key (a FIFO lock per key hash, held until the update's commit is applied or the update is closed or
+  expires after its 10 s lease; a waiter gives up after 12 s with `UPDATE_RETRY`). It then reads what the
+  previous one committed, instead of every concurrent update of a hot key reading the same value and all but
+  one conflicting.
 - **Staged writes** happen natively. The leader also records them, with their conflict keys: the written keys
   plus the `getForUpdate` keys.
 - **Commit** proposes one `Guarded` entry that carries the writes, the snapshot index and the conflict keys.
@@ -180,7 +218,13 @@ Production uses `OptimisticTransactionDB`. Yotsuba relies on conflicts spanning 
 - **Check.** It checks the conflict keys against `ConflictTracker`, a map from key hash (or whole column) to
   the index of the last entry that wrote it, filled as entries are appended. A key written after the snapshot
   index, including by an entry still in flight, is a conflict.
-- **On conflict** commit returns `false` and the transaction stays open, as on a single node.
+- **On conflict** commit returns `false` and the transaction stays open, as on a single node. Commits share
+  entries: the leader rejects the entry before appending it and names the commits that conflict (with history,
+  or with an earlier write of the same entry); those fail and the others go again in the next entry.
+- **Outcome of a commit.** It is submitted once, to the local Raft server. Only a refusal that Ratis gives before
+  appending (leader not ready, no pending-request permit, or the state machine's own refusals) means "not
+  committed"; `NotLeaderException`, which a leader stepping down also returns for appended entries, is an
+  unknown outcome.
 - **Otherwise** the entry is appended and later applied atomically on every replica. The leader's native
   transaction is then rolled back, because its effects arrive through the log.
 - **Hash collisions** can only cause false conflicts.
@@ -205,7 +249,8 @@ against an incomplete history.
   - the WALs still needed are copied.
 - **Why not `org.rocksdb.Checkpoint`.** It refuses the column volumes (`cf_paths`) that the default config
   uses.
-- **When.** Every `snapshotEveryEntries` applied entries.
+- **When.** Every `snapshotEveryEntries` applied entries (default 500k). Taking one flushes the memtables and
+  stops the apply for about 100–300 ms. Files that are hard links of durable files are not fsynced again.
 - **Log retention.** The Raft log is purged only up to the snapshot index and the lowest commit index of any
   member, and keeps `snapshotEveryEntries` entries more. A node restarted during a deploy, or one that just
   installed a snapshot, therefore catches up from the log. A member that is gone for good holds the log back,
@@ -247,8 +292,12 @@ against an incomplete history.
 - **`scanRaw` SST tokens** describe the leader's own files, so a leader change invalidates them.
 - **Merge operators** must be deterministic.
 - **Maintenance.** `flush` and `compact` act only on the node that receives them.
-- **Workload limits.** The replicated server's `GrpcServer` uses its own scheduler, not each column's
-  workload scheduler.
+- **Workload limits.** The replicated server's `GrpcServer` runs requests on virtual threads of their own (at
+  most 16384 waiting on the leader), not through each column's workload scheduler.
+- **Updates of one key run one at a time** on the leader. Nested or crossed updates of the same keys by one
+  client block (up to 12 s) instead of conflicting at once.
+- **After a kill** (not a graceful stop), a replica's database files are an older consistent point until it
+  starts again and replays its log.
 
 ## Tests
 
@@ -259,7 +308,8 @@ address, so a test can partition any set of links.
 | Test | What it proves |
 |---|---|
 | `ReplicationTest` (in-process) | Replication through any node; results; leader loss; snapshot catch-up; batches; transactions, conflicts and updates; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
-| `ApplierTest` | At-most-once retries, including after a restart; deletion of records; rejections; atomic commits; detection of column id divergence. |
+| `ApplierTest` | At-most-once retries, including after a restart; deletion of records; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; crash consistency of applies without the WAL. |
+| `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry and end of leadership); history kept for open transactions and in-flight commits. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Failover takes about 1 s. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history is linearizable. |
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. |
@@ -289,13 +339,10 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
 2. **Exactly-once for client retries.** A client request id in `RequestContext`, mapped onto `Request`
    identities, would make a client-level retry after an "outcome unknown" error safe. Also consider a
    dedicated error type for unknown outcomes instead of `SERVER_OVERLOADED`, which Yotsuba retries.
-3. **Capacity and performance.** Benchmark against the single node on production-like data:
-   - write latency and throughput, given the Raft fsync plus the one local transaction per entry;
-   - reads behind the barrier;
-   - forwarding overhead;
-   - snapshot creation time and install time at 171 GB, and at the multi-TB message and file datasets;
-   - the `RaftSettings` values: segment size, snapshot interval, entry size limit, and log retention in
-     bytes, not only in entries.
+3. **Capacity.** See [performance.md](performance.md) for the measurements on one PC and the load benchmark.
+   Still to measure on the production machines and data: their fsync latency, snapshot creation and install
+   time at 171 GB and at the multi-TB datasets, and log retention in bytes. Raise Yotsuba's in-flight request
+   limits for the cluster (see performance.md).
 4. **Write failover after a frozen leader.** When the leader freezes (SIGSTOP, a long GC pause, a hung disk),
    writes resume about 4 s later, although the election takes about 1 s and reads resume sooner. The cause is
    Ratis' client closing the channel to the frozen leader, which waits a hard-coded 3 s
@@ -316,10 +363,9 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
    - The result records of a proposer process that crashed are never deleted. Only the few that were in flight
      remain per crash; add a cleanup entry if crashes turn out to be frequent.
    - A result larger than the Ratis message limit makes a committed write look failed.
-   - Snapshots are triggered by entry count only, and a failing snapshot is retried at every apply step.
+   - Snapshots are triggered by entry count only, and a failing snapshot is retried at every apply step. Each
+     one stops the apply for its memtable flush (100–300 ms measured).
    - Iterator calls after a leader change fail with an internal "iterator not found" error, not `UPDATE_RETRY`.
-   - After a read barrier confirms leadership, the wait for the local apply to catch up has no deadline of its
-     own.
    - The snapshot taken right after a seeded genesis is attempted once, on the leader only.
    - A SIGTERM that races a replica failure can exit with 0 instead of 3.
 8. **Upstream.** Report the Ratis ReadIndex reuse bug, and switch back to Ratis ReadIndex once it is fixed

@@ -50,7 +50,9 @@ final class YotsubaWorkload {
 		EXISTS_MULTI(136),
 		FIRST_LAST(40),
 		RANGE_PAGE(4),
-		MONITOR_TX(34);
+		MONITOR_TX(34),
+		/** Not in the production mix: 1 MiB putMulti calls, to measure bandwidth (use with --only). */
+		BULK_PUT(0);
 
 		final double ratePerSecond;
 
@@ -194,6 +196,16 @@ final class YotsubaWorkload {
 				yield (long) page.items().size() * (valueBytes + 12);
 			}
 			case MONITOR_TX -> monitorTransaction(api, random);
+			case BULK_PUT -> {
+				var keys = new ArrayList<Keys>(16);
+				var values = new ArrayList<Buf>(16);
+				for (int i = 0; i < 16; i++) {
+					keys.add(historyKey(random));
+					values.add(value(64 * 1024));
+				}
+				api.putMultiAsync(0, history, keys, values, RequestType.none()).join();
+				yield 16L * (39 + 64 * 1024);
+			}
 		};
 	}
 

@@ -63,6 +63,13 @@ final class NodeMetrics {
 		}, 1, 1, TimeUnit.MILLISECONDS);
 	}
 
+	private final Map<String, java.util.function.LongSupplier> gauges = new ConcurrentHashMap<>();
+
+	/** A value read and logged at every interval, such as a queue length. */
+	void gauge(String name, java.util.function.LongSupplier value) {
+		gauges.put(name, value);
+	}
+
 	/** A series of durations in nanoseconds, logged in milliseconds. */
 	Series duration(String name) {
 		return durations.computeIfAbsent(name, _ -> new Series());
@@ -78,6 +85,13 @@ final class NodeMetrics {
 		append(line, durations, 1e6, "ms");
 		append(line, amounts, 1, "");
 		if (!line.isEmpty()) {
+			for (var gauge : new TreeMap<>(gauges).entrySet()) {
+				try {
+					line.append(' ').append(gauge.getKey()).append('=').append(gauge.getValue().getAsLong()).append(';');
+				} catch (RuntimeException ignored) {
+					// Not available right now.
+				}
+			}
 			LOG.info("{}: last {}s:{}", nodeId, INTERVAL_SECONDS, line);
 		}
 	}
