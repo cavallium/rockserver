@@ -54,10 +54,15 @@ import org.jetbrains.annotations.Nullable;
  * applying a copy of a request that already took effect returns the recorded result instead of executing it again.
  * So a write takes effect at most once even when copies reach a new leader or a restarted node. The same holds for a
  * request whose result did not fit in its batch's reply: a copy of it sent alone gets that result. When this node is
- * the leader, an attempt goes straight to its own Raft server; otherwise it is a single Ratis client call, which
- * follows the leader hints Ratis returns.</p>
+ * the leader, an attempt goes straight to its own Raft server; otherwise it goes, through the Ratis client's RPC
+ * layer, to the leader that this node's own Raft server knows.</p>
  *
- * <p>Each client attempt is an independent blocking call on its own virtual thread, not a request of the client's
+ * <p>Every attempt of one batch is the same Ratis invocation (client id and call id). A leader that still has an
+ * earlier attempt pending, or answered it, returns that attempt's reply from its retry cache instead of appending
+ * the batch again. A leader that never saw it (a new leader, or after the cache entry expired) appends it again,
+ * and the apply deduplicates its requests by sequence.</p>
+ *
+ * <p>Each remote attempt is an independent blocking call on its own virtual thread, not a request of the client's
  * ordered async stream: once one request of that stream runs out of retries, Ratis closes the stream for good, and
  * every later proposal of this node would fail without being sent.</p>
  *
@@ -109,8 +114,9 @@ final class Proposer implements Closeable {
 	private final Supplier<RaftServer> localServer;
 	private final RaftGroupId groupId;
 	private final RaftPeerId self;
-	private final ClientId localClientId = ClientId.randomId();
-	private final AtomicLong localCallIds = new AtomicLong();
+	/** Client id of every batch's Ratis invocation: separate from {@link #client}'s own, whose call ids are global. */
+	private final ClientId invocationClientId = ClientId.randomId();
+	private final AtomicLong callIds = new AtomicLong();
 	private final ExecutorService sender = Executors.newThreadPerTaskExecutor(
 			Thread.ofVirtual().name("rockserver-propose-", 0).factory());
 	/** Fails queued requests at their caller's deadline, also while no batch slot frees up to look at the queue. */
@@ -142,7 +148,7 @@ final class Proposer implements Closeable {
 		}
 		this.attemptTimeoutNanos = attemptTimeout.toNanos();
 		RaftClientConfigKeys.Rpc.setRequestTimeout(attemptProperties, RaftSettings.duration(attemptTimeout));
-		// One Ratis call per attempt; the batch is resent until its deadline.
+		// Attempts go through the client's RPC layer, one call each; the batch is resent until its deadline.
 		this.client = RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
 				.setRaftGroup(group)
@@ -497,10 +503,12 @@ final class Proposer implements Closeable {
 				queueTime.record(now - pending.queuedNanos);
 			}
 			batchSize.record(batch.size());
+			// One Ratis invocation for every attempt of this batch; a batch formed later is another invocation.
+			long callId = callIds.incrementAndGet();
 			if (commits) {
-				sendCommits(batch, message, deadline, now);
+				sendCommits(batch, message, callId, deadline, now);
 			} else {
-				attempt(batch, message, deadline, now, false);
+				attempt(batch, message, callId, deadline, now, false);
 			}
 		}
 
@@ -509,10 +517,10 @@ final class Proposer implements Closeable {
 		 * ended without telling whether the entry was appended ({@code ambiguous}), a later refusal no longer means
 		 * "not applied": the batch can only end with its results or an unknown outcome.
 		 */
-		private void attempt(List<Pending> batch, Message message, long deadlineNanos, long sentNanos,
+		private void attempt(List<Pending> batch, Message message, long callId, long deadlineNanos, long sentNanos,
 				boolean ambiguous) {
-			var reply = isLocalLeader() ? submitLocal(message, deadlineNanos)
-					: CompletableFuture.supplyAsync(() -> sendBlocking(message), sender);
+			var reply = isLocalLeader() ? submitLocal(message, callId, deadlineNanos)
+					: CompletableFuture.supplyAsync(() -> sendToLeader(message, callId), sender);
 			reply.handleAsync((answer, error) -> {
 				try {
 					var refusal = error != null ? stateMachineException(error)
@@ -530,7 +538,7 @@ final class Proposer implements Closeable {
 						boolean nowAmbiguous = ambiguous || (refusal == null && !isRefusedBeforeAppend(cause));
 						resends.record(1);
 						CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS, sender)
-								.execute(() -> attempt(batch, message, deadlineNanos, sentNanos, nowAmbiguous));
+								.execute(() -> attempt(batch, message, callId, deadlineNanos, sentNanos, nowAmbiguous));
 						return null;
 					}
 				} catch (Throwable unexpected) {
@@ -571,8 +579,9 @@ final class Proposer implements Closeable {
 		 * The single attempt at a batch of transaction commits. A conflict rejects the whole log entry before it is
 		 * appended: the commits that conflict fail, the others go again with the next batch.
 		 */
-		private void sendCommits(List<Pending> batch, Message message, long deadlineNanos, long sentNanos) {
-			submitLocal(message, deadlineNanos).handleAsync((answer, error) -> {
+		private void sendCommits(List<Pending> batch, Message message, long callId, long deadlineNanos,
+				long sentNanos) {
+			submitLocal(message, callId, deadlineNanos).handleAsync((answer, error) -> {
 				roundTrip.since(sentNanos);
 				try {
 					var refusal = error != null ? stateMachineException(error)
@@ -696,28 +705,56 @@ final class Proposer implements Closeable {
 		}
 	}
 
-	/** Submits straight to the local Raft server, with no client in between that could redirect it elsewhere. */
-	private CompletableFuture<RaftClientReply> submitLocal(Message message, long deadlineNanos) {
-		var request = RaftClientRequest.newBuilder()
-				.setClientId(localClientId)
-				.setServerId(self)
+	/** The batch's Ratis invocation {@code callId}, addressed to {@code server}. */
+	private RaftClientRequest invocation(Message message, long callId, RaftPeerId server) {
+		return RaftClientRequest.newBuilder()
+				.setClientId(invocationClientId)
+				.setServerId(server)
 				.setGroupId(groupId)
-				.setCallId(localCallIds.incrementAndGet())
+				.setCallId(callId)
 				.setMessage(message)
 				.setType(RaftClientRequest.writeRequestType())
 				.build();
+	}
+
+	/** Submits straight to the local Raft server, with no client in between that could redirect it elsewhere. */
+	private CompletableFuture<RaftClientReply> submitLocal(Message message, long callId, long deadlineNanos) {
 		try {
-			return localServer.get().submitClientRequestAsync(request)
+			return localServer.get().submitClientRequestAsync(invocation(message, callId, self))
 					.orTimeout(Math.max(1, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
 		} catch (IOException ex) {
 			return CompletableFuture.failedFuture(ex);
 		}
 	}
 
-	private RaftClientReply sendBlocking(Message message) {
+	/**
+	 * Sends one attempt to the leader that this node's own Raft server knows, through the client's RPC layer, which
+	 * waits for the reply at most the attempt timeout. Not through {@code client.io()}, which would make each attempt
+	 * a new invocation. With no leader known (an election), nothing is sent: the attempt fails as refused before
+	 * the append.
+	 */
+	private RaftClientReply sendToLeader(Message message, long callId) {
+		var rpc = client.getClientRpc();
+		RaftPeerId leader;
 		try {
-			return client.io().send(message);
+			var division = localServer.get().getDivision(groupId);
+			leader = division.getInfo().getLeaderId();
+			if (leader == null) {
+				throw new LeaderNotReadyException(division.getMemberId());
+			}
+			var peer = division.getGroup().getPeer(leader);
+			if (peer != null) {
+				// A member that joined after the client was built; known members are kept as they are.
+				rpc.addRaftPeers(List.of(peer));
+			}
 		} catch (IOException ex) {
+			throw new CompletionException(ex);
+		}
+		try {
+			return rpc.sendRequest(invocation(message, callId, leader));
+		} catch (IOException ex) {
+			// Resets the connection to that peer if the error calls for it, as the client's own calls do.
+			rpc.handleException(leader, ex, false);
 			throw new CompletionException(ex);
 		}
 	}

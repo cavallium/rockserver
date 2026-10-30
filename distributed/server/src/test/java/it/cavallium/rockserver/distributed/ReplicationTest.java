@@ -314,6 +314,39 @@ class ReplicationTest {
 		}
 	}
 
+	/**
+	 * A follower's attempt that times out while the leader still has the batch pending is resent as the same Ratis
+	 * invocation: the leader answers it from its retry cache when the first copy is applied, instead of appending
+	 * the whole batch again as a second log entry.
+	 */
+	@Test
+	void aFollowersResendWhileTheLeaderIsSlowIsNotAppendedAgain() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var follower = cluster.anyFollower();
+		long column = api(follower).createColumn("c", SCHEMA);
+		api(follower).put(0, column, key(1), text("before"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		long before = leader.appliedIndex();
+		var gate = new java.util.concurrent.CountDownLatch(1);
+		leader.stateMachine().applyGateForTesting = gate;
+		java.util.concurrent.CompletableFuture<Void> write;
+		try {
+			write = follower.connection().getAsyncApi(CONTEXT).putAsync(0, column, key(1), text("slow"),
+					RequestType.none());
+			// Longer than one attempt (3 s with these election timeouts) and shorter than the retry cache expiry plus
+			// it: the follower resent the batch once, while the leader could not apply it.
+			Thread.sleep(4500);
+		} finally {
+			gate.countDown();
+			leader.stateMachine().applyGateForTesting = null;
+		}
+		write.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		cluster.awaitConverged(TIMEOUT);
+		assertEquals("slow", localValue(leader, column, 1));
+		assertEquals(before + 1, leader.appliedIndex(), "the resent batch was appended again");
+	}
+
 	@Test
 	void writesContinueAfterLeaderLossAndTheOldLeaderCatchesUp() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();

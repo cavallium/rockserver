@@ -113,9 +113,15 @@ and the `LogEntry`.
   queue of their own, and commits of different leader terms never share an entry.
 - **Retries.** A batch is resent with the same bytes across leader changes until the latest deadline of its
   requests (at most one attempt past the oldest one's). On the leader an attempt goes straight to the local Raft
-  server; elsewhere it is an independent blocking Ratis client call on a virtual thread. Ratis' ordered async
-  stream closes for good after one exhausted request, so it is not used. A batch whose attempt ended without
-  saying whether it was appended can only end with its results or an unknown outcome, never "not applied".
+  server. Elsewhere it is an independent blocking call on a virtual thread, through the Ratis client's RPC layer,
+  to the leader that the node's own Raft server knows. Ratis' ordered async stream closes for good after one
+  exhausted request, so it is not used. Every attempt of a batch is the same Ratis invocation (client id and call
+  id). A leader that has an earlier attempt pending, or applied it, answers from its retry cache, for as long as
+  the cache keeps the entry (`RaftSettings`), instead of appending the batch again. Every replica fills that
+  cache when it applies an entry, and every replica computes the same results, so a new leader answers the same
+  way. A node that never saw the batch appends it again, and the apply deduplicates it. A batch whose attempt
+  ended without saying whether it was appended can only end with its results or an unknown outcome, never "not
+  applied".
 - **Caller deadlines.** When the caller's request-context timeout ends before the node's request timeout, a
   write is resent only until the caller's deadline, less a margin of 20 ms (at most a tenth of the timeout). A
   write still queued at that point, or whose caller cancelled it before it was sent, is never sent. It fails with
