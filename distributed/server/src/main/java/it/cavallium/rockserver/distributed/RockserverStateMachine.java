@@ -641,7 +641,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * latest snapshot; this starts the flush a hundredth of that interval earlier.
 	 */
 	private void prepareSnapshot(@Nullable TermIndex applied) {
-		if (applied == null || Boolean.getBoolean("rockserver.noPreflushAB")) {
+		if (applied == null) {
 			return;
 		}
 		var latest = storage.getLatestSnapshot();
