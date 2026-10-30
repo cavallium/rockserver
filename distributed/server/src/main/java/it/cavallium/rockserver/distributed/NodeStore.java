@@ -499,6 +499,11 @@ final class NodeStore implements Closeable {
 		return metaKey(FLOOR, proposerId, 0);
 	}
 
+	/** The proposer id in a key made by {@link #floorKey}. */
+	static long floorProposerId(Keys key) {
+		return java.nio.ByteBuffer.wrap(key.keys()[0].toByteArray()).getLong(1);
+	}
+
 	/** Key of the recorded result of request {@code sequence} of proposer {@code proposerId}. */
 	static Keys requestKey(long proposerId, long sequence) {
 		return metaKey(REQUEST, proposerId, sequence);

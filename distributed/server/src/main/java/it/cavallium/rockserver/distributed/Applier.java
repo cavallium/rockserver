@@ -13,6 +13,7 @@ import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
@@ -58,22 +59,28 @@ final class Applier {
 	private static final long APPLY_TRANSACTION_TIMEOUT_MS = 24L * 60 * 60 * 1000;
 
 	/** How far a proposer's floor moves between two deletions of the records below it, see {@link #purge}. */
-	static final long PURGE_EVERY_SEQUENCES = 1 << 16;
+	static final long PURGE_EVERY_SEQUENCES = 1 << 10;
+	/** Bytes of results a proposer records between two deletions of its records below the floor, see {@link #purge}. */
+	static final long PURGE_EVERY_BYTES = 4 << 20;
 
 	private final NodeStore store;
 	private final long purgeEverySequences;
+	private final long purgeEveryBytes;
+	/** True once the records below every proposer's floor were deleted, see {@link #purgeAllProposers}. */
+	private boolean purgedAllProposers;
 
 	Applier(NodeStore store) {
 		this(store, null);
 	}
 
 	Applier(NodeStore store, @Nullable NodeMetrics metrics) {
-		this(store, metrics, PURGE_EVERY_SEQUENCES);
+		this(store, metrics, PURGE_EVERY_SEQUENCES, PURGE_EVERY_BYTES);
 	}
 
-	Applier(NodeStore store, @Nullable NodeMetrics metrics, long purgeEverySequences) {
+	Applier(NodeStore store, @Nullable NodeMetrics metrics, long purgeEverySequences, long purgeEveryBytes) {
 		this.store = store;
 		this.purgeEverySequences = purgeEverySequences;
+		this.purgeEveryBytes = purgeEveryBytes;
 		this.openTime = metrics == null ? null : metrics.duration("apply.open");
 		this.executeTime = metrics == null ? null : metrics.duration("apply.execute");
 		this.commitTime = metrics == null ? null : metrics.duration("apply.commit");
@@ -98,6 +105,8 @@ final class Applier {
 		long floor;
 		/** Records below this were deleted from the database by this applier, see {@link #purge}. */
 		long purgedBelow;
+		/** Bytes of the results recorded since the last purge, see {@link #purge}. */
+		long recordedBytes;
 		final LongSortedSet recorded = new LongRBTreeSet();
 	}
 
@@ -105,8 +114,16 @@ final class Applier {
 
 	/** The result recorded for {@code request} by an earlier application, or null if it was never applied. */
 	@Nullable ApplyResult recordedResult(Request request) {
-		Buf recorded = store.db().get(0L, store.metaColumnId(),
-				NodeStore.requestKey(request.proposerId(), request.sequence()), RequestType.<Buf>current());
+		return recordedResult(store, request.proposerId(), request.sequence());
+	}
+
+	/**
+	 * The result recorded in {@code store} for request {@code sequence} of {@code proposerId}, or null if there is
+	 * none. Safe from any thread.
+	 */
+	static @Nullable ApplyResult recordedResult(NodeStore store, long proposerId, long sequence) {
+		Buf recorded = store.db().get(0L, store.metaColumnId(), NodeStore.requestKey(proposerId, sequence),
+				RequestType.<Buf>current());
 		return recorded == null ? null : ResultCodec.decode(recorded.toByteArray());
 	}
 
@@ -131,6 +148,7 @@ final class Applier {
 	 */
 	List<ApplyResult> applyBatch(List<Request> requests, TermIndex position) {
 		try {
+			purgeAllProposers();
 			if (requests.size() == 1 && !isBatchable(requests.getFirst().entry())) {
 				return List.of(applyAlone(requests.getFirst(), position));
 			}
@@ -229,7 +247,7 @@ final class Applier {
 		if (existingId != null) {
 			// Creating a column that exists with the same schema changes nothing: it needs no flush nor fsync.
 			ApplyResult outcome = new ApplyResult.Ok(existingId);
-			inApplyTransaction(position, tx -> finish(tx, request, floor, outcome, position, true));
+			inApplyTransaction(position, tx -> finish(tx, records, request, floor, outcome, position, true));
 			committed(request.proposerId(), records, List.of(request), request.completedBelow());
 			purge(request.proposerId(), records);
 			return outcome;
@@ -238,14 +256,15 @@ final class Applier {
 		// the WAL. Make everything before them durable first (the data writes applied without the WAL included) and
 		// everything after them durable at once, so a crash cannot keep one without the other.
 		makeDurable();
-		ApplyResult outcome;
+		ApplyResult executed;
 		if (entry instanceof LogEntry.DeleteColumn || entry instanceof LogEntry.DeleteColumnIfExists) {
-			outcome = deleteColumn(entry, position);
+			executed = deleteColumn(entry, position);
 		} else {
-			outcome = applyLogical(() -> execute(0L, entry));
+			executed = applyLogical(() -> execute(0L, entry));
 		}
+		var outcome = ResultCodec.bounded(executed);
 		// Record, floor and position in one logged write: all or none of them survive a crash.
-		inLoggedTransaction(position, tx -> finish(tx, request, floor, outcome, position, true));
+		inLoggedTransaction(position, tx -> finish(tx, records, request, floor, outcome, position, true));
 		syncWal();
 		committed(request.proposerId(), records, List.of(request), request.completedBelow());
 		purge(request.proposerId(), records);
@@ -310,11 +329,12 @@ final class Applier {
 				db.closeTransaction(tx, false);
 				open = false;
 				var rejected = toRun.getFirst();
+				outcomes[0] = ResultCodec.bounded(outcomes[0]);
 				inApplyTransaction(position,
-						recordTx -> finish(recordTx, rejected, floor, outcomes[0], position, markPosition));
+						recordTx -> finish(recordTx, records, rejected, floor, outcomes[0], position, markPosition));
 			} else {
 				for (int j = 0; j < toRun.size(); j++) {
-					record(tx, toRun.get(j), outcomes[j]);
+					outcomes[j] = record(tx, records, toRun.get(j), outcomes[j]);
 				}
 				finishBatch(tx, proposerId, completedBelow, floor, position, markPosition);
 				record(executeTime, executeStart);
@@ -367,6 +387,8 @@ final class Applier {
 		if (records == null) {
 			records = new ProposerRecords();
 			records.floor = floor(proposerId);
+			// Only this applier moved the floor since purgeAllProposers deleted everything below it.
+			records.purgedBelow = records.floor;
 			try (var keys = store.db().getRange(0L, store.metaColumnId(), NodeStore.requestKey(proposerId, records.floor),
 					NodeStore.requestKey(proposerId, Long.MAX_VALUE), false, RequestType.<KV>allInRange())) {
 				var recorded = records.recorded;
@@ -390,9 +412,10 @@ final class Applier {
 
 	/**
 	 * Deletes the records below the proposer's floor from the database, with one range deletion, once the floor
-	 * moved {@link #purgeEverySequences} past the last one. Records below the floor are never read: a copy below the
-	 * floor is refused before any lookup, and {@link #records} does not load them. So they need not be deleted in the
-	 * apply transaction, which would cost a write per request.
+	 * moved {@link #purgeEverySequences} past the last one or the proposer recorded {@link #purgeEveryBytes} of
+	 * results since then. Records below the floor are never read: a copy below the floor is refused before any
+	 * lookup, and {@link #records} does not load them. So they need not be deleted in the apply transaction, which
+	 * would cost a write per request.
 	 *
 	 * <p>The deletion skips the WAL, like the apply transactions (see {@link #beginApply}), and runs after the
 	 * transaction that wrote the floor committed. With atomic flush, a crash keeps a prefix of the writes made
@@ -403,12 +426,45 @@ final class Applier {
 	 * again.</p>
 	 */
 	private void purge(long proposerId, ProposerRecords records) {
-		if (records.floor - records.purgedBelow < purgeEverySequences) {
+		if (records.floor <= records.purgedBelow || (records.floor - records.purgedBelow < purgeEverySequences
+				&& records.recordedBytes < purgeEveryBytes)) {
 			return;
 		}
 		store.db().deleteRangeUnlogged(store.metaColumnId(), NodeStore.requestKey(proposerId, records.purgedBelow),
 				NodeStore.requestKey(proposerId, records.floor));
 		records.purgedBelow = records.floor;
+		records.recordedBytes = 0;
+	}
+
+	/**
+	 * Deletes the records below the floor of every proposer in the database, once, before this applier applies its
+	 * first entry. {@link #purge} only runs for a proposer whose own entries move its floor, and a proposer id lives
+	 * as long as its node process: without this, the records a stopped process left below its floor would stay.
+	 * Each deletion is like the one of {@link #purge}, after the floor it covers was written, so a crash keeps it
+	 * only together with that floor.
+	 */
+	private void purgeAllProposers() {
+		if (purgedAllProposers) {
+			return;
+		}
+		var db = store.db();
+		long metaColumn = store.metaColumnId();
+		var floors = new Long2LongOpenHashMap();
+		try (var keys = db.getRange(0L, metaColumn, NodeStore.key(NodeStore.FLOOR),
+				NodeStore.key((byte) (NodeStore.FLOOR + 1)), false, RequestType.<KV>allInRange())) {
+			keys.forEach(kv -> floors.put(NodeStore.floorProposerId(kv.keys()),
+					java.nio.ByteBuffer.wrap(kv.value().toByteArray()).getLong()));
+		}
+		for (var floor : floors.long2LongEntrySet()) {
+			var start = NodeStore.requestKey(floor.getLongKey(), 0);
+			var end = NodeStore.requestKey(floor.getLongKey(), floor.getLongValue());
+			// Skips proposers with nothing left below their floor, so that restarts do not pile up range deletions.
+			if (floor.getLongValue() > 0 && db.reduceRange(0L, metaColumn, start, end, false,
+					RequestType.<KV>firstAndLast()).first() != null) {
+				db.deleteRangeUnlogged(metaColumn, start, end);
+			}
+		}
+		purgedAllProposers = true;
 	}
 
 	private ApplyResult requireRecorded(Request request) {
@@ -631,15 +687,25 @@ final class Applier {
 	}
 
 	/** Writes the result record, the proposer's floor and the applied position, in transaction {@code tx} if not 0. */
-	private void finish(long tx, Request request, long floor, ApplyResult result, TermIndex position,
-			boolean markPosition) {
-		record(tx, request, result);
+	private void finish(long tx, ProposerRecords records, Request request, long floor, ApplyResult result,
+			TermIndex position, boolean markPosition) {
+		record(tx, records, request, result);
 		finishBatch(tx, request.proposerId(), request.completedBelow(), floor, position, markPosition);
 	}
 
-	private void record(long tx, Request request, ApplyResult result) {
+	/**
+	 * Writes the record of {@code request} and returns the result it holds, which the reply must carry too:
+	 * {@code result} bounded by {@link ResultCodec#bounded}. A result that cannot be encoded, or too large for a
+	 * reply by itself, would otherwise stop every replica here, at every restart. Bounded, any recorded result fits
+	 * alone in a reply, so a copy of the request sent alone always gets it.
+	 */
+	private ApplyResult record(long tx, ProposerRecords records, Request request, ApplyResult result) {
+		var bounded = ResultCodec.bounded(result);
+		byte[] encoded = ResultCodec.encode(bounded);
 		store.db().put(tx, store.metaColumnId(), NodeStore.requestKey(request.proposerId(), request.sequence()),
-				Buf.wrap(ResultCodec.encode(result)), RequestType.none());
+				Buf.wrap(encoded), RequestType.none());
+		records.recordedBytes += encoded.length;
+		return bounded;
 	}
 
 	/**

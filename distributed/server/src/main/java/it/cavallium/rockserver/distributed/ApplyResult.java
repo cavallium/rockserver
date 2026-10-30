@@ -25,5 +25,14 @@ public sealed interface ApplyResult {
 		}
 	}
 
+	/**
+	 * Only in a reply, never applied nor recorded: the request's result did not fit in the reply of its batch (see
+	 * {@link ResultCodec#encodeAll}). The request took effect and its result is recorded; a copy of it sent alone gets
+	 * that result.
+	 */
+	record ResendAlone() implements ApplyResult {}
+
 	ApplyResult OK_NULL = new Ok(null);
+
+	ApplyResult RESEND_ALONE = new ResendAlone();
 }

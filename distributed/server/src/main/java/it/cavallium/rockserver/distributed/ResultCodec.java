@@ -21,9 +21,9 @@ import org.jetbrains.annotations.Nullable;
 /**
  * Binary encoding of {@link ApplyResult}, carried in Raft replies from the leader to the proposing node.
  *
- * <p>Layout: a tag byte for {@code Ok} or {@code Failed}. {@code Ok} is followed by its value, written as a type
- * byte and then the value's fields; {@code Failed} by the error type name and the message. Primitive encodings
- * are those of {@link LogEntryCodec}.</p>
+ * <p>Layout: a tag byte for {@code Ok}, {@code Failed} or {@code ResendAlone}. {@code Ok} is followed by its value,
+ * written as a type byte and then the value's fields; {@code Failed} by the error type name and the message;
+ * {@code ResendAlone} by nothing. Primitive encodings are those of {@link LogEntryCodec}.</p>
  *
  * <p>A failure message is written leniently: it comes from an arbitrary exception during apply, so characters
  * that are not valid Unicode, such as unpaired surrogates, become {@code '?'} instead of failing the reply.</p>
@@ -32,6 +32,7 @@ final class ResultCodec {
 
 	private static final byte OK = 1;
 	private static final byte FAILED = 2;
+	private static final byte RESEND_ALONE = 3;
 
 	private static final byte NULL = 0;
 	private static final byte BUF = 1;
@@ -61,6 +62,7 @@ final class ResultCodec {
 					writeString(out, type.name());
 					writeBytes(out, message.getBytes(UTF_8));
 				}
+				case ApplyResult.ResendAlone _ -> out.writeByte(RESEND_ALONE);
 			}
 		} catch (IOException e) {
 			// ByteArrayOutputStream never throws
@@ -76,6 +78,9 @@ final class ResultCodec {
 	 */
 	static final int MAX_REPLY_BYTES = RaftSettings.MAX_ENTRY_BYTES + (1 << 20);
 
+	/** Largest result that fits alone in a reply, which adds a count and the result's length. */
+	static final int MAX_RESULT_BYTES = MAX_REPLY_BYTES - 2 * Integer.BYTES;
+
 	/** {@link #encodeAll(List, int)} with {@link #MAX_REPLY_BYTES}. */
 	static byte[] encodeAll(List<ApplyResult> results) {
 		return encodeAll(results, MAX_REPLY_BYTES);
@@ -85,10 +90,12 @@ final class ResultCodec {
 	 * Encodes the results of a batch, in order: their count, then each one's length and {@link #encode} bytes.
 	 *
 	 * <p>It never fails: every replica runs it after the entry was applied, and an exception would stop the
-	 * replica. When the results do not fit in {@code maxBytes}, the largest ones (the first of equal ones) are
-	 * replaced by a failure saying that the write was applied, until they fit; a result that cannot be encoded is
-	 * replaced too. The choice depends only on the results, so every replica builds the same reply: Ratis can answer
-	 * a client's retry with the reply a replica computed before it became the leader.</p>
+	 * replica. A result that cannot be encoded, or that does not fit in {@code maxBytes} even alone, is replaced as
+	 * {@link #bounded} does; apply already recorded it so. When the results together do not fit, the largest ones
+	 * (the first of equal ones) are replaced by {@link ApplyResult#RESEND_ALONE} until they fit. Each of those fits
+	 * alone, so its proposer sends it again in a batch of its own and gets its recorded result. The choice depends
+	 * only on the results, so every replica builds the same reply: Ratis can answer a client's retry with the reply
+	 * a replica computed before it became the leader.</p>
 	 */
 	static byte[] encodeAll(List<ApplyResult> results, int maxBytes) {
 		int count = results.size();
@@ -96,16 +103,11 @@ final class ResultCodec {
 		var sizes = new long[count];
 		long total = Integer.BYTES;
 		for (int i = 0; i < count; i++) {
-			chosen[i] = results.get(i);
-			try {
-				sizes[i] = encodedSize(chosen[i]);
-			} catch (IllegalArgumentException ex) {
-				chosen[i] = new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR,
-						"The result cannot be encoded; the write was applied");
-				sizes[i] = encodedSize(chosen[i]);
-			}
+			chosen[i] = bounded(results.get(i), maxBytes - 2L * Integer.BYTES);
+			sizes[i] = encodedSize(chosen[i]);
 			total += Integer.BYTES + sizes[i];
 		}
+		// Only with more than one result: a single bounded one fits.
 		if (total > maxBytes) {
 			var largestFirst = new Integer[count];
 			for (int i = 0; i < count; i++) {
@@ -113,24 +115,52 @@ final class ResultCodec {
 			}
 			java.util.Arrays.sort(largestFirst, (a, b) -> sizes[a] != sizes[b] ? Long.compare(sizes[b], sizes[a])
 					: Integer.compare(a, b));
+			long resendSize = encodedSize(ApplyResult.RESEND_ALONE);
 			for (int i : largestFirst) {
-				var failure = tooLarge(sizes[i]);
-				long size = encodedSize(failure);
-				if (total <= maxBytes || size >= sizes[i]) {
+				if (total <= maxBytes || sizes[i] <= resendSize) {
 					break;
 				}
-				chosen[i] = failure;
-				total -= sizes[i] - size;
-				sizes[i] = size;
+				chosen[i] = ApplyResult.RESEND_ALONE;
+				total -= sizes[i] - resendSize;
+				sizes[i] = resendSize;
 			}
 		}
-		// Fits in an int: it is at most maxBytes, or every result is now as small as a failure.
+		// Fits in an int: it is at most maxBytes, or every result is now as small as RESEND_ALONE.
 		var buffer = java.nio.ByteBuffer.allocate((int) total).putInt(count);
 		for (var result : chosen) {
 			byte[] bytes = encode(result);
 			buffer.putInt(bytes.length).put(bytes);
 		}
 		return buffer.array();
+	}
+
+	/** {@link #bounded(ApplyResult, long)} with {@link #MAX_RESULT_BYTES}. */
+	static ApplyResult bounded(ApplyResult result) {
+		return bounded(result, MAX_RESULT_BYTES);
+	}
+
+	/**
+	 * {@code result}, or the failure that replaces it if it cannot be encoded or its encoding is larger than
+	 * {@code maxBytes}. The result is measured without being encoded, so a huge one costs no memory. A successful
+	 * result that is replaced was applied, and its failure says so; a rejection keeps its error type with a short
+	 * message. The replacement depends only on the result, so every replica records and returns the same one.
+	 */
+	static ApplyResult bounded(ApplyResult result, long maxBytes) {
+		long size;
+		try {
+			size = encodedSize(result);
+		} catch (IllegalArgumentException ex) {
+			return new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR,
+					"The result cannot be encoded; the write was applied");
+		}
+		if (size <= maxBytes) {
+			return result;
+		}
+		return switch (result) {
+			case ApplyResult.Failed(RocksDBErrorType type, String _) -> new ApplyResult.Failed(type,
+					"The failure message (" + size + " bytes) is too large for a reply");
+			default -> tooLarge(size);
+		};
 	}
 
 	/** The result that replaces one of {@code size} bytes that does not fit in a reply. */
@@ -150,6 +180,7 @@ final class ResultCodec {
 			// The error type name is ASCII.
 			case ApplyResult.Failed(RocksDBErrorType type, String message) ->
 					1 + Integer.BYTES + type.name().length() + Integer.BYTES + message.getBytes(UTF_8).length;
+			case ApplyResult.ResendAlone _ -> 1;
 		};
 	}
 
@@ -198,6 +229,7 @@ final class ResultCodec {
 		ApplyResult result = switch (tag) {
 			case OK -> new ApplyResult.Ok(readValue(in, 0));
 			case FAILED -> new ApplyResult.Failed(readErrorType(in), in.readString());
+			case RESEND_ALONE -> ApplyResult.RESEND_ALONE;
 			default -> throw new IllegalArgumentException("Unknown result tag: " + tag);
 		};
 		in.finish();

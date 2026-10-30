@@ -82,7 +82,7 @@ class ApplierTest {
 	void recordsOfCompletedRequestsAreDeletedInBulk() throws Exception {
 		long column;
 		try (var store = open()) {
-			var applier = new Applier(store, null, 100);
+			var applier = new Applier(store, null, 100, Long.MAX_VALUE);
 			column = store.db().createColumn("c", SCHEMA);
 			for (long sequence = 0; sequence <= 256; sequence++) {
 				long completedBelow = sequence;
@@ -99,7 +99,7 @@ class ApplierTest {
 		}
 		// After a restart, the records left below the floor are not loaded and never used: a copy is refused.
 		try (var store = open()) {
-			var applier = new Applier(store, null, 100);
+			var applier = new Applier(store, null, 100, Long.MAX_VALUE);
 			var late = applier.apply(new Request(5, 230, 230,
 					new LogEntry.Put(column, key(230), text("late"), RequestTypeId.NOTHING)), TermIndex.valueOf(1, 258));
 			assertInstanceOf(ApplyResult.Failed.class, late);
@@ -116,6 +116,80 @@ class ApplierTest {
 	/** A request that names the record of {@code sequence} of {@code proposerId}, for {@link Applier#recordedResult}. */
 	private static Request record(long proposerId, long sequence) {
 		return new Request(proposerId, sequence, 0, new LogEntry.Genesis("x", false));
+	}
+
+	@Test
+	void recordsAreDeletedOnceTheirResultsAddUpToTheByteLimit() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store, null, Long.MAX_VALUE, 4000);
+			long column = store.db().createColumn("c", SCHEMA);
+			var value = Buf.wrap(new byte[1000]);
+			for (long sequence = 0; sequence < 3; sequence++) {
+				var merge = new LogEntry.Merge(column, key(sequence), value, RequestTypeId.MERGED);
+				applier.apply(new Request(11, sequence, sequence, merge), TermIndex.valueOf(1, sequence + 1));
+			}
+			// About 3000 bytes of results: the records below the floor (2) stay.
+			assertInstanceOf(ApplyResult.Ok.class, applier.recordedResult(record(11, 0)));
+			applier.apply(new Request(11, 3, 3, new LogEntry.Merge(column, key(3), value, RequestTypeId.MERGED)),
+					TermIndex.valueOf(1, 4));
+			// Over 4000 bytes: everything below the floor (3) is deleted, however little the floor moved.
+			assertNull(applier.recordedResult(record(11, 0)));
+			assertNull(applier.recordedResult(record(11, 2)));
+			assertInstanceOf(ApplyResult.Ok.class, applier.recordedResult(record(11, 3)));
+		}
+	}
+
+	@Test
+	void recordsLeftBelowTheFloorOfAStoppedProposerAreDeletedAtTheNextStart() throws Exception {
+		long column;
+		try (var store = open()) {
+			var applier = new Applier(store);
+			column = store.db().createColumn("c", SCHEMA);
+			for (long sequence = 0; sequence < 10; sequence++) {
+				var put = new LogEntry.Put(column, key(sequence), text("v"), RequestTypeId.NOTHING);
+				applier.apply(new Request(12, sequence, sequence, put), TermIndex.valueOf(1, sequence + 1));
+			}
+			// Proposer 12 stops here (its process exits): its own entries will never delete these.
+			assertInstanceOf(ApplyResult.Ok.class, applier.recordedResult(record(12, 0)));
+		}
+		try (var store = open()) {
+			var applier = new Applier(store);
+			// Only another proposer writes after the restart.
+			applier.apply(new Request(13, 0, 0, new LogEntry.Put(column, key(100), text("w"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 11));
+			assertNull(applier.recordedResult(record(12, 0)));
+			assertNull(applier.recordedResult(record(12, 8)));
+			// The record at the floor stays: its request may still be in flight.
+			assertInstanceOf(ApplyResult.Ok.class, applier.recordedResult(record(12, 9)));
+		}
+	}
+
+	@Test
+	void aResultTooLargeForAReplyIsRecordedAsAFailureAndTheReplicaGoesOn() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			// Two values whose previous values add up to more than a reply can carry.
+			var large = Buf.wrap(new byte[ResultCodec.MAX_RESULT_BYTES / 2 + 1]);
+			applier.applyBatch(List.of(
+					new Request(14, 0, 0, new LogEntry.Put(column, key(1), large, RequestTypeId.NOTHING)),
+					new Request(14, 1, 0, new LogEntry.Put(column, key(2), large, RequestTypeId.NOTHING))),
+					TermIndex.valueOf(1, 1));
+			var request = new Request(14, 2, 2, new LogEntry.PutMulti(column, List.of(key(1), key(2)),
+					List.of(text("a"), text("b")), RequestTypeId.PREVIOUS));
+			long size = ResultCodec.encodedSize(new ApplyResult.Ok(List.of(large, large)));
+			var result = applier.apply(request, TermIndex.valueOf(1, 2));
+			assertEquals(ResultCodec.tooLarge(size), result);
+			assertEquals(result, applier.recordedResult(request), "the record holds what the reply carries");
+			// The write took effect, and the replica keeps applying.
+			assertEquals("a", value(store, column, 1));
+			assertEquals("b", value(store, column, 2));
+			assertEquals(TermIndex.valueOf(1, 2), store.applied());
+			assertEquals(result, applier.apply(request, TermIndex.valueOf(1, 3)), "a copy gets the same result");
+			assertEquals(ApplyResult.OK_NULL, applier.apply(new Request(14, 3, 3,
+					new LogEntry.Put(column, key(3), text("c"), RequestTypeId.NOTHING)), TermIndex.valueOf(1, 4)));
+			assertEquals(TermIndex.valueOf(1, 4), store.applied());
+		}
 	}
 
 	@Test
@@ -276,7 +350,7 @@ class ApplierTest {
 			column = store.db().createColumn("c", SCHEMA);
 		}
 		var crashed = open();
-		var applier = new Applier(crashed, null, 4);
+		var applier = new Applier(crashed, null, 4, Long.MAX_VALUE);
 		for (int i = 1; i <= 10; i++) {
 			applier.apply(new Request(8, i, i, new LogEntry.Put(column, key(i), text("v" + i), RequestTypeId.NOTHING)),
 					TermIndex.valueOf(1, i));
@@ -288,7 +362,7 @@ class ApplierTest {
 		try (var store = open()) {
 			// The flush kept entries 1 to 5, the floor 5 and the deletion of the records below 4.
 			assertEquals(5, store.applied().getIndex());
-			var replay = new Applier(store, null, 4);
+			var replay = new Applier(store, null, 4, Long.MAX_VALUE);
 			assertNull(replay.recordedResult(record(8, 3)));
 			assertInstanceOf(ApplyResult.Ok.class, replay.recordedResult(record(8, 5)));
 			for (int i = 6; i <= 10; i++) {

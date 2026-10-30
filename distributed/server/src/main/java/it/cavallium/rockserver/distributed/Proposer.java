@@ -1,6 +1,5 @@
 package it.cavallium.rockserver.distributed;
 
-import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
@@ -49,7 +48,8 @@ import org.jetbrains.annotations.Nullable;
  * log, its fsync and the apply then cost one entry for the whole batch. A batch is resent (leader changes,
  * unreachable nodes, timeouts) with the same bytes until it gets an answer or the request timeout passes, and
  * applying a copy of a request that already took effect returns the recorded result instead of executing it again.
- * So a write takes effect at most once even when copies reach a new leader or a restarted node. When this node is
+ * So a write takes effect at most once even when copies reach a new leader or a restarted node. The same holds for a
+ * request whose result did not fit in its batch's reply: a copy of it sent alone gets that result. When this node is
  * the leader, an attempt goes straight to its own Raft server; otherwise it is a single Ratis client call, which
  * follows the leader hints Ratis returns.</p>
  *
@@ -74,12 +74,6 @@ final class Proposer implements Closeable {
 	private static final int MAX_BATCH_REQUESTS = 4096;
 	/** Bytes of entry bodies per batch; a single larger request goes alone. */
 	private static final int MAX_BATCH_BYTES = 8 * 1024 * 1024;
-	/**
-	 * Requests per batch whose result can hold stored values (see {@link #returnsValues}): the results of a batch
-	 * come back in one reply, which has a size limit ({@link ResultCodec#MAX_REPLY_BYTES}), whereas a request's
-	 * size says nothing about the size of the value it returns.
-	 */
-	private static final int MAX_BATCH_VALUE_RESULTS = 16;
 	/**
 	 * A request with less time left than this when its batch is formed is failed without being sent: it would get at
 	 * most one hurried attempt, and its outcome would then be unknown instead of a clean "not applied".
@@ -164,22 +158,52 @@ final class Proposer implements Closeable {
 		final long sequence;
 		final byte[] body;
 		final boolean batchable;
-		/** See {@link #returnsValues}. */
-		final boolean returnsValues;
 		final long deadlineNanos;
 		/** Leader epoch of a transaction commit, -1 otherwise: commits of different epochs never share an entry. */
 		final long epoch;
-		final long queuedNanos = System.nanoTime();
+		/** When it last entered the queue. */
+		volatile long queuedNanos = System.nanoTime();
+		/**
+		 * Set when its batch's reply had no room for its result ({@link ApplyResult#RESEND_ALONE}): it took effect, and
+		 * its recorded result is fetched instead, see {@link Lane#complete}. A data write is sent again alone, and
+		 * never shares a batch again.
+		 */
+		volatile boolean resentAlone;
 		/** Completed only by the proposer; callers get a copy, so that cancelling theirs cannot complete this one. */
 		final CompletableFuture<Object> result = new CompletableFuture<>();
 
-		Pending(long sequence, byte[] body, boolean batchable, boolean returnsValues, long deadlineNanos, long epoch) {
+		Pending(long sequence, byte[] body, boolean batchable, long deadlineNanos, long epoch) {
 			this.sequence = sequence;
 			this.body = body;
 			this.batchable = batchable;
-			this.returnsValues = returnsValues;
 			this.deadlineNanos = deadlineNanos;
 			this.epoch = epoch;
+		}
+
+		/** True if it goes in a batch of its own. */
+		boolean alone() {
+			return !batchable || resentAlone;
+		}
+
+		/** Completes it with {@code result}, its final answer. */
+		void complete(ApplyResult result) {
+			switch (result) {
+				case ApplyResult.Ok ok -> this.result.complete(ok.value());
+				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.UPDATE_RETRY ->
+						this.result.completeExceptionally(new RocksDBRetryException());
+				case ApplyResult.Failed failed -> this.result.completeExceptionally(failed.toException());
+				case ApplyResult.ResendAlone _ -> fail(unavailable(new IllegalStateException(
+						"The reply of a request sent alone has no room for its result")));
+			}
+		}
+
+		/**
+		 * Fails it with {@code error}. A request resent alone already took effect, so whatever ended its resend, it
+		 * fails saying that it was applied.
+		 */
+		void fail(RocksDBException error) {
+			result.completeExceptionally(resentAlone ? RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
+					"The write was applied, but its result was not received: " + error.getMessage()) : error);
 		}
 	}
 
@@ -206,8 +230,7 @@ final class Proposer implements Closeable {
 			sequence = nextSequence++;
 			inFlight.add(sequence);
 		}
-		var pending = new Pending(sequence, body, Applier.isBatchable(entry), returnsValues(entry),
-				System.nanoTime() + requestTimeoutNanos,
+		var pending = new Pending(sequence, body, Applier.isBatchable(entry), System.nanoTime() + requestTimeoutNanos,
 				entry instanceof LogEntry.Guarded guarded ? guarded.leaderEpoch() : -1);
 		live.add(pending);
 		pending.result.whenComplete((_, _) -> {
@@ -223,30 +246,6 @@ final class Proposer implements Closeable {
 					"The node is stopping"));
 		}
 		return pending.result.copy();
-	}
-
-	/**
-	 * True if the result of {@code entry} can hold stored values (previous, delta or merged values), rather than
-	 * nothing, a flag or a column id. Unknown request types count as returning values.
-	 */
-	static boolean returnsValues(LogEntry entry) {
-		return switch (entry) {
-			case LogEntry.Put put -> returnsValues(put.requestType());
-			case LogEntry.PutMulti put -> returnsValues(put.requestType());
-			case LogEntry.Delete delete -> returnsValues(delete.requestType());
-			case LogEntry.DeleteMulti delete -> returnsValues(delete.requestType());
-			case LogEntry.Merge merge -> returnsValues(merge.requestType());
-			case LogEntry.MergeMulti merge -> returnsValues(merge.requestType());
-			case LogEntry.Guarded guarded -> guarded.singleResult() && returnsValues(guarded.writes().getFirst());
-			default -> false;
-		};
-	}
-
-	private static boolean returnsValues(RequestTypeId type) {
-		return switch (type) {
-			case NOTHING, EXISTS, CHANGED, PREVIOUS_PRESENCE, ENSURE -> false;
-			default -> true;
-		};
 	}
 
 	/** Every request numbered below this has its final answer: no copy of it will ever be sent again. */
@@ -270,6 +269,7 @@ final class Proposer implements Closeable {
 		private final NodeMetrics.Series roundTrip;
 		private final NodeMetrics.Series batchSize;
 		private final NodeMetrics.Series resends;
+		private final NodeMetrics.Series aloneResends;
 
 		Lane(boolean commits) {
 			this.commits = commits;
@@ -278,6 +278,7 @@ final class Proposer implements Closeable {
 			this.roundTrip = metrics.duration(name + ".batch");
 			this.batchSize = metrics.amount(name + ".batchSize");
 			this.resends = metrics.amount(name + ".resends");
+			this.aloneResends = metrics.amount(name + ".resentAlone");
 		}
 
 		void enqueue(Pending pending) {
@@ -322,13 +323,13 @@ final class Proposer implements Closeable {
 
 		/**
 		 * The next batch: the first queued request and, if it is a data write, the data writes behind it, up to the
-		 * batch limits. Requests already past their deadline were never sent, so they fail without taking effect.
+		 * batch limits. Requests already past their deadline were never sent, so they fail without taking effect
+		 * (except those resent alone, see {@link Pending#fail}).
 		 */
 		private List<Pending> take() {
 			var batch = new ArrayList<Pending>();
 			long now = System.nanoTime();
 			int bytes = 0;
-			int valueResults = 0;
 			while (!queue.isEmpty()) {
 				var next = queue.peekFirst();
 				if (next.result.isDone()) {
@@ -337,22 +338,18 @@ final class Proposer implements Closeable {
 				}
 				if (closed || next.deadlineNanos - now < MIN_TIME_LEFT_NANOS) {
 					queue.pollFirst();
-					next.result.completeExceptionally(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+					next.fail(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
 							closed ? "The node is stopping" : "No leader accepted the write in time; it was not applied"));
 					continue;
 				}
-				if (!batch.isEmpty() && (!next.batchable || !batch.getFirst().batchable || next.epoch != batch.getFirst().epoch
-						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES
-						|| (next.returnsValues && valueResults >= MAX_BATCH_VALUE_RESULTS))) {
+				if (!batch.isEmpty() && (next.alone() || batch.getFirst().alone()
+						|| next.epoch != batch.getFirst().epoch || batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES)) {
 					break;
 				}
 				queue.pollFirst();
 				batch.add(next);
 				bytes += next.body.length + Long.BYTES;
-				if (next.returnsValues) {
-					valueResults++;
-				}
-				if (!next.batchable) {
+				if (next.alone()) {
 					break;
 				}
 			}
@@ -503,6 +500,69 @@ final class Proposer implements Closeable {
 				return null;
 			}, sender);
 		}
+
+		/**
+		 * Completes each request of {@code batch} with its own result from {@code reply}. A request whose result did
+		 * not fit in the reply ({@link ApplyResult#RESEND_ALONE}) took effect, and its sequence is still in flight, so
+		 * its record is kept: a data write is sent again alone, and applying that copy returns the record, which fits
+		 * in a reply by itself. A transaction commit cannot be sent again (a copy would conflict with itself, or reach
+		 * another leader), but this node's own Raft server applied it before answering: its record is read here.
+		 */
+		private void complete(List<Pending> batch, RaftClientReply reply) {
+			if (!reply.isSuccess()) {
+				fail(batch, unavailable(reply.getException()));
+				return;
+			}
+			List<ApplyResult> results;
+			try {
+				results = ResultCodec.decodeAll(reply.getMessage().getContent().toByteArray());
+			} catch (IllegalArgumentException ex) {
+				fail(batch, unavailable(ex));
+				return;
+			}
+			if (results.size() != batch.size()) {
+				fail(batch, unavailable(new IllegalStateException(
+						"Expected " + batch.size() + " results, got " + results.size())));
+				return;
+			}
+			var resend = new ArrayList<Pending>(0);
+			for (int i = 0; i < results.size(); i++) {
+				var pending = batch.get(i);
+				var result = results.get(i);
+				if (!(result instanceof ApplyResult.ResendAlone) || batch.size() == 1) {
+					pending.complete(result);
+					continue;
+				}
+				pending.resentAlone = true;
+				if (commits) {
+					completeFromLocalRecord(pending);
+				} else {
+					pending.queuedNanos = System.nanoTime();
+					resend.add(pending);
+				}
+			}
+			if (!resend.isEmpty()) {
+				aloneResends.record(resend.size());
+				requeue(resend);
+			}
+		}
+
+		private void completeFromLocalRecord(Pending pending) {
+			ApplyResult recorded;
+			try {
+				recorded = localRecord(pending.sequence);
+			} catch (IOException | RuntimeException ex) {
+				pending.fail(unavailable(ex));
+				return;
+			}
+			if (recorded == null) {
+				pending.fail(unavailable(new IllegalStateException("No local record of transaction commit "
+						+ pending.sequence)));
+			} else {
+				aloneResends.record(1);
+				pending.complete(recorded);
+			}
+		}
 	}
 
 	private boolean isLocalLeader() {
@@ -594,38 +654,18 @@ final class Proposer implements Closeable {
 		return exception.getCause() != null && exception.getCause().getClass().getName().equals(type.getName());
 	}
 
-	/** Completes each request of {@code batch} with its own result from {@code reply}. */
-	private static void complete(List<Pending> batch, RaftClientReply reply) {
-		if (!reply.isSuccess()) {
-			fail(batch, unavailable(reply.getException()));
-			return;
-		}
-		List<ApplyResult> results;
-		try {
-			results = ResultCodec.decodeAll(reply.getMessage().getContent().toByteArray());
-		} catch (IllegalArgumentException ex) {
-			fail(batch, unavailable(ex));
-			return;
-		}
-		if (results.size() != batch.size()) {
-			fail(batch, unavailable(new IllegalStateException(
-					"Expected " + batch.size() + " results, got " + results.size())));
-			return;
-		}
-		for (int i = 0; i < results.size(); i++) {
-			var result = batch.get(i).result;
-			switch (results.get(i)) {
-				case ApplyResult.Ok ok -> result.complete(ok.value());
-				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.UPDATE_RETRY ->
-						result.completeExceptionally(new RocksDBRetryException());
-				case ApplyResult.Failed failed -> result.completeExceptionally(failed.toException());
-			}
-		}
+	/**
+	 * The result this node's replica recorded for request {@code sequence}, or null if there is none. It is there
+	 * for a request whose entry this node's own Raft server answered: the leader answers only once it applied it.
+	 */
+	private @Nullable ApplyResult localRecord(long sequence) throws IOException {
+		return localServer.get().getDivision(groupId).getStateMachine() instanceof RockserverStateMachine stateMachine
+				? stateMachine.recordedResult(proposerId, sequence) : null;
 	}
 
 	private static void fail(List<Pending> batch, RocksDBException error) {
 		for (var pending : batch) {
-			pending.result.completeExceptionally(error);
+			pending.fail(error);
 		}
 	}
 

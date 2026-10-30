@@ -109,7 +109,9 @@ class ReplicationTest {
 
 	/**
 	 * The results of a batch come back in one reply, which a follower receives through gRPC with a size limit: many
-	 * concurrent writes through a follower, each returning a large previous value, all get their results.
+	 * concurrent writes through a follower, each returning a large previous value, all get their results. Twelve of
+	 * these results already exceed a reply, so those that do not fit are sent again alone (data writes) or read from
+	 * the leader's own record (update commits).
 	 */
 	@Test
 	void manyLargeResultsThroughAFollowerAreAllReceived() throws Exception {
@@ -117,11 +119,12 @@ class ReplicationTest {
 		cluster.awaitLeader(TIMEOUT);
 		var api = api(cluster.anyFollower());
 		long column = api.createColumn("c", SCHEMA);
-		int writes = 128;
-		var large = Buf.wrap(new byte[768 * 1024]);
+		int writes = 64;
+		var large = Buf.wrap(new byte[3 * 512 * 1024]);
 		try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+			// Keys below `writes` for data writes, the others for updates.
 			var puts = new ArrayList<java.util.concurrent.Future<?>>();
-			for (int i = 0; i < writes; i++) {
+			for (int i = 0; i < 2 * writes; i++) {
 				long key = i;
 				puts.add(executor.submit(() -> api.put(0, column, key(key), large, RequestType.none())));
 			}
@@ -134,6 +137,21 @@ class ReplicationTest {
 				previous.add(executor.submit(() -> api.put(0, column, key(key), text("small"), RequestType.previous())));
 			}
 			for (var result : previous) {
+				assertEquals(large.size(), result.get().size());
+			}
+			// Updates opened first, then committed together, so that their commits share log entries.
+			var updates = new long[writes];
+			for (int i = 0; i < writes; i++) {
+				updates[i] = api.get(0, column, key(writes + i), RequestType.<Buf>forUpdate()).updateId();
+			}
+			var updated = new ArrayList<java.util.concurrent.Future<Buf>>();
+			for (int i = 0; i < writes; i++) {
+				long update = updates[i];
+				long key = writes + i;
+				updated.add(executor.submit(() -> api.put(update, column, key(key), text("small"),
+						RequestType.<Buf>previous())));
+			}
+			for (var result : updated) {
 				assertEquals(large.size(), result.get().size());
 			}
 		}

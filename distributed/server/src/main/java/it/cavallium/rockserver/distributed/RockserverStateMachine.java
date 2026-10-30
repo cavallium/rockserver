@@ -203,6 +203,11 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return applied;
 	}
 
+	/** The result this replica recorded for request {@code sequence} of {@code proposerId}, or null. Any thread. */
+	@Nullable ApplyResult recordedResult(long proposerId, long sequence) {
+		return Applier.recordedResult(store, proposerId, sequence);
+	}
+
 	boolean isFailed() {
 		return failed;
 	}

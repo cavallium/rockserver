@@ -58,7 +58,8 @@ class ResultCodecTest {
 				Named.of("large list", new Ok(largeList())),
 				Named.of("failure", new Failed(RocksDBErrorType.COLUMN_NOT_FOUND, "Column 7 not found")),
 				Named.of("failure, empty message", new Failed(RocksDBErrorType.COLUMN_EXISTS, "")),
-				Named.of("failure, unicode message", new Failed(RocksDBErrorType.INTERNAL_ERROR, "è 列 🚀")));
+				Named.of("failure, unicode message", new Failed(RocksDBErrorType.INTERNAL_ERROR, "è 列 🚀")),
+				Named.of("resend alone", ApplyResult.RESEND_ALONE));
 	}
 
 	@ParameterizedTest
@@ -128,19 +129,29 @@ class ResultCodecTest {
 	}
 
 	@Test
-	void theLargestResultsThatDoNotFitInAReplyBecomeFailures() {
+	void theLargestResultsThatDoNotFitInAReplyAreSentAgainAlone() {
 		var small = new Ok(buf("small"));
 		var large = new Ok(Buf.wrap(new byte[1000]));
 		var larger = new Ok(Buf.wrap(new byte[1500]));
 		var results = List.<ApplyResult>of(small, large, larger, large, ApplyResult.OK_NULL);
-		long largeSize = ResultCodec.encodedSize(large);
-		long largerSize = ResultCodec.encodedSize(larger);
 		// Room for the small results and one large one: the larger one goes, then the first of the equal ones.
 		byte[] encoded = ResultCodec.encodeAll(results, 2000);
 		assertTrue(encoded.length <= 2000, "reply of " + encoded.length + " bytes");
-		assertEquals(List.of(small, ResultCodec.tooLarge(largeSize), ResultCodec.tooLarge(largerSize), large,
-				ApplyResult.OK_NULL), ResultCodec.decodeAll(encoded));
+		assertEquals(List.of(small, ApplyResult.RESEND_ALONE, ApplyResult.RESEND_ALONE, large, ApplyResult.OK_NULL),
+				ResultCodec.decodeAll(encoded));
 		assertArrayEquals(encoded, ResultCodec.encodeAll(results, 2000), "the choice is not deterministic");
+		// Each of them fits in a reply alone.
+		assertEquals(List.of(larger), ResultCodec.decodeAll(ResultCodec.encodeAll(List.of(larger), 2000)));
+	}
+
+	@Test
+	void aResultThatDoesNotFitInAReplyEvenAloneIsAFinalFailure() {
+		var large = new Ok(Buf.wrap(new byte[3000]));
+		long size = ResultCodec.encodedSize(large);
+		assertEquals(List.of(ResultCodec.tooLarge(size)),
+				ResultCodec.decodeAll(ResultCodec.encodeAll(List.of(large), 2000)));
+		assertEquals(List.of(ApplyResult.OK_NULL, ResultCodec.tooLarge(size)),
+				ResultCodec.decodeAll(ResultCodec.encodeAll(List.of(ApplyResult.OK_NULL, large), 2000)));
 	}
 
 	@Test
@@ -151,6 +162,7 @@ class ResultCodecTest {
 		var decoded = ResultCodec.decodeAll(ResultCodec.encodeAll(results));
 		assertEquals(ApplyResult.OK_NULL, decoded.getFirst());
 		assertEquals(ResultCodec.tooLarge(ResultCodec.encodedSize(huge)), decoded.get(1));
+		assertEquals(ResultCodec.tooLarge(ResultCodec.encodedSize(huge)), ResultCodec.bounded(huge));
 	}
 
 	@Test
@@ -158,6 +170,25 @@ class ResultCodecTest {
 		var decoded = ResultCodec.decodeAll(ResultCodec.encodeAll(List.of(new Ok("string"), ApplyResult.OK_NULL)));
 		assertInstanceOf(Failed.class, decoded.getFirst());
 		assertEquals(ApplyResult.OK_NULL, decoded.get(1));
+		assertEquals(decoded.getFirst(), ResultCodec.bounded(new Ok("string")));
+	}
+
+	@Test
+	void boundedKeepsWhatFitsAloneInAReply() {
+		var largest = new Ok(Buf.wrap(new byte[ResultCodec.MAX_RESULT_BYTES - 6]));
+		assertEquals(ResultCodec.MAX_RESULT_BYTES, ResultCodec.encodedSize(largest));
+		assertTrue(largest == ResultCodec.bounded(largest));
+		assertEquals(ResultCodec.MAX_REPLY_BYTES, ResultCodec.encodeAll(List.of(largest)).length);
+		var tooLarge = new Ok(Buf.wrap(new byte[ResultCodec.MAX_RESULT_BYTES - 5]));
+		assertEquals(ResultCodec.tooLarge(ResultCodec.MAX_RESULT_BYTES + 1), ResultCodec.bounded(tooLarge));
+	}
+
+	@Test
+	void boundedKeepsTheErrorTypeOfARejectionWithATooLargeMessage() {
+		var rejection = new Failed(RocksDBErrorType.COLUMN_NOT_FOUND, "x".repeat(3000));
+		var bounded = assertInstanceOf(Failed.class, ResultCodec.bounded(rejection, 2000));
+		assertEquals(RocksDBErrorType.COLUMN_NOT_FOUND, bounded.type());
+		assertEquals(bounded, ResultCodec.bounded(bounded, 2000), "bounding twice changes nothing");
 	}
 
 	@Test

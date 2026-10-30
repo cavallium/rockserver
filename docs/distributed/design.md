@@ -105,8 +105,7 @@ and the `LogEntry`.
 
 - **Batches.** Requests that arrive while 32 batches are in flight wait, then go together as one log entry
   (`LogEntryCodec.encodeBatch`: the proposer id and `completedBelow` once, then each sequence and entry; up to
-  4096 requests or 8 MiB, and at most 16 requests whose result can hold stored values, such as previous, delta
-  or merged values; schema changes, `deleteRange` and genesis always alone). One entry costs one Ratis
+  4096 requests or 8 MiB; schema changes, `deleteRange` and genesis always alone). One entry costs one Ratis
   append, one place in a group fsync and one apply transaction, whatever it holds. Transaction commits have a
   queue of their own, and commits of different leader terms never share an entry.
 - **Retries.** A batch is resent with the same bytes across leader changes until the latest deadline of its
@@ -126,10 +125,13 @@ and the `LogEntry`.
   and without reading any record. Sequence numbers are allocated and registered atomically, so
   `completedBelow` never passes a request that is still in flight.
 - **Records are deleted in bulk.** Records below the floor are never read again, so they are not deleted in
-  the entry's write. Once a proposer's floor has moved 65536 sequences, one range deletion without the WAL
-  removes everything below it, after the entry that moved the floor. With atomic flush a crash keeps that
-  deletion only together with the floor that covers it; if it loses it, the records come back below the floor,
-  unread, until the next one. Loading a proposer's records skips those below its floor.
+  the entry's write. Once a proposer's floor has moved 1024 sequences, or the proposer has recorded 4 MiB of
+  results, since the last deletion, one range deletion without the WAL removes everything below its floor,
+  after the entry that moved the floor. Before applying its first entry after a start, a replica also scans
+  every proposer's floor and deletes the records below it, which covers proposers of processes that stopped
+  (a proposer id lives as long as its process). With atomic flush a crash keeps a deletion only together with
+  the floor that covers it; if it loses it, the records come back below the floor, unread, until the next
+  one. Loading a proposer's records skips those below its floor.
 - **Duplicates are found in memory.** Each replica keeps, per proposer, its floor and the sequences recorded
   at or above it, loaded from the internal column the first time the proposer is seen: checking a request for
   an earlier copy costs no read.
@@ -150,9 +152,15 @@ API.
   nothing and is recorded without the flush.
 - **Return values** (previous value, delta, merged value...) are computed by apply, so they are the same on
   every replica. The results of an entry go back in one reply of at most 17 MiB (the Raft client's gRPC limit
-  is 18 MiB). If they do not fit, the largest ones become an `INVALID_REQUEST` failure saying that the write
-  was applied, the same on every replica; building the reply never fails. A reply too large to receive anyway
-  fails its requests the same way instead of being resent.
+  is 18 MiB). A result too large for a reply by itself, or one that cannot be encoded, is replaced before it
+  is recorded, the same on every replica: by an `INVALID_REQUEST` failure saying that the write was applied
+  (an `INTERNAL_ERROR` one if it cannot be encoded). That failure is both the record and the reply. If the
+  results of an entry do not fit together, the largest ones are replaced in the reply by a "resend alone"
+  marker. The proposer then sends each of those requests again in an entry of its own: its sequence is still
+  in flight, so the copy does not run and gets the recorded result, which fits in a reply by itself. A
+  transaction commit is not sent again (the copy would conflict with itself); the leader that answered is
+  this node, which applied it, so its record is read locally. Building the reply never fails. A reply too
+  large to receive anyway fails its requests with an "applied" `INVALID_REQUEST` instead of being resent.
 
 **Failures during apply.**
 
@@ -327,7 +335,7 @@ address, so a test can partition any set of links.
 | Test | What it proves |
 |---|---|
 | `ReplicationTest` (in-process) | Replication through any node; results; leader loss; snapshot catch-up; batches; transactions, conflicts and updates; updates whose caller timed out or cancelled while queued do not take the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
-| `ApplierTest` | At-most-once retries, including after a restart; deletion of records; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; crash consistency of applies without the WAL. |
+| `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; crash consistency of applies without the WAL. |
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); history kept for open transactions and in-flight commits. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Failover takes about 1 s. |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
@@ -380,9 +388,11 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
 7. **Known limits to decide on.**
    - `deleteColumn` waits for open iterators on the leader, which stalls apply there until they close or
      expire.
-   - The result records of a proposer process that crashed are never deleted. Only the few that were in flight
-     remain per crash; add a cleanup entry if crashes turn out to be frequent.
-   - A result larger than the Ratis message limit makes a committed write look failed.
+   - The result records that a stopped proposer process had in flight (at or above its floor) are never
+     deleted; those below its floor are deleted when each replica next starts. Add a cleanup entry if crashes
+     turn out to be frequent.
+   - A result larger than 17 MiB (for example a multi-key previous value) is replaced by an
+     `INVALID_REQUEST` failure: the write is applied, but its caller does not get the result.
    - Snapshots are triggered by entry count only, and a failing snapshot is retried at every apply step. Each
      one stops the apply for its memtable flush (100–300 ms measured).
    - Iterator calls after a leader change fail with an internal "iterator not found" error, not `UPDATE_RETRY`.
