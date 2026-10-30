@@ -353,7 +353,6 @@ public class GrpcServer extends Server {
 	 */
 	private static final int PROXY_STREAM_PARALLELISM = 256;
 	private static final String MAX_CONNECTION_AGE_PROPERTY = "it.cavallium.rockserver.grpc.server.max-connection-age-ms";
-	private static final Duration DEFAULT_MAX_CONNECTION_AGE = Duration.ofMinutes(30);
 	private static final String MAX_CONNECTION_AGE_GRACE_PROPERTY
 			= "it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms";
 	private static final Duration DEFAULT_MAX_CONNECTION_AGE_GRACE = Duration.ofMinutes(10);
@@ -404,21 +403,30 @@ public class GrpcServer extends Server {
 		LOG.info("GRPC RocksDB server is listening at " + socketAddress);
 	}
 
+	/** The age at which a server in front of another connection ends a connection; zero, the default, means never. */
+	@VisibleForTesting
+	public static Duration configuredMaxConnectionAge() {
+		return durationProperty(MAX_CONNECTION_AGE_PROPERTY, Duration.ZERO);
+	}
+
 	private io.grpc.Server newTransport(SocketAddress socketAddress) {
 		var builder = NettyServerBuilder
 				.forAddress(socketAddress)
 				.bossEventLoopGroup(elg)
 				.workerEventLoopGroup(elg);
 		if (proxyScheduler != null) {
-			// Clients that moved away (the node they used was lost, or it paused) come back to the first address of
-			// their list only with a new connection, so connections end after a while. gRPC adds a jitter of +/-10%
-			// to the age, and the grace leaves long streams running: only those that outlive it are cut.
-			builder.executor(callExecutor)
-					.maxConnectionAge(durationProperty(MAX_CONNECTION_AGE_PROPERTY, DEFAULT_MAX_CONNECTION_AGE).toNanos(),
-							TimeUnit.NANOSECONDS)
-					.maxConnectionAgeGrace(
-							durationProperty(MAX_CONNECTION_AGE_GRACE_PROPERTY, DEFAULT_MAX_CONNECTION_AGE_GRACE).toNanos(),
-							TimeUnit.NANOSECONDS);
+			builder.executor(callExecutor);
+			// Off by default. Ending a connection brings a client that moved away back to the first address of its list,
+			// but every client then starts again from the top of the list at every cycle, so a silent first address costs
+			// it the connect timeout each time, and the grace cuts every call that outlives it, on a healthy cluster too.
+			// gRPC adds a jitter of +/-10% to the age.
+			var maxAge = configuredMaxConnectionAge();
+			if (maxAge.isPositive()) {
+				builder.maxConnectionAge(maxAge.toNanos(), TimeUnit.NANOSECONDS)
+						.maxConnectionAgeGrace(
+								durationProperty(MAX_CONNECTION_AGE_GRACE_PROPERTY, DEFAULT_MAX_CONNECTION_AGE_GRACE).toNanos(),
+								TimeUnit.NANOSECONDS);
+			}
 		} else {
 			builder.directExecutor();
 		}

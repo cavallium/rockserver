@@ -338,8 +338,22 @@ class GrpcConnectionFailoverTest {
 		System.setProperty(MAX_RECONNECT_DELAY_PROPERTY, "200");
 		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
 		resources.add(node);
-		var client = GrpcConnection.forHostsAndPorts("reconnect-client",
+		assertReconnectsWithoutTheGrowingBackoff(node,
 				List.of(node.address(), new HostAndPort("127.0.0.1", unusedPort())));
+	}
+
+	/** A client with one address, whose node stopped listening for a while, comes back as fast. */
+	@Test
+	void reconnectingOnOneAddressDoesNotWaitForTheGrowingBackoff() throws Exception {
+		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
+		System.setProperty(MAX_RECONNECT_DELAY_PROPERTY, "200");
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(node);
+		assertReconnectsWithoutTheGrowingBackoff(node, List.of(node.address()));
+	}
+
+	private void assertReconnectsWithoutTheGrowingBackoff(FakeNode node, List<HostAndPort> addresses) throws Exception {
+		var client = GrpcConnection.forHostsAndPorts("reconnect-client", addresses);
 		try {
 			assertEquals(node.port(), remotePort(client));
 			node.stopNow();
@@ -359,6 +373,44 @@ class GrpcConnectionFailoverTest {
 		} finally {
 			client.close();
 		}
+	}
+
+	/** The timer runs only in {@code TRANSIENT_FAILURE}: a healthy or idle channel has nothing scheduled. */
+	@Test
+	void onlyAFailingChannelHasAReconnectTimer() throws Exception {
+		System.setProperty(MAX_ATTEMPTS_PROPERTY, "1");
+		System.setProperty(MAX_RECONNECT_DELAY_PROPERTY, "200");
+		var node = new FakeNode(FIRST_NODE_COLUMN_ID);
+		resources.add(node);
+		var client = GrpcConnection.forHostAndPort("timer-client", node.address());
+		try {
+			assertEquals(node.port(), remotePort(client));
+			assertFalse(hasReconnectTimer(client));
+
+			node.stopNow();
+			assertThrows(StatusRuntimeException.class, () -> remotePort(client));
+			awaitReconnectTimer(client, true);
+
+			node.restart();
+			assertEquals(node.port(), awaitServedBy(client, node));
+			awaitReconnectTimer(client, false);
+
+			node.stopNow();
+			assertThrows(StatusRuntimeException.class, () -> remotePort(client));
+			awaitReconnectTimer(client, true);
+			channel(client).enterIdle();
+			awaitReconnectTimer(client, false);
+			try (var attempts = new ConnectionCounter(node.port())) {
+				Thread.sleep(1_000);
+				assertEquals(0, attempts.count(), "an idle channel kept reconnecting");
+			}
+
+			assertThrows(StatusRuntimeException.class, () -> remotePort(client));
+			awaitReconnectTimer(client, true);
+		} finally {
+			client.close();
+		}
+		assertFalse(hasReconnectTimer(client), "a closed connection kept its timer");
 	}
 
 	/** A paused server stops listening and its clients move, while what it was running ends normally. */
@@ -396,7 +448,7 @@ class GrpcConnectionFailoverTest {
 		assertEquals(proxy.getPort(), awaitServedBy(late, proxy.getPort()));
 	}
 
-	/** Connections end with age, so a client that moved away returns to the first address of its list. */
+	/** With a maximum age, connections end, so a client that moved away returns to the first address of its list. */
 	@Test
 	void aClientReturnsToTheFirstAddressWhenItsConnectionGetsOld() throws Exception {
 		System.setProperty(MAX_CONNECTION_AGE_PROPERTY, "1000");
@@ -415,6 +467,40 @@ class GrpcConnectionFailoverTest {
 		first.resume();
 
 		assertEquals(first.getPort(), awaitServedBy(client, first.getPort()));
+	}
+
+	@Test
+	void connectionsDoNotEndWithAgeByDefault() throws Exception {
+		assertEquals(Duration.ZERO, GrpcServer.configuredMaxConnectionAge());
+		assertAClientStaysAfterItMoved();
+	}
+
+	@Test
+	void aMaximumAgeOfZeroIsOff() throws Exception {
+		System.setProperty(MAX_CONNECTION_AGE_PROPERTY, "0");
+		assertEquals(Duration.ZERO, GrpcServer.configuredMaxConnectionAge());
+		assertAClientStaysAfterItMoved();
+	}
+
+	private void assertAClientStaysAfterItMoved() throws Exception {
+		var firstBackend = new FakeNode(FIRST_NODE_COLUMN_ID);
+		var secondBackend = new FakeNode(SECOND_NODE_COLUMN_ID);
+		resources.add(firstBackend);
+		resources.add(secondBackend);
+		var first = proxyOf(firstBackend);
+		var second = proxyOf(secondBackend);
+		var client = connect(List.of(new HostAndPort("127.0.0.1", first.getPort()),
+				new HostAndPort("127.0.0.1", second.getPort())));
+		first.pause();
+		assertEquals(second.getPort(), awaitServedBy(client, second.getPort()));
+
+		first.resume();
+
+		long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+		while (System.nanoTime() < end) {
+			assertEquals(second.getPort(), remotePort(client));
+			Thread.sleep(20);
+		}
 	}
 
 	@Test
@@ -667,6 +753,28 @@ class GrpcConnectionFailoverTest {
 		while (System.nanoTime() < end) {
 			assertEquals(node.port(), remotePort(client));
 			Thread.sleep(20);
+		}
+	}
+
+	private static boolean hasReconnectTimer(GrpcConnection client) throws Exception {
+		var delegateField = GrpcConnection.class.getDeclaredField("delegate");
+		delegateField.setAccessible(true);
+		var delegate = delegateField.get(client);
+		var timerField = delegate.getClass().getDeclaredField("reconnectTimer");
+		timerField.setAccessible(true);
+		var reconnectTimer = timerField.get(delegate);
+		var scheduled = reconnectTimer.getClass().getDeclaredField("timer");
+		scheduled.setAccessible(true);
+		synchronized (reconnectTimer) {
+			return scheduled.get(reconnectTimer) != null;
+		}
+	}
+
+	private static void awaitReconnectTimer(GrpcConnection client, boolean expected) throws Exception {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+		while (hasReconnectTimer(client) != expected) {
+			assertTrue(System.nanoTime() < deadline, () -> "the reconnect timer never became " + expected);
+			Thread.sleep(10);
 		}
 	}
 

@@ -302,7 +302,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private final URI address;
 	private final int maxInboundMessageSize;
 	private final RockserverCapabilities capabilities;
-	private final @Nullable ScheduledFuture<?> reconnectTimer;
+	private final ReconnectTimer reconnectTimer;
 
 	private static it.cavallium.rockserver.core.common.api.proto.RequestContext[] createNoDeadlineWireContexts() {
 		var contexts = new it.cavallium.rockserver.core.common.api.proto.RequestContext[WorkloadProfile.values().length];
@@ -456,23 +456,61 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		this.address = address;
 		this.maxInboundMessageSize = maxInboundMessageSize;
 		this.capabilities = capabilities;
-		this.reconnectTimer = severalAddresses ? startReconnectTimer(channel, eventLoopGroup) : null;
+		this.reconnectTimer = new ReconnectTimer(channel, eventLoopGroup);
 	}
 
 	/**
-	 * With every address failing, gRPC retries after a delay that grows up to 2 minutes, and failing calls do not start
-	 * a connection: a client could lag behind a cluster that returned. This timer skips the rest of that delay, so a
-	 * client reconnects within the configured maximum. Each client has its own period, which keeps the clients of a
-	 * cluster that returned from reconnecting together.
+	 * With its address or every address of its list failing, a channel retries after a delay that grows up to 2 minutes,
+	 * and failing calls do not start a connection: a client could lag behind a node, or a cluster, that returned. This
+	 * timer skips the rest of that delay, so a client reconnects within the configured maximum. Each client has its own
+	 * period, which keeps the clients of a cluster that returned from reconnecting together.
+	 *
+	 * <p>The timer runs only while the channel is in {@code TRANSIENT_FAILURE}. In any other state there is only a
+	 * listener for its next change: a healthy channel has nothing scheduled, and an idle one stays idle.</p>
 	 */
-	private static ScheduledFuture<?> startReconnectTimer(ManagedChannel channel, EventLoopGroup eventLoopGroup) {
-		int maxDelayMillis = intProperty(MAX_RECONNECT_DELAY_PROPERTY, DEFAULT_MAX_RECONNECT_DELAY_MILLIS, 2);
-		long periodMillis = ThreadLocalRandom.current().nextLong(maxDelayMillis / 2, maxDelayMillis + 1L);
-		return eventLoopGroup.scheduleWithFixedDelay(() -> {
-			if (channel.getState(false) == ConnectivityState.TRANSIENT_FAILURE) {
-				channel.resetConnectBackoff();
+	private static final class ReconnectTimer {
+
+		private final ManagedChannel channel;
+		private final EventLoopGroup eventLoopGroup;
+		private final long periodMillis;
+		private @Nullable ScheduledFuture<?> timer;
+		private boolean closed;
+
+		ReconnectTimer(ManagedChannel channel, EventLoopGroup eventLoopGroup) {
+			this.channel = channel;
+			this.eventLoopGroup = eventLoopGroup;
+			int maxDelayMillis = intProperty(MAX_RECONNECT_DELAY_PROPERTY, DEFAULT_MAX_RECONNECT_DELAY_MILLIS, 2);
+			this.periodMillis = ThreadLocalRandom.current().nextLong(maxDelayMillis / 2, maxDelayMillis + 1L);
+			onStateChange();
+		}
+
+		private synchronized void onStateChange() {
+			if (closed) {
+				return;
 			}
-		}, periodMillis, periodMillis, TimeUnit.MILLISECONDS);
+			var state = channel.getState(false);
+			if (state != ConnectivityState.TRANSIENT_FAILURE) {
+				stopTimer();
+			} else if (timer == null) {
+				timer = eventLoopGroup.scheduleWithFixedDelay(channel::resetConnectBackoff, periodMillis, periodMillis,
+						TimeUnit.MILLISECONDS);
+			}
+			if (state != ConnectivityState.SHUTDOWN) {
+				channel.notifyWhenStateChanged(state, this::onStateChange);
+			}
+		}
+
+		private void stopTimer() {
+			if (timer != null) {
+				timer.cancel(false);
+				timer = null;
+			}
+		}
+
+		synchronized void close() {
+			closed = true;
+			stopTimer();
+		}
 	}
 
 	@Override
@@ -1966,9 +2004,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	@Override
 	public void close() {
-		if (this.reconnectTimer != null) {
-			this.reconnectTimer.cancel(false);
-		}
+		this.reconnectTimer.close();
 		try {
 			this.channel.shutdown();
 		} catch (Exception ex) {
