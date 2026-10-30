@@ -10894,6 +10894,28 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		flush(true);
 	}
 
+	/**
+	 * Starts a flush of every column's memtables and returns without waiting for it: for a caller that will flush
+	 * synchronously soon (a checkpoint) and wants that flush to find little left to write.
+	 */
+	public void requestFlush() {
+		ops.beginOp();
+		try {
+			synchronized (columnEditLock) {
+				try (var fo = new FlushOptions().setWaitForFlush(false).setAllowWriteStall(true)) {
+					db.get().flush(fo, columns.values().stream()
+							.map(ColumnInstance::cfh)
+							.filter(AbstractImmutableNativeReference::isOwningHandle)
+							.toList());
+				}
+			}
+		} catch (org.rocksdb.RocksDBException ex) {
+			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
+		} finally {
+			ops.endOp();
+		}
+	}
+
 	private void flush(boolean walOnly) {
 		var start = System.nanoTime();
 		ops.beginOp();
