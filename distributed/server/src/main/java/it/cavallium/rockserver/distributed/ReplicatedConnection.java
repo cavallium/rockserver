@@ -105,6 +105,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private final NodeMetrics.Series closeWaitTime;
 	private final NodeMetrics.Series closeRetries;
 	private final NodeMetrics.Series transactionConflicts;
+	private final NodeMetrics.Series transactionChainConflicts;
 	private final NodeMetrics.Series localTime;
 	/** Runs short local commands, each on a virtual thread of its own; see {@link #local}. */
 	private static final java.util.concurrent.ExecutorService INLINE = java.util.concurrent.Executors
@@ -127,6 +128,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		this.closeWaitTime = metrics.duration("update.closeWait");
 		this.closeRetries = metrics.amount("update.closeRetry");
 		this.transactionConflicts = metrics.amount("transaction.conflict");
+		this.transactionChainConflicts = metrics.amount("transaction.chainConflict");
 		this.localTime = metrics.duration("local");
 		this.stateMachine = stateMachine;
 		this.proposer = proposer;
@@ -1006,6 +1008,9 @@ final class ReplicatedConnection implements RocksDBConnection {
 			if (error != null && unwrap(error) instanceof Proposer.ConflictException) {
 				// Same contract as a single node: false, and the transaction stays open.
 				transactionConflicts.record(1);
+				if (session.yieldChainsTo(entry)) {
+					transactionChainConflicts.record(1);
+				}
 				return false;
 			}
 			session.remove(transaction);

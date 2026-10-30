@@ -645,6 +645,27 @@ final class LeaderSession {
 		}
 	}
 
+	/**
+	 * Called after the transaction commit {@code commit} conflicted: stops chaining on its conflict keys that have
+	 * unsettled links, and returns true if there was one. Its snapshot was older than those links, so no wait could save
+	 * it, but on a key that chains without a pause, no transaction ever opened after the last link: the pause until the
+	 * links settle is the room its retry needs, and it costs updates of that key only while transactions collide with
+	 * them.
+	 */
+	boolean yieldChainsTo(LogEntry.Guarded commit) {
+		boolean yielded = false;
+		synchronized (chainLock) {
+			for (long key : commit.conflictHashes()) {
+				var state = keys.get(key);
+				if (state != null && state.links > 0) {
+					breakChain(state);
+					yielded = true;
+				}
+			}
+		}
+		return yielded;
+	}
+
 	/** Releases {@code lock}, passing the key to the next waiting update that still waits. */
 	void unlockKey(KeyLock lock) {
 		synchronized (chainLock) {
