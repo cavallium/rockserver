@@ -199,11 +199,16 @@ Other results:
   commit), one more hop each. One connection is enough: its calls no longer share one event loop thread.
 - **Client failover.** Create clients with every node's address (`GrpcConnection.forHostsAndPorts`, or
   `http://node-1:5333,node-2:5333,node-3:5333`), the expected leader first: without it, a dead node takes the
-  clients pinned to it down with it. A client that moved stays on its new node, so after a leader change it may
-  talk to a follower until its connection is lost. A crash is noticed at once. A host that goes down or a process
-  that freezes is noticed by keepalive, in at most 15 s (10 s of silence, 5 s for the answer), which is the
-  price of not closing connections on shorter pauses; each such node before the first live one in the list then
-  costs 3 s (the connect timeout) when the client reconnects. See the [README](../../README.md#client-connections).
+  clients pinned to it down with it. All the clients with the same list sit on its first node. After a leader change
+  they stay there, so all their calls that need the leader take a forwarding hop through what is now a follower,
+  which costs capacity (see above), until their connection is lost, or ends after about 30 minutes (+/-10%), when
+  they return to the first address. The benchmark's `--route failover` spreads the lists, so it does not measure
+  this. A crash is noticed at once. A host that goes down or a process that freezes is noticed by keepalive, in at
+  most 15 s (10 s of silence, 5 s for the answer), which is the price of not closing connections on shorter pauses;
+  each such node before the first live one in the list then costs 3 s (the connect timeout) when the client
+  reconnects. A node cut off from the Raft majority stops listening after 3 maximum election timeouts without a
+  leader (about 8 s in all by default), so its clients move, and listens again once it knows a leader. A hung disk
+  is not detected. See the [README](../../README.md#client-connections).
 - **Snapshots.** One every 500k entries (`--snapshot-every`), about every 100 s at 2×. A snapshot flushes the
   memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.
 - **Memory.** In a 10-minute run at 2× the leader's heap stayed between 1.3 and 2.8 GiB (4 GiB heap). The
