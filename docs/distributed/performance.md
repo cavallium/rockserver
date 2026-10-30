@@ -102,6 +102,16 @@ with 11–18 s write latency. In order of discovery:
    position writes, two scans of a hash set of recorded sequences) took about a fifth of the apply thread's Java
    samples. Records below the floor are now deleted with one range deletion per 65536 sequences, and the
    recorded sequences are kept in a sorted set.
+10. **Conflict checks nobody needed.** At 4× with 2048 writes in flight the leader's apply thread was the
+    limit (about 81% busy, 37 entries waiting to apply on average). `perf` on that thread: 40% in the RocksDB
+    commit, half of it validating every written key against the memtables, as an optimistic transaction does,
+    although the apply thread is the only writer of those keys. Apply transactions now write untracked and read
+    with `get` instead of `getForUpdate`: per entry, commit 0.22 → 0.12 ms and execute 0.40 → 0.35 ms.
+11. **The embedded scheduler on the leader's reads.** The leader's local reads (a get, the read of an update, a
+    transactional put, opening and closing native transactions) went through the embedded workload scheduler,
+    whose queues cost 2.6–8.6 ms per request on average at 2–4×, and up to 1.4 s. Those requests were admitted
+    by `GrpcServer` already: they now run on a virtual thread of their own, straight on the database. Ranges
+    and multi-key reads keep the scheduler. Local time 0.8–1.4 ms; `UPDATE` p99 at 2× from 876 to 232 ms.
 
 ## Results
 
