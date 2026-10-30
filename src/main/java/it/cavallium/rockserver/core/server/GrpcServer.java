@@ -152,7 +152,8 @@ public class GrpcServer extends Server {
 	/**
 	 * For a non-embedded connection: every request waits on that connection for a whole round trip and its admission
 	 * happens there, so each runs on a virtual thread of its own, at most {@link #PROXY_PARALLELISM} at once, without
-	 * this server's workload queues. Null for an embedded database.
+	 * this server's workload queues. Only for single-shot {@code schedule} calls: streaming paths need a worker, and
+	 * they use {@link #scheduler} instead. Null for an embedded database.
 	 */
 	private final reactor.core.scheduler.@Nullable Scheduler proxyScheduler;
 	private final @Nullable EmbeddedDB embeddedDatabase;
@@ -331,7 +332,10 @@ public class GrpcServer extends Server {
 
 	/** Requests that may wait on a non-embedded connection at once; more are refused as overload. */
 	private static final int PROXY_PARALLELISM = 16384;
-	/** Streaming requests (iterators) of each kind that may wait on a non-embedded connection at once. */
+	/**
+	 * Streaming requests (iterators and streamed putMulti, deleteMulti and mergeMulti) of each kind that may wait on a
+	 * non-embedded connection at once.
+	 */
 	private static final int PROXY_STREAM_PARALLELISM = 256;
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
@@ -344,8 +348,9 @@ public class GrpcServer extends Server {
 			this.proxyScheduler = null;
 		} else {
 			// Every request waits on the other connection (a remote or replicated database) for a whole round trip:
-			// with one platform thread per core, the round trip latency would cap the throughput. The workload
-			// scheduler only serves the rare streaming paths; requests use the proxy scheduler.
+			// with one platform thread per core, the round trip latency would cap the throughput. Single-shot
+			// requests use the proxy scheduler. Streaming paths, which hold a worker for the whole stream, and
+			// rollbacks and maintenance use the workload scheduler, whose bounded queues refuse excess streams.
 			this.scheduler = RWScheduler.withVirtualWorkers(WorkloadSettings.proxy(PROXY_STREAM_PARALLELISM), "grpc-db");
 			this.ownsScheduler = true;
 			this.embeddedDatabase = null;
@@ -1369,10 +1374,14 @@ public class GrpcServer extends Server {
 					context.profile(), remainingNanos);
 		}
 
-		private reactor.core.scheduler.Scheduler contextualScheduler(
+		/**
+		 * The scheduler of a streaming path ({@code publishOn}): always a view of the column's workload scheduler,
+		 * never the proxy scheduler, whose workers bypass its permits.
+		 */
+		private reactor.core.scheduler.Scheduler streamingScheduler(
 				ResolvedRequestContext context,
 				OperationFamily family, long columnId) {
-			return workloadScheduler(columnWorkloadScheduler(columnId), context.profile(),
+			return columnWorkloadScheduler(columnId).scheduler(context.profile(),
 					family,
 					context.localMonotonicDeadlineNanos());
 		}
@@ -1834,7 +1843,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+					.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 							initialRequest.getColumnId(),
 							mapKeys(data.getKeysList()),
@@ -1885,7 +1894,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+							.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 							.map(data -> mapper.apply(contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysList()),
@@ -2007,7 +2016,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+							.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 							.map(data -> {
 								var merged = contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 										initialRequest.getColumnId(),
@@ -2046,7 +2055,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+					.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> {
 						contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
@@ -2197,7 +2206,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+							.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 							.map(data -> mapper.apply(contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysList()),
@@ -2231,7 +2240,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+					.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> {
 						contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
@@ -2265,7 +2274,7 @@ public class GrpcServer extends Server {
 			var contextualApi = syncApi(context);
 			return dataFlux
 					.buffer(WRITE_ELISION_MULTI_STEP_SIZE)
-					.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
+					.publishOn(streamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> {
 						var batch = mapKVBatch(data);
 						contextualApi.putMulti(initialRequest.getTransactionOrUpdateId(),

@@ -101,15 +101,23 @@ public class MergeOperatorRegistry implements Closeable {
                 // Instantiate before writing anything: an operator that cannot be loaded leaves no rows behind,
                 // so uploading it again fails the same way instead of finding them and reusing the version.
                 FFMAbstractMergeOperator op = loadAndInstantiate(className, jarData);
-
-                // Write the version counter, the data and the hash index atomically
-                try (var batch = new LeakSafeWriteBatch()) {
-                    batch.put(cfh, encodeMetaKey(name), encodeLong(version));
-                    batch.put(cfh, key, value);
-                    batch.put(cfh, encodeHashKey(name, hash), encodeLong(version));
-                    write(batch);
+                boolean cached = false;
+                try {
+                    // Write the version counter, the data and the hash index atomically
+                    try (var batch = new LeakSafeWriteBatch()) {
+                        batch.put(cfh, encodeMetaKey(name), encodeLong(version));
+                        batch.put(cfh, key, value);
+                        batch.put(cfh, encodeHashKey(name, hash), encodeLong(version));
+                        write(batch);
+                    }
+                    cache.computeIfAbsent(name, k -> new ConcurrentHashMap<>()).put(version, op);
+                    cached = true;
+                } finally {
+                    // The operator owns a shared arena and a native handle that only close() releases
+                    if (!cached) {
+                        op.close();
+                    }
                 }
-                cache.computeIfAbsent(name, k -> new ConcurrentHashMap<>()).put(version, op);
 
                 LOG.info("Uploaded merge operator '{}' version {} (class: {})", name, version, className);
                 return version;

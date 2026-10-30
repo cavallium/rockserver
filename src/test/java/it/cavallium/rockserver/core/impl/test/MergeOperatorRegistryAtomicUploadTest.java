@@ -20,6 +20,7 @@ import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.Attributes;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
@@ -144,6 +145,41 @@ class MergeOperatorRegistryAtomicUploadTest {
 		try (var registry = newRegistry()) {
 			var error = assertThrows(RocksDBException.class, () -> registry.upload(NAME, CLASS_NAME, corrupt));
 			assertNoIOExceptionCause(error);
+		}
+	}
+
+	@Test
+	void failedWriteClosesTheInstantiatedOperator() throws Exception {
+		db.close();
+		db = RocksDB.openReadOnly(options, directory.resolve("registry").toString());
+		int created = CountingAppendOperator.CREATED.get();
+		int disposed = CountingAppendOperator.DISPOSED.get();
+		try (var registry = newRegistry()) {
+			assertThrows(RocksDBException.class,
+					() -> registry.upload(NAME, CountingAppendOperator.class.getName(), jar("first")));
+			assertEquals(List.of(), versions(registry));
+		}
+		assertEquals(created + 1, CountingAppendOperator.CREATED.get(), "the operator is instantiated before the write");
+		assertEquals(disposed + 1, CountingAppendOperator.DISPOSED.get(), "an operator that is not cached is closed");
+	}
+
+	/** Counts its instances and the ones whose native resources were released. */
+	public static class CountingAppendOperator extends MyStringAppendOperator {
+
+		static final AtomicInteger CREATED = new AtomicInteger();
+		static final AtomicInteger DISPOSED = new AtomicInteger();
+
+		public CountingAppendOperator() {
+			CREATED.incrementAndGet();
+		}
+
+		@Override
+		public void disposeInternal(long handle) {
+			try {
+				super.disposeInternal(handle);
+			} finally {
+				DISPOSED.incrementAndGet();
+			}
 		}
 	}
 
