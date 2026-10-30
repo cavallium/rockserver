@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -324,18 +325,53 @@ public final class RWScheduler {
 	/** {@link #publishOn(Flux, Scheduler)} that prefetches at most {@code prefetch} elements. */
 	public static <T> Flux<T> publishOn(Flux<T> source, Scheduler scheduler, int prefetch) {
 		if (scheduler instanceof IndexedWorkloadScheduler indexedScheduler) {
-			// takeUntilOther cancels the source only when the other publisher emits a value, not an error
-			return Flux.defer(() -> {
-				var failure = new AtomicReference<RuntimeException>();
-				return source.publishOn(indexedScheduler, prefetch)
-						.takeUntilOther(indexedScheduler.streamFailure().doOnNext(failure::set))
-						.concatWith(Mono.defer(() -> {
-							var error = failure.get();
-							return error != null ? Mono.error(error) : Mono.empty();
-						}));
-			});
+			return Flux.defer(() -> endOnFailure(source.publishOn(indexedScheduler, prefetch),
+					indexedScheduler.streamFailure()));
 		}
 		return source.publishOn(scheduler, prefetch);
+	}
+
+	/**
+	 * {@link #publishOn(Flux, Scheduler, int)} for the batches of a client stream that the subscriber
+	 * writes one at a time, after {@code batching} regroups them. A dropped task ends the stream at
+	 * any time, but the view's deadline ends it only while the client stream is still open: whichever
+	 * comes first of the deadline and the client's completion decides. So the deadline ends the stream
+	 * only between two batches, after the running write returns and before the next one starts. Once
+	 * the client has completed, every batch it sent is written, however late, and the subscriber
+	 * reports the real outcome of writing them.
+	 */
+	public static <T, R> Flux<R> publishBatchesOn(Flux<T> clientStream,
+			Function<Flux<T>, Flux<R>> batching,
+			Scheduler scheduler,
+			int prefetch) {
+		if (scheduler instanceof IndexedWorkloadScheduler indexedScheduler) {
+			return Flux.defer(() -> {
+				var open = new AtomicBoolean(true);
+				var deadline = indexedScheduler.deadlineFailure()
+						.flatMap(failure -> open.compareAndSet(true, false)
+								? Mono.just(failure)
+								: Mono.<RuntimeException>never());
+				return endOnFailure(batching.apply(clientStream.doOnComplete(() -> open.set(false)))
+								.publishOn(indexedScheduler, prefetch),
+						indexedScheduler.droppedTaskFailure().or(deadline));
+			});
+		}
+		return batching.apply(clientStream).publishOn(scheduler, prefetch);
+	}
+
+	/**
+	 * Ends {@code published} with the first failure of {@code failures}. takeUntilOther delivers that
+	 * end after the element being processed, and cancels the source only when the other publisher
+	 * emits a value, not an error.
+	 */
+	private static <T> Flux<T> endOnFailure(Flux<T> published, Mono<RuntimeException> failures) {
+		var failure = new AtomicReference<RuntimeException>();
+		return published
+				.takeUntilOther(failures.doOnNext(failure::set))
+				.concatWith(Mono.defer(() -> {
+					var error = failure.get();
+					return error != null ? Mono.error(error) : Mono.empty();
+				}));
 	}
 
 	/**
@@ -346,8 +382,9 @@ public final class RWScheduler {
 	 * never subscribed and never terminates. On failure the source is cancelled, which removes a
 	 * still queued subscription without running it and releases the resources of a subscribed one.
 	 * Once the subscription runs, the deadline no longer ends the source here: a stream inside it
-	 * ends at the deadline through {@link #publishOn(Flux, Scheduler)}, between two elements. A drop
-	 * fails every source on the same view, so give each source its own view.
+	 * ends at the deadline through {@link #publishOn(Flux, Scheduler)} or
+	 * {@link #publishBatchesOn(Flux, Function, Scheduler, int)}, between two elements. A drop fails
+	 * every source on the same view, so give each source its own view.
 	 */
 	public static <T> Mono<T> subscribeOn(Mono<T> source, Scheduler scheduler) {
 		return subscribeOn(_ -> source, scheduler);

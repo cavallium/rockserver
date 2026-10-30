@@ -150,12 +150,24 @@ atomically rejects new workers and new worker submissions, disposes every regist
 removes its queued tasks through the same indexed cancellation path. A submission that linearizes
 before parent disposal may run or be cancelled; one attempted after disposal is never admitted.
 
-Streamed `PutBatch` and `MergeBatch` follow the request deadline in three steps. While the
-subscription is still queued, the deadline or a dropped task ends the call with an error and the
-batch never runs. Once it runs, the deadline ends the stream only between two batches, after the
-running batch write returns. Once the final write starts (write-batch flush, transaction commit, or
-SST ingestion), neither the deadline nor a dropped task ends the call, so the client sees the
-outcome of that write. A batch that was applied never reports `DEADLINE_EXCEEDED`.
+Streamed `PutBatch` and `MergeBatch` follow the request deadline in four steps. While the
+subscription is still queued, the deadline or a dropped task ends the call with an error and no
+batch is written. Once it runs and while the client stream is still open, the deadline ends the
+call only between two batches: the running batch write is never interrupted, and the next batch is
+never written. Once the server has received the end of the client stream, after its last batch, the
+deadline no longer ends the call: the batches already received are still written and the call
+reports the outcome of writing them. Once the final write starts (write-batch flush, transaction
+commit, or SST ingestion), neither the deadline nor a dropped task ends the call, so the client sees
+the outcome of that write.
+
+A deadline that ends the call between batches does not undo the batches written before it. Some
+modes apply each batch when it is written: `MERGE_WRITE_BATCH` and `MERGE_WRITE_BATCH_NO_WAL` on a
+column without buckets, and the `PutBatch` write-batch modes once a write batch reaches its flush
+threshold (10,000 entries or 4 MiB). There, a `DEADLINE_EXCEEDED` on a streamed batch can follow
+batches that stay applied, so it is not safe to retry blindly. The other modes apply nothing before
+their final write. After the end of the client stream was received, the work still waiting for a
+worker can expire in the queue; the call then reports `DEADLINE_EXCEEDED` only if some batch it
+received was not applied, and success when every batch was already applied.
 
 The LATENCY burst counter is a bounded state, not a lifetime completion counter. It saturates at
 the configured burst limit and resets when guaranteed work is selected, so multi-year LATENCY-only

@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import org.junit.jupiter.api.Test;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
@@ -402,6 +403,69 @@ class RWSchedulerIndexedQueueTest {
 
 			assertDeadlineFailure(assertThrows(ExecutionException.class, () -> operation.get(5, SECONDS)));
 			assertFalse(failedWhileProcessing.get(), "the deadline ended the stream while an element was processed");
+			assertEquals(1, processed.get());
+			assertReadPoolDrained(scheduler);
+		} finally {
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void batchStreamDeadlineIsIgnoredOnceTheClientStreamCompleted() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-batch-stream-deadline-after-completion");
+		long deadline = scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(50L));
+		var view = scheduler.scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, deadline);
+		var processed = new AtomicInteger();
+		try {
+			// The prefetch covers every batch, so the client stream completes before the first write
+			var operation = RWScheduler.subscribeOn(RWScheduler.publishBatchesOn(Flux.just(1, 2, 3),
+									Function.identity(),
+									view,
+									4)
+							.doOnNext(_ -> {
+								// The deadline passes while the first batch is written, after the client completed
+								sleepUninterruptibly(100L);
+								processed.incrementAndGet();
+							})
+							.then(Mono.fromCallable(processed::get)), view)
+					.toFuture();
+
+			assertEquals(3, operation.get(5, SECONDS));
+			assertReadPoolDrained(scheduler);
+		} finally {
+			view.dispose();
+			scheduler.disposeNow();
+		}
+	}
+
+	@Test
+	void batchStreamDeadlineEndsAnOpenClientStreamBeforeTheNextBatch() throws Exception {
+		var scheduler = scheduler(1, 8, "indexed-batch-stream-deadline-between-batches");
+		long deadline = scheduler.bindTimeoutNanos(MILLISECONDS.toNanos(50L));
+		var view = scheduler.scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, deadline);
+		var processing = new AtomicBoolean();
+		var processed = new AtomicInteger();
+		var failedWhileProcessing = new AtomicBoolean();
+		try {
+			var operation = RWScheduler.subscribeOn(RWScheduler.publishBatchesOn(Flux.just(1, 2, 3)
+											.concatWith(Flux.never()),
+									Function.identity(),
+									view,
+									1)
+							.doOnNext(_ -> {
+								processing.set(true);
+								// The deadline passes while the first batch is written, with the client stream open
+								sleepUninterruptibly(250L);
+								processed.incrementAndGet();
+								processing.set(false);
+							})
+							.then(), view)
+					.doOnError(_ -> failedWhileProcessing.set(processing.get()))
+					.toFuture();
+
+			assertDeadlineFailure(assertThrows(ExecutionException.class, () -> operation.get(5, SECONDS)));
+			assertFalse(failedWhileProcessing.get(), "the deadline ended the stream while a batch was written");
 			assertEquals(1, processed.get());
 			assertReadPoolDrained(scheduler);
 		} finally {

@@ -143,6 +143,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
+import reactor.util.concurrent.Queues;
 import reactor.util.retry.Retry;
 import org.rocksdb.TransactionLogIterator;
 import org.rocksdb.WriteBatch;
@@ -446,6 +447,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private volatile @Nullable Runnable iteratorAdvanceStepCompletedObserver;
 	private volatile @Nullable Runnable forcedShutdownObserver;
 	private volatile @Nullable Runnable existsMultiChunkObserver;
+	private volatile @Nullable Runnable batchWriteObserver;
 	private volatile @Nullable Runnable batchFinalWriteObserver;
 	private volatile @Nullable Runnable existsMultiSnapshotObserver;
 	private volatile @Nullable Consumer<Boolean> existsMultiArenaObserver;
@@ -2334,6 +2336,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public void setExistsMultiChunkObserverForTesting(@Nullable Runnable observer) {
 		this.existsMultiChunkObserver = observer;
+	}
+
+	/** Runs at the start of each batch write of a streamed putBatch or mergeBatch, before the final write. */
+	@VisibleForTesting
+	public void setBatchWriteObserverForTesting(@Nullable Runnable observer) {
+		this.batchWriteObserver = observer;
 	}
 
 	/** Runs at the start of the final write of a streamed putBatch or mergeBatch. */
@@ -4299,16 +4307,24 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		);
 
 		// A queued task dropped by the view, or its deadline, ends the batch with an error instead of a stall.
-		// The deadline ends a running batch only between two client batches. Once the final write has started,
-		// neither the deadline nor a dropped task ends it, so an applied batch reports success.
-		return RWScheduler.<Void>subscribeOn(commit -> Mono.using(
-						() -> new PutBatchState(columnId, mode, start),
-						state -> RWScheduler.publishOn(Flux.from(batchPublisher), workloadScheduler)
-								.doOnNext(state::write)
-								.then(Mono.fromRunnable(() -> commit.run(state::writePending))),
-						BatchWriteState::close,
-						true
-				), workloadScheduler)
+		// The deadline ends a running batch only between two client batches, and no longer once the client has
+		// ended its stream. Once the final write has started, neither the deadline nor a dropped task ends it,
+		// and a failure that comes once every batch was applied is not reported.
+		return Mono.defer(() -> {
+					var progress = new StreamedBatchProgress();
+					return RWScheduler.<Void>subscribeOn(commit -> Mono.using(
+									() -> new PutBatchState(columnId, mode, start, progress),
+									state -> RWScheduler.publishBatchesOn(progress.track(Flux.from(batchPublisher)),
+													Function.identity(),
+													workloadScheduler,
+													Queues.SMALL_BUFFER_SIZE)
+											.doOnNext(state::write)
+											.then(Mono.fromRunnable(() -> commit.run(state::writePending))),
+									BatchWriteState::close,
+									true
+							), workloadScheduler)
+							.onErrorResume(failure -> progress.applied() ? Mono.empty() : Mono.error(failure));
+				})
 				.onErrorMap(EmbeddedDB::mapBatchWriteFailure)
 				.doFinally(ignored -> putBatchTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS))
 				.toFuture();
@@ -4344,23 +4360,26 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		);
 
 		// A queued task dropped by the view, or its deadline, ends the batch with an error instead of a stall.
-		// The deadline ends a running batch only between two batches. Once the final write has started,
-		// neither the deadline nor a dropped task ends it, so an applied batch reports success.
-		return RWScheduler.<Void>subscribeOn(commit -> Mono.using(
-						() -> new MergeBatchState(columnId, mode, ingestBehindEnabled, start),
-						// The batcher flushes partial batches from a timer of another scheduler, so the writes move
-						// onto the workload scheduler after batching, one batch at a time
-						state -> RWScheduler.publishOn(AdaptiveBatcher.buffer(
-											Flux.from(batchPublisher),
-											128,
-											4096,
-											Duration.ofMillis(10)
-										), workloadScheduler, 1)
-								.doOnNext(state::write)
-								.then(Mono.fromRunnable(() -> commit.run(state::writePending))),
-						BatchWriteState::close,
-						true
-				), workloadScheduler)
+		// The deadline ends a running batch only between two batches, and no longer once the client has ended its
+		// stream. Once the final write has started, neither the deadline nor a dropped task ends it, and a
+		// failure that comes once every batch was applied is not reported.
+		return Mono.defer(() -> {
+					var progress = new StreamedBatchProgress();
+					return RWScheduler.<Void>subscribeOn(commit -> Mono.using(
+									() -> new MergeBatchState(columnId, mode, ingestBehindEnabled, start, progress),
+									// The batcher flushes partial batches from a timer of another scheduler, so the
+									// writes move onto the workload scheduler after batching, one batch at a time
+									state -> RWScheduler.publishBatchesOn(progress.track(Flux.from(batchPublisher)),
+													batches -> AdaptiveBatcher.buffer(batches, 128, 4096, Duration.ofMillis(10)),
+													workloadScheduler,
+													1)
+											.doOnNext(state::write)
+											.then(Mono.fromRunnable(() -> commit.run(state::writePending))),
+									BatchWriteState::close,
+									true
+							), workloadScheduler)
+							.onErrorResume(failure -> progress.applied() ? Mono.empty() : Mono.error(failure));
+				})
 				.onErrorMap(EmbeddedDB::mapBatchWriteFailure)
 				.toFuture();
 	}
@@ -4379,6 +4398,41 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, failure);
 	}
 
+	/**
+	 * Tells whether a streamed putBatch or mergeBatch was applied in full: the client ended its stream, every
+	 * batch it sent was written, and the final write has nothing left to apply. Every batch can be applied before
+	 * the end of the stream is delivered, when each write applies its batch (merge write batches of a column
+	 * without buckets, write batches past the flush thresholds). A failure that comes after that, such as a
+	 * dropped or refused drain that only carried the end of the stream, does not undo those writes, so the call
+	 * reports success instead.
+	 */
+	private static final class StreamedBatchProgress {
+
+		private final AtomicLong received = new AtomicLong();
+		private final AtomicLong written = new AtomicLong();
+		private volatile boolean clientCompleted;
+		// Unknown until the first write
+		private volatile boolean finalWritePending = true;
+
+		private <T> Flux<T> track(Flux<T> clientStream) {
+			return clientStream
+					.doOnNext(_ -> received.incrementAndGet())
+					.doOnComplete(() -> clientCompleted = true);
+		}
+
+		/** Records written client batches, after the write that applied them returned. */
+		private void written(int batches, boolean finalWritePending) {
+			// Published by the counter, which applied() reads first
+			this.finalWritePending = finalWritePending;
+			written.addAndGet(batches);
+		}
+
+		private boolean applied() {
+			// The received count is final once the client completed
+			return clientCompleted && received.get() == written.get() && !finalWritePending;
+		}
+	}
+
 	private abstract class BatchWriteState implements AutoCloseable {
 
 		private static final VarHandle LIFECYCLE =
@@ -4388,8 +4442,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private static final int CLOSED = 1 << 2;
 
 		private volatile int lifecycle;
+		private final StreamedBatchProgress progress;
 
-		private BatchWriteState() {
+		private BatchWriteState(StreamedBatchProgress progress) {
+			this.progress = progress;
 			ops.beginOp();
 		}
 
@@ -4469,6 +4525,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 		}
 
+		protected final void observeWrite() {
+			var observer = batchWriteObserver;
+			if (observer != null) {
+				observer.run();
+			}
+		}
+
+		/** Records that a write of {@code batches} client batches returned. */
+		protected final void written(int batches) {
+			progress.written(batches, hasFinalWritePending());
+		}
+
+		/** Whether the final write still has something to apply. */
+		protected abstract boolean hasFinalWritePending();
+
 		protected final void observeFinalWrite() {
 			var observer = batchFinalWriteObserver;
 			if (observer != null) {
@@ -4489,7 +4560,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private DBWriter writer;
 		private boolean sstEntriesWritten;
 
-		private PutBatchState(long columnId, PutBatchMode mode, long start) {
+		private PutBatchState(long columnId, PutBatchMode mode, long start, StreamedBatchProgress progress) {
+			super(progress);
 			this.columnId = columnId;
 			this.mode = mode;
 			this.start = start;
@@ -4510,6 +4582,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private void write(KVBatch batch) {
 			runWhileOpen(() -> {
+				observeWrite();
 				validateBatch(batch);
 				var keyIt = batch.keys().iterator();
 				var valueIt = batch.values().iterator();
@@ -4523,7 +4596,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					}
 					flushFullWriteBatch(writer);
 				}
+				written(1);
 			});
+		}
+
+		@Override
+		protected boolean hasFinalWritePending() {
+			return switch (writer) {
+				case WB wb -> wb.wb().count() > 0;
+				case SSTWriter _ -> sstEntriesWritten;
+				default -> true;
+			};
 		}
 
 		private void writePending() {
@@ -4574,7 +4657,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private DBWriter writer;
 		private ArrayList<Map.Entry<Keys, Buf>> pendingSstEntries;
 
-		private MergeBatchState(long columnId, MergeBatchMode mode, boolean ingestBehindEnabled, long start) {
+		private MergeBatchState(long columnId,
+				MergeBatchMode mode,
+				boolean ingestBehindEnabled,
+				long start,
+				StreamedBatchProgress progress) {
+			super(progress);
 			this.columnId = columnId;
 			this.mode = mode;
 			this.start = start;
@@ -4610,6 +4698,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		private void write(List<KVBatch> batches) {
 			runWhileOpen(() -> {
+				observeWrite();
 				for (var batch : batches) {
 					validateBatch(batch);
 					var keyIt = batch.keys().iterator();
@@ -4629,7 +4718,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (writer instanceof WB wb && wb.wb().count() > 0) {
 					wb.flushAndReset();
 				}
+				written(batches.size());
 			});
+		}
+
+		@Override
+		protected boolean hasFinalWritePending() {
+			return switch (writer) {
+				case WB wb -> wb.wb().count() > 0;
+				case SSTWriter _ -> !pendingSstEntries.isEmpty();
+				// A transaction applies its writes only when committed
+				default -> true;
+			};
 		}
 
 		private void writePending() {
