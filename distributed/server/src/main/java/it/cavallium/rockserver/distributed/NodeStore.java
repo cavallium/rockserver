@@ -263,8 +263,8 @@ final class NodeStore implements Closeable {
 	 */
 	/**
 	 * Held by writes that go through the WAL (schema changes and the like, see {@code Applier}) and by
-	 * {@link #checkpoint}: a checkpoint taken while the apply goes on lists the flushed files and copies the WAL,
-	 * which a logged write in between could make disagree.
+	 * {@link #checkpoint}: a checkpoint lists the flushed files and copies the WAL, which a logged write in between
+	 * could make disagree. Snapshots are taken while the apply is idle, so this only guards other callers.
 	 */
 	private final java.util.concurrent.locks.ReentrantLock loggedWrites = new java.util.concurrent.locks.ReentrantLock();
 
@@ -273,10 +273,9 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
-	 * Copies a consistent point of the database to {@code target} and returns its applied position. The apply may go
-	 * on meanwhile: the copy then holds a later point, whose own applied position (in its meta column, written
-	 * atomically with the data) is the one that counts when it is opened. The returned position is never ahead of
-	 * the copy.
+	 * Copies a consistent point of the database to {@code target} and returns its applied position. If writes go on
+	 * meanwhile, the copy holds a later point, whose own applied position (in its meta column, written atomically
+	 * with the data) is the one that counts when it is opened; the returned position is never ahead of the copy.
 	 */
 	TermIndex checkpoint(Path target) throws IOException {
 		target = target.toAbsolutePath();

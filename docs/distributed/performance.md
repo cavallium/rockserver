@@ -132,8 +132,8 @@ with 11–18 s write latency. In order of discovery:
 ## Results
 
 Suite `s2` (commit `cdca0b2`), 2026-10-30, on the PC described above, with other workloads on it at times;
-the values marked * come from later runs that include `cd8904b`, and ** from runs at `a5b555e` (background
-snapshots, caller deadlines). Results move by 10–15% with the node that wins the election: the one on the
+the values marked * come from later runs that include `cd8904b`, and ** from runs at `a5b555e` (caller
+deadlines; its background snapshots were later reverted). Results move by 10–15% with the node that wins the election: the one on the
 SATA disk serves fewer operations at saturation than those on NVMe disks. Open loop, 30 s steps
 after 10 s of warmup, 512 reads and 512 writes in flight unless noted, four client connections. Latencies are
 from the planned start of each operation, so a client queue shows up as latency. `UPDATE` is the whole

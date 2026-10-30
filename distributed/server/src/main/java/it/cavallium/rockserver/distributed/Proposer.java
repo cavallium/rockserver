@@ -559,10 +559,16 @@ final class Proposer implements Closeable {
 						CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS, sender).execute(() -> {
 							if (closed || System.nanoTime() - deadlineNanos >= 0) {
 								// Too late after all (the timer ran late): no copy goes out after the deadline.
-								fail(batch, nowAmbiguous ? unavailable(cause != null ? cause
-										: new java.util.concurrent.TimeoutException("No answer before the deadline"))
-										: RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
-												"No leader accepted the write in time; it was not applied"));
+								if (nowAmbiguous) {
+									fail(batch, unavailable(cause != null ? cause
+											: new java.util.concurrent.TimeoutException("No answer before the deadline")));
+								} else {
+									for (var pending : batch) {
+										pending.fail(pending.callerDeadline ? callerDeadlinePassed()
+												: RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+														"No leader accepted the write in time; it was not applied"));
+									}
+								}
 								finished();
 								return;
 							}
@@ -577,7 +583,18 @@ final class Proposer implements Closeable {
 				}
 				roundTrip.since(sentNanos);
 				try {
-					if (error == null && !answer.isSuccess() && !(answer.getException() instanceof StateMachineException)) {
+					var finalCause = error != null ? ReplicatedConnection.unwrap(error)
+							: !answer.isSuccess() ? answer.getException() : null;
+					if (!ambiguous && finalCause != null && !(finalCause instanceof StateMachineException)
+							&& isRefusedBeforeAppend(finalCause)) {
+						// No copy was ever appended, and no more will be sent: not applied.
+						for (var pending : batch) {
+							pending.fail(pending.callerDeadline ? callerDeadlinePassed()
+									: RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+											"No leader accepted the write in time; it was not applied"));
+						}
+					} else if (error == null && !answer.isSuccess()
+							&& !(answer.getException() instanceof StateMachineException)) {
 						fail(batch, unavailable(answer.getException()));
 					} else {
 						var refusal = error != null ? stateMachineException(error)
@@ -749,8 +766,11 @@ final class Proposer implements Closeable {
 	/** Submits straight to the local Raft server, with no client in between that could redirect it elsewhere. */
 	private CompletableFuture<RaftClientReply> submitLocal(Message message, long callId, long deadlineNanos) {
 		try {
+			// The deadline only stops new copies (see attempt): a copy already submitted here runs to its end, so
+			// wait for its answer at least as long as a remote attempt would, or a healthy commit of a batch holding
+			// one short caller deadline would end as "outcome unknown" for every member.
 			return localServer.get().submitClientRequestAsync(invocation(message, callId, self))
-					.orTimeout(Math.max(1, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
+					.orTimeout(Math.max(deadlineNanos - System.nanoTime(), attemptTimeoutNanos), TimeUnit.NANOSECONDS);
 		} catch (IOException ex) {
 			return CompletableFuture.failedFuture(ex);
 		}

@@ -35,11 +35,9 @@ final class RaftSettings {
 		// configuration entry, which keeps the applied-index bookkeeping simple.
 		RaftServerConfigKeys.Log.setLogMetadataEnabled(properties, false);
 		RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf("64MB"));
-		// The open segment is preallocated with zeros, so after a power loss in the middle of a group commit its tail
-		// reads back as a bad checksum or terminator rather than as its end, and the default policy (EXCEPTION) keeps
-		// the node from starting. Those entries were never fsynced, so they never counted toward a quorum or an
-		// acknowledgement: drop them and start. Closed segments are still checked and fail loudly.
-		RaftServerConfigKeys.Log.setCorruptionPolicy(properties, RaftServerConfigKeys.Log.CorruptionPolicy.WARN_AND_RETURN);
+		// The corruption policy stays the default, EXCEPTION. WARN_AND_RETURN would let a node start after a power loss
+		// tore the unsynced tail of its open segment, but in Ratis 3.3.1 it applies to closed segments too, which it
+		// truncates: committed, acknowledged entries could disappear.
 		RaftServerConfigKeys.Log.Appender.setBufferByteLimit(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (1 << 20)));
 		RaftServerConfigKeys.Log.setWriteBufferSize(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (2 << 20)));
 		RaftServerConfigKeys.Log.setQueueByteLimit(properties, SizeInBytes.valueOf(4L * MAX_ENTRY_BYTES));
@@ -54,12 +52,12 @@ final class RaftSettings {
 		RaftServerConfigKeys.Write.setElementLimit(properties, 65536);
 		RaftServerConfigKeys.Write.setByteLimit(properties, SizeInBytes.valueOf(64L * MAX_ENTRY_BYTES));
 		// Every attempt at one proposer batch is the same Ratis invocation (see Proposer), so the retry cache answers a
-		// resend while the first copy is still pending instead of appending it again. Keep replies for longer than a
-		// batch can be resent (request timeout plus an attempt), but not the default 60 s: Rockserver deduplicates
-		// requests itself (see Request), so the cache only saves log space.
+		// resend while the first copy is still pending instead of appending it again. Every replica caches every
+		// reply, with no size bound, so keep them only about two attempt timeouts, which covers the usual resend of a
+		// copy still pending: Rockserver deduplicates requests itself (see Request), so a resend the cache misses is
+		// only appended again.
 		RaftServerConfigKeys.RetryCache.setExpiryTime(properties, TimeDuration.valueOf(
-				Math.max(20_000, config.requestTimeout().toMillis() + 2 * config.electionTimeoutMax().toMillis() + 5_000),
-				TimeUnit.MILLISECONDS));
+				Math.max(6_000, 4 * config.electionTimeoutMax().toMillis()), TimeUnit.MILLISECONDS));
 		GrpcConfigKeys.setMessageSizeMax(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (2 << 20)));
 		// AppendEntries calls in flight to each follower (default 8). A follower fsyncs once per call it processes, so
 		// with many calls of one entry each its fsync rate caps the commit rate; with fewer calls in flight, the next
