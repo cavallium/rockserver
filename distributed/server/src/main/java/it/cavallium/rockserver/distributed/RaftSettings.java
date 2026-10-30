@@ -29,7 +29,7 @@ final class RaftSettings {
 	 *
 	 * <p>The count of the last step is that high on purpose: a follower must not reach the end of the policy, where Ratis
 	 * no longer sleeps and retries a dead follower with only the heartbeat wait between attempts. With its default
-	 * policy that happens to a follower down for about 80 minutes.</p>
+	 * policy that happens to a follower down for about 40 minutes: a failed try counted about twice in a test run.</p>
 	 */
 	static final String APPENDER_RETRY_POLICY = "1ms,10, 1s,20, " + APPENDER_RETRY_LAST_STEP.toSeconds() + "s,1000000000";
 	/** Ratis multiplies each step by a random number from 0.5 to 1.5, so a sleep can reach 1.5 times the step. */

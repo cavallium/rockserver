@@ -131,7 +131,9 @@ multiplies each step of the appender retry policy by a random number from 0.5 to
 policy, `1ms,10, 1s,20, 5s,1000`, sleeps 2.5 to 7.5 s. `RaftSettings.APPENDER_RETRY_POLICY` lowers that step to 2 s,
 at most 3 s of sleep, and the minimum is twice that, which leaves room for one more try if the first is lost. The
 count of the last step is about a billion because past the end of the policy Ratis no longer sleeps at all: with the
-default policy a follower down for about 80 minutes would then get an attempt at every heartbeat interval.
+default policy a follower down for about 40 minutes (a failed try counted about twice in a test run) would then get an
+attempt at every heartbeat interval. A dead follower now gets about 2.5 times the attempts, which cost its leader about
+0.15% of a core more and 20% more log lines, because Ratis batches those warnings every 5 s.
 
 The gate lives in memory, so a node that restarts learns from its disk that a leader existed: its database has a
 cluster id or its Raft log has an entry (neither alone is enough: a kill can lose a recent cluster id, and a purge can

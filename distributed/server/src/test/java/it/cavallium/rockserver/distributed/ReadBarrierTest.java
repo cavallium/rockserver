@@ -687,10 +687,9 @@ class ReadBarrierTest {
 		return RaftPeer.newBuilder().setId(id).setAddress(freeAddress()).build();
 	}
 
+	/** Not a port from the system: see {@link InProcessCluster}. */
 	private static String freeAddress() throws IOException {
-		try (var socket = new ServerSocket(0)) {
-			return "127.0.0.1:" + socket.getLocalPort();
-		}
+		return "127.0.0.1:" + ProcessCluster.freePorts(1, List.of()).getFirst();
 	}
 
 	private static RaftPeer withPriority(RaftPeer peer, int priority) {

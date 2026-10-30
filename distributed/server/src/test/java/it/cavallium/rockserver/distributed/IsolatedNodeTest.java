@@ -185,6 +185,22 @@ class IsolatedNodeTest {
 		}
 	}
 
+	/** A restart before any leader leaves a Raft directory and no entry: that node has known no leader either. */
+	@Test
+	void aNodeOfANewClusterRestartedBeforeItsFirstLeaderDoesNotPause() throws Exception {
+		cluster = ProcessCluster.create(root.resolve("cluster"), 3, 0, SERVER_ARGS);
+		cluster.start("1");
+		cluster.waitReady("1", READY_TIMEOUT);
+		cluster.kill("1");
+		cluster.start("1");
+		cluster.waitReady("1", READY_TIMEOUT);
+		long end = System.nanoTime() + ApiGate.MIN_PAUSE_AFTER.plusSeconds(2).toNanos();
+		while (System.nanoTime() - end < 0) {
+			assertTrue(serves("1"), "the node paused");
+			Thread.sleep(50);
+		}
+	}
+
 	/** Every node pauses, a leader appears, every node resumes, and the client's connection recovers by itself. */
 	@Test
 	void aClusterThatLostItsLeaderForLongRecoversByItself() throws Exception {

@@ -70,6 +70,12 @@ class PartitionTest {
 
 	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);
 	private static final Duration WAIT_TIMEOUT = Duration.ofSeconds(30);
+	/**
+	 * After a heal the leader's next try reaches the cut-off node (up to 3 s), the node serves again (one maximum election
+	 * timeout), its clients reconnect (up to 2 s) and each gets a write and a read through (up to about 2 s each): about
+	 * 10 s at worst. It took 1.8 to 6.2 s in 12 test runs on a busy machine, and this leaves room for a slower one.
+	 */
+	private static final Duration SERVED_AGAIN_TIMEOUT = Duration.ofSeconds(15);
 	private static final Duration POLL_INTERVAL = Duration.ofMillis(20);
 	/**
 	 * Nodes give up on a request after 3 seconds, well within a fault: the test also covers nodes whose Raft client
@@ -449,7 +455,7 @@ class PartitionTest {
 		 * {@code from}; returns when the last of them completed.
 		 */
 		long awaitServedByEveryNode(long from) {
-			await(WAIT_TIMEOUT, () -> "every node acknowledges a write and a read again\n" + progress(from),
+			await(SERVED_AGAIN_TIMEOUT, () -> "every node acknowledges a write and a read again\n" + progress(from),
 					() -> clients.keySet().stream().allMatch(id -> Stream.of(Operation.Kind.values())
 							.allMatch(kind -> firstAcknowledged(id, kind, from).isPresent())));
 			return clients.keySet().stream()

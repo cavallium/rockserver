@@ -130,8 +130,8 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 - With every node down, calls wait for one full pass over the list, which takes up to the connect timeout for each
   node that does not answer, and from then on they fail with `UNAVAILABLE` at once. The reads that the retry policy
   allows also spend its backoff. The connection keeps trying the list, at least every 2 s, each client at its own
-  pace. One address works the same way. Those attempts run only while calls fail: a connection that works or is idle
-  has nothing scheduled.
+  pace. One address works the same way. Those attempts stop when the connection works again, or when the channel goes
+  idle after 30 minutes without calls: a connection that works or is idle has nothing scheduled.
 - Names are resolved again when a connection is lost. A name that stops resolving keeps its last addresses, and one
   whose lookup hangs does not hold back the others for more than 1 s: its host joins when the lookup answers.
 
