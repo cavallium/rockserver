@@ -33,6 +33,11 @@ public final class ReplicatedServerMain {
 	private ReplicatedServerMain() {}
 
 	public static void main(String[] args) throws Exception {
+		// Netty's leak detector records a stack trace for sampled buffers: about 3% of the leader's event loop under
+		// load. Off unless the operator chose a level (-Dio.netty.leakDetection.level=...).
+		if (System.getProperty("io.netty.leakDetection.level") == null) {
+			System.setProperty("io.netty.leakDetection.level", "disabled");
+		}
 		if (args.length == 0) {
 			usage("missing command");
 		}
