@@ -63,6 +63,9 @@ class MembershipTest {
 	private static final int MAX_FILLER_KEYS = 4_000;
 	private static final int WRITERS = 8;
 	private static final Duration RETRY_PAUSE = Duration.ofMillis(100);
+	private static final String JOIN = "--join";
+	/** Longer than any election timeout of {@link #SERVER_ARGS}: the time a new node waits for its {@code add-peer}. */
+	private static final Duration WAIT_BEFORE_ADD_PEER = Duration.ofSeconds(5);
 	private static final String SNAPSHOT_INSTALLED = "installing snapshot";
 	private static final String REPLICA_FAILED = "replica failed";
 	private static final String SEEDED_BUT_EMPTY = "The cluster was seeded with an existing database, but this"
@@ -87,6 +90,9 @@ class MembershipTest {
 	/**
 	 * A member is lost with its disk; a new node with a new id and empty data replaces it through add-peer and
 	 * remove-peer, catches up by snapshot install, and the cluster then survives the loss of another original member.
+	 * What is lost is the leader, and the new node waits for its add-peer longer than an election timeout: a leader of
+	 * a later term closes the Raft server of a node outside its configuration that asks for a vote, so a new node must
+	 * not ask. It restarts during the wait, and again later, without the option.
 	 */
 	@Test
 	void lostNodeIsReplacedByANewNodeThatCatchesUpFromASnapshot() throws Exception {
@@ -95,12 +101,27 @@ class MembershipTest {
 		client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
 		long column = client.createColumn("data", SCHEMA, CONTEXT).valueOrThrow();
 		int keys = fillUntilLogsArePurged(column, 0, List.of("1", "2", "3"));
+		var originals = List.of("1", "2", "3");
+		assertOk(cluster.admin(originals, "transfer-leader", "2"));
+		assertOk(cluster.admin(originals, "transfer-leader", "1"));
+		InProcessCluster.await(TIMEOUT, () -> {
+			try {
+				return leaderOf(originals).equals("1");
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+		});
 
 		cluster.kill("1");
 		deleteRecursively(cluster.dataDir("1"));
 		cluster.setMembers(List.of("2", "3", "4"));
-		cluster.start("4");
+		cluster.start("4", JOIN);
 		cluster.waitReady("4", READY_TIMEOUT);
+		Thread.sleep(WAIT_BEFORE_ADD_PEER);
+		cluster.kill("4");
+		cluster.start("4", JOIN);
+		cluster.waitReady("4", READY_TIMEOUT);
+		Thread.sleep(WAIT_BEFORE_ADD_PEER);
 
 		long addStart = System.nanoTime();
 		assertOk(cluster.admin(List.of("1", "2", "3"), "add-peer", cluster.peer("4").format()));
@@ -118,6 +139,12 @@ class MembershipTest {
 			client.put(column, key(i), fillerValue(i), CONTEXT).valueOrThrow();
 		}
 		keys += 100;
+
+		// With a configuration of its own the node needs the option no more. A majority of {2, 3, 4} needs it later on.
+		cluster.stop("4");
+		cluster.start("4");
+		cluster.waitReady("4", READY_TIMEOUT);
+		assertArrayEquals(fillerValue(keys - 1).toByteArray(), readThrough("4", column, key(keys - 1)).toByteArray());
 
 		// Another original member is lost: the new membership {2, 3, 4} keeps a majority.
 		cluster.kill("2");
@@ -158,7 +185,7 @@ class MembershipTest {
 		long filler = client.createColumn("filler", SCHEMA, CONTEXT).valueOrThrow();
 		int keys = fillUntilLogsArePurged(filler, 0, List.of("1", "2", "3"));
 
-		cluster.start("4");
+		cluster.start("4", JOIN);
 		cluster.waitReady("4", READY_TIMEOUT);
 		long addStart = System.nanoTime();
 		assertOk(cluster.admin(List.of("1", "2", "3"), "add-peer", cluster.peer("4").format()));
@@ -168,8 +195,12 @@ class MembershipTest {
 		assertTrue(output4.contains(SNAPSHOT_INSTALLED), "node 4 did not receive a snapshot");
 		assertFalse(output4.contains(REPLICA_FAILED), "node 4 failed:\n" + cluster.logTail("4"));
 
-		// The new member serves the seed from its own database once it leads.
+		// The option stays harmless on a node that is a member, and the new member serves the seed from its own database
+		// once it leads.
 		var members = List.of("1", "2", "3", "4");
+		cluster.stop("4");
+		cluster.start("4", JOIN);
+		cluster.waitReady("4", READY_TIMEOUT);
 		assertOk(cluster.admin(members, "transfer-leader", "4"));
 		assertSeedServed(seed, List.of("4"));
 		awaitAppliedEverywhere(members, filler, key(keys - 1), fillerValue(keys - 1));
@@ -195,7 +226,7 @@ class MembershipTest {
 		client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
 		assertSeedServed(seed, List.of("1", "2", "3"));
 
-		cluster.start("4");
+		cluster.start("4", JOIN);
 		cluster.waitReady("4", READY_TIMEOUT);
 		assertOk(cluster.admin(List.of("1", "2", "3"), "add-peer", cluster.peer("4").format()));
 		InProcessCluster.await(TIMEOUT, () -> cluster.output("4").contains(SNAPSHOT_INSTALLED));
@@ -209,6 +240,28 @@ class MembershipTest {
 		var expected = new TreeMap<String, Long>(seed.keysByColumn);
 		expected.merge("seeded", 1L, Long::sum);
 		assertReplicasEqual(members, expected);
+	}
+
+	/** A running node that a {@code remove-peer} removes closes Raft by itself, and must not stay up as a shell. */
+	@Test
+	void aNodeRemovedWhileRunningExits() throws Exception {
+		cluster = ProcessCluster.create(root, 3, 0, serverArgs());
+		startAll(List.of("1", "2", "3"));
+		client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
+		client.createColumn("data", SCHEMA, CONTEXT).valueOrThrow();
+
+		var removed = List.of("1", "2", "3").stream()
+				.filter(id -> {
+					try {
+						return !id.equals(leaderOf(List.of("1", "2", "3")));
+					} catch (IOException e) {
+						throw new UncheckedIOException(e);
+					}
+				})
+				.findFirst()
+				.orElseThrow();
+		assertOk(cluster.admin(List.of("1", "2", "3"), "remove-peer", removed));
+		assertEquals(3, cluster.awaitExit(removed, TIMEOUT), () -> cluster.logTail(removed));
 	}
 
 	// ---- cluster helpers ----

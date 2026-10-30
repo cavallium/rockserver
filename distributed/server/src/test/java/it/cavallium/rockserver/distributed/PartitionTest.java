@@ -73,7 +73,7 @@ class PartitionTest {
 	/**
 	 * After a heal the leader's next try reaches the cut-off node (up to 3 s), the node serves again (one maximum election
 	 * timeout), its clients reconnect (up to 2 s) and each gets a write and a read through (up to about 2 s each): about
-	 * 10 s at worst. It took 1.8 to 6.2 s in 12 test runs on a busy machine, and this leaves room for a slower one.
+	 * 10 s at worst. It took 1.8 to 6.2 s in 18 test runs on a busy machine, and this leaves room for a slower one.
 	 */
 	private static final Duration SERVED_AGAIN_TIMEOUT = Duration.ofSeconds(15);
 	private static final Duration POLL_INTERVAL = Duration.ofMillis(20);

@@ -21,20 +21,30 @@ import org.apache.ratis.protocol.RaftPeerId;
  * run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT (repeat per member) --data-dir DIR
  *       [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
  *       [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
- *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates]
+ *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
+ *       [--jvm-pause-limit-ms N]
  * admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
  * </pre>
  *
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
- * (leadership hand-off) on SIGTERM. For {@code add-peer} the new member must already run with the new peer list.
- * {@code repair-log} runs on a stopped node, after a power loss left it unable to read its Raft log: see
+ * (leadership hand-off) on SIGTERM. For {@code add-peer} the new member must already run, with the new peer list and
+ * with {@code --join}, however long before the {@code add-peer}. It exits with 3 if its replica failed or its Raft server
+ * closed, so that a supervisor notices. {@code repair-log} runs on a stopped node, after a power loss left it unable to read its Raft log: see
  * {@link RaftLogRepair}. It exits with 0 if the log is valid or was repaired (with {@code --dry-run}: could be) and
  * with 1 if it refuses.</p>
  *
  * <p>{@code --pipelined-updates}, off by default, lets a leader pass a key to its next {@code getForUpdate} update as
  * soon as the previous update's commit is admitted to the log: see "Transactions" in the design document, which also
  * tells what it changes for clients.</p>
+ *
+ * <p>{@code --join} starts a node outside the group, so that it waits for {@code add-peer} without an election timer:
+ * a leader answers a vote request from a node outside its configuration by closing that node's Raft server. It can stay
+ * in the command line of the node: once the node has a configuration of its own, the option changes nothing. See
+ * "Replacing a node" in the design document.</p>
+ *
+ * <p>{@code --jvm-pause-limit-ms}, 60000 by default, is the longest pause of the JVM that a node survives: see "Long
+ * pauses" in the design document.</p>
  */
 public final class ReplicatedServerMain {
 
@@ -73,7 +83,10 @@ public final class ReplicatedServerMain {
 				Duration.ofMillis(Long.parseLong(options.value("--max-transaction-lease-ms",
 						String.valueOf(NodeConfig.DEFAULT_MAX_TRANSACTION_LEASE.toMillis())))),
 				Long.parseLong(options.value("--log-segment-bytes", String.valueOf(NodeConfig.DEFAULT_LOG_SEGMENT_BYTES))),
-				options.flag("--pipelined-updates"));
+				options.flag("--pipelined-updates"),
+				options.flag("--join"),
+				Duration.ofMillis(Long.parseLong(options.value("--jvm-pause-limit-ms",
+						String.valueOf(NodeConfig.DEFAULT_JVM_PAUSE_LIMIT.toMillis())))));
 		options.requireConsumed();
 		ReplicatedNode node;
 		try {
@@ -96,8 +109,8 @@ public final class ReplicatedServerMain {
 		System.out.flush();
 		var failure = node.stopped().join();
 		if (failure != null) {
-			// The replica cannot apply the log: exit, so that a supervisor notices and an operator repairs it.
-			System.err.println("Node " + config.nodeId() + " stopped after a replica failure: " + failure);
+			// The replica cannot apply the log, or Raft closed: exit, so that a supervisor notices.
+			System.err.println("Node " + config.nodeId() + " stopped after a failure: " + failure);
 			System.exit(3);
 		}
 	}
@@ -188,7 +201,8 @@ public final class ReplicatedServerMain {
 				  run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT ... --data-dir DIR
 				        [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
 				        [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
-				        [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates]
+				        [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
+				        [--jvm-pause-limit-ms N]
 				  admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]""");
 		System.exit(2);
@@ -196,7 +210,7 @@ public final class ReplicatedServerMain {
 
 	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
 	private static final class Options {
-		private static final List<String> FLAGS = List.of("--pipelined-updates", "--dry-run");
+		private static final List<String> FLAGS = List.of("--pipelined-updates", "--join", "--dry-run");
 
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();

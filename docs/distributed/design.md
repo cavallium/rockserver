@@ -139,9 +139,13 @@ The gate lives in memory, so a node that restarts learns from its disk that a le
 cluster id or its Raft log has an entry (neither alone is enough: a kill can lose a recent cluster id, and a purge can
 empty a log). Such a node has known a leader, and the bound counts from its start, or a restart while cut off from the
 majority would keep clients on a node that cannot serve them. Raft has its own port, so a paused node keeps voting,
-and elections, genesis and the read barrier's term checks use only Raft ports: a whole cluster that starts together
-pauses until it elects a leader, which costs nothing because none of its nodes can serve before that, and it then
-serves by itself. A member of a new cluster has neither, and is not judged until it first knows a leader. Once a node
+and elections, genesis and the read barrier's term checks use only Raft ports: a whole cluster that takes longer than
+the bound to elect a leader pauses until it does, and it then serves by itself. None of its nodes could serve before
+that. What it costs is the capability handshake of a client that starts meanwhile, which needs an answer before
+`GrpcConnection` returns: with several addresses it keeps asking while the answer is `UNAVAILABLE`, for 30 s by
+default (`handshake-wait-ms`), and with one address it fails at once, as a client of a plain server that is down does.
+A cluster that elects within the bound pauses nothing. A member of a new cluster has neither, and is not judged until
+it first knows a leader. Once a node
 has known a leader for one maximum election timeout, long enough for a heartbeat to have confirmed it, `GrpcServer.resume` builds
 a new gRPC server on the same port. Both conditions must hold without a break, so a short election never pauses a
 node, and a pause and the next are at least 4 maximum election timeouts apart. A cluster where no node has a leader
@@ -276,7 +280,7 @@ Raft log on disk instead of decoded on the heap. Any error on the apply or compl
   request's result and the log moves on.
 - **Local failures** (native or IO errors, a lost local transaction) stop the replica:
   - its Raft server stops first, so a failed leader stops leading;
-  - the process exits with code 3;
+  - the process exits with code 3 (also when Raft closes under a running node: see "Long pauses");
   - it never skips the entry.
 
 **Column ids** are native column family ids. Every replica gets the same ones because each runs the same
@@ -521,12 +525,25 @@ against an incomplete history.
   before any log entry, so it gets the seed. A node that replays the seeded `Genesis` with an empty database (an
   initial member without the copy, before the log is purged, or a new member while the leader has no snapshot
   because that one attempt failed) stops instead of diverging.
-- **Replacing a node.** Start the new member first, under a new id, with an empty data directory and a peer
-  list that includes itself. Then run `ReplicatedServerMain admin --peer ... add-peer` and `remove-peer` (Ratis
-  `setConfiguration`). `admin` does not read the current configuration: it sets it to exactly its own `--peer`
-  list plus or minus one peer, so `--peer` must list every current member, or the ones left out are removed.
-  New members catch up from a snapshot. A node that lost its Raft state but kept its id refuses to start,
-  because it could vote twice in one term. Replace it under a new id.
+- **Replacing a node.** Start the new member first, under a new id, with an empty data directory, a peer list
+  that includes itself and `--join`. Then run `ReplicatedServerMain admin --peer ... add-peer` and `remove-peer`
+  (Ratis `setConfiguration`), whenever you like: the new node waits, also across restarts. `admin` does not read the
+  current configuration: it sets it to exactly its own `--peer` list plus or minus one peer, so `--peer` must list
+  every current member, or the ones left out are removed. New members catch up from a snapshot. A node that lost its
+  Raft state but kept its id refuses to start, because it could vote twice in one term. Replace it under a new id.
+
+  `--join` gives Ratis an empty group, so the node starts in Ratis' initializing state: no election timer, until a
+  leader sends it a request that is not part of bringing it up to date. Without the option the node would start
+  elections. A leader that is not of the first term answers a pre-vote from a node outside its configuration with a
+  request to shut down (its configuration entry has an index, which it compares with the candidate's log), Ratis
+  closes that node's division, and `add-peer` then hangs with no end. So a node that replaces a lost leader had 1 to 2 s
+  to get its `add-peer`. Now such a node exits (see "Long pauses"), and `--join` keeps it from getting there. The
+  option does not change a node that has a configuration of its own, from its log or from a snapshot, so it can stay in
+  the node's command line; a node of a running cluster also restarts without it. It leaves nothing on disk: a node
+  restarted without it before its `add-peer` is an ordinary new member, with the election timer above.
+
+  A node still running when `remove-peer` removes it closes Raft by itself and exits with 3. Take it out of its
+  supervisor first, or the supervisor keeps restarting a node that has no group to join.
 - **No quorum.** Replacing a node takes a leader (`setConfiguration`), so it does not help when too few nodes
   can start: two of three after a shared power cut, for example, each with a hole in a group commit followed by
   later data, which `repair-log` refuses. Writes through a volatile device cache can complete out of order within
@@ -535,7 +552,8 @@ against an incomplete history.
   the loss. Meanwhile the cluster stays down and loses nothing. What exists:
   1. Stop every node and copy every data directory before anything else.
   2. Run `repair-log --dry-run` on every node, repair the ones it accepts and start every node that can start. Any
-     majority of the members elects a leader, repaired or not, and the refused nodes can then be replaced as above.
+     majority of the members elects a leader, repaired or not, and the refused nodes can then be replaced as above,
+     with `--join`: the new node waits for as long as the leader takes.
      A refused node stays a member until then, so it still counts in the size of the majority.
   3. Otherwise, restore a copy of the whole cluster: every node's complete data directory, from one moment, under
      the same ids. The writes since then are lost. Restoring only some nodes from an older copy is the fault this
@@ -548,6 +566,35 @@ against an incomplete history.
      test covers this way, which is a last resort.
 - **Graceful stop.** On SIGTERM a leader hands leadership to the most up-to-date live follower before
   stopping. A deploy restart costs a few hundred milliseconds without writes (see the tests).
+- **Long pauses.** Ratis closes its server after a JVM pause longer than a limit, and a division also closes when a
+  leader tells a node outside its configuration to shut down. Both leave the process up: the API listens, the Raft
+  port refuses connections, and a closed division still reports its last leader, which it can no longer follow. So
+  the maintenance loop of `ReplicatedNode` watches the division, and a node whose Raft closed while it was running
+  stops like a failed replica: it exits with code 3, with `Raft closed` in its error, so that a supervisor restarts it.
+  Its clients then move at once, and it comes back from its disk like any restart. The limit stays at Ratis' 60 s, set
+  by `--jvm-pause-limit-ms`: a pause that long comes from a machine in trouble (swap, a stuck disk, a stopped VM), and
+  a restart is the recovery path that every test covers. Raft stays safe through any pause, so a higher limit is safe
+  too: it trades that restart for a node that resumes by itself. Without a supervisor the node stays down until an
+  operator starts it.
+- **A new leader whose first entry gets no reply.** A leader appends an entry when its term starts and refuses writes
+  until that entry is committed. Ratis moves a follower's match index only on the reply to a request with entries:
+  `AppendEntriesReply.matchIndex` is -1 on a heartbeat. It moves the next index when it sends an entry, and keeps it
+  when a stream fails with no call id (`keep nextIndex unchanged`). So with one node of three down, if the other
+  follower wrote the entry and its stream died before the reply, as when it restarts just then, no heartbeat can ever
+  report the entry, and no write can carry a later one. On a real disk this took 189 s and more, with no end, and fsync
+  decides the race: on a tmpfs the reply gets out first. `LeaderStall`, in the same maintenance loop, makes such a
+  leader step down, with a `TransferLeadershipRequest` with no new leader, which works on a leader that is not ready.
+  The rule: no entry of the term committed, the commit index not moving for 5 maximum election timeouts and at least
+  10 s, and the whole log sent to a majority of members that still answer. It does not look at what is applied, so a
+  long replay after a restart is no stall. A follower still catching up, from the log or a snapshot, has not been sent
+  everything, so it does not count; a step down would start it over. A leader without such a majority does not step
+  down this way: Ratis does that by itself after one election timeout. The cost is about 12 s without writes, in a case
+  that had no end. The log says `stepping down to restart replication`, and the metric `leader.stall.stepdowns` counts.
+  After its first commit a leader cannot stall like this: the next write it accepts has entries, and its reply moves
+  the match index past the entry whose reply was lost. An uncommitted entry waits for that write, and only the client
+  that wrote it waits with it, until its deadline. If a partner's disk hangs and heartbeats still pass, the leader
+  steps down once per bound and the other side does the same: elections, and no writes, which is what that fault
+  gives anyway.
 
 ## Behavior differences from a single node
 
@@ -609,11 +656,12 @@ failover" below).
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, no acknowledged increment of a hot counter is lost, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `ClientFailoverTest` | One client connection listing all three nodes, while the node it uses is killed (the leader, or a follower): only retryable errors, new calls succeed on another node of the same connection (about 1 s with an election, under 200 ms without), a new connection skips the dead node, and a transaction opened through a dead follower still commits. |
-| `IsolatedNodeTest` | A client listing every node, connected to a node that gets isolated (the leader, or a follower), moves to the majority and keeps working, and the isolated node listens and serves again after the heal. With every node isolated all pause, and after the heal all resume and the client recovers by itself. An election shorter than the bound pauses no node. A follower restarted while cut off pauses too, and the client that lists it first moves. A cluster killed or stopped as a whole and restarted at once serves again, a paused node takes part in the election, and a node of a new cluster does not pause. |
+| `IsolatedNodeTest` | A client listing every node, connected to a node that gets isolated (the leader, or a follower), moves to the majority and keeps working, and the isolated node listens and serves again after the heal. With every node isolated all pause, and after the heal all resume and the client recovers by itself. An election shorter than the bound pauses no node. A follower restarted while cut off pauses too, and the client that lists it first moves. A cluster killed or stopped as a whole and restarted at once serves again, a paused node takes part in the election, and a node of a new cluster does not pause. A node that lost its database and kept its log pauses, and a client that starts during a cold start waits for the cluster. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history, hot counters included, is linearizable. |
-| `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. |
+| `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. A freeze longer than `--jvm-pause-limit-ms` ends the node with exit code 3, and it starts again. |
+| `LeaderStallTest` | The rule of `LeaderStall`. With one node down, the reply to a new leader's first entry is lost on a link, after the entry reached the follower's disk: nothing commits and the leader stays, until it steps down and a write gets through. The same loss after the first commit heals with the next write. A leader behind in applying does not step down. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
-| `MembershipTest` | A node replaced through `add-peer`/`remove-peer` catches up from a snapshot. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. |
+| `MembershipTest` | A node started with `--join` replaces a lost leader, however long before its `add-peer` it started and after a restart in between, catches up from a snapshot, and restarts with or without the option. A node removed while it runs exits. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories, with read-modify-write updates and hot counters in them, are linearizable, and the transactional bank-transfer invariant holds. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
@@ -623,6 +671,15 @@ Run them all (about 15 minutes):
 
 ```bash
 mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockserver.distributed.**' -Dsurefire.failIfNoSpecifiedTests=false
+```
+
+The suite must also pass with its directories on a real disk: JUnit puts them in `/tmp`, and fsync costs nothing on the
+tmpfs that `/tmp` often is, which hid a stall that a real disk shows every time (see "A new leader whose first entry gets
+no reply"). Timing on a tmpfs is not timing on a disk, so run it both ways before calling a change done:
+
+```bash
+mkdir -p /var/tmp/rockserver-test
+mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockserver.distributed.**' -Dsurefire.failIfNoSpecifiedTests=false -Drockserver.test.tmpdir=/var/tmp/rockserver-test
 ```
 
 `-Drockserver.test.pipelinedUpdates=true` runs every test cluster with pipelined updates on. Hot counters also

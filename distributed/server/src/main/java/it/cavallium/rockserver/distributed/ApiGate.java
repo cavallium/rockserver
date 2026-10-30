@@ -20,10 +20,12 @@ import java.time.Duration;
  *
  * <p>The state of the gate is in memory, but whether a leader existed is not: a node that restarts with what a leader
  * left behind has known one, and it is judged from its start, or a restart while cut off from the majority would keep
- * its clients on a node that cannot serve them. Then a whole cluster that starts together pauses until it elects a
- * leader, which costs nothing: none of its nodes can serve before that, and elections and everything else that forms the
- * cluster use the Raft ports. Only a node that never had any of that, the member of a new cluster, is not judged: a
- * cluster that is still forming has nothing better to offer its clients.</p>
+ * its clients on a node that cannot serve them. Then a whole cluster that takes longer than the bound to elect a leader
+ * pauses until it does. None of its nodes could serve before that, and elections and everything else that forms the
+ * cluster use the Raft ports. What it costs is an answer to the capability handshake of a client that starts meanwhile: a
+ * connection to several addresses keeps asking, for 30 s by default (see {@code GrpcConnection.forHostsAndPorts}), and one
+ * to a single address fails at once. Only a node that never had any of that, the member of a new cluster, is not judged:
+ * a cluster that is still forming has nothing better to offer its clients.</p>
  *
  * <p>A node must keep knowing a leader for {@value #ELECTION_TIMEOUTS_TO_RESUME} maximum election timeout to serve
  * again. Its leader was then confirmed by a heartbeat: without one, its election timer would have fired and cleared it.

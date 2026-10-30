@@ -92,6 +92,9 @@ final class RaftSettings {
 		RaftServerConfigKeys.Rpc.setTimeoutMax(properties, duration(config.electionTimeoutMax()));
 		RaftServerConfigKeys.Rpc.setRequestTimeout(properties, duration(config.electionTimeoutMax()));
 		RaftServerConfigKeys.LeaderElection.setPreVote(properties, true);
+		// After a JVM pause longer than this Ratis closes the server. ReplicatedNode then stops the node: see "Long pauses"
+		// in the design document.
+		RaftServerConfigKeys.setCloseThreshold(properties, duration(config.jvmPauseLimit()));
 
 		// Snapshots are RocksDB checkpoints; the log is purged up to the latest one.
 		RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(properties, true);

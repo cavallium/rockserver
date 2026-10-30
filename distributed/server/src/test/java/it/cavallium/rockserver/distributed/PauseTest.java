@@ -7,11 +7,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
+import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -76,6 +78,7 @@ class PauseTest {
 	private static final Duration ELECTION_TIMEOUT_MIN = Duration.ofMillis(400);
 	private static final Duration ELECTION_TIMEOUT_MAX = Duration.ofMillis(800);
 	private static final Duration PAUSE = ELECTION_TIMEOUT_MAX.multipliedBy(3);
+	private static final Duration PAUSE_LIMIT = Duration.ofSeconds(3);
 	private static final List<String> SERVER_ARGS = List.of(
 			"--election-timeout-ms", ELECTION_TIMEOUT_MIN.toMillis() + ":" + ELECTION_TIMEOUT_MAX.toMillis(),
 			"--request-timeout-ms", "3000");
@@ -130,6 +133,46 @@ class PauseTest {
 		}
 		if (cluster != null) {
 			cluster.close();
+		}
+	}
+
+	/** A freeze past {@code --jvm-pause-limit-ms}: Ratis closes the server, and the node stops and can start again. */
+	@Test
+	void aNodeFrozenPastThePauseLimitStopsAndRestarts() throws Exception {
+		var args = new ArrayList<>(SERVER_ARGS);
+		args.addAll(List.of("--jvm-pause-limit-ms", String.valueOf(PAUSE_LIMIT.toMillis())));
+		cluster = ProcessCluster.start(root.resolve("cluster"), 3, ProcessCluster.pipelined(args));
+		cluster.waitReady(READY_TIMEOUT);
+		var leader = ClientFailoverTest.awaitLeader(cluster);
+		var frozen = Stream.of("1", "2", "3").filter(id -> !id.equals(leader)).findFirst().orElseThrow();
+
+		cluster.pause(frozen);
+		Thread.sleep(PAUSE_LIMIT.plusSeconds(2));
+		cluster.resume(frozen);
+
+		assertEquals(3, cluster.awaitExit(frozen, READY_TIMEOUT), () -> cluster.logTail(frozen));
+		assertTrue(cluster.logTail(frozen).contains("Raft closed"), () -> cluster.logTail(frozen));
+		cluster.start(frozen);
+		cluster.waitReady(frozen, READY_TIMEOUT);
+		try (var connection = GrpcConnection.forHostAndPort("restarted-client", cluster.apiAddress(frozen))) {
+			var api = connection.getSyncApi(SETUP);
+			long column = awaitColumn(api);
+			api.put(0, column, new Keys(Buf.wrap(new byte[8])), Buf.wrap(new byte[] {1}), RequestType.none());
+		}
+	}
+
+	/** The node serves through whichever leader there is, soon after its start. */
+	private static long awaitColumn(RocksDBSyncAPI api) throws InterruptedException {
+		long deadline = System.nanoTime() + WAIT_TIMEOUT.toNanos();
+		while (true) {
+			try {
+				return api.createColumn("after", SCHEMA);
+			} catch (RuntimeException e) {
+				if (System.nanoTime() - deadline > 0) {
+					throw e;
+				}
+				Thread.sleep(50);
+			}
 		}
 	}
 

@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -57,6 +58,9 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final ApiGate apiGate;
 	/** Only used on the maintenance thread. */
 	private boolean clusterInitialized;
+	/** Only used on the maintenance thread. */
+	private final LeaderStall leaderStall;
+	private final NodeMetrics.Series leaderStallStepDowns;
 	private final AtomicBoolean closed = new AtomicBoolean();
 	private final CompletableFuture<@Nullable Throwable> stopped = new CompletableFuture<>();
 	private final NodeMetrics metrics;
@@ -68,6 +72,8 @@ public final class ReplicatedNode implements AutoCloseable {
 		var groupId = RaftGroupId.valueOf(UUID.fromString(config.groupId()));
 		this.group = RaftGroup.valueOf(groupId, raftPeers(config));
 		this.metrics = new NodeMetrics(config.nodeId());
+		this.leaderStall = LeaderStall.forElectionTimeout(config.electionTimeoutMax());
+		this.leaderStallStepDowns = metrics.amount("leader.stall.stepdowns");
 		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure, metrics);
 
 		var parameters = new Parameters();
@@ -79,7 +85,10 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 		this.server = RaftServer.newBuilder()
 				.setServerId(RaftPeerId.valueOf(config.nodeId()))
-				.setGroup(group)
+				// With no peers at all Ratis starts the node without an election timer, until a leader's first request
+				// that is not part of bringing the node up to date. Its own log or snapshot overrides this when it has a
+				// configuration, and nothing about this start stays behind for a later start without the option.
+				.setGroup(config.join() ? RaftGroup.valueOf(groupId) : group)
 				.setStateMachine(stateMachine)
 				.setProperties(RaftSettings.server(config))
 				.setParameters(parameters)
@@ -108,6 +117,8 @@ public final class ReplicatedNode implements AutoCloseable {
 			this.apiGate = ApiGate.forElectionTimeout(config.electionTimeoutMax(), hadLeaderBeforeStart(), System.nanoTime());
 			maintenance.scheduleWithFixedDelay(this::initializeCluster, 0, MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 			maintenance.scheduleWithFixedDelay(this::gateApi, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
+					TimeUnit.MILLISECONDS);
+			maintenance.scheduleWithFixedDelay(this::watchRaft, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
 			var appendLag = metrics.amount("lag.uncommitted");
 			var applyLag = metrics.amount("lag.unapplied");
@@ -212,15 +223,94 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 	}
 
-	/** A former leader that stepped down may keep its own id as leader: it does not count. */
-	private boolean knowsLeader() {
+	/**
+	 * A former leader that stepped down may keep its own id as leader: it does not count. Neither does what a closed
+	 * division remembers.
+	 */
+	boolean knowsLeader() {
 		var division = stateMachine.division();
-		if (division == null) {
+		if (division == null || !division.getInfo().isAlive()) {
 			return false;
 		}
 		var info = division.getInfo();
 		var leader = info.getLeaderId();
 		return leader != null && (info.isLeader() || !leader.toString().equals(config.nodeId()));
+	}
+
+	/** Stops the node if Raft closed, and starts a new election if this leader is stalled (see {@link LeaderStall}). */
+	private void watchRaft() {
+		try {
+			if (closed.get()) {
+				return;
+			}
+			var division = stateMachine.division();
+			if (division == null || !division.getInfo().isAlive()) {
+				stopAfterRaftClosed();
+				return;
+			}
+			var log = division.getRaftLog();
+			long commitIndex = log.getLastCommittedIndex();
+			long term = division.getInfo().getCurrentTerm();
+			if (leaderStall.shouldStepDown(waitsForReplyOfSentEntry(division), term, commitIndex, System.nanoTime())) {
+				LOG.warn("{}: leader of term {}: no entry of this term committed, commit index {} did not move and the log"
+						+ " up to {} went to a majority, stepping down to restart replication", config.nodeId(), term,
+						commitIndex, log.getNextIndex() - 1);
+				leaderStallStepDowns.record(1);
+				// With no new leader Ratis only steps down, which needs no ready leader.
+				var request = new TransferLeadershipRequest(ClientId.randomId(), server.getId(), group.getGroupId(), 0, null,
+						LEADERSHIP_TRANSFER_TIMEOUT_MS);
+				server.transferLeadershipAsync(request).whenComplete((reply, error) -> {
+					if (error != null || !reply.isSuccess()) {
+						LOG.warn("{}: failed to step down", config.nodeId(), error != null ? error : reply.getException());
+					}
+				});
+			}
+		} catch (IOException | RuntimeException ex) {
+			LOG.warn("{}: failed to check Raft, retrying", config.nodeId(), ex);
+		}
+	}
+
+	/**
+	 * This node leads, no entry of its term is committed, and a majority of members has been sent all of its log and
+	 * still answers: see {@link LeaderStall}.
+	 */
+	private boolean waitsForReplyOfSentEntry(RaftServer.Division division) {
+		var info = division.getInfo();
+		var log = division.getRaftLog();
+		if (!info.isLeader()) {
+			return false;
+		}
+		var committed = log.getTermIndex(log.getLastCommittedIndex());
+		if (committed != null && committed.getTerm() == info.getCurrentTerm()) {
+			return false;
+		}
+		var nextIndices = info.getFollowerNextIndices();
+		var replies = info.getRoleInfoProto().getLeaderInfo().getFollowerInfoList();
+		if (nextIndices == null || nextIndices.length != replies.size()) {
+			return false;
+		}
+		var followers = new ArrayList<LeaderStall.Follower>();
+		for (int i = 0; i < nextIndices.length; i++) {
+			var reply = replies.get(i);
+			followers.add(new LeaderStall.Follower(RaftPeerId.valueOf(reply.getId().getId()).toString(), nextIndices[i],
+					reply.getLastRpcElapsedTimeMs()));
+		}
+		var conf = division.getRaftConf();
+		return LeaderStall.sentToMajority(followers, log.getNextIndex(), config.electionTimeoutMax().toMillis(),
+				config.nodeId(), peerIds(conf.getCurrentPeers()), peerIds(conf.getPreviousPeers()));
+	}
+
+	private static List<String> peerIds(Collection<RaftPeer> peers) {
+		return peers.stream().map(peer -> peer.getId().toString()).toList();
+	}
+
+	/**
+	 * Ratis closed this node's Raft server by itself: after a JVM pause longer than {@link NodeConfig#jvmPauseLimit()},
+	 * or after a leader told a node outside its configuration to go away. The process would stay up, with an API that
+	 * only forwards to a leader it can no longer follow. Stop it like a failed replica, so that a supervisor restarts it.
+	 */
+	private void stopAfterRaftClosed() {
+		onReplicaFailure(new IOException("Raft closed on node " + config.nodeId() + " while the node was running"));
 	}
 
 	/**
@@ -241,7 +331,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 	}
 
-	/** Completes when the node stopped: normally with null, or with the failure that stopped its replica. */
+	/** Completes when the node stopped: normally with null, or with the failure that stopped it. */
 	public CompletableFuture<@Nullable Throwable> stopped() {
 		return stopped;
 	}
@@ -284,6 +374,11 @@ public final class ReplicatedNode implements AutoCloseable {
 	/** The local replica, for tests that inspect each node's own database. */
 	RockserverStateMachine stateMachine() {
 		return stateMachine;
+	}
+
+	/** This node's Raft server, for tests. */
+	RaftServer raftServerForTests() {
+		return server;
 	}
 
 	/** This node's metrics, for tests. */

@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -610,14 +611,14 @@ class ReplicationTest {
 		for (int term = 0; term < 3; term++) {
 			var leader = cluster.awaitLeader(TIMEOUT);
 			for (int i = 0; i < 600; i++, written++) {
-				api(leader).put(0, column, key(written), text("v" + written), RequestType.none());
+				putUntilAccepted(leader, column, written);
 			}
 			var leaderId = leader.config().nodeId();
 			cluster.stop(leaderId);
 			cluster.start(leaderId);
 		}
 		var leader = cluster.awaitLeader(TIMEOUT);
-		api(leader).put(0, column, key(written), text("v" + written), RequestType.none());
+		putUntilAccepted(leader, column, written);
 		written++;
 		long logStart = leader.stateMachine().division().getRaftLog().getStartIndex();
 		assertTrue(logStart <= laggingApplied + 1, "log purged past the lagging follower: starts at " + logStart
@@ -635,6 +636,45 @@ class ReplicationTest {
 		api(cluster.awaitLeader(TIMEOUT)).put(0, column, key(written), text("after"), RequestType.none());
 		cluster.awaitConverged(TIMEOUT);
 		assertEquals("after", localValue(node, column, written));
+	}
+
+	/**
+	 * With only two members left, the old leader can stop before the reply to its successor's first entry goes out: that
+	 * leader then takes the bound of {@link LeaderStall} to start over, longer than one request waits for a leader.
+	 */
+	private void putUntilAccepted(ReplicatedNode through, long column, int index) {
+		long deadline = System.nanoTime() + TIMEOUT.toNanos();
+		while (true) {
+			try {
+				api(through).put(0, column, key(index), text("v" + index), RequestType.none());
+				return;
+			} catch (RuntimeException e) {
+				if (!ClusterClient.isRetryable(e) || System.nanoTime() - deadline > 0) {
+					throw e;
+				}
+			}
+		}
+	}
+
+	/**
+	 * Ratis closes its server by itself after a long JVM pause. The node stops as after a failed apply, and what the
+	 * closed division remembers about the leader does not count until then.
+	 */
+	@Test
+	void aNodeWhoseRaftClosedStops() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var follower = cluster.anyFollower();
+		assertTrue(follower.knowsLeader());
+
+		follower.raftServerForTests().close();
+
+		assertFalse(follower.knowsLeader());
+		var cause = follower.stopped().get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		assertNotNull(cause);
+		assertTrue(cause.getMessage().contains("Raft closed"), cause::toString);
+		cluster.halt(follower.config().nodeId());
+		cluster.awaitLeader(TIMEOUT);
 	}
 
 	/**

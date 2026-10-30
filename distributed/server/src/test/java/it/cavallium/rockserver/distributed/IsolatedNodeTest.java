@@ -21,10 +21,14 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.AfterEach;
@@ -50,6 +54,8 @@ class IsolatedNodeTest {
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
 	private static final int CALLS_ON_THE_MAJORITY = 20;
 	private static final List<String> MEMBERS = List.of("1", "2", "3");
+	/** More than the 7.5 s that the retries of one handshake take. */
+	private static final Duration COLD_START_WAIT = Duration.ofSeconds(9);
 
 	/** Kept when a test fails, for the node logs. */
 	@TempDir(cleanup = CleanupMode.ON_SUCCESS)
@@ -160,6 +166,53 @@ class IsolatedNodeTest {
 		cluster.waitReady("2", READY_TIMEOUT);
 		awaitLeader(cluster, List.of("1", "2"));
 		await(() -> serves("1"), "the node to serve again");
+	}
+
+	/**
+	 * A node that lost its database and kept its Raft log has no cluster id, and has known a leader: the entries in its
+	 * log tell. It pauses when it comes back with no majority to find.
+	 */
+	@Test
+	void aNodeWithItsLogAndWithoutItsDatabasePauses() throws Exception {
+		startCluster(SERVER_ARGS);
+		awaitLeader(cluster);
+		try (var connection = GrpcConnection.forHostsAndPorts("setup-client",
+				MEMBERS.stream().map(cluster::apiAddress).toList())) {
+			connection.getAsyncApi(SETUP).createColumnAsync("data", SCHEMA).join();
+		}
+		cluster.killAll();
+		deleteRecursively(cluster.dataDir("1").resolve("db"));
+		cluster.start("1");
+		cluster.waitReady("1", READY_TIMEOUT);
+		await(() -> !serves("1"), "the node alone to pause");
+	}
+
+	/**
+	 * A client that starts during a cold start, with the only running node paused, waits for the cluster instead of
+	 * failing in the constructor: the node takes more than the handshake's own retries to serve.
+	 */
+	@Test
+	void aClientStartedDuringAColdStartWaitsForTheCluster() throws Exception {
+		startCluster(SERVER_ARGS);
+		awaitLeader(cluster);
+		var addresses = MEMBERS.stream().map(cluster::apiAddress).toList();
+		long column;
+		try (var setup = GrpcConnection.forHostsAndPorts("cold-start-setup-client", addresses)) {
+			column = setup.getAsyncApi(SETUP).createColumnAsync("data", SCHEMA).join();
+		}
+		cluster.killAll();
+		cluster.start("1");
+		cluster.waitReady("1", READY_TIMEOUT);
+		await(() -> !serves("1"), "the node alone to pause");
+
+		var connecting = CompletableFuture.supplyAsync(() -> GrpcConnection.forHostsAndPorts("cold-start-client", addresses));
+		Thread.sleep(COLD_START_WAIT);
+		assertFalse(connecting.isDone(), "the connection did not wait");
+		cluster.start("2");
+		cluster.waitReady("2", READY_TIMEOUT);
+		try (var connection = connecting.get(WAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS)) {
+			awaitWorks(connection.getAsyncApi(CONTEXT), column);
+		}
 	}
 
 	/** A member of a cluster that never formed has known no leader: it does not pause, however long it waits. */
@@ -330,6 +383,14 @@ class IsolatedNodeTest {
 			return true;
 		} catch (IOException refused) {
 			return false;
+		}
+	}
+
+	private static void deleteRecursively(Path path) throws IOException {
+		try (var paths = Files.walk(path)) {
+			for (var entry : paths.sorted(Comparator.reverseOrder()).toList()) {
+				Files.delete(entry);
+			}
 		}
 	}
 

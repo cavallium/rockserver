@@ -30,6 +30,11 @@ import org.jetbrains.annotations.Nullable;
  *                         the previous one is admitted to the log, instead of after its apply. The next update then
  *                         reads the value from leader memory, provisionally: see the design document. It changes
  *                         nothing but this node's behavior as a leader, so nodes may differ. Off by default
+ * @param join start outside the group, as a node that an {@code add-peer} will add: no election timer, so that the
+ *             node never asks a leader for a vote, which would close its Raft server. It changes nothing once the node
+ *             has a configuration of its own in its log or snapshot. Off by default
+ * @param jvmPauseLimit a pause of this JVM longer than this closes Raft, and the node stops with an error when it
+ *                      resumes. See "Long pauses" in the design document
  */
 public record NodeConfig(String nodeId,
 		List<PeerConfig> peers,
@@ -44,13 +49,17 @@ public record NodeConfig(String nodeId,
 		Duration requestTimeout,
 		Duration maxTransactionLease,
 		long logSegmentBytes,
-		boolean pipelinedUpdates) {
+		boolean pipelinedUpdates,
+		boolean join,
+		Duration jvmPauseLimit) {
 
 	public static final String DEFAULT_GROUP_ID = "5e3b8c1a-7a52-4b8e-9d2c-0c9f6a3d4e71";
 	/** One snapshot every minute or two at a few thousand entries per second. */
 	public static final long DEFAULT_SNAPSHOT_EVERY_ENTRIES = 500_000;
 	public static final Duration DEFAULT_MAX_TRANSACTION_LEASE = Duration.ofSeconds(60);
 	public static final long DEFAULT_LOG_SEGMENT_BYTES = 64L << 20;
+	/** Ratis' own default, set explicitly: see {@link RaftSettings}. */
+	public static final Duration DEFAULT_JVM_PAUSE_LIMIT = Duration.ofSeconds(60);
 
 	public NodeConfig {
 		Objects.requireNonNull(nodeId, "nodeId");
@@ -75,12 +84,15 @@ public record NodeConfig(String nodeId,
 		if (logSegmentBytes <= 0) {
 			throw new IllegalArgumentException("logSegmentBytes must be positive");
 		}
+		if (jvmPauseLimit.isNegative() || jvmPauseLimit.isZero()) {
+			throw new IllegalArgumentException("jvmPauseLimit must be positive");
+		}
 	}
 
 	public static NodeConfig defaults(String nodeId, List<PeerConfig> peers, Path dataDir) {
 		return new NodeConfig(nodeId, peers, dataDir, null, null, null, DEFAULT_GROUP_ID,
 				Duration.ofMillis(1000), Duration.ofMillis(2000), DEFAULT_SNAPSHOT_EVERY_ENTRIES, Duration.ofSeconds(10),
-				DEFAULT_MAX_TRANSACTION_LEASE, DEFAULT_LOG_SEGMENT_BYTES, false);
+				DEFAULT_MAX_TRANSACTION_LEASE, DEFAULT_LOG_SEGMENT_BYTES, false, false, DEFAULT_JVM_PAUSE_LIMIT);
 	}
 
 	public PeerConfig self() {
@@ -100,45 +112,63 @@ public record NodeConfig(String nodeId,
 		return dataDir.resolve("raft");
 	}
 
+	public NodeConfig withPeers(List<PeerConfig> value) {
+		return new NodeConfig(nodeId, value, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
+				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,
+				logSegmentBytes, pipelinedUpdates, join, jvmPauseLimit);
+	}
+
 	public NodeConfig withRockserverConfig(@Nullable Path value) {
 		return new NodeConfig(nodeId, peers, dataDir, value, raftBindHost, apiBindHost, groupId,
 				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,
-				logSegmentBytes, pipelinedUpdates);
+				logSegmentBytes, pipelinedUpdates, join, jvmPauseLimit);
 	}
 
 	public NodeConfig withBindHosts(@Nullable String raft, @Nullable String api) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raft, api, groupId,
 				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,
-				logSegmentBytes, pipelinedUpdates);
+				logSegmentBytes, pipelinedUpdates, join, jvmPauseLimit);
 	}
 
 	public NodeConfig withSnapshotEveryEntries(long value) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
 				electionTimeoutMin, electionTimeoutMax, value, requestTimeout, maxTransactionLease,
-				logSegmentBytes, pipelinedUpdates);
+				logSegmentBytes, pipelinedUpdates, join, jvmPauseLimit);
 	}
 
 	public NodeConfig withElectionTimeouts(Duration min, Duration max) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
 				min, max, snapshotEveryEntries, requestTimeout, maxTransactionLease,
-				logSegmentBytes, pipelinedUpdates);
+				logSegmentBytes, pipelinedUpdates, join, jvmPauseLimit);
 	}
 
 	public NodeConfig withRequestTimeout(Duration value) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
 				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, value, maxTransactionLease,
-				logSegmentBytes, pipelinedUpdates);
+				logSegmentBytes, pipelinedUpdates, join, jvmPauseLimit);
 	}
 
 	public NodeConfig withMaxTransactionLease(Duration value) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
 				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, value,
-				logSegmentBytes, pipelinedUpdates);
+				logSegmentBytes, pipelinedUpdates, join, jvmPauseLimit);
 	}
 
 	public NodeConfig withPipelinedUpdates(boolean value) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
 				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,
-				logSegmentBytes, value);
+				logSegmentBytes, value, join, jvmPauseLimit);
+	}
+
+	public NodeConfig withJoin(boolean value) {
+		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
+				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,
+				logSegmentBytes, pipelinedUpdates, value, jvmPauseLimit);
+	}
+
+	public NodeConfig withJvmPauseLimit(Duration value) {
+		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
+				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,
+				logSegmentBytes, pipelinedUpdates, join, value);
 	}
 }

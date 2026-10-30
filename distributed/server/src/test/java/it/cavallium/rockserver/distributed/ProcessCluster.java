@@ -280,6 +280,24 @@ public final class ProcessCluster implements AutoCloseable {
 		return node(id).running();
 	}
 
+	/** Waits until the node's process exits by itself, and returns its exit code. */
+	public int awaitExit(String id, Duration timeout) throws InterruptedException {
+		Process process;
+		synchronized (this) {
+			process = node(id).process;
+		}
+		if (process == null) {
+			throw new IllegalStateException("Node " + id + " was never started");
+		}
+		if (!process.waitFor(timeout.toNanos(), TimeUnit.NANOSECONDS)) {
+			throw new AssertionError("Node " + id + " is still running after " + timeout + "\n" + logTail(id));
+		}
+		synchronized (this) {
+			node(id).shouldRun = false;
+		}
+		return process.exitValue();
+	}
+
 	/** Process id of the node's current (or last) JVM. */
 	synchronized long pid(String id) {
 		var process = node(id).process;
@@ -342,8 +360,12 @@ public final class ProcessCluster implements AutoCloseable {
 		}
 	}
 
-	/** Starts (or restarts, with the same directories and ports) a node that is not running. */
-	public synchronized void start(String id) throws IOException {
+	/**
+	 * Starts (or restarts, with the same directories and ports) a node that is not running.
+	 *
+	 * @param extraArgs {@code run} options of this start only, e.g. {@code --join}
+	 */
+	public synchronized void start(String id, String... extraArgs) throws IOException {
 		var node = node(id);
 		if (node.running()) {
 			throw new IllegalStateException("Node " + id + " is already running");
@@ -355,7 +377,7 @@ public final class ProcessCluster implements AutoCloseable {
 		node.stdoutStart = Files.size(node.stdout());
 		// The child writes straight to the files: reading its stdout through a pipe can lose the last lines, as
 		// the JDK closes the pipe when the process exits.
-		node.process = new ProcessBuilder(command(node))
+		node.process = new ProcessBuilder(command(node, List.of(extraArgs)))
 				.redirectOutput(ProcessBuilder.Redirect.appendTo(node.stdout().toFile()))
 				.redirectError(ProcessBuilder.Redirect.appendTo(node.stderr().toFile()))
 				.start();
@@ -501,7 +523,7 @@ public final class ProcessCluster implements AutoCloseable {
 		return PIPELINED_UPDATES || serverArgs.contains(PIPELINED_UPDATES_ARG);
 	}
 
-	private List<String> command(Node node) {
+	private List<String> command(Node node, List<String> extraArgs) {
 		var command = new ArrayList<String>();
 		command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
 		command.add("-cp");
@@ -535,6 +557,7 @@ public final class ProcessCluster implements AutoCloseable {
 		command.add("--api-bind-host");
 		command.add(LOOPBACK);
 		command.addAll(serverArgs);
+		command.addAll(extraArgs);
 		if (PIPELINED_UPDATES && !serverArgs.contains(PIPELINED_UPDATES_ARG)) {
 			command.add(PIPELINED_UPDATES_ARG);
 		}

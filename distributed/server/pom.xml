@@ -12,6 +12,9 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <ratis.version>3.3.1</ratis.version>
     <junit.version>5.14.3</junit.version>
+    <!-- Where tests create their directories. Fsync is free on the tmpfs that /tmp often is: see "Tests" in the design
+         document for why the suite must also pass with -Drockserver.test.tmpdir set to a directory on a real disk. -->
+    <rockserver.test.tmpdir>${java.io.tmpdir}</rockserver.test.tmpdir>
   </properties>
 
   <repositories>
@@ -55,7 +58,7 @@
         <configuration>
           <!-- Ratis jars are automatic modules with split packages: run on the classpath. -->
           <useModulePath>false</useModulePath>
-          <argLine>--enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector</argLine>
+          <argLine>--enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Djava.io.tmpdir=${rockserver.test.tmpdir}</argLine>
           <systemPropertyVariables>
             <org.slf4j.simpleLogger.defaultLogLevel>warn</org.slf4j.simpleLogger.defaultLogLevel>
             <org.slf4j.simpleLogger.log.it.cavallium.rockserver.distributed>info</org.slf4j.simpleLogger.log.it.cavallium.rockserver.distributed>

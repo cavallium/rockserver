@@ -4,9 +4,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import org.apache.ratis.retry.MultipleLinearRandomRetry;
+import org.apache.ratis.server.RaftServerConfigKeys;
 import org.junit.jupiter.api.Test;
 
 class ApiGateTest {
@@ -102,6 +105,14 @@ class ApiGateTest {
 			}
 		}
 		assertFalse(policy.handleAttemptFailure(() -> 1_000_000_031).shouldRetry());
+	}
+
+	/** The bound assumes the policy above: it must be the one Ratis gets. */
+	@Test
+	void theRetryPolicyReachesRatis() {
+		var config = NodeConfig.defaults("a", List.of(new PeerConfig("a", "localhost", 1, "localhost", 2)), Path.of("data"));
+		assertEquals(RaftSettings.APPENDER_RETRY_POLICY,
+				RaftServerConfigKeys.Log.Appender.retryPolicy(RaftSettings.server(config)));
 	}
 
 	@Test
