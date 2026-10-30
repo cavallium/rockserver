@@ -134,7 +134,7 @@ selector_main="it.cavallium.rockserver.core.impl.benchmark.WorkloadBenchmarkSele
 The Java command for every step is:
 
 ```bash
-java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms4g -Xmx4g \
   -cp "${workload_classpath}" "${workload_main}" ...
 ```
 
@@ -257,7 +257,7 @@ For candidate 8, first prepare and close the isolated-baseline root:
 ```bash
 baseline_root="/mnt/rockserver-hdd/workload-candidate-8-ingest-baseline"
 
-java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms4g -Xmx4g \
   -cp "${workload_classpath}" "${workload_main}" \
   "--root=${baseline_root}" --candidate=8 "${common_options[@]}" \
   --prepare-only=true
@@ -275,7 +275,7 @@ sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 Reopen it exactly once for the isolated baseline:
 
 ```bash
-java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms4g -Xmx4g \
   -cp "${workload_classpath}" "${workload_main}" \
   "--root=${baseline_root}" --candidate=8 "${common_options[@]}" \
   --reuse-prepared=true --cache-state=cold --ingest-baseline-only=true
@@ -287,14 +287,14 @@ verification, and cache eviction workflow with a fresh mixed root:
 ```bash
 candidate_root="/mnt/rockserver-hdd/workload-candidate-8-mixed"
 
-java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms4g -Xmx4g \
   -cp "${workload_classpath}" "${workload_main}" \
   "--root=${candidate_root}" --candidate=8 "${common_options[@]}" \
   --prepare-only=true
 
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 
-java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms4g -Xmx4g \
   -cp "${workload_classpath}" "${workload_main}" \
   "--root=${candidate_root}" --candidate=8 "${common_options[@]}" \
   --reuse-prepared=true --cache-state=cold --enforce=true \

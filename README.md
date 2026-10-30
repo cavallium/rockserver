@@ -1,5 +1,8 @@
 # Rockserver
 
+Requires Java 27. Start it with `--enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector`: the
+second flag lets hot paths use the Vector API (without it they fall back to scalar code).
+
 ## Workload admission
 
 Rockserver schedules requests by the explicit `LATENCY`, `INGEST`,

@@ -98,7 +98,7 @@ baseline_sha="bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e"
 candidate_sha="REPLACE_WITH_FINAL_RC_SHA"
 retained_root="/mnt/rockserver-hdd/retained-read-${candidate_sha}"
 
-java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms4g -Xmx4g \
   -cp "${retained_classpath}" "${retained_main}" \
   "--root=${retained_root}" \
   --baseline-classes=/tmp/rockserver-baseline/target/classes \

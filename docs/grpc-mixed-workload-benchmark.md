@@ -153,7 +153,7 @@ the host page cache:
 ```bash
 overload_root="/mnt/rockserver-hdd/grpc-mixed-REPLACE_ME"
 
-java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms4g -Xmx4g \
   -cp "${overload_classpath}" "${overload_main}" \
   "--root=${overload_root}" \
   "--build-id=${rockserver_rc_sha}" --build-state=clean \
@@ -169,7 +169,7 @@ Reopen the prepared root exactly once with the identical workload and database
 options:
 
 ```bash
-java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms4g -Xmx4g \
   -cp "${overload_classpath}" "${overload_main}" \
   "--root=${overload_root}" \
   "--build-id=${rockserver_rc_sha}" --build-state=clean \

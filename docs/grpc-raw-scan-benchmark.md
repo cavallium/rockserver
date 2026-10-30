@@ -75,7 +75,7 @@ baseline_sha="bb4f1a7e90db1fdfd785936594d080e8c4a0ba4e"
 candidate_sha="REPLACE_WITH_CLEAN_CANDIDATE_FULL_SHA"
 raw_root="/mnt/rockserver-hdd/raw-scan-${candidate_sha}"
 
-java --enable-native-access=ALL-UNNAMED -Xms4g -Xmx4g \
+java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms4g -Xmx4g \
   -cp "${raw_classpath}" "${raw_main}" \
   "--root=${raw_root}" \
   --baseline-classes=/tmp/rockserver-baseline/target/classes \
