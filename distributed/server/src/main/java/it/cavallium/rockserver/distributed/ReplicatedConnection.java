@@ -712,7 +712,20 @@ final class ReplicatedConnection implements RocksDBConnection {
 		// do, and the session's term is checked again when the update opens.
 		long term = currentTerm();
 		var leadership = barrier.awaitLeadership().whenComplete((_, _) -> barrierTime.since(start));
-		var waiter = session.lockKey(ConflictTracker.keyHash(command.columnId(), command.keys()));
+		long hash = ConflictTracker.keyHash(command.columnId(), command.keys());
+		var waiter = new CompletableFuture<LeaderSession.KeyLock>();
+		if (session.pipelined()) {
+			// The key is asked for once leadership is confirmed: its next holder may be running one round trip behind.
+			leadership.whenComplete((_, error) -> {
+				if (error == null) {
+					session.lockKey(hash, waiter);
+				} else {
+					waiter.completeExceptionally(barrierFailure(error));
+				}
+			});
+		} else {
+			session.lockKey(hash, waiter);
+		}
 		var result = new CompletableFuture<Object>();
 		// The caller is gone once its deadline passed or it cancelled: an update it cannot learn the id of would keep
 		// the key locked for the whole lease.

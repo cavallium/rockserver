@@ -21,12 +21,16 @@ import org.apache.ratis.protocol.RaftPeerId;
  * run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT (repeat per member) --data-dir DIR
  *       [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
  *       [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
- *       [--max-transaction-lease-ms N]
+ *       [--max-transaction-lease-ms N] [--pipelined-updates]
  * admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
  * </pre>
  *
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
  * (leadership hand-off) on SIGTERM. For {@code add-peer} the new member must already run with the new peer list.</p>
+ *
+ * <p>{@code --pipelined-updates}, off by default, lets a leader pass a key to its next {@code getForUpdate} update as
+ * soon as the previous update's commit is admitted to the log: see "Transactions" in the design document, which also
+ * tells what it changes for clients.</p>
  */
 public final class ReplicatedServerMain {
 
@@ -62,7 +66,8 @@ public final class ReplicatedServerMain {
 				Long.parseLong(options.value("--snapshot-every", String.valueOf(NodeConfig.DEFAULT_SNAPSHOT_EVERY_ENTRIES))),
 				Duration.ofMillis(Long.parseLong(options.value("--request-timeout-ms", "10000"))),
 				Duration.ofMillis(Long.parseLong(options.value("--max-transaction-lease-ms",
-						String.valueOf(NodeConfig.DEFAULT_MAX_TRANSACTION_LEASE.toMillis())))));
+						String.valueOf(NodeConfig.DEFAULT_MAX_TRANSACTION_LEASE.toMillis())))),
+				options.flag("--pipelined-updates"));
 		options.requireConsumed();
 		ReplicatedNode node;
 		try {
@@ -165,13 +170,15 @@ public final class ReplicatedServerMain {
 				  run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT ... --data-dir DIR
 				        [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
 				        [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
-				        [--max-transaction-lease-ms N]
+				        [--max-transaction-lease-ms N] [--pipelined-updates]
 				  admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID""");
 		System.exit(2);
 	}
 
-	/** Minimal "--name value" parser; {@code --peer} may repeat. */
+	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
 	private static final class Options {
+		private static final List<String> FLAGS = List.of("--pipelined-updates");
+
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();
 		private final List<String> consumed = new ArrayList<>();
@@ -179,7 +186,9 @@ public final class ReplicatedServerMain {
 		Options(List<String> args) {
 			for (int i = 0; i < args.size(); i++) {
 				var arg = args.get(i);
-				if (arg.startsWith("--")) {
+				if (FLAGS.contains(arg)) {
+					pairs.add(new String[] {arg, "true"});
+				} else if (arg.startsWith("--")) {
 					if (i + 1 >= args.size()) {
 						usage("missing value for " + arg);
 					}
@@ -188,6 +197,10 @@ public final class ReplicatedServerMain {
 					positional.add(arg);
 				}
 			}
+		}
+
+		boolean flag(String name) {
+			return value(name) != null;
 		}
 
 		String value(String name) {

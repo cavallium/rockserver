@@ -280,7 +280,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			if (current != null) {
 				current.close(store.db());
 			}
-			var created = new LeaderSession(term, applied);
+			var created = new LeaderSession(term, applied, new ConflictTracker(), config.pipelinedUpdates());
 			// The session tracks writes from this term on: a transaction whose snapshot misses an earlier leader's
 			// entries would not see them conflict. Reads wait for those entries (see leaderReadyIndex); this makes
 			// sure no commit validates against such a snapshot anyway.

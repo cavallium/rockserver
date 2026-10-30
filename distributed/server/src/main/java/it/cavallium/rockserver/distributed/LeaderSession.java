@@ -139,6 +139,7 @@ final class LeaderSession {
 	}
 
 	private final long term;
+	private final boolean pipelined;
 	private final AppliedIndex applied;
 	private final ConflictTracker tracker;
 	private final ConcurrentHashMap<Long, OpenTransaction> transactions = new ConcurrentHashMap<>();
@@ -169,9 +170,19 @@ final class LeaderSession {
 	}
 
 	LeaderSession(long term, AppliedIndex applied, ConflictTracker tracker) {
+		this(term, applied, tracker, false);
+	}
+
+	LeaderSession(long term, AppliedIndex applied, ConflictTracker tracker, boolean pipelined) {
 		this.term = term;
 		this.applied = applied;
 		this.tracker = tracker;
+		this.pipelined = pipelined;
+	}
+
+	/** Whether {@link NodeConfig#pipelinedUpdates()} is on. */
+	boolean pipelined() {
+		return pipelined;
 	}
 
 	long term() {
@@ -240,22 +251,38 @@ final class LeaderSession {
 	 * future completes on the thread that released the key, or here: chain work to it with an async stage. Fails with
 	 * {@link RocksDBRetryException} if leadership ends first.
 	 */
-	synchronized CompletableFuture<KeyLock> lockKey(long key) {
+	CompletableFuture<KeyLock> lockKey(long key) {
+		var waiter = new CompletableFuture<KeyLock>();
+		lockKey(key, waiter);
+		return waiter;
+	}
+
+	/**
+	 * {@link #lockKey(long)} with the caller's own future, which it may have made depend on a timeout or a cancellation
+	 * before the key is asked for. A future that is complete by the time its turn comes is skipped.
+	 */
+	synchronized void lockKey(long key, CompletableFuture<KeyLock> waiter) {
 		if (closed) {
-			return CompletableFuture.failedFuture(new RocksDBRetryException());
+			waiter.completeExceptionally(new RocksDBRetryException());
+			return;
+		}
+		if (waiter.isDone()) {
+			return;
 		}
 		var queue = keyQueues.get(key);
 		if (queue == null) {
 			keyQueues.put(key, new ArrayDeque<>());
-			return CompletableFuture.completedFuture(new KeyLock(key));
+			var lock = new KeyLock(key);
+			if (!waiter.complete(lock)) {
+				unlockKey(lock);
+			}
+			return;
 		}
-		var waiter = new CompletableFuture<KeyLock>();
 		queue.addLast(waiter);
 		if (!expiryScheduled) {
 			expiryScheduled = true;
 			EXPIRY_DELAY.execute(this::expiryTick);
 		}
-		return waiter;
 	}
 
 	/** Expires what is due, and runs again later while a key is held and leadership lasts. */
