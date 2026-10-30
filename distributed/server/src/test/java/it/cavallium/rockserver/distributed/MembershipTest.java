@@ -233,9 +233,14 @@ class MembershipTest {
 		cluster.waitReady(READY_TIMEOUT);
 	}
 
+	/**
+	 * Stops the nodes gracefully, so that their databases hold everything they applied: replicas apply entries
+	 * without the RocksDB WAL, so after a kill the files are a consistent but older prefix, which the node completes
+	 * from its Raft log only when it starts again.
+	 */
 	private void stopAll(List<String> ids) {
 		for (var id : ids) {
-			cluster.kill(id);
+			cluster.stop(id);
 		}
 	}
 

@@ -170,4 +170,107 @@ class ApplierTest {
 			assertEquals(TermIndex.valueOf(1, 1), store.applied());
 		}
 	}
+
+	@Test
+	void aBatchAppliesEveryRequestOnceInOneEntry() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			var first = new Request(3, 10, 10, new LogEntry.Put(column, key(1), text("a"), RequestTypeId.NOTHING));
+			applier.apply(first, TermIndex.valueOf(1, 1));
+			var batch = List.of(
+					// Already applied: gets its recorded result and does not run again.
+					new Request(3, 10, 10, new LogEntry.Put(column, key(1), text("changed"), RequestTypeId.NOTHING)),
+					new Request(3, 11, 10, new LogEntry.Put(column, key(2), text("b"), RequestTypeId.NOTHING)),
+					// The same request twice in one entry runs once.
+					new Request(3, 12, 10, new LogEntry.Merge(column, key(3), text("c"), RequestTypeId.NOTHING)),
+					new Request(3, 12, 10, new LogEntry.Merge(column, key(3), text("c"), RequestTypeId.NOTHING)));
+			var results = applier.applyBatch(batch.stream()
+					.map(r -> new Request(r.proposerId(), r.sequence(), 10, r.entry())).toList(), TermIndex.valueOf(1, 2));
+			assertEquals(4, results.size());
+			results.forEach(result -> assertInstanceOf(ApplyResult.Ok.class, result));
+			assertEquals("a", value(store, column, 1));
+			assertEquals("b", value(store, column, 2));
+			assertEquals("c", value(store, column, 3));
+			assertEquals(TermIndex.valueOf(1, 2), store.applied());
+		}
+	}
+
+	@Test
+	void aRejectedRequestInABatchLeavesNoWritesAndTheOthersApply() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			var results = applier.applyBatch(List.of(
+					new Request(4, 0, 0, new LogEntry.Put(column, key(1), text("a"), RequestTypeId.NOTHING)),
+					// Writes key 2, then fails on a key of the wrong size: neither may stay.
+					new Request(4, 1, 0, new LogEntry.PutMulti(column, List.of(key(2), new Keys(text("bad"))),
+							List.of(text("b"), text("b")), RequestTypeId.NOTHING)),
+					new Request(4, 2, 0, new LogEntry.Put(column, key(3), text("c"), RequestTypeId.NOTHING))),
+					TermIndex.valueOf(1, 1));
+			assertInstanceOf(ApplyResult.Ok.class, results.get(0));
+			assertInstanceOf(ApplyResult.Failed.class, results.get(1));
+			assertInstanceOf(ApplyResult.Ok.class, results.get(2));
+			assertEquals("a", value(store, column, 1));
+			assertNull(value(store, column, 2));
+			assertEquals("c", value(store, column, 3));
+			// The rejection is recorded like any result: a retry gets it again instead of running.
+			assertInstanceOf(ApplyResult.Failed.class, applier.recordedResult(new Request(4, 1, 0,
+					new LogEntry.Genesis("x", false))));
+		}
+	}
+
+	@Test
+	void aCrashKeepsAConsistentPrefixOfUnloggedApplies() throws Exception {
+		long column;
+		try (var store = open()) {
+			column = store.db().createColumn("c", SCHEMA);
+		}
+		// Entries applied without the WAL, then a crash before any flush: data and position go away together.
+		var crashed = open();
+		var applier = new Applier(crashed);
+		for (int i = 1; i <= 20; i++) {
+			applier.apply(new Request(6, i, i, new LogEntry.Put(column, key(i), text("v" + i), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, i));
+		}
+		crashed.connection().close();
+		try (var store = open()) {
+			assertEquals(TermIndex.INITIAL_VALUE, store.applied());
+			assertNull(value(store, column, 1));
+			assertNull(value(store, column, 20));
+			// Replaying the log reapplies them exactly once.
+			var replay = new Applier(store);
+			for (int i = 1; i <= 20; i++) {
+				replay.apply(new Request(6, i, i, new LogEntry.Put(column, key(i), text("v" + i), RequestTypeId.NOTHING)),
+						TermIndex.valueOf(1, i));
+			}
+			assertEquals("v20", value(store, column, 20));
+		}
+	}
+
+	@Test
+	void aLoggedEntryMakesTheUnloggedOnesBeforeItDurable() throws Exception {
+		long column;
+		try (var store = open()) {
+			column = store.db().createColumn("c", SCHEMA);
+		}
+		var crashed = open();
+		var applier = new Applier(crashed);
+		for (int i = 1; i <= 5; i++) {
+			applier.apply(new Request(7, i, i, new LogEntry.Put(column, key(i), text("v" + i), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, i));
+		}
+		// A schema change goes through the WAL: everything applied before it must survive with it.
+		applier.apply(new Request(7, 6, 6, new LogEntry.CreateColumn("d", SCHEMA)), TermIndex.valueOf(1, 6));
+		applier.apply(new Request(7, 7, 7, new LogEntry.Put(column, key(7), text("v7"), RequestTypeId.NOTHING)),
+				TermIndex.valueOf(1, 7));
+		crashed.connection().close();
+		try (var store = open()) {
+			var applied = store.applied().getIndex();
+			assertEquals(6, applied, "the logged schema change and every entry before it survive, the later one not");
+			assertEquals("v5", value(store, column, 5));
+			assertNull(value(store, column, 7));
+			store.db().getColumnId("d");
+		}
+	}
 }

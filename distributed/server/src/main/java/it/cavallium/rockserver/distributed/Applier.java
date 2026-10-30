@@ -58,7 +58,24 @@ final class Applier {
 	private final NodeStore store;
 
 	Applier(NodeStore store) {
+		this(store, null);
+	}
+
+	Applier(NodeStore store, @Nullable NodeMetrics metrics) {
 		this.store = store;
+		this.openTime = metrics == null ? null : metrics.duration("apply.open");
+		this.executeTime = metrics == null ? null : metrics.duration("apply.execute");
+		this.commitTime = metrics == null ? null : metrics.duration("apply.commit");
+	}
+
+	private final NodeMetrics.@Nullable Series openTime;
+	private final NodeMetrics.@Nullable Series executeTime;
+	private final NodeMetrics.@Nullable Series commitTime;
+
+	private static void record(NodeMetrics.@Nullable Series series, long startNanos) {
+		if (series != null) {
+			series.since(startNanos);
+		}
 	}
 
 	/**
@@ -167,10 +184,13 @@ final class Applier {
 			}
 		}
 		var db = store.db();
+		long openStart = System.nanoTime();
 		long tx = beginApply();
+		record(openTime, openStart);
 		boolean open = true;
 		try {
 			var outcomes = new ApplyResult[toRun.size()];
+			long executeStart = System.nanoTime();
 			for (int j = 0; j < toRun.size(); j++) {
 				var request = toRun.get(j);
 				if (!isBatchable(request.entry())) {
@@ -195,8 +215,12 @@ final class Applier {
 					record(tx, toRun.get(j), outcomes[j]);
 				}
 				finishBatch(tx, proposerId, completedBelow, floor, position);
+				record(executeTime, executeStart);
 				open = false;
-				if (!db.closeTransaction(tx, true)) {
+				long commitStart = System.nanoTime();
+				boolean committed = db.closeTransaction(tx, true);
+				record(commitTime, commitStart);
+				if (!committed) {
 					// Only the apply thread writes the database, so an optimistic conflict means local corruption.
 					throw new ReplicaFailedException("Local apply transaction conflicted at " + position);
 				}

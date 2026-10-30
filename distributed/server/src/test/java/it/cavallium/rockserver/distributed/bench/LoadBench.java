@@ -293,7 +293,7 @@ public final class LoadBench {
 		for (var node : nodes.nodes()) {
 			var file = root.resolve("node-" + node.id() + "-" + step + ".jfr");
 			try {
-				new ProcessBuilder("jcmd", String.valueOf(node.process().pid()), "JFR.start", "settings=profile",
+				new ProcessBuilder("jcmd", String.valueOf(node.process().pid()), "JFR.start", "settings=" + (option("--jfr", "true").equals("true") ? "profile" : option("--jfr", "profile")),
 						"duration=" + seconds + "s", "filename=" + file).redirectErrorStream(true)
 						.redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
 			} catch (java.io.IOException e) {

@@ -45,7 +45,10 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
- * The Rockserver API of a replicated node. Each command takes one of these paths:
+ * The Rockserver API of a replicated node. Reads on the leader wait only for a leadership confirmation
+ * ({@link ReadBarrier#awaitLeadership}), not for the apply of what is committed: every write is acknowledged only
+ * after the leader applied it (the result comes from the leader's apply), so whatever a client saw acknowledged is
+ * already in the leader's database. Each command takes one of these paths:
  * <ul>
  *   <li><b>replicated write</b> (no transaction): proposed to the log from this node; the result is computed by
  *   the leader's apply;</li>
@@ -259,7 +262,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 			if (!isLeader()) {
 				return forwardStream(context, command);
 			}
-			return Mono.fromFuture(barrier::await)
+			return Mono.fromFuture(barrier::awaitLeadership)
 					.onErrorMap(ReplicatedConnection::barrierFailure)
 					.thenMany(Flux.defer(() -> localStream(context, command)));
 		});
@@ -290,7 +293,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 			return forward(context, command);
 		}
 		long start = System.nanoTime();
-		return barrier.await().handle((_, error) -> {
+		return barrier.awaitLeadership().handle((_, error) -> {
 			barrierTime.since(start);
 			if (error == null) {
 				return local(context, command);
@@ -445,7 +448,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	private CompletableFuture<?> openTransaction(RequestContext context, OpenTransaction command) {
 		long term = currentTerm();
-		return barrier.await().handle((_, error) -> {
+		return barrier.awaitLeadership().handle((_, error) -> {
 			if (error != null) {
 				throw new CompletionException(barrierFailure(unwrap(error)));
 			}
@@ -478,7 +481,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 					lockWaitTime.since(start);
 					long term = currentTerm();
 					long barrierStart = System.nanoTime();
-					return barrier.await().handle((_, error) -> {
+					return barrier.awaitLeadership().handle((_, error) -> {
 						barrierTime.since(barrierStart);
 						if (error != null) {
 							session.unlockKey(lock);

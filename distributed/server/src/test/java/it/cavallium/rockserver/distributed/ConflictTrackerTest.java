@@ -514,6 +514,56 @@ class ConflictTrackerTest {
 		}
 	}
 
+	@Test
+	void aCommitConflictsWithAnEarlierWriteOfTheSameEntry() {
+		// One log entry: an update of k, then another update of k read at the same snapshot. The first is applied
+		// first, so the second read a value that is overwritten before it applies.
+		var first = update(10, COLUMN, key("k"));
+		var second = update(10, COLUMN, key("k"));
+		assertEquals(IntList.of(1), tracker.conflicts(List.of(first, second)));
+		// Without the second one, nothing conflicts and the entry can be registered.
+		assertEquals(IntList.of(), tracker.conflicts(List.of(first)));
+	}
+
+	@Test
+	void anAutocommitWriteEarlierInTheEntryIsAConflict() {
+		assertEquals(IntList.of(1), tracker.conflicts(List.of(put(COLUMN, key("k")), transaction(10, COLUMN, key("k")))));
+		// After it in the entry, the write cannot change what the commit read.
+		assertEquals(IntList.of(), tracker.conflicts(List.of(transaction(10, COLUMN, key("k")), put(COLUMN, key("k")))));
+	}
+
+	@Test
+	void aRejectedCommitDoesNotMakeLaterOnesConflict() {
+		var pending = tracker.register(put(COLUMN, key("k")));
+		// The first commit conflicts with the pending write and will not be applied: its own write of k must not
+		// count against the second commit, which read k2.
+		var rejected = update(10, COLUMN, key("k"));
+		var accepted = update(10, COLUMN, key("k2"));
+		assertEquals(IntList.of(0), tracker.conflicts(List.of(rejected, accepted)));
+		tracker.resolve(pending, 11);
+	}
+
+	@Test
+	void anEntryRegistersTheWritesOfAllItsRequests() {
+		var token = tracker.register(List.of(put(COLUMN, key("a")), update(10, COLUMN, key("b"))));
+		assertTrue(tracker.conflicts(transaction(10, COLUMN, key("a"))));
+		assertTrue(tracker.conflicts(transaction(10, COLUMN, key("b"))));
+		tracker.resolve(token, 12);
+		assertFalse(tracker.conflicts(transaction(12, COLUMN, key("a"))));
+		assertTrue(tracker.conflicts(transaction(11, COLUMN, key("b"))));
+	}
+
+	/** A single-key update: it read {@code keys} at {@code snapshotIndex} and writes it. */
+	private static LogEntry.Guarded update(long snapshotIndex, long columnId, Keys keys) {
+		return new LogEntry.Guarded(EPOCH,
+				snapshotIndex,
+				new long[] {columnId},
+				new long[] {ConflictTracker.keyHash(columnId, keys)},
+				List.of(put(columnId, keys)),
+				true
+		);
+	}
+
 	private static Keys key(String... segments) {
 		return new Keys(Arrays.stream(segments).map(segment -> Buf.wrap(segment.getBytes(UTF_8))).toArray(Buf[]::new));
 	}

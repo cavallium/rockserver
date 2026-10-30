@@ -116,6 +116,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	RockserverStateMachine(NodeConfig config, Consumer<Throwable> onReplicaFailure, NodeMetrics metrics) {
 		this.config = config;
+		this.metrics = metrics;
 		this.onReplicaFailure = onReplicaFailure;
 		this.applyTime = metrics.duration("apply");
 		this.applyRequests = metrics.amount("apply.requests");
@@ -125,6 +126,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	}
 
 	private final NodeMetrics.Series snapshotTime;
+	private final NodeMetrics metrics;
 
 	private final NodeMetrics.Series admitTime;
 	private final NodeMetrics.Series commitWait;
@@ -169,7 +171,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 		var position = opened.applied();
 		this.store = opened;
-		this.applier = new Applier(opened);
+		this.applier = new Applier(opened, metrics);
 		setLastAppliedTermIndex(position);
 		applied.advance(Math.max(applied.get(), position.getIndex()));
 		LOG.info("{}: database open, applied position {}", config.nodeId(), position);

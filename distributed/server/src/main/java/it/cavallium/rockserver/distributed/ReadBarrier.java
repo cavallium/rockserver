@@ -57,6 +57,7 @@ final class ReadBarrier implements Closeable {
 		}
 	}
 
+	/** A caller of the next round; {@code commitIndex} is -1 when it does not wait for the apply. */
 	private record Waiter(long term, long commitIndex, CompletableFuture<Void> future) {}
 
 	private final RaftServer server;
@@ -93,6 +94,21 @@ final class ReadBarrier implements Closeable {
 	 * the leader after this call. Fails with {@link NotLeaderException} or {@link java.util.concurrent.TimeoutException}.
 	 */
 	CompletableFuture<Void> await() {
+		return await(true);
+	}
+
+	/**
+	 * Completes when this node was the ready leader after this call; unlike {@link #await()}, it does not wait for
+	 * the entries committed before this call to be applied. That is enough when the state machine acknowledges a
+	 * write only after this leader applied it, and the caller reads only acknowledged writes: being the ready leader
+	 * means its own first entry, and so every entry of earlier leaders, is applied, and any write acknowledged in
+	 * its term was applied before its acknowledgement.
+	 */
+	CompletableFuture<Void> awaitLeadership() {
+		return await(false);
+	}
+
+	private CompletableFuture<Void> await(boolean waitForApply) {
 		long term;
 		long commitIndex;
 		try {
@@ -117,7 +133,7 @@ final class ReadBarrier implements Closeable {
 				return CompletableFuture.failedFuture(new NotLeaderException("Read barrier closed"));
 			}
 			outstanding.add(future);
-			nextRound.add(new Waiter(term, commitIndex, future));
+			nextRound.add(new Waiter(term, waitForApply ? commitIndex : -1, future));
 			round = takeNextRoundIfIdle();
 		}
 		future.whenComplete((_, _) -> outstanding.remove(future));
@@ -198,6 +214,8 @@ final class ReadBarrier implements Closeable {
 				var notLeader = new NotLeaderException(
 						"Leadership of term " + waiter.term + " ended, current term " + confirmedTerm);
 				execute(() -> waiter.future.completeExceptionally(notLeader));
+			} else if (waiter.commitIndex < 0) {
+				execute(() -> waiter.future.complete(null));
 			} else {
 				applied.await(waiter.commitIndex).thenRunAsync(() -> waiter.future.complete(null), this::execute);
 			}

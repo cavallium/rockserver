@@ -193,6 +193,48 @@ class LogEntryCodecTest {
 	}
 
 	@Test
+	void roundTripsABatchOfEveryEntry() {
+		var requests = new ArrayList<Request>();
+		long sequence = 5;
+		for (var named : entries().toList()) {
+			requests.add(new Request(-77, sequence++, 5, named.getPayload()));
+		}
+		byte[] encoded = LogEntryCodec.encodeBatch(requests);
+		var decoded = LogEntryCodec.decodeBatch(encoded);
+		assertEquals(requests.size(), decoded.size());
+		for (int i = 0; i < requests.size(); i++) {
+			assertEquals(requests.get(i).proposerId(), decoded.get(i).proposerId());
+			assertEquals(requests.get(i).sequence(), decoded.get(i).sequence());
+			assertEquals(requests.get(i).completedBelow(), decoded.get(i).completedBelow());
+			assertSameEntry(requests.get(i).entry(), decoded.get(i).entry());
+		}
+		assertArrayEquals(encoded, LogEntryCodec.encodeBatch(decoded));
+	}
+
+	@Test
+	void rejectsMalformedBatches() {
+		var request = new Request(1, 3, 2, new Genesis("x", false));
+		byte[] encoded = LogEntryCodec.encodeBatch(List.of(request));
+		for (int length = 0; length < encoded.length; length++) {
+			byte[] truncated = Arrays.copyOf(encoded, length);
+			assertThrows(IllegalArgumentException.class, () -> LogEntryCodec.decodeBatch(truncated), "length " + length);
+		}
+		assertThrows(IllegalArgumentException.class, () -> LogEntryCodec.decodeBatch(Arrays.copyOf(encoded,
+				encoded.length + 1)));
+		// An empty batch, a request numbered below the batch's completedBelow, mixed proposers.
+		var empty = ByteBuffer.allocate(21).put(LogEntryCodec.BATCH_VERSION).putLong(1).putLong(0).putInt(0).array();
+		assertThrows(IllegalArgumentException.class, () -> LogEntryCodec.decodeBatch(empty));
+		var below = encoded.clone();
+		ByteBuffer.wrap(below).putLong(9, 4);
+		assertThrows(IllegalArgumentException.class, () -> LogEntryCodec.decodeBatch(below));
+		assertThrows(IllegalArgumentException.class, () -> LogEntryCodec.encodeBatch(List.of(request,
+				new Request(2, 4, 2, new Genesis("x", false)))));
+		// A single entry is not a batch.
+		assertThrows(IllegalArgumentException.class, () -> LogEntryCodec.decodeBatch(LogEntryCodec.encode(
+				new Genesis("x", false))));
+	}
+
+	@Test
 	void rejectsUnknownVersion() {
 		byte[] encoded = LogEntryCodec.encode(new DeleteColumn(5));
 		for (byte version : new byte[] {0, 2, -1}) {
