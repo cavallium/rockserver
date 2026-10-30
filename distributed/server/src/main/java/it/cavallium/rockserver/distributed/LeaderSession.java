@@ -2,6 +2,8 @@ package it.cavallium.rockserver.distributed;
 
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.unimi.dsi.fastutil.longs.Long2IntRBTreeMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
@@ -54,6 +56,11 @@ final class LeaderSession {
 		private final List<LogEntry.Write> writes = new ArrayList<>();
 		private final LongArrayList conflictColumns = new LongArrayList();
 		private final LongArrayList conflictHashes = new LongArrayList();
+		/**
+		 * Encoded size of the commit entry ({@link LogEntryCodec#encodeEntryBody}) with every staged write and conflict
+		 * key, plus the writes and keys being staged.
+		 */
+		private long commitBytes = LogEntryCodec.GUARDED_BASE_BYTES;
 
 		private OpenTransaction(long id, boolean update, long snapshotIndex, @Nullable KeyLock keyLock,
 				long deadlineNanos) {
@@ -62,6 +69,32 @@ final class LeaderSession {
 			this.snapshotIndex = snapshotIndex;
 			this.keyLock = keyLock;
 			this.deadlineNanos = deadlineNanos;
+		}
+
+		/** What a write with {@code keyCount} keys adds to the commit entry: the write and its conflict keys. */
+		static long stagedBytes(LogEntry.Write write, int keyCount) {
+			return LogEntryCodec.writeSize(write) + (long) keyCount * LogEntryCodec.CONFLICT_KEY_BYTES;
+		}
+
+		/**
+		 * Reserves room in the commit entry before a write or {@code getForUpdate} key is staged, so that a
+		 * transaction that grows too large to commit is refused at that request instead of at commit, before the
+		 * leader holds all of it. Release it with {@link #releaseBytes} if the request then fails.
+		 *
+		 * @throws RocksDBException {@code INVALID_REQUEST} if the commit entry would not fit in one log entry; the
+		 *                          transaction stays open, without that request
+		 */
+		synchronized void reserveBytes(long bytes) {
+			if (commitBytes + bytes > Proposer.MAX_ENTRY_BODY_BYTES) {
+				throw RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
+						"Transaction too large for one replicated entry: " + commitBytes + " bytes staged, " + bytes
+								+ " more requested, at most " + Proposer.MAX_ENTRY_BODY_BYTES);
+			}
+			commitBytes += bytes;
+		}
+
+		synchronized void releaseBytes(long bytes) {
+			commitBytes -= bytes;
 		}
 
 		/** Records a write staged in the transaction; its keys become conflict keys, as in RocksDB optimistic transactions. */
@@ -107,7 +140,7 @@ final class LeaderSession {
 
 	private final long term;
 	private final AppliedIndex applied;
-	private final ConflictTracker tracker = new ConflictTracker();
+	private final ConflictTracker tracker;
 	private final ConcurrentHashMap<Long, OpenTransaction> transactions = new ConcurrentHashMap<>();
 	private final ConcurrentHashMap<Object, Long> pins = new ConcurrentHashMap<>();
 	/**
@@ -132,8 +165,13 @@ final class LeaderSession {
 	private volatile boolean closed;
 
 	LeaderSession(long term, AppliedIndex applied) {
+		this(term, applied, new ConflictTracker());
+	}
+
+	LeaderSession(long term, AppliedIndex applied, ConflictTracker tracker) {
 		this.term = term;
 		this.applied = applied;
+		this.tracker = tracker;
 	}
 
 	long term() {

@@ -313,6 +313,54 @@ final class LogEntryCodec {
 		out.writeBoolean(guarded.singleResult());
 	}
 
+	/** Encoded size of a {@link LogEntry.Guarded} body without conflict keys and writes. */
+	static final int GUARDED_BASE_BYTES = 1 + 2 * Long.BYTES + 2 * Integer.BYTES + 1;
+	/** Encoded size of one conflict key of a {@link LogEntry.Guarded}: its column id and key hash. */
+	static final int CONFLICT_KEY_BYTES = 2 * Long.BYTES;
+
+	/** Encoded size of {@code write} as {@link #writeWrite} writes it, inside a {@link LogEntry.Guarded}. */
+	static long writeSize(LogEntry.Write write) {
+		// Tag, column id and, except for deleteRange, the request type.
+		long size = 1 + Long.BYTES;
+		switch (write) {
+			case LogEntry.Put(_, Keys keys, Buf value, _) -> size += keysSize(keys) + nullableBufSize(value) + 1;
+			case LogEntry.Merge(_, Keys keys, Buf value, _) -> size += keysSize(keys) + nullableBufSize(value) + 1;
+			case LogEntry.Delete(_, Keys keys, _) -> size += keysSize(keys) + 1;
+			case LogEntry.PutMulti(_, List<Keys> keys, List<Buf> values, _) -> size += multiSize(keys, values) + 1;
+			case LogEntry.MergeMulti(_, List<Keys> keys, List<Buf> values, _) -> size += multiSize(keys, values) + 1;
+			case LogEntry.DeleteMulti(_, List<Keys> keys, _) -> {
+				size += Integer.BYTES + 1;
+				for (Keys key : keys) {
+					size += keysSize(key);
+				}
+			}
+			case LogEntry.DeleteRange(_, Keys start, Keys end) ->
+					size += 2 + (start != null ? keysSize(start) : 0) + (end != null ? keysSize(end) : 0);
+		}
+		return size;
+	}
+
+	private static long multiSize(List<Keys> keys, List<Buf> values) {
+		long size = Integer.BYTES;
+		for (int i = 0; i < keys.size(); i++) {
+			size += keysSize(keys.get(i)) + Integer.BYTES + values.get(i).size();
+		}
+		return size;
+	}
+
+	private static long keysSize(Keys keys) {
+		Buf[] segments = keys.keys();
+		long size = Integer.BYTES;
+		for (Buf segment : segments) {
+			size += Integer.BYTES + segment.size();
+		}
+		return size;
+	}
+
+	private static long nullableBufSize(@Nullable Buf buf) {
+		return Integer.BYTES + (buf != null ? buf.size() : 0);
+	}
+
 	private static void writeKeys(DataOutputStream out, Keys keys) throws IOException {
 		Buf[] segments = keys.keys();
 		out.writeInt(segments.length);

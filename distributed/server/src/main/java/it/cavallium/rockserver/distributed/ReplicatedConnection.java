@@ -665,13 +665,22 @@ final class ReplicatedConnection implements RocksDBConnection {
 		// A transaction that opens after its caller's deadline is rolled back: nobody would learn its id, and it
 		// would keep its snapshot and write history for the whole lease.
 		BooleanSupplier callerGone = () -> remainingNanos(context, start) <= 0;
+		// The lease is capped: an open transaction keeps the write history after its snapshot on the leader. The
+		// native transaction gets the same lease, so that both expire together.
+		var lease = transactionLease(command.transactionLeaseTtl(), config.maxTransactionLease());
+		var open = lease.equals(command.transactionLeaseTtl()) ? command : new OpenTransaction(lease);
 		return barrier.awaitLeadership().handle((_, error) -> {
 			if (error != null) {
 				throw new CompletionException(barrierFailure(unwrap(error)));
 			}
-			return openNative(remainingContext(context, start), command, term, false, command.transactionLeaseTtl(),
+			return openNative(remainingContext(context, start), open, term, false, lease,
 					result -> (Long) result, null, null, null, callerGone);
 		}).thenCompose(f -> f);
+	}
+
+	/** The lease a replicated transaction gets: the requested one, at most {@code max}. */
+	static Duration transactionLease(Duration requested, Duration max) {
+		return requested.compareTo(max) > 0 ? max : requested;
 	}
 
 	private long currentTerm() {
@@ -682,7 +691,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private CompletableFuture<?> getForUpdate(RequestContext context, Get<?> command) {
 		if (command.transactionOrUpdateId() != 0) {
 			var transaction = requireLeaderTransaction(command.transactionOrUpdateId());
-			return local(context, command).thenApply(result -> {
+			transaction.reserveBytes(LogEntryCodec.CONFLICT_KEY_BYTES);
+			return stageLocally(context, command, transaction, LogEntryCodec.CONFLICT_KEY_BYTES).thenApply(result -> {
 				transaction.addConflict(command.columnId(), command.keys());
 				return result;
 			});
@@ -853,9 +863,31 @@ final class ReplicatedConnection implements RocksDBConnection {
 			});
 		}
 		var staged = stagedOnly(write);
-		return local(context, command).thenApply(result -> {
+		// Refused before it is staged if the commit could not carry it, instead of failing the commit at the end.
+		long bytes = LeaderSession.OpenTransaction.stagedBytes(staged, keys.size());
+		transaction.reserveBytes(bytes);
+		return stageLocally(context, command, transaction, bytes).thenApply(result -> {
 			transaction.addWrite(staged, keys);
 			return result;
+		});
+	}
+
+	/** Runs a request staged in {@code transaction}, which reserved {@code bytes} for it, releasing them on failure. */
+	private CompletableFuture<?> stageLocally(RequestContext context,
+			RocksDBAPICommandSingle<?> command,
+			LeaderSession.OpenTransaction transaction,
+			long bytes) {
+		CompletableFuture<?> result;
+		try {
+			result = local(context, command);
+		} catch (RuntimeException ex) {
+			transaction.releaseBytes(bytes);
+			throw ex;
+		}
+		return result.whenComplete((_, error) -> {
+			if (error != null) {
+				transaction.releaseBytes(bytes);
+			}
 		});
 	}
 

@@ -103,6 +103,8 @@ final class Proposer implements Closeable {
 	static final long NO_CALLER_DEADLINE = Long.MAX_VALUE;
 	/** Batch header, plus a sequence per request. */
 	private static final int BATCH_HEADER_BYTES = 1 + 2 * Long.BYTES + Integer.BYTES;
+	/** Largest entry body ({@link LogEntryCodec#encodeEntryBody}) that fits in a log entry alone. */
+	static final long MAX_ENTRY_BODY_BYTES = RaftSettings.MAX_ENTRY_BYTES - BATCH_HEADER_BYTES - Long.BYTES;
 
 	private final long proposerId = new SecureRandom().nextLong();
 	/** Guards {@link #nextSequence} and {@link #inFlight}. */
@@ -289,7 +291,7 @@ final class Proposer implements Closeable {
 		} catch (IllegalArgumentException ex) {
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST, ex.getMessage()));
 		}
-		if (BATCH_HEADER_BYTES + Long.BYTES + (long) body.length > RaftSettings.MAX_ENTRY_BYTES) {
+		if (body.length > MAX_ENTRY_BODY_BYTES) {
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
 					"Write too large for one replicated entry: " + body.length + " bytes"));
 		}

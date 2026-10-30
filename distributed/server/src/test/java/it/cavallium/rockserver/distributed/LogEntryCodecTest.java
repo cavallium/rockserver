@@ -126,6 +126,24 @@ class LogEntryCodecTest {
 		assertArrayEquals(LogEntryCodec.encode(entry), LogEntryCodec.encode(entry));
 	}
 
+	@ParameterizedTest
+	@MethodSource("entries")
+	void computedSizesMatchTheEncoding(LogEntry entry) {
+		int encoded = LogEntryCodec.encodeEntryBody(entry).length;
+		switch (entry) {
+			case LogEntry.Write write -> assertEquals(encoded, LogEntryCodec.writeSize(write));
+			case Guarded guarded -> {
+				long size = LogEntryCodec.GUARDED_BASE_BYTES
+						+ (long) guarded.conflictHashes().length * LogEntryCodec.CONFLICT_KEY_BYTES;
+				for (LogEntry.Write write : guarded.writes()) {
+					size += LogEntryCodec.writeSize(write);
+				}
+				assertEquals(encoded, size);
+			}
+			default -> {}
+		}
+	}
+
 	@Test
 	void equalEntriesFromDifferentBuffersEncodeEqually() {
 		byte[] backing = "__key__value__".getBytes(UTF_8);

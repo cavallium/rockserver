@@ -196,6 +196,57 @@ class ConflictTrackerTest {
 	}
 
 	@Test
+	void pastTheKeyCapTheOldestHistoryIsForgottenAndOlderSnapshotsConflict() {
+		var capped = new ConflictTracker(3);
+		var keys = List.of("a", "b", "c", "d", "e");
+		for (int i = 0; i < keys.size(); i++) {
+			capped.resolve(capped.register(put(COLUMN, key(keys.get(i)))), 10 + i);
+		}
+		// A transaction at snapshot 9 pins everything, but only 3 keys may be kept: the writes at 10 and 11 go.
+		capped.prune(9);
+		assertEquals(3, capped.resolvedKeys());
+		assertEquals(11, capped.prunedThrough());
+		assertTrue(capped.conflicts(transaction(9, COLUMN, key("unrelated"))), "its history is gone");
+		assertTrue(capped.conflicts(transaction(10, COLUMN, key("unrelated"))));
+		assertFalse(capped.conflicts(transaction(11, COLUMN, key("a"))));
+		assertTrue(capped.conflicts(transaction(11, COLUMN, key("c"))), "the write at 12 is still known");
+		assertFalse(capped.conflicts(transaction(12, COLUMN, key("c"))));
+
+		// Pending writes do not count, and are never forgotten.
+		var pending = capped.register(put(COLUMN, key("f")));
+		capped.prune(9);
+		assertEquals(3, capped.resolvedKeys());
+		assertTrue(capped.conflicts(transaction(1_000, COLUMN, key("f"))));
+		capped.resolve(pending, 15);
+		capped.prune(9);
+		assertEquals(12, capped.prunedThrough());
+		assertTrue(capped.conflicts(transaction(14, COLUMN, key("f"))));
+	}
+
+	@Test
+	void aLargeHistoryIsForgottenOverSeveralPrunes() {
+		// Three entries of 40,000 keys each: one prune forgets about 65,536 keys, here two entries.
+		for (int entry = 0; entry < 3; entry++) {
+			var keys = new ArrayList<Keys>();
+			var values = new ArrayList<Buf>();
+			for (int i = 0; i < 40_000; i++) {
+				keys.add(key(entry + ":" + i));
+				values.add(VALUE);
+			}
+			tracker.resolve(tracker.register(new LogEntry.PutMulti(COLUMN, keys, values, RequestTypeId.NOTHING)),
+					10 + entry);
+		}
+		tracker.prune(12);
+		assertEquals(40_000, tracker.resolvedKeys());
+		// What is left is at or below the pruned index: it makes nothing conflict.
+		assertFalse(tracker.conflicts(transaction(12, COLUMN, key("2:0"))));
+		assertTrue(tracker.conflicts(transaction(11, COLUMN, key("2:0"))), "older than the pruned index");
+		tracker.prune(12);
+		assertEquals(0, tracker.resolvedKeys());
+		assertEquals(0, tracker.size());
+	}
+
+	@Test
 	void entryThatFailedToAppendStopsConflictingOnceALaterEntryApplies() {
 		// Ratis rejects both appends after preAppendTransaction registered them: they are never resolved.
 		tracker.register(put(COLUMN, key("k")));
@@ -267,8 +318,16 @@ class ConflictTrackerTest {
 	@Test
 	void neverMissesAConflictOfARandomHistory() {
 		for (int seed = 0; seed < 20; seed++) {
-			new RandomHistory(new Random(seed), false).run(3_000);
-			new RandomHistory(new Random(seed), true).run(3_000);
+			new RandomHistory(new Random(seed), false, ConflictTracker.DEFAULT_MAX_KEYS).run(3_000);
+			new RandomHistory(new Random(seed), true, ConflictTracker.DEFAULT_MAX_KEYS).run(3_000);
+		}
+	}
+
+	@Test
+	void neverMissesAConflictOfARandomHistoryWithACappedHistory() {
+		for (int seed = 0; seed < 20; seed++) {
+			new RandomHistory(new Random(seed), false, 8).run(3_000);
+			new RandomHistory(new Random(seed), true, 8).run(3_000);
 		}
 	}
 
@@ -285,7 +344,7 @@ class ConflictTrackerTest {
 
 		private final Random random;
 		private final boolean withLostEntries;
-		private final ConflictTracker tracker = new ConflictTracker();
+		private final ConflictTracker tracker;
 		private final List<ReferenceEntry> registered = new ArrayList<>();
 		private final ArrayDeque<ReferenceEntry> unapplied = new ArrayDeque<>();
 		private final List<ReferenceEntry> unsettledLost = new ArrayList<>();
@@ -295,9 +354,11 @@ class ConflictTrackerTest {
 		private int conflictsSeen;
 		private int nonConflictsSeen;
 
-		RandomHistory(Random random, boolean withLostEntries) {
+		/** {@code maxKeys}: the tracker's cap; snapshots older than history it forgot early may conflict falsely. */
+		RandomHistory(Random random, boolean withLostEntries, long maxKeys) {
 			this.random = random;
 			this.withLostEntries = withLostEntries;
+			this.tracker = new ConflictTracker(maxKeys);
 		}
 
 		void run(int steps) {
@@ -377,7 +438,7 @@ class ConflictTrackerTest {
 			String context = "step " + step + ", snapshot " + snapshot + ", keys " + keys;
 			if (expected) {
 				assertTrue(actual, "missed conflict at " + context);
-			} else {
+			} else if (snapshot >= tracker.prunedThrough()) {
 				assertFalse(actual, "false conflict at " + context);
 			}
 			if (expected) {

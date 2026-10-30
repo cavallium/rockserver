@@ -9,6 +9,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import java.util.List;
 import java.util.concurrent.CompletionException;
@@ -16,7 +18,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import org.junit.jupiter.api.Test;
 
-/** Key locks of single-key updates and the snapshot bookkeeping of the leader session. */
+/** Key locks of single-key updates, the snapshot bookkeeping and the commit size of the leader session. */
 class LeaderSessionTest {
 
 	private static final long KEY = 1234;
@@ -129,6 +131,46 @@ class LeaderSessionTest {
 		assertTrue(session.tracker().conflicts(commit(100, key("k"))));
 		session.unpin(pin);
 		assertEquals(0, session.tracker().size());
+	}
+
+	@Test
+	void aLongTransactionDoesNotKeepMoreHistoryThanTheCap() {
+		var capped = new LeaderSession(3, applied, new ConflictTracker(4));
+		var transaction = capped.register(capped.reserve(applied), 12, false, null, LEASE_NANOS);
+		for (int i = 0; i < 10; i++) {
+			var token = capped.tracker().register(put(key("k" + i)));
+			applied.advance(101 + i);
+			capped.tracker().resolve(token, 101 + i);
+			capped.afterApply();
+		}
+		assertEquals(4, capped.tracker().resolvedKeys(), "the open transaction does not pin more than the cap");
+		// Its commit cannot be validated any more: it conflicts, even on a key nobody wrote.
+		assertTrue(capped.tracker().conflicts(commit(transaction.snapshotIndex, key("unrelated"))));
+		// A transaction opened now is validated as usual.
+		var recent = capped.register(capped.reserve(applied), 13, false, null, LEASE_NANOS);
+		assertFalse(capped.tracker().conflicts(commit(recent.snapshotIndex, key("k9"))));
+		var token = capped.tracker().register(put(key("k9")));
+		assertTrue(capped.tracker().conflicts(commit(recent.snapshotIndex, key("k9"))));
+		capped.tracker().resolve(token, 111);
+	}
+
+	@Test
+	void aWriteThatWouldMakeTheCommitTooLargeIsRefused() {
+		var transaction = session.register(session.reserve(applied), 14, false, null, LEASE_NANOS);
+		var large = new LogEntry.Put(1, key("k"), Buf.wrap(new byte[4 * 1024 * 1024]), RequestTypeId.NOTHING);
+		long bytes = LeaderSession.OpenTransaction.stagedBytes(large, 1);
+		assertEquals(LogEntryCodec.writeSize(large) + 16, bytes);
+		for (int i = 0; i < 3; i++) {
+			transaction.reserveBytes(bytes);
+		}
+		var error = assertThrows(RocksDBException.class, () -> transaction.reserveBytes(bytes));
+		assertEquals(RocksDBErrorType.INVALID_REQUEST, error.getErrorUniqueId());
+		// A staged write that failed gives its room back.
+		transaction.releaseBytes(bytes);
+		transaction.reserveBytes(bytes);
+		transaction.reserveBytes(3 * 1024 * 1024);
+		assertThrows(RocksDBException.class, () -> transaction.reserveBytes(1024 * 1024));
+		transaction.reserveBytes(1024);
 	}
 
 	private static Keys key(String value) {

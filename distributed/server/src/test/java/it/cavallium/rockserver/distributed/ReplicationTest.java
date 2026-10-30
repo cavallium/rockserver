@@ -536,6 +536,40 @@ class ReplicationTest {
 	}
 
 	@Test
+	void aTransactionIsRefusedTheWriteThatWouldMakeItsCommitTooLarge() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var api = api(cluster.anyFollower());
+		long column = api.createColumn("c", SCHEMA);
+		var value = Buf.wrap(new byte[4 * 1024 * 1024]);
+		long tx = api.openTransaction(Duration.ofSeconds(30));
+		for (int i = 0; i < 3; i++) {
+			api.put(tx, column, key(i), value, RequestType.none());
+		}
+		// A fourth value would take the commit past 16 MiB: refused now, not at commit.
+		var error = assertThrows(RocksDBException.class, () -> api.put(tx, column, key(3), value, RequestType.none()));
+		assertEquals(RocksDBErrorType.INVALID_REQUEST, error.getErrorUniqueId());
+		// The transaction stays open without that write, as after a failed write on a single node.
+		api.put(tx, column, key(4), text("small"), RequestType.none());
+		assertTrue(api.closeTransaction(tx, true));
+		assertEquals(value.size(), api.get(0, column, key(2), RequestType.current()).size());
+		assertNull(api.get(0, column, key(3), RequestType.current()));
+		assertEquals("small", text(api.get(0, column, key(4), RequestType.current())));
+	}
+
+	@Test
+	void theLeaseOfATransactionIsCapped() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withMaxTransactionLease(Duration.ofSeconds(1))).startAll();
+		var api = api(cluster.anyFollower());
+		long column = api.createColumn("c", SCHEMA);
+		long tx = api.openTransaction(Duration.ofHours(1));
+		api.put(tx, column, key(1), text("tx"), RequestType.none());
+		Thread.sleep(2_000);
+		// Expired after the capped lease, not the requested hour: the client must run it again.
+		assertThrows(RocksDBRetryException.class, () -> api.closeTransaction(tx, true));
+		assertNull(api.get(0, column, key(1), RequestType.current()));
+	}
+
+	@Test
 	void updatesDetectConflicts() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
 		var api = api(cluster.anyFollower());

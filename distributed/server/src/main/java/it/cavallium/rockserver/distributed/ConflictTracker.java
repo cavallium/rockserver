@@ -32,13 +32,28 @@ import org.jetbrains.annotations.Nullable;
  * resolving an entry also settles every entry registered before it: those precede it in the log, or were never
  * appended and write nothing.</p>
  *
- * <p>False conflicts are allowed (hash collisions, coarse column markers, entries that failed to append);
- * missed conflicts are not. Thread-safe.</p>
+ * <p>The history is bounded. Once resolved entries hold more than {@code maxKeys} keys and columns, {@link #prune}
+ * forgets the oldest ones even if an open transaction's snapshot still needs them, and that transaction then
+ * conflicts at commit. A long or abandoned transaction costs a false conflict instead of unbounded heap.</p>
+ *
+ * <p>False conflicts are allowed (hash collisions, coarse column markers, entries that failed to append, history
+ * forgotten past the cap); missed conflicts are not. Thread-safe.</p>
  */
 final class ConflictTracker {
 
 	/** Index of an entry that has not been applied yet: newer than any snapshot. */
 	private static final long PENDING = Long.MAX_VALUE;
+	/**
+	 * Default {@code maxKeys}: about 300 MB of heap, and minutes of history at tens of thousands of written keys per
+	 * second, well over the longest transaction lease.
+	 */
+	static final long DEFAULT_MAX_KEYS = 4_000_000;
+	/**
+	 * Keys and columns that one {@link #prune} call forgets at most (always at least one entry, if it can forget
+	 * one), so that it never holds the lock {@code preAppendTransaction} needs for long. The next calls, one per
+	 * applied entry, forget the rest.
+	 */
+	private static final int PRUNE_BATCH_KEYS = 65_536;
 
 	private static final ValueLayout.OfLong LONG_LE
 			= ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
@@ -58,6 +73,21 @@ final class ConflictTracker {
 	private final PriorityQueue<Token> resolved = new PriorityQueue<>(Comparator.comparingLong(token -> token.index));
 	/** Pending entries in registration order, which is log order. */
 	private final ArrayDeque<Token> pending = new ArrayDeque<>();
+	private final long maxKeys;
+	/** Keys and columns held by the entries in {@link #resolved}, overwritten ones included. */
+	private long resolvedKeys;
+
+	ConflictTracker() {
+		this(DEFAULT_MAX_KEYS);
+	}
+
+	/** {@code maxKeys}: how many keys and columns resolved entries may hold before history is forgotten early. */
+	ConflictTracker(long maxKeys) {
+		if (maxKeys <= 0) {
+			throw new IllegalArgumentException("maxKeys must be positive");
+		}
+		this.maxKeys = maxKeys;
+	}
 
 	/** Opaque handle for one registered entry. */
 	static final class Token {
@@ -76,6 +106,10 @@ final class ConflictTracker {
 
 		private boolean isEmpty() {
 			return keys.isEmpty() && columns.isEmpty() && !global;
+		}
+
+		private int weight() {
+			return keys.size() + columns.size() + (global ? 1 : 0);
 		}
 	}
 
@@ -260,6 +294,7 @@ final class ConflictTracker {
 		token.index = index;
 		if (!token.isEmpty()) {
 			resolved.add(token);
+			resolvedKeys += token.weight();
 		}
 	}
 
@@ -267,11 +302,27 @@ final class ConflictTracker {
 	 * Forgets resolved writes at or below {@code index}: no open transaction has a snapshot older than that. A
 	 * transaction whose snapshot is older than a pruned index is then always reported as conflicting, whatever
 	 * pinned or forgot it, so pruning too eagerly can only cause false conflicts.
+	 *
+	 * <p>While resolved entries hold more than {@code maxKeys} keys and columns, it also forgets the oldest entries
+	 * above {@code index}, and raises the pruned index to theirs. One call forgets about {@link #PRUNE_BATCH_KEYS}
+	 * keys. Entries at or below the pruned index that are left for a later call make nothing conflict: every
+	 * snapshot that is still validated is at or above that index.</p>
 	 */
 	synchronized void prune(long index) {
 		prunedThrough = Math.max(prunedThrough, index);
-		while (!resolved.isEmpty() && resolved.peek().index <= index) {
-			Token token = resolved.poll();
+		long forgotten = 0;
+		while (!resolved.isEmpty() && forgotten < PRUNE_BATCH_KEYS) {
+			Token token = resolved.peek();
+			if (token.index > prunedThrough) {
+				if (resolvedKeys <= maxKeys) {
+					break;
+				}
+				// Over the cap: a transaction with an older snapshot will conflict instead of being validated.
+				prunedThrough = token.index;
+			}
+			resolved.poll();
+			resolvedKeys -= token.weight();
+			forgotten += token.weight();
 			// Only the keys this token still owns: a later writer of the same key keeps its own state.
 			for (KeyId key : token.keys) {
 				keyWriters.remove(key, token);
@@ -283,6 +334,16 @@ final class ConflictTracker {
 				globalWriter = null;
 			}
 		}
+	}
+
+	/** Highest index whose older writes may have been forgotten, for tests. */
+	synchronized long prunedThrough() {
+		return prunedThrough;
+	}
+
+	/** Keys and columns held by resolved entries, overwritten ones included, for tests. */
+	synchronized long resolvedKeys() {
+		return resolvedKeys;
 	}
 
 	/** Number of tracked keys and columns, for tests and metrics. */

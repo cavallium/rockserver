@@ -265,6 +265,10 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
   node. A `getForUpdate` starts the barrier when it arrives, so the barrier runs while it waits for its key.
   The caller's timeout counts from the request's arrival, barrier included: a transaction that finishes opening
   after its caller's deadline is rolled back at once instead of being held for its lease.
+- **Lease cap.** A transaction's lease is at most 60 s (`NodeConfig.maxTransactionLease`,
+  `--max-transaction-lease-ms`); a longer requested lease is shortened to it, for the native transaction too.
+  An open transaction keeps the write history after its snapshot on the leader, so an abandoned one must not
+  hold it for hours.
 - **Single-key updates queue.** A `getForUpdate` without a transaction first waits for the earlier updates of
   the same key (a FIFO lock per key hash, held until the update's commit is applied or the update is closed or
   expires after its 10 s lease; a waiter gives up after 12 s, or at its caller's deadline, with `UPDATE_RETRY`).
@@ -276,7 +280,9 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
   leader expires abandoned updates every 100 ms, so the waiter gets the key at the end of the lease even when no
   other request comes.
 - **Staged writes** happen natively. The leader also records them, with their conflict keys: the written keys
-  plus the `getForUpdate` keys.
+  plus the `getForUpdate` keys. It counts the encoded size of the commit entry as they arrive. A write or
+  `getForUpdate` that would take it past the 16 MiB entry limit fails at once with `INVALID_REQUEST` and is not
+  staged; the transaction stays open without it, as after a failed write on a single node.
 - **Commit** proposes one `Guarded` entry that carries the writes, the snapshot index and the conflict keys.
   It is submitted straight to the local Raft server in a single attempt, so a refusal really means the entry
   was not appended.
@@ -301,6 +307,10 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
 - **History is kept** as long as any open transaction, reservation or in-flight commit pins a snapshot. A commit
   whose snapshot is older than history that was already forgotten always conflicts, whatever released it, so a
   timing mistake can only cause a false conflict, never a missed one.
+- **History is bounded.** Once the applied entries in the tracker hold more than 4M keys (about 300 MB), the
+  oldest are forgotten even if a snapshot still needs them, and the transactions with that snapshot conflict at
+  commit. Pruning forgets about 64k keys per call, and runs after every applied entry, so it never holds the
+  tracker lock (which appends need) for long.
 
 **Leader changes.** Transactions, update ids and iterators do not survive a leader change. Clients get
 `UPDATE_RETRY` and run the transaction again, which Yotsuba already does. A commit of a transaction that
@@ -370,7 +380,10 @@ against an incomplete history.
   `INVALID_REQUEST`, whose message gives the number of chunks and keys applied, instead of the chunk's own error.
   That error could be retryable, and resending the whole batch would apply the first chunks twice. A failure of
   the first chunk keeps its own error.
-- **Size limit.** One replicated entry (one write, multi-write or transaction commit) is limited to 16 MiB.
+- **Size limit.** One replicated entry (one write, multi-write or transaction commit) is limited to 16 MiB. A
+  transaction write that would take its commit past that fails with `INVALID_REQUEST` when it is made.
+- **Transaction leases** are at most 60 s by default (`--max-transaction-lease-ms`). A transaction whose snapshot
+  is older than the last 4M keys written on the leader conflicts at commit.
 - **`scanRaw` SST tokens** describe the leader's own files, so a leader change invalidates them.
 - **Merge operators** must be deterministic.
 - **Maintenance.** `flush` and `compact` act only on the node that receives them.
@@ -392,9 +405,9 @@ address, so a test can partition any set of links.
 
 | Test | What it proves |
 |---|---|
-| `ReplicationTest` (in-process) | Replication through any node; results; leader loss, including a new leader that has not applied what the old one acknowledged yet; snapshot catch-up; batches; transactions, conflicts and updates; updates whose caller timed out or cancelled while queued, or cancelled while the update opened, do not keep the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
+| `ReplicationTest` (in-process) | Replication through any node; results; leader loss, including a new leader that has not applied what the old one acknowledged yet; snapshot catch-up; batches; transactions, conflicts and updates; a transaction write too large for the commit refused at once; the capped transaction lease; updates whose caller timed out or cancelled while queued, or cancelled while the update opened, do not keep the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups. |
-| `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); history kept for open transactions and in-flight commits. |
+| `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); history kept for open transactions and in-flight commits, up to the key cap; the commit size limit of staged writes. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Failover takes about 1 s. |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history is linearizable. |
@@ -403,7 +416,7 @@ address, so a test can partition any set of links.
 | `MembershipTest` | A node replaced through `add-peer`/`remove-peer` catches up from a snapshot. Seeded bootstrap works. An empty node joining a seeded cluster stops at `Genesis`. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories are linearizable, and the transactional bank-transfer invariant holds. |
-| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. |
+| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. |
 
 Run them all (about 10 minutes):
 

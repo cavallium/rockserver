@@ -21,6 +21,7 @@ import org.apache.ratis.protocol.RaftPeerId;
  * run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT (repeat per member) --data-dir DIR
  *       [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
  *       [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
+ *       [--max-transaction-lease-ms N]
  * admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
  * </pre>
  *
@@ -54,7 +55,9 @@ public final class ReplicatedServerMain {
 				Duration.ofMillis(Long.parseLong(options.value("--election-timeout-ms", "1000:2000").split(":")[0])),
 				Duration.ofMillis(Long.parseLong(options.value("--election-timeout-ms", "1000:2000").split(":")[1])),
 				Long.parseLong(options.value("--snapshot-every", String.valueOf(NodeConfig.DEFAULT_SNAPSHOT_EVERY_ENTRIES))),
-				Duration.ofMillis(Long.parseLong(options.value("--request-timeout-ms", "10000"))));
+				Duration.ofMillis(Long.parseLong(options.value("--request-timeout-ms", "10000"))),
+				Duration.ofMillis(Long.parseLong(options.value("--max-transaction-lease-ms",
+						String.valueOf(NodeConfig.DEFAULT_MAX_TRANSACTION_LEASE.toMillis())))));
 		options.requireConsumed();
 		ReplicatedNode node;
 		try {
@@ -157,6 +160,7 @@ public final class ReplicatedServerMain {
 				  run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT ... --data-dir DIR
 				        [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
 				        [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
+				        [--max-transaction-lease-ms N]
 				  admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID""");
 		System.exit(2);
 	}
