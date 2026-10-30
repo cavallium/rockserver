@@ -24,6 +24,8 @@ Path prefixes used below:
 
 Some derived writes intentionally have weaker semantics. `core/MessagesImpl.java:1024` establishes monotonic sender presence outside the hot transaction; stale positives are safe. `core/SentMessageSenderIndex.java:188` uses key-only `RequestType.ensure()`. `monitor/RockserverMonitorStorage.java:501` writes expiration then queued match as separate autocommit operations. Do not impose cross-shard transactions on every derived index.
 
+With `--pipelined-updates` (off by default, see [design.md](design.md)), a value from a `getForUpdate` without a transaction is provisional: it is the value an earlier update's commit will write, if that commit applies. It may be acted on only after the update's own commit is acknowledged or its `closeFailedUpdate` returned. That close can take up to 2 s, and fails with `UPDATE_RETRY` if the value never became real, so a no-change path must keep retrying on it, as every `usingForUpdate` site does through its `retryWhen`. A failed update's read does not count.
+
 ## Logical reads and retained resources
 
 `core/MessagesImpl.java:1785` uses `firstAndLast()` for chat extremes; line 2715 uses bounded `existsMultiAsync`. The distributed API must preserve comparator order, range boundaries, reverse direction, and first/last results.

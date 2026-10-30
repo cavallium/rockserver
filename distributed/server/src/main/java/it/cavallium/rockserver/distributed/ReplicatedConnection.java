@@ -99,6 +99,11 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private final NodeMetrics.Series commitTime;
 	private final NodeMetrics.Series forwardTime;
 	private final NodeMetrics.Series lockWaitTime;
+	private final NodeMetrics.Series chainedUpdates;
+	private final NodeMetrics.Series chainConflicts;
+	private final NodeMetrics.Series closeWaitTime;
+	private final NodeMetrics.Series closeRetries;
+	private final NodeMetrics.Series transactionConflicts;
 	private final NodeMetrics.Series localTime;
 	/** Runs short local commands, each on a virtual thread of its own; see {@link #local}. */
 	private static final java.util.concurrent.ExecutorService INLINE = java.util.concurrent.Executors
@@ -116,6 +121,11 @@ final class ReplicatedConnection implements RocksDBConnection {
 		this.commitTime = metrics.duration("commit");
 		this.forwardTime = metrics.duration("forward");
 		this.lockWaitTime = metrics.duration("update.lockWait");
+		this.chainedUpdates = metrics.amount("update.chained");
+		this.chainConflicts = metrics.amount("update.chainConflict");
+		this.closeWaitTime = metrics.duration("update.closeWait");
+		this.closeRetries = metrics.amount("update.closeRetry");
+		this.transactionConflicts = metrics.amount("transaction.conflict");
 		this.localTime = metrics.duration("local");
 		this.stateMachine = stateMachine;
 		this.proposer = proposer;
@@ -886,6 +896,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 			session.unlockKey(lock);
 			throw ex instanceof IllegalStateException ? new RocksDBRetryException() : ex;
 		}
+		chainedUpdates.record(1);
 		// Its commit conflicts on what follows the predecessor.
 		transaction.addConflict(command.columnId(), command.keys());
 		return CompletableFuture.completedFuture(new UpdateContext<>(lock.base.value, transaction.id));
@@ -921,6 +932,9 @@ final class ReplicatedConnection implements RocksDBConnection {
 					return result;
 				}
 				var cause = unwrap(error);
+				if (cause instanceof Proposer.ConflictException && transaction.chained()) {
+					chainConflicts.record(1);
+				}
 				// On a conflict the update is closed and must be retried, as on a single node.
 				throw new CompletionException(cause instanceof Proposer.ConflictException
 						? new RocksDBRetryException() : cause);
@@ -984,6 +998,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		return commit(context, session, transaction, entry).handle((_, error) -> {
 			if (error != null && unwrap(error) instanceof Proposer.ConflictException) {
 				// Same contract as a single node: false, and the transaction stays open.
+				transactionConflicts.record(1);
 				return false;
 			}
 			session.remove(transaction);
@@ -1044,9 +1059,11 @@ final class ReplicatedConnection implements RocksDBConnection {
 		long wait = Math.min(CHAINED_CLOSE_WAIT.toNanos(), remainingNanos(context, start));
 		// A copy: the timeout would otherwise complete the future every waiter shares.
 		return transaction.base.settled.copy().orTimeout(wait, TimeUnit.NANOSECONDS).handleAsync((ok, error) -> {
+			closeWaitTime.since(start);
 			if (error == null && ok) {
 				return null;
 			}
+			closeRetries.record(1);
 			throw new CompletionException(new RocksDBRetryException());
 		});
 	}

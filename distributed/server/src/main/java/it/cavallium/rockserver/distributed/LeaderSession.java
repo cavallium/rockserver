@@ -56,6 +56,7 @@ final class LeaderSession {
 		final long key;
 		/** The admitted commit the update should read, instead of the database; null for a head. */
 		final @Nullable ChainLink base;
+		private final long grantedNanos = System.nanoTime();
 		private final AtomicBoolean released = new AtomicBoolean();
 
 		private KeyLock(long key, @Nullable ChainLink base) {
@@ -233,6 +234,10 @@ final class LeaderSession {
 
 	private final long term;
 	private final boolean pipelined;
+	/** How long an update keeps a key: the real cycle of a hot key. */
+	private final NodeMetrics.Series keyHold;
+	private final NodeMetrics.Series chainLength;
+	private final NodeMetrics.Series chainBroken;
 	private final AppliedIndex applied;
 	private final ConflictTracker tracker;
 	private final ConcurrentHashMap<Long, OpenTransaction> transactions = new ConcurrentHashMap<>();
@@ -276,10 +281,18 @@ final class LeaderSession {
 	}
 
 	LeaderSession(long term, AppliedIndex applied, ConflictTracker tracker, boolean pipelined) {
+		this(term, applied, tracker, pipelined, null);
+	}
+
+	LeaderSession(long term, AppliedIndex applied, ConflictTracker tracker, boolean pipelined,
+			@Nullable NodeMetrics metrics) {
 		this.term = term;
 		this.applied = applied;
 		this.tracker = tracker;
 		this.pipelined = pipelined;
+		this.keyHold = metrics != null ? metrics.duration("update.keyHold") : new NodeMetrics.Series();
+		this.chainLength = metrics != null ? metrics.amount("update.chainLength") : new NodeMetrics.Series();
+		this.chainBroken = metrics != null ? metrics.amount("update.chainBroken") : new NodeMetrics.Series();
 	}
 
 	/** Whether {@link NodeConfig#pipelinedUpdates()} is on. */
@@ -408,8 +421,7 @@ final class LeaderSession {
 				return;
 			}
 			if (!tracker.chainIntact(state.columnId, key, state.tail.token, applied.get())) {
-				state.broken = true;
-				state.tail = null;
+				breakChain(state);
 				return;
 			}
 			base = state.tail;
@@ -460,9 +472,11 @@ final class LeaderSession {
 				if (state == null) {
 					continue;
 				}
+				keyHold.since(transaction.keyLock.grantedNanos);
 				transaction.link = link;
 				unsettled.add(link);
 				state.links++;
+				chainLength.record(state.links);
 				state.tail = state.broken ? null : link;
 				state.held = false;
 				grantNext(link.keyHash, state);
@@ -522,8 +536,7 @@ final class LeaderSession {
 			if (state != null) {
 				state.links--;
 				if (!ok && state.links > 0) {
-					state.broken = true;
-					state.tail = null;
+					breakChain(state);
 				}
 				if (state.tail == link) {
 					state.tail = null;
@@ -543,10 +556,17 @@ final class LeaderSession {
 		synchronized (chainLock) {
 			var state = keys.get(key);
 			if (state != null && state.links > 0) {
-				state.broken = true;
-				state.tail = null;
+				breakChain(state);
 			}
 		}
+	}
+
+	private void breakChain(KeyState state) {
+		if (!state.broken) {
+			chainBroken.record(1);
+		}
+		state.broken = true;
+		state.tail = null;
 	}
 
 	/**
@@ -604,6 +624,7 @@ final class LeaderSession {
 			if (!lock.released.compareAndSet(false, true)) {
 				return;
 			}
+			keyHold.since(lock.grantedNanos);
 			var state = keys.get(lock.key);
 			if (state == null) {
 				return;

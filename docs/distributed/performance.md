@@ -130,6 +130,13 @@ with 11–18 s write latency. In order of discovery:
     p99 of 20 ms, at 2× 167 ms instead of 984 ms, and at 3× it serves 24.2k instead of 20.7k, limited by
     the client's 512 writes in flight like several connections. Single-node servers keep `directExecutor`.
 
+14. **One update per key at a time.** A hot key's update waited for the previous update's fsync, replication and
+    apply, so one key saw only 30–70 updates/s. `--pipelined-updates` (off by default, see
+    [design.md](design.md)) hands the key on when the commit is admitted to the log instead, at the cost of one point
+    read and one SHA-256 per chained commit on every replica, and 9 bytes on every update commit plus about
+    60–100 on chained ones. Not measured yet: `LoadBench --hot-keys` compares it on and off, with `update.keyHold`,
+    `update.lockWait`, `update.guardRejected`, `update.chainConflict` and `transaction.conflict` in the node logs.
+
 ## Results
 
 Suite `s2` (commit `cdca0b2`), 2026-10-30, on the PC described above, with other workloads on it at times;

@@ -184,6 +184,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 			var session = leaderSession;
 			return session == null ? -1 : session.lockedKeys();
 		});
+		metrics.gauge("leader.chainLinks", () -> {
+			var session = leaderSession;
+			return session == null ? -1 : session.chainLinks();
+		});
 		metrics.gauge("heapUsedMiB", () -> (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) >> 20);
 		this.applyGroupEntries = metrics.amount("apply.groupEntries");
 		this.completer = java.util.concurrent.Executors.newSingleThreadExecutor(
@@ -282,7 +286,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			if (current != null) {
 				current.close(store.db());
 			}
-			var created = new LeaderSession(term, applied, new ConflictTracker(), config.pipelinedUpdates());
+			var created = new LeaderSession(term, applied, new ConflictTracker(), config.pipelinedUpdates(), metrics);
 			// The session tracks writes from this term on: a transaction whose snapshot misses an earlier leader's
 			// entries would not see them conflict. Reads wait for those entries (see leaderReadyIndex); this makes
 			// sure no commit validates against such a snapshot anyway.
