@@ -40,7 +40,7 @@ import org.junit.jupiter.api.io.TempDir;
 class IsolatedNodeTest {
 
 	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);
-	/** Far more than the 4 maximum election timeouts it takes on a quiet machine. */
+	/** Far more than the 7 s it takes on a quiet machine: one election timeout, and the bound of {@link ApiGate}. */
 	private static final Duration WAIT_TIMEOUT = Duration.ofSeconds(40);
 	private static final List<String> SERVER_ARGS = List.of("--election-timeout-ms", "400:800",
 			"--request-timeout-ms", "3000");
@@ -114,7 +114,7 @@ class IsolatedNodeTest {
 			}
 		});
 
-		// Past the end of the election, and past the bound counted from the kill.
+		// Past the end of the election, and past the bound of 6 s counted from the kill.
 		long end = killedAt + Duration.ofSeconds(8).toNanos();
 		while (System.nanoTime() - end < 0) {
 			for (var id : survivors) {

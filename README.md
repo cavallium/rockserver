@@ -137,7 +137,7 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 |---|---|---|
 | Dies, its host stays up (crash, SIGKILL) | At once: the connection is reset | In milliseconds: the port refuses connections |
 | Stops answering with its host down, cut off from the client or frozen (power loss, SIGSTOP) | By keepalive, in at most 15 s | After that, plus one connect timeout for each such node listed before the one that works |
-| Is cut off from the Raft majority, and the client still reaches it | The node stops serving: it loses its leader within one election timeout, and after 3 maximum election timeouts without one (about 8 s in all by default) it stops listening and sends GOAWAY. Calls running on it end as they do | In milliseconds. Until then calls fail with the errors of a node without a leader |
+| Is cut off from the Raft majority, and the client still reaches it | The node stops serving: it loses its leader within one election timeout, and after 3 maximum election timeouts without one, at least 6 s (about 8 s in all by default), it stops listening and sends GOAWAY. Calls running on it end as they do | In milliseconds. Until then calls fail with the errors of a node without a leader |
 | Has a hung disk | **Not detected**: the process still answers the connection handshake and keepalive. Calls wait for their deadline, and calls without one wait for the node | Never: the client stays on this node |
 
 | System property | Default | Effect |

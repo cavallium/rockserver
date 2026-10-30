@@ -207,8 +207,8 @@ Other results:
   most 15 s (10 s of silence, 5 s for the answer), which is the price of not closing connections on shorter pauses;
   each such node before the first live one in the list then costs 3 s (the connect timeout) when the client
   reconnects. A node cut off from the Raft majority stops listening after 3 maximum election timeouts without a
-  leader (about 8 s in all by default), so its clients move, and listens again once it knows a leader. A hung disk
-  is not detected. See the [README](../../README.md#client-connections).
+  leader, at least 6 s (about 8 s in all by default), so its clients move, and listens again once it knows a leader.
+  A hung disk is not detected. See the [README](../../README.md#client-connections).
 - **Snapshots.** One every 500k entries (`--snapshot-every`), about every 100 s at 2×. A snapshot flushes the
   memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.
 - **Memory.** In a 10-minute run at 2× the leader's heap stayed between 1.3 and 2.8 GiB (4 GiB heap). The

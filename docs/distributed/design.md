@@ -120,11 +120,13 @@ including a frozen process, whose kernel accepts the connection. See the
 
 `pick_first` reacts only to the transport, so a node that stays reachable but cannot serve has to shed its clients
 itself. A node cut off from the Raft majority answers HTTP/2 and keepalive while every request fails. So a node that
-once knew a leader and has had none for 3 maximum election timeouts stops serving its API (`ApiGate`, checked by the
-maintenance loop of `ReplicatedNode`): `GrpcServer.pause` closes the port and sends GOAWAY to every connection, and
-running calls end as they do. Clients move on, because the port refuses them. The bound leaves room for two more
-voting rounds lost to a split vote, so it is not reached by an election, and an isolated leader first has to step
-down, about one more election timeout. Raft has its own port, so a paused node keeps voting. Once it has known a
+once knew a leader and has had none for 3 maximum election timeouts, and at least 6 s, stops serving its API
+(`ApiGate`, checked by the maintenance loop of `ReplicatedNode`): `GrpcServer.pause` closes the port and sends GOAWAY
+to every connection, and running calls end as they do. Clients move on, because the port refuses them. The bound
+leaves room for two more voting rounds lost to a split vote, so it is not reached by an election, and an isolated
+leader first has to step down, about one more election timeout. The minimum is for a node that stopped for a moment:
+a leader that got no answer from it for a while waits up to 5 s before it tries again (Ratis' appender retry policy),
+and the node has no leader until then. Raft has its own port, so a paused node keeps voting. Once it has known a
 leader for one maximum election timeout, long enough for a heartbeat to have confirmed it, `GrpcServer.resume` builds
 a new gRPC server on the same port. Both conditions must hold without a break, so a short election never pauses a
 node, and a pause and the next are at least 4 maximum election timeouts apart. A cluster where no node has a leader

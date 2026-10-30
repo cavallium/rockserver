@@ -40,6 +40,25 @@ class ApiGateTest {
 		assertFalse(run(false, TICK));
 	}
 
+	/** A follower that stopped for a moment waits for the leader's next try, whatever its election timeout. */
+	@Test
+	void aShortElectionTimeoutDoesNotShortenTheBound() {
+		var shortTimeout = ApiGate.forElectionTimeout(Duration.ofMillis(800));
+		assertTrue(shortTimeout.shouldServe(true, 0));
+		assertTrue(shortTimeout.shouldServe(false, TICK));
+		assertTrue(shortTimeout.shouldServe(false, ApiGate.MIN_PAUSE_AFTER.toNanos()));
+		assertFalse(shortTimeout.shouldServe(false, TICK + ApiGate.MIN_PAUSE_AFTER.toNanos()));
+	}
+
+	@Test
+	void aLongElectionTimeoutLengthensTheBound() {
+		var longTimeout = ApiGate.forElectionTimeout(Duration.ofSeconds(4));
+		assertTrue(longTimeout.shouldServe(true, 0));
+		assertTrue(longTimeout.shouldServe(false, TICK));
+		assertTrue(longTimeout.shouldServe(false, TimeUnit.SECONDS.toNanos(12)));
+		assertFalse(longTimeout.shouldServe(false, TICK + TimeUnit.SECONDS.toNanos(12)));
+	}
+
 	@Test
 	void aShortElectionNeverPauses() {
 		assertTrue(run(true, TICK));
