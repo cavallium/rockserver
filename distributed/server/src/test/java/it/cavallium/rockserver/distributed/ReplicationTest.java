@@ -2,6 +2,7 @@ package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -24,6 +25,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -314,6 +317,30 @@ class ReplicationTest {
 		assertThrows(RocksDBRetryException.class,
 				() -> api.put(stale.updateId(), column, key(1), text("lost"), RequestType.none()));
 		assertEquals("two", text(api.get(0, column, key(1), RequestType.current())));
+	}
+
+	@Test
+	void anUpdateWhoseCallerIsGoneDoesNotTakeTheKey() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = api(leader);
+		long column = api.createColumn("c", SCHEMA);
+		var holder = api.get(0, column, key(1), RequestType.forUpdate());
+
+		// Queued behind the holder: one caller whose deadline passes, and one that cancels.
+		var timedOut = leader.connection().getAsyncApi(RequestContext.latency(Duration.ofMillis(300)))
+				.getAsync(0, column, key(1), RequestType.forUpdate());
+		var cancelled = leader.connection().getAsyncApi(CONTEXT).getAsync(0, column, key(1), RequestType.forUpdate());
+		var error = assertThrows(ExecutionException.class, () -> timedOut.get(5, TimeUnit.SECONDS));
+		assertInstanceOf(RocksDBRetryException.class, error.getCause());
+		cancelled.cancel(true);
+
+		api.closeFailedUpdate(holder.updateId());
+		// The key is free at once: neither gone caller opened an update that nobody can close.
+		var next = leader.connection().getAsyncApi(RequestContext.latency(Duration.ofSeconds(3)))
+				.getAsync(0, column, key(1), RequestType.forUpdate())
+				.get(5, TimeUnit.SECONDS);
+		api.closeFailedUpdate(next.updateId());
 	}
 
 	@Test

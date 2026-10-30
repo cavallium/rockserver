@@ -69,6 +69,8 @@ final class LeaderForwarder implements Closeable {
 	private final ExecutorService connector = Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
 			.name("rockserver-leader-connect-", 0)
 			.factory());
+	/** {@link #leader} results still waiting for a leader, failed by {@link #close()}. */
+	private final java.util.Set<CompletableFuture<String>> pendingLeaders = ConcurrentHashMap.newKeySet();
 	private volatile boolean closed;
 
 	LeaderForwarder(NodeConfig config) {
@@ -83,7 +85,19 @@ final class LeaderForwarder implements Closeable {
 		var result = new CompletableFuture<String>();
 		long deadline = System.nanoTime() + config.requestTimeout().toNanos();
 		poll(stateMachine, result, deadline);
+		if (!result.isDone()) {
+			// Its next poll waits in the timer, whose queue close() drops.
+			pendingLeaders.add(result);
+			result.whenComplete((_, _) -> pendingLeaders.remove(result));
+			if (closed) {
+				result.completeExceptionally(closing());
+			}
+		}
 		return result;
+	}
+
+	private static RocksDBException closing() {
+		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "Node is closing");
 	}
 
 	private void poll(RockserverStateMachine stateMachine, CompletableFuture<String> result, long deadline) {
@@ -107,7 +121,7 @@ final class LeaderForwarder implements Closeable {
 		try {
 			timer.schedule(() -> poll(stateMachine, result, deadline), POLL_MS, TimeUnit.MILLISECONDS);
 		} catch (RuntimeException ex) {
-			result.completeExceptionally(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "Node is closing"));
+			result.completeExceptionally(closing());
 		}
 	}
 
@@ -210,7 +224,11 @@ final class LeaderForwarder implements Closeable {
 	@Override
 	public void close() throws IOException {
 		closed = true;
+		// The timer drops the next polls of pending leader() calls: fail those calls instead.
 		timer.shutdownNow();
+		for (var pending : pendingLeaders) {
+			pending.completeExceptionally(closing());
+		}
 		connector.shutdown();
 		closer.shutdown();
 		IOException failure = null;

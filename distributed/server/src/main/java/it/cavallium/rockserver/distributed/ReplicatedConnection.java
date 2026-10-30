@@ -33,11 +33,14 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
@@ -355,7 +358,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 				var cause = unwrap(error);
 				boolean notSent = cause instanceof LeaderForwarder.NotConnectedException;
 				boolean lost = !notSent && isTransportFailure(cause);
-				if (!(notSent || lost || cause instanceof RocksDBRetryException) || (!isReplayable(command) && !notSent)) {
+				if (!(notSent || lost || cause instanceof RocksDBRetryException)
+						|| (!isReplayable(command, lost) && !notSent)) {
 					return CompletableFuture.failedFuture(lost ? unreachableFailure(command, cause) : cause);
 				}
 				if (System.nanoTime() - deadlineNanos > 0) {
@@ -383,10 +387,14 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	/**
 	 * Commands that can run again on another leader after an attempt whose outcome is unknown: reads, and the
-	 * opening of transactions and updates (one opened on a leader that is gone went away with it).
+	 * opening of transactions and updates (one opened on a leader that is gone went away with it). An update is not
+	 * opened again after an attempt that was {@code lost} in transport: the leader may be alive and have opened it,
+	 * and that update would hold its key until its lease ends, also against the update sent again.
 	 */
-	private static boolean isReplayable(RocksDBAPICommandSingle<?> command) {
+	private static boolean isReplayable(RocksDBAPICommandSingle<?> command, boolean lost) {
 		return switch (command) {
+			case Get<?> c when c.requestType() instanceof RequestType.RequestForUpdate<?> ->
+					c.transactionOrUpdateId() == 0 && !lost;
 			case Get<?> c -> c.transactionOrUpdateId() == 0;
 			case OpenTransaction _ -> true;
 			case RocksDBAPICommandSingle.GetMulti _, RocksDBAPICommandSingle.GetColumnId _,
@@ -417,8 +425,19 @@ final class ReplicatedConnection implements RocksDBConnection {
 		return new RocksDBRetryException();
 	}
 
-	@SuppressWarnings("unchecked")
 	private Flux<Object> forwardStream(RequestContext context, RocksDBAPICommandStream<?> command) {
+		return forwardStream(context, command, System.nanoTime() + config.requestTimeout().toNanos());
+	}
+
+	/**
+	 * Forwards a stream to the leader. As for {@link #forward}, a stream that was never sent, or a non-transactional
+	 * stream that failed before its first element, is sent again to whichever node leads then, until
+	 * {@code deadlineNanos}. A stream inside a transaction fails with a retryable error when the leader becomes
+	 * unreachable; a stream cut after some elements fails with {@code SERVER_OVERLOADED}, since the caller already
+	 * received part of it.
+	 */
+	@SuppressWarnings("unchecked")
+	private Flux<Object> forwardStream(RequestContext context, RocksDBAPICommandStream<?> command, long deadlineNanos) {
 		return Mono.fromFuture(forwarder.leader(stateMachine)).flatMapMany(leader -> {
 			if (leader.equals(config.nodeId())) {
 				if (!isLeader()) {
@@ -427,10 +446,39 @@ final class ReplicatedConnection implements RocksDBConnection {
 				}
 				return Flux.from(stream(context, command));
 			}
+			var emitted = new AtomicBoolean();
 			return Mono.fromFuture(forwarder.target(leader, stateMachine))
 					.flatMapMany(target -> Flux.from((Publisher<Object>) target.connection().getAsyncApi(context)
-							.requestAsync(command)));
+									.requestAsync(command))
+							.doOnNext(_ -> emitted.set(true))
+							.doOnError(error -> {
+								if (isTransportFailure(unwrap(error))) {
+									forwarder.invalidate(target);
+								}
+							}))
+					.onErrorResume(error -> {
+						var cause = unwrap(error);
+						boolean notSent = cause instanceof LeaderForwarder.NotConnectedException;
+						boolean lost = !notSent && isTransportFailure(cause);
+						if (!(notSent || lost || cause instanceof RocksDBRetryException)) {
+							return Flux.error(cause);
+						}
+						if (emitted.get()) {
+							return Flux.error(lost ? RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+									"The leader became unreachable during the stream: " + cause) : cause);
+						}
+						if ((!notSent && isTransactional(command)) || System.nanoTime() - deadlineNanos > 0) {
+							return Flux.error(lost ? new RocksDBRetryException() : cause);
+						}
+						return Mono.delay(Duration.ofMillis(FORWARD_RETRY_MS))
+								.thenMany(Flux.defer(() -> forwardStream(context, command, deadlineNanos)));
+					});
 		});
+	}
+
+	/** Streams that iterate inside a transaction, which exists only on the leader that opened it. */
+	private static boolean isTransactional(RocksDBAPICommandStream<?> command) {
+		return command instanceof RocksDBAPICommandStream.GetRange<?> range && range.transactionId() != 0;
 	}
 
 	private CompletableFuture<?> local(RequestContext context, RocksDBAPICommandSingle<?> command) {
@@ -545,7 +593,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 				throw new CompletionException(barrierFailure(unwrap(error)));
 			}
 			return openNative(context, command, term, false, command.transactionLeaseTtl(), result -> (Long) result,
-					null, null, null);
+					null, null, null, null);
 		}).thenCompose(f -> f);
 	}
 
@@ -565,31 +613,73 @@ final class ReplicatedConnection implements RocksDBConnection {
 		// Updates of one key queue up here instead of conflicting: each one reads what the previous one committed.
 		var session = currentSession();
 		long start = System.nanoTime();
-		return session.lockKey(ConflictTracker.keyHash(command.columnId(), command.keys()))
-				.orTimeout(UPDATE_LOCK_WAIT.toNanos(), TimeUnit.NANOSECONDS)
-				.exceptionallyCompose(error -> CompletableFuture.failedFuture(
-						unwrap(error) instanceof TimeoutException ? new RocksDBRetryException() : unwrap(error)))
-				.thenComposeAsync(lock -> {
+		// Leadership is confirmed while the update waits for its key: any confirmation after the request arrived will
+		// do, and the session's term is checked again when the update opens.
+		long term = currentTerm();
+		var leadership = barrier.awaitLeadership().whenComplete((_, _) -> barrierTime.since(start));
+		var waiter = session.lockKey(ConflictTracker.keyHash(command.columnId(), command.keys()));
+		var result = new CompletableFuture<Object>();
+		// The caller is gone once its deadline passed or it cancelled: an update it cannot learn the id of would keep
+		// the key locked for the whole lease.
+		BooleanSupplier callerGone = () -> result.isCancelled() || remainingNanos(context, start) <= 0;
+		waiter.orTimeout(Math.min(UPDATE_LOCK_WAIT.toNanos(), remainingNanos(context, start)), TimeUnit.NANOSECONDS)
+				.handleAsync((lock, lockError) -> {
+					if (lockError != null) {
+						var cause = unwrap(lockError);
+						boolean gaveUp = cause instanceof TimeoutException || cause instanceof CancellationException;
+						throw new CompletionException(gaveUp ? new RocksDBRetryException() : cause);
+					}
 					lockWaitTime.since(start);
-					long term = currentTerm();
-					long barrierStart = System.nanoTime();
-					return barrier.awaitLeadership().handle((_, error) -> {
-						barrierTime.since(barrierStart);
+					return leadership.handle((_, error) -> {
 						if (error != null) {
 							session.unlockKey(lock);
 							throw new CompletionException(barrierFailure(unwrap(error)));
 						}
-						return openNative(context, command, term, true, UPDATE_LEASE,
-								result -> ((UpdateContext<?>) result).updateId(), command, session, lock);
+						if (callerGone.getAsBoolean()) {
+							session.unlockKey(lock);
+							throw new CompletionException(new RocksDBRetryException());
+						}
+						return openNative(remainingContext(context, start), command, term, true, UPDATE_LEASE,
+								r -> ((UpdateContext<?>) r).updateId(), command, session, lock, callerGone);
 					}).thenCompose(f -> f);
-				}).whenComplete((_, _) -> updateOpenTime.since(start));
+				})
+				.thenCompose(f -> f)
+				.whenComplete((value, error) -> {
+					updateOpenTime.since(start);
+					if (error != null) {
+						result.completeExceptionally(unwrap(error));
+					} else {
+						result.complete(value);
+					}
+				});
+		// A queued update whose caller cancelled leaves the queue.
+		result.whenComplete((_, _) -> {
+			if (result.isCancelled()) {
+				waiter.cancel(false);
+			}
+		});
+		return result;
+	}
+
+	/** What is left of {@code context}'s timeout, counted from {@code startNanos}; {@link Long#MAX_VALUE} if none. */
+	private static long remainingNanos(RequestContext context, long startNanos) {
+		return context.hasTimeout() ? context.timeoutNanos() - (System.nanoTime() - startNanos) : Long.MAX_VALUE;
+	}
+
+	/** {@code context} with only the time left of its timeout, counted from {@code startNanos}. */
+	private static RequestContext remainingContext(RequestContext context, long startNanos) {
+		if (!context.hasTimeout()) {
+			return context;
+		}
+		return new RequestContext(context.profile(), Math.max(1, remainingNanos(context, startNanos)));
 	}
 
 	/**
 	 * Opens a native transaction or update on the local database and registers it in the current leader session.
 	 * The snapshot index is reserved first, so that no history it needs can be pruned meanwhile. The session must
 	 * belong to the term the read barrier confirmed: a later term of this same node may not have applied, nor
-	 * tracked, the entries another leader committed in between.
+	 * tracked, the entries another leader committed in between. If {@code callerGone} turns true before the
+	 * registration, the native transaction is rolled back instead, since nobody would ever close it.
 	 */
 	private CompletableFuture<?> openNative(RequestContext context,
 			RocksDBAPICommandSingle<?> command,
@@ -599,7 +689,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 			java.util.function.Function<Object, Long> idOf,
 			@Nullable Get<?> forUpdate,
 			@Nullable LeaderSession lockSession,
-			@Nullable LeaderSession.KeyLock keyLock) {
+			@Nullable LeaderSession.KeyLock keyLock,
+			@Nullable BooleanSupplier callerGone) {
 		LeaderSession session;
 		try {
 			session = currentSession();
@@ -632,6 +723,14 @@ final class ReplicatedConnection implements RocksDBConnection {
 				throw new CompletionException(unwrap(openError));
 			}
 			long id = idOf.apply(result);
+			if (callerGone != null && callerGone.getAsBoolean()) {
+				session.cancel(reservation);
+				if (keyLock != null) {
+					session.unlockKey(keyLock);
+				}
+				rollBackNativeQuietly(id, update);
+				throw new CompletionException(new RocksDBRetryException());
+			}
 			LeaderSession.OpenTransaction transaction;
 			try {
 				transaction = session.register(reservation, id, update, keyLock, lease.toNanos());

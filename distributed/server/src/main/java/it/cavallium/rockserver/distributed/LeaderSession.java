@@ -11,6 +11,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -119,6 +121,12 @@ final class LeaderSession {
 	 */
 	private final Long2ObjectOpenHashMap<ArrayDeque<CompletableFuture<KeyLock>>> keyQueues = new Long2ObjectOpenHashMap<>();
 	private long appliesSincePrune;
+	/**
+	 * Whether {@link #expiryTick} is scheduled: it runs while some key is held after an update queued behind it, so
+	 * that an abandoned update releases its key at the end of its lease even when no other request comes. Guarded by
+	 * this.
+	 */
+	private boolean expiryScheduled;
 	/** When {@link #expireIfDue} last expired transactions, in {@link System#nanoTime()} units. */
 	private volatile long lastExpireNanos = System.nanoTime();
 	private volatile boolean closed;
@@ -205,7 +213,23 @@ final class LeaderSession {
 		}
 		var waiter = new CompletableFuture<KeyLock>();
 		queue.addLast(waiter);
+		if (!expiryScheduled) {
+			expiryScheduled = true;
+			EXPIRY_DELAY.execute(this::expiryTick);
+		}
 		return waiter;
+	}
+
+	/** Expires what is due, and runs again later while a key is held and leadership lasts. */
+	private void expiryTick() {
+		expireIfDue();
+		synchronized (this) {
+			if (closed || keyQueues.isEmpty()) {
+				expiryScheduled = false;
+				return;
+			}
+		}
+		EXPIRY_DELAY.execute(this::expiryTick);
 	}
 
 	/** Open transactions and updates, for metrics. */
@@ -317,6 +341,8 @@ final class LeaderSession {
 	}
 
 	private static final long EXPIRE_EVERY_NANOS = 100_000_000L;
+	private static final Executor EXPIRY_DELAY = CompletableFuture.delayedExecutor(EXPIRE_EVERY_NANOS,
+			TimeUnit.NANOSECONDS);
 
 	private long minSnapshotIndex() {
 		long min = snapshots.isEmpty() ? Long.MAX_VALUE : snapshots.firstLongKey();

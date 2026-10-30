@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
@@ -26,11 +27,12 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import reactor.core.publisher.Flux;
 
 /**
- * A client attached to a follower while the leader is killed (SIGKILL): the follower forwards its reads and
- * proposes its writes to whichever node leads. The client must only ever see retryable errors, never a transport
- * or internal error from the forwarding, and reads must come back soon after the election.
+ * A client attached to a follower while the leader is killed (SIGKILL): the follower forwards its reads (point
+ * reads and range streams) and proposes its writes to whichever node leads. The client must only ever see retryable
+ * errors, never a transport or internal error from the forwarding, and reads must come back soon after the election.
  */
 @Timeout(180)
 class ForwardingFailoverTest {
@@ -38,6 +40,9 @@ class ForwardingFailoverTest {
 	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);
 	private static final RequestContext CONTEXT = RequestContext.latency(Duration.ofSeconds(8));
+	private static final RequestContext SETUP = RequestContext.batch(Duration.ofSeconds(30));
+	/** Range streams are not latency work. */
+	private static final RequestContext STREAM = RequestContext.analytical(Duration.ofSeconds(8));
 	private static final int KEYS = 64;
 
 	@TempDir
@@ -58,12 +63,13 @@ class ForwardingFailoverTest {
 				"--request-timeout-ms", "5000"));
 		cluster.waitReady(READY_TIMEOUT);
 		var members = List.of("1", "2", "3");
-		var leader = leaderOf(members);
+		var leader = awaitLeader(members);
 		var follower = members.stream().filter(id -> !id.equals(leader)).findFirst().orElseThrow();
 
 		try (var connection = GrpcConnection.forHostAndPort("follower-client", cluster.apiAddress(follower))) {
 			var api = connection.getAsyncApi(CONTEXT);
-			long column = api.createColumnAsync("data", SCHEMA).join();
+			var streamApi = connection.getAsyncApi(STREAM);
+			long column = connection.getAsyncApi(SETUP).createColumnAsync("data", SCHEMA).join();
 			for (int key = 0; key < KEYS; key++) {
 				api.putAsync(0, column, key(key), Buf.wrap(new byte[] {1}), RequestType.none()).join();
 			}
@@ -72,15 +78,22 @@ class ForwardingFailoverTest {
 			var unexpected = new ConcurrentHashMap<String, String>();
 			var retryable = new AtomicLong();
 			var lastReadNanos = new AtomicLong();
+			var lastRangeNanos = new AtomicLong();
 			var lastWriteNanos = new AtomicLong();
 			var workers = new ArrayList<Thread>();
 			for (int i = 0; i < 8; i++) {
-				boolean reader = i % 2 == 0;
+				boolean reader = i % 4 == 0;
+				boolean rangeReader = i % 4 == 2;
 				workers.add(Thread.ofVirtual().start(() -> {
 					var random = ThreadLocalRandom.current();
 					while (!stop.get()) {
 						try {
-							if (reader) {
+							if (rangeReader) {
+								var range = streamApi.getRangeAsync(0, column, null, null, false,
+										RequestType.<KV>allInRange());
+								Flux.from(range).count().block();
+								lastRangeNanos.set(System.nanoTime());
+							} else if (reader) {
 								api.getAsync(0, column, key(random.nextInt(KEYS)), RequestType.current()).join();
 								lastReadNanos.set(System.nanoTime());
 							} else {
@@ -88,7 +101,7 @@ class ForwardingFailoverTest {
 										RequestType.none()).join();
 								lastWriteNanos.set(System.nanoTime());
 							}
-						} catch (CompletionException | RocksDBException e) {
+						} catch (RuntimeException e) {
 							var cause = e instanceof CompletionException && e.getCause() != null ? e.getCause() : e;
 							if (cause instanceof RocksDBException rocks
 									&& (rocks.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED
@@ -112,22 +125,35 @@ class ForwardingFailoverTest {
 			}
 
 			System.out.println("ForwardingFailoverTest: retryable errors " + retryable.get() + ", reads resumed "
-					+ Duration.ofNanos(lastReadNanos.get() - killedAt).toMillis() + " ms and writes "
+					+ Duration.ofNanos(lastReadNanos.get() - killedAt).toMillis() + " ms, range reads "
+					+ Duration.ofNanos(lastRangeNanos.get() - killedAt).toMillis() + " ms and writes "
 					+ Duration.ofNanos(lastWriteNanos.get() - killedAt).toMillis() + " ms after the kill (last success)");
 			assertTrue(unexpected.isEmpty(), () -> "non-retryable errors through the follower: " + unexpected);
 			// Requests kept succeeding until the end, well after the election.
 			assertTrue(lastReadNanos.get() - killedAt > Duration.ofSeconds(4).toNanos(), "reads did not resume");
+			assertTrue(lastRangeNanos.get() - killedAt > Duration.ofSeconds(4).toNanos(),
+					"range reads did not resume");
 			assertTrue(lastWriteNanos.get() - killedAt > Duration.ofSeconds(4).toNanos(), "writes did not resume");
 		}
 	}
 
-	private String leaderOf(List<String> members) throws Exception {
-		var status = cluster.admin(members, "status");
-		return status.lines()
-				.filter(line -> line.contains(": LEADER"))
-				.map(line -> line.substring(0, line.indexOf(':')))
-				.findFirst()
-				.orElseThrow(() -> new AssertionError("No leader in status:\n" + status));
+	/** Waits for a leader: every node printed READY, but the first election may still be running. */
+	private String awaitLeader(List<String> members) throws Exception {
+		long deadline = System.nanoTime() + READY_TIMEOUT.toNanos();
+		while (true) {
+			var status = cluster.admin(members, "status");
+			var leader = status.lines()
+					.filter(line -> line.contains(": LEADER"))
+					.map(line -> line.substring(0, line.indexOf(':')))
+					.findFirst();
+			if (leader.isPresent()) {
+				return leader.get();
+			}
+			if (System.nanoTime() - deadline > 0) {
+				throw new AssertionError("No leader in status:\n" + status);
+			}
+			Thread.sleep(100);
+		}
 	}
 
 	private static Keys key(long value) {

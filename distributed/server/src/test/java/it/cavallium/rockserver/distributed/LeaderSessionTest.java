@@ -80,6 +80,17 @@ class LeaderSessionTest {
 	}
 
 	@Test
+	void aQueuedUpdateGetsTheKeyWhenTheAbandonedOneExpiresWithoutOtherTraffic() throws Exception {
+		var lock = session.lockKey(KEY).join();
+		session.register(session.reserve(applied), 79, true, lock, TimeUnit.MILLISECONDS.toNanos(200));
+		var waiter = session.lockKey(KEY);
+		// Nothing calls expire(): the session must do it on its own once the lease ends.
+		waiter.get(2, TimeUnit.SECONDS);
+		session.unlockKey(waiter.join());
+		assertEquals(0, session.lockedKeys());
+	}
+
+	@Test
 	void endOfLeadershipFailsTheWaitersWithARetry() {
 		session.lockKey(KEY).join();
 		var waiter = session.lockKey(KEY);

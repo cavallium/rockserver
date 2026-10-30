@@ -88,7 +88,11 @@ Forwarding uses the leader's ordinary Rockserver API through the core `GrpcConne
 peer, without gRPC's own retries; a port probe first, so a dead peer fails in milliseconds). When the leader
 cannot be reached, reads and transaction or update opens are sent again to whichever node leads then, until the
 request timeout; a request that was never sent can always be retried; a commit whose connection broke has an
-unknown outcome. A node learns the API address of a member that joined later from that member's `TermService`. The internal column
+unknown outcome. A `getForUpdate` whose connection broke is not sent again but fails with `UPDATE_RETRY`: the
+leader may still be alive and hold the key for that update until its lease ends. A forwarded stream is sent again
+only if it was never sent, or if it is not in a transaction and returned nothing yet. Otherwise it fails with
+`UPDATE_RETRY`, or with `SERVER_OVERLOADED` once part of it was returned. A node learns the API address of a
+member that joined later from that member's `TermService`. The internal column
 `__rockserver_replication` is hidden from `getAllColumnDefinitions`, and every command that names it is
 rejected.
 
@@ -208,12 +212,15 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
 
 - **Open.** `openTransaction` and `getForUpdate` wait for the read barrier, then open a native transaction or
   update on the leader's `EmbeddedDB`. That gives the same snapshot and read-your-writes behavior as on one
-  node.
+  node. A `getForUpdate` starts the barrier when it arrives, so the barrier runs while it waits for its key.
 - **Single-key updates queue.** A `getForUpdate` without a transaction first waits for the earlier updates of
   the same key (a FIFO lock per key hash, held until the update's commit is applied or the update is closed or
-  expires after its 10 s lease; a waiter gives up after 12 s with `UPDATE_RETRY`). It then reads what the
-  previous one committed, instead of every concurrent update of a hot key reading the same value and all but
-  one conflicting.
+  expires after its 10 s lease; a waiter gives up after 12 s, or at its caller's deadline, with `UPDATE_RETRY`).
+  It then reads what the previous one committed, instead of every concurrent update of a hot key reading the
+  same value and all but one conflicting. An update whose caller is gone (its deadline passed, or it cancelled)
+  when it gets the key releases the key at once, without opening the native update. While an update waits, the
+  leader expires abandoned updates every 100 ms, so the waiter gets the key at the end of the lease even when no
+  other request comes.
 - **Staged writes** happen natively. The leader also records them, with their conflict keys: the written keys
   plus the `getForUpdate` keys.
 - **Commit** proposes one `Guarded` entry that carries the writes, the snapshot index and the conflict keys.
@@ -316,17 +323,18 @@ address, so a test can partition any set of links.
 
 | Test | What it proves |
 |---|---|
-| `ReplicationTest` (in-process) | Replication through any node; results; leader loss; snapshot catch-up; batches; transactions, conflicts and updates; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
+| `ReplicationTest` (in-process) | Replication through any node; results; leader loss; snapshot catch-up; batches; transactions, conflicts and updates; updates whose caller timed out or cancelled while queued do not take the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; crash consistency of applies without the WAL. |
-| `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry and end of leadership); history kept for open transactions and in-flight commits. |
+| `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); history kept for open transactions and in-flight commits. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, and replicas are byte-identical. Failover takes about 1 s. |
+| `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history is linearizable. |
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
 | `MembershipTest` | A node replaced through `add-peer`/`remove-peer` catches up from a snapshot. Seeded bootstrap works. An empty node joining a seeded cluster stops at `Genesis`. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories are linearizable, and the transactional bank-transfer invariant holds. |
-| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, fault proxy, linearizability checker. |
+| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. |
 
 Run them all (about 10 minutes):
 

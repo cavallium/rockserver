@@ -93,8 +93,9 @@ with 11–18 s write latency. In order of discovery:
 7. **The proxy scheduler's lock.** 13% of the leader's CPU was lock and condition traffic of the workload
    executor, plus virtual-thread churn; the direct proxy path gave 25–30% more throughput at 3×.
 8. **Failover of forwarded requests.** A follower forwarding to a dead leader kept failing (or hanging in gRPC
-   retries for up to 9 s) until the election. Reads and transaction opens are now re-sent to whichever node
-   leads, over connections without gRPC's own retries that probe the port first.
+   retries for up to 9 s) until the election. Reads (also range streams that returned nothing yet) and
+   transaction opens are now re-sent to whichever node leads, over connections without gRPC's own retries that
+   probe the port first.
 9. **Dedupe records on the apply thread.** Each applied request wrote its record and, once the floor passed it,
    a point delete in a later entry's transaction: two of every three writes of a single put, each through the
    full `EmbeddedDB` path. In the fs1 profile, writing records and finishing entries (the deletes, the floor and
