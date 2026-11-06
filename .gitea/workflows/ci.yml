@@ -79,7 +79,10 @@ jobs:
             -Dsurefire.failIfNoSpecifiedTests=false \
             -Dtest='it.cavallium.rockserver.distributed.**' \
             -Drockserver.test.tmpdir="$TEST_TMPDIR" \
+            -Djunit.jupiter.tempdir.cleanup.mode.default=ON_SUCCESS \
             -Drockserver.test.pipelinedUpdates=${{ matrix.pipelined }}
+      # JUnit deletes a test's @TempDir (where the process suites keep each node's stdout.log and stderr.log) only
+      # when the test passed (ON_SUCCESS above), so the logs of a failed scenario are still there to upload.
       - name: Test reports and node logs
         if: always()
         uses: actions/upload-artifact@v3

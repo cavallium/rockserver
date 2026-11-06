@@ -10,6 +10,25 @@ public final class LogWorkerGate {
 
 	private LogWorkerGate() {}
 
+	/**
+	 * Bytes of log entries the log keeps in memory (the entry caches of its closed segments and of its open one), and
+	 * the most closed segments Ratis keeps cached before it evicts, as {@code {bytes, maxCachedSegments}}.
+	 */
+	public static long[] cache(RaftLog log) throws ReflectiveOperationException {
+		var cache = ((SegmentedRaftLog) log).getRaftLogCache();
+		var closedField = SegmentedRaftLogCache.class.getDeclaredField("closedSegments");
+		closedField.setAccessible(true);
+		var closed = (SegmentedRaftLogCache.LogSegmentList) closedField.get(cache);
+		var open = cache.getOpenSegment();
+		var cacheInfo = SegmentedRaftLogCache.LogSegmentList.class.getDeclaredMethod("getCacheInfo");
+		cacheInfo.setAccessible(true);
+		var info = cacheInfo.invoke(closed);
+		var size = info.getClass().getDeclaredMethod("getSize");
+		size.setAccessible(true);
+		long bytes = (long) size.invoke(info) + (open == null ? 0 : open.getTotalCacheSize());
+		return new long[] {bytes, cache.getMaxCachedSegments()};
+	}
+
 	/** The worker writes nothing more once it reaches this, until {@code release} opens. */
 	public static void block(RaftLog log, CountDownLatch release) throws ReflectiveOperationException {
 		run(log, release::await);
@@ -42,6 +61,10 @@ public final class LogWorkerGate {
 			throw new NoSuchFieldException("SegmentedRaftLog.fileLogWorker is a " + workerField.getType());
 		}
 		SegmentedRaftLogWorker.class.getDeclaredMethod("addIOTask", SegmentedRaftLog.Task.class);
+		var closed = SegmentedRaftLogCache.class.getDeclaredField("closedSegments");
+		if (closed.getType() != SegmentedRaftLogCache.LogSegmentList.class) {
+			throw new NoSuchFieldException("SegmentedRaftLogCache.closedSegments is a " + closed.getType());
+		}
 		SegmentedRaftLog.Task.class.getDeclaredMethod("execute");
 		SegmentedRaftLog.Task.class.getDeclaredMethod("getEndIndex");
 	}

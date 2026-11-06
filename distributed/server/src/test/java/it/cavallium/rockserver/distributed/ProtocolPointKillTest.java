@@ -189,20 +189,35 @@ class ProtocolPointKillTest {
 			workload.awaitMore(100, PHASE_TIMEOUT, "before the fault");
 			var leader = support.awaitLeader(PHASE_TIMEOUT);
 			var followers = cluster.nodeIds().stream().filter(id -> !id.equals(leader)).toList();
-			long followersLast = followers.stream().mapToLong(support::applied).max().orElseThrow();
+			long leaderTerm = support.lastEntryTerm(leader);
 			cluster.network().isolate(leader);
+			// The followers' copies of this leader's log can no longer grow (the test reaches every node directly). Read
+			// their last entries once what was in flight had time to land, and before an election (at least 400 ms) can
+			// add entries of a new term; then wait for the leader to append past both: those entries of its term exist on
+			// the leader only.
+			Thread.sleep(100);
+			var infos = support.groupInfos(followers);
+			assertTrue(infos.size() == followers.size(), "the followers do not answer");
+			long followersLast = -1;
+			for (var entry : infos.entrySet()) {
+				var last = entry.getValue().getLogInfoProto().getLastEntry();
+				assertTrue(last.getTerm() == leaderTerm, "follower " + entry.getKey() + " is already in term "
+						+ last.getTerm() + ", not " + leaderTerm + ": the precondition cannot be checked");
+				followersLast = Math.max(followersLast, last.getIndex());
+			}
+			long followersLastOfTerm = followersLast;
 			// Clients reach the leader directly: their writes are appended there, and go nowhere else.
 			ScenarioSupport.await(Duration.ofSeconds(5), () -> {
-				var info = support.groupInfos().get(leader);
-				return info != null && info.getLogInfoProto().getLastEntry().getIndex() > followersLast + 1;
-			}, "the isolated leader appended nothing");
-			long leaderLast = support.groupInfos().get(leader).getLogInfoProto().getLastEntry().getIndex();
+				var info = support.groupInfo(leader);
+				return info != null && info.getLogInfoProto().getLastEntry().getIndex() > followersLastOfTerm;
+			}, "the isolated leader appended nothing past the followers' last entry " + followersLastOfTerm);
+			long leaderLast = support.groupInfo(leader).getLogInfoProto().getLastEntry().getIndex();
 			cluster.kill(leader);
 			cluster.network().heal();
 			var newLeader = support.awaitLeader(PHASE_TIMEOUT);
 			assertTrue(Set.copyOf(followers).contains(newLeader), newLeader);
-			System.out.println("Killed " + leader + " with its log at " + leaderLast + ", the followers at "
-					+ followersLast);
+			System.out.println("Killed " + leader + " with its log at " + leaderLast + ", the followers' logs at "
+					+ followersLastOfTerm + " (term " + leaderTerm + ")");
 			long healedAt = System.nanoTime();
 			ScenarioSupport.await(PHASE_TIMEOUT, () -> workload.lastAcknowledgedNanos() > healedAt,
 					"no write acknowledged by the new leader");

@@ -48,6 +48,11 @@ final class RaftSettings {
 	static final int NODES_UNDER_PENDING_LIMIT = 4;
 	/** Ratis' pending-request count limit on the leader: its default. */
 	static final int PENDING_REQUESTS_LIMIT = 4096;
+	/**
+	 * Tests only: when this system property is true, a node purges its log up to its latest snapshot even if a member
+	 * has not committed that far, so that a member that lags gets a snapshot install. Never set in production.
+	 */
+	static final String PURGE_UP_TO_SNAPSHOT = "rockserver.test.purgeUpToSnapshot";
 	/** Ratis' pending-request byte limit on the leader (default 64 MB), see {@link #server}. */
 	static final SizeInBytes PENDING_BYTES_LIMIT =
 			SizeInBytes.valueOf((NODES_UNDER_PENDING_LIMIT + 1) * Proposer.ATTEMPT_BYTES_IN_FLIGHT);
@@ -131,8 +136,10 @@ final class RaftSettings {
 		RaftServerConfigKeys.Snapshot.setTriggerWhenRemoveEnabled(properties, false);
 		// Purge only what every member already committed: a follower that is restarting or installing a snapshot
 		// can then catch up from the log afterwards, instead of needing a new snapshot install forever. A member
-		// that is gone for good holds the log back until it is removed from the configuration.
-		RaftServerConfigKeys.Log.setPurgeUptoSnapshotIndex(properties, false);
+		// that is gone for good holds the log back until it is removed from the configuration. Followers too: each
+		// learns every member's commit index from the leader, so none purges past a member that lags. Tests that need a
+		// member to lag past the purged log (an install to an existing member) turn this off, see PURGE_UP_TO_SNAPSHOT.
+		RaftServerConfigKeys.Log.setPurgeUptoSnapshotIndex(properties, Boolean.getBoolean(PURGE_UP_TO_SNAPSHOT));
 		RaftServerConfigKeys.Log.setPurgeGap(properties, 1024);
 		// Keep a margin of log behind the snapshot, so that a member restarted during a deploy catches up from the
 		// log instead of downloading the whole database.

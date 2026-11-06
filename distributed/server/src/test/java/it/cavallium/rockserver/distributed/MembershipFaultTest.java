@@ -14,7 +14,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Random;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
@@ -29,12 +28,17 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Scenario 8 of the design: a membership change under faults. Node 4 joins a 3-node cluster under writes through
- * {@code add-peer}, and a node halts while the change is in its joint configuration (old and new members together):
- * the leader, at the moment it applied the joint configuration (committed, the final one not yet), the joining node
- * at the same moment, or the leader at a random moment right after the command, which may fall before the joint
- * configuration commits. The configuration must end as a plain one (never stuck in the joint phase), with node 4 in
- * it whenever the joint configuration was committed, no acknowledged write may be lost, and every member must end
- * with the same data.
+ * {@code add-peer}, and a node halts or is killed while the change is in its joint configuration (old and new members
+ * together):
+ * <ul>
+ *   <li>the leader, or node 4, halted where it applies the committed joint configuration (the final one not yet);</li>
+ *   <li>the leader, or node 4, killed while the joint configuration is appended and not committed. The test holds that
+ *   state on purpose: the two old followers are paused (SIGSTOP) before {@code add-peer}, so the leader catches node 4
+ *   up and appends the joint configuration, which needs a majority of the old members and cannot get one; the kill
+ *   comes once the node's own configuration shows the joint one, then the followers resume.</li>
+ * </ul>
+ * The configuration must end as a plain one (never stuck in the joint phase), with node 4 in it whenever the joint
+ * configuration was committed, no acknowledged write may be lost, and every member must end with the same data.
  */
 @Timeout(600)
 class MembershipFaultTest {
@@ -42,6 +46,12 @@ class MembershipFaultTest {
 	private static final Duration CRASH_TIMEOUT = Duration.ofSeconds(90);
 	private static final List<String> ORIGINALS = List.of("1", "2", "3");
 	private static final List<String> ALL = List.of("1", "2", "3", "4");
+	/**
+	 * Election timeouts of the tests that pause both old followers: the leader steps down once a majority has not
+	 * answered for the longest one, and before that {@code add-peer} must start its JVM, wait out the paused members'
+	 * answers (3 s) and reach the leader.
+	 */
+	private static final String SLOW_ELECTIONS = "15000:20000";
 
 	@TempDir
 	Path root;
@@ -70,12 +80,16 @@ class MembershipFaultTest {
 	}
 
 	private void start() throws Exception {
+		start("400:800");
+	}
+
+	private void start(String electionTimeouts) throws Exception {
 		rockserverConfig = root.resolve("rockserver.conf");
 		Files.writeString(rockserverConfig, InProcessCluster.MERGE_CONFIG);
 		cluster = ProcessCluster.create(root.resolve("cluster"), 3, 1, List.of(
 				"--rockserver-config", rockserverConfig.toString(),
 				"--snapshot-every", "200",
-				"--election-timeout-ms", "400:800",
+				"--election-timeout-ms", electionTimeouts,
 				"--request-timeout-ms", "5000"), CrashPointMain.class.getName());
 		for (var id : ORIGINALS) {
 			cluster.start(id);
@@ -95,9 +109,17 @@ class MembershipFaultTest {
 
 	/** Runs {@code add-peer 4} in the background: the command may fail when its leader dies. */
 	private CompletableFuture<ProcessCluster.CommandResult> addPeerAsync() {
+		return addPeerAsync(ORIGINALS);
+	}
+
+	/**
+	 * Runs {@code add-peer 4} in the background with the members listed in this order (the Ratis client of the command
+	 * tries the first one first).
+	 */
+	private CompletableFuture<ProcessCluster.CommandResult> addPeerAsync(List<String> members) {
 		return CompletableFuture.supplyAsync(() -> {
 			try {
-				return cluster.adminResult(ORIGINALS, "add-peer", cluster.peer("4").format());
+				return cluster.adminResult(members, "add-peer", cluster.peer("4").format());
 			} catch (java.io.IOException e) {
 				throw new java.io.UncheckedIOException(e);
 			}
@@ -134,21 +156,20 @@ class MembershipFaultTest {
 	}
 
 	/**
-	 * The leader is killed (SIGKILL from the test) a random moment after {@code add-peer} started: during the
-	 * catch-up of node 4, with the joint configuration appended and not committed, or later. Whatever the moment, the
-	 * configuration ends plain, and node 4 can be added (again) afterwards.
+	 * The leader is killed (SIGKILL) while the joint configuration is appended in its log and in node 4's, and not
+	 * committed. The old followers never received it. Whichever node wins next (node 4 may, as its log is the longest)
+	 * the configuration ends plain, old or new, and node 4 can be added (again) afterwards.
 	 */
 	@Test
-	void theLeaderKilledAtARandomMomentOfTheChangeLeavesAPlainConfiguration() throws Exception {
-		long seed = Long.getLong("rockserver.test.seed", System.nanoTime());
-		System.out.println("MembershipFaultTest seed: " + seed);
-		var random = new Random(seed);
-		start();
+	void theLeaderKilledWithTheJointConfigurationAppendedButNotCommittedLeavesAPlainConfiguration() throws Exception {
+		start(SLOW_ELECTIONS);
 		var leader = support.awaitLeader(PHASE_TIMEOUT);
-		var command = addPeerAsync();
-		Thread.sleep(random.nextInt(400));
+		var followers = ORIGINALS.stream().filter(id -> !id.equals(leader)).toList();
+		var command = holdJointConfigurationUncommitted(leader, followers, false);
 		cluster.kill(leader);
-		System.out.println("Killed leader " + leader + "; add-peer: " + outcome(command));
+		followers.forEach(cluster::resume);
+		System.out.println("Killed leader " + leader + " with the joint configuration uncommitted; add-peer: "
+				+ outcome(command));
 		var members = awaitPlainConfiguration(null);
 		System.out.println("Configuration after the kill: " + members);
 		cluster.start(leader);
@@ -159,6 +180,60 @@ class MembershipFaultTest {
 		}
 		awaitPlainConfiguration(Set.copyOf(ALL));
 		finish(ALL);
+	}
+
+	/**
+	 * Node 4 is killed (SIGKILL) once it holds the appended, uncommitted joint configuration; then the old followers
+	 * resume, and 1, 2 and 3, a majority of both configurations, complete the change without it. It rejoins after a
+	 * restart.
+	 */
+	@Test
+	void theJoiningNodeKilledWithTheJointConfigurationAppendedButNotCommittedRejoinsAfterItsRestart() throws Exception {
+		start(SLOW_ELECTIONS);
+		var leader = support.awaitLeader(PHASE_TIMEOUT);
+		var followers = ORIGINALS.stream().filter(id -> !id.equals(leader)).toList();
+		var command = holdJointConfigurationUncommitted(leader, followers, true);
+		cluster.kill("4");
+		followers.forEach(cluster::resume);
+		System.out.println("Killed node 4 with the joint configuration uncommitted; add-peer: " + outcome(command));
+		var members = awaitPlainConfiguration(null);
+		System.out.println("Configuration after the kill: " + members);
+		cluster.start("4", "--join");
+		cluster.waitReady("4", READY_TIMEOUT);
+		if (!members.contains("4")) {
+			var again = cluster.adminResult(ORIGINALS, "add-peer", cluster.peer("4").format());
+			assertTrue(again.exitCode() == 0, again.output());
+		}
+		awaitPlainConfiguration(Set.copyOf(ALL));
+		finish(ALL);
+	}
+
+	/**
+	 * Pauses the old followers and starts {@code add-peer 4}: the leader catches node 4 up and appends the joint
+	 * configuration, which cannot commit without one of the paused followers. Returns the running command once the
+	 * leader's configuration (and node 4's too, if {@code onNode4}) is the joint one. The followers stay paused.
+	 */
+	private CompletableFuture<ProcessCluster.CommandResult> holdJointConfigurationUncommitted(String leader,
+			List<String> followers, boolean onNode4) {
+		followers.forEach(cluster::pause);
+		var order = new java.util.ArrayList<String>();
+		order.add(leader);
+		order.addAll(followers);
+		var command = addPeerAsync(order);
+		ScenarioSupport.await(Duration.ofSeconds(15), () -> isJoint(leader) && (!onNode4 || isJoint("4")),
+				"the joint configuration was not appended" + (onNode4 ? " on the leader and on node 4" : " on the leader")
+						+ " while the old followers were paused");
+		// Still the leader of the same configuration: a step-down could only follow 15 s without a majority.
+		var info = support.groupInfo(leader);
+		assertTrue(info != null && info.getRoleInfoProto().getRole() == org.apache.ratis.proto.RaftProtos.RaftPeerRole.LEADER,
+				"the leader stepped down before the kill");
+		return command;
+	}
+
+	/** Whether the node's current configuration (appended, committed or not) is a joint one. */
+	private boolean isJoint(String id) {
+		var info = support.groupInfo(id);
+		return info != null && info.getConf().map(conf -> conf.getOldPeersCount() > 0).orElse(false);
 	}
 
 	private void armAndWait(String id, Point point) throws Exception {

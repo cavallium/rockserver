@@ -44,11 +44,28 @@ public final class CrashPointMain {
 		return !Files.exists(armFile(dataDir));
 	}
 
+	/**
+	 * Makes every later start of the node of {@code dataDir} purge its log up to its snapshots, whatever the other
+	 * members committed ({@link RaftSettings#PURGE_UP_TO_SNAPSHOT}): a member that lags then needs an install.
+	 */
+	static void purgeUpToSnapshot(Path dataDir) throws IOException {
+		var file = dataDir.resolveSibling(PURGE_UP_TO_SNAPSHOT_FILE);
+		Files.createDirectories(file.getParent());
+		Files.writeString(file, "true", StandardCharsets.UTF_8);
+	}
+
+	private static final String PURGE_UP_TO_SNAPSHOT_FILE = "purge-up-to-snapshot";
+
 	public static void main(String[] args) throws Exception {
 		var list = List.of(args);
 		int dataDirOption = list.indexOf("--data-dir");
 		if (!list.isEmpty() && list.getFirst().equals("run") && dataDirOption >= 0 && dataDirOption + 1 < args.length) {
-			var file = armFile(Path.of(args[dataDirOption + 1]));
+			var dataDir = Path.of(args[dataDirOption + 1]);
+			if (Files.exists(dataDir.resolveSibling(PURGE_UP_TO_SNAPSHOT_FILE))) {
+				System.setProperty(RaftSettings.PURGE_UP_TO_SNAPSHOT, "true");
+				System.err.println("PURGING THE LOG UP TO EACH SNAPSHOT (test setting)");
+			}
+			var file = armFile(dataDir);
 			// A file left from before this start arms nothing.
 			Files.deleteIfExists(file);
 			Thread.ofPlatform().daemon().name("crash-point-watcher").start(() -> watch(file));

@@ -21,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -331,6 +332,16 @@ final class ScenarioSupport {
 
 	/** Group info of every running node that answers, by node id. */
 	Map<String, GroupInfoReply> groupInfos() {
+		return groupInfos(cluster.nodeIds());
+	}
+
+	/** Group info of the node, or null if it is not running or does not answer within a second. */
+	@Nullable GroupInfoReply groupInfo(String id) {
+		return groupInfos(List.of(id)).get(id);
+	}
+
+	/** Group info of those of {@code ids} that run and answer, by node id. */
+	Map<String, GroupInfoReply> groupInfos(Collection<String> ids) {
 		var peers = cluster.nodeIds().stream()
 				.map(id -> RaftPeer.newBuilder().setId(id).setAddress(cluster.raftAddress(id).host() + ":"
 						+ cluster.raftAddress(id).port()).build())
@@ -344,7 +355,7 @@ final class ScenarioSupport {
 				.setProperties(properties)
 				.setRetryPolicy(RetryPolicies.noRetry())
 				.build()) {
-			for (var id : cluster.nodeIds()) {
+			for (var id : ids) {
 				if (!cluster.isRunning(id)) {
 					continue;
 				}

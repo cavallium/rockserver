@@ -23,20 +23,21 @@ import org.junit.jupiter.api.io.TempDir;
  * Scenario 7 of the design: an existing member that lags behind past the log that the leader still holds catches up
  * through a snapshot install, also when the follower or the leader is killed in the middle of it.
  *
- * <p>The leader of this cluster keeps its log for a follower that lags ({@code RaftSettings}: the log is purged only
- * up to what every member committed), so a lagging member needs an install only from a leader that did not track
- * it: a former follower, which purged its own log up to its snapshots. The tests build that case: follower {@code F}
- * is cut off (a partitioned link) while the others take snapshots and the other follower {@code G} purges its log;
- * leadership then moves to {@code G}, and the link heals. {@code F} must install a snapshot from
- * {@code G}. A slow link (once {@code LinkProxy} can throttle, see RT-4) would give the same lag without a cut.</p>
+ * <p>With the production settings this cannot happen: the log is purged only up to what every member committed
+ * ({@code RaftSettings}), and that holds on the followers as well, since the leader sends every member's commit index
+ * to each of them. A lagging member then always catches up from the log. These tests start every node with the test
+ * setting {@link RaftSettings#PURGE_UP_TO_SNAPSHOT} (through {@link CrashPointMain#purgeUpToSnapshot}), which purges up
+ * to each snapshot: follower {@code F} is cut off (a partitioned link) while the others write and snapshot, and the
+ * link heals only once the leader's log starts past {@code F}'s last entry, checked on disk before the heal. The
+ * install path that runs is the production one; only the reason the log is gone differs (in production: a new member,
+ * or a member whose log the leader no longer has after a repair). A slow link (once {@code LinkProxy} can throttle,
+ * see RT-4) would give the same lag without a cut.</p>
  */
 @Timeout(600)
 class LaggingInstallTest {
 
 	private static final String SNAPSHOT_INSTALLED = "installing snapshot";
 	private static final long SNAPSHOT_EVERY = 100;
-	/** Ratis purges in steps of 1024 entries ({@code RaftSettings}): G's log must have moved well past that. */
-	private static final long LAG_ENTRIES = 1024 + 4 * SNAPSHOT_EVERY;
 	private static final Duration CRASH_TIMEOUT = Duration.ofSeconds(60);
 
 	@TempDir
@@ -65,8 +66,8 @@ class LaggingInstallTest {
 		}
 	}
 
-	/** The three roles of a test: the leader, the follower that lags, the follower that purges and then leads. */
-	private record Roles(String leader, String lagging, String purging) {}
+	/** The roles of a test: the leader (which purges its log and sends the snapshot) and the follower that lags. */
+	private record Roles(String leader, String lagging) {}
 
 	private void finish(Roles roles) throws Exception {
 		for (var id : cluster.nodeIds()) {
@@ -119,8 +120,8 @@ class LaggingInstallTest {
 
 	/**
 	 * The leader that sends the snapshot is killed as soon as the lagging node starts receiving it (its first
-	 * received file appears). The remaining two elect a leader, which resends a snapshot or the log; the killed node
-	 * restarts. Whether the kill fell inside the transfer depends on timing, and is printed.
+	 * received file appears). The remaining two elect a leader, which resends a snapshot (its log is purged too); the
+	 * killed node restarts. Whether the kill fell inside the transfer depends on timing, and is printed.
 	 */
 	@Test
 	void theLeaderKilledDuringAnInstallLeavesTheLaggingMemberToCatchUpFromTheNextLeader() throws Exception {
@@ -136,17 +137,18 @@ class LaggingInstallTest {
 			}
 			Thread.onSpinWait();
 		}
-		cluster.kill(roles.purging());
-		System.out.println("Killed the sending leader " + roles.purging() + (caught ? " during" : " after")
+		cluster.kill(roles.leader());
+		System.out.println("Killed the sending leader " + roles.leader() + (caught ? " during" : " after")
 				+ " the transfer to " + roles.lagging());
-		// The old leader and the lagging node elect a leader without the killed one.
+		// The other follower and the lagging node elect a leader without the killed one.
 		support.awaitLeader(PHASE_TIMEOUT);
 		finish(roles);
 	}
 
 	/**
-	 * Cuts the lagging follower off, writes until the purging follower took a snapshot well past it (purging its own
-	 * log), then hands leadership to the purging follower. The lagging one is still cut off.
+	 * Cuts the lagging follower off and writes until the leader's log starts past the lagging follower's last entry
+	 * (the leader purged it up to a snapshot), so that only an install can catch it up. The lagging one is still cut
+	 * off when this returns.
 	 */
 	private Roles startLagging() throws Exception {
 		rockserverConfig = root.resolve("rockserver.conf");
@@ -157,6 +159,7 @@ class LaggingInstallTest {
 				"--request-timeout-ms", "5000",
 				"--snapshot-every", String.valueOf(SNAPSHOT_EVERY)), CrashPointMain.class.getName());
 		for (var id : cluster.members()) {
+			CrashPointMain.purgeUpToSnapshot(cluster.dataDir(id));
 			cluster.start(id);
 		}
 		cluster.waitReady(READY_TIMEOUT);
@@ -167,22 +170,45 @@ class LaggingInstallTest {
 		workload = new ScenarioSupport.UniqueWrites(cluster.apiAddresses(), column, 4, 1024).start();
 		workload.awaitMore(100, PHASE_TIMEOUT, "before the lag");
 		var leader = support.awaitLeader(PHASE_TIMEOUT);
-		var followers = cluster.nodeIds().stream().filter(id -> !id.equals(leader)).toList();
-		var roles = new Roles(leader, followers.get(0), followers.get(1));
-		long lagFrom = support.applied(roles.lagging());
+		var lagging = cluster.nodeIds().stream().filter(id -> !id.equals(leader)).findFirst().orElseThrow();
+		var roles = new Roles(leader, lagging);
 		cluster.network().isolate(roles.lagging());
-		ScenarioSupport.await(Duration.ofMinutes(3),
-				() -> support.snapshotIndex(roles.purging()) > lagFrom + LAG_ENTRIES,
-				"the purging follower took no snapshot far enough past the lagging one");
-		var transfer = cluster.adminResult(List.of(roles.leader(), roles.purging()), "transfer-leader",
-				roles.purging());
-		assertTrue(transfer.exitCode() == 0, transfer.output());
-		ScenarioSupport.await(PHASE_TIMEOUT, () -> roles.purging().equals(support.leaderOrNull()),
-				"the purging follower did not take over");
-		workload.awaitMore(50, PHASE_TIMEOUT, "under the purging follower");
-		System.out.println("Lagging " + roles.lagging() + " from index " + lagFrom + "; leader now " + roles.purging()
-				+ " with its snapshot at " + support.snapshotIndex(roles.purging()));
+		// The test reaches the nodes directly, not through the cut links. Nothing reaches the lagging node any more.
+		long[] laggingLast = {-1};
+		ScenarioSupport.await(PHASE_TIMEOUT, () -> {
+			var info = support.groupInfos().get(roles.lagging());
+			laggingLast[0] = info == null ? -1 : info.getLogInfoProto().getLastEntry().getIndex();
+			return laggingLast[0] >= 0;
+		}, "the lagging node does not answer");
+		ScenarioSupport.await(Duration.ofMinutes(3), () -> logStart(cluster.dataDir(roles.leader())) > laggingLast[0] + 1,
+				"the leader did not purge its log past the lagging node's last entry " + laggingLast[0]);
+		assertTrue(roles.leader().equals(support.leaderOrNull()), "the leader changed while the lagging node was cut off");
+		System.out.println("Lagging " + roles.lagging() + " with its last entry at " + laggingLast[0] + "; leader "
+				+ roles.leader() + " has its log from " + logStart(cluster.dataDir(roles.leader()))
+				+ " and its snapshot at " + support.snapshotIndex(roles.leader()));
 		return roles;
+	}
+
+	/**
+	 * The first index of the node's Raft log, from the names of its segment files ({@code log_<start>-<end>},
+	 * {@code log_inprogress_<start>}), or -1 if there is none or the directory cannot be read.
+	 */
+	static long logStart(Path dataDir) {
+		try (Stream<Path> paths = Files.walk(dataDir.resolve("raft"), 4)) {
+			return paths.filter(path -> path.getParent() != null && path.getParent().getFileName() != null
+							&& path.getParent().getFileName().toString().equals("current"))
+					.map(path -> path.getFileName().toString())
+					.filter(name -> name.startsWith("log_"))
+					.mapToLong(name -> {
+						var rest = name.startsWith("log_inprogress_") ? name.substring("log_inprogress_".length())
+								: name.substring("log_".length());
+						int dash = rest.indexOf('-');
+						return Long.parseLong(dash < 0 ? rest : rest.substring(0, dash));
+					})
+					.min().orElse(-1);
+		} catch (IOException | java.io.UncheckedIOException | NumberFormatException e) {
+			return -1;
+		}
 	}
 
 	/** Where Ratis writes a snapshot it receives: {@code tmp/} of the state machine directory. */
