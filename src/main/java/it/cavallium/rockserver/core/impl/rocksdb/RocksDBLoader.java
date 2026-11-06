@@ -99,30 +99,48 @@ public class RocksDBLoader {
     }
 
     private static Path loadLibraryFromJarToTemp(final Path tmpDir) throws IOException {
-        var temp1 = tmpDir.resolve(bugJniLibraryFileName);
-        if (Files.exists(temp1)) {
-            return temp1;
+        var loader = RocksDB.class.getClassLoader();
+        var resource = loader.getResource(jniLibraryFileName);
+        if (resource != null) {
+            return extractLibrary(tmpDir, bugJniLibraryFileName, resource);
         }
-        try (InputStream is = RocksDB.class.getClassLoader().getResourceAsStream(jniLibraryFileName)) {
-            if (is != null) {
-                Files.copy(is, temp1, StandardCopyOption.REPLACE_EXISTING);
-                return temp1;
-            }
-        }
-
-        if (bugFallbackJniLibraryFileName == null) {
+        if (bugFallbackJniLibraryFileName == null || fallbackJniLibraryFileName == null) {
             throw new RuntimeException("rocksdb was not found inside JAR.");
         }
-
-        var temp2 = tmpDir.resolve(bugFallbackJniLibraryFileName);
-        try (InputStream is = RocksDB.class.getClassLoader().getResourceAsStream(fallbackJniLibraryFileName)) {
-            if (is != null) {
-                Files.copy(is, temp2, StandardCopyOption.REPLACE_EXISTING);
-                return temp2;
-            }
+        var fallback = loader.getResource(fallbackJniLibraryFileName);
+        if (fallback != null) {
+            return extractLibrary(tmpDir, bugFallbackJniLibraryFileName, fallback);
         }
-
         throw new RuntimeException("rocksdb was not found inside JAR.");
+    }
+
+    /**
+     * Extracts a native library into {@code dir} (already keyed by the RocksDB version hash) without ever exposing a
+     * partly written file: the bytes go to a temporary file in the same directory, which is then renamed into place
+     * atomically. Several processes starting at once each write their own temporary file; the last rename wins and
+     * replaces the directory entry only, so a process that already mapped the previous file keeps a valid inode (the
+     * old copy-with-REPLACE_EXISTING truncated a library another process had loaded). An existing file is reused when
+     * its size matches the resource's, which the jar's directory gives without reading or hashing the library; any
+     * other file (a crash mid-copy by an older version) is replaced.
+     */
+    @org.jetbrains.annotations.VisibleForTesting
+    public static Path extractLibrary(Path dir, String fileName, java.net.URL resource) throws IOException {
+        var target = dir.resolve(fileName);
+        var connection = resource.openConnection();
+        long expectedSize = connection.getContentLengthLong();
+        if (expectedSize >= 0 && Files.isRegularFile(target) && Files.size(target) == expectedSize) {
+            return target;
+        }
+        var temp = Files.createTempFile(dir, fileName + ".", ".tmp");
+        try {
+            try (InputStream is = connection.getInputStream()) {
+                Files.copy(is, temp, StandardCopyOption.REPLACE_EXISTING);
+            }
+            Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE);
+            return target;
+        } finally {
+            Files.deleteIfExists(temp);
+        }
     }
 
     public record LoadedDb(TransactionalDB db, @Nullable Path path, @NotNull Path definitiveDbPath,
