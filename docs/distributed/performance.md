@@ -243,8 +243,10 @@ Other results:
   6 connections, a small dataset, not a throughput measurement) the second of the kill had 289 errors and the
   11 s after the 4 s gap had 1 error in 58k requests, against a third of the requests with `--route all`.
 - **Bandwidth.** Sixteen clients writing 1 MiB `putMulti` calls: 183 MiB/s on one node, 103 MiB/s
-  replicated, where each device writes 280–390 MiB/s (Raft log, flushes and compactions). Not profiled: Yotsuba does
-  not bulk-ingest, and its one bulk copy is far below this rate (see "Known limits, decided" in the design document).
+  replicated, where each device writes 280–390 MiB/s (Raft log, flushes and compactions). Not profiled, and whether
+  Yotsuba's bulk writers (file-location migration, history and photo-recovery archive chunks, chat imports) come near
+  this rate is not measured: their call rates are known, their bytes per call are not (see "Known limits, decided"
+  in the design document).
 
 ## Deployment notes
 

@@ -121,7 +121,7 @@ forwards to a non-embedded connection:
 | `ReadBarrier`, `TermService` | Linearizable reads. `TermService` also answers what a node holds (`NodeState`), a follower's read index, and a node's latest configuration (for `RemovalCheck`). |
 | `FollowerReads` | A follower's read indexes from the leader, for the point reads it serves itself (off by default). |
 | `ClusterCheck` | A leader tells its followers which cluster it leads, and a node of another cluster stops. |
-| `PeerChannels` | The gRPC channels to other members' Raft ports: one cached channel per address, with a fresh connection attempt when it failed. Each node has one shared cache for `ReplicaOps` (checksum results, capabilities) and `LeaderForwarder`'s address lookups, pruned by the maintenance thread to the members, the peers being brought in and the peer list, and closed last when the node stops. `ReadBarrier` and `FollowerReads` keep one each: they close theirs to fail their requests in flight when they close, and the barrier prunes its own to the voters of each round. `ClusterCheck` (once per follower and term), `RemovalCheck` (at start) and the `admin` commands use a one-off channel per call. |
+| `PeerChannels` | The gRPC channels to other members' Raft ports: one cached channel per address, with a fresh connection attempt when it failed. Each node has one shared cache for `ReplicaOps` (checksum results, capabilities) and `LeaderForwarder`'s address lookups, pruned by the maintenance thread to the members, the peers being brought in and the peer list, and closed last when the node stops. `ReadBarrier` and `FollowerReads` keep one each: they close theirs to fail their requests in flight when they close, and the barrier prunes its own to the voters of each round. `ClusterCheck` (once per follower and term), `RemovalCheck` (at start) and the `admin` commands use a one-off channel per call, on purpose: `RemovalCheck` runs once before the node exists, keeps one channel per member across its retries and closes them when it decides, so a cache would hold nothing past it; `ClusterCheck` makes one call, and after a match one configuration comparison, per follower and term, a few channels per election, and it shuts its channel to a follower of another cluster, which on the shared cache would also cut that address's calls of `ReplicaOps`; the `admin` commands run in another process. The pruning (`ReplicatedNode.dropChannelsOfFormerMembers`, every 200 ms) keeps the current and previous configuration, the followers a leader replicates to besides it (a peer being added) and the addresses of `--peer`, and shuts down any other address: `PeerChannelsPruningTest`. An address that a caller of the shared cache takes from elsewhere would be rebuilt at every pruning, so its callers use only these addresses (`ReplicaOps.pollPeers`, `PeerConfig.raftAddress`). |
 | `ApiGate`, `CommitHeartbeats` | Whether a node serves its API, from whether it knows a leader; the leader sending its commit index to every follower at once instead of with its next heartbeat. |
 | `LeaderStall` | Tells a leader that cannot commit to step down. |
 | `NodeThreads` | The node's control-plane platform threads and the virtual threads of the leader's short local commands (see "Threads"). |
@@ -1770,8 +1770,11 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
      tested against local builds of it; Yotsuba's pom still pins 2.0.3), and deploy it.
    - Set `database.rockserver.nodes` in the deployed settings once the cluster exists.
    - Optional, not needed for correctness: the `createColumn` sites that retry only `UNAVAILABLE` could also retry an
-     unknown outcome (`createColumn` is idempotent); a failed no-change close is closed a second time by the cleanup,
-     which logs a rate-limited warning with `UPDATE_RETRY` and does nothing else.
+     unknown outcome (`createColumn` is idempotent). At `c73697eae` only `SentMessageSenderIndex` does; the
+     branch's working tree has uncommitted edits that move the other `createColumn` sites (`CommunitiesImpl`,
+     `FileLocationsImpl`, `ForumTopicsImpl` and others) to `ReactiveGuard.isRetryableIdempotentFailure`. Once those
+     are committed this bullet is done; check the branch before relying on it. A failed no-change close is closed a
+     second time by the cleanup, which logs a rate-limited warning with `UPDATE_RETRY` and does nothing else.
 
    On the Rockserver side, the core client's automatic gRPC retry of reads waits for its backoff before it sends a
    read to the next node: 50 ms, then growing, on a connection with several addresses (the next node is another one,
@@ -1785,8 +1788,13 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
      it only when sessions kept expiring until the deadline, never after a copy that may have applied, and then with
      the not-applied flag (`isNotApplied()`, the `rockserver-applied: no` trailer; also set when the refused copy was
      the only one sent, R4-1): safe to retry. `SERVER_OVERLOADED` and `READ_DEADLINE_EXCEEDED` from replicated writes
-     mean "not applied" and stay safe to retry. Yotsuba: `2cb001186` (its `ReactiveGuard` vetoes every retry of an
-     unknown outcome or a `MERGE_OPERATOR_FAILED`), `5e648b895` (reads the structured flag instead of the message).
+     mean "not applied" and stay safe to retry. Yotsuba: `2cb001186` (its `ReactiveGuard` keeps an unknown outcome or
+     a `MERGE_OPERATOR_FAILED` out of every generic retry classification; a call site whose operation is idempotent,
+     a put of a fixed value, a delete that does not return presence, a column creation or a read, opts back in with
+     `ReactiveGuard.isRetryableIdempotentFailure` and does retry an unknown outcome, never a
+     `MERGE_OPERATOR_FAILED`: at `c73697eae` that is `SentMessageSenderIndex`'s column setup, with more
+     `createColumn` sites pending, see item 1; an audit of double applies checks those sites, not only the guard),
+     `5e648b895` (reads the structured flag instead of the message).
    - A local timeout around a write must not be shorter than the write's client deadline: the client keeps resending
      a write its caller cancelled, so an outer retry after a shorter local timeout could apply the write twice.
      Yotsuba: `53d400ef4` sizes its local timeouts from the client's deadline.
@@ -1871,12 +1879,23 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
      `takeSnapshot` answers "no snapshot" (which Ratis passes over without an error or a purge) for 1 s, doubling with
      each failure in a row up to a minute; the snapshots by bytes wait for the same delay.
    - Bulk bandwidth is not profiled: 1 MiB `putMulti` calls reach 103 MiB/s replicated against 183 MiB/s on one
-     node (performance.md, "Bandwidth"). Kept for now: Yotsuba does not bulk-ingest. Its writes are small requests,
-     bound by requests per second and their latency, not bytes (see "Client concurrency" in performance.md); its one
-     bulk path, the `MessagesV2Migration` copy, writes through logical `putMulti` at the pace of its source scan, and
-     103 MiB/s is about 380 GB an hour, the 171 GB dataset in under half an hour. Before a bulk import or migration of the
-     multi-TB datasets, profile the path (`load-bench.sh --only BULK_PUT --jfr profile`): a replicated byte is
-     written to the Raft log of every node and sent to two followers, on top of the work of a single node.
+     node (performance.md, "Bandwidth"). Open, needs the user: whether Yotsuba's bulk writers come near this rate is
+     not measured. Its bulk writers on the `replicated-rockserver` branch are: the `FileLocationsImpl` migration of
+     the old column (pages of the old column, then one `putAsync` per entry with concurrency 1, keys only, empty
+     values: bound by one replicated write's latency, a few hundred small writes a second, far below the limit);
+     `putMultiAsync` of new file locations (keys only, one call per request batch); `HistoryArchive` chunk writes
+     (one `putMultiAsync` per observation batch, rows of up to 32 observations each) and `PhotoRecoveryArchive`
+     (one `putMultiAsync` of profile-photo observations), both paced by the observations coming in; and the dump
+     plugin's import of exported chats, which goes message by message through the messages layer (a read and an
+     update per message), not through a bulk call. None of them writes at the pace of a source scan with large
+     values. Production (the single-node Rockserver, `rocksdb_operation_timer`, 7 days to 2026-11-06) peaks at
+     about 6,000 `Put` and 5,300 `PutMulti` calls a second (1-minute rates); the byte counters have no recent data,
+     so the bytes per call are not known. At those call rates the 103 MiB/s limit is reached only if the calls
+     average about 9 KiB, which keys-only file locations do not and history chunks could only with large rows. To
+     close it: measure the bytes of `PutMulti` in production (or of `HistoryArchive` rows) and compare with
+     103 MiB/s; before a bulk import or migration of the multi-TB datasets, profile the path
+     (`load-bench.sh --only BULK_PUT --jfr profile`): a replicated byte is written to the Raft log of every node and
+     sent to two followers, on top of the work of a single node.
    - Iterator calls after a leader change get `UPDATE_RETRY` (see "Leader changes").
    - The snapshot taken right after a seeded genesis is attempted once, on the leader only.
    - A SIGTERM that races a replica failure exits with 3: the shutdown hook closes the node, then waits until it

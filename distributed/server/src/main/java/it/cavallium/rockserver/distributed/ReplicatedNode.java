@@ -531,10 +531,18 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * the members of the configuration, the peers the leader is bringing in, and this node's peer list stay.
 	 */
 	private void dropChannelsOfFormerMembers(RaftServer.Division division) {
-		if (peerChannels.size() == 0) {
+		dropChannelsOfFormerMembers(peerChannels, division, config);
+	}
+
+	/**
+	 * Shuts down the channels of {@code channels} to addresses that are no longer a member's ({@link #memberAddresses}):
+	 * the address of a removed member, or the old address of a member that moved.
+	 */
+	static void dropChannelsOfFormerMembers(PeerChannels channels, RaftServer.Division division, NodeConfig config) {
+		if (channels.size() == 0) {
 			return;
 		}
-		peerChannels.retainOnly(memberAddresses(division, config));
+		channels.retainOnly(memberAddresses(division, config));
 	}
 
 	/** The Raft addresses that {@link #peerChannels} keeps channels to. */

@@ -18,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -74,10 +75,28 @@ class ClusterOpsTest {
 		for (var node : cluster.runningNodes()) {
 			var result = node.stateMachine().ops().checksumResult(checksumIndex);
 			assertEquals(500, result.keys());
-			assertTrue(node.stateMachine().ops().checksumResults().contains(result), node.config().nodeId());
 			digests.add(result.detail());
 		}
 		assertEquals(1, digests.size(), "digests " + digests);
+		// A second checksum after one more write: every replica lists exactly both, in log order, with its own results.
+		api.put(0, column, key(500), value("v500"), RequestType.none());
+		long secondIndex = (Long) leader.proposer().propose(new LogEntry.Checksum()).get(20, TimeUnit.SECONDS);
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node ->
+				node.stateMachine().ops().checksumResult(secondIndex).state() == ReplicaOps.State.DONE));
+		var listedDigests = new HashSet<List<String>>();
+		for (var node : cluster.runningNodes()) {
+			var ops = node.stateMachine().ops();
+			var listed = ops.checksumResults();
+			assertEquals(List.of(checksumIndex, secondIndex), listed.stream().map(ReplicaOps.Result::index).toList(),
+					node.config().nodeId());
+			assertEquals(List.of(ops.checksumResult(checksumIndex), ops.checksumResult(secondIndex)), listed,
+					node.config().nodeId());
+			assertEquals(List.of(500L, 501L), listed.stream().map(ReplicaOps.Result::keys).toList(), node.config().nodeId());
+			listedDigests.add(listed.stream().map(ReplicaOps.Result::detail).toList());
+		}
+		assertEquals(1, listedDigests.size(), "listed digests " + listedDigests);
+		assertTrue(!listedDigests.iterator().next().get(0).equals(listedDigests.iterator().next().get(1)),
+				"the second digest covers one more key");
 		// Every replica compared with the others and found them equal.
 		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node ->
 				node.metrics().amount("checksum.matches").count() >= 1));
