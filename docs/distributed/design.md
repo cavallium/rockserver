@@ -1071,8 +1071,9 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
      A refused node stays a member until then, so it still counts in the size of the majority.
   3. Otherwise, restore a copy of the whole cluster: every node's complete data directory, from one moment, under
      the same ids. The writes since then are lost. Restoring only some nodes from an older copy is the fault this
-     section is about, losing fsynced entries and votes. Nothing takes such copies today: they have to come from the
-     storage layer (see "Left before a first deployment").
+     section is about, losing fsynced entries and votes. Such copies have to come from the storage layer. A `Backup`
+     entry gives the other kind: a copy of the data, the same on every node, from which a new cluster starts (see
+     "Checksums and backups", and the runbook in [runbooks.md](runbooks.md)).
   4. Without a copy, each replica's `data/db` still holds its last flushed state, which a plain Rockserver can open.
      It cannot seed a new cluster as it is, since it belongs to the old cluster and a node without Raft state refuses
      it, so its keys would have to be exported into a new database that seeds one ("Migrating from a single node").
@@ -1139,6 +1140,104 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   `stepping down`, and the metric `leader.log.stepdowns` counts. It does nothing on a leader with nothing to flush, and
   it cannot help once the queue is full under a heavy load, which blocks the server lock: then the heartbeats stop
   anyway, within seconds at that load. The node stays up with its hung disk, as a follower that does not answer.
+
+## Cluster version
+
+Some features write log entries, or entry flags, that an older node cannot read: it would stop on the first one, and a
+majority of such nodes would stop the cluster. So the cluster has a version (`Capabilities`): the capabilities that
+every member supports, kept in the meta column of every replica. A leader asks every member of its configuration what it
+supports (the `Ops` call of `TermService`, on the Raft port), every 10 s while the cluster lacks something that this
+version supports, and proposes a `ClusterVersion` entry once all of them answered with more; a member that does not
+answer, or that predates the question, holds the version where it is. Replicas apply it as a union, so it never goes
+down. A cluster created by this version starts with everything this version supports (its `Genesis` writes it): every
+node of a new cluster must run the same version. A cluster created before has no version until its leader raises it.
+
+What waits for it:
+
+- `--pipelined-updates`: a leader chains updates only when the cluster version has them at the start of its term, or
+  when it starts the term that creates the cluster (its genesis brings this node's version). One raised during a term
+  takes effect at the next term; a node with the option logs a warning at each term without it.
+- Client sessions: a node advertises them to its clients (`RockserverCapabilities.clientSessions`) only when the cluster
+  version has them, or before genesis. A client reads that when it connects, so one connected before stays without
+  sessions until it reconnects.
+- Checksums and backups (next section): refused until the version has them.
+- `admin add-peer` refuses a node that lacks a capability of the cluster. A member must not be downgraded below it.
+
+Rejected: a check of the members' versions at each use instead of a version in the log. A node restarted during an
+upgrade would not know whether it may serve sessions until a leader asked everyone again, and pipelining would turn on
+and off with members coming and going; the log gives every replica the same answer at the same entry, also after a
+restart. The upgrade procedure is in [runbooks.md](runbooks.md).
+
+## Checksums and backups
+
+Two entries act outside the database at one log position on every replica (`ReplicaOps`). Both are applied alone, and
+their result is the entry's log index on every replica, whatever happened locally: a local failure is logged and
+reported, and stops nothing.
+
+- **`Checksum`** (DD-32). Each replica opens a database transaction with a snapshot at that position, which takes no
+  time on the apply thread, and lists its user columns. A thread of its own then reads every key and value of those
+  columns at the snapshot, in key order, and digests them: SHA-256 over each column's name and entries, columns in name
+  order, each key part and value with its length. Equal histories give equal digests, whatever the files and
+  compactions of each replica. The meta column is left out: it holds things that are local by design (results purged
+  at a start). Each replica then asks the others for their digest of that position every 10 s, until each one answered,
+  skipped it (a snapshot install jumped over it, or it restarted while digesting: results are kept in
+  `<data-dir>/replica-ops.log`) or for 24 hours. A difference is logged on every replica that sees it as
+  `REPLICAS DIVERGED` and counted in `checksum.mismatches`, with an alert. This is what finds a merge operator that is
+  not deterministic, which nothing else detects. A check reads the whole database on every node at once and holds a
+  snapshot meanwhile, which keeps the files that compactions replace: it runs when asked (`admin checksum`) or every N
+  hours with `-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` (off by default).
+- **`Backup`** (RA-7.2, DD-6f). Each replica writes a checkpoint of its database (`NodeStore.checkpoint`, as for a
+  snapshot: a memtable flush and hard links, 100–300 ms during which its apply waits) to `<data-dir>/backups/<name>/db`,
+  with `backup.properties` (log index, cluster, node, time). All of them hold the data of every entry before the backup
+  entry: a consistent copy of the whole cluster, on every node. The same entry applied again after a crash finds its
+  backup and changes nothing. `restore-backup` prepares an empty data directory from a copy: it restores the
+  checkpoint and deletes the meta column, so the database belongs to no cluster, and every node of a new cluster is
+  prepared from the same backup and started as a seeded cluster (see "Migrating from a single node"). Client sessions
+  go with the meta column: clients open new ones. Restoring under the old cluster's ids and Raft state was rejected:
+  each node's Raft log and vote are local and not taken at the backup's position, and an older log with a newer vote,
+  or the reverse, is the fault that "No quorum" describes. A new cluster has neither problem.
+
+## Metrics and alerts
+
+`NodeMetrics` exports its series and gauges into the registry of the node's database, the core server's metrics
+pipeline (JMX, and InfluxDB with `database.metrics.influx`): every series as `rockserver.replication.duration` (a
+function timer) or `rockserver.replication.count` and `.amount` (function counters), tagged `name`, `node` and `kind`;
+every gauge as `rockserver.replication.<name>`. The values are cumulative; the log line keeps its own interval sums. A
+snapshot install opens a new database, with a new registry, and the meters move to it. Every meter of a replica's
+database, the core ones included, also gets the tag `node`: a replica sets `database.metrics.node-name` to its node id
+unless the config sets it, since the nodes of a cluster share one config and would otherwise write the same series.
+
+`NodeMonitor` reads, once per second on the maintenance thread, what the alerts watch: `raft.role` (2 leader, 1
+candidate, 0 follower, -1 unknown), `raft.term`, `raft.last_index`, `raft.commit_index`, `raft.applied_index`,
+`raft.flush_index`, `raft.start_index`, the lags between them (`raft.commit_lag`, `raft.apply_lag`, `raft.flush_lag`),
+on the leader `raft.follower_lag` per follower (tag `follower`, from the commit index the leader knows of it) and
+`raft.follower_lag_max`, `raft.log.bytes` and `raft.log.entries` (DD-22), `snapshot.index` and `snapshot.age_seconds`,
+`disk.data.*` and `disk.raft.*` (usable and total bytes, usable percent) and `replica.failed`; and from `ReplicaOps`,
+`cluster.version` and the last checksum matched or mismatched. The metrics thread only reads fields. The node also logs
+the alarms it can tell by itself, once when they start, every minute while they last and once when they end: less than
+10% free on either disk, a Raft log above 4 snapshots' worth of `--snapshot-every-bytes` (a member gone for good holds
+it back), and RocksDB stopping or delaying writes (the core server's `rockserver.workload.storage.pressure.reason`
+gauges). The alert rules are [alerts/grafana-alert-rules.yaml](alerts/grafana-alert-rules.yaml), with what each means
+and what to do in [runbooks.md](runbooks.md). A replica failure ends the process with exit code 3, so the alert for it is
+a node that stops reporting.
+
+**Reading `rocksdb.operation.timer` on a cluster** (DD-6c). It times calls into the local database: on every node the
+apply of replicated writes (as `Put`, `PutMulti`, ..., with the internal record, floor and position puts, and one
+`CloseTransaction` per applied group), and on the leader (or a follower serving a follower read) the reads, staged
+transactional writes, opens and rollbacks of clients, with their database time only. Group it by `node` and keep the
+apply apart by its actions, or read the replication timers instead, whose `kind` tag says `apply` (the apply of
+committed entries and snapshots, on every node), `raft` (lags and step downs) or `client` (the work of client requests:
+queues, Raft round trips, read barriers, forwarding, local commands). Rejected: tagging the core timer itself by role and
+by apply or client. Each of its 22 recording sites would have to learn which caller it serves, through a thread-local
+read on every database call of the hot path, in the core module that is shared with the single-node server; and a role
+tag on a cumulative timer would split one series at every leader change. The node tag and the replication timers give
+the same answers without touching the core's calls.
+
+**Sampling of Raft positions** (CR-11). The lag series of the log line (`lag.uncommitted`, `lag.unapplied`,
+`lag.unflushed`) were sampled every millisecond on every node, always. They are now sampled every 10 ms, set by
+`-Dit.cavallium.rockserver.distributed.metrics.lag-sample-ms` (0 turns them off): the alerts read the gauges above, and
+the samples only add averages and maxima to the log line, which 100 samples per second give as well. The overhead of
+either rate under load is not measured (it needs a LoadBench run).
 
 ## Threads
 
@@ -1241,6 +1340,8 @@ failover" below).
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories, with read-modify-write updates and hot counters in them, are linearizable, and the transactional bank-transfer invariant holds. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
+| `ClusterOpsTest` (in-process) | A cluster created by this version has the full cluster version, and advertises sessions. A checksum proposed through a follower gives the same digest and key count on every replica, and every replica finds the others equal; the Raft port answers it. A backup asked through the Raft port is written by every replica at the same log index; restored with `restore-backup` into a new seeded cluster, it holds every key written before it and none written after. The monitor's gauges (one leader, a Raft log with bytes) and the replication timers reach each node's database registry, and the core meters carry the node tag. |
+| `ReplicaOpsTest` | The new entries round-trip and are applied alone; backup names; the wire form of results; capability names; digests that tell key parts and values apart; series and gauges exported cumulative, with their kind, and moved to a new registry; the lag sampling period; Raft log bytes counted from segment files only; the alarm's start, repeat and end. |
 | Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
 
 Run them all (about 20 minutes on a real disk):
@@ -1267,8 +1368,8 @@ flag on, that an update chained after each fault, and with the flag off that non
 0. **Pipelined updates** stay off until the benchmark on hot keys (see [performance.md](performance.md)) and a full
    review of the Yotsuba call sites: a chained value must not be acted on before the update ended well, and
    `UPDATE_RETRY` from a no-change close must be retried. Watch `update.guardRejected`, `update.chainConflict`,
-   `transaction.conflict` and `transaction.chainConflict`. Every node must run a version with the flags of `Guarded`
-   entries before any node turns the option on: an older one would fail on the entries of a pipelined leader. With the
+   `transaction.conflict` and `transaction.chainConflict`. A leader chains only once the cluster version has pipelined
+   updates (see "Cluster version"): an older node would fail on the entries of a pipelined leader. With the
    option off, entries keep the bytes they always had, and logs written before these flags stay readable.
 1. **Client side.**
    - Yotsuba does not compile against this version as is: CDC was removed from the client API, and
@@ -1289,8 +1390,8 @@ flag on, that an update chained after each fault, and with the flag off that non
    - It must build its connection with every node (item 1): a single address has nowhere to resend to while its
      node is down, so its writes end with `OUTCOME_UNKNOWN` at their deadline.
    - Every node must run this version before clients use sessions: an older node cannot read a version 3 batch,
-     a stamp or a `RegisterClient` entry. Start the clients after the upgrade, or with
-     `-Dit.cavallium.rockserver.grpc.client.session-writes=false` until it is done.
+     a stamp or a `RegisterClient` entry. The cluster version enforces it from this version on (see "Cluster
+     version"): restart the clients once the upgrade is done, since they read it when they connect.
    - Not done: writes staged in a transaction are not numbered (a resent `merge` in a transaction could stage it
      twice); a caller that cancels its future does not stop the resends; the rust client has the proto fields,
      `open_client_session` and `RequestContext::with_request_id`, but numbers and resends nothing by itself.
@@ -1314,15 +1415,10 @@ flag on, that an update chained after each fault, and with the flag off that non
    - Start nodes with `-Djava.io.tmpdir` on a directory of the node. RocksDB's Java binding extracts its 17 MB
      native library there at every start, and a killed JVM leaves it behind. On a test machine 2,099 such files
      filled a `/tmp` quota, and new nodes then could not start.
-   - Metrics and alerts: role, term, commit and apply lag, snapshot age, follower lag, replica failure exit.
-     Today the replication timers (`NodeMetrics`) are only logged. The existing `rocksdb_operation_timer`
-     changes meaning on a cluster: replicated writes are counted on every node when applied (with the internal
-     result, floor and position puts and one `closeTransaction` per applied group), and reads, staged
-     transactional writes, opens, rollbacks and ranges only on the leader, with their local database time only.
-   - A seeding runbook (copy the single-node database to all nodes before the first start).
-   - A node replacement runbook.
-   - Consistent copies of the whole cluster, and a runbook to restore them: with no quorum (see Membership) they
-     are the only way back that keeps a cluster.
+   - Load [alerts/grafana-alert-rules.yaml](alerts/grafana-alert-rules.yaml) and set its placeholders, and follow
+     [runbooks.md](runbooks.md): seeding, node replacement, backups and restore, checksums, upgrades (see "Metrics and
+     alerts" and "Checksums and backups"). Test a restore of a backup once on the production data, and time a checksum
+     there before running one periodically.
    - Placement on separate hosts, each node's data directory on one file system (see Disk layout).
    - The same Rockserver config file on every node.
 7. **Known limits to decide on.**

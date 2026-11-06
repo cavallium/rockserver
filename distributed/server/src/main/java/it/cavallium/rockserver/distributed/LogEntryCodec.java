@@ -58,6 +58,10 @@ final class LogEntryCodec {
 	private static final byte GENESIS = 13;
 	private static final byte VERIFY_COLUMN = 14;
 	private static final byte REGISTER_CLIENT = 15;
+	// Far from the codes above, so that other new entry kinds can take the next ones.
+	private static final byte CLUSTER_VERSION = 40;
+	private static final byte CHECKSUM = 41;
+	private static final byte BACKUP = 42;
 
 	/** Flags of a {@link LogEntry.Guarded}: {@link LogEntry.Guarded#singleResult()}. */
 	private static final int GUARDED_SINGLE_RESULT = 1;
@@ -438,6 +442,15 @@ final class LogEntryCodec {
 				out.writeByte(REGISTER_CLIENT);
 				out.writeLong(timeoutMillis);
 			}
+			case LogEntry.ClusterVersion(long capabilities) -> {
+				out.writeByte(CLUSTER_VERSION);
+				out.writeLong(capabilities);
+			}
+			case LogEntry.Checksum() -> out.writeByte(CHECKSUM);
+			case LogEntry.Backup(String name) -> {
+				out.writeByte(BACKUP);
+				writeString(out, name);
+			}
 		}
 		return entry;
 	}
@@ -610,6 +623,9 @@ final class LogEntryCodec {
 			case LogEntry.VerifyColumn(String name, long _) -> 1 + stringSize(name) + Long.BYTES;
 			case LogEntry.Genesis(String clusterId, boolean _) -> 1 + stringSize(clusterId) + 1;
 			case LogEntry.RegisterClient _ -> 1 + Long.BYTES;
+			case LogEntry.ClusterVersion _ -> 1 + Long.BYTES;
+			case LogEntry.Checksum _ -> 1;
+			case LogEntry.Backup(String name) -> 1 + stringSize(name);
 		};
 	}
 
@@ -777,6 +793,9 @@ final class LogEntryCodec {
 			case GENESIS -> new LogEntry.Genesis(in.readString(), in.readBoolean());
 			case VERIFY_COLUMN -> new LogEntry.VerifyColumn(in.readString(), in.readLong());
 			case REGISTER_CLIENT -> new LogEntry.RegisterClient(in.readLong());
+			case CLUSTER_VERSION -> new LogEntry.ClusterVersion(in.readLong());
+			case CHECKSUM -> new LogEntry.Checksum();
+			case BACKUP -> new LogEntry.Backup(in.readString());
 			default -> readWrite(in, tag);
 		};
 	}

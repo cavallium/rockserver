@@ -100,6 +100,8 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final AtomicLong snapshotCalls = new AtomicLong();
 	private final CompletableFuture<@Nullable Throwable> stopped = new CompletableFuture<>();
 	private final NodeMetrics metrics;
+	/** The gauges and alarms of this node; only refreshed on the maintenance thread. */
+	private NodeMonitor monitor;
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
 		this.config = config;
@@ -119,7 +121,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		var parameters = new Parameters();
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
 		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress,
-				this::nodeState, this::readIndex));
+				this::nodeState, this::readIndex, this::answerOps));
 		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
 		if (!existing) {
 			requireNoClusterData(config);
@@ -158,6 +160,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			this.proposer = new Proposer(group, RaftSettings.client(config), config, this::raftServer, metrics,
 					threads.control());
 			started.add(proposer);
+			stateMachine.ops().proposer(proposer);
 			this.forwarder = new LeaderForwarder(config);
 			started.add(forwarder);
 			stateMachine.onLeaderChange(forwarder::leaderChanged);
@@ -179,6 +182,9 @@ public final class ReplicatedNode implements AutoCloseable {
 					TimeUnit.MILLISECONDS);
 			maintenance.scheduleWithFixedDelay(this::watchRaft, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
+			this.monitor = new NodeMonitor(config, stateMachine::division, stateMachine,
+					config.raftDir().resolve(groupId.getUuid().toString()).resolve("current"), metrics);
+			maintenance.scheduleWithFixedDelay(this::refreshMonitor, 0, NodeMonitor.REFRESH_MILLIS, TimeUnit.MILLISECONDS);
 			var appendLag = metrics.amount("lag.uncommitted");
 			var applyLag = metrics.amount("lag.unapplied");
 			var flushLag = metrics.amount("lag.unflushed");
@@ -245,6 +251,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			if (division != null) {
 				takeSeedSnapshot(division);
 				checkFollowers(division);
+				stateMachine.ops().onLeader(division, group.getGroupId());
 			}
 		} catch (Exception ex) {
 			LOG.warn("{}: cluster initialization attempt failed, retrying", config.nodeId(), ex);
@@ -309,6 +316,30 @@ public final class ReplicatedNode implements AutoCloseable {
 	/** Tests only. */
 	ReadBarrier readBarrier() {
 		return barrier;
+	}
+
+	/** Answers {@link TermService#OPS}: see {@link ReplicaOps#answer}. */
+	private CompletableFuture<byte[]> answerOps(RaftGroupId requested, byte[] request) {
+		if (!requested.equals(group.getGroupId())) {
+			return CompletableFuture.failedFuture(org.apache.ratis.thirdparty.io.grpc.Status.NOT_FOUND
+					.withDescription("No group " + requested).asRuntimeException());
+		}
+		return stateMachine.ops().answer(request);
+	}
+
+	private void refreshMonitor() {
+		try {
+			if (!closed.get()) {
+				monitor.refresh();
+			}
+		} catch (RuntimeException ex) {
+			LOG.debug("{}: failed to refresh the monitor", config.nodeId(), ex);
+		}
+	}
+
+	/** This node's gauges and alarms, for tests. */
+	NodeMonitor monitor() {
+		return monitor;
 	}
 
 	/** Answers a follower's {@link TermService#READ_INDEX}: see {@link ReadBarrier#readIndex()}. */

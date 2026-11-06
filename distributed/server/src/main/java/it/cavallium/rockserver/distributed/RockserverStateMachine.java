@@ -223,7 +223,32 @@ final class RockserverStateMachine extends BaseStateMachine {
 		this.applyLanes = config.parallelApplyThreads() >= 2
 				? new ApplyLanes(config.nodeId(), config.parallelApplyThreads()) : null;
 		this.applyThread = Thread.ofPlatform().name(config.nodeId() + "-apply").daemon().unstarted(this::applyLoop);
+		this.ops = new ReplicaOps(config, this, metrics);
 		applyThread.start();
+	}
+
+	/** Cluster version, checksums and backups: see {@link ReplicaOps}. */
+	private final ReplicaOps ops;
+
+	ReplicaOps ops() {
+		return ops;
+	}
+
+	RaftGroupId groupId() {
+		return groupId;
+	}
+
+	/** When the latest snapshot was taken or installed, from its files; 0 if unknown. */
+	long latestSnapshotTimeMillis() {
+		var dir = storage.latestSnapshotDir();
+		if (dir == null) {
+			return 0;
+		}
+		try {
+			return java.nio.file.Files.getLastModifiedTime(dir).toMillis();
+		} catch (IOException | RuntimeException ex) {
+			return 0;
+		}
 	}
 
 	/** Threads of the partitioned apply ({@link NodeConfig#parallelApplyThreads()}), or null for the serial apply. */
@@ -279,6 +304,9 @@ final class RockserverStateMachine extends BaseStateMachine {
 		raiseVisibleTerm(position.getTerm());
 		this.store = opened;
 		this.applier = new Applier(opened, metrics, applyLanes);
+		applier.maintenance(ops);
+		ops.opened(opened);
+		metrics.bind(opened.db().getMetricsRegistry());
 		setLastAppliedTermIndex(position);
 		applied.advance(Math.max(applied.get(), position.getIndex()));
 		LOG.info("{}: database open, applied position {}", config.nodeId(), position);
@@ -350,7 +378,16 @@ final class RockserverStateMachine extends BaseStateMachine {
 				return null;
 			}
 			replaced = current;
-			created = new LeaderSession(term, applied, new ConflictTracker(), config.pipelinedUpdates(), metrics);
+			// Only once every member can read the entries of a pipelined leader (see Capabilities). A cluster version
+			// raised during the term takes effect at the next term. Before genesis this leader creates the cluster, whose
+			// genesis gives it the version of this node.
+			boolean pipelined = config.pipelinedUpdates() && (ops.clusterHas(Capabilities.PIPELINED_UPDATES)
+					|| (store.clusterId() == null && Capabilities.has(Capabilities.GENESIS, Capabilities.PIPELINED_UPDATES)));
+			if (config.pipelinedUpdates() && !pipelined) {
+				LOG.warn("{}: --pipelined-updates is on, but not every member supports it yet (cluster version {}): term {}"
+						+ " runs without it", config.nodeId(), Capabilities.describe(ops.clusterVersion()), term);
+			}
+			created = new LeaderSession(term, applied, new ConflictTracker(), pipelined, metrics);
 			// The session tracks writes from this term on: a transaction whose snapshot misses an earlier leader's
 			// entries would not see them conflict. Reads wait for those entries (see leaderReadyIndex); this makes
 			// sure no commit validates against such a snapshot anyway.
@@ -1099,6 +1136,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	@Override
 	public void close() throws IOException {
+		ops.close();
 		// Offers whose answers never come, if any: nothing will take them now.
 		localProposals.clear();
 		// Ratis waited for every reply it handed over; stop the apply thread before closing the database.

@@ -1,0 +1,378 @@
+# Grafana alert rules for a replicated Rockserver cluster (Grafana unified alerting, file provisioning format).
+#
+# The nodes export their metrics through the core server's pipeline (database.metrics.influx in the Rockserver config):
+# see "Metrics and alerts" in design.md for every meter. Before loading this file:
+#   - replace CLUSTER with the cluster's database.metrics.database-name (every node uses the same config);
+#   - replace INFLUX_UID with the uid of the InfluxQL data source that receives the metrics;
+#   - set the threshold of rockserver-node-missing to the number of members;
+#   - set folder and the notification policy (labels: severity = critical | warning, team = rockserver).
+# Thresholds are starting points for a 3-node cluster with the default --snapshot-every-bytes (4 GiB).
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: rockserver-cluster
+    folder: Rockserver
+    interval: 1m
+    rules:
+      - uid: rockserver-no-leader
+        title: No Raft leader
+        condition: C
+        for: 1m
+        noDataState: Alerting
+        execErrState: Error
+        labels: {severity: critical, team: rockserver}
+        annotations:
+          summary: "No node reported the leader role (2) for a minute: writes stop. See design.md, \"No quorum\", and runbooks.md."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT max("role") FROM (SELECT last("value") AS "role" FROM "rockserver_replication_raft_role" WHERE "database-name" = 'CLUSTER' AND time > now() - 2m GROUP BY "node")
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: lt, params: [2]}}]}
+      - uid: rockserver-node-missing
+        title: A node stopped reporting
+        condition: C
+        for: 2m
+        noDataState: Alerting
+        execErrState: Error
+        labels: {severity: critical, team: rockserver}
+        annotations:
+          summary: "Fewer nodes report than the cluster has (set the threshold to the cluster size). A replica that fails exits with code 3: check its supervisor and log."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT count("role") FROM (SELECT last("value") AS "role" FROM "rockserver_replication_raft_role" WHERE "database-name" = 'CLUSTER' AND time > now() - 2m GROUP BY "node")
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: lt, params: [3]}}]}
+      - uid: rockserver-replica-failed
+        title: A replica failed
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical, team: rockserver}
+        annotations:
+          summary: "The replica could not apply the log and stops (exit code 3). Its log says why."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_replica_failed" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [0]}}]}
+      - uid: rockserver-term-churn
+        title: Raft terms change often
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "More than 5 elections in 15 minutes: flapping links, long pauses or a stalled leader (leader.stall.stepdowns)."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT spread("value") FROM "rockserver_replication_raft_term" WHERE "database-name" = 'CLUSTER' AND time > now() - 15m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [5]}}]}
+      - uid: rockserver-apply-lag
+        title: Apply far behind commit
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "Committed entries wait to be applied on this node: a slow disk, a write stall, or a stuck apply."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_raft_apply_lag" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [50000]}}]}
+      - uid: rockserver-commit-lag
+        title: Leader's entries not committed
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "The leader appended entries that a majority has not confirmed: slow followers or links."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_raft_commit_lag" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [10000]}}]}
+      - uid: rockserver-follower-lag
+        title: Follower far behind
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "A follower is far behind the leader's commit index; if it stays behind it will need a snapshot install."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_raft_follower_lag" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node", "follower"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [100000]}}]}
+      - uid: rockserver-raft-log-size
+        title: Raft log too large
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "Over 16 GiB of Raft log (4 snapshots' worth at the default --snapshot-every-bytes). A member that is gone for good holds the log back: runbooks.md, \"Raft log grows\"."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_raft_log_bytes" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [17179869184]}}]}
+      - uid: rockserver-disk-low
+        title: Disk space low
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical, team: rockserver}
+        annotations:
+          summary: "Less than 10% free on the disk of the database or of the Raft log. A snapshot keeps the files that compactions replaced, and a full disk stops writes: runbooks.md, \"Disk space\"."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM /^rockserver_replication_disk_(data|raft)_usable_percent$/ WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: lt, params: [10]}}]}
+      - uid: rockserver-write-stopped
+        title: RocksDB stopped writes
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical, team: rockserver}
+        annotations:
+          summary: "A write stall on this node: its apply waits, and the cluster's writes too if a majority stalls."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_workload_storage_pressure_reason" WHERE "database-name" = 'CLUSTER' AND "reason" = 'write_stopped' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [0]}}]}
+      - uid: rockserver-write-delayed
+        title: RocksDB delays writes
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "Compactions are behind on this node for 15 minutes."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_workload_storage_pressure_reason" WHERE "database-name" = 'CLUSTER' AND "reason" = 'delayed_write' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [0]}}]}
+      - uid: rockserver-checksum-mismatch
+        title: Replicas diverged
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical, team: rockserver}
+        annotations:
+          summary: "A cross-replica checksum differs: the replicas hold different data. Stop writing and keep every data directory: runbooks.md, \"Checksums\"."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT sum("value") FROM "rockserver_replication_count" WHERE "database-name" = 'CLUSTER' AND "name" = 'checksum.mismatches' AND time > now() - 1h GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [0]}}]}
+      - uid: rockserver-leader-stall
+        title: Leader stepped down to restart replication
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "LeaderStall made a leader step down (a lost reply, or a Raft log that stopped flushing: a hung disk). See design.md, \"A leader whose log stops\"."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT sum("value") FROM "rockserver_replication_count" WHERE "database-name" = 'CLUSTER' AND "name" =~ /^leader\.(stall|log)\.stepdowns$/ AND time > now() - 30m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [0]}}]}
+      - uid: rockserver-snapshot-old
+        title: No snapshot for a day with a large log
+        condition: C
+        for: 30m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "No snapshot for 24 hours while the Raft log holds more than 8 GiB: snapshots fail (see the node's log, and the disk space), so the log is not purged and a new member cannot catch up."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_snapshot_age_seconds" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: D
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: D
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_raft_log_bytes" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: E
+            datasourceUid: __expr__
+            model: {refId: E, type: reduce, expression: D, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: math, expression: "$B > 86400 && $E > 8589934592"}

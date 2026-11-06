@@ -34,9 +34,16 @@ import org.jetbrains.annotations.Nullable;
  *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
  *       [--jvm-pause-limit-ms N] [--snapshot-every-bytes N] [--parallel-apply-threads N]
  * admin --peer ... [--group-id UUID] [--timeout-ms N]
- *       status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
+ *       status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID | checksum | backup NAME
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
+ * restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]
  * </pre>
+ *
+ * <p>{@code checksum} has every replica digest its data at one log position and compares the digests; it prints each
+ * member's and exits with 1 if they differ. {@code backup NAME} has every replica write a checkpoint of its database at
+ * one log position to {@code <data-dir>/backups/NAME}; it prints where each member wrote it, and exits with 1 if a
+ * member failed. {@code restore-backup} prepares an empty data directory to seed a new cluster from such a backup. See
+ * {@link ReplicaOps} and {@code docs/distributed/runbooks.md}.</p>
  *
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
  * (leadership hand-off) on SIGTERM. For {@code add-peer} the new member must already run, with the new peer list and
@@ -94,6 +101,7 @@ public final class ReplicatedServerMain {
 			case "run" -> run(new Options(rest));
 			case "admin" -> admin(new Options(rest));
 			case "repair-log" -> repairLog(new Options(rest));
+			case "restore-backup" -> restoreBackup(new Options(rest));
 			default -> usage("unknown command " + args[0]);
 		}
 	}
@@ -198,6 +206,7 @@ public final class ReplicatedServerMain {
 				case "add-peer" -> {
 					var added = PeerConfig.parse(arg(command));
 					requireFitToJoin(added, peers, groupId, deadline);
+					requireCapabilities(added, peers, groupId);
 					var members = new ArrayList<>(peers.stream().map(ReplicatedServerMain::raftPeer).toList());
 					members.removeIf(p -> p.getId().toString().equals(added.id()));
 					members.add(raftPeer(added));
@@ -214,6 +223,38 @@ public final class ReplicatedServerMain {
 					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(arg(command)));
 					yield attempt(timeout, () -> api.create(timeout.toMillis()));
 				}
+				case "checksum" -> {
+					if (command.size() != 1) {
+						usage("checksum takes no argument");
+					}
+					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0], deadline);
+					System.out.println("checksum at log index " + index);
+					var results = awaitResults(peers, groupId, ReplicaOps.OP_CHECKSUM_RESULT,
+							java.nio.ByteBuffer.allocate(Long.BYTES).putLong(index).array(), deadline);
+					var digests = results.values().stream().filter(r -> r.state() == ReplicaOps.State.DONE)
+							.map(r -> r.detail() + "/" + r.keys()).distinct().count();
+					if (digests > 1) {
+						fail("the replicas hold different data at log index " + index + ": see the lines above, and"
+								+ " \"Checksums\" in docs/distributed/runbooks.md");
+					}
+					System.out.println("OK");
+					yield null;
+				}
+				case "backup" -> {
+					var name = arg(command);
+					if (!ReplicaOps.validBackupName(name)) {
+						usage("invalid backup name " + name);
+					}
+					var payload = name.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_BACKUP, payload, deadline);
+					System.out.println("backup " + name + " at log index " + index);
+					var results = awaitResults(peers, groupId, ReplicaOps.OP_BACKUP_RESULT, payload, deadline);
+					if (results.values().stream().anyMatch(r -> r.state() != ReplicaOps.State.DONE)) {
+						fail("not every member wrote the backup: see the lines above");
+					}
+					System.out.println("OK");
+					yield null;
+				}
 				default -> {
 					usage("unknown admin command " + command.getFirst());
 					yield null;
@@ -225,6 +266,105 @@ public final class ReplicatedServerMain {
 					System.exit(1);
 				}
 			}
+		}
+	}
+
+	/** Proposes a cluster operation through the first member that takes it; returns the log index of its entry. */
+	private static long proposeOp(List<PeerConfig> peers, RaftGroupId groupId, byte op, byte[] payload,
+			long deadlineNanos) throws InterruptedException {
+		while (true) {
+			String last = null;
+			for (PeerConfig peer : peers) {
+				try {
+					var reply = ReplicaOps.call(peer.raftAddress(), groupId, op, payload, remaining(deadlineNanos)).join();
+					return java.nio.ByteBuffer.wrap(reply).getLong();
+				} catch (CompletionException ex) {
+					var status = Status.fromThrowable(ex.getCause());
+					if (status.getCode() == Status.Code.FAILED_PRECONDITION || status.getCode() == Status.Code.INVALID_ARGUMENT
+							|| status.getCode() == Status.Code.UNIMPLEMENTED) {
+						fail(peer.id() + " refused: " + status.getDescription());
+					}
+					last = peer.id() + ": " + status;
+				}
+			}
+			if (System.nanoTime() - deadlineNanos > 0) {
+				fail("no member took the request within the time limit (--timeout-ms); last answer " + last);
+			}
+			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
+		}
+	}
+
+	/**
+	 * Asks every member for its result of a cluster operation until each one has a final one, or until the deadline;
+	 * prints them.
+	 */
+	private static java.util.Map<String, ReplicaOps.Result> awaitResults(List<PeerConfig> peers, RaftGroupId groupId,
+			byte op, byte[] payload, long deadlineNanos) throws InterruptedException {
+		var results = new java.util.TreeMap<String, ReplicaOps.Result>();
+		while (results.size() < peers.size() && System.nanoTime() - deadlineNanos < 0) {
+			for (PeerConfig peer : peers) {
+				if (results.containsKey(peer.id())) {
+					continue;
+				}
+				try {
+					var result = ReplicaOps.decodeResult(ReplicaOps.call(peer.raftAddress(), groupId, op, payload,
+							PEER_ANSWER_TIMEOUT).join());
+					if (result.state() != ReplicaOps.State.PENDING) {
+						results.put(peer.id(), result);
+					}
+				} catch (CompletionException unanswered) {
+					// Down or busy: asked again.
+				}
+			}
+			if (results.size() < peers.size()) {
+				Thread.sleep(SEED_SNAPSHOT_POLL_MS);
+			}
+		}
+		for (PeerConfig peer : peers) {
+			var result = results.get(peer.id());
+			System.out.println(peer.id() + ": " + (result == null ? "no result within the time limit"
+					: result.state() + (result.keys() > 0 ? " " + result.keys() + " keys" : "") + " " + result.detail()));
+		}
+		return results;
+	}
+
+	private static Duration remaining(long deadlineNanos) {
+		return Duration.ofNanos(Math.max(1_000_000, deadlineNanos - System.nanoTime()));
+	}
+
+	/**
+	 * Fails the command if {@code added} lacks a capability that the cluster uses already: it would stop on the first
+	 * entry that it cannot read. See {@link Capabilities}.
+	 */
+	private static void requireCapabilities(PeerConfig added, List<PeerConfig> peers, RaftGroupId groupId) {
+		long clusterVersion = 0;
+		for (PeerConfig member : peers) {
+			if (member.id().equals(added.id())) {
+				continue;
+			}
+			try {
+				var reply = java.nio.ByteBuffer.wrap(ReplicaOps.call(member.raftAddress(), groupId,
+						ReplicaOps.OP_CAPABILITIES, new byte[0], PEER_ANSWER_TIMEOUT).join());
+				reply.getLong();
+				clusterVersion |= reply.getLong();
+			} catch (CompletionException unanswered) {
+				// A member down, or of a version before the cluster versions: it holds the version where it is.
+			}
+		}
+		long supported;
+		try {
+			supported = java.nio.ByteBuffer.wrap(ReplicaOps.call(added.raftAddress(), groupId, ReplicaOps.OP_CAPABILITIES,
+					new byte[0], PEER_ANSWER_TIMEOUT).join()).getLong();
+		} catch (CompletionException ex) {
+			if (Status.fromThrowable(ex.getCause()).getCode() != Status.Code.UNIMPLEMENTED) {
+				fail("node " + added.id() + " did not tell its capabilities: " + ex.getCause().getMessage());
+			}
+			supported = 0;
+		}
+		long missing = clusterVersion & ~supported;
+		if (missing != 0) {
+			fail("node " + added.id() + " runs a version without " + Capabilities.describe(missing) + ", which this cluster"
+					+ " uses: it would stop on the first such entry. Upgrade it first");
 		}
 	}
 
@@ -341,6 +481,22 @@ public final class ReplicatedServerMain {
 		}
 	}
 
+	private static void restoreBackup(Options options) throws IOException {
+		var backup = Path.of(options.required("--backup"));
+		var dataDir = Path.of(options.required("--data-dir"));
+		var rockserverConfig = options.value("--rockserver-config") != null
+				? Path.of(options.value("--rockserver-config")) : null;
+		options.requireConsumed();
+		try {
+			var applied = ReplicaOps.restore(backup, dataDir, rockserverConfig);
+			System.out.println("OK: " + dataDir + " holds the data up to log index " + applied.getIndex()
+					+ " of the old cluster, and belongs to no cluster. Start every node of the new cluster from a copy of the same"
+					+ " backup, without --join");
+		} catch (IOException | RuntimeException ex) {
+			fail(String.valueOf(ex));
+		}
+	}
+
 	private static String arg(List<String> command) {
 		if (command.size() != 2) {
 			usage(command.getFirst() + " takes exactly one argument");
@@ -362,8 +518,9 @@ public final class ReplicatedServerMain {
 				        [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
 				        [--jvm-pause-limit-ms N]
 				  admin --peer ... [--group-id UUID] [--timeout-ms N]
-				        status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
-				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]""");
+				        status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID | checksum | backup NAME
+				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]
+				  restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]""");
 		System.exit(2);
 	}
 

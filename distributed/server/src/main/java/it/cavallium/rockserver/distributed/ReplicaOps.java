@@ -1,0 +1,700 @@
+package it.cavallium.rockserver.distributed;
+
+import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.KV;
+import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RangeBudget;
+import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import java.io.IOException;
+import java.io.Writer;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
+import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.server.protocol.TermIndex;
+import org.apache.ratis.thirdparty.io.grpc.Status;
+import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * The cluster-wide operations of a replica that go through the log but act outside the database: the cluster version
+ * ({@link Capabilities}), cross-replica checksums ({@link LogEntry.Checksum}) and cluster-consistent backups
+ * ({@link LogEntry.Backup}). It also answers the {@link TermService#OPS} calls about them, on the Raft port.
+ *
+ * <p><b>Checksums.</b> Every replica applies a checksum entry at the same log position. There it opens a database
+ * transaction with a snapshot, which takes no time, and lists the user columns; a thread of its own then reads every
+ * key and value of those columns at that snapshot, in key order, and digests them (SHA-256 of each column's name and
+ * entries, columns in name order). Equal histories give equal digests on every replica, whatever their files and
+ * compactions. The internal meta column is left out: it holds things that are local by design (results purged at a
+ * start). Each replica then asks the others for their digest of the same position, until each one has answered, or
+ * skipped the position (a snapshot install jumped over it), or for {@link #COMPARE_FOR}; a different digest is logged
+ * as an error on every replica that sees it and counted in {@code checksum.mismatches}. A replica whose database is
+ * replaced or closed while it reads gives up on that check. The read holds a snapshot of the database, which keeps the
+ * files that compactions replace meanwhile: a check of a large database costs a full read of it and that space while it
+ * runs. Checks run when an operator asks ({@code admin checksum}) or, with the system property
+ * {@value #CHECKSUM_EVERY_HOURS_PROPERTY}, every that many hours from the leader.</p>
+ *
+ * <p><b>Backups.</b> Every replica applies a backup entry at the same log position, by writing a checkpoint of its
+ * database ({@link NodeStore#checkpoint}: a memtable flush and hard links, 100–300 ms during which the apply waits) to
+ * {@code <data-dir>/backups/<name>/db}, with {@code backup.properties} beside it. All of them hold the same data, that of
+ * every entry before the backup entry: a copy of the whole cluster at one moment, on every node. A backup that a replica
+ * could not write (disk full, a name used before) is logged and reported by {@code admin backup-status}, and does not
+ * stop the replica: the entry's result is its log index on every replica. Restoring one starts a new cluster seeded from
+ * it, see {@link #restore}. The runbook is {@code docs/distributed/runbooks.md}.</p>
+ */
+final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
+
+	private static final Logger LOG = LoggerFactory.getLogger(ReplicaOps.class);
+	static final String CHECKSUM_EVERY_HOURS_PROPERTY = "it.cavallium.rockserver.distributed.checksum-every-hours";
+	static final String BACKUPS_DIR = "backups";
+	static final String BACKUP_DB_DIR = "db";
+	static final String BACKUP_PROPERTIES = "backup.properties";
+	private static final String RESULTS_FILE = "replica-ops.log";
+	private static final Pattern BACKUP_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,63}");
+	/** How long a replica keeps asking the others for their digest of one check. */
+	static final Duration COMPARE_FOR = Duration.ofHours(24);
+	private static final Duration COMPARE_EVERY = Duration.ofSeconds(10);
+	private static final Duration PEER_TIMEOUT = Duration.ofSeconds(5);
+	private static final Duration VERSION_CHECK_EVERY = Duration.ofSeconds(10);
+	/** Results kept in memory and answered. */
+	private static final int KEPT_RESULTS = 256;
+	private static final long CHECK_TRANSACTION_MILLIS = Duration.ofDays(7).toMillis();
+
+	/** Operations of {@link TermService#OPS}. */
+	static final byte OP_CAPABILITIES = 1;
+	static final byte OP_CHECKSUM_RESULT = 2;
+	static final byte OP_BACKUP_RESULT = 3;
+	static final byte OP_PROPOSE_CHECKSUM = 4;
+	static final byte OP_PROPOSE_BACKUP = 5;
+
+	/** State of one replica's result of a check or backup. */
+	enum State {
+		/** Not applied here yet, or still running. */
+		PENDING,
+		DONE,
+		/** Applied past it without a result: a snapshot install jumped over it, or the node restarted while it ran. */
+		NONE,
+		FAILED
+	}
+
+	/** A replica's result. {@code detail}: the hex digest of a checksum, the directory of a backup, or why it failed. */
+	record Result(State state, long index, long keys, String detail) {}
+
+	private final NodeConfig config;
+	private final RockserverStateMachine stateMachine;
+	private final NodeMetrics.Series mismatches;
+	private final NodeMetrics.Series matches;
+	private final ScheduledExecutorService worker;
+	private final Path resultsFile;
+	private final Map<Long, Result> checksums = new ConcurrentHashMap<>();
+	private final Map<String, Result> backups = new ConcurrentHashMap<>();
+	private volatile long clusterVersion;
+	private volatile @Nullable Proposer proposer;
+	/** Leader only, initialization thread only. */
+	private long versionCheckTerm = -1;
+	private long nextVersionCheckNanos;
+	private boolean versionCheckRunning;
+	private long nextChecksumNanos;
+	private volatile long lastMismatchIndex = -1;
+	private volatile long lastMatchIndex = -1;
+
+	ReplicaOps(NodeConfig config, RockserverStateMachine stateMachine, NodeMetrics metrics) {
+		this.config = config;
+		this.stateMachine = stateMachine;
+		this.mismatches = metrics.amount("checksum.mismatches");
+		this.matches = metrics.amount("checksum.matches");
+		this.resultsFile = config.dataDir().resolve(RESULTS_FILE);
+		this.worker = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon()
+				.name("rockserver-" + config.nodeId() + "-replica-ops").factory());
+		metrics.exportedGauge("cluster.version", () -> clusterVersion);
+		metrics.exportedGauge("checksum.last_mismatch_index", () -> lastMismatchIndex);
+		metrics.exportedGauge("checksum.last_match_index", () -> lastMatchIndex);
+		loadResults();
+	}
+
+	static boolean validBackupName(@Nullable String name) {
+		return name != null && BACKUP_NAME.matcher(name).matches();
+	}
+
+	/** The proposer of the node, once it exists: for the operations that propose entries. */
+	void proposer(Proposer proposer) {
+		this.proposer = proposer;
+	}
+
+	/** The cluster version of the database just opened. */
+	void opened(NodeStore store) {
+		clusterVersion = store.clusterVersion();
+	}
+
+	long clusterVersion() {
+		return clusterVersion;
+	}
+
+	/** Whether the cluster may use {@code capability}: every member supports it, see {@link Capabilities}. */
+	boolean clusterHas(long capability) {
+		return Capabilities.has(clusterVersion, capability);
+	}
+
+	@Override
+	public void clusterVersion(long version) {
+		if (version != clusterVersion) {
+			LOG.info("{}: cluster version is now {}", config.nodeId(), Capabilities.describe(version));
+		}
+		clusterVersion = version;
+	}
+
+	// Checksums
+
+	@Override
+	public void checksum(TermIndex position, NodeStore store) {
+		long index = position.getIndex();
+		var db = store.db();
+		var columns = new TreeMap<String, Long>();
+		long transaction;
+		try {
+			for (String name : db.getAllColumnDefinitions().keySet()) {
+				if (!name.equals(NodeStore.META_COLUMN)) {
+					columns.put(name, db.getColumnId(name));
+				}
+			}
+			// A snapshot of the database as of this position: what the apply writes after it is not seen.
+			transaction = db.openTransaction(CHECK_TRANSACTION_MILLIS, WorkloadProfile.BATCH);
+		} catch (RuntimeException ex) {
+			LOG.error("{}: checksum at {} could not start", config.nodeId(), index, ex);
+			record(new Result(State.FAILED, index, 0, String.valueOf(ex)));
+			return;
+		}
+		record(new Result(State.PENDING, index, 0, ""));
+		worker.execute(() -> computeChecksum(index, db, columns, transaction));
+	}
+
+	private void computeChecksum(long index, EmbeddedDB db, TreeMap<String, Long> columns, long transaction) {
+		long start = System.nanoTime();
+		Result result;
+		try {
+			var digest = sha256();
+			long keys = 0;
+			for (var column : columns.entrySet()) {
+				update(digest, column.getKey().getBytes(StandardCharsets.UTF_8));
+				Keys resumeAfter = null;
+				while (true) {
+					var page = db.getRangePage(transaction, column.getValue(), null, null, false, resumeAfter,
+							RequestType.<KV>allInRangeNoCache(), RangeBudget.DEFAULT);
+					for (KV kv : page.items()) {
+						digestEntry(digest, kv);
+						keys++;
+					}
+					if (!page.hasMore()) {
+						break;
+					}
+					resumeAfter = page.resumeAfter();
+				}
+				// Ends the column: no entry of one column can pass for an entry of the next.
+				digest.update((byte) 0xFF);
+			}
+			result = new Result(State.DONE, index, keys, HexFormat.of().formatHex(digest.digest()));
+			LOG.info("{}: checksum at {}: {} keys in {} columns, {} ({} ms)", config.nodeId(), index, keys, columns.size(),
+					result.detail(), (System.nanoTime() - start) / 1_000_000);
+		} catch (RuntimeException ex) {
+			// Its database was replaced (snapshot install) or closed, or a column was deleted while it was read.
+			LOG.warn("{}: checksum at {} given up: {}", config.nodeId(), index, ex.toString());
+			result = new Result(State.FAILED, index, 0, String.valueOf(ex));
+		} finally {
+			try {
+				db.closeTransaction(transaction, false);
+			} catch (RuntimeException closed) {
+				// The database closed meanwhile, with the transaction.
+			}
+		}
+		record(result);
+		if (result.state() == State.DONE) {
+			compare(result, System.nanoTime() + COMPARE_FOR.toNanos(), new LinkedHashMap<>());
+		}
+	}
+
+	static void digestEntry(MessageDigest digest, KV kv) {
+		var keys = kv.keys().keys();
+		digest.update((byte) 1);
+		digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(keys.length).array());
+		for (Buf key : keys) {
+			update(digest, key.toByteArray());
+		}
+		var value = kv.value();
+		if (value == null) {
+			digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(-1).array());
+		} else {
+			update(digest, value.toByteArray());
+		}
+	}
+
+	private static void update(MessageDigest digest, byte[] bytes) {
+		digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(bytes.length).array());
+		digest.update(bytes);
+	}
+
+	private static MessageDigest sha256() {
+		try {
+			return MessageDigest.getInstance("SHA-256");
+		} catch (NoSuchAlgorithmException ex) {
+			throw new IllegalStateException("Every Java platform has SHA-256", ex);
+		}
+	}
+
+	/**
+	 * Asks every other member for its digest of {@code own}'s position, until each one gave a final answer or the
+	 * deadline passed. {@code answered} holds the final answers so far, by member.
+	 */
+	private void compare(Result own, long deadlineNanos, Map<String, Result> answered) {
+		var division = stateMachine.division();
+		if (division == null) {
+			return;
+		}
+		var asked = new ArrayList<CompletableFuture<Void>>();
+		for (RaftPeer peer : division.getRaftConf().getAllPeers()) {
+			var id = peer.getId().toString();
+			if (id.equals(config.nodeId()) || answered.containsKey(id)) {
+				continue;
+			}
+			asked.add(ask(peer, OP_CHECKSUM_RESULT, ByteBuffer.allocate(Long.BYTES).putLong(own.index()).array())
+					.thenAccept(reply -> {
+						var result = decodeResult(reply);
+						if (result.state() != State.PENDING) {
+							synchronized (answered) {
+								answered.put(id, result);
+							}
+						}
+					})
+					.exceptionally(_ -> null));
+		}
+		CompletableFuture.allOf(asked.toArray(CompletableFuture[]::new)).whenComplete((_, _) -> {
+			boolean pending;
+			synchronized (answered) {
+				pending = division.getRaftConf().getAllPeers().stream()
+						.map(peer -> peer.getId().toString())
+						.anyMatch(id -> !id.equals(config.nodeId()) && !answered.containsKey(id));
+			}
+			if (pending && System.nanoTime() - deadlineNanos < 0) {
+				worker.schedule(() -> compare(own, deadlineNanos, answered), COMPARE_EVERY.toMillis(), TimeUnit.MILLISECONDS);
+				return;
+			}
+			report(own, answered, pending);
+		});
+	}
+
+	private void report(Result own, Map<String, Result> answered, boolean incomplete) {
+		var differing = new TreeMap<String, Result>();
+		var same = new ArrayList<String>();
+		synchronized (answered) {
+			answered.forEach((id, result) -> {
+				if (result.state() == State.DONE) {
+					if (result.detail().equals(own.detail()) && result.keys() == own.keys()) {
+						same.add(id);
+					} else {
+						differing.put(id, result);
+					}
+				}
+			});
+		}
+		if (!differing.isEmpty()) {
+			lastMismatchIndex = own.index();
+			mismatches.record(1);
+			LOG.error("{}: REPLICAS DIVERGED: checksum at log index {} is {} ({} keys) here, but {}. The replicas applied the"
+							+ " same entries and hold different data: a merge operator that is not deterministic, a bug, or a damaged"
+							+ " disk. Stop writing through the cluster, keep every data directory, and see \"Checksums\" in"
+							+ " docs/distributed/runbooks.md", config.nodeId(), own.index(), own.detail(), own.keys(),
+					differing.entrySet().stream().map(e -> e.getKey() + " has " + e.getValue().detail() + " ("
+							+ e.getValue().keys() + " keys)").toList());
+			return;
+		}
+		if (!same.isEmpty()) {
+			lastMatchIndex = Math.max(lastMatchIndex, own.index());
+			matches.record(1);
+		}
+		LOG.info("{}: checksum at {} matches on {}{}", config.nodeId(), own.index(), same.isEmpty() ? "no other member" : same,
+				incomplete ? " (not every member answered: they compare by themselves once they have a result)" : "");
+	}
+
+	// Backups
+
+	@Override
+	public void backup(String name, TermIndex position, NodeStore store) {
+		long index = position.getIndex();
+		Path dir = config.dataDir().resolve(BACKUPS_DIR).resolve(name);
+		Result result;
+		try {
+			if (Files.exists(dir.resolve(BACKUP_PROPERTIES))) {
+				var existing = readBackupProperties(dir);
+				if (Long.parseLong(existing.getProperty("index", "-1")) == index) {
+					// The same entry applied again after a restart: the backup is there already.
+					result = new Result(State.DONE, index, 0, dir.toString());
+					record(name, result);
+					return;
+				}
+				throw new IOException("A backup named " + name + " exists already, at index " + existing.getProperty("index"));
+			}
+			long start = System.nanoTime();
+			// An interrupted attempt leaves a database without properties: start over.
+			NodeStore.deleteRecursively(dir);
+			Files.createDirectories(dir);
+			var contained = store.checkpoint(dir.resolve(BACKUP_DB_DIR));
+			var properties = new Properties();
+			properties.setProperty("name", name);
+			properties.setProperty("index", String.valueOf(index));
+			properties.setProperty("term", String.valueOf(position.getTerm()));
+			properties.setProperty("applied", contained.getTerm() + ":" + contained.getIndex());
+			properties.setProperty("cluster", String.valueOf(store.clusterId()));
+			properties.setProperty("node", config.nodeId());
+			properties.setProperty("taken", Instant.now().toString());
+			var temporary = dir.resolve(BACKUP_PROPERTIES + ".tmp");
+			try (Writer out = Files.newBufferedWriter(temporary, StandardCharsets.UTF_8)) {
+				properties.store(out, "Rockserver cluster backup: every node took it at the same log index");
+			}
+			Files.move(temporary, dir.resolve(BACKUP_PROPERTIES));
+			NodeStore.syncDirectory(dir);
+			result = new Result(State.DONE, index, 0, dir.toString());
+			LOG.info("{}: backup {} at log index {} written to {} in {} ms", config.nodeId(), name, index, dir,
+					(System.nanoTime() - start) / 1_000_000);
+		} catch (IOException | RuntimeException ex) {
+			LOG.error("{}: backup {} at log index {} failed on this node: {}", config.nodeId(), name, index, ex.toString(), ex);
+			result = new Result(State.FAILED, index, 0, String.valueOf(ex));
+		}
+		record(name, result);
+	}
+
+	static Properties readBackupProperties(Path backupDir) throws IOException {
+		var properties = new Properties();
+		try (var in = Files.newBufferedReader(backupDir.resolve(BACKUP_PROPERTIES), StandardCharsets.UTF_8)) {
+			properties.load(in);
+		}
+		return properties;
+	}
+
+	/**
+	 * Prepares {@code dataDir}, which must hold no database and no Raft state, to seed a new cluster from the backup in
+	 * {@code backupDir}: restores its database ({@link NodeStore#restore}) and deletes its replication metadata, so that
+	 * the database belongs to no cluster. Every node of the new cluster is prepared from a copy of the same backup and
+	 * started without {@code --join}: the cluster starts seeded, see "Migrating from a single node" in the design
+	 * document. Client sessions and the results kept for them are gone with the metadata: clients open new sessions.
+	 */
+	static TermIndex restore(Path backupDir, Path dataDir, @Nullable Path rockserverConfig) throws IOException {
+		var properties = readBackupProperties(backupDir);
+		Path db = dataDir.resolve("db");
+		Path raft = dataDir.resolve("raft");
+		if (Files.exists(db) || (Files.isDirectory(raft) && !isEmpty(raft))) {
+			throw new IOException(dataDir + " holds a database or a Raft log: restore into an empty data directory");
+		}
+		Files.createDirectories(dataDir);
+		NodeStore.restore(backupDir.resolve(BACKUP_DB_DIR), db);
+		TermIndex applied;
+		try (var store = NodeStore.open(db, rockserverConfig, "restore")) {
+			applied = store.applied();
+			store.db().deleteColumn(store.metaColumnId());
+		}
+		LOG.info("Restored backup {} (log index {} of cluster {}) into {}, holding the entries up to {}",
+				properties.getProperty("name"), properties.getProperty("index"), properties.getProperty("cluster"), db, applied);
+		return applied;
+	}
+
+	private static boolean isEmpty(Path dir) throws IOException {
+		try (var files = Files.list(dir)) {
+			return files.findAny().isEmpty();
+		}
+	}
+
+	// Results
+
+	private void record(Result result) {
+		checksums.put(result.index(), result);
+		trim(checksums);
+		if (result.state() != State.PENDING) {
+			persist("checksum " + result.index() + " " + result.state() + " " + result.keys() + " " + oneLine(result.detail()));
+		}
+	}
+
+	private void record(String name, Result result) {
+		backups.put(name, result);
+		trim(backups);
+		persist("backup " + result.index() + " " + result.state() + " " + name + " " + oneLine(result.detail()));
+	}
+
+	private static String oneLine(String text) {
+		return text.isEmpty() ? "-" : text.replace('\n', ' ').replace('\r', ' ');
+	}
+
+	private static <K extends Comparable<K>> void trim(Map<K, Result> results) {
+		if (results.size() > KEPT_RESULTS) {
+			results.entrySet().stream().min(Map.Entry.comparingByValue((a, b) -> Long.compare(a.index(), b.index())))
+					.ifPresent(oldest -> results.remove(oldest.getKey()));
+		}
+	}
+
+	/** Appends one line to the results file, so that a restarted node still answers about its past results. */
+	private synchronized void persist(String line) {
+		try {
+			Files.createDirectories(resultsFile.getParent());
+			Files.writeString(resultsFile, Instant.now() + " " + line + "\n", StandardCharsets.UTF_8,
+					StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+		} catch (IOException ex) {
+			LOG.warn("{}: failed to write {}: {}", config.nodeId(), resultsFile, ex.toString());
+		}
+	}
+
+	private void loadResults() {
+		if (!Files.isRegularFile(resultsFile)) {
+			return;
+		}
+		try {
+			for (String line : Files.readAllLines(resultsFile, StandardCharsets.UTF_8)) {
+				var parts = line.split(" ", 6);
+				if (parts.length < 6) {
+					continue;
+				}
+				try {
+					long index = Long.parseLong(parts[2]);
+					var state = State.valueOf(parts[3]);
+					switch (parts[1]) {
+						case "checksum" -> {
+							checksums.put(index, new Result(state, index, Long.parseLong(parts[4]), parts[5]));
+							trim(checksums);
+						}
+						case "backup" -> {
+							backups.put(parts[4], new Result(state, index, 0, parts[5]));
+							trim(backups);
+						}
+						default -> {}
+					}
+				} catch (IllegalArgumentException malformed) {
+					// A line cut by a crash.
+				}
+			}
+		} catch (IOException ex) {
+			LOG.warn("{}: failed to read {}: {}", config.nodeId(), resultsFile, ex.toString());
+		}
+	}
+
+	/** This replica's result of the check at {@code index}. */
+	Result checksumResult(long index) {
+		var result = checksums.get(index);
+		if (result != null) {
+			return result;
+		}
+		return new Result(stateMachine.appliedIndex().get() >= index ? State.NONE : State.PENDING, index, 0, "");
+	}
+
+	/** This replica's result of the backup {@code name}, null if it has none. */
+	@Nullable Result backupResult(String name) {
+		return backups.get(name);
+	}
+
+	// The cluster version, on the leader
+
+	/**
+	 * On the leader: asks every member what it supports, every {@link #VERSION_CHECK_EVERY} and at each new term, and
+	 * proposes a higher cluster version when all of them answered with more. Also proposes the periodic checksums.
+	 * Initialization thread only.
+	 */
+	void onLeader(RaftServer.Division division, RaftGroupId groupId) {
+		var info = division.getInfo();
+		if (!info.isLeader() || !info.isLeaderReady()) {
+			return;
+		}
+		long now = System.nanoTime();
+		long term = info.getCurrentTerm();
+		proposePeriodicChecksum(now);
+		if ((Capabilities.SUPPORTED & ~clusterVersion) == 0 || versionCheckRunning
+				|| (term == versionCheckTerm && now - nextVersionCheckNanos < 0)) {
+			return;
+		}
+		versionCheckTerm = term;
+		nextVersionCheckNanos = now + VERSION_CHECK_EVERY.toNanos();
+		versionCheckRunning = true;
+		var answers = new ArrayList<CompletableFuture<Long>>();
+		for (RaftPeer peer : division.getRaftConf().getAllPeers()) {
+			if (peer.getId().toString().equals(config.nodeId())) {
+				answers.add(CompletableFuture.completedFuture(Capabilities.SUPPORTED));
+			} else {
+				answers.add(ask(peer, OP_CAPABILITIES, new byte[0]).thenApply(reply -> ByteBuffer.wrap(reply).getLong()));
+			}
+		}
+		CompletableFuture.allOf(answers.toArray(CompletableFuture[]::new)).whenComplete((_, error) -> {
+			try {
+				if (error != null) {
+					LOG.debug("{}: not every member told its capabilities, the cluster version stays {}", config.nodeId(),
+							Capabilities.describe(clusterVersion), error);
+					return;
+				}
+				long common = Capabilities.SUPPORTED;
+				for (var answer : answers) {
+					common &= answer.join();
+				}
+				long current = clusterVersion;
+				if ((common & ~current) == 0) {
+					return;
+				}
+				var proposer = this.proposer;
+				if (proposer == null) {
+					return;
+				}
+				LOG.info("{}: every member supports {}: raising the cluster version", config.nodeId(),
+						Capabilities.describe(common | current));
+				proposer.propose(new LogEntry.ClusterVersion(common | current)).get(config.requestTimeout().toMillis(),
+						TimeUnit.MILLISECONDS);
+			} catch (Exception ex) {
+				LOG.warn("{}: failed to raise the cluster version, retrying", config.nodeId(), ex);
+			} finally {
+				versionCheckRunning = false;
+			}
+		});
+	}
+
+	private void proposePeriodicChecksum(long now) {
+		long hours = Long.getLong(CHECKSUM_EVERY_HOURS_PROPERTY, 0);
+		if (hours <= 0 || !clusterHas(Capabilities.CHECKSUM)) {
+			return;
+		}
+		if (nextChecksumNanos == 0) {
+			nextChecksumNanos = now + TimeUnit.HOURS.toNanos(hours);
+			return;
+		}
+		if (now - nextChecksumNanos < 0) {
+			return;
+		}
+		nextChecksumNanos = now + TimeUnit.HOURS.toNanos(hours);
+		var proposer = this.proposer;
+		if (proposer != null) {
+			proposer.propose(new LogEntry.Checksum()).whenComplete((index, error) -> {
+				if (error != null) {
+					LOG.warn("{}: periodic checksum not proposed", config.nodeId(), error);
+				} else {
+					LOG.info("{}: periodic checksum at log index {}", config.nodeId(), index);
+				}
+			});
+		}
+	}
+
+	// The Raft port
+
+	private CompletableFuture<byte[]> ask(RaftPeer peer, byte op, byte[] payload) {
+		var groupId = stateMachine.groupId();
+		var channel = NettyChannelBuilder.forTarget(peer.getAddress()).usePlaintext().build();
+		return TermService.ops(channel, groupId, request(op, payload), PEER_TIMEOUT)
+				.whenComplete((_, _) -> channel.shutdown());
+	}
+
+	static byte[] request(byte op, byte[] payload) {
+		return ByteBuffer.allocate(1 + payload.length).put(op).put(payload).array();
+	}
+
+	/** Answers a {@link TermService#OPS} call: {@code request} is the operation byte, then its payload. */
+	CompletableFuture<byte[]> answer(byte[] request) {
+		if (request.length == 0) {
+			return failed(Status.INVALID_ARGUMENT, "Empty request");
+		}
+		var payload = ByteBuffer.wrap(request, 1, request.length - 1).slice();
+		switch (request[0]) {
+			case OP_CAPABILITIES -> {
+				return CompletableFuture.completedFuture(ByteBuffer.allocate(2 * Long.BYTES)
+						.putLong(Capabilities.SUPPORTED).putLong(clusterVersion).array());
+			}
+			case OP_CHECKSUM_RESULT -> {
+				return CompletableFuture.completedFuture(encodeResult(checksumResult(payload.getLong())));
+			}
+			case OP_BACKUP_RESULT -> {
+				var name = StandardCharsets.UTF_8.decode(payload).toString();
+				var result = backupResult(name);
+				return CompletableFuture.completedFuture(encodeResult(result != null ? result
+						: new Result(State.PENDING, -1, 0, "")));
+			}
+			case OP_PROPOSE_CHECKSUM -> {
+				return propose(Capabilities.CHECKSUM, new LogEntry.Checksum());
+			}
+			case OP_PROPOSE_BACKUP -> {
+				var name = StandardCharsets.UTF_8.decode(payload).toString();
+				if (!validBackupName(name)) {
+					return failed(Status.INVALID_ARGUMENT, "Invalid backup name " + name + ": 1 to 64 letters, digits, '.', '_'"
+							+ " or '-', starting with a letter or a digit");
+				}
+				return propose(Capabilities.BACKUP, new LogEntry.Backup(name));
+			}
+			default -> {
+				return failed(Status.UNIMPLEMENTED, "Unknown operation " + request[0]);
+			}
+		}
+	}
+
+	private CompletableFuture<byte[]> propose(long capability, LogEntry entry) {
+		var proposer = this.proposer;
+		if (proposer == null) {
+			return failed(Status.UNAVAILABLE, "The node is starting");
+		}
+		if (!clusterHas(capability)) {
+			return failed(Status.FAILED_PRECONDITION, "Not every member supports " + Capabilities.describe(capability)
+					+ " yet: the cluster version is " + Capabilities.describe(clusterVersion) + ". Upgrade every member first");
+		}
+		return proposer.propose(entry).thenApply(index -> ByteBuffer.allocate(Long.BYTES).putLong((Long) index).array());
+	}
+
+	private static CompletableFuture<byte[]> failed(Status status, String message) {
+		return CompletableFuture.failedFuture(status.withDescription(message).asRuntimeException());
+	}
+
+	static byte[] encodeResult(Result result) {
+		var detail = result.detail().getBytes(StandardCharsets.UTF_8);
+		return ByteBuffer.allocate(1 + 2 * Long.BYTES + detail.length)
+				.put((byte) result.state().ordinal()).putLong(result.index()).putLong(result.keys()).put(detail).array();
+	}
+
+	static Result decodeResult(byte[] value) {
+		var buffer = ByteBuffer.wrap(value);
+		var state = State.values()[buffer.get()];
+		long index = buffer.getLong();
+		long keys = buffer.getLong();
+		return new Result(state, index, keys, StandardCharsets.UTF_8.decode(buffer).toString());
+	}
+
+	/** Asks the node behind {@code address} (its Raft address) to run {@code op}: for {@code admin}. */
+	static CompletableFuture<byte[]> call(String address, RaftGroupId groupId, byte op, byte[] payload, Duration timeout) {
+		var channel = NettyChannelBuilder.forTarget(address).usePlaintext().build();
+		return TermService.ops(channel, groupId, request(op, payload), timeout).whenComplete((_, _) -> channel.shutdown());
+	}
+
+	@Override
+	public void close() {
+		worker.shutdownNow();
+	}
+
+	/** Tests only. */
+	List<Result> checksumResults() {
+		return checksums.values().stream().sorted((a, b) -> Long.compare(a.index(), b.index())).toList();
+	}
+
+	/** The backups directory of a data directory. */
+	static Path backupsDir(Path dataDir) {
+		return dataDir.resolve(BACKUPS_DIR);
+	}
+}

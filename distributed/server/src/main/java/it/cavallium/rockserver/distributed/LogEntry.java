@@ -194,4 +194,31 @@ public sealed interface LogEntry {
 	 * assigned the same id, and stops if not, instead of silently writing other columns' data into it.
 	 */
 	record VerifyColumn(String name, long columnId) implements LogEntry {}
+
+	/**
+	 * Raises the cluster version: the {@link Capabilities} that every member supports, so that entries and behaviors that
+	 * need them can be used. Proposed by a leader only once every member of the configuration said that it supports
+	 * them (see {@link Capabilities}); applied as a union, so the version never goes down.
+	 */
+	record ClusterVersion(long capabilities) implements LogEntry {}
+
+	/**
+	 * Asks every replica for a checksum of its user columns at this log position (see {@link ReplicaOps}). Applying it
+	 * changes nothing in the database: each replica compares its result with the others' outside the log, and a
+	 * difference is reported loudly. Needs {@link Capabilities#CHECKSUM}.
+	 */
+	record Checksum() implements LogEntry {}
+
+	/**
+	 * Every replica writes a checkpoint of its database at this log position under {@code backups/<name>} of its data
+	 * directory: a copy of the cluster at one moment, on every node (see {@link ReplicaOps}). Needs
+	 * {@link Capabilities#BACKUP}.
+	 */
+	record Backup(String name) implements LogEntry {
+		public Backup {
+			if (!ReplicaOps.validBackupName(name)) {
+				throw new IllegalArgumentException("Invalid backup name: " + name);
+			}
+		}
+	}
 }

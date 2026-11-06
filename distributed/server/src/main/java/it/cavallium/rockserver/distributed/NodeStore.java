@@ -64,6 +64,7 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #SESSION} + session id: a client session, see {@link #encodeSession}</li>
  *   <li>{@link #SESSION_REQUEST} + session id + sequence: the encoded result of an applied write of that session</li>
  *   <li>{@link #CLOCK}: the latest leader time stamped on an applied entry, see {@link LogEntryCodec#stamp}</li>
+ *   <li>{@link #CLUSTER_VERSION}: the 8-byte {@link Capabilities} of the cluster, see {@link #clusterVersion}</li>
  * </ul>
  *
  * <p>The meta column is created locally when a database is first opened, before any log entry is applied, so it
@@ -94,6 +95,8 @@ final class NodeStore implements Closeable {
 	static final byte SESSION = 7;
 	static final byte SESSION_REQUEST = 8;
 	static final byte CLOCK = 9;
+	/** Far from the kinds above, so that other new kinds can take the next ones. */
+	static final byte CLUSTER_VERSION = 40;
 
 	private static final int META_KEY_BYTES = 1 + 2 * Long.BYTES;
 	private static final ColumnSchema META_SCHEMA = ColumnSchema.of(IntList.of(META_KEY_BYTES), ObjectList.of(), true);
@@ -117,6 +120,9 @@ final class NodeStore implements Closeable {
 	 *   leader stops.</li>
 	 * </ul>
 	 */
+	/** Tags every meter of the database with the node id, unless the config sets it: see {@code MetricsConfig}. */
+	private static final String METRICS_NODE_NAME = "database.metrics.node-name";
+
 	private static final String REPLICA_OVERRIDES = """
 			database.global.absolute-consistency = false
 			database.global.atomic-flush = true
@@ -145,7 +151,7 @@ final class NodeStore implements Closeable {
 	static NodeStore open(Path dbDir, @Nullable Path rockserverConfig, String name) throws IOException {
 		dbDir = dbDir.toAbsolutePath().normalize();
 		RestoreDirs.of(dbDir).recover();
-		Path config = replicaConfig(rockserverConfig);
+		Path config = replicaConfig(rockserverConfig, name);
 		EmbeddedConnection connection;
 		try {
 			connection = new EmbeddedConnection(dbDir, name, config);
@@ -173,12 +179,16 @@ final class NodeStore implements Closeable {
 	 * Writes the config the replica opens its database with to a new temporary file: {@link #REPLICA_OVERRIDES} over
 	 * the given Rockserver config (HOCON), or over the defaults when there is none.
 	 */
-	private static Path replicaConfig(@Nullable Path rockserverConfig) throws IOException {
+	private static Path replicaConfig(@Nullable Path rockserverConfig, String nodeId) throws IOException {
 		var config = ConfigFactory.parseString(REPLICA_OVERRIDES);
 		try {
 			if (rockserverConfig != null) {
 				config = config.withFallback(ConfigFactory.parseFile(rockserverConfig.toFile(),
 						ConfigParseOptions.defaults().setAllowMissing(false)));
+			}
+			if (!config.hasPath(METRICS_NODE_NAME)) {
+				// The nodes of a cluster share one config: their meters must still tell them apart.
+				config = config.withValue(METRICS_NODE_NAME, ConfigValueFactory.fromAnyRef(nodeId));
 			}
 			config = withReplicaWriteBuffers(config.resolve());
 		} catch (ConfigException | IllegalArgumentException e) {
@@ -315,6 +325,15 @@ final class NodeStore implements Closeable {
 	@Nullable String clusterId() {
 		Buf value = readMeta(CLUSTER_ID);
 		return value == null ? null : value.toString(StandardCharsets.UTF_8);
+	}
+
+	/**
+	 * The cluster version ({@link Capabilities}) applied here: written by {@link LogEntry.Genesis} and raised by
+	 * {@link LogEntry.ClusterVersion}. 0 on a cluster created before the version existed, until a leader raises it.
+	 */
+	long clusterVersion() {
+		Buf value = readMeta(CLUSTER_VERSION);
+		return value == null || value.size() != Long.BYTES ? 0 : java.nio.ByteBuffer.wrap(value.toByteArray()).getLong();
 	}
 
 	/** True if the {@link LogEntry.Genesis} entry applied here said that the cluster started from a seed database. */

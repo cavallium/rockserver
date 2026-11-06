@@ -130,7 +130,19 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 
 	@Override
 	public RockserverCapabilities getCapabilities() {
-		return RockserverCapabilities.CURRENT.withClientSessions(true).withNumberedBatches(true);
+		// Sessions only once every member can read their entries (see Capabilities); before genesis the cluster is
+		// being created, by one version. A client reads this when it connects: one connected before the cluster version
+		// allowed sessions runs without them until it reconnects.
+		boolean sessions = stateMachine.ops().clusterHas(Capabilities.CLIENT_SESSIONS);
+		if (!sessions) {
+			try {
+				var store = stateMachine.store();
+				sessions = store != null && store.clusterId() == null;
+			} catch (RuntimeException replaced) {
+				// Its database is being replaced by a snapshot install.
+			}
+		}
+		return RockserverCapabilities.CURRENT.withClientSessions(sessions).withNumberedBatches(sessions);
 	}
 
 	/**

@@ -195,6 +195,10 @@ public class MetricsManager implements AutoCloseable {
             }
 
 			compositeRegistry.config().commonTags("appname", "rockserver", "database-name", Objects.requireNonNullElse(config.metrics().databaseName(), "default"));
+			var nodeName = config.metrics().nodeName();
+			if (nodeName != null && !nodeName.isBlank()) {
+				compositeRegistry.config().commonTags("node", nodeName);
+			}
 
 			new JvmCompilationMetrics().bindTo(compositeRegistry);
 			new JvmMemoryMetrics().bindTo(compositeRegistry);
