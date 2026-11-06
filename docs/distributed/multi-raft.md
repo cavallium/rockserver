@@ -159,8 +159,9 @@ divisions.
   - log queue (`:72`), retry cache (`:88`), apply backlog 256 MiB per state machine.
 - **One log worker per division.** Each division has its own `SegmentedRaftLogWorker` and fsyncs its own segment, so
   N groups mean N fsync streams on the same disk. Batching amortizes less: at production load each group's batches
-  are smaller, and on the consumer SSDs (1-3 ms per fdatasync idle, 10-30 ms during compaction, performance.md:197-199)
-  that can raise commit latency. **This is the main hidden cost; measure it** (`LoadBench --groups 1,2,3`).
+  are smaller, and on the consumer SSDs (1-3 ms per fdatasync idle, 10-30 ms during compaction, performance.md
+  "Deployment notes") that can raise commit latency. **This is the main hidden cost; measure it**
+  (`LoadBench --groups 1,2,3`).
 - **Leader spreading.**
   - Give each group's `RaftPeer`s a priority (`RaftPeer.newBuilder().setPriority`) so that group i prefers node
     (i mod 3). Ratis' leader then yields to a caught-up higher-priority peer by itself.
@@ -225,7 +226,8 @@ Costs, and what to do about them:
   it, split the configured budgets by N.
 - **Column ids collide across DBs.** That is handled by the encoding in 3.4.
 - **Merge operators are registered per DB.** `uploadMergeOperator` is therefore proposed to every group (each
-  upload is atomic and idempotent, `MergeOperatorRegistry.upload`, design.md:59). Yotsuba uses none.
+  upload is atomic and idempotent, `MergeOperatorRegistry.upload`, design.md "Shape", "What this module needs from
+  core"). Yotsuba uses none.
 
 **Column families per group in one DB (rejected).**
 
@@ -234,7 +236,8 @@ Costs, and what to do about them:
 - The blocker is the per-group snapshot. A checkpoint is DB-wide and holds other groups at other positions. Installing
   one group would mean `dropColumnFamily` plus `createColumnFamilyWithImport` of that group's column families.
 - That gives **new native column-family ids on the installing follower**, which breaks the "column id = native CF id"
-  invariant (design.md:289-292). The fix would be a replicated logical-id table and remapping in every apply.
+  invariant (design.md "Column ids", in "Writes, exactly once"). The fix would be a replicated logical-id table and
+  remapping in every apply.
 - Every schema-change or `deleteRange` flush, and every snapshot flush, would also pause all groups.
 - Atomic flush across even more column families makes review 3.5 (tiny L0 files in cold columns) worse, not better.
 
@@ -298,7 +301,7 @@ With the co-located column map, Yotsuba issues none. Options for a future consum
     alternative is to require that all new columns go to G0 in Phase 1.
 - **Commands:**
   - `createColumn(name)` is proposed to the group the map gives for the name. That group creates it and proposes
-    `VerifyColumn` (design.md:289-292), and the encoded id is returned.
+    `VerifyColumn` (design.md "Column ids"), and the encoded id is returned.
   - `deleteColumn(id)` routes by the id bits. `deleteColumnIfExists(name)` routes by the map.
   - A name exists in at most one group, by construction, since the map is a function.
   - `uploadMergeOperator` goes to every group in turn. A `createColumn` that names an operator checks it in the
@@ -380,7 +383,8 @@ The session work in progress registers sessions through the log and keys records
    - Run it on one node and copy the result to every node, or run it on identical seed copies: it is
      deterministic. Each group's seeded genesis records the fingerprint, and a replica whose DB does not match it
      stops, which extends today's "replays the seeded Genesis with an empty database" check.
-   - Every group takes its post-genesis snapshot, as design.md:541-552 requires today.
+   - Every group takes its post-genesis snapshot, as design.md "Migrating from a single node" (in "Snapshots,
+     catch-up and membership") requires today.
 7. **Admin:**
    - `add-peer`/`remove-peer` loop over the groups;
    - `status` per group;
@@ -394,7 +398,7 @@ Expected result, to be checked in Phase 0 and 1 measurements:
   led by a different node.
 - The apply-bound saturation could rise from about 38k to about 55-65k ops/s, assuming apply is the only limit
   and the second fsync stream costs little.
-- Latency per write stays the same, the commit round trip of 10-16 ms on these SSDs (performance.md:172-176), so
+- Latency per write stays the same, the commit round trip of 10-16 ms on these SSDs (performance.md "Results"), so
   at 512 writes in flight throughput stays near 2.3x production.
 - **Phase 1 only pays off if Yotsuba's in-flight limits rise too** (performance.md, "Client concurrency").
 
@@ -403,7 +407,7 @@ Expected result, to be checked in Phase 0 and 1 measurements:
 - **Metrics:** per-group role, term, lags, snapshot age, and leader counts per node. Add an alert on a node that leads
   every group for more than 10 minutes.
 - **Migration of a running single-group replicated cluster** (only if Multi-Raft lands after the first deployment;
-  the replicated cluster has never been deployed, design.md:3):
+  the replicated cluster has never been deployed, design.md status line):
   1. Gracefully stop every node. Graceful stops flush, and the leader hands over first.
   2. Pick the node with the highest applied index, from `admin status` before the stop or from the applied row in
      its `db/`.
@@ -413,7 +417,8 @@ Expected result, to be checked in Phase 0 and 1 measurements:
      seeded cluster with a new cluster id.
   - **Downtime:** dominated by the copy, 171 GB at 100-200 MB/s per link is about 15-30 min, unless the other
     nodes' own `db/` copies are reused. They are logically identical after a graceful stop of a cluster where all
-    applied the same index; the tests show replicas byte-identical (design.md:790,800).
+    applied the same index; the tests show replicas byte-identical (design.md "Tests": `LeaderKillTest`,
+    `ColdRestartTest`, `ProtocolPointKillTest`).
   - Reuse is allowed only if every node reports the same applied index and the same cluster id. Otherwise copy.
   - Every client retries through the outage. Run it in a maintenance window, not during a deploy.
 - **Online column move (optional, only if downtime is unacceptable):** have Yotsuba copy into a new column name
@@ -481,7 +486,7 @@ Expected result, to be checked in Phase 0 and 1 measurements:
 
 | Item | Where | Expected effect |
 |---|---|---|
-| ~~Leaner apply (`WriteBatchWithIndex`, no `EmbeddedDB` transaction API on the apply thread)~~ done: `EmbeddedDB.ApplyWriter`; the headroom it gave is still to measure (PF-3) | review 3.1, arch/apply | removes per-op bookkeeping and commit validation; the earlier apply changes already took execute from 0.40 to 0.35 ms and commit from 0.22 to 0.12 ms per entry (performance.md:106-110); expect tens of percent more apply headroom |
+| ~~Leaner apply (`WriteBatchWithIndex`, no `EmbeddedDB` transaction API on the apply thread)~~ done: `EmbeddedDB.ApplyWriter`; the headroom it gave is still to measure (PF-3) | review 3.1, arch/apply | removes per-op bookkeeping and commit validation; the earlier apply changes already took execute from 0.40 to 0.35 ms and commit from 0.22 to 0.12 ms per entry (performance.md "What limited it, and what changed", item 10); expect tens of percent more apply headroom |
 | ~~**Partitioned apply inside one group**~~ done: `--parallel-apply-threads N`, off by default (design.md, "Partitioned apply"), by first key part of fixed-key columns, else by column | new | within one apply group, execute entries in K partitions by column (or by key hash for single-key entries) on K threads, each into its own indexed batch, then merge them into **one** atomic `db.write` with the position. Entries that touch several columns, and schema changes, run as barriers. Results stay deterministic because a request reads only its own column's keys (guards, previous values) in log order within its partition. Crash consistency and the single log stay. This captures more apply parallelism than column groups (it is not bounded by `messages-v2`) with none of the membership, snapshot or fsync costs. |
 | ~~Follower reads and leader hint~~ done: follower point reads are off by default until measured with the Yotsuba mix (design.md, "Follower reads") | review 2.1, arch/routing | takes 6.1k gets/s and `existsMulti` off the leader and removes the forwarding hop for about 2/3 of the traffic |
 | `ConflictTracker` off the append lock for plain writes (not done: still under the lock, without a per-key allocation since; unmeasured, performance.md item 16) | review 2.3 | less leader CPU per write, inside the Ratis lock |

@@ -216,18 +216,39 @@ Upgrades across these versions need more care, because no gate covers them:
 ## Exit codes
 
 Each command has its own codes; the same number can mean different things for different commands. Supervise `run`
-only: restart it on 1 and 3, never on 2, 4 or 5, which need an operator. With systemd:
+only: restart it on 1 and 3, never on 2, 4 or 5, which need an operator. With systemd, the exit and stop settings of
+the unit:
 
 ```ini
+[Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Restart=on-failure
 RestartPreventExitStatus=2 4 5
 SuccessExitStatus=143
+TimeoutStopSec=150
 ```
 
-A restart loop on 2 is harmless but useless (the same command line fails the same way), and one on 4 or 5 is what
-the codes exist to prevent. `SuccessExitStatus=143` is there because the JVM, not `run`, chooses the status of a
-stop by signal (below): without it, every `systemctl stop` leaves the unit "failed".
+A restart on 4 or 5 is what those codes exist to prevent: the node would refuse to start again, or start a version
+that cannot read its data. 2 is always a fault of the command line or of the JVM options, so it fails the same way on
+every restart. 1 is not always transient either: of its causes only a port in use can pass by itself, while a bad or
+non-numeric option value, a refused data directory or a pointless `--join` fail the same way each time. 1 stays
+restarted because it mixes both kinds and the exit code cannot tell which one it was; the start limit ends a loop of
+the deterministic kind. The limit is set wider than systemd's default (5 starts in 10 s), which a node whose failed
+start takes a few seconds (the JVM, opening the database) never reaches; 5 in 5 minutes also stops restarting a node
+that fails with 3 over and over, which needs an operator too.
+
+`SuccessExitStatus=143` is there because the JVM, not `run`, chooses the status of a stop by signal (below): without
+it, every `systemctl stop` leaves the unit "failed". `TimeoutStopSec=150` is there because a stop can outlast
+systemd's default of 90 s. The shutdown hook hands over leadership (up to 5 s for the transfer and 3 s for the
+successor's commit), then closes the node in place: the apply thread finishes its entry, its completer gets up to a
+minute, and the database closes (with its flush). When another thread had already started the close (a replica
+failure racing the signal), the hook waits up to 2 minutes for it. A stop past `TimeoutStopSec` gets SIGKILL, exit
+137, and the unit is "failed" whatever `SuccessExitStatus` says; for the node that is a crash (it replays its log at
+the next start), not a loss. 150 s covers the waits the node bounds itself; a database close slower than that is a
+disk problem to look at.
 
 | Code | `run` | `admin` | `repair-log` | `export-seed`, `restore-backup` |
 |---|---|---|---|---|

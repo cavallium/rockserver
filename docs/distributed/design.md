@@ -1445,8 +1445,9 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   that stay), and it was started without `--join` or was a member once (it writes `raft/member` when a configuration
   from the log makes it one, after the leader checks of each maintenance tick and on its own, so that a failed write,
   such as on a full disk, does not keep a stalled leader in place). With systemd, `RestartPreventExitStatus=2 4 5` keeps it down (2: wrong usage or no `-XX:+ExitOnOutOfMemoryError`;
-  5: a database of a newer cluster version; see "Exit codes" in runbooks.md for the whole unit, with
-  `SuccessExitStatus=143` for a stop by SIGTERM). A node of a version before
+  5: a database of a newer cluster version; see "Exit codes" in runbooks.md for the exit and stop settings of the
+  unit, with `SuccessExitStatus=143` for a stop by SIGTERM and `TimeoutStopSec=150` for a stop longer than systemd's
+  default of 90 s). A node of a version before
   this, started with `--join`, has no `raft/member` and still stays up in the initializing state, printing `READY`; it
   says so in its log as above. One start is refused wrongly: a node that holds a joint configuration of its own
   removal that its leader never committed before losing its leadership. Only a node that was being removed gets there;
@@ -1964,10 +1965,15 @@ Two differences remain, both judged not worth a privileged harness. A blackholed
 (the TCP handshake with the proxy succeeds) and then holds it, where a real dead host leaves the connect hanging on
 SYN retries: a client then waits for the HTTP/2 preface instead of the connect, and both end on the same gRPC
 deadline or keepalive. And the gradual shape of a lossy link (throughput collapsing under congestion control,
-stalls of a few RTOs) is approximated by fixed jitter and a fixed cap, not reproduced. netem in a namespace also
-needs the host's `sch_netem` module, which only root can load (`tc` in `unshare -rn` on the development machine
-answers "Specified qdisc kind is unknown"), so it would not run unattended anyway. Faults that need several machines
-(a real switch, failure domains) stay with the multi-host item (RT-28).
+stalls of a few RTOs) is approximated by fixed jitter and a fixed cap, not reproduced. netem in a namespace would
+also need a one-time step by root on each machine that runs the tests: the kernel does not load a module on request
+from inside a user namespace, so `sch_netem` must be loaded beforehand (`modprobe sch_netem`, or a line in
+`/etc/modules-load.d/`). After that, `tc qdisc ... netem` inside `unshare -rn` should need no privilege. On the
+development machine `tc` in `unshare -rn` answers "Specified qdisc kind is unknown" for a reason of its own: the
+running kernel (7.3.0-5) has no module tree after an upgrade without a reboot (`modinfo sch_netem` finds nothing,
+while the installed 7.3.1-1 ships `sch_netem.ko.zst` and its config has `CONFIG_NET_SCH_NETEM=m`). So netem is
+feasible here after a reboot and that root step (needs-user), but the argument above does not depend on it. Faults
+that need several machines (a real switch, failure domains) stay with the multi-host item (RT-28).
 
 When two faults overlap, a flapping link cuts and restores only the links of its node that no other network fault of
 the step holds, so the other fault keeps its links for its whole planned hold instead of being healed by the flapper
@@ -2124,18 +2130,34 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      callers' retries), the server has already ended the update, so the cleanup does not close it a second time
      and the double-close warning is gone. Every other failure, including an `UPDATE_RETRY` from the put or delete
      that ends the update, and a cancel still close it: a single node keeps the native transaction open after a
-     conflicting ending write, and the cluster answers a close of an update it has dropped quietly. One case still
-     warns: with `--pipelined-updates`, the cluster refuses the put or delete that ends a chained update with
-     `UPDATE_RETRY` when the commit it read from failed, and drops the update (`UpdateProtocol.stagedWrite`); the same
-     happens when the chained commit itself conflicts. The cleanup then closes it, as after any `UPDATE_RETRY` from an
-     ending write, and the close of a chained update the leader does not hold answers `UPDATE_RETRY`, not quietly
-     (`UpdateProtocol.closeChained`: the read may not be real, so the client must run the update again).
-     `RockserverUpdateTransactions.closeFailedUpdate` turns that answer into a `NoChangeCloseRetryException`, and
-     `closeFailedUpdateQuietly` logs "Failed to close RocksDB update transaction" (at most once a minute) and drops it.
-     The caller gets the put's `UPDATE_RETRY` and runs the update again, as it would anyway; nothing is written or left
-     open, since a chained update has no native transaction. The close cannot tell this case from a real retry
-     without knowing that the put already failed, so the warning stays; it only counts refused chained writes, which a
-     pipelined cluster under contention makes on purpose. Not checked against a running replicated server.
+     conflicting ending write. The cluster answers such a close quietly for an update without `--pipelined-updates`
+     (`UpdateProtocol.closeFailedUpdate` rolls back a native id and answers at once, whether or not it still holds
+     it), but not for a chained one. With `--pipelined-updates`, `UpdateProtocol.closeChained` answers `UPDATE_RETRY`
+     whenever it cannot confirm the chained read (see "Chained close"), and `RockserverUpdateTransactions` turns
+     that into a `NoChangeCloseRetryException` that `closeFailedUpdateQuietly` logs ("Failed to close RocksDB update
+     transaction", at most once a minute) and drops. The cleanup close of a chained update therefore warns:
+     - when the leader no longer holds the update: the commit of any chained ending write removes it, whatever its
+       error (`UpdateProtocol.stagedWrite`: `UPDATE_RETRY` from a chain conflict or a failed guard, a deadline or
+       `OUTCOME_UNKNOWN`, `NOT_LEADER`, a cancel), and so does the refusal of an ending write whose base commit
+       failed; the same when the update was opened under a previous leader, the close reaches a new one, or its
+       lease ended;
+     - when the leader still holds it but the commit it read from failed or is not known to have applied within
+       the close's wait: a body that throws its own error, or is cancelled, after reading a chained value whose
+       predecessor failed.
+
+     So under `--pipelined-updates` the warning follows leader changes, timeouts and body failures as well as refused
+     chained writes: it counts failed chained updates, and a pipelined cluster under contention makes some on purpose.
+     Nothing is written or left open in any of these cases, since a chained update has no native transaction and the
+     leader removes it before it answers. In the first case the caller already has the ending write's own error, and
+     runs the update again on an `UPDATE_RETRY`, as it would anyway. In the second the caller gets the body's error,
+     while the close's `UPDATE_RETRY`, which says the read was not real, is only logged: a body that fails because of
+     what it read has acted on a provisional value, which "Behavior differences from a single node" forbids, and the
+     warning is the only trace of it. Answering these closes quietly would be wrong (a clean close of an unconfirmed
+     chained read would confirm it), and the cleanup cannot skip them without knowing that the update already ended,
+     so the warning stays. Left on the Yotsuba side: the javadoc of `RockserverUpdateTransactions.updateAlreadyEnded`
+     still says the cluster answers a close of a dropped update quietly, which holds only without
+     `--pipelined-updates`; that repository is outside this branch's work. Not checked against a running replicated
+     server.
 
    On the Rockserver side, the core client's automatic gRPC retry of reads waits for its backoff before it sends a
    read to the next node: 50 ms, then growing, on a connection with several addresses (the next node is another one,
