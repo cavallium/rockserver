@@ -33,7 +33,8 @@ import java.util.concurrent.locks.LockSupport;
  *
  * <pre>
  * java -cp ... LoadBench --target replicated|single --root DIR [--scales 1,2,4] [--closed 64,256]
- *     [--step-seconds 30] [--warmup-seconds 10] [--route leader|all|failover] [--connections 4]
+ *     [--step-seconds 30] [--warmup-seconds 10] [--route leader|all|failover|same-list] [--connections 4]
+ *     [--first follower|leader|ID] [--leader-hint listed|any|off]
  *     [--chats 20000] [--messages-per-chat 50] [--value-bytes 600] [--skew 0.5] [--max-in-flight 512]
  *     [--hot-keys 4:0.5] [--only UPDATE,GET] [--jvm "-Xmx4g -XX:+UseZGC"] [--server-arg "--snapshot-every 100000"]
  *     [--label text]
@@ -41,6 +42,13 @@ import java.util.concurrent.locks.LockSupport;
  *
  * <p>{@code --hot-keys N:SHARE} sends that share of the updates to N single keys, for what one key sustains; compare
  * with and without {@code --server-arg --pipelined-updates}. {@code --only UPDATE --hot-keys 1:1} isolates it.</p>
+ *
+ * <p>{@code --route same-list} (DD-25, PF-5) connects as production clients do: every connection lists every node, in
+ * the same order, starting from the node {@code --first} names (a follower by default, so that the clients start on a
+ * node that must forward or hint). {@code --leader-hint} sets the client's leader-hint mode for the run (the
+ * {@code it.cavallium.rockserver.grpc.client.leader-hint} property); compare {@code listed} with {@code off} to measure
+ * what the hint gains over forwarding through a follower, which saturated near 2x of production in the earlier runs.
+ * The other routes give each connection one node, or (failover) a list rotated per node.</p>
  */
 public final class LoadBench {
 
@@ -120,6 +128,15 @@ public final class LoadBench {
 	private List<GrpcConnection> connect(BenchNodes nodes, boolean replicated) throws Exception {
 		int perNode = Integer.parseInt(option("--connections", "4"));
 		var route = option("--route", "leader");
+		var hint = option("--leader-hint", "");
+		if (!hint.isEmpty()) {
+			// Read by each connection as it is made.
+			System.setProperty("it.cavallium.rockserver.grpc.client.leader-hint", hint);
+			line("leader hint: " + hint);
+		}
+		if (replicated && route.equals("same-list")) {
+			return connectSameList(nodes, perNode);
+		}
 		var targets = new ArrayList<BenchNodes.Node>();
 		if (!replicated || route.equals("all") || route.equals("failover")) {
 			targets.addAll(nodes.nodes());
@@ -138,6 +155,41 @@ public final class LoadBench {
 			java.util.Collections.rotate(addresses, -1);
 		}
 		line("connections: " + connections.size() + " to nodes " + targets.stream().map(BenchNodes.Node::id).toList());
+		return connections;
+	}
+
+	/**
+	 * {@code --route same-list}: {@code perNode} connections per node, each listing every node in one order, which
+	 * starts at {@code --first} (follower, leader, or a node id) and goes on in node order.
+	 */
+	private List<GrpcConnection> connectSameList(BenchNodes nodes, int perNode) throws Exception {
+		var first = option("--first", "follower");
+		var all = nodes.nodes();
+		String firstId;
+		if (first.equals("leader") || first.equals("follower")) {
+			var leaderId = leader(nodes).id();
+			firstId = first.equals("leader") ? leaderId
+					: all.stream().map(BenchNodes.Node::id).filter(id -> !id.equals(leaderId)).findFirst().orElseThrow();
+		} else {
+			firstId = first;
+		}
+		var ordered = new ArrayList<BenchNodes.Node>(all);
+		int start = -1;
+		for (int i = 0; i < ordered.size(); i++) {
+			if (ordered.get(i).id().equals(firstId)) {
+				start = i;
+			}
+		}
+		if (start < 0) {
+			throw new IllegalArgumentException("--first " + first + ": no such node");
+		}
+		java.util.Collections.rotate(ordered, -start);
+		var addresses = ordered.stream().map(BenchNodes.Node::api).toList();
+		var connections = new ArrayList<GrpcConnection>();
+		for (int i = 0; i < perNode * all.size(); i++) {
+			connections.add(GrpcConnection.forHostsAndPorts("bench-same-list-" + i, addresses));
+		}
+		line("connections: " + connections.size() + ", each to the list " + ordered.stream().map(BenchNodes.Node::id).toList());
 		return connections;
 	}
 
