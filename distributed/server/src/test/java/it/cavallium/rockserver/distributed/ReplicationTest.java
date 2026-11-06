@@ -97,7 +97,7 @@ class ReplicationTest {
 
 	/**
 	 * Halts {@code id} on a thread of its own and returns that thread: a node whose apply thread waits for
-	 * {@code applyGateForTesting} stops only once the gate opens.
+	 * {@code testHooks().applyGate} stops only once the gate opens.
 	 */
 	private Thread haltInBackground(String id) {
 		return Thread.ofPlatform().name("halt-" + id).start(() -> {
@@ -161,7 +161,7 @@ class ReplicationTest {
 		var followers = cluster.runningNodes().stream().filter(node -> node != oldLeader).toList();
 		try {
 			for (var follower : followers) {
-				follower.stateMachine().applyGateForTesting = gate;
+				follower.stateMachine().testHooks().applyGate = gate;
 			}
 			// Acknowledged by the leader once a follower logged it; neither follower can apply it.
 			api(oldLeader).put(0, column, key(1), text("new"), RequestType.none());
@@ -178,7 +178,7 @@ class ReplicationTest {
 		} finally {
 			gate.countDown();
 			for (var follower : followers) {
-				follower.stateMachine().applyGateForTesting = null;
+				follower.stateMachine().testHooks().applyGate = null;
 			}
 		}
 		var newLeader = cluster.awaitLeader(TIMEOUT);
@@ -428,7 +428,7 @@ class ReplicationTest {
 		cluster.awaitConverged(TIMEOUT);
 		long committedBefore = commitIndex(other);
 		var gate = new CountDownLatch(1);
-		leader.stateMachine().applyGateForTesting = gate;
+		leader.stateMachine().testHooks().applyGate = gate;
 		CompletableFuture<Void> write;
 		Thread halting = null;
 		try {
@@ -444,7 +444,7 @@ class ReplicationTest {
 			InProcessCluster.await(TIMEOUT, () -> through.leaderId() == null);
 		} finally {
 			gate.countDown();
-			leader.stateMachine().applyGateForTesting = null;
+			leader.stateMachine().testHooks().applyGate = null;
 			if (halting != null) {
 				halting.join();
 			}
@@ -505,7 +505,7 @@ class ReplicationTest {
 		cluster.awaitConverged(TIMEOUT);
 		long before = leader.appliedIndex();
 		var gate = new java.util.concurrent.CountDownLatch(1);
-		leader.stateMachine().applyGateForTesting = gate;
+		leader.stateMachine().testHooks().applyGate = gate;
 		java.util.concurrent.CompletableFuture<Void> write;
 		try {
 			write = follower.connection().getAsyncApi(CONTEXT).putAsync(0, column, key(1), text("slow"),
@@ -515,7 +515,7 @@ class ReplicationTest {
 			Thread.sleep(4500);
 		} finally {
 			gate.countDown();
-			leader.stateMachine().applyGateForTesting = null;
+			leader.stateMachine().testHooks().applyGate = null;
 		}
 		write.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
 		cluster.awaitConverged(TIMEOUT);
@@ -690,7 +690,7 @@ class ReplicationTest {
 		long column = api(through).createColumn("c", SCHEMA);
 		cluster.awaitConverged(TIMEOUT);
 		var failure = new IllegalStateException("Injected apply failure");
-		leader.stateMachine().applyFailureForTesting = failure;
+		leader.stateMachine().testHooks().applyFailure = failure;
 
 		var write = through.connection().getAsyncApi(CONTEXT).putAsync(0, column, key(1), text("written"),
 				RequestType.none());
@@ -730,9 +730,9 @@ class ReplicationTest {
 		var stateMachine = failing.stateMachine();
 		long column = api(leader).createColumn("c", SCHEMA);
 		cluster.awaitConverged(TIMEOUT);
-		stateMachine.limitApplyQueueForTesting(QUEUE_LIMIT_KIB);
+		stateMachine.testHooks().limitApplyQueue(QUEUE_LIMIT_KIB);
 		var gate = new CountDownLatch(1);
-		stateMachine.applyGateForTesting = gate;
+		stateMachine.testHooks().applyGate = gate;
 		var failure = new IllegalStateException("Injected apply failure");
 		try {
 			writeLarge(leader, column, 0, 64);
@@ -741,10 +741,10 @@ class ReplicationTest {
 			assertTrue(stateMachine.handedOverForTesting() < committed - 32,
 					"precondition: Ratis waits for room in the apply queue, handed over "
 							+ stateMachine.handedOverForTesting() + " of " + committed);
-			stateMachine.applyFailureForTesting = failure;
+			stateMachine.testHooks().applyFailure = failure;
 		} finally {
 			gate.countDown();
-			stateMachine.applyGateForTesting = null;
+			stateMachine.testHooks().applyGate = null;
 		}
 		assertSame(failure, failing.stopped().get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
 		assertTrue(failing.isFailed());
@@ -773,10 +773,10 @@ class ReplicationTest {
 		var stateMachine = lagging.stateMachine();
 		long column = api(leader).createColumn("c", SCHEMA);
 		cluster.awaitConverged(TIMEOUT);
-		stateMachine.limitApplyQueueForTesting(QUEUE_LIMIT_KIB);
+		stateMachine.testHooks().limitApplyQueue(QUEUE_LIMIT_KIB);
 		int largeWrites = 256;
 		var gate = new CountDownLatch(1);
-		stateMachine.applyGateForTesting = gate;
+		stateMachine.testHooks().applyGate = gate;
 		try {
 			long applied = lagging.appliedIndex();
 			// 4 MiB, written through the leader and the other follower.
@@ -789,7 +789,7 @@ class ReplicationTest {
 			assertEquals(applied, lagging.appliedIndex());
 		} finally {
 			gate.countDown();
-			stateMachine.applyGateForTesting = null;
+			stateMachine.testHooks().applyGate = null;
 		}
 		cluster.awaitConverged(TIMEOUT);
 		for (int i = 0; i < largeWrites; i += 17) {
@@ -1011,7 +1011,7 @@ class ReplicationTest {
 		cluster.awaitConverged(TIMEOUT);
 		long committedBefore = commitIndex(other);
 		var gate = new CountDownLatch(1);
-		leader.stateMachine().applyGateForTesting = gate;
+		leader.stateMachine().testHooks().applyGate = gate;
 		var graceful = System.getProperty(GRPC_GRACEFUL_SHUTDOWN);
 		Thread halting = null;
 		CompletableFuture<Boolean> commit;
@@ -1032,7 +1032,7 @@ class ReplicationTest {
 			assertTrue(cause.getMessage().contains("outcome of the commit is unknown"), cause.getMessage());
 		} finally {
 			gate.countDown();
-			leader.stateMachine().applyGateForTesting = null;
+			leader.stateMachine().testHooks().applyGate = null;
 			if (halting != null) {
 				halting.join();
 			}
@@ -1122,7 +1122,7 @@ class ReplicationTest {
 		var async = leader.connection().getAsyncApi(CONTEXT);
 		var fillerCommits = new ArrayList<CompletableFuture<Boolean>>();
 		var gate = new CountDownLatch(1);
-		leader.stateMachine().applyGateForTesting = gate;
+		leader.stateMachine().testHooks().applyGate = gate;
 		CompletableFuture<Boolean> firstCommit;
 		CompletableFuture<Boolean> secondCommit;
 		CompletableFuture<Boolean> thirdCommit;
@@ -1136,7 +1136,7 @@ class ReplicationTest {
 			thirdCommit = async.closeTransactionAsync(third, true);
 		} finally {
 			gate.countDown();
-			leader.stateMachine().applyGateForTesting = null;
+			leader.stateMachine().testHooks().applyGate = null;
 		}
 		for (var commit : fillerCommits) {
 			assertTrue(commit.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));

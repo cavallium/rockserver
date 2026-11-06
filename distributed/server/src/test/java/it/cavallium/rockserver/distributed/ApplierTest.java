@@ -726,4 +726,79 @@ class ApplierTest {
 			store.db().getColumnId("d");
 		}
 	}
+
+	@Test
+	void aDeleteRangeIsAppliedWithoutFlushAndAReplayGivesTheSameResult() throws Exception {
+		long column;
+		try (var store = open()) {
+			column = store.db().createColumn("c", SCHEMA);
+		}
+		var deleteRange = new Request(12, 6, 0, new LogEntry.DeleteRange(column, key(2), key(4)));
+		var crashed = open();
+		var applier = new Applier(crashed);
+		for (int i = 1; i <= 5; i++) {
+			applier.apply(new Request(12, i, 0, new LogEntry.Put(column, key(i), text("v" + i), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, i));
+		}
+		crashed.db().flush();
+		applier.beginGroup();
+		assertEquals(ApplyResult.OK_NULL, applier.applyBatch(List.of(deleteRange), TermIndex.valueOf(1, 6)).getFirst());
+		applier.applyBatch(List.of(new Request(12, 7, 0, new LogEntry.Put(column, key(3), text("after"),
+				RequestTypeId.NOTHING))), TermIndex.valueOf(1, 7));
+		applier.endGroup();
+		assertNull(value(crashed, column, 2));
+		assertEquals("after", value(crashed, column, 3));
+		assertEquals(TermIndex.valueOf(1, 7), crashed.applied());
+		// Kill: nothing after the flush is durable, the range deletion included (it flushed nothing, and wrote no WAL).
+		crashed.connection().close();
+		try (var store = open()) {
+			assertEquals(TermIndex.valueOf(1, 5), store.applied());
+			assertEquals("v2", value(store, column, 2));
+			// The deletion survives a crash without its record: replaying the entry deletes the range again, with the
+			// same result, and the later entry follows.
+			store.db().deleteRangeUnlogged(column, key(2), key(4));
+			store.db().flush();
+			var replay = new Applier(store);
+			assertEquals(ApplyResult.OK_NULL, replay.apply(deleteRange, TermIndex.valueOf(1, 6)));
+			replay.apply(new Request(12, 7, 0, new LogEntry.Put(column, key(3), text("after"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 7));
+			assertNull(value(store, column, 2));
+			assertEquals("after", value(store, column, 3));
+			assertEquals("v4", value(store, column, 4));
+			assertEquals(TermIndex.valueOf(1, 7), store.applied());
+			// A copy of the entry gets the recorded result.
+			assertEquals(ApplyResult.OK_NULL, replay.apply(deleteRange, TermIndex.valueOf(1, 8)));
+			assertEquals("after", value(store, column, 3));
+		}
+	}
+
+	@Test
+	void aBatchDecodedInPlaceAppliesLikeACopy() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			var requests = List.of(
+					new Request(13, 0, 0, new LogEntry.Put(column, key(1), text("a"), RequestTypeId.NOTHING)),
+					new Request(13, 1, 0, new LogEntry.Merge(column, key(1), text("b"), RequestTypeId.MERGED)),
+					new Request(13, 2, 0, new LogEntry.MergeMulti(column, List.of(key(2), key(3)),
+							List.of(text("c"), text("d")), RequestTypeId.NOTHING)),
+					new Request(13, 3, 0, new LogEntry.Put(column, key(4), text("e"), RequestTypeId.PREVIOUS)));
+			byte[] encoded = LogEntryCodec.encodeBatch(requests);
+			// Inside a larger array, as a slice of a log segment or of a request would be.
+			byte[] framed = new byte[encoded.length + 7];
+			System.arraycopy(encoded, 0, framed, 3, encoded.length);
+			var decoded = RockserverStateMachine.decodeBatch(
+					org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations.unsafeWrap(framed, 3,
+							encoded.length));
+			var value = ((LogEntry.Put) decoded.getFirst().entry()).value();
+			assertNull(value.asArrayStrict(), "decoded in place, not copied");
+			org.junit.jupiter.api.Assertions.assertArrayEquals(encoded, LogEntryCodec.encodeBatch(decoded));
+			var results = applier.applyBatch(decoded, TermIndex.valueOf(1, 1));
+			assertEquals("a,b", ((Buf) ((ApplyResult.Ok) results.get(1)).value()).toString(StandardCharsets.UTF_8));
+			assertEquals("a,b", value(store, column, 1));
+			assertEquals("c", value(store, column, 2));
+			assertEquals("d", value(store, column, 3));
+			assertEquals("e", value(store, column, 4));
+		}
+	}
 }

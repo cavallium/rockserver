@@ -44,7 +44,13 @@ public class RocksDBException extends RuntimeException {
 		COMPACTION_CONFLICT,
 		COMPACTION_FAILED,
 		GET_MULTI_ITEM_TOO_LARGE,
-		INVALID_REQUEST
+		INVALID_REQUEST,
+		/**
+		 * A merge operator failed: it threw, or returned no value, while merging the operands of a key. The failure
+		 * follows from the operator and the data, not from the machine: a replicated write gets it as its result on
+		 * every replica.
+		 */
+		MERGE_OPERATOR_FAILED
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {
@@ -98,6 +104,8 @@ public class RocksDBException extends RuntimeException {
 
 	protected RocksDBException(RocksDBErrorType errorUniqueId, String message, org.rocksdb.RocksDBException ex) {
 		this(errorUniqueId, message + ": " + ex.getMessage());
+		// Kept: the native status tells a storage failure from a logical one.
+		super.initCause(ex);
 	}
 
 	public RocksDBErrorType getErrorUniqueId() {

@@ -48,7 +48,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Updates of one key with {@link NodeConfig#pipelinedUpdates()} on, on real Ratis servers in one JVM. Most tests stop
- * the leader's apply with {@code applyGateForTesting}, which keeps chain links unsettled for as long as a test needs.
+ * the leader's apply with {@code testHooks().applyGate}, which keeps chain links unsettled for as long as a test needs.
  */
 class PipelinedUpdatesTest {
 
@@ -107,13 +107,13 @@ class PipelinedUpdatesTest {
 	private void closeGate(ReplicatedNode node) {
 		gate = new CountDownLatch(1);
 		gated = node;
-		node.stateMachine().applyGateForTesting = gate;
+		node.stateMachine().testHooks().applyGate = gate;
 	}
 
 	private void openGate() {
 		if (gate != null) {
 			gate.countDown();
-			gated.stateMachine().applyGateForTesting = null;
+			gated.stateMachine().testHooks().applyGate = null;
 			gate = null;
 		}
 	}
@@ -609,14 +609,14 @@ class PipelinedUpdatesTest {
 	 */
 	private CompletableFuture<?> aRejectedEntry() throws Exception {
 		var stopped = new CountDownLatch(1);
-		leader.stateMachine().applyGateForTesting = stopped;
+		leader.stateMachine().testHooks().applyGate = stopped;
 		var commit = put(forUpdate(1), 1, "v20");
 		var chained = forUpdate(1);
 		assertTrue(chained(chained));
 		long rejections = count(leader, "update.guardRejected");
 		var rejected = appended(() -> commitWithWrongGuard(chained, "wrong", "crafted"));
 		stopped.countDown();
-		leader.stateMachine().applyGateForTesting = null;
+		leader.stateMachine().testHooks().applyGate = null;
 		assertRetry(rejected);
 		assertEquals(rejections + 1, count(leader, "update.guardRejected"), "the log holds a rejection");
 		await(async(leader).closeFailedUpdateAsync(chained.updateId()));

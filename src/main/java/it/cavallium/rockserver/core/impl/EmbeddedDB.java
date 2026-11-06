@@ -2499,6 +2499,159 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	/**
+	 * Opens a write transaction for the apply thread of replication, which is the only writer of the database: like
+	 * {@link #openUnloggedTransaction}, but held by the caller instead of being registered under an id. Its
+	 * operations run the same code as the public ones with a transaction, so keys, schemas, merges and results are
+	 * the same byte for byte, without the per-call bookkeeping of a client operation: the transaction lookup and
+	 * lock, column use counting, action logging, operation counters and timers. The caller must not use it from
+	 * several threads, must not delete a column while it is open, and must close it before the database closes.
+	 */
+	public ApplyWriter openApplyWriter(boolean disableWal) {
+		ops.beginOp();
+		try {
+			return new ApplyWriter(openTransactionInternal(APPLY_WRITER_EXPIRATION_MS, false, WorkloadProfile.BATCH,
+					false, disableWal, true));
+		} finally {
+			ops.endOp();
+		}
+	}
+
+	/**
+	 * Expiration of an {@link ApplyWriter}'s native transaction. It must never expire while it is used: on a
+	 * pessimistic database an expired transaction fails its commit, which would look like a rejected entry on this
+	 * replica only.
+	 */
+	private static final long APPLY_WRITER_EXPIRATION_MS = 24L * 60 * 60 * 1000;
+
+	/** A write transaction of the replication apply thread, see {@link #openApplyWriter}. */
+	public final class ApplyWriter implements AutoCloseable {
+
+		private final Tx tx;
+
+		private ApplyWriter(Tx tx) {
+			this.tx = tx;
+		}
+
+		public <T> T put(long columnId, @NotNull Keys keys, @NotNull Buf value, RequestPut<? super Buf, T> requestType) {
+			return EmbeddedDB.this.put(tx, getColumn(columnId), 0L, keys, value, requestType);
+		}
+
+		/** Like {@link EmbeddedDB#putMulti} with a transaction. */
+		public <T> List<T> putMulti(long columnId, @NotNull List<Keys> keysList, @NotNull List<@NotNull Buf> valueList,
+				RequestPut<? super Buf, T> requestType) {
+			try {
+				var col = getColumn(columnId);
+				if (keysList.size() != valueList.size()) {
+					throw new IllegalArgumentException(
+							"keys length is different than values length: " + keysList.size() + " != " + valueList.size());
+				}
+				List<T> responses = requestType instanceof RequestType.RequestNothing<?>
+						|| requestType instanceof RequestType.RequestEnsure<?> ? null : new ArrayList<>(keysList.size());
+				for (int i = 0; i < keysList.size(); i++) {
+					T result = EmbeddedDB.this.put(tx, col, 0L, keysList.get(i), valueList.get(i), requestType);
+					if (responses != null) {
+						responses.add(result);
+					}
+				}
+				return responses != null ? responses : List.of();
+			} catch (RocksDBException ex) {
+				throw ex;
+			} catch (Exception ex) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			}
+		}
+
+		public <T> T delete(long columnId, @NotNull Keys keys, RequestDelete<? super Buf, T> requestType) {
+			return EmbeddedDB.this.delete(tx, getColumn(columnId), 0L, keys, requestType);
+		}
+
+		/** Like {@link EmbeddedDB#deleteMulti} with a transaction. */
+		public <T> List<T> deleteMulti(long columnId, @NotNull List<Keys> keysList,
+				RequestDelete<? super Buf, T> requestType) {
+			var col = getColumn(columnId);
+			List<T> responses =
+					requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+			for (Keys keys : keysList) {
+				T result = EmbeddedDB.this.delete(tx, col, 0L, keys, requestType);
+				if (responses != null) {
+					responses.add(result);
+				}
+			}
+			return responses != null ? responses : List.of();
+		}
+
+		public <T> T merge(long columnId, @NotNull Keys keys, @NotNull Buf value,
+				RequestMerge<? super Buf, T> requestType) {
+			return EmbeddedDB.this.merge(tx, getColumn(columnId), 0L, keys, value, requestType);
+		}
+
+		/** Like {@link EmbeddedDB#mergeMulti} with a transaction. */
+		public <T> List<T> mergeMulti(long columnId, @NotNull List<Keys> keysList,
+				@NotNull List<@NotNull Buf> valueList, RequestMerge<? super Buf, T> requestType) {
+			try {
+				var col = getColumn(columnId);
+				if (keysList.size() != valueList.size()) {
+					throw new IllegalArgumentException(
+							"keys length is different than values length: " + keysList.size() + " != " + valueList.size());
+				}
+				List<T> responses =
+						requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
+				for (int i = 0; i < keysList.size(); i++) {
+					T result = EmbeddedDB.this.merge(tx, col, 0L, keysList.get(i), valueList.get(i), requestType);
+					if (responses != null) {
+						responses.add(result);
+					}
+				}
+				return responses != null ? responses : List.of();
+			} catch (RocksDBException ex) {
+				throw ex;
+			} catch (Exception ex) {
+				throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
+			}
+		}
+
+		/** A read through the transaction: it sees the writes made to it. Not {@code forUpdate}. */
+		public <T> T get(long columnId, Keys keys, RequestGet<? super Buf, T> requestType) {
+			if (requestType instanceof RequestType.RequestForUpdate<?>) {
+				throw new UnsupportedOperationException("An apply writer does not run updates");
+			}
+			return EmbeddedDB.this.get(tx, 0L, getColumn(columnId), keys, requestType);
+		}
+
+		/** Marks the current state: {@link #rollbackToSavePoint} undoes the writes made after it. */
+		public void setSavePoint() {
+			try {
+				tx.val().setSavePoint();
+			} catch (org.rocksdb.RocksDBException e) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+			}
+		}
+
+		/** Undoes the writes made since the latest {@link #setSavePoint}, and forgets it. */
+		public void rollbackToSavePoint() {
+			try {
+				tx.val().rollbackToSavePoint();
+			} catch (org.rocksdb.RocksDBException e) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+			}
+		}
+
+		/**
+		 * Commits the writes and closes the transaction. Returns false, with the transaction still open, only for an
+		 * optimistic conflict, which nothing should cause: it tracks no keys.
+		 */
+		public boolean commit() {
+			return closeTransactionInternal(tx, true);
+		}
+
+		/** Rolls back what was not committed, and closes the transaction. Safe to call again. */
+		@Override
+		public void close() {
+			closeTransactionInternal(tx, false);
+		}
+	}
+
 	private long allocateTransactionInternal(Tx tx) {
 		try {
 			return FastRandomUtils.allocateNewValue(txs, tx, Long.MIN_VALUE, -2);
@@ -3166,12 +3319,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private static void txMerge(Tx tx, ColumnFamilyHandle column, byte[] key, byte[] value)
+	private static void txMerge(Tx tx, ColumnFamilyHandle column, byte[] key, Buf value)
 			throws org.rocksdb.RocksDBException {
 		if (tx.untracked()) {
-			tx.val().mergeUntracked(column, key, value);
+			byte[] array = value.asArrayStrict();
+			if (array != null) {
+				tx.val().mergeUntracked(column, key, array);
+			} else {
+				// A slice of a larger array (such as a value decoded in place from a replicated log entry): passed with
+				// its offset, without a copy. Heap buffers both, as RocksDB's binding requires.
+				tx.val().mergeUntracked(column, java.nio.ByteBuffer.wrap(key), value.asHeapByteBuffer());
+			}
 		} else {
-			tx.val().merge(column, key, value);
+			tx.val().merge(column, key, jniArray(value));
 		}
 	}
 
@@ -5307,6 +5467,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestMerge<? super Buf, U> callback) throws RocksDBException {
+		// Forget a failure of an earlier merge on this thread: only one of this merge may name the operator.
+		FFMAbstractMergeOperator.takeFailureOnThisThread();
 		try {
 			boolean needsTx = col.hasBuckets() || !(callback instanceof RequestType.RequestNothing<?>);
 			if (optionalDbWriter instanceof Tx tx && tx.isFromGetForUpdate() && callback instanceof RequestType.RequestMerged<?>) {
@@ -5346,7 +5508,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							var existing = bucket.getElement(bucketElementKeys);
 							Buf mergedValue;
 							if (existing != null) {
-								var mergedRes = col.mergeOperator().merge(calculatedKey, existing, List.of(value));
+								var mergedRes = mergeInJava(col, calculatedKey, existing, value);
 								mergedValue = mergedRes != null ? mergedRes : existing;
 							} else {
 								mergedValue = value;
@@ -5368,7 +5530,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							case WB wb -> wb.wb().merge(col.cfh(), calculatedKeyArray, jniArray(value));
 							case SSTWriter ignored ->
 									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Merge not supported with SST writer");
-							case Tx t -> txMerge(t, col.cfh(), calculatedKeyArray, jniArray(value));
+							case Tx t -> txMerge(t, col.cfh(), calculatedKeyArray, value);
 							case null -> {
 								try (var w = new LeakSafeWriteOptions(null)) {
 									db.get().merge(col.cfh(), w, calculatedKeyArray, jniArray(value));
@@ -5430,12 +5592,49 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (updateId != 0L && !(ex instanceof RocksDBRetryException)) {
 				closeTransaction(updateId, false);
 			}
+			// A read of the merged value runs the operator on this thread, and RocksDB reports its failure as a
+			// corruption: name the operator instead, so that the failure is not taken for a storage one.
+			var operatorFailure = FFMAbstractMergeOperator.takeFailureOnThisThread();
+			if (operatorFailure != null && !(ex instanceof RocksDBException rocksDBException
+					&& rocksDBException.getErrorUniqueId() == RocksDBErrorType.MERGE_OPERATOR_FAILED)) {
+				var failure = mergeOperatorFailed(operatorFailure);
+				failure.addSuppressed(ex);
+				throw failure;
+			}
 			if (ex instanceof RocksDBException rocksDBException) {
 				throw rocksDBException;
 			} else {
 				throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 			}
 		}
+	}
+
+	/**
+	 * Merges {@code value} into {@code existing} with the column's operator, called from Java (bucketed columns keep
+	 * their elements inside one RocksDB value, so RocksDB cannot merge them). A failure of the operator is reported
+	 * as {@link RocksDBErrorType#MERGE_OPERATOR_FAILED}; a failure of the JVM itself is not the operator's.
+	 */
+	private static @Nullable Buf mergeInJava(ColumnInstance col, Buf key, Buf existing, Buf value) {
+		var operator = col.mergeOperator();
+		if (operator == null) {
+			throw RocksDBException.of(RocksDBErrorType.MERGE_OPERATOR_FAILED, "The column has no merge operator");
+		}
+		try {
+			return operator.merge(key, existing, List.of(value));
+		} catch (VirtualMachineError error) {
+			throw error;
+		} catch (Throwable operatorFailure) {
+			throw mergeOperatorFailed(operatorFailure);
+		}
+	}
+
+	/**
+	 * The failure of a merge operator: the same on every replica that runs the same operator over the same data. See
+	 * {@link FFMAbstractMergeOperator#takeFailureOnThisThread}.
+	 */
+	public static RocksDBException mergeOperatorFailed(Throwable operatorFailure) {
+		return RocksDBException.of(RocksDBErrorType.MERGE_OPERATOR_FAILED, "Merge operator failed: " + operatorFailure,
+				operatorFailure);
 	}
 
 	private Buf transformResultValue(ColumnInstance col, Buf realPreviousValue) {

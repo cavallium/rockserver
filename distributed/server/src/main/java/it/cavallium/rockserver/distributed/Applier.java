@@ -10,7 +10,9 @@ import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
-import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.EmbeddedDB.ApplyWriter;
+import it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -33,13 +35,14 @@ import org.jetbrains.annotations.Nullable;
  * <p>Applying a {@link Request} makes three things durable together: the entry's effects, its result (recorded under
  * the request's identity, see {@link Request}) and the new applied position. The data writes of a group of entries
  * run inside one local transaction without the WAL that writes all three (see {@link #beginGroup}), so a crash keeps
- * all or none of them. Schema changes and {@code deleteRange} cannot run in a transaction: the memtables are flushed
- * first, then their record and position are written in one logged write and the WAL is synced.</p>
+ * all or none of them. A {@code deleteRange} runs alone without the WAL, followed by its record and position (see
+ * {@link #applyAlone}). Schema changes cannot run in a transaction: the memtables are flushed first, then their record
+ * and position are written in one logged write and the WAL is synced.</p>
  *
- * <p>An entry that the database rejects for a logical reason (missing column, malformed keys...) is rejected the
- * same way on every replica: that becomes an {@link ApplyResult.Failed} and the log moves on. A storage or native
- * failure is specific to this replica: it is thrown as {@link ReplicaFailedException}, and the replica stops
- * instead of skipping the entry.</p>
+ * <p>A failure that follows from the entry (a logical rejection, a failing merge operator, an exception of the apply
+ * code) happens the same way on every replica: that becomes an {@link ApplyResult.Failed} and the log moves on. A
+ * failure of the local storage or of the JVM is specific to this replica (see {@link #isLocalFailure}): it is thrown
+ * as {@link ReplicaFailedException}, and the replica stops instead of skipping the entry.</p>
  */
 final class Applier {
 
@@ -53,12 +56,6 @@ final class Applier {
 			super(message);
 		}
 	}
-
-	/**
-	 * Lease of the local apply transaction. It must never expire while the entry is applied: an expired transaction
-	 * would look like a rejected entry on this replica only.
-	 */
-	private static final long APPLY_TRANSACTION_TIMEOUT_MS = 24L * 60 * 60 * 1000;
 
 	/** How far a proposer's floor moves between two deletions of the records below it, see {@link #purge}. */
 	static final long PURGE_EVERY_SEQUENCES = 1 << 10;
@@ -119,8 +116,8 @@ final class Applier {
 
 	/** True between {@link #beginGroup} and {@link #endGroup}. */
 	private boolean grouping;
-	/** The open local transaction of the current group, or 0 if none is open. */
-	private long groupTx;
+	/** The open local transaction of the current group, or null if none is open. */
+	private @Nullable ApplyWriter groupTx;
 	/** The position of the last entry written to {@link #groupTx}. */
 	private @Nullable TermIndex groupPosition;
 	/** Proposers whose floor moved in the current group: their records are purged once it commits. */
@@ -202,7 +199,7 @@ final class Applier {
 					.putLong(position.getIndex()).put((byte) (existed ? 1 : 0)).array()), RequestType.none());
 			syncWal();
 		}
-		var outcome = applyLogical(() -> execute(0L, entry));
+		var outcome = applyLogical(() -> execute(null, entry));
 		if (!existed) {
 			// Not found, now as on the first run.
 			return outcome;
@@ -262,9 +259,17 @@ final class Applier {
 		if (existingId != null) {
 			// Creating a column that exists with the same schema changes nothing: it needs no flush nor fsync.
 			ApplyResult outcome = new ApplyResult.Ok(existingId);
-			inApplyTransaction(position, tx -> finish(tx, records, request, floor, outcome, position, true));
-			committed(request.proposerId(), records, List.of(request), request.completedBelow());
-			purge(request.proposerId(), records);
+			finishUnlogged(records, request, floor, outcome, position);
+			return outcome;
+		}
+		if (entry instanceof LogEntry.DeleteRange) {
+			// A plain write, which changes no MANIFEST: neither a flush nor the WAL. The range deletion skips the WAL
+			// like the apply transactions, after the group before it committed (see applyBatch), and its record and
+			// position follow it. With atomic flush a crash keeps a prefix of these writes: the deletion without its
+			// record makes the entry run again, and deleting the same range again removes nothing that the later
+			// writes (lost with the record) could have added, with the same result as the first run.
+			var outcome = ResultCodec.bounded(applyLogical(() -> execute(null, entry)));
+			finishUnlogged(records, request, floor, outcome, position);
 			return outcome;
 		}
 		// Schema changes write the RocksDB MANIFEST synchronously, while their schema rows, record and position go to
@@ -275,7 +280,7 @@ final class Applier {
 		if (entry instanceof LogEntry.DeleteColumn || entry instanceof LogEntry.DeleteColumnIfExists) {
 			executed = deleteColumn(entry, position);
 		} else {
-			executed = applyLogical(() -> execute(0L, entry));
+			executed = applyLogical(() -> execute(null, entry));
 		}
 		var outcome = ResultCodec.bounded(executed);
 		// Record, floor and position in one logged write: all or none of them survive a crash.
@@ -284,6 +289,23 @@ final class Applier {
 		committed(request.proposerId(), records, List.of(request), request.completedBelow());
 		purge(request.proposerId(), records);
 		return outcome;
+	}
+
+	/**
+	 * Writes the record, floor and position of an entry applied alone without the WAL: into the open group, if any,
+	 * else in a transaction of its own.
+	 */
+	private void finishUnlogged(ProposerRecords records, Request request, long floor, ApplyResult outcome,
+			TermIndex position) {
+		if (grouping) {
+			finish(openGroupTx(position), records, request, floor, outcome, position, true);
+			committed(request.proposerId(), records, List.of(request), request.completedBelow());
+			groupPurges.add(request.proposerId());
+		} else {
+			inApplyTransaction(position, tx -> finish(tx, records, request, floor, outcome, position, true));
+			committed(request.proposerId(), records, List.of(request), request.completedBelow());
+			purge(request.proposerId(), records);
+		}
 	}
 
 	/**
@@ -297,51 +319,28 @@ final class Applier {
 		long completedBelow = requests.getFirst().completedBelow();
 		var records = records(proposerId);
 		long floor = records.floor;
-		var results = new ApplyResult[requests.size()];
-		var toRun = new ArrayList<Request>(requests.size());
-		var runIndexes = new IntArrayList(requests.size());
-		var seen = new LongOpenHashSet();
-		for (int i = 0; i < requests.size(); i++) {
-			var request = requests.get(i);
-			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
-				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
-			}
-			if (request.sequence() < floor) {
-				results[i] = STALE_COPY;
-			} else if (records.recorded.contains(request.sequence())) {
-				results[i] = requireRecorded(request);
-			} else if (!seen.add(request.sequence())) {
-				// A second copy in the same entry: it gets the first copy's result below.
-				results[i] = null;
-			} else {
-				toRun.add(request);
-				runIndexes.add(i);
-			}
-		}
-		var db = store.db();
+		var batch = classify(requests, records);
+		var toRun = batch.toRun();
+		var outcomes = new ApplyResult[toRun.size()];
 		long openStart = System.nanoTime();
-		long tx = beginApply();
+		var tx = beginApply();
 		record(openTime, openStart);
 		boolean open = true;
 		try {
-			var outcomes = new ApplyResult[toRun.size()];
 			long executeStart = System.nanoTime();
 			for (int j = 0; j < toRun.size(); j++) {
 				var request = toRun.get(j);
-				if (!isBatchable(request.entry())) {
-					throw new IllegalArgumentException("A batch cannot contain " + request.entry().getClass().getSimpleName());
-				}
 				outcomes[j] = applyLogical(() -> execute(tx, request.entry()));
 				if (outcomes[j] instanceof ApplyResult.Failed failed && toRun.size() > 1) {
 					// Its partial writes are in the transaction with the others' writes: start over one at a time.
-					db.closeTransaction(tx, false);
+					tx.close();
 					open = false;
 					return applyOneByOne(requests, position, markPosition);
 				}
 			}
 			if (toRun.size() == 1 && outcomes[0] instanceof ApplyResult.Failed) {
 				// A rejected entry has no effects: roll back its partial writes, then record the rejection.
-				db.closeTransaction(tx, false);
+				tx.close();
 				open = false;
 				var rejected = toRun.getFirst();
 				outcomes[0] = ResultCodec.bounded(outcomes[0]);
@@ -353,31 +352,82 @@ final class Applier {
 				}
 				finishBatch(tx, proposerId, completedBelow, floor, position, markPosition);
 				record(executeTime, executeStart);
-				open = false;
 				long commitStart = System.nanoTime();
-				boolean committed = db.closeTransaction(tx, true);
+				// Closing it afterwards, in the finally block, does nothing once it committed.
+				boolean committed = tx.commit();
 				record(commitTime, commitStart);
 				if (!committed) {
 					// Only the apply thread writes the database, so an optimistic conflict means local corruption.
 					throw new ReplicaFailedException("Local apply transaction conflicted at " + position);
 				}
 			}
-			for (int j = 0; j < toRun.size(); j++) {
-				results[runIndexes.getInt(j)] = outcomes[j];
-			}
 		} finally {
 			if (open) {
-				db.closeTransaction(tx, false);
+				tx.close();
 			}
 		}
 		committed(proposerId, records, toRun, completedBelow);
 		purge(proposerId, records);
-		for (int i = 0; i < results.length; i++) {
-			if (results[i] == null) {
-				results[i] = requireRecorded(requests.get(i));
+		return batch.complete(outcomes);
+	}
+
+	/**
+	 * The requests of one entry, sorted out before anything runs: those already answered (a late copy below the
+	 * floor, or a recorded one) have their {@link #results}; {@link #toRun} are to apply, at {@link #runIndexes} in
+	 * the entry; {@link #duplicates} are second copies of one of them in the same entry, which get its result.
+	 */
+	private record Classified(ApplyResult[] results, List<Request> toRun, IntArrayList runIndexes,
+			IntArrayList duplicates, List<Request> requests) {
+
+		/** The results of the entry, given those of {@link #toRun}, in its order. */
+		List<ApplyResult> complete(ApplyResult[] outcomes) {
+			for (int j = 0; j < toRun.size(); j++) {
+				results[runIndexes.getInt(j)] = outcomes[j];
+			}
+			for (int d = 0; d < duplicates.size(); d++) {
+				int i = duplicates.getInt(d);
+				long sequence = requests.get(i).sequence();
+				for (int j = 0; j < toRun.size(); j++) {
+					if (toRun.get(j).sequence() == sequence) {
+						results[i] = outcomes[j];
+						break;
+					}
+				}
+			}
+			return List.of(results);
+		}
+	}
+
+	/** Sorts out the requests of one entry, see {@link Classified}. */
+	private Classified classify(List<Request> requests, ProposerRecords records) {
+		long proposerId = requests.getFirst().proposerId();
+		long completedBelow = requests.getFirst().completedBelow();
+		long floor = records.floor;
+		var results = new ApplyResult[requests.size()];
+		var toRun = new ArrayList<Request>(requests.size());
+		var runIndexes = new IntArrayList(requests.size());
+		var duplicates = new IntArrayList(0);
+		var seen = new LongOpenHashSet();
+		for (int i = 0; i < requests.size(); i++) {
+			var request = requests.get(i);
+			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
+				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
+			}
+			if (request.sequence() < floor) {
+				results[i] = STALE_COPY;
+			} else if (records.recorded.contains(request.sequence())) {
+				results[i] = requireRecorded(request);
+			} else if (!seen.add(request.sequence())) {
+				duplicates.add(i);
+			} else {
+				if (!isBatchable(request.entry())) {
+					throw new IllegalArgumentException("A batch cannot contain " + request.entry().getClass().getSimpleName());
+				}
+				toRun.add(request);
+				runIndexes.add(i);
 			}
 		}
-		return List.of(results);
+		return new Classified(results, toRun, runIndexes, duplicates, requests);
 	}
 
 	/**
@@ -405,19 +455,19 @@ final class Applier {
 	void abortGroup() {
 		grouping = false;
 		groupPurges.clear();
-		long tx = groupTx;
-		groupTx = 0;
-		if (tx != 0) {
+		var tx = groupTx;
+		groupTx = null;
+		if (tx != null) {
 			try {
-				store.db().closeTransaction(tx, false);
+				tx.close();
 			} catch (RuntimeException ex) {
 				// The replica stops anyway.
 			}
 		}
 	}
 
-	private long openGroupTx(TermIndex position) {
-		if (groupTx == 0) {
+	private ApplyWriter openGroupTx(TermIndex position) {
+		if (groupTx == null) {
 			long openStart = System.nanoTime();
 			groupTx = beginApply();
 			record(openTime, openStart);
@@ -428,13 +478,16 @@ final class Applier {
 
 	/** Commits the writes of the group so far, if any, then deletes the records their floors passed. */
 	private void commitGroup() {
-		long tx = groupTx;
-		if (tx != 0) {
-			groupTx = 0;
+		var tx = groupTx;
+		if (tx != null) {
+			groupTx = null;
 			long commitStart = System.nanoTime();
 			boolean committed;
 			try {
-				committed = store.db().closeTransaction(tx, true);
+				committed = tx.commit();
+				if (!committed) {
+					tx.close();
+				}
 			} catch (RuntimeException ex) {
 				throw new ReplicaFailedException("Failed to commit the entries applied up to " + groupPosition, ex);
 			}
@@ -460,64 +513,29 @@ final class Applier {
 		long completedBelow = requests.getFirst().completedBelow();
 		var records = records(proposerId);
 		long floor = records.floor;
-		var results = new ApplyResult[requests.size()];
-		var toRun = new ArrayList<Request>(requests.size());
-		var runIndexes = new IntArrayList(requests.size());
-		var seen = new LongOpenHashSet();
-		var duplicates = new IntArrayList(0);
-		for (int i = 0; i < requests.size(); i++) {
-			var request = requests.get(i);
-			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
-				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
-			}
-			if (request.sequence() < floor) {
-				results[i] = STALE_COPY;
-			} else if (records.recorded.contains(request.sequence())) {
-				results[i] = requireRecorded(request);
-			} else if (!seen.add(request.sequence())) {
-				duplicates.add(i);
-			} else {
-				if (!isBatchable(request.entry())) {
-					throw new IllegalArgumentException("A batch cannot contain " + request.entry().getClass().getSimpleName());
-				}
-				toRun.add(request);
-				runIndexes.add(i);
-			}
-		}
-		var db = store.db();
-		long tx = openGroupTx(position);
+		var batch = classify(requests, records);
+		var toRun = batch.toRun();
+		var tx = openGroupTx(position);
 		long executeStart = System.nanoTime();
-		db.setSavePoint(tx);
+		tx.setSavePoint();
 		var outcomes = new ApplyResult[toRun.size()];
 		for (int j = 0; j < toRun.size(); j++) {
 			var request = toRun.get(j);
 			outcomes[j] = applyLogical(() -> execute(tx, request.entry()));
 			if (outcomes[j] instanceof ApplyResult.Failed) {
-				db.rollbackToSavePoint(tx);
+				tx.rollbackToSavePoint();
 				commitGroup();
 				return applyData(requests, position, true);
 			}
 		}
 		for (int j = 0; j < toRun.size(); j++) {
 			outcomes[j] = record(tx, records, toRun.get(j), outcomes[j]);
-			results[runIndexes.getInt(j)] = outcomes[j];
 		}
 		finishBatch(tx, proposerId, completedBelow, floor, position, true);
 		record(executeTime, executeStart);
 		committed(proposerId, records, toRun, completedBelow);
 		groupPurges.add(proposerId);
-		for (int d = 0; d < duplicates.size(); d++) {
-			// A second copy in the same entry gets the first copy's result.
-			int i = duplicates.getInt(d);
-			long sequence = requests.get(i).sequence();
-			for (int j = 0; j < toRun.size(); j++) {
-				if (toRun.get(j).sequence() == sequence) {
-					results[i] = outcomes[j];
-					break;
-				}
-			}
-		}
-		return List.of(results);
+		return batch.complete(outcomes);
 	}
 
 	/**
@@ -624,8 +642,10 @@ final class Applier {
 
 	private ApplyResult requireRecorded(Request request) {
 		// Through the open group transaction, if any: the record may have been written by an earlier entry of it.
-		Buf value = store.db().get(groupTx, store.metaColumnId(),
-				NodeStore.requestKey(request.proposerId(), request.sequence()), RequestType.<Buf>current());
+		var key = NodeStore.requestKey(request.proposerId(), request.sequence());
+		var tx = groupTx;
+		Buf value = tx != null ? tx.get(store.metaColumnId(), key, RequestType.<Buf>current())
+				: store.db().get(0L, store.metaColumnId(), key, RequestType.<Buf>current());
 		var recorded = value == null ? null : ResultCodec.decode(value.toByteArray());
 		if (recorded == null) {
 			throw new ReplicaFailedException("Request " + request.sequence() + " of proposer " + request.proposerId()
@@ -657,12 +677,12 @@ final class Applier {
 	 * the log is only ever purged up to a snapshot, which flushes. Any write that does go through the WAL must first
 	 * call {@link #makeDurable}, or recovering that WAL could keep it without the writes before it.
 	 */
-	private long beginApply() {
-		return store.db().openUnloggedTransaction(APPLY_TRANSACTION_TIMEOUT_MS, WorkloadProfile.BATCH, true);
+	private ApplyWriter beginApply() {
+		return store.db().openApplyWriter(true);
 	}
 
 	private interface TransactionWrites {
-		void write(long tx);
+		void write(ApplyWriter tx);
 	}
 
 	/** Runs {@code writes} in an apply transaction ({@link #beginApply}) and commits it. */
@@ -677,18 +697,10 @@ final class Applier {
 
 	private void inTransaction(TermIndex position, TransactionWrites writes, boolean unlogged) {
 		var db = store.db();
-		long tx = unlogged ? beginApply()
-				: db.openUnloggedTransaction(APPLY_TRANSACTION_TIMEOUT_MS, WorkloadProfile.BATCH, false);
-		boolean open = true;
-		try {
+		try (var tx = unlogged ? beginApply() : db.openApplyWriter(false)) {
 			writes.write(tx);
-			open = false;
-			if (!db.closeTransaction(tx, true)) {
+			if (!tx.commit()) {
 				throw new ReplicaFailedException("Local apply transaction conflicted at " + position);
-			}
-		} finally {
-			if (open) {
-				db.closeTransaction(tx, false);
 			}
 		}
 	}
@@ -718,25 +730,28 @@ final class Applier {
 		}
 	}
 
-	private Object execute(long tx, LogEntry entry) {
+	private Object execute(@Nullable ApplyWriter tx, LogEntry entry) {
 		var db = store.db();
 		if (entry instanceof LogEntry.Write write) {
 			requireUserColumn(write.columnId());
 		}
 		return switch (entry) {
-			case LogEntry.Put put -> db.put(tx, put.columnId(), put.keys(), put.value(), putType(put.requestType()));
-			case LogEntry.PutMulti put ->
-					db.putMulti(tx, put.columnId(), put.keys(), put.values(), putType(put.requestType()));
-			case LogEntry.Delete delete -> db.delete(tx, delete.columnId(), delete.keys(), deleteType(delete.requestType()));
-			case LogEntry.DeleteMulti delete ->
-					db.deleteMulti(tx, delete.columnId(), delete.keys(), deleteType(delete.requestType()));
-			case LogEntry.Merge merge ->
-					db.merge(tx, merge.columnId(), merge.keys(), merge.value(), mergeType(merge.requestType()));
-			case LogEntry.MergeMulti merge ->
-					db.mergeMulti(tx, merge.columnId(), merge.keys(), merge.values(), mergeType(merge.requestType()));
+			case LogEntry.Put put ->
+					requireTransaction(tx, entry).put(put.columnId(), put.keys(), put.value(), putType(put.requestType()));
+			case LogEntry.PutMulti put -> requireTransaction(tx, entry)
+					.putMulti(put.columnId(), put.keys(), put.values(), putType(put.requestType()));
+			case LogEntry.Delete delete ->
+					requireTransaction(tx, entry).delete(delete.columnId(), delete.keys(), deleteType(delete.requestType()));
+			case LogEntry.DeleteMulti delete -> requireTransaction(tx, entry)
+					.deleteMulti(delete.columnId(), delete.keys(), deleteType(delete.requestType()));
+			case LogEntry.Merge merge -> requireTransaction(tx, entry)
+					.merge(merge.columnId(), merge.keys(), merge.value(), mergeType(merge.requestType()));
+			case LogEntry.MergeMulti merge -> requireTransaction(tx, entry)
+					.mergeMulti(merge.columnId(), merge.keys(), merge.values(), mergeType(merge.requestType()));
 			case LogEntry.DeleteRange range -> {
 				requireNoTransaction(tx, entry);
-				db.deleteRange(range.columnId(), range.start(), range.end());
+				// Without the WAL, like every data write of the apply: see applyAlone.
+				db.deleteRangeUnlogged(range.columnId(), range.start(), range.end());
 				yield null;
 			}
 			case LogEntry.CreateColumn create -> {
@@ -770,8 +785,8 @@ final class Applier {
 							null);
 				} catch (RocksDBException failed) {
 					// An operator that cannot be instantiated (missing class, wrong type, failing constructor) is
-					// reported as PUT_UNKNOWN_ERROR; only a native storage error below it is a local failure.
-					if (isNativeFailure(failed)) {
+					// reported as PUT_UNKNOWN_ERROR; only a storage error below it is a local failure.
+					if (isLocalFailure(failed)) {
 						throw failed;
 					}
 					throw new IllegalArgumentException("Merge operator " + upload.name() + " rejected: "
@@ -784,7 +799,8 @@ final class Applier {
 					requireUserColumn(guard.columnId());
 					// Through the transaction, so that an earlier entry of the same group is seen. Every replica sees the
 					// same value at this log position, so all reach the same verdict.
-					Buf current = db.get(tx, guard.columnId(), guard.keys(), RequestType.<Buf>current());
+					Buf current = requireTransaction(tx, entry).get(guard.columnId(), guard.keys(),
+							RequestType.<Buf>current());
 					if (!guard.matches(current)) {
 						throw new RocksDBRetryException();
 					}
@@ -864,8 +880,8 @@ final class Applier {
 		}
 	}
 
-	/** Writes the result record, the proposer's floor and the applied position, in transaction {@code tx} if not 0. */
-	private void finish(long tx, ProposerRecords records, Request request, long floor, ApplyResult result,
+	/** Writes the result record, the proposer's floor and the applied position, in transaction {@code tx}. */
+	private void finish(ApplyWriter tx, ProposerRecords records, Request request, long floor, ApplyResult result,
 			TermIndex position, boolean markPosition) {
 		record(tx, records, request, result);
 		finishBatch(tx, request.proposerId(), request.completedBelow(), floor, position, markPosition);
@@ -877,7 +893,7 @@ final class Applier {
 	 * reply by itself, would otherwise stop every replica here, at every restart. Bounded, any recorded result fits
 	 * alone in a reply, so a copy of the request sent alone always gets it.
 	 */
-	private ApplyResult record(long tx, ProposerRecords records, Request request, ApplyResult result) {
+	private ApplyResult record(ApplyWriter tx, ProposerRecords records, Request request, ApplyResult result) {
 		if (guardRejected != null && result instanceof ApplyResult.Failed failed
 				&& failed.type() == RocksDBErrorType.UPDATE_RETRY) {
 			// Counted here, not where the guard is checked: a rejected entry is applied up to three times.
@@ -885,7 +901,7 @@ final class Applier {
 		}
 		var bounded = ResultCodec.bounded(result);
 		byte[] encoded = ResultCodec.encode(bounded);
-		store.db().put(tx, store.metaColumnId(), NodeStore.requestKey(request.proposerId(), request.sequence()),
+		tx.put(store.metaColumnId(), NodeStore.requestKey(request.proposerId(), request.sequence()),
 				Buf.wrap(encoded), RequestType.none());
 		records.recordedBytes += encoded.length;
 		return bounded;
@@ -896,10 +912,10 @@ final class Applier {
 	 * read again (copies below the floor are refused before any lookup); they are deleted later, in bulk, by
 	 * {@link #purge}.
 	 */
-	private void finishBatch(long tx, long proposerId, long completedBelow, long floor, TermIndex position,
+	private void finishBatch(ApplyWriter tx, long proposerId, long completedBelow, long floor, TermIndex position,
 			boolean markPosition) {
 		if (completedBelow > floor) {
-			store.db().put(tx, store.metaColumnId(), NodeStore.floorKey(proposerId),
+			tx.put(store.metaColumnId(), NodeStore.floorKey(proposerId),
 					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(completedBelow).array()),
 					RequestType.none());
 		}
@@ -908,8 +924,8 @@ final class Applier {
 		}
 	}
 
-	private void markApplied(long tx, TermIndex position) {
-		store.db().put(tx, store.metaColumnId(), NodeStore.key(NodeStore.APPLIED),
+	private void markApplied(ApplyWriter tx, TermIndex position) {
+		tx.put(store.metaColumnId(), NodeStore.key(NodeStore.APPLIED),
 				NodeStore.encodeTermIndex(position), RequestType.none());
 	}
 
@@ -917,37 +933,72 @@ final class Applier {
 		Object run();
 	}
 
-	/** Runs a logical operation, turning deterministic rejections into results. */
+	/**
+	 * Runs a logical operation and turns every failure that follows from the entry into its result, the same on every
+	 * replica: rejections by the database, failures of a merge operator, and exceptions of the code that applies it
+	 * (a bug there fails the same way everywhere, since every replica runs the same binary). Only a local failure
+	 * ({@link #isLocalFailure}) is thrown, as {@link ReplicaFailedException}: it stops this replica, which must not
+	 * record a result that the others may not reach. An {@link Error} is not caught: it stops the replica too.
+	 */
 	private static ApplyResult applyLogical(Operation operation) {
+		// Forget an operator failure of an earlier operation on this thread: only one of this operation counts.
+		FFMAbstractMergeOperator.takeFailureOnThisThread();
 		try {
 			return new ApplyResult.Ok(operation.run());
 		} catch (ReplicaFailedException ex) {
 			throw ex;
 		} catch (RuntimeException ex) {
-			if (isLocalFailure(ex)) {
-				throw new ReplicaFailedException("Storage failure while applying", ex);
+			var failure = mergeOperatorFailure(ex);
+			if (isLocalFailure(failure)) {
+				throw new ReplicaFailedException("Storage failure while applying", failure);
 			}
-			if (ex instanceof RocksDBException rocksDBException) {
-				return new ApplyResult.Failed(rocksDBException.getErrorUniqueId(), String.valueOf(ex.getMessage()));
-			}
-			if (ex instanceof IllegalArgumentException || ex instanceof UnsupportedOperationException) {
-				return new ApplyResult.Failed(RocksDBErrorType.INVALID_REQUEST, String.valueOf(ex.getMessage()));
-			}
-			throw ex;
+			return switch (failure) {
+				case RocksDBException rocksDBException ->
+						new ApplyResult.Failed(rocksDBException.getErrorUniqueId(), String.valueOf(failure.getMessage()));
+				case IllegalArgumentException _, UnsupportedOperationException _ ->
+						new ApplyResult.Failed(RocksDBErrorType.INVALID_REQUEST, String.valueOf(failure.getMessage()));
+				default -> new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR, failure.toString());
+			};
 		}
 	}
 
 	/**
-	 * A failure caused by this machine (disk, native storage, a lost local transaction) rather than by the entry: it
-	 * might not happen on other replicas, so it must not become a result.
+	 * {@code failure}, or a {@link RocksDBErrorType#MERGE_OPERATOR_FAILED} exception if a merge operator failed on this
+	 * thread while the operation ran. A read of a merged key runs the operator on the reading thread, and RocksDB
+	 * reports its failure as a corruption, which would otherwise look like a local storage failure on every replica.
+	 */
+	private static RuntimeException mergeOperatorFailure(RuntimeException failure) {
+		var operatorFailure = FFMAbstractMergeOperator.takeFailureOnThisThread();
+		if (operatorFailure == null || (failure instanceof RocksDBException rocksDBException
+				&& rocksDBException.getErrorUniqueId() == RocksDBErrorType.MERGE_OPERATOR_FAILED)) {
+			return failure;
+		}
+		var named = EmbeddedDB.mergeOperatorFailed(operatorFailure);
+		named.addSuppressed(failure);
+		return named;
+	}
+
+	/**
+	 * A failure caused by this machine rather than by the entry: it might not happen on other replicas, so it must
+	 * not become a result. Decided by origin, along the causes: an I/O error, an {@link Error} (out of memory...), a
+	 * native status that reports the storage ({@link #isLocalStatus}), or an error type that reports a lost local
+	 * transaction or a broken database. A merge operator failure is never local, whatever native status reported it.
+	 * Everything else (a rejection, an exception of the apply code) is deterministic.
 	 */
 	static boolean isLocalFailure(Throwable error) {
 		for (Throwable t = error; t != null; t = t.getCause()) {
-			if (t instanceof org.rocksdb.RocksDBException || t instanceof IOException
-					|| t instanceof UncheckedIOException || t instanceof Error) {
+			if (t instanceof RocksDBException rocksDBException) {
+				if (rocksDBException.getErrorUniqueId() == RocksDBErrorType.MERGE_OPERATOR_FAILED) {
+					return false;
+				}
+				if (isLocalErrorType(rocksDBException.getErrorUniqueId())) {
+					return true;
+				}
+			}
+			if (t instanceof org.rocksdb.RocksDBException nativeFailure && isLocalStatus(nativeFailure.getStatus())) {
 				return true;
 			}
-			if (t instanceof RocksDBException rocksDBException && isLocalErrorType(rocksDBException.getErrorUniqueId())) {
+			if (t instanceof IOException || t instanceof UncheckedIOException || t instanceof Error) {
 				return true;
 			}
 			if (t.getCause() == t) {
@@ -957,27 +1008,48 @@ final class Applier {
 		return false;
 	}
 
-	private static boolean isNativeFailure(Throwable error) {
-		for (Throwable t = error; t != null && t.getCause() != t; t = t.getCause()) {
-			if (t instanceof org.rocksdb.RocksDBException || t instanceof IOException || t instanceof UncheckedIOException) {
-				return true;
-			}
+	/**
+	 * True for a native status that reports the storage or the process rather than the request: I/O errors,
+	 * corruption, no space, busy, timeouts, shutdown, and anything unknown, including a missing status. Only statuses
+	 * that follow from the request and the data (invalid argument, not found, not supported) are deterministic.
+	 */
+	static boolean isLocalStatus(org.rocksdb.@Nullable Status status) {
+		if (status == null) {
+			return true;
 		}
-		return false;
+		var subCode = status.getSubCode();
+		if (subCode == org.rocksdb.Status.SubCode.NoSpace || subCode == org.rocksdb.Status.SubCode.MemoryLimit) {
+			return true;
+		}
+		return switch (status.getCode()) {
+			case InvalidArgument, NotFound, NotSupported -> false;
+			default -> true;
+		};
 	}
 
-	/** Error types that report a failure of the local database rather than a property of the request. */
+	/**
+	 * Error types that report a failure of the local database rather than a property of the request: a lost local
+	 * transaction, a database that cannot load or write files. {@code PUT_UNKNOWN_ERROR} and {@code INTERNAL_ERROR}
+	 * are not among them: they wrap anything, so their causes decide.
+	 */
 	private static boolean isLocalErrorType(RocksDBErrorType type) {
 		return switch (type) {
-			case TX_NOT_FOUND, TRANSACTION_NOT_FOUND, COMMIT_FAILED, COMMIT_FAILED_TRY_AGAIN, INTERNAL_ERROR,
-					ROCKSDB_LOAD_ERROR, ROCKSDB_CONFIG_ERROR, WRITE_BATCH_1, PUT_UNKNOWN_ERROR, DIRECTORY_DELETE,
-					SST_WRITE_1, SST_WRITE_2, SST_WRITE_3, SST_WRITE_4, SST_GET_SIZE_FAILED, GET_PROPERTY_ERROR -> true;
+			case TX_NOT_FOUND, TRANSACTION_NOT_FOUND, COMMIT_FAILED, COMMIT_FAILED_TRY_AGAIN, ROCKSDB_LOAD_ERROR,
+					ROCKSDB_CONFIG_ERROR, WRITE_BATCH_1, DIRECTORY_DELETE, SST_WRITE_1, SST_WRITE_2, SST_WRITE_3,
+					SST_WRITE_4, SST_GET_SIZE_FAILED, GET_PROPERTY_ERROR -> true;
 			default -> false;
 		};
 	}
 
-	private static void requireNoTransaction(long tx, LogEntry entry) {
-		if (tx != 0L) {
+	private static ApplyWriter requireTransaction(@Nullable ApplyWriter tx, LogEntry entry) {
+		if (tx == null) {
+			throw new IllegalArgumentException(entry.getClass().getSimpleName() + " needs a transaction");
+		}
+		return tx;
+	}
+
+	private static void requireNoTransaction(@Nullable ApplyWriter tx, LogEntry entry) {
+		if (tx != null) {
 			throw new IllegalArgumentException(entry.getClass().getSimpleName() + " cannot run in a transaction");
 		}
 	}

@@ -194,6 +194,33 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
         LOG.error("Merge error (partial={})", partial, t);
     }
 
+    /**
+     * The latest failure of a full merge on each thread, set when {@link #merge} throws or returns null. RocksDB only
+     * sees a failed merge, which it reports as a corruption status: this tells a caller on the same thread that the
+     * operator failed, not the storage. See {@link #takeFailureOnThisThread}.
+     */
+    private static final ThreadLocal<Throwable> FAILURE_ON_THREAD = new ThreadLocal<>();
+
+    /**
+     * Returns and clears the latest failure of a full merge run on the calling thread, or null if none failed since
+     * the last call. A read of a merged key runs the operator on the reading thread, so a read that failed while
+     * this returns non-null failed because of the operator. Failures of the JVM itself (out of memory, stack
+     * overflow) and of the native result allocation are not reported: they say nothing about the operator.
+     */
+    public static @org.jetbrains.annotations.Nullable Throwable takeFailureOnThisThread() {
+        var failure = FAILURE_ON_THREAD.get();
+        if (failure != null) {
+            FAILURE_ON_THREAD.remove();
+        }
+        return failure;
+    }
+
+    private static void recordFailureOnThisThread(Throwable failure) {
+        if (!(failure instanceof VirtualMachineError)) {
+            FAILURE_ON_THREAD.set(failure);
+        }
+    }
+
     private void handleMergeError(Throwable t, boolean partial, Buf key) {
         try {
             onMergeError(t, partial, key);
@@ -319,19 +346,25 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 operands.add(new MemorySegmentBuf(opPtr.reinterpret(len)));
             }
 
+            Buf result = null;
             try {
-                Buf result = merge(key, existing, operands);
-
-                if (result != null) {
-                    return allocateResult(result, successPtr, newValLenPtr);
+                result = merge(key, existing, operands);
+                if (result == null) {
+                    recordFailureOnThisThread(new IllegalStateException(getClass().getName()
+                            + " returned no merged value"));
                 }
             } catch (Throwable t) {
+                recordFailureOnThisThread(t);
                 // System.err.println("DEBUG: Caught exception in fullMerge: " + t);
                 try {
                     handleMergeError(t, false, key);
                 } catch (Throwable ignored) {
                     LOG.error("Swallowed exception in fullMerge handleMergeError", ignored);
                 }
+            }
+            if (result != null) {
+                // Outside the try above: a failure to allocate the native result is not the operator's.
+                return allocateResult(result, successPtr, newValLenPtr);
             }
 
             // Fallback: preserve existing value (or first operand) to avoid corruption

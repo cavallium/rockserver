@@ -19,6 +19,8 @@ import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteOutput;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
 import org.apache.ratis.util.LifeCycle;
 import org.jetbrains.annotations.Nullable;
@@ -254,8 +256,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return failed;
 	}
 
-	/** The leader session of the current term, if this node leads it; created on first use. */
+	/**
+	 * The leader session of the current term, if this node leads it; created on first use. The session of an earlier
+	 * term is closed outside the monitor, as in {@link #notifyLeaderChanged}: closing rolls back its native
+	 * transactions and updates, and {@link #preAppendTransaction} waits for this monitor under Ratis' append lock.
+	 */
 	@Nullable LeaderSession leaderSession(long term) {
+		LeaderSession replaced;
+		LeaderSession created;
 		synchronized (this) {
 			var current = leaderSession;
 			if (current != null && current.term() == term) {
@@ -265,18 +273,19 @@ final class RockserverStateMachine extends BaseStateMachine {
 			if (division == null || !division.getInfo().isLeader() || division.getInfo().getCurrentTerm() != term) {
 				return null;
 			}
-			if (current != null) {
-				current.close(store.db());
-			}
-			var created = new LeaderSession(term, applied, new ConflictTracker(), config.pipelinedUpdates(), metrics);
+			replaced = current;
+			created = new LeaderSession(term, applied, new ConflictTracker(), config.pipelinedUpdates(), metrics);
 			// The session tracks writes from this term on: a transaction whose snapshot misses an earlier leader's
 			// entries would not see them conflict. Reads wait for those entries (see leaderReadyIndex); this makes
 			// sure no commit validates against such a snapshot anyway.
 			created.tracker().prune(leaderReadyIndex(term));
 			leaderSession = created;
-			LOG.info("{}: leading term {}", config.nodeId(), term);
-			return created;
 		}
+		if (replaced != null) {
+			replaced.close(store.db());
+		}
+		LOG.info("{}: leading term {}", config.nodeId(), term);
+		return created;
 	}
 
 	@Nullable RaftServer.Division division() {
@@ -297,7 +306,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 				.setStateMachine(this)
 				.setClientRequest(request);
 		try {
-			var decoded = LogEntryCodec.decodeBatch(request.getMessage().getContent().asReadOnlyByteBuffer());
+			var decoded = decodeBatch(request.getMessage().getContent());
 			if (decoded.size() > 1 && !decoded.stream().allMatch(r -> Applier.isBatchable(r.entry()))) {
 				throw new IllegalArgumentException("Only data writes can share a log entry");
 			}
@@ -385,7 +394,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var data = logEntry.getStateMachineLogEntry().getLogData();
 		List<Request> requests;
 		try {
-			requests = proposal != null ? proposal.requests : LogEntryCodec.decodeBatch(data.asReadOnlyByteBuffer());
+			requests = proposal != null ? proposal.requests : decodeBatch(data);
 		} catch (RuntimeException ex) {
 			return CompletableFuture.failedFuture(fail("decode entry " + position, ex));
 		}
@@ -400,6 +409,63 @@ final class RockserverStateMachine extends BaseStateMachine {
 		applyQueue.add(new ApplyEntry(position, requests, proposal, data.size(), kib, reply));
 		handedOver = position.getIndex();
 		return reply;
+	}
+
+	/**
+	 * Decodes the batch of a log entry. When its bytes are one heap array, as Ratis reads them from the log or from
+	 * a request (protobuf copies bytes fields unless it aliases its input, which Ratis does not do), the keys and
+	 * values of the writes are slices of that array instead of copies: a {@code ByteString} never changes.
+	 */
+	static List<Request> decodeBatch(ByteString data) {
+		var array = new WholeArray();
+		try {
+			UnsafeByteOperations.unsafeWriteTo(data, array);
+		} catch (IOException ex) {
+			array.whole = false;
+		}
+		return array.whole && array.value != null
+				? LogEntryCodec.decodeBatchInPlace(array.value, array.offset, array.length)
+				: LogEntryCodec.decodeBatch(data.asReadOnlyByteBuffer());
+	}
+
+	/** Catches the backing array of a {@code ByteString} made of exactly one array, see {@link #decodeBatch}. */
+	private static final class WholeArray extends ByteOutput {
+		byte @Nullable [] value;
+		int offset;
+		int length;
+		boolean whole = true;
+
+		@Override
+		public void writeLazy(byte[] value, int offset, int length) {
+			if (this.value != null) {
+				whole = false;
+				return;
+			}
+			this.value = value;
+			this.offset = offset;
+			this.length = length;
+		}
+
+		@Override
+		public void write(byte value) {
+			whole = false;
+		}
+
+		@Override
+		public void write(byte[] value, int offset, int length) {
+			whole = false;
+		}
+
+		@Override
+		public void write(java.nio.ByteBuffer value) {
+			whole = false;
+		}
+
+		@Override
+		public void writeLazy(java.nio.ByteBuffer value) {
+			// A buffer may be pooled and reused once the message is processed: copy.
+			whole = false;
+		}
 	}
 
 	/**
@@ -519,19 +585,32 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 	}
 
-	/**
-	 * Applies {@code group} in one local transaction, then has {@link #completer} make each entry count as applied
-	 * and complete its reply, in log order. A failure stops the replica: no entry of the group, nor any queued after it, is answered.
-	 */
-	/** Tests only: while set, the apply thread waits for it before each group. */
-	volatile java.util.concurrent.@Nullable CountDownLatch applyGateForTesting;
 	private final java.util.concurrent.CountDownLatch closed = new java.util.concurrent.CountDownLatch(1);
-	/** Tests only: while set, applying a group throws it, as a failing apply would. */
-	volatile @Nullable RuntimeException applyFailureForTesting;
 
-	/** Tests only: lowers the limit of {@link #queuedKiB} to {@code kib}; it waits until that much is free. */
-	void limitApplyQueueForTesting(int kib) {
-		queuedKiB.acquireUninterruptibly(MAX_QUEUED_KIB - kib);
+	/** Hooks for tests, see {@link #testHooks()}. */
+	final class TestHooks {
+		/** While set, the apply thread waits for it before each group. */
+		volatile java.util.concurrent.@Nullable CountDownLatch applyGate;
+		/** While set, applying a group throws it, as a failing apply would. */
+		volatile @Nullable RuntimeException applyFailure;
+
+		/** Lowers the limit of {@link #queuedKiB} to {@code kib}; it waits until that much is free. */
+		void limitApplyQueue(int kib) {
+			queuedKiB.acquireUninterruptibly(MAX_QUEUED_KIB - kib);
+		}
+	}
+
+	/** Null unless a test asked for them: the apply thread then reads one field per group, and nothing else. */
+	private volatile @Nullable TestHooks testHooks;
+
+	/** Tests only: the test hooks of this state machine, created on first use. */
+	synchronized TestHooks testHooks() {
+		var hooks = testHooks;
+		if (hooks == null) {
+			hooks = new TestHooks();
+			testHooks = hooks;
+		}
+		return hooks;
 	}
 
 	/** Tests only: the KiB of {@link #queuedKiB} that no queued entry holds. */
@@ -544,8 +623,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return handedOver;
 	}
 
+	/**
+	 * Applies {@code group} in one local transaction, then has {@link #completer} make each entry count as applied
+	 * and complete its reply, in log order. A failure stops the replica: no entry of the group, nor any queued after
+	 * it, is answered.
+	 */
 	private void applyGroup(List<Applying> group) {
-		var gate = applyGateForTesting;
+		var hooks = testHooks;
+		var gate = hooks != null ? hooks.applyGate : null;
 		if (gate != null) {
 			try {
 				gate.await();
@@ -562,7 +647,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var applier = this.applier;
 		applier.beginGroup();
 		try {
-			var injected = applyFailureForTesting;
+			var injected = hooks != null ? hooks.applyFailure : null;
 			if (injected != null) {
 				throw injected;
 			}
@@ -594,11 +679,20 @@ final class RockserverStateMachine extends BaseStateMachine {
 		applyTime.since(start);
 		applyGroupEntries.record(group.size());
 		prepareSnapshot(positionOf(group.getLast()));
+		long groupBytes = 0;
+		for (var item : group) {
+			if (item instanceof ApplyEntry entry) {
+				groupBytes += entry.bytes();
+			}
+		}
+		long appliedBytes = groupBytes;
 		completer.execute(() -> {
 			try {
 				for (var completion : completions) {
 					completion.run();
 				}
+				// After the applied index moved: a snapshot covers only what was applied.
+				snapshotByBytes(appliedBytes);
 			} catch (Throwable error) {
 				// The replies first: reporting the failure may itself fail.
 				failed = true;
@@ -610,6 +704,51 @@ final class RockserverStateMachine extends BaseStateMachine {
 				}
 			}
 		});
+	}
+
+	/** Bytes of log entries applied since the latest snapshot, or since the start: see {@link #snapshotByBytes}. */
+	private final java.util.concurrent.atomic.AtomicLong bytesSinceSnapshot = new java.util.concurrent.atomic.AtomicLong();
+	/** True while a snapshot asked by {@link #snapshotByBytes} is pending. */
+	private final java.util.concurrent.atomic.AtomicBoolean snapshotByBytesPending =
+			new java.util.concurrent.atomic.AtomicBoolean();
+	private final java.util.concurrent.atomic.AtomicLong snapshotCalls = new java.util.concurrent.atomic.AtomicLong();
+	private static final long SNAPSHOT_REQUEST_TIMEOUT_MS = 10L * 60 * 1000;
+
+	/**
+	 * Asks Ratis for a snapshot once {@code snapshotEveryBytes} of log entries were applied since the latest one.
+	 * Ratis' own trigger counts entries ({@code snapshotEveryEntries}), and an entry holds up to 4096 requests or
+	 * 8 MiB, so the log that a snapshot lets Ratis purge could otherwise grow to hundreds of GiB. It goes through
+	 * Ratis' snapshot management API, as an operator's {@code admin snapshot} does, so Ratis takes the snapshot on its
+	 * own thread, as usual. Runs on {@link #completer}.
+	 */
+	private void snapshotByBytes(long appliedBytes) {
+		if (bytesSinceSnapshot.addAndGet(appliedBytes) < config.snapshotEveryBytes()
+				|| !snapshotByBytesPending.compareAndSet(false, true)) {
+			return;
+		}
+		var server = this.server;
+		var groupId = this.groupId;
+		if (server == null || groupId == null) {
+			snapshotByBytesPending.set(false);
+			return;
+		}
+		LOG.info("{}: {} bytes of log entries applied since the latest snapshot, taking one", config.nodeId(),
+				bytesSinceSnapshot.get());
+		try {
+			var request = org.apache.ratis.protocol.SnapshotManagementRequest.newCreate(
+					org.apache.ratis.protocol.ClientId.randomId(), server.getId(), groupId, snapshotCalls.incrementAndGet(),
+					SNAPSHOT_REQUEST_TIMEOUT_MS);
+			server.snapshotManagementAsync(request).whenComplete((reply, error) -> {
+				snapshotByBytesPending.set(false);
+				if (error != null || !reply.isSuccess()) {
+					LOG.warn("{}: the snapshot asked after {} bytes of log failed; asking again after the next entries",
+							config.nodeId(), config.snapshotEveryBytes(), error != null ? error : reply.getException());
+				}
+			});
+		} catch (RuntimeException ex) {
+			snapshotByBytesPending.set(false);
+			LOG.warn("{}: could not ask for a snapshot", config.nodeId(), ex);
+		}
 	}
 
 	/** The next snapshot's due index whose memtables were already flushed ahead, see {@link #prepareSnapshot}. */
@@ -724,7 +863,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 		// Ratis waited for the entries it handed over; positions without data may still be queued.
 		drainApplyQueue();
 		long start = System.nanoTime();
+		// Before the checkpoint: entries applied while it runs count towards the next one.
+		long bytesBefore = bytesSinceSnapshot.get();
 		var position = storage.take(store);
+		bytesSinceSnapshot.addAndGet(-bytesBefore);
 		snapshotTime.since(start);
 		LOG.info("{}: snapshot taken at {} in {} ms", config.nodeId(), position, (System.nanoTime() - start) / 1_000_000);
 		return position.getIndex();

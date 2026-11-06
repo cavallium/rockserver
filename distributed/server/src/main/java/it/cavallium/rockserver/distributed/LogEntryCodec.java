@@ -202,6 +202,14 @@ final class LogEntryCodec {
 		return decodeBatch(new Input(data));
 	}
 
+	/**
+	 * Like {@link #decodeBatch(ByteBuffer)} over {@code length} bytes of {@code array} from {@code offset}, but the keys
+	 * and values of the writes are slices of {@code array} instead of copies: it must never change afterwards.
+	 */
+	static List<Request> decodeBatchInPlace(byte[] array, int offset, int length) {
+		return decodeBatch(new Input(ByteBuffer.wrap(array, offset, length), true));
+	}
+
 	private static List<Request> decodeBatch(Input in) {
 		byte version = in.readByte();
 		if (version != BATCH_VERSION) {
@@ -775,14 +783,23 @@ final class LogEntryCodec {
 	static final class Input {
 
 		private final ByteBuffer buffer;
+		/** True if {@link #readBuf} returns slices of {@link #buffer}'s array instead of copies. */
+		private final boolean inPlace;
 
 		Input(byte[] data) {
 			this.buffer = ByteBuffer.wrap(Objects.requireNonNull(data, "data"));
+			this.inPlace = false;
 		}
 
 		/** Reads the remaining bytes of {@code data}, which may be a read-only view; {@code data} is not moved. */
 		Input(ByteBuffer data) {
+			this(data, false);
+		}
+
+		/** {@code inPlace} requires a heap buffer whose array never changes afterwards. */
+		private Input(ByteBuffer data, boolean inPlace) {
 			this.buffer = data.slice().order(ByteOrder.BIG_ENDIAN);
+			this.inPlace = inPlace && buffer.hasArray();
 		}
 
 		private void require(int length) {
@@ -842,13 +859,13 @@ final class LogEntryCodec {
 		 */
 		Input readNested() {
 			int length = readCount(1);
-			var nested = new Input(buffer.slice(buffer.position(), length));
+			var nested = new Input(buffer.slice(buffer.position(), length), inPlace);
 			buffer.position(buffer.position() + length);
 			return nested;
 		}
 
 		Buf readBuf() {
-			return Buf.wrap(readBytes());
+			return readBuf(readCount(1));
 		}
 
 		@Nullable Buf readNullableBuf() {
@@ -859,7 +876,17 @@ final class LogEntryCodec {
 			if (length < 0 || length > buffer.remaining()) {
 				throw new IllegalArgumentException("Invalid length " + length + " at byte " + (buffer.position() - 4));
 			}
-			return Buf.wrap(readBytes(length));
+			return readBuf(length);
+		}
+
+		/** The next {@code length} bytes, which the caller checked are there: a slice if {@link #inPlace}. */
+		private Buf readBuf(int length) {
+			if (!inPlace) {
+				return Buf.wrap(readBytes(length));
+			}
+			int from = buffer.arrayOffset() + buffer.position();
+			buffer.position(buffer.position() + length);
+			return Buf.wrap(buffer.array(), from, from + length);
 		}
 
 		private byte[] readBytes(int length) {

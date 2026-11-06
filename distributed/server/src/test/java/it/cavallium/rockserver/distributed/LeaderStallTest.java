@@ -504,7 +504,7 @@ class LeaderStallTest {
 		cluster.halt(followers.getLast().config().nodeId());
 
 		var stopped = new CountDownLatch(1);
-		partner.stateMachine().applyGateForTesting = stopped;
+		partner.stateMachine().testHooks().applyGate = stopped;
 		try {
 			oldLeader.connection().getSyncApi(CONTEXT).put(0, column, key(), Buf.wrap(new byte[] {1}), RequestType.none());
 			long applied = partner.appliedIndex();
@@ -525,7 +525,7 @@ class LeaderStallTest {
 			assertEquals(term, division.getInfo().getCurrentTerm());
 			assertEquals(0, partner.metrics().amount("leader.stall.stepdowns").count());
 		} finally {
-			partner.stateMachine().applyGateForTesting = null;
+			partner.stateMachine().testHooks().applyGate = null;
 			stopped.countDown();
 		}
 	}
