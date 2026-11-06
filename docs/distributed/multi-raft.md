@@ -395,7 +395,7 @@ Expected result, to be checked in Phase 0 and 1 measurements:
   and the second fsync stream costs little.
 - Latency per write stays the same, the commit round trip of 10-16 ms on these SSDs (performance.md:172-176), so
   at 512 writes in flight throughput stays near 2.3x production.
-- **Phase 1 only pays off if Yotsuba's in-flight limits rise too** (performance.md:214-216).
+- **Phase 1 only pays off if Yotsuba's in-flight limits rise too** (performance.md, "Client concurrency").
 
 ### Phase 2: operations and migration of a deployed single-group cluster
 
@@ -483,7 +483,7 @@ Expected result, to be checked in Phase 0 and 1 measurements:
 | **Partitioned apply inside one group** | new | within one apply group, execute entries in K partitions by column (or by key hash for single-key entries) on K threads, each into its own indexed batch, then merge them into **one** atomic `db.write` with the position. Entries that touch several columns, and schema changes, run as barriers. Results stay deterministic because a request reads only its own column's keys (guards, previous values) in log order within its partition. Crash consistency and the single log stay. This captures more apply parallelism than column groups (it is not bounded by `messages-v2`) with none of the membership, snapshot or fsync costs. |
 | Follower reads and leader hint | review 2.1, arch/routing | takes 6.1k gets/s and `existsMulti` off the leader and removes the forwarding hop for about 2/3 of the traffic |
 | `ConflictTracker` off the append lock for plain writes | review 2.3 | less leader CPU per write, inside the Ratis lock |
-| Raise Yotsuba's `maxConcurrentWriteRequests` and read limit | performance.md:214-216 | 256 in flight caps the cluster near 2x; 2048 reach about 3.5x |
+| ~~Raise Yotsuba's `maxConcurrentWriteRequests` and read limit~~ done: 1024 each on a cluster (Yotsuba `456b8f8b7`, `df8acf015`); the production value is still to measure | performance.md, "Client concurrency" | 256 in flight caps the cluster near 2x; 2048 reach about 3.5x |
 | Snapshots by log bytes | review 3.7 | fewer apply pauses at high batch sizes |
 
 **Numbers for the verdict** (performance.md):

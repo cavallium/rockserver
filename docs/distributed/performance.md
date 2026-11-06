@@ -284,7 +284,8 @@ Other results:
   they stay there, but the nodes name their leader in every response, and the client sends the calls the leader
   serves straight to it, on a second channel, once that is connected (see "Routing" in the design document): only
   point reads still take the forwarding hop through what is now a follower, unless follower reads are on (off by
-  default: under steady writes a follower read took 3-4 ms more than a forwarded one in process, see "Follower reads"
+  default: under steady writes a follower read ties with a forwarded one at the median in process and is slower in
+  the tail, and turning the option on adds the wait for the leader's apply to every leader read, see "Follower reads"
   in the design document). This
   needs the clients to list the nodes by the host names of the cluster's `--peer` configuration. Not measured yet. A
   client stays on the node it failed over to until that node goes away. The benchmark's `--route failover` spreads the lists, so it does not measure this; `--route same-list` does (DD-25,

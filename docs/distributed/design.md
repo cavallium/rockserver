@@ -1075,8 +1075,8 @@ to receive, flush and apply the latest entries; with the appender it now ties wi
 and is slower in the tail. Turning the option on also makes every leader read wait for the leader's apply, about
 0.5-1 ms more here. Under
 Yotsuba's steady writes that is a latency loss on every read in exchange for taking point reads off the leader, which
-only a benchmark of the Yotsuba mix can weigh. The bound of 20 ms plus a round trip is large against a 2-3 ms
-forwarded read, so the option stays off; measure it with the load benchmark before turning it on.
+only a benchmark of the Yotsuba mix can weigh. The bound of 20 ms plus a round trip is large against a forwarded read
+of 3-4 ms here, so the option stays off; measure it with the load benchmark before turning it on.
 
 ## Transactions
 
@@ -2058,8 +2058,10 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      whose staged write or commit has an unknown outcome rolls the transaction back and runs it again, never resends
      the write. Yotsuba: `5e648b895` reruns its two transactions (invite evidence, monitors) that way, and `c73697eae`
      sends the search update of an invite commit whose outcome was unknown when the rerun finds the change already
-     stored (R4-2). The Rust client numbers and resends its writes outside transactions the same way as the Java
-     client, and leaves staged writes unnumbered too (see "The Rust client").
+     stored (R4-2). The Rust client numbers and resends its writes outside transactions mostly the same way as the
+     Java client, and leaves staged writes unnumbered too; the differences (a streamed multi write over
+     `NUMBERED_MULTI_MAX_BYTES` is sent unnumbered and only once, and dropping the future is the cancel) are in
+     "The Rust client".
    - A client needs every node's address (item 1): a single address has nowhere to resend to while its node is
      down, so its writes end with `OUTCOME_UNKNOWN` at their deadline.
    - Every node must run this version before clients use sessions: an older node cannot read a version 3 batch,
@@ -2070,10 +2072,11 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
 3. **Capacity.** See [performance.md](performance.md) for the measurements on one PC and the load benchmark.
    Still to measure on the production machines and data: their fsync latency, snapshot creation and install
    time at 171 GB and at the multi-TB datasets, and log retention in bytes. Yotsuba's in-flight request limits
-   are raised for a cluster on its branch (`456b8f8b7`, `df8acf015`); the value for production is still to measure
+   are raised for a cluster on its branch (since `456b8f8b7` and `df8acf015`); the value for production is still to measure
    with the Yotsuba mix (see performance.md).
 
-   *Upgrade note, Yotsuba's in-flight limits.* `database.rockserver.maxConcurrentReadRequests` and
+   *Upgrade note, Yotsuba's in-flight limits* (behaviour as of `df8acf015`; later commits on that branch may
+   reword the warning and the settings comments). `database.rockserver.maxConcurrentReadRequests` and
    `maxConcurrentWriteRequests` now default to 0, automatic: 256 each with one node, 1024 each when
    `database.rockserver.nodes` lists several. A positive value is used as is, with one exception: with several
    nodes an explicit 256 also means automatic, so it becomes 1024. Earlier versions wrote 256, their default, into
