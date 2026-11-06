@@ -241,7 +241,9 @@ Other results:
   clients pinned to it down with it. All the clients with the same list sit on its first node. After a leader change
   they stay there, but the nodes name their leader in every response, and the client sends the calls the leader
   serves straight to it, on a second channel, once that is connected (see "Routing" in the design document): only
-  point reads still take the forwarding hop through what is now a follower, unless follower reads are on. This
+  point reads still take the forwarding hop through what is now a follower, unless follower reads are on (off by
+  default: under steady writes a follower read took 3-4 ms more than a forwarded one in process, see "Follower reads"
+  in the design document). This
   needs the clients to list the nodes by the host names of the cluster's `--peer` configuration. Not measured yet. A
   client stays on the node it failed over to until that node goes away. The benchmark's `--route failover` spreads the lists, so it does not measure this. A
   server option brings clients back to the first address, `max-connection-age-ms`, which is off by default. With it

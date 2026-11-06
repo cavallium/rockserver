@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import it.cavallium.rockserver.core.client.GrpcClientTransport;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
@@ -42,7 +43,11 @@ final class LeaderForwarder implements Closeable {
 	 */
 	private static final long POLL_MS = 250;
 
-	/** Connections to each peer, used in turn: one connection has a single event loop thread. */
+	/**
+	 * Connections to each peer, used in turn. They share {@link #transport}, which has this many event loop threads:
+	 * Netty hands each new connection the next thread, so the connections to one peer, made one after another, get a
+	 * thread each, as when every connection had its own.
+	 */
 	private static final int CONNECTIONS_PER_PEER = 4;
 	/** A peer whose API port does not accept a connection this fast is treated as down. */
 	private static final int PROBE_TIMEOUT_MS = 500;
@@ -80,10 +85,13 @@ final class LeaderForwarder implements Closeable {
 	private final ConcurrentHashMap<CompletableFuture<String>, Runnable> pendingLeaders = new ConcurrentHashMap<>();
 	/** API addresses learned from members missing from this node's peer list, by peer id. */
 	private final ConcurrentHashMap<String, HostAndPort> learnedAddresses = new ConcurrentHashMap<>();
+	/** The event loop threads and callback executor of every forwarding connection; closed after them. */
+	private final GrpcClientTransport transport;
 	private volatile boolean closed;
 
 	LeaderForwarder(NodeConfig config) {
 		this.config = config;
+		this.transport = GrpcClientTransport.create(config.nodeId() + "-forward", CONNECTIONS_PER_PEER);
 	}
 
 	/**
@@ -232,7 +240,7 @@ final class LeaderForwarder implements Closeable {
 			LOG.debug("{}: connecting to {} at {}:{}", config.nodeId(), peerId, api.host(), api.port());
 			probe(api);
 			// Retried here, possibly at another leader, never by gRPC against a peer that may be gone.
-			return GrpcConnection.forHostAndPortWithoutRetry(config.nodeId() + "->" + peerId, api);
+			return GrpcConnection.forHostAndPortWithoutRetry(config.nodeId() + "->" + peerId, api, transport);
 		}, connector);
 	}
 
@@ -310,6 +318,8 @@ final class LeaderForwarder implements Closeable {
 			}
 		}
 		connections.clear();
+		// Handshakes still in progress fail on the stopped threads and close their connections.
+		transport.close();
 		if (failure != null) {
 			throw failure;
 		}

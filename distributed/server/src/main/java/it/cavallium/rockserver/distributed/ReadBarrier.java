@@ -119,6 +119,11 @@ final class ReadBarrier implements Closeable {
 	/** Rounds whose RPCs were sent and that have not ended. Guarded by {@link #lock}. */
 	private int roundsRunning;
 	private volatile boolean closed;
+	/**
+	 * Followers may serve reads: {@link #awaitLeadership()} then waits for the whole commit index, as {@link #await()}.
+	 * Set by the node's configuration, and for good by the first {@link #readIndex()}.
+	 */
+	volatile boolean followerReads;
 
 	ReadBarrier(RaftServer server, RaftGroupId groupId, AppliedIndex applied, Duration roundTimeout) {
 		this(server, groupId, applied, roundTimeout, _ -> -1);
@@ -167,6 +172,11 @@ final class ReadBarrier implements Closeable {
 	 * That is enough when the state machine acknowledges a write only after this leader applied it, and the caller
 	 * reads only acknowledged writes: every entry of earlier leaders is then applied, and any write acknowledged in
 	 * its term was applied before its acknowledgement.
+	 *
+	 * <p>Not with follower reads ({@link #followerReads}): a follower applies an entry once it learns that it is
+	 * committed, possibly before this leader applied it and acknowledged its write, and a client may read it there.
+	 * A read that starts after that one ended must see the entry too, here as well, so it waits for the commit index,
+	 * as {@link #await()} does.</p>
 	 */
 	CompletableFuture<Void> awaitLeadership() {
 		return enqueue(Wait.LEADERSHIP).thenApply(_ -> null);
@@ -179,6 +189,8 @@ final class ReadBarrier implements Closeable {
 	 * {@link #awaitLeadership()}'s shortcut: the follower did not apply this leader's entries in its own apply.
 	 */
 	CompletableFuture<Long> readIndex() {
+		// Before the answer: once a follower has it, it may expose entries this leader did not apply yet.
+		followerReads = true;
 		return enqueue(Wait.NOTHING);
 	}
 
@@ -203,7 +215,7 @@ final class ReadBarrier implements Closeable {
 		var future = new CompletableFuture<Long>();
 		long applyIndex = switch (wait) {
 			case COMMITTED -> commitIndex;
-			case LEADERSHIP -> Math.min(commitIndex, readyIndex.applyAsLong(term));
+			case LEADERSHIP -> followerReads ? commitIndex : Math.min(commitIndex, readyIndex.applyAsLong(term));
 			case NOTHING -> -1;
 		};
 		List<Waiter> round;

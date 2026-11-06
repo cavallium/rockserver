@@ -109,7 +109,10 @@ forwards to a non-embedded connection:
 | Local | `flush`, `compact`, `compactFiles`, `getSstMetadata`, `getTableProperties` | The node that received the request does it on its own database. |
 
 Forwarding uses the leader's ordinary Rockserver API through the core `GrpcConnection` (4 connections per
-peer, without gRPC's own retries; a port probe first, so a dead peer fails in milliseconds). A request that finds no
+peer, without gRPC's own retries; a port probe first, so a dead peer fails in milliseconds). The forwarding
+connections of a node share one `GrpcClientTransport`: 4 Netty event loop threads, which Netty hands to new
+connections in turn, so the 4 connections to the leader get one each, and one callback executor. `LeaderForwarder`
+closes it after the connections, when the node stops. Before, each connection made its own event loop and executor. A request that finds no
 leader waits for one: the state machine tells `LeaderForwarder` of every leader change, and of this node becoming a
 ready leader, so it goes on at once. A request registers for that wake-up before its last check, so a change between
 the two is not missed; a 250 ms poll only enforces the deadline. Each forwarded call takes at most the
@@ -527,6 +530,8 @@ leader can therefore serve stale reads. `ReadBarrier` does the check itself, wit
    lagging, applied index), and `awaitLeadership` waits, at most a round timeout, for the applied index to
    reach it (the commit index, if Ratis has not reported the term ready yet). A new leader session also treats any transaction snapshot older than
    that index as conflicting, so no commit validates against a snapshot that misses those entries.
+   With follower reads (below) that shortcut is unsafe, and `awaitLeadership` waits for the commit index `c`, as
+   `await` does.
 
 **Why this is safe.** Suppose a leader with a higher term had committed something before the read arrived.
 Then a majority had already moved to that higher term, and terms never decrease. A majority answering after
@@ -556,9 +561,9 @@ election that skips the pre-vote. The barrier costs one round trip, and that is 
 
 ### Follower reads
 
-With `-Dit.cavallium.rockserver.distributed.follower-reads=true` (off by default; nodes may differ), a follower serves
-`get`, `exists`, `getMulti` and `existsMulti` outside a transaction from its own database (Raft dissertation §6.4,
-TiKV follower read). Updates, transactions, iterators and ranges still go to the leader.
+With `-Dit.cavallium.rockserver.distributed.follower-reads=true` (off by default; set it alike on every node), a
+follower serves `get`, `exists`, `getMulti` and `existsMulti` outside a transaction from its own database (Raft
+dissertation §6.4, TiKV follower read). Updates, transactions, iterators and ranges still go to the leader.
 
 1. The follower asks the node it knows as leader for a read index (`TermService` `ReadIndex`, on the Raft port). The
    leader records its commit index `c` when the request arrives, confirms its leadership with a barrier round that
@@ -572,18 +577,53 @@ itself. Reads share requests, with at most one in flight per follower: a read th
 waits for the next, because the one in flight may reach the leader before a write that was acknowledged before the
 read arrived. The answer of a node that is no longer the leader is a failure, as for any barrier.
 
+**The leader waits for its apply too.** A follower applies an entry as soon as it learns that it is committed, which
+can be before the leader applied it, and so before the leader acknowledged the write (its apply thread may be behind,
+or paused). A client can then read the new value on the follower, and a read that starts after that one ended must
+not answer the old value on the leader. So with follower reads the leader's `awaitLeadership` waits for its applied
+index to reach its commit index at the read's arrival, like `await`, for every leader read, update and transaction
+open. It does so when the node has the option on, and from the first read index it answers, in case a follower has it
+on while the leader does not. A follower that got its read index from an earlier leader can still expose an entry of
+the current one before that one answered any read index, which is why the option must be set alike on every node.
+`FollowerReadTest.leaderReadSeesWhatAFollowerAlreadyServed` holds the leader's apply and fails without this.
+
+**The commit index reaches the follower at once.** The follower cannot apply an entry it does not know is committed,
+and Ratis sends the commit index only with appends: at once while writes flow, but on a quiet cluster only with the
+next heartbeat, a quarter to a half of the minimum election timeout later. An appender whose follower lags in commit
+index wakes on every commit (`LeaderStateImpl.commitIndexChanged` notifies it) but sends nothing without new entries
+or a due heartbeat. So when the leader answers a read index request it also asks for a heartbeat round
+(`CommitHeartbeats`): Ratis 3.3.1 has no public way to call `LogAppender.triggerHeartbeat`, but its linearizable read
+path does it (`raft.server.read.option=LINEARIZABLE`, set in `RaftSettings`, with the default leader heartbeat check),
+so the leader submits a Ratis read with its dummy message, which skips the state machine, and ignores the reply.
+Each heartbeat carries the commit index when it is sent, at least `c`. Ratis skips the round when one already
+confirmed a commit index at least as high, and coalesces triggers per follower, so it costs at most one empty append
+per follower per read index request (at most one in flight per follower). The read index itself still comes from
+`ReadBarrier`, never from Ratis' heartbeat confirmation.
+
 The read is forwarded to the leader instead, as without follower reads, when no read index comes (no leader known, the
 leader unreachable or not confirmed within a maximum election timeout, or a leader that predates the method), when the
-follower is more than 1024 entries behind `c`, or when its apply does not reach `c` in time: 500 ms if it knows that
-`c` is committed, 5 ms if it does not. That last case is why the option is off by default. Ratis tells a follower the
-commit index with its next append, which comes at once while writes flow, but on a quiet cluster only with the next
-heartbeat, half a minimum election timeout later. The barrier's term queries do not carry it, as Ratis' own heartbeats
-would. So a read right after a write, with little else going on, waits 5 ms and is forwarded: in an in-process test
-with one writer in the background, a follower served from 2% to 88% of such reads, depending on timing, and the rest
-paid the 5 ms and the forwarding. A busy cluster, where appends follow each other, gains; a quiet one with
-read-your-write patterns loses a few milliseconds. Turning on Ratis' commit metadata entries
-(`RaftServerConfigKeys.Log.logMetadataEnabled`, off in `RaftSettings`) would send the commit index at once after every
-commit, at the cost of a log entry per commit; that is not done here.
+follower is more than 1024 entries behind `c`, or when its apply does not reach `c` within 20 ms of the answer
+(`Router.FOLLOWER_READ_WAIT`). A follower read is therefore never slower than a forwarded one by more than that wait
+and the read index round trip. A read that fails on a database that a snapshot install replaced meanwhile is forwarded
+too.
+
+**Why still off by default.** Measured in process (3 nodes on one machine and one disk, `FollowerReadLatencyTest`,
+100 rounds of a write on the leader and a read of it on a follower, in turn per mode):
+
+| Read after write | Quiet cluster, p50 / p90 | One writer in the background, p50 / p90 |
+|---|---|---|
+| Follower read | 1.1-1.3 / 2.6-3.1 ms, 97-98% served by the follower | 6.0 / 7.4-10.1 ms, 100% served |
+| Follower read, without `CommitHeartbeats` | 24-25 / 27-28 ms, 0% served (waits, then forwards) | 5.9-6.2 / 7.2-10.5 ms, 100% served |
+| Forwarded, leader waits for its apply (follower reads on) | 2.1-2.6 / 3.9-5.0 ms | 1.8-3.0 / 2.8-5.0 ms |
+| Forwarded, leader shortcut (follower reads off) | 1.7-2.4 / 3.3-4.8 ms | 1.4-2.4 / 2.5-4.6 ms |
+
+On a quiet cluster the follower now serves reads after writes and beats forwarding. With writes flowing, a follower
+read waits for the follower to receive, flush and apply the latest entries, and takes about 3-4 ms more than a
+forwarded read at the median (with a wait of 5 ms instead of 20, half of these reads fell back to forwarding and paid
+both). Turning the option on also makes every leader read wait for the leader's apply, about 0.5 ms more here. Under
+Yotsuba's steady writes that is a latency loss on every read in exchange for taking point reads off the leader, which
+only a benchmark of the Yotsuba mix can weigh. The bound of 20 ms plus a round trip is large against a 2-3 ms
+forwarded read, so the option stays off; measure it with the load benchmark before turning it on.
 
 ## Transactions
 
@@ -1072,7 +1112,8 @@ failover" below).
 | `PipelinedUpdatesTest` (in-process, flag on) | With the leader's apply stopped: chained updates see each other's values and nothing is acknowledged; wrong guards; plain writes, transactions and `deleteRange` against a chain; closes in mid-chain, and more of them waiting than a server's CONTROL workers and queue hold; refused operations on chained ids; second writes; merges and multi-key commits; caller gone, abandon; a snapshot and a restart inside a chain, around a rejected entry; a leader change with a chain in flight; a commit that ends without an outcome; the flag on and off at restarts, and a chained id handed to a leader without it; concurrent counters. With the flag off: the commit of an update, read back from the Raft log, has the old bytes, and a second write goes to the log. |
 | `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. With `PipelinedUpdatesTest`, the only tests that chain in a default run: the suites below run the plain per-key queue unless the property below is set, and fail if an update chains there. After each fault these three wait for an update that chains. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, no acknowledged increment of a hot counter is lost, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
-| `FollowerReadTest` (in-process, follower reads on) | A follower serves reads of writes acknowledged on the leader, with writes flowing meanwhile, and forwards the rest; once it knows the commit index it serves by itself. A follower whose apply is held forwards instead of answering with the old value, and one cut off from the rest fails instead of answering. A follower names the leader in its responses, and a client of several nodes listing the follower first reads its writes and its transaction through it. |
+| `FollowerReadTest` (in-process, follower reads on) | A follower serves reads of writes acknowledged on the leader, with writes flowing meanwhile and on a quiet cluster (thanks to `CommitHeartbeats`), nearly all by itself; once it knows the commit index it serves by itself. A read on the leader whose apply is held does not answer the old value after a follower served the new one. A follower whose apply is held forwards instead of answering with the old value, and one cut off from the rest fails instead of answering. A follower names the leader in its responses, and a client of several nodes listing the follower first reads its writes and its transaction through it. |
+| `FollowerReadLatencyTest` (in-process, prints numbers) | Read-after-write latency on a follower, with and without `CommitHeartbeats`, against forwarded reads with and without the leader's apply wait, quiet and with a writer in the background; with the heartbeats the follower serves at least 90% itself. The numbers in "Follower reads" come from it. |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `ClientFailoverTest` | One client connection listing all three nodes, while the node it uses is killed (the leader, or a follower): only retryable errors, new calls succeed on another node of the same connection (about 1 s with an election, under 200 ms without), a new connection skips the dead node, and a transaction opened through a dead follower still commits. |
 | `IsolatedNodeTest` | A client listing every node, connected to a node that gets isolated (the leader, or a follower), moves to the majority and keeps working, and the isolated node listens and serves again after the heal. With every node isolated all pause, and after the heal all resume and the client recovers by itself. An election shorter than the bound pauses no node. A follower restarted while cut off pauses too, and the client that lists it first moves. A cluster killed or stopped as a whole and restarted at once serves again, a paused node takes part in the election, and a node of a new cluster does not pause. A node that lost its database and kept its log pauses, and a client that starts during a cold start waits for the cluster, also past a frozen node. |

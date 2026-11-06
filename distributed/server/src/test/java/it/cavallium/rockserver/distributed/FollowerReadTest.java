@@ -134,9 +134,9 @@ class FollowerReadTest {
 		System.out.println("FollowerReadTest: " + writes + " writes took " + Duration.ofNanos(writeNanos).toMillis()
 				+ " ms, the follower reads after them " + Duration.ofNanos(readNanos).toMillis() + " ms; " + served
 				+ " served by the follower, " + forwarded + " forwarded");
-		// A read that finds the commit index not known here yet is forwarded after a few milliseconds, so how many
-		// the follower serves depends on timing: some do.
-		assertTrue(served > 0, "served by the follower: " + served + ", forwarded: " + forwarded);
+		// A read whose index the follower does not apply within Router.FOLLOWER_READ_WAIT is forwarded: with the
+		// leader sending the commit index on every read index request, nearly none is.
+		assertTrue(served > writes * 9 / 10, "served by the follower: " + served + ", forwarded: " + forwarded);
 		assertEquals(writes + 2, served + forwarded);
 
 		// Once it knows the commit index, a follower serves a read by itself.
@@ -146,6 +146,74 @@ class FollowerReadTest {
 		long servedNow = routing(follower).followerReadsServedForTesting();
 		assertEquals("last", get(follower, column, writes));
 		assertEquals(servedNow + 1, routing(follower).followerReadsServedForTesting());
+	}
+
+	@Test
+	void followerOfAQuietClusterServesReadsOfTheWriteJustAcknowledged() throws Exception {
+		start();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var follower = cluster.anyFollower();
+		long column = api(leader).createColumn("c", SCHEMA);
+		// Warm up the follower's channel to the leader and the code paths.
+		for (int i = 0; i < 20; i++) {
+			api(leader).put(0, column, key(-1), text("warm-up"), RequestType.none());
+			get(follower, column, -1);
+		}
+		long servedBefore = routing(follower).followerReadsServedForTesting();
+
+		// Nothing else goes on: without CommitHeartbeats the follower would learn each commit index only with the next
+		// heartbeat, hundreds of milliseconds later, and forward every read.
+		int writes = 50;
+		for (int i = 0; i < writes; i++) {
+			api(leader).put(0, column, key(i), text("v" + i), RequestType.none());
+			assertEquals("v" + i, get(follower, column, i));
+		}
+
+		long served = routing(follower).followerReadsServedForTesting() - servedBefore;
+		assertTrue(served > writes * 9 / 10, "served by the follower: " + served + " of " + writes);
+	}
+
+	@Test
+	void leaderReadSeesWhatAFollowerAlreadyServed() throws Exception {
+		start();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var follower = cluster.anyFollower();
+		long column = api(leader).createColumn("c", SCHEMA);
+		api(leader).put(0, column, key(1), text("old"), RequestType.none());
+		assertEquals("old", get(follower, column, 1));
+
+		// The leader commits the write but does not apply it, so it does not acknowledge it either; the followers apply
+		// it, and a client reads it on one of them.
+		// The follower must serve the read itself: forwarded, it would wait for the held apply of the leader.
+		routing(follower).followerReadWaitNanos = TIMEOUT.toNanos();
+		var gate = new CountDownLatch(1);
+		leader.stateMachine().testHooks().applyGate = gate;
+		try {
+			var write = Thread.ofVirtual().start(() -> api(leader).put(0, column, key(1), text("new"),
+					RequestType.none()));
+			InProcessCluster.await(TIMEOUT, () -> "new".equals(get(follower, column, 1)));
+
+			// A read that starts after that one ended must see the write too, on the leader as well: it waits for its own
+			// apply of the commit index instead of answering "old" at once.
+			var onLeader = new java.util.concurrent.CompletableFuture<String>();
+			Thread.ofVirtual().start(() -> {
+				try {
+					onLeader.complete(get(leader, column, 1));
+				} catch (Throwable e) {
+					onLeader.completeExceptionally(e);
+				}
+			});
+			Thread.sleep(300);
+			if (onLeader.isDone()) {
+				assertEquals("new", onLeader.join(), "the leader answered while its apply was held");
+			}
+			gate.countDown();
+			assertEquals("new", onLeader.get(TIMEOUT.toSeconds(), java.util.concurrent.TimeUnit.SECONDS));
+			write.join();
+		} finally {
+			gate.countDown();
+			leader.stateMachine().testHooks().applyGate = null;
+		}
 	}
 
 	@Test

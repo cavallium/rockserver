@@ -47,17 +47,13 @@ final class Router {
 	/** A follower further behind the leader's read index than this many log entries forwards a read instead. */
 	private static final long FOLLOWER_READ_MAX_LAG = 1024;
 	/**
-	 * How long a follower that knows the read index is committed waits for its apply to reach it, before it forwards
-	 * the read instead.
+	 * How long a follower waits, once it has the read index, to learn that it is committed and to apply up to it, before
+	 * it forwards the read instead. The leader sends the commit index to its followers when it answers a read index
+	 * request ({@link CommitHeartbeats}), and while writes flow with every append, so a follower that keeps up waits for
+	 * its own log flush and apply of the latest entries. This bounds how much slower than a forwarded read a follower
+	 * read can be: this wait, plus the read index round trip. See "Follower reads" in the design document.
 	 */
-	private static final Duration FOLLOWER_READ_APPLY_WAIT = Duration.ofMillis(500);
-	/**
-	 * How long a follower that does not know yet that the read index is committed waits for it, before it forwards the
-	 * read instead. Ratis tells followers the commit index with its next append: at once while writes flow, but on a
-	 * quiet cluster only with the next heartbeat, half an election timeout later. Forwarding costs about two round
-	 * trips, so waiting longer than that for the heartbeat is not worth it.
-	 */
-	private static final Duration FOLLOWER_READ_COMMIT_WAIT = Duration.ofMillis(5);
+	static final Duration FOLLOWER_READ_WAIT = Duration.ofMillis(20);
 	/**
 	 * {@code true} turns follower reads on for this node; off by default, a follower forwards every read to the leader.
 	 * Nodes may differ. See "Reads" in the design document for what they cost on a quiet cluster.
@@ -71,7 +67,9 @@ final class Router {
 	private final UpdateProtocol updates;
 	private final Forwarder forwarding;
 	/** Whether this node serves point reads as a follower; see {@link #FOLLOWER_READS_PROPERTY}. */
-	volatile boolean followerReadsEnabled = Boolean.getBoolean(FOLLOWER_READS_PROPERTY);
+	volatile boolean followerReadsEnabled = followerReadsConfigured();
+	/** {@link #FOLLOWER_READ_WAIT}; tests change it. */
+	volatile long followerReadWaitNanos = FOLLOWER_READ_WAIT.toNanos();
 	/** Point reads this node served as a follower, and those it forwarded after trying. */
 	private final AtomicLong followerReadsServed = new AtomicLong();
 	private final AtomicLong followerReadsForwarded = new AtomicLong();
@@ -100,6 +98,11 @@ final class Router {
 		this.followerReadFallbacks = metrics.amount("read.follower.forwarded");
 		this.barrierTime = metrics.duration("read.barrier");
 		this.forwarding = new Forwarder(config, stateMachine, forwarder, localCommands, this, metrics);
+	}
+
+	/** Whether {@link #FOLLOWER_READS_PROPERTY} turns follower reads on. */
+	static boolean followerReadsConfigured() {
+		return Boolean.parseBoolean(System.getProperty(FOLLOWER_READS_PROPERTY, "false"));
 	}
 
 	private CompletableFuture<?> local(RequestContext context, RocksDBAPICommandSingle<?> command) {
@@ -305,10 +308,7 @@ final class Router {
 					if (index - applied.get() > FOLLOWER_READ_MAX_LAG) {
 						return CompletableFuture.failedFuture(new ReadBarrier.ApplyLagException(index, applied.get()));
 					}
-					var division = stateMachine.division();
-					boolean committedHere = division != null && division.getRaftLog().getLastCommittedIndex() >= index;
-					long wait = Math.min((committedHere ? FOLLOWER_READ_APPLY_WAIT : FOLLOWER_READ_COMMIT_WAIT).toNanos(),
-							remainingNanos(context, start));
+					long wait = Math.min(followerReadWaitNanos, remainingNanos(context, start));
 					return applied.await(index).orTimeout(Math.max(0, wait), TimeUnit.NANOSECONDS);
 				})
 				// Off gRPC and apply threads: the read runs here.
@@ -321,7 +321,14 @@ final class Router {
 					}
 					followerReadsServed.incrementAndGet();
 					followerReadTime.since(start);
-					return local(remaining, command);
+					var store = stateMachine.store();
+					@SuppressWarnings("unchecked")
+					var local = (CompletableFuture<Object>) local(remaining, command);
+					// A snapshot install replaces the database under a follower: a read that fails on the old one is
+					// forwarded instead. Its answer could not be stale (the new database is further ahead), only lost.
+					return local.exceptionallyCompose(localError -> stateMachine.store() != store
+							? forwarding.forward(remainingContext(context, start), command).thenApply(r -> (Object) r)
+							: CompletableFuture.failedFuture(localError));
 				}, inline)
 				.thenCompose(f -> f);
 	}
