@@ -5,9 +5,11 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import org.apache.ratis.proto.RaftProtos.ServerRpcProto;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Tells when a leader should step down because it cannot commit: a new leader whose first entry got no reply, and a
@@ -167,20 +169,40 @@ final class LeaderStall {
 		if (committed != null && committed.getTerm() == info.getCurrentTerm()) {
 			return false;
 		}
+		// Ratis gives the next indices without follower ids, in the order of its log appenders, the same order as
+		// the follower list of the role info. Each is a separate snapshot of that list, so the indices are paired with
+		// ids only when the list has the same followers in the same order before and after them.
+		var before = info.getRoleInfoProto().getLeaderInfo().getFollowerInfoList();
 		var nextIndices = info.getFollowerNextIndices();
-		var replies = info.getRoleInfoProto().getLeaderInfo().getFollowerInfoList();
-		if (nextIndices == null || nextIndices.length != replies.size()) {
+		var after = info.getRoleInfoProto().getLeaderInfo().getFollowerInfoList();
+		var followers = pairById(before, nextIndices, after);
+		if (followers == null) {
 			return false;
-		}
-		var followers = new ArrayList<Follower>();
-		for (int i = 0; i < nextIndices.length; i++) {
-			var reply = replies.get(i);
-			followers.add(new Follower(RaftPeerId.valueOf(reply.getId().getId()).toString(), nextIndices[i],
-					reply.getLastRpcElapsedTimeMs()));
 		}
 		var conf = division.getRaftConf();
 		return sentToMajority(followers, log.getNextIndex(), answeredWithinMillis, self, peerIds(conf.getCurrentPeers()),
 				peerIds(conf.getPreviousPeers()));
+	}
+
+	/**
+	 * The followers of {@code nextIndices}, with the latest reply times of {@code after}; null if the follower lists
+	 * read around the indices differ in ids or order, or in length from the indices: they cannot then be paired.
+	 */
+	static @Nullable List<Follower> pairById(List<ServerRpcProto> before, long @Nullable [] nextIndices,
+			List<ServerRpcProto> after) {
+		if (nextIndices == null || before.size() != nextIndices.length || after.size() != nextIndices.length) {
+			return null;
+		}
+		var followers = new ArrayList<Follower>(nextIndices.length);
+		for (int i = 0; i < nextIndices.length; i++) {
+			var id = before.get(i).getId().getId();
+			if (!id.equals(after.get(i).getId().getId())) {
+				return null;
+			}
+			followers.add(new Follower(RaftPeerId.valueOf(id).toString(), nextIndices[i],
+					after.get(i).getLastRpcElapsedTimeMs()));
+		}
+		return followers;
 	}
 
 	private static List<String> peerIds(Collection<RaftPeer> peers) {
