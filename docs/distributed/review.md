@@ -1,5 +1,10 @@
 # Review of the Codex distributed Rockserver branch
 
+> **Historical, superseded.** This reviews the Codex implementation (`distributed/ratis`, the patched Ratis fork
+> and its tests), which was removed and replaced by the design in [design.md](design.md). Nothing here describes the
+> current code. Its references to `status.md` and to Codex classes point to that branch: `status.md` is no longer
+> in the tree; read it with `git show 9b2d16d:docs/distributed/status.md`.
+
 Reviewed 2026-10-29. Subject: `codex/source-quiescence` at `9b2d16d`, which is
 `codex/distributed-rockserver` (`820461f`) plus one commit. The other `codex/*`
 branches are subsets of this line. Baseline: merge-base `c431f88` with `master`.

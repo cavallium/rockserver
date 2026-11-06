@@ -2484,24 +2484,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	/**
-	 * Opens a transaction for a caller that is the only writer of the keys it writes and does its own recovery: its
-	 * writes are not tracked for conflicts (nothing else writes them, so commit has nothing to validate), no
-	 * snapshot is taken and, if {@code disableWal}, its commit skips the WAL, so it survives a crash only once
-	 * flushed. Only for replication, which replays the writes lost by a crash from its own log.
-	 */
-	public long openUnloggedTransaction(long timeoutMs, WorkloadProfile workloadProfile, boolean disableWal) {
-		ops.beginOp();
-		try {
-			return allocateTransactionInternal(openTransactionInternal(timeoutMs, false, workloadProfile, false,
-					disableWal, true));
-		} finally {
-			ops.endOp();
-		}
-	}
-
-	/**
-	 * Opens a write transaction for the apply thread of replication, which is the only writer of the database: like
-	 * {@link #openUnloggedTransaction}, but held by the caller instead of being registered under an id. Its
+	 * Opens a write transaction for the apply thread of replication, which is the only writer of the database. Its
+	 * writes are not tracked for conflicts (nothing else writes them, so commit has nothing to validate), no snapshot
+	 * is taken and, if {@code disableWal}, its commit skips the WAL, so it survives a crash only once flushed: the
+	 * replication log replays the writes a crash loses. It is held by the caller instead of being registered under
+	 * an id. Its
 	 * operations run the same code as the public ones with a transaction, so keys, schemas, merges and results are
 	 * the same byte for byte, without the per-call bookkeeping of a client operation: the transaction lookup and
 	 * lock, column use counting, action logging, operation counters and timers. The caller must not use it from
@@ -5333,7 +5320,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
 							}
 						} else if (RequestType.requiresGettingPreviousPresence(callback)) {
-							// todo: in the future this should be replaced with just keyExists
+							// A presence check stays a getForUpdate: it locks the key and records it for conflict
+							// validation, which no exists-style call of a RocksJava Transaction does (keyMayExist
+							// may also answer a false positive).
 							assert newTx instanceof Tx;
 							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray = pointGetForUpdate((Tx) newTx, readOptions, col.cfh(), calculatedKeyArray);
@@ -5490,7 +5479,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
 							}
 						} else if (RequestType.requiresGettingPreviousPresence(callback)) {
-							// todo: in the future this should be replaced with just keyExists
+							// A presence check stays a getForUpdate: it locks the key and records it for conflict
+							// validation, which no exists-style call of a RocksJava Transaction does (keyMayExist
+							// may also answer a false positive).
 							assert newTx instanceof Tx;
 							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray;
@@ -7430,7 +7421,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public void closeIterator(long iteratorId) throws RocksDBException {
 		var start = System.nanoTime();
 		try {
-			actionLogger.logAction("CloseIterator", start, null, null, null, null, null, null, null); // todo: improve logging
+			actionLogger.logAction("CloseIterator", start, null, null, null, iteratorId, null, null, null);
 			closeIteratorInternal(iteratorId);
 		} finally {
 			var end = System.nanoTime();
@@ -7890,10 +7881,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					startKeysInclusive,
 					endKeysExclusive,
 					transactionId,
-					null,
+					reverse,
 					null,
 					requestType
-			); // todo: log if reversed or not
+			);
 			col = beginColumnUse(columnId);
 
 
@@ -8176,10 +8167,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				startKeysInclusive,
 				endKeysExclusive,
 				transactionId,
-				null,
+				reverse,
 				null,
 				requestType
-		); // todo: log if reversed or not
+		);
 		if (!isCooperativeRetainedProfile(workloadProfile)) {
 			return Flux.usingWhen(
 					openOrdinaryRetainedRangeCursorAsync(transactionId,
@@ -8286,10 +8277,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				startKeysInclusive,
 				endKeysExclusive,
 				transactionId,
-				null,
+				reverse,
 				null,
 				RequestType.entriesCount()
-		); // todo: log if reversed or not
+		);
 		if (!isCooperativeRetainedProfile(workloadProfile)) {
 			return Flux.usingWhen(
 					openOrdinaryRetainedRangeCursorAsync(transactionId,

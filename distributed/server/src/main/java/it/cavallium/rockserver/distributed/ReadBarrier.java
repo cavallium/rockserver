@@ -19,9 +19,6 @@ import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
-import org.apache.ratis.thirdparty.io.grpc.ConnectivityState;
-import org.apache.ratis.thirdparty.io.grpc.ManagedChannel;
-import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,8 +48,11 @@ import org.slf4j.LoggerFactory;
  * they still need that peer and have time left; meanwhile the peer simply does not contribute to them.</p>
  * <p>{@link #readIndex()} serves a follower's read: the commit index recorded when it was called, and the term, once
  * leadership was confirmed after the call. The follower then waits for its own apply to reach it.</p>
- * <p>The returned futures complete on threads of this barrier, never on gRPC, Ratis apply or JDK timer threads,
- * so callers may run blocking work, such as a database read, in their continuations.</p>
+ * <p>The returned futures complete on this barrier's executor, never on gRPC, Ratis apply or JDK timer threads. In a
+ * node that executor is the node's few control-plane platform threads ({@link NodeThreads#control()}), which also run
+ * every round: a continuation must not block on them, and work that may wait, such as a database read, a transaction
+ * open or a stream, must hop to another executor first (as {@link LocalCommands#leadership()} does with
+ * {@code whenCompleteAsync}). Only a barrier built without an executor completes on virtual threads of its own.</p>
  */
 final class ReadBarrier implements Closeable {
 
@@ -106,8 +106,8 @@ final class ReadBarrier implements Closeable {
 	private final RaftGroupId groupId;
 	private final AppliedIndex applied;
 	private final Duration roundTimeout;
-	/** Channels to the other peers' Raft ports, by address, so that a peer whose address changes gets a new one. */
-	private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
+	/** Channels to the other peers' Raft ports. */
+	private final PeerChannels channels = new PeerChannels();
 	/** The term queries to each other voting peer. */
 	private final Map<RaftPeerId, PeerLink> links = new ConcurrentHashMap<>();
 	/** Every future returned by {@link #await} and not completed yet, failed by {@link #close}. */
@@ -264,7 +264,7 @@ final class ReadBarrier implements Closeable {
 		for (var future : outstanding) {
 			future.completeExceptionally(new NotLeaderException("Read barrier closed"));
 		}
-		closeChannels();
+		channels.close();
 		if (ownsExecutor) {
 			executor.shutdown();
 		}
@@ -379,7 +379,10 @@ final class ReadBarrier implements Closeable {
 				}
 			}
 		}
-		dropUnusedChannels(others.values());
+		var addresses = new ArrayList<@Nullable String>();
+		others.values().forEach(peer -> addresses.add(peer.getAddress()));
+		// shutdown, not shutdownNow: the queries of an earlier round finish.
+		channels.retainOnly(addresses);
 		links.keySet().retainAll(others.keySet());
 		votes.check();
 		for (var peer : others.values()) {
@@ -518,7 +521,7 @@ final class ReadBarrier implements Closeable {
 				if (!closed && !live.isEmpty()) {
 					long remaining = live.stream().mapToLong(round -> round.deadline - now).max().orElseThrow();
 					try {
-						TermService.currentTerm(channel(address), groupId, Duration.ofNanos(remaining))
+						TermService.currentTerm(channels.get(address), groupId, Duration.ofNanos(remaining))
 								.whenComplete((peerTerm, error) -> {
 									var next = release();
 									if (error == null) {
@@ -553,45 +556,6 @@ final class ReadBarrier implements Closeable {
 			var next = List.copyOf(waiting);
 			waiting.clear();
 			return next;
-		}
-	}
-
-	private ManagedChannel channel(String address) {
-		var channel = channels.computeIfAbsent(address,
-				_ -> NettyChannelBuilder.forTarget(address).usePlaintext().build());
-		if (closed) {
-			// close() may have swept the channels before this one was added.
-			closeChannels();
-		}
-		// While a peer is down, gRPC waits longer and longer (up to two minutes) between attempts to reach it, and
-		// fails calls at once in between. A round must reach a peer as soon as it is back, so each query that finds
-		// the channel failed makes a fresh attempt: at most one connection attempt per query, and a peer has at
-		// most one query in flight, which lasts at most a round timeout.
-		if (channel.getState(false) == ConnectivityState.TRANSIENT_FAILURE) {
-			channel.resetConnectBackoff();
-		}
-		return channel;
-	}
-
-	private void dropUnusedChannels(Iterable<RaftPeer> peers) {
-		var addresses = new HashSet<String>();
-		peers.forEach(peer -> addresses.add(peer.getAddress()));
-		channels.entrySet().removeIf(entry -> {
-			if (addresses.contains(entry.getKey())) {
-				return false;
-			}
-			// shutdown() lets the RPCs of an earlier round finish.
-			entry.getValue().shutdown();
-			return true;
-		});
-	}
-
-	private void closeChannels() {
-		for (var address : List.copyOf(channels.keySet())) {
-			var channel = channels.remove(address);
-			if (channel != null) {
-				channel.shutdownNow();
-			}
 		}
 	}
 }

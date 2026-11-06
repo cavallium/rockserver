@@ -1,5 +1,10 @@
 # Review: `distributed/ratis` adapter (main sources)
 
+> **Historical, superseded.** This reviews the Codex implementation (`distributed/ratis`, the patched Ratis fork
+> and its tests), which was removed and replaced by the design in [design.md](../design.md). Nothing here describes the
+> current code. Its references to `status.md` and to Codex classes point to that branch: `status.md` is no longer
+> in the tree; read it with `git show 9b2d16d:docs/distributed/status.md`.
+
 Scope: `distributed/ratis/src/main/java/it/cavallium/rockserver/distributed/ratis/` (worktree `distributed-rockserver-rewrite-e46da4`, HEAD `9b2d16d`). Read-only review; nothing was built or run. Paths below are relative to that package directory unless stated otherwise. `SM` = `RatisRangeStateMachine.java`.
 
 Bar used: *a production single-node RocksDB server becomes replicated, so the Yotsuba client survives node restart or loss with high uptime*. The simplest design that meets that bar is the yardstick.

@@ -1,5 +1,11 @@
 # Review: Codex changes to single-node Rockserver core (branch `claude/distributed-rockserver-rewrite-e46da4`)
 
+> **Historical, superseded.** This reviews the core changes of the Codex implementation, which was removed and
+> replaced by the design in [design.md](../design.md). Most of these core changes were reverted with it; the ones
+> kept, and the fixes taken from them, are listed in design.md ("Shape") and its rejections. Line numbers are those
+> of `9b2d16d`, not of the current code. Its references to `status.md` and to Codex classes point to that branch: `status.md` is no longer
+> in the tree; read it with `git show 9b2d16d:docs/distributed/status.md`.
+
 Worktree: `/home/cavallium/IdeaProjects/rockserver/.claude/worktrees/distributed-rockserver-rewrite-e46da4`
 Range: merge-base `c431f88` .. `9b2d16d` (427 commits). Read-only review; nothing was built or run.
 Line numbers are at HEAD `9b2d16d` unless marked `base:`.

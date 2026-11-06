@@ -124,7 +124,8 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
 
     public FFMAbstractMergeOperator(String name) {
         super(0);
-        
+
+        MemorySegment rawCpObject = MemorySegment.NULL;
         try {
             this.nameSegment = instanceArena.allocateFrom(name);
 
@@ -134,7 +135,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
             this.partialMergeStub = createPartialMergeCallback();
             this.deleteValueStub = createDeleteValueCallback();
 
-            MemorySegment rawCpObject = (MemorySegment) CREATE_OP.invokeExact(
+            rawCpObject = (MemorySegment) CREATE_OP.invokeExact(
                     MemorySegment.NULL,
                     destructorStub,
                     fullMergeStub,
@@ -154,6 +155,17 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
             setNativeHandle(sharedPtrContainer.address());
 
         } catch (Throwable t) {
+            // The native operator exists once create returned: destroy it before the arena frees the upcall stubs it
+            // points to, and drop the handle so nothing disposes it again (otherwise it leaks on every failed
+            // construction, for example when the handle cannot be injected).
+            if (!rawCpObject.equals(MemorySegment.NULL)) {
+                try {
+                    DESTROY_OP.invokeExact(rawCpObject);
+                } catch (Throwable destroyError) {
+                    t.addSuppressed(destroyError);
+                }
+            }
+            disOwnNativeHandle();
             instanceArena.close();
             throw new RuntimeException("Failed to construct FFM MergeOperator", t);
         }

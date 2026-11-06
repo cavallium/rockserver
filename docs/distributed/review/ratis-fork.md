@@ -1,5 +1,10 @@
 # Review: Rockserver's patched Apache Ratis 3.3.1 (`distributed/ratis-server`, `distributed/ratis-grpc`)
 
+> **Historical, superseded.** This reviews the Codex implementation (`distributed/ratis`, the patched Ratis fork
+> and its tests), which was removed and replaced by the design in [design.md](../design.md). Nothing here describes the
+> current code. Its references to `status.md` and to Codex classes point to that branch: `status.md` is no longer
+> in the tree; read it with `git show 9b2d16d:docs/distributed/status.md`.
+
 Reviewer stance: independent, read-only. No builds run, no files or git state changed.
 Upstream baseline: GitHub tag `ratis-3.3.1`, fetched into `/tmp/claude-1000/ratis-review-513402/up/`.
 The SHA-256 of the fetched `RaftServerImpl`, `StateMachineUpdater`, `LogSegment`, `SegmentedRaftLog`,

@@ -4,16 +4,11 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
-import org.apache.ratis.thirdparty.io.grpc.ConnectivityState;
 import org.apache.ratis.thirdparty.io.grpc.ManagedChannel;
-import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -41,7 +36,7 @@ final class FollowerReads implements Closeable {
 	private final RaftGroupId groupId;
 	private final String selfId;
 	private final Duration timeout;
-	private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
+	private final PeerChannels channels = new PeerChannels();
 	private final Object lock = new Object();
 	/** Reads waiting for the next request. Guarded by {@link #lock}. */
 	private List<CompletableFuture<ReadBarrier.ReadIndex>> next = new ArrayList<>();
@@ -168,16 +163,7 @@ final class FollowerReads implements Closeable {
 			// Addresses of members that left: keep the current members only.
 			dropUnusedChannels();
 		}
-		var channel = channels.computeIfAbsent(address,
-				_ -> NettyChannelBuilder.forTarget(address).usePlaintext().build());
-		if (closed) {
-			closeChannels();
-		}
-		// As in ReadBarrier: a leader that is back must be reached at once, not after gRPC's growing backoff.
-		if (channel.getState(false) == ConnectivityState.TRANSIENT_FAILURE) {
-			channel.resetConnectBackoff();
-		}
-		return channel;
+		return channels.get(address);
 	}
 
 	private void dropUnusedChannels() {
@@ -185,26 +171,11 @@ final class FollowerReads implements Closeable {
 		if (division == null) {
 			return;
 		}
-		var addresses = new HashSet<@Nullable String>();
+		var addresses = new ArrayList<@Nullable String>();
 		var conf = division.getRaftConf();
 		conf.getCurrentPeers().forEach(peer -> addresses.add(peer.getAddress()));
 		conf.getPreviousPeers().forEach(peer -> addresses.add(peer.getAddress()));
-		channels.entrySet().removeIf(entry -> {
-			if (addresses.contains(entry.getKey())) {
-				return false;
-			}
-			entry.getValue().shutdown();
-			return true;
-		});
-	}
-
-	private void closeChannels() {
-		for (var address : List.copyOf(channels.keySet())) {
-			var channel = channels.remove(address);
-			if (channel != null) {
-				channel.shutdownNow();
-			}
-		}
+		channels.retainOnly(addresses);
 	}
 
 	@Override
@@ -219,6 +190,6 @@ final class FollowerReads implements Closeable {
 			future.completeExceptionally(new IOException("Closed"));
 		}
 		// Requests in flight fail with their channels, and complete their reads.
-		closeChannels();
+		channels.close();
 	}
 }
