@@ -234,6 +234,13 @@ class RandomFaultTest {
 
 			log(terms.summary());
 			assertEquals(List.of(), terms.violations(), "a node's Raft term went down, " + repro);
+			// Without these the check above passes vacuously, for example if Ratis moved or renamed its meta file.
+			assertEquals(new TreeSet<>(cluster.nodeIds()), new TreeSet<>(terms.sampledNodes()),
+					"the Raft term of some node was never read, " + repro);
+			if (executed.stream().anyMatch(step -> step.targetWasLeader()
+					&& (step.step().fault() == Fault.KILL || step.step().fault() == Fault.RESTART))) {
+				assertTrue(terms.increases() > 0, "the leader was stopped but no term increase was seen, " + repro);
+			}
 
 			reportAvailability(executed, workload, repro, !overlap);
 
@@ -319,10 +326,34 @@ class RandomFaultTest {
 					Duration.ofMillis(500 + random.nextInt(2_500)));
 		}
 
-		/** Starts the fault on {@code target} and returns how to end it. */
-		Repair inject(ProcessCluster cluster, String target) {
+		/**
+		 * Starts the fault on {@code target} and returns how to end it. A network fault registers the links it
+		 * holds in {@code held}, so a {@link Fault#FLAP flapping} fault running at the same time leaves them alone.
+		 */
+		Repair inject(ProcessCluster cluster, String target, HeldLinks held) {
 			var network = cluster.network();
 			var others = cluster.nodeIds().stream().filter(id -> !id.equals(target)).toList();
+			List<List<String>> heldLinks = switch (fault) {
+				case ISOLATE, PARTITION, SLOW, THROTTLE, BLACKHOLE -> network.linksOf(target);
+				case ONE_WAY -> others.stream().map(other -> List.of(target, other)).toList();
+				case CUT_LINK -> {
+					var other = others.get(pick % others.size());
+					yield List.of(List.of(target, other), List.of(other, target));
+				}
+				default -> List.of();
+			};
+			if (heldLinks.isEmpty()) {
+				return injectHeld(cluster, network, target, others, held, heldLinks);
+			}
+			// Registering and cutting are atomic for a flapper, which checks the registry under the same lock.
+			synchronized (held) {
+				held.add(heldLinks);
+				return injectHeld(cluster, network, target, others, held, heldLinks);
+			}
+		}
+
+		private Repair injectHeld(ProcessCluster cluster, Network network, String target, List<String> others,
+				HeldLinks held, List<List<String>> heldLinks) {
 			switch (fault) {
 				case KILL -> {
 					cluster.kill(target);
@@ -364,13 +395,17 @@ class RandomFaultTest {
 				case FLAP -> {
 					var flapping = new AtomicBoolean(true);
 					var flapRandom = new Random(pick);
+					// The flapper cuts and restores only the links of the target that no other fault holds, so an
+					// overlapping network fault keeps its links for its whole hold.
+					var cutByFlapper = new ArrayList<List<String>>();
 					var flapper = Thread.ofPlatform().name("random-fault-flap-" + target).daemon().start(() -> {
 						boolean cut = false;
 						while (flapping.get()) {
 							if (cut) {
-								network.heal();
+								held.restoreFree(network, cutByFlapper);
+								cutByFlapper.clear();
 							} else {
-								network.isolate(target);
+								cutByFlapper.addAll(held.cutFree(network, network.linksOf(target)));
 							}
 							cut = !cut;
 							try {
@@ -388,7 +423,7 @@ class RandomFaultTest {
 						} catch (InterruptedException e) {
 							Thread.currentThread().interrupt();
 						}
-						network.heal();
+						held.restoreFree(network, cutByFlapper);
 					};
 				}
 				case CLIENT_LOSS -> {
@@ -401,8 +436,13 @@ class RandomFaultTest {
 				}
 			}
 			// Every other fault is in the network between nodes. Healing it all also ends an overlapping network
-			// fault early, which only shortens that one.
-			return network::heal;
+			// fault, which is repaired at the same time anyway (both are repaired once both holds are over).
+			return () -> {
+				synchronized (held) {
+					held.remove(heldLinks);
+					network.heal();
+				}
+			};
 		}
 
 		String target(List<String> ids, Optional<String> leader) {
@@ -421,10 +461,38 @@ class RandomFaultTest {
 		}
 	}
 
+	/** The links held by the network faults of the running step, as {@code [src, dst]} pairs. */
+	private static final class HeldLinks {
+
+		private final Set<List<String>> links = new java.util.HashSet<>();
+
+		synchronized void add(List<List<String>> faulted) {
+			links.addAll(faulted);
+		}
+
+		synchronized void remove(List<List<String>> faulted) {
+			faulted.forEach(links::remove);
+		}
+
+		/** Cuts every link of {@code candidates} that no fault holds, and returns those. */
+		synchronized List<List<String>> cutFree(Network network, List<List<String>> candidates) {
+			var cut = candidates.stream().filter(link -> !links.contains(link)).toList();
+			cut.forEach(link -> network.blockLink(link.get(0), link.get(1)));
+			return cut;
+		}
+
+		/** Restores every link of {@code cut} that no fault took over meanwhile. */
+		synchronized void restoreFree(Network network, List<List<String>> cut) {
+			cut.stream().filter(link -> !links.contains(link))
+					.forEach(link -> network.restoreLink(link.get(0), link.get(1)));
+		}
+	}
+
 	/**
 	 * A fault, and optionally a second one that starts {@code offset} into the first one's hold and holds for its
 	 * own time. Both are repaired, the second first, once both holds are over. Two process faults never hit the
-	 * same node; two network faults may touch the same links, and repairing the first heals both.
+	 * same node; two network faults may touch the same links, and repairing the first heals both. A flapping link
+	 * never touches the links another network fault holds (see {@link HeldLinks}).
 	 */
 	private record CompoundStep(FaultStep first, @org.jetbrains.annotations.Nullable FaultStep second,
 			Duration offset) {
@@ -459,7 +527,8 @@ class RandomFaultTest {
 			long start = System.nanoTime();
 			log(String.format("[%s] %s node %s (role %s, leader %s), hold %d ms", clock(), first.fault(), target,
 					first.role(), leader.orElse("unknown"), first.hold().toMillis()));
-			var firstRepair = first.inject(cluster, target);
+			var held = new HeldLinks();
+			var firstRepair = first.inject(cluster, target, held);
 			Repair secondRepair = null;
 			if (second != null) {
 				waitFor(offset);
@@ -470,7 +539,7 @@ class RandomFaultTest {
 				log(String.format("[%s]   overlapping %s node %s (role %s, leader %s), hold %d ms", clock(),
 						second.fault(), secondTarget, second.role(), secondLeader.orElse("unknown"),
 						second.hold().toMillis()));
-				secondRepair = second.inject(cluster, secondTarget);
+				secondRepair = second.inject(cluster, secondTarget, held);
 			}
 			waitFor(Duration.ofMillis(Math.max(0, start / 1_000_000 + holdMillis() - System.nanoTime() / 1_000_000)));
 			if (secondRepair != null) {
@@ -1235,6 +1304,15 @@ class RandomFaultTest {
 
 		List<String> violations() {
 			return List.copyOf(violations);
+		}
+
+		/** The nodes whose term was read at least once. */
+		Set<String> sampledNodes() {
+			return Set.copyOf(last.keySet());
+		}
+
+		long increases() {
+			return changes.get();
 		}
 
 		String summary() {

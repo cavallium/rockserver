@@ -222,10 +222,69 @@ class LinkProxyTest {
 			proxy.dropReplies();
 			lossy.getOutputStream().write("lost\n".getBytes(StandardCharsets.UTF_8));
 			echo.awaitBytes(("before\nlost\n").length() + ("idle\n").length());
+			// The server got the request; wait until the proxy also read and dropped its echo, or unblock() would
+			// find nothing lost and let the echo through.
+			awaitTrue(proxy::hasLostReplies, "the proxy never dropped the echo");
 			proxy.unblock();
 			// Its stream lost bytes in the middle: it is reset. The other one never lost any and stays open.
 			assertCutPromptly(lossy);
 			assertEchoes(idle, "still open");
+		}
+	}
+
+	/** A throttled backlog is not paced at the old rate after unblock(): the link is at full speed at once. */
+	@Test
+	void unblockReleasesAThrottledBacklogAtOnce() throws Exception {
+		try (var echo = new EchoServer(new InetSocketAddress(LOOPBACK, 0));
+				var proxy = new LinkProxy(new InetSocketAddress(LOOPBACK, 0), echo.address());
+				var socket = connect(proxy.listenAddress())) {
+			proxy.shape(LinkProxy.Shaping.bandwidth(64 * 1024));
+			// 8 s of data at 64 KiB/s, each way.
+			var payload = new byte[512 * 1024];
+			new Random(7).nextBytes(payload);
+			var writer = CompletableFuture.runAsync(() -> {
+				try {
+					socket.getOutputStream().write(payload);
+				} catch (IOException e) {
+					throw new RuntimeException(e);
+				}
+			});
+			var reader = CompletableFuture.supplyAsync(() -> {
+				try {
+					return socket.getInputStream().readNBytes(payload.length);
+				} catch (IOException e) {
+					throw new RuntimeException(e);
+				}
+			});
+			// Let the proxy queue a backlog that the cap would take seconds to drain.
+			Thread.sleep(500);
+			assertTrue(echo.receivedBytes() < payload.length / 2, "not throttled: " + echo.receivedBytes());
+			proxy.unblock();
+			long start = System.nanoTime();
+			var received = reader.get(10, TimeUnit.SECONDS);
+			var elapsed = Duration.ofNanos(System.nanoTime() - start);
+			writer.get(10, TimeUnit.SECONDS);
+			assertArrayEquals(payload, received);
+			assertTrue(elapsed.compareTo(PROMPT) < 0, "backlog drained in " + elapsed + " after unblock");
+		}
+	}
+
+	/** A blackhole lets no connection end through either: a half-close is held until unblock(). */
+	@Test
+	void blackholeHoldsHalfClose() throws Exception {
+		try (var echo = new EchoServer(new InetSocketAddress(LOOPBACK, 0));
+				var proxy = new LinkProxy(new InetSocketAddress(LOOPBACK, 0), echo.address());
+				var socket = connect(proxy.listenAddress())) {
+			// Fast path only: this direction never had a writer thread.
+			assertEchoes(socket, "before");
+			var serverSideEnded = echo.nextConnectionEnd();
+			proxy.blackhole();
+			socket.shutdownOutput();
+			Thread.sleep(500);
+			assertTrue(!serverSideEnded.isDone(), "the half-close went through the blackhole");
+			proxy.unblock();
+			serverSideEnded.get(PROMPT.toMillis(), TimeUnit.MILLISECONDS);
+			assertEquals(-1, socket.getInputStream().read());
 		}
 	}
 
@@ -342,6 +401,17 @@ class LinkProxyTest {
 		}
 	}
 
+	private static void awaitTrue(java.util.function.BooleanSupplier condition, String message)
+			throws InterruptedException {
+		long deadline = System.nanoTime() + PROMPT.toNanos();
+		while (!condition.getAsBoolean()) {
+			if (System.nanoTime() - deadline > 0) {
+				throw new AssertionError(message);
+			}
+			Thread.sleep(5);
+		}
+	}
+
 	private static void assertEchoes(Socket socket, String message) throws IOException {
 		var bytes = (message + "\n").getBytes(StandardCharsets.UTF_8);
 		socket.getOutputStream().write(bytes);
@@ -405,6 +475,10 @@ class LinkProxyTest {
 
 		int connections() {
 			return connections.get();
+		}
+
+		int receivedBytes() {
+			return received.get();
 		}
 
 		/** Waits until the server received at least {@code count} bytes over all connections. */

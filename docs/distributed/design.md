@@ -1279,9 +1279,17 @@ port for the test clients (`ProcessCluster.clientLink`). Besides cutting a link 
 at once), it can delay each chunk by a latency plus jitter, cap the bandwidth per direction, blackhole the link, or
 drop the answers. Bytes are never reordered or lost in the middle of a stream: TCP does neither, so reordering below
 it cannot be observed by the nodes, and a blackhole holds bytes (as TCP retransmissions would) and releases them on
-heal unless an endpoint's own timeout closed the connection first. A connection that did lose answers is reset when
-the link heals, since its stream is garbage after the gap. The client link makes the "committed but unanswered"
+heal unless an endpoint's own timeout closed the connection first. A blackhole holds a half-close (FIN) as well, so
+no connection end gets through it either. Held and queued bytes always follow the link's current state, not the one
+they were read under: after a heal a throttled or delayed backlog (up to 4 MiB per direction and connection) is
+forwarded at once, so a healed node is not still effectively throttled when the next fault starts. A connection that
+did lose answers is reset when the link heals, since its stream is garbage after the gap. The client link makes the "committed but unanswered"
 case reproducible without killing the leader: the node commits and applies, only the reply is lost.
+
+When two faults overlap, a flapping link cuts and restores only the links of its node that no other network fault of
+the step holds, so the other fault keeps its links for its whole planned hold instead of being healed by the flapper
+within 400 ms. The term check is not allowed to pass vacuously: every node's `raft-meta` term must have been read at
+least once, and a run that stopped the leader must have seen a term increase.
 
 `ListAppendChecker` is a port of Elle's list-append analysis: unique appended elements recover each key's version
 order from the longest read, from which it derives `ww`, `wr` and `rw` dependencies and searches for G0, G1c,

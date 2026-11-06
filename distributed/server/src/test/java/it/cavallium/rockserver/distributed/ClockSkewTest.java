@@ -49,7 +49,8 @@ class ClockSkewTest {
 
 	/**
 	 * A leader two hours behind takes over: the clock stays where the previous leader left it, and a session
-	 * write still applies once. Then a node back on time leads again, and the clock moves on from there.
+	 * write still applies once. Then every clock is back on time, and the next session write moves the replicated
+	 * clock past the wall clock, whichever node leads.
 	 */
 	@Test
 	void aLeaderBehindNeverMovesTheReplicatedClockBack() throws Exception {
@@ -78,16 +79,22 @@ class ClockSkewTest {
 			// Every stamp of the new leader is older than the clock: it stays put, it never goes back.
 			assertEquals(before, frozen, "the clock moved under a leader behind it");
 
-			// The node with the right time comes back and takes over: the clock moves forward again.
+			// The node with the right time comes back and every clock is right again: the clock moves forward. The
+			// restarted node need not lead, so the check is against the wall clock: with no skew left, the leader
+			// stamps "c" with a time at least the one read here, and `after >= frozen` alone would hold even if the
+			// write were stamped two hours behind, or not stamped at all.
 			cluster.start(leaderId);
 			cluster.awaitConverged(TIMEOUT);
 			for (var node : cluster.runningNodes()) {
 				node.stateMachine().testHooks().clockSkewMillis = 0;
 			}
+			long wallBeforeMerge = System.currentTimeMillis();
+			assertTrue(wallBeforeMerge > frozen, "the wall clock is behind the replicated clock");
 			assertEquals("a,b,c", merge(api, column, "c"));
 			cluster.awaitConverged(TIMEOUT);
 			long after = sameClockEverywhere();
-			assertTrue(after >= frozen, "the clock went back from " + frozen + " to " + after);
+			assertTrue(after >= wallBeforeMerge,
+					"the clock did not move forward to the wall clock " + wallBeforeMerge + ": " + frozen + " -> " + after);
 			assertEquals("a,b,c", localValue(cluster.node(leaderId), column));
 		}
 	}

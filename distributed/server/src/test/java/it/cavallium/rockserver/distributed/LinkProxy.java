@@ -92,6 +92,11 @@ public final class LinkProxy implements AutoCloseable {
 	private volatile boolean dropReplies;
 	private volatile boolean blackholed;
 	private volatile Shaping shaping = Shaping.NONE;
+	/**
+	 * Bumped by every change of {@link #shaping} or {@link #blackholed}: a writer holding a chunk recomputes when it
+	 * is due, so queued bytes follow the link's current state, not the one they were read under.
+	 */
+	private volatile long stateGeneration;
 	private volatile boolean closed;
 	/** Guards nothing: what stalled writers wait on until {@link #unblock()} or a reset. */
 	private final Object released = new Object();
@@ -143,15 +148,23 @@ public final class LinkProxy implements AutoCloseable {
 	 */
 	public void blackhole() {
 		blackholed = true;
-	}
-
-	/** Delays and throttles both directions from now on, until {@link #unblock()} or another call. */
-	public void shape(Shaping shaping) {
-		this.shaping = shaping;
+		stateGeneration++;
 	}
 
 	/**
-	 * Forwards new connections and replies again, at full speed. Connections reset while blocked stay closed, and
+	 * Delays and throttles both directions from now on, until {@link #unblock()} or another call. Bytes already
+	 * queued are held by the new shaping too.
+	 */
+	public void shape(Shaping shaping) {
+		this.shaping = shaping;
+		resetPacers();
+		stateGeneration++;
+		wakeStalled();
+	}
+
+	/**
+	 * Forwards new connections and replies again, at full speed: bytes held or queued under a blackhole or a shaping
+	 * are forwarded at once, in order. Connections reset while blocked stay closed, and
 	 * connections whose replies were dropped are reset now: their byte streams lost data in the middle, which TCP
 	 * never does, so the peers could not make sense of what follows.
 	 */
@@ -159,6 +172,8 @@ public final class LinkProxy implements AutoCloseable {
 		blocked = false;
 		blackholed = false;
 		shaping = Shaping.NONE;
+		resetPacers();
+		stateGeneration++;
 		if (dropReplies) {
 			dropReplies = false;
 			connections.stream().filter(connection -> connection.lostBytes).forEach(Connection::reset);
@@ -176,6 +191,11 @@ public final class LinkProxy implements AutoCloseable {
 
 	public boolean isBlocked() {
 		return blocked;
+	}
+
+	/** Whether some open connection already lost reply bytes to {@link #dropReplies()}: a hook for tests. */
+	boolean hasLostReplies() {
+		return connections.stream().anyMatch(connection -> connection.lostBytes);
 	}
 
 	@Override
@@ -201,6 +221,11 @@ public final class LinkProxy implements AutoCloseable {
 				+ (blackholed ? ", blackholed" : "") + (shaping.isNone() ? "" : ", " + shaping) + "]";
 	}
 
+	private void resetPacers() {
+		requestPacer.reset();
+		replyPacer.reset();
+	}
+
 	private void wakeStalled() {
 		synchronized (released) {
 			released.notifyAll();
@@ -211,6 +236,11 @@ public final class LinkProxy implements AutoCloseable {
 	private static final class Pacer {
 
 		private long nextFreeNanos = System.nanoTime();
+
+		/** Forgets reservations made under an earlier bandwidth cap. */
+		synchronized void reset() {
+			nextFreeNanos = System.nanoTime();
+		}
 
 		/** When {@code bytes} ready at {@code readyNanos} may start, reserving the time they take. */
 		synchronized long reserve(long readyNanos, int bytes, long bytesPerSecond) {
@@ -310,10 +340,10 @@ public final class LinkProxy implements AutoCloseable {
 					if (direction.queued.get() == 0 && !blackholed && currentShaping.isNone()) {
 						out.write(buffer, 0, read);
 					} else {
-						direction.enqueue(new Chunk(Arrays.copyOf(buffer, read), System.nanoTime(), currentShaping));
+						direction.enqueue(new Chunk(Arrays.copyOf(buffer, read), System.nanoTime(), false));
 					}
 				}
-				direction.enqueue(Chunk.END);
+				direction.enqueue(new Chunk(new byte[0], System.nanoTime(), true));
 				direction.awaitWriter();
 			} catch (IOException e) {
 				reset();
@@ -334,10 +364,8 @@ public final class LinkProxy implements AutoCloseable {
 			}
 		}
 
-		/** Bytes read from one side, with when they were read and the shaping at that time. */
-		private record Chunk(byte[] bytes, long readNanos, Shaping shaping) {
-			static final Chunk END = new Chunk(new byte[0], 0, Shaping.NONE);
-		}
+		/** Bytes read from one side and when they were read, or the end of the stream ({@code end}). */
+		private record Chunk(byte[] bytes, long readNanos, boolean end) {}
 
 		/** One direction of the connection: the queue towards {@code to} and its writer thread, started on demand. */
 		private final class Direction {
@@ -357,8 +385,9 @@ public final class LinkProxy implements AutoCloseable {
 			}
 
 			void enqueue(Chunk chunk) throws InterruptedException {
-				if (chunk == Chunk.END && writer == null) {
-					// Nothing was ever queued: half-close directly.
+				if (chunk.end() && writer == null && !blackholed && shaping.isNone()) {
+					// Nothing was ever queued and nothing holds the end: half-close directly. Otherwise the end of the
+					// stream (a FIN) is held like the bytes before it, so a blackhole does not let it through.
 					shutdownOutput();
 					return;
 				}
@@ -387,13 +416,13 @@ public final class LinkProxy implements AutoCloseable {
 						if (chunk == null) {
 							continue;
 						}
-						if (chunk == Chunk.END) {
-							shutdownOutput();
-							queued.decrementAndGet();
-							return;
-						}
 						holdUntilDue(chunk);
 						if (isReset || closed) {
+							return;
+						}
+						if (chunk.end()) {
+							shutdownOutput();
+							queued.decrementAndGet();
 							return;
 						}
 						out.write(chunk.bytes());
@@ -407,27 +436,39 @@ public final class LinkProxy implements AutoCloseable {
 				}
 			}
 
-			/** Waits while the link is blackholed, then until the chunk's delay passed and the bandwidth allows it. */
+			/**
+			 * Waits while the link is blackholed, then until the chunk's delay passed and the bandwidth allows it,
+			 * under the link's current shaping. When the shaping or the blackhole changes meanwhile (an
+			 * {@link #unblock()} above all), it starts over, so a healed link forwards its backlog at once.
+			 */
 			private void holdUntilDue(Chunk chunk) throws InterruptedException {
-				while (blackholed && !isReset && !closed) {
-					awaitRelease();
-				}
-				var chunkShaping = chunk.shaping();
-				long due = chunk.readNanos() + chunkShaping.delay().toNanos();
-				long jitter = chunkShaping.jitter().toNanos();
-				if (jitter > 0) {
-					due += ThreadLocalRandom.current().nextLong(jitter + 1);
-				}
-				if (lastDueNanos != Long.MIN_VALUE && lastDueNanos - due > 0) {
-					due = lastDueNanos;
-				}
-				lastDueNanos = due;
-				if (chunkShaping.bytesPerSecond() > 0) {
-					due = pacer.reserve(due, chunk.bytes().length, chunkShaping.bytesPerSecond());
-				}
-				long wait;
-				while ((wait = due - System.nanoTime()) > 0 && !isReset && !closed) {
-					TimeUnit.NANOSECONDS.sleep(Math.min(wait, POLL_NANOS));
+				while (true) {
+					while (blackholed && !isReset && !closed) {
+						awaitRelease();
+					}
+					long generation = stateGeneration;
+					var currentShaping = shaping;
+					long due = chunk.readNanos() + currentShaping.delay().toNanos();
+					long jitter = currentShaping.jitter().toNanos();
+					if (jitter > 0) {
+						due += ThreadLocalRandom.current().nextLong(jitter + 1);
+					}
+					if (lastDueNanos != Long.MIN_VALUE && lastDueNanos - due > 0) {
+						due = lastDueNanos;
+					}
+					long orderDue = due;
+					if (currentShaping.bytesPerSecond() > 0) {
+						due = pacer.reserve(due, chunk.bytes().length, currentShaping.bytesPerSecond());
+					}
+					long wait;
+					while ((wait = due - System.nanoTime()) > 0 && !isReset && !closed
+							&& generation == stateGeneration) {
+						TimeUnit.NANOSECONDS.sleep(Math.min(wait, POLL_NANOS));
+					}
+					if (generation == stateGeneration || isReset || closed) {
+						lastDueNanos = orderDue;
+						return;
+					}
 				}
 			}
 
