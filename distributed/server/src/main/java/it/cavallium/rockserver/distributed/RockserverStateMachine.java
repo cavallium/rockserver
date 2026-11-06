@@ -1217,8 +1217,28 @@ final class RockserverStateMachine extends BaseStateMachine {
 		CrashPoints.reach(CrashPoints.Point.INSTALL_RESTORING);
 		NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
 		openStore();
+		var gate = installGateForTesting;
+		if (gate != null) {
+			var reached = installReachedForTesting;
+			if (reached != null) {
+				reached.countDown();
+			}
+			try {
+				gate.await();
+			} catch (InterruptedException ex) {
+				Thread.currentThread().interrupt();
+			}
+		}
 		storeGeneration++;
 	}
+
+	/**
+	 * Tests only: while set, an install holds after the new database opened (and the applied index moved to the
+	 * snapshot), before the second {@link #storeGeneration} bump, counting {@link #installReachedForTesting} down first.
+	 * Static, so that it is set before the node that installs starts.
+	 */
+	static volatile java.util.concurrent.@Nullable CountDownLatch installGateForTesting;
+	static volatile java.util.concurrent.@Nullable CountDownLatch installReachedForTesting;
 
 	@Override
 	public void notifyLeaderChanged(RaftGroupMemberId groupMemberId, RaftPeerId newLeaderId) {

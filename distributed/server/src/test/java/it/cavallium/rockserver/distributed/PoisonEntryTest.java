@@ -275,9 +275,25 @@ class PoisonEntryTest {
 	@Test
 	void aFailingMergeOperatorInALaneIsTheResultAndTheGroupGoesOn() throws Exception {
 		var lanes = new ApplyLanes("poison-test", 3);
+		// R2-PA-4: each failure is logged once, by the serial redo that records it, not also by the lane that cut.
+		var originalErr = System.err;
+		var captured = new java.io.ByteArrayOutputStream();
 		try (var store = open()) {
 			var applier = new Applier(store, null, lanes);
 			long column = store.db().createColumn("c", SCHEMA);
+			System.setErr(new java.io.PrintStream(new java.io.OutputStream() {
+				@Override
+				public void write(int b) {
+					originalErr.write(b);
+					captured.write(b);
+				}
+
+				@Override
+				public void write(byte[] bytes, int offset, int length) {
+					originalErr.write(bytes, offset, length);
+					captured.write(bytes, offset, length);
+				}
+			}, true));
 			applier.beginGroup();
 			var before = applier.applyBatch(List.of(
 					new Request(1, 0, 0, new LogEntry.Put(column, key(1), text("a"), RequestTypeId.NOTHING)),
@@ -296,6 +312,9 @@ class PoisonEntryTest {
 					new Request(1, 7, 0, new LogEntry.Put(column, key(4), text("z"), RequestTypeId.NOTHING))),
 					TermIndex.valueOf(1, 4));
 			applier.endGroup();
+			System.setErr(originalErr);
+			long logged = captured.toString().lines().filter(line -> line.contains("Applier - Merge operator failed")).count();
+			assertEquals(2, logged, captured::toString);
 			assertEquals(List.of(ApplyResult.OK_NULL, ApplyResult.OK_NULL), List.copyOf(before));
 			assertInstanceOf(ApplyResult.Ok.class, batch.get(0));
 			assertMergeFailure(batch.get(1));
@@ -312,6 +331,7 @@ class PoisonEntryTest {
 			assertEquals(TermIndex.valueOf(1, 4), store.applied());
 			assertTrue(applier.segmentCuts >= 2, "both rejected entries cut their segment: " + applier.segmentCuts);
 		} finally {
+			System.setErr(originalErr);
 			lanes.close();
 		}
 	}

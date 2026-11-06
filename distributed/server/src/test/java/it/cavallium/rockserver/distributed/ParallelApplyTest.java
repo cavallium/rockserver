@@ -71,6 +71,40 @@ class ParallelApplyTest {
 	 * A cluster whose nodes apply in lanes (two of them) or serially (the third) serves concurrent writes over several
 	 * columns, a multi-column transaction included, and every replica holds the same data, also after a restart.
 	 */
+	/**
+	 * R2-PA-5: the batch that commitWith writes is, byte for byte, the batch RocksDB would hold with every part's
+	 * operations in order (what WriteBatchInternal::Append makes): records of every kind, parts of one and several
+	 * records, an empty one skipped by the caller.
+	 */
+	@Test
+	void joinedWriteBatchesAreTheBatchOfAllTheirOperationsInOrder() throws Exception {
+		org.rocksdb.RocksDB.loadLibrary();
+		try (var first = new org.rocksdb.WriteBatch(); var second = new org.rocksdb.WriteBatch();
+				var third = new org.rocksdb.WriteBatch(); var all = new org.rocksdb.WriteBatch()) {
+			byte[] k1 = {1}, k2 = {2, 2}, k3 = {3}, k4 = {4, 4, 4}, k5 = {5}, k6 = {6};
+			first.put(k1, new byte[] {10});
+			first.delete(k2);
+			second.merge(k3, new byte[300]);
+			second.put(k4, new byte[] {40, 41});
+			second.deleteRange(k5, k6);
+			third.singleDelete(k1);
+			all.put(k1, new byte[] {10});
+			all.delete(k2);
+			all.merge(k3, new byte[300]);
+			all.put(k4, new byte[] {40, 41});
+			all.deleteRange(k5, k6);
+			all.singleDelete(k1);
+			byte[] joined = it.cavallium.rockserver.core.impl.EmbeddedDB.ApplyWriter.joinWriteBatches(
+					List.of(first.data(), second.data(), third.data()));
+			org.junit.jupiter.api.Assertions.assertArrayEquals(all.data(), joined);
+			try (var reread = new org.rocksdb.WriteBatch(joined)) {
+				assertEquals(6, reread.count());
+			}
+			org.junit.jupiter.api.Assertions.assertArrayEquals(first.data(),
+					it.cavallium.rockserver.core.impl.EmbeddedDB.ApplyWriter.joinWriteBatches(List.of(first.data())));
+		}
+	}
+
 	@Test
 	void aClusterWithPartitionedApplyConverges() throws Exception {
 		Files.createDirectories(temp.resolve("cluster"));

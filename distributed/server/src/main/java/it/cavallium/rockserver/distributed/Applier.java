@@ -548,7 +548,8 @@ final class Applier {
 			long executeStart = System.nanoTime();
 			for (int j = 0; j < toRun.size(); j++) {
 				var request = toRun.get(j);
-				outcomes[j] = applyLogical(() -> execute(tx, request.entry()));
+				// With several requests a failure is not recorded here but run again one at a time, which logs it.
+				outcomes[j] = applyLogical(() -> execute(tx, request.entry()), toRun.size() == 1);
 				if (outcomes[j] instanceof ApplyResult.Failed failed && toRun.size() > 1) {
 					// Its partial writes are in the transaction with the others' writes: start over one at a time.
 					tx.close();
@@ -766,7 +767,8 @@ final class Applier {
 		var outcomes = new ApplyResult[toRun.size()];
 		for (int j = 0; j < toRun.size(); j++) {
 			var request = toRun.get(j);
-			outcomes[j] = applyLogical(() -> execute(tx, request.entry()));
+			// A failure here is not recorded but run again outside the group (applyData), which logs it.
+			outcomes[j] = applyLogical(() -> execute(tx, request.entry()), false);
 			if (outcomes[j] instanceof ApplyResult.Failed) {
 				tx.rollbackToSavePoint();
 				commitGroup();
@@ -1773,7 +1775,9 @@ final class Applier {
 			writer.setSavePoint();
 			open.savePoints[lane].add(ordinal);
 			for (var task : tasks) {
-				var outcome = applyLogical(() -> execute(writer, task.request.entry()));
+				// Not logged here: a failed outcome cuts the segment, and the entry runs again on the serial path, which
+				// decides and records it, and logs it once (R2-PA-4).
+				var outcome = applyLogical(() -> execute(writer, task.request.entry()), false);
 				task.outcome = outcome;
 				if (outcome instanceof ApplyResult.Failed) {
 					open.cut.accumulateAndGet(ordinal, Math::min);
@@ -1988,6 +1992,11 @@ final class Applier {
 	 * record a result that the others may not reach. An {@link Error} is not caught: it stops the replica too.
 	 */
 	private ApplyResult applyLogical(Operation operation) {
+		return applyLogical(operation, true);
+	}
+
+	/** {@link #applyLogical(Operation)}; {@code log} false leaves the failures it records unlogged. */
+	private ApplyResult applyLogical(Operation operation, boolean log) {
 		// Forget an operator failure of an earlier operation on this thread: only one of this operation counts.
 		FFMAbstractMergeOperator.takeFailureOnThisThread();
 		try {
@@ -2010,6 +2019,9 @@ final class Applier {
 				default -> new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR,
 						Failures.describeForReplica(failure, store.directories()));
 			};
+			if (!log) {
+				return result;
+			}
 			if (result.type() == RocksDBErrorType.INTERNAL_ERROR) {
 				// A bug of the apply code: worth its stack trace.
 				LOG.warn("Entry failed the same way on every replica, recorded as {}", result.type(), failure);

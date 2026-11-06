@@ -1796,10 +1796,42 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		 * are joined as RocksDB's own {@code WriteBatchInternal::Append} does: one header (sequence, count) followed by
 		 * the records of each batch. If any of them fails, all are closed and the exception is thrown.
 		 */
+		/**
+		 * The serialized write batches {@code parts}, in order, as one batch: what RocksDB's {@code WriteBatchInternal::Append}
+		 * makes (RocksJava has no call for it). A batch is a 12-byte header (8-byte sequence, which the database assigns
+		 * on write, and a 4-byte count, both little endian) followed by its records, each self-delimiting and independent of
+		 * its position; so the records of every part one after the other, under a header of sequence 0 and the summed
+		 * count, are the batch that holds each part's operations in order.
+		 */
+		@VisibleForTesting
+		public static byte[] joinWriteBatches(List<byte[]> parts) {
+			int count = 0;
+			long size = WRITE_BATCH_HEADER;
+			for (byte[] part : parts) {
+				count += (part[8] & 0xFF) | (part[9] & 0xFF) << 8 | (part[10] & 0xFF) << 16 | (part[11] & 0xFF) << 24;
+				size += part.length - WRITE_BATCH_HEADER;
+			}
+			if (size > Integer.MAX_VALUE - 16) {
+				throw RocksDBException.of(RocksDBErrorType.WRITE_BATCH_1, "Apply writes too large for one batch: "
+						+ size + " bytes");
+			}
+			byte[] joined = new byte[(int) size];
+			// Sequence 0 (the database assigns it), then the count, little endian.
+			joined[8] = (byte) count;
+			joined[9] = (byte) (count >>> 8);
+			joined[10] = (byte) (count >>> 16);
+			joined[11] = (byte) (count >>> 24);
+			int offset = WRITE_BATCH_HEADER;
+			for (byte[] part : parts) {
+				int length = part.length - WRITE_BATCH_HEADER;
+				System.arraycopy(part, WRITE_BATCH_HEADER, joined, offset, length);
+				offset += length;
+			}
+			return joined;
+		}
+
 		public void commitWith(List<ApplyWriter> others) {
 			try {
-				int count = 0;
-				long size = WRITE_BATCH_HEADER;
 				var parts = new ArrayList<byte[]>(others.size() + 1);
 				for (int i = 0; i <= others.size(); i++) {
 					var writer = i < others.size() ? others.get(i) : this;
@@ -1807,34 +1839,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						throw new IllegalArgumentException("Apply writers with different WAL settings");
 					}
 					var batch = writer.tx.val().getWriteBatch().getWriteBatch();
-					int partCount = batch.count();
-					if (partCount == 0) {
+					if (batch.count() == 0) {
 						continue;
 					}
-					byte[] data = batch.data();
-					parts.add(data);
-					count += partCount;
-					size += data.length - WRITE_BATCH_HEADER;
+					parts.add(batch.data());
 				}
 				if (parts.isEmpty()) {
 					return;
 				}
-				if (size > Integer.MAX_VALUE - 16) {
-					throw RocksDBException.of(RocksDBErrorType.WRITE_BATCH_1, "Apply writes too large for one batch: "
-							+ size + " bytes");
-				}
-				byte[] joined = new byte[(int) size];
-				// Sequence 0 (the database assigns it), then the count, little endian.
-				joined[8] = (byte) count;
-				joined[9] = (byte) (count >>> 8);
-				joined[10] = (byte) (count >>> 16);
-				joined[11] = (byte) (count >>> 24);
-				int offset = WRITE_BATCH_HEADER;
-				for (byte[] part : parts) {
-					int length = part.length - WRITE_BATCH_HEADER;
-					System.arraycopy(part, WRITE_BATCH_HEADER, joined, offset, length);
-					offset += length;
-				}
+				byte[] joined = joinWriteBatches(parts);
 				try (var writeOptions = new LeakSafeWriteOptions("apply-writers-commit");
 						var batch = new WriteBatch(joined)) {
 					if (disableWal) {
