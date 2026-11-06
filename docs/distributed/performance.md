@@ -141,6 +141,12 @@ with 11–18 s write latency. In order of discovery:
     `transaction.chainConflict` in the node logs. In its report, `lockretry` counts the updates that failed because
     `getForUpdate` said to retry, such as a lock wait that ran out: they are errors, as they always were in this
     benchmark, while `retry` counts commits and no-change closes told to retry.
+15. **Leaner apply.** Not measured yet; compare `apply.open`, `apply.execute` and `apply.commit` with the figures
+    above. The apply thread writes through `EmbeddedDB.ApplyWriter` (a native transaction it holds itself) instead
+    of the client API with a transaction id: no id lookup and lock, column use counting, action logging, operation
+    counters or timers per write. `deleteRange` no longer flushes every memtable and syncs the WAL (hundreds of
+    milliseconds on the apply thread, and small L0 files in every column). Keys and values are decoded as slices
+    of the log entry instead of one array each, and merges pass their slice to RocksDB without a copy.
 
 ## Results
 
