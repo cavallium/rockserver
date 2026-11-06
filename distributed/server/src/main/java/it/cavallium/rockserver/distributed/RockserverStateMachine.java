@@ -19,6 +19,8 @@ import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteOutput;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
 import org.apache.ratis.util.LifeCycle;
 import org.jetbrains.annotations.Nullable;
@@ -315,7 +317,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 				.setStateMachine(this)
 				.setClientRequest(request);
 		try {
-			var decoded = LogEntryCodec.decodeBatch(request.getMessage().getContent().asReadOnlyByteBuffer());
+			var decoded = decodeBatch(request.getMessage().getContent());
 			if (decoded.size() > 1 && !decoded.stream().allMatch(r -> Applier.isBatchable(r.entry()))) {
 				throw new IllegalArgumentException("Only data writes can share a log entry");
 			}
@@ -403,7 +405,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var data = logEntry.getStateMachineLogEntry().getLogData();
 		List<Request> requests;
 		try {
-			requests = proposal != null ? proposal.requests : LogEntryCodec.decodeBatch(data.asReadOnlyByteBuffer());
+			requests = proposal != null ? proposal.requests : decodeBatch(data);
 		} catch (RuntimeException ex) {
 			return CompletableFuture.failedFuture(fail("decode entry " + position, ex));
 		}
@@ -418,6 +420,63 @@ final class RockserverStateMachine extends BaseStateMachine {
 		applyQueue.add(new ApplyEntry(position, requests, proposal, data.size(), kib, reply));
 		handedOver = position.getIndex();
 		return reply;
+	}
+
+	/**
+	 * Decodes the batch of a log entry. When its bytes are one heap array, as Ratis reads them from the log or from
+	 * a request (protobuf copies bytes fields unless it aliases its input, which Ratis does not do), the keys and
+	 * values of the writes are slices of that array instead of copies: a {@code ByteString} never changes.
+	 */
+	static List<Request> decodeBatch(ByteString data) {
+		var array = new WholeArray();
+		try {
+			UnsafeByteOperations.unsafeWriteTo(data, array);
+		} catch (IOException ex) {
+			array.whole = false;
+		}
+		return array.whole && array.value != null
+				? LogEntryCodec.decodeBatchInPlace(array.value, array.offset, array.length)
+				: LogEntryCodec.decodeBatch(data.asReadOnlyByteBuffer());
+	}
+
+	/** Catches the backing array of a {@code ByteString} made of exactly one array, see {@link #decodeBatch}. */
+	private static final class WholeArray extends ByteOutput {
+		byte @Nullable [] value;
+		int offset;
+		int length;
+		boolean whole = true;
+
+		@Override
+		public void writeLazy(byte[] value, int offset, int length) {
+			if (this.value != null) {
+				whole = false;
+				return;
+			}
+			this.value = value;
+			this.offset = offset;
+			this.length = length;
+		}
+
+		@Override
+		public void write(byte value) {
+			whole = false;
+		}
+
+		@Override
+		public void write(byte[] value, int offset, int length) {
+			whole = false;
+		}
+
+		@Override
+		public void write(java.nio.ByteBuffer value) {
+			whole = false;
+		}
+
+		@Override
+		public void writeLazy(java.nio.ByteBuffer value) {
+			// A buffer may be pooled and reused once the message is processed: copy.
+			whole = false;
+		}
 	}
 
 	/**

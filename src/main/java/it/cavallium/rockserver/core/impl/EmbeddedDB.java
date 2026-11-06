@@ -3319,12 +3319,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private static void txMerge(Tx tx, ColumnFamilyHandle column, byte[] key, byte[] value)
+	private static void txMerge(Tx tx, ColumnFamilyHandle column, byte[] key, Buf value)
 			throws org.rocksdb.RocksDBException {
 		if (tx.untracked()) {
-			tx.val().mergeUntracked(column, key, value);
+			byte[] array = value.asArrayStrict();
+			if (array != null) {
+				tx.val().mergeUntracked(column, key, array);
+			} else {
+				// A slice of a larger array (such as a value decoded in place from a replicated log entry): passed with
+				// its offset, without a copy. Heap buffers both, as RocksDB's binding requires.
+				tx.val().mergeUntracked(column, java.nio.ByteBuffer.wrap(key), value.asHeapByteBuffer());
+			}
 		} else {
-			tx.val().merge(column, key, value);
+			tx.val().merge(column, key, jniArray(value));
 		}
 	}
 
@@ -5523,7 +5530,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							case WB wb -> wb.wb().merge(col.cfh(), calculatedKeyArray, jniArray(value));
 							case SSTWriter ignored ->
 									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Merge not supported with SST writer");
-							case Tx t -> txMerge(t, col.cfh(), calculatedKeyArray, jniArray(value));
+							case Tx t -> txMerge(t, col.cfh(), calculatedKeyArray, value);
 							case null -> {
 								try (var w = new LeakSafeWriteOptions(null)) {
 									db.get().merge(col.cfh(), w, calculatedKeyArray, jniArray(value));

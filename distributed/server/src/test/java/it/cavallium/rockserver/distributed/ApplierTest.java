@@ -771,4 +771,34 @@ class ApplierTest {
 			assertEquals("after", value(store, column, 3));
 		}
 	}
+
+	@Test
+	void aBatchDecodedInPlaceAppliesLikeACopy() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			var requests = List.of(
+					new Request(13, 0, 0, new LogEntry.Put(column, key(1), text("a"), RequestTypeId.NOTHING)),
+					new Request(13, 1, 0, new LogEntry.Merge(column, key(1), text("b"), RequestTypeId.MERGED)),
+					new Request(13, 2, 0, new LogEntry.MergeMulti(column, List.of(key(2), key(3)),
+							List.of(text("c"), text("d")), RequestTypeId.NOTHING)),
+					new Request(13, 3, 0, new LogEntry.Put(column, key(4), text("e"), RequestTypeId.PREVIOUS)));
+			byte[] encoded = LogEntryCodec.encodeBatch(requests);
+			// Inside a larger array, as a slice of a log segment or of a request would be.
+			byte[] framed = new byte[encoded.length + 7];
+			System.arraycopy(encoded, 0, framed, 3, encoded.length);
+			var decoded = RockserverStateMachine.decodeBatch(
+					org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations.unsafeWrap(framed, 3,
+							encoded.length));
+			var value = ((LogEntry.Put) decoded.getFirst().entry()).value();
+			assertNull(value.asArrayStrict(), "decoded in place, not copied");
+			org.junit.jupiter.api.Assertions.assertArrayEquals(encoded, LogEntryCodec.encodeBatch(decoded));
+			var results = applier.applyBatch(decoded, TermIndex.valueOf(1, 1));
+			assertEquals("a,b", ((Buf) ((ApplyResult.Ok) results.get(1)).value()).toString(StandardCharsets.UTF_8));
+			assertEquals("a,b", value(store, column, 1));
+			assertEquals("c", value(store, column, 2));
+			assertEquals("d", value(store, column, 3));
+			assertEquals("e", value(store, column, 4));
+		}
+	}
 }
