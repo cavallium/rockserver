@@ -38,7 +38,7 @@ only once the apply thread is still the limit above about 4x production load.
  node A        node B (leader)               node C
  GrpcServer    GrpcServer                    GrpcServer        ← core server, unchanged
  ReplicatedConnection (implements RocksDBConnection; Router)    ← routes every API command
- EmbeddedDB    EmbeddedDB                    EmbeddedDB        ← core engine, unchanged
+ EmbeddedDB    EmbeddedDB                    EmbeddedDB        ← core engine (facade + package-private parts)
  Ratis server ═══ Raft log replication (stock Apache Ratis 3.3.1, gRPC) ═══
 ```
 

@@ -19,7 +19,8 @@ class PointReadCompletionCountersTest {
         final Object monitor;
         final java.lang.reflect.Method record, sample, count, nanos, tail;
         Counters() throws Exception {
-            var type = Class.forName(EmbeddedDB.class.getName() + "$PointReadCompletionCounters");
+            var type = Class.forName(EmbeddedDB.class.getPackageName()
+                    + ".EmbeddedDBStorageMetrics$PointReadCompletionCounters");
             var constructor = type.getDeclaredConstructor(); constructor.setAccessible(true);
             monitor = constructor.newInstance();
             record = type.getDeclaredMethod("record", long.class); record.setAccessible(true);

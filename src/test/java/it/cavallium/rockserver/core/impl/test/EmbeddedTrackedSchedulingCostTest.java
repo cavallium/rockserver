@@ -273,13 +273,18 @@ class EmbeddedTrackedSchedulingCostTest {
 			RWScheduler.WorkloadExecutor executor,
 			Callable<T> callable,
 			Consumer<T> cleanup) throws Exception {
-		Method method = EmbeddedDB.class.getDeclaredMethod(
+		// scheduleOrdinaryRangeStep lives in the package-private EmbeddedDBRanges part,
+		// reached through EmbeddedDB's "ranges" field.
+		var rangesField = EmbeddedDB.class.getDeclaredField("ranges");
+		rangesField.setAccessible(true);
+		Object ranges = rangesField.get(database);
+		Method method = ranges.getClass().getDeclaredMethod(
 				"scheduleOrdinaryRangeStep",
 				RWScheduler.WorkloadExecutor.class,
 				Callable.class,
 				Consumer.class);
 		method.setAccessible(true);
-		return (Mono<T>) method.invoke(database, executor, callable, cleanup);
+		return (Mono<T>) method.invoke(ranges, executor, callable, cleanup);
 	}
 
 	private static final class ImmediateCostProbeScheduler implements Scheduler {
