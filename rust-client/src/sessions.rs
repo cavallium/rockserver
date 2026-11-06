@@ -113,7 +113,7 @@ fn not_sent(cause: impl Display) -> Status {
     )
 }
 
-fn deadline_before_sent() -> Status {
+pub(crate) fn deadline_before_sent() -> Status {
     rocks_status(
         Code::DeadlineExceeded,
         "READ_DEADLINE_EXCEEDED",
@@ -199,6 +199,8 @@ pub(crate) struct SessionWrites {
     session: tokio::sync::Mutex<Option<Arc<Session>>>,
     updates: Mutex<Updates>,
     numbered_batches: bool,
+    /// Copies sent again after an unknown outcome, over the life of this client.
+    resends: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for SessionWrites {
@@ -238,6 +240,11 @@ impl SessionWrites {
 
     pub(crate) fn numbered_batches(&self) -> bool {
         self.numbered_batches
+    }
+
+    /// Copies sent again after an unknown outcome, over the life of this client.
+    pub(crate) fn resends(&self) -> u64 {
+        self.resends.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// True if a write with this transaction or update id is numbered: outside transactions, or the write that ends
@@ -399,6 +406,9 @@ impl SessionWrites {
                     sequence: number.sequence,
                     completed_below: session.completed_below(),
                 };
+                if maybe_applied {
+                    self.resends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 let status = match send(id, timeout).await {
                     Ok(value) => return Ok(value),
                     Err(status) => status,
@@ -627,6 +637,7 @@ mod tests {
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 4);
         assert!(sent.iter().all(|id| id.session_id == 7 && id.sequence == 0));
+        assert_eq!(writes.resends(), 3, "every copy after the first is a resend");
     }
 
     #[tokio::test]

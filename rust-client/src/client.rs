@@ -6,7 +6,8 @@ use futures::{Stream, StreamExt};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use crate::sessions::{
-    multi_keys_bytes, multi_kv_bytes, partly_applied, read_multi_items, split_batch, MultiItems, SessionWrites,
+    deadline_before_sent, multi_keys_bytes, multi_kv_bytes, partly_applied, read_multi_items, split_batch, MultiItems,
+    SessionWrites,
     DEFAULT_RETRY_WINDOW, NUMBERED_MULTI_MAX_BYTES,
 };
 use futures::stream::BoxStream;
@@ -1719,6 +1720,12 @@ impl RockserverClient {
         self.sessions.is_some()
     }
 
+    /// How many copies of numbered writes this client (all its views) sent again after an unknown outcome: a lost
+    /// call, `OUTCOME_UNKNOWN`, or a deadline error not flagged "not applied". 0 without client sessions.
+    pub fn numbered_resends(&self) -> u64 {
+        self.sessions.as_ref().map_or(0, |writes| writes.resends())
+    }
+
     /// A view of this client that sends every write once, unnumbered, as to a server without client sessions.
     pub fn without_client_sessions(&self) -> Self {
         Self {
@@ -1803,10 +1810,53 @@ impl RockserverClient {
         S: FnMut(RockserverClient) -> SF,
         SF: Future<Output = Result<R>>,
     {
-        let (deadline, finite) = self.numbered_deadline()?;
+        let started = self.numbered_deadline()?;
+        self.numbered_from(writes, update_id, started, send).await
+    }
+
+    /// [`Self::numbered`] with the deadline `started` taken earlier, by [`Self::read_numbered_multi`].
+    async fn numbered_from<R, S, SF>(
+        &self,
+        writes: &SessionWrites,
+        update_id: i64,
+        (deadline, finite): (tokio::time::Instant, bool),
+        send: S,
+    ) -> Result<R>
+    where
+        S: FnMut(RockserverClient) -> SF,
+        SF: Future<Output = Result<R>>,
+    {
         let result = self.numbered_until(writes, deadline, finite, send).await;
         writes.update_ended(update_id);
         result
+    }
+
+    /// Reads the input of a numbered multi write ([`read_multi_items`]), with its deadline taken first: the
+    /// caller's deadline counts from the call, as when the stream is sent as it is read, not from the end of its
+    /// input. A caller with a deadline that its input outlasts gets `READ_DEADLINE_EXCEEDED` flagged not applied
+    /// (nothing was sent), and the rest of the input is not read. Returns the deadline with the items.
+    async fn read_numbered_multi<T: Send + 'static>(
+        &self,
+        items: impl Stream<Item = T> + Send + 'static,
+        size: fn(&T) -> u64,
+    ) -> Result<(MultiItems<T>, (tokio::time::Instant, bool))> {
+        let (deadline, finite) = self.numbered_deadline()?;
+        let read = read_multi_items(items, size, NUMBERED_MULTI_MAX_BYTES);
+        let items = if finite {
+            tokio::time::timeout_at(deadline, read)
+                .await
+                .map_err(|_| deadline_before_sent())?
+        } else {
+            read.await
+        };
+        Ok((items, (deadline, finite)))
+    }
+
+    /// The view an unnumbered multi write over the numbering limit is sent through, after its first items were
+    /// read: this one with what is left of the deadline `started`.
+    fn streamed_view(&self, (deadline, finite): (tokio::time::Instant, bool)) -> Self {
+        let left = finite.then(|| deadline.saturating_duration_since(tokio::time::Instant::now()));
+        self.copy_view(None, left)
     }
 
     /// A batch write as numbered chunks, one at a time, in order. A caller with a deadline sends every chunk within
@@ -2078,10 +2128,10 @@ impl RockserverClient {
     pub async fn put_multi(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<()> {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
-            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(items) => self.numbered(&writes, tx, copy!(view => view.put_multi_once(tx, column_id, futures::stream::iter(items)); items)).await,
-                MultiItems::Streamed(items) => {
-                    let result = self.put_multi_once(tx, column_id, items).await;
+            Some(writes) => match self.read_numbered_multi(items, multi_kv_bytes).await? {
+                (MultiItems::Whole(items), started) => self.numbered_from(&writes, tx, started, copy!(view => view.put_multi_once(tx, column_id, futures::stream::iter(items)); items)).await,
+                (MultiItems::Streamed(items), started) => {
+                    let result = self.streamed_view(started).put_multi_once(tx, column_id, items).await;
                     writes.update_ended(tx);
                     result
                 }
@@ -2095,10 +2145,10 @@ impl RockserverClient {
     pub async fn put_multi_ensure(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<()> {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
-            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(items) => self.numbered(&writes, tx, copy!(view => view.put_multi_ensure_once(tx, column_id, futures::stream::iter(items)); items)).await,
-                MultiItems::Streamed(items) => {
-                    let result = self.put_multi_ensure_once(tx, column_id, items).await;
+            Some(writes) => match self.read_numbered_multi(items, multi_kv_bytes).await? {
+                (MultiItems::Whole(items), started) => self.numbered_from(&writes, tx, started, copy!(view => view.put_multi_ensure_once(tx, column_id, futures::stream::iter(items)); items)).await,
+                (MultiItems::Streamed(items), started) => {
+                    let result = self.streamed_view(started).put_multi_ensure_once(tx, column_id, items).await;
                     writes.update_ended(tx);
                     result
                 }
@@ -2112,10 +2162,10 @@ impl RockserverClient {
     pub async fn put_multi_get_previous(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<impl Stream<Item = Result<Previous>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(items) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_previous_once(tx, column_id, futures::stream::iter(items))); items)).await?),
-                MultiItems::Streamed(items) => {
-                    let results = self.put_multi_get_previous_once(tx, column_id, items).await;
+            Some(writes) => match self.read_numbered_multi(items, multi_kv_bytes).await? {
+                (MultiItems::Whole(items), started) => replayed(self.numbered_from(&writes, tx, started, copy!(view => collected(view.put_multi_get_previous_once(tx, column_id, futures::stream::iter(items))); items)).await?),
+                (MultiItems::Streamed(items), started) => {
+                    let results = self.streamed_view(started).put_multi_get_previous_once(tx, column_id, items).await;
                     writes.update_ended(tx);
                     results?.boxed()
                 }
@@ -2129,10 +2179,10 @@ impl RockserverClient {
     pub async fn put_multi_get_delta(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<impl Stream<Item = Result<Delta>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(items) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_delta_once(tx, column_id, futures::stream::iter(items))); items)).await?),
-                MultiItems::Streamed(items) => {
-                    let results = self.put_multi_get_delta_once(tx, column_id, items).await;
+            Some(writes) => match self.read_numbered_multi(items, multi_kv_bytes).await? {
+                (MultiItems::Whole(items), started) => replayed(self.numbered_from(&writes, tx, started, copy!(view => collected(view.put_multi_get_delta_once(tx, column_id, futures::stream::iter(items))); items)).await?),
+                (MultiItems::Streamed(items), started) => {
+                    let results = self.streamed_view(started).put_multi_get_delta_once(tx, column_id, items).await;
                     writes.update_ended(tx);
                     results?.boxed()
                 }
@@ -2146,10 +2196,10 @@ impl RockserverClient {
     pub async fn put_multi_get_changed(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<impl Stream<Item = Result<Changed>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(items) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_changed_once(tx, column_id, futures::stream::iter(items))); items)).await?),
-                MultiItems::Streamed(items) => {
-                    let results = self.put_multi_get_changed_once(tx, column_id, items).await;
+            Some(writes) => match self.read_numbered_multi(items, multi_kv_bytes).await? {
+                (MultiItems::Whole(items), started) => replayed(self.numbered_from(&writes, tx, started, copy!(view => collected(view.put_multi_get_changed_once(tx, column_id, futures::stream::iter(items))); items)).await?),
+                (MultiItems::Streamed(items), started) => {
+                    let results = self.streamed_view(started).put_multi_get_changed_once(tx, column_id, items).await;
                     writes.update_ended(tx);
                     results?.boxed()
                 }
@@ -2163,10 +2213,10 @@ impl RockserverClient {
     pub async fn put_multi_get_previous_presence(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<impl Stream<Item = Result<PreviousPresence>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(items) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_previous_presence_once(tx, column_id, futures::stream::iter(items))); items)).await?),
-                MultiItems::Streamed(items) => {
-                    let results = self.put_multi_get_previous_presence_once(tx, column_id, items).await;
+            Some(writes) => match self.read_numbered_multi(items, multi_kv_bytes).await? {
+                (MultiItems::Whole(items), started) => replayed(self.numbered_from(&writes, tx, started, copy!(view => collected(view.put_multi_get_previous_presence_once(tx, column_id, futures::stream::iter(items))); items)).await?),
+                (MultiItems::Streamed(items), started) => {
+                    let results = self.streamed_view(started).put_multi_get_previous_presence_once(tx, column_id, items).await;
                     writes.update_ended(tx);
                     results?.boxed()
                 }
@@ -2180,10 +2230,10 @@ impl RockserverClient {
     pub async fn delete_multi(&self, transaction_or_update_id: i64, column_id: i64, keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static) -> Result<()> {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
-            Some(writes) => match read_multi_items(keys, multi_keys_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(keys) => self.numbered(&writes, tx, copy!(view => view.delete_multi_once(tx, column_id, futures::stream::iter(keys)); keys)).await,
-                MultiItems::Streamed(keys) => {
-                    let result = self.delete_multi_once(tx, column_id, keys).await;
+            Some(writes) => match self.read_numbered_multi(keys, multi_keys_bytes).await? {
+                (MultiItems::Whole(keys), started) => self.numbered_from(&writes, tx, started, copy!(view => view.delete_multi_once(tx, column_id, futures::stream::iter(keys)); keys)).await,
+                (MultiItems::Streamed(keys), started) => {
+                    let result = self.streamed_view(started).delete_multi_once(tx, column_id, keys).await;
                     writes.update_ended(tx);
                     result
                 }
@@ -2197,10 +2247,10 @@ impl RockserverClient {
     pub async fn delete_multi_get_previous(&self, transaction_or_update_id: i64, column_id: i64, keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static) -> Result<impl Stream<Item = Result<Previous>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => match read_multi_items(keys, multi_keys_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(keys) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.delete_multi_get_previous_once(tx, column_id, futures::stream::iter(keys))); keys)).await?),
-                MultiItems::Streamed(keys) => {
-                    let results = self.delete_multi_get_previous_once(tx, column_id, keys).await;
+            Some(writes) => match self.read_numbered_multi(keys, multi_keys_bytes).await? {
+                (MultiItems::Whole(keys), started) => replayed(self.numbered_from(&writes, tx, started, copy!(view => collected(view.delete_multi_get_previous_once(tx, column_id, futures::stream::iter(keys))); keys)).await?),
+                (MultiItems::Streamed(keys), started) => {
+                    let results = self.streamed_view(started).delete_multi_get_previous_once(tx, column_id, keys).await;
                     writes.update_ended(tx);
                     results?.boxed()
                 }
@@ -2214,10 +2264,10 @@ impl RockserverClient {
     pub async fn delete_multi_get_previous_presence(&self, transaction_or_update_id: i64, column_id: i64, keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static) -> Result<impl Stream<Item = Result<PreviousPresence>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => match read_multi_items(keys, multi_keys_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(keys) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.delete_multi_get_previous_presence_once(tx, column_id, futures::stream::iter(keys))); keys)).await?),
-                MultiItems::Streamed(keys) => {
-                    let results = self.delete_multi_get_previous_presence_once(tx, column_id, keys).await;
+            Some(writes) => match self.read_numbered_multi(keys, multi_keys_bytes).await? {
+                (MultiItems::Whole(keys), started) => replayed(self.numbered_from(&writes, tx, started, copy!(view => collected(view.delete_multi_get_previous_presence_once(tx, column_id, futures::stream::iter(keys))); keys)).await?),
+                (MultiItems::Streamed(keys), started) => {
+                    let results = self.streamed_view(started).delete_multi_get_previous_presence_once(tx, column_id, keys).await;
                     writes.update_ended(tx);
                     results?.boxed()
                 }
@@ -2231,10 +2281,10 @@ impl RockserverClient {
     pub async fn merge_multi(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<()> {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
-            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(items) => self.numbered(&writes, tx, copy!(view => view.merge_multi_once(tx, column_id, futures::stream::iter(items)); items)).await,
-                MultiItems::Streamed(items) => {
-                    let result = self.merge_multi_once(tx, column_id, items).await;
+            Some(writes) => match self.read_numbered_multi(items, multi_kv_bytes).await? {
+                (MultiItems::Whole(items), started) => self.numbered_from(&writes, tx, started, copy!(view => view.merge_multi_once(tx, column_id, futures::stream::iter(items)); items)).await,
+                (MultiItems::Streamed(items), started) => {
+                    let result = self.streamed_view(started).merge_multi_once(tx, column_id, items).await;
                     writes.update_ended(tx);
                     result
                 }
@@ -2248,10 +2298,10 @@ impl RockserverClient {
     pub async fn merge_multi_get_merged(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<impl Stream<Item = Result<Merged>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
-                MultiItems::Whole(items) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.merge_multi_get_merged_once(tx, column_id, futures::stream::iter(items))); items)).await?),
-                MultiItems::Streamed(items) => {
-                    let results = self.merge_multi_get_merged_once(tx, column_id, items).await;
+            Some(writes) => match self.read_numbered_multi(items, multi_kv_bytes).await? {
+                (MultiItems::Whole(items), started) => replayed(self.numbered_from(&writes, tx, started, copy!(view => collected(view.merge_multi_get_merged_once(tx, column_id, futures::stream::iter(items))); items)).await?),
+                (MultiItems::Streamed(items), started) => {
+                    let results = self.streamed_view(started).merge_multi_get_merged_once(tx, column_id, items).await;
                     writes.update_ended(tx);
                     results?.boxed()
                 }
@@ -2606,5 +2656,90 @@ mod workload_context_tests {
                 tonic::Code::Internal
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod numbered_multi_tests {
+    use super::*;
+    use crate::sessions::{is_not_applied, is_outcome_unknown, rocksdb_error_type};
+    use tonic::transport::Endpoint;
+
+    /// A client numbering its writes through an already open session, over a channel to a closed port: every copy
+    /// it sends fails as unavailable, an unknown outcome.
+    fn numbering_client(timeout: Duration) -> RockserverClient {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut client =
+            RockserverClient::new_unchecked(channel, RequestContext::batch_with_timeout(timeout));
+        client.sessions = Some(Arc::new(SessionWrites::with_open_session(true, 7)));
+        client
+    }
+
+    /// An input stream of `count` small items, one every `every`.
+    fn slow_items(count: u64, every: Duration) -> impl Stream<Item = Kv> + Send + 'static {
+        futures::stream::iter(0..count).then(move |k| async move {
+            tokio::time::sleep(every).await;
+            Kv {
+                keys: vec![k.to_be_bytes().to_vec()],
+                value: vec![1],
+            }
+        })
+    }
+
+    /// R6-4: the deadline of a numbered multi write counts from the call. An input stream that outlasts it ends the
+    /// write at the deadline, flagged not applied (nothing was sent), instead of starting the deadline once the
+    /// whole input was read and then sending copies for a full timeout.
+    #[tokio::test]
+    async fn a_numbered_multi_write_whose_input_outlasts_its_deadline_is_not_sent() {
+        for variant in 0..3 {
+            let client = numbering_client(Duration::from_millis(200));
+            let start = std::time::Instant::now();
+            let error = match variant {
+                0 => client
+                    .put_multi(0, 1, slow_items(10, Duration::from_millis(100)))
+                    .await
+                    .unwrap_err(),
+                1 => client
+                    .merge_multi_get_merged(0, 1, slow_items(10, Duration::from_millis(100)))
+                    .await
+                    .err()
+                    .expect("refused"),
+                _ => client
+                    .delete_multi(
+                        0,
+                        1,
+                        slow_items(10, Duration::from_millis(100)).map(|kv| kv.keys),
+                    )
+                    .await
+                    .unwrap_err(),
+            };
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(700),
+                "variant {variant}: ended after {elapsed:?}, not at the deadline"
+            );
+            assert_eq!(rocksdb_error_type(&error), Some("READ_DEADLINE_EXCEEDED"), "variant {variant}: {error:?}");
+            assert!(is_not_applied(&error), "variant {variant}: {error:?}");
+            assert!(!is_outcome_unknown(&error), "variant {variant}: {error:?}");
+        }
+    }
+
+    /// An input that ends within the deadline is sent with what is left of it: copies to an unreachable server end
+    /// as an unknown outcome by the call's deadline, not by one counted from the end of the input.
+    #[tokio::test]
+    async fn a_numbered_multi_write_keeps_the_deadline_of_its_call() {
+        let client = numbering_client(Duration::from_millis(1000));
+        let start = std::time::Instant::now();
+        let error = client
+            .put_multi(0, 1, slow_items(5, Duration::from_millis(100)))
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        // The input takes 500 ms: the call's deadline is at 1000 ms, one counted from the input's end at 1500 ms.
+        assert!(
+            elapsed < Duration::from_millis(1150),
+            "ended after {elapsed:?}: the deadline started after the input"
+        );
+        assert!(is_outcome_unknown(&error) || is_not_applied(&error), "{error:?}");
     }
 }

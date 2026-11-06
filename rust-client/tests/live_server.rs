@@ -224,9 +224,200 @@ async fn numbered_writes_against_a_live_server() {
         assert_eq!(client.get(0, column, key(k)).await.unwrap().map(|v| v.len()), Some(large), "key {k}");
     }
 
+    // R6-6c: the variants with results over NUMBERED_MULTI_MAX_BYTES are streamed unnumbered too, with their results.
+    let big = move |k: u64, fill: u8| Kv { keys: key(k), value: vec![fill; large] };
+    client
+        .put_multi_ensure(0, column, futures::stream::iter((90..95u64).map(move |k| big(k, b'e'))))
+        .await
+        .unwrap();
+    let previous: Vec<_> = client
+        .put_multi_get_previous(0, column, futures::stream::iter((90..95u64).map(move |k| big(k, b'p'))))
+        .await
+        .unwrap()
+        .map(|p| p.unwrap().previous.map(|v| (v.len(), v[0])))
+        .collect()
+        .await;
+    assert_eq!(previous, vec![Some((large, b'e')); 5]);
+    let deltas: Vec<_> = client
+        .put_multi_get_delta(0, column, futures::stream::iter((90..95u64).map(move |k| big(k, b'd'))))
+        .await
+        .unwrap()
+        .map(|d| {
+            let d = d.unwrap();
+            (d.previous.map(|v| v[0]), d.current.map(|v| v[0]))
+        })
+        .collect()
+        .await;
+    assert_eq!(deltas, vec![(Some(b'p'), Some(b'd')); 5]);
+    let changed: Vec<bool> = client
+        .put_multi_get_changed(
+            0,
+            column,
+            futures::stream::iter((90..95u64).map(move |k| big(k, if k < 92 { b'd' } else { b'c' }))),
+        )
+        .await
+        .unwrap()
+        .map(|c| c.unwrap().changed)
+        .collect()
+        .await;
+    assert_eq!(changed, vec![false, false, true, true, true]);
+    let presence: Vec<bool> = client
+        .put_multi_get_previous_presence(0, column, futures::stream::iter((93..98u64).map(move |k| big(k, b'q'))))
+        .await
+        .unwrap()
+        .map(|p| p.unwrap().present)
+        .collect()
+        .await;
+    assert_eq!(presence, vec![true, true, false, false, false]);
+    let merged: Vec<_> = client
+        .merge_multi_get_merged(0, column, futures::stream::iter((100..105u64).map(move |k| big(k, b'm'))))
+        .await
+        .unwrap()
+        .map(|m| m.unwrap().merged.map(|v| v.len()))
+        .collect()
+        .await;
+    assert_eq!(merged, vec![Some(large); 5], "each merged once, into an empty key");
+
+    // RA-2.6b: two copies of one numbered multi write with results (same request id), as after an unknown outcome:
+    // the second is answered from the server's record with the first's results, and applies nothing.
+    let multi_copy = |sequence: i64| {
+        client.with_context(
+            RequestContext::batch_with_timeout(Duration::from_secs(30)).with_request_id(session, sequence, 0),
+        )
+    };
+    let merge_items = || {
+        futures::stream::iter((110..113u64).map(|k| Kv {
+            keys: key(k),
+            value: format!("r{k}").into_bytes(),
+        }))
+    };
+    let mut answers = Vec::new();
+    for _ in 0..2 {
+        let merged: Vec<_> = multi_copy(1)
+            .merge_multi_get_merged(0, column, merge_items())
+            .await
+            .unwrap()
+            .map(|m| text(&m.unwrap().merged))
+            .collect()
+            .await;
+        answers.push(merged);
+    }
+    let expected: Vec<_> = (110..113u64).map(|k| Some(format!("r{k}"))).collect();
+    assert_eq!(answers, vec![expected.clone(), expected], "the copy answers with the first's results");
+    let put_items = || {
+        futures::stream::iter((110..112u64).map(|k| Kv {
+            keys: key(k),
+            value: format!("s{k}").into_bytes(),
+        }))
+    };
+    let mut answers = Vec::new();
+    for _ in 0..2 {
+        let previous: Vec<_> = multi_copy(2)
+            .put_multi_get_previous(0, column, put_items())
+            .await
+            .unwrap()
+            .map(|p| text(&p.unwrap().previous))
+            .collect()
+            .await;
+        answers.push(previous);
+    }
+    let expected = vec![Some("r110".to_owned()), Some("r111".to_owned())];
+    assert_eq!(answers, vec![expected.clone(), expected], "the copy answers with the first's previous values");
+    for k in 110..113u64 {
+        let expected = if k < 112 { format!("s{k}") } else { format!("r{k}") };
+        assert_eq!(text(&client.get(0, column, key(k)).await.unwrap()), Some(expected), "key {k}");
+    }
+
     // Unnumbered writes still work.
     let plain = client.without_client_sessions();
     assert!(!plain.client_sessions());
     plain.put(0, column, key(60), b"plain".to_vec()).await.unwrap();
     assert_eq!(text(&client.get(0, column, key(60)).await.unwrap()).as_deref(), Some("plain"));
+}
+
+/// RA-2.6b: numbered writes whose calls are lost with a real leader. `RustClientLiveTest` drives it through the files
+/// of `ROCKSERVER_TEST_SIGNAL_DIR`: `ROCKSERVER_TEST_ADDR` is a proxy to the leader. Once this test wrote `warm`
+/// (the session is open), the Java side stops the leader's apply and writes `go`; the writes below then commit on the
+/// followers but get no answer. The Java side halts the leader, which loses the calls, and points the proxy at a
+/// follower: the client sends the same numbered writes again, and the follower's forward to the new leader answers
+/// them from the record, with the first copy's results, applied once.
+#[tokio::test]
+#[ignore = "driven by RustClientLiveTest, with ROCKSERVER_TEST_ADDR and ROCKSERVER_TEST_SIGNAL_DIR"]
+async fn numbered_writes_resent_across_a_leader_loss() {
+    let address = std::env::var("ROCKSERVER_TEST_ADDR")
+        .expect("ROCKSERVER_TEST_ADDR names the server to test against");
+    let signals = std::path::PathBuf::from(
+        std::env::var("ROCKSERVER_TEST_SIGNAL_DIR").expect("ROCKSERVER_TEST_SIGNAL_DIR names the signal directory"),
+    );
+    let client = RockserverClient::connect(address, RequestContext::batch_with_timeout(Duration::from_secs(60)))
+        .await
+        .expect("connect");
+    assert!(client.client_sessions(), "a replicated server offers client sessions");
+    let column = client.create_column("rust-failover".to_owned(), schema()).await.unwrap();
+    client.put(0, column, key(5), b"old5".to_vec()).await.unwrap();
+    client.put(0, column, key(6), b"old6".to_vec()).await.unwrap();
+    std::fs::write(signals.join("warm"), b"").unwrap();
+    let go = signals.join("go");
+    let waited = std::time::Instant::now();
+    while !go.exists() {
+        assert!(waited.elapsed() < Duration::from_secs(60), "no go signal");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let merge = client.merge_get_merged(0, column, key(1), b"x".to_vec());
+    let merge_multi = async {
+        client
+            .merge_multi_get_merged(
+                0,
+                column,
+                futures::stream::iter((2..5u64).map(|k| Kv {
+                    keys: key(k),
+                    value: format!("m{k}").into_bytes(),
+                })),
+            )
+            .await?
+            .map(|m| m.map(|m| text(&m.merged)))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let put_multi = async {
+        client
+            .put_multi_get_previous(
+                0,
+                column,
+                futures::stream::iter((5..7u64).map(|k| Kv {
+                    keys: key(k),
+                    value: format!("new{k}").into_bytes(),
+                })),
+            )
+            .await?
+            .map(|p| p.map(|p| text(&p.previous)))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let (merged, multi_merged, previous) = tokio::join!(merge, merge_multi, put_multi);
+    assert_eq!(text(&merged.unwrap()).as_deref(), Some("x"), "merged once");
+    assert_eq!(
+        multi_merged.unwrap(),
+        vec![Some("m2".to_owned()), Some("m3".to_owned()), Some("m4".to_owned())],
+        "the multi merge's results, merged once"
+    );
+    assert_eq!(
+        previous.unwrap(),
+        vec![Some("old5".to_owned()), Some("old6".to_owned())],
+        "the first copy's previous values"
+    );
+    let resends = client.numbered_resends();
+    println!("RESENDS {resends}");
+    assert!(resends > 0, "the writes were lost with the leader and sent again");
+
+    // A later write of the same session, on the new leader.
+    assert_eq!(
+        text(&client.merge_get_merged(0, column, key(1), b"y".to_vec()).await.unwrap()).as_deref(),
+        Some("x,y")
+    );
 }
