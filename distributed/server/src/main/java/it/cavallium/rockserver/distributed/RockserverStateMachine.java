@@ -433,6 +433,15 @@ final class RockserverStateMachine extends BaseStateMachine {
 			// Not info.getLastAppliedIndex(): that is the state machine's own applied index, which lags behind.
 			readiness = new Readiness(division.getInfo().getCurrentTerm(), handedOver);
 		}
+		leaderListener.run();
+	}
+
+	/** Runs on every leader change and when this node becomes a ready leader, on a Ratis thread: it must not block. */
+	private volatile Runnable leaderListener = () -> {};
+
+	/** Sets what runs on every leader change and when this node becomes a ready leader; it must not block. */
+	void onLeaderChange(Runnable listener) {
+		this.leaderListener = listener;
 	}
 
 	/**
@@ -796,6 +805,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 				session.close(store.db());
 			}
 		}
+		leaderListener.run();
 	}
 
 	@Override

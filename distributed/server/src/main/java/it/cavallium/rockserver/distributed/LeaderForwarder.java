@@ -29,11 +29,15 @@ import org.slf4j.LoggerFactory;
  * <p>The API address of a member comes from this node's peer list. A member added to the group after this node
  * started is missing from it: its address is then asked to the member itself, through {@link TermService} on its
  * Raft address, which the Raft configuration carries.</p>
+ *
+ * <p>A request that finds no leader waits for one: {@link #leaderChanged()}, called on every leader change and when
+ * this node becomes a ready leader, wakes it at once. A slow poll stays behind as a safety net.</p>
  */
 final class LeaderForwarder implements Closeable {
 
 	private static final Logger LOG = LoggerFactory.getLogger(LeaderForwarder.class);
-	private static final long POLL_MS = 20;
+	/** Checks again this often while waiting for a leader, in case a notification was missed. */
+	private static final long POLL_MS = 250;
 
 	/** Connections to each peer, used in turn: one connection has a single event loop thread. */
 	private static final int CONNECTIONS_PER_PEER = 4;
@@ -69,8 +73,10 @@ final class LeaderForwarder implements Closeable {
 	private final ExecutorService connector = Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
 			.name("rockserver-leader-connect-", 0)
 			.factory());
-	/** {@link #leader} results still waiting for a leader, failed by {@link #close()}. */
-	private final java.util.Set<CompletableFuture<String>> pendingLeaders = ConcurrentHashMap.newKeySet();
+	/** {@link #leader} results still waiting for a leader, with their check; failed by {@link #close()}. */
+	private final ConcurrentHashMap<CompletableFuture<String>, Runnable> pendingLeaders = new ConcurrentHashMap<>();
+	/** API addresses learned from members missing from this node's peer list, by peer id. */
+	private final ConcurrentHashMap<String, HostAndPort> learnedAddresses = new ConcurrentHashMap<>();
 	private volatile boolean closed;
 
 	LeaderForwarder(NodeConfig config) {
@@ -84,23 +90,56 @@ final class LeaderForwarder implements Closeable {
 	CompletableFuture<String> leader(RockserverStateMachine stateMachine) {
 		var result = new CompletableFuture<String>();
 		long deadline = System.nanoTime() + config.requestTimeout().toNanos();
-		poll(stateMachine, result, deadline);
-		if (!result.isDone()) {
-			// Its next poll waits in the timer, whose queue close() drops.
-			pendingLeaders.add(result);
-			result.whenComplete((_, _) -> pendingLeaders.remove(result));
-			if (closed) {
-				result.completeExceptionally(closing());
-			}
+		if (check(stateMachine, result, deadline)) {
+			return result;
+		}
+		// Woken by leaderChanged(), or by the next poll, which waits in the timer whose queue close() drops.
+		pendingLeaders.put(result, () -> check(stateMachine, result, deadline));
+		result.whenComplete((_, _) -> pendingLeaders.remove(result));
+		schedule(stateMachine, result, deadline);
+		if (closed) {
+			result.completeExceptionally(closing());
 		}
 		return result;
+	}
+
+	/**
+	 * Checks again every request waiting for a leader, off the calling thread (Ratis' own, which must not run the
+	 * requests' continuations). Called on every leader change, and when this node becomes a ready leader.
+	 */
+	void leaderChanged() {
+		if (pendingLeaders.isEmpty()) {
+			return;
+		}
+		try {
+			connector.execute(() -> pendingLeaders.values().forEach(Runnable::run));
+		} catch (java.util.concurrent.RejectedExecutionException closing) {
+			// close() fails them.
+		}
+	}
+
+	/**
+	 * The API address of {@code peerId} as this node knows it: from its peer list, or learned from the member itself;
+	 * null if unknown yet.
+	 */
+	@Nullable HostAndPort apiAddress(String peerId) {
+		for (var peer : config.peers()) {
+			if (peer.id().equals(peerId)) {
+				return new HostAndPort(peer.apiHost(), peer.apiPort());
+			}
+		}
+		return learnedAddresses.get(peerId);
 	}
 
 	private static RocksDBException closing() {
 		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "Node is closing");
 	}
 
-	private void poll(RockserverStateMachine stateMachine, CompletableFuture<String> result, long deadline) {
+	/** Completes {@code result} if a leader is known or the deadline passed; true if it is done. */
+	private boolean check(RockserverStateMachine stateMachine, CompletableFuture<String> result, long deadline) {
+		if (result.isDone()) {
+			return true;
+		}
 		var division = stateMachine.division();
 		if (division != null) {
 			var info = division.getInfo();
@@ -109,17 +148,26 @@ final class LeaderForwarder implements Closeable {
 				var leader = leaderId.toString();
 				if (!leader.equals(config.nodeId()) || (info.isLeader() && info.isLeaderReady())) {
 					result.complete(leader);
-					return;
+					return true;
 				}
 			}
 		}
 		if (System.nanoTime() - deadline > 0) {
 			result.completeExceptionally(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
 					"No Raft leader available"));
-			return;
+			return true;
 		}
+		return false;
+	}
+
+	private void schedule(RockserverStateMachine stateMachine, CompletableFuture<String> result, long deadline) {
+		long delay = Math.max(1, Math.min(TimeUnit.MILLISECONDS.toNanos(POLL_MS), deadline - System.nanoTime() + 1));
 		try {
-			timer.schedule(() -> poll(stateMachine, result, deadline), POLL_MS, TimeUnit.MILLISECONDS);
+			timer.schedule(() -> {
+				if (!check(stateMachine, result, deadline)) {
+					schedule(stateMachine, result, deadline);
+				}
+			}, delay, TimeUnit.NANOSECONDS);
 		} catch (RuntimeException ex) {
 			result.completeExceptionally(closing());
 		}
@@ -199,6 +247,7 @@ final class LeaderForwarder implements Closeable {
 		return TermService.apiAddress(channel, config.requestTimeout()).whenComplete((address, error) -> {
 			channel.shutdown();
 			if (address != null) {
+				learnedAddresses.put(peerId, address);
 				LOG.info("{}: member {} at {} serves its API at {}:{}", config.nodeId(), peerId, raftAddress,
 						address.host(), address.port());
 			}
@@ -226,7 +275,7 @@ final class LeaderForwarder implements Closeable {
 		closed = true;
 		// The timer drops the next polls of pending leader() calls: fail those calls instead.
 		timer.shutdownNow();
-		for (var pending : pendingLeaders) {
+		for (var pending : pendingLeaders.keySet()) {
 			pending.completeExceptionally(closing());
 		}
 		connector.shutdown();

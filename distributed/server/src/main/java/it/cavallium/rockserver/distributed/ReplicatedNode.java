@@ -140,6 +140,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			started.add(proposer);
 			this.forwarder = new LeaderForwarder(config);
 			started.add(forwarder);
+			stateMachine.onLeaderChange(forwarder::leaderChanged);
 			this.connection = new ReplicatedConnection(config, stateMachine, proposer, barrier, forwarder, metrics);
 			var self = config.self();
 			var apiHost = config.apiBindHost() != null ? config.apiBindHost() : self.apiHost();
