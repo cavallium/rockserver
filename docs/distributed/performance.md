@@ -55,7 +55,10 @@ distributed/bench/load-bench.sh --target replicated --root /path/on/a/real/disk/
 Other options: `--target single`, `--closed 64,512`, `--only UPDATE,GET` (or `BULK_PUT`, 1 MiB `putMulti`
 calls for bandwidth), `--max-in-flight N`, `--route all` (clients spread over every node, so most requests are
 forwarded), `--route failover` (spread over every node too, each connection listing every node, starting from a
-different one), `--kill-leader-after S` (SIGKILL of the leader during the step, with a per-second timeline), `--jfr
+different one), `--route same-list` (every connection lists every node in one order, as production clients do,
+starting from `--first follower|leader|ID`, a follower by default; with `--leader-hint listed|any|off` for the
+client's hint mode, so that a run with `listed` and one with `off` show what the leader hint gains over forwarding
+through a follower), `--kill-leader-after S` (SIGKILL of the leader during the step, with a per-second timeline), `--jfr
 profile` (or a `.jfc` file) to record every node. Each node logs its own timers every 10 s (`NodeMetrics`:
 proposer queue and batch round trip, append-to-apply, apply phases, read barrier, update lock wait, log lags,
 tracked keys, heap).
@@ -277,7 +280,9 @@ Other results:
   default: under steady writes a follower read took 3-4 ms more than a forwarded one in process, see "Follower reads"
   in the design document). This
   needs the clients to list the nodes by the host names of the cluster's `--peer` configuration. Not measured yet. A
-  client stays on the node it failed over to until that node goes away. The benchmark's `--route failover` spreads the lists, so it does not measure this. A
+  client stays on the node it failed over to until that node goes away. The benchmark's `--route failover` spreads the lists, so it does not measure this; `--route same-list` does (DD-25,
+  PF-5: forwarding through followers saturated near 2x of production), with `--leader-hint listed` against `off`. Not
+  run yet: it needs the user's go-ahead for a benchmark. A
   server option brings clients back to the first address, `max-connection-age-ms`, which is off by default. With it
   every client starts again from the top of its list at every age cycle, so a silent first address costs each of them
   the connect timeout at every cycle instead of once, and the grace of 10 minutes cuts any longer call, including

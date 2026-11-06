@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -14,6 +15,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -47,6 +49,12 @@ import org.slf4j.LoggerFactory;
  *   {@value #MAX_QUEUED_CHUNKS} chunks per direction meanwhile, then stops reading, so the sender's buffers fill
  *   up as they would.</li>
  * </ul>
+ *
+ * <p>A connection to a target that is down is accepted and then reset, which a client cannot tell from a connection
+ * reset after its request was forwarded. For clients that must know whether a request may have arrived (test clients
+ * classifying a write as certainly failed), {@link #refuseWhileTargetDown()} makes the proxy behave like the dead
+ * target instead: it closes its listening socket ({@link #refuseConnections()}), so connections are refused, and binds
+ * the same port again once the target accepts connections ({@link #acceptWhenTargetUp()}).</p>
  */
 public final class LinkProxy implements AutoCloseable {
 
@@ -56,6 +64,7 @@ public final class LinkProxy implements AutoCloseable {
 	/** Chunks read but not yet forwarded, per direction of a connection, before the reader stops reading. */
 	private static final int MAX_QUEUED_CHUNKS = 256;
 	private static final long POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(50);
+	private static final long TARGET_PROBE_MILLIS = 50;
 
 	/**
 	 * How a {@link #shape shaped} link forwards: each chunk after {@code delay} plus a uniform random part of
@@ -84,7 +93,17 @@ public final class LinkProxy implements AutoCloseable {
 		}
 	}
 
-	private final ServerSocket server;
+	/** Null while connections are refused ({@link #refuseConnections()}). Changed under {@link #listening}. */
+	private volatile @Nullable ServerSocket server;
+	/** The address bound first, bound again by {@link #acceptConnections()}. */
+	private final InetSocketAddress listenAddress;
+	/** Guards binding and closing {@link #server}; the acceptor waits on it while connections are refused. */
+	private final Object listening = new Object();
+	private volatile boolean refuseWhileTargetDown;
+	/** Set while a thread waits for the target to accept connections again ({@link #acceptWhenTargetUp()}). */
+	private final AtomicBoolean watchingTarget = new AtomicBoolean();
+	/** Calls of {@link #acceptWhenTargetUp()}: one that a running watcher may have missed starts a new watcher. */
+	private final java.util.concurrent.atomic.AtomicLong watchRequests = new java.util.concurrent.atomic.AtomicLong();
 	private final InetSocketAddress target;
 	private final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 	private final Thread acceptor;
@@ -107,21 +126,115 @@ public final class LinkProxy implements AutoCloseable {
 	/** Binds {@code listen} (port 0 picks a free port) and starts forwarding to {@code target}. */
 	public LinkProxy(InetSocketAddress listen, InetSocketAddress target) throws IOException {
 		this.target = target;
-		this.server = new ServerSocket();
-		try {
-			server.setReuseAddress(true);
-			server.bind(listen, 128);
-		} catch (IOException e) {
-			server.close();
-			throw e;
-		}
+		var socket = bind(listen);
+		this.server = socket;
+		this.listenAddress = (InetSocketAddress) socket.getLocalSocketAddress();
 		this.acceptor = Thread.ofVirtual()
-				.name("link-proxy-" + server.getLocalSocketAddress() + "->" + target)
+				.name("link-proxy-" + listenAddress + "->" + target)
 				.start(this::acceptLoop);
 	}
 
+	private static ServerSocket bind(InetSocketAddress address) throws IOException {
+		var socket = new ServerSocket();
+		try {
+			socket.setReuseAddress(true);
+			socket.bind(address, 128);
+		} catch (IOException e) {
+			socket.close();
+			throw e;
+		}
+		return socket;
+	}
+
 	public InetSocketAddress listenAddress() {
-		return (InetSocketAddress) server.getLocalSocketAddress();
+		return listenAddress;
+	}
+
+	/**
+	 * From now on, a connection whose target refuses it makes the proxy refuse connections too, until the target
+	 * accepts them again: see the class comment. The connection that found the target down is still reset.
+	 */
+	public void refuseWhileTargetDown() {
+		refuseWhileTargetDown = true;
+	}
+
+	/**
+	 * Closes the listening socket, so that new connections are refused as by a closed port, until
+	 * {@link #acceptConnections()} or {@link #acceptWhenTargetUp()}. Open connections are left alone.
+	 */
+	public void refuseConnections() {
+		synchronized (listening) {
+			var socket = server;
+			server = null;
+			if (socket != null) {
+				try {
+					socket.close();
+				} catch (IOException e) {
+					LOG.debug("Failed to close {}", socket, e);
+				}
+			}
+		}
+	}
+
+	/** Binds the listening port again after {@link #refuseConnections()}; nothing if it is bound. */
+	public void acceptConnections() throws IOException {
+		synchronized (listening) {
+			if (server == null && !closed) {
+				server = bind(listenAddress);
+				listening.notifyAll();
+			}
+		}
+	}
+
+	/** Whether the listening socket is bound (see {@link #refuseConnections()}). */
+	public boolean isAccepting() {
+		return server != null;
+	}
+
+	/**
+	 * Binds the listening port again, after {@link #refuseConnections()}, as soon as the target accepts a connection
+	 * (probed every {@value #TARGET_PROBE_MILLIS} ms by a thread of its own). A call that comes while a watcher is
+	 * still running, after that watcher bound the port (a kill right after a restart: the port was closed again), is
+	 * not lost: the watcher starts another one as it ends.
+	 */
+	public void acceptWhenTargetUp() {
+		watchRequests.incrementAndGet();
+		if (!watchingTarget.compareAndSet(false, true)) {
+			return;
+		}
+		Thread.ofVirtual().name("link-proxy-target-watch-" + target).start(() -> {
+			long served = -1;
+			try {
+				while (!closed) {
+					long requests = watchRequests.get();
+					if (targetAccepts()) {
+						acceptConnections();
+						served = requests;
+						return;
+					}
+					Thread.sleep(TARGET_PROBE_MILLIS);
+				}
+			} catch (IOException e) {
+				LOG.error("{} cannot listen again", this, e);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			} finally {
+				watchingTarget.set(false);
+				// Requests after the bind found this watcher still marked running, and returned.
+				if (served >= 0 && watchRequests.get() != served && !closed) {
+					acceptWhenTargetUp();
+				}
+			}
+		});
+	}
+
+	private boolean targetAccepts() {
+		try (var probe = new Socket()) {
+			probe.connect(target, CONNECT_TIMEOUT_MILLIS);
+			return true;
+		} catch (IOException e) {
+			return false;
+		}
 	}
 
 	public InetSocketAddress target() {
@@ -201,10 +314,9 @@ public final class LinkProxy implements AutoCloseable {
 	@Override
 	public void close() {
 		closed = true;
-		try {
-			server.close();
-		} catch (IOException e) {
-			LOG.debug("Failed to close {}", server, e);
+		refuseConnections();
+		synchronized (listening) {
+			listening.notifyAll();
 		}
 		connections.forEach(Connection::reset);
 		wakeStalled();
@@ -217,7 +329,8 @@ public final class LinkProxy implements AutoCloseable {
 
 	@Override
 	public String toString() {
-		return "LinkProxy[" + listenAddress() + " -> " + target + (blocked ? ", blocked" : "")
+		return "LinkProxy[" + listenAddress + " -> " + target + (blocked ? ", blocked" : "")
+				+ (server == null ? ", refusing" : "")
 				+ (blackholed ? ", blackholed" : "") + (shaping.isNone() ? "" : ", " + shaping) + "]";
 	}
 
@@ -252,13 +365,32 @@ public final class LinkProxy implements AutoCloseable {
 
 	private void acceptLoop() {
 		while (!closed) {
+			var socket = server;
+			if (socket == null) {
+				synchronized (listening) {
+					if (server == null && !closed) {
+						try {
+							listening.wait(TimeUnit.NANOSECONDS.toMillis(POLL_NANOS));
+						} catch (InterruptedException e) {
+							Thread.currentThread().interrupt();
+							return;
+						}
+					}
+				}
+				continue;
+			}
 			Socket client;
 			try {
-				client = server.accept();
+				client = socket.accept();
 			} catch (IOException e) {
-				if (!closed) {
-					LOG.warn("{} stopped accepting connections", this, e);
+				if (closed) {
+					return;
 				}
+				if (server != socket) {
+					// Closed by refuseConnections().
+					continue;
+				}
+				LOG.warn("{} stopped accepting connections", this, e);
 				return;
 			}
 			var connection = new Connection(client);
@@ -302,6 +434,10 @@ public final class LinkProxy implements AutoCloseable {
 				upstream.connect(target, CONNECT_TIMEOUT_MILLIS);
 			} catch (IOException e) {
 				// The target is down (or block() closed the socket): fail the client side just as abruptly.
+				if (refuseWhileTargetDown && e instanceof ConnectException && !isReset && !closed) {
+					refuseConnections();
+					acceptWhenTargetUp();
+				}
 				reset();
 				return;
 			}

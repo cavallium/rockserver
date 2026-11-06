@@ -5,16 +5,21 @@ import static it.cavallium.rockserver.distributed.ScenarioSupport.CLIENT_RETRY_T
 import static it.cavallium.rockserver.distributed.ScenarioSupport.PHASE_TIMEOUT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.READY_TIMEOUT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.SCHEMA;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.distributed.CrashPoints.Point;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.TreeMap;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -141,6 +146,29 @@ class ProtocolPointKillTest {
 		System.out.println("Rounds: " + done + "; writes " + writes.size() + ", unknown outcomes that applied: "
 				+ unknownApplied);
 		support.checkReplicasIdentical(rockserverConfig);
+		assertLogsMatch();
+	}
+
+	/**
+	 * R3-G4b-3: with every node stopped, Raft's log matching holds on disk: wherever two logs hold the same index, they
+	 * hold the same term. A restarted node that kept an entry the cluster replaced (an unreplicated tail of a killed
+	 * leader not truncated) fails this. Returns each node's index-to-term map.
+	 */
+	private Map<String, TreeMap<Long, Long>> assertLogsMatch() throws IOException {
+		var logs = new LinkedHashMap<String, TreeMap<Long, Long>>();
+		for (var id : cluster.nodeIds()) {
+			logs.put(id, LogTerms.read(cluster.dataDir(id)));
+		}
+		for (var a : logs.entrySet()) {
+			for (var b : logs.entrySet()) {
+				if (a.getKey().compareTo(b.getKey()) < 0) {
+					long index = LogTerms.firstDisagreement(a.getValue(), b.getValue());
+					assertEquals(-1, index, () -> "the logs of " + a.getKey() + " and " + b.getKey() + " disagree at index "
+							+ index + ": term " + a.getValue().get(index) + " and " + b.getValue().get(index));
+				}
+			}
+		}
+		return logs;
 	}
 
 	/**
@@ -185,6 +213,10 @@ class ProtocolPointKillTest {
 		var support = new ScenarioSupport(cluster);
 		long column = client.createColumn("data", SCHEMA, BATCH_CONTEXT).valueOrThrow();
 		var workload = new ScenarioSupport.UniqueWrites(cluster.apiAddresses(), column, 4, 64).start();
+		String oldLeader;
+		long oldTerm;
+		long replicatedUpTo;
+		long appendedUpTo;
 		try {
 			workload.awaitMore(100, PHASE_TIMEOUT, "before the fault");
 			var leader = support.awaitLeader(PHASE_TIMEOUT);
@@ -213,6 +245,10 @@ class ProtocolPointKillTest {
 			}, "the isolated leader appended nothing past the followers' last entry " + followersLastOfTerm);
 			long leaderLast = support.groupInfo(leader).getLogInfoProto().getLastEntry().getIndex();
 			cluster.kill(leader);
+			oldLeader = leader;
+			oldTerm = leaderTerm;
+			replicatedUpTo = followersLastOfTerm;
+			appendedUpTo = leaderLast;
 			cluster.network().heal();
 			var newLeader = support.awaitLeader(PHASE_TIMEOUT);
 			assertTrue(Set.copyOf(followers).contains(newLeader), newLeader);
@@ -231,5 +267,21 @@ class ProtocolPointKillTest {
 		support.awaitQuiescent();
 		ScenarioSupport.checkWrites(client, column, workload.writes());
 		support.checkReplicasIdentical(rockserverConfig);
+		// R3-G4b-3, the truncation itself: the entries only the old leader had appended are gone from its log, replaced
+		// by the new leader's (a later term), wherever its log still holds those indices.
+		var logs = assertLogsMatch();
+		var oldLog = logs.get(oldLeader);
+		int replaced = 0;
+		for (long index = replicatedUpTo + 1; index <= appendedUpTo; index++) {
+			var term = oldLog.get(index);
+			if (term != null) {
+				long at = index;
+				assertTrue(term > oldTerm, () -> "node " + oldLeader + " still holds its unreplicated entry " + at
+						+ " of term " + oldTerm);
+				replaced++;
+			}
+		}
+		System.out.println("Old leader " + oldLeader + ": entries " + (replicatedUpTo + 1) + ".." + appendedUpTo
+				+ " of term " + oldTerm + " replaced, " + replaced + " of them still in its log with a later term");
 	}
 }

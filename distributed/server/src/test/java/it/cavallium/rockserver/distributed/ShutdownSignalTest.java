@@ -58,4 +58,18 @@ class ShutdownSignalTest {
 		assertEquals(3, ReplicatedServerMain.closeOnSignal(failing));
 		assertTrue(failing.stopped().isDone(), "the hook halts only once the node stopped");
 	}
+
+	/**
+	 * Ratis closes the division by itself (as its log worker does after a disk error) and the signal lands before
+	 * {@code watchRaft} noticed: the signal's stop is the failure's stop, and gives 3.
+	 */
+	@Test
+	void aSignalRightAfterRaftClosedByItselfExitsWithThree() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var failing = cluster.anyFollower();
+		failing.stateMachine().division().close();
+		assertEquals(3, ReplicatedServerMain.closeOnSignal(failing));
+		assertTrue(failing.stopped().isDone(), "the hook halts only once the node stopped");
+	}
 }

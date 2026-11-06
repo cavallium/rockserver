@@ -75,6 +75,8 @@ public final class ProcessCluster implements AutoCloseable {
 		int starts;
 		/** Extra JVM options for the next starts, e.g. a clock skew ({@link #setJvmOptions}). */
 		List<String> jvmOptions = List.of();
+		/** Extra environment variables for the next starts, e.g. {@code LD_PRELOAD} ({@link #setEnvironment}). */
+		Map<String, String> environment = Map.of();
 
 		Node(String id, int raftPort, int apiPort, Path dir) {
 			this.id = id;
@@ -149,7 +151,9 @@ public final class ProcessCluster implements AutoCloseable {
 		var nodes = new LinkedHashMap<String, Node>();
 		var ports = new LinkedHashMap<String, List<Integer>>();
 		var linkAddresses = Network.linkAddresses(total);
-		var freePorts = freePorts(total * 2, linkAddresses);
+		// Two per node, and one per client link: a client link closes and binds its port again while its node is down
+		// (LinkProxy.refuseWhileTargetDown), so that port too must stay out of the ephemeral range.
+		var freePorts = freePorts(total * 3, linkAddresses);
 		for (int i = 0; i < total; i++) {
 			var id = String.valueOf(i + 1);
 			var node = new Node(id, freePorts.get(2 * i), freePorts.get(2 * i + 1), root.resolve(Network.hostname(id)));
@@ -162,8 +166,13 @@ public final class ProcessCluster implements AutoCloseable {
 		try {
 			for (var node : nodes.values()) {
 				// Port 0 on 127.0.0.1: an ephemeral port is fine, the proxy keeps it bound for the cluster's lifetime.
-				clientLinks.put(node.id, new LinkProxy(new InetSocketAddress(InetAddress.getByName(LOOPBACK), 0),
-						new InetSocketAddress(InetAddress.getByName(LOOPBACK), node.apiPort)));
+				var link = new LinkProxy(new InetSocketAddress(InetAddress.getByName(LOOPBACK),
+						freePorts.get(2 * total + clientLinks.size())),
+						new InetSocketAddress(InetAddress.getByName(LOOPBACK), node.apiPort));
+				// A client of a dead node gets a refused connection, as without the proxy: proof that its request did not
+				// arrive (RT-N1), instead of a connection accepted and reset, which ClusterClient must count as unknown.
+				link.refuseWhileTargetDown();
+				clientLinks.put(node.id, link);
 			}
 		} catch (IOException | RuntimeException e) {
 			clientLinks.values().forEach(LinkProxy::close);
@@ -324,6 +333,28 @@ public final class ProcessCluster implements AutoCloseable {
 		node(id).jvmOptions = List.copyOf(options);
 	}
 
+	/**
+	 * Extra environment variables for the node's next starts, for example {@code LD_PRELOAD} with the fault-injecting
+	 * file system shim of {@link FaultFs}.
+	 */
+	public synchronized void setEnvironment(String id, Map<String, String> environment) {
+		node(id).environment = Map.copyOf(environment);
+	}
+
+	/** Exit code of the node's last JVM, which must have exited. */
+	public synchronized int exitCode(String id) {
+		var process = node(id).process;
+		if (process == null || process.isAlive()) {
+			throw new IllegalStateException("Node " + id + " has not exited");
+		}
+		return process.exitValue();
+	}
+
+	/** The node's directory: its data directory, logs and the files a test puts next to them. */
+	public Path nodeDir(String id) {
+		return node(id).dir;
+	}
+
 	public Path dataDir(String id) {
 		return node(id).dataDir();
 	}
@@ -429,10 +460,11 @@ public final class ProcessCluster implements AutoCloseable {
 		node.stdoutStart = Files.size(node.stdout());
 		// The child writes straight to the files: reading its stdout through a pipe can lose the last lines, as
 		// the JDK closes the pipe when the process exits.
-		node.process = new ProcessBuilder(command(node, List.of(extraArgs)))
+		var builder = new ProcessBuilder(command(node, List.of(extraArgs)))
 				.redirectOutput(ProcessBuilder.Redirect.appendTo(node.stdout().toFile()))
-				.redirectError(ProcessBuilder.Redirect.appendTo(node.stderr().toFile()))
-				.start();
+				.redirectError(ProcessBuilder.Redirect.appendTo(node.stderr().toFile()));
+		builder.environment().putAll(node.environment);
+		node.process = builder.start();
 		node.shouldRun = true;
 		node.paused = false;
 	}
@@ -444,8 +476,11 @@ public final class ProcessCluster implements AutoCloseable {
 		if (node.process == null) {
 			return;
 		}
+		// Refused before the node dies, so that no client connects to it through the proxy in between.
+		clientLinks.get(id).refuseConnections();
 		node.process.destroyForcibly();
 		awaitExit(node);
+		clientLinks.get(id).acceptWhenTargetUp();
 	}
 
 	/**
@@ -455,12 +490,14 @@ public final class ProcessCluster implements AutoCloseable {
 	public synchronized void killAll() {
 		for (var node : nodes.values()) {
 			node.shouldRun = false;
+			clientLinks.get(node.id).refuseConnections();
 		}
 		killAllNow();
 		for (var node : nodes.values()) {
 			if (node.process != null) {
 				awaitExit(node);
 			}
+			clientLinks.get(node.id).acceptWhenTargetUp();
 		}
 	}
 
@@ -475,6 +512,7 @@ public final class ProcessCluster implements AutoCloseable {
 			// A stopped process only acts on SIGTERM once continued.
 			resume(id);
 		}
+		clientLinks.get(id).refuseConnections();
 		node.process.destroy();
 		try {
 			if (!node.process.waitFor(GRACEFUL_STOP_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS)) {
@@ -486,6 +524,8 @@ public final class ProcessCluster implements AutoCloseable {
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
 			throw new IllegalStateException("Interrupted while stopping node " + id, e);
+		} finally {
+			clientLinks.get(id).acceptWhenTargetUp();
 		}
 		awaitExit(node);
 	}

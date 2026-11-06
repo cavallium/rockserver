@@ -662,7 +662,11 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * only forwards to a leader it can no longer follow. Stop it like a failed replica, so that a supervisor restarts it.
 	 */
 	private void stopAfterRaftClosed() {
-		onReplicaFailure(new IOException("Raft closed on node " + config.nodeId() + " while the node was running"));
+		onReplicaFailure(raftClosedFailure());
+	}
+
+	private IOException raftClosedFailure() {
+		return new IOException("Raft closed on node " + config.nodeId() + " while the node was running");
 	}
 
 	/**
@@ -886,10 +890,19 @@ public final class ReplicatedNode implements AutoCloseable {
 		return stateMachine.isFailed();
 	}
 
-	/** Graceful stop: hands leadership to another member first, then closes everything. */
+	/**
+	 * Graceful stop: hands leadership to another member first, then closes everything. If Ratis already closed its
+	 * server by itself (a log worker that hit a disk error closes the division), this is the failure's stop, not a
+	 * graceful one: {@link #watchRaft} notices that only on its next run, and a signal that lands before it would
+	 * otherwise end a failed node with the exit status of a normal stop (DD-7h).
+	 */
 	@Override
 	public void close() throws IOException {
 		if (closed.get()) {
+			return;
+		}
+		if (raftClosedByItself()) {
+			shutdown(true, raftClosedFailure());
 			return;
 		}
 		var division = stateMachine.division();
@@ -899,7 +912,21 @@ public final class ReplicatedNode implements AutoCloseable {
 				awaitSuccessorCommit(division, term);
 			}
 		}
+		// Raft can close by itself during the hand-off too.
+		if (raftClosedByItself()) {
+			shutdown(true, raftClosedFailure());
+			return;
+		}
 		shutdown(false, null);
+	}
+
+	/** Whether this node's Raft server closed while nothing here closed it. */
+	private boolean raftClosedByItself() {
+		if (closed.get()) {
+			return false;
+		}
+		var division = stateMachine.division();
+		return division == null || !division.getInfo().isAlive();
 	}
 
 	/**

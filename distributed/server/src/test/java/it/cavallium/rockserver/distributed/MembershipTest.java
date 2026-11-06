@@ -490,9 +490,13 @@ class MembershipTest {
 		assertFalse(cluster.output("3").contains("snapshot taken at"), () -> cluster.logTail("3"));
 	}
 
-	/** Such a node printed READY and listens, with no election timer: only its log can tell. */
+	/**
+	 * DD-30 / R4-6: a removed node that a supervisor starts again exits with 4 before it serves anything (it no longer
+	 * prints READY and waits outside the cluster, as it did before), whether its log holds the configuration that
+	 * removed it or the members tell it.
+	 */
 	@Test
-	void aRemovedNodeThatRestartsWarnsThatItIsOutside() throws Exception {
+	void aRemovedNodeThatRestartsExitsWithFour() throws Exception {
 		cluster = ProcessCluster.create(root, 3, 0, serverArgs());
 		var members = List.of("1", "2", "3");
 		startAll(members);
@@ -509,10 +513,14 @@ class MembershipTest {
 		assertEquals(3, cluster.awaitExit(removed, TIMEOUT), () -> cluster.logTail(removed));
 
 		cluster.start(removed);
-		cluster.waitReady(removed, READY_TIMEOUT);
-		InProcessCluster.await(TIMEOUT, () -> cluster.output(removed).contains(OUTSIDE));
-		assertTrue(cluster.output(removed).contains("it was removed from the cluster"), () -> cluster.logTail(removed));
-		assertTrue(cluster.isRunning(removed), "a removed node that restarts waits, it does not exit");
+		assertEquals(4, cluster.awaitExit(removed, TIMEOUT), () -> cluster.logTail(removed));
+		var output = cluster.output(removed);
+		assertTrue(output.contains("removed from the cluster"), () -> cluster.logTail(removed));
+		assertEquals(1, output.lines().filter(line -> line.strip().equals("READY " + removed)).count(),
+				() -> "READY only from its first start\n" + cluster.logTail(removed));
+		// The other two serve on without it.
+		client.put(client.createColumn("after", SCHEMA, CONTEXT).valueOrThrow(), key(1), text("x"), CONTEXT)
+				.valueOrThrow();
 	}
 
 	/** Nothing starts an election in such a cluster. */
