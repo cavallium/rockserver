@@ -423,6 +423,82 @@ class RatisContractTest {
 		assertTrue(share < 0.5, () -> "the appender takes " + share * 100 + "% of a core");
 	}
 
+	/**
+	 * CR2-3: {@link CommitHeartbeats} relies on this. With the node's Raft settings ({@link RaftSettings}: no commit
+	 * metadata entries, whose appends would carry the commit index by themselves; the read option LINEARIZABLE and the
+	 * leader's heartbeat check on), a follower learns that a new write is committed only with the next append or
+	 * heartbeat, and a read with Ratis' dummy message on the leader makes the appenders send that heartbeat at once.
+	 * Heartbeats come every 3 s here (half the minimum election timeout of 6 s); five times in a row, a follower must
+	 * learn the commit index of a new write within 600 ms of the trigger. The system property
+	 * {@code rockserver.test.commitTrigger=false} runs the same without the trigger, to see the wait it saves.
+	 */
+	@Test
+	void aDummyReadOnTheLeaderSendsTheCommitIndexAtOnce() throws Exception {
+		var peerConfigs = new ArrayList<PeerConfig>();
+		var ports = ProcessCluster.freePorts(3, List.of());
+		for (int port : ports) {
+			peerConfigs.add(new PeerConfig("h" + peerConfigs.size(), "127.0.0.1", port, "127.0.0.1", 1));
+		}
+		var peers = new ArrayList<RaftPeer>();
+		for (var peer : peerConfigs) {
+			peers.add(RaftPeer.newBuilder().setId(peer.id()).setAddress(peer.raftHost() + ":" + peer.raftPort()).build());
+		}
+		var group = RaftGroup.valueOf(groupId, peers);
+		for (int i = 0; i < peers.size(); i++) {
+			var config = NodeConfig.defaults(peerConfigs.get(i).id(), peerConfigs, tempDir.resolve(peerConfigs.get(i).id()))
+					.withElectionTimeouts(Duration.ofSeconds(6), Duration.ofSeconds(12));
+			var properties = RaftSettings.server(config);
+			assertFalse(RaftServerConfigKeys.Log.logMetadataEnabled(properties));
+			assertEquals(RaftServerConfigKeys.Read.Option.LINEARIZABLE, RaftServerConfigKeys.Read.option(properties));
+			assertTrue(RaftServerConfigKeys.Read.leaderHeartbeatCheckEnabled(properties));
+			RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMin(properties, TimeDuration.valueOf(300, TimeUnit.MILLISECONDS));
+			RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMax(properties, TimeDuration.valueOf(600, TimeUnit.MILLISECONDS));
+			others.add(start(peers.get(i), group, properties, new GateStateMachine()));
+		}
+		RaftServer leader = null;
+		long deadline = System.nanoTime() + WAIT.toNanos();
+		while (leader == null && System.nanoTime() - deadline < 0) {
+			for (var member : others) {
+				var info = member.getDivision(groupId).getInfo();
+				if (info.isLeader() && info.isLeaderReady()) {
+					leader = member;
+				}
+			}
+			Thread.sleep(20);
+		}
+		assertNotNull(leader, "a ready leader");
+		var leaderServer = leader;
+		var follower = others.stream().filter(member -> member != leaderServer).findFirst().orElseThrow();
+		var trigger = new CommitHeartbeats(() -> leaderServer, groupId);
+		trigger.enabled = Boolean.parseBoolean(System.getProperty("rockserver.test.commitTrigger", "true"));
+		var lags = new ArrayList<Long>();
+		for (int i = 0; i < 5; i++) {
+			var reply = leaderServer.submitClientRequestAsync(RaftClientRequest.newBuilder()
+					.setClientId(ClientId.randomId())
+					.setServerId(leaderServer.getId())
+					.setGroupId(groupId)
+					.setCallId(1)
+					.setMessage(Message.valueOf("w" + i))
+					.setType(RaftClientRequest.writeRequestType())
+					.build()).get(20, TimeUnit.SECONDS);
+			assertTrue(reply.isSuccess());
+			long target = leaderServer.getDivision(groupId).getRaftLog().getLastCommittedIndex();
+			long start = System.nanoTime();
+			trigger.send();
+			var followerLog = follower.getDivision(groupId).getRaftLog();
+			while (followerLog.getLastCommittedIndex() < target) {
+				assertTrue(System.nanoTime() - start < WAIT.toNanos(), "the follower learns the commit index");
+				Thread.sleep(0, 200_000);
+			}
+			lags.add(TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start));
+		}
+		System.out.println("Commit index on a follower after " + (trigger.enabled ? "a trigger" : "no trigger") + ", us: "
+				+ lags);
+		if (trigger.enabled) {
+			assertTrue(lags.stream().allMatch(lag -> lag < 600_000), lags::toString);
+		}
+	}
+
 	/** CPU time of the leader's threads that append to {@code followerId} (named {@code ...->followerId-...}). */
 	private static long appenderCpuNanos(java.lang.management.ThreadMXBean threads, String followerId) {
 		long total = 0;
@@ -445,6 +521,25 @@ class RatisContractTest {
 
 	/** A member of a group of several servers in this JVM, with this test's timeouts. */
 	private RaftServer startMember(RaftPeer peer, RaftGroup group, GateStateMachine machine) throws IOException {
+		var properties = memberProperties(peer);
+		RaftServerConfigKeys.Log.Appender.setRetryPolicy(properties, RaftSettings.APPENDER_RETRY_POLICY);
+		return start(peer, group, properties, machine);
+	}
+
+	private RaftServer start(RaftPeer peer, RaftGroup group, RaftProperties properties, GateStateMachine machine)
+			throws IOException {
+		var member = RaftServer.newBuilder()
+				.setServerId(peer.getId())
+				.setGroup(group)
+				.setProperties(properties)
+				.setStateMachine(machine)
+				.setOption(RaftStorage.StartupOption.FORMAT)
+				.build();
+		member.start();
+		return member;
+	}
+
+	private RaftProperties memberProperties(RaftPeer peer) {
 		var properties = new RaftProperties();
 		RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.GRPC);
 		var address = peer.getAddress();
@@ -455,16 +550,7 @@ class RatisContractTest {
 		RaftServerConfigKeys.Rpc.setTimeoutMax(properties, TimeDuration.valueOf(600, TimeUnit.MILLISECONDS));
 		RaftServerConfigKeys.LeaderElection.setLeaderStepDownWaitTime(properties,
 				TimeDuration.valueOf(600, TimeUnit.MILLISECONDS));
-		RaftServerConfigKeys.Log.Appender.setRetryPolicy(properties, RaftSettings.APPENDER_RETRY_POLICY);
-		var member = RaftServer.newBuilder()
-				.setServerId(peer.getId())
-				.setGroup(group)
-				.setProperties(properties)
-				.setStateMachine(machine)
-				.setOption(RaftStorage.StartupOption.FORMAT)
-				.build();
-		member.start();
-		return member;
+		return properties;
 	}
 
 	private RaftPeer start(Duration firstElection, int pendingLimit) throws IOException {

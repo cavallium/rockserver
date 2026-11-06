@@ -894,9 +894,19 @@ or a due heartbeat. So when the leader answers a read index request it also asks
 path does it (`raft.server.read.option=LINEARIZABLE`, set in `RaftSettings`, with the default leader heartbeat check),
 so the leader submits a Ratis read with its dummy message, which skips the state machine, and ignores the reply.
 Each heartbeat carries the commit index when it is sent, at least `c`. Ratis skips the round when one already
-confirmed a commit index at least as high, and coalesces triggers per follower, so it costs at most one empty append
-per follower per read index request (at most one in flight per follower). The read index itself still comes from
-`ReadBarrier`, never from Ratis' heartbeat confirmation.
+confirmed a commit index at least as high. The read index itself still comes from `ReadBarrier`, never from Ratis'
+heartbeat confirmation. The trigger does ride on Ratis' ReadIndex path, the one with the reuse bug that made this
+design use its own barrier; that bug only makes Ratis' read answer too early, and the trigger ignores the answer, so it
+costs nothing here but the heartbeats. It is kept small (CR2-3): `CommitHeartbeats` keeps at most one trigger in
+flight per commit index (a second confirms nothing more) and at most 4 in all. A dummy read completes only once the
+leader applied its read index, so under an apply lag they stay pending: without the bound, one per follower read
+index request would pile up in Ratis. A request that finds the bound reached is answered without a trigger, and its
+follower waits for the next append or heartbeat; with an apply lag, writes usually flow and appends carry the commit
+index anyway. The heartbeat check is set explicitly in `RaftSettings` (it is Ratis' default), and
+`RatisContractTest.aDummyReadOnTheLeaderSendsTheCommitIndexAtOnce` pins the behavior with the node's own Raft settings:
+with heartbeats every 3 s, a follower learned the commit index of a new write 1.6-3.0 ms after a trigger, and 3.0 s
+after the write without one (the next heartbeat; no commit metadata entries, which `RaftSettings` turns off, would
+have carried it).
 
 The read is forwarded to the leader instead, as without follower reads, when no read index comes (no leader known, the
 leader unreachable or not confirmed within a maximum election timeout, or a leader that predates the method), when the
@@ -1637,6 +1647,7 @@ failover" below).
 | `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. With `PipelinedUpdatesTest`, the only tests that chain in a default run: the suites below run the plain per-key queue unless the property below is set, and fail if an update chains there. After each fault these three wait for an update that chains. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, no acknowledged increment of a hot counter is lost, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
 | `FollowerReadTest` (in-process, follower reads on) | A follower serves reads of writes acknowledged on the leader, with writes flowing meanwhile and on a quiet cluster (thanks to `CommitHeartbeats`), some by itself (the share is printed, not asserted beyond a loose bound: it depends on the disk and load); once it knows the commit index it serves by itself. The option is set on every node through the property. A follower whose database may hold an entry of a term later than its read index forwards; reads stay linearizable on the follower and the new leader across a leader change. A read on the leader whose apply is held does not answer the old value after a follower served the new one. A follower whose apply is held forwards instead of answering with the old value, and one cut off from the rest fails instead of answering. A follower names the leader in its responses, and a client of several nodes listing the follower first reads its writes and its transaction through it. |
+| `CommitHeartbeatsTest` | One commit heartbeat trigger in flight per commit index, a higher index triggers again, an ended trigger lets the same index trigger again, at most 4 in flight in all, nothing before a commit index or when disabled. |
 | `FollowerReadLatencyTest` (in-process, prints numbers) | Read-after-write latency on a follower, with and without `CommitHeartbeats`, against forwarded reads with and without the leader's apply wait, quiet and with a writer in the background; with the heartbeats the follower serves more than half of the quiet reads and some of the busy ones itself (loose bounds; the printed shares are the measurement). The numbers in "Follower reads" come from it. |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `ClientFailoverTest` | One client connection listing all three nodes, while the node it uses is killed (the leader, or a follower): only retryable errors, new calls succeed on another node of the same connection (about 1 s with an election, under 200 ms without), a new connection skips the dead node, and a transaction opened through a dead follower still commits. |

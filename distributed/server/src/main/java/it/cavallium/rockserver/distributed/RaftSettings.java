@@ -129,8 +129,11 @@ final class RaftSettings {
 		// call carries every entry appended meanwhile, and they cost one fsync together.
 		GrpcConfigKeys.Server.setLeaderOutstandingAppendsMax(properties, 2);
 
-		// Reads use ReadBarrier, not Ratis ReadIndex (see ReadBarrier). Keep Ratis' own read path strict anyway.
+		// Reads use ReadBarrier, not Ratis ReadIndex (see ReadBarrier). Keep Ratis' own read path strict anyway. Its
+		// heartbeat check (the default, set here so that it stays) is what CommitHeartbeats triggers: a read on the leader
+		// makes the appenders send a heartbeat round, with the commit index, at once.
 		RaftServerConfigKeys.Read.setOption(properties, RaftServerConfigKeys.Read.Option.LINEARIZABLE);
+		RaftServerConfigKeys.Read.setLeaderHeartbeatCheckEnabled(properties, true);
 		RaftServerConfigKeys.Read.setLeaderLeaseEnabled(properties, false);
 
 		RaftServerConfigKeys.Rpc.setTimeoutMin(properties, duration(config.electionTimeoutMin()));
