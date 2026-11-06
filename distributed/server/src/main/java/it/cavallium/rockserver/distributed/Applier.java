@@ -82,7 +82,19 @@ final class Applier {
 	}
 
 	Applier(NodeStore store, @Nullable NodeMetrics metrics, long purgeEverySequences, long purgeEveryBytes) {
+		this(store, metrics, purgeEverySequences, purgeEveryBytes, null);
+	}
+
+	/** With {@code lanes}, data entries of a group are applied in parallel: see "Partitioned apply" below. */
+	Applier(NodeStore store, @Nullable NodeMetrics metrics, @Nullable ApplyLanes lanes) {
+		this(store, metrics, PURGE_EVERY_SEQUENCES, PURGE_EVERY_BYTES, lanes);
+	}
+
+	Applier(NodeStore store, @Nullable NodeMetrics metrics, long purgeEverySequences, long purgeEveryBytes,
+			@Nullable ApplyLanes lanes) {
 		this.store = store;
+		this.lanes = lanes;
+		this.parallelCuts = metrics == null ? null : metrics.amount("apply.parallelCuts");
 		this.purgeEverySequences = purgeEverySequences;
 		this.purgeEveryBytes = purgeEveryBytes;
 		this.openTime = metrics == null ? null : metrics.duration("apply.open");
@@ -95,6 +107,7 @@ final class Applier {
 	private final NodeMetrics.@Nullable Series executeTime;
 	private final NodeMetrics.@Nullable Series commitTime;
 	private final NodeMetrics.@Nullable Series guardRejected;
+	private final NodeMetrics.@Nullable Series parallelCuts;
 
 	private static void record(NodeMetrics.@Nullable Series series, long startNanos) {
 		if (series != null) {
@@ -239,26 +252,53 @@ final class Applier {
 	List<ApplyResult> applyBatch(List<Request> requests, TermIndex position, long leaderTimeMillis) {
 		try {
 			purgeAllProposers();
-			if (leaderTimeMillis > clock) {
-				clock = leaderTimeMillis;
-				clockMoved = true;
-			}
-			List<ApplyResult> results;
-			if (requests.size() == 1 && !isBatchable(requests.getFirst().entry())) {
-				commitGroup();
-				results = List.of(applyAlone(requests.getFirst(), position));
-			} else {
-				results = grouping ? applyGrouped(requests, position) : applyData(requests, position, true);
-			}
-			if (groupTx == null) {
-				sweepSessions();
-			}
-			return results;
+			return applyRouted(requests, position, leaderTimeMillis, null, false);
 		} catch (ReplicaFailedException ex) {
 			throw ex;
 		} catch (RuntimeException ex) {
 			throw new ReplicaFailedException("Failed to apply entry " + position, ex);
 		}
+	}
+
+	/**
+	 * {@link #applyBatch} after the first-entry setup: into the open segment of a partitioned apply if the entry
+	 * can run in lanes (and {@code serial} is false), else serially as before. {@code pending}, if not null, is the
+	 * list an earlier attempt returned for this entry (see {@link #finishSegment}): it receives the results.
+	 */
+	private List<ApplyResult> applyRouted(List<Request> requests, TermIndex position, long leaderTimeMillis,
+			@Nullable PendingResults pending, boolean serial) {
+		int[] requestLanes = null;
+		if (!serial && grouping && lanes != null && !(requests.size() == 1 && !isBatchable(requests.getFirst().entry()))) {
+			requestLanes = lanesOf(requests);
+		}
+		if (requestLanes == null) {
+			// Everything before this entry is committed or in the group's transaction first: it may read any of it.
+			finishSegment();
+		}
+		long clockBefore = clock;
+		boolean clockMovedBefore = clockMoved;
+		if (leaderTimeMillis > clock) {
+			clock = leaderTimeMillis;
+			clockMoved = true;
+		}
+		List<ApplyResult> results;
+		if (requestLanes != null) {
+			results = applySegmented(requests, position, leaderTimeMillis, clockBefore, clockMovedBefore, requestLanes,
+					pending);
+		} else if (requests.size() == 1 && !isBatchable(requests.getFirst().entry())) {
+			commitGroup();
+			results = List.of(applyAlone(requests.getFirst(), position));
+		} else {
+			results = grouping ? applyGrouped(requests, position) : applyData(requests, position, true);
+		}
+		if (groupTx == null && segment == null) {
+			sweepSessions();
+		}
+		if (pending != null && results != pending) {
+			pending.set(results);
+			return pending;
+		}
+		return results;
 	}
 
 	/**
@@ -576,6 +616,11 @@ final class Applier {
 	void abortGroup() {
 		grouping = false;
 		groupPurges.clear();
+		var open = segment;
+		segment = null;
+		if (open != null) {
+			discardSegment(open);
+		}
 		var tx = groupTx;
 		groupTx = null;
 		if (tx != null) {
@@ -599,6 +644,20 @@ final class Applier {
 
 	/** Commits the writes of the group so far, if any, then deletes the records their floors passed. */
 	private void commitGroup() {
+		finishSegment();
+		commitGroupTx();
+		for (var records : groupPurges) {
+			purge(records);
+		}
+		groupPurges.clear();
+		sweepSessions();
+	}
+
+	/**
+	 * Commits {@link #groupTx}, if open, without the deletions that follow a group's commit: for the partitioned
+	 * apply, which commits a prefix of the group when it changes between lanes and the serial path.
+	 */
+	private void commitGroupTx() {
 		var tx = groupTx;
 		if (tx != null) {
 			groupTx = null;
@@ -618,11 +677,6 @@ final class Applier {
 				throw new ReplicaFailedException("Local apply transaction conflicted at " + groupPosition);
 			}
 		}
-		for (var records : groupPurges) {
-			purge(records);
-		}
-		groupPurges.clear();
-		sweepSessions();
 	}
 
 	/**
@@ -737,10 +791,14 @@ final class Applier {
 	 * {@code requests}, the new floors, and the sessions' activity.
 	 */
 	private void committed(List<Request> requests, List<Request> applied) {
+		var undo = undoLog;
 		for (var request : applied) {
 			var owner = owner(request);
 			if (owner != null) {
-				owner.recorded.add(sequence(request));
+				long sequence = sequence(request);
+				if (owner.recorded.add(sequence) && undo != null) {
+					undo.add(() -> owner.recorded.remove(sequence));
+				}
 			}
 		}
 		raiseFloor(records(requests.getFirst().proposerId()), requests.getFirst().completedBelow());
@@ -749,6 +807,10 @@ final class Applier {
 			if (client != null) {
 				var session = owner(request);
 				if (session != null) {
+					if (undo != null) {
+						long lastActive = session.lastActiveMillis;
+						undo.add(() -> session.lastActiveMillis = lastActive);
+					}
 					session.lastActiveMillis = clock;
 					raiseFloor(session, client.completedBelow());
 				}
@@ -756,8 +818,17 @@ final class Applier {
 		}
 	}
 
-	private static void raiseFloor(ProposerRecords records, long completedBelow) {
+	private void raiseFloor(ProposerRecords records, long completedBelow) {
 		if (completedBelow > records.floor) {
+			var undo = undoLog;
+			if (undo != null) {
+				long floor = records.floor;
+				var dropped = new it.unimi.dsi.fastutil.longs.LongArrayList(records.recorded.headSet(completedBelow));
+				undo.add(() -> {
+					records.floor = floor;
+					records.recorded.addAll(dropped);
+				});
+			}
 			records.floor = completedBelow;
 			records.recorded.headSet(completedBelow).clear();
 		}
@@ -887,6 +958,11 @@ final class Applier {
 	}
 
 	private ApplyResult requireRecorded(Request request) {
+		var open = segment;
+		if (open != null && open.pending.containsKey(Identity.of(request))) {
+			// Applied by an earlier entry of the open segment, whose result is known only once its lane ran it.
+			return PENDING_COPY;
+		}
 		// Through the open group transaction, if any: the record may have been written by an earlier entry of it.
 		var key = recordKey(request);
 		var tx = groupTx;
@@ -903,6 +979,10 @@ final class Applier {
 	/** Records a position that carries no data entry (configuration changes, leader no-ops). */
 	void markApplied(TermIndex position) {
 		try {
+			if (grouping && lanes != null) {
+				addMark(position);
+				return;
+			}
 			if (grouping) {
 				markApplied(openGroupTx(position), position);
 				return;
@@ -1173,11 +1253,24 @@ final class Applier {
 	 * deleted later, in bulk, by {@link #purge}.
 	 */
 	private void finishBatch(ApplyWriter tx, List<Request> requests, TermIndex position, boolean markPosition) {
+		finishBatch(metaSink(tx), requests, position, markPosition);
+	}
+
+	/** Where the meta-column writes of {@link #finishBatch} and {@link #markApplied(MetaSink, TermIndex)} go. */
+	private interface MetaSink {
+		void put(Keys key, Buf value);
+	}
+
+	private MetaSink metaSink(ApplyWriter tx) {
+		long metaColumn = store.metaColumnId();
+		return (key, value) -> tx.put(metaColumn, key, value, RequestType.none());
+	}
+
+	private void finishBatch(MetaSink tx, List<Request> requests, TermIndex position, boolean markPosition) {
 		var first = requests.getFirst();
 		if (first.completedBelow() > records(first.proposerId()).floor) {
-			tx.put(store.metaColumnId(), NodeStore.floorKey(first.proposerId()),
-					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(first.completedBelow()).array()),
-					RequestType.none());
+			tx.put(NodeStore.floorKey(first.proposerId()),
+					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(first.completedBelow()).array()));
 		}
 		Long2LongOpenHashMap sessionFloors = null;
 		for (var request : requests) {
@@ -1193,9 +1286,8 @@ final class Applier {
 		if (sessionFloors != null) {
 			for (var touched : sessionFloors.long2LongEntrySet()) {
 				var session = sessions.get(touched.getLongKey());
-				tx.put(store.metaColumnId(), NodeStore.sessionKey(session.id),
-						NodeStore.encodeSession(session.timeoutMillis, clock, Math.max(session.floor, touched.getLongValue())),
-						RequestType.none());
+				tx.put(NodeStore.sessionKey(session.id),
+						NodeStore.encodeSession(session.timeoutMillis, clock, Math.max(session.floor, touched.getLongValue())));
 			}
 		}
 		if (markPosition) {
@@ -1205,12 +1297,526 @@ final class Applier {
 
 	/** Writes the applied position, and the {@link #clock} if it moved. */
 	private void markApplied(ApplyWriter tx, TermIndex position) {
-		tx.put(store.metaColumnId(), NodeStore.key(NodeStore.APPLIED),
-				NodeStore.encodeTermIndex(position), RequestType.none());
+		markApplied(metaSink(tx), position);
+	}
+
+	private void markApplied(MetaSink tx, TermIndex position) {
+		tx.put(NodeStore.key(NodeStore.APPLIED), NodeStore.encodeTermIndex(position));
 		if (clockMoved) {
-			tx.put(store.metaColumnId(), NodeStore.key(NodeStore.CLOCK),
-					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(clock).array()), RequestType.none());
+			tx.put(NodeStore.key(NodeStore.CLOCK),
+					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(clock).array()));
 			clockMoved = false;
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------
+	// Partitioned apply
+	// ---------------------------------------------------------------------------------------------------------------
+
+	/*
+	 * With lanes (NodeConfig.parallelApplyThreads), the data entries of a group run on several threads, and the result
+	 * is the one of the serial apply, byte for byte, whatever the timing:
+	 *
+	 * - Every request is given a lane from the RocksDB keys it can touch: the first key part of a column whose schema
+	 *   has fixed key parts (every RocksDB key of such a column starts with it, buckets included), or else the whole
+	 *   column. A request that touches two lanes, a VerifyColumn, and every entry applied alone are not run in lanes:
+	 *   they take the serial path, after what came before them was committed.
+	 * - The apply thread sorts the entry out as the serial path does (floors, records, sessions, clock), writes down its
+	 *   meta-column writes (floor, sessions, position) and hands its requests to their lanes, then goes on with the
+	 *   next entry: none of that depends on the results, which only the records hold.
+	 * - Each lane runs its requests in log order in a writer of its own (an ApplyWriter: same code as the serial
+	 *   path), so a request reads every earlier write to its keys: they are all in its lane.
+	 * - At the end of a segment (the group's end, or anything that needs the serial path) the apply thread waits for
+	 *   the lanes, writes the records and the meta writes in log order, and commits the lanes' writers and its own in
+	 *   one atomic write (ApplyWriter.commitWith): a crash keeps all of it or none, as for a serial group.
+	 * - A rejected request rolls back its whole entry in the serial path, and applies it again one request at a time.
+	 *   Here its lane marks the entry as the segment's cut and the lanes skip what follows; at the end the lanes roll
+	 *   back to their save point before the cut, the entries before it commit, the in-memory changes of the entries
+	 *   from the cut on are undone (undoLog), and these entries are applied again: the cut one on the serial path,
+	 *   which rejects it exactly as the serial apply does, the next ones in a new segment.
+	 */
+
+	/** Lanes of the partitioned apply, or null for the serial apply. */
+	private final @Nullable ApplyLanes lanes;
+	/** The open segment of the partitioned apply, or null. */
+	private @Nullable Segment segment;
+	/** Entries sorted out into a segment, and segments cut by a rejection: statistics, for tests. */
+	long segmentedEntries;
+	long segmentCuts;
+	/** While the apply thread sorts out an entry of a segment: what undoes its in-memory changes. */
+	private @Nullable List<Runnable> undoLog;
+
+	/** A recorded result that is not known yet: that of an earlier entry of the open segment, see {@link #segment}. */
+	private static final ApplyResult PENDING_COPY = new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR,
+			"Pending result of the partitioned apply");
+
+	/**
+	 * The results of an entry of a segment, known once the segment ends (at the latest when the group ends). Reading
+	 * them earlier throws.
+	 */
+	static final class PendingResults extends java.util.AbstractList<ApplyResult> {
+		private @Nullable List<ApplyResult> value;
+
+		void set(List<ApplyResult> results) {
+			value = results;
+		}
+
+		private List<ApplyResult> require() {
+			var results = value;
+			if (results == null) {
+				throw new IllegalStateException("The results of this entry are known once its group is committed");
+			}
+			return results;
+		}
+
+		@Override
+		public ApplyResult get(int index) {
+			return require().get(index);
+		}
+
+		@Override
+		public int size() {
+			return require().size();
+		}
+	}
+
+	/** A request of a segment, run by its lane. */
+	private static final class Task {
+		final Request request;
+		final ProposerRecords owner;
+		/** Set by the lane. */
+		@Nullable ApplyResult outcome;
+		/** The result recorded for it, once the segment ended. */
+		@Nullable ApplyResult recorded;
+
+		Task(Request request, ProposerRecords owner) {
+			this.request = request;
+			this.owner = owner;
+		}
+	}
+
+	/** An entry of a segment: a data entry, or a position without data ({@code requests} null). */
+	private static final class SegmentEntry {
+		final int ordinal;
+		final @Nullable List<Request> requests;
+		final TermIndex position;
+		final long leaderTimeMillis;
+		final long clockBefore;
+		final boolean clockMovedBefore;
+		final int purgesBefore;
+		final int undoBefore;
+		final List<Keys> metaKeys = new ArrayList<>(4);
+		final List<Buf> metaValues = new ArrayList<>(4);
+		@Nullable Classified batch;
+		Task @Nullable [] tasks;
+		@Nullable PendingResults results;
+
+		SegmentEntry(int ordinal, @Nullable List<Request> requests, TermIndex position, long leaderTimeMillis,
+				long clockBefore, boolean clockMovedBefore, int purgesBefore, int undoBefore) {
+			this.ordinal = ordinal;
+			this.requests = requests;
+			this.position = position;
+			this.leaderTimeMillis = leaderTimeMillis;
+			this.clockBefore = clockBefore;
+			this.clockMovedBefore = clockMovedBefore;
+			this.purgesBefore = purgesBefore;
+			this.undoBefore = undoBefore;
+		}
+
+		MetaSink meta() {
+			return (key, value) -> {
+				metaKeys.add(key);
+				metaValues.add(value);
+			};
+		}
+	}
+
+	/** Entries handed to the lanes and not committed yet, see "Partitioned apply". */
+	private static final class Segment {
+		final List<SegmentEntry> entries = new ArrayList<>();
+		final ApplyWriter[] writers;
+		/** Per lane: the ordinals of the entries before which it set a save point, in order. */
+		final IntArrayList[] savePoints;
+		/** The first entry with a rejected request: it and the entries after it are applied again. */
+		final java.util.concurrent.atomic.AtomicInteger cut =
+				new java.util.concurrent.atomic.AtomicInteger(Integer.MAX_VALUE);
+		/** A failure of a lane that is not a result (a local failure, an Error): the replica stops. */
+		final java.util.concurrent.atomic.AtomicReference<Throwable> failure =
+				new java.util.concurrent.atomic.AtomicReference<>();
+		/** The requests run in this segment, by identity, for later copies of them, see {@link #requireRecorded}. */
+		final java.util.HashMap<Identity, Task> pending = new java.util.HashMap<>();
+		final List<Runnable> undo = new ArrayList<>();
+
+		Segment(int lanes) {
+			writers = new ApplyWriter[lanes];
+			savePoints = new IntArrayList[lanes];
+			for (int i = 0; i < lanes; i++) {
+				savePoints[i] = new IntArrayList();
+			}
+		}
+	}
+
+	/** The lane of each request of an entry, or null if one of them cannot run in a lane. */
+	private int @Nullable [] lanesOf(List<Request> requests) {
+		var laneCount = lanes.count();
+		var result = new int[requests.size()];
+		for (int i = 0; i < requests.size(); i++) {
+			int lane = laneOf(requests.get(i).entry(), laneCount);
+			if (lane < 0) {
+				return null;
+			}
+			result[i] = lane;
+		}
+		return result;
+	}
+
+	/** The lane of {@code entry}, or -1 if it can touch more than one lane, or cannot run in a lane. */
+	private int laneOf(LogEntry entry, int laneCount) {
+		return switch (entry) {
+			case LogEntry.Put put -> keyLane(put.columnId(), put.keys(), laneCount);
+			case LogEntry.Delete delete -> keyLane(delete.columnId(), delete.keys(), laneCount);
+			case LogEntry.Merge merge -> keyLane(merge.columnId(), merge.keys(), laneCount);
+			case LogEntry.PutMulti put -> keysLane(put.columnId(), put.keys(), laneCount);
+			case LogEntry.DeleteMulti delete -> keysLane(delete.columnId(), delete.keys(), laneCount);
+			case LogEntry.MergeMulti merge -> keysLane(merge.columnId(), merge.keys(), laneCount);
+			case LogEntry.Guarded guarded -> {
+				int lane = guarded.guard() == null ? -2
+						: keyLane(guarded.guard().columnId(), guarded.guard().keys(), laneCount);
+				for (var write : guarded.writes()) {
+					int writeLane = laneOf(write, laneCount);
+					if (writeLane < 0 || (lane != -2 && lane != writeLane)) {
+						yield -1;
+					}
+					lane = writeLane;
+				}
+				yield lane == -2 ? 0 : lane;
+			}
+			// Deletions of ranges, schema changes, column checks: the serial path.
+			default -> -1;
+		};
+	}
+
+	private int keysLane(long columnId, List<Keys> keys, int laneCount) {
+		int lane = 0;
+		for (int i = 0; i < keys.size(); i++) {
+			int keyLane = keyLane(columnId, keys.get(i), laneCount);
+			if (i > 0 && keyLane != lane) {
+				return -1;
+			}
+			lane = keyLane;
+		}
+		return lane;
+	}
+
+	/**
+	 * The lane of one key of a column: by its first key part if the column's schema has fixed key parts, else by the
+	 * column. Two requests that can touch the same RocksDB key get the same lane: every RocksDB key of a column with
+	 * fixed key parts (a bucket too) starts with the first one. Which lane does not matter for the result, only that.
+	 */
+	private int keyLane(long columnId, Keys keys, int laneCount) {
+		var schema = store.db().columnSchemaOrNull(columnId);
+		int hash;
+		var parts = keys.keys();
+		if (schema == null || schema.fixedLengthKeysCount() == 0 || parts.length == 0) {
+			hash = Long.hashCode(columnId * 0x9E3779B97F4A7C15L);
+		} else {
+			var first = parts[0];
+			byte[] array = first.getBackingByteArray();
+			int from = first.getBackingByteArrayOffset();
+			int to = from + first.getBackingByteArrayLength();
+			hash = 1;
+			for (int i = from; i < to; i++) {
+				hash = 31 * hash + array[i];
+			}
+			hash ^= hash >>> 16;
+			hash *= 0x85EBCA6B;
+			hash ^= hash >>> 13;
+		}
+		return Math.floorMod(hash, laneCount);
+	}
+
+	/** The open segment, opened if there is none: what the group's transaction holds is committed first. */
+	private Segment openSegment() {
+		var open = segment;
+		if (open == null) {
+			// The lanes read the database: the writes of serial entries before them must be there.
+			commitGroupTx();
+			open = new Segment(lanes.count());
+			segment = open;
+		}
+		return open;
+	}
+
+	/** {@link #applyGrouped} for an entry whose requests run in lanes, see "Partitioned apply". */
+	private List<ApplyResult> applySegmented(List<Request> requests, TermIndex position, long leaderTimeMillis,
+			long clockBefore, boolean clockMovedBefore, int[] requestLanes, @Nullable PendingResults pending) {
+		var open = openSegment();
+		var entry = new SegmentEntry(open.entries.size(), requests, position, leaderTimeMillis, clockBefore,
+				clockMovedBefore, groupPurges.size(), open.undo.size());
+		open.entries.add(entry);
+		segmentedEntries++;
+		undoLog = open.undo;
+		try {
+			var batch = classify(requests);
+			entry.batch = batch;
+			var toRun = batch.toRun();
+			var tasks = new Task[toRun.size()];
+			for (int j = 0; j < toRun.size(); j++) {
+				var request = toRun.get(j);
+				tasks[j] = new Task(request, owner(request));
+				open.pending.put(Identity.of(request), tasks[j]);
+			}
+			entry.tasks = tasks;
+			finishBatch(entry.meta(), requests, position, true);
+			committed(requests, toRun);
+			groupPurges.addAll(owners(requests));
+			// One piece of work per lane, with the entry's requests of that lane in their order.
+			var byLane = new java.util.ArrayList[lanes.count()];
+			for (int j = 0; j < toRun.size(); j++) {
+				int lane = requestLanes[batch.runIndexes().getInt(j)];
+				if (byLane[lane] == null) {
+					byLane[lane] = new ArrayList<Task>();
+				}
+				byLane[lane].add(tasks[j]);
+			}
+			for (int lane = 0; lane < byLane.length; lane++) {
+				if (byLane[lane] == null) {
+					continue;
+				}
+				if (open.writers[lane] == null) {
+					open.writers[lane] = beginApply();
+				}
+				@SuppressWarnings("unchecked")
+				List<Task> laneTasks = byLane[lane];
+				int laneIndex = lane;
+				lanes.submit(lane, () -> runLane(open, laneIndex, entry.ordinal, laneTasks));
+			}
+		} finally {
+			undoLog = null;
+		}
+		var results = pending != null ? pending : new PendingResults();
+		entry.results = results;
+		return results;
+	}
+
+	/** A position without data, recorded in the open segment. */
+	private void addMark(TermIndex position) {
+		var open = openSegment();
+		var entry = new SegmentEntry(open.entries.size(), null, position, -1, clock, clockMoved, groupPurges.size(),
+				open.undo.size());
+		open.entries.add(entry);
+		markApplied(entry.meta(), position);
+	}
+
+	/** Runs, on lane {@code lane}, the requests of entry {@code ordinal} of {@code open} that belong to it. */
+	private void runLane(Segment open, int lane, int ordinal, List<Task> tasks) {
+		if (open.failure.get() != null || ordinal >= open.cut.get()) {
+			return;
+		}
+		try {
+			var writer = open.writers[lane];
+			writer.setSavePoint();
+			open.savePoints[lane].add(ordinal);
+			for (var task : tasks) {
+				var outcome = applyLogical(() -> execute(writer, task.request.entry()));
+				task.outcome = outcome;
+				if (outcome instanceof ApplyResult.Failed) {
+					open.cut.accumulateAndGet(ordinal, Math::min);
+					return;
+				}
+			}
+		} catch (Throwable error) {
+			open.failure.compareAndSet(null, error);
+		}
+	}
+
+	/**
+	 * Ends the open segment, if any: commits it up to its cut, and applies the entries from the cut on again (which
+	 * may open and end further segments). Afterwards no segment is open.
+	 */
+	private void finishSegment() {
+		while (segment != null) {
+			var open = segment;
+			segment = null;
+			var again = completeSegment(open);
+			for (int i = 0; i < again.size(); i++) {
+				var entry = again.get(i);
+				if (entry.requests == null) {
+					markApplied(entry.position);
+				} else {
+					// The cut entry on the serial path, which rejects it as the serial apply does.
+					applyRouted(entry.requests, entry.position, entry.leaderTimeMillis, entry.results, i == 0);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Waits for the lanes of {@code open}, records the results of its entries before the cut, commits them in one
+	 * write, and returns the entries from the cut on, whose in-memory changes are undone.
+	 */
+	private List<SegmentEntry> completeSegment(Segment open) {
+		boolean done = false;
+		try {
+			awaitLanes(open);
+			var failure = open.failure.get();
+			if (failure != null) {
+				switch (failure) {
+					case Error error -> throw error;
+					case ReplicaFailedException replicaFailed -> throw replicaFailed;
+					default -> throw new ReplicaFailedException("Failed to apply in a lane", failure);
+				}
+			}
+			int cut = Math.min(open.cut.get(), open.entries.size());
+			for (int lane = 0; lane < open.writers.length; lane++) {
+				var savePoints = open.savePoints[lane];
+				while (!savePoints.isEmpty() && savePoints.getInt(savePoints.size() - 1) >= cut) {
+					open.writers[lane].rollbackToSavePoint();
+					savePoints.removeInt(savePoints.size() - 1);
+				}
+			}
+			long executeStart = System.nanoTime();
+			ApplyWriter tx = cut > 0 ? openGroupTx(open.entries.get(cut - 1).position) : null;
+			for (int i = 0; i < cut; i++) {
+				recordEntry(tx, open, open.entries.get(i));
+			}
+			record(executeTime, executeStart);
+			var writers = new ArrayList<ApplyWriter>(open.writers.length);
+			for (var writer : open.writers) {
+				if (writer != null) {
+					writers.add(writer);
+				}
+			}
+			if (tx != null) {
+				groupTx = null;
+				long commitStart = System.nanoTime();
+				try {
+					tx.commitWith(writers);
+				} catch (RuntimeException ex) {
+					throw new ReplicaFailedException("Failed to commit the entries applied up to " + groupPosition, ex);
+				}
+				record(commitTime, commitStart);
+			} else {
+				for (var writer : writers) {
+					writer.close();
+				}
+			}
+			java.util.Arrays.fill(open.writers, null);
+			done = true;
+			if (cut == open.entries.size()) {
+				return List.of();
+			}
+			segmentCuts++;
+			if (parallelCuts != null) {
+				parallelCuts.record(1);
+			}
+			var first = open.entries.get(cut);
+			for (int i = open.undo.size() - 1; i >= first.undoBefore; i--) {
+				open.undo.get(i).run();
+			}
+			clock = first.clockBefore;
+			clockMoved = first.clockMovedBefore;
+			while (groupPurges.size() > first.purgesBefore) {
+				groupPurges.removeLast();
+			}
+			return List.copyOf(open.entries.subList(cut, open.entries.size()));
+		} finally {
+			if (!done) {
+				discardSegment(open);
+			}
+		}
+	}
+
+	/** Writes the records and meta writes of an entry of a segment into {@code tx}, and completes its results. */
+	private void recordEntry(ApplyWriter tx, Segment open, SegmentEntry entry) {
+		var batch = entry.batch;
+		if (batch != null) {
+			var tasks = entry.tasks;
+			var outcomes = new ApplyResult[tasks.length];
+			for (int j = 0; j < tasks.length; j++) {
+				var task = tasks[j];
+				if (task.outcome == null) {
+					throw new ReplicaFailedException("A lane did not run a request of entry " + entry.position);
+				}
+				task.recorded = record(tx, task.owner, task.request, task.outcome);
+				outcomes[j] = task.recorded;
+			}
+			var results = batch.complete(outcomes);
+			if (results.contains(PENDING_COPY)) {
+				var resolved = new ArrayList<>(results);
+				for (int i = 0; i < resolved.size(); i++) {
+					if (resolved.get(i) == PENDING_COPY) {
+						var original = segmentTask(open, Identity.of(entry.requests.get(i)));
+						// As read back from its record by the serial path.
+						resolved.set(i, ResultCodec.decode(ResultCodec.encode(original.recorded)));
+					}
+				}
+				results = List.copyOf(resolved);
+			}
+			entry.results.set(results);
+		}
+		long metaColumn = store.metaColumnId();
+		for (int i = 0; i < entry.metaKeys.size(); i++) {
+			tx.put(metaColumn, entry.metaKeys.get(i), entry.metaValues.get(i), RequestType.none());
+		}
+	}
+
+	/** The task of {@code open} that ran the request {@code identity}, recorded already. */
+	private static Task segmentTask(Segment open, Identity identity) {
+		var task = open.pending.get(identity);
+		if (task == null || task.recorded == null) {
+			throw new ReplicaFailedException("Request " + identity + " is marked applied, but its record is missing");
+		}
+		return task;
+	}
+
+	/** Waits until the lanes ran everything given to them for {@code open}. */
+	private void awaitLanes(Segment open) {
+		int used = 0;
+		for (var writer : open.writers) {
+			if (writer != null) {
+				used++;
+			}
+		}
+		var done = new java.util.concurrent.CountDownLatch(used);
+		for (int lane = 0; lane < open.writers.length; lane++) {
+			if (open.writers[lane] != null) {
+				lanes.submit(lane, done::countDown);
+			}
+		}
+		boolean interrupted = false;
+		while (true) {
+			try {
+				done.await();
+				break;
+			} catch (InterruptedException ex) {
+				// The lanes use the writers until they are done: never close them earlier.
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	/** Drops a segment without committing it: the replica stops after this. */
+	private void discardSegment(Segment open) {
+		open.cut.set(-1);
+		try {
+			awaitLanes(open);
+		} catch (RuntimeException ex) {
+			// Lanes already closed: nothing runs any more.
+		}
+		for (int lane = 0; lane < open.writers.length; lane++) {
+			var writer = open.writers[lane];
+			open.writers[lane] = null;
+			if (writer != null) {
+				try {
+					writer.close();
+				} catch (RuntimeException ex) {
+					// The replica stops anyway.
+				}
+			}
 		}
 	}
 

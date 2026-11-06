@@ -161,6 +161,17 @@ with 11–18 s write latency. In order of discovery:
     counters or timers per write. `deleteRange` no longer flushes every memtable and syncs the WAL (hundreds of
     milliseconds on the apply thread, and small L0 files in every column). Keys and values are decoded as slices
     of the log entry instead of one array each, and merges pass their slice to RocksDB without a copy.
+16. **One apply thread per replica.** Not measured yet (benchmarks are off for now). `--parallel-apply-threads N`
+    (off by default) runs the data writes of each group on N lanes split by first key part, with one commit per
+    group as before: see "Partitioned apply" in the design document. It parallelizes what costs on the apply
+    thread (key encoding, reads for guards, previous values and merge checks, the merge operator, the index of
+    the native batch); the commit (memtable inserts) and the records stay on one thread. Yotsuba's writes are
+    single-key updates and single-key or one-owner multi-key puts, so nearly all of them run in lanes; the
+    multi-column transactions (monitors, invites, about 0.03k/s) take the serial path. What can make it slower
+    than the serial apply: rejected requests (`update.guardRejected`), each of which cuts its group
+    (`apply.parallelCuts`), and the commits added between lanes and the serial path. Compare `apply`,
+    `apply.execute` and `apply.commit` per entry with and without it, at 3.5× with 2048 in flight, where the
+    apply was 70–81% busy.
 
 ## Results
 
@@ -254,6 +265,8 @@ Other results:
   after 3 maximum election timeouts without a leader, at least 6 s (about 8 s in all by default), so its clients move,
   and listens again once it knows a leader. A hung disk is not detected. See the
   [README](../../README.md#client-connections).
+- **Partitioned apply.** Off. Turn it on (`--parallel-apply-threads 4`) only after a back-to-back run shows it
+  helps, see item 16; nodes may differ in this setting.
 - **Snapshots.** One every 500k entries (`--snapshot-every`), about every 100 s at 2×, or every 4 GiB of
   applied log entries (`--snapshot-every-bytes`), whichever comes first. A snapshot flushes the
   memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.

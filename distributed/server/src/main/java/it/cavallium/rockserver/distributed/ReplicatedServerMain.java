@@ -32,7 +32,7 @@ import org.jetbrains.annotations.Nullable;
  *       [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
  *       [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
  *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
- *       [--jvm-pause-limit-ms N] [--snapshot-every-bytes N]
+ *       [--jvm-pause-limit-ms N] [--snapshot-every-bytes N] [--parallel-apply-threads N]
  * admin --peer ... [--group-id UUID] [--timeout-ms N]
  *       status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
@@ -66,6 +66,9 @@ import org.jetbrains.annotations.Nullable;
  *
  * <p>{@code --snapshot-every-bytes}, 4 GiB by default, makes a node also take a snapshot once it applied that many bytes
  * of log entries since its latest one, besides every {@code --snapshot-every} entries.</p>
+ *
+ * <p>{@code --parallel-apply-threads}, 0 (off) by default, applies the data entries of each group on that many threads
+ * (at least 2), split by key, with the result of the serial apply: see "Partitioned apply" in the design document.</p>
  */
 public final class ReplicatedServerMain {
 
@@ -115,7 +118,8 @@ public final class ReplicatedServerMain {
 				Duration.ofMillis(Long.parseLong(options.value("--jvm-pause-limit-ms",
 						String.valueOf(NodeConfig.DEFAULT_JVM_PAUSE_LIMIT.toMillis())))),
 				Long.parseLong(options.value("--snapshot-every-bytes",
-						String.valueOf(NodeConfig.DEFAULT_SNAPSHOT_EVERY_BYTES))));
+						String.valueOf(NodeConfig.DEFAULT_SNAPSHOT_EVERY_BYTES))),
+				Integer.parseInt(options.value("--parallel-apply-threads", "0")));
 		options.requireConsumed();
 		warnWithoutExitOnOutOfMemory();
 		ReplicatedNode node;

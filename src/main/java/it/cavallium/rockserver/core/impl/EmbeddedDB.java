@@ -2511,10 +2511,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		ops.beginOp();
 		try {
 			return new ApplyWriter(openTransactionInternal(APPLY_WRITER_EXPIRATION_MS, false, WorkloadProfile.BATCH,
-					false, disableWal, true));
+					false, disableWal, true), disableWal);
 		} finally {
 			ops.endOp();
 		}
+	}
+
+	/**
+	 * The schema of column {@code columnId}, or null if there is none. For the replication apply, which splits the
+	 * writes of a group by key among several {@link ApplyWriter}s and needs to know which key parts name a RocksDB key.
+	 */
+	public @Nullable ColumnSchema columnSchemaOrNull(long columnId) {
+		var col = columns.get(columnId);
+		return col == null ? null : col.schema();
 	}
 
 	/**
@@ -2528,9 +2537,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public final class ApplyWriter implements AutoCloseable {
 
 		private final Tx tx;
+		private final boolean disableWal;
 
-		private ApplyWriter(Tx tx) {
+		private ApplyWriter(Tx tx, boolean disableWal) {
 			this.tx = tx;
+			this.disableWal = disableWal;
 		}
 
 		public <T> T put(long columnId, @NotNull Keys keys, @NotNull Buf value, RequestPut<? super Buf, T> requestType) {
@@ -2684,7 +2695,84 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		public void close() {
 			closeTransactionInternal(tx, false);
 		}
+
+		/**
+		 * Commits the writes of {@code others} and of this writer in <b>one</b> atomic database write, in that order,
+		 * then closes them all: a crash keeps all of them or none. For the partitioned apply of replication, whose
+		 * writers were filled by different threads and hold writes to different keys. Every writer must have been
+		 * opened with the same {@code disableWal} as this one, and none may be in use meanwhile. Their native batches
+		 * are joined as RocksDB's own {@code WriteBatchInternal::Append} does: one header (sequence, count) followed by
+		 * the records of each batch. If any of them fails, all are closed and the exception is thrown.
+		 */
+		public void commitWith(List<ApplyWriter> others) {
+			try {
+				int count = 0;
+				long size = WRITE_BATCH_HEADER;
+				var parts = new ArrayList<byte[]>(others.size() + 1);
+				for (int i = 0; i <= others.size(); i++) {
+					var writer = i < others.size() ? others.get(i) : this;
+					if (writer.disableWal != disableWal) {
+						throw new IllegalArgumentException("Apply writers with different WAL settings");
+					}
+					var batch = writer.tx.val().getWriteBatch().getWriteBatch();
+					int partCount = batch.count();
+					if (partCount == 0) {
+						continue;
+					}
+					byte[] data = batch.data();
+					parts.add(data);
+					count += partCount;
+					size += data.length - WRITE_BATCH_HEADER;
+				}
+				if (parts.isEmpty()) {
+					return;
+				}
+				if (size > Integer.MAX_VALUE - 16) {
+					throw RocksDBException.of(RocksDBErrorType.WRITE_BATCH_1, "Apply writes too large for one batch: "
+							+ size + " bytes");
+				}
+				byte[] joined = new byte[(int) size];
+				// Sequence 0 (the database assigns it), then the count, little endian.
+				joined[8] = (byte) count;
+				joined[9] = (byte) (count >>> 8);
+				joined[10] = (byte) (count >>> 16);
+				joined[11] = (byte) (count >>> 24);
+				int offset = WRITE_BATCH_HEADER;
+				for (byte[] part : parts) {
+					int length = part.length - WRITE_BATCH_HEADER;
+					System.arraycopy(part, WRITE_BATCH_HEADER, joined, offset, length);
+					offset += length;
+				}
+				try (var writeOptions = new LeakSafeWriteOptions("apply-writers-commit");
+						var batch = new WriteBatch(joined)) {
+					if (disableWal) {
+						writeOptions.setDisableWAL(true);
+					}
+					db.get().write(writeOptions, batch);
+				}
+			} catch (org.rocksdb.RocksDBException e) {
+				throw RocksDBException.of(RocksDBErrorType.COMMIT_FAILED, "Apply writers commit failed", e);
+			} finally {
+				// Their writes are in the database now (or the commit failed): closing rolls back nothing that counts.
+				RuntimeException closeFailure = null;
+				for (int i = 0; i <= others.size(); i++) {
+					try {
+						(i < others.size() ? others.get(i) : this).close();
+					} catch (RuntimeException ex) {
+						if (closeFailure == null) {
+							closeFailure = ex;
+						}
+					}
+				}
+				if (closeFailure != null) {
+					throw closeFailure;
+				}
+			}
+		}
 	}
+
+	/** Bytes of the header of a serialized {@link WriteBatch}: an 8-byte sequence and a 4-byte count. */
+	private static final int WRITE_BATCH_HEADER = 12;
 
 	private long allocateTransactionInternal(Tx tx) {
 		try {
