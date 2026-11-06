@@ -230,6 +230,51 @@ class SessionWritesTest {
 	}
 
 	/**
+	 * R6-3: the server collects a numbered streamed multi write whole and refuses one over 16 MiB counted (or its item
+	 * limit) as invalid. A streamed putMulti, deleteMulti or mergeMulti over 4 MiB counted is therefore sent unnumbered,
+	 * as the Rust client does; a putMulti without results that goes as one unary putMultiList stays numbered.
+	 */
+	@Test
+	void largeStreamedMultiWritesAreNotNumbered() throws Exception {
+		var writes = new Writes(_ -> new CompletableFuture<>(), (_, _) -> new CompletableFuture<>(), Runnable::run);
+		var smallKeys = List.of(KEY, KEY);
+		var smallValues = List.of(Buf.wrap(new byte[10]), Buf.wrap(new byte[10]));
+		assertTrue(writes.numbers(new RocksDBAPICommandSingle.PutMulti<>(0, 1, smallKeys, smallValues,
+				RequestType.previous())));
+		assertTrue(writes.numbers(new RocksDBAPICommandSingle.MergeMulti<>(0, 1, smallKeys, smallValues,
+				RequestType.none())));
+		assertTrue(writes.numbers(new RocksDBAPICommandSingle.DeleteMulti<>(0, 1, smallKeys, RequestType.none())));
+
+		// 9 values of 1 MiB: over 4 MiB counted, and over the unary putMultiList budget (8 MiB).
+		var bigKeys = new ArrayList<Keys>();
+		var bigValues = new ArrayList<Buf>();
+		for (int i = 0; i < 9; i++) {
+			bigKeys.add(KEY);
+			bigValues.add(Buf.wrap(new byte[1024 * 1024]));
+		}
+		assertFalse(writes.numbers(new RocksDBAPICommandSingle.PutMulti<>(0, 1, bigKeys, bigValues,
+				RequestType.previous())));
+		assertFalse(writes.numbers(new RocksDBAPICommandSingle.PutMulti<>(0, 1, bigKeys, bigValues,
+				RequestType.none())));
+		assertFalse(writes.numbers(new RocksDBAPICommandSingle.MergeMulti<>(0, 1, bigKeys, bigValues,
+				RequestType.none())));
+
+		// Many small items count their per-item costs: 40 000 one-byte keys count over 4 MiB.
+		var manyKeys = new ArrayList<Keys>();
+		var manyValues = new ArrayList<Buf>();
+		for (int i = 0; i < 40_000; i++) {
+			manyKeys.add(KEY);
+			manyValues.add(Buf.wrap(new byte[1]));
+		}
+		assertFalse(writes.numbers(new RocksDBAPICommandSingle.DeleteMulti<>(0, 1, manyKeys, RequestType.none())));
+		assertFalse(writes.numbers(new RocksDBAPICommandSingle.PutMulti<>(0, 1, manyKeys, manyValues,
+				RequestType.changed())));
+		// Within putMultiList's 65 536 items and 8 MiB: one unary call, which the server does not collect.
+		assertTrue(writes.numbers(new RocksDBAPICommandSingle.PutMulti<>(0, 1, manyKeys, manyValues,
+				RequestType.none())));
+	}
+
+	/**
 	 * The write that ends an update is numbered while the update is open, and forgotten once that write ended (or the
 	 * update was closed as failed): the id may be reused later by a transaction, whose staged writes are not numbered.
 	 */

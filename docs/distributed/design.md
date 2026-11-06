@@ -504,6 +504,16 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   collected at once: a few million-item `deleteMulti` calls could hold gigabytes before admission refused them. The collected path also maps
   each result before streaming it, so a missing previous value (null) no longer fails the call
   (`NumberedWritesTest.numberedStreamedMultiWritesOfABatchCallerApplyEveryItem`, which fails without the change).
+  The Java client numbers a streamed `putMulti`, `deleteMulti` or `mergeMulti` only up to
+  `SessionWrites.NUMBERED_MULTI_MAX_BYTES` (4 MiB counted as the server counts it, a quarter of its limit, as the Rust
+  client does); a larger one is sent unnumbered, streamed and applied item by item as before numbering, once (a lost
+  call leaves its outcome unknown). It used to number every one, so a BATCH or INGEST call over 16 MiB counted (or
+  about 150 000 items) that was applied before numbering was refused as invalid with nothing applied (R6-3). A
+  `putMulti` without results that goes as one unary `putMultiList` (at most 65 536 items and 8 MiB) is not collected
+  by the server and stays numbered. Splitting a large call into numbered chunks was not done, for the reasons given
+  for the Rust client below. `SessionWritesTest.largeStreamedMultiWritesAreNotNumbered` checks the rule;
+  `NumberedWritesTest.aStreamedMultiWriteOverTheNumberingLimitIsSentUnnumberedAndApplied` (a BATCH `putMulti` with
+  previous values of 20 values of 1 MiB) fails with `PUT_INVALID_REQUEST` without the change.
 - **Leader time.** The leader prepends its clock (`LogEntryCodec.stamp`: a marker byte and 8 bytes, without copying
   the batch) to every entry that holds a session write or registration. A proposal that already starts with the
   stamp marker is refused as malformed: only the leader stamps. Apply keeps the highest stamp seen as the
@@ -661,7 +671,7 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   numbering existed, so a large `put_multi` of an INGEST caller still has no size limit and is not held in the
   client's memory, but is sent once (a lost call leaves its outcome unknown, as before). Splitting it into numbered
   chunks, as batches are, was not done: a multi write is one call with one result list and no "partly applied"
-  answer, and the Java client does not split these either; a caller that wants every item numbered uses
+  answer, and the Java client does not split these either (it has the same 4 MiB fallback); a caller that wants every item numbered uses
   `put_batch`/`merge_batch` or smaller calls; a view whose context already carries a request id (`RequestContext::with_request_id`) is
   numbered by its caller and sends once; `without_client_sessions()` sends everything once, as before. The unit tests
   (`sessions::tests`) drive the resend loop with scripted answers, as `SessionWritesTest` does; the live test

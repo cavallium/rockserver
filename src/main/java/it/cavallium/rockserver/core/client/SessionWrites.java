@@ -1,10 +1,12 @@
 package it.cavallium.rockserver.core.client;
 
 import io.grpc.Status;
+import it.cavallium.buffer.Buf;
 import io.grpc.Status.Code;
 import it.cavallium.rockserver.core.common.ClientRequestId;
 import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.KVBatchChunks;
+import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
@@ -75,6 +77,16 @@ final class SessionWrites {
 	/** How long an update id is remembered: longer than any update lease. */
 	private static final long UPDATE_MEMORY_NANOS = TimeUnit.MINUTES.toNanos(10);
 	static final int MAX_REMEMBERED_UPDATES = 1 << 16;
+	/**
+	 * Counted bytes up to which a streamed {@code putMulti}, {@code deleteMulti} or {@code mergeMulti} is numbered
+	 * ({@link #fitsNumberedMulti}), as the Rust client's {@code sessions::NUMBERED_MULTI_MAX_BYTES}: a quarter of the
+	 * server's limit for a numbered multi write ({@code GrpcServerImpl.NUMBERED_MULTI_MAX_BYTES}, 16 MiB, which it
+	 * refuses past as invalid). A larger call is sent unnumbered, streamed and applied item by item as before numbering,
+	 * once: its size has no limit, and a lost call leaves its outcome unknown.
+	 */
+	static final long NUMBERED_MULTI_MAX_BYTES = KVBatchChunks.CHUNK_BYTES;
+	/** Heap cost the server counts per item of a numbered multi write ({@code GrpcServerImpl.NUMBERED_MULTI_ITEM_HEAP_BYTES}). */
+	static final long MULTI_ITEM_HEAP_BYTES = 96;
 	/** Extra wait of a synchronous caller beyond the deadline, for the answer that ends its write ({@link #syncWaitNanos}). */
 	static final long SYNC_WAIT_MARGIN_NANOS = TimeUnit.SECONDS.toNanos(5);
 	/** {@link #syncWaitNanos} of a caller without a deadline: it waits until the write ends (still interruptible). */
@@ -306,11 +318,17 @@ final class SessionWrites {
 	boolean numbers(RocksDBAPICommand<?, ?, ?> command) {
 		return switch (command) {
 			case RocksDBAPICommandSingle.Put<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId());
-			case RocksDBAPICommandSingle.PutMulti<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId());
+			// A multi write goes unary (putMultiList, for a put without results within its budget) or streamed; the server
+			// collects a numbered stream whole, up to a limit, so a stream past NUMBERED_MULTI_MAX_BYTES is sent unnumbered.
+			case RocksDBAPICommandSingle.PutMulti<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId())
+					&& (GrpcConnectionDelegate.sendsPutMultiList(c.keys(), c.values(), c.requestType())
+							|| fitsNumberedMulti(c.keys(), c.values()));
 			case RocksDBAPICommandSingle.Delete<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId());
-			case RocksDBAPICommandSingle.DeleteMulti<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId());
+			case RocksDBAPICommandSingle.DeleteMulti<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId())
+					&& fitsNumberedMulti(c.keys(), null);
 			case RocksDBAPICommandSingle.Merge<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId());
-			case RocksDBAPICommandSingle.MergeMulti<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId());
+			case RocksDBAPICommandSingle.MergeMulti<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId())
+					&& fitsNumberedMulti(c.keys(), c.values());
 			case RocksDBAPICommandSingle.CloseTransaction c -> c.commit();
 			// Schema changes: a copy of a deletion would answer "not found" (or false) for a deletion that took effect, and
 			// creation and upload, which the server already makes idempotent by name and schema or content, get resent
@@ -324,6 +342,36 @@ final class SessionWrites {
 			case RocksDBAPICommandSingle.DeleteRange _ -> true;
 			default -> false;
 		};
+	}
+
+	/**
+	 * True if a streamed multi write of {@code keys} (and {@code values}, null for a {@code deleteMulti}) counts at most
+	 * {@link #NUMBERED_MULTI_MAX_BYTES}, as the server counts it ({@code GrpcServerImpl.numberedItemBytes}): per item
+	 * its key and value bytes, {@link KVBatchChunks#ITEM_OVERHEAD_BYTES} per key segment and value (at least one) and
+	 * {@link #MULTI_ITEM_HEAP_BYTES}. So it also holds far fewer items than the server's item limit.
+	 */
+	static boolean fitsNumberedMulti(List<Keys> keys, @Nullable List<Buf> values) {
+		if (values != null && values.size() != keys.size()) {
+			// Refused by the connection before anything is sent.
+			return true;
+		}
+		long bytes = 0;
+		for (int index = 0; index < keys.size(); index++) {
+			int segments = 0;
+			for (var key : keys.get(index).keys()) {
+				bytes += key.size();
+				segments++;
+			}
+			if (values != null) {
+				bytes += values.get(index).size();
+				segments++;
+			}
+			bytes += MULTI_ITEM_HEAP_BYTES + Math.max(1, segments) * KVBatchChunks.ITEM_OVERHEAD_BYTES;
+			if (bytes > NUMBERED_MULTI_MAX_BYTES) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	private boolean isReplicatedOrUpdateEnd(long id) {

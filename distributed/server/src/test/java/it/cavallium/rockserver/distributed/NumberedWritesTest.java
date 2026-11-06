@@ -166,6 +166,47 @@ class NumberedWritesTest {
 	}
 
 	/**
+	 * R6-3: the server refuses a numbered streamed multi write over 16 MiB counted as invalid, nothing applied. The Java
+	 * client used to number every streamed putMulti, deleteMulti and mergeMulti, so such a call of a BATCH caller,
+	 * applied item by item before numbering, failed. Past 4 MiB counted the client now sends it unnumbered, as the Rust
+	 * client does: it is applied item by item, with its results.
+	 */
+	@Test
+	void aStreamedMultiWriteOverTheNumberingLimitIsSentUnnumberedAndApplied() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var addresses = cluster.runningNodes().stream().map(NumberedWritesTest::apiAddress).toList();
+		try (var client = GrpcConnection.forHostsAndPorts("large-multi", addresses)) {
+			assertTrue(client.getCapabilities().clientSessions());
+			var api = client.getAsyncApi(RequestContext.batch(TIMEOUT));
+			long column = api.createColumnAsync("m", SCHEMA).get(30, TimeUnit.SECONDS);
+			// 20 values of 1 MiB: 20 MiB counted, over the server's 16 MiB for one numbered multi write.
+			var keys = new ArrayList<Keys>();
+			var values = new ArrayList<Buf>();
+			for (int i = 0; i < 20; i++) {
+				keys.add(key(i));
+				var value = new byte[1024 * 1024];
+				value[0] = (byte) i;
+				values.add(Buf.wrap(value));
+			}
+			List<@Nullable Buf> previous = api.putMultiAsync(0, column, keys, values, RequestType.previous())
+					.get(60, TimeUnit.SECONDS);
+			assertEquals(20, previous.size());
+			assertTrue(previous.stream().allMatch(p -> p == null), "no previous values");
+			api.deleteMultiAsync(0, column, keys.subList(0, 10), RequestType.none()).get(30, TimeUnit.SECONDS);
+			cluster.awaitConverged(TIMEOUT);
+			for (var node : cluster.runningNodes()) {
+				var db = node.stateMachine().store().db();
+				assertNull(db.get(0, column, key(0), RequestType.current()), "on " + node.config().nodeId());
+				Buf last = db.get(0, column, key(19), RequestType.current());
+				assertNotNull(last, "on " + node.config().nodeId());
+				assertEquals(1024 * 1024, last.size());
+				assertEquals(19, last.getByte(0));
+			}
+		}
+	}
+
+	/**
 	 * A numbered streamed multi write of a BATCH caller is held on the heap while the server collects it, before the
 	 * node's write admission sees it: it takes its counted bytes (keys, values and per-item costs) from the server's
 	 * collect budget. A write that does not fit is refused as SERVER_OVERLOADED flagged not applied, and applies

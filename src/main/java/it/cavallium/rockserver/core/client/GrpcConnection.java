@@ -1068,8 +1068,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				.setContext(currentWireRequestContext())
 				.build();
 
-		if ((requestType instanceof RequestNothing<?> || requestType instanceof RequestType.RequestEnsure<?>)
-				&& fitsPutMultiListBudget(allKeys, allValues)) {
+		if (sendsPutMultiList(allKeys, allValues, requestType)) {
 			var listRequest = PutMultiListRequest.newBuilder()
 					.setInitialRequest(initialRequest);
 			for (int index = 0; index < count; index++) {
@@ -1504,6 +1503,13 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 							.collectList()
 							.toFuture());
 		};
+	}
+
+	/** True if {@link #putMultiAsync} sends these items as one unary {@code putMultiList} call instead of a stream. */
+	static boolean sendsPutMultiList(List<Keys> allKeys, List<Buf> allValues, RequestPut<?, ?> requestType) {
+		return (requestType instanceof RequestNothing<?> || requestType instanceof RequestType.RequestEnsure<?>)
+				&& allKeys.size() == allValues.size()
+				&& fitsPutMultiListBudget(allKeys, allValues);
 	}
 
 	private static boolean fitsPutMultiListBudget(List<Keys> allKeys, List<Buf> allValues) {
