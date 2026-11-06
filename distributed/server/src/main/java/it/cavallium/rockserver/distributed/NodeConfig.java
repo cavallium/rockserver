@@ -188,6 +188,12 @@ public record NodeConfig(String nodeId,
 				logSegmentBytes, pipelinedUpdates, join, jvmPauseLimit, value, parallelApplyThreads);
 	}
 
+	public NodeConfig withLogSegmentBytes(long value) {
+		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
+				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,
+				value, pipelinedUpdates, join, jvmPauseLimit, snapshotEveryBytes, parallelApplyThreads);
+	}
+
 	public NodeConfig withParallelApplyThreads(int value) {
 		return new NodeConfig(nodeId, peers, dataDir, rockserverConfig, raftBindHost, apiBindHost, groupId,
 				electionTimeoutMin, electionTimeoutMax, snapshotEveryEntries, requestTimeout, maxTransactionLease,

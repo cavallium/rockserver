@@ -36,6 +36,8 @@
 
     <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>${junit.version}</version><scope>test</scope></dependency>
     <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-simple</artifactId><version>2.0.17</version><scope>test</scope></dependency>
+    <!-- Property-based tests (ConflictTrackerPropertyTest); runs on the JUnit platform next to Jupiter. -->
+    <dependency><groupId>net.jqwik</groupId><artifactId>jqwik</artifactId><version>1.10.2</version><scope>test</scope></dependency>
   </dependencies>
 
   <build>

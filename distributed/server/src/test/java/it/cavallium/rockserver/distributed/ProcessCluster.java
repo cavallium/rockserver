@@ -143,7 +143,7 @@ public final class ProcessCluster implements AutoCloseable {
 		return create(root, size, spares, serverArgs, MAIN_CLASS);
 	}
 
-	private static ProcessCluster create(Path root, int size, int spares, List<String> serverArgs, String mainClass)
+	static ProcessCluster create(Path root, int size, int spares, List<String> serverArgs, String mainClass)
 			throws IOException {
 		int total = size + spares;
 		var nodes = new LinkedHashMap<String, Node>();

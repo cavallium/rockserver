@@ -208,6 +208,7 @@ final class CheckpointStorage implements StateMachineStorage {
 			termIndex = store.checkpoint(building.resolve(DB_DIR));
 			writeProperties(building.resolve(PROPERTIES_FILE), termIndex);
 			NodeStore.syncDirectory(building);
+			CrashPoints.reach(CrashPoints.Point.SNAPSHOT_BUILT);
 		} catch (IOException | RuntimeException failure) {
 			try {
 				NodeStore.deleteRecursively(building);
