@@ -505,6 +505,10 @@ class RatisContractTest {
 		assertNotNull(leader, "a ready leader");
 		var trigger = heartbeats.get(others.indexOf(leader));
 		assertEquals(2, trigger.appenders(), "the leader appends to its followers with CommitHeartbeats.Appender");
+		for (var appender : trigger.appenderSet()) {
+			assertInstanceOf(CommitHeartbeats.WakeSignal.class, appender.getEventAwaitForSignal(),
+					"R7-1: Ratis waits on the appender's own wake signal");
+		}
 		var leaderServer = leader;
 		return new HeartbeatCluster(leader, trigger, others.stream().filter(member -> member != leaderServer).toList());
 	}

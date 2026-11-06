@@ -6,6 +6,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import org.apache.ratis.conf.Parameters;
@@ -20,6 +22,7 @@ import org.apache.ratis.server.leader.FollowerInfo;
 import org.apache.ratis.server.leader.LeaderState;
 import org.apache.ratis.server.leader.LogAppender;
 import org.apache.ratis.server.raftlog.RaftLogIOException;
+import org.apache.ratis.util.AwaitForSignal;
 import org.apache.ratis.util.LifeCycle;
 import org.jetbrains.annotations.Nullable;
 
@@ -46,14 +49,16 @@ import org.jetbrains.annotations.Nullable;
  * previous entry ({@code LogAppenderBase.newAppendEntriesRequest}), so it carries commit index 0
  * ({@code ServerImplUtils.effectiveCommitIndex}) and tells the follower nothing; the follower then waited a full
  * heartbeat interval. This appender instead waits for that append's reply, which wakes it again, and sends the
- * heartbeat then.</p>
+ * heartbeat then. Its wake signal ({@link WakeSignal}) keeps a wake given while it is not waiting, which Ratis' own
+ * signal loses.</p>
  *
  * <p>{@link #send} wakes only the appenders whose follower lags below the index and that have no append in flight: a
  * woken appender with appends in flight would send Ratis' heartbeat with commit index 0, extra load on a follower that
  * is already behind. If the stream to a follower breaks before the heartbeat's reply
  * ({@code GrpcLogAppender.resetClient} drops every request in flight, without waking the appender), the appender, which checks every
- * {@link Appender#RESEND_CHECK_MS} while that reply is due, sends the heartbeat again on the new stream. One that only
- * times out is not sent again: Ratis' request timeout ({@link RaftSettings}: the maximum election timeout) is longer
+ * {@link Appender#RESEND_CHECK_MS} while that reply is due, sends the heartbeat again on the new stream, at most
+ * {@link CommitWindow#MAX_RESENDS} times per commit index and only within half the minimum election timeout of its first
+ * send ({@link CommitWindow}). One that only times out is not sent again: Ratis' request timeout ({@link RaftSettings}: the maximum election timeout) is longer
  * than the interval of Ratis' own heartbeats, which carry the commit index too.</p>
  *
  * <p>The cost is at most one heartbeat per follower per wanted commit index (and per broken stream), and only while
@@ -158,6 +163,11 @@ final class CommitHeartbeats {
 		return appenders.size();
 	}
 
+	/** Tests only: the appenders of this node now. */
+	Set<Appender> appenderSet() {
+		return Set.copyOf(appenders);
+	}
+
 	/**
 	 * Ratis' gRPC transport with {@link Appender} as the leader's log appender. Ratis finds it by class name
 	 * ({@code raft.rpc.type}, see {@link RpcType#valueOf}), so it is public, with a public constructor without arguments.
@@ -201,17 +211,17 @@ final class CommitHeartbeats {
 
 		private final @Nullable CommitHeartbeats heartbeats;
 		/**
-		 * The highest commit index that a request built for this follower on its current stream carried, -1 after the
-		 * stream broke. Only the appender's own thread builds requests ({@code GrpcLogAppender.appendLog}), so it needs
-		 * no synchronization.
+		 * What went to this follower and when. Only the appender's own thread builds requests
+		 * ({@code GrpcLogAppender.appendLog}) and waits ({@code GrpcLogAppender.mayWait}), so it needs no synchronization.
 		 */
-		private long sentCommit = -1;
-		/** When {@link #sentCommit} last rose, in {@link System#nanoTime()} units. */
-		private long sentCommitNanos;
+		private final CommitWindow window = new CommitWindow();
+		/** Replaces Ratis' wake signal, which loses a wake given while the appender is not waiting: see {@link WakeSignal}. */
+		private final WakeSignal wake;
 
 		Appender(RaftServer.Division server, LeaderState state, FollowerInfo follower,
 				@Nullable CommitHeartbeats heartbeats) {
 			super(server, state, follower);
+			this.wake = new WakeSignal(follower.getName());
 			this.heartbeats = heartbeats;
 			if (heartbeats != null) {
 				heartbeats.appenders.add(this);
@@ -230,17 +240,17 @@ final class CommitHeartbeats {
 			if (request == null && !heartbeat && heartbeats != null) {
 				// Nothing to send: no new entry, and no heartbeat due.
 				boolean resend = false;
-				if (sentCommit >= 0 && heartbeats.resendOnNewStream && noStream()) {
+				if (window.sentCommit() >= 0 && heartbeats.resendOnNewStream && noStream()) {
 					// The stream broke (GrpcLogAppender.resetClient on an error or a completed stream drops every request in
-					// flight, and opens a new stream with the next request): what it carried may never have arrived.
-					sentCommit = -1;
-					resend = true;
+					// flight, and opens a new stream with the next request): what it carried may never have arrived. Sent
+					// again a bounded number of times, and only within the window of the first send (see CommitWindow).
+					resend = window.streamBroke(System.nanoTime(), windowNanos());
 				}
 				// Send a heartbeat anyway if the follower must learn a wanted commit index. Not while an append is in
 				// flight: Ratis would build the heartbeat without its previous entry, so that it carried commit index 0;
 				// the reply to that append wakes this appender again.
 				long target = Math.min(getRaftLog().getLastCommittedIndex(), heartbeats.wanted());
-				if (target > getFollower().getCommitIndex() && target > sentCommit && !hasPendingDataRequests()) {
+				if (target > getFollower().getCommitIndex() && target > window.sentCommit() && !hasPendingDataRequests()) {
 					request = super.newAppendEntriesRequest(callId, true);
 					if (request != null) {
 						heartbeats.heartbeats.incrementAndGet();
@@ -250,11 +260,24 @@ final class CommitHeartbeats {
 					}
 				}
 			}
-			if (request != null && request.getLeaderCommit() > sentCommit) {
-				sentCommit = request.getLeaderCommit();
-				sentCommitNanos = System.nanoTime();
+			if (request != null) {
+				window.sent(request.getLeaderCommit(), System.nanoTime());
 			}
 			return request;
+		}
+
+		/** Half the minimum election timeout: by then Ratis' own heartbeat, which carries the commit index, is due. */
+		private long windowNanos() {
+			return TimeUnit.MILLISECONDS.toNanos(getServer().properties().minRpcTimeoutMs() / 2);
+		}
+
+		/**
+		 * The wake signal that {@code GrpcLogAppender.mayWait} waits on, and that {@link #notifyLogAppender} (from
+		 * {@link CommitHeartbeats#send}, a reply, a commit) signals. Ratis reads it only through this method.
+		 */
+		@Override
+		public AwaitForSignal getEventAwaitForSignal() {
+			return wake;
 		}
 
 		/**
@@ -279,9 +302,8 @@ final class CommitHeartbeats {
 		 */
 		private boolean awaitsCommitReply() {
 			long target = Math.min(getRaftLog().getLastCommittedIndex(), heartbeats.wanted());
-			return target > getFollower().getCommitIndex() && sentCommit >= target && !hasPendingDataRequests()
-					&& System.nanoTime() - sentCommitNanos
-							< TimeUnit.MILLISECONDS.toNanos(getServer().properties().minRpcTimeoutMs() / 2);
+			return target > getFollower().getCommitIndex() && window.sentCommit() >= target && !hasPendingDataRequests()
+					&& window.open(System.nanoTime(), windowNanos());
 		}
 
 		/**
@@ -300,6 +322,124 @@ final class CommitHeartbeats {
 				heartbeats.appenders.remove(this);
 			}
 			return super.stopAsync();
+		}
+	}
+
+	/**
+	 * What an {@link Appender} sent to its follower for the commit index, and when (R7-2). The window that allows a quick
+	 * check of the stream ({@link Appender#RESEND_CHECK_MS}) and a resend after the stream broke opens when a request
+	 * first carries a commit index, and a resend does not open it again: before, a resend restarted it, so a stream that
+	 * kept ending (gRPC {@code onCompleted} is not limited by Ratis' retry policy, unlike an error) was reopened every
+	 * {@link Appender#RESEND_CHECK_MS}, about 100 streams a second, for as long as it kept ending. Now there are at most
+	 * {@link #MAX_RESENDS} resends per commit index, all within half the minimum election timeout of its first send;
+	 * after that Ratis' own heartbeat carries it.
+	 */
+	static final class CommitWindow {
+
+		/** The most heartbeats sent again for one commit index. */
+		static final int MAX_RESENDS = 3;
+
+		/** The highest commit index that a request on the current stream carried, -1 after the stream broke. */
+		private long sentCommit = -1;
+		/** The highest commit index ever sent; its first send opened the window. */
+		private long windowCommit = -1;
+		private long windowStartNanos;
+		private int resends;
+
+		/** A request that carried {@code leaderCommit} was built at {@code nanos}. */
+		void sent(long leaderCommit, long nanos) {
+			if (leaderCommit > sentCommit) {
+				sentCommit = leaderCommit;
+			}
+			if (leaderCommit > windowCommit) {
+				windowCommit = leaderCommit;
+				windowStartNanos = nanos;
+				resends = 0;
+			}
+		}
+
+		long sentCommit() {
+			return sentCommit;
+		}
+
+		/** Whether the first send of the highest commit index sent was less than {@code windowNanos} ago. */
+		boolean open(long nanos, long windowNanos) {
+			return windowCommit >= 0 && nanos - windowStartNanos < windowNanos;
+		}
+
+		/**
+		 * The stream broke after a request carried {@link #sentCommit}: true if that commit index may be sent again (it
+		 * then counts as unsent), false if it was sent again {@link #MAX_RESENDS} times or its window closed.
+		 */
+		boolean streamBroke(long nanos, long windowNanos) {
+			if (sentCommit < 0 || resends >= MAX_RESENDS || !open(nanos, windowNanos)) {
+				return false;
+			}
+			sentCommit = -1;
+			resends++;
+			return true;
+		}
+	}
+
+	/**
+	 * The wake signal of an {@link Appender}, in place of Ratis' {@link AwaitForSignal} (R7-1). In Ratis 3.3.1
+	 * {@code signal()} sets the flag it replaces ({@code signaled.getAndSet(new AtomicBoolean()).set(true)}), and
+	 * {@code await} reads the new one, so a wake given while the appender is not waiting (between building its requests
+	 * and {@code GrpcLogAppender.mayWait}) is lost: the appender then waits its full wait, a heartbeat interval, and the
+	 * commit heartbeat that {@link CommitHeartbeats#send} asked for in that moment goes out only with Ratis' heartbeat.
+	 * Here a wake is kept until the next wait takes it, which then returns at once; the appender then looks at everything
+	 * again, so a wake given before the wait is never lost and two wakes cost at most one extra pass of its loop.
+	 */
+	static final class WakeSignal extends AwaitForSignal {
+
+		private final ReentrantLock lock = new ReentrantLock();
+		private final Condition woken = lock.newCondition();
+		private boolean signaled;
+
+		WakeSignal(Object name) {
+			super(name);
+		}
+
+		@Override
+		public void signal() {
+			lock.lock();
+			try {
+				signaled = true;
+				woken.signalAll();
+			} finally {
+				lock.unlock();
+			}
+		}
+
+		@Override
+		public void await() throws InterruptedException {
+			lock.lock();
+			try {
+				while (!signaled) {
+					woken.await();
+				}
+				signaled = false;
+			} finally {
+				lock.unlock();
+			}
+		}
+
+		@Override
+		public boolean await(long time, TimeUnit unit) throws InterruptedException {
+			lock.lock();
+			try {
+				long nanos = unit.toNanos(time);
+				while (!signaled) {
+					if (nanos <= 0) {
+						return false;
+					}
+					nanos = woken.awaitNanos(nanos);
+				}
+				signaled = false;
+				return true;
+			} finally {
+				lock.unlock();
+			}
 		}
 	}
 }

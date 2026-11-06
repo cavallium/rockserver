@@ -1056,6 +1056,24 @@ reply, and for at most half the minimum election timeout after it, the appender 
 send and no heartbeat due, which leaves only the missing stream), it sends the heartbeat again on the new stream. A
 heartbeat that only times out is not sent again: Ratis' request timeout (the maximum election timeout) is longer than
 the interval of its own heartbeats, which carry the commit index too, and a gRPC stream that loses a message breaks.
+The resend is bounded (R7-2, `CommitHeartbeats.CommitWindow`): the window of half the minimum election timeout opens
+when a request first carries `c`, a resend does not open it again, and `c` goes again at most 3 times. Before, each
+resend counted as a new first send and restarted the window, so a stream that kept ending was reopened every 10 ms for
+as long as it kept ending: errors are spaced by Ratis' retry policy (`RaftSettings.APPENDER_RETRY_POLICY`), but a
+stream that ends with `onCompleted` is not, about 100 streams a second. After the bound, Ratis' own heartbeat carries `c`.
+
+The appender also has a wake signal of its own (R7-1, `CommitHeartbeats.WakeSignal`, returned by
+`Appender.getEventAwaitForSignal`, the only way Ratis reaches it). Ratis 3.3.1's `AwaitForSignal.signal()` sets the
+flag that it replaces (`signaled.getAndSet(new AtomicBoolean()).set(true)`) and `await` reads the new one, so a wake
+given while the appender is not parked in `GrpcLogAppender.mayWait` (between building its requests and the wait) is
+lost, and the appender waits its whole wait, up to a heartbeat interval. A `send` that lands in that moment, or the
+reply to the append it waited for, was then lost, and later `send` calls for the same `c` are skipped: the follower
+learned `c` with the next heartbeat, the R6-1 symptom through another door. The signal here keeps a wake until the next
+wait takes it, which then returns at once; the appender looks at everything again, so no wake is lost and two wakes
+before a wait cost one extra pass of its loop. Shortening `getWaitTimeMs` while a commit heartbeat is wanted but not
+sent was not enough: a wake between that call and the wait is still lost, and the wait would be 0 for as long as the
+heartbeat cannot be built (a follower that needs a snapshot), a busy loop. `CommitHeartbeatsTest` shows the lost wake
+on Ratis' signal (a wait after a signal parks for its whole timeout) and not on this one.
 
 Until R6-1 the trigger was a Ratis read with its dummy message on the leader, whose linearizable read path asks the
 appenders for a heartbeat round (`LogAppender.triggerHeartbeat`, from `ReadIndexHeartbeats.AppendEntriesListener`).
@@ -1875,7 +1893,7 @@ failover" below).
 | `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. With `PipelinedUpdatesTest`, the only tests that chain in a default run: the suites below run the plain per-key queue unless the property below is set, and fail if an update chains there. After each fault these three wait for an update that chains. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, no acknowledged increment of a hot counter is lost, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
 | `FollowerReadTest` (in-process, follower reads on) | A follower serves reads of writes acknowledged on the leader, with writes flowing meanwhile and on a quiet cluster (thanks to `CommitHeartbeats`), some by itself (the share is printed, not asserted beyond a loose bound: it depends on the disk and load); once it knows the commit index it serves by itself. The option is set on every node through the property. A follower whose database may hold an entry of a term later than its read index forwards, also after a real leader change: a read index of term T whose apply (held by the test) is reached in one group with the entries of the next leader's term is forwarded, not served (a mutation without the check serves it); reads stay linearizable on the follower and the new leader across a leader change. A read on the leader whose apply is held does not answer the old value after a follower served the new one. A follower whose apply is held forwards instead of answering with the old value, and one cut off from the rest fails instead of answering. A follower names the leader in its responses, and a client of several nodes listing the follower first reads its writes and its transaction through it. |
-| `CommitHeartbeatsTest` | Each commit index is asked for once and a higher one again, nothing before a commit index or when disabled; Ratis finds the transport by class name and builds it with and without the node's instance. |
+| `CommitHeartbeatsTest` | Each commit index is asked for once and a higher one again, nothing before a commit index or when disabled; Ratis finds the transport by class name and builds it with and without the node's instance. A wake given before the appender waits is kept for that wait (R7-1; Ratis' `AwaitForSignal` loses it), and resends after broken streams do not reopen the window of the first send and stop at 3 per commit index (R7-2). |
 | `FollowerReadLatencyTest` (in-process, prints numbers) | Read-after-write latency on a follower, with and without `CommitHeartbeats`, against forwarded reads with and without the leader's apply wait, quiet and with a writer in the background; with the heartbeats the follower serves more than half of the quiet reads and some of the busy ones itself (loose bounds; the printed shares are the measurement). The numbers in "Follower reads" come from it. |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `ClientFailoverTest` | One client connection listing all three nodes, while the node it uses is killed (the leader, or a follower): only retryable errors, new calls succeed on another node of the same connection (about 1 s with an election, under 200 ms without), a new connection skips the dead node, and a transaction opened through a dead follower still commits. |
