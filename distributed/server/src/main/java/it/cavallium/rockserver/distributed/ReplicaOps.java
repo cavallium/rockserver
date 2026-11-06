@@ -14,6 +14,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -61,8 +62,9 @@ import org.slf4j.LoggerFactory;
  * runs. Checks run when an operator asks ({@code admin checksum}) or, with the system property
  * {@value #CHECKSUM_EVERY_HOURS_PROPERTY}, every that many hours from the leader. That interval counts from the last
  * check this replica applied, whoever proposed it (its time is kept in the results file), so a leader change does not
- * start it over: a leader proposes the next one once the interval passed since the last one, or since its start if it
- * knows of none.</p>
+ * start it over: a leader proposes the next one once the interval passed since the last one, or, if it knows of none,
+ * since its first start with periodic checks on ({@value #SCHEDULE_FILE} in the data directory), so that restarts do
+ * not start it over either. A proposal that fails is tried again a minute later.</p>
  *
  * <p><b>Backups.</b> Every replica applies a backup entry at the same log position, by writing a checkpoint of its
  * database ({@link NodeStore#checkpoint}: a memtable flush and hard links, 100–300 ms during which the apply waits) to
@@ -83,6 +85,10 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	static final String BACKUP_DB_DIR = "db";
 	static final String BACKUP_PROPERTIES = "backup.properties";
 	private static final String RESULTS_FILE = "replica-ops.log";
+	/** When the periodic schedule of this node started, while it knows of no check: see {@link #scheduleStartMillis}. */
+	static final String SCHEDULE_FILE = "checksum-schedule";
+	/** After a periodic checksum that could not be proposed, how soon the leader tries again (at most the interval). */
+	static final Duration PROPOSAL_RETRY = Duration.ofMinutes(1);
 	private static final Pattern BACKUP_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,63}");
 	/** How long a replica keeps asking the others for their digest of one check. */
 	static final Duration COMPARE_FOR = Duration.ofHours(24);
@@ -147,10 +153,18 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 * tail, entries after the snapshot) keeps that time instead of moving the schedule to the replay.
 	 */
 	private final Map<Long, Long> recordedChecksumMillis = new ConcurrentHashMap<>();
-	/** The start of this node: what the interval counts from while it knows of no check. */
-	private final long startMillis = System.currentTimeMillis();
-	/** Leader only, initialization thread only: when this node last proposed a periodic check itself. */
-	private long proposedChecksumMillis;
+	/**
+	 * What the interval counts from while this node knows of no check: the first start of this node with periodic checks
+	 * on, kept in {@link #SCHEDULE_FILE} so that restarts more frequent than the interval do not start it over. 0 until
+	 * read.
+	 */
+	private volatile long scheduleStartMillis;
+	private final Path scheduleFile;
+	/**
+	 * Leader only: when this node last proposed a periodic check itself, or the time that delays the next try as long as
+	 * {@link #PROPOSAL_RETRY} after a proposal that failed. Written on the initialization thread, and by the failure.
+	 */
+	private volatile long proposedChecksumMillis;
 	private volatile long lastMismatchIndex = -1;
 	private volatile long lastMatchIndex = -1;
 
@@ -166,6 +180,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		metrics.exportedGauge("checksum.last_mismatch_index", () -> lastMismatchIndex);
 		metrics.exportedGauge("checksum.last_match_index", () -> lastMatchIndex);
 		this.checksumEvery = Duration.ofHours(Math.max(0, DistributedProperties.getLong(0, CHECKSUM_EVERY_HOURS_PROPERTY)));
+		this.scheduleFile = config.dataDir().resolve(SCHEDULE_FILE);
+		if (!checksumEvery.isZero()) {
+			// On every member, not only the leader: any of them may lead when the first check is due.
+			scheduleStartMillis = loadScheduleStart(System.currentTimeMillis());
+		}
 		loadResults();
 	}
 
@@ -177,6 +196,38 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	/** Tests only: see {@link #lastChecksumMillis}. */
 	long lastChecksumMillisForTesting() {
 		return lastChecksumMillis;
+	}
+
+	/** Tests only: see {@link #scheduleStartMillis}. */
+	long scheduleStartMillisForTesting() {
+		return scheduleStartMillis;
+	}
+
+	/**
+	 * The start of the periodic schedule from {@link #SCHEDULE_FILE}, or {@code nowMillis}, written there, if the file is
+	 * missing or unreadable. If it cannot be written, the schedule counts from this start, as before the file existed.
+	 */
+	private long loadScheduleStart(long nowMillis) {
+		try {
+			if (Files.isRegularFile(scheduleFile)) {
+				long recorded = Long.parseLong(Files.readString(scheduleFile, StandardCharsets.UTF_8).strip());
+				if (recorded > 0) {
+					return Math.min(recorded, nowMillis);
+				}
+			}
+		} catch (IOException | NumberFormatException ex) {
+			LOG.warn("{}: failed to read {}, the periodic checksums count from now: {}", config.nodeId(), scheduleFile,
+					ex.toString());
+		}
+		try {
+			Files.createDirectories(scheduleFile.getParent());
+			var temporary = scheduleFile.resolveSibling(SCHEDULE_FILE + ".tmp");
+			Files.writeString(temporary, nowMillis + "\n", StandardCharsets.UTF_8);
+			Files.move(temporary, scheduleFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+		} catch (IOException ex) {
+			LOG.warn("{}: failed to write {}: {}", config.nodeId(), scheduleFile, ex.toString());
+		}
+		return nowMillis;
 	}
 
 	static boolean validBackupName(@Nullable String name) {
@@ -716,27 +767,53 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	/**
 	 * Proposes a checksum once {@link #checksumEvery} passed since the last one this replica applied (the replicated
 	 * history, so a new leader goes on with the schedule of the old one), or since it proposed one itself (applied
-	 * later), or since its start if it knows of neither. Wall clock: it outlives a restart through the results file.
+	 * later), or since the start of its schedule ({@link #scheduleStartMillis}) if it knows of neither. Wall clock: it
+	 * outlives a restart through the results file and the schedule file. A proposal that fails is tried again after
+	 * {@link #PROPOSAL_RETRY}, not a full interval later.
 	 */
 	private void proposePeriodicChecksum(long nowMillis) {
-		var every = checksumEvery;
-		if (every.isZero() || every.isNegative() || !clusterHas(Capabilities.CHECKSUM)) {
+		if (!periodicChecksumDue(nowMillis)) {
 			return;
 		}
-		long last = Math.max(lastChecksumMillis, proposedChecksumMillis);
-		if (nowMillis - (last != 0 ? last : startMillis) < every.toMillis()) {
-			return;
-		}
-		proposedChecksumMillis = nowMillis;
 		var proposer = this.proposer;
 		if (proposer != null) {
 			proposer.propose(new LogEntry.Checksum()).whenComplete((index, error) -> {
 				if (error != null) {
-					LOG.warn("{}: periodic checksum not proposed", config.nodeId(), error);
+					periodicChecksumFailed(nowMillis);
+					LOG.warn("{}: periodic checksum not proposed, trying again in {} s", config.nodeId(),
+							Math.min(checksumEvery.toMillis(), PROPOSAL_RETRY.toMillis()) / 1000, error);
 				} else {
 					LOG.info("{}: periodic checksum at log index {}", config.nodeId(), index);
 				}
 			});
+		}
+	}
+
+	/** Whether a periodic checksum is due at {@code nowMillis}; if it is, records it as proposed then. */
+	boolean periodicChecksumDue(long nowMillis) {
+		var every = checksumEvery;
+		if (every.isZero() || every.isNegative() || !clusterHas(Capabilities.CHECKSUM)) {
+			return false;
+		}
+		if (scheduleStartMillis == 0) {
+			scheduleStartMillis = loadScheduleStart(nowMillis);
+		}
+		long last = Math.max(lastChecksumMillis, proposedChecksumMillis);
+		if (nowMillis - (last != 0 ? last : scheduleStartMillis) < every.toMillis()) {
+			return false;
+		}
+		proposedChecksumMillis = nowMillis;
+		return true;
+	}
+
+	/**
+	 * The periodic checksum proposed at {@code proposedAtMillis} failed (a lost leadership, a full queue): the next try
+	 * comes {@link #PROPOSAL_RETRY} later, unless a newer proposal happened meanwhile.
+	 */
+	void periodicChecksumFailed(long proposedAtMillis) {
+		if (proposedChecksumMillis == proposedAtMillis) {
+			long every = checksumEvery.toMillis();
+			proposedChecksumMillis = Math.max(1, proposedAtMillis - every + Math.min(every, PROPOSAL_RETRY.toMillis()));
 		}
 	}
 

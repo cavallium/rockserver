@@ -1649,7 +1649,10 @@ reported, and stops nothing.
   the last check the replica applied, whoever proposed it (CR2-2): each replica keeps the wall-clock time it applied
   one, also in `replica-ops.log`, so a new leader goes on with the schedule instead of starting it over, and checks
   still run when the leadership moves more often than every N hours. A leader that knows of no check counts from its
-  own start. Applying the same checksum entry again (a restart that replays it after a lost WAL tail, or the entries
+  first start with the property set, which every node writes once to `<data-dir>/checksum-schedule` (R6-5): restarts
+  more frequent than N hours, a few deploys a day, would otherwise keep the first check from ever running. A periodic
+  check whose proposal fails (the leadership moved, a full queue) is tried again a minute later (at most N hours),
+  not N hours later. Applying the same checksum entry again (a restart that replays it after a lost WAL tail, or the entries
   after the snapshot) keeps the time of its first apply, the earliest line of that index in the file, instead of the
   replay's. A member that applies an old check for the first time (catching up, or after an install) still takes its
   own time for it: checksum entries carry no leader stamp (only session entries do, and adding one changes the log

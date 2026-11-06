@@ -135,6 +135,8 @@ that skipped the position. The digest reads every key of the
 database on every node at once, holding a snapshot meanwhile: run it at a quiet time on large databases. With
 `-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` on the nodes, the leader also runs one every N hours,
 counted from the last check of the cluster (also one run by hand), so a leader change does not start the count over.
+Before the first check, it counts from the first start with the property set (`<data-dir>/checksum-schedule`), so
+restarts do not start it over either.
 The digest covers each column's schema and merge operator too, once every member runs a version that does (the
 capability `checksum-schemas`): a column created or altered differently on one replica is a divergence even with the
 same data. A malformed value of this property, as of every `it.cavallium.rockserver.distributed.*` property, is logged
