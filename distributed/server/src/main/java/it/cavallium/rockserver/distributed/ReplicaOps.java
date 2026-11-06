@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RangeBudget;
@@ -49,15 +50,18 @@ import org.slf4j.LoggerFactory;
  * <p><b>Checksums.</b> Every replica applies a checksum entry at the same log position. There it opens a database
  * transaction with a snapshot, which takes no time, and lists the user columns; a thread of its own then reads every
  * key and value of those columns at that snapshot, in key order, and digests them (SHA-256 of each column's name and
- * entries, columns in name order). Equal histories give equal digests on every replica, whatever their files and
- * compactions. The internal meta column is left out: it holds things that are local by design (results purged at a
+ * entries, columns in name order; with {@link Capabilities#CHECKSUM_SCHEMAS}, each column's schema too, merge operator
+ * included). Equal histories give equal digests on every replica, whatever their files and compactions. The internal meta column is left out: it holds things that are local by design (results purged at a
  * start). Each replica then asks the others for their digest of the same position, until each one has answered, or
  * skipped the position (a snapshot install jumped over it), or for {@link #COMPARE_FOR}; a different digest is logged
  * as an error on every replica that sees it and counted in {@code checksum.mismatches}. A replica whose database is
  * replaced or closed while it reads gives up on that check. The read holds a snapshot of the database, which keeps the
  * files that compactions replace meanwhile: a check of a large database costs a full read of it and that space while it
  * runs. Checks run when an operator asks ({@code admin checksum}) or, with the system property
- * {@value #CHECKSUM_EVERY_HOURS_PROPERTY}, every that many hours from the leader.</p>
+ * {@value #CHECKSUM_EVERY_HOURS_PROPERTY}, every that many hours from the leader. That interval counts from the last
+ * check this replica applied, whoever proposed it (its time is kept in the results file), so a leader change does not
+ * start it over: a leader proposes the next one once the interval passed since the last one, or since its start if it
+ * knows of none.</p>
  *
  * <p><b>Backups.</b> Every replica applies a backup entry at the same log position, by writing a checkpoint of its
  * database ({@link NodeStore#checkpoint}: a memtable flush and hard links, 100–300 ms during which the apply waits) to
@@ -73,7 +77,7 @@ import org.slf4j.LoggerFactory;
 final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 
 	private static final Logger LOG = LoggerFactory.getLogger(ReplicaOps.class);
-	static final String CHECKSUM_EVERY_HOURS_PROPERTY = "it.cavallium.rockserver.distributed.checksum-every-hours";
+	static final String CHECKSUM_EVERY_HOURS_PROPERTY = DistributedProperties.PREFIX + "checksum-every-hours";
 	static final String BACKUPS_DIR = "backups";
 	static final String BACKUP_DB_DIR = "db";
 	static final String BACKUP_PROPERTIES = "backup.properties";
@@ -127,7 +131,14 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	private long nextVersionCheckNanos;
 	/** Set on the initialization thread, cleared by the thread that ends the check. */
 	private volatile boolean versionCheckRunning;
-	private long nextChecksumNanos;
+	/** How often the leader proposes a checksum ({@link #CHECKSUM_EVERY_HOURS_PROPERTY}, read at start); zero: never. */
+	private volatile Duration checksumEvery;
+	/** Wall-clock time this replica last applied a checksum entry (from the results file at start); 0: none known. */
+	private volatile long lastChecksumMillis;
+	/** The start of this node: what the interval counts from while it knows of no check. */
+	private final long startMillis = System.currentTimeMillis();
+	/** Leader only, initialization thread only: when this node last proposed a periodic check itself. */
+	private long proposedChecksumMillis;
 	private volatile long lastMismatchIndex = -1;
 	private volatile long lastMatchIndex = -1;
 
@@ -142,7 +153,13 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		metrics.exportedGauge("cluster.version", () -> clusterVersion);
 		metrics.exportedGauge("checksum.last_mismatch_index", () -> lastMismatchIndex);
 		metrics.exportedGauge("checksum.last_match_index", () -> lastMatchIndex);
+		this.checksumEvery = Duration.ofHours(Math.max(0, DistributedProperties.getLong(0, CHECKSUM_EVERY_HOURS_PROPERTY)));
 		loadResults();
+	}
+
+	/** Tests only: the interval of the periodic checksums, below the hour of the property. */
+	void checksumEveryForTesting(Duration every) {
+		this.checksumEvery = every;
 	}
 
 	static boolean validBackupName(@Nullable String name) {
@@ -181,13 +198,20 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	@Override
 	public void checksum(TermIndex position, NodeStore store) {
 		long index = position.getIndex();
+		lastChecksumMillis = System.currentTimeMillis();
 		var db = store.db();
 		var columns = new TreeMap<String, Long>();
+		// The cluster version at this position, the same on every replica: digests with schemas only once all have it.
+		var schemas = clusterHas(Capabilities.CHECKSUM_SCHEMAS) ? new TreeMap<String, String>() : null;
 		long transaction;
 		try {
-			for (String name : db.getAllColumnDefinitions().keySet()) {
+			for (var definition : db.getAllColumnDefinitions().entrySet()) {
+				String name = definition.getKey();
 				if (!name.equals(NodeStore.META_COLUMN)) {
 					columns.put(name, db.getColumnId(name));
+					if (schemas != null) {
+						schemas.put(name, describeSchema(definition.getValue()));
+					}
 				}
 			}
 			// A snapshot of the database as of this position: what the apply writes after it is not seen.
@@ -198,10 +222,22 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			return;
 		}
 		record(new Result(State.PENDING, index, 0, ""));
-		worker.execute(() -> computeChecksum(index, db, columns, transaction));
+		worker.execute(() -> computeChecksum(index, db, columns, schemas, transaction));
 	}
 
-	private void computeChecksum(long index, EmbeddedDB db, TreeMap<String, Long> columns, long transaction) {
+	/**
+	 * A column's schema as the checksum digests it: its key layout, whether it has values, and its merge operator (name,
+	 * version and class). Two replicas whose columns were created or altered differently differ here even with equal
+	 * data.
+	 */
+	static String describeSchema(ColumnSchema schema) {
+		return "keys=" + schema.keys() + ";tail=" + schema.variableTailKeys() + ";value=" + schema.hasValue()
+				+ ";merge=" + schema.mergeOperatorName() + "/" + schema.mergeOperatorVersion() + "/"
+				+ schema.mergeOperatorClass();
+	}
+
+	private void computeChecksum(long index, EmbeddedDB db, TreeMap<String, Long> columns,
+			@Nullable TreeMap<String, String> schemas, long transaction) {
 		long start = System.nanoTime();
 		Result result;
 		try {
@@ -209,6 +245,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			long keys = 0;
 			for (var column : columns.entrySet()) {
 				update(digest, column.getKey().getBytes(StandardCharsets.UTF_8));
+				if (schemas != null) {
+					update(digest, schemas.get(column.getKey()).getBytes(StandardCharsets.UTF_8));
+				}
 				Keys resumeAfter = null;
 				while (true) {
 					var page = db.getRangePage(transaction, column.getValue(), null, null, false, resumeAfter,
@@ -508,6 +547,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 						case "checksum" -> {
 							checksums.put(index, new Result(state, index, Long.parseLong(parts[4]), parts[5]));
 							trim(checksums);
+							try {
+								lastChecksumMillis = Math.max(lastChecksumMillis, Instant.parse(parts[0]).toEpochMilli());
+							} catch (java.time.format.DateTimeParseException malformed) {
+								// The interval then counts from the start.
+							}
 						}
 						case "backup" -> {
 							backups.put(index, new BackupResult(parts[4], new Result(state, index, 0, parts[5])));
@@ -563,7 +607,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		}
 		long now = System.nanoTime();
 		long term = info.getCurrentTerm();
-		proposePeriodicChecksum(now);
+		proposePeriodicChecksum(System.currentTimeMillis());
 		if ((Capabilities.SUPPORTED & ~clusterVersion) == 0 || versionCheckRunning
 				|| (term == versionCheckTerm && now - nextVersionCheckNanos < 0)) {
 			return;
@@ -624,19 +668,21 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		return peers;
 	}
 
-	private void proposePeriodicChecksum(long now) {
-		long hours = Long.getLong(CHECKSUM_EVERY_HOURS_PROPERTY, 0);
-		if (hours <= 0 || !clusterHas(Capabilities.CHECKSUM)) {
+	/**
+	 * Proposes a checksum once {@link #checksumEvery} passed since the last one this replica applied (the replicated
+	 * history, so a new leader goes on with the schedule of the old one), or since it proposed one itself (applied
+	 * later), or since its start if it knows of neither. Wall clock: it outlives a restart through the results file.
+	 */
+	private void proposePeriodicChecksum(long nowMillis) {
+		var every = checksumEvery;
+		if (every.isZero() || every.isNegative() || !clusterHas(Capabilities.CHECKSUM)) {
 			return;
 		}
-		if (nextChecksumNanos == 0) {
-			nextChecksumNanos = now + TimeUnit.HOURS.toNanos(hours);
+		long last = Math.max(lastChecksumMillis, proposedChecksumMillis);
+		if (nowMillis - (last != 0 ? last : startMillis) < every.toMillis()) {
 			return;
 		}
-		if (now - nextChecksumNanos < 0) {
-			return;
-		}
-		nextChecksumNanos = now + TimeUnit.HOURS.toNanos(hours);
+		proposedChecksumMillis = nowMillis;
 		var proposer = this.proposer;
 		if (proposer != null) {
 			proposer.propose(new LogEntry.Checksum()).whenComplete((index, error) -> {
@@ -748,6 +794,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	@Override
 	public void close() {
 		worker.shutdownNow();
+	}
+
+	/** The log index of the last check that found a divergence, or -1: the gauge {@code checksum.last_mismatch_index}. */
+	long lastMismatchIndex() {
+		return lastMismatchIndex;
 	}
 
 	/** Tests only. */

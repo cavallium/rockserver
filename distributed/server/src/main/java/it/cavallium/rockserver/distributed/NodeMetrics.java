@@ -75,7 +75,7 @@ final class NodeMetrics {
 	}
 
 	/** Sampling period of {@link #sampleEveryMillisecond}, see {@link #LAG_SAMPLE_PROPERTY}. */
-	static final String LAG_SAMPLE_PROPERTY = "it.cavallium.rockserver.distributed.metrics.lag-sample-ms";
+	static final String LAG_SAMPLE_PROPERTY = DistributedProperties.PREFIX + "metrics.lag-sample-ms";
 	private static final long DEFAULT_LAG_SAMPLE_MS = 10;
 
 	private final String nodeId;
@@ -123,16 +123,7 @@ final class NodeMetrics {
 	}
 
 	static long lagSamplePeriodMs() {
-		var value = System.getProperty(LAG_SAMPLE_PROPERTY);
-		if (value == null || value.isBlank()) {
-			return DEFAULT_LAG_SAMPLE_MS;
-		}
-		try {
-			return Long.parseLong(value.trim());
-		} catch (NumberFormatException ex) {
-			LOG.warn("Ignoring {}={}: not a number of milliseconds", LAG_SAMPLE_PROPERTY, value);
-			return DEFAULT_LAG_SAMPLE_MS;
-		}
+		return DistributedProperties.getLong(DEFAULT_LAG_SAMPLE_MS, LAG_SAMPLE_PROPERTY);
 	}
 
 	private final Map<String, java.util.function.LongSupplier> gauges = new ConcurrentHashMap<>();

@@ -64,7 +64,7 @@ final class Router {
 	 * index (see {@link #followerRead}), so never an entry that a leader with the shortcut may not have applied yet. See
 	 * "Follower reads" in the design document.
 	 */
-	static final String FOLLOWER_READS_PROPERTY = "it.cavallium.rockserver.distributed.follower-reads";
+	static final String FOLLOWER_READS_PROPERTY = DistributedProperties.PREFIX + "follower-reads";
 
 	private final RockserverStateMachine stateMachine;
 	private final String nodeId;
@@ -110,7 +110,7 @@ final class Router {
 
 	/** Whether {@link #FOLLOWER_READS_PROPERTY} turns follower reads on. */
 	static boolean followerReadsConfigured() {
-		return Boolean.parseBoolean(System.getProperty(FOLLOWER_READS_PROPERTY, "false"));
+		return DistributedProperties.getBoolean(false, FOLLOWER_READS_PROPERTY);
 	}
 
 	private CompletableFuture<?> local(RequestContext context, RocksDBAPICommandSingle<?> command) {

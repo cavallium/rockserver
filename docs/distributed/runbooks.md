@@ -129,7 +129,12 @@ equal. It exits with 1 if they differ, and with 4 if a node gave none (down, fai
 or it skipped the position because a snapshot install jumped over it): run it again. `--allow-skipped` accepts nodes
 that skipped the position. The digest reads every key of the
 database on every node at once, holding a snapshot meanwhile: run it at a quiet time on large databases. With
-`-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` on the nodes, the leader also runs one every N hours.
+`-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` on the nodes, the leader also runs one every N hours,
+counted from the last check of the cluster (also one run by hand), so a leader change does not start the count over.
+The digest covers each column's schema and merge operator too, once every member runs a version that does (the
+capability `checksum-schemas`): a column created or altered differently on one replica is a divergence even with the
+same data. A malformed value of this property, as of every `it.cavallium.rockserver.distributed.*` property, is logged
+as a warning at the start and the default is used.
 
 A difference (the log says `REPLICAS DIVERGED`, the alert `rockserver-checksum-mismatch` fires):
 

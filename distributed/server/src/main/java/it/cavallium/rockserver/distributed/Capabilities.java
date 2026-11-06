@@ -29,9 +29,15 @@ final class Capabilities {
 	static final long CHECKSUM = 1 << 2;
 	/** {@link LogEntry.Backup}. */
 	static final long BACKUP = 1 << 3;
+	/**
+	 * Checksums digest each column's schema and merge operator too ({@link ReplicaOps#describeSchema}). A bit of its own,
+	 * though it writes no new entry: replicas digest one position alike only if all of them include the schemas, or
+	 * none, so an older member would report every check as a divergence.
+	 */
+	static final long CHECKSUM_SCHEMAS = 1 << 4;
 
 	/** Everything this version supports. */
-	static final long SUPPORTED = PIPELINED_UPDATES | CLIENT_SESSIONS | CHECKSUM | BACKUP;
+	static final long SUPPORTED = PIPELINED_UPDATES | CLIENT_SESSIONS | CHECKSUM | BACKUP | CHECKSUM_SCHEMAS;
 	/** The version of a cluster created by this version (see the class documentation). */
 	static final long GENESIS = SUPPORTED;
 
@@ -44,7 +50,7 @@ final class Capabilities {
 	/** The names of the bits of {@code capabilities}, for logs and messages. */
 	static String describe(long capabilities) {
 		var names = new ArrayList<String>();
-		for (var bit : List.of(PIPELINED_UPDATES, CLIENT_SESSIONS, CHECKSUM, BACKUP)) {
+		for (var bit : List.of(PIPELINED_UPDATES, CLIENT_SESSIONS, CHECKSUM, BACKUP, CHECKSUM_SCHEMAS)) {
 			if (has(capabilities, bit)) {
 				names.add(name(bit));
 			}
@@ -63,6 +69,8 @@ final class Capabilities {
 			return "client-sessions";
 		} else if (bit == CHECKSUM) {
 			return "checksum";
+		} else if (bit == CHECKSUM_SCHEMAS) {
+			return "checksum-schemas";
 		} else {
 			return "backup";
 		}
