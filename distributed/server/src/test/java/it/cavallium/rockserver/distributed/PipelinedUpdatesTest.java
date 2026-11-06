@@ -193,7 +193,7 @@ class PipelinedUpdatesTest {
 		var entry = new LogEntry.Guarded(term, transaction.snapshotIndex, new long[] {column}, new long[] {hash},
 				List.of(new LogEntry.Put(column, key(1), text(value), RequestTypeId.NOTHING)), true, update.updateId(),
 				LogEntry.Guard.of(column, key(1), text(read)));
-		return leader.proposer().proposeOnce(entry, Proposer.NO_CALLER_DEADLINE);
+		return leader.proposer().proposeOnce(entry, Proposer.NO_CALLER_DEADLINE, null);
 	}
 
 	/** One client, every update after the first seeing the last value before any commit was applied. */

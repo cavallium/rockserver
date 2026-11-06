@@ -176,6 +176,20 @@ public sealed interface LogEntry {
 	record Genesis(String clusterId, boolean seeded) implements LogEntry {}
 
 	/**
+	 * Opens a client session (Raft dissertation, section 6.3). Its id is the log index of this entry, the same on every
+	 * replica. The session expires once no request of it was applied for {@code timeoutMillis} of leader time (see
+	 * {@link LogEntryCodec#stamp}): the timeout travels in the entry so that every replica expires it at the same entry,
+	 * whatever its own configuration.
+	 */
+	record RegisterClient(long timeoutMillis) implements LogEntry {
+		public RegisterClient {
+			if (timeoutMillis <= 0) {
+				throw new IllegalArgumentException("timeoutMillis must be positive");
+			}
+		}
+	}
+
+	/**
 	 * Proposed by the leader after it created column {@code name} as {@code columnId}: every replica checks that it
 	 * assigned the same id, and stops if not, instead of silently writing other columns' data into it.
 	 */

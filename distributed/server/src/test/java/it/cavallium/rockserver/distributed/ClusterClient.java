@@ -57,6 +57,7 @@ public final class ClusterClient implements AutoCloseable {
 	private static final Duration ROUND_PAUSE = Duration.ofMillis(100);
 	private static final int PROBE_TIMEOUT_MILLIS = 1_000;
 	private static final Set<RocksDBErrorType> RETRYABLE_TYPES = Set.of(RocksDBErrorType.SERVER_OVERLOADED,
+			RocksDBErrorType.OUTCOME_UNKNOWN,
 			RocksDBErrorType.UPDATE_RETRY,
 			RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 			RocksDBErrorType.COMMIT_FAILED_TRY_AGAIN);

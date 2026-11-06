@@ -114,6 +114,12 @@ public final class GrpcConnection extends BaseConnection {
 	public static final int MIN_MAX_INBOUND_MESSAGE_SIZE =
 			GrpcConnectionDelegate.MIN_MAX_INBOUND_MESSAGE_SIZE;
 
+	/**
+	 * System property: {@code false} turns off {@link SessionWrites} on connections made afterwards: writes are then
+	 * sent once, as to a server without client sessions.
+	 */
+	public static final String SESSION_WRITES_PROPERTY = "it.cavallium.rockserver.grpc.client.session-writes";
+
 	private final GrpcConnectionDelegate delegate;
 	/** Numbered writes, on a replicated server that has client sessions and a connection that retries. */
 	private final @Nullable SessionWrites sessionWrites;
@@ -134,6 +140,7 @@ public final class GrpcConnection extends BaseConnection {
 		super(name);
 		this.delegate = delegate;
 		this.sessionWrites = delegate.automaticRetry && delegate.getCapabilities().clientSessions()
+				&& !"false".equalsIgnoreCase(System.getProperty(SESSION_WRITES_PROPERTY))
 				? new SessionWrites(delegate::openClientSessionAsync,
 						(context, command) -> (CompletableFuture<?>) delegate.requestAsync(context, command),
 						delegate.callbackExecutor)

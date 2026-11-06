@@ -182,7 +182,8 @@ final class ConflictTracker {
 				case LogEntry.Guarded guarded -> guarded.writes().forEach(write -> collectWrite(write, keys, columns));
 				case LogEntry.DeleteColumn deleteColumn -> columns.add(deleteColumn.columnId());
 				case LogEntry.CreateColumn _, LogEntry.DeleteColumnIfExists _ -> global = true;
-				case LogEntry.UploadMergeOperator _, LogEntry.Genesis _, LogEntry.VerifyColumn _ -> {}
+				case LogEntry.UploadMergeOperator _, LogEntry.Genesis _, LogEntry.VerifyColumn _,
+						LogEntry.RegisterClient _ -> {}
 			}
 		}
 		var token = new Token(keys, columns, global);

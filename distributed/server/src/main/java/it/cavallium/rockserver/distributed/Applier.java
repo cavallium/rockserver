@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.distributed;
 
 import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.ClientRequestId;
+import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
@@ -16,8 +18,6 @@ import java.io.UncheckedIOException;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
-import it.unimi.dsi.fastutil.longs.LongArrayList;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
 import it.unimi.dsi.fastutil.longs.LongSortedSet;
 import java.nio.charset.StandardCharsets;
@@ -107,15 +107,52 @@ final class Applier {
 	 * as an entry is written to the open transaction of a group (see {@link #beginGroup}).
 	 */
 	private static final class ProposerRecords {
+		/** A client session's records ({@link Request#client()}), not a proposer's. */
+		final boolean session;
+		/** The proposer id or the session id. */
+		final long id;
 		long floor;
 		/** Records below this were deleted from the database by this applier, see {@link #purge}. */
 		long purgedBelow;
 		/** Bytes of the results recorded since the last purge, see {@link #purge}. */
 		long recordedBytes;
 		final LongSortedSet recorded = new LongRBTreeSet();
+		/** Sessions only: the session's timeout, from its {@link LogEntry.RegisterClient}. */
+		long timeoutMillis;
+		/** Sessions only: the leader time of its last applied write, or of its registration. */
+		long lastActiveMillis;
+		/** Sessions only: {@link #recorded} was loaded from the database. */
+		boolean loaded;
+
+		ProposerRecords(boolean session, long id) {
+			this.session = session;
+			this.id = id;
+		}
+
+		/** Key of the record of request {@code sequence} of this proposer or session. */
+		Keys recordKey(long sequence) {
+			return session ? NodeStore.sessionRequestKey(id, sequence) : NodeStore.requestKey(id, sequence);
+		}
 	}
 
 	private final Long2ObjectOpenHashMap<ProposerRecords> proposers = new Long2ObjectOpenHashMap<>();
+	/**
+	 * Every client session in the database, loaded before the first entry is applied ({@link #loadSessions}). A session
+	 * expired at the current {@link #clock} stays here until {@link #sweepSessions} deletes it, and is treated as gone.
+	 */
+	private final Long2ObjectOpenHashMap<ProposerRecords> sessions = new Long2ObjectOpenHashMap<>();
+	/**
+	 * The latest leader time stamped on an applied entry ({@link LogEntryCodec#stamp}), the same on every replica at
+	 * the same log position: the only clock that session expiry reads. It never goes back, even if a new leader's clock
+	 * is behind. Written ({@link NodeStore#CLOCK}) with the applied position of the entry that moved it.
+	 */
+	private long clock;
+	/** {@link #clock} moved since it was last written. */
+	private boolean clockMoved;
+	/** When {@link #sweepSessions} looks for expired sessions next: only this replica's pace, not replicated state. */
+	private long nextSweepMillis;
+	/** How often, in leader time, {@link #sweepSessions} looks for expired sessions. */
+	private static final long SWEEP_EVERY_MILLIS = 1000;
 
 	/** True between {@link #beginGroup} and {@link #endGroup}. */
 	private boolean grouping;
@@ -123,12 +160,37 @@ final class Applier {
 	private long groupTx;
 	/** The position of the last entry written to {@link #groupTx}. */
 	private @Nullable TermIndex groupPosition;
-	/** Proposers whose floor moved in the current group: their records are purged once it commits. */
-	private final LongArrayList groupPurges = new LongArrayList();
+	/** Proposers and sessions whose floor moved in the current group: their records are purged once it commits. */
+	private final List<ProposerRecords> groupPurges = new ArrayList<>();
 
 	/** The result recorded for {@code request} by an earlier application, or null if it was never applied. */
 	@Nullable ApplyResult recordedResult(Request request) {
-		return recordedResult(store, request.proposerId(), request.sequence());
+		return recordedResult(store, recordKey(request));
+	}
+
+	/**
+	 * The result recorded in {@code store} for write {@code id} of a client session, or null if there is none. Safe
+	 * from any thread.
+	 */
+	static @Nullable ApplyResult recordedResult(NodeStore store, ClientRequestId id) {
+		return recordedResult(store, NodeStore.sessionRequestKey(id.sessionId(), id.sequence()));
+	}
+
+	private static @Nullable ApplyResult recordedResult(NodeStore store, Keys key) {
+		Buf recorded = store.db().get(0L, store.metaColumnId(), key, RequestType.<Buf>current());
+		return recorded == null ? null : ResultCodec.decode(recorded.toByteArray());
+	}
+
+	/** Key of the record of {@code request}: under its client session if it has one, else under its proposer. */
+	static Keys recordKey(Request request) {
+		var client = request.client();
+		return client != null ? NodeStore.sessionRequestKey(client.sessionId(), client.sequence())
+				: NodeStore.requestKey(request.proposerId(), request.sequence());
+	}
+
+	/** The number that identifies {@code request} within its session, or else within its proposer. */
+	private static long sequence(Request request) {
+		return request.client() != null ? request.client().sequence() : request.sequence();
 	}
 
 	/**
@@ -136,14 +198,22 @@ final class Applier {
 	 * none. Safe from any thread.
 	 */
 	static @Nullable ApplyResult recordedResult(NodeStore store, long proposerId, long sequence) {
-		Buf recorded = store.db().get(0L, store.metaColumnId(), NodeStore.requestKey(proposerId, sequence),
-				RequestType.<Buf>current());
-		return recorded == null ? null : ResultCodec.decode(recorded.toByteArray());
+		return recordedResult(store, NodeStore.requestKey(proposerId, sequence));
 	}
 
 	/** Applies one request alone, see {@link #applyBatch}. */
 	ApplyResult apply(Request request, TermIndex position) {
 		return applyBatch(List.of(request), position).getFirst();
+	}
+
+	/** Applies one request alone, stamped by the leader with {@code leaderTimeMillis}, see {@link #applyBatch}. */
+	ApplyResult apply(Request request, TermIndex position, long leaderTimeMillis) {
+		return applyBatch(List.of(request), position, leaderTimeMillis).getFirst();
+	}
+
+	/** {@link #applyBatch(List, TermIndex, long)} of an entry without a leader time. */
+	List<ApplyResult> applyBatch(List<Request> requests, TermIndex position) {
+		return applyBatch(requests, position, -1);
 	}
 
 	/**
@@ -159,15 +229,29 @@ final class Applier {
 	 * with (answered, or given up as unknown): it is never executed, so cleaning up records cannot make an old
 	 * request run again. A request with a record is a copy of one that already took effect: it gets the recorded
 	 * result.</p>
+	 *
+	 * <p>A request of a client session is identified by the session's numbering, with the session's own floor and
+	 * records. A session that is unknown, or expired at this entry's leader time ({@code leaderTimeMillis}, -1 if the
+	 * entry has none), rejects its requests with {@code SESSION_EXPIRED}, which is not recorded.</p>
 	 */
-	List<ApplyResult> applyBatch(List<Request> requests, TermIndex position) {
+	List<ApplyResult> applyBatch(List<Request> requests, TermIndex position, long leaderTimeMillis) {
 		try {
 			purgeAllProposers();
+			if (leaderTimeMillis > clock) {
+				clock = leaderTimeMillis;
+				clockMoved = true;
+			}
+			List<ApplyResult> results;
 			if (requests.size() == 1 && !isBatchable(requests.getFirst().entry())) {
 				commitGroup();
-				return List.of(applyAlone(requests.getFirst(), position));
+				results = List.of(applyAlone(requests.getFirst(), position));
+			} else {
+				results = grouping ? applyGrouped(requests, position) : applyData(requests, position, true);
 			}
-			return grouping ? applyGrouped(requests, position) : applyData(requests, position, true);
+			if (groupTx == 0) {
+				sweepSessions();
+			}
+			return results;
 		} catch (ReplicaFailedException ex) {
 			throw ex;
 		} catch (RuntimeException ex) {
@@ -247,24 +331,42 @@ final class Applier {
 	}
 
 	private ApplyResult applyAlone(Request request, TermIndex position) {
-		var records = records(request.proposerId());
+		var records = owner(request);
+		if (records == null) {
+			inApplyTransaction(position, tx -> markApplied(tx, position));
+			return SESSION_GONE;
+		}
 		long floor = records.floor;
-		if (request.sequence() < floor) {
+		if (sequence(request) < floor) {
 			inApplyTransaction(position, tx -> markApplied(tx, position));
 			return STALE_COPY;
 		}
-		if (records.recorded.contains(request.sequence())) {
+		if (records.recorded.contains(sequence(request))) {
 			inApplyTransaction(position, tx -> markApplied(tx, position));
 			return requireRecorded(request);
 		}
 		var entry = request.entry();
 		var existingId = existingColumn(entry);
-		if (existingId != null) {
-			// Creating a column that exists with the same schema changes nothing: it needs no flush nor fsync.
-			ApplyResult outcome = new ApplyResult.Ok(existingId);
-			inApplyTransaction(position, tx -> finish(tx, records, request, floor, outcome, position, true));
-			committed(request.proposerId(), records, List.of(request), request.completedBelow());
-			purge(request.proposerId(), records);
+		if (existingId != null || entry instanceof LogEntry.RegisterClient) {
+			// Creating a column that exists with the same schema changes nothing: it needs no flush nor fsync. Neither
+			// does registering a client session, which only writes the meta column. The session id is the entry's index.
+			ApplyResult outcome = new ApplyResult.Ok(existingId != null ? existingId : position.getIndex());
+			inApplyTransaction(position, tx -> {
+				if (entry instanceof LogEntry.RegisterClient register) {
+					store.db().put(tx, store.metaColumnId(), NodeStore.sessionKey(position.getIndex()),
+							NodeStore.encodeSession(register.timeoutMillis(), clock, 0), RequestType.none());
+				}
+				finish(tx, records, request, outcome, List.of(request), position, true);
+			});
+			if (entry instanceof LogEntry.RegisterClient register) {
+				var session = new ProposerRecords(true, position.getIndex());
+				session.timeoutMillis = register.timeoutMillis();
+				session.lastActiveMillis = clock;
+				session.loaded = true;
+				sessions.put(session.id, session);
+			}
+			committed(List.of(request), List.of(request));
+			purge(List.of(request));
 			return outcome;
 		}
 		// Schema changes write the RocksDB MANIFEST synchronously, while their schema rows, record and position go to
@@ -279,10 +381,10 @@ final class Applier {
 		}
 		var outcome = ResultCodec.bounded(executed);
 		// Record, floor and position in one logged write: all or none of them survive a crash.
-		inLoggedTransaction(position, tx -> finish(tx, records, request, floor, outcome, position, true));
+		inLoggedTransaction(position, tx -> finish(tx, records, request, outcome, List.of(request), position, true));
 		syncWal();
-		committed(request.proposerId(), records, List.of(request), request.completedBelow());
-		purge(request.proposerId(), records);
+		committed(List.of(request), List.of(request));
+		purge(List.of(request));
 		return outcome;
 	}
 
@@ -293,31 +395,10 @@ final class Applier {
 	 * recorded results.
 	 */
 	private List<ApplyResult> applyData(List<Request> requests, TermIndex position, boolean markPosition) {
-		long proposerId = requests.getFirst().proposerId();
-		long completedBelow = requests.getFirst().completedBelow();
-		var records = records(proposerId);
-		long floor = records.floor;
-		var results = new ApplyResult[requests.size()];
-		var toRun = new ArrayList<Request>(requests.size());
-		var runIndexes = new IntArrayList(requests.size());
-		var seen = new LongOpenHashSet();
-		for (int i = 0; i < requests.size(); i++) {
-			var request = requests.get(i);
-			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
-				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
-			}
-			if (request.sequence() < floor) {
-				results[i] = STALE_COPY;
-			} else if (records.recorded.contains(request.sequence())) {
-				results[i] = requireRecorded(request);
-			} else if (!seen.add(request.sequence())) {
-				// A second copy in the same entry: it gets the first copy's result below.
-				results[i] = null;
-			} else {
-				toRun.add(request);
-				runIndexes.add(i);
-			}
-		}
+		var plan = plan(requests);
+		var results = plan.results;
+		var toRun = plan.toRun;
+		var runIndexes = plan.runIndexes;
 		var db = store.db();
 		long openStart = System.nanoTime();
 		long tx = beginApply();
@@ -328,9 +409,6 @@ final class Applier {
 			long executeStart = System.nanoTime();
 			for (int j = 0; j < toRun.size(); j++) {
 				var request = toRun.get(j);
-				if (!isBatchable(request.entry())) {
-					throw new IllegalArgumentException("A batch cannot contain " + request.entry().getClass().getSimpleName());
-				}
 				outcomes[j] = applyLogical(() -> execute(tx, request.entry()));
 				if (outcomes[j] instanceof ApplyResult.Failed failed && toRun.size() > 1) {
 					// Its partial writes are in the transaction with the others' writes: start over one at a time.
@@ -345,13 +423,13 @@ final class Applier {
 				open = false;
 				var rejected = toRun.getFirst();
 				outcomes[0] = ResultCodec.bounded(outcomes[0]);
-				inApplyTransaction(position,
-						recordTx -> finish(recordTx, records, rejected, floor, outcomes[0], position, markPosition));
+				inApplyTransaction(position, recordTx -> finish(recordTx, owner(rejected), rejected, outcomes[0],
+						requests, position, markPosition));
 			} else {
 				for (int j = 0; j < toRun.size(); j++) {
-					outcomes[j] = record(tx, records, toRun.get(j), outcomes[j]);
+					outcomes[j] = record(tx, owner(toRun.get(j)), toRun.get(j), outcomes[j]);
 				}
-				finishBatch(tx, proposerId, completedBelow, floor, position, markPosition);
+				finishBatch(tx, requests, position, markPosition);
 				record(executeTime, executeStart);
 				open = false;
 				long commitStart = System.nanoTime();
@@ -370,14 +448,64 @@ final class Applier {
 				db.closeTransaction(tx, false);
 			}
 		}
-		committed(proposerId, records, toRun, completedBelow);
-		purge(proposerId, records);
-		for (int i = 0; i < results.length; i++) {
-			if (results[i] == null) {
-				results[i] = requireRecorded(requests.get(i));
-			}
+		committed(requests, toRun);
+		purge(requests);
+		for (int d = 0; d < plan.duplicates.size(); d++) {
+			// A second copy in the same entry gets the first copy's result.
+			int i = plan.duplicates.getInt(d);
+			results[i] = requireRecorded(requests.get(i));
 		}
 		return List.of(results);
+	}
+
+	/** How {@link #plan} sorted the requests of an entry. */
+	private record Plan(ApplyResult[] results, List<Request> toRun, IntArrayList runIndexes, IntArrayList duplicates) {}
+
+	/** Identity of a request at apply: its session's numbering if it has one, else its proposer's. */
+	private record Identity(boolean session, long id, long sequence) {
+		static Identity of(Request request) {
+			var client = request.client();
+			return client != null ? new Identity(true, client.sessionId(), client.sequence())
+					: new Identity(false, request.proposerId(), request.sequence());
+		}
+	}
+
+	/**
+	 * Sorts the requests of an entry: those that run, and the others with their result (a late copy, a copy of a
+	 * request already applied, or a request of a session that is gone), or as a second copy of a request in the same
+	 * entry ({@link Plan#duplicates}, which get the first copy's result).
+	 */
+	private Plan plan(List<Request> requests) {
+		long proposerId = requests.getFirst().proposerId();
+		long completedBelow = requests.getFirst().completedBelow();
+		var results = new ApplyResult[requests.size()];
+		var toRun = new ArrayList<Request>(requests.size());
+		var runIndexes = new IntArrayList(requests.size());
+		var duplicates = new IntArrayList(0);
+		var seen = new java.util.HashSet<Identity>();
+		for (int i = 0; i < requests.size(); i++) {
+			var request = requests.get(i);
+			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
+				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
+			}
+			var owner = owner(request);
+			if (owner == null) {
+				results[i] = SESSION_GONE;
+			} else if (sequence(request) < owner.floor) {
+				results[i] = STALE_COPY;
+			} else if (owner.recorded.contains(sequence(request))) {
+				results[i] = requireRecorded(request);
+			} else if (!seen.add(Identity.of(request))) {
+				duplicates.add(i);
+			} else {
+				if (!isBatchable(request.entry())) {
+					throw new IllegalArgumentException("A batch cannot contain " + request.entry().getClass().getSimpleName());
+				}
+				toRun.add(request);
+				runIndexes.add(i);
+			}
+		}
+		return new Plan(results, toRun, runIndexes, duplicates);
 	}
 
 	/**
@@ -444,11 +572,11 @@ final class Applier {
 				throw new ReplicaFailedException("Local apply transaction conflicted at " + groupPosition);
 			}
 		}
-		for (int i = 0; i < groupPurges.size(); i++) {
-			long proposerId = groupPurges.getLong(i);
-			purge(proposerId, records(proposerId));
+		for (var records : groupPurges) {
+			purge(records);
 		}
 		groupPurges.clear();
+		sweepSessions();
 	}
 
 	/**
@@ -456,34 +584,9 @@ final class Applier {
 	 * savepoint taken before it, commits the group, and applies the entry again on its own, as outside a group.
 	 */
 	private List<ApplyResult> applyGrouped(List<Request> requests, TermIndex position) {
-		long proposerId = requests.getFirst().proposerId();
-		long completedBelow = requests.getFirst().completedBelow();
-		var records = records(proposerId);
-		long floor = records.floor;
-		var results = new ApplyResult[requests.size()];
-		var toRun = new ArrayList<Request>(requests.size());
-		var runIndexes = new IntArrayList(requests.size());
-		var seen = new LongOpenHashSet();
-		var duplicates = new IntArrayList(0);
-		for (int i = 0; i < requests.size(); i++) {
-			var request = requests.get(i);
-			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
-				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
-			}
-			if (request.sequence() < floor) {
-				results[i] = STALE_COPY;
-			} else if (records.recorded.contains(request.sequence())) {
-				results[i] = requireRecorded(request);
-			} else if (!seen.add(request.sequence())) {
-				duplicates.add(i);
-			} else {
-				if (!isBatchable(request.entry())) {
-					throw new IllegalArgumentException("A batch cannot contain " + request.entry().getClass().getSimpleName());
-				}
-				toRun.add(request);
-				runIndexes.add(i);
-			}
-		}
+		var plan = plan(requests);
+		var results = plan.results;
+		var toRun = plan.toRun;
 		var db = store.db();
 		long tx = openGroupTx(position);
 		long executeStart = System.nanoTime();
@@ -499,19 +602,19 @@ final class Applier {
 			}
 		}
 		for (int j = 0; j < toRun.size(); j++) {
-			outcomes[j] = record(tx, records, toRun.get(j), outcomes[j]);
-			results[runIndexes.getInt(j)] = outcomes[j];
+			outcomes[j] = record(tx, owner(toRun.get(j)), toRun.get(j), outcomes[j]);
+			results[plan.runIndexes.getInt(j)] = outcomes[j];
 		}
-		finishBatch(tx, proposerId, completedBelow, floor, position, true);
+		finishBatch(tx, requests, position, true);
 		record(executeTime, executeStart);
-		committed(proposerId, records, toRun, completedBelow);
-		groupPurges.add(proposerId);
-		for (int d = 0; d < duplicates.size(); d++) {
+		committed(requests, toRun);
+		groupPurges.addAll(owners(requests));
+		for (int d = 0; d < plan.duplicates.size(); d++) {
 			// A second copy in the same entry gets the first copy's result.
-			int i = duplicates.getInt(d);
-			long sequence = requests.get(i).sequence();
+			int i = plan.duplicates.getInt(d);
+			var identity = Identity.of(requests.get(i));
 			for (int j = 0; j < toRun.size(); j++) {
-				if (toRun.get(j).sequence() == sequence) {
+				if (Identity.of(toRun.get(j)).equals(identity)) {
 					results[i] = outcomes[j];
 					break;
 				}
@@ -540,35 +643,105 @@ final class Applier {
 	private ProposerRecords records(long proposerId) {
 		var records = proposers.get(proposerId);
 		if (records == null) {
-			records = new ProposerRecords();
+			records = new ProposerRecords(false, proposerId);
 			records.floor = floor(proposerId);
 			// Only this applier moved the floor since purgeAllProposers deleted everything below it.
 			records.purgedBelow = records.floor;
-			try (var keys = store.db().getRange(0L, store.metaColumnId(), NodeStore.requestKey(proposerId, records.floor),
-					NodeStore.requestKey(proposerId, Long.MAX_VALUE), false, RequestType.<KV>allInRange())) {
-				var recorded = records.recorded;
-				keys.forEach(kv -> recorded.add(NodeStore.requestSequence(kv.keys())));
-			}
+			loadRecorded(records);
 			proposers.put(proposerId, records);
 		}
 		return records;
 	}
 
-	/** Updates the in-memory records after the database committed {@code applied} and the new floor. */
-	private void committed(long proposerId, ProposerRecords records, List<Request> applied, long completedBelow) {
-		for (var request : applied) {
-			records.recorded.add(request.sequence());
+	private void loadRecorded(ProposerRecords records) {
+		try (var keys = store.db().getRange(0L, store.metaColumnId(), records.recordKey(records.floor),
+				records.recordKey(Long.MAX_VALUE), false, RequestType.<KV>allInRange())) {
+			var recorded = records.recorded;
+			keys.forEach(kv -> recorded.add(NodeStore.requestSequence(kv.keys())));
 		}
+		records.loaded = true;
+	}
+
+	/**
+	 * The records that identify {@code request}: its client session's if it has one, else its proposer's. Null if its
+	 * session is unknown, or expired at the current {@link #clock}: then it must not run.
+	 */
+	private @Nullable ProposerRecords owner(Request request) {
+		var client = request.client();
+		if (client == null) {
+			return records(request.proposerId());
+		}
+		var session = sessions.get(client.sessionId());
+		if (session == null || expired(session)) {
+			return null;
+		}
+		if (!session.loaded) {
+			loadRecorded(session);
+		}
+		return session;
+	}
+
+	private boolean expired(ProposerRecords session) {
+		return clock - session.lastActiveMillis > session.timeoutMillis;
+	}
+
+	/** The proposer of {@code requests} and the live sessions of their client requests, each once. */
+	private List<ProposerRecords> owners(List<Request> requests) {
+		var owners = new ArrayList<ProposerRecords>(1);
+		owners.add(records(requests.getFirst().proposerId()));
+		for (var request : requests) {
+			if (request.client() != null) {
+				var session = owner(request);
+				if (session != null && !owners.contains(session)) {
+					owners.add(session);
+				}
+			}
+		}
+		return owners;
+	}
+
+	/**
+	 * Updates the in-memory records after the database committed the requests {@code applied} of the entry
+	 * {@code requests}, the new floors, and the sessions' activity.
+	 */
+	private void committed(List<Request> requests, List<Request> applied) {
+		for (var request : applied) {
+			var owner = owner(request);
+			if (owner != null) {
+				owner.recorded.add(sequence(request));
+			}
+		}
+		raiseFloor(records(requests.getFirst().proposerId()), requests.getFirst().completedBelow());
+		for (var request : requests) {
+			var client = request.client();
+			if (client != null) {
+				var session = owner(request);
+				if (session != null) {
+					session.lastActiveMillis = clock;
+					raiseFloor(session, client.completedBelow());
+				}
+			}
+		}
+	}
+
+	private static void raiseFloor(ProposerRecords records, long completedBelow) {
 		if (completedBelow > records.floor) {
 			records.floor = completedBelow;
 			records.recorded.headSet(completedBelow).clear();
 		}
 	}
 
+	/** {@link #purge(ProposerRecords)} of the proposer and sessions of {@code requests}. */
+	private void purge(List<Request> requests) {
+		for (var owner : owners(requests)) {
+			purge(owner);
+		}
+	}
+
 	/**
-	 * Deletes the records below the proposer's floor from the database, with one range deletion, once the floor
-	 * moved {@link #purgeEverySequences} past the last one or the proposer recorded {@link #purgeEveryBytes} of
-	 * results since then. Records below the floor are never read: a copy below the floor is refused before any
+	 * Deletes the records below the floor of a proposer or session from the database, with one range deletion, once
+	 * the floor moved {@link #purgeEverySequences} past the last one or {@link #purgeEveryBytes} of results were
+	 * recorded since then. Records below the floor are never read: a copy below the floor is refused before any
 	 * lookup, and {@link #records} does not load them. So they need not be deleted in the apply transaction, which
 	 * would cost a write per request.
 	 *
@@ -580,15 +753,71 @@ final class Applier {
 	 * it could then survive without the floor, and a replayed copy of a request whose record it deleted would run
 	 * again.</p>
 	 */
-	private void purge(long proposerId, ProposerRecords records) {
+	private void purge(ProposerRecords records) {
 		if (records.floor <= records.purgedBelow || (records.floor - records.purgedBelow < purgeEverySequences
 				&& records.recordedBytes < purgeEveryBytes)) {
 			return;
 		}
-		store.db().deleteRangeUnlogged(store.metaColumnId(), NodeStore.requestKey(proposerId, records.purgedBelow),
-				NodeStore.requestKey(proposerId, records.floor));
+		store.db().deleteRangeUnlogged(store.metaColumnId(), records.recordKey(records.purgedBelow),
+				records.recordKey(records.floor));
 		records.purgedBelow = records.floor;
 		records.recordedBytes = 0;
+	}
+
+	/**
+	 * Loads every client session, and the clock, before this applier applies its first entry, and deletes the records
+	 * below each session's floor, as {@link #purgeAllProposers} does for proposers.
+	 */
+	private void loadSessions() {
+		var db = store.db();
+		long metaColumn = store.metaColumnId();
+		Buf clockValue = db.get(0L, metaColumn, NodeStore.key(NodeStore.CLOCK), RequestType.<Buf>current());
+		clock = clockValue == null ? 0 : java.nio.ByteBuffer.wrap(clockValue.toByteArray()).getLong();
+		try (var rows = db.getRange(0L, metaColumn, NodeStore.key(NodeStore.SESSION),
+				NodeStore.key((byte) (NodeStore.SESSION + 1)), false, RequestType.<KV>allInRange())) {
+			rows.forEach(kv -> {
+				var fields = NodeStore.decodeSession(kv.value());
+				var session = new ProposerRecords(true, NodeStore.sessionId(kv.keys()));
+				session.timeoutMillis = fields[0];
+				session.lastActiveMillis = fields[1];
+				session.floor = fields[2];
+				session.purgedBelow = session.floor;
+				sessions.put(session.id, session);
+			});
+		}
+		for (var session : sessions.values()) {
+			var start = session.recordKey(0);
+			var end = session.recordKey(session.floor);
+			if (session.floor > 0 && db.reduceRange(0L, metaColumn, start, end, false,
+					RequestType.<KV>firstAndLast()).first() != null) {
+				db.deleteRangeUnlogged(metaColumn, start, end);
+			}
+		}
+	}
+
+	/**
+	 * Deletes the sessions expired at the current {@link #clock}, with their records. Only after the transaction that
+	 * moved the clock past their expiry committed, and without the WAL: as for {@link #purge}, a crash keeps a
+	 * deletion only together with that clock, and a session expired at a clock stays expired, since the clock never
+	 * goes back. A deletion that a crash loses leaves a session that is expired anyway, until a later sweep. So when
+	 * it runs is up to each replica: what a request sees depends only on the clock and the session's row.
+	 */
+	private void sweepSessions() {
+		if (clock < nextSweepMillis || sessions.isEmpty()) {
+			return;
+		}
+		nextSweepMillis = clock + SWEEP_EVERY_MILLIS;
+		var db = store.db();
+		long metaColumn = store.metaColumnId();
+		for (var it = sessions.values().iterator(); it.hasNext(); ) {
+			var session = it.next();
+			if (expired(session)) {
+				db.deleteRangeUnlogged(metaColumn, NodeStore.sessionRequestKey(session.id, 0),
+						NodeStore.sessionRequestKey(session.id + 1, 0));
+				db.deleteRangeUnlogged(metaColumn, NodeStore.sessionKey(session.id), NodeStore.sessionKey(session.id + 1));
+				it.remove();
+			}
+		}
 	}
 
 	/**
@@ -602,6 +831,7 @@ final class Applier {
 		if (purgedAllProposers) {
 			return;
 		}
+		loadSessions();
 		var db = store.db();
 		long metaColumn = store.metaColumnId();
 		var floors = new Long2LongOpenHashMap();
@@ -624,12 +854,11 @@ final class Applier {
 
 	private ApplyResult requireRecorded(Request request) {
 		// Through the open group transaction, if any: the record may have been written by an earlier entry of it.
-		Buf value = store.db().get(groupTx, store.metaColumnId(),
-				NodeStore.requestKey(request.proposerId(), request.sequence()), RequestType.<Buf>current());
+		Buf value = store.db().get(groupTx, store.metaColumnId(), recordKey(request), RequestType.<Buf>current());
 		var recorded = value == null ? null : ResultCodec.decode(value.toByteArray());
 		if (recorded == null) {
-			throw new ReplicaFailedException("Request " + request.sequence() + " of proposer " + request.proposerId()
-					+ " is marked applied, but its record is missing");
+			throw new ReplicaFailedException("Request " + Identity.of(request) + " is marked applied, but its record is"
+					+ " missing");
 		}
 		return recorded;
 	}
@@ -704,6 +933,9 @@ final class Applier {
 
 	private static final ApplyResult STALE_COPY = new ApplyResult.Failed(RocksDBErrorType.INVALID_REQUEST,
 			"Late copy of a request that its proposer already finished");
+	/** Not recorded: there is no session to record it under. The same on every replica, whatever was swept. */
+	static final ApplyResult SESSION_GONE = new ApplyResult.Failed(RocksDBErrorType.SESSION_EXPIRED,
+			"The client session is unknown or expired; this copy of the write was not applied");
 
 	private long floor(long proposerId) {
 		Buf value = store.db().get(0L, store.metaColumnId(), NodeStore.floorKey(proposerId), RequestType.<Buf>current());
@@ -803,6 +1035,9 @@ final class Applier {
 				applyGenesis(genesis);
 				yield null;
 			}
+			case LogEntry.RegisterClient _ ->
+					// Applied by applyAlone, which knows the entry's position, the session id.
+					throw new IllegalStateException("A client registration is applied alone");
 			case LogEntry.VerifyColumn verify -> {
 				verifyColumn(verify);
 				yield null;
@@ -864,11 +1099,14 @@ final class Applier {
 		}
 	}
 
-	/** Writes the result record, the proposer's floor and the applied position, in transaction {@code tx} if not 0. */
-	private void finish(long tx, ProposerRecords records, Request request, long floor, ApplyResult result,
+	/**
+	 * Writes the result record of {@code request}, then the floors and sessions of its entry {@code requests} and the
+	 * applied position, in transaction {@code tx} if not 0.
+	 */
+	private void finish(long tx, ProposerRecords records, Request request, ApplyResult result, List<Request> requests,
 			TermIndex position, boolean markPosition) {
 		record(tx, records, request, result);
-		finishBatch(tx, request.proposerId(), request.completedBelow(), floor, position, markPosition);
+		finishBatch(tx, requests, position, markPosition);
 	}
 
 	/**
@@ -885,32 +1123,58 @@ final class Applier {
 		}
 		var bounded = ResultCodec.bounded(result);
 		byte[] encoded = ResultCodec.encode(bounded);
-		store.db().put(tx, store.metaColumnId(), NodeStore.requestKey(request.proposerId(), request.sequence()),
-				Buf.wrap(encoded), RequestType.none());
+		store.db().put(tx, store.metaColumnId(), records.recordKey(sequence(request)), Buf.wrap(encoded),
+				RequestType.none());
 		records.recordedBytes += encoded.length;
 		return bounded;
 	}
 
 	/**
-	 * Writes the proposer's new floor, if it moved, and the applied position. The records the floor passed are never
-	 * read again (copies below the floor are refused before any lookup); they are deleted later, in bulk, by
-	 * {@link #purge}.
+	 * Writes the new floor of the proposer of {@code requests}, if it moved, the row of each live session of their
+	 * client requests (its activity at the current {@link #clock}, and its floor), and the applied position. The
+	 * records a floor passed are never read again (copies below the floor are refused before any lookup); they are
+	 * deleted later, in bulk, by {@link #purge}.
 	 */
-	private void finishBatch(long tx, long proposerId, long completedBelow, long floor, TermIndex position,
-			boolean markPosition) {
-		if (completedBelow > floor) {
-			store.db().put(tx, store.metaColumnId(), NodeStore.floorKey(proposerId),
-					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(completedBelow).array()),
+	private void finishBatch(long tx, List<Request> requests, TermIndex position, boolean markPosition) {
+		var first = requests.getFirst();
+		if (first.completedBelow() > records(first.proposerId()).floor) {
+			store.db().put(tx, store.metaColumnId(), NodeStore.floorKey(first.proposerId()),
+					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(first.completedBelow()).array()),
 					RequestType.none());
+		}
+		Long2LongOpenHashMap sessionFloors = null;
+		for (var request : requests) {
+			var client = request.client();
+			if (client != null && owner(request) != null) {
+				if (sessionFloors == null) {
+					sessionFloors = new Long2LongOpenHashMap();
+				}
+				sessionFloors.put(client.sessionId(),
+						Math.max(sessionFloors.getOrDefault(client.sessionId(), 0L), client.completedBelow()));
+			}
+		}
+		if (sessionFloors != null) {
+			for (var touched : sessionFloors.long2LongEntrySet()) {
+				var session = sessions.get(touched.getLongKey());
+				store.db().put(tx, store.metaColumnId(), NodeStore.sessionKey(session.id),
+						NodeStore.encodeSession(session.timeoutMillis, clock, Math.max(session.floor, touched.getLongValue())),
+						RequestType.none());
+			}
 		}
 		if (markPosition) {
 			markApplied(tx, position);
 		}
 	}
 
+	/** Writes the applied position, and the {@link #clock} if it moved. */
 	private void markApplied(long tx, TermIndex position) {
 		store.db().put(tx, store.metaColumnId(), NodeStore.key(NodeStore.APPLIED),
 				NodeStore.encodeTermIndex(position), RequestType.none());
+		if (clockMoved) {
+			store.db().put(tx, store.metaColumnId(), NodeStore.key(NodeStore.CLOCK),
+					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(clock).array()), RequestType.none());
+			clockMoved = false;
+		}
 	}
 
 	private interface Operation {

@@ -231,6 +231,7 @@ final class OldLogEntryCodec {
 				writeString(out, clusterId);
 				out.writeBoolean(seeded);
 			}
+			case LogEntry.RegisterClient _ -> throw new IllegalArgumentException("Not in the old format");
 		}
 	}
 
