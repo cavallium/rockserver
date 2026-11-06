@@ -38,9 +38,15 @@ import java.util.concurrent.locks.LockSupport;
  *     [--step-seconds 30] [--warmup-seconds 10] [--route leader|all|failover|same-list] [--connections 4]
  *     [--first follower|leader|ID] [--leader-hint listed|any|off]
  *     [--chats 20000] [--messages-per-chat 50] [--value-bytes 600] [--skew 0.5] [--max-in-flight 512]
- *     [--hot-keys 4:0.5] [--only UPDATE,GET] [--jvm "-Xmx4g -XX:+UseZGC"] [--server-arg "--snapshot-every 100000"]
- *     [--label text]
+ *     [--hot-keys 4:0.5] [--only UPDATE,GET] [--merge-rate 2000] [--jvm "-Xmx4g -XX:+UseZGC"]
+ *     [--server-arg "--snapshot-every 100000"] [--label text]
  * </pre>
+ *
+ * <p>{@code --merge-rate R} adds {@code MERGE} (single merges, see {@link Kind#MERGE}) to the mix at R per second at
+ * scale 1; {@code --only MERGE} runs merges alone. Whenever MERGE runs, every node gets a Rockserver config that gives
+ * every column the string-append merge operator ({@code <root>/merge.conf}), unless {@code --server-arg} already names
+ * a {@code --rockserver-config}. For the merge-heavy benchmark (WA-15): compare the merge rate a node sustains with
+ * {@code --only MERGE} against {@code --only HISTORY_PUT_MULTI} or a put-only mix of the same rate.</p>
  *
  * <p>{@code --hot-keys N:SHARE} sends that share of the updates to N single keys, for what one key sustains; compare
  * with and without {@code --server-arg --pipelined-updates}. {@code --only UPDATE --hot-keys 1:1} isolates it.</p>
@@ -53,6 +59,17 @@ import java.util.concurrent.locks.LockSupport;
  * The other routes give each connection one node, or (failover) a list rotated per node.</p>
  */
 public final class LoadBench {
+
+	/** Every column with the string-append merge operator, for {@link Kind#MERGE}. */
+	static final String MERGE_CONFIG = """
+			database: {
+			  global: {
+			    fallback-column-options: {
+			      merge-operator-class: "it.cavallium.rockserver.core.impl.MyStringAppendOperator"
+			    }
+			  }
+			}
+			""";
 
 	private final Map<String, String> options;
 	private final Path root;
@@ -79,6 +96,18 @@ public final class LoadBench {
 		Files.createDirectories(root);
 		var jvm = List.of(option("--jvm", "-Xms4g -Xmx4g -XX:+UseZGC -XX:+AlwaysPreTouch -XX:+ExitOnOutOfMemoryError").split("\\s+"));
 		var serverArgs = splitArgs(option("--server-arg", ""));
+		var mix = mix();
+		Path mergeConfig = null;
+		if (mix.getOrDefault(Kind.MERGE, 0.0) > 0) {
+			mergeConfig = root.resolve("merge.conf");
+			Files.writeString(mergeConfig, MERGE_CONFIG);
+			if (!serverArgs.contains("--rockserver-config")) {
+				var withConfig = new ArrayList<>(serverArgs);
+				withConfig.add("--rockserver-config");
+				withConfig.add(mergeConfig.toAbsolutePath().toString());
+				serverArgs = List.copyOf(withConfig);
+			}
+		}
 		boolean replicated = option("--target", "replicated").equals("replicated");
 		int nodeCount = Integer.parseInt(option("--nodes", "3"));
 		var hotKeys = option("--hot-keys", "0:0").split(":");
@@ -91,7 +120,7 @@ public final class LoadBench {
 		try (var nodes = replicated
 				? BenchNodes.startReplicated(root, list("--node-dirs", "").stream().map(Path::of).toList(), nodeCount, jvm,
 						serverArgs)
-				: BenchNodes.startSingle(root, jvm, null)) {
+				: BenchNodes.startSingle(root, jvm, mergeConfig)) {
 			var connections = connect(nodes, replicated);
 			try {
 				var setup = connections.getFirst().getAsyncApi(RequestContext.batch(YotsubaWorkload.TIMEOUT));
@@ -104,7 +133,6 @@ public final class LoadBench {
 						preloadSeconds, preloaded / preloadSeconds,
 						preloaded * (workload.valueBytes + 12) / preloadSeconds / (1 << 20)));
 
-				var mix = mix();
 				int warmup = Integer.parseInt(option("--warmup-seconds", "10"));
 				int step = Integer.parseInt(option("--step-seconds", "30"));
 				for (var scale : list("--scales", "")) {
@@ -395,7 +423,7 @@ public final class LoadBench {
 			var map = new LinkedHashMap<Kind, RocksDBAsyncAPI>();
 			for (var kind : Kind.values()) {
 				map.put(kind, switch (kind) {
-					case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, BULK_PUT -> ingest;
+					case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, BULK_PUT, MERGE -> ingest;
 					case GET, EXISTS_MULTI -> latency;
 					case FIRST_LAST, RANGE_PAGE -> analytical;
 					case MONITOR_TX -> batch;
@@ -408,13 +436,14 @@ public final class LoadBench {
 
 	private static boolean isWrite(Kind kind) {
 		return switch (kind) {
-			case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, MONITOR_TX, BULK_PUT -> true;
+			case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, MONITOR_TX, BULK_PUT, MERGE -> true;
 			case GET, EXISTS_MULTI, FIRST_LAST, RANGE_PAGE -> false;
 		};
 	}
 
 	private Map<Kind, Double> mix() {
 		var mix = YotsubaWorkload.productionMix();
+		mix.put(Kind.MERGE, Double.parseDouble(option("--merge-rate", "0")));
 		var only = option("--only", "");
 		if (!only.isBlank()) {
 			var keep = List.of(only.split(","));

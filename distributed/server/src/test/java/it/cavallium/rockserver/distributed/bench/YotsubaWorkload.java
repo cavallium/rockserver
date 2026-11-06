@@ -14,6 +14,7 @@ import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -37,6 +38,8 @@ import java.util.concurrent.atomic.AtomicReference;
  *   chunk;</li>
  *   <li>{@code file-locations}: key [4] + two XXHASH32 tails, no value, written with {@code putMulti};</li>
  *   <li>{@code monitor-log}: key [8, 8], small transactions of two {@code putMulti}.</li>
+ *   <li>{@code merge-appends}: key [8 chat, 4 slot], single {@code merge} calls of a short operand (not in the
+ *   production mix, see {@link Kind#MERGE}).</li>
  * </ul>
  * Chats are picked with a Zipf-like skew so that hot chats produce real update conflicts. {@link #hotKeys} sends a
  * share of the updates to a few single keys instead, to measure what one key sustains.
@@ -55,7 +58,15 @@ final class YotsubaWorkload {
 		RANGE_PAGE(4),
 		MONITOR_TX(34),
 		/** Not in the production mix: 1 MiB putMulti calls, to measure bandwidth (use with --only). */
-		BULK_PUT(0);
+		BULK_PUT(0),
+		/**
+		 * Not in the production mix: a {@code merge} with {@code RequestType.none()} of an 8-byte operand into one of 16
+		 * slots of a skewed chat, for the cost of the read that checks each merge at apply (WA-15, "Every merge is
+		 * checked at apply" in the design). The column needs a merge operator: {@code LoadBench} gives every column the
+		 * string-append operator when MERGE runs. With that operator a value grows by 9 bytes per merge, so hot slots
+		 * grow over a long run.
+		 */
+		MERGE(0);
 
 		final double ratePerSecond;
 
@@ -79,6 +90,7 @@ final class YotsubaWorkload {
 	long history;
 	long files;
 	long monitorLog;
+	long mergeAppends;
 
 	YotsubaWorkload(int chats, int messagesPerChat, int valueBytes, double skew) {
 		this(chats, messagesPerChat, valueBytes, skew, 0, 0);
@@ -106,6 +118,8 @@ final class YotsubaWorkload {
 		files = api.createColumnAsync("file-locations",
 				ColumnSchema.of(IntList.of(4), ObjectList.of(ColumnHashType.XXHASH32, ColumnHashType.XXHASH32), false)).join();
 		monitorLog = api.createColumnAsync("monitor-log-v1", ColumnSchema.of(IntList.of(8, 8), ObjectList.of(), true))
+				.join();
+		mergeAppends = api.createColumnAsync("merge-appends", ColumnSchema.of(IntList.of(8, 4), ObjectList.of(), true))
 				.join();
 	}
 
@@ -220,6 +234,13 @@ final class YotsubaWorkload {
 				}
 				api.putMultiAsync(0, history, keys, values, RequestType.none()).join();
 				yield 16L * (39 + 64 * 1024);
+			}
+			case MERGE -> {
+				// ASCII digits: the string-append operator reads operands as UTF-8.
+				var operand = String.format("%08d", random.nextInt(100_000_000)).getBytes(StandardCharsets.US_ASCII);
+				api.mergeAsync(0, mergeAppends, new Keys(fixed(8, chat(random)), fixed(4, random.nextInt(16))),
+						Buf.wrap(operand), RequestType.none()).join();
+				yield 12 + operand.length;
 			}
 		};
 	}

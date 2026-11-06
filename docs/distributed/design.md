@@ -820,7 +820,8 @@ anyway. Apply rejects such entries the same way on every replica (below), at the
   operator. If it fails, the entry is rolled back to its savepoint and the request gets `MERGE_OPERATOR_FAILED`,
   as a merge that returns its value does. This costs one read per merge (in the memtable or block cache when the
   key is hot, a disk read otherwise); merges that return the merged value, and bucketed columns, which merge in
-  Java, already merge and skip it. A later flush or compaction then only merges operand sequences that a read
+  Java, already merge and skip it. The load bench has a `MERGE` operation to measure this cost (`--only MERGE`,
+  `--merge-rate`, see performance.md; WA-15); that run has not been done. A later flush or compaction then only merges operand sequences that a read
   already merged at apply: each operand was checked over the base and every operand before it, which is what a
   full merge at flush or compaction computes, and a partial merge that the operator declines leaves the operands
   as they are. With a deterministic operator, that cannot fail. An operator that is not deterministic (it depends
