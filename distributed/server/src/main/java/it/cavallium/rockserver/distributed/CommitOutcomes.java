@@ -213,7 +213,10 @@ final class CommitOutcomes {
 				throw new CompletionException(earlierCopyInFlight());
 			}
 			if (!sessionExists.test(id.sessionId())) {
-				throw new CompletionException(((ApplyResult.Failed) Applier.SESSION_GONE).toException());
+				// This copy is refused before it runs: flagged not applied. An earlier copy may have applied, which only
+				// the client knows (it sent it): it ends the write unknown then.
+				var gone = (ApplyResult.Failed) Applier.SESSION_GONE;
+				throw new CompletionException(RocksDBException.notApplied(gone.type(), gone.message()));
 			}
 			throw new CompletionException(new RocksDBRetryException());
 		});

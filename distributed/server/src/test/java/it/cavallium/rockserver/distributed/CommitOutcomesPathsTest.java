@@ -135,7 +135,9 @@ class CommitOutcomesPathsTest {
 	@Test
 	void aCopyOfAGoneSessionIsExpiredNotRunAgain() {
 		sessionExists.set(false);
-		assertEquals(RocksDBErrorType.SESSION_EXPIRED, type(failure(outcomes.settledCommit(new ClientRequestId(7, 1, 0)))));
+		var error = failure(outcomes.settledCommit(new ClientRequestId(7, 1, 0)));
+		assertEquals(RocksDBErrorType.SESSION_EXPIRED, type(error));
+		assertTrue(((RocksDBException) error).isNotApplied(), "this copy was refused before it ran");
 	}
 
 	@Test

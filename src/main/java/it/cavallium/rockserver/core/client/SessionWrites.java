@@ -627,6 +627,9 @@ final class SessionWrites {
 				return;
 			}
 			var cause = unwrap(error);
+			// SESSION_EXPIRED: this copy was refused before it ran (a server sets the not-applied flag on it, and answers
+			// OUTCOME_UNKNOWN instead when a copy of its own may have run). Copies this client sent earlier are the
+			// client's to judge (maybeApplied), so the flag is not needed here; the final failure carries it.
 			if (cause instanceof RocksDBException rocks
 					&& rocks.getErrorUniqueId() == RocksDBErrorType.SESSION_EXPIRED) {
 				call.finish();
@@ -642,8 +645,10 @@ final class SessionWrites {
 					call.pauseNanos = Math.min(MAX_PAUSE_NANOS, pause * 2);
 					later(pause, () -> start(call), call::failClosed);
 				} else {
-					// Not applied, and no time left to send it again.
-					call.fail(cause);
+					// Not applied, and no time left to send it again: flagged, also when a server without the trailer
+					// sent it, so that the caller can tell it from an unknown outcome.
+					call.fail(rocks.isNotApplied() ? rocks : RocksDBException.notApplied(rocks.getErrorUniqueId(),
+							rocks.getMessage()));
 				}
 				return;
 			}
