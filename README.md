@@ -226,7 +226,8 @@ To replace a node of a replicated cluster, start the new node first with `--join
 leaving the old node out of `--peer` replaces it in one step. See "Replacing a node" in the [design
 document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
 without it), and see "Heap" there for the heap that a snapshot send needs. A removed node that is started again exits
-with 4: set `RestartPreventExitStatus=4` in its systemd unit. A replicated node flushes its memtables when all columns together
+with 4, and one that meets a database or log of a newer cluster version with 5: set `RestartPreventExitStatus=4 5` in its
+systemd unit (see "Exit codes" in [runbooks.md](docs/distributed/runbooks.md)). A replicated node flushes its memtables when all columns together
 reach `database.global.write-buffer-manager` (128 MiB by default): it replaces every column's `write-buffer-size`
 with that budget, because with atomic flush any flush writes every column (see "Memtables" in
 [performance.md](docs/distributed/performance.md)).

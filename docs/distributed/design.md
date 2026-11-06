@@ -1602,7 +1602,8 @@ What waits for it:
   places. A member of a newer version that answered the leader's poll and was then rolled back can meet the raise in
   its log: its database lost the unsynced WAL tail that held it and replays it, or it had not applied it yet and
   catches up. The apply of a `ClusterVersion` entry to bits the node lacks stops the replica (the version stays as it
-  was; the failure carries `NewerVersionException`, and `run` exits with 5, not 3). The same member lagging past the
+  was; the failure carries `NewerVersionException`, and `run` exits with 5, not 3, also through its shutdown hook: see
+  R6-2 under "Left before a first deployment"). The same member lagging past the
   leader's log installs the leader's snapshot, whose version has the raise: the install checks the database it just
   opened and stops the replica the same way. Not an entry failure: a replica of the newer version applies the entry.
 - `checksum-schemas` (CR2-9) puts the column schemas into the checksum digest: a bit of its own though it writes no new
@@ -2170,6 +2171,16 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      open until `DiskFaultTest` runs: `ShutdownSignalTest` checks both in process (a failed apply, and a division
      closed right before the signal); `DiskFaultTest` sends a real SIGTERM to a node whose disk is failing (written,
      not run yet: it is a process suite).
+   - The exit status after a start is the same on both paths (R6-2): the main thread's exit is a `System.exit`,
+     which runs the shutdown hook, and the hook ends with `Runtime.halt`. The hook used to halt with 3 for any
+     failure, which replaced the 4 of a node that found out, while it waited outside the cluster, that it was
+     removed, and the 5 of a replica that met a newer cluster version in its log or in an installed snapshot, so
+     `RestartPreventExitStatus=4 5` never saw them after a start. Both now take the status from the failure that
+     stopped the node (`ReplicatedServerMain.failedExitStatus`, looking through its causes: 4, 5, else 3).
+     `ShutdownSignalTest.aFailureWithItsOwnStatusExitsWithItAlsoThroughTheShutdownHook` runs the main thread's part
+     (`serve`) with the exit, the hook registration and the halt replaced, then the hook as `System.exit` would, for 4
+     and 5 (it fails with 3 from the hook without the change). A real process exit is checked by
+     `MembershipTest.aRemovedNodeThatRestartsExitsWithFour` only for the start path, and that suite has not run.
 8. **Upstream.** Report the Ratis ReadIndex reuse bug, and switch back to Ratis ReadIndex once it is fixed
    upstream. Also to report (drafts in the round-3 notes), none of them blocking:
    - `GrpcUtil.shutdownManagedChannel` waits 3 s, then 2 s more, on the thread that resets a peer's proxy; worked

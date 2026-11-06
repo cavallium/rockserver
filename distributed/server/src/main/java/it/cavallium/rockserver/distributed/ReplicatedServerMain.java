@@ -19,6 +19,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.protocol.ClientId;
@@ -127,6 +128,14 @@ public final class ReplicatedServerMain {
 	 */
 	static volatile IntConsumer exiter = System::exit;
 
+	/**
+	 * How the shutdown hook ends the process once the node stopped after a failure: {@link Runtime#halt}, unless a test
+	 * replaced it. A test also replaces {@link #shutdownHooks}, to run the hook itself.
+	 */
+	static volatile IntConsumer halter = code -> Runtime.getRuntime().halt(code);
+	/** Where {@code run} registers its shutdown hook: the JVM's, unless a test replaced it. */
+	static volatile Consumer<Thread> shutdownHooks = hook -> Runtime.getRuntime().addShutdownHook(hook);
+
 	private static void exit(int code) {
 		exiter.accept(code);
 		throw new IllegalStateException("exit(" + code + ") returned");
@@ -203,31 +212,42 @@ public final class ReplicatedServerMain {
 			exit(1);
 			return;
 		}
-		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+		serve(node, directMemoryWatch);
+	}
+
+	/**
+	 * The rest of {@code run} once the node started: registers the shutdown hook, then waits until the node stops and
+	 * exits with {@link #failedExitStatus} if it failed. The main thread's {@code exit} is a {@link System#exit}, which runs
+	 * the hook, and the hook ends with {@link Runtime#halt}: so both give the same status, or the hook's 3 would replace
+	 * the 4 of a node that found out it was removed and the 5 of a replica that met a newer cluster version
+	 * ({@code RestartPreventExitStatus=4 5} relies on those).
+	 */
+	static void serve(ReplicatedNode node, @Nullable DirectMemoryWatch directMemoryWatch) {
+		var nodeId = node.config().nodeId();
+		shutdownHooks.accept(new Thread(() -> {
 			int status = closeOnSignal(node);
 			// A replica failure that raced the signal: its own stop found the node already closing, so the main thread
 			// below saw a normal stop, and the JVM would exit with the signal's status. Exit with the failure's.
+			// After a failure the main thread's own exit also runs this hook, which then halts with the same status.
 			if (status != 0) {
-				System.err.println("Node " + config.nodeId() + " stopped after a failure during its shutdown");
+				System.err.println("Node " + nodeId + " stopped after a failure during its shutdown");
 				System.err.flush();
-				Runtime.getRuntime().halt(status);
+				halter.accept(status);
 			}
 		}, "rockserver-shutdown"));
-		System.out.println("READY " + config.nodeId());
+		System.out.println("READY " + nodeId);
 		System.out.flush();
 		var failure = node.stopped().join();
 		if (directMemoryWatch != null) {
 			directMemoryWatch.close();
 		}
-		if (failure != null || node.isFailed()) {
+		int status = failedExitStatus(node);
+		if (status != 0) {
 			// The replica cannot apply the log, or Raft closed: exit, so that a supervisor notices.
-			System.err.println("Node " + config.nodeId() + " stopped after a failure: "
+			System.err.println("Node " + nodeId + " stopped after a failure: "
 					+ (failure != null ? failure : "replica failed"));
-			// When a signal already started the shutdown, this blocks; the hook then halts with 3 once the node stopped.
-			// A node that found out, while it waited outside the cluster, that it was removed exits as at start.
-			// A replica that met a cluster version it cannot read in its log or in an installed snapshot exits as at start.
-			exit(failure instanceof ReplicatedNode.RemovedException ? 4
-					: ReplicatedNode.NewerVersionException.in(failure) ? 5 : 3);
+			// When a signal already started the shutdown, this blocks; the hook then halts once the node stopped.
+			exit(status);
 		}
 	}
 
@@ -257,11 +277,28 @@ public final class ReplicatedServerMain {
 		return failedExitStatus(node);
 	}
 
-	/** The exit status of a node that stopped: 3 if its replica failed or its Raft server closed by itself, else 0. */
+	/**
+	 * The exit status of a node that stopped, used by both the main thread and the shutdown hook: 0 if it stopped without
+	 * a failure, else {@link #exitStatusOf} its failure.
+	 */
 	static int failedExitStatus(ReplicatedNode node) {
 		var stopped = node.stopped();
-		boolean failedStop = stopped.isDone() && !stopped.isCompletedExceptionally() && stopped.join() != null;
-		return failedStop || node.isFailed() ? 3 : 0;
+		var failure = stopped.isDone() && !stopped.isCompletedExceptionally() ? stopped.join() : null;
+		return failure != null ? exitStatusOf(failure) : node.isFailed() ? 3 : 0;
+	}
+
+	/**
+	 * The exit status for the failure that stopped a running node, the same as at start: 4 if it found out, while it waited
+	 * outside the cluster, that it was removed; 5 if its replica met a cluster version it cannot read in its log or in an
+	 * installed snapshot; else 3 (its replica failed, or its Raft server closed by itself).
+	 */
+	static int exitStatusOf(Throwable failure) {
+		for (var cause = failure; cause != null; cause = cause.getCause()) {
+			if (cause instanceof ReplicatedNode.RemovedException) {
+				return 4;
+			}
+		}
+		return ReplicatedNode.NewerVersionException.in(failure) ? 5 : 3;
 	}
 
 	/**
