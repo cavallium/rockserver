@@ -3,22 +3,50 @@ package it.cavallium.rockserver.distributed;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.grpc.Server;
+import io.grpc.netty.NettyServerBuilder;
+import io.grpc.stub.StreamObserver;
+import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest;
+import it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse;
+import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/** Leader lookup of the forwarder, without a Raft server. */
+/**
+ * The forwarder without a Raft server: leader lookups against a {@link StubRaft} division, and connections to a
+ * minimal gRPC server that answers the capability handshake.
+ */
 class LeaderForwarderTest {
 
 	@TempDir
 	Path temp;
+	private final List<AutoCloseable> closing = new ArrayList<>();
+
+	@AfterEach
+	void tearDown() throws Exception {
+		for (var resource : closing.reversed()) {
+			resource.close();
+		}
+	}
 
 	@Test
 	void closingFailsTheCallsStillWaitingForALeader() throws Exception {
@@ -41,5 +69,249 @@ class LeaderForwarderTest {
 		} finally {
 			metrics.close();
 		}
+	}
+
+	// -------------------------------------------------------------------------------------------------------------
+	// Leader lookup
+
+	private record Setup(StubRaft raft, RockserverStateMachine stateMachine, LeaderForwarder forwarder) {}
+
+	private Setup setup(List<PeerConfig> peers, Duration requestTimeout) throws Exception {
+		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(requestTimeout);
+		var metrics = new NodeMetrics("n0");
+		closing.add(metrics::close);
+		var stateMachine = new RockserverStateMachine(config, _ -> {}, metrics);
+		var raft = new StubRaft();
+		raft.installInto(stateMachine);
+		var forwarder = new LeaderForwarder(config);
+		closing.add(forwarder);
+		return new Setup(raft, stateMachine, forwarder);
+	}
+
+	private static List<PeerConfig> peers(int apiPortOfN1) {
+		return List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2),
+				new PeerConfig("n1", "127.0.0.1", 3, "127.0.0.1", apiPortOfN1));
+	}
+
+	@Test
+	void anotherNodeKnownAsLeaderIsAnsweredAtOnceAndThisNodeOnlyOnceItIsAReadyLeader() throws Exception {
+		var s = setup(peers(4), Duration.ofSeconds(5));
+		s.raft().leaderId = "n1";
+		assertEquals("n1", s.forwarder().leader(s.stateMachine()).getNow(null));
+
+		s.raft().leaderId = "n0";
+		s.raft().leader = true;
+		var waiting = s.forwarder().leader(s.stateMachine());
+		assertFalse(waiting.isDone(), "this node leads but is not ready yet");
+		s.raft().leaderReady = true;
+		s.forwarder().leaderChanged();
+		assertEquals("n0", waiting.get(5, TimeUnit.SECONDS));
+	}
+
+	/**
+	 * A leader that becomes known while a request waits wakes it through {@link LeaderForwarder#leaderChanged()},
+	 * well before the safety poll (250 ms) would.
+	 */
+	@Test
+	void aLeaderChangeWakesTheWaitingRequestsAtOnce() throws Exception {
+		var s = setup(peers(4), Duration.ofSeconds(5));
+		for (int round = 0; round < 5; round++) {
+			s.raft().leaderId = null;
+			var waiting = List.of(s.forwarder().leader(s.stateMachine()), s.forwarder().leader(s.stateMachine()));
+			waiting.forEach(future -> assertFalse(future.isDone()));
+			s.raft().leaderId = "n1";
+			long start = System.nanoTime();
+			s.forwarder().leaderChanged();
+			for (var future : waiting) {
+				assertEquals("n1", future.get(5, TimeUnit.SECONDS));
+			}
+			long tookMillis = (System.nanoTime() - start) / 1_000_000;
+			assertTrue(tookMillis < 200, "woken after " + tookMillis + " ms: by the poll, not by the change");
+		}
+	}
+
+	/**
+	 * The lost wake-up race: the leader becomes known right after the request's first check read the leader id, and
+	 * Ratis notifies the change before the request registered for wake-ups, so the notification wakes nothing. The
+	 * check made after the registration must see the leader: the request completes at once, without waiting for the
+	 * safety poll.
+	 */
+	@Test
+	void aLeaderThatAppearsBetweenTheFirstCheckAndTheRegistrationIsNotMissed() throws Exception {
+		var s = setup(peers(4), Duration.ofSeconds(5));
+		var reads = new AtomicInteger();
+		s.raft().leaderId = null;
+		s.raft().onLeaderIdRead = () -> {
+			if (reads.incrementAndGet() == 1) {
+				// The first read answers null; then the leader changes and Ratis notifies, nobody registered yet.
+				s.raft().leaderId = "n1";
+				s.forwarder().leaderChanged();
+			}
+		};
+		var result = s.forwarder().leader(s.stateMachine());
+		assertTrue(reads.get() >= 2, "the request did not check again after registering");
+		assertTrue(result.isDone(), "the request waits although the leader is known");
+		assertEquals("n1", result.get(1, TimeUnit.SECONDS));
+	}
+
+	@Test
+	void noLeaderWithinTheRequestTimeoutFailsAsRetryableOverload() throws Exception {
+		var s = setup(peers(4), Duration.ofMillis(400));
+		var error = assertThrows(ExecutionException.class,
+				() -> s.forwarder().leader(s.stateMachine()).get(5, TimeUnit.SECONDS));
+		var cause = assertInstanceOf(RocksDBException.class, error.getCause());
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, cause.getErrorUniqueId());
+	}
+
+	// -------------------------------------------------------------------------------------------------------------
+	// Connections
+
+	/** A gRPC server that answers only the capability handshake, as a Rockserver would. */
+	private int handshakeServer() throws Exception {
+		Server server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0))
+				.addService(new RocksDBServiceGrpc.RocksDBServiceImplBase() {
+					@Override
+					public void getCapabilities(CapabilitiesRequest request,
+							StreamObserver<CapabilitiesResponse> response) {
+						var current = RockserverCapabilities.CURRENT;
+						response.onNext(CapabilitiesResponse.newBuilder()
+								.setWorkloadContractVersion(current.workloadContractVersion())
+								.setClientSessions(current.clientSessions())
+								.setNumberedBatches(current.numberedBatches())
+								.build());
+						response.onCompleted();
+					}
+				})
+				.build()
+				.start();
+		closing.add(() -> server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS));
+		return server.getPort();
+	}
+
+	/** A port nothing listens on. */
+	private static int closedPort() throws Exception {
+		try (var socket = new ServerSocket(0)) {
+			return socket.getLocalPort();
+		}
+	}
+
+	@Test
+	void requestsRotateOverFourConnectionsPerPeer() throws Exception {
+		var s = setup(peers(handshakeServer()), Duration.ofSeconds(5));
+		var targets = new ArrayList<LeaderForwarder.Target>();
+		for (int i = 0; i < 8; i++) {
+			targets.add(s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		}
+		var keys = new HashSet<String>();
+		var connections = new HashSet<Object>();
+		for (var target : targets) {
+			assertEquals("n1", target.peerId());
+			keys.add(target.key());
+			connections.add(target.connection());
+		}
+		assertEquals(4, keys.size(), keys::toString);
+		assertEquals(4, connections.size());
+		// In turn: the fifth request uses the first request's connection again.
+		for (int i = 0; i < 4; i++) {
+			assertEquals(targets.get(i).key(), targets.get(i + 4).key());
+			assertSame(targets.get(i).connection(), targets.get(i + 4).connection());
+		}
+	}
+
+	@Test
+	void anInvalidatedConnectionIsReplacedAndTheOtherSlotsAreKept() throws Exception {
+		var s = setup(peers(handshakeServer()), Duration.ofSeconds(5));
+		var first = new ArrayList<LeaderForwarder.Target>();
+		for (int i = 0; i < 4; i++) {
+			first.add(s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		}
+		var broken = first.get(1);
+		s.forwarder().invalidate(broken);
+		// Invalidating again, or a stale target of the same slot, changes nothing more.
+		s.forwarder().invalidate(broken);
+		var second = new ArrayList<LeaderForwarder.Target>();
+		for (int i = 0; i < 4; i++) {
+			second.add(s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		}
+		for (int i = 0; i < 4; i++) {
+			assertEquals(first.get(i).key(), second.get(i).key());
+			if (i == 1) {
+				assertNotSame(broken.connection(), second.get(i).connection(), "the broken connection is reused");
+			} else {
+				assertSame(first.get(i).connection(), second.get(i).connection(), "slot " + i + " reconnected");
+			}
+		}
+		s.forwarder().invalidate(broken);
+		assertSame(second.get(1).connection(),
+				nextOfSlot(s, second.get(1).key()).connection(), "a stale target invalidated a newer connection");
+	}
+
+	private static LeaderForwarder.Target nextOfSlot(Setup s, String key) throws Exception {
+		for (int i = 0; i < 4; i++) {
+			var target = s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS);
+			if (target.key().equals(key)) {
+				return target;
+			}
+		}
+		throw new AssertionError("slot " + key + " not handed out in four requests");
+	}
+
+	/**
+	 * A peer whose API port refuses connections fails at once (the probe, instead of the handshake's seconds of
+	 * retries), and for the next 200 ms every request to it fails without trying; after that it is tried again.
+	 */
+	@Test
+	void aPeerThatIsDownFailsFastAndIsNotRetriedDuringTheBackoff() throws Exception {
+		int port = closedPort();
+		var s = setup(peers(port), Duration.ofSeconds(5));
+		long start = System.nanoTime();
+		var error = assertThrows(ExecutionException.class,
+				() -> s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		assertInstanceOf(LeaderForwarder.NotConnectedException.class, error.getCause());
+		long probeMillis = (System.nanoTime() - start) / 1_000_000;
+		assertTrue(probeMillis < 2_000, "a refused connection took " + probeMillis + " ms to fail");
+
+		// Now something listens there, but the peer is still marked down.
+		try (var listening = new ServerSocket()) {
+			listening.setReuseAddress(true);
+			listening.bind(new InetSocketAddress("127.0.0.1", port));
+			var during = s.forwarder().target("n1", s.stateMachine());
+			assertTrue(during.isDone(), "a request during the backoff tried to connect");
+			assertTrue(during.isCompletedExceptionally());
+		}
+		Thread.sleep(250);
+		// After the backoff it tries again (and fails again: the port is closed once more).
+		var after = s.forwarder().target("n1", s.stateMachine());
+		var again = assertThrows(ExecutionException.class, () -> after.get(10, TimeUnit.SECONDS));
+		assertInstanceOf(LeaderForwarder.NotConnectedException.class, again.getCause());
+	}
+
+	/** A peer that is back after its backoff gets a working connection. */
+	@Test
+	void aPeerThatComesBackIsConnectedAfterTheBackoff() throws Exception {
+		int port = closedPort();
+		var s = setup(peers(port), Duration.ofSeconds(5));
+		assertThrows(ExecutionException.class, () -> s.forwarder().target("n1", s.stateMachine()).get(10,
+				TimeUnit.SECONDS));
+		Thread.sleep(250);
+		var server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", port))
+				.addService(new RocksDBServiceGrpc.RocksDBServiceImplBase() {
+					@Override
+					public void getCapabilities(CapabilitiesRequest request,
+							StreamObserver<CapabilitiesResponse> response) {
+						var current = RockserverCapabilities.CURRENT;
+						response.onNext(CapabilitiesResponse.newBuilder()
+								.setWorkloadContractVersion(current.workloadContractVersion())
+								.setClientSessions(current.clientSessions())
+								.setNumberedBatches(current.numberedBatches())
+								.build());
+						response.onCompleted();
+					}
+				})
+				.build()
+				.start();
+		closing.add(() -> server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS));
+		var target = s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS);
+		assertEquals("n1", target.peerId());
 	}
 }

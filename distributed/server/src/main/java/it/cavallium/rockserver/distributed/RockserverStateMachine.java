@@ -496,6 +496,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 				throw new StateMachineException(conflict.getMessage(), conflict, false);
 			}
 		}
+		CrashPoints.reach(CrashPoints.Point.BEFORE_APPEND);
 		proposal.session = session;
 		proposal.token = session.tracker().register(entries);
 		proposal.appendedNanos = System.nanoTime();
@@ -787,6 +788,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			failAll(group, new IllegalStateException("Replica failed"));
 			return;
 		}
+		CrashPoints.reach(CrashPoints.Point.BEFORE_APPLY);
 		var completions = new java.util.ArrayList<Runnable>(group.size());
 		long start = System.nanoTime();
 		var applier = this.applier;
@@ -826,6 +828,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			fail("apply entries up to " + positionOf(group.getLast()), ex);
 			return;
 		}
+		CrashPoints.reach(CrashPoints.Point.AFTER_APPLY_BEFORE_REPLY);
 		applyTime.since(start);
 		applyGroupEntries.record(group.size());
 		prepareSnapshot(positionOf(group.getLast()));
@@ -1017,6 +1020,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		// Before the checkpoint: entries applied while it runs count towards the next one.
 		long bytesBefore = bytesSinceSnapshot.get();
 		var position = storage.take(store);
+		CrashPoints.reach(CrashPoints.Point.SNAPSHOT_TAKEN);
 		bytesSinceSnapshot.addAndGet(-bytesBefore);
 		snapshotTime.since(start);
 		LOG.info("{}: snapshot taken at {} in {} ms", config.nodeId(), position, (System.nanoTime() - start) / 1_000_000);
@@ -1029,6 +1033,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		try {
 			// The database is replaced: nothing may still be applying to it.
 			drainApplyQueue();
+			CrashPoints.reach(CrashPoints.Point.INSTALL_RECEIVED);
 			getLifeCycle().startAndTransition(this::installSnapshot);
 		} catch (IOException | RuntimeException ex) {
 			// Ratis would only close this division and leave the process running: stop the node for good instead.
@@ -1056,6 +1061,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		// Odd from here until the restored database replaced the old one: reads that fail meanwhile are retried elsewhere.
 		storeGeneration++;
 		old.close();
+		CrashPoints.reach(CrashPoints.Point.INSTALL_RESTORING);
 		NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
 		openStore();
 		storeGeneration++;
@@ -1063,6 +1069,9 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	@Override
 	public void notifyLeaderChanged(RaftGroupMemberId groupMemberId, RaftPeerId newLeaderId) {
+		if (groupMemberId.getPeerId().equals(newLeaderId)) {
+			CrashPoints.reach(CrashPoints.Point.ELECTED);
+		}
 		if (!groupMemberId.getPeerId().equals(newLeaderId)) {
 			LeaderSession session;
 			synchronized (this) {
@@ -1075,6 +1084,15 @@ final class RockserverStateMachine extends BaseStateMachine {
 			}
 		}
 		leaderListener.run();
+	}
+
+	/** Only a test hook: the configuration itself is Ratis' business. */
+	@Override
+	public void notifyConfigurationChanged(long term, long index,
+			org.apache.ratis.proto.RaftProtos.RaftConfigurationProto newRaftConfiguration) {
+		if (newRaftConfiguration.getOldPeersCount() > 0) {
+			CrashPoints.reach(CrashPoints.Point.JOINT_CONFIGURATION_APPLIED);
+		}
 	}
 
 	@Override

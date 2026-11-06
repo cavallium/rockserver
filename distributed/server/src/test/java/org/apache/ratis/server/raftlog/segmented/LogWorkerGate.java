@@ -15,6 +15,37 @@ public final class LogWorkerGate {
 		run(log, release::await);
 	}
 
+	/**
+	 * The worker sleeps {@code millis} once it reaches this, as a disk that stalls for that long, then goes on. The
+	 * result completes after the sleep: a slow (not stopped) disk is a loop of short pauses.
+	 */
+	public static java.util.concurrent.CompletableFuture<Void> pause(RaftLog log, long millis)
+			throws ReflectiveOperationException {
+		var slept = new java.util.concurrent.CompletableFuture<Void>();
+		run(log, () -> {
+			try {
+				Thread.sleep(millis);
+			} finally {
+				slept.complete(null);
+			}
+		});
+		return slept;
+	}
+
+	/**
+	 * Fails unless the Ratis internals this gate uses are still there: a Ratis upgrade that renames them must fail
+	 * here, by name, rather than as an odd timing in the tests that use the gate.
+	 */
+	public static void checkContract() throws ReflectiveOperationException {
+		var workerField = SegmentedRaftLog.class.getDeclaredField("fileLogWorker");
+		if (workerField.getType() != SegmentedRaftLogWorker.class) {
+			throw new NoSuchFieldException("SegmentedRaftLog.fileLogWorker is a " + workerField.getType());
+		}
+		SegmentedRaftLogWorker.class.getDeclaredMethod("addIOTask", SegmentedRaftLog.Task.class);
+		SegmentedRaftLog.Task.class.getDeclaredMethod("execute");
+		SegmentedRaftLog.Task.class.getDeclaredMethod("getEndIndex");
+	}
+
 	@FunctionalInterface
 	private interface Wait {
 		void run() throws InterruptedException;
