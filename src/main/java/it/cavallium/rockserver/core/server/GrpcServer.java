@@ -349,7 +349,11 @@ public class GrpcServer extends Server {
 		private final AtomicLong suppressed = new AtomicLong();
 	}
 
-	/** Requests that may wait on a non-embedded connection at once; more are refused as overload. */
+	/**
+	 * Requests that may wait on a non-embedded connection at once; more are refused as overload. A count, not bytes: a
+	 * replicated node bounds the bytes of its writes itself (its proposer's byte admission), and a waiting read holds
+	 * only its key. At the production workload's 0.5-2 KiB values this many requests hold at most tens of MiB.
+	 */
 	private static final int PROXY_PARALLELISM = 16384;
 	/**
 	 * Streaming requests (iterators and streamed putMulti, deleteMulti and mergeMulti) of each kind that may wait on a
@@ -360,6 +364,13 @@ public class GrpcServer extends Server {
 	private static final String MAX_CONNECTION_AGE_GRACE_PROPERTY
 			= "it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms";
 	private static final Duration DEFAULT_MAX_CONNECTION_AGE_GRACE = Duration.ofMinutes(10);
+	/**
+	 * Largest message a client may send, in bytes. Each call holds its whole message on the heap while it is decoded,
+	 * so at most the proxy parallelism times this; the default fits the largest batches of a single node.
+	 */
+	private static final String MAX_INBOUND_MESSAGE_BYTES_PROPERTY
+			= "it.cavallium.rockserver.grpc.server.max-inbound-message-bytes";
+	private static final int DEFAULT_MAX_INBOUND_MESSAGE_BYTES = 512 * 1024 * 1024;
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
@@ -407,6 +418,28 @@ public class GrpcServer extends Server {
 		LOG.info("GRPC RocksDB server is listening at " + socketAddress);
 	}
 
+	/**
+	 * The largest message a client may send: the system property
+	 * {@code it.cavallium.rockserver.grpc.server.max-inbound-message-bytes}, by default 512 MiB.
+	 */
+	@VisibleForTesting
+	public static int configuredMaxInboundMessageBytes() {
+		var value = System.getProperty(MAX_INBOUND_MESSAGE_BYTES_PROPERTY);
+		if (value == null || value.isBlank()) {
+			return DEFAULT_MAX_INBOUND_MESSAGE_BYTES;
+		}
+		try {
+			int bytes = Integer.parseInt(value.strip());
+			if (bytes > 0) {
+				return bytes;
+			}
+		} catch (NumberFormatException ignored) {
+			// Warned below.
+		}
+		LOG.warn("Invalid value for system property {}: {}", MAX_INBOUND_MESSAGE_BYTES_PROPERTY, value);
+		return DEFAULT_MAX_INBOUND_MESSAGE_BYTES;
+	}
+
 	/** The age at which a server in front of another connection ends a connection; zero, the default, means never. */
 	@VisibleForTesting
 	public static Duration configuredMaxConnectionAge() {
@@ -437,7 +470,7 @@ public class GrpcServer extends Server {
 		return builder
 				.channelType(channelType)
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
-				.maxInboundMessageSize(512 * 1024 * 1024)
+				.maxInboundMessageSize(configuredMaxInboundMessageBytes())
 				.addService(service)
 				.permitKeepAliveWithoutCalls(true)
 				.permitKeepAliveTime(5, TimeUnit.SECONDS)
