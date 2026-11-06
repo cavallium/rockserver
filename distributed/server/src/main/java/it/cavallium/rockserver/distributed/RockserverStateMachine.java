@@ -273,7 +273,29 @@ final class RockserverStateMachine extends BaseStateMachine {
 		this.server = server;
 		this.groupId = groupId;
 		storage.init(raftStorage);
-		getLifeCycle().startAndTransition(this::openStore);
+		getLifeCycle().startAndTransition(() -> {
+			openStore();
+			requireKnownClusterVersion();
+		});
+	}
+
+	/**
+	 * Refuses a database whose cluster version has a capability this version of the node lacks: a downgrade below the
+	 * cluster version, or a backup of a newer cluster restored here. The log may hold entries of that capability, which
+	 * this node cannot read, and a capability check would never ask it again (the version never goes down). Only at
+	 * the start: an install brings the database of a leader of this cluster, which raised nothing a member lacks.
+	 */
+	private void requireKnownClusterVersion() throws IOException {
+		var opened = store;
+		long version = opened.clusterVersion();
+		long unknown = version & ~Capabilities.SUPPORTED;
+		if (unknown != 0) {
+			store = null;
+			opened.close();
+			throw new ReplicatedNode.NewerVersionException("Node " + config.nodeId() + " has a database of cluster version "
+					+ Capabilities.describe(version) + ", with capabilities this version lacks (" + Capabilities.describe(unknown)
+					+ "): it was written by a newer version. Run the newer version, see \"Upgrades\" in docs/distributed/runbooks.md");
+		}
 	}
 
 	/**

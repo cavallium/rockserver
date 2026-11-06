@@ -268,6 +268,38 @@ class StartupChecksTest {
 		}
 	}
 
+	/**
+	 * CR2-6: a database whose cluster version has a capability this version lacks (a downgrade, or a newer cluster's
+	 * backup restored here) is refused at the start, with an exception of its own ({@code run} exits with 5).
+	 */
+	@Test
+	void aDatabaseOfANewerClusterVersionIsRefused() throws Exception {
+		try (var cluster = new InProcessCluster(Files.createDirectories(tempDir.resolve("cluster")), 1, config -> config).startAll()) {
+			cluster.awaitLeader(java.time.Duration.ofSeconds(30));
+			InProcessCluster.await(java.time.Duration.ofSeconds(30),
+					() -> cluster.node("n0").stateMachine().ops().clusterVersion() == Capabilities.SUPPORTED);
+			cluster.stop("n0");
+			var config = cluster.config("n0");
+			long newer = Capabilities.SUPPORTED | (1L << 40);
+			writeClusterVersion(config, newer);
+			var refused = assertThrows(ReplicatedNode.NewerVersionException.class, () -> cluster.start("n0"));
+			assertTrue(refused.getMessage().contains("0x10000000000"), refused.getMessage());
+			// Nothing was changed by the refusal: the same database starts again once its version is known.
+			writeClusterVersion(config, Capabilities.SUPPORTED);
+			cluster.start("n0");
+			cluster.awaitLeader(java.time.Duration.ofSeconds(30));
+		}
+	}
+
+	private static void writeClusterVersion(NodeConfig config, long version) throws IOException {
+		try (var store = NodeStore.open(config.dbDir(), config.rockserverConfig(), "test")) {
+			store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_VERSION),
+					it.cavallium.buffer.Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(version).array()),
+					it.cavallium.rockserver.core.common.RequestType.none());
+			assertEquals(version, store.clusterVersion());
+		}
+	}
+
 	@Test
 	void directMemoryErrorsAreRecognized() {
 		assertTrue(DirectMemoryWatch.isDirectMemoryError("io.netty.util.internal.OutOfDirectMemoryError", "failed"));

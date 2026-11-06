@@ -67,7 +67,10 @@ import org.jetbrains.annotations.Nullable;
  * with exit code 3, see {@link DirectMemoryWatch}. See "Heap" in the design document.</p>
  *
  * <p>{@code run} exits with 4, and does not start, if the configuration in its log no longer contains the node: it was
- * removed from the cluster, and a supervisor must not start it again. See "Replacing a node" in the design document.</p>
+ * removed from the cluster, and a supervisor must not start it again. See "Replacing a node" in the design document.
+ * It exits with 5, and does not start, if its database has a cluster version with capabilities this version lacks (a
+ * downgrade, or a newer cluster's backup). Every command's exit codes: "Exit codes" in
+ * {@code docs/distributed/runbooks.md}; 4 means "removed" for {@code run} and "incomplete" for {@code admin}.</p>
  *
  * <p>Unless {@code -Djava.io.tmpdir} is given, {@code run} extracts the RocksDB library into {@code DATA-DIR/tmp}, and
  * deletes the copies that earlier runs left there; a given one outside the data directory is warned about.</p>
@@ -167,6 +170,10 @@ public final class ReplicatedServerMain {
 		} catch (ReplicatedNode.RemovedException e) {
 			System.err.println("Node " + config.nodeId() + " does not start: " + e.getMessage());
 			System.exit(4);
+			return;
+		} catch (ReplicatedNode.NewerVersionException e) {
+			System.err.println("Node " + config.nodeId() + " does not start: " + e.getMessage());
+			System.exit(5);
 			return;
 		} catch (IOException | RuntimeException e) {
 			// Ratis and gRPC leave non-daemon threads behind, which would keep the JVM running without a node.

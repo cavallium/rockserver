@@ -1243,7 +1243,7 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   the joint configuration of its removal, with the node in the old half only, since the final one goes to the members
   that stay), and it was started without `--join` or was a member once (it writes `raft/member` when a configuration
   from the log makes it one, after the leader checks of each maintenance tick and on its own, so that a failed write,
-  such as on a full disk, does not keep a stalled leader in place). With systemd, `RestartPreventExitStatus=4` keeps it down. A node of a version before
+  such as on a full disk, does not keep a stalled leader in place). With systemd, `RestartPreventExitStatus=4 5` keeps it down (5: a database of a newer cluster version, see "Exit codes" in runbooks.md). A node of a version before
   this, started with `--join`, has no `raft/member` and still stays up in the initializing state, printing `READY`; it
   says so in its log as above. One start is refused wrongly: a node that holds a joint configuration of its own
   removal that its leader never committed before losing its leadership. Only a node that was being removed gets there;

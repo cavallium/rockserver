@@ -166,7 +166,18 @@ public final class ReplicatedNode implements AutoCloseable {
 
 		var started = new ArrayList<Closeable>();
 		try {
-			server.start();
+			try {
+				server.start();
+			} catch (IOException | RuntimeException ex) {
+				// Ratis wraps what the state machine's initialization threw.
+				for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
+					if (cause instanceof NewerVersionException newer) {
+						server.close();
+						throw newer;
+					}
+				}
+				throw ex;
+			}
 			started.add(server);
 			requireNotRemoved(existing);
 			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout(),
@@ -736,6 +747,16 @@ public final class ReplicatedNode implements AutoCloseable {
 			NodeStore.syncDirectory(config.raftDir());
 		}
 		memberRecorded = true;
+	}
+
+	/**
+	 * Thrown by {@link #start} for a database whose cluster version has capabilities this version lacks (a downgrade, or a
+	 * restore of a newer cluster's backup): {@code run} exits with 5.
+	 */
+	public static final class NewerVersionException extends IOException {
+		NewerVersionException(String message) {
+			super(message);
+		}
 	}
 
 	/** Thrown by {@link #start} for a node that was removed from the cluster: see {@link #requireNotRemoved}. */
