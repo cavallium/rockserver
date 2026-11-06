@@ -13,6 +13,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -53,6 +54,54 @@ class FaultFsTest {
 		var raw = Map.of("LD_PRELOAD", library.toAbsolutePath().toString(), "FAULTFS_DIR", asGiven.toString(),
 				"FAULTFS_TRIGGER", trigger.toAbsolutePath().toString());
 		assertEquals(EXPECTED, runProbe(asGiven, other, trigger, raw));
+	}
+
+	/**
+	 * R3-G2a-3: with "HANG sync" a sync under the faulty directory blocks until the trigger goes, then succeeds; writes
+	 * there and syncs elsewhere go on meanwhile.
+	 */
+	@Test
+	void hangsSyncsUnderTheDirectoryUntilTheTriggerGoes() throws Exception {
+		var library = FaultFs.build(temp.resolve("lib"));
+		var faulty = Files.createDirectories(temp.resolve("faulty"));
+		var other = Files.createDirectories(temp.resolve("other"));
+		var trigger = temp.resolve("trigger");
+		var command = List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+				"-Xmx32m", "-XX:TieredStopAtLevel=1", "-cp", System.getProperty("java.class.path"),
+				HangProbe.class.getName(), faulty.toString(), other.toString(), trigger.toString());
+		var builder = new ProcessBuilder(command).redirectErrorStream(true);
+		builder.environment().putAll(FaultFs.environment(library, faulty, trigger));
+		var process = builder.start();
+		var output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+		assertTrue(process.waitFor(60, TimeUnit.SECONDS), output);
+		assertEquals(0, process.exitValue(), output);
+		assertEquals(List.of("hang faulty force blocked", "hang faulty write OK", "hang other force OK",
+						"cleared faulty force OK"),
+				output.lines().filter(line -> line.startsWith("> ")).map(line -> line.substring(2)).toList(), output);
+	}
+
+	/** The JVM under the shim for the hang: a sync on a thread of its own, watched from the main one. */
+	public static final class HangProbe {
+
+		public static void main(String[] args) throws Exception {
+			var faulty = Path.of(args[0]);
+			var other = Path.of(args[1]);
+			var trigger = Path.of(args[2]);
+			var results = new ArrayList<String>();
+			Probe.write(faulty.resolve("a"));
+			Probe.write(other.resolve("a"));
+			FaultFs.trigger(trigger, FaultFs.Errno.HANG, FaultFs.Ops.SYNC);
+			Thread.sleep(20);
+			var synced = new CompletableFuture<String>();
+			Thread.ofPlatform().daemon().start(() -> synced.complete(Probe.force(faulty.resolve("a"))));
+			Thread.sleep(500);
+			results.add("hang faulty force " + (synced.isDone() ? "returned " + synced.join() : "blocked"));
+			results.add("hang faulty write " + Probe.write(faulty.resolve("b")));
+			results.add("hang other force " + Probe.force(other.resolve("a")));
+			FaultFs.clear(trigger);
+			results.add("cleared faulty force " + synced.get(10, TimeUnit.SECONDS));
+			results.forEach(line -> System.out.println("> " + line));
+		}
 	}
 
 	private static final List<String> EXPECTED = List.of(
@@ -119,7 +168,7 @@ class FaultFsTest {
 		}
 
 		/** A plain write through a stream (libc write). */
-		private static String write(Path file) {
+		static String write(Path file) {
 			try (var out = Files.newOutputStream(file, StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
 				out.write("data".getBytes(StandardCharsets.UTF_8));
 				return "OK";
@@ -139,7 +188,7 @@ class FaultFsTest {
 		}
 
 		/** fdatasync and fsync, as Ratis' log and RocksDB call them. */
-		private static String force(Path file) {
+		static String force(Path file) {
 			try (var channel = FileChannel.open(file, StandardOpenOption.WRITE)) {
 				channel.force(false);
 				channel.force(true);

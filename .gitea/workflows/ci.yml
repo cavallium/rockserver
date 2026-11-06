@@ -19,9 +19,9 @@ env:
   TEST_TMPDIR: ${{ github.workspace }}/../rockserver-test-tmp
   # Multi-process suites: one class per line, also the list the fast job excludes.
   PROCESS_SUITES: >-
-    ClientFailoverTest,ClockSkewRandomFaultTest,ColdRestartTest,DiskFaultTest,ForwardingFailoverTest,IsolatedNodeTest,
-    LaggingInstallTest,LeaderKillTest,MembershipFaultTest,MembershipTest,OverlappingRandomFaultTest,PartitionTest,
-    PauseTest,PipelinedLeaderKillTest,PipelinedPartitionTest,PipelinedRandomFaultTest,ProcessClusterTest,
+    ClientFailoverTest,ClockSkewRandomFaultTest,ColdRestartTest,DiskFaultTest,ForwardingFailoverTest,HungDiskTest,
+    IsolatedNodeTest,LaggingInstallTest,LeaderKillTest,MembershipFaultTest,MembershipTest,OverlappingRandomFaultTest,
+    PartitionTest,PauseTest,PipelinedLeaderKillTest,PipelinedPartitionTest,PipelinedRandomFaultTest,ProcessClusterTest,
     ProtocolPointKillTest,PublicApiRecoveryTest,RaftLogRepairTest,RandomFaultTest,RollingRestartTest
 
 jobs:

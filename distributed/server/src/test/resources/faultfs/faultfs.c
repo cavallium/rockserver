@@ -14,8 +14,10 @@
  *                    it appeared. Until then the path is compared as given.
  *   FAULTFS_TRIGGER  the trigger file; it should lie outside FAULTFS_DIR
  *
- * Trigger file contents: "<ERRNO> [<OPS>]", for example "EIO", "ENOSPC write" or "EIO sync".
- *   ERRNO  EIO (default), ENOSPC, EDQUOT or EROFS
+ * Trigger file contents: "<ERRNO> [<OPS>]", for example "EIO", "ENOSPC write", "EIO sync" or "HANG sync".
+ *   ERRNO  EIO (default), ENOSPC, EDQUOT or EROFS; or HANG: the call blocks, without failing, until the trigger no
+ *          longer says HANG (removed, or another error), as on a hung disk (R3-G2a-3); then it fails with the new
+ *          error, if any, or goes to libc
  *   OPS    all (default): every interposed call; write: the write and fallocate calls only (a full disk);
  *          sync: fsync, fdatasync and sync_file_range only (a disk that fails on flush)
  * The trigger is read at most once every 2 ms per process, so it takes effect within a few milliseconds.
@@ -55,6 +57,7 @@ static int enabled;
 
 /* The trigger as last read: errno to return (0: no fault) and the operations it applies to. Races are benign. */
 static volatile int current_errno;
+static volatile int current_hang;
 static volatile int current_ops;
 static volatile long long next_check_ns;
 
@@ -121,6 +124,7 @@ static void refresh_trigger(void) {
 	int fd = open(trigger_path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		current_errno = 0;
+		current_hang = 0;
 	} else {
 		char buffer[64];
 		ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
@@ -131,7 +135,8 @@ static void refresh_trigger(void) {
 		sscanf(buffer, "%31s %31s", first, second);
 		current_ops = strcmp(second, "write") == 0 ? OP_WRITE
 				: strcmp(second, "sync") == 0 ? OP_SYNC : OP_WRITE | OP_SYNC;
-		current_errno = parse_errno(first);
+		current_hang = strcmp(first, "HANG") == 0;
+		current_errno = current_hang ? 0 : parse_errno(first);
 	}
 	next_check_ns = now + 2000000LL;
 	errno = saved;
@@ -143,8 +148,7 @@ static int must_fail(int fd, int op) {
 		return 0;
 	}
 	refresh_trigger();
-	int error = current_errno;
-	if (error == 0 || (current_ops & op) == 0) {
+	if ((current_errno == 0 && !current_hang) || (current_ops & op) == 0) {
 		return 0;
 	}
 	try_resolve();
@@ -166,6 +170,17 @@ static int must_fail(int fd, int op) {
 	path[n] = '\0';
 	if ((size_t) n < fault_dir_len || strncmp(path, fault_dir, fault_dir_len) != 0
 			|| (path[fault_dir_len] != '\0' && path[fault_dir_len] != '/')) {
+		return 0;
+	}
+	/* A hung disk: wait, polling the trigger (nanosleep and the trigger's reads are not interposed). */
+	while (current_hang && (current_ops & op) != 0) {
+		struct timespec pause = {0, 2000000L};
+		nanosleep(&pause, NULL);
+		refresh_trigger();
+	}
+	int error = current_errno;
+	if (error == 0 || (current_ops & op) == 0) {
+		errno = saved;
 		return 0;
 	}
 	errno = error;
