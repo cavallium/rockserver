@@ -73,7 +73,7 @@ forwards to a non-embedded connection:
   waits for), `GrpcRequestContexts` (wire context to `RequestContext` and deadline), `GrpcScheduledCalls` and
   `GrpcIteratorOperations` (scheduling, cancellation and iterator leases), and `GrpcServerImpl` (the service
   methods). The split moved code only: behavior, status mapping and the `rockserver-leader` header are the same.
-- `EmbeddedDB.openUnloggedTransaction` (a transaction without snapshot, untracked, optionally without the WAL),
+- `EmbeddedDB.openApplyWriter` (the apply thread's transaction: no snapshot, untracked, optionally without the WAL),
   `EmbeddedDB.deleteRangeUnlogged` (a range deletion without the WAL) and the `atomic-flush` global option (off
   by default; it turns pipelined writes off).
 - `GrpcConnection.forHostAndPortWithoutRetry`, for callers that retry on their own.
@@ -89,19 +89,58 @@ forwards to a non-embedded connection:
 | `Proposer` | Batches numbered requests into log entries and submits them to the leader: straight to the local Raft server on the leader, through a Ratis client elsewhere. |
 | `RockserverStateMachine` | Ratis state machine. Leader admission in `startTransaction`/`preAppendTransaction`; entries are queued to an apply thread of its own, which applies them in groups; snapshots. |
 | `Applier` | Applies the requests of log entries to the local database, a group of entries in one transaction without the WAL, with their result records and the applied position. |
+| `ApplyResult`, `AppliedIndex`, `ApplyLanes` | The outcome of one entry, identical on every replica; the highest applied index and the reads waiting for it; the platform threads of the partitioned apply (see "Partitioned apply"). |
 | `LeaderSession`, `ConflictTracker` | Transactions bound to the leader's term, per-key queues of single-key updates, and conflict validation. |
 | `NodeMetrics` | Timers and gauges of the replication path, logged every 10 s. |
+| `ByteAdmission` | The byte-weighted semaphore that never waits, behind `Proposer`'s bound on the bytes of writes a node holds and has in flight. |
 | `ReadBarrier`, `TermService` | Linearizable reads. `TermService` also answers what a node holds (`NodeState`), and a follower's read index. |
 | `FollowerReads` | A follower's read indexes from the leader, for the point reads it serves itself (off by default). |
 | `ClusterCheck` | A leader tells its followers which cluster it leads, and a node of another cluster stops. |
+| `PeerChannels` | The gRPC channels to other members' Raft ports used by `ReadBarrier`, `FollowerReads` (one cached channel per address, a fresh connection attempt when it failed) and `ClusterCheck` (a one-off channel per call). |
+| `ApiGate`, `CommitHeartbeats` | Whether a node serves its API, from whether it knows a leader; the leader sending its commit index to every follower at once instead of with its next heartbeat. |
 | `LeaderStall` | Tells a leader that cannot commit to step down. |
 | `NodeThreads` | The node's control-plane platform threads and the virtual threads of the leader's short local commands (see "Threads"). |
 | `ConflictPositions` | The text that carries a conflict's positions from the leader's refusal to the proposer. |
 | `NodeStore`, `CheckpointStorage` | Local database, internal metadata, checkpoint snapshots, restore. |
 | `LeaderForwarder` | Finds the leader's API and forwards to it; knows the leader's API address that nodes send to clients. |
 | `LogEntry`, `Request`, `LogEntryCodec`, `ResultCodec` | Log entry model and its binary encoding. |
-| `ReplicatedServerMain` | Command line: `run`, `admin` and `repair-log`. |
+| `ReplicatedServerMain`, `NodeConfig`, `PeerConfig`, `RaftSettings` | Command line: `run`, `admin` and `repair-log`; the node's settings and its members; the Ratis settings, every safety-relevant one set explicitly. |
 | `RaftLogRepair` | Offline repair of a torn last write in the open segment of the Raft log. |
+
+**Internal encodings are hand-written, not protobuf.** Log entries, batches, results and the `TermService`
+messages use small binary codecs of their own (`LogEntryCodec`, `ResultCodec` and the like), the
+entry formats with a version or marker byte. Protobuf (already on the classpath for the client API) was not used for them,
+because the apply path depends on what a generated codec cannot do: the apply decodes an entry in place, so each key
+and value is a slice of the log entry's buffer that goes to RocksDB without a copy, and the leader encodes each
+request once, straight into the batch buffer, at an offset it computed before (see "Encoded once"). Protobuf-java
+parses into objects of its own and copies each `bytes` field into a `ByteString`, and its encoder writes a message
+of its own: one copy and one allocation per key and value on every replica, which is the cost the leaner apply
+removed. The price of hand-written codecs is that every format change needs a version and a test for old bytes:
+`CodecEquivalenceTest` (against the previous codecs, kept as test classes) and the codec tests, fuzzing included,
+pin them, and a format change must keep reading the old bytes. The client API and Ratis' own messages stay protobuf.
+
+**Core changes considered and not taken.**
+
+- **Puts without the apply copy.** A put still copies its key and value once at apply, into the `byte[]` that
+  RocksJava's `Transaction.putUntracked` takes. RocksJava has a `ByteBuffer` put only for tracked writes, which would
+  lock every key and track it for a validation the apply does not need, so removing this copy needs a change to
+  rocksdbjni itself. The branch deliberately depends
+  on the published rocksdbjni only (the Codex branch's dependence on an unpublished JNI fork was one of its
+  production risks), and the copy has not been measured as a bottleneck (performance.md, item 15, lists the apply
+  timers to compare first). If a profile shows the copy, the change belongs upstream in
+  RocksJava (an untracked `ByteBuffer` put), not in a fork.
+- **A presence check with an exists call instead of `getForUpdate`.** `EmbeddedDB`'s previous-presence path (a put
+  or delete that returns whether the key existed) reads the whole value with `getForUpdate` and keeps only whether
+  it was found. It stays: the call also locks the key and records it for conflict validation, which no exists-style
+  call of a RocksJava `Transaction` does, and `keyMayExist` may answer a false positive.
+- **Table-properties mapping de-duplication** (`TablePropertiesAccumulator`, `GrpcPortableWire`,
+  `ThriftTablePropertiesWire` on the Codex branch). A faithful refactor of single-node code that replication does not
+  use: `getTableProperties` is a local command on a cluster. Master changed the same regions since, so it is better
+  re-done on master on its own, with the single-node tests, than carried in this branch.
+- Two Codex core fixes were kept in a simpler form: a merge operator whose constructor fails destroys the native
+  object it created, and the JNI library is extracted to a temporary file in the version-keyed directory and renamed
+  into place atomically, so concurrent starts never truncate a library another process has loaded. An existing file
+  is reused when its size matches the jar entry, with no hashing at start.
 
 ## Routing
 
@@ -504,8 +543,12 @@ Raft log on disk instead of decoded on the heap. Any error on the apply or compl
     Every replica runs the same binary, so it fails the same way everywhere.
 
   The recorded text of these failures is the same on every replica: the exception's class and message, without
-  native addresses, identity hashes (as in class loader names) or thread names, which differ between processes.
-  The full failure is only logged.
+  native addresses, identity hashes (as in class loader names), thread names, which differ between processes, or
+  absolute file paths (a RocksDB status names the node's own data directory), which differ between nodes: each
+  becomes `<path>`. The full failure is only logged. The messages themselves come from the JDK, RocksDB and the
+  Rockserver code, so every replica must run the same Rockserver build on the same JDK build: during a rolling
+  upgrade a deterministic failure may be recorded with different text on the replicas of the two versions (its
+  error type is still the same).
 - **Local failures** report this machine, not the entry: an `IOException`, an `Error` (out of memory...), a
   native status of the storage or the process (`IOError`, `Corruption`, `NoSpace`, `Busy`, `TimedOut`,
   `Aborted`, `ShutdownInProgress`, or no status at all), a lost local transaction, a failed commit of the group,

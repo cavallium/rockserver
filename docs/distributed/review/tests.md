@@ -1,5 +1,10 @@
 # Review: Codex test suite for the distributed (Raft/Ratis) Rockserver
 
+> **Historical, superseded.** This reviews the Codex implementation (`distributed/ratis`, the patched Ratis fork
+> and its tests), which was removed and replaced by the design in [design.md](../design.md). Nothing here describes the
+> current code. Its references to `status.md` and to Codex classes point to that branch: `status.md` is no longer
+> in the tree; read it with `git show 9b2d16d:docs/distributed/status.md`.
+
 Worktree reviewed: `/home/cavallium/IdeaProjects/rockserver/.claude/worktrees/distributed-rockserver-rewrite-e46da4` (HEAD 9b2d16d).
 This was a read-only review. I ran no builds and no tests, so every statement about whether a test passes comes from the docs or the source, not from running anything.
 

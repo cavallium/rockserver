@@ -160,7 +160,8 @@ with 11–18 s write latency. In order of discovery:
     of the client API with a transaction id: no id lookup and lock, column use counting, action logging, operation
     counters or timers per write. `deleteRange` no longer flushes every memtable and syncs the WAL (hundreds of
     milliseconds on the apply thread, and small L0 files in every column). Keys and values are decoded as slices
-    of the log entry instead of one array each, and merges pass their slice to RocksDB without a copy.
+    of the log entry instead of one array each, and merges pass their slice to RocksDB without a copy. Puts still copy
+    key and value once, into the arrays of `putUntracked` (see "Core changes considered and not taken" in design.md).
 16. **The conflict tracker under the append lock.** Not measured yet. `preAppendTransaction` registers every
     written key in `ConflictTracker`, under Ratis' append lock and the tracker's monitor. Each key used to allocate
     a record and a `HashMap` node there; keys are now `long` hashes in an open-addressing map and in one `long`
@@ -298,10 +299,13 @@ Other results:
   applied log entries (`--snapshot-every-bytes`), whichever comes first. A snapshot flushes the
   memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.
 - **Memory.** In a 10-minute run at 2× the leader's heap stayed between 1.3 and 2.8 GiB (4 GiB heap). The
-  bounds are larger: at most 256 MiB of committed entries wait for the apply thread, the leader holds up to
-  65536 pending Raft requests (proposer batches of up to 4096 writes each) or 1 GiB of them, the Raft log write queue 64 MiB, every replica keeps every reply
-  (up to 17 MiB each) in Ratis' retry cache for 8 s by default, and each node admits 16384 requests at once,
-  with messages up to 512 MiB. Size the heap for bursts of large `putMulti` calls and large results: an
+  bounds are larger: at most 256 MiB of committed entries wait for the apply thread; the leader holds up to
+  4096 pending Raft requests (Ratis' default; proposer batches of up to 4096 writes each) or 160 MiB of them
+  (the attempts in flight of 4 nodes, 32 MiB each, plus the leader's own commits); the Raft log write queue holds
+  up to 64 MiB (65536 entries); each node holds the writes it proposed up to an eighth of its heap (Proposer's
+  byte admission, `-Dit.cavallium.rockserver.replicated.write-admission-bytes`); every replica keeps every reply
+  (up to 17 MiB each) in Ratis' retry cache for 4 election timeouts, at least 6 s (8 s by default); and each node
+  admits 16384 requests at once, with messages up to 512 MiB. Size the heap for bursts of large `putMulti` calls and large results: an
   `OutOfMemoryError` on the apply thread stops the replica.
 - **Memtables.** Replicas flush when the memtables of all columns together reach the write buffer budget,
   `database.global.write-buffer-manager` in the Rockserver config (128 MiB by default, charged to the block
