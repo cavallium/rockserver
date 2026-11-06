@@ -421,7 +421,11 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		super(name);
 		boolean severalAddresses = addresses != null;
 		var hintMode = severalAddresses ? LeaderHintRouter.configuredMode() : LeaderHintRouter.Mode.OFF;
-		var leaderRouter = hintMode == LeaderHintRouter.Mode.OFF ? null : new LeaderHintRouter(hintMode, addresses);
+		// Reads that the retry policy would send again run again on the ordinary channel if the leader's fails.
+		var leaderRouter = hintMode == LeaderHintRouter.Mode.OFF ? null : new LeaderHintRouter(hintMode, addresses,
+				automaticRetry ? AUTOMATIC_RETRY_METHOD_DESCRIPTORS.stream()
+						.map(MethodDescriptor::getBareMethodName)
+						.collect(java.util.stream.Collectors.toUnmodifiableSet()) : java.util.Set.of());
 		int maxInboundMessageSize = configuredMaxInboundMessageSize();
 
 		// A node that dies without closing its connections (power loss, partition, a frozen process) is noticed by
@@ -524,7 +528,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		// The handshake stays on the ordinary channel; later calls may go to the leader's.
 		this.leaderRouter = leaderRouter;
 		if (leaderRouter != null) {
-			leaderRouter.start(leader -> newLeaderChannel(leader, maxInboundMessageSize, automaticRetry,
+			leaderRouter.start(leader -> newLeaderChannel(leader, maxInboundMessageSize,
 					this.callbackExecutor, this.eventLoopGroup, leaderRouter));
 		}
 		var stubChannel = leaderRouter != null ? leaderRouter.route(channel) : channel;
@@ -2151,7 +2155,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	/** A channel to the leader that {@link LeaderHintRouter} found, configured like the ordinary one. */
 	private static ManagedChannel newLeaderChannel(HostAndPort leader,
 			int maxInboundMessageSize,
-			boolean automaticRetry,
 			ExecutorService callbackExecutor,
 			EventLoopGroup eventLoopGroup,
 			LeaderHintRouter router) {
@@ -2167,11 +2170,9 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				.channelType(NioSocketChannel.class)
 				.withOption(ChannelOption.CONNECT_TIMEOUT_MILLIS,
 						intProperty(CONNECT_TIMEOUT_PROPERTY, DEFAULT_CONNECT_TIMEOUT_MILLIS, 1));
-		if (automaticRetry) {
-			configureRetry(builder);
-		} else {
-			builder.disableRetry().defaultServiceConfig(Map.of("loadBalancingConfig", PICK_FIRST_IN_ORDER));
-		}
+		// No retries here: a retry would go to the same leader, perhaps dead. LeaderHintRouter runs the reads that the
+		// ordinary channel would retry again on that channel instead, which fails over to a live node.
+		builder.disableRetry().defaultServiceConfig(Map.of("loadBalancingConfig", PICK_FIRST_IN_ORDER));
 		return builder.intercept(new RetryLoggingInterceptor(), router.hintReader()).build();
 	}
 

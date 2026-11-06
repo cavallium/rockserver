@@ -12,6 +12,7 @@ import io.grpc.MethodDescriptor;
 import io.grpc.Status;
 import it.cavallium.rockserver.core.common.LeaderHint;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -77,6 +78,8 @@ final class LeaderHintRouter implements AutoCloseable {
 	record Hint(String address, ManagedChannel channel) {}
 
 	private final Mode mode;
+	/** Methods, by bare name, that run again on the ordinary channel when the leader's channel fails before answering. */
+	private final Set<String> replayable;
 	private final Set<String> listed = new HashSet<>();
 	/** Opens a channel to the leader; null until {@link #start}, and hints are ignored until then. */
 	private volatile @Nullable Function<HostAndPort, ManagedChannel> channels;
@@ -94,11 +97,20 @@ final class LeaderHintRouter implements AutoCloseable {
 	 * @param listed the addresses the client was given
 	 */
 	LeaderHintRouter(Mode mode, List<HostAndPort> listed) {
-		this(mode, listed, System::nanoTime);
+		this(mode, listed, Set.of(), System::nanoTime);
 	}
 
-	LeaderHintRouter(Mode mode, List<HostAndPort> listed, LongSupplier nanoTime) {
+	/**
+	 * @param replayable methods, by bare name, that the ordinary channel's retry policy would send again: they run
+	 *                   again on the ordinary channel when the leader's channel fails before answering
+	 */
+	LeaderHintRouter(Mode mode, List<HostAndPort> listed, Set<String> replayable) {
+		this(mode, listed, replayable, System::nanoTime);
+	}
+
+	LeaderHintRouter(Mode mode, List<HostAndPort> listed, Set<String> replayable, LongSupplier nanoTime) {
 		this.mode = mode;
+		this.replayable = Set.copyOf(replayable);
 		listed.forEach(address -> this.listed.add(normalize(address.host(), address.port())));
 		this.nanoTime = nanoTime;
 	}
@@ -158,20 +170,7 @@ final class LeaderHintRouter implements AutoCloseable {
 				if (hint == null) {
 					return main.newCall(method, options);
 				}
-				return new ForwardingClientCall.SimpleForwardingClientCall<>(hint.channel().newCall(method, options)) {
-					@Override
-					public void start(Listener<R> listener, Metadata headers) {
-						super.start(new ForwardingClientCallListener.SimpleForwardingClientCallListener<>(listener) {
-							@Override
-							public void onClose(Status status, Metadata trailers) {
-								if (status.getCode() == Status.Code.UNAVAILABLE) {
-									drop(hint);
-								}
-								super.onClose(status, trailers);
-							}
-						}, headers);
-					}
-				};
+				return new LeaderCall<>(hint, main, method, options, replayable.contains(method.getBareMethodName()));
 			}
 
 			@Override
@@ -179,6 +178,213 @@ final class LeaderHintRouter implements AutoCloseable {
 				return main.authority();
 			}
 		};
+	}
+
+	/**
+	 * A call on the leader's channel. It drops the hint when the call ends with {@code UNAVAILABLE}, or when the node
+	 * answers without naming itself as the leader (it was deposed, or is cut off and knows no leader). A
+	 * {@code replayable} call (a read that the ordinary channel's retry policy would send again) that fails with
+	 * {@code UNAVAILABLE} before any answer runs again on the ordinary channel, which fails over to a live node; the
+	 * leader's channel itself does not retry, so this happens at once. Other calls fail as on any lost connection.
+	 *
+	 * <p>Methods of a {@link ClientCall} come from one caller at a time, listener calls from one thread at a time; the
+	 * two may overlap, hence the lock.</p>
+	 */
+	private final class LeaderCall<Q, R> extends ClientCall<Q, R> {
+
+		private final Hint hint;
+		private final Channel main;
+		private final MethodDescriptor<Q, R> method;
+		private final CallOptions options;
+		private final boolean replayable;
+		private final Object callLock = new Object();
+		/** Guarded by callLock. */
+		private ClientCall<Q, R> current;
+		/** What the caller did so far, to replay it; guarded by callLock. Only kept for a replayable call. */
+		private final List<Q> sent = new ArrayList<>();
+		private int requested;
+		private boolean halfClosed;
+		private boolean cancelled;
+		private boolean replayed;
+		/** An answer came: the call is no longer replayable. Guarded by callLock. */
+		private boolean answered;
+		private @Nullable Listener<R> listener;
+		private @Nullable Metadata headers;
+
+		LeaderCall(Hint hint, Channel main, MethodDescriptor<Q, R> method, CallOptions options, boolean replayable) {
+			this.hint = hint;
+			this.main = main;
+			this.method = method;
+			this.options = options;
+			this.replayable = replayable;
+			this.current = hint.channel().newCall(method, options);
+		}
+
+		@Override
+		public void start(Listener<R> listener, Metadata headers) {
+			ClientCall<Q, R> call;
+			synchronized (callLock) {
+				this.listener = listener;
+				if (replayable) {
+					var copy = new Metadata();
+					copy.merge(headers);
+					this.headers = copy;
+				}
+				call = current;
+			}
+			call.start(new LeaderListener(listener), headers);
+		}
+
+		@Override
+		public void request(int numMessages) {
+			ClientCall<Q, R> call;
+			synchronized (callLock) {
+				requested += numMessages;
+				call = current;
+			}
+			call.request(numMessages);
+		}
+
+		@Override
+		public void cancel(@Nullable String message, @Nullable Throwable cause) {
+			ClientCall<Q, R> call;
+			synchronized (callLock) {
+				cancelled = true;
+				call = current;
+			}
+			call.cancel(message, cause);
+		}
+
+		@Override
+		public void halfClose() {
+			ClientCall<Q, R> call;
+			synchronized (callLock) {
+				halfClosed = true;
+				call = current;
+			}
+			call.halfClose();
+		}
+
+		@Override
+		public void sendMessage(Q message) {
+			ClientCall<Q, R> call;
+			synchronized (callLock) {
+				if (replayable) {
+					sent.add(message);
+				}
+				call = current;
+			}
+			call.sendMessage(message);
+		}
+
+		@Override
+		public boolean isReady() {
+			synchronized (callLock) {
+				return current.isReady();
+			}
+		}
+
+		@Override
+		public void setMessageCompression(boolean enabled) {
+			synchronized (callLock) {
+				current.setMessageCompression(enabled);
+			}
+		}
+
+		@Override
+		public io.grpc.Attributes getAttributes() {
+			synchronized (callLock) {
+				return current.getAttributes();
+			}
+		}
+
+		/**
+		 * Runs the call again on the ordinary channel, if it is replayable and nothing came back; returns false if it
+		 * cannot.
+		 */
+		private boolean replay(Listener<R> listener) {
+			ClientCall<Q, R> call;
+			Metadata replayHeaders;
+			List<Q> messages;
+			int toRequest;
+			boolean close;
+			synchronized (callLock) {
+				if (!replayable || answered || replayed || cancelled || headers == null) {
+					return false;
+				}
+				replayed = true;
+				call = main.newCall(method, options);
+				current = call;
+				replayHeaders = headers;
+				messages = List.copyOf(sent);
+				toRequest = requested;
+				close = halfClosed;
+			}
+			call.start(listener, replayHeaders);
+			if (toRequest > 0) {
+				call.request(toRequest);
+			}
+			messages.forEach(call::sendMessage);
+			if (close) {
+				call.halfClose();
+			}
+			return true;
+		}
+
+		private final class LeaderListener extends ForwardingClientCallListener.SimpleForwardingClientCallListener<R> {
+
+			private final Listener<R> caller;
+			private boolean headersSeen;
+
+			LeaderListener(Listener<R> caller) {
+				super(caller);
+				this.caller = caller;
+			}
+
+			@Override
+			public void onHeaders(Metadata responseHeaders) {
+				headersSeen = true;
+				answered();
+				checkNamesItself(responseHeaders);
+				super.onHeaders(responseHeaders);
+			}
+
+			@Override
+			public void onMessage(R message) {
+				answered();
+				super.onMessage(message);
+			}
+
+			@Override
+			public void onClose(Status status, Metadata trailers) {
+				if (status.getCode() == Status.Code.UNAVAILABLE) {
+					drop(hint);
+					if (replay(caller)) {
+						return;
+					}
+				} else if (!headersSeen && status.getCode() != Status.Code.CANCELLED
+						&& status.getCode() != Status.Code.DEADLINE_EXCEEDED) {
+					// An answer without headers: the node's trailers name its leader instead.
+					checkNamesItself(trailers);
+				}
+				super.onClose(status, trailers);
+			}
+
+			private void answered() {
+				synchronized (callLock) {
+					answered = true;
+				}
+			}
+
+			/** A node that no longer names itself as the leader is not one: back to the ordinary channel. */
+			private void checkNamesItself(Metadata metadata) {
+				var named = metadata.get(KEY);
+				if (named == null || !named.equals(hint.address())) {
+					// A new name, if any, was taken by the leader channel's own hint reader already.
+					drop(hint);
+				}
+			}
+		}
 	}
 
 	/** The leader's channel for {@code method}, if it goes there and the channel is connected. */

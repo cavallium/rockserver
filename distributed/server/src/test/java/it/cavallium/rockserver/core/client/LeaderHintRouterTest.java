@@ -18,6 +18,7 @@ import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.jetbrains.annotations.Nullable;
@@ -37,7 +38,7 @@ class LeaderHintRouterTest {
 	private final FakeChannel main = new FakeChannel("main");
 
 	private LeaderHintRouter router(LeaderHintRouter.Mode mode) {
-		var router = new LeaderHintRouter(mode, LISTED, now::get);
+		var router = new LeaderHintRouter(mode, LISTED, Set.of("getRangePage"), now::get);
 		router.start(address -> {
 			var channel = new FakeChannel(address.host() + ":" + address.port());
 			opened.add(channel);
@@ -172,16 +173,124 @@ class LeaderHintRouterTest {
 		assertEquals(2, opened.size());
 	}
 
+	private static Metadata naming(@Nullable String leader) {
+		var metadata = new Metadata();
+		if (leader != null) {
+			metadata.put(LeaderHintRouter.KEY, leader);
+		}
+		return metadata;
+	}
+
 	@Test
-	void otherErrorsKeepTheHint() {
+	void otherErrorsOfTheLeaderKeepTheHint() {
 		var router = router(LeaderHintRouter.Mode.LISTED);
 		var routed = router.route(main);
 		router.offer("node-b:5333");
 		var leader = opened.getFirst();
 		leader.state = ConnectivityState.READY;
 		call(routed, "put");
-		leader.lastListener.onClose(Status.ABORTED, new Metadata());
+		leader.lastListener.onClose(Status.ABORTED, naming("node-b:5333"));
 		assertEquals("node-b:5333", router.currentAddress());
+		// A deadline or a cancellation is the client's own: nothing to learn about the node.
+		call(routed, "put");
+		leader.lastListener.onClose(Status.DEADLINE_EXCEEDED, new Metadata());
+		assertEquals("node-b:5333", router.currentAddress());
+	}
+
+	@Test
+	void hintedNodeThatNoLongerNamesItselfIsDropped() {
+		var router = router(LeaderHintRouter.Mode.LISTED);
+		var routed = router.route(main);
+		router.offer("node-b:5333");
+		var leader = opened.getFirst();
+		leader.state = ConnectivityState.READY;
+
+		// A deposed or isolated node: it fails calls without naming any leader.
+		call(routed, "put");
+		leader.lastListener.onClose(Status.RESOURCE_EXHAUSTED, naming(null));
+		assertNull(router.currentAddress());
+		assertSame(main, call(routed, "put"));
+
+		// Answering with headers that name another node.
+		now.addAndGet(LeaderHintRouter.FAILED_HINT_BACKOFF_NANOS + 1);
+		router.offer("node-b:5333");
+		var again = opened.getLast();
+		again.state = ConnectivityState.READY;
+		assertSame(again, call(routed, "put"));
+		again.lastListener.onHeaders(naming("node-c:5333"));
+		assertTrue(again.shutdown);
+		assertSame(main, call(routed, "put"));
+	}
+
+	@Test
+	void replayableReadFailingOnTheLeaderRunsAgainOnTheOrdinaryChannel() {
+		var router = router(LeaderHintRouter.Mode.LISTED);
+		var routed = router.route(main);
+		router.offer("node-b:5333");
+		var leader = opened.getFirst();
+		leader.state = ConnectivityState.READY;
+
+		var closes = new ArrayList<Status>();
+		var call = routed.newCall(method("getRangePage"), CallOptions.DEFAULT);
+		call.start(new ClientCall.Listener<>() {
+			@Override
+			public void onClose(Status status, Metadata trailers) {
+				closes.add(status);
+			}
+		}, new Metadata());
+		call.request(1);
+		call.sendMessage(new byte[] {1});
+		call.halfClose();
+		assertEquals(1, leader.calls);
+		int mainCalls = main.calls;
+
+		// The leader dies before answering: the read runs again through the ordinary channel, as the caller sent it.
+		leader.lastListener.onClose(Status.UNAVAILABLE, new Metadata());
+		assertTrue(closes.isEmpty(), "the caller saw the failure: " + closes);
+		assertEquals(mainCalls + 1, main.calls);
+		assertEquals(List.of(1), main.lastCall.requested);
+		assertEquals(1, main.lastCall.messages);
+		assertTrue(main.lastCall.halfClosed);
+		assertNull(router.currentAddress());
+		main.lastListener.onClose(Status.OK, new Metadata());
+		assertEquals(List.of(Status.OK), closes);
+
+		// A write is not sent again: its outcome is the caller's to judge.
+		now.addAndGet(LeaderHintRouter.FAILED_HINT_BACKOFF_NANOS + 1);
+		router.offer("node-b:5333");
+		var again = opened.getLast();
+		again.state = ConnectivityState.READY;
+		var writeCloses = new ArrayList<Status>();
+		var write = routed.newCall(method("put"), CallOptions.DEFAULT);
+		write.start(new ClientCall.Listener<>() {
+			@Override
+			public void onClose(Status status, Metadata trailers) {
+				writeCloses.add(status);
+			}
+		}, new Metadata());
+		mainCalls = main.calls;
+		again.lastListener.onClose(Status.UNAVAILABLE, new Metadata());
+		assertEquals(List.of(Status.Code.UNAVAILABLE), writeCloses.stream().map(Status::getCode).toList());
+		assertEquals(mainCalls, main.calls);
+
+		// Nor is a read that already got an answer.
+		now.addAndGet(LeaderHintRouter.FAILED_HINT_BACKOFF_NANOS + 1);
+		router.offer("node-b:5333");
+		var third = opened.getLast();
+		third.state = ConnectivityState.READY;
+		var readCloses = new ArrayList<Status>();
+		var read = routed.newCall(method("getRangePage"), CallOptions.DEFAULT);
+		read.start(new ClientCall.Listener<>() {
+			@Override
+			public void onClose(Status status, Metadata trailers) {
+				readCloses.add(status);
+			}
+		}, new Metadata());
+		third.lastListener.onHeaders(naming("node-b:5333"));
+		mainCalls = main.calls;
+		third.lastListener.onClose(Status.UNAVAILABLE, new Metadata());
+		assertEquals(1, readCloses.size());
+		assertEquals(mainCalls, main.calls);
 	}
 
 	@Test
@@ -222,6 +331,7 @@ class LeaderHintRouterTest {
 		boolean shutdown;
 		/** The listener of the last call started on this channel. */
 		ClientCall.@Nullable Listener<?> lastListener;
+		@Nullable FakeCall<?, ?> lastCall;
 		int calls;
 
 		FakeChannel(String name) {
@@ -231,7 +341,9 @@ class LeaderHintRouterTest {
 		@Override
 		public <Q, R> ClientCall<Q, R> newCall(MethodDescriptor<Q, R> method, CallOptions options) {
 			calls++;
-			return new FakeCall<>();
+			var call = new FakeCall<Q, R>();
+			lastCall = call;
+			return call;
 		}
 
 		@Override
@@ -285,17 +397,27 @@ class LeaderHintRouterTest {
 				lastListener = listener;
 			}
 
+			final List<Integer> requested = new ArrayList<>();
+			int messages;
+			boolean halfClosed;
+
 			@Override
-			public void request(int numMessages) {}
+			public void request(int numMessages) {
+				requested.add(numMessages);
+			}
 
 			@Override
 			public void cancel(@Nullable String message, @Nullable Throwable cause) {}
 
 			@Override
-			public void halfClose() {}
+			public void halfClose() {
+				halfClosed = true;
+			}
 
 			@Override
-			public void sendMessage(Q message) {}
+			public void sendMessage(Q message) {
+				messages++;
+			}
 		}
 	}
 
