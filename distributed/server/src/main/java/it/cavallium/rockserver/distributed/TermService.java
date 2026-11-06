@@ -39,6 +39,10 @@ import org.jetbrains.annotations.Nullable;
  *   the UTF-8 id of the caller's cluster, if it speaks for one: a node of another cluster stops. Response: the
  *   {@link NodeState} encoded by {@link #encode}, or nothing if this server has no such group (or is not started
  *   yet).</li>
+ *   <li>"what may a follower read up to?", for {@link FollowerReads}. Request: the 16-byte group UUID. Response: the
+ *   8-byte big-endian read index ({@link ReadBarrier#readIndex()}), once this node confirmed its leadership after the
+ *   request arrived; {@code FAILED_PRECONDITION} if it is not the ready leader, {@code UNIMPLEMENTED} on a node that
+ *   predates the method or cannot serve it.</li>
  * </ul>
  */
 final class TermService {
@@ -73,6 +77,15 @@ final class TermService {
 			.setResponseMarshaller(BytesMarshaller.INSTANCE)
 			.build();
 
+	static final MethodDescriptor<byte[], byte[]> READ_INDEX = MethodDescriptor.<byte[], byte[]>newBuilder()
+			.setType(MethodDescriptor.MethodType.UNARY)
+			.setFullMethodName(MethodDescriptor.generateFullMethodName(SERVICE_NAME, "ReadIndex"))
+			.setRequestMarshaller(BytesMarshaller.INSTANCE)
+			.setResponseMarshaller(BytesMarshaller.INSTANCE)
+			.setIdempotent(true)
+			.setSafe(true)
+			.build();
+
 	private static final int GROUP_ID_BYTES = 16;
 	private static final byte SEEDED = 1;
 	private static final byte HAS_SNAPSHOT = 2;
@@ -88,6 +101,13 @@ final class TermService {
 		@Nullable NodeState state(RaftGroupId groupId, @Nullable String callerClusterId);
 	}
 
+	/** Answers {@link #READ_INDEX} on a node. */
+	@FunctionalInterface
+	interface ReadIndexSource {
+		/** The read index of {@code groupId}, once this node confirmed its leadership; fails if it is not the leader. */
+		CompletableFuture<Long> readIndex(RaftGroupId groupId);
+	}
+
 	private TermService() {}
 
 	/**
@@ -97,6 +117,13 @@ final class TermService {
 	 */
 	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
 			NodeStateSource nodeState) {
+		return customizer(server, apiAddress, nodeState, _ -> CompletableFuture.failedFuture(
+				Status.UNIMPLEMENTED.withDescription("This node serves no read index").asRuntimeException()));
+	}
+
+	/** {@link #customizer(Supplier, HostAndPort, NodeStateSource)}, answering {@link #READ_INDEX} too. */
+	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
+			NodeStateSource nodeState, ReadIndexSource readIndex) {
 		ServerCalls.UnaryMethod<byte[], byte[]> handler = (request, response) -> answer(server, request, response);
 		var address = (apiAddress.host() + ":" + apiAddress.port()).getBytes(StandardCharsets.UTF_8);
 		ServerCalls.UnaryMethod<byte[], byte[]> addressHandler = (_, response) -> {
@@ -104,10 +131,13 @@ final class TermService {
 			response.onCompleted();
 		};
 		ServerCalls.UnaryMethod<byte[], byte[]> stateHandler = (request, response) -> answerState(nodeState, request, response);
+		ServerCalls.UnaryMethod<byte[], byte[]> readIndexHandler = (request, response) ->
+				answerReadIndex(readIndex, request, response);
 		var service = ServerServiceDefinition.builder(SERVICE_NAME)
 				.addMethod(CURRENT_TERM, ServerCalls.asyncUnaryCall(handler))
 				.addMethod(API_ADDRESS, ServerCalls.asyncUnaryCall(addressHandler))
 				.addMethod(NODE_STATE, ServerCalls.asyncUnaryCall(stateHandler))
+				.addMethod(READ_INDEX, ServerCalls.asyncUnaryCall(readIndexHandler))
 				.build();
 		// Ratis may run admin and client services on separate ports; the peers' Raft address is the SERVER one.
 		return (builder, types) -> types.contains(GrpcServices.Type.SERVER) ? builder.addService(service) : builder;
@@ -118,6 +148,16 @@ final class TermService {
 		return call(channel, CURRENT_TERM, encodeGroupId(groupId), timeout).thenApply(value -> {
 			if (value.length != Long.BYTES) {
 				throw new CompletionException(new IOException("Bad term reply size " + value.length));
+			}
+			return ByteBuffer.wrap(value).getLong();
+		});
+	}
+
+	/** Asks the leader behind {@code channel} for a read index of {@code groupId}: see {@link #READ_INDEX}. */
+	static CompletableFuture<Long> readIndex(Channel channel, RaftGroupId groupId, Duration timeout) {
+		return call(channel, READ_INDEX, encodeGroupId(groupId), timeout).thenApply(value -> {
+			if (value.length != Long.BYTES) {
+				throw new CompletionException(new IOException("Bad read index reply size " + value.length));
 			}
 			return ByteBuffer.wrap(value).getLong();
 		});
@@ -215,6 +255,37 @@ final class TermService {
 		}
 		response.onNext(ByteBuffer.allocate(Long.BYTES).putLong(term).array());
 		response.onCompleted();
+	}
+
+	private static void answerReadIndex(ReadIndexSource source, byte[] request, StreamObserver<byte[]> response) {
+		if (request.length != GROUP_ID_BYTES) {
+			response.onError(Status.INVALID_ARGUMENT
+					.withDescription("Expected a 16-byte group id, got " + request.length + " bytes")
+					.asRuntimeException());
+			return;
+		}
+		var uuid = ByteBuffer.wrap(request);
+		var groupId = RaftGroupId.valueOf(new UUID(uuid.getLong(), uuid.getLong()));
+		CompletableFuture<Long> index;
+		try {
+			index = source.readIndex(groupId);
+		} catch (RuntimeException e) {
+			index = CompletableFuture.failedFuture(e);
+		}
+		index.whenComplete((value, error) -> {
+			if (error == null) {
+				response.onNext(ByteBuffer.allocate(Long.BYTES).putLong(value).array());
+				response.onCompleted();
+				return;
+			}
+			var cause = ReplicatedConnection.unwrap(error);
+			var status = Status.fromThrowable(cause);
+			if (status.getCode() == Status.Code.UNKNOWN) {
+				// Not the leader, leadership not confirmed in time, or closing: the follower forwards the read instead.
+				status = Status.FAILED_PRECONDITION.withDescription(String.valueOf(cause));
+			}
+			response.onError(status.asRuntimeException());
+		});
 	}
 
 	private static void answerState(NodeStateSource source, byte[] request, StreamObserver<byte[]> response) {

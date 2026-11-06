@@ -41,12 +41,16 @@ import org.slf4j.LoggerFactory;
  *       reports this leader's term; any reply with a higher term fails it;</li>
  *   <li>waits until the local applied index reaches {@code c}.</li>
  * </ol>
- * <p>Concurrent calls share rounds. A round costs one network round trip, no fsync.</p>
- * <p>Each peer has at most one term query in flight, whose deadline is the end of the round that sent it, so a
- * paused or dead peer does not pile up calls, nor connection attempts, while rounds keep succeeding without it. A
- * reply counts only for the round that sent the query, so only if the query was sent after the read arrived: a
- * round that finds an earlier round's query still in flight to a peer sends its own once that one ends, if it
- * still needs that peer and has time left; meanwhile the peer simply does not contribute to it.</p>
+ * <p>Concurrent calls share rounds. A round costs one network round trip, no fsync. At most
+ * {@link #ROUNDS_IN_FLIGHT} rounds run at once, so a call that arrives just after a round was sent starts the next
+ * one at once instead of waiting for the first to end; calls that arrive while both run share the round after.</p>
+ * <p>Each peer has at most {@link #QUERIES_PER_PEER} term queries in flight, whose deadline is the end of the
+ * rounds that sent them, so a paused or dead peer does not pile up calls, nor connection attempts, while rounds keep
+ * succeeding without it. A reply counts only for the rounds that sent the query, so only if the query was sent after
+ * the read arrived: rounds that find every query slot to a peer taken send one query together once a slot frees, if
+ * they still need that peer and have time left; meanwhile the peer simply does not contribute to them.</p>
+ * <p>{@link #readIndex()} serves a follower's read: the commit index recorded when it was called, once leadership
+ * was confirmed after the call. The follower then waits for its own apply to reach it.</p>
  * <p>The returned futures complete on threads of this barrier, never on gRPC, Ratis apply or JDK timer threads,
  * so callers may run blocking work, such as a database read, in their continuations.</p>
  */
@@ -70,8 +74,26 @@ final class ReadBarrier implements Closeable {
 		}
 	}
 
-	/** A caller of the next round; {@code commitIndex} is the applied index it waits for, -1 for none. */
-	private record Waiter(long term, long commitIndex, CompletableFuture<Void> future) {}
+	/** Rounds that may run at once. */
+	static final int ROUNDS_IN_FLIGHT = 2;
+	/** Term queries that may be in flight to one peer at once. */
+	static final int QUERIES_PER_PEER = ROUNDS_IN_FLIGHT;
+
+	/**
+	 * A caller of the next round: {@code commitIndex} is the commit index when it arrived, which its future completes
+	 * with; {@code applyIndex} is the applied index it waits for, -1 for none.
+	 */
+	private record Waiter(long term, long commitIndex, long applyIndex, CompletableFuture<Long> future) {}
+
+	/** What a caller waits for, once leadership is confirmed. */
+	private enum Wait {
+		/** Every entry committed before the call is applied here. */
+		COMMITTED,
+		/** The entries of earlier leaders are applied here: see {@link #awaitLeadership()}. */
+		LEADERSHIP,
+		/** Nothing: the caller only wants the commit index. */
+		NOTHING
+	}
 
 	private final RaftServer server;
 	private final RaftGroupId groupId;
@@ -82,7 +104,7 @@ final class ReadBarrier implements Closeable {
 	/** The term queries to each other voting peer. */
 	private final Map<RaftPeerId, PeerLink> links = new ConcurrentHashMap<>();
 	/** Every future returned by {@link #await} and not completed yet, failed by {@link #close}. */
-	private final Set<CompletableFuture<Void>> outstanding = ConcurrentHashMap.newKeySet();
+	private final Set<CompletableFuture<Long>> outstanding = ConcurrentHashMap.newKeySet();
 	/**
 	 * Completes the callers' futures and starts queued rounds; see {@link #execute}. In a node, the platform threads of
 	 * its control plane ({@link NodeThreads#control()}), which the node shuts down.
@@ -94,8 +116,8 @@ final class ReadBarrier implements Closeable {
 	private final Object lock = new Object();
 	/** Waiters of the next round, whose RPCs have not been sent yet. Guarded by {@link #lock}. */
 	private List<Waiter> nextRound = new ArrayList<>();
-	/** Guarded by {@link #lock}. */
-	private boolean roundRunning;
+	/** Rounds whose RPCs were sent and that have not ended. Guarded by {@link #lock}. */
+	private int roundsRunning;
 	private volatile boolean closed;
 
 	ReadBarrier(RaftServer server, RaftGroupId groupId, AppliedIndex applied, Duration roundTimeout) {
@@ -136,7 +158,7 @@ final class ReadBarrier implements Closeable {
 	 * the leader after this call. Fails with {@link NotLeaderException} or {@link java.util.concurrent.TimeoutException}.
 	 */
 	CompletableFuture<Void> await() {
-		return await(true);
+		return enqueue(Wait.COMMITTED).thenApply(_ -> null);
 	}
 
 	/**
@@ -147,10 +169,20 @@ final class ReadBarrier implements Closeable {
 	 * its term was applied before its acknowledgement.
 	 */
 	CompletableFuture<Void> awaitLeadership() {
-		return await(false);
+		return enqueue(Wait.LEADERSHIP).thenApply(_ -> null);
 	}
 
-	private CompletableFuture<Void> await(boolean waitForApply) {
+	/**
+	 * Completes with this node's commit index at the time of this call, once this node was the ready leader after
+	 * this call; it does not wait for any apply. A follower that applied up to it may serve a linearizable read: it
+	 * then has every entry committed before the read arrived, including every acknowledged write. Not
+	 * {@link #awaitLeadership()}'s shortcut: the follower did not apply this leader's entries in its own apply.
+	 */
+	CompletableFuture<Long> readIndex() {
+		return enqueue(Wait.NOTHING);
+	}
+
+	private CompletableFuture<Long> enqueue(Wait wait) {
 		long term;
 		long commitIndex;
 		try {
@@ -168,15 +200,19 @@ final class ReadBarrier implements Closeable {
 			return CompletableFuture.failedFuture(new NotLeaderException("No division for " + groupId + ": " + e));
 		}
 
-		var future = new CompletableFuture<Void>();
+		var future = new CompletableFuture<Long>();
+		long applyIndex = switch (wait) {
+			case COMMITTED -> commitIndex;
+			case LEADERSHIP -> Math.min(commitIndex, readyIndex.applyAsLong(term));
+			case NOTHING -> -1;
+		};
 		List<Waiter> round;
 		synchronized (lock) {
 			if (closed) {
 				return CompletableFuture.failedFuture(new NotLeaderException("Read barrier closed"));
 			}
 			outstanding.add(future);
-			nextRound.add(new Waiter(term, waitForApply ? commitIndex : Math.min(commitIndex, readyIndex.applyAsLong(term)),
-					future));
+			nextRound.add(new Waiter(term, commitIndex, applyIndex, future));
 			round = takeNextRoundIfIdle();
 		}
 		future.whenComplete((_, _) -> outstanding.remove(future));
@@ -205,28 +241,28 @@ final class ReadBarrier implements Closeable {
 		}
 	}
 
-	/** The waiters of the next round, if no round is running; the caller must then run it. */
+	/** The waiters of the next round, if fewer than {@link #ROUNDS_IN_FLIGHT} run; the caller must then run it. */
 	private @Nullable List<Waiter> takeNextRoundIfIdle() {
 		assert Thread.holdsLock(lock);
-		if (roundRunning || closed || nextRound.isEmpty()) {
+		if (roundsRunning >= ROUNDS_IN_FLIGHT || closed || nextRound.isEmpty()) {
 			return null;
 		}
 		var round = nextRound;
 		nextRound = new ArrayList<>();
-		roundRunning = true;
+		roundsRunning++;
 		return round;
 	}
 
 	/**
 	 * Sends the RPCs of a round now and, when it ends, completes its waiters and starts the round that queued up
-	 * behind it. At most one round runs at a time.
+	 * behind it. At most {@link #ROUNDS_IN_FLIGHT} rounds run at a time.
 	 */
 	private void startRound(List<Waiter> waiters) {
 		CompletableFuture<Long> outcome;
 		try {
 			outcome = confirmLeadership(waiters);
 		} catch (RuntimeException e) {
-			// Never leave roundRunning set: that would stall every later barrier.
+			// Never leave the round counted as running: that would stall every later barrier.
 			outcome = CompletableFuture.failedFuture(e);
 		}
 		// A round ends on a gRPC thread inside Votes' monitor, on the JDK timeout thread or, for a single voter,
@@ -242,7 +278,7 @@ final class ReadBarrier implements Closeable {
 
 	private @Nullable List<Waiter> afterRound() {
 		synchronized (lock) {
-			roundRunning = false;
+			roundsRunning--;
 			return takeNextRoundIfIdle();
 		}
 	}
@@ -259,16 +295,16 @@ final class ReadBarrier implements Closeable {
 				var notLeader = new NotLeaderException(
 						"Leadership of term " + waiter.term + " ended, current term " + confirmedTerm);
 				execute(() -> waiter.future.completeExceptionally(notLeader));
-			} else if (waiter.commitIndex < 0) {
-				execute(() -> waiter.future.complete(null));
+			} else if (waiter.applyIndex < 0) {
+				execute(() -> waiter.future.complete(waiter.commitIndex));
 			} else {
 				// Bounded like the round: a new leader far behind in applying earlier terms fails its reads in time.
-				applied.await(waiter.commitIndex).orTimeout(roundTimeout.toNanos(), TimeUnit.NANOSECONDS)
+				applied.await(waiter.applyIndex).orTimeout(roundTimeout.toNanos(), TimeUnit.NANOSECONDS)
 						.whenCompleteAsync((_, applyError) -> {
 							if (applyError == null) {
-								waiter.future.complete(null);
+								waiter.future.complete(waiter.commitIndex);
 							} else {
-								waiter.future.completeExceptionally(new ApplyLagException(waiter.commitIndex, applied.get()));
+								waiter.future.completeExceptionally(new ApplyLagException(waiter.applyIndex, applied.get()));
 							}
 						}, this::execute);
 			}
@@ -406,17 +442,20 @@ final class ReadBarrier implements Closeable {
 	}
 
 	/**
-	 * The term queries to one peer, at most one in flight at a time. Without this limit every round would send its
-	 * own query to a paused peer, and each would stay pending until its deadline.
+	 * The term queries to one peer, at most {@link #QUERIES_PER_PEER} in flight at a time. Without this limit every
+	 * round would send its own query to a paused peer, and each would stay pending until its deadline.
 	 */
 	private final class PeerLink {
 
 		final RaftPeerId id;
 		final String address;
 		/** Guarded by this. */
-		private boolean inFlight;
-		/** The round that found a query in flight and needs one of its own once that one ends. Guarded by this. */
-		private @Nullable Votes waiting;
+		private int inFlight;
+		/**
+		 * Rounds that found every slot taken and need a query of their own once one frees: they share it. Guarded by
+		 * this.
+		 */
+		private final List<Votes> waiting = new ArrayList<>();
 		/** When a failure to send to this peer was last logged, see {@link #SEND_FAILURE_LOG_INTERVAL_NANOS}. */
 		private volatile long lastSendFailureLogNanos = System.nanoTime() - SEND_FAILURE_LOG_INTERVAL_NANOS;
 
@@ -425,59 +464,65 @@ final class ReadBarrier implements Closeable {
 			this.address = address;
 		}
 
-		/** Asks the peer for its term on behalf of {@code votes}, now or once the query in flight ends. */
+		/** Asks the peer for its term on behalf of {@code votes}, now or once a query in flight ends. */
 		void ask(Votes votes) {
 			synchronized (this) {
-				if (inFlight) {
-					// The query in flight was sent before this round started: its reply cannot count for it.
-					// Rounds run one at a time, so any round already waiting here has ended: this one replaces it.
-					waiting = votes;
+				if (inFlight >= QUERIES_PER_PEER) {
+					// The queries in flight were sent before this round started: their replies cannot count for it.
+					waiting.removeIf(round -> round.outcome.isDone());
+					waiting.add(votes);
 					return;
 				}
-				inFlight = true;
+				inFlight++;
 			}
-			send(votes);
+			send(List.of(votes));
 		}
 
 		/**
-		 * Sends the query of {@code votes}, which owns the link; if that round no longer needs it, passes the link
-		 * on to the round waiting behind it, or frees it.
+		 * Sends one query on behalf of {@code rounds}, which own a slot of the link; if none of them needs it any more,
+		 * passes the slot on to the rounds waiting for one, or frees it.
 		 */
-		private void send(@Nullable Votes votes) {
-			while (votes != null) {
-				long remaining = votes.deadline - System.nanoTime();
-				if (!closed && !votes.outcome.isDone() && remaining > 0) {
-					var round = votes;
+		private void send(@Nullable List<Votes> rounds) {
+			while (rounds != null) {
+				long now = System.nanoTime();
+				var live = rounds.stream().filter(round -> !round.outcome.isDone() && round.deadline - now > 0).toList();
+				if (!closed && !live.isEmpty()) {
+					long remaining = live.stream().mapToLong(round -> round.deadline - now).max().orElseThrow();
 					try {
 						TermService.currentTerm(channel(address), groupId, Duration.ofNanos(remaining))
 								.whenComplete((peerTerm, error) -> {
 									var next = release();
 									if (error == null) {
-										round.onReply(id, peerTerm);
+										for (var round : live) {
+											round.onReply(id, peerTerm);
+										}
 									}
 									send(next);
 								});
 						return;
 					} catch (RuntimeException e) {
-						// Such as an unusable address: this peer does not contribute to the round. Said in the log, or
+						// Such as an unusable address: this peer does not contribute to these rounds. Said in the log, or
 						// a misconfigured peer would show only as rounds that time out.
-						long now = System.nanoTime();
-						if (now - lastSendFailureLogNanos >= SEND_FAILURE_LOG_INTERVAL_NANOS) {
-							lastSendFailureLogNanos = now;
+						long failedAt = System.nanoTime();
+						if (failedAt - lastSendFailureLogNanos >= SEND_FAILURE_LOG_INTERVAL_NANOS) {
+							lastSendFailureLogNanos = failedAt;
 							LOG.warn("Read barrier: cannot ask peer {} at {} for its term; it does not count toward"
 									+ " leadership confirmations (logged at most once a minute per peer)", id, address, e);
 						}
 					}
 				}
-				votes = release();
+				rounds = release();
 			}
 		}
 
-		/** Ends the query in flight; returns the round that now owns the link and must send its own, if any. */
-		private synchronized @Nullable Votes release() {
-			var next = waiting;
-			waiting = null;
-			inFlight = next != null;
+		/** Ends a query in flight; returns the rounds that now own its slot and must send their own, if any. */
+		private synchronized @Nullable List<Votes> release() {
+			if (waiting.isEmpty()) {
+				inFlight--;
+				return null;
+			}
+			var next = List.copyOf(waiting);
+			waiting.clear();
 			return next;
 		}
 	}

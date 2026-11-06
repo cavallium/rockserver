@@ -118,8 +118,15 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 
 - It uses the first address that accepts a connection, never shuffling the list, so all the clients with the same
   list sit on the first node. List the expected leader first, so that their calls do not take a forwarding hop
-  through a follower. After a leader change they stay where they are, and every call that needs the leader takes
-  that hop, until their connection is lost.
+  through a follower. After a leader change they stay where they are.
+- A replicated node names its cluster's leader in every response. If that address is in the client's list (same host
+  name and port), the connection opens a second channel to it, and sends there every call the leader serves: writes,
+  transactions, updates, iterators and ranges. Point reads (`get`, `exists`, `existsMulti`, `getMulti`), maintenance
+  and the handshake stay on the node of the ordinary channel. The leader's channel is used only while it is
+  connected; until then, and once a call on it ends with `UNAVAILABLE`, calls go through the ordinary channel, and a
+  follower forwards them as before. A call in flight on the leader's channel when it fails fails as on any lost
+  connection. List the nodes with the host names their peer configuration uses (`--peer`), or set the property below
+  to `any`.
 - When the connection to its node is lost, calls in flight fail as they do with one address: the reads that the
   automatic retry policy allows run again, on the next node, and the others surface `UNAVAILABLE`, because a write
   may already have been applied. On a replicated cluster, writes are sent again instead (see below). New calls wait
@@ -152,6 +159,7 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 | `it.cavallium.rockserver.grpc.client.handshake-wait-ms` | `30000` with several addresses, `0` with one | How long a new connection keeps asking for the capabilities of a server, before it fails, while the answer is `UNAVAILABLE` or no answer comes within 10 s. It ends at this time, or with the first attempt, which takes up to 10 s, if that is later: `0` means one attempt. |
 | `it.cavallium.rockserver.grpc.client.write-retry-window-ms` | `30000` | On a replicated cluster, how long a write of a caller without a deadline is sent again after an unknown outcome. A caller's deadline bounds it otherwise. |
 | `it.cavallium.rockserver.grpc.client.session-writes` | `true` | `false` turns off client sessions (below) for connections made afterwards: writes are sent once, as to a single server. |
+| `it.cavallium.rockserver.grpc.client.leader-hint` | `listed` | With several addresses, which leader addresses named by the nodes the connection uses for the calls the leader serves: `listed` only those in its list, `any` any, `off` none. A server could otherwise send the client anywhere, and the address the members use among themselves may not be reachable from the client. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-ms` | `0` (off) | On a server in front of another connection, such as a replicated node, the age at which a connection ends, +/-10%. The client then starts again from the top of its list, which is what brings it back to the first address. It has two costs: a silent first address costs every client the connect timeout at every cycle, not once, and calls that outlive the grace below fail with `UNAVAILABLE`, which includes `Compact` and long scans, on a healthy cluster too. Left off, a client stays on the node it failed over to until that node goes away. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms` | `600000` | With a maximum age, the time left to the calls running on a connection that reached it. |
 

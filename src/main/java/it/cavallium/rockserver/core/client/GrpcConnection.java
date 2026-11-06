@@ -365,6 +365,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private final int maxInboundMessageSize;
 	private final RockserverCapabilities capabilities;
 	private final ReconnectTimer reconnectTimer;
+	/** Sends leader-bound calls straight to the leader; null for one address. */
+	private final @Nullable LeaderHintRouter leaderRouter;
 
 	private static it.cavallium.rockserver.core.common.api.proto.RequestContext[] createNoDeadlineWireContexts() {
 		var contexts = new it.cavallium.rockserver.core.common.api.proto.RequestContext[WorkloadProfile.values().length];
@@ -391,7 +393,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 						? NettyChannelBuilder.forAddress(inetSocketAddress.getHostString(), inetSocketAddress.getPort())
 						: NettyChannelBuilder.forAddress(socketAddress),
 				socketAddress instanceof DomainSocketAddress,
-				false,
+				null,
 				address,
 				automaticRetry);
 	}
@@ -402,18 +404,24 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				NettyChannelBuilder.forTarget(MultiAddressNameResolver.target(addresses))
 						.setNameResolverArg(MultiAddressNameResolver.LAST_GOOD_ADDRESSES, new HashMap<>()),
 				false,
-				true,
+				addresses,
 				address,
 				automaticRetry);
 	}
 
+	/**
+	 * @param addresses the nodes of a connection to several of them, null for one: see {@link LeaderHintRouter}
+	 */
 	private GrpcConnectionDelegate(String name,
 			NettyChannelBuilder channelBuilder,
 			boolean domainSocket,
-			boolean severalAddresses,
+			@Nullable List<HostAndPort> addresses,
 			URI address,
 			boolean automaticRetry) {
 		super(name);
+		boolean severalAddresses = addresses != null;
+		var hintMode = severalAddresses ? LeaderHintRouter.configuredMode() : LeaderHintRouter.Mode.OFF;
+		var leaderRouter = hintMode == LeaderHintRouter.Mode.OFF ? null : new LeaderHintRouter(hintMode, addresses);
 		int maxInboundMessageSize = configuredMaxInboundMessageSize();
 
 		// A node that dies without closing its connections (power loss, partition, a frozen process) is noticed by
@@ -470,6 +478,9 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				}
 			}
 			channelBuilder.intercept(new RetryLoggingInterceptor());
+			if (leaderRouter != null) {
+				channelBuilder.intercept(leaderRouter.hintReader());
+			}
 			channel = channelBuilder.build();
 		} catch (RuntimeException | Error ex) {
 			callbackExecutor.shutdownNow();
@@ -510,8 +521,15 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		this.callbackExecutor = callbackExecutor;
 		this.eventLoopGroup = eventLoopGroup;
 		this.automaticRetry = automaticRetry;
-		this.futureStub = futureStub;
-		this.reactiveStub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
+		// The handshake stays on the ordinary channel; later calls may go to the leader's.
+		this.leaderRouter = leaderRouter;
+		if (leaderRouter != null) {
+			leaderRouter.start(leader -> newLeaderChannel(leader, maxInboundMessageSize, automaticRetry,
+					this.callbackExecutor, this.eventLoopGroup, leaderRouter));
+		}
+		var stubChannel = leaderRouter != null ? leaderRouter.route(channel) : channel;
+		this.futureStub = leaderRouter != null ? RocksDBServiceGrpc.newFutureStub(stubChannel) : futureStub;
+		this.reactiveStub = ReactorRocksDBServiceGrpc.newReactorStub(stubChannel);
 		this.address = address;
 		this.maxInboundMessageSize = maxInboundMessageSize;
 		this.capabilities = capabilities;
@@ -2130,8 +2148,39 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		}
 	}
 
+	/** A channel to the leader that {@link LeaderHintRouter} found, configured like the ordinary one. */
+	private static ManagedChannel newLeaderChannel(HostAndPort leader,
+			int maxInboundMessageSize,
+			boolean automaticRetry,
+			ExecutorService callbackExecutor,
+			EventLoopGroup eventLoopGroup,
+			LeaderHintRouter router) {
+		var builder = NettyChannelBuilder.forAddress(leader.host(), leader.port())
+				.usePlaintext()
+				.maxInboundMessageSize(maxInboundMessageSize)
+				.keepAliveTime(intProperty(KEEP_ALIVE_TIME_PROPERTY, DEFAULT_KEEP_ALIVE_TIME_MILLIS, 1), TimeUnit.MILLISECONDS)
+				.keepAliveTimeout(intProperty(KEEP_ALIVE_TIMEOUT_PROPERTY, DEFAULT_KEEP_ALIVE_TIMEOUT_MILLIS, 1),
+						TimeUnit.MILLISECONDS)
+				.keepAliveWithoutCalls(true)
+				.executor(callbackExecutor)
+				.eventLoopGroup(eventLoopGroup)
+				.channelType(NioSocketChannel.class)
+				.withOption(ChannelOption.CONNECT_TIMEOUT_MILLIS,
+						intProperty(CONNECT_TIMEOUT_PROPERTY, DEFAULT_CONNECT_TIMEOUT_MILLIS, 1));
+		if (automaticRetry) {
+			configureRetry(builder);
+		} else {
+			builder.disableRetry().defaultServiceConfig(Map.of("loadBalancingConfig", PICK_FIRST_IN_ORDER));
+		}
+		return builder.intercept(new RetryLoggingInterceptor(), router.hintReader()).build();
+	}
+
 	@Override
 	public void close() {
+		if (this.leaderRouter != null) {
+			// Before the event loop and the callback executor it shares go away.
+			this.leaderRouter.close();
+		}
 		this.reconnectTimer.close();
 		try {
 			this.channel.shutdown();

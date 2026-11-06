@@ -359,7 +359,7 @@ class ReadBarrierTest {
 	}
 
 	@Test
-	void unansweringPeerHasAtMostOneQueryInFlight() throws Exception {
+	void unansweringPeerHasAtMostTwoQueriesInFlight() throws Exception {
 		startCluster();
 		var leader = awaitLeader();
 		var followers = followersOf(leader);
@@ -382,16 +382,86 @@ class ReadBarrierTest {
 		long calls = paused.termCalls.get() - callsBefore;
 
 		assertTrue(rounds >= 50, "rounds: " + rounds);
-		// A query lasts until the end of the round that sent it; only a round after that sends the next one.
-		assertTrue(calls <= 2 * timeouts + 1, calls + " calls in " + rounds + " rounds and " + timeouts + " timeouts");
-		// One, plus at most one that the caller gave up on but whose cancellation the peer did not see yet.
-		assertTrue(paused.mostOpenTermCalls.get() <= 2, "open calls: " + paused.mostOpenTermCalls.get());
+		// A query lasts until the end of the rounds that sent it; only rounds after that send the next one in its slot.
+		int slots = ReadBarrier.QUERIES_PER_PEER;
+		assertTrue(calls <= slots * (2 * timeouts + 1),
+				calls + " calls in " + rounds + " rounds and " + timeouts + " timeouts");
+		// One per slot, plus at most one per slot that the caller gave up on but whose cancellation the peer did not see
+		// yet.
+		assertTrue(paused.mostOpenTermCalls.get() <= 2L * slots, "open calls: " + paused.mostOpenTermCalls.get());
 
 		// Once the peer answers again it confirms rounds as before, here alone with the leader.
 		paused.ignoreTermCalls = false;
 		waitUntil(() -> paused.openTermCalls.get() == 0, "the unanswered call given up");
 		other.stop();
 		barrier.await().get(10, TimeUnit.SECONDS);
+	}
+
+	@Test
+	void secondRoundStartsWhileTheFirstIsInFlight() throws Exception {
+		startCluster();
+		var leader = awaitLeader();
+		var followers = followersOf(leader);
+		var barrier = barrier(leader);
+		barrier.await().get(10, TimeUnit.SECONDS);
+		var before = followers.stream().map(node -> node.termCalls.get()).toList();
+		BooleanSupplier[] sent = new BooleanSupplier[3];
+		for (int queries = 1; queries <= 2; queries++) {
+			int expected = queries;
+			sent[queries] = () -> {
+				for (int i = 0; i < followers.size(); i++) {
+					if (followers.get(i).termCalls.get() - before.get(i) < expected) {
+						return false;
+					}
+				}
+				return true;
+			};
+		}
+
+		CompletableFuture<Void> third;
+		followers.forEach(Node::holdTermCalls);
+		try {
+			barrier.await();
+			waitUntil(sent[1], "the first round sent");
+			barrier.await();
+			// Not after the first round ends: its queries are held.
+			waitUntil(sent[2], "the second round sent while the first is in flight");
+			third = barrier.await();
+			Thread.sleep(50);
+			for (int i = 0; i < followers.size(); i++) {
+				assertEquals(2, followers.get(i).termCalls.get() - before.get(i), "a third round started");
+			}
+			assertFalse(third.isDone());
+		} finally {
+			followers.forEach(Node::releaseTermCalls);
+		}
+		// It runs once one of the first two ends.
+		third.get(10, TimeUnit.SECONDS);
+	}
+
+	@Test
+	void readIndexIsTheCommitIndexAtTheCallAndWaitsForNoApply() throws Exception {
+		startCluster();
+		var leader = awaitLeader();
+		var barrier = barrier(leader);
+		var client = client();
+		assertNotLeader(barrier(followersOf(leader).getFirst()).readIndex().thenApply(_ -> null));
+
+		var gate = new CountDownLatch(1);
+		leader.stateMachine.applyGate = gate;
+		try {
+			long before = leader.commitIndex();
+			client.async().send(Message.valueOf("inc"));
+			waitUntil(() -> leader.commitIndex() > before, "write committed");
+			long committed = leader.commitIndex();
+
+			long index = barrier.readIndex().get(10, TimeUnit.SECONDS);
+
+			assertTrue(index >= committed, "read index " + index + " < commit index " + committed);
+			assertTrue(leader.stateMachine.applied.get() < committed, "the write was applied");
+		} finally {
+			gate.countDown();
+		}
 	}
 
 	@Test

@@ -79,13 +79,14 @@ forwards to a non-embedded connection:
 | `Applier` | Applies the requests of log entries to the local database, a group of entries in one transaction without the WAL, with their result records and the applied position. |
 | `LeaderSession`, `ConflictTracker` | Transactions bound to the leader's term, per-key queues of single-key updates, and conflict validation. |
 | `NodeMetrics` | Timers and gauges of the replication path, logged every 10 s. |
-| `ReadBarrier`, `TermService` | Linearizable reads. `TermService` also answers what a node holds (`NodeState`). |
+| `ReadBarrier`, `TermService` | Linearizable reads. `TermService` also answers what a node holds (`NodeState`), and a follower's read index. |
+| `FollowerReads` | A follower's read indexes from the leader, for the point reads it serves itself (off by default). |
 | `ClusterCheck` | A leader tells its followers which cluster it leads, and a node of another cluster stops. |
 | `LeaderStall` | Tells a leader that cannot commit to step down. |
 | `NodeThreads` | The node's control-plane platform threads and the virtual threads of the leader's short local commands (see "Threads"). |
 | `ConflictPositions` | The text that carries a conflict's positions from the leader's refusal to the proposer. |
 | `NodeStore`, `CheckpointStorage` | Local database, internal metadata, checkpoint snapshots, restore. |
-| `LeaderForwarder` | Finds the leader's API and forwards to it. |
+| `LeaderForwarder` | Finds the leader's API and forwards to it; knows the leader's API address that nodes send to clients. |
 | `LogEntry`, `Request`, `LogEntryCodec`, `ResultCodec` | Log entry model and its binary encoding. |
 | `ReplicatedServerMain` | Command line: `run`, `admin` and `repair-log`. |
 | `RaftLogRepair` | Offline repair of a torn last write in the open segment of the Raft log. |
@@ -97,13 +98,20 @@ forwards to a non-embedded connection:
 | Path | Commands | Handling |
 |---|---|---|
 | Replicated write | `put*`, `delete*`, `merge*` without a transaction id; `deleteRange`; `putBatch`/`mergeBatch` (split into ordered chunks of at most 4 MiB); `createColumn`, `deleteColumn*`, `uploadMergeOperator` | Proposed from the node that received it. The result is computed when the leader applies it. |
-| Linearizable read | `get`, `exists*`, `getMulti`, `reduceRange*`, `getRange*`, `getRangePage`, iterator open, `getColumnId`, `getAllColumnDefinitions`, `checkMergeOperator`, `estimateNumKeys`, `scanRaw*` | On the leader, after the read barrier, against its local database. Forwarded to the leader from the other nodes. |
+| Linearizable read | `get`, `exists*`, `getMulti`, `reduceRange*`, `getRange*`, `getRangePage`, iterator open, `getColumnId`, `getAllColumnDefinitions`, `checkMergeOperator`, `estimateNumKeys`, `scanRaw*` | On the leader, after the read barrier, against its local database. Forwarded to the leader from the other nodes, except point reads (`get`, `exists`, `getMulti`, `existsMulti` outside a transaction) on a node with follower reads on: see "Follower reads". |
 | Leader-bound | `openTransaction`, `getForUpdate`, writes and reads with a transaction or update id, `closeTransaction`, `closeFailedUpdate`, iterator seek, next and close | Served by the leader of the current term. Forwarded to it from the other nodes. |
 | Local | `flush`, `compact`, `compactFiles`, `getSstMetadata`, `getTableProperties` | The node that received the request does it on its own database. |
 
 Forwarding uses the leader's ordinary Rockserver API through the core `GrpcConnection` (4 connections per
-peer, without gRPC's own retries; a port probe first, so a dead peer fails in milliseconds). When the leader
-cannot be reached, reads and transaction or update opens are sent again to whichever node leads then, until the
+peer, without gRPC's own retries; a port probe first, so a dead peer fails in milliseconds). A request that finds no
+leader waits for one: the state machine tells `LeaderForwarder` of every leader change, and of this node becoming a
+ready leader, so it goes on at once (a 250 ms poll stays as a safety net). Each forwarded call takes at most the
+caller's deadline or the request timeout, whichever comes first (for a `getForUpdate`, the request timeout plus its
+12 s key wait), and the leader gets that deadline as the call's own: a leader that is alive but stuck, such as one
+whose apply waits, or one in a long pause, holds neither the call nor the follower's proxy permit longer. A call that
+times out is treated as lost, as below, but its connection is kept, since other calls use it. A forwarded stream fails
+the same way once no element comes for a request timeout while its consumer waits for one; a consumer that asks for
+nothing stops that clock. When the leader cannot be reached, reads and transaction or update opens are sent again to whichever node leads then, until the
 request timeout; a request that was never sent can always be retried; a commit whose connection broke has an
 unknown outcome. A `getForUpdate` whose connection broke is not sent again but fails with `UPDATE_RETRY`: the
 leader may still be alive and hold the key for that update until its lease ends. A forwarded stream is sent again
@@ -157,10 +165,22 @@ node, and a pause and the next are at least 4 maximum election timeouts apart. A
 pauses every node and recovers by itself: elections go on, and every node resumes after the new leader appears. A
 single-node embedded server never pauses.
 
-Placement is deliberately simple, and the client knows nothing about the leader. All the clients with the same list
-sit on its first node. After a leader change they stay on what is now a follower, and calls that need the leader
-take a forwarding hop, until the connection is lost. A node that returns gets its clients back the same way, not at
-once: a client stays on the node it failed over to until that node goes away.
+Placement is deliberately simple. All the clients with the same list sit on its first node, and stay on what is now
+a follower after a leader change. A node that returns gets its clients back the same way, not at once: a client stays
+on the node it failed over to until that node goes away. What spares them the forwarding hop is the leader hint (as
+etcd's clientv3 and the TiKV client's region cache do): every response of a replicated node carries the leader's API
+address, as the members know it (`rockserver-leader`, in the headers, or in the trailers of a call that fails before
+them; `ReplicatedConnection` implements the core `LeaderHint`, and `GrpcServer` adds it). A client of several nodes
+(`LeaderHintRouter`, inside `GrpcConnection`) keeps a second channel to that address and sends it the calls the leader
+serves: writes, transactions, updates, iterators, ranges and column calls. Point reads stay on the client's node, which
+serves them itself with follower reads on, and so do maintenance calls, which concern that node, and the handshake. The
+second channel takes calls only while it is connected; before that, and after a call on it ends with `UNAVAILABLE`
+(the channel is then dropped, and the same address is not taken again for 2 s), calls go through the ordinary channel
+and a follower forwards them. A hint moves with the leader, since every response carries the current one. By default
+the client takes only an address of its own list, compared by host name and port: otherwise a server could send it to
+an address its user never listed, and the address the members use among themselves (an internal name, a NAT address)
+may not be reachable from the client (`it.cavallium.rockserver.grpc.client.leader-hint`: `listed`, `any` or `off`). A
+plain single-node server sends no hint, and a client with one address never uses one.
 
 A maximum connection age (`maxConnectionAge`, off by default, gRPC adds +/-10%, with 10 minutes of grace for running
 calls) would bring clients back, because after the GOAWAY a client starts again from the top of its list. That is its
@@ -442,7 +462,10 @@ leader can therefore serve stale reads. `ReadBarrier` does the check itself, wit
 1. When a read arrives, the leader must be ready, meaning it committed an entry of its own term. It records
    the commit index `c`.
 2. The read joins the next confirmation round whose queries have not been sent yet. That round asks every
-   voting peer for its current term, using `TermService` on the Ratis gRPC port. The read may proceed once
+   voting peer for its current term, using `TermService` on the Ratis gRPC port. Two rounds may run at once, so a
+   read that arrives just after a round was sent starts the next one at once; reads that arrive while two run share
+   the one after. Each peer has at most two term queries in flight, and rounds that find both taken share the next
+   one: a paused peer does not pile up calls. The read may proceed once
    a majority of the current configuration reports the leader's term, counting the leader itself. During a
    membership change, a majority of the previous configuration is needed too. A higher term fails the read.
 3. The read then runs against the local database. `ReadBarrier.await` also waits until the local applied
@@ -460,6 +483,58 @@ leader can therefore serve stale reads. `ReadBarrier` does the check itself, wit
 Then a majority had already moved to that higher term, and terms never decrease. A majority answering after
 the read arrived must overlap it, so it could not report the old term. One round costs one network round
 trip, with no fsync, and it serves every read that arrived before it started.
+
+**Why not a leader lease.** Ratis 3.3.1 has one (`RaftServerConfigKeys.Read.leaderLeaseEnabled`, off here), and its
+idea is sound: `LeaderLease.extend` takes, for a majority, the send time of the last `appendEntries` each follower
+answered (`FollowerInfo.getLastRespondedAppendEntriesSendTime`), and the lease lasts `leaderLeaseTimeoutRatio` (0.9)
+of the minimum election timeout from there; with PreVote a follower that heard from its leader within the minimum
+election timeout refuses pre-votes (`VoteContext.checkLeader`, `FollowerState.isCurrentLeaderValid`). It is not the
+`ReadIndexHeartbeats` reuse. But it is not safe as shipped, from the 3.3.1 class files:
+
+- `GrpcLogAppender.AppendLogResponseHandler.onNext` records that send time for every reply before it looks at the
+  result, so a `NOT_LEADER` reply from a follower that already moved to a higher term extends the lease too. The
+  step-down that follows is an event queued for the leader's event processor (`LeaderStateImpl.onFollowerTerm` ->
+  `submitStepDownEvent`), and only if that follower is caught up: until then a read checks a lease that a deposed
+  leader's former follower just renewed.
+- It is not reachable through public APIs. `LeaderStateImpl.hasLease()` is package-private; the only way in is Ratis'
+  own ReadIndex, which falls back to `ReadIndexHeartbeats`, with the reuse above, whenever the lease is not valid.
+
+A lease of our own, built on `TermService` replies the way CheckQuorum leases are, is not done either: a term reply
+says nothing about when the follower stops refusing pre-votes, and a follower would have to report how long ago it
+heard from its leader. Even then, a follower that restarts forgets its leader and grants pre-votes at once, and Ratis
+can move leadership by itself (a peer of higher priority, or `admin transfer-leader` sent to any node) with an
+election that skips the pre-vote. The barrier costs one round trip, and that is not worth those cases.
+
+### Follower reads
+
+With `-Dit.cavallium.rockserver.distributed.follower-reads=true` (off by default; nodes may differ), a follower serves
+`get`, `exists`, `getMulti` and `existsMulti` outside a transaction from its own database (Raft dissertation §6.4,
+TiKV follower read). Updates, transactions, iterators and ranges still go to the leader.
+
+1. The follower asks the node it knows as leader for a read index (`TermService` `ReadIndex`, on the Raft port). The
+   leader records its commit index `c` when the request arrives, confirms its leadership with a barrier round that
+   starts after that (`ReadBarrier.readIndex`, which waits for no apply), and answers `c`.
+2. The follower waits until its own applied index reaches `c`, then reads its own database.
+
+Every write acknowledged before the read arrived at the follower was committed before the request reached the
+leader, so its index is at most `c`, and a follower that applied `c` has it. The follower must wait for the whole of
+`c`, not for the entries of earlier leaders as a leader does (`awaitLeadership`): it did not acknowledge those writes
+itself. Reads share requests, with at most one in flight per follower: a read that arrives while one is in flight
+waits for the next, because the one in flight may reach the leader before a write that was acknowledged before the
+read arrived. The answer of a node that is no longer the leader is a failure, as for any barrier.
+
+The read is forwarded to the leader instead, as without follower reads, when no read index comes (no leader known, the
+leader unreachable or not confirmed within a maximum election timeout, or a leader that predates the method), when the
+follower is more than 1024 entries behind `c`, or when its apply does not reach `c` in time: 500 ms if it knows that
+`c` is committed, 5 ms if it does not. That last case is why the option is off by default. Ratis tells a follower the
+commit index with its next append, which comes at once while writes flow, but on a quiet cluster only with the next
+heartbeat, half a minimum election timeout later. The barrier's term queries do not carry it, as Ratis' own heartbeats
+would. So a read right after a write, with little else going on, waits 5 ms and is forwarded: in an in-process test
+with one writer in the background, a follower served from 2% to 88% of such reads, depending on timing, and the rest
+paid the 5 ms and the forwarding. A busy cluster, where appends follow each other, gains; a quiet one with
+read-your-write patterns loses a few milliseconds. Turning on Ratis' commit metadata entries
+(`RaftServerConfigKeys.Log.logMetadataEnabled`, off in `RaftSettings`) would send the commit index at once after every
+commit, at the cost of a log entry per commit; that is not done here.
 
 ## Transactions
 
@@ -930,6 +1005,7 @@ failover" below).
 | `PipelinedUpdatesTest` (in-process, flag on) | With the leader's apply stopped: chained updates see each other's values and nothing is acknowledged; wrong guards; plain writes, transactions and `deleteRange` against a chain; closes in mid-chain, and more of them waiting than a server's CONTROL workers and queue hold; refused operations on chained ids; second writes; merges and multi-key commits; caller gone, abandon; a snapshot and a restart inside a chain, around a rejected entry; a leader change with a chain in flight; a commit that ends without an outcome; the flag on and off at restarts, and a chained id handed to a leader without it; concurrent counters. With the flag off: the commit of an update, read back from the Raft log, has the old bytes, and a second write goes to the log. |
 | `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. With `PipelinedUpdatesTest`, the only tests that chain in a default run: the suites below run the plain per-key queue unless the property below is set, and fail if an update chains there. After each fault these three wait for an update that chains. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, no acknowledged increment of a hot counter is lost, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
+| `FollowerReadTest` (in-process, follower reads on) | A follower serves reads of writes acknowledged on the leader, with writes flowing meanwhile, and forwards the rest; once it knows the commit index it serves by itself. A follower whose apply is held forwards instead of answering with the old value, and one cut off from the rest fails instead of answering. A follower names the leader in its responses, and a client of several nodes listing the follower first reads its writes and its transaction through it. |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `ClientFailoverTest` | One client connection listing all three nodes, while the node it uses is killed (the leader, or a follower): only retryable errors, new calls succeed on another node of the same connection (about 1 s with an election, under 200 ms without), a new connection skips the dead node, and a transaction opened through a dead follower still commits. |
 | `IsolatedNodeTest` | A client listing every node, connected to a node that gets isolated (the leader, or a follower), moves to the majority and keeps working, and the isolated node listens and serves again after the heal. With every node isolated all pause, and after the heal all resume and the client recovers by itself. An election shorter than the bound pauses no node. A follower restarted while cut off pauses too, and the client that lists it first moves. A cluster killed or stopped as a whole and restarted at once serves again, a paused node takes part in the election, and a node of a new cluster does not pause. A node that lost its database and kept its log pauses, and a client that starts during a cold start waits for the cluster, also past a frozen node. |
@@ -944,7 +1020,7 @@ failover" below).
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories, with read-modify-write updates and hot counters in them, are linearizable, and the transactional bank-transfer invariant holds. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
-| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass), `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
+| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
 
 Run them all (about 20 minutes on a real disk):
 

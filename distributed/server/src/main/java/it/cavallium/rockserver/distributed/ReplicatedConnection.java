@@ -65,7 +65,7 @@ import reactor.core.publisher.Mono;
  *   <li><b>local</b>: maintenance (flush, compaction, SST metadata) of this node's own database.</li>
  * </ul>
  */
-final class ReplicatedConnection implements RocksDBConnection {
+final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rockserver.core.common.LeaderHint {
 
 	private static final Logger LOG = LoggerFactory.getLogger(ReplicatedConnection.class);
 
@@ -119,12 +119,39 @@ final class ReplicatedConnection implements RocksDBConnection {
 	 */
 	private final java.util.concurrent.ConcurrentHashMap<SessionWrite, Long> unsettledCommits =
 			new java.util.concurrent.ConcurrentHashMap<>();
+	/** A follower further behind the leader's read index than this many log entries forwards a read instead. */
+	private static final long FOLLOWER_READ_MAX_LAG = 1024;
+	/**
+	 * How long a follower that knows the read index is committed waits for its apply to reach it, before it forwards
+	 * the read instead.
+	 */
+	private static final Duration FOLLOWER_READ_APPLY_WAIT = Duration.ofMillis(500);
+	/**
+	 * How long a follower that does not know yet that the read index is committed waits for it, before it forwards the
+	 * read instead. Ratis tells followers the commit index with its next append: at once while writes flow, but on a
+	 * quiet cluster only with the next heartbeat, half an election timeout later. Forwarding costs about two round
+	 * trips, so waiting longer than that for the heartbeat is not worth it.
+	 */
+	private static final Duration FOLLOWER_READ_COMMIT_WAIT = Duration.ofMillis(5);
+	/**
+	 * {@code true} turns follower reads on for this node; off by default, a follower forwards every read to the leader.
+	 * Nodes may differ. See "Reads" in the design document for what they cost on a quiet cluster.
+	 */
+	static final String FOLLOWER_READS_PROPERTY = "it.cavallium.rockserver.distributed.follower-reads";
 
 	private final NodeConfig config;
 	private final RockserverStateMachine stateMachine;
 	private final Proposer proposer;
 	private final ReadBarrier barrier;
+	private final FollowerReads followerReads;
 	private final LeaderForwarder forwarder;
+	/** Whether this node serves point reads as a follower; see {@link #FOLLOWER_READS_PROPERTY}. */
+	volatile boolean followerReadsEnabled = Boolean.getBoolean(FOLLOWER_READS_PROPERTY);
+	/** Point reads this node served as a follower, and those it forwarded after trying. */
+	private final AtomicLong followerReadsServed = new AtomicLong();
+	private final AtomicLong followerReadsForwarded = new AtomicLong();
+	private final NodeMetrics.Series followerReadTime;
+	private final NodeMetrics.Series followerReadFallbacks;
 	private final URI url;
 	private final NodeMetrics.Series barrierTime;
 	private final NodeMetrics.Series updateOpenTime;
@@ -145,11 +172,15 @@ final class ReplicatedConnection implements RocksDBConnection {
 			RockserverStateMachine stateMachine,
 			Proposer proposer,
 			ReadBarrier barrier,
+			FollowerReads followerReads,
 			LeaderForwarder forwarder,
 			NodeMetrics metrics,
 			java.util.concurrent.ExecutorService inline) {
 		this.config = config;
 		this.inline = inline;
+		this.followerReads = followerReads;
+		this.followerReadTime = metrics.duration("read.follower");
+		this.followerReadFallbacks = metrics.amount("read.follower.forwarded");
 		this.barrierTime = metrics.duration("read.barrier");
 		this.updateOpenTime = metrics.duration("update.open");
 		this.commitTime = metrics.duration("commit");
@@ -173,6 +204,35 @@ final class ReplicatedConnection implements RocksDBConnection {
 	@Override
 	public URI getUrl() {
 		return url;
+	}
+
+	/** The leader and its API address, as last looked up. */
+	private record CachedHint(org.apache.ratis.protocol.RaftPeerId leader, @Nullable String address) {}
+
+	private volatile @Nullable CachedHint cachedHint;
+
+	/**
+	 * The leader's API address, which {@code GrpcServer} sends to clients with every response, so that a client of
+	 * several nodes can send what the leader serves straight to it. This node's own address while it leads.
+	 */
+	@Override
+	public @Nullable String leaderApiAddress() {
+		var division = stateMachine.division();
+		if (division == null) {
+			return null;
+		}
+		var leaderId = division.getInfo().getLeaderId();
+		if (leaderId == null) {
+			return null;
+		}
+		var cached = cachedHint;
+		if (cached != null && cached.leader().equals(leaderId) && cached.address() != null) {
+			return cached.address();
+		}
+		var api = forwarder.apiAddress(leaderId.toString());
+		var address = api == null ? null : api.host() + ":" + api.port();
+		cachedHint = new CachedHint(leaderId, address);
+		return address;
 	}
 
 	@Override
@@ -380,7 +440,9 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	private CompletableFuture<?> leaderRead(RequestContext context, RocksDBAPICommandSingle<?> command, int attempts) {
 		if (!isLeader()) {
-			return forward(context, command);
+			return followerReadsEnabled && isFollowerReadable(command)
+					? followerRead(context, command)
+					: forward(context, command);
 		}
 		long start = System.nanoTime();
 		return barrier.awaitLeadership().handle((_, error) -> {
@@ -398,19 +460,120 @@ final class ReplicatedConnection implements RocksDBConnection {
 		}).thenCompose(f -> f);
 	}
 
+	/**
+	 * Point reads that a follower serves from its own database once it applied up to a read index from the leader
+	 * ({@link FollowerReads}): not reads in a transaction or for an update, which live on the leader.
+	 */
+	private static boolean isFollowerReadable(RocksDBAPICommandSingle<?> command) {
+		return switch (command) {
+			case Get<?> c -> c.transactionOrUpdateId() == 0 && !(c.requestType() instanceof RequestType.RequestForUpdate<?>);
+			case RocksDBAPICommandSingle.ExistsMulti c -> c.transactionId() == 0;
+			case RocksDBAPICommandSingle.GetMulti _ -> true;
+			default -> false;
+		};
+	}
+
+	/**
+	 * A point read on a follower: once this node applied up to a read index the leader confirmed after the read arrived,
+	 * it has every write acknowledged before the read arrived, and serves it from its own database. Unlike the leader's
+	 * {@link ReadBarrier#awaitLeadership()}, it waits for the whole index: this node did not acknowledge those writes
+	 * itself. If no read index comes, or this node is too far behind, it forwards the read to the leader instead.
+	 */
+	private CompletableFuture<?> followerRead(RequestContext context, RocksDBAPICommandSingle<?> command) {
+		if (stateMachine.isFailed()) {
+			return forward(context, command);
+		}
+		long start = System.nanoTime();
+		var applied = stateMachine.appliedIndex();
+		var readIndex = followerReads.readIndex();
+		if (context.hasTimeout()) {
+			// This caller's copy: the request is shared with other reads.
+			readIndex = readIndex.copy().orTimeout(Math.max(0, remainingNanos(context, start)), TimeUnit.NANOSECONDS);
+		}
+		return readIndex.thenCompose(index -> {
+					if (index - applied.get() > FOLLOWER_READ_MAX_LAG) {
+						return CompletableFuture.failedFuture(new ReadBarrier.ApplyLagException(index, applied.get()));
+					}
+					var division = stateMachine.division();
+					boolean committedHere = division != null && division.getRaftLog().getLastCommittedIndex() >= index;
+					long wait = Math.min((committedHere ? FOLLOWER_READ_APPLY_WAIT : FOLLOWER_READ_COMMIT_WAIT).toNanos(),
+							remainingNanos(context, start));
+					return applied.await(index).orTimeout(Math.max(0, wait), TimeUnit.NANOSECONDS);
+				})
+				// Off gRPC and apply threads: the read runs here.
+				.handleAsync((_, error) -> {
+					var remaining = remainingContext(context, start);
+					if (error != null) {
+						followerReadsForwarded.incrementAndGet();
+						followerReadFallbacks.record(1);
+						return forward(remaining, command);
+					}
+					followerReadsServed.incrementAndGet();
+					followerReadTime.since(start);
+					return local(remaining, command);
+				}, inline)
+				.thenCompose(f -> f);
+	}
+
+	/** Tests only: point reads this node served as a follower. */
+	long followerReadsServedForTesting() {
+		return followerReadsServed.get();
+	}
+
+	/** Tests only: point reads this node tried to serve as a follower, then forwarded. */
+	long followerReadsForwardedForTesting() {
+		return followerReadsForwarded.get();
+	}
+
 	@SuppressWarnings("unchecked")
 	private CompletableFuture<?> forward(RequestContext context, RocksDBAPICommandSingle<?> command) {
-		return forward(context, command, System.nanoTime() + config.requestTimeout().toNanos());
+		return forward(context, command, System.nanoTime() + config.requestTimeout().toNanos(), callerDeadline(context));
+	}
+
+	/** When the caller of a request that arrives now gives up, in {@link System#nanoTime()} units. */
+	private static long callerDeadline(RequestContext context) {
+		long now = System.nanoTime();
+		return context.hasTimeout() ? now + Math.min(context.timeoutNanos(), Long.MAX_VALUE / 4) : now + Long.MAX_VALUE / 4;
+	}
+
+	/**
+	 * How long a forwarded call may take, at most: the request timeout, which also bounds the leader's own waits of
+	 * a read, plus the key wait for an update, which waits for its key on the leader longer than that.
+	 */
+	private long forwardTimeoutNanos(RocksDBAPICommandSingle<?> command) {
+		long timeout = config.requestTimeout().toNanos();
+		if (command instanceof Get<?> c && c.requestType() instanceof RequestType.RequestForUpdate<?>
+				&& c.transactionOrUpdateId() == 0) {
+			return timeout + UPDATE_LOCK_WAIT.toNanos();
+		}
+		return timeout;
+	}
+
+	/**
+	 * {@code call}, failed with a {@link TimeoutException} if it does not end within {@code timeoutNanos}; the gRPC
+	 * call is then cancelled.
+	 */
+	private static <T> CompletableFuture<T> withTimeout(CompletableFuture<T> call, long timeoutNanos) {
+		call.orTimeout(timeoutNanos, TimeUnit.NANOSECONDS).whenComplete((_, error) -> {
+			if (error != null && unwrap(error) instanceof TimeoutException) {
+				// The core client's futures cancel their gRPC call; the leader also stops at the deadline it was given.
+				call.cancel(false);
+			}
+		});
+		return call;
 	}
 
 	/**
 	 * Forwards {@code command} to the leader. When the leader cannot be reached (it died or lost leadership, and this
 	 * node may not know yet), a command that can safely run again ({@link #isReplayable}) is sent again, to whichever
 	 * node leads then, until {@code deadlineNanos}; any other command fails with a retryable error, or with an
-	 * unknown outcome if it may have taken effect.
+	 * unknown outcome if it may have taken effect. Each attempt takes at most the caller's deadline or
+	 * {@link #forwardTimeoutNanos}, whichever comes first, and the leader gets that deadline too: a leader that is alive
+	 * but stuck does not hold the call, nor this node's caller, indefinitely.
 	 */
 	@SuppressWarnings("unchecked")
-	private CompletableFuture<?> forward(RequestContext context, RocksDBAPICommandSingle<?> command, long deadlineNanos) {
+	private CompletableFuture<?> forward(RequestContext context, RocksDBAPICommandSingle<?> command, long deadlineNanos,
+			long callerDeadlineNanos) {
 		return forwarder.leader(stateMachine).thenCompose(leader -> {
 			if (leader.equals(config.nodeId())) {
 				if (!isLeader()) {
@@ -423,14 +586,18 @@ final class ReplicatedConnection implements RocksDBConnection {
 			}
 			long start = System.nanoTime();
 			return forwarder.target(leader, stateMachine).thenCompose(target -> {
-				var call = (CompletableFuture<Object>) target.connection().getAsyncApi(context).requestAsync(command);
-				if (isCleanup(command)) {
-					// Rollbacks carry no deadline of their own: bound them, so a frozen leader cannot hold them.
-					call = call.orTimeout(config.requestTimeout().toNanos(), TimeUnit.NANOSECONDS);
+				long attempt = Math.min(forwardTimeoutNanos(command), callerDeadlineNanos - System.nanoTime());
+				if (attempt <= 0) {
+					return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+							"The request deadline passed before the request was forwarded to the leader"));
 				}
+				var bounded = context.withTimeoutNanos(attempt);
+				var call = withTimeout(
+						(CompletableFuture<Object>) target.connection().getAsyncApi(bounded).requestAsync(command), attempt);
 				return call.whenComplete((_, error) -> {
 					forwardTime.since(start);
-					if (error != null && isTransportFailure(unwrap(error))) {
+					// Not after a timeout: the connection may be fine, and other calls use it.
+					if (error != null && !(unwrap(error) instanceof TimeoutException) && isTransportFailure(unwrap(error))) {
 						forwarder.invalidate(target);
 					}
 				});
@@ -449,7 +616,8 @@ final class ReplicatedConnection implements RocksDBConnection {
 				}
 				return CompletableFuture.supplyAsync(() -> null,
 								CompletableFuture.delayedExecutor(FORWARD_RETRY_MS, TimeUnit.MILLISECONDS))
-						.thenCompose(_ -> (CompletableFuture<Object>) forward(context, command, deadlineNanos));
+						.thenCompose(_ -> (CompletableFuture<Object>) forward(context, command, deadlineNanos,
+								callerDeadlineNanos));
 			});
 		});
 	}
@@ -465,11 +633,6 @@ final class ReplicatedConnection implements RocksDBConnection {
 		}
 		var code = io.grpc.Status.fromThrowable(cause).getCode();
 		return code == io.grpc.Status.Code.UNAVAILABLE || code == io.grpc.Status.Code.CANCELLED;
-	}
-
-	/** Rollbacks, sent without a deadline. */
-	private static boolean isCleanup(RocksDBAPICommandSingle<?> command) {
-		return command instanceof CloseFailedUpdate || (command instanceof CloseTransaction c && !c.commit());
 	}
 
 	/**
@@ -535,11 +698,13 @@ final class ReplicatedConnection implements RocksDBConnection {
 			}
 			var emitted = new AtomicBoolean();
 			return Mono.fromFuture(forwarder.target(leader, stateMachine))
-					.flatMapMany(target -> Flux.from((Publisher<Object>) target.connection().getAsyncApi(context)
-									.requestAsync(command))
+					.flatMapMany(target -> idleTimeout(Flux.from((Publisher<Object>) target.connection()
+									.getAsyncApi(context)
+									.requestAsync(command)), config.requestTimeout())
 							.doOnNext(_ -> emitted.set(true))
 							.doOnError(error -> {
-								if (isTransportFailure(unwrap(error))) {
+								var cause = unwrap(error);
+								if (!(cause instanceof TimeoutException) && isTransportFailure(cause)) {
 									forwarder.invalidate(target);
 								}
 							}))
@@ -559,6 +724,39 @@ final class ReplicatedConnection implements RocksDBConnection {
 						}
 						return Mono.delay(Duration.ofMillis(FORWARD_RETRY_MS))
 								.thenMany(Flux.defer(() -> forwardStream(context, command, deadlineNanos)));
+					});
+		});
+	}
+
+	/**
+	 * {@code source}, failed with a {@link TimeoutException} (and cancelled) once it delivers no element for
+	 * {@code idle} while its subscriber is waiting for one. A subscriber that requests nothing stops the clock: a slow
+	 * consumer is not a stuck leader.
+	 */
+	static <T> Flux<T> idleTimeout(Flux<T> source, Duration idle) {
+		return Flux.defer(() -> {
+			var demand = new AtomicLong();
+			var since = new AtomicLong(System.nanoTime());
+			var timedOut = new AtomicBoolean();
+			long idleNanos = idle.toNanos();
+			var stuck = Flux.interval(idle.dividedBy(4).isZero() ? Duration.ofMillis(1) : idle.dividedBy(4))
+					.filter(_ -> demand.get() > 0 && System.nanoTime() - since.get() > idleNanos)
+					.take(1)
+					.doOnNext(_ -> timedOut.set(true));
+			return source
+					.doOnNext(_ -> {
+						demand.decrementAndGet();
+						since.set(System.nanoTime());
+					})
+					.takeUntilOther(stuck)
+					.concatWith(Mono.defer(() -> timedOut.get()
+							? Mono.error(new TimeoutException("No element for " + idle))
+							: Mono.empty()))
+					.doOnRequest(n -> {
+						long before = demand.getAndAccumulate(n, (a, b) -> a + b < 0 ? Long.MAX_VALUE : a + b);
+						if (before <= 0) {
+							since.set(System.nanoTime());
+						}
 					});
 		});
 	}
