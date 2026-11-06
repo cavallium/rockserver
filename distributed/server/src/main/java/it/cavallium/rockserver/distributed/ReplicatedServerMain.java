@@ -19,6 +19,7 @@ import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.retry.RetryPolicy;
+import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.apache.ratis.util.TimeDuration;
 import org.jetbrains.annotations.Nullable;
@@ -245,9 +246,9 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
-	 * Fails the command if {@code added} does not run or holds a log of its own. On a seeded cluster it then waits until
-	 * every member that answers holds a snapshot, which it takes right after genesis: a new member cannot catch up from a
-	 * leader without one.
+	 * Fails the command if {@code added} does not run or holds a log of its own. It then waits until every member that
+	 * answers has applied the genesis entry and, on a seeded cluster, holds a snapshot, which it takes right after: a new
+	 * member cannot catch up from a leader without one.
 	 */
 	private static void requireFitToJoin(PeerConfig added, List<PeerConfig> peers, RaftGroupId groupId, long deadlineNanos)
 			throws InterruptedException {
@@ -255,35 +256,55 @@ public final class ReplicatedServerMain {
 		while (true) {
 			var answers = members.stream().map(member -> nodeState(member, groupId)).toList();
 			var target = nodeState(added, groupId);
-			NodeState state;
-			try {
-				state = target.join();
-			} catch (CompletionException ex) {
-				fail("node " + added.id() + " does not answer at " + added.raftAddress() + ": start it first, with --join and"
-						+ " the same --group-id (" + ex.getCause().getMessage() + ")");
-				return;
-			}
-			if (state == null) {
-				fail("node " + added.id() + " at " + added.raftAddress() + " has no group " + groupId.getUuid()
-						+ ": start it with the same --group-id as the cluster");
-				return;
-			}
 			var known = answers.stream().map(ReplicatedServerMain::answerOrNull).filter(Objects::nonNull).toList();
 			var clusterId = known.stream().map(NodeState::clusterId).filter(Objects::nonNull).findFirst().orElse(null);
-			var refusal = state.refusalToJoin(added.id(), clusterId);
-			if (refusal != null) {
-				fail(refusal);
-				return;
+			String waitingFor = null;
+			try {
+				var state = target.join();
+				if (state == null) {
+					fail("node " + added.id() + " at " + added.raftAddress() + " has no group " + groupId.getUuid()
+							+ ": start it with the same --group-id as the cluster");
+					return;
+				}
+				var refusal = state.refusalToJoin(added.id(), clusterId);
+				if (refusal != null) {
+					fail(refusal);
+					return;
+				}
+			} catch (CompletionException ex) {
+				if (Status.fromThrowable(ex.getCause()).getCode() != Status.Code.ABORTED) {
+					fail("node " + added.id() + " does not answer at " + added.raftAddress() + ": start it first, with --join and"
+							+ " the same --group-id (" + ex.getCause().getMessage() + ")");
+					return;
+				}
+				waitingFor = "node " + added.id() + ", which is installing a snapshot";
 			}
-			if (known.stream().noneMatch(member -> member.seeded() && !member.hasSnapshot())) {
+			if (waitingFor == null) {
+				waitingFor = memberNotReady(known);
+			}
+			if (waitingFor == null) {
 				return;
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
-				fail("a member of this seeded cluster still has no snapshot, which a new member needs");
+				fail("no result within the time limit (--timeout-ms): still waiting for " + waitingFor);
 				return;
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
 		}
+	}
+
+	/**
+	 * What keeps a new member from getting a state from any member that may lead, null if nothing does. Until a member has
+	 * applied the genesis entry nobody can tell whether it needs a snapshot.
+	 */
+	private static @Nullable String memberNotReady(List<NodeState> members) {
+		if (members.stream().anyMatch(member -> member.clusterId() == null)) {
+			return "a member that has not applied the first entry of the cluster yet";
+		}
+		if (members.stream().anyMatch(member -> member.seeded() && !member.hasSnapshot())) {
+			return "a member of this seeded cluster that has no snapshot yet, which a new member needs";
+		}
+		return null;
 	}
 
 	private static CompletableFuture<@Nullable NodeState> nodeState(PeerConfig peer, RaftGroupId groupId) {

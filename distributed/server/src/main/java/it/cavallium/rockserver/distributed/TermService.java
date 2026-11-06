@@ -232,8 +232,8 @@ final class TermService {
 		try {
 			state = source.state(groupId, clusterId);
 		} catch (RuntimeException e) {
-			// Its database closes while it installs a snapshot: ask again.
-			response.onError(Status.UNAVAILABLE.withDescription(e.toString()).asRuntimeException());
+			// Its database closes while it installs a snapshot: the caller asks again. A node that does not run is UNAVAILABLE.
+			response.onError(Status.ABORTED.withDescription(e.toString()).asRuntimeException());
 			return;
 		}
 		response.onNext(state == null ? new byte[0] : encode(state));

@@ -101,6 +101,9 @@ final class RaftSettings {
 		RaftServerConfigKeys.Rpc.setTimeoutMax(properties, duration(config.electionTimeoutMax()));
 		RaftServerConfigKeys.Rpc.setRequestTimeout(properties, duration(config.electionTimeoutMax()));
 		RaftServerConfigKeys.LeaderElection.setPreVote(properties, true);
+		// A leader that lost its majority starts no election for this long (default 10 s). With one node of three down and
+		// the other one restarting it may be the only node that can win, and pre-votes keep it from disturbing anyone.
+		RaftServerConfigKeys.LeaderElection.setLeaderStepDownWaitTime(properties, duration(config.electionTimeoutMax()));
 		// After a JVM pause longer than this Ratis closes the server. ReplicatedNode then stops the node: see "Long pauses"
 		// in the design document.
 		RaftServerConfigKeys.setCloseThreshold(properties, duration(config.jvmPauseLimit()));

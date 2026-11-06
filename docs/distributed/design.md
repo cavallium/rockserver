@@ -79,7 +79,9 @@ forwards to a non-embedded connection:
 | `Applier` | Applies the requests of log entries to the local database, a group of entries in one transaction without the WAL, with their result records and the applied position. |
 | `LeaderSession`, `ConflictTracker` | Transactions bound to the leader's term, per-key queues of single-key updates, and conflict validation. |
 | `NodeMetrics` | Timers and gauges of the replication path, logged every 10 s. |
-| `ReadBarrier`, `TermService` | Linearizable reads. |
+| `ReadBarrier`, `TermService` | Linearizable reads. `TermService` also answers what a node holds (`NodeState`). |
+| `ClusterCheck` | A leader tells its followers which cluster it leads, and a node of another cluster stops. |
+| `LeaderStall` | Tells a leader that cannot commit to step down. |
 | `NodeStore`, `CheckpointStorage` | Local database, internal metadata, checkpoint snapshots, restore. |
 | `LeaderForwarder` | Finds the leader's API and forwards to it. |
 | `LogEntry`, `Request`, `LogEntryCodec`, `ResultCodec` | Log entry model and its binary encoding. |
@@ -529,7 +531,8 @@ against an incomplete history.
   `add-peer` asks the new node what it holds and refuses it (see below), and a leader tells each of its followers
   once per term which cluster it leads, also a follower still catching up to join (`ClusterCheck`). A follower of
   another cluster exits with 3, so a node that the Ratis tools add, or that gets a log right after `add-peer` asked,
-  stops before the configuration changes. A second `Genesis` in a log, from a resent batch of a former leader,
+  stops before the configuration changes, and so does a member named in the peer list of the others that started a
+  cluster of its own. A second `Genesis` in a log, from a resent batch of a former leader,
   changes nothing: the first one wins on every replica. Other ways for two histories to meet are closed: a database
   that holds a cluster id with no Raft state is refused at start, whichever cluster it comes from, so a copy of a
   replica cannot seed a new cluster or rejoin; and a new member takes a seeded cluster's data from a snapshot, which
@@ -586,7 +589,7 @@ against an incomplete history.
   change a node that has a configuration of its own, from its log or from a snapshot, so it can stay in the node's
   command line; a node of a running cluster also restarts without it.
 
-  `--join` must be there from the first start. A start without it writes `raft-meta.bootstrap` in the Raft directory,
+  `--join` must be there from the first start until `add-peer`. A start without it writes `raft-meta.bootstrap` in the Raft directory,
   and Ratis uses that peer list whatever a later start says, so adding the option afterwards would change nothing: the
   node would keep exiting. A start with `--join` is refused when that file exists and no log gave the node a
   configuration: wipe the data directory and start again with the option. Do that before an `add-peer` reaches the
@@ -667,7 +670,12 @@ against an incomplete history.
 - **Graceful stop.** On SIGTERM a leader hands leadership to the most up-to-date live follower. It then waits until
   it knows of a commit of the new leader, for at most 3 s, and stops. A deploy restart with all nodes up costs a few
   hundred milliseconds without writes (see the tests). With one node of three down the stopping node is the only
-  partner of the new leader, so writes wait for it to come back: GRACEFUL_FIGURES.
+  partner of the new leader, so writes wait for it to come back. The new leader loses its majority while the old one
+  restarts, steps down after one maximum election timeout, and a new election follows once the node is back. Measured
+  with real processes on a real disk, 6 rounds each: 4.6 to 6.1 s without writes at the default election timeouts, and
+  2.3 s at 3000:6000. Before this wait, and before a leader that lost its majority could stand for election again
+  after one maximum election timeout instead of Ratis' default of 10 s (`leaderStepDownWaitTime`), the same rounds took
+  3.0 to 15.6 s, and once 35 s at 3000:6000.
 - **Long pauses.** Ratis closes its server after a JVM pause longer than a limit, and a division also closes when a
   leader tells a node outside its configuration to shut down. Both leave the process up: the API listens, the Raft
   port refuses connections, and a closed division still reports its last leader, which it can no longer follow. So
@@ -700,7 +708,9 @@ against an incomplete history.
 
   A disk that is slow looks the same: the reply exists, and takes longer than the bound on every leader, and a step
   down only starts the wait over. So the bound doubles after each step down of a node, up to 8 times its first value,
-  and goes back when the commit index moves, under any leader. SLOW_DISK_FIGURES If a partner's disk hangs and heartbeats
+  and goes back when the commit index moves, under any leader. Before the doubling, with both remaining disks slowed
+  to 12 s per write round, leaders stepped down every 11.5 s and committed nothing in 90 s, against 7 commits without
+  the rule; the doubling has not been measured on such disks yet. If a partner's disk hangs and heartbeats
   still pass, the leader steps down at growing intervals and the other side does the same: elections and no writes,
   which is what a hung disk gives anyway, when the majority needs it.
 - **A leader whose log stops.** Ratis commits on a leader only up to what the leader itself flushed
@@ -711,8 +721,10 @@ against an incomplete history.
   That took 38 to 45 s with 8 writers of 1 MiB values, and with a few small writes it would never happen. So a
   `LeaderStall` rule in the maintenance loop looks at the leader's log: entries to flush, and a flush index that does
   not move for 3 maximum election timeouts and at least 5 s, makes it hand over to its most up-to-date follower, or
-  step down if it has none: a leader that only stepped down often won the next election with the same log. The doubling
-  above applies, so that disks that are all this slow do not end every leader in turn. LOG_FIGURES The log says
+  step down if it has none: a leader that only stepped down often won the next election with the same log. The bound
+  doubles here too, and goes back when a flush takes less than its first value, so that disks that are all this slow
+  do not end every leader in turn. `LeaderStallTest` stops the log worker of a leader and checks that writes resume
+  on another node; how long that takes on a real disk under load has not been measured yet. The log says
   `stepping down`, and the metric `leader.log.stepdowns` counts. It does nothing on a leader with nothing to flush, and
   it cannot help once the queue is full under a heavy load, which blocks the server lock: then the heartbeats stop
   anyway, within seconds at that load. The node stays up with its hung disk, as a follower that does not answer.

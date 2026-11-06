@@ -48,7 +48,8 @@ import org.apache.ratis.server.RaftServer;
  * log worker filled up and Ratis, which then blocks with the log lock held, stopped sending heartbeats: after about 40 s
  * with 8 writers of 1 MiB values, and never with a few small writes. So a leader that has entries to flush and flushes
  * nothing for {@value #ELECTION_TIMEOUTS_TO_LOG_STALL} maximum election timeouts, and at least {@link #MIN_LOG_STALL},
- * steps down too. The same doubling applies, so that disks that are all slow do not end every leader in turn.</p>
+ * steps down too. Its bound doubles in the same way, and goes back when a flush takes less than its first value: with
+ * disks that are all this slow a commit proves nothing, and a shorter bound would end the next leader before its own.</p>
  */
 final class LeaderStall {
 
@@ -73,9 +74,11 @@ final class LeaderStall {
 	private boolean logWaiting;
 	private long flushIndex;
 	private long logSinceNanos;
-	/** Step downs since the commit index last moved. */
+	/** Step downs of the rule of the first entry since the commit index last moved. */
 	private int stepDowns;
 	private long commitIndexAtStepDown;
+	/** Step downs of the rule of the log since a flush took less than the first bound. */
+	private int logStepDowns;
 
 	LeaderStall(Duration stallAfter, Duration logStallAfter) {
 		this.stallAfterNanos = stallAfter.toNanos();
@@ -107,18 +110,18 @@ final class LeaderStall {
 			sinceNanos = nowNanos;
 			return false;
 		}
-		if (nowNanos - sinceNanos < stallAfterNanos << doublings()) {
+		if (nowNanos - sinceNanos < stallAfterNanos << doublings(stepDowns)) {
 			return false;
 		}
 		sinceNanos = nowNanos;
-		countStepDown();
+		stepDowns++;
+		commitIndexAtStepDown = commitIndex;
 		return true;
 	}
 
 	/**
 	 * Takes the current observation of the leader's own log and tells whether it should step down now: it has entries to
-	 * flush and its flush index stayed where it is for the whole bound. Bounds and step downs are those of
-	 * {@link #shouldStepDown}, which keeps them up to date.
+	 * flush and its flush index stayed where it is for the whole bound. After a true answer the doubled bound starts.
 	 *
 	 * @param leader whether this node leads
 	 * @param flushIndex the last entry of the log that reached the disk
@@ -127,26 +130,25 @@ final class LeaderStall {
 	boolean logStopped(boolean leader, long flushIndex, long lastIndex, long nowNanos) {
 		boolean waiting = leader && flushIndex < lastIndex;
 		if (!waiting || !logWaiting || flushIndex != this.flushIndex) {
+			// Only a leader's flush says something about the disk: a step down ends the wait too, right after the bound.
+			if (leader && logWaiting && flushIndex != this.flushIndex && nowNanos - logSinceNanos < logStallAfterNanos) {
+				logStepDowns = 0;
+			}
 			logWaiting = waiting;
 			this.flushIndex = flushIndex;
 			logSinceNanos = nowNanos;
 			return false;
 		}
-		if (nowNanos - logSinceNanos < logStallAfterNanos << doublings()) {
+		if (nowNanos - logSinceNanos < logStallAfterNanos << doublings(logStepDowns)) {
 			return false;
 		}
 		logSinceNanos = nowNanos;
-		countStepDown();
+		logStepDowns++;
 		return true;
 	}
 
-	private int doublings() {
+	private static int doublings(int stepDowns) {
 		return Math.min(stepDowns, MAX_DOUBLINGS);
-	}
-
-	private void countStepDown() {
-		stepDowns++;
-		commitIndexAtStepDown = commitIndex;
 	}
 
 	/**

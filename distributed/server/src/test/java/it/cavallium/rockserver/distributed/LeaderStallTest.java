@@ -190,6 +190,32 @@ class LeaderStallTest {
 		assertTrue(runLog(true, COMMIT, COMMIT + 1, TICK));
 	}
 
+	/** With rounds that take more than the bound, commits still happen: they say nothing about the disk. */
+	@Test
+	void aSlowFlushKeepsTheLogBoundLong() {
+		assertTrue(runLog(true, COMMIT, COMMIT + 1, LOG_STALL));
+		assertFalse(runLog(true, COMMIT, COMMIT + 1, LOG_STALL + TICK));
+		assertFalse(runLog(true, COMMIT + 1, COMMIT + 2, 2 * LOG_STALL - TICK));
+		assertTrue(runLog(true, COMMIT + 1, COMMIT + 2, TICK));
+	}
+
+	@Test
+	void aQuickFlushBringsTheLogBoundBack() {
+		assertTrue(runLog(true, COMMIT, COMMIT + 1, LOG_STALL));
+		assertFalse(runLog(true, COMMIT, COMMIT + 1, TICK));
+		assertFalse(runLog(true, COMMIT + 1, COMMIT + 2, LOG_STALL - TICK));
+		assertTrue(runLog(true, COMMIT + 1, COMMIT + 2, TICK));
+	}
+
+	/** The first tick after a step down has no leader, right after the bound: that is no quick flush. */
+	@Test
+	void aStepDownIsNoQuickFlush() {
+		assertTrue(runLog(true, COMMIT, COMMIT + 1, LOG_STALL));
+		assertFalse(runLog(false, COMMIT, COMMIT + 1, TICK));
+		assertFalse(runLog(true, COMMIT, COMMIT + 1, 2 * LOG_STALL - TICK));
+		assertTrue(runLog(true, COMMIT, COMMIT + 1, TICK));
+	}
+
 	@Test
 	void aShortElectionTimeoutDoesNotShortenTheLogBound() {
 		var shortTimeout = LeaderStall.forElectionTimeout(Duration.ofMillis(800));
