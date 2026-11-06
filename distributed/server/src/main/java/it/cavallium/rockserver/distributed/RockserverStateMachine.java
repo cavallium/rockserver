@@ -678,11 +678,20 @@ final class RockserverStateMachine extends BaseStateMachine {
 		applyTime.since(start);
 		applyGroupEntries.record(group.size());
 		prepareSnapshot(positionOf(group.getLast()));
+		long groupBytes = 0;
+		for (var item : group) {
+			if (item instanceof ApplyEntry entry) {
+				groupBytes += entry.bytes();
+			}
+		}
+		long appliedBytes = groupBytes;
 		completer.execute(() -> {
 			try {
 				for (var completion : completions) {
 					completion.run();
 				}
+				// After the applied index moved: a snapshot covers only what was applied.
+				snapshotByBytes(appliedBytes);
 			} catch (Throwable error) {
 				// The replies first: reporting the failure may itself fail.
 				failed = true;
@@ -694,6 +703,51 @@ final class RockserverStateMachine extends BaseStateMachine {
 				}
 			}
 		});
+	}
+
+	/** Bytes of log entries applied since the latest snapshot, or since the start: see {@link #snapshotByBytes}. */
+	private final java.util.concurrent.atomic.AtomicLong bytesSinceSnapshot = new java.util.concurrent.atomic.AtomicLong();
+	/** True while a snapshot asked by {@link #snapshotByBytes} is pending. */
+	private final java.util.concurrent.atomic.AtomicBoolean snapshotByBytesPending =
+			new java.util.concurrent.atomic.AtomicBoolean();
+	private final java.util.concurrent.atomic.AtomicLong snapshotCalls = new java.util.concurrent.atomic.AtomicLong();
+	private static final long SNAPSHOT_REQUEST_TIMEOUT_MS = 10L * 60 * 1000;
+
+	/**
+	 * Asks Ratis for a snapshot once {@code snapshotEveryBytes} of log entries were applied since the latest one.
+	 * Ratis' own trigger counts entries ({@code snapshotEveryEntries}), and an entry holds up to 4096 requests or
+	 * 8 MiB, so the log that a snapshot lets Ratis purge could otherwise grow to hundreds of GiB. It goes through
+	 * Ratis' snapshot management API, as an operator's {@code admin snapshot} does, so Ratis takes the snapshot on its
+	 * own thread, as usual. Runs on {@link #completer}.
+	 */
+	private void snapshotByBytes(long appliedBytes) {
+		if (bytesSinceSnapshot.addAndGet(appliedBytes) < config.snapshotEveryBytes()
+				|| !snapshotByBytesPending.compareAndSet(false, true)) {
+			return;
+		}
+		var server = this.server;
+		var groupId = this.groupId;
+		if (server == null || groupId == null) {
+			snapshotByBytesPending.set(false);
+			return;
+		}
+		LOG.info("{}: {} bytes of log entries applied since the latest snapshot, taking one", config.nodeId(),
+				bytesSinceSnapshot.get());
+		try {
+			var request = org.apache.ratis.protocol.SnapshotManagementRequest.newCreate(
+					org.apache.ratis.protocol.ClientId.randomId(), server.getId(), groupId, snapshotCalls.incrementAndGet(),
+					SNAPSHOT_REQUEST_TIMEOUT_MS);
+			server.snapshotManagementAsync(request).whenComplete((reply, error) -> {
+				snapshotByBytesPending.set(false);
+				if (error != null || !reply.isSuccess()) {
+					LOG.warn("{}: the snapshot asked after {} bytes of log failed; asking again after the next entries",
+							config.nodeId(), config.snapshotEveryBytes(), error != null ? error : reply.getException());
+				}
+			});
+		} catch (RuntimeException ex) {
+			snapshotByBytesPending.set(false);
+			LOG.warn("{}: could not ask for a snapshot", config.nodeId(), ex);
+		}
 	}
 
 	/** The next snapshot's due index whose memtables were already flushed ahead, see {@link #prepareSnapshot}. */
@@ -808,7 +862,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 		// Ratis waited for the entries it handed over; positions without data may still be queued.
 		drainApplyQueue();
 		long start = System.nanoTime();
+		// Before the checkpoint: entries applied while it runs count towards the next one.
+		long bytesBefore = bytesSinceSnapshot.get();
 		var position = storage.take(store);
+		bytesSinceSnapshot.addAndGet(-bytesBefore);
 		snapshotTime.since(start);
 		LOG.info("{}: snapshot taken at {} in {} ms", config.nodeId(), position, (System.nanoTime() - start) / 1_000_000);
 		return position.getIndex();

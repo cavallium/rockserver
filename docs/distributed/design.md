@@ -538,15 +538,20 @@ against an incomplete history.
   - the WALs still needed are copied.
 - **Why not `org.rocksdb.Checkpoint`.** It refuses the column volumes (`cf_paths`) that the default config
   uses.
-- **When.** Every `snapshotEveryEntries` applied entries (default 500k), not at stops (a graceful stop flushes
-  the database instead). Taking one flushes the memtables and copies the live files, 100–300 ms, during which
+- **When.** Every `snapshotEveryEntries` applied entries (default 500k, Ratis' own trigger), and also once
+  `snapshotEveryBytes` of log entries (default 4 GiB, `--snapshot-every-bytes`) were applied since the latest
+  snapshot or since the start: an entry holds up to 4096 requests or 8 MiB, so a count alone does not bound the
+  log a snapshot lets Ratis purge. The byte trigger asks through Ratis' snapshot management API, like `admin
+  snapshot`, from the thread that completes applied groups, so Ratis still takes the snapshot on its own thread.
+  Not at stops (a graceful stop flushes the database instead). Taking one flushes the memtables and copies the live files, 100–300 ms, during which
   Ratis hands over no entry: about every 100 s at 2×, writes wait that long. (Taking it on a thread of its own,
   answering Ratis with the previous snapshot meanwhile, was tried and dropped: a result finished before a
   snapshot install could then be returned after it, behind Ratis' snapshot index, and a copy finishing during
   an install could land among the installed snapshot's files.) Files that are hard links of durable files are
   not fsynced again.
 - **Log retention.** The Raft log is purged only up to the snapshot index and the lowest commit index of any
-  member, and keeps `snapshotEveryEntries` entries more. A node restarted during a deploy, or one that just
+  member, and keeps `snapshotEveryEntries` entries more (Ratis counts that margin in entries only: with large
+  entries, lower `--snapshot-every` to bound it in bytes). A node restarted during a deploy, or one that just
   installed a snapshot, therefore catches up from the log. A member that is gone for good holds the log back,
   so remove it from the configuration promptly, and alert on Raft log size.
 
@@ -928,7 +933,7 @@ flag on, that an update chained after each fault, and with the flag off that non
      turn out to be frequent.
    - A result larger than 17 MiB (for example a multi-key previous value) is replaced by an
      `INVALID_REQUEST` failure: the write is applied, but its caller does not get the result.
-   - Snapshots are triggered by entry count only, and a failing snapshot is retried at every apply step. Each
+   - The log kept behind a snapshot is counted in entries only, and a failing snapshot is retried at every apply step. Each
      one stops the apply for its memtable flush (100–300 ms measured).
    - Iterator calls after a leader change fail with an internal "iterator not found" error, not `UPDATE_RETRY`.
    - The snapshot taken right after a seeded genesis is attempted once, on the leader only.

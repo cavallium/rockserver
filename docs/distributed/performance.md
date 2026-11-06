@@ -232,7 +232,8 @@ Other results:
   after 3 maximum election timeouts without a leader, at least 6 s (about 8 s in all by default), so its clients move,
   and listens again once it knows a leader. A hung disk is not detected. See the
   [README](../../README.md#client-connections).
-- **Snapshots.** One every 500k entries (`--snapshot-every`), about every 100 s at 2×. A snapshot flushes the
+- **Snapshots.** One every 500k entries (`--snapshot-every`), about every 100 s at 2×, or every 4 GiB of
+  applied log entries (`--snapshot-every-bytes`), whichever comes first. A snapshot flushes the
   memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.
 - **Memory.** In a 10-minute run at 2× the leader's heap stayed between 1.3 and 2.8 GiB (4 GiB heap). The
   bounds are larger: at most 256 MiB of committed entries wait for the apply thread, the leader holds up to
