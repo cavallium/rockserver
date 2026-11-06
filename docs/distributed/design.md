@@ -277,14 +277,50 @@ Raft log on disk instead of decoded on the heap. Any error on the apply or compl
   this node, which applied it, so its record is read locally. Building the reply never fails. A reply too
   large to receive anyway fails its requests with an "applied" `INVALID_REQUEST` instead of being resent.
 
-**Failures during apply.**
+**Failures during apply.** A failure is classified by where it comes from, not by its exception type.
 
-- **Logical rejections** (missing column, malformed keys...) are identical on every replica. They become the
-  request's result and the log moves on.
-- **Local failures** (native or IO errors, a lost local transaction) stop the replica:
+- **Deterministic failures** are identical on every replica: they become the request's result, the entry's
+  writes are rolled back, and the log moves on. They are:
+  - logical rejections (missing column, malformed keys, a wrong request type...);
+  - a native status that follows from the request and the data (`InvalidArgument`, `NotFound`, `NotSupported`);
+  - a **merge operator that fails** (throws, or returns no value), as `MERGE_OPERATOR_FAILED`. RocksDB reports a
+    failed merge as a `Corruption` status, which alone would look like a broken disk. The operator records its
+    failure on the thread that ran it (a read of a merged key runs the operator on the reading thread), and the
+    apply names it. Bucketed columns run the operator from Java, and report it directly. A failure of the JVM
+    itself inside the operator (out of memory, stack overflow) stays local;
+  - any other exception of the apply code (a bug: a `NullPointerException`, a bad cast), as `INTERNAL_ERROR`
+    with the exception's text. Every replica runs the same binary, so it fails the same way everywhere.
+- **Local failures** report this machine, not the entry: an `IOException`, an `Error` (out of memory...), a
+  native status of the storage or the process (`IOError`, `Corruption`, `NoSpace`, `Busy`, `TimedOut`,
+  `Aborted`, `ShutdownInProgress`, or no status at all), a lost local transaction, a failed commit of the group,
+  or a failed write of the result record. They stop the replica:
   - its Raft server stops first, so a failed leader stops leading;
   - the process exits with code 3 (also when Raft closes under a running node: see "Long pauses");
   - it never skips the entry.
+- **An operand that fails to merge later.** A merge whose request type does not return the merged value
+  (`none()`) stores its operand without running the operator. If the operator then fails on it, every read of the
+  key fails with `MERGE_OPERATOR_FAILED`, and so does every write that reads the key (a previous value, a guard),
+  until a put or delete replaces it. The memtable flush that has to merge it fails too: RocksDB stops the
+  database with a background error, on each replica in turn, and replaying the log stores the operand again. Both
+  merge operator fixes below avoid this: an operator that never fails, or one built with RocksDB's `kMustMerge`
+  failure scope (flush and compaction then keep the operands), which the C API that the Java operators go
+  through does not offer yet.
+
+Runbook: **every replica stops at the same entry** (each exits with code 3, its log names the same position and
+the same cause, and each restart stops there again). That is a deterministic failure still classified as local.
+
+1. Read the cause in the log of any replica. A storage cause that is real on all of them at once (every disk full)
+   is fixed in place: free the space, restart, and the entry applies.
+2. Otherwise fix the code, not the data: a build that classifies the cause as a result (or fixes the bug that
+   raises it), or a merge operator that no longer fails on that input. Install it on **every** node, then start
+   them: each replays the entry and records the same result.
+3. Do not skip the entry, and there is no switch to do so. A replica that skips it lacks its effects and records
+   no result, while the others (or any later replica that replays the log from an older snapshot, or a new member
+   that catches up from the log) apply it. The entries after it then run on different data, and the replicas
+   diverge silently, with nothing that ever detects it. A skip is only safe if every replica, present and
+   future, makes the same decision at the same position, which only the code can do: that is step 2.
+4. Never edit the Raft log or the applied position by hand. A single replica that stops while the others go on
+   has a local fault: replace it (see "Replacing a node").
 
 **Column ids** are native column family ids. Every replica gets the same ones because each runs the same
 history from the same starting point. After a `createColumn` the leader proposes `VerifyColumn(name, id)`,
@@ -752,7 +788,8 @@ against an incomplete history.
   client that retries it may never finish it; raise the cap for such clients. A transaction whose snapshot is
   older than the last 4M keys written on the leader conflicts at commit.
 - **`scanRaw` SST tokens** describe the leader's own files, so a leader change invalidates them.
-- **Merge operators** must be deterministic.
+- **Merge operators** must be deterministic. One that fails makes the write fail with
+  `MERGE_OPERATOR_FAILED` on every replica, see "Failures during apply".
 - **Maintenance.** `flush` and `compact` act only on the node that receives them.
 - **Workload limits.** The replicated server's `GrpcServer` runs requests on virtual threads of their own (at
   most 16384 waiting on the leader), not through each column's workload scheduler. Streamed mutations run at

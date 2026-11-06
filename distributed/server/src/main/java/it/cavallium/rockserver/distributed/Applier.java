@@ -11,6 +11,8 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -36,10 +38,10 @@ import org.jetbrains.annotations.Nullable;
  * all or none of them. Schema changes and {@code deleteRange} cannot run in a transaction: the memtables are flushed
  * first, then their record and position are written in one logged write and the WAL is synced.</p>
  *
- * <p>An entry that the database rejects for a logical reason (missing column, malformed keys...) is rejected the
- * same way on every replica: that becomes an {@link ApplyResult.Failed} and the log moves on. A storage or native
- * failure is specific to this replica: it is thrown as {@link ReplicaFailedException}, and the replica stops
- * instead of skipping the entry.</p>
+ * <p>A failure that follows from the entry (a logical rejection, a failing merge operator, an exception of the apply
+ * code) happens the same way on every replica: that becomes an {@link ApplyResult.Failed} and the log moves on. A
+ * failure of the local storage or of the JVM is specific to this replica (see {@link #isLocalFailure}): it is thrown
+ * as {@link ReplicaFailedException}, and the replica stops instead of skipping the entry.</p>
  */
 final class Applier {
 
@@ -770,8 +772,8 @@ final class Applier {
 							null);
 				} catch (RocksDBException failed) {
 					// An operator that cannot be instantiated (missing class, wrong type, failing constructor) is
-					// reported as PUT_UNKNOWN_ERROR; only a native storage error below it is a local failure.
-					if (isNativeFailure(failed)) {
+					// reported as PUT_UNKNOWN_ERROR; only a storage error below it is a local failure.
+					if (isLocalFailure(failed)) {
 						throw failed;
 					}
 					throw new IllegalArgumentException("Merge operator " + upload.name() + " rejected: "
@@ -917,37 +919,72 @@ final class Applier {
 		Object run();
 	}
 
-	/** Runs a logical operation, turning deterministic rejections into results. */
+	/**
+	 * Runs a logical operation and turns every failure that follows from the entry into its result, the same on every
+	 * replica: rejections by the database, failures of a merge operator, and exceptions of the code that applies it
+	 * (a bug there fails the same way everywhere, since every replica runs the same binary). Only a local failure
+	 * ({@link #isLocalFailure}) is thrown, as {@link ReplicaFailedException}: it stops this replica, which must not
+	 * record a result that the others may not reach. An {@link Error} is not caught: it stops the replica too.
+	 */
 	private static ApplyResult applyLogical(Operation operation) {
+		// Forget an operator failure of an earlier operation on this thread: only one of this operation counts.
+		FFMAbstractMergeOperator.takeFailureOnThisThread();
 		try {
 			return new ApplyResult.Ok(operation.run());
 		} catch (ReplicaFailedException ex) {
 			throw ex;
 		} catch (RuntimeException ex) {
-			if (isLocalFailure(ex)) {
-				throw new ReplicaFailedException("Storage failure while applying", ex);
+			var failure = mergeOperatorFailure(ex);
+			if (isLocalFailure(failure)) {
+				throw new ReplicaFailedException("Storage failure while applying", failure);
 			}
-			if (ex instanceof RocksDBException rocksDBException) {
-				return new ApplyResult.Failed(rocksDBException.getErrorUniqueId(), String.valueOf(ex.getMessage()));
-			}
-			if (ex instanceof IllegalArgumentException || ex instanceof UnsupportedOperationException) {
-				return new ApplyResult.Failed(RocksDBErrorType.INVALID_REQUEST, String.valueOf(ex.getMessage()));
-			}
-			throw ex;
+			return switch (failure) {
+				case RocksDBException rocksDBException ->
+						new ApplyResult.Failed(rocksDBException.getErrorUniqueId(), String.valueOf(failure.getMessage()));
+				case IllegalArgumentException _, UnsupportedOperationException _ ->
+						new ApplyResult.Failed(RocksDBErrorType.INVALID_REQUEST, String.valueOf(failure.getMessage()));
+				default -> new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR, failure.toString());
+			};
 		}
 	}
 
 	/**
-	 * A failure caused by this machine (disk, native storage, a lost local transaction) rather than by the entry: it
-	 * might not happen on other replicas, so it must not become a result.
+	 * {@code failure}, or a {@link RocksDBErrorType#MERGE_OPERATOR_FAILED} exception if a merge operator failed on this
+	 * thread while the operation ran. A read of a merged key runs the operator on the reading thread, and RocksDB
+	 * reports its failure as a corruption, which would otherwise look like a local storage failure on every replica.
+	 */
+	private static RuntimeException mergeOperatorFailure(RuntimeException failure) {
+		var operatorFailure = FFMAbstractMergeOperator.takeFailureOnThisThread();
+		if (operatorFailure == null || (failure instanceof RocksDBException rocksDBException
+				&& rocksDBException.getErrorUniqueId() == RocksDBErrorType.MERGE_OPERATOR_FAILED)) {
+			return failure;
+		}
+		var named = EmbeddedDB.mergeOperatorFailed(operatorFailure);
+		named.addSuppressed(failure);
+		return named;
+	}
+
+	/**
+	 * A failure caused by this machine rather than by the entry: it might not happen on other replicas, so it must
+	 * not become a result. Decided by origin, along the causes: an I/O error, an {@link Error} (out of memory...), a
+	 * native status that reports the storage ({@link #isLocalStatus}), or an error type that reports a lost local
+	 * transaction or a broken database. A merge operator failure is never local, whatever native status reported it.
+	 * Everything else (a rejection, an exception of the apply code) is deterministic.
 	 */
 	static boolean isLocalFailure(Throwable error) {
 		for (Throwable t = error; t != null; t = t.getCause()) {
-			if (t instanceof org.rocksdb.RocksDBException || t instanceof IOException
-					|| t instanceof UncheckedIOException || t instanceof Error) {
+			if (t instanceof RocksDBException rocksDBException) {
+				if (rocksDBException.getErrorUniqueId() == RocksDBErrorType.MERGE_OPERATOR_FAILED) {
+					return false;
+				}
+				if (isLocalErrorType(rocksDBException.getErrorUniqueId())) {
+					return true;
+				}
+			}
+			if (t instanceof org.rocksdb.RocksDBException nativeFailure && isLocalStatus(nativeFailure.getStatus())) {
 				return true;
 			}
-			if (t instanceof RocksDBException rocksDBException && isLocalErrorType(rocksDBException.getErrorUniqueId())) {
+			if (t instanceof IOException || t instanceof UncheckedIOException || t instanceof Error) {
 				return true;
 			}
 			if (t.getCause() == t) {
@@ -957,21 +994,35 @@ final class Applier {
 		return false;
 	}
 
-	private static boolean isNativeFailure(Throwable error) {
-		for (Throwable t = error; t != null && t.getCause() != t; t = t.getCause()) {
-			if (t instanceof org.rocksdb.RocksDBException || t instanceof IOException || t instanceof UncheckedIOException) {
-				return true;
-			}
+	/**
+	 * True for a native status that reports the storage or the process rather than the request: I/O errors,
+	 * corruption, no space, busy, timeouts, shutdown, and anything unknown, including a missing status. Only statuses
+	 * that follow from the request and the data (invalid argument, not found, not supported) are deterministic.
+	 */
+	static boolean isLocalStatus(org.rocksdb.@Nullable Status status) {
+		if (status == null) {
+			return true;
 		}
-		return false;
+		var subCode = status.getSubCode();
+		if (subCode == org.rocksdb.Status.SubCode.NoSpace || subCode == org.rocksdb.Status.SubCode.MemoryLimit) {
+			return true;
+		}
+		return switch (status.getCode()) {
+			case InvalidArgument, NotFound, NotSupported -> false;
+			default -> true;
+		};
 	}
 
-	/** Error types that report a failure of the local database rather than a property of the request. */
+	/**
+	 * Error types that report a failure of the local database rather than a property of the request: a lost local
+	 * transaction, a database that cannot load or write files. {@code PUT_UNKNOWN_ERROR} and {@code INTERNAL_ERROR}
+	 * are not among them: they wrap anything, so their causes decide.
+	 */
 	private static boolean isLocalErrorType(RocksDBErrorType type) {
 		return switch (type) {
-			case TX_NOT_FOUND, TRANSACTION_NOT_FOUND, COMMIT_FAILED, COMMIT_FAILED_TRY_AGAIN, INTERNAL_ERROR,
-					ROCKSDB_LOAD_ERROR, ROCKSDB_CONFIG_ERROR, WRITE_BATCH_1, PUT_UNKNOWN_ERROR, DIRECTORY_DELETE,
-					SST_WRITE_1, SST_WRITE_2, SST_WRITE_3, SST_WRITE_4, SST_GET_SIZE_FAILED, GET_PROPERTY_ERROR -> true;
+			case TX_NOT_FOUND, TRANSACTION_NOT_FOUND, COMMIT_FAILED, COMMIT_FAILED_TRY_AGAIN, ROCKSDB_LOAD_ERROR,
+					ROCKSDB_CONFIG_ERROR, WRITE_BATCH_1, DIRECTORY_DELETE, SST_WRITE_1, SST_WRITE_2, SST_WRITE_3,
+					SST_WRITE_4, SST_GET_SIZE_FAILED, GET_PROPERTY_ERROR -> true;
 			default -> false;
 		};
 	}

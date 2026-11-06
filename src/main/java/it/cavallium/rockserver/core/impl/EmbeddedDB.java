@@ -5307,6 +5307,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestMerge<? super Buf, U> callback) throws RocksDBException {
+		// Forget a failure of an earlier merge on this thread: only one of this merge may name the operator.
+		FFMAbstractMergeOperator.takeFailureOnThisThread();
 		try {
 			boolean needsTx = col.hasBuckets() || !(callback instanceof RequestType.RequestNothing<?>);
 			if (optionalDbWriter instanceof Tx tx && tx.isFromGetForUpdate() && callback instanceof RequestType.RequestMerged<?>) {
@@ -5346,7 +5348,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							var existing = bucket.getElement(bucketElementKeys);
 							Buf mergedValue;
 							if (existing != null) {
-								var mergedRes = col.mergeOperator().merge(calculatedKey, existing, List.of(value));
+								var mergedRes = mergeInJava(col, calculatedKey, existing, value);
 								mergedValue = mergedRes != null ? mergedRes : existing;
 							} else {
 								mergedValue = value;
@@ -5430,12 +5432,49 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (updateId != 0L && !(ex instanceof RocksDBRetryException)) {
 				closeTransaction(updateId, false);
 			}
+			// A read of the merged value runs the operator on this thread, and RocksDB reports its failure as a
+			// corruption: name the operator instead, so that the failure is not taken for a storage one.
+			var operatorFailure = FFMAbstractMergeOperator.takeFailureOnThisThread();
+			if (operatorFailure != null && !(ex instanceof RocksDBException rocksDBException
+					&& rocksDBException.getErrorUniqueId() == RocksDBErrorType.MERGE_OPERATOR_FAILED)) {
+				var failure = mergeOperatorFailed(operatorFailure);
+				failure.addSuppressed(ex);
+				throw failure;
+			}
 			if (ex instanceof RocksDBException rocksDBException) {
 				throw rocksDBException;
 			} else {
 				throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
 			}
 		}
+	}
+
+	/**
+	 * Merges {@code value} into {@code existing} with the column's operator, called from Java (bucketed columns keep
+	 * their elements inside one RocksDB value, so RocksDB cannot merge them). A failure of the operator is reported
+	 * as {@link RocksDBErrorType#MERGE_OPERATOR_FAILED}; a failure of the JVM itself is not the operator's.
+	 */
+	private static @Nullable Buf mergeInJava(ColumnInstance col, Buf key, Buf existing, Buf value) {
+		var operator = col.mergeOperator();
+		if (operator == null) {
+			throw RocksDBException.of(RocksDBErrorType.MERGE_OPERATOR_FAILED, "The column has no merge operator");
+		}
+		try {
+			return operator.merge(key, existing, List.of(value));
+		} catch (VirtualMachineError error) {
+			throw error;
+		} catch (Throwable operatorFailure) {
+			throw mergeOperatorFailed(operatorFailure);
+		}
+	}
+
+	/**
+	 * The failure of a merge operator: the same on every replica that runs the same operator over the same data. See
+	 * {@link FFMAbstractMergeOperator#takeFailureOnThisThread}.
+	 */
+	public static RocksDBException mergeOperatorFailed(Throwable operatorFailure) {
+		return RocksDBException.of(RocksDBErrorType.MERGE_OPERATOR_FAILED, "Merge operator failed: " + operatorFailure,
+				operatorFailure);
 	}
 
 	private Buf transformResultValue(ColumnInstance col, Buf realPreviousValue) {

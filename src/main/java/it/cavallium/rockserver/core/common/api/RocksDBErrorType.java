@@ -50,7 +50,8 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
   SERVER_OVERLOADED(43),
   RANGE_ITEM_TOO_LARGE(44),
   GET_MULTI_ITEM_TOO_LARGE(45),
-  INVALID_REQUEST(46);
+  INVALID_REQUEST(46),
+  MERGE_OPERATOR_FAILED(47);
 
   private final int value;
 
@@ -159,6 +160,8 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
         return GET_MULTI_ITEM_TOO_LARGE;
       case 46:
         return INVALID_REQUEST;
+      case 47:
+        return MERGE_OPERATOR_FAILED;
       default:
         return null;
     }
