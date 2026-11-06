@@ -1028,8 +1028,8 @@ the commit index of each within 0.5-7.3 ms of the trigger (20 runs out of 20), a
 `RatisContractTest.aCommitHeartbeatLostWithItsStreamIsSentAgain` holds the heartbeat in a `LinkProxy` and then resets
 the link: the follower learned the commit index 5-30 ms after the reset (10 runs of 5 writes), and 2.85 s after it
 without the resend (`-Drockserver.test.commitResend=false`). With the old dummy read in place of `send`,
-`aCommitHeartbeatSendsTheCommitIndexAtOnce` fails every run (5 of 5). `FollowerReadLatencyTest` after the change, one run
-on a busier machine: quiet follower reads 100/100 served by the follower, p50 2.2 / p90 3.8 ms.
+`aCommitHeartbeatSendsTheCommitIndexAtOnce` fails every run (5 of 5). `FollowerReadLatencyTest` after the change:
+quiet follower reads 100/100 served by the follower in every run (p50 1.2-2.5 ms), see the table below.
 
 The read is forwarded to the leader instead, as without follower reads, when no read index comes (no leader known, the
 leader unreachable or not confirmed within a maximum election timeout, or a leader that predates the method), when the
@@ -1055,19 +1055,25 @@ without touching the database: during the install the applied index already reac
 database is open, before the counter is even again (`SnapshotInstallTest` holds an install there).
 
 **Why still off by default.** Measured in process (3 nodes on one machine and one disk, `FollowerReadLatencyTest`,
-100 rounds of a write on the leader and a read of it on a follower, in turn per mode):
+100 rounds of a write on the leader and a read of it on a follower, in turn per mode), with the appender above
+(R6-1); three runs, on a machine busier than for the earlier figures (the forwarded rows are about 1 ms slower than
+they were, so compare rows within this table, not with older numbers):
 
 | Read after write | Quiet cluster, p50 / p90 | One writer in the background, p50 / p90 |
 |---|---|---|
-| Follower read | 1.1-1.3 / 2.6-3.1 ms, 97-98% served by the follower | 6.0 / 7.4-10.1 ms, 100% served |
-| Follower read, without `CommitHeartbeats` | 24-25 / 27-28 ms, 0% served (waits, then forwards) | 5.9-6.2 / 7.2-10.5 ms, 100% served |
-| Forwarded, leader waits for its apply (follower reads on) | 2.1-2.6 / 3.9-5.0 ms | 1.8-3.0 / 2.8-5.0 ms |
-| Forwarded, leader shortcut (follower reads off) | 1.7-2.4 / 3.3-4.8 ms | 1.4-2.4 / 2.5-4.6 ms |
+| Follower read | 1.2-2.5 / 3.8-5.1 ms, 100% served by the follower | 3.5 / 6.5-7.0 ms, 100% served |
+| Follower read, without `CommitHeartbeats` | 26.6-27.3 / 31.4-32.8 ms, 0% served (waits, then forwards) | 6.3 / 7.2-8.0 ms, 100% served |
+| Forwarded, leader waits for its apply (follower reads on) | 3.6-4.0 / 7.7-7.9 ms | 3.3-3.6 / 4.9-5.6 ms |
+| Forwarded, leader shortcut (follower reads off) | 2.5-3.7 / 6.5-8.6 ms | 3.0 / 4.5-5.2 ms |
 
-On a quiet cluster the follower now serves reads after writes and beats forwarding. With writes flowing, a follower
-read waits for the follower to receive, flush and apply the latest entries, and takes about 3-4 ms more than a
-forwarded read at the median (with a wait of 5 ms instead of 20, half of these reads fell back to forwarding and paid
-both). Turning the option on also makes every leader read wait for the leader's apply, about 0.5 ms more here. Under
+(The quiet follower read: 2.2 / 3.8 ms in the R6-1 run, 1.2 / 5.1 and 2.5 / 5.1 ms in two later runs; the other
+rows are from the two later runs.) Before R6-1 the trigger was a Ratis read on the leader, and the follower served
+97-98% of the quiet reads, the rest waiting for the next heartbeat; now it serves all of them. On a quiet cluster the
+follower serves reads after writes and beats forwarding. With writes flowing, a follower read waits for the follower
+to receive, flush and apply the latest entries; with the appender it now ties with a forwarded read at the median
+(3.5 against 3.3-3.6 ms; before R6-1, and still without `CommitHeartbeats`, about 6 ms, 3-4 ms more than forwarding)
+and is slower in the tail. Turning the option on also makes every leader read wait for the leader's apply, about
+0.5-1 ms more here. Under
 Yotsuba's steady writes that is a latency loss on every read in exchange for taking point reads off the leader, which
 only a benchmark of the Yotsuba mix can weigh. The bound of 20 ms plus a round trip is large against a 2-3 ms
 forwarded read, so the option stays off; measure it with the load benchmark before turning it on.
@@ -2007,16 +2013,24 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
    and not deployed: `0427455d1` removes the dead `cdcPollBatchAsync` override and its test stubs (Yotsuba did not
    compile without it, CDC being gone from the client API), `9cb3a9d6f` builds the connection with every node
    (`database.rockserver.nodes`, the host names of the cluster's `--peer`, expected leader first; empty keeps the
-   single address), and the commits of item 2. Left on the Yotsuba side:
+   single address), the commits of item 2, and the round-5 commits `456b8f8b7` and `df8acf015` (column
+   registrations retry an unknown outcome, the update cleanup closes once, in-flight limits for a cluster; below
+   and in item 3). Left on the Yotsuba side:
    - Merge the branch, build it against a released `rockserver-core` of this version (the branch was compiled and
      tested against local builds of it; Yotsuba's pom still pins 2.0.3), and deploy it.
    - Set `database.rockserver.nodes` in the deployed settings once the cluster exists.
-   - Optional, not needed for correctness: the `createColumn` sites that retry only `UNAVAILABLE` could also retry an
-     unknown outcome (`createColumn` is idempotent). At `c73697eae` only `SentMessageSenderIndex` does; the
-     branch's working tree has uncommitted edits that move the other `createColumn` sites (`CommunitiesImpl`,
-     `FileLocationsImpl`, `ForumTopicsImpl` and others) to `ReactiveGuard.isRetryableIdempotentFailure`. Once those
-     are committed this bullet is done; check the branch before relying on it. A failed no-change close is closed a
-     second time by the cleanup, which logs a rate-limited warning with `UPDATE_RETRY` and does nothing else.
+   - Done on the branch: the `createColumn` sites no longer retry only a raw `UNAVAILABLE` (`456b8f8b7`;
+     `createColumn` is idempotent). The ones that wait in place (`CommunitiesImpl`, `FileLocationsImpl`,
+     `ForumTopicsImpl` and others) retry while Rockserver is unavailable and after an unknown outcome
+     (`RockserverRequests.isColumnRegistrationWaitable`), never after a deterministic failure; overload and
+     timeouts still reach their caller. The bounded ones (the history archive, the old file-location column during
+     its migration) use `ReactiveGuard.isRetryableIdempotentFailure`, as `SentMessageSenderIndex` already did.
+   - Done on the branch: an update is closed once (`456b8f8b7`, narrowed by `df8acf015`). When the body's own
+     no-change close fails with `UPDATE_RETRY` (`NoChangeCloseRetryException`, still an `UPDATE_RETRY` for the
+     callers' retries), the server has already ended the update, so the cleanup does not close it a second time
+     and the double-close warning is gone. Every other failure, including an `UPDATE_RETRY` from the put or delete
+     that ends the update, and a cancel still close it: a single node keeps the native transaction open after a
+     conflicting ending write, and the cluster answers a close of an update it has dropped quietly.
 
    On the Rockserver side, the core client's automatic gRPC retry of reads waits for its backoff before it sends a
    read to the next node: 50 ms, then growing, on a connection with several addresses (the next node is another one,
@@ -2034,8 +2048,8 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      a `MERGE_OPERATOR_FAILED` out of every generic retry classification; a call site whose operation is idempotent,
      a put of a fixed value, a delete that does not return presence, a column creation or a read, opts back in with
      `ReactiveGuard.isRetryableIdempotentFailure` and does retry an unknown outcome, never a
-     `MERGE_OPERATOR_FAILED`: at `c73697eae` that is `SentMessageSenderIndex`'s column setup, with more
-     `createColumn` sites pending, see item 1; an audit of double applies checks those sites, not only the guard),
+     `MERGE_OPERATOR_FAILED`: `SentMessageSenderIndex`'s column setup and, since `456b8f8b7`, every column
+     registration, see item 1; an audit of double applies checks those sites, not only the guard),
      `5e648b895` (reads the structured flag instead of the message).
    - A local timeout around a write must not be shorter than the write's client deadline: the client keeps resending
      a write its caller cancelled, so an outer retry after a shorter local timeout could apply the write twice.
@@ -2044,8 +2058,8 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      whose staged write or commit has an unknown outcome rolls the transaction back and runs it again, never resends
      the write. Yotsuba: `5e648b895` reruns its two transactions (invite evidence, monitors) that way, and `c73697eae`
      sends the search update of an invite commit whose outcome was unknown when the rerun finds the change already
-     stored (R4-2). The rust client has the proto fields, `open_client_session` and
-     `RequestContext::with_request_id`, but numbers and resends nothing by itself.
+     stored (R4-2). The Rust client numbers and resends its writes outside transactions the same way as the Java
+     client, and leaves staged writes unnumbered too (see "The Rust client").
    - A client needs every node's address (item 1): a single address has nowhere to resend to while its node is
      down, so its writes end with `OUTCOME_UNKNOWN` at their deadline.
    - Every node must run this version before clients use sessions: an older node cannot read a version 3 batch,
@@ -2053,13 +2067,22 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      version"): restart the clients once the upgrade is done, since they read it when they connect, or start them
      with `-Dit.cavallium.rockserver.grpc.client.session-writes=false` until it is done. Sessions need no Yotsuba
      change otherwise: the client turns them on by itself.
-   - Writes staged in a transaction are not numbered, by design (see "Writes staged in a transaction"): a caller
-     whose staged write has an unknown outcome rolls the transaction back and runs it again, never resends the
-     write. The rust client numbers its writes too (see "The Rust client").
 3. **Capacity.** See [performance.md](performance.md) for the measurements on one PC and the load benchmark.
    Still to measure on the production machines and data: their fsync latency, snapshot creation and install
-   time at 171 GB and at the multi-TB datasets, and log retention in bytes. Raise Yotsuba's in-flight request
-   limits for the cluster (see performance.md).
+   time at 171 GB and at the multi-TB datasets, and log retention in bytes. Yotsuba's in-flight request limits
+   are raised for a cluster on its branch (`456b8f8b7`, `df8acf015`); the value for production is still to measure
+   with the Yotsuba mix (see performance.md).
+
+   *Upgrade note, Yotsuba's in-flight limits.* `database.rockserver.maxConcurrentReadRequests` and
+   `maxConcurrentWriteRequests` now default to 0, automatic: 256 each with one node, 1024 each when
+   `database.rockserver.nodes` lists several. A positive value is used as is, with one exception: with several
+   nodes an explicit 256 also means automatic, so it becomes 1024. Earlier versions wrote 256, their default, into
+   every settings file, and a cluster would otherwise keep the single-node limit without anyone choosing it. The
+   change is silent apart from one warning per limit at startup (`SettingsImpl`, "... treated as automatic,
+   1024"). So with several nodes the limit 256 itself cannot be configured: set 0 to keep the automatic value
+   without the warning, or another value (255, 257, ...) to fix the limit. A negative value is rejected at startup.
+   With one node nothing changes. Yotsuba documents the same rule in `docs/rockserver-workload-mapping.md`
+   ("In-flight limits").
 4. **Write failover after a frozen leader.** When the leader freezes (SIGSTOP, a long GC pause, a hung disk),
    writes resume about 4 s later in the tests, although the election takes about 1 s there and reads resume
    sooner. The cause is Ratis' client closing the channel to the frozen leader, which waits a hard-coded 3 s

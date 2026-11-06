@@ -272,7 +272,10 @@ Other results:
   Budget the database plus at least one older snapshot's compacted-away files, more while installs run.
 - **Client concurrency.** Throughput is in-flight requests divided by latency. A replicated write takes
   5–15 ms instead of a fraction of one, so Yotsuba's 256 writes in flight cap it near 2× today's mean (512
-  reach about 2.3×, 2048 about 3.5×). Raise `maxConcurrentWriteRequests` (and the read limit) for the cluster.
+  reach about 2.3×, 2048 about 3.5×). Yotsuba's `replicated-rockserver` branch raises both limits to 1024 when
+  `database.rockserver.nodes` lists several nodes (`456b8f8b7`, `df8acf015`; an explicit 256, the old default,
+  counts as automatic there, see "Left before a first deployment" in the design document); the production value
+  is still to measure with the Yotsuba mix.
 - **Talk to the leader.** A client connected to a follower has every update forwarded (its open and its
   commit), one more hop each. One connection is enough: its calls no longer share one event loop thread.
 - **Client failover.** Create clients with every node's address (`GrpcConnection.forHostsAndPorts`, or
