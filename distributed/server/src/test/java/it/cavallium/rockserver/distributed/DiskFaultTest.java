@@ -179,7 +179,7 @@ class DiskFaultTest {
 				System.out.println(line);
 				rounds.add(line);
 				// Only a failure that showed before the signal makes it the failure's stop. One that first shows during the
-				// graceful stop (the stop's own flush hits the disk) may exit 0: see DD-7h in the design document.
+				// graceful stop (the stop's own flush hits the disk) may exit 143: see DD-7h in the design document.
 				if (failingAtSignal) {
 					assertEquals(3, code, () -> line + "\n" + cluster.logTail(victim));
 				}

@@ -174,7 +174,14 @@ On a replicated cluster, when the node that died was the leader, the new calls a
 A replicated cluster advertises client sessions, and the connection uses them (the forwarding connections between
 nodes do not). Its first write opens a session through the replicated log. Every write outside a transaction, every
 transaction commit, the write that ends an update opened through the connection, `deleteRange` and schema change then
-carries the session id and a number of its own. `putBatch` and `mergeBatch` (when the server also advertises
+carries the session id and a number of its own, except a large streamed multi write: a `deleteMulti`, a
+`mergeMulti`, or a `putMulti` sent as a stream, is numbered only up to 4 MiB (`SessionWrites.NUMBERED_MULTI_MAX_BYTES`,
+counting its key and value bytes, 16 bytes per key segment and value and 96 per item), because the connection must
+hold a numbered one whole to send it again. A larger one is streamed unnumbered, as before, once and without resends:
+if its connection is lost, its caller gets that failure at once and cannot tell how much of it was applied. A
+`putMulti` that asks for nothing back (or `ensure`), with at most 65,536 items and 8 MiB of keys and values, goes as one message instead of a stream and is
+numbered whatever its size; split a larger multi write yourself, or use `putBatch`, if it must survive a leader
+loss. `putBatch` and `mergeBatch` (when the server also advertises
 `numberedBatches`; otherwise they are streamed once, unnumbered, as before) are sent as numbered chunks of at most
 4 MiB, one call per chunk, in order, within the call's deadline; once a chunk took effect, a later failure ends the
 call with `INVALID_REQUEST` ("partly applied"), since resending the whole batch would apply the first chunks twice. When its outcome is unknown, because the connection was lost (`UNAVAILABLE`, or `CANCELLED` by a
@@ -226,7 +233,8 @@ To replace a node of a replicated cluster, start the new node first with `--join
 leaving the old node out of `--peer` replaces it in one step. See "Replacing a node" in the [design
 document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
 without it), and see "Heap" there for the heap that a snapshot send needs. A removed node that is started again exits
-with 4, and one that meets a database or log of a newer cluster version with 5: set `RestartPreventExitStatus=4 5` in its
+with 4, and one that meets a database or log of a newer cluster version with 5: set `RestartPreventExitStatus=2 4 5` (2: wrong
+usage, or no `-XX:+ExitOnOutOfMemoryError`) and `SuccessExitStatus=143` (the JVM's status after SIGTERM) in its
 systemd unit (see "Exit codes" in [runbooks.md](docs/distributed/runbooks.md)). A replicated node flushes its memtables when all columns together
 reach `database.global.write-buffer-manager` (128 MiB by default): it replaces every column's `write-buffer-size`
 with that budget, because with atomic flush any flush writes every column (see "Memtables" in

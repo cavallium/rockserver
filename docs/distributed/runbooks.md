@@ -216,16 +216,34 @@ Upgrades across these versions need more care, because no gate covers them:
 ## Exit codes
 
 Each command has its own codes; the same number can mean different things for different commands. Supervise `run`
-only: restart it on 1 and 3, never on 2, 4 or 5, which need an operator.
+only: restart it on 1 and 3, never on 2, 4 or 5, which need an operator. With systemd:
+
+```ini
+[Service]
+Restart=on-failure
+RestartPreventExitStatus=2 4 5
+SuccessExitStatus=143
+```
+
+A restart loop on 2 is harmless but useless (the same command line fails the same way), and one on 4 or 5 is what
+the codes exist to prevent. `SuccessExitStatus=143` is there because the JVM, not `run`, chooses the status of a
+stop by signal (below): without it, every `systemctl stop` leaves the unit "failed".
 
 | Code | `run` | `admin` | `repair-log` | `export-seed`, `restore-backup` |
 |---|---|---|---|---|
-| 0 | Stopped by SIGTERM (or SIGINT), after its hand-off | `OK` | The log is valid, or was (with `--dry-run`: could be) repaired | Done |
+| 0 | Not on a stop by signal: see below | `OK` | The log is valid, or was (with `--dry-run`: could be) repaired | Done |
 | 1 | Did not start: a bad option value, a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`) | `FAILED: ...`: refused, a change failed, the replicas differ (`checksum`), a member failed (`backup`) | Refused: see its output | Failed: see the exception |
 | 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError` | Wrong usage | Wrong usage | Wrong usage |
-| 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM | - | - | - |
+| 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
 | 4 | Removed from the cluster: refused at the start, or found out while waiting outside the cluster. Do not start it again | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`): run it again | - | - |
 | 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | - |
+
+A stop of `run` by SIGTERM, after its hand-off, ends with 143 and one by SIGINT with 130: the JVM's
+status for a signal (128 plus its number), since the shutdown hook halts with a status of its own only after a
+failure (then 3, 4 or 5, as in the table). A node that is killed (SIGKILL, 137 in a shell) or crashes in native code
+(SIGABRT, 134) ends by a signal, and an uncaught exception before the node starts, such as a non-numeric option
+value, ends with 1, as in the table. A supervisor restarts all of these except a stop it asked for. So the codes a
+supervisor must not restart are 2, 4 and 5, and 143 is a clean stop.
 
 Code 4 is kept for both meanings: renumbering either would change what deployed supervisors and scripts, and the
 process tests, already expect, and a supervisor never runs `admin`, nor a script `run`.

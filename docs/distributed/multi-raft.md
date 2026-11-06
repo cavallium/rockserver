@@ -1,7 +1,8 @@
 # Multi-Raft for replicated Rockserver: design (read-only study)
 
 Status: **decided, not built.** Follower reads and the leader hint, the leaner apply path (`EmbeddedDB.ApplyWriter`),
-client sessions and partitioned apply inside one group (`--parallel-apply-threads`, section 6) have all landed.
+client sessions, snapshots by log bytes (`--snapshot-every-bytes`) and partitioned apply inside one group
+(`--parallel-apply-threads`) have all landed (section 6 marks them).
 Partitioned apply spreads the CPU of the single apply thread over lanes split by first key part, including inside
 `messages-v2`, so it lifts the ceiling that Multi-Raft by column would lift (at most 1.75x, section 0), without a
 second fsync stream, a second election, per-group membership, snapshots and monitoring. Multi-Raft is therefore
@@ -470,7 +471,8 @@ Expected result, to be checked in Phase 0 and 1 measurements:
   - empty-group `--join`;
   - recovery of all group dirs at start;
   - priorities combined with the pre-vote setting;
-  - the Ratis client's channel-shutdown delay of 3 s (design.md:848-857) once per group.
+  - the Ratis client's channel-shutdown delay of 3 s (`GrpcUtil.shutdownManagedChannel`; design.md, "Left before a
+    first deployment", item 4, where `Proposer.resetConnection` takes it off the proposer's path) once per group.
 - **The lazy transaction binding** changes when the snapshot is taken (at the first call, not at open). That is legal
   for optimistic transactions, but it is observable by a client that opens, sleeps, then reads.
 - **The ceiling is fixed by `messages-v2`** until Phase 3.
@@ -479,12 +481,12 @@ Expected result, to be checked in Phase 0 and 1 measurements:
 
 | Item | Where | Expected effect |
 |---|---|---|
-| Leaner apply (`WriteBatchWithIndex`, no `EmbeddedDB` transaction API on the apply thread) | review 3.1, arch/apply | removes per-op bookkeeping and commit validation; the earlier apply changes already took execute from 0.40 to 0.35 ms and commit from 0.22 to 0.12 ms per entry (performance.md:106-110); expect tens of percent more apply headroom |
-| **Partitioned apply inside one group** | new | within one apply group, execute entries in K partitions by column (or by key hash for single-key entries) on K threads, each into its own indexed batch, then merge them into **one** atomic `db.write` with the position. Entries that touch several columns, and schema changes, run as barriers. Results stay deterministic because a request reads only its own column's keys (guards, previous values) in log order within its partition. Crash consistency and the single log stay. This captures more apply parallelism than column groups (it is not bounded by `messages-v2`) with none of the membership, snapshot or fsync costs. |
-| Follower reads and leader hint | review 2.1, arch/routing | takes 6.1k gets/s and `existsMulti` off the leader and removes the forwarding hop for about 2/3 of the traffic |
-| `ConflictTracker` off the append lock for plain writes | review 2.3 | less leader CPU per write, inside the Ratis lock |
+| ~~Leaner apply (`WriteBatchWithIndex`, no `EmbeddedDB` transaction API on the apply thread)~~ done: `EmbeddedDB.ApplyWriter`; the headroom it gave is still to measure (PF-3) | review 3.1, arch/apply | removes per-op bookkeeping and commit validation; the earlier apply changes already took execute from 0.40 to 0.35 ms and commit from 0.22 to 0.12 ms per entry (performance.md:106-110); expect tens of percent more apply headroom |
+| ~~**Partitioned apply inside one group**~~ done: `--parallel-apply-threads N`, off by default (design.md, "Partitioned apply"), by first key part of fixed-key columns, else by column | new | within one apply group, execute entries in K partitions by column (or by key hash for single-key entries) on K threads, each into its own indexed batch, then merge them into **one** atomic `db.write` with the position. Entries that touch several columns, and schema changes, run as barriers. Results stay deterministic because a request reads only its own column's keys (guards, previous values) in log order within its partition. Crash consistency and the single log stay. This captures more apply parallelism than column groups (it is not bounded by `messages-v2`) with none of the membership, snapshot or fsync costs. |
+| ~~Follower reads and leader hint~~ done: follower point reads are off by default until measured with the Yotsuba mix (design.md, "Follower reads") | review 2.1, arch/routing | takes 6.1k gets/s and `existsMulti` off the leader and removes the forwarding hop for about 2/3 of the traffic |
+| `ConflictTracker` off the append lock for plain writes (not done: still under the lock, without a per-key allocation since; unmeasured, performance.md item 16) | review 2.3 | less leader CPU per write, inside the Ratis lock |
 | ~~Raise Yotsuba's `maxConcurrentWriteRequests` and read limit~~ done: 1024 each on a cluster (Yotsuba `456b8f8b7`, `df8acf015`); the production value is still to measure | performance.md, "Client concurrency" | 256 in flight caps the cluster near 2x; 2048 reach about 3.5x |
-| Snapshots by log bytes | review 3.7 | fewer apply pauses at high batch sizes |
+| ~~Snapshots by log bytes~~ done: `--snapshot-every-bytes`, 4 GiB by default (design.md, "Snapshots, catch-up and membership") | review 3.7 | fewer apply pauses at high batch sizes |
 
 **Numbers for the verdict** (performance.md):
 
