@@ -99,6 +99,12 @@ impl RequestContext {
     /// or may not have been applied; send the same numbered write again to learn which) and
     /// `FAILED_PRECONDITION` with `SESSION_EXPIRED` in its message (the session is gone; a first copy was not
     /// applied and can be sent again under a new session, a later copy's outcome stays unknown).
+    ///
+    /// A numbered `putBatch` or `mergeBatch` (only on a server that also advertises `numbered_batches`) must be
+    /// one `KVBatch` message that is one replicated chunk: the sum, over its items, of every key segment's length
+    /// plus 16, the value's length plus 16, at most 4 MiB (4194304 bytes), or a single item. The server refuses
+    /// (`INVALID_ARGUMENT`, nothing applied) a numbered call holding more, as soon as a second chunk arrives. Split
+    /// a larger batch the same way (greedy, in order) and number each chunk as its own write.
     pub fn with_request_id(mut self, session_id: i64, sequence: i64, completed_below: i64) -> Self {
         self.request_id = Some(ClientRequestId {
             session_id,

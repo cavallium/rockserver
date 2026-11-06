@@ -42,23 +42,42 @@ final class CommitOutcomes {
 	private final AtomicLong pruneUnsettledAt = new AtomicLong(MIN_PRUNE_UNSETTLED);
 	private static final long MIN_PRUNE_UNSETTLED = 1024;
 
-	private final RockserverStateMachine stateMachine;
-	private final LocalCommands localCommands;
+	private final java.util.function.Supplier<CompletableFuture<Void>> leadership;
+	private final java.util.function.LongSupplier currentTerm;
+	private final java.util.function.Function<it.cavallium.rockserver.core.common.ClientRequestId, ApplyResult> recorded;
+	private final java.util.function.LongPredicate sessionExists;
 	private final java.util.concurrent.ExecutorService inline;
 
 	CommitOutcomes(RockserverStateMachine stateMachine, LocalCommands localCommands,
 			java.util.concurrent.ExecutorService inline) {
-		this.stateMachine = stateMachine;
-		this.localCommands = localCommands;
+		this(localCommands::leadership, localCommands::currentTerm, stateMachine::recordedResult, sessionId -> {
+			var store = stateMachine.store();
+			return store.db().get(0L, store.metaColumnId(), NodeStore.sessionKey(sessionId),
+					RequestType.<it.cavallium.buffer.Buf>current()) != null;
+		}, inline);
+	}
+
+	/**
+	 * Over its sources: the leadership barrier, the current term, the record of a session write (null if none), and
+	 * whether a session exists. Tests give fakes.
+	 */
+	CommitOutcomes(java.util.function.Supplier<CompletableFuture<Void>> leadership,
+			java.util.function.LongSupplier currentTerm,
+			java.util.function.Function<it.cavallium.rockserver.core.common.ClientRequestId, ApplyResult> recorded,
+			java.util.function.LongPredicate sessionExists, java.util.concurrent.ExecutorService inline) {
+		this.leadership = leadership;
+		this.currentTerm = currentTerm;
+		this.recorded = recorded;
+		this.sessionExists = sessionExists;
 		this.inline = inline;
 	}
 
 	private CompletableFuture<Void> leadership() {
-		return localCommands.leadership();
+		return leadership.get();
 	}
 
 	private long currentTerm() {
-		return localCommands.currentTerm();
+		return currentTerm.getAsLong();
 	}
 
 	/** A commit of a client session write, marked unsettled in a term. */
@@ -110,7 +129,7 @@ final class CommitOutcomes {
 			inline.execute(() -> {
 				try {
 					unsettledCommits.entrySet().removeIf(mark -> mark.getValue() < term
-							|| stateMachine.recordedResult(new it.cavallium.rockserver.core.common.ClientRequestId(
+							|| recorded.apply(new it.cavallium.rockserver.core.common.ClientRequestId(
 									mark.getKey().sessionId(), mark.getKey().sequence(), 0)) != null);
 				} finally {
 					pruneUnsettledAt.set(Math.max(MIN_PRUNE_UNSETTLED, 2L * unsettledCommits.size()));
@@ -153,7 +172,7 @@ final class CommitOutcomes {
 			// The mark first: a commit removes it only after its record is in the database, so no mark and then no record
 			// proves that no copy applied in this term.
 			Long unsettledTerm = unsettledCommits.get(write);
-			var recorded = stateMachine.recordedResult(id);
+			var recorded = this.recorded.apply(id);
 			if (recorded != null && unsettledTerm != null) {
 				unsettledCommits.remove(write, unsettledTerm);
 			}
@@ -172,9 +191,7 @@ final class CommitOutcomes {
 			if (unsettledTerm != null && unsettledTerm >= term) {
 				throw new CompletionException(earlierCopyInFlight());
 			}
-			var store = stateMachine.store();
-			if (store.db().get(0L, store.metaColumnId(), NodeStore.sessionKey(id.sessionId()),
-					RequestType.<it.cavallium.buffer.Buf>current()) == null) {
+			if (!sessionExists.test(id.sessionId())) {
 				throw new CompletionException(((ApplyResult.Failed) Applier.SESSION_GONE).toException());
 			}
 			throw new CompletionException(new RocksDBRetryException());

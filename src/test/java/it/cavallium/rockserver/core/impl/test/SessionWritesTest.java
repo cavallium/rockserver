@@ -59,9 +59,16 @@ class SessionWritesTest {
 
 		Writes(Function<RequestContext, CompletableFuture<Long>> opener,
 				BiFunction<Object, Object, CompletableFuture<?>> sender, Executor executor) throws Exception {
-			var constructor = TYPE.getDeclaredConstructor(Function.class, BiFunction.class, Executor.class);
+			this(opener, sender, executor, true);
+		}
+
+		Writes(Function<RequestContext, CompletableFuture<Long>> opener,
+				BiFunction<Object, Object, CompletableFuture<?>> sender, Executor executor, boolean numberedBatches)
+				throws Exception {
+			var constructor = TYPE.getDeclaredConstructor(Function.class, BiFunction.class, Executor.class,
+					boolean.class);
 			constructor.setAccessible(true);
-			target = constructor.newInstance(opener, sender, executor);
+			target = constructor.newInstance(opener, sender, executor, numberedBatches);
 		}
 
 		static boolean observes(RocksDBAPICommand<?, ?, ?> command) {
@@ -198,6 +205,13 @@ class SessionWritesTest {
 		assertTrue(writes.numbers(new RocksDBAPICommandSingle.PutBatch(1, Flux.empty(), PutBatchMode.WRITE_BATCH)));
 		assertTrue(writes.numbers(new RocksDBAPICommandSingle.DeleteRange(1, KEY, KEY)));
 		assertFalse(writes.numbers(new RocksDBAPICommandSingle.CloseTransaction(5, false)));
+
+		// A server that does not number batches (it ignores their id) gets them unnumbered, never resent.
+		var older = new Writes(_ -> new CompletableFuture<>(), (_, _) -> new CompletableFuture<>(), Runnable::run, false);
+		assertFalse(older.numbers(new RocksDBAPICommandSingle.PutBatch(1, Flux.empty(), PutBatchMode.WRITE_BATCH)));
+		assertFalse(older.numbers(new RocksDBAPICommandSingle.MergeBatch(1, Flux.empty(),
+				it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_WRITE_BATCH)));
+		assertTrue(older.numbers(new RocksDBAPICommandSingle.DeleteRange(1, KEY, KEY)));
 	}
 
 	/**
@@ -335,6 +349,33 @@ class SessionWritesTest {
 		} catch (ExecutionException expected) {
 			// Ended at its own deadline.
 		}
+		executor.shutdownNow();
+	}
+
+	/**
+	 * An opening that ended "not applied" at the opener's deadline (the proposer still had it queued), or refused as
+	 * overloaded, does not end a write waiting for it with more time: that write opens again in its own time.
+	 */
+	@Test
+	void aSharedOpeningEndedByTheOpenersDeadlineOrOverloadIsOpenedAgain() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opens = new AtomicInteger();
+		var firstOpening = new CompletableFuture<Long>();
+		var writes = new Writes(_ -> switch (opens.incrementAndGet()) {
+			case 1 -> firstOpening;
+			case 2 -> CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "busy"));
+			default -> CompletableFuture.completedFuture(4L);
+		}, (_, _) -> CompletableFuture.completedFuture("ok"), executor);
+		var shortWrite = writes.send(RequestContext.latency(Duration.ofMillis(200)), put(0));
+		var longWrite = writes.send(RequestContext.latency(Duration.ofSeconds(10)), put(0));
+		Thread.sleep(250);
+		firstOpening.completeExceptionally(RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+				"The request deadline came before the write was sent; it was not applied"));
+		assertEquals("ok", longWrite.get(5, TimeUnit.SECONDS));
+		var error = assertThrows(ExecutionException.class, () -> shortWrite.get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks(error).getErrorUniqueId(),
+				"the opener, out of time, ends with its own deadline");
+		assertEquals(3, opens.get(), "opened again after the deadline error, and again after the overload");
 		executor.shutdownNow();
 	}
 

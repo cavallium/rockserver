@@ -103,6 +103,9 @@ message CapabilitiesResponse {
   int32 workloadContractVersion = 1;
   // The server is replicated and numbers client writes: see openClientSession.
   bool clientSessions = 2;
+  // The server numbers putBatch and mergeBatch calls with a request id: each such call is one replicated chunk
+  // (KVBatchChunks), applied at most once. Without it, a client sends batches unnumbered and never resends them.
+  bool numberedBatches = 3;
 }
 
 message OpenClientSessionRequest {RequestContext context = 1;}

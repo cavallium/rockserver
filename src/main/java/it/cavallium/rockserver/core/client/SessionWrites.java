@@ -46,7 +46,7 @@ import reactor.core.publisher.Mono;
  * <p>Numbered: writes outside transactions, transaction commits, the write that ends an update opened through
  * this connection (whose id this class remembers from the {@code getForUpdate} answer), schema changes (column
  * creation and deletion, merge operator upload), range deletions, and batch writes, chunk by chunk
- * ({@link #sendBatch}). A write staged in a transaction is not: sending it again could stage it twice. A write whose first copy is refused because its
+ * ({@link #sendBatch}) when the server numbers batches. A write staged in a transaction is not: sending it again could stage it twice. A write whose first copy is refused because its
  * session expired was not applied, and goes again under a new session; a copy sent again after an unknown outcome that
  * meets an expired session ends with {@code OUTCOME_UNKNOWN}.</p>
  */
@@ -187,6 +187,8 @@ final class SessionWrites {
 	private final BiFunction<BoundRequestContext, RocksDBAPICommandSingle<?>, CompletableFuture<?>> sender;
 	private final Executor executor;
 	private final long retryWindowNanos;
+	/** The server numbers batch calls ({@link it.cavallium.rockserver.core.common.RockserverCapabilities#numberedBatches()}). */
+	private final boolean numberedBatches;
 	private final Object sessionLock = new Object();
 	/** The current session, or its opening; null before the first write and after it expired. Guarded by sessionLock. */
 	private @Nullable CompletableFuture<Session> session;
@@ -196,6 +198,13 @@ final class SessionWrites {
 	SessionWrites(Function<RequestContext, CompletableFuture<Long>> opener,
 			BiFunction<BoundRequestContext, RocksDBAPICommandSingle<?>, CompletableFuture<?>> sender,
 			Executor executor) {
+		this(opener, sender, executor, true);
+	}
+
+	SessionWrites(Function<RequestContext, CompletableFuture<Long>> opener,
+			BiFunction<BoundRequestContext, RocksDBAPICommandSingle<?>, CompletableFuture<?>> sender,
+			Executor executor, boolean numberedBatches) {
+		this.numberedBatches = numberedBatches;
 		this.opener = opener;
 		this.sender = sender;
 		this.executor = executor;
@@ -218,7 +227,9 @@ final class SessionWrites {
 			// after an unknown outcome instead of failing with it.
 			case RocksDBAPICommandSingle.CreateColumn _, RocksDBAPICommandSingle.DeleteColumn _,
 					RocksDBAPICommandSingle.DeleteColumnIfExists _, RocksDBAPICommandSingle.UploadMergeOperator _ -> true;
-			case RocksDBAPICommandSingle.PutBatch _, RocksDBAPICommandSingle.MergeBatch _ -> true;
+			// Only on a server that numbers them: an older one ignores the id of a batch, and would apply a resent chunk
+			// twice. Unnumbered, a batch is streamed as before and never resent.
+			case RocksDBAPICommandSingle.PutBatch _, RocksDBAPICommandSingle.MergeBatch _ -> numberedBatches;
 			// A copy of a range deletion sent after later writes into the range would delete them too.
 			case RocksDBAPICommandSingle.DeleteRange _ -> true;
 			default -> false;
@@ -354,10 +365,13 @@ final class SessionWrites {
 			if (error != null) {
 				// Not sent: whatever the opening's own outcome, this write was not applied.
 				var cause = unwrap(error);
-				if (isUnknownOutcome(cause) && !closed && canPause(call, FIRST_PAUSE_NANOS)) {
-					// The opening shared with other writes ended at another write's deadline: this one opens again, in its
-					// own time.
-					later(FIRST_PAUSE_NANOS, () -> start(call), call::failClosed);
+				if ((isUnknownOutcome(cause) || isNotApplied(cause)) && !closed && canPause(call, call.pauseNanos)) {
+					// The opening, maybe shared with other writes and sent within another write's deadline, ended without a
+					// session but did not refuse sessions for good (an unknown outcome, overload, or the opener's deadline):
+					// this one opens again, in its own time. A refusal such as NOT_IMPLEMENTED ends every waiting write.
+					long pause = call.pauseNanos;
+					call.pauseNanos = Math.min(MAX_PAUSE_NANOS, pause * 2);
+					later(pause, () -> start(call), call::failClosed);
 					return;
 				}
 				call.fail(cause instanceof RocksDBException rocks

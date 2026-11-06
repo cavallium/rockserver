@@ -220,6 +220,25 @@ class ClientSessionTest {
 		return new KVBatch.KVBatchRef(keys, bufs);
 	}
 
+	/** Values of a size that puts exactly two items with an 8-byte key into one chunk ({@link KVBatchChunks}). */
+	private static final int BOUNDARY_VALUE_BYTES =
+			(int) (KVBatchChunks.CHUNK_BYTES / 2 - Long.BYTES - 2 * KVBatchChunks.ITEM_OVERHEAD_BYTES);
+
+	private static String[] boundaryValues(char fill, int count) {
+		var values = new String[count];
+		java.util.Arrays.fill(values, String.valueOf(fill).repeat(BOUNDARY_VALUE_BYTES));
+		return values;
+	}
+
+	/** The id of the newest client session in {@code node}'s database (ids are log indexes: the last opened). */
+	private static long newestSession(ReplicatedNode node) {
+		var store = node.stateMachine().store();
+		try (var sessions = store.db().getRange(0L, store.metaColumnId(), NodeStore.sessionKey(0),
+				NodeStore.sessionKey(Long.MAX_VALUE), false, RequestType.<it.cavallium.rockserver.core.common.KV>allInRange())) {
+			return sessions.mapToLong(kv -> NodeStore.sessionId(kv.keys())).max().orElseThrow();
+		}
+	}
+
 	private static RocksDBErrorType errorOf(java.util.concurrent.CompletableFuture<?> future) {
 		var error = assertThrows(java.util.concurrent.CompletionException.class, future::join);
 		return ((RocksDBException) error.getCause()).getErrorUniqueId();
@@ -294,14 +313,31 @@ class ClientSessionTest {
 		numbered.apply(5).deleteRangeAsync(column, key(40), key(50)).join();
 		assertEquals("w", localValue(leader, column, 41));
 
-		// Through the client library: every batch goes as numbered chunks.
+		// Through the client library: every batch goes as numbered chunks, split by the client as the server splits them
+		// again after gRPC encoding (a mismatch would be refused as more than one chunk). Two batches of one chunk each,
+		// then one of three chunks whose items fill a chunk to the byte: 5 numbers. The put after them is number 5.
 		var addresses = cluster.runningNodes().stream().map(ClientSessionTest::apiAddress).toList();
 		try (var client = GrpcConnection.forHostsAndPorts("batch-client", addresses)) {
+			assertTrue(client.getCapabilities().numberedBatches());
 			var clientApi = client.getAsyncApi(RequestContext.batch(TIMEOUT));
 			clientApi.mergeBatchAsync(column, Flux.just(kv(30, "p", "q"), kv(32, "r")), MergeBatchMode.MERGE_WRITE_BATCH)
 					.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+			clientApi.putBatchAsync(column, Flux.just(kv(60, boundaryValues('b', 5))), PutBatchMode.WRITE_BATCH)
+					.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+			clientApi.putAsync(0, column, key(70), text("after"), RequestType.none()).get(TIMEOUT.toSeconds(),
+					TimeUnit.SECONDS);
 		}
 		cluster.awaitConverged(TIMEOUT);
+		long clientSession = newestSession(leader);
+		assertTrue(clientSession != session);
+		assertTrue(leader.stateMachine().recordedResult(new ClientRequestId(clientSession, 5, 0)) != null,
+				"the put after the batches is number 5: one number per chunk");
+		assertEquals(null, leader.stateMachine().recordedResult(new ClientRequestId(clientSession, 6, 0)));
+		for (var node : cluster.runningNodes()) {
+			for (int i = 0; i < 5; i++) {
+				assertEquals(BOUNDARY_VALUE_BYTES, localValue(node, column, 60 + i).length());
+			}
+		}
 		for (var node : cluster.runningNodes()) {
 			assertEquals("p", localValue(node, column, 30));
 			assertEquals("q", localValue(node, column, 31));
@@ -309,6 +345,76 @@ class ClientSessionTest {
 			assertEquals("a", localValue(node, column, 1));
 			assertEquals("u", localValue(node, column, 20));
 			assertEquals("w", localValue(node, column, 41));
+		}
+	}
+
+	/**
+	 * The leader dies while a client batch of three chunks is in flight: it committed the first chunk (its followers
+	 * applied it) and never answered. The client sends that chunk again, with its number, to the next node, then the
+	 * rest. Every key is merged exactly once: a second merge would double its value.
+	 */
+	@Test
+	void aClientBatchSpanningALeaderKillAppliesEveryChunkOnce() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var leaderId = leader.config().nodeId();
+		var addresses = new ArrayList<HostAndPort>();
+		addresses.add(apiAddress(leader));
+		for (var node : cluster.runningNodes()) {
+			if (node != leader) {
+				addresses.add(apiAddress(node));
+			}
+		}
+		var graceful = System.getProperty(GRPC_GRACEFUL_SHUTDOWN);
+		var gate = new CountDownLatch(1);
+		Thread halting = null;
+		try (var connection = GrpcConnection.forHostsAndPorts("batch-kill-client", addresses)) {
+			var api = connection.getAsyncApi(RequestContext.batch(TIMEOUT));
+			long column = api.createColumnAsync("c", SCHEMA).join();
+			api.putAsync(0, column, key(1), text("warm"), RequestType.none()).join();
+			cluster.awaitConverged(TIMEOUT);
+
+			leader.stateMachine().testHooks().applyGate = gate;
+			// Chunks of keys 100-101, 102-103, 104.
+			var batch = api.mergeBatchAsync(column, Flux.just(kv(100, boundaryValues('m', 5))),
+					MergeBatchMode.MERGE_WRITE_BATCH);
+			var followers = cluster.runningNodes().stream().filter(node -> node != leader).toList();
+			InProcessCluster.await(TIMEOUT, () -> followers.stream().allMatch(node ->
+					localValue(node, column, 101) != null));
+			assertTrue(!batch.isDone(), "precondition: the leader cannot answer the first chunk");
+
+			System.setProperty(GRPC_GRACEFUL_SHUTDOWN, "0");
+			halting = Thread.ofPlatform().name("halt-" + leaderId).start(() -> {
+				try {
+					cluster.halt(leaderId);
+				} catch (IOException ex) {
+					throw new UncheckedIOException(ex);
+				}
+			});
+			batch.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+			gate.countDown();
+			halting.join();
+			halting = null;
+
+			cluster.awaitConverged(TIMEOUT);
+			for (var node : cluster.runningNodes()) {
+				for (int i = 0; i < 5; i++) {
+					var value = localValue(node, column, 100 + i);
+					assertEquals(BOUNDARY_VALUE_BYTES, value == null ? -1 : value.length(),
+							"key " + (100 + i) + " merged once on " + node.config().nodeId());
+				}
+			}
+		} finally {
+			gate.countDown();
+			leader.stateMachine().testHooks().applyGate = null;
+			if (halting != null) {
+				halting.join();
+			}
+			if (graceful == null) {
+				System.clearProperty(GRPC_GRACEFUL_SHUTDOWN);
+			} else {
+				System.setProperty(GRPC_GRACEFUL_SHUTDOWN, graceful);
+			}
 		}
 	}
 }

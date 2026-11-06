@@ -54,7 +54,8 @@ final class ReplicatedWrites {
 	 *
 	 * <p>A call with a client request id is one numbered chunk of a client session (the client splits its batches the
 	 * same way and numbers each chunk): it is proposed as one entry under that id, so a copy of it takes effect once. A
-	 * numbered call that is more than one chunk is refused before anything is proposed.</p>
+	 * numbered call that is more than one chunk is refused before anything is proposed, as soon as its second chunk
+	 * arrives: the rest of its stream is cancelled, not read.</p>
 	 */
 	CompletableFuture<Void> batch(RequestContext context, long columnId, Publisher<? extends KVBatch> batches,
 			boolean merge) {
@@ -62,6 +63,9 @@ final class ReplicatedWrites {
 		if (context.requestId() != null) {
 			return Flux.from(batches)
 					.concatMapIterable(KVBatchChunks::split)
+					// A second chunk is enough to refuse the call: the rest of the stream is not read (and not held in memory,
+					// which byte admission, later, would not cover).
+					.take(2)
 					.collectList()
 					.toFuture()
 					.thenCompose(chunks -> {
@@ -71,7 +75,7 @@ final class ReplicatedWrites {
 						if (chunks.size() > 1) {
 							return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
 									"A numbered " + (merge ? "mergeBatch" : "putBatch") + " must fit one replicated chunk of "
-											+ KVBatchChunks.CHUNK_BYTES + " bytes; it has " + chunks.size() + "; nothing was applied"));
+											+ KVBatchChunks.CHUNK_BYTES + " bytes; it has more than one; nothing was applied"));
 						}
 						return propose(context, start, entry(columnId, chunks.getFirst(), merge)).thenApply(_ -> null);
 					});

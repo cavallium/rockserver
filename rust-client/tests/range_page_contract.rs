@@ -10,6 +10,7 @@ fn workload_v3_capability_is_exact() {
     let capability = CapabilitiesResponse {
         workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         client_sessions: false,
+        numbered_batches: false,
     };
     let decoded = CapabilitiesResponse::decode(capability.encode_to_vec().as_slice()).unwrap();
     assert_eq!(decoded.workload_contract_version, 3);

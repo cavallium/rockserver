@@ -1664,6 +1664,7 @@ public class GrpcServer extends Server {
 			return Mono.just(CapabilitiesResponse.newBuilder()
 					.setWorkloadContractVersion(capabilities.workloadContractVersion())
 					.setClientSessions(capabilities.clientSessions())
+					.setNumberedBatches(capabilities.numberedBatches())
 					.build());
 		}
 

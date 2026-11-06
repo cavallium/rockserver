@@ -169,7 +169,8 @@ On a replicated cluster, when the node that died was the leader, the new calls a
 A replicated cluster advertises client sessions, and the connection uses them (the forwarding connections between
 nodes do not). Its first write opens a session through the replicated log. Every write outside a transaction, every
 transaction commit, the write that ends an update opened through the connection, `deleteRange` and schema change then
-carries the session id and a number of its own. `putBatch` and `mergeBatch` are sent as numbered chunks of at most
+carries the session id and a number of its own. `putBatch` and `mergeBatch` (when the server also advertises
+`numberedBatches`; otherwise they are streamed once, unnumbered, as before) are sent as numbered chunks of at most
 4 MiB, one call per chunk, in order, within the call's deadline; once a chunk took effect, a later failure ends the
 call with `INVALID_REQUEST` ("partly applied"), since resending the whole batch would apply the first chunks twice. When its outcome is unknown, because the connection was lost (`UNAVAILABLE`, or `CANCELLED` by a
 server that stops) or the server answered `OUTCOME_UNKNOWN`, the connection sends the same numbered write again,

@@ -143,7 +143,7 @@ public final class GrpcConnection extends BaseConnection {
 				&& !"false".equalsIgnoreCase(System.getProperty(SESSION_WRITES_PROPERTY))
 				? new SessionWrites(delegate::openClientSessionAsync,
 						(context, command) -> (CompletableFuture<?>) delegate.requestAsync(context, command),
-						delegate.callbackExecutor)
+						delegate.callbackExecutor, delegate.getCapabilities().numberedBatches())
 				: null;
 		this.channel = delegate.channel;
 		this.callbackExecutor = delegate.callbackExecutor;
@@ -506,7 +506,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		try {
 			var response = handshake(channel, futureStub, severalAddresses);
 			capabilities = new RockserverCapabilities(response.getWorkloadContractVersion(),
-					response.getClientSessions());
+					response.getClientSessions(), response.getNumberedBatches());
 			capabilities.requireCompatible();
 		} catch (InterruptedException interrupted) {
 			Thread.currentThread().interrupt();
