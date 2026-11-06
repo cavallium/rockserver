@@ -349,6 +349,9 @@ public class GrpcServer extends Server {
 		private final AtomicLong suppressed = new AtomicLong();
 	}
 
+	/** Names the leader in every response, for a connection to a replicated node; null otherwise. */
+	private final it.cavallium.rockserver.core.common.@Nullable LeaderHint leaderHint;
+
 	/** Requests that may wait on a non-embedded connection at once; more are refused as overload. */
 	private static final int PROXY_PARALLELISM = 16384;
 	/**
@@ -363,6 +366,8 @@ public class GrpcServer extends Server {
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
+		// The client itself: getClient() wraps it.
+		this.leaderHint = client instanceof it.cavallium.rockserver.core.common.LeaderHint hint ? hint : null;
 		ExpectedGrpcStreamCloseLogFilter.install();
 		if (client instanceof InternalConnection internalConnection) {
 			this.scheduler = internalConnection.getScheduler();
@@ -434,6 +439,9 @@ public class GrpcServer extends Server {
 		} else {
 			builder.directExecutor();
 		}
+		if (leaderHint != null) {
+			builder.intercept(new LeaderHintInterceptor(leaderHint));
+		}
 		return builder
 				.channelType(channelType)
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
@@ -443,6 +451,55 @@ public class GrpcServer extends Server {
 				.permitKeepAliveTime(5, TimeUnit.SECONDS)
 				.intercept(new AdaptiveCompressionInterceptor())
 				.build();
+	}
+
+	/** Adds the leader's address to the response headers, or to the trailers of a call that sends no headers. */
+	private static final class LeaderHintInterceptor implements ServerInterceptor {
+
+		private static final Metadata.Key<String> KEY = Metadata.Key.of(
+				it.cavallium.rockserver.core.common.LeaderHint.METADATA_KEY, Metadata.ASCII_STRING_MARSHALLER);
+		private final it.cavallium.rockserver.core.common.LeaderHint hint;
+
+		LeaderHintInterceptor(it.cavallium.rockserver.core.common.LeaderHint hint) {
+			this.hint = hint;
+		}
+
+		@Override
+		public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
+				Metadata headers,
+				ServerCallHandler<ReqT, RespT> next) {
+			return next.startCall(new io.grpc.ForwardingServerCall.SimpleForwardingServerCall<>(call) {
+				private volatile boolean headersSent;
+
+				@Override
+				public void sendHeaders(Metadata responseHeaders) {
+					add(responseHeaders);
+					headersSent = true;
+					super.sendHeaders(responseHeaders);
+				}
+
+				@Override
+				public void close(io.grpc.Status status, Metadata trailers) {
+					if (!headersSent) {
+						add(trailers);
+					}
+					super.close(status, trailers);
+				}
+			}, headers);
+		}
+
+		private void add(Metadata metadata) {
+			String address;
+			try {
+				address = hint.leaderApiAddress();
+			} catch (RuntimeException e) {
+				return;
+			}
+			if (address != null) {
+				metadata.discardAll(KEY);
+				metadata.put(KEY, address);
+			}
+		}
 	}
 
 	@Override
