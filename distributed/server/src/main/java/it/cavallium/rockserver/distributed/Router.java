@@ -20,11 +20,15 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.RocksDBRetryException;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
@@ -84,7 +88,7 @@ final class Router {
 	private final NodeMetrics.Series followerReadFallbacks;
 	private final NodeMetrics.Series barrierTime;
 	/** Runs short local commands, each on a virtual thread of its own ({@link NodeThreads#local()}). */
-	private final java.util.concurrent.ExecutorService inline;
+	private final ExecutorService inline;
 
 	Router(NodeConfig config,
 			RockserverStateMachine stateMachine,
@@ -94,7 +98,7 @@ final class Router {
 			ReplicatedWrites writes,
 			UpdateProtocol updates,
 			NodeMetrics metrics,
-			java.util.concurrent.ExecutorService inline) {
+			ExecutorService inline) {
 		this.stateMachine = stateMachine;
 		this.nodeId = config.nodeId();
 		this.followerReads = followerReads;
@@ -255,7 +259,7 @@ final class Router {
 	 */
 	private Flux<Object> scanRawResumable(RequestContext context, RocksDBAPICommandStream.ScanRawResumable command) {
 		String origin = sstTokenOrigin(localCommands.currentTerm());
-		var local = new java.util.HashSet<RawSstToken>();
+		var local = new HashSet<RawSstToken>();
 		for (var token : command.completedSsts()) {
 			if (origin.equals(token.origin())) {
 				local.add(token.untagged());
@@ -279,7 +283,7 @@ final class Router {
 
 	static String sstTokenOrigin(String nodeId, long term) {
 		var origin = new StringBuilder();
-		for (byte b : nodeId.getBytes(java.nio.charset.StandardCharsets.UTF_8)) {
+		for (byte b : nodeId.getBytes(StandardCharsets.UTF_8)) {
 			char c = (char) (b & 0xFF);
 			if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_'
 					|| c == '-') {
@@ -317,7 +321,7 @@ final class Router {
 	 */
 	static CompletableFuture<?> iteratorCall(CompletableFuture<?> call, long iteratorId) {
 		return call.exceptionallyCompose(error -> CompletableFuture.failedFuture(
-				isUnknownIterator(unwrap(error), iteratorId) ? new it.cavallium.rockserver.core.common.RocksDBRetryException()
+				isUnknownIterator(unwrap(error), iteratorId) ? new RocksDBRetryException()
 						: unwrap(error)));
 	}
 

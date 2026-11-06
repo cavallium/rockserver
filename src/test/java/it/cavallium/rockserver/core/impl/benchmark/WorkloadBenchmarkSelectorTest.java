@@ -18,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.EnumMap;
 import java.util.List;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -33,7 +34,7 @@ class WorkloadBenchmarkSelectorTest {
 		var selection = new WorkloadBenchmarkSelector.Selection(value, value, value, value,
 				42L, 4, 100.0d, 10L, List.of(), List.of());
 		var json = WorkloadBenchmarkSelection.toJson(selection);
-		var parsed = org.bson.Document.parse(json);
+		var parsed = Document.parse(json);
 		assertEquals(value, parsed.getString("dataset_fingerprint"));
 		assertEquals(value, parsed.getString("comparison_fingerprint"));
 		assertEquals(value, parsed.getString("build_id"));

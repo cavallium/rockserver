@@ -15,6 +15,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongUnaryOperator;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
@@ -142,7 +143,7 @@ final class ReadBarrier implements Closeable {
 	 *                   once the state machine applied them
 	 */
 	ReadBarrier(RaftServer server, RaftGroupId groupId, AppliedIndex applied, Duration roundTimeout,
-			java.util.function.LongUnaryOperator readyIndex) {
+			LongUnaryOperator readyIndex) {
 		this(server, groupId, applied, roundTimeout, readyIndex, null);
 	}
 
@@ -151,7 +152,7 @@ final class ReadBarrier implements Closeable {
 	 *                 threads). A given one is not shut down by {@link #close}
 	 */
 	ReadBarrier(RaftServer server, RaftGroupId groupId, AppliedIndex applied, Duration roundTimeout,
-			java.util.function.LongUnaryOperator readyIndex, @Nullable ExecutorService executor) {
+			LongUnaryOperator readyIndex, @Nullable ExecutorService executor) {
 		this.ownsExecutor = executor == null;
 		this.executor = executor != null ? executor : Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
 				.name("rockserver-read-barrier-", 0)
@@ -163,7 +164,7 @@ final class ReadBarrier implements Closeable {
 		this.readyIndex = readyIndex;
 	}
 
-	private final java.util.function.LongUnaryOperator readyIndex;
+	private final LongUnaryOperator readyIndex;
 
 	/**
 	 * Completes when every write committed before this call is visible in the local database and this node was

@@ -16,6 +16,7 @@ import net.jqwik.api.Combinators;
 import net.jqwik.api.ForAll;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
+import net.jqwik.api.Tuple;
 
 /**
  * Property-based check of {@link ConflictTracker} against a reference model of the log (jqwik: failures shrink to a
@@ -65,11 +66,11 @@ class ConflictTrackerPropertyTest {
 		Arbitrary<Step> prune = Arbitraries.integers().between(0, 6).map(Prune::new);
 		var step = faults
 				? Arbitraries.frequencyOf(
-						net.jqwik.api.Tuple.of(4, register), net.jqwik.api.Tuple.of(4, apply),
-						net.jqwik.api.Tuple.of(4, check), net.jqwik.api.Tuple.of(1, prune))
+						Tuple.of(4, register), Tuple.of(4, apply),
+						Tuple.of(4, check), Tuple.of(1, prune))
 				: Arbitraries.frequencyOf(
-						net.jqwik.api.Tuple.of(4, register), net.jqwik.api.Tuple.of(4, apply),
-						net.jqwik.api.Tuple.of(4, check));
+						Tuple.of(4, register), Tuple.of(4, apply),
+						Tuple.of(4, check));
 		return step.list().ofMinSize(1).ofMaxSize(80);
 	}
 

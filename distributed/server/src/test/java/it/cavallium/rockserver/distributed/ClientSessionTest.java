@@ -8,6 +8,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ClientRequestId;
+import it.cavallium.rockserver.core.common.KV;
+import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
@@ -30,9 +32,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongFunction;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -178,7 +183,7 @@ class ClientSessionTest {
 		api.mergeAsync(tx, column, key(3), text("t"), RequestType.none()).join();
 		var staged = connection.getAsyncApi(context.withRequestId(new ClientRequestId(session, 0, 0)))
 				.mergeAsync(tx, column, key(3), text("again"), RequestType.none());
-		var refused = assertThrows(java.util.concurrent.CompletionException.class, staged::join);
+		var refused = assertThrows(CompletionException.class, staged::join);
 		assertEquals(RocksDBErrorType.INVALID_REQUEST, ((RocksDBException) refused.getCause()).getErrorUniqueId());
 
 		cluster.awaitConverged(TIMEOUT);
@@ -191,7 +196,7 @@ class ClientSessionTest {
 			var followers = cluster.runningNodes().stream().filter(node -> node != leader).toList();
 			InProcessCluster.await(TIMEOUT, () -> followers.stream().allMatch(node ->
 					"t".equals(localValue(node, column, 3))));
-			var second = assertThrows(java.util.concurrent.CompletionException.class,
+			var second = assertThrows(CompletionException.class,
 					() -> numbered.closeTransactionAsync(tx, true).join());
 			assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, ((RocksDBException) second.getCause()).getErrorUniqueId());
 			assertTrue(connection.outcomes.unsettledCommitsForTesting() == 1);
@@ -207,7 +212,7 @@ class ClientSessionTest {
 
 		var never = connection.getAsyncApi(context.withRequestId(new ClientRequestId(session, 2, 2)))
 				.closeTransactionAsync(123_456, true);
-		var retry = assertThrows(java.util.concurrent.CompletionException.class, never::join);
+		var retry = assertThrows(CompletionException.class, never::join);
 		assertInstanceOf(RocksDBRetryException.class, retry.getCause());
 	}
 	private static KVBatch kv(long firstKey, String... values) {
@@ -226,7 +231,7 @@ class ClientSessionTest {
 
 	private static String[] boundaryValues(char fill, int count) {
 		var values = new String[count];
-		java.util.Arrays.fill(values, String.valueOf(fill).repeat(BOUNDARY_VALUE_BYTES));
+		Arrays.fill(values, String.valueOf(fill).repeat(BOUNDARY_VALUE_BYTES));
 		return values;
 	}
 
@@ -234,13 +239,13 @@ class ClientSessionTest {
 	private static long newestSession(ReplicatedNode node) {
 		var store = node.stateMachine().store();
 		try (var sessions = store.db().getRange(0L, store.metaColumnId(), NodeStore.sessionKey(0),
-				NodeStore.sessionKey(Long.MAX_VALUE), false, RequestType.<it.cavallium.rockserver.core.common.KV>allInRange())) {
+				NodeStore.sessionKey(Long.MAX_VALUE), false, RequestType.<KV>allInRange())) {
 			return sessions.mapToLong(kv -> NodeStore.sessionId(kv.keys())).max().orElseThrow();
 		}
 	}
 
-	private static RocksDBErrorType errorOf(java.util.concurrent.CompletableFuture<?> future) {
-		var error = assertThrows(java.util.concurrent.CompletionException.class, future::join);
+	private static RocksDBErrorType errorOf(CompletableFuture<?> future) {
+		var error = assertThrows(CompletionException.class, future::join);
 		return ((RocksDBException) error.getCause()).getErrorUniqueId();
 	}
 
@@ -259,7 +264,7 @@ class ClientSessionTest {
 		var api = connection.getAsyncApi(context);
 		long session = connection.openClientSessionAsync(context).join();
 		long column = api.createColumnAsync("c", SCHEMA).join();
-		java.util.function.LongFunction<it.cavallium.rockserver.core.common.RocksDBAsyncAPI> numbered = sequence ->
+		LongFunction<RocksDBAsyncAPI> numbered = sequence ->
 				connection.getAsyncApi(context.withRequestId(new ClientRequestId(session, sequence, 0)));
 
 		// A merge batch chunk sent twice is merged once.

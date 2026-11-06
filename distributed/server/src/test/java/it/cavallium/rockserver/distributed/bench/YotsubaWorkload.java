@@ -20,8 +20,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Operations shaped after what production Yotsuba sends to Rockserver (Grafana, 7 days to 2026-10-30, per second:
@@ -109,8 +111,8 @@ final class YotsubaWorkload {
 
 	/** Writes the initial messages, {@code batch} keys per putMulti, with {@code parallelism} batches in flight. */
 	void preload(RocksDBAsyncAPI api, int batch, int parallelism) {
-		var inFlight = new java.util.concurrent.Semaphore(parallelism);
-		var failures = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+		var inFlight = new Semaphore(parallelism);
+		var failures = new AtomicReference<Throwable>();
 		var keys = new ArrayList<Keys>(batch);
 		var values = new ArrayList<Buf>(batch);
 		for (int chat = 0; chat < chats; chat++) {
@@ -134,7 +136,7 @@ final class YotsubaWorkload {
 	}
 
 	private void submitPreload(RocksDBAsyncAPI api, List<Keys> keys, List<Buf> values,
-			java.util.concurrent.Semaphore inFlight, java.util.concurrent.atomic.AtomicReference<Throwable> failures) {
+			Semaphore inFlight, AtomicReference<Throwable> failures) {
 		inFlight.acquireUninterruptibly();
 		api.putMultiAsync(0, messages, keys, values, RequestType.none()).whenComplete((_, error) -> {
 			if (error != null) {

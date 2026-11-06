@@ -1,18 +1,48 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.config.ConfigParser;
+import it.cavallium.rockserver.core.impl.ColumnInstance;
+import it.cavallium.rockserver.core.impl.CompactionIoBudget;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.impl.RocksDBLongProperty;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
+import it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongUnaryOperator;
+import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.DBOptions;
+import org.rocksdb.FlushOptions;
+import org.rocksdb.HistogramType;
+import org.rocksdb.RateLimiter;
+import org.rocksdb.RateLimiterMode;
+import org.rocksdb.TickerType;
 import org.slf4j.LoggerFactory;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -34,7 +64,7 @@ class CompactionIoIntegrationTest {
         var key = new Keys(new Buf[]{Buf.wrap(new byte[]{1})});
         var value = Buf.wrap(new byte[]{2, 3});
         try (var connection = new EmbeddedConnection(dbPath, "adaptive-workflow", cfg)) {
-            var api = connection.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)));
+            var api = connection.getSyncApi(RequestContext.latency(Duration.ofSeconds(10)));
             var col = connection.getSyncApi(RequestContext.batch()).createColumn("data", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
             for (int i = 0; i < 3; i++) {
                 api.put(0, col, key, value, RequestType.none());
@@ -53,18 +83,18 @@ class CompactionIoIntegrationTest {
             var controller = (AutoCloseable) controllerField.get(internal); controller.close();
             var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
             var optionsField = internal.getClass().getDeclaredField("dbOptions"); optionsField.setAccessible(true);
-            var sampler = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            var sampler = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", RateLimiter.class);
             sampler.setAccessible(true);
-            try (var statistics = ((org.rocksdb.DBOptions) optionsField.get(internal)).statistics()) {
-                var bytes = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES);
-                var time = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_MICROS);
+            try (var statistics = ((DBOptions) optionsField.get(internal)).statistics()) {
+                var bytes = statistics.getHistogramData(HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES);
+                var time = statistics.getHistogramData(HistogramType.FILE_READ_COMPACTION_COMPLETED_MICROS);
                 assertTrue(bytes.getCount() > 0, "manual compaction must exercise actual synchronous filesystem reads");
                 assertEquals(bytes.getCount(), time.getCount());
                 var completion = statistics.getCompactionReadCompletion();
                 assertArrayEquals(new long[]{bytes.getCount(), bytes.getSum(), time.getSum()}, completion,
                         "atomic JNI population must retain the exported histogram cohort");
                 for (int i = 0; i < 2; i++) {
-                    var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
+                    var sample = (CompactionIoBudget.Sample)
                             sampler.invoke(part(internal, "storageMetrics"), limiterField.get(controller));
                     assertTrue(sample.valid());
                     assertEquals(bytes.getSum(), sample.compactionReadBytes());
@@ -72,12 +102,12 @@ class CompactionIoIntegrationTest {
                     assertEquals(time.getCount(), sample.compactionReadCount());
                 }
                 assertEquals(bytes.getSum(), statistics.getHistogramData(
-                        org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES).getSum(),
+                        HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES).getSum(),
                         "sampling must retain cumulative completion statistics");
                 statistics.reset();
                 assertArrayEquals(new long[]{0, 0, 0}, statistics.getCompactionReadCompletion(),
                         "native reset must clear the atomic completion population");
-                var resetSample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
+                var resetSample = (CompactionIoBudget.Sample)
                         sampler.invoke(part(internal, "storageMetrics"), limiterField.get(controller));
                 assertEquals(0, resetSample.compactionReadCount());
                 assertEquals(0, resetSample.compactionReadBytes());
@@ -85,7 +115,7 @@ class CompactionIoIntegrationTest {
             }
         }
         try (var connection = new EmbeddedConnection(dbPath, "adaptive-reopen", cfg)) {
-            var api = connection.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)));
+            var api = connection.getSyncApi(RequestContext.latency(Duration.ofSeconds(10)));
             assertEquals(value, api.get(0, api.getColumnId("data"), key, RequestType.current()));
         }
     }
@@ -97,10 +127,10 @@ class CompactionIoIntegrationTest {
             var controller = (AutoCloseable) controllerField.get(internal);
             controller.close();
             var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
-            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
-            var sampler = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            var limiter = (RateLimiter) limiterField.get(controller);
+            var sampler = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", RateLimiter.class);
             sampler.setAccessible(true);
-            var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampler.invoke(part(internal, "storageMetrics"), limiter);
+            var sample = (CompactionIoBudget.Sample) sampler.invoke(part(internal, "storageMetrics"), limiter);
             assertTrue(sample.valid());
             assertEquals(-1, sample.readFailures(),
                     "selected-group queue depth and summed completions cannot qualify queue-only benefit");
@@ -115,19 +145,19 @@ class CompactionIoIntegrationTest {
             var controller = (AutoCloseable) controllerField.get(internal);
             controller.close(); // Serialize the sampler so the policy thread cannot drain these test observations.
             var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
-            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
-            var sampler = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            var limiter = (RateLimiter) limiterField.get(controller);
+            var sampler = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", RateLimiter.class);
             sampler.setAccessible(true);
-            var api = connection.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)));
+            var api = connection.getSyncApi(RequestContext.latency(Duration.ofSeconds(10)));
             var col = connection.getSyncApi(RequestContext.batch()).createColumn("data", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
             var key = new Keys(Buf.wrap(new byte[]{1}));
             var value = Buf.wrap(new byte[]{2});
             api.put(0, col, key, value, RequestType.none());
-            var before = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampler.invoke(part(internal, "storageMetrics"), limiter);
+            var before = (CompactionIoBudget.Sample) sampler.invoke(part(internal, "storageMetrics"), limiter);
             for (int cycle = 0; cycle < 2; cycle++) {
                 assertEquals(value, api.get(0, col, key, RequestType.current()));
-                assertEquals(java.util.List.of(true), api.existsMulti(0, col, java.util.List.of(key)));
-                var observed = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampler.invoke(part(internal, "storageMetrics"), limiter);
+                assertEquals(List.of(true), api.existsMulti(0, col, List.of(key)));
+                var observed = (CompactionIoBudget.Sample) sampler.invoke(part(internal, "storageMetrics"), limiter);
                 assertEquals(1, observed.nativePointCompletions() - before.nativePointCompletions());
                 long pointElapsed = observed.nativePointReadNanos() - before.nativePointReadNanos();
                 assertTrue(pointElapsed > 0);
@@ -137,7 +167,7 @@ class CompactionIoIntegrationTest {
                 assertEquals(1, observed.nativeBulkKeys() - before.nativeBulkKeys());
                 assertTrue(observed.pointTailMicros() > 0);
                 assertTrue(observed.bulkTailMicros() > 0);
-                var drained = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampler.invoke(part(internal, "storageMetrics"), limiter);
+                var drained = (CompactionIoBudget.Sample) sampler.invoke(part(internal, "storageMetrics"), limiter);
                 assertEquals(0, drained.pointTailMicros());
                 assertEquals(0, drained.bulkTailMicros());
                 assertEquals(observed.nativePointCompletions(), drained.nativePointCompletions());
@@ -152,7 +182,7 @@ class CompactionIoIntegrationTest {
     private long persistedReadahead(Path dbPath) throws Exception {
         try (var files = Files.list(dbPath)) {
             var latest = files.filter(p -> p.getFileName().toString().startsWith("OPTIONS-"))
-                    .max(java.util.Comparator.comparingLong(p -> Long.parseLong(p.getFileName().toString().substring(8))))
+                    .max(Comparator.comparingLong(p -> Long.parseLong(p.getFileName().toString().substring(8))))
                     .orElseThrow();
             var line = Files.readAllLines(latest).stream().map(String::strip)
                     .filter(l -> l.startsWith("compaction_readahead_size=")).findFirst().orElseThrow();
@@ -165,14 +195,14 @@ class CompactionIoIntegrationTest {
         var lastKey = new Keys(Buf.wrap(new byte[]{15, (byte) 255}));
         Buf lastValue = null;
         var dbPath = root.resolve("live-readahead");
-        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        var registry = new SimpleMeterRegistry();
         try (var connection = new EmbeddedConnection(dbPath, "live-readahead", cfg)) {
             var internal = connection.getInternalDB();
-            ((io.micrometer.core.instrument.composite.CompositeMeterRegistry) internal.getMetricsRegistry()).add(registry);
+            ((CompositeMeterRegistry) internal.getMetricsRegistry()).add(registry);
             var dbField = internal.getClass().getDeclaredField("db"); dbField.setAccessible(true);
-            var nativeDb = ((it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB) dbField.get(internal)).get();
+            var nativeDb = ((TransactionalDB) dbField.get(internal)).get();
             var optionsField = internal.getClass().getDeclaredField("dbOptions"); optionsField.setAccessible(true);
-            var options = (org.rocksdb.DBOptions) optionsField.get(internal);
+            var options = (DBOptions) optionsField.get(internal);
             assertTrue(options.useDirectReads());
             assertFalse(options.allowMmapReads());
             var apply = part(internal, "storageMetrics").getClass().getDeclaredMethod("applyCompactionReadahead", long.class);
@@ -181,14 +211,14 @@ class CompactionIoIntegrationTest {
             int jobs = options.maxBackgroundJobs();
             long walLimit = options.maxTotalWalSize();
             try (var statistics = options.statistics()) {
-                long before = statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES).getCount();
+                long before = statistics.getHistogramData(HistogramType.COMPACTION_PREFETCH_BYTES).getCount();
                 assertEquals(1L << 20, apply.invoke(part(internal, "storageMetrics"), 1L << 20));
                 assertEquals(1L << 20, persistedReadahead(dbPath));
                 assertEquals(walLimit, options.maxTotalWalSize());
                 assertEquals(jobs, options.maxBackgroundJobs());
                 var api = connection.getSyncApi(RequestContext.batch());
                 var column = api.createColumn("prefetch-data", ColumnSchema.of(IntList.of(2), ObjectList.of(), true));
-                var random = new java.util.Random(7);
+                var random = new Random(7);
                 for (int i = 0; i < 4096; i++) {
                     var data = new byte[1024]; random.nextBytes(data);
                     var value = Buf.wrap(data);
@@ -197,7 +227,7 @@ class CompactionIoIntegrationTest {
                     if ((i + 1) % 1024 == 0) api.flush();
                 }
                 api.compact();
-                assertTrue(statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES).getCount() > before,
+                assertTrue(statistics.getHistogramData(HistogramType.COMPACTION_PREFETCH_BYTES).getCount() > before,
                         "a new direct compaction must use the changed prefetch option");
                 assertEquals(lastValue, api.get(0, column, lastKey, RequestType.current()));
                 var collectorField = internal.getClass().getDeclaredField("rocksDBStatistics"); collectorField.setAccessible(true);
@@ -206,28 +236,28 @@ class CompactionIoIntegrationTest {
                 var counter = registry.get("rocksdb.statistics").tag("ticker_name", "COMPACT_READ_BYTES").counter();
                 var compactionCount = registry.get("rocksdb.statistics").tag("histogram_name", "COMPACTION_TIME")
                         .tag("field", "count").gauge();
-                long readBytes = statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES);
+                long readBytes = statistics.getTickerCount(TickerType.COMPACT_READ_BYTES);
                 assertTrue(readBytes > 0, "the cumulative contract must cover actual direct compaction bytes");
                 for (int cycle = 0; cycle < 2; cycle++) {
                     collector.interrupt();
-                    assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                    assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
                         while (counter.count() < readBytes || compactionCount.value() == 0) Thread.sleep(10);
                     });
-                    assertEquals(readBytes, statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES));
+                    assertEquals(readBytes, statistics.getTickerCount(TickerType.COMPACT_READ_BYTES));
                     assertEquals(readBytes, counter.count(), "collection must export actual bytes exactly once without resetting them");
                 }
                 statistics.reset(); collector.interrupt();
-                assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
                     while (compactionCount.value() != 0) Thread.sleep(10);
                 });
                 lastValue = Buf.wrap(new byte[2048]);
                 api.put(0, column, lastKey, lastValue, RequestType.none()); api.flush(); api.compact();
-                long freshBytes = statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES);
+                long freshBytes = statistics.getTickerCount(TickerType.COMPACT_READ_BYTES);
                 assertTrue(freshBytes > 0); collector.interrupt();
-                assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
                     while (counter.count() < readBytes + freshBytes) Thread.sleep(10);
                 });
-                assertEquals(freshBytes, statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES));
+                assertEquals(freshBytes, statistics.getTickerCount(TickerType.COMPACT_READ_BYTES));
                 assertEquals(readBytes + freshBytes, counter.count(), "a genuine reset starts a fresh exported epoch");
                 assertEquals(0L, apply.invoke(part(internal, "storageMetrics"), 0L));
                 assertEquals(0, persistedReadahead(dbPath));
@@ -242,10 +272,10 @@ class CompactionIoIntegrationTest {
     @Test void healthyNativeSamplerReadsL0FilesAndPollsWithoutFailures(@TempDir Path root) throws Exception {
         var cfg = config(root, "database.metrics.jmx.enabled=false\n"
                 + "database.metrics.influx.enabled=false\n");
-        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        var registry = new SimpleMeterRegistry();
         try (var connection = new EmbeddedConnection(root.resolve("db"), "healthy-native-sampler", cfg)) {
             var internal = connection.getInternalDB();
-            ((io.micrometer.core.instrument.composite.CompositeMeterRegistry) internal.getMetricsRegistry()).add(registry);
+            ((CompositeMeterRegistry) internal.getMetricsRegistry()).add(registry);
             var api = connection.getSyncApi(RequestContext.batch());
             var column = api.createColumn("sampler-data", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
             var controllerField = internal.getClass().getDeclaredField("compactionIoController");
@@ -253,10 +283,10 @@ class CompactionIoIntegrationTest {
             var controller = controllerField.get(internal);
             var limiterField = controller.getClass().getDeclaredField("limiter");
             limiterField.setAccessible(true);
-            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
-            var sampleMethod = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            var limiter = (RateLimiter) limiterField.get(controller);
+            var sampleMethod = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", RateLimiter.class);
             sampleMethod.setAccessible(true);
-            var empty = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
+            var empty = (CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
             assertTrue(empty.valid());
             assertFalse(empty.pressure());
             assertTrue(empty.recoveryClear());
@@ -265,40 +295,40 @@ class CompactionIoIntegrationTest {
             api.flush();
             var dbField = internal.getClass().getDeclaredField("db");
             dbField.setAccessible(true);
-            var nativeDb = ((it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB) dbField.get(internal)).get();
+            var nativeDb = ((TransactionalDB) dbField.get(internal)).get();
             var columnsField = internal.getClass().getDeclaredField("columns");
             columnsField.setAccessible(true);
-            var registeredColumn = (it.cavallium.rockserver.core.impl.ColumnInstance)
-                    ((java.util.Map<?, ?>) columnsField.get(internal)).get(column);
+            var registeredColumn = (ColumnInstance)
+                    ((Map<?, ?>) columnsField.get(internal)).get(column);
             var handle = registeredColumn.cfh();
             long levelZeroFiles = Long.parseUnsignedLong(nativeDb.getProperty(handle, "rocksdb.num-files-at-level0"));
             assertTrue(levelZeroFiles > 0, "the regression must sample a real flushed L0 SST");
             var perColumnProperty = part(internal, "storageMetrics").getClass().getDeclaredMethod("getPerCfLongProperty", String.class);
             perColumnProperty.setAccessible(true);
-            var counts = (java.util.Map<?, ?>) perColumnProperty.invoke(part(internal, "storageMetrics"), "rocksdb.num-files-at-level0");
+            var counts = (Map<?, ?>) perColumnProperty.invoke(part(internal, "storageMetrics"), "rocksdb.num-files-at-level0");
             assertEquals(Long.valueOf(levelZeroFiles), counts.get("sampler-data"));
             var aggregateProperty = part(internal, "storageMetrics").getClass().getDeclaredMethod("getLongProperty", String.class,
-                    it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode.class);
+                    RocksDBLongProperty.AggregationMode.class);
             aggregateProperty.setAccessible(true);
-            assertEquals(java.math.BigInteger.valueOf(levelZeroFiles), aggregateProperty.invoke(part(internal, "storageMetrics"),
-                    "rocksdb.num-files-at-level0", it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode.PER_CF));
+            assertEquals(BigInteger.valueOf(levelZeroFiles), aggregateProperty.invoke(part(internal, "storageMetrics"),
+                    "rocksdb.num-files-at-level0", RocksDBLongProperty.AggregationMode.PER_CF));
             assertThrows(org.rocksdb.RocksDBException.class,
                     () -> nativeDb.getLongProperty(handle, "rocksdb.num-files-at-level0"),
                     "the native registry exposes this count only through the string-property API");
-            assertEquals(Long.valueOf(0), ((java.util.Map<?, ?>) perColumnProperty.invoke(part(internal, "storageMetrics"),
+            assertEquals(Long.valueOf(0), ((Map<?, ?>) perColumnProperty.invoke(part(internal, "storageMetrics"),
                     "rocksdb.num-files-at-level1")).get("sampler-data"));
-            assertTrue(((java.util.Map<?, ?>) perColumnProperty.invoke(part(internal, "storageMetrics"), "rocksdb.num-files-at-level9")).isEmpty());
+            assertTrue(((Map<?, ?>) perColumnProperty.invoke(part(internal, "storageMetrics"), "rocksdb.num-files-at-level9")).isEmpty());
             // Isolate the cached CF trigger from DB-wide delay using the real flushed L0 count.
             assertEquals(0, nativeDb.getLongProperty("rocksdb.actual-delayed-write-rate"));
             var configuredColumnsField = internal.getClass().getDeclaredField("columnsConifg");
             configuredColumnsField.setAccessible(true);
-            var columnOptions = (org.rocksdb.ColumnFamilyOptions)
-                    ((java.util.Map<?, ?>) configuredColumnsField.get(internal)).get("sampler-data");
+            var columnOptions = (ColumnFamilyOptions)
+                    ((Map<?, ?>) configuredColumnsField.get(internal)).get("sampler-data");
             var pressureColumnsField = internal.getClass().getDeclaredField("storagePressureColumns");
             pressureColumnsField.setAccessible(true);
             var originalPressureColumns = (Object[]) pressureColumnsField.get(internal);
             var cachePressureColumn = part(internal, "storageMetrics").getClass().getDeclaredMethod("storagePressureColumn", String.class,
-                    org.rocksdb.ColumnFamilyHandle.class);
+                    ColumnFamilyHandle.class);
             cachePressureColumn.setAccessible(true);
             int originalSlowdown = columnOptions.level0SlowdownWritesTrigger();
             try {
@@ -317,12 +347,12 @@ class CompactionIoIntegrationTest {
                     var cachedHandle = configured.getClass().getDeclaredMethod("handle");
                     cachedHandle.setAccessible(true);
                     for (int index = 0; index < snapshot.length; index++) {
-                        if (((org.rocksdb.ColumnFamilyHandle) cachedHandle.invoke(snapshot[index])).getID() == handle.getID()) {
+                        if (((ColumnFamilyHandle) cachedHandle.invoke(snapshot[index])).getID() == handle.getID()) {
                             snapshot[index] = configured;
                         }
                     }
                     pressureColumnsField.set(internal, snapshot);
-                    var classified = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
+                    var classified = (CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
                     assertEquals(trigger >= 0 && levelZeroFiles >= trigger, classified.urgentPressure());
                     assertEquals(classified.urgentPressure(), classified.pressure());
                     assertEquals(!classified.urgentPressure(), classified.recoveryClear());
@@ -331,14 +361,14 @@ class CompactionIoIntegrationTest {
                 pressureColumnsField.set(internal, originalPressureColumns);
                 columnOptions.setLevel0SlowdownWritesTrigger(originalSlowdown);
             }
-            var flushed = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
+            var flushed = (CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
             assertTrue(flushed.valid());
             assertFalse(flushed.pressure());
             assertTrue(flushed.recoveryClear());
             var polls = new CountDownLatch(2);
             internal.setCompactionIoSampleObserverForTesting(polls::countDown);
             assertTrue(polls.await(5, TimeUnit.SECONDS));
-            assertTimeoutPreemptively(java.time.Duration.ofSeconds(2), () -> {
+            assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
                 while (internal.getPendingOpsCount() != 0) Thread.sleep(10);
             });
             assertEquals(0, registry.get("rockserver.compaction.io.adjustment.failures").gauge().value());
@@ -357,39 +387,39 @@ class CompactionIoIntegrationTest {
             api.put(0, column, new Keys(Buf.wrap(new byte[]{1})), Buf.wrap(new byte[]{2}), RequestType.none());
             assertNotNull(api.get(0, column, new Keys(Buf.wrap(new byte[]{1})), RequestType.current()));
             collectorThread.interrupt();
-            assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+            assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
                 while (readCounter.count() <= initialReadExport || writeCounter.count() <= initialWriteExport) Thread.sleep(10);
             });
-            assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+            assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
                 while (registry.find("rocksdb.property.long").tag("property_name", "rocksdb.num-files-at-level0")
                         .tag("column_family", "sampler-data").gauge() == null) Thread.sleep(10);
             });
             assertEquals(levelZeroFiles, registry.get("rocksdb.property.long")
                     .tag("property_name", "rocksdb.num-files-at-level0").tag("column_family", "sampler-data").gauge().value());
-            try (var nativeStatistics = ((org.rocksdb.DBOptions) optionsField.get(internal)).statistics()) {
-                long previousReads = nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ);
-                long previousWrites = nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN);
+            try (var nativeStatistics = ((DBOptions) optionsField.get(internal)).statistics()) {
+                long previousReads = nativeStatistics.getTickerCount(TickerType.NUMBER_KEYS_READ);
+                long previousWrites = nativeStatistics.getTickerCount(TickerType.NUMBER_KEYS_WRITTEN);
                 double previousReadExport = readCounter.count();
                 double previousWriteExport = writeCounter.count();
-                long previousCompletions = ((it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
+                long previousCompletions = ((CompactionIoBudget.Sample)
                         sampleMethod.invoke(part(internal, "storageMetrics"), limiter)).foregroundCompletions();
                 for (int cycle = 0; cycle < 5; cycle++) {
                     if (cycle == 3) nativeStatistics.reset();
                     api.put(0, column, new Keys(Buf.wrap(new byte[]{1})), Buf.wrap(new byte[]{2}), RequestType.none());
                     assertNotNull(api.get(0, column, new Keys(Buf.wrap(new byte[]{1})), RequestType.current()));
-                    long reads = nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ);
-                    long writes = nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN);
+                    long reads = nativeStatistics.getTickerCount(TickerType.NUMBER_KEYS_READ);
+                    long writes = nativeStatistics.getTickerCount(TickerType.NUMBER_KEYS_WRITTEN);
                     double expectedReadExport = previousReadExport + (cycle == 3 ? reads : reads - previousReads);
                     double expectedWriteExport = previousWriteExport + (cycle == 3 ? writes : writes - previousWrites);
                     collectorThread.interrupt();
-                    assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                    assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
                         while (readCounter.count() < expectedReadExport || writeCounter.count() < expectedWriteExport) Thread.sleep(10);
                     });
                     assertEquals(expectedReadExport, readCounter.count(), "each native read must be exported once");
                     assertEquals(expectedWriteExport, writeCounter.count(), "each native write must be exported once");
-                    assertEquals(reads, nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ));
-                    assertEquals(writes, nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN));
-                    var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
+                    assertEquals(reads, nativeStatistics.getTickerCount(TickerType.NUMBER_KEYS_READ));
+                    assertEquals(writes, nativeStatistics.getTickerCount(TickerType.NUMBER_KEYS_WRITTEN));
+                    var sample = (CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
                     assertTrue(sample.valid());
                     assertEquals(reads + writes, sample.foregroundCompletions());
                     if (cycle != 3) assertTrue(sample.foregroundCompletions() > previousCompletions);
@@ -426,70 +456,70 @@ class CompactionIoIntegrationTest {
             close.get(10, TimeUnit.SECONDS);
         } finally { release.countDown(); connection.close(); }
         try (var reopened = new EmbeddedConnection(root.resolve("db"), "adaptive-close-reopen", config(root, ""))) {
-            assertNotNull(reopened.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10))));
+            assertNotNull(reopened.getSyncApi(RequestContext.latency(Duration.ofSeconds(10))));
         }
     }
     @Test void realBulkSamplerAndCollectorPreserveIndependentKeys(@TempDir Path root) throws Exception {
-        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        var registry = new SimpleMeterRegistry();
         try (var connection = new EmbeddedConnection(root.resolve("bulk-feedback"), "bulk-feedback", config(root, ""))) {
             var internal = connection.getInternalDB();
-            ((io.micrometer.core.instrument.composite.CompositeMeterRegistry) internal.getMetricsRegistry()).add(registry);
-            var api = connection.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)));
+            ((CompositeMeterRegistry) internal.getMetricsRegistry()).add(registry);
+            var api = connection.getSyncApi(RequestContext.latency(Duration.ofSeconds(10)));
             var column = connection.getSyncApi(RequestContext.batch()).createColumn("bulk-data",
                     ColumnSchema.of(IntList.of(2), ObjectList.of(), true));
-            var keys = new java.util.ArrayList<Keys>();
+            var keys = new ArrayList<Keys>();
             for (int i = 0; i < 72; i++) {
                 var key = new Keys(Buf.wrap(new byte[]{0, (byte) i})); keys.add(key);
                 api.put(0, column, key, Buf.wrap(new byte[]{(byte) i}), RequestType.none());
             }
             connection.getSyncApi(RequestContext.batch()).flush();
             for (int i = 0; i < 64; i++) assertTrue(api.existsMulti(0, column, keys).stream().allMatch(Boolean::booleanValue));
-            connection.getAsyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)))
+            connection.getAsyncApi(RequestContext.latency(Duration.ofSeconds(10)))
                     .getAsync(0, column, keys.getFirst(), RequestType.current()).get(5, TimeUnit.SECONDS);
             var schedulerField = internal.getClass().getDeclaredField("scheduler"); schedulerField.setAccessible(true);
-            var scheduler = (it.cavallium.rockserver.core.impl.RWScheduler) schedulerField.get(internal);
-            assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
-                while (scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ).outstandingTasks() != 0)
+            var scheduler = (RWScheduler) schedulerField.get(internal);
+            assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
+                while (scheduler.poolSnapshot(RWScheduler.Pool.READ).outstandingTasks() != 0)
                     Thread.sleep(10);
             });
-            var readSnapshot = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ);
+            var readSnapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
             long accepted = readSnapshot.acceptedTasks();
             assertTrue(accepted > 0, "the async point read must exercise the real READ arrival counter");
             var optionsField = internal.getClass().getDeclaredField("dbOptions"); optionsField.setAccessible(true);
             var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
             var controller = controllerField.get(internal);
             var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
-            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
-            var sampleMethod = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            var limiter = (RateLimiter) limiterField.get(controller);
+            var sampleMethod = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", RateLimiter.class);
             sampleMethod.setAccessible(true);
             var collectorField = internal.getClass().getDeclaredField("rocksDBStatistics"); collectorField.setAccessible(true);
             var collector = collectorField.get(internal);
             var threadField = collector.getClass().getDeclaredField("executor"); threadField.setAccessible(true);
             var thread = (Thread) threadField.get(collector);
             var counter = registry.get("rocksdb.statistics").tag("ticker_name", "NUMBER_MULTIGET_KEYS_READ").counter();
-            try (var statistics = ((org.rocksdb.DBOptions) optionsField.get(internal)).statistics()) {
-                var histogram = statistics.getHistogramData(org.rocksdb.HistogramType.DB_MULTIGET);
-                long nativeKeys = statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ);
+            try (var statistics = ((DBOptions) optionsField.get(internal)).statistics()) {
+                var histogram = statistics.getHistogramData(HistogramType.DB_MULTIGET);
+                long nativeKeys = statistics.getTickerCount(TickerType.NUMBER_MULTIGET_KEYS_READ);
                 assertEquals(64L * keys.size(), nativeKeys);
-                long nativeFound = statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND);
-                long nativeReturned = statistics.getHistogramData(org.rocksdb.HistogramType.BYTES_PER_MULTIGET).getSum();
+                long nativeFound = statistics.getTickerCount(TickerType.NUMBER_MULTIGET_KEYS_FOUND);
+                long nativeReturned = statistics.getHistogramData(HistogramType.BYTES_PER_MULTIGET).getSum();
                 assertEquals(nativeKeys, nativeFound); assertTrue(nativeReturned > 0);
                 assertTrue(histogram.getCount() >= 64); assertTrue(histogram.getSum() > 0);
                 for (int cycle = 0; cycle < 2; cycle++) {
                     thread.interrupt();
-                    assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                    assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
                         while (counter.count() < nativeKeys) Thread.sleep(10);
                     });
                     assertEquals(nativeKeys, counter.count());
-                    assertEquals(nativeKeys, statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ));
-                    var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
+                    assertEquals(nativeKeys, statistics.getTickerCount(TickerType.NUMBER_MULTIGET_KEYS_READ));
+                    var sample = (CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
                     assertEquals(nativeKeys, sample.bulkKeys()); assertEquals(histogram.getCount(), sample.bulkCount());
                     assertEquals(nativeFound, sample.bulkFoundKeys()); assertEquals(nativeReturned, sample.bulkReturnedBytes());
-                    assertEquals(nativeFound, statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND));
+                    assertEquals(nativeFound, statistics.getTickerCount(TickerType.NUMBER_MULTIGET_KEYS_FOUND));
                     assertTrue(sample.readFailures() >= 0); assertEquals(accepted, sample.readAccepted());
                     assertEquals(readSnapshot.terminalOutcomes(), sample.readTerminalOutcomes());
                     assertEquals(readSnapshot.terminalOutcomes()
-                            - readSnapshot.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.RUN),
+                            - readSnapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN),
                             sample.readNonRunOutcomes());
                     assertTrue(sample.bulkMicros() > 0); assertTrue(sample.readWorkers() > 0);
                     assertEquals(0, sample.latencyReadQueued());
@@ -498,7 +528,7 @@ class CompactionIoIntegrationTest {
             }
             var activeField = internal.getClass().getDeclaredField("activeNativeMultiGets");
             activeField.setAccessible(true);
-            var active = (java.util.concurrent.atomic.AtomicInteger) activeField.get(internal);
+            var active = (AtomicInteger) activeField.get(internal);
             assertEquals(0, active.get());
             internal.setExistsMultiChunkObserverForTesting(() -> { throw new IllegalStateException("after native batch"); });
             try { assertThrows(RuntimeException.class, () -> api.existsMulti(0, column, keys)); }
@@ -518,13 +548,13 @@ class CompactionIoIntegrationTest {
                 try (var connection = new EmbeddedConnection(root.resolve("gate" + direct + ceiling), "direct-gate", cfg)) {
                     var internal = connection.getInternalDB();
                     var optionsField = internal.getClass().getDeclaredField("dbOptions"); optionsField.setAccessible(true);
-                    var options = (org.rocksdb.DBOptions) optionsField.get(internal);
+                    var options = (DBOptions) optionsField.get(internal);
                     assertEquals(direct, options.useDirectReads());
                     assertTrue(options.useDirectIoForFlushAndCompaction(), "generic direct write mode does not establish direct reads");
                     var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
                     var controller = controllerField.get(internal);
                     var budgetField = controller.getClass().getDeclaredField("budget"); budgetField.setAccessible(true);
-                    var ceilingField = it.cavallium.rockserver.core.impl.CompactionIoBudget.class.getDeclaredField("readaheadCeiling");
+                    var ceilingField = CompactionIoBudget.class.getDeclaredField("readaheadCeiling");
                     ceilingField.setAccessible(true);
                     assertEquals(direct && !ceiling.equals("0") ? 16L << 20 : 0,
                             ceilingField.getLong(budgetField.get(controller)));
@@ -533,7 +563,7 @@ class CompactionIoIntegrationTest {
             }
         }
     }
-    private double registryValue(it.cavallium.rockserver.core.impl.EmbeddedDB db, String meter) {
+    private double registryValue(EmbeddedDB db, String meter) {
         return db.getMetricsRegistry().get(meter).gauge().value();
     }
 
@@ -552,29 +582,29 @@ class CompactionIoIntegrationTest {
     }
     @Test void ownedPointMeanGaugePublishesQualifiedWindowsClearsMissingDataAndIsRemovedOnClose() throws Exception {
         RocksDBLoader.loadLibrary();
-        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
-        var pointCalls = new java.util.concurrent.atomic.AtomicInteger(8);
-        var valid = new java.util.concurrent.atomic.AtomicBoolean(true);
-        var fail = new java.util.concurrent.atomic.AtomicBoolean();
+        var registry = new SimpleMeterRegistry();
+        var pointCalls = new AtomicInteger(8);
+        var valid = new AtomicBoolean(true);
+        var fail = new AtomicBoolean();
         long[] totals = {System.nanoTime(), 0, 0, 0};
-        java.util.function.Supplier<it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample> sample = () -> {
+        Supplier<CompactionIoBudget.Sample> sample = () -> {
             if (fail.get()) throw new IllegalStateException("injected mean-gauge sampling failure");
             totals[0] += 1_000_000_000L; totals[1] += pointCalls.get();
             totals[2] += pointCalls.get() * 123000L; totals[3] += 1_000_000L;
-            return new it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample(totals[0], 0, 0, totals[3],
+            return new CompactionIoBudget.Sample(totals[0], 0, 0, totals[3],
                     true, false, false, valid.get(), true, totals[1], true, false,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
                     123, 0, totals[1], 0, 0, totals[2]);
         };
-        try (var limiter = new org.rocksdb.RateLimiter(1_000_000, 100_000,
-                org.rocksdb.RateLimiter.DEFAULT_FAIRNESS, org.rocksdb.RateLimiterMode.ALL_IO, false)) {
+        try (var limiter = new RateLimiter(1_000_000, 100_000,
+                RateLimiter.DEFAULT_FAIRNESS, RateLimiterMode.ALL_IO, false)) {
             var type = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController");
-            var constructor = type.getDeclaredConstructor(String.class, org.rocksdb.RateLimiter.class,
-                    java.util.function.Supplier.class, io.micrometer.core.instrument.MeterRegistry.class,
-                    long.class, java.util.function.LongUnaryOperator.class, boolean.class);
+            var constructor = type.getDeclaredConstructor(String.class, RateLimiter.class,
+                    Supplier.class, MeterRegistry.class,
+                    long.class, LongUnaryOperator.class, boolean.class);
             constructor.setAccessible(true);
             try (var controller = (AutoCloseable) constructor.newInstance("point-mean-gauge", limiter, sample, registry,
-                    0L, (java.util.function.LongUnaryOperator) size -> size, false)) {
+                    0L, (LongUnaryOperator) size -> size, false)) {
                 var executorField = type.getDeclaredField("executor"); executorField.setAccessible(true);
                 var executor = (ScheduledExecutorService) executorField.get(controller);
                 var pollField = type.getDeclaredField("poll"); pollField.setAccessible(true);
@@ -603,27 +633,27 @@ class CompactionIoIntegrationTest {
     }
     @Test void failedSamplerRestoresNativeProbeBudget(@TempDir Path root) throws Exception {
         RocksDBLoader.loadLibrary();
-        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
-        try (var limiter = new org.rocksdb.RateLimiter(1_000_000, 100_000,
-                org.rocksdb.RateLimiter.DEFAULT_FAIRNESS, org.rocksdb.RateLimiterMode.ALL_IO, false)) {
-            var calls = new java.util.concurrent.atomic.AtomicInteger();
-            var reduced = new java.util.concurrent.atomic.AtomicLong();
+        var registry = new SimpleMeterRegistry();
+        try (var limiter = new RateLimiter(1_000_000, 100_000,
+                RateLimiter.DEFAULT_FAIRNESS, RateLimiterMode.ALL_IO, false)) {
+            var calls = new AtomicInteger();
+            var reduced = new AtomicLong();
             var failedTwice = new CountDownLatch(1);
-            java.util.function.Supplier<it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample> sample = () -> {
+            Supplier<CompactionIoBudget.Sample> sample = () -> {
                 int call = calls.incrementAndGet();
                 if (call >= 7) {
                     if (call == 7) reduced.set(limiter.getBytesPerSecond());
                     else failedTwice.countDown();
                     throw new IllegalStateException("injected sampling failure");
                 }
-                return new it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample(call * 1_000_000_000L,
+                return new CompactionIoBudget.Sample(call * 1_000_000_000L,
                         call * 10, call * 1000, call * 1_000_000L, true, false, false, true, true, call * 10, true, false,
                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
                         100, 0, call * 10, 0, 0, call * 1_000_000L);
             };
             var constructor = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
-                    .getDeclaredConstructor(String.class, org.rocksdb.RateLimiter.class,
-                            java.util.function.Supplier.class, io.micrometer.core.instrument.MeterRegistry.class);
+                    .getDeclaredConstructor(String.class, RateLimiter.class,
+                            Supplier.class, MeterRegistry.class);
             constructor.setAccessible(true);
             try (var controller = (AutoCloseable) constructor.newInstance("sample-failure", limiter, sample, registry)) {
                 assertTrue(failedTwice.await(12, TimeUnit.SECONDS));
@@ -634,36 +664,36 @@ class CompactionIoIntegrationTest {
     }
     @Test void closeRestoresUsefulRateBeforeJoinAndAfterLateSamplerAdjustment() throws Exception {
         RocksDBLoader.loadLibrary();
-        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        var registry = new SimpleMeterRegistry();
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
         var restored = new CountDownLatch(1);
         var lateThrottle = new CountDownLatch(1);
-        var restoreSeen = new java.util.concurrent.atomic.AtomicBoolean();
-        try (var limiter = new org.rocksdb.RateLimiter(1_000_000, 100_000,
-                org.rocksdb.RateLimiter.DEFAULT_FAIRNESS, org.rocksdb.RateLimiterMode.ALL_IO, false) {
+        var restoreSeen = new AtomicBoolean();
+        try (var limiter = new RateLimiter(1_000_000, 100_000,
+                RateLimiter.DEFAULT_FAIRNESS, RateLimiterMode.ALL_IO, false) {
             @Override public void setBytesPerSecond(long bytes) {
                 super.setBytesPerSecond(bytes);
                 if (bytes == 1_000_000) { restoreSeen.set(true); restored.countDown(); }
                 else if (restoreSeen.get() && bytes == 750_000) lateThrottle.countDown();
             }
         }; var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-            var calls = new java.util.concurrent.atomic.AtomicInteger();
-            java.util.function.Supplier<it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample> sample = () -> {
+            var calls = new AtomicInteger();
+            Supplier<CompactionIoBudget.Sample> sample = () -> {
                 int call = calls.incrementAndGet();
                 if (call == 7) {
                     entered.countDown();
                     try { assertTrue(release.await(10, TimeUnit.SECONDS)); }
                     catch (InterruptedException failure) { throw new AssertionError(failure); }
                 }
-                return new it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample(call * 1_000_000_000L,
+                return new CompactionIoBudget.Sample(call * 1_000_000_000L,
                         call * 10, call * 1000, call * 1_000_000L, true, false, false, true, true, call * 10, true, false,
                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
                         100, 0, call * 10, 0, 0, call * 1_000_000L);
             };
             var constructor = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
-                    .getDeclaredConstructor(String.class, org.rocksdb.RateLimiter.class,
-                            java.util.function.Supplier.class, io.micrometer.core.instrument.MeterRegistry.class);
+                    .getDeclaredConstructor(String.class, RateLimiter.class,
+                            Supplier.class, MeterRegistry.class);
             constructor.setAccessible(true);
             try (var controller = (AutoCloseable) constructor.newInstance("shutdown-restore", limiter, sample, registry)) {
                 assertTrue(entered.await(12, TimeUnit.SECONDS));
@@ -694,16 +724,16 @@ class CompactionIoIntegrationTest {
             controller.close(); // Keep the native property observations deterministic.
             var limiterField = controller.getClass().getDeclaredField("limiter");
             limiterField.setAccessible(true);
-            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
-            var sampleMethod = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            var limiter = (RateLimiter) limiterField.get(controller);
+            var sampleMethod = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", RateLimiter.class);
             sampleMethod.setAccessible(true);
             var dbField = internal.getClass().getDeclaredField("db");
             dbField.setAccessible(true);
-            var nativeDb = ((it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB) dbField.get(internal)).get();
+            var nativeDb = ((TransactionalDB) dbField.get(internal)).get();
             var columnsField = internal.getClass().getDeclaredField("columns");
             columnsField.setAccessible(true);
-            var column = (it.cavallium.rockserver.core.impl.ColumnInstance)
-                    ((java.util.Map<?, ?>) columnsField.get(internal)).get(columnId);
+            var column = (ColumnInstance)
+                    ((Map<?, ?>) columnsField.get(internal)).get(columnId);
             var handle = column.cfh();
             var snapshotField = internal.getClass().getDeclaredField("storagePressureColumns");
             snapshotField.setAccessible(true);
@@ -714,24 +744,24 @@ class CompactionIoIntegrationTest {
             var cachedHandle = type.getDeclaredMethod("handle");
             maxBuffers.setAccessible(true); mergeBuffers.setAccessible(true); cachedHandle.setAccessible(true);
             var optionsField = internal.getClass().getDeclaredField("columnsConifg"); optionsField.setAccessible(true);
-            var effectiveOptions = (java.util.Map<String, org.rocksdb.ColumnFamilyOptions>) optionsField.get(internal);
+            var effectiveOptions = (Map<String, ColumnFamilyOptions>) optionsField.get(internal);
             for (var cached : original) {
-                var cf = (org.rocksdb.ColumnFamilyHandle) cachedHandle.invoke(cached);
-                var options = effectiveOptions.get(new String(cf.getName(), java.nio.charset.StandardCharsets.UTF_8));
+                var cf = (ColumnFamilyHandle) cachedHandle.invoke(cached);
+                var options = effectiveOptions.get(new String(cf.getName(), StandardCharsets.UTF_8));
                 assertEquals(options.maxWriteBufferNumber(), maxBuffers.invoke(cached),
                         "system and dynamic columns must retain their own effective limits");
                 assertEquals(options.minWriteBufferNumberToMerge(), mergeBuffers.invoke(cached));
             }
             var constructor = type.getDeclaredConstructors()[0]; constructor.setAccessible(true);
             nativeDb.pauseBackgroundWork();
-            try (var flush = new org.rocksdb.FlushOptions().setWaitForFlush(false)) {
+            try (var flush = new FlushOptions().setWaitForFlush(false)) {
                 for (int immutable = 1; immutable <= 3; immutable++) {
                     nativeDb.put(handle, new byte[]{(byte) immutable}, new byte[]{1});
                     nativeDb.flush(flush, handle);
                     assertEquals(immutable, nativeDb.getLongProperty(handle, "rocksdb.num-immutable-mem-table"));
                     assertEquals(0, nativeDb.getLongProperty("rocksdb.is-write-stopped"));
                     assertEquals(0, nativeDb.getLongProperty("rocksdb.actual-delayed-write-rate"));
-                    var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
+                    var sample = (CompactionIoBudget.Sample)
                             sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
                     assertTrue(sample.valid());
                     assertEquals(immutable == 3, sample.urgentPressure());
@@ -741,14 +771,14 @@ class CompactionIoIntegrationTest {
                     for (int[] limits : new int[][]{{4, 2, 0}, {2, 1, 1}, {3, 1, 2}}) {
                         var snapshot = original.clone();
                         for (int index = 0; index < snapshot.length; index++) {
-                            if (((org.rocksdb.ColumnFamilyHandle) cachedHandle.invoke(snapshot[index])).getID() == handle.getID()) {
+                            if (((ColumnFamilyHandle) cachedHandle.invoke(snapshot[index])).getID() == handle.getID()) {
                                 snapshot[index] = constructor.newInstance((long) handle.getID(), handle, column,
                                         Long.MAX_VALUE, -1, limits[0], limits[1]);
                             }
                         }
                         try {
                             snapshotField.set(internal, snapshot);
-                            var boundary = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
+                            var boundary = (CompactionIoBudget.Sample)
                                     sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
                             boolean urgent = limits[2] > 0 && immutable >= limits[2];
                             assertEquals(urgent, boundary.urgentPressure());
@@ -763,21 +793,21 @@ class CompactionIoIntegrationTest {
                 snapshotField.set(internal, original);
                 nativeDb.continueBackgroundWork();
             }
-            try (var flush = new org.rocksdb.FlushOptions().setWaitForFlush(true)) { nativeDb.flush(flush, handle); }
+            try (var flush = new FlushOptions().setWaitForFlush(true)) { nativeDb.flush(flush, handle); }
             assertEquals(0, nativeDb.getLongProperty(handle, "rocksdb.num-immutable-mem-table"));
-            var drained = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
+            var drained = (CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
             assertFalse(drained.urgentPressure()); assertTrue(drained.recoveryClear());
             var system = nativeDb.getDefaultColumnFamily();
             int systemThreshold = Math.max(1, effectiveOptions.get("default").maxWriteBufferNumber() - 1);
             nativeDb.pauseBackgroundWork();
-            try (var flush = new org.rocksdb.FlushOptions().setWaitForFlush(false)) {
+            try (var flush = new FlushOptions().setWaitForFlush(false)) {
                 for (int i = 0; i < systemThreshold; i++) { nativeDb.put(system, new byte[]{(byte) i}, new byte[]{1}); nativeDb.flush(flush, system); }
                 assertEquals(systemThreshold, nativeDb.getLongProperty(system, "rocksdb.num-immutable-mem-table"));
-                var systemSample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
+                var systemSample = (CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
                 assertTrue(systemSample.urgentPressure()); assertFalse(systemSample.recoveryClear());
             } finally { nativeDb.continueBackgroundWork(); }
-            try (var flush = new org.rocksdb.FlushOptions().setWaitForFlush(true)) { nativeDb.flush(flush, system); }
-            var systemDrained = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
+            try (var flush = new FlushOptions().setWaitForFlush(true)) { nativeDb.flush(flush, system); }
+            var systemDrained = (CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
             assertFalse(systemDrained.urgentPressure()); assertTrue(systemDrained.recoveryClear());
         }
     }

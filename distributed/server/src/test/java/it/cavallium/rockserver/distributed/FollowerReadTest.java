@@ -21,7 +21,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -32,6 +34,8 @@ import io.grpc.stub.MetadataUtils;
 import it.cavallium.rockserver.core.common.LeaderHint;
 import it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
+import org.apache.ratis.protocol.ClientId;
+import org.apache.ratis.protocol.TransferLeadershipRequest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -234,12 +238,12 @@ class FollowerReadTest {
 		var applyThread = follower.config().nodeId() + "-apply";
 		InProcessCluster.await(TIMEOUT, () -> Thread.getAllStackTraces().entrySet().stream()
 				.anyMatch(e -> e.getKey().getName().equals(applyThread) && e.getKey().getState() == Thread.State.WAITING
-						&& java.util.Arrays.stream(e.getValue()).anyMatch(f -> f.getMethodName().equals("applyGroup"))));
+						&& Arrays.stream(e.getValue()).anyMatch(f -> f.getMethodName().equals("applyGroup"))));
 		// Queued behind it: v2, of term T. The read index of the follower's read is at least its index, of term T.
 		api(leader).put(0, column, key(1), text("v2"), RequestType.none());
 		long servedBefore = routing(follower).followerReadsServedForTesting();
 		long forwardedBefore = routing(follower).followerReadsForwardedForTesting();
-		var read = java.util.concurrent.CompletableFuture.supplyAsync(() -> get(follower, column, 1));
+		var read = CompletableFuture.supplyAsync(() -> get(follower, column, 1));
 		// The read index arrives and the read waits for the apply.
 		Thread.sleep(300);
 		assertFalse(read.isDone());
@@ -247,7 +251,7 @@ class FollowerReadTest {
 
 		// A new leader in term T+1, on the third node; its first entries reach the follower's log, behind v2.
 		var transfer = leader.stateMachine().division().getRaftServer().transferLeadershipAsync(
-				new org.apache.ratis.protocol.TransferLeadershipRequest(org.apache.ratis.protocol.ClientId.randomId(),
+				new TransferLeadershipRequest(ClientId.randomId(),
 						leader.stateMachine().division().getId(), leader.stateMachine().division().getGroup().getGroupId(),
 						1, successor.stateMachine().division().getId(), 10_000));
 		assertTrue(transfer.get(30, TimeUnit.SECONDS).isSuccess());
@@ -316,7 +320,7 @@ class FollowerReadTest {
 
 			// A read that starts after that one ended must see the write too, on the leader as well: it waits for its own
 			// apply of the commit index instead of answering "old" at once.
-			var onLeader = new java.util.concurrent.CompletableFuture<String>();
+			var onLeader = new CompletableFuture<String>();
 			Thread.ofVirtual().start(() -> {
 				try {
 					onLeader.complete(get(leader, column, 1));
@@ -329,7 +333,7 @@ class FollowerReadTest {
 				assertEquals("new", onLeader.join(), "the leader answered while its apply was held");
 			}
 			gate.countDown();
-			assertEquals("new", onLeader.get(TIMEOUT.toSeconds(), java.util.concurrent.TimeUnit.SECONDS));
+			assertEquals("new", onLeader.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
 			write.join();
 		} finally {
 			gate.countDown();

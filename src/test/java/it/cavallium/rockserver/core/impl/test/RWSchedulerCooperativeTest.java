@@ -7,6 +7,11 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
+import java.util.Locale;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
@@ -195,7 +200,7 @@ class RWSchedulerCooperativeTest {
 			assertTrue(parkedHandle.cancel());
 			assertTrue(parked.completed.await(5, SECONDS));
 			assertEventually(parkedHandle::isDisposed);
-			assertEventually(() -> parked.failure.get() instanceof java.util.concurrent.CancellationException);
+			assertEventually(() -> parked.failure.get() instanceof CancellationException);
 
 			var activeHandle = analytical.executeCooperatively(active, 1L);
 			assertTrue(active.parked.await(5, SECONDS));
@@ -205,7 +210,7 @@ class RWSchedulerCooperativeTest {
 			active.release.countDown();
 			assertTrue(active.completed.await(5, SECONDS));
 			assertEventually(activeHandle::isDisposed);
-			assertEventually(() -> active.failure.get() instanceof java.util.concurrent.CancellationException);
+			assertEventually(() -> active.failure.get() instanceof CancellationException);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).batchStartAllowance() >= 6);
 
 			var allBatchStarted = new CountDownLatch(6);
@@ -275,7 +280,7 @@ class RWSchedulerCooperativeTest {
 			scheduler.disposeNow();
 			assertTrue(task.completed.await(5, SECONDS));
 			assertEventually(handle::isDisposed);
-			assertEventually(() -> task.failure.get() instanceof java.util.concurrent.RejectedExecutionException);
+			assertEventually(() -> task.failure.get() instanceof RejectedExecutionException);
 
 			var drained = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			assertEquals(1L, drained.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
@@ -301,11 +306,11 @@ class RWSchedulerCooperativeTest {
 				assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).parkedTasks() == 1);
 
 				var raceStart = new CountDownLatch(1);
-				var cancellation = java.util.concurrent.CompletableFuture.runAsync(() -> {
+				var cancellation = CompletableFuture.runAsync(() -> {
 					awaitUninterruptibly(raceStart);
 					handle.cancel();
 				});
-				var shutdown = java.util.concurrent.CompletableFuture.runAsync(() -> {
+				var shutdown = CompletableFuture.runAsync(() -> {
 					awaitUninterruptibly(raceStart);
 					scheduler.disposeNow();
 				});
@@ -369,7 +374,7 @@ class RWSchedulerCooperativeTest {
 
 			var foregroundStarted = new CountDownLatch(4);
 			long queuedAtNanos = System.nanoTime();
-			var latestStartNanos = new java.util.concurrent.atomic.AtomicLong();
+			var latestStartNanos = new AtomicLong();
 			Runnable foreground = () -> {
 				latestStartNanos.accumulateAndGet(System.nanoTime(), Math::max);
 				foregroundStarted.countDown();
@@ -514,7 +519,7 @@ class RWSchedulerCooperativeTest {
 					scheduler.executor(WorkloadProfile.BATCH,
 							OperationFamily.RANGE_PAGE,
 							Long.MAX_VALUE));
-			assertSame(scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE), scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE));
+			assertSame(scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE), scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE));
 
 			var handle = executor.executeCooperatively(task, 2L * 1024L * 1024L);
 			assertTrue(task.parked.await(5, SECONDS));
@@ -556,7 +561,7 @@ class RWSchedulerCooperativeTest {
 			assertEquals(1L, snapshot.completedTasks());
 			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
 			assertEquals(0L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN));
-			assertTrue(task.failure.get() instanceof java.util.concurrent.CancellationException);
+			assertTrue(task.failure.get() instanceof CancellationException);
 		} finally {
 			scheduler.disposeNow();
 		}
@@ -695,8 +700,8 @@ class RWSchedulerCooperativeTest {
 
 			assertTrue(active.completed.await(5, SECONDS));
 			assertTrue(parked.completed.await(5, SECONDS));
-			assertTrue(active.failure.get() instanceof java.util.concurrent.RejectedExecutionException);
-			assertTrue(parked.failure.get() instanceof java.util.concurrent.RejectedExecutionException);
+			assertTrue(active.failure.get() instanceof RejectedExecutionException);
+			assertTrue(parked.failure.get() instanceof RejectedExecutionException);
 			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			assertEquals(2L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
 			assertTrue(snapshot.drainedAndConserved());
@@ -748,7 +753,7 @@ class RWSchedulerCooperativeTest {
 			assertTrue(cancelled.terminal.await(5, SECONDS));
 			assertEquals(0, cancelled.successes.get());
 			assertEquals(1, cancelled.rejections.get());
-			assertTrue(cancelled.failure.get() instanceof java.util.concurrent.CancellationException);
+			assertTrue(cancelled.failure.get() instanceof CancellationException);
 
 			var completed = new TerminalAuthorityTask(true);
 			var completedHandle = scheduler.executor(WorkloadProfile.BATCH,
@@ -851,7 +856,7 @@ class RWSchedulerCooperativeTest {
 			task.release.countDown();
 
 			assertTrue(task.terminal.await(5, SECONDS));
-			assertTrue(task.rejection.get() instanceof java.util.concurrent.CancellationException);
+			assertTrue(task.rejection.get() instanceof CancellationException);
 			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			assertEquals(0L, snapshot.failedTasks());
 			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION));
@@ -919,7 +924,7 @@ class RWSchedulerCooperativeTest {
 			shutdownThread.join(SECONDS.toMillis(5));
 			assertFalse(shutdownThread.isAlive());
 			assertTrue(task.terminationObserved);
-			assertTrue(task.rejection.get() instanceof java.util.concurrent.RejectedExecutionException);
+			assertTrue(task.rejection.get() instanceof RejectedExecutionException);
 			var snapshot = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 			assertEquals(0L, snapshot.failedTasks());
 			assertEquals(1L, snapshot.outcomes().get(RWScheduler.TerminalOutcome.SHUTDOWN));
@@ -1049,7 +1054,7 @@ class RWSchedulerCooperativeTest {
 						OperationFamily.RANGE_PAGE,
 						Long.MAX_VALUE).executeCooperatively(task, 2L * 1024L * 1024L);
 				assertTrue(task.completed.await(5, SECONDS));
-				var profileTag = profile.name().toLowerCase(java.util.Locale.ROOT);
+				var profileTag = profile.name().toLowerCase(Locale.ROOT);
 				assertEventually(() -> registry.get("rockserver.workload.quantums")
 						.tags("database", "cooperative-metrics-db",
 								"resource", "read",
@@ -1134,7 +1139,7 @@ class RWSchedulerCooperativeTest {
 					.executeCooperatively(task, 2L * 1024L * 1024L);
 			assertTrue(task.started.await(5, SECONDS));
 			assertTrue(task.completed.await(5, SECONDS));
-			assertTrue(task.failure.get() instanceof it.cavallium.rockserver.core.common.RocksDBException);
+			assertTrue(task.failure.get() instanceof RocksDBException);
 			assertEquals(1L,
 					scheduler.poolSnapshot(RWScheduler.Pool.READ)
 							.outcomes()
@@ -1261,7 +1266,7 @@ class RWSchedulerCooperativeTest {
 		@Override
 		public void reject(RuntimeException failure) {
 			try {
-				java.util.concurrent.CompletableFuture.runAsync(
+				CompletableFuture.runAsync(
 						() -> scheduler.poolSnapshot(RWScheduler.Pool.READ)).get(2, SECONDS);
 				callbackOutsideLock.set(true);
 			} catch (Throwable callbackError) {

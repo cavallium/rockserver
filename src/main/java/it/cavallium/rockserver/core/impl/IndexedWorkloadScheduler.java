@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.impl;
 
+import it.cavallium.rockserver.core.common.OperationFamily;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.time.Duration;
@@ -33,16 +35,16 @@ import reactor.core.scheduler.Schedulers;
 final class IndexedWorkloadScheduler implements Scheduler, RWScheduler.WorkloadExecutor {
 
 	private final ProfiledWorkloadExecutor executor;
-	private final it.cavallium.rockserver.core.common.WorkloadProfile profile;
-	private final it.cavallium.rockserver.core.common.OperationFamily family;
+	private final WorkloadProfile profile;
+	private final OperationFamily family;
 	private final long monotonicDeadlineNanos;
 	private final Set<IndexedWorker> workers = new HashSet<>();
 	private volatile boolean disposed;
 	private @Nullable Sinks.One<RuntimeException> droppedTaskFailure;
 
 	IndexedWorkloadScheduler(ProfiledWorkloadExecutor executor,
-			it.cavallium.rockserver.core.common.WorkloadProfile profile,
-			it.cavallium.rockserver.core.common.OperationFamily family,
+			WorkloadProfile profile,
+			OperationFamily family,
 			long monotonicDeadlineNanos) {
 		this.executor = Objects.requireNonNull(executor, "executor");
 		this.profile = Objects.requireNonNull(profile, "profile");

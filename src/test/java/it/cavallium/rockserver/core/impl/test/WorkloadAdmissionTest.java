@@ -27,6 +27,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream;
 import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.SstMaintenance;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.WorkloadCost;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
@@ -37,13 +38,16 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.AbstractList;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.function.IntFunction;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
 
@@ -144,10 +148,10 @@ class WorkloadAdmissionTest {
 	void everyConcreteCommandHasAnExplicitResultForEveryClientProfile() {
 		var commands = commandExpectations();
 		assertEquals(EXPECTED_COMMAND_FAMILIES.keySet(),
-				commands.stream().map(CommandExpectation::name).collect(java.util.stream.Collectors.toSet()),
+				commands.stream().map(CommandExpectation::name).collect(Collectors.toSet()),
 				"Every command variant must have an explicit family expectation");
 		assertEquals(permittedConcreteCommandTypes(),
-				commands.stream().map(expectation -> expectation.command().getClass()).collect(java.util.stream.Collectors.toSet()),
+				commands.stream().map(expectation -> expectation.command().getClass()).collect(Collectors.toSet()),
 				"Every sealed command subtype must have an admission expectation");
 
 		for (var expectation : commands) {
@@ -296,7 +300,7 @@ class WorkloadAdmissionTest {
 
 	@Test
 	void everyLatencyPointReadChecksEncodedBytesBelowAtAndAboveLimit() {
-		List<java.util.function.Function<Keys, RocksDBAPICommand<?, ?, ?>>> commands = List.of(
+		List<Function<Keys, RocksDBAPICommand<?, ?, ?>>> commands = List.of(
 				key -> new RocksDBAPICommandSingle.Get<>(0, 1, key, RequestType.current()),
 				key -> new RocksDBAPICommandSingle.Get<>(0, 1, key, RequestType.exists()),
 				key -> new RocksDBAPICommandSingle.Get<>(0, 1, key, RequestType.forUpdate()));
@@ -498,7 +502,7 @@ class WorkloadAdmissionTest {
 		assertTrue(ANALYTICAL.isClientSelectable());
 		assertTrue(INGEST.isClientSelectable());
 		assertTrue(BATCH.isClientSelectable());
-		assertEquals(LATENCY, RequestContext.latency(java.time.Duration.ofSeconds(5)).profile());
+		assertEquals(LATENCY, RequestContext.latency(Duration.ofSeconds(5)).profile());
 		assertEquals(ANALYTICAL, RequestContext.analytical().profile());
 		assertEquals(INGEST, RequestContext.ingest().profile());
 		assertEquals(BATCH, RequestContext.batch().profile());
@@ -518,7 +522,7 @@ class WorkloadAdmissionTest {
 		assertThrows(IllegalArgumentException.class,
 				() -> new RequestContext(LATENCY, Long.MAX_VALUE));
 		assertThrows(IllegalArgumentException.class,
-				() -> RequestContext.latency(java.time.Duration.ZERO));
+				() -> RequestContext.latency(Duration.ZERO));
 	}
 
 	@Test
@@ -597,7 +601,7 @@ class WorkloadAdmissionTest {
 		commands.add(protectedCommand("flush", new RocksDBAPICommand.Flush(), PHYSICAL_MAINTENANCE));
 		commands.add(protectedCommand("compact", new RocksDBAPICommand.Compact(), PHYSICAL_MAINTENANCE));
         commands.add(protectedCommand("compactFiles", new RocksDBAPICommand.CompactFiles(
-                new it.cavallium.rockserver.core.common.SstMaintenance.Request(1,"session",List.of("1.sst"),6,0,1024,1024,1,true)), PHYSICAL_MAINTENANCE));
+                new SstMaintenance.Request(1,"session",List.of("1.sst"),6,0,1024,1024,1,true)), PHYSICAL_MAINTENANCE));
         commands.add(client("getSstMetadata", new RocksDBAPICommand.GetSstMetadata(1,6), batch));
 		commands.add(client("getAllColumnDefinitions", new RocksDBAPICommand.GetAllColumnDefinitions(), all));
 		return List.copyOf(commands);
@@ -637,7 +641,7 @@ class WorkloadAdmissionTest {
 
 	private static RequestContext context(WorkloadProfile profile) {
 		return switch (profile) {
-			case LATENCY -> RequestContext.latency(java.time.Duration.ofMinutes(1));
+			case LATENCY -> RequestContext.latency(Duration.ofMinutes(1));
 			case ANALYTICAL -> RequestContext.analytical();
 			case INGEST -> RequestContext.ingest();
 			case BATCH -> RequestContext.batch();
@@ -685,7 +689,7 @@ class WorkloadAdmissionTest {
 	}
 
 	private static List<Keys> emptyKeysList(int count) {
-		return java.util.Collections.nCopies(count, EMPTY_KEYS);
+		return Collections.nCopies(count, EMPTY_KEYS);
 	}
 
 	private static List<Keys> keysList(int count, int encodedBytes) {

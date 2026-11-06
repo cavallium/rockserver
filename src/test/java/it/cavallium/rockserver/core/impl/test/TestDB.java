@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.impl.test;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
+import it.cavallium.rockserver.core.client.ThriftConnection;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBAPI;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
@@ -23,6 +24,7 @@ import java.net.ServerSocket;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.stream.Stream;
+import org.apache.thrift.TException;
 import reactor.core.publisher.Flux;
 
 public class TestDB implements AutoCloseable {
@@ -59,10 +61,10 @@ public class TestDB implements AutoCloseable {
 					int port = findFreePort();
 					var thriftServer = new ThriftServer(this.db, "127.0.0.1", port);
 					thriftServer.start();
-					it.cavallium.rockserver.core.client.ThriftConnection thriftClient;
+					ThriftConnection thriftClient;
 					try {
-						thriftClient = new it.cavallium.rockserver.core.client.ThriftConnection("test", "127.0.0.1", port);
-					} catch (org.apache.thrift.TException e) {
+						thriftClient = new ThriftConnection("test", "127.0.0.1", port);
+					} catch (TException e) {
 						throw new IOException(e);
 					}
 

@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.grpc.BindableService;
 import io.grpc.ForwardingServerCallListener;
 import io.grpc.Metadata;
+import io.grpc.Server;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
@@ -30,6 +31,8 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.server.GrpcServer;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.util.ArrayList;
@@ -115,7 +118,7 @@ class GrpcProxyCloseTest {
 	private LateConnection connection;
 	private GrpcServer server;
 	private GrpcConnection client;
-	private io.grpc.Server observedServer;
+	private Server observedServer;
 	private GrpcConnection observedClient;
 
 	@BeforeEach
@@ -293,8 +296,8 @@ class GrpcProxyCloseTest {
 		var shutdown = CompletableFuture.runAsync(() -> {
 			try {
 				server.close();
-			} catch (java.io.IOException ex) {
-				throw new java.io.UncheckedIOException(ex);
+			} catch (IOException ex) {
+				throw new UncheckedIOException(ex);
 			}
 		});
 		assertThrows(TimeoutException.class, () -> shutdown.get(2, TimeUnit.SECONDS), "the close still runs");

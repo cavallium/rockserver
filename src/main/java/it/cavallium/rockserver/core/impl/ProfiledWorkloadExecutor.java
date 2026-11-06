@@ -12,6 +12,7 @@ import it.cavallium.rockserver.core.common.WorkloadCost;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -19,6 +20,7 @@ import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.PriorityQueue;
@@ -33,6 +35,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
+import java.util.function.IntConsumer;
 import java.util.function.ToDoubleFunction;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -2361,7 +2364,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private static String[] tagsWith(String[] tags, String key, String value) {
-		var result = java.util.Arrays.copyOf(tags, tags.length + 2);
+		var result = Arrays.copyOf(tags, tags.length + 2);
 		result[tags.length] = key;
 		result[tags.length + 1] = value;
 		return result;
@@ -2406,7 +2409,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private static String metricName(Enum<?> value) {
-		return value.name().toLowerCase(java.util.Locale.ROOT);
+		return value.name().toLowerCase(Locale.ROOT);
 	}
 
 	@Override
@@ -3915,11 +3918,11 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 
 		private static TaskMetrics inert() {
 			var outcomes = new CounterHandle[TERMINAL_OUTCOMES.length];
-			java.util.Arrays.fill(outcomes, INERT_COUNTER);
+			Arrays.fill(outcomes, INERT_COUNTER);
 			var rejections = new CounterHandle[TERMINAL_OUTCOMES.length];
-			java.util.Arrays.fill(rejections, INERT_COUNTER);
+			Arrays.fill(rejections, INERT_COUNTER);
 			var admissions = new CounterHandle[AdmissionResult.values().length];
-			java.util.Arrays.fill(admissions, INERT_COUNTER);
+			Arrays.fill(admissions, INERT_COUNTER);
 			return new TaskMetrics(INERT_TIMER,
 					INERT_TIMER,
 					INERT_COUNTER,
@@ -3995,15 +3998,15 @@ final class WorkloadPressureController {
 	private volatile boolean notificationPending;
 	private volatile Runnable notifier = () -> {
 	};
-	private volatile java.util.function.IntConsumer batchNotifier = _ -> {
+	private volatile IntConsumer batchNotifier = _ -> {
 	};
 
 	WorkloadPressureController(int competingMaximumActiveReadBatches,
 	                           int competingMaximumActiveWriteBatches,
-	                           java.time.Duration competingWriteInterval,
+	                           Duration competingWriteInterval,
 	                           int pressuredMaximumActiveBatches,
-	                           java.time.Duration competitionHold,
-	                           java.time.Duration batchInterval) {
+	                           Duration competitionHold,
+	                           Duration batchInterval) {
 		if (competingMaximumActiveReadBatches < 1 || competingMaximumActiveWriteBatches < 1) {
 			throw new IllegalArgumentException("competing BATCH maxima must be positive");
 		}
@@ -4031,7 +4034,7 @@ final class WorkloadPressureController {
 		this.notifier = Objects.requireNonNull(notifier, "notifier");
 	}
 
-	void setBatchNotifier(java.util.function.IntConsumer batchNotifier) {
+	void setBatchNotifier(IntConsumer batchNotifier) {
 		this.batchNotifier = Objects.requireNonNull(batchNotifier, "batchNotifier");
 	}
 

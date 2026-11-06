@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.Empty;
 import io.grpc.ManagedChannel;
+import io.grpc.MethodDescriptor;
 import io.grpc.Server;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
@@ -29,12 +30,15 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -66,7 +70,7 @@ class GrpcRetryPolicyTest {
 	void configureFastTwoAttemptRetry() {
 		previousProperties = RETRY_PROPERTIES.stream()
 				.filter(name -> System.getProperty(name) != null)
-				.collect(java.util.stream.Collectors.toUnmodifiableMap(
+				.collect(Collectors.toUnmodifiableMap(
 						name -> name,
 						System::getProperty));
 		System.setProperty(MAX_ATTEMPTS_PROPERTY, "2");
@@ -163,11 +167,11 @@ class GrpcRetryPolicyTest {
 		var one = retryPolicy(5, false);
 		assertEquals("0.05s", several.get("initialBackoff"));
 		assertEquals("0.5s", one.get("initialBackoff"));
-		for (var policy : java.util.List.of(several, one)) {
+		for (var policy : List.of(several, one)) {
 			assertEquals("30s", policy.get("maxBackoff"));
 			assertEquals(2.0d, policy.get("backoffMultiplier"));
 			assertEquals(5.0d, policy.get("maxAttempts"));
-			assertEquals(java.util.List.of("UNAVAILABLE"), policy.get("retryableStatusCodes"));
+			assertEquals(List.of("UNAVAILABLE"), policy.get("retryableStatusCodes"));
 		}
 		System.setProperty(INITIAL_BACKOFF_PROPERTY, "0.2s");
 		System.setProperty(MAX_BACKOFF_PROPERTY, "3s");
@@ -205,18 +209,18 @@ class GrpcRetryPolicyTest {
 		var descriptorsField = Class.forName("it.cavallium.rockserver.core.client.GrpcConnectionDelegate")
 				.getDeclaredField("AUTOMATIC_RETRY_METHOD_DESCRIPTORS");
 		descriptorsField.setAccessible(true);
-		var configuredDescriptors = assertInstanceOf(java.util.List.class, descriptorsField.get(null));
-		var configuredNames = new java.util.HashSet<String>();
+		var configuredDescriptors = assertInstanceOf(List.class, descriptorsField.get(null));
+		var configuredNames = new HashSet<String>();
 		for (var configuredDescriptor : configuredDescriptors) {
-			var method = assertInstanceOf(io.grpc.MethodDescriptor.class, configuredDescriptor);
+			var method = assertInstanceOf(MethodDescriptor.class, configuredDescriptor);
 			configuredNames.add(method.getFullMethodName());
-			assertEquals(io.grpc.MethodDescriptor.MethodType.UNARY, method.getType(),
+			assertEquals(MethodDescriptor.MethodType.UNARY, method.getType(),
 					"streaming calls are deliberately excluded even when read-only");
 		}
 		assertEquals(expected, configuredNames);
 		var generatedMethods = RocksDBServiceGrpc.getServiceDescriptor().getMethods().stream()
 				.map(method -> method.getFullMethodName())
-				.collect(java.util.stream.Collectors.toUnmodifiableSet());
+				.collect(Collectors.toUnmodifiableSet());
 		assertTrue(generatedMethods.containsAll(expected),
 				"every configured name must resolve to the generated service descriptor");
 	}

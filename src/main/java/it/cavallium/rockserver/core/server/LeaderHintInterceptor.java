@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.server;
 
 
+import io.grpc.ForwardingServerCall;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
 import io.grpc.ServerCall.Listener;
@@ -15,10 +16,10 @@ import it.cavallium.rockserver.core.common.api.proto.*;
 final class LeaderHintInterceptor implements ServerInterceptor {
 
 	private static final Metadata.Key<String> KEY = Metadata.Key.of(
-			it.cavallium.rockserver.core.common.LeaderHint.METADATA_KEY, Metadata.ASCII_STRING_MARSHALLER);
-	private final it.cavallium.rockserver.core.common.LeaderHint hint;
+			LeaderHint.METADATA_KEY, Metadata.ASCII_STRING_MARSHALLER);
+	private final LeaderHint hint;
 
-	LeaderHintInterceptor(it.cavallium.rockserver.core.common.LeaderHint hint) {
+	LeaderHintInterceptor(LeaderHint hint) {
 		this.hint = hint;
 	}
 
@@ -26,7 +27,7 @@ final class LeaderHintInterceptor implements ServerInterceptor {
 	public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call,
 			Metadata headers,
 			ServerCallHandler<ReqT, RespT> next) {
-		return next.startCall(new io.grpc.ForwardingServerCall.SimpleForwardingServerCall<>(call) {
+		return next.startCall(new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
 			private volatile boolean headersSent;
 
 			@Override
@@ -37,7 +38,7 @@ final class LeaderHintInterceptor implements ServerInterceptor {
 			}
 
 			@Override
-			public void close(io.grpc.Status status, Metadata trailers) {
+			public void close(Status status, Metadata trailers) {
 				if (!headersSent) {
 					add(trailers);
 				}

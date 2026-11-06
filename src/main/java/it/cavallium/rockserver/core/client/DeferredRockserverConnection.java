@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.client;
 
+import io.grpc.Status;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
@@ -110,7 +111,7 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 	}
 
 	private static RuntimeException deadlineExceeded() {
-		return io.grpc.Status.DEADLINE_EXCEEDED.withDescription("Rockserver request deadline expired during connection initialization")
+		return Status.DEADLINE_EXCEEDED.withDescription("Rockserver request deadline expired during connection initialization")
 				.asRuntimeException();
 	}
 

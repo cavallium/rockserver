@@ -13,7 +13,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import org.jetbrains.annotations.Nullable;
@@ -116,7 +118,7 @@ final class OldResultCodec {
 			for (int i = 0; i < count; i++) {
 				largestFirst[i] = i;
 			}
-			java.util.Arrays.sort(largestFirst, (a, b) -> sizes[a] != sizes[b] ? Long.compare(sizes[b], sizes[a])
+			Arrays.sort(largestFirst, (a, b) -> sizes[a] != sizes[b] ? Long.compare(sizes[b], sizes[a])
 					: Integer.compare(a, b));
 			long resendSize = encodedSize(ApplyResult.RESEND_ALONE);
 			for (int i : largestFirst) {
@@ -129,7 +131,7 @@ final class OldResultCodec {
 			}
 		}
 		// Fits in an int: it is at most maxBytes, or every result is now as small as RESEND_ALONE.
-		var buffer = java.nio.ByteBuffer.allocate((int) total).putInt(count);
+		var buffer = ByteBuffer.allocate((int) total).putInt(count);
 		for (var result : chosen) {
 			byte[] bytes = encode(result);
 			buffer.putInt(bytes.length).put(bytes);

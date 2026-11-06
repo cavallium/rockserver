@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.benchmark;
 
 import static it.cavallium.rockserver.core.impl.benchmark.BenchmarkJson.appendJsonString;
 
+import com.sun.management.OperatingSystemMXBean;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Timer;
@@ -24,6 +25,8 @@ import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -47,15 +50,19 @@ import java.util.Set;
 import java.util.SplittableRandom;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Stream;
@@ -296,7 +303,7 @@ public final class SevenProfileWorkloadBenchmark {
 		var composite = (CompositeMeterRegistry) connection.getEmbeddedDB().getMetricsRegistry();
 		ExecutorService workers = Executors.newFixedThreadPool(workerCount(options),
 				Thread.ofPlatform().name("seven-profile-workload-", 0).factory());
-		var futures = new ArrayList<java.util.concurrent.Future<?>>();
+		var futures = new ArrayList<Future<?>>();
 
 		var analytical = connection.getSyncApi(RequestContext.analytical());
 		var ingest = connection.getSyncApi(RequestContext.ingest());
@@ -314,7 +321,7 @@ public final class SevenProfileWorkloadBenchmark {
 			futures.add(workers.submit(() -> runWorker(control, pressure,
 					new WorkloadKey(WorkloadProfile.CONTROL, OperationFamily.CONTROL),
 					new Pacer(options.controlRate(), options.controlWorkers(), workerIndex), () -> {
-						long transactionId = batch.openTransaction( java.time.Duration.ofMillis(60_000L));
+						long transactionId = batch.openTransaction( Duration.ofMillis(60_000L));
 						if (!batch.closeTransaction(transactionId, false)) {
 							throw new IllegalStateException("CONTROL rollback did not close its transaction");
 						}
@@ -327,7 +334,7 @@ public final class SevenProfileWorkloadBenchmark {
 				runWorker(control, pressure,
 						new WorkloadKey(WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP),
 						new Pacer(options.latencyRate(), options.latencyWorkers(), workerIndex),
-						() -> connection.getSyncApi(RequestContext.latency(java.time.Duration.ofMillis(LATENCY_DEADLINE_MILLIS)))
+						() -> connection.getSyncApi(RequestContext.latency(Duration.ofMillis(LATENCY_DEADLINE_MILLIS)))
 								.get(0L, dataset.columnId(), key(random.nextInt(options.preloadKeys())), RequestType.current()));
 			}));
 		}
@@ -385,7 +392,7 @@ public final class SevenProfileWorkloadBenchmark {
 					new WorkloadKey(WorkloadProfile.LATENCY, OperationFamily.BOUNDED_FAN_OUT),
 					new Pacer(options.cancellationRate(), options.cancellationWorkers(), workerIndex), () -> {
 						CompletableFuture<List<Boolean>> request = connection
-								.getAsyncApi(RequestContext.latency(java.time.Duration.ofMillis(LATENCY_DEADLINE_MILLIS)))
+								.getAsyncApi(RequestContext.latency(Duration.ofMillis(LATENCY_DEADLINE_MILLIS)))
 								.existsMultiAsync(0L, dataset.columnId(), cancellationKeys);
 						if (request.cancel(false)) {
 							throw new CancellationException("intentional benchmark cancellation");
@@ -453,7 +460,7 @@ public final class SevenProfileWorkloadBenchmark {
 		byte[][] values = writeValues(options);
 		ExecutorService workers = Executors.newFixedThreadPool(options.ingestWorkers(),
 				Thread.ofPlatform().name("isolated-ingest-baseline-", 0).factory());
-		var futures = new ArrayList<java.util.concurrent.Future<?>>();
+		var futures = new ArrayList<Future<?>>();
 		boolean workersStopped = false;
 		Throwable failure = null;
 		try {
@@ -510,7 +517,7 @@ public final class SevenProfileWorkloadBenchmark {
 	private static void stopHarnessWorkers(EmbeddedConnection connection,
 			RunControl control,
 			ExecutorService workers,
-			List<? extends java.util.concurrent.Future<?>> futures,
+			List<? extends Future<?>> futures,
 			Thread pressureThread) {
 		control.stopMeasuring();
 		control.stop().set(true);
@@ -981,14 +988,14 @@ public final class SevenProfileWorkloadBenchmark {
 		try {
 			return Path.of(type.getProtectionDomain().getCodeSource().getLocation().toURI())
 					.toAbsolutePath().normalize();
-		} catch (java.net.URISyntaxException | NullPointerException invalid) {
+		} catch (URISyntaxException | NullPointerException invalid) {
 			throw new IllegalStateException("Unable to resolve code source for " + type.getName(), invalid);
 		}
 	}
 
 	private static String hardwareDescription() {
-		var os = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
-		long memory = os instanceof com.sun.management.OperatingSystemMXBean extended
+		var os = ManagementFactory.getOperatingSystemMXBean();
+		long memory = os instanceof OperatingSystemMXBean extended
 				? extended.getTotalMemorySize() : -1L;
 		String cpu = System.getProperty("os.arch", "unknown");
 		Path cpuInfo = Path.of("/proc/cpuinfo");
@@ -1407,8 +1414,8 @@ public final class SevenProfileWorkloadBenchmark {
 
 	private static Throwable unwrap(Throwable failure) {
 		Throwable current = failure;
-		while ((current instanceof java.util.concurrent.CompletionException
-				|| current instanceof java.util.concurrent.ExecutionException)
+		while ((current instanceof CompletionException
+				|| current instanceof ExecutionException)
 				&& current.getCause() != null) {
 			current = current.getCause();
 		}
@@ -1973,8 +1980,8 @@ public final class SevenProfileWorkloadBenchmark {
 	private static final class PressureTracker {
 
 		private final boolean injected;
-		private final java.util.concurrent.atomic.AtomicReference<PressurePhase> phase =
-				new java.util.concurrent.atomic.AtomicReference<>(PressurePhase.BEFORE);
+		private final AtomicReference<PressurePhase> phase =
+				new AtomicReference<>(PressurePhase.BEFORE);
 		private final LongAdder batchBefore = new LongAdder();
 		private final LongAdder batchDuring = new LongAdder();
 		private final LongAdder batchAfter = new LongAdder();

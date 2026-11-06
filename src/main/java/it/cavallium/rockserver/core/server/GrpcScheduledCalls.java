@@ -9,6 +9,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Objects;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.RejectedExecutionException;
@@ -27,6 +28,8 @@ import reactor.core.publisher.Mono;
 import static it.cavallium.rockserver.core.server.GrpcIteratorOperations.ITERATOR_OPERATION_LEASE_CONTEXT_KEY;
 import static it.cavallium.rockserver.core.server.GrpcRequestErrors.lateErrorHandler;
 import it.cavallium.rockserver.core.server.GrpcIteratorOperations.IteratorOperationLease;
+import reactor.core.publisher.MonoSink;
+import reactor.core.scheduler.Scheduler;
 
 final class GrpcScheduledCalls {
 
@@ -114,7 +117,7 @@ final class GrpcScheduledCalls {
 						"Iterator future was started without an operation lease"));
 			}
 			if (!iteratorLease.registerTask()) {
-				return Mono.error(new java.util.concurrent.CancellationException(
+				return Mono.error(new CancellationException(
 						"Iterator operation terminated before its continuation could start"));
 			}
 			final CompletableFuture<T> future;
@@ -140,12 +143,12 @@ final class GrpcScheduledCalls {
 	private final class CancellableFutureBridge<T> implements Disposable, BiConsumer<T, Throwable> {
 
 		private final CompletableFuture<T> future;
-		private final reactor.core.publisher.MonoSink<T> sink;
+		private final MonoSink<T> sink;
 		private final @Nullable IteratorOperationLease terminalLease;
 		private boolean cancelled;
 
 		private CancellableFutureBridge(CompletableFuture<T> future,
-				reactor.core.publisher.MonoSink<T> sink,
+				MonoSink<T> sink,
 				@Nullable IteratorOperationLease terminalLease) {
 			this.future = future;
 			this.sink = sink;
@@ -181,7 +184,7 @@ final class GrpcScheduledCalls {
 				}
 			}
 			if (late && error != null
-					&& !(error instanceof java.util.concurrent.CancellationException)) {
+					&& !(error instanceof CancellationException)) {
 				lateErrorHandler(sink.contextView()).accept(error);
 			}
 		}
@@ -192,11 +195,11 @@ final class GrpcScheduledCalls {
 			RWScheduler.EstimatedWork,
 			RWScheduler.RejectionAwareTask {
 
-		private final reactor.core.publisher.MonoSink<T> sink;
+		private final MonoSink<T> sink;
 		private final Callable<T> callable;
-		private final reactor.core.scheduler.Scheduler executionScheduler;
+		private final Scheduler executionScheduler;
 		private final @Nullable Consumer<T> lateSuccessCleanup;
-		private final @Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler;
+		private final @Nullable Scheduler lateSuccessCleanupScheduler;
 		private final @Nullable ScheduledTaskLifecycle taskLifecycle;
 		private final boolean mustComplete;
 		private final @Nullable String protectedOperation;
@@ -207,11 +210,11 @@ final class GrpcScheduledCalls {
 		private boolean running;
 		private boolean terminated;
 
-		private ScheduledCall(reactor.core.publisher.MonoSink<T> sink,
+		private ScheduledCall(MonoSink<T> sink,
 				Callable<T> callable,
-				reactor.core.scheduler.Scheduler executionScheduler,
+				Scheduler executionScheduler,
 				@Nullable Consumer<T> lateSuccessCleanup,
-				@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler,
+				@Nullable Scheduler lateSuccessCleanupScheduler,
 				@Nullable ScheduledTaskLifecycle taskLifecycle,
 				boolean mustComplete,
 				@Nullable String protectedOperation,
@@ -447,12 +450,12 @@ final class GrpcScheduledCalls {
 		}
 	}
 
-	<T> Mono<T> executeScheduled(Callable<T> callable, reactor.core.scheduler.Scheduler executionScheduler) {
+	<T> Mono<T> executeScheduled(Callable<T> callable, Scheduler executionScheduler) {
 		return executeScheduled(callable, executionScheduler, 0L);
 	}
 
 	<T> Mono<T> executeScheduled(Callable<T> callable,
-			reactor.core.scheduler.Scheduler executionScheduler,
+			Scheduler executionScheduler,
 			long estimatedBytes) {
 		return executeScheduled(callable,
 				executionScheduler,
@@ -465,7 +468,7 @@ final class GrpcScheduledCalls {
 
 	<T> Mono<T> executeMustComplete(String operation,
 			Callable<T> callable,
-			reactor.core.scheduler.Scheduler executionScheduler) {
+			Scheduler executionScheduler) {
 		return executeScheduled(callable,
 				executionScheduler,
 				null,
@@ -511,9 +514,9 @@ final class GrpcScheduledCalls {
 	}
 
 	<T> Mono<T> executeScheduled(Callable<T> callable,
-			reactor.core.scheduler.Scheduler executionScheduler,
+			Scheduler executionScheduler,
 			@Nullable Consumer<T> lateSuccessCleanup,
-			@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler) {
+			@Nullable Scheduler lateSuccessCleanupScheduler) {
 		return executeScheduled(callable,
 				executionScheduler,
 				lateSuccessCleanup,
@@ -522,9 +525,9 @@ final class GrpcScheduledCalls {
 	}
 
 	<T> Mono<T> executeScheduled(Callable<T> callable,
-			reactor.core.scheduler.Scheduler executionScheduler,
+			Scheduler executionScheduler,
 			@Nullable Consumer<T> lateSuccessCleanup,
-			@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler,
+			@Nullable Scheduler lateSuccessCleanupScheduler,
 			long estimatedBytes) {
 		return executeScheduled(callable,
 				executionScheduler,
@@ -536,9 +539,9 @@ final class GrpcScheduledCalls {
 	}
 
 	<T> Mono<T> executeScheduled(Callable<T> callable,
-			reactor.core.scheduler.Scheduler executionScheduler,
+			Scheduler executionScheduler,
 			@Nullable Consumer<T> lateSuccessCleanup,
-			@Nullable reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler,
+			@Nullable Scheduler lateSuccessCleanupScheduler,
 			ScheduledCancellationPolicy cancellationPolicy,
 			@Nullable String protectedOperation,
 			long estimatedBytes) {
@@ -548,7 +551,7 @@ final class GrpcScheduledCalls {
 			ScheduledTaskLifecycle taskLifecycle;
 			if (iteratorLease != null) {
 				if (!iteratorLease.registerTask()) {
-					return Mono.error(new java.util.concurrent.CancellationException(
+					return Mono.error(new CancellationException(
 							"Iterator operation terminated before its task could be scheduled"));
 				}
 				taskLifecycle = new ScheduledTaskLifecycle(iteratorLease);

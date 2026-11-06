@@ -8,6 +8,8 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -329,7 +331,7 @@ final class TermService {
 			boolean committed = buffer.get() != 0;
 			var text = new String(value, buffer.position(), buffer.remaining(), StandardCharsets.UTF_8);
 			return new RemovalCheck.PeerConfiguration(index, committed,
-					text.isEmpty() ? java.util.List.of() : java.util.List.of(text.split("\n")));
+					text.isEmpty() ? List.of() : List.of(text.split("\n")));
 		});
 	}
 
@@ -485,7 +487,7 @@ final class TermService {
 		}
 		var buffer = ByteBuffer.wrap(request);
 		var groupId = RaftGroupId.valueOf(new UUID(buffer.getLong(), buffer.getLong()));
-		var rest = java.util.Arrays.copyOfRange(request, GROUP_ID_BYTES, request.length);
+		var rest = Arrays.copyOfRange(request, GROUP_ID_BYTES, request.length);
 		CompletableFuture<byte[]> answer;
 		try {
 			answer = source.answer(groupId, rest);

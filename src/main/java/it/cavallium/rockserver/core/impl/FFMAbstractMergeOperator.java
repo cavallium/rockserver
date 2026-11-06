@@ -2,6 +2,8 @@ package it.cavallium.rockserver.core.impl;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.buffer.MemorySegmentBuf;
+import it.cavallium.rockserver.core.common.Failures;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.jetbrains.annotations.VisibleForTesting;
@@ -219,7 +221,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
      * this returns non-null failed because of the operator. Failures of the JVM itself (out of memory, stack
      * overflow) and of the native result allocation are not reported: they say nothing about the operator.
      */
-    public static @org.jetbrains.annotations.Nullable Throwable takeFailureOnThisThread() {
+    public static @Nullable Throwable takeFailureOnThisThread() {
         var failure = FAILURE_ON_THREAD.get();
         if (failure != null) {
             FAILURE_ON_THREAD.remove();
@@ -230,7 +232,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
     private static void recordFailureOnThisThread(Throwable failure) {
         // A failure of the JVM anywhere in the chain (an operator may wrap it) is not the operator's: RocksDB then
         // reports the failed merge as a corruption, a local failure.
-        if (!it.cavallium.rockserver.core.common.Failures.isJvmFailure(failure)) {
+        if (!Failures.isJvmFailure(failure)) {
             FAILURE_ON_THREAD.set(failure);
         }
     }

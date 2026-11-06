@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import reactor.core.Disposable;
+import reactor.core.scheduler.Scheduler;
 
 /**
  * Fresh-process, direct scheduler benchmark for heavily contended mixed work.
@@ -654,9 +655,9 @@ public final class SchedulerHighContentionBenchmark {
 					WorkloadProfile.class, OperationFamily.class, long.class);
 			private static final MethodType V2_VIEW_TYPE = MethodType.methodType(RWScheduler.WorkloadExecutor.class,
 					WorkloadProfile.class, OperationFamily.class, long.class, long.class);
-			private static final MethodType V3_SCHEDULER_TYPE = MethodType.methodType(reactor.core.scheduler.Scheduler.class,
+			private static final MethodType V3_SCHEDULER_TYPE = MethodType.methodType(Scheduler.class,
 					WorkloadProfile.class, OperationFamily.class, long.class);
-			private static final MethodType V2_SCHEDULER_TYPE = MethodType.methodType(reactor.core.scheduler.Scheduler.class,
+			private static final MethodType V2_SCHEDULER_TYPE = MethodType.methodType(Scheduler.class,
 					WorkloadProfile.class, OperationFamily.class, long.class, long.class);
 
 			private final RWScheduler owner;
@@ -737,15 +738,15 @@ public final class SchedulerHighContentionBenchmark {
 				}
 			}
 
-			private reactor.core.scheduler.Scheduler scheduler(WorkloadProfile profile,
+			private Scheduler scheduler(WorkloadProfile profile,
 					OperationFamily family,
 					Deadline deadline) {
 				try {
 					if (relativeContract) {
-						return (reactor.core.scheduler.Scheduler) scheduler.invokeExact(owner,
+						return (Scheduler) scheduler.invokeExact(owner,
 								profile, family, deadline.monotonicNanos());
 					}
-					return (reactor.core.scheduler.Scheduler) scheduler.invokeExact(owner,
+					return (Scheduler) scheduler.invokeExact(owner,
 							profile, family, deadline.epochMillis(), deadline.monotonicNanos());
 				} catch (Throwable failure) {
 					throw rethrow(failure);

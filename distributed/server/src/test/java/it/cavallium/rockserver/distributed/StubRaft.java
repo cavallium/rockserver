@@ -2,6 +2,7 @@ package it.cavallium.rockserver.distributed;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
@@ -53,7 +54,7 @@ final class StubRaft {
 		case "getCurrentPeers" -> currentPeers;
 		case "getPreviousPeers" -> previousPeers;
 		case "getAllPeers" -> {
-			var all = new java.util.LinkedHashSet<>(currentPeers);
+			var all = new LinkedHashSet<>(currentPeers);
 			all.addAll(previousPeers);
 			yield List.copyOf(all);
 		}

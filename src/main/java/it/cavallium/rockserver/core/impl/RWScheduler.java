@@ -3,10 +3,12 @@ package it.cavallium.rockserver.core.impl;
 import com.google.common.annotations.VisibleForTesting;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.config.WorkloadSettings;
+import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
@@ -22,6 +24,7 @@ import java.util.function.Supplier;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
@@ -237,8 +240,8 @@ public final class RWScheduler {
 					pressureController,
 					value -> value.isPressured() ? 1 : 0)
 					.tag("database", databaseName)
-					.tags(workloadGroup.equals("default") ? io.micrometer.core.instrument.Tags.empty()
-							: io.micrometer.core.instrument.Tags.of("workload_group", workloadGroup))
+					.tags(workloadGroup.equals("default") ? Tags.empty()
+							: Tags.of("workload_group", workloadGroup))
 					.register(registry);
 		} catch (VirtualMachineError fatal) {
 			throw fatal;
@@ -845,10 +848,10 @@ public final class RWScheduler {
 				|| ownedPools.stream().anyMatch(pool -> pool.snapshot().shutdown())) {
 			throw new IllegalStateException("Cannot attach workload group to this scheduler");
 		}
-		var combined = new java.util.ArrayList<>(ownedPools);
+		var combined = new ArrayList<>(ownedPools);
 		combined.addAll(group.pools());
 		ownedPools = List.copyOf(combined);
-		var groups = new java.util.ArrayList<>(ownedGroups);
+		var groups = new ArrayList<>(ownedGroups);
 		groups.add(group);
 		ownedGroups = List.copyOf(groups);
 	}
@@ -993,7 +996,7 @@ public final class RWScheduler {
 	/**
 	 * Stable handle for resuming parked work or cancelling its logical submission.
 	 */
-	public interface CooperativeHandle extends reactor.core.Disposable {
+	public interface CooperativeHandle extends Disposable {
 
 		void resume();
 

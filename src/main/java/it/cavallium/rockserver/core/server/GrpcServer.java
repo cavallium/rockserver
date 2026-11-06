@@ -17,6 +17,7 @@ import io.netty.channel.epoll.EpollServerDomainSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
+import io.netty.util.concurrent.DefaultThreadFactory;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.OperationFamily;
@@ -31,7 +32,9 @@ import java.net.SocketAddress;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.LogRecord;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -77,7 +80,7 @@ public class GrpcServer extends Server {
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
 		super(client);
 		// The client itself: getClient() wraps it.
-		this.leaderHint = client instanceof it.cavallium.rockserver.core.common.LeaderHint hint ? hint : null;
+		this.leaderHint = client instanceof LeaderHint hint ? hint : null;
 		ExpectedGrpcStreamCloseLogFilter.install();
 		if (client instanceof InternalConnection internalConnection) {
 			this.scheduler = internalConnection.getScheduler();
@@ -105,7 +108,7 @@ public class GrpcServer extends Server {
 		Class<? extends ServerChannel> channelType;
 		// Named, so that a replicated node tells the API's transport threads from those of Ratis' own (shaded) gRPC,
 		// which keeps Netty's default names: a direct memory error is fatal only on the latter (DirectMemoryWatch).
-		var threads = new io.netty.util.concurrent.DefaultThreadFactory("rockserver-grpc-server-loop", false);
+		var threads = new DefaultThreadFactory("rockserver-grpc-server-loop", false);
 		if (socketAddress instanceof DomainSocketAddress _) {
 			elg = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2, threads);
 			channelType = EpollServerDomainSocketChannel.class;
@@ -119,7 +122,7 @@ public class GrpcServer extends Server {
 		// Calls to another connection: their callbacks run off the event loop, so that one client connection
 		// (one event loop thread) is not limited to what a single thread can decode, dispatch and answer.
 		this.callExecutor = proxyScheduler != null
-				? java.util.concurrent.Executors.newThreadPerTaskExecutor(
+				? Executors.newThreadPerTaskExecutor(
 						Thread.ofVirtual().name("grpc-call-", 0).factory())
 				: null;
 		this.transport = new GrpcTransport(socketAddress, elg, channelType, service, callExecutor, leaderHint);
@@ -214,7 +217,7 @@ public class GrpcServer extends Server {
 	}
 
 	@VisibleForTesting
-	public static boolean isExpectedGrpcClientCancellationForTesting(java.util.logging.LogRecord record) {
+	public static boolean isExpectedGrpcClientCancellationForTesting(LogRecord record) {
 		return ExpectedGrpcStreamCloseLogFilter.isExpectedClientCancellation(record);
 	}
 

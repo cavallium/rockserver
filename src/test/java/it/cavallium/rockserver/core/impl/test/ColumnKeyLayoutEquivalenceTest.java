@@ -19,6 +19,7 @@ import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.util.Arrays;
 import java.util.SplittableRandom;
 import net.jpountz.xxhash.XXHashFactory;
 import org.junit.jupiter.api.Test;
@@ -53,7 +54,7 @@ class ColumnKeyLayoutEquivalenceTest {
 		for (int len = 0; len < 200; len++) {
 			byte[] padded = bytes(random, len + 9);
 			int off = random.nextInt(10);
-			byte[] exact = java.util.Arrays.copyOfRange(padded, off, off + len);
+			byte[] exact = Arrays.copyOfRange(padded, off, off + len);
 			int expected = LegacyColumnKeyBuilder.xxHash32(exact);
 			assertEquals(expected, xxHash.hash(padded, off, len, 0));
 			assertEquals(expected, xxHash.hash(Buf.wrap(padded), off, len, 0));
@@ -72,7 +73,7 @@ class ColumnKeyLayoutEquivalenceTest {
 					type.hash(input, expected);
 					byte[] out = new byte[type.bytesSize() + 3];
 					type.hashInto(input, out, 2);
-					assertArrayEquals(expected.toByteArray(), java.util.Arrays.copyOfRange(out, 2, 2 + type.bytesSize()),
+					assertArrayEquals(expected.toByteArray(), Arrays.copyOfRange(out, 2, 2 + type.bytesSize()),
 							type + " " + kind + " " + size);
 				}
 			}

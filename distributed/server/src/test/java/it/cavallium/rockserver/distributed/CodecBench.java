@@ -1,14 +1,17 @@
 package it.cavallium.rockserver.distributed;
 
+import com.sun.management.ThreadMXBean;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Random;
+import java.util.function.Supplier;
 import java.util.function.ToLongFunction;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
@@ -20,8 +23,8 @@ import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
  */
 final class CodecBench {
 
-	private static final com.sun.management.ThreadMXBean THREADS =
-			(com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+	private static final ThreadMXBean THREADS =
+			(ThreadMXBean) ManagementFactory.getThreadMXBean();
 	private static final Random RANDOM = new Random(42);
 	private static volatile long sink;
 
@@ -152,7 +155,7 @@ final class CodecBench {
 		return List.of(entry);
 	}
 
-	private static List<LogEntry> repeat(int count, java.util.function.Supplier<LogEntry> entry) {
+	private static List<LogEntry> repeat(int count, Supplier<LogEntry> entry) {
 		var entries = new ArrayList<LogEntry>();
 		for (int i = 0; i < count; i++) {
 			entries.add(entry.get());
@@ -193,7 +196,7 @@ final class CodecBench {
 	}
 
 	private static List<ApplyResult> okNulls(int count) {
-		return java.util.Collections.nCopies(count, ApplyResult.OK_NULL);
+		return Collections.nCopies(count, ApplyResult.OK_NULL);
 	}
 
 	private static List<ApplyResult> okBufs(int count, int size) {

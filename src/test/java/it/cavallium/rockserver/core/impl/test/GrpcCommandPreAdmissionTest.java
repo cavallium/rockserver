@@ -24,6 +24,10 @@ import it.cavallium.rockserver.core.common.api.proto.PutBatchInitialRequest;
 import it.cavallium.rockserver.core.common.api.proto.PutBatchMode;
 import it.cavallium.rockserver.core.common.api.proto.PutBatchRequest;
 import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
+import it.cavallium.rockserver.core.common.api.proto.RequestContext;
+import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
+import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.cavallium.rockserver.core.impl.ReactorResultOwnership;
 import java.net.InetSocketAddress;
@@ -34,14 +38,19 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import reactor.core.Disposable;
@@ -49,6 +58,7 @@ import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 @Timeout(30)
 class GrpcCommandPreAdmissionTest {
@@ -98,7 +108,7 @@ class GrpcCommandPreAdmissionTest {
 			assertEquals(0, scheduler.queuedTasks(WorkloadProfile.LATENCY));
 
 			var stub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
-			var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+			var context = RequestContext.newBuilder()
 					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY)
 					.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Duration.ofSeconds(10).toNanos())
@@ -175,7 +185,7 @@ class GrpcCommandPreAdmissionTest {
 			assertInvalid(stub.get(GetRequest.newBuilder()
 					.setColumnId(1)
 					.addKeys(ByteString.copyFrom(new byte[
-							(int) it.cavallium.rockserver.core.impl.WorkloadAdmission
+							(int) WorkloadAdmission
 									.MAX_LATENCY_ENCODED_INPUT_BYTES + 1]))
 					.setContext(latency)
 					.build()));
@@ -196,8 +206,8 @@ class GrpcCommandPreAdmissionTest {
 
 	@Test
 	void grpcScheduledWrappersExposeEstimatedWorkToDeficitAccounting() throws Exception {
-		var estimatedWork = it.cavallium.rockserver.core.impl.RWScheduler.EstimatedWork.class;
-		var rejectionAware = it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask.class;
+		var estimatedWork = RWScheduler.EstimatedWork.class;
+		var rejectionAware = RWScheduler.RejectionAwareTask.class;
 		assertTrue(estimatedWork.isAssignableFrom(Class.forName(
 				"it.cavallium.rockserver.core.server.FastGetCallHandler$FastGetListener")));
 		assertTrue(estimatedWork.isAssignableFrom(Class.forName(
@@ -224,11 +234,11 @@ class GrpcCommandPreAdmissionTest {
 			var rejectedCalls = new AtomicInteger();
 			var rejected = invokeScheduled(execute, grpc, rejectedScheduler,
 					() -> rejectedCalls.incrementAndGet(), 8L);
-			var firstFailure = new java.util.concurrent.RejectedExecutionException("deadline");
-			var rejectedTask = (it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask)
+			var firstFailure = new RejectedExecutionException("deadline");
+			var rejectedTask = (RWScheduler.RejectionAwareTask)
 					rejectedScheduler.task();
 			rejectedTask.reject(firstFailure);
-			rejectedTask.reject(new java.util.concurrent.RejectedExecutionException("duplicate"));
+			rejectedTask.reject(new RejectedExecutionException("duplicate"));
 			var rejectedResult = assertThrows(ExecutionException.class,
 					() -> rejected.get(5, TimeUnit.SECONDS));
 			assertEquals(firstFailure, rejectedResult.getCause());
@@ -239,8 +249,8 @@ class GrpcCommandPreAdmissionTest {
 			var running = invokeScheduled(execute, grpc, runningScheduler,
 					runningCalls::incrementAndGet, 16L);
 			runningScheduler.task().run();
-			((it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask) runningScheduler.task())
-					.reject(new java.util.concurrent.RejectedExecutionException("late"));
+			((RWScheduler.RejectionAwareTask) runningScheduler.task())
+					.reject(new RejectedExecutionException("late"));
 			assertEquals(1, running.get(5, TimeUnit.SECONDS));
 			assertEquals(1, runningCalls.get());
 
@@ -249,8 +259,8 @@ class GrpcCommandPreAdmissionTest {
 			var cancelled = invokeScheduled(execute, grpc, cancelledScheduler,
 					cancelledCalls::incrementAndGet, 32L);
 			assertTrue(cancelled.cancel(true));
-			((it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask) cancelledScheduler.task())
-					.reject(new java.util.concurrent.RejectedExecutionException("cancelled"));
+			((RWScheduler.RejectionAwareTask) cancelledScheduler.task())
+					.reject(new RejectedExecutionException("cancelled"));
 			cancelledScheduler.task().run();
 			assertTrue(cancelled.isCancelled());
 			assertEquals(0, cancelledCalls.get());
@@ -294,7 +304,7 @@ class GrpcCommandPreAdmissionTest {
 						ignored -> successes.incrementAndGet(),
 						ignored -> errors.incrementAndGet());
 				Runnable task = scheduler.task();
-				var rejectionAware = (it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask) task;
+				var rejectionAware = (RWScheduler.RejectionAwareTask) task;
 				var raceStart = new CountDownLatch(1);
 				var run = CompletableFuture.runAsync(() -> {
 					awaitUninterruptibly(raceStart);
@@ -306,7 +316,7 @@ class GrpcCommandPreAdmissionTest {
 				});
 				var reject = CompletableFuture.runAsync(() -> {
 					awaitUninterruptibly(raceStart);
-					rejectionAware.reject(new java.util.concurrent.RejectedExecutionException(
+					rejectionAware.reject(new RejectedExecutionException(
 							"synthetic terminal race " + raceIndex));
 				});
 				raceStart.countDown();
@@ -316,7 +326,7 @@ class GrpcCommandPreAdmissionTest {
 
 				// Late/duplicate contenders must remain inert after the first state transition.
 				task.run();
-				rejectionAware.reject(new java.util.concurrent.RejectedExecutionException("late duplicate"));
+				rejectionAware.reject(new RejectedExecutionException("late duplicate"));
 				subscription.dispose();
 				assertTrue(booleanField(task, "terminated"), "task did not reach a terminal state");
 				assertFalse(booleanField(task, "running"), "task retained running ownership");
@@ -348,7 +358,7 @@ class GrpcCommandPreAdmissionTest {
 			execute.setAccessible(true);
 			String lateErrorKey = (String) field(Class.forName("it.cavallium.rockserver.core.server.GrpcRequestErrors"),
 					"GRPC_LATE_ERROR_HANDLER_CONTEXT_KEY").get(null);
-			assertTrue(java.util.Arrays.stream(ReactorResultOwnership.class.getDeclaredFields())
+			assertTrue(Arrays.stream(ReactorResultOwnership.class.getDeclaredFields())
 					.allMatch(candidate -> Modifier.isStatic(candidate.getModifiers())));
 
 			var cancelScheduler = new CapturingScheduler();
@@ -380,8 +390,8 @@ class GrpcCommandPreAdmissionTest {
 			assertTrue(booleanField(cancelledTask, "cancelled"));
 			releaseCallable.countDown();
 			running.get(5, TimeUnit.SECONDS);
-			((it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask) cancelledTask)
-					.reject(new java.util.concurrent.RejectedExecutionException("late duplicate"));
+			((RWScheduler.RejectionAwareTask) cancelledTask)
+					.reject(new RejectedExecutionException("late duplicate"));
 			cancelledSubscription.dispose();
 			assertEquals(1, cleanupCalls.get());
 			assertEquals("synthetic late cleanup failure", cleanupFailure.get().getMessage());
@@ -462,7 +472,7 @@ class GrpcCommandPreAdmissionTest {
 					});
 				}
 				assertTrue(blockersStarted.await(5, TimeUnit.SECONDS));
-				var before = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ);
+				var before = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 				long deadline = Duration.ofMillis(100).toNanos();
 				var call = new RecordingServerCall(scheduler);
 				ServerCall.Listener<GetRequest> listener = (ServerCall.Listener<GetRequest>) startCall.invoke(
@@ -470,7 +480,7 @@ class GrpcCommandPreAdmissionTest {
 				listener.onMessage(GetRequest.newBuilder()
 						.setColumnId(Long.MAX_VALUE)
 						.addKeys(ByteString.copyFrom(new byte[] {1}))
-						.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+						.setContext(RequestContext.newBuilder()
 								.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
 								.setWorkloadContractVersion(3)
 				.setTimeoutNanos(deadline))
@@ -501,7 +511,7 @@ class GrpcCommandPreAdmissionTest {
 				cancel.get(5, TimeUnit.SECONDS);
 				dispatchOrDeadline.get(5, TimeUnit.SECONDS);
 				assertEventually(() -> scheduler.poolSnapshot(
-						it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ).drainedAndConserved());
+						RWScheduler.Pool.READ).drainedAndConserved());
 
 				listener.onCancel();
 				listener.onHalfClose();
@@ -511,18 +521,18 @@ class GrpcCommandPreAdmissionTest {
 				}
 				assertTrue(call.callbackFailure.get() == null,
 						() -> "Fast Get terminal callback held the scheduler lock: " + call.callbackFailure.get());
-				var after = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ);
+				var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 				assertEquals(1L, after.submissionAttempts() - before.submissionAttempts());
 				assertEquals(4L, after.terminalOutcomes() - before.terminalOutcomes());
 				long targetRun = after.outcomes().get(
-						it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.RUN)
-						- before.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.RUN)
+						RWScheduler.TerminalOutcome.RUN)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.RUN)
 						- 3L;
 				long selected = targetRun
-						+ after.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.DEADLINE)
-						- before.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.DEADLINE)
-						+ after.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.CANCELLATION)
-						- before.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.CANCELLATION);
+						+ after.outcomes().get(RWScheduler.TerminalOutcome.DEADLINE)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.DEADLINE)
+						+ after.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION)
+						- before.outcomes().get(RWScheduler.TerminalOutcome.CANCELLATION);
 				assertEquals(1L, selected, "Fast Get did not select exactly one scheduler terminal cause");
 			}
 		} finally {
@@ -548,7 +558,7 @@ class GrpcCommandPreAdmissionTest {
 			Consumer<T> cleanup,
 			long estimatedBytes) throws Exception {
 		return (Mono<T>) method.invoke(
-				grpc, callable, scheduler, cleanup, reactor.core.scheduler.Schedulers.immediate(), estimatedBytes);
+				grpc, callable, scheduler, cleanup, Schedulers.immediate(), estimatedBytes);
 	}
 
 	private static boolean booleanField(Object owner, String name) throws Exception {
@@ -557,10 +567,10 @@ class GrpcCommandPreAdmissionTest {
 	}
 
 	private static void assertIntrusiveOwnershipState(Object task) {
-		assertEquals(0L, java.util.Arrays.stream(task.getClass().getDeclaredFields())
+		assertEquals(0L, Arrays.stream(task.getClass().getDeclaredFields())
 				.filter(candidate -> candidate.getType() == ReactorResultOwnership.class
-						|| candidate.getType() == java.util.concurrent.atomic.AtomicBoolean.class
-						|| candidate.getType() == java.util.concurrent.atomic.AtomicReference.class)
+						|| candidate.getType() == AtomicBoolean.class
+						|| candidate.getType() == AtomicReference.class)
 				.count(), "gRPC result ownership allocated a per-request helper");
 	}
 
@@ -598,19 +608,19 @@ class GrpcCommandPreAdmissionTest {
 
 		private Runnable task() {
 			var captured = task.get();
-			org.junit.jupiter.api.Assertions.assertNotNull(captured);
+			Assertions.assertNotNull(captured);
 			return captured;
 		}
 	}
 
 	private static final class RecordingServerCall extends ServerCall<GetRequest, Object> {
 
-		private final it.cavallium.rockserver.core.impl.RWScheduler scheduler;
+		private final RWScheduler scheduler;
 		private final AtomicInteger closeCount = new AtomicInteger();
 		private final AtomicReference<Throwable> callbackFailure = new AtomicReference<>();
 		private volatile boolean cancelled;
 
-		private RecordingServerCall(it.cavallium.rockserver.core.impl.RWScheduler scheduler) {
+		private RecordingServerCall(RWScheduler scheduler) {
 			this.scheduler = scheduler;
 		}
 
@@ -636,7 +646,7 @@ class GrpcCommandPreAdmissionTest {
 			closeCount.incrementAndGet();
 			try {
 				CompletableFuture.runAsync(() -> scheduler.poolSnapshot(
-						it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ)).get(2, TimeUnit.SECONDS);
+						RWScheduler.Pool.READ)).get(2, TimeUnit.SECONDS);
 			} catch (Throwable failure) {
 				callbackFailure.set(failure);
 			}
@@ -650,12 +660,12 @@ class GrpcCommandPreAdmissionTest {
 		@Override
 		@SuppressWarnings({"unchecked", "rawtypes"})
 		public MethodDescriptor<GetRequest, Object> getMethodDescriptor() {
-			return (MethodDescriptor) it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc
+			return (MethodDescriptor) RocksDBServiceGrpc
 					.getGetMethod();
 		}
 	}
 
-	private static void assertEventually(java.util.function.BooleanSupplier condition) throws InterruptedException {
+	private static void assertEventually(BooleanSupplier condition) throws InterruptedException {
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
 		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
 			Thread.sleep(5L);
@@ -678,9 +688,9 @@ class GrpcCommandPreAdmissionTest {
 		}
 	}
 
-	private static it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext(
+	private static RequestContext wireContext(
 			it.cavallium.rockserver.core.common.api.proto.WorkloadProfile profile) {
-		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+		return RequestContext.newBuilder()
 				.setProfile(profile)
 				.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Duration.ofSeconds(10).toNanos())

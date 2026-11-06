@@ -12,6 +12,7 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
@@ -605,7 +606,7 @@ class LeaderStallTest {
 				try {
 					network = Network.start(ports, linksRoot);
 				} catch (IOException e) {
-					throw new java.io.UncheckedIOException(e);
+					throw new UncheckedIOException(e);
 				}
 			}
 			return config.withPeers(config.peers().stream()

@@ -47,6 +47,7 @@ import org.jetbrains.annotations.VisibleForTesting;
 import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
@@ -336,7 +337,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		};
     }
 
-	private <T> T withEmbeddedContext(BoundRequestContext context, java.util.function.Supplier<T> operation) {
+	private <T> T withEmbeddedContext(BoundRequestContext context, Supplier<T> operation) {
 		long remainingNanos = context.remainingNanos();
 		if (remainingNanos == 0L) {
 			throw RocksDBException.notApplied(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
@@ -834,9 +835,9 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 		private final CompletableFuture<Void> finished = new CompletableFuture<>();
 		private volatile boolean cancellationRequested;
-		private volatile @Nullable reactor.core.Disposable cancellation;
+		private volatile @Nullable Disposable cancellation;
 
-		private void attachCancellation(reactor.core.Disposable cancellation) {
+		private void attachCancellation(Disposable cancellation) {
 			this.cancellation = Objects.requireNonNull(cancellation, "cancellation");
 			if (cancellationRequested) {
 				cancellation.dispose();
@@ -885,7 +886,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	 * and leaves {@link EmbeddedDB} before this state can yield.
 	 */
 	private final class CooperativeIteratorContinuation<T> extends CompletableFuture<T>
-			implements RWScheduler.CooperativeCompletionTask, reactor.core.Disposable {
+			implements RWScheduler.CooperativeCompletionTask, Disposable {
 
 		private final long iterationId;
 		private final AsyncIteratorOperation iteratorOperation;
@@ -1579,7 +1580,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
         return db.getScheduler();
     }
 
-    @org.jetbrains.annotations.VisibleForTesting
+    @VisibleForTesting
     public EmbeddedDB getInternalDB() {
         return db;
     }

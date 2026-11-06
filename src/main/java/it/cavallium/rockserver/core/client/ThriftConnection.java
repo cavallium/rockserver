@@ -45,13 +45,19 @@ import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.SerializedKVBatch;
+import it.cavallium.rockserver.core.common.SstMaintenance;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
+import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.common.api.Column;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
+import it.cavallium.rockserver.core.common.api.RangeRequestType;
 import it.cavallium.rockserver.core.common.api.RocksDB;
 import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
 import it.cavallium.rockserver.core.common.api.UpdateBegin;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -68,12 +74,14 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.thrift.TApplicationException;
@@ -636,7 +644,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 				return (T) mapOptionalBinary(client.get(transactionOrUpdateId, columnId, mapKeys(keys), context));
 			} else if (requestType instanceof RequestForUpdate) {
 				UpdateBegin ub = client.getForUpdate(transactionOrUpdateId, columnId, mapKeys(keys), context);
-				return (T) new it.cavallium.rockserver.core.common.UpdateContext<>(
+				return (T) new UpdateContext<>(
 						ub.isSetPrevious() ? Utils.fromByteBuffer(ub.previous) : null,
 						ub.getUpdateId());
 			} else if (requestType instanceof RequestExists) {
@@ -793,8 +801,8 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Request type cannot be null");
 			}
 			var wireType = switch (requestType) {
-				case RequestGetAllInRange<?> _ -> it.cavallium.rockserver.core.common.api.RangeRequestType.ALL_IN_RANGE;
-				case RequestGetAllInRangeNoCache<?> _ -> it.cavallium.rockserver.core.common.api.RangeRequestType.ALL_IN_RANGE_NO_CACHE;
+				case RequestGetAllInRange<?> _ -> RangeRequestType.ALL_IN_RANGE;
+				case RequestGetAllInRangeNoCache<?> _ -> RangeRequestType.ALL_IN_RANGE_NO_CACHE;
 			};
 			var wireBudget = new it.cavallium.rockserver.core.common.api.RangeBudget(
 					budget.maxItems(), budget.maxBytes());
@@ -829,16 +837,16 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		}
 	}
 
-    @Override public it.cavallium.rockserver.core.common.SstMaintenance.Metadata getSstMetadata(long columnId, int level) {
+    @Override public SstMaintenance.Metadata getSstMetadata(long columnId, int level) {
         throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "SST maintenance requires gRPC or embedded transport");
     }
-    @Override public it.cavallium.rockserver.core.common.SstMaintenance.Result compactFiles(it.cavallium.rockserver.core.common.SstMaintenance.Request request) {
+    @Override public SstMaintenance.Result compactFiles(SstMaintenance.Request request) {
         throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "SST maintenance requires gRPC or embedded transport");
     }
-    @Override public CompletableFuture<it.cavallium.rockserver.core.common.SstMaintenance.Metadata> getSstMetadataAsync(long columnId, int level) {
+    @Override public CompletableFuture<SstMaintenance.Metadata> getSstMetadataAsync(long columnId, int level) {
         return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "SST maintenance requires gRPC or embedded transport"));
     }
-    @Override public CompletableFuture<it.cavallium.rockserver.core.common.SstMaintenance.Result> compactFilesAsync(it.cavallium.rockserver.core.common.SstMaintenance.Request request) {
+    @Override public CompletableFuture<SstMaintenance.Result> compactFilesAsync(SstMaintenance.Request request) {
         return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "SST maintenance requires gRPC or embedded transport"));
     }
 
@@ -856,7 +864,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		try {
 			return client.getAllColumnDefinitions(currentWireRequestContext()).stream()
 					.collect(Collectors.toMap(
-							it.cavallium.rockserver.core.common.api.Column::getName,
+							Column::getName,
 							c -> mapSchemaFromThrift(c.getSchema())
 					));
 		} catch (TException e) {
@@ -1256,8 +1264,8 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 				remainingNanos);
 	}
 
-	private <T> CompletableFuture<T> supplyAsyncContextual(java.util.function.Supplier<T> operation,
-			java.util.concurrent.Executor ignoredExecutor) {
+	private <T> CompletableFuture<T> supplyAsyncContextual(Supplier<T> operation,
+			Executor ignoredExecutor) {
 		var context = currentBoundRequestContext();
 		var future = new ThriftCallFuture<>(context, operation);
 		try {
@@ -1269,7 +1277,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	private CompletableFuture<Void> runAsyncContextual(Runnable operation,
-			java.util.concurrent.Executor ignoredExecutor) {
+			Executor ignoredExecutor) {
 		return supplyAsyncContextual(() -> {
 			operation.run();
 			return null;
@@ -1289,10 +1297,10 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		private static final int CANCELLED = 3;
 
 		private final BoundRequestContext context;
-		private final java.util.function.Supplier<T> operation;
+		private final Supplier<T> operation;
 		private final AtomicInteger state = new AtomicInteger(QUEUED);
 
-		private ThriftCallFuture(BoundRequestContext context, java.util.function.Supplier<T> operation) {
+		private ThriftCallFuture(BoundRequestContext context, Supplier<T> operation) {
 			this.context = context;
 			this.operation = operation;
 		}
@@ -1413,8 +1421,8 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	private ColumnSchema mapSchemaFromThrift(it.cavallium.rockserver.core.common.api.ColumnSchema schema) {
 		return ColumnSchema.of(
-				it.unimi.dsi.fastutil.ints.IntArrayList.wrap(schema.getFixedKeys().stream().mapToInt(i -> i).toArray()),
-				it.unimi.dsi.fastutil.objects.ObjectArrayList.wrap(schema.getVariableTailKeys().stream()
+				IntArrayList.wrap(schema.getFixedKeys().stream().mapToInt(i -> i).toArray()),
+				ObjectArrayList.wrap(schema.getVariableTailKeys().stream()
 						.map(t -> it.cavallium.rockserver.core.common.ColumnHashType.valueOf(t.name()))
 						.toArray(it.cavallium.rockserver.core.common.ColumnHashType[]::new)),
 				schema.isHasValue(),

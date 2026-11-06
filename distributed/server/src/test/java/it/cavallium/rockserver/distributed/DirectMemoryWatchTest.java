@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -55,7 +56,7 @@ class DirectMemoryWatchTest {
 	void theThreadsOfARunningClusterAreClassified() throws Exception {
 		try (var cluster = new InProcessCluster(temp, 3, config -> config).startAll()) {
 			var leader = cluster.awaitLeader(Duration.ofSeconds(30));
-			var db = leader.connection().getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch(Duration.ofSeconds(20)));
+			var db = leader.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
 			long column = db.createColumn("c", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 			db.put(0, column, new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(1).array())),
 					Buf.wrap(new byte[] {1}), RequestType.none());

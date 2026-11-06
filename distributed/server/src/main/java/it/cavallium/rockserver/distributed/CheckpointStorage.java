@@ -3,8 +3,10 @@ package it.cavallium.rockserver.distributed;
 import java.io.File;
 import java.io.IOException;
 import java.io.StringReader;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -357,7 +359,7 @@ final class CheckpointStorage implements StateMachineStorage {
 					files++;
 					bytes += Files.size(file);
 				}
-			} catch (java.io.UncheckedIOException | java.nio.file.NoSuchFileException ex) {
+			} catch (UncheckedIOException | NoSuchFileException ex) {
 				// Changing under the walk: it is alive.
 				installProgress.remove(name);
 				continue;

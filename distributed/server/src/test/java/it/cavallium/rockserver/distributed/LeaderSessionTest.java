@@ -12,6 +12,8 @@ import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
+import it.unimi.dsi.fastutil.ints.IntList;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -232,7 +234,7 @@ class LeaderSessionTest {
 	}
 
 	private static Buf text(String value) {
-		return Buf.wrap(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+		return Buf.wrap(value.getBytes(StandardCharsets.UTF_8));
 	}
 
 	private static List<ApplyResult> ok() {
@@ -265,7 +267,7 @@ class LeaderSessionTest {
 		assertTrue(second.isDone());
 		assertFalse(third.isDone());
 		assertEquals(firstLink, second.join().base);
-		assertEquals("one", firstLink.value.toString(java.nio.charset.StandardCharsets.UTF_8));
+		assertEquals("one", firstLink.value.toString(StandardCharsets.UTF_8));
 
 		var secondLink = admit(open(second.join()), "two");
 		assertEquals(secondLink, third.join().base);
@@ -518,7 +520,7 @@ class LeaderSessionTest {
 
 		chain.linkFailed(link);
 		assertEquals(null, chain.chainCheck(entry), "its base failed");
-		assertEquals(it.unimi.dsi.fastutil.ints.IntList.of(0),
+		assertEquals(IntList.of(0),
 				chain.tracker().conflicts(List.of((LogEntry) entry), chain::chainCheck));
 	}
 
@@ -710,7 +712,7 @@ class LeaderSessionTest {
 	}
 
 	private static Keys key(String value) {
-		return new Keys(Buf.wrap(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+		return new Keys(Buf.wrap(value.getBytes(StandardCharsets.UTF_8)));
 	}
 
 	private static LogEntry.Put put(Keys keys) {

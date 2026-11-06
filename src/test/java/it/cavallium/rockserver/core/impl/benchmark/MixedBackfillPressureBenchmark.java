@@ -9,12 +9,16 @@ import it.cavallium.rockserver.core.common.RawScanEvent;
 import it.cavallium.rockserver.core.common.RawSstToken;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -32,12 +37,16 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.LongConsumer;
+import java.util.stream.Stream;
 import reactor.core.publisher.Flux;
 
 /**
@@ -366,10 +375,10 @@ public final class MixedBackfillPressureBenchmark {
 				|| event instanceof RawScanEvent.Batch batch && batch.completedSstToken() != null;
 	}
 
-	private static long consumeScan(java.util.stream.Stream<RawScanEvent> stream,
+	private static long consumeScan(Stream<RawScanEvent> stream,
 			Set<RawSstToken> checkpoints,
 			Path checkpointFile,
-			java.util.function.LongConsumer progress) {
+			LongConsumer progress) {
 		var rows = new LongAdder();
 		try (stream) {
 			stream.forEach(event -> processEvent(event, checkpoints, checkpointFile, value -> {
@@ -382,7 +391,7 @@ public final class MixedBackfillPressureBenchmark {
 	private static void processEvent(RawScanEvent event,
 			Set<RawSstToken> checkpoints,
 			Path checkpointFile,
-			java.util.function.LongConsumer rows,
+			LongConsumer rows,
 			CountDownLatch checkpoint) {
 		RawSstToken token = null;
 		if (event instanceof RawScanEvent.Batch batch) {
@@ -395,18 +404,18 @@ public final class MixedBackfillPressureBenchmark {
 			if (checkpointFile != null) {
 				try {
 					appendCheckpoint(checkpointFile, token);
-				} catch (java.io.IOException failure) {
-					throw new java.io.UncheckedIOException(failure);
+				} catch (IOException failure) {
+					throw new UncheckedIOException(failure);
 				}
 			}
 			if (checkpoint != null) checkpoint.countDown();
 		}
 	}
 
-	private static void appendCheckpoint(Path checkpointFile, RawSstToken token) throws java.io.IOException {
+	private static void appendCheckpoint(Path checkpointFile, RawSstToken token) throws IOException {
 		boolean createDirectoryEntry = Files.notExists(checkpointFile);
-		byte[] value = (token.value() + '\n').getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-		try (var channel = java.nio.channels.FileChannel.open(checkpointFile,
+		byte[] value = (token.value() + '\n').getBytes(StandardCharsets.US_ASCII);
+		try (var channel = FileChannel.open(checkpointFile,
 				StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND,
 				StandardOpenOption.DSYNC)) {
 			var buffer = ByteBuffer.wrap(value);
@@ -414,14 +423,14 @@ public final class MixedBackfillPressureBenchmark {
 			channel.force(true);
 		}
 		if (createDirectoryEntry) {
-			try (var directory = java.nio.channels.FileChannel.open(checkpointFile.getParent(),
+			try (var directory = FileChannel.open(checkpointFile.getParent(),
 					StandardOpenOption.READ)) {
 				directory.force(true);
 			}
 		}
 	}
 
-	private static void preload(it.cavallium.rockserver.core.common.RocksDBSyncAPI api,
+	private static void preload(RocksDBSyncAPI api,
 			long columnId,
 			Options options,
 			Keys[] keySpace) {
@@ -483,7 +492,7 @@ public final class MixedBackfillPressureBenchmark {
 		command.add(directory.toString());
 		command.addAll(List.of(arguments));
 		var process = new ProcessBuilder(command).redirectErrorStream(true).start();
-		var output = new java.util.concurrent.FutureTask<byte[]>(() -> process.getInputStream().readAllBytes());
+		var output = new FutureTask<byte[]>(() -> process.getInputStream().readAllBytes());
 		Thread.ofVirtual().name("mixed-pressure-provenance").start(output);
 		byte[] bytes;
 		try {
@@ -498,7 +507,7 @@ public final class MixedBackfillPressureBenchmark {
 			output.cancel(true);
 			Thread.currentThread().interrupt();
 			throw interrupted;
-		} catch (java.util.concurrent.TimeoutException timeout) {
+		} catch (TimeoutException timeout) {
 			process.destroyForcibly();
 			output.cancel(true);
 			throw new IllegalStateException("Git provenance output drain timed out", timeout);
@@ -530,7 +539,7 @@ public final class MixedBackfillPressureBenchmark {
 		try {
 			return RequestContext.latency(measurement.plusSeconds(30L));
 		} catch (ArithmeticException overflow) {
-			return new RequestContext(it.cavallium.rockserver.core.common.WorkloadProfile.LATENCY,
+			return new RequestContext(WorkloadProfile.LATENCY,
 					RequestContext.NO_TIMEOUT - 1L);
 		}
 	}
@@ -596,7 +605,7 @@ public final class MixedBackfillPressureBenchmark {
 			return Path.of(type.getProtectionDomain().getCodeSource().getLocation().toURI()).toRealPath();
 		}
 
-		private static String contentSha(Path path) throws java.io.IOException {
+		private static String contentSha(Path path) throws IOException {
 			return GrpcRetainedReadBenchmark.classPathContentSha256ForTesting(path.toString());
 		}
 
@@ -665,7 +674,7 @@ public final class MixedBackfillPressureBenchmark {
 		}
 
 		static Options parse(String[] args) {
-			var values = new java.util.LinkedHashMap<String, String>();
+			var values = new LinkedHashMap<String, String>();
 			for (String argument : args) {
 				if (!argument.startsWith("--") || !argument.contains("=")) throw new IllegalArgumentException("Use --name=value");
 				int equals = argument.indexOf('=');
@@ -755,7 +764,7 @@ public final class MixedBackfillPressureBenchmark {
 			}
 		}
 
-		void write() throws java.io.IOException {
+		void write() throws IOException {
 			assertCorrect();
 			Files.writeString(output, properties(), StandardOpenOption.CREATE_NEW);
 			Files.writeString(options.root().resolve("mixed-results.md"), toMarkdown(), StandardOpenOption.CREATE_NEW);

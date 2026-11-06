@@ -2,8 +2,11 @@ package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 
+import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
@@ -17,7 +20,7 @@ class PointReadCompletionCountersTest {
     // The test module uses reflection rather than introducing a public telemetry API.
     private static final class Counters {
         final Object monitor;
-        final java.lang.reflect.Method record, sample, count, nanos, tail;
+        final Method record, sample, count, nanos, tail;
         Counters() throws Exception {
             var type = Class.forName(EmbeddedDB.class.getPackageName()
                     + ".EmbeddedDBStorageMetrics$PointReadCompletionCounters");
@@ -79,7 +82,7 @@ class PointReadCompletionCountersTest {
         counters.record(700);
         var attempting = new CountDownLatch(1);
         try (var executor = Executors.newSingleThreadExecutor()) {
-            java.util.concurrent.Future<?> publisher;
+            Future<?> publisher;
             var publisherThread = executor.submit(Thread::currentThread).get(5, TimeUnit.SECONDS);
             synchronized (counters.stripeFor(publisherThread)) {
                 publisher = executor.submit(() -> { attempting.countDown(); counters.record(1700); });
@@ -121,7 +124,7 @@ class PointReadCompletionCountersTest {
         var start = new CountDownLatch(1);
         var finished = new CountDownLatch(publishers);
         try (var executor = Executors.newFixedThreadPool(publishers)) {
-            var futures = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+            var futures = new ArrayList<Future<?>>();
             for (int i = 0; i < publishers; i++) futures.add(executor.submit(() -> {
                 try {
                     assertTrue(start.await(5, TimeUnit.SECONDS));

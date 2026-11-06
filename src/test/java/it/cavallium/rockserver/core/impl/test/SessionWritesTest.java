@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.grpc.Status;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
@@ -20,6 +21,7 @@ import it.cavallium.rockserver.core.common.UpdateContext;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
@@ -42,6 +44,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Which writes the core client's {@code SessionWrites} numbers, how it resends them, re-issues them under a new session
@@ -222,7 +225,7 @@ class SessionWritesTest {
 		var older = new Writes(_ -> new CompletableFuture<>(), (_, _) -> new CompletableFuture<>(), Runnable::run, false);
 		assertFalse(older.numbers(new RocksDBAPICommandSingle.PutBatch(1, Flux.empty(), PutBatchMode.WRITE_BATCH)));
 		assertFalse(older.numbers(new RocksDBAPICommandSingle.MergeBatch(1, Flux.empty(),
-				it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_WRITE_BATCH)));
+				MergeBatchMode.MERGE_WRITE_BATCH)));
 		assertTrue(older.numbers(new RocksDBAPICommandSingle.DeleteRange(1, KEY, KEY)));
 	}
 
@@ -605,7 +608,7 @@ class SessionWritesTest {
 			return copies.getLast();
 		}, executor);
 		var result = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
-		var subscription = reactor.core.publisher.Mono.fromFuture(result).subscribe(_ -> {}, _ -> {});
+		var subscription = Mono.fromFuture(result).subscribe(_ -> {}, _ -> {});
 		while (copies.size() < 3) {
 			Thread.sleep(5);
 		}
@@ -623,7 +626,7 @@ class SessionWritesTest {
 			return lost.getLast();
 		}, executor);
 		var write = timedOut.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
-		assertThrows(RuntimeException.class, () -> reactor.core.publisher.Mono.fromFuture(write)
+		assertThrows(RuntimeException.class, () -> Mono.fromFuture(write)
 				.timeout(Duration.ofMillis(300)).block());
 		assertTrue(write.isDone());
 		int sent = lost.size();
@@ -705,7 +708,7 @@ class SessionWritesTest {
 	void theSynchronousWaitIsUnboundedWithoutADeadlineAndNeverOverflows() throws Exception {
 		assertEquals(Long.MAX_VALUE, syncWaitNanos(RequestContext.ingest()));
 		assertEquals(Long.MAX_VALUE, syncWaitNanos(RequestContext.batch()));
-		assertEquals(Long.MAX_VALUE, syncWaitNanos(RequestContext.latency(java.time.temporal.ChronoUnit.FOREVER.getDuration())));
+		assertEquals(Long.MAX_VALUE, syncWaitNanos(RequestContext.latency(ChronoUnit.FOREVER.getDuration())));
 		assertEquals(Long.MAX_VALUE, syncWaitNanos(RequestContext.latency(Duration.ofSeconds(Long.MAX_VALUE))));
 		long wait = syncWaitNanos(RequestContext.latency(Duration.ofSeconds(1)));
 		assertTrue(wait > TimeUnit.SECONDS.toNanos(5) && wait <= TimeUnit.SECONDS.toNanos(6), String.valueOf(wait));

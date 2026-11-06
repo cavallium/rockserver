@@ -11,6 +11,7 @@ import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -120,7 +121,7 @@ final class CommitHeartbeats {
 		try {
 			var request = RaftClientRequest.newBuilder()
 					.setClientId(clientId)
-					.setServerId(org.apache.ratis.protocol.RaftPeerId.valueOf(serverId()))
+					.setServerId(RaftPeerId.valueOf(serverId()))
 					.setGroupId(groupId)
 					.setCallId(callIds.incrementAndGet())
 					.setMessage(OrderedAsync.DUMMY)

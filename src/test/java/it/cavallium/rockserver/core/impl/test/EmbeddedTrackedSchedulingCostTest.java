@@ -13,6 +13,7 @@ import it.cavallium.rockserver.core.impl.ReactorResultOwnership;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -23,6 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -140,9 +142,9 @@ class EmbeddedTrackedSchedulingCostTest {
 				}
 				assertEquals(null, objectField(task, "pendingResult"),
 						"terminal hooks retained a native result");
-				org.junit.jupiter.api.Assertions.assertTrue(calls.get() <= 1L, "native callable ran twice");
-				org.junit.jupiter.api.Assertions.assertTrue(cleanups.get() <= 1L, "native cleanup ran twice");
-				org.junit.jupiter.api.Assertions.assertTrue(successes.get() + errors.get() <= 1L,
+				Assertions.assertTrue(calls.get() <= 1L, "native callable ran twice");
+				Assertions.assertTrue(cleanups.get() <= 1L, "native cleanup ran twice");
+				Assertions.assertTrue(successes.get() + errors.get() <= 1L,
 						"subscriber saw duplicate terminal signals");
 			}
 		}
@@ -153,7 +155,7 @@ class EmbeddedTrackedSchedulingCostTest {
 			throws Exception {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("db-result-ownership"),
 				"embedded-result-ownership", null)) {
-			assertTrue(java.util.Arrays.stream(ReactorResultOwnership.class.getDeclaredFields())
+			assertTrue(Arrays.stream(ReactorResultOwnership.class.getDeclaredFields())
 					.allMatch(field -> Modifier.isStatic(field.getModifiers())),
 					"the shared ownership helper must remain allocation-free static code");
 
@@ -431,10 +433,10 @@ class EmbeddedTrackedSchedulingCostTest {
 	}
 
 	private static void assertIntrusiveOwnershipState(Object task) {
-		assertEquals(0L, java.util.Arrays.stream(task.getClass().getDeclaredFields())
+		assertEquals(0L, Arrays.stream(task.getClass().getDeclaredFields())
 				.filter(field -> field.getType() == ReactorResultOwnership.class
-						|| field.getType() == java.util.concurrent.atomic.AtomicBoolean.class
-						|| field.getType() == java.util.concurrent.atomic.AtomicReference.class)
+						|| field.getType() == AtomicBoolean.class
+						|| field.getType() == AtomicReference.class)
 				.count(), "result ownership allocated a per-request helper for " + task.getClass());
 	}
 }

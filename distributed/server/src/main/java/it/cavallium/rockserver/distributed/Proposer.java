@@ -13,9 +13,12 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -23,11 +26,15 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Supplier;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.RaftClientConfigKeys;
+import org.apache.ratis.client.RaftClientRpc;
+import org.apache.ratis.client.impl.RaftClientRpcWithProxy;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
@@ -45,7 +52,9 @@ import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
 import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.thirdparty.io.grpc.StatusRuntimeException;
+import org.apache.ratis.util.IOUtils;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.LoggerFactory;
 
 /**
  * Submits log entries to the current leader, from any node, batching the requests that arrive together.
@@ -522,7 +531,7 @@ final class Proposer implements Closeable {
 	}
 
 	/** Every request submitted and not answered yet, so that close() can answer them all. */
-	private final java.util.Set<Pending> live = java.util.concurrent.ConcurrentHashMap.newKeySet();
+	private final Set<Pending> live = ConcurrentHashMap.newKeySet();
 
 	private CompletableFuture<Object> submit(LogEntry entry, Lane lane, long callerTimeLeftNanos,
 			@Nullable ClientRequestId client) {
@@ -683,7 +692,7 @@ final class Proposer implements Closeable {
 
 	private static RocksDBException noAnswer(@Nullable Throwable cause) {
 		return unavailable(cause != null ? cause
-				: new java.util.concurrent.TimeoutException("No answer before the deadline"));
+				: new TimeoutException("No answer before the deadline"));
 	}
 
 	/** Every request numbered below this has its final answer: no copy of it will ever be sent again. */
@@ -870,7 +879,7 @@ final class Proposer implements Closeable {
 					clients[i] = pending.client;
 				}
 				// Not null: a request taken into a batch is never abandoned (see Pending.markSent).
-				entries.add(java.util.Objects.requireNonNull(pending.entry, "entry"));
+				entries.add(Objects.requireNonNull(pending.entry, "entry"));
 				entriesSize += pending.bodySize;
 				earliest = Math.min(earliest, pending.deadlineNanos);
 				latest = Math.max(latest, pending.deadlineNanos);
@@ -936,7 +945,7 @@ final class Proposer implements Closeable {
 			var rest = new ArrayList<Pending>(batch.size());
 			for (var pending : batch) {
 				try {
-					var entry = java.util.Objects.requireNonNull(pending.entry, "entry");
+					var entry = Objects.requireNonNull(pending.entry, "entry");
 					if (LogEntryCodec.encodeEntryBody(entry).length != pending.bodySize) {
 						throw new IllegalStateException("The write changed size after it was submitted");
 					}
@@ -1125,7 +1134,7 @@ final class Proposer implements Closeable {
 								batch.get(position).result.completeExceptionally(new ConflictException());
 								rest.set(position, null);
 							}
-							rest.removeIf(java.util.Objects::isNull);
+							rest.removeIf(Objects::isNull);
 							requeue(rest);
 						}
 					} else if (refusal != null) {
@@ -1217,7 +1226,7 @@ final class Proposer implements Closeable {
 					// A database read: off the control threads, which this reply handler runs on.
 					try {
 						sender.execute(() -> completeFromLocalRecord(pending));
-					} catch (java.util.concurrent.RejectedExecutionException stopping) {
+					} catch (RejectedExecutionException stopping) {
 						pending.fail(unavailable(stopping));
 					}
 				} else {
@@ -1371,14 +1380,14 @@ final class Proposer implements Closeable {
 	 * channel, and is not sent on the old one that the reset then closes under it; attempts to other peers never
 	 * waited for the close (the map's lock is not held meanwhile).
 	 */
-	static void resetConnection(org.apache.ratis.client.RaftClientRpc rpc, RaftPeerId peer, IOException error) {
+	static void resetConnection(RaftClientRpc rpc, RaftPeerId peer, IOException error) {
 		// Ratis' proxy map resets on these errors only (PeerProxyMap.handleException with reconnect false).
-		Object failed = org.apache.ratis.util.IOUtils.shouldReconnect(error) ? currentProxy(rpc, peer) : null;
+		Object failed = IOUtils.shouldReconnect(error) ? currentProxy(rpc, peer) : null;
 		Thread.ofVirtual().name("rockserver-propose-reset-" + peer).start(() -> {
 			try {
 				rpc.handleException(peer, error, false);
 			} catch (RuntimeException ex) {
-				org.slf4j.LoggerFactory.getLogger(Proposer.class).debug("Could not reset the connection to {}", peer, ex);
+				LoggerFactory.getLogger(Proposer.class).debug("Could not reset the connection to {}", peer, ex);
 			}
 		});
 		if (failed == null) {
@@ -1386,13 +1395,13 @@ final class Proposer implements Closeable {
 		}
 		long deadline = System.nanoTime() + RESET_REMOVAL_WAIT_NANOS;
 		while (currentProxy(rpc, peer) == failed && System.nanoTime() - deadline < 0) {
-			java.util.concurrent.locks.LockSupport.parkNanos(50_000);
+			LockSupport.parkNanos(50_000);
 		}
 	}
 
 	/** The proxy that {@code rpc} uses for {@code peer} now, or null if it has none or does not say. */
-	private static @Nullable Object currentProxy(org.apache.ratis.client.RaftClientRpc rpc, RaftPeerId peer) {
-		if (!(rpc instanceof org.apache.ratis.client.impl.RaftClientRpcWithProxy<?> withProxy)) {
+	private static @Nullable Object currentProxy(RaftClientRpc rpc, RaftPeerId peer) {
+		if (!(rpc instanceof RaftClientRpcWithProxy<?> withProxy)) {
 			return null;
 		}
 		try {

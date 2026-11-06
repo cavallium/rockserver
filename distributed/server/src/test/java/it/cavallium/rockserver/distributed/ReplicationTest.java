@@ -11,8 +11,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.Delta;
 import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.MergeBatchMode;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
@@ -33,12 +35,21 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.LockSupport;
+import java.util.stream.IntStream;
+import org.apache.ratis.protocol.ClientId;
+import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientRequest;
+import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /** Replication through real Ratis servers in one JVM: writes, reads, transactions, restarts, catch-up. */
 class ReplicationTest {
@@ -157,7 +168,7 @@ class ReplicationTest {
 		long column = api(oldLeader).createColumn("c", SCHEMA);
 		api(oldLeader).put(0, column, key(1), text("old"), RequestType.none());
 		cluster.awaitConverged(TIMEOUT);
-		var gate = new java.util.concurrent.CountDownLatch(1);
+		var gate = new CountDownLatch(1);
 		var followers = cluster.runningNodes().stream().filter(node -> node != oldLeader).toList();
 		try {
 			for (var follower : followers) {
@@ -170,9 +181,9 @@ class ReplicationTest {
 			var read = newLeader.connection().getAsyncApi(RequestContext.batch(Duration.ofSeconds(20)))
 					.getAsync(0, column, key(1), RequestType.current());
 			try {
-				var value = read.get(1, java.util.concurrent.TimeUnit.SECONDS);
+				var value = read.get(1, TimeUnit.SECONDS);
 				assertEquals("new", text(value), "read served before the acknowledged write was applied");
-			} catch (java.util.concurrent.TimeoutException | java.util.concurrent.ExecutionException expected) {
+			} catch (TimeoutException | ExecutionException expected) {
 				// Still waiting for the apply, or failed in time: either way not stale.
 			}
 		} finally {
@@ -213,9 +224,9 @@ class ReplicationTest {
 		long column = api.createColumn("c", SCHEMA);
 		int writes = 64;
 		var large = Buf.wrap(new byte[3 * 512 * 1024]);
-		try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+		try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
 			// Keys below `writes` for data writes, the others for updates.
-			var puts = new ArrayList<java.util.concurrent.Future<?>>();
+			var puts = new ArrayList<Future<?>>();
 			for (int i = 0; i < 2 * writes; i++) {
 				long key = i;
 				puts.add(executor.submit(() -> api.put(0, column, key(key), large, RequestType.none())));
@@ -223,7 +234,7 @@ class ReplicationTest {
 			for (var put : puts) {
 				put.get();
 			}
-			var previous = new ArrayList<java.util.concurrent.Future<Buf>>();
+			var previous = new ArrayList<Future<Buf>>();
 			for (int i = 0; i < writes; i++) {
 				long key = i;
 				previous.add(executor.submit(() -> api.put(0, column, key(key), text("small"), RequestType.previous())));
@@ -236,7 +247,7 @@ class ReplicationTest {
 			for (int i = 0; i < writes; i++) {
 				updates[i] = api.get(0, column, key(writes + i), RequestType.<Buf>forUpdate()).updateId();
 			}
-			var updated = new ArrayList<java.util.concurrent.Future<Buf>>();
+			var updated = new ArrayList<Future<Buf>>();
 			for (int i = 0; i < writes; i++) {
 				long update = updates[i];
 				long key = writes + i;
@@ -264,7 +275,7 @@ class ReplicationTest {
 		// A delta result is a tag, a value tag and both sides with their lengths.
 		var previous = Buf.wrap(new byte[15 * 1024 * 1024]);
 		var current = Buf.wrap(new byte[ResultCodec.MAX_RESULT_BYTES - 2 - 10 - previous.size()]);
-		var result = new ApplyResult.Ok(new it.cavallium.rockserver.core.common.Delta<>(previous, current));
+		var result = new ApplyResult.Ok(new Delta<>(previous, current));
 		assertEquals(List.of(ApplyResult.RESEND_ALONE, ApplyResult.RESEND_ALONE),
 				ResultCodec.decodeAll(ResultCodec.encodeAll(List.of(result, result))), "precondition");
 		api.put(0, column, key(1), previous, RequestType.none());
@@ -278,7 +289,7 @@ class ReplicationTest {
 			cluster.halt(id);
 		}
 		var async = through.connection().getAsyncApi(CONTEXT);
-		var fillers = new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+		var fillers = new ArrayList<CompletableFuture<Void>>();
 		for (int i = 0; i < Proposer.MAX_BATCHES_IN_FLIGHT; i++) {
 			fillers.add(async.putAsync(0, column, key(100 + i), text("filler"), RequestType.none()));
 		}
@@ -334,7 +345,7 @@ class ReplicationTest {
 			cluster.halt(id);
 		}
 		var async = through.connection().getAsyncApi(CONTEXT);
-		var fillers = new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+		var fillers = new ArrayList<CompletableFuture<Void>>();
 		for (int i = 0; i < Proposer.MAX_BATCHES_IN_FLIGHT; i++) {
 			fillers.add(async.putAsync(0, column, key(100 + i), text("filler"), RequestType.none()));
 		}
@@ -385,7 +396,7 @@ class ReplicationTest {
 		// Fillers take every batch slot until their own deadline: the two writes queue meanwhile, and then go
 		// together in one batch.
 		var fillerApi = through.connection().getAsyncApi(RequestContext.latency(Duration.ofMillis(500)));
-		var fillers = new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+		var fillers = new ArrayList<CompletableFuture<Void>>();
 		for (int i = 0; i < Proposer.MAX_BATCHES_IN_FLIGHT; i++) {
 			fillers.add(fillerApi.putAsync(0, column, key(100 + i), text("filler"), RequestType.none()));
 		}
@@ -397,7 +408,7 @@ class ReplicationTest {
 				() -> shortWrite.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
 		assertInstanceOf(RocksDBException.class, shortError.getCause());
 		// With no leader electable, the other write must still be pending a while later.
-		assertThrows(java.util.concurrent.TimeoutException.class, () -> longWrite.get(1, TimeUnit.SECONDS),
+		assertThrows(TimeoutException.class, () -> longWrite.get(1, TimeUnit.SECONDS),
 				"the write without a deadline ended with the short one");
 
 		for (String id : halted) {
@@ -504,9 +515,9 @@ class ReplicationTest {
 		api(follower).put(0, column, key(1), text("before"), RequestType.none());
 		cluster.awaitConverged(TIMEOUT);
 		long before = leader.appliedIndex();
-		var gate = new java.util.concurrent.CountDownLatch(1);
+		var gate = new CountDownLatch(1);
 		leader.stateMachine().testHooks().applyGate = gate;
-		java.util.concurrent.CompletableFuture<Void> write;
+		CompletableFuture<Void> write;
 		try {
 			write = follower.connection().getAsyncApi(CONTEXT).putAsync(0, column, key(1), text("slow"),
 					RequestType.none());
@@ -537,7 +548,7 @@ class ReplicationTest {
 		for (int i = 50; i < 100; i++) {
 			api(survivor).merge(0, column, key(1), text(Integer.toString(i)), RequestType.none());
 		}
-		var expected = String.join(",", java.util.stream.IntStream.range(0, 100).mapToObj(Integer::toString).toList());
+		var expected = String.join(",", IntStream.range(0, 100).mapToObj(Integer::toString).toList());
 		assertEquals(expected, text(api(survivor).get(0, column, key(1), RequestType.current())));
 
 		cluster.start(oldLeader);
@@ -842,9 +853,9 @@ class ReplicationTest {
 		KVBatch first = new KVBatch.KVBatchRef(List.of(key(1)), List.of(text("first")));
 		KVBatch second = new KVBatch.KVBatchRef(List.of(key(2)), List.of(text("second")));
 		var batches = Flux.concat(Flux.just(first),
-				reactor.core.publisher.Mono.delay(Duration.ofSeconds(2)).thenMany(Flux.just(second)));
+				Mono.delay(Duration.ofSeconds(2)).thenMany(Flux.just(second)));
 		var call = through.connection().getAsyncApi(RequestContext.batch(Duration.ofSeconds(1)))
-				.mergeBatchAsync(column, batches, it.cavallium.rockserver.core.common.MergeBatchMode.MERGE_WRITE_BATCH);
+				.mergeBatchAsync(column, batches, MergeBatchMode.MERGE_WRITE_BATCH);
 		var error = assertThrows(ExecutionException.class, () -> call.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
 		var cause = assertInstanceOf(RocksDBException.class, error.getCause());
 		assertEquals(RocksDBErrorType.INVALID_REQUEST, cause.getErrorUniqueId());
@@ -924,16 +935,16 @@ class ReplicationTest {
 		var entry = new LogEntry.Put(column, key(1), text("once"), RequestType.RequestTypeId.NOTHING);
 		var encoded = LogEntryCodec.encodeBatch(Long.MAX_VALUE / 3, 0, new long[] {1}, null, List.of(entry),
 				LogEntryCodec.entrySize(entry), true);
-		var content = org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations.unsafeWrap(encoded.bytes());
-		var clientId = org.apache.ratis.protocol.ClientId.randomId();
+		var content = UnsafeByteOperations.unsafeWrap(encoded.bytes());
+		var clientId = ClientId.randomId();
 		var division = stateMachine.division();
-		var request = org.apache.ratis.protocol.RaftClientRequest.newBuilder()
+		var request = RaftClientRequest.newBuilder()
 				.setClientId(clientId)
 				.setServerId(division.getId())
 				.setGroupId(division.getGroup().getGroupId())
 				.setCallId(1)
-				.setMessage(org.apache.ratis.protocol.Message.valueOf(content))
-				.setType(org.apache.ratis.protocol.RaftClientRequest.writeRequestType())
+				.setMessage(Message.valueOf(content))
+				.setType(RaftClientRequest.writeRequestType())
 				.build();
 		long taken = stateMachine.localProposalsTaken();
 		stateMachine.offerLocal(clientId, 1, content, encoded.requests());

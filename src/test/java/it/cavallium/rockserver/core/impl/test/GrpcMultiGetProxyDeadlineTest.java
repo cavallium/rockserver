@@ -12,6 +12,7 @@ import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
+import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.MultiGetPage;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
@@ -34,6 +35,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -92,10 +94,10 @@ class GrpcMultiGetProxyDeadlineTest {
 
 	private static RWScheduler scheduler(AtomicLong clock) throws ReflectiveOperationException {
 		var factory = RWScheduler.class.getDeclaredMethod("forTesting", int.class, int.class,
-				int.class, int.class, int.class, String.class, java.util.function.LongSupplier.class);
+				int.class, int.class, int.class, String.class, LongSupplier.class);
 		factory.setAccessible(true);
 		return (RWScheduler) factory.invoke(null, 1, 1, 1, 8, 8,
-				"multi-get-proxy-deadline", (java.util.function.LongSupplier) clock::get);
+				"multi-get-proxy-deadline", (LongSupplier) clock::get);
 	}
 
 	private static final class Fixture implements AutoCloseable {
@@ -175,7 +177,7 @@ class GrpcMultiGetProxyDeadlineTest {
 		public RocksDBSyncAPI getSyncApi(RequestContext context) {
 			return new RocksDBSyncAPI() {
 				@Override
-				public MultiGetPage getMulti(long columnId, List<it.cavallium.rockserver.core.common.Keys> keys,
+				public MultiGetPage getMulti(long columnId, List<Keys> keys,
 						it.cavallium.rockserver.core.common.RangeBudget budget) {
 					calls.incrementAndGet();
 					timeout.set(context.timeoutNanos());

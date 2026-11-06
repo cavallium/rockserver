@@ -6,10 +6,15 @@ import static org.mockito.Mockito.*;
 
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.config.ConfigParser;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.lang.reflect.InvocationTargetException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Collection;
 import java.util.stream.Stream;
 import java.util.List;
 import java.util.Map;
@@ -20,6 +25,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import reactor.core.publisher.Mono;
 
 @Timeout(120)
 class TablePropertiesTest {
@@ -61,25 +67,25 @@ class TablePropertiesTest {
 
     @Test
     void tableMetricsConfigurationIsOptInAndRejectsUnsafeIntervals() throws Exception {
-        var defaults = it.cavallium.rockserver.core.config.ConfigParser.parseDefault().metrics();
+        var defaults = ConfigParser.parseDefault().metrics();
         assertFalse(defaults.tablePropertiesEnabled());
         assertEquals(300, defaults.tablePropertiesIntervalSeconds());
         var config = tempDir.resolve("metrics.conf");
-        java.nio.file.Files.writeString(config, "database.metrics { table-properties-enabled: true, table-properties-interval-seconds: 60 }");
-        var configured = it.cavallium.rockserver.core.config.ConfigParser.parse(config).metrics();
+        Files.writeString(config, "database.metrics { table-properties-enabled: true, table-properties-interval-seconds: 60 }");
+        var configured = ConfigParser.parse(config).metrics();
         assertTrue(configured.tablePropertiesEnabled());
         assertEquals(60, configured.tablePropertiesIntervalSeconds());
-        try (var db = new it.cavallium.rockserver.core.impl.EmbeddedDB(tempDir.resolve("db"), "metrics-enabled", config)) {
+        try (var db = new EmbeddedDB(tempDir.resolve("db"), "metrics-enabled", config)) {
             long column = db.createColumn("entries", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
             db.put(0, column, new Keys(toBufSimple(1)), toBufSimple(2), RequestType.none());
             db.flush();
             var method = part(db, "maintenance").getClass().getDeclaredMethod("collectTablePropertiesMetrics");
             method.setAccessible(true);
             @SuppressWarnings("unchecked")
-            var collection = (reactor.core.publisher.Mono<java.util.Map<String, ColumnTableProperties>>) method.invoke(part(db, "maintenance"));
+            var collection = (Mono<Map<String, ColumnTableProperties>>) method.invoke(part(db, "maintenance"));
             assertEquals(1, collection.block(Duration.ofSeconds(10)).get("entries").numEntries());
         }
-        java.nio.file.Files.writeString(config, "database.metrics.table-properties-interval-seconds: 1");
+        Files.writeString(config, "database.metrics.table-properties-interval-seconds: 1");
         assertThrows(RocksDBException.class, () -> new EmbeddedConnection(tempDir.resolve("bad"), "invalid-metrics", config));
     }
 
@@ -94,13 +100,13 @@ class TablePropertiesTest {
         }
     }
 
-    private static ColumnTableProperties aggregate(java.util.Collection<TableProperties> tables) {
+    private static ColumnTableProperties aggregate(Collection<TableProperties> tables) {
         try {
             var method = Class.forName("it.cavallium.rockserver.core.impl.EmbeddedDBMaintenance")
-                    .getDeclaredMethod("aggregateTableProperties", java.util.Collection.class);
+                    .getDeclaredMethod("aggregateTableProperties", Collection.class);
             method.setAccessible(true);
             return (ColumnTableProperties) method.invoke(null, tables);
-        } catch (java.lang.reflect.InvocationTargetException e) {
+        } catch (InvocationTargetException e) {
             if (e.getCause() instanceof RuntimeException cause) throw cause;
             throw new AssertionError(e.getCause());
         } catch (ReflectiveOperationException e) { throw new AssertionError(e); }

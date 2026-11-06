@@ -10,15 +10,22 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Descriptors;
 import io.grpc.protobuf.ProtoFileDescriptorSupplier;
+import it.cavallium.rockserver.core.common.api.RangeBudget;
 import it.cavallium.rockserver.core.common.api.RocksDB;
+import it.cavallium.rockserver.core.common.api.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse;
+import it.cavallium.rockserver.core.common.api.proto.KV;
 import it.cavallium.rockserver.core.common.api.proto.PutBatchInitialRequest;
 import it.cavallium.rockserver.core.common.api.proto.PutRequest;
+import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
 import java.nio.ByteBuffer;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.server.ThriftServer;
@@ -71,10 +78,10 @@ class WorkloadWireContractTest {
 
 	@Test
 	void workloadV3CapabilitiesAndRangeRequestValuesAreExplicitAndStable() throws Exception {
-		var capabilities = it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse.newBuilder()
+		var capabilities = CapabilitiesResponse.newBuilder()
 				.setWorkloadContractVersion(3)
 				.build();
-		var decoded = it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse.parseFrom(
+		var decoded = CapabilitiesResponse.parseFrom(
 				capabilities.toByteArray());
 		assertEquals(3, decoded.getWorkloadContractVersion());
 
@@ -85,7 +92,7 @@ class WorkloadWireContractTest {
 		assertEquals(1, it.cavallium.rockserver.core.common.api.RangeRequestType.ALL_IN_RANGE.getValue());
 		assertEquals(2, it.cavallium.rockserver.core.common.api.RangeRequestType.ALL_IN_RANGE_NO_CACHE.getValue());
 		assertEquals(44,
-				it.cavallium.rockserver.core.common.api.RocksDBErrorType.RANGE_ITEM_TOO_LARGE.getValue());
+				RocksDBErrorType.RANGE_ITEM_TOO_LARGE.getValue());
 	}
 
 	@Test
@@ -97,7 +104,7 @@ class WorkloadWireContractTest {
 				.build();
 		var unary = PutRequest.newBuilder()
 				.setColumnId(1)
-				.setData(it.cavallium.rockserver.core.common.api.proto.KV.newBuilder()
+				.setData(KV.newBuilder()
 						.addKeys(ByteString.copyFrom(new byte[] {1}))
 						.setValue(ByteString.copyFrom(new byte[] {2})))
 				.setContext(context)
@@ -121,16 +128,16 @@ class WorkloadWireContractTest {
 		assertNotNull(RocksDB.Iface.class.getMethod("getRangePage",
 				long.class, long.class, List.class, List.class, boolean.class, List.class,
 				it.cavallium.rockserver.core.common.api.RangeRequestType.class,
-				it.cavallium.rockserver.core.common.api.RangeBudget.class,
+				RangeBudget.class,
 				it.cavallium.rockserver.core.common.api.RequestContext.class));
 		assertNotNull(RocksDB.Iface.class.getMethod("flush", int.class));
 	}
 
 	@Test
 	void everyGrpcAndThriftRequestVariantHasExactlyOneDeclaredContextPolicy() {
-		var schemaSupplier = org.junit.jupiter.api.Assertions.assertInstanceOf(
+		var schemaSupplier = Assertions.assertInstanceOf(
 				ProtoFileDescriptorSupplier.class,
-				it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc
+				RocksDBServiceGrpc
 						.getServiceDescriptor().getSchemaDescriptor());
 		var service = schemaSupplier.getFileDescriptor().findServiceByName("RocksDBService");
 		assertNotNull(service);
@@ -172,7 +179,7 @@ class WorkloadWireContractTest {
 		var names = new HashSet<String>();
 		for (Method method : api.getDeclaredMethods()) {
 			names.add(method.getName());
-			long contexts = java.util.Arrays.stream(method.getParameterTypes())
+			long contexts = Arrays.stream(method.getParameterTypes())
 					.filter(type -> type == it.cavallium.rockserver.core.common.api.RequestContext.class)
 					.count();
 			if (CONTEXT_FREE_METHODS.contains(method.getName())) {
@@ -202,7 +209,7 @@ class WorkloadWireContractTest {
 					Long.MAX_VALUE);
 			var invocation = assertThrows(InvocationTargetException.class,
 					() -> mapper.invoke(null, wire));
-			var failure = org.junit.jupiter.api.Assertions.assertInstanceOf(
+			var failure = Assertions.assertInstanceOf(
 					RocksDBException.class, invocation.getCause());
 			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					failure.getErrorUniqueId());
@@ -214,7 +221,7 @@ class WorkloadWireContractTest {
 				0L);
 		var invocation = assertThrows(InvocationTargetException.class,
 				() -> mapper.invoke(null, invalidTimeout));
-		var failure = org.junit.jupiter.api.Assertions.assertInstanceOf(
+		var failure = Assertions.assertInstanceOf(
 				RocksDBException.class, invocation.getCause());
 		assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 				failure.getErrorUniqueId());
@@ -234,7 +241,7 @@ class WorkloadWireContractTest {
 			}
 			var invocation = assertThrows(InvocationTargetException.class,
 					() -> mapper.invoke(null, wire));
-			var failure = org.junit.jupiter.api.Assertions.assertInstanceOf(
+			var failure = Assertions.assertInstanceOf(
 					RocksDBException.class, invocation.getCause());
 			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					failure.getErrorUniqueId());

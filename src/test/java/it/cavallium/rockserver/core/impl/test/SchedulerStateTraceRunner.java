@@ -2,10 +2,12 @@ package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /** Compact, replayable byte-action driver for the independent scheduler model. */
 final class SchedulerStateTraceRunner {
@@ -24,7 +26,7 @@ final class SchedulerStateTraceRunner {
 	static void run(byte[] input) {
 		byte[] actions = input.length <= MAX_ACTIONS
 				? input
-				: java.util.Arrays.copyOf(input, MAX_ACTIONS);
+				: Arrays.copyOf(input, MAX_ACTIONS);
 		var model = new SchedulerReferenceModel(settings());
 		var gate = new SchedulerReferenceModel.BatchGate(2, 3, 1, 3L, 2L, 4L);
 		var permits = new EnumMap<SchedulerReferenceModel.BatchGate.Pool,
@@ -126,10 +128,10 @@ final class SchedulerStateTraceRunner {
 		return ids;
 	}
 
-	private static java.util.Optional<Long> select(List<Long> ids, int selector) {
+	private static Optional<Long> select(List<Long> ids, int selector) {
 		return ids.isEmpty()
-				? java.util.Optional.empty()
-				: java.util.Optional.of(ids.get(Math.floorMod(selector, ids.size())));
+				? Optional.empty()
+				: Optional.of(ids.get(Math.floorMod(selector, ids.size())));
 	}
 
 	private static SchedulerReferenceModel.BatchGate.Pool pool(int argument) {

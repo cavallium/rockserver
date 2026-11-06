@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPI;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
@@ -47,7 +48,7 @@ final class ContextBoundRocksDBAPI implements RocksDBAPI {
 	}
 
 	@Override
-	public java.util.concurrent.CompletableFuture<Void> flushWalAsync() {
+	public CompletableFuture<Void> flushWalAsync() {
 		return requestAsync(new RocksDBAPICommand.Flush(true));
 	}
 }

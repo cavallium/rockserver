@@ -35,11 +35,14 @@ import org.rocksdb.SstFileReader;
 import org.rocksdb.LiveFileMetaData;
 import org.rocksdb.Options;
 import org.rocksdb.util.SizeUnit;
+import reactor.core.Disposable;
 import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.MonoSink;
 import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import reactor.util.retry.Retry;
 
 /**
@@ -82,13 +85,13 @@ final class EmbeddedDBRawScan {
 		private static final int CANCELLED = 3;
 
 		private final Callable<RawScanPinnedSstSet> capture;
-		private final reactor.core.publisher.MonoSink<RawScanPinnedSstSet> sink;
+		private final MonoSink<RawScanPinnedSstSet> sink;
 		private final AtomicInteger state = new AtomicInteger(QUEUED);
 		private @Nullable Object pendingResult;
 		private boolean deliveryCancelled;
 
 		private RawScanPinCaptureTask(Callable<RawScanPinnedSstSet> capture,
-				reactor.core.publisher.MonoSink<RawScanPinnedSstSet> sink) {
+				MonoSink<RawScanPinnedSstSet> sink) {
 			this.capture = capture;
 			this.sink = sink;
 		}
@@ -708,7 +711,7 @@ final class EmbeddedDBRawScan {
 
 	private final class ScanState<T> implements RWScheduler.CooperativeCompletionTask,
 			LongConsumer,
-			reactor.core.Disposable {
+			Disposable {
 		private static final VarHandle DEMAND =
 				EmbeddedDB.varHandle(ScanState.class, "demand", long.class);
 		private static final VarHandle TERMINATED =
@@ -1287,7 +1290,7 @@ final class EmbeddedDBRawScan {
 														// Retry only pre-dispatch queue rejection. ScanState keeps the
 														// same hard link available, while native/data failures remain terminal.
 														.retryWhen(EmbeddedDB.RAW_SCAN_ADMISSION_RETRY)
-														.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
+														.publishOn(Schedulers.parallel(), 1);
 
 										var ssts = Flux.fromIterable(pinnedSsts.files());
 										if (shardCount == 1) {
@@ -1327,7 +1330,7 @@ final class EmbeddedDBRawScan {
 		}).thenMany(scan);
 	}
 
-	private record RawScanInitialAdmission(reactor.core.publisher.MonoSink<Void> sink)
+	private record RawScanInitialAdmission(MonoSink<Void> sink)
 			implements Runnable, RWScheduler.RejectionAwareTask {
 
 		@Override

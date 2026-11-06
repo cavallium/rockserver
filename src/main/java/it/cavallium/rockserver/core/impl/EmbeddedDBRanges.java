@@ -40,10 +40,13 @@ import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
 import org.rocksdb.Snapshot;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.MonoSink;
 import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 /**
  * Range operations of {@link EmbeddedDB}: reduceRange, getRange (paged, streamed, async), countRange, range
@@ -402,7 +405,7 @@ final class EmbeddedDBRanges {
 							workloadExecutor),
 					cursor -> Flux.defer(() -> scheduleOrdinaryRangeStep(workloadExecutor,
 								() -> cursor.readChunk(totalTime)))
-							.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
+							.publishOn(Schedulers.parallel(), 1)
 							.doOnNext(chunk -> {
 								var chunkObserver = edb.rangeReadChunkSizeObserver;
 								if (chunkObserver != null) {
@@ -439,7 +442,7 @@ final class EmbeddedDBRanges {
 					sink.onDispose(state::cancelDelivery);
 					state.start();
 				}, FluxSink.OverflowStrategy.ERROR)
-						.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
+						.publishOn(Schedulers.parallel(), 1)
 						.doOnNext(chunk -> {
 							var chunkObserver = edb.rangeReadChunkSizeObserver;
 							if (chunkObserver != null) {
@@ -515,7 +518,7 @@ final class EmbeddedDBRanges {
 						}
 						return chunk;
 					}))
-							.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
+							.publishOn(Schedulers.parallel(), 1)
 							.doOnNext(chunk -> {
 								var sizeObserver = edb.rangeCountQuantumItemsObserver;
 								if (sizeObserver != null) {
@@ -647,7 +650,7 @@ final class EmbeddedDBRanges {
 		private final RWScheduler.WorkloadExecutor target;
 		private final Callable<T> callable;
 		private final @Nullable Consumer<? super T> lateSuccessCleanup;
-		private final reactor.core.publisher.MonoSink<T> sink;
+		private final MonoSink<T> sink;
 		private volatile int state = QUEUED;
 		private @Nullable Object pendingResult;
 		private boolean deliveryCancelled;
@@ -655,7 +658,7 @@ final class EmbeddedDBRanges {
 		private OrdinaryRetainedRangeTask(RWScheduler.WorkloadExecutor target,
 				Callable<T> callable,
 				@Nullable Consumer<? super T> lateSuccessCleanup,
-				reactor.core.publisher.MonoSink<T> sink) {
+				MonoSink<T> sink) {
 			this.target = target;
 			this.callable = callable;
 			this.lateSuccessCleanup = lateSuccessCleanup;
@@ -837,7 +840,7 @@ final class EmbeddedDBRanges {
 			implements RWScheduler.CooperativeCompletionTask,
 			ActiveRangeResource,
 			LongConsumer,
-			reactor.core.Disposable {
+			Disposable {
 
 		private static final VarHandle TERMINATED =
 				EmbeddedDB.varHandle(RetainedRangeCooperativeTask.class, "terminated", boolean.class);
@@ -1282,7 +1285,7 @@ final class EmbeddedDBRanges {
 
 	private final class RetainedRangeCountTask extends RetainedRangeCooperativeTask {
 
-		private final reactor.core.publisher.MonoSink<Long> sink;
+		private final MonoSink<Long> sink;
 		private long count;
 
 		private RetainedRangeCountTask(long transactionId,
@@ -1294,7 +1297,7 @@ final class EmbeddedDBRanges {
 				LongAdder totalTime,
 				RWScheduler.WorkloadExecutor workloadExecutor,
 				RetainedQueryPermit retainedPermit,
-				reactor.core.publisher.MonoSink<Long> sink) {
+				MonoSink<Long> sink) {
 			super(transactionId,
 					columnId,
 					startKeysInclusive,
@@ -1363,7 +1366,7 @@ final class EmbeddedDBRanges {
 				return false;
 			}
 			try {
-				reactor.core.scheduler.Schedulers.parallel().schedule(() -> {
+				Schedulers.parallel().schedule(() -> {
 					try {
 						observer.run();
 					} finally {
@@ -1549,7 +1552,7 @@ final class EmbeddedDBRanges {
 
 			private final long ticket;
 			private final long monotonicDeadlineNanos;
-			private final reactor.core.publisher.MonoSink<RetainedQueryPermit> sink;
+			private final MonoSink<RetainedQueryPermit> sink;
 			private int state = WAITING;
 			private @Nullable RetainedQueryPermit permit;
 			private @Nullable ScheduledFuture<?> expiration;
@@ -1558,7 +1561,7 @@ final class EmbeddedDBRanges {
 
 			private RetainedQueryWaiter(long ticket,
 					long monotonicDeadlineNanos,
-					reactor.core.publisher.MonoSink<RetainedQueryPermit> sink) {
+					MonoSink<RetainedQueryPermit> sink) {
 				this.ticket = ticket;
 				this.monotonicDeadlineNanos = monotonicDeadlineNanos;
 				this.sink = sink;
@@ -1725,7 +1728,7 @@ final class EmbeddedDBRanges {
 		private final @Nullable RetainedQueryPermit retainedPermit;
 		private final ReadOptions readOptions;
 		private final RocksIterator iterator;
-		private java.util.ListIterator<Entry<Buf[], Buf>> bucketIterator;
+		private ListIterator<Entry<Buf[], Buf>> bucketIterator;
 		private @Nullable KV pendingRangeItem;
 		private long pendingCountItems;
 		private long pendingCountBytes;

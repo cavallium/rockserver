@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import io.grpc.ServerBuilder;
+import io.grpc.Status;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.client.ClientBuilder;
 
@@ -7,33 +9,46 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
+import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest;
+import it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse;
+import it.cavallium.rockserver.core.common.api.proto.GetColumnIdRequest;
+import it.cavallium.rockserver.core.common.api.proto.GetColumnIdResponse;
+import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
 import java.io.IOException;
 import java.net.URI;
+import java.net.UnixDomainSocketAddress;
 import java.time.Duration;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 class DeferredRockserverConnectionTest {
 
 	private static final URI URL = URI.create("http://localhost:1234");
 
-	private static RocksDBConnection deferred(URI url, java.util.concurrent.Callable<RocksDBConnection> factory)
+	private static RocksDBConnection deferred(URI url, Callable<RocksDBConnection> factory)
 			throws Exception {
 		return deferred(url, factory, System::nanoTime);
 	}
 
-	private static RocksDBConnection deferred(URI url, java.util.concurrent.Callable<RocksDBConnection> factory,
-			java.util.function.LongSupplier clock) throws Exception {
+	private static RocksDBConnection deferred(URI url, Callable<RocksDBConnection> factory,
+			LongSupplier clock) throws Exception {
 		var constructor = Class.forName("it.cavallium.rockserver.core.client.DeferredRockserverConnection")
-				.getDeclaredConstructor(URI.class, java.util.concurrent.Callable.class, java.util.function.LongSupplier.class);
+				.getDeclaredConstructor(URI.class, Callable.class, LongSupplier.class);
 		constructor.setAccessible(true);
 		return (RocksDBConnection) constructor.newInstance(url, factory, clock);
 	}
@@ -42,15 +57,15 @@ class DeferredRockserverConnectionTest {
 	void builderDefersRemoteConstructionAndCloseWithoutUse() throws Exception {
 		var builder = new ClientBuilder();
 		builder.setDeferred(true);
-		builder.setHttpAddress(new it.cavallium.rockserver.core.common.Utils.HostAndPort("localhost", 1));
+		builder.setHttpAddress(new Utils.HostAndPort("localhost", 1));
 		try (var client = builder.build()) {
 			assertEquals(URI.create("http://localhost:1"), client.getUrl());
 			assertNotNull(client.getAsyncApi(RequestContext.analytical()));
-			builder.setHttpAddress(new it.cavallium.rockserver.core.common.Utils.HostAndPort("localhost", 2));
+			builder.setHttpAddress(new Utils.HostAndPort("localhost", 2));
 			assertEquals(URI.create("http://localhost:1"), client.getUrl());
 		}
 		builder.setHttpAddress(null);
-		builder.setUnixSocket(java.net.UnixDomainSocketAddress.of("/tmp/rockserver-deferred-unused.sock"));
+		builder.setUnixSocket(UnixDomainSocketAddress.of("/tmp/rockserver-deferred-unused.sock"));
 		try (var client = builder.build()) {
 			assertEquals(URI.create("unix:///tmp/rockserver-deferred-unused.sock"), client.getUrl());
 		}
@@ -60,29 +75,29 @@ class DeferredRockserverConnectionTest {
 	void builderValidatesCapabilitiesOnceAndReusesThenReopensRemoteConnection() throws Exception {
 		var handshakes = new AtomicInteger();
 		var operations = new AtomicInteger();
-		var service = new it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc.RocksDBServiceImplBase() {
+		var service = new ReactorRocksDBServiceGrpc.RocksDBServiceImplBase() {
 			@Override
-			public Mono<it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse> getCapabilities(
-					it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest request) {
+			public Mono<CapabilitiesResponse> getCapabilities(
+					CapabilitiesRequest request) {
 				handshakes.incrementAndGet();
-				return Mono.just(it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse.newBuilder()
+				return Mono.just(CapabilitiesResponse.newBuilder()
 						.setWorkloadContractVersion(3).build());
 			}
 
 			@Override
-			public Mono<it.cavallium.rockserver.core.common.api.proto.GetColumnIdResponse> getColumnId(
-					it.cavallium.rockserver.core.common.api.proto.GetColumnIdRequest request) {
+			public Mono<GetColumnIdResponse> getColumnId(
+					GetColumnIdRequest request) {
 				assertTrue(handshakes.get() > 0);
 				operations.incrementAndGet();
-				return Mono.just(it.cavallium.rockserver.core.common.api.proto.GetColumnIdResponse.newBuilder()
+				return Mono.just(GetColumnIdResponse.newBuilder()
 						.setColumnId(11).build());
 			}
 		};
-		var server = io.grpc.ServerBuilder.forPort(0).addService(service).build().start();
+		var server = ServerBuilder.forPort(0).addService(service).build().start();
 		try {
 			var builder = new ClientBuilder();
 			builder.setDeferred(true);
-			builder.setHttpAddress(new it.cavallium.rockserver.core.common.Utils.HostAndPort("127.0.0.1", server.getPort()));
+			builder.setHttpAddress(new Utils.HostAndPort("127.0.0.1", server.getPort()));
 			for (int opened = 0; opened < 2; opened++) {
 				try (var client = builder.build()) {
 					assertEquals(opened, handshakes.get());
@@ -104,7 +119,7 @@ class DeferredRockserverConnectionTest {
 		var calls = new AtomicInteger();
 		try (var deferred = deferred(URL, () -> { calls.incrementAndGet(); return client(); })) {
 			assertThrows(IllegalStateException.class, () -> Mono.fromCallable(deferred::getCapabilities)
-					.subscribeOn(reactor.core.scheduler.Schedulers.parallel()).block());
+					.subscribeOn(Schedulers.parallel()).block());
 			assertEquals(0, calls.get());
 		}
 	}
@@ -168,7 +183,7 @@ class DeferredRockserverConnectionTest {
 			verify(api, never()).flushAsync();
 			verify(api, never()).requestAsync(any());
 			verify(client).getAsyncApi(argThat(context -> context.profile()
-					== it.cavallium.rockserver.core.common.WorkloadProfile.BATCH
+					== WorkloadProfile.BATCH
 					&& context.timeoutNanos() == Duration.ofSeconds(1).toNanos()));
 		}
 	}
@@ -262,10 +277,10 @@ class DeferredRockserverConnectionTest {
 			var pending = deferred.getAsyncApi(RequestContext.latency(Duration.ofSeconds(1)))
 					.getColumnIdAsync("timeout");
 			assertTrue(entered.await(5, TimeUnit.SECONDS));
-			var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+			var failure = assertThrows(ExecutionException.class,
 					() -> pending.get(5, TimeUnit.SECONDS));
-			assertEquals(io.grpc.Status.Code.DEADLINE_EXCEEDED,
-					io.grpc.Status.fromThrowable(failure.getCause()).getCode());
+			assertEquals(Status.Code.DEADLINE_EXCEEDED,
+					Status.fromThrowable(failure.getCause()).getCode());
 			verify(late, never()).getAsyncApi(any());
 			var retry = deferred.getAsyncApi(RequestContext.analytical()).getColumnIdAsync("retry");
 			assertFalse(retry.isDone());
@@ -285,7 +300,7 @@ class DeferredRockserverConnectionTest {
 			var client = client();
 			var api = mock(RocksDBAsyncAPI.class);
 			when(api.requestAsync(any())).thenAnswer(invocation -> invocation.getArgument(0)
-					instanceof it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream<?>
+					instanceof RocksDBAPICommand.RocksDBAPICommandStream<?>
 					? Flux.empty() : CompletableFuture.completedFuture(11L));
 			when(client.getAsyncApi(any())).thenReturn(api);
 			try (var deferred = deferred(URL, () -> {
@@ -309,10 +324,10 @@ class DeferredRockserverConnectionTest {
 				clock.set(Duration.ofSeconds(2).toNanos());
 				return client;
 			}, clock::get)) {
-				var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+				var failure = assertThrows(ExecutionException.class,
 						() -> perform(selectedOperation, deferred.getAsyncApi(RequestContext.analytical(Duration.ofSeconds(1))))
 								.get(5, TimeUnit.SECONDS));
-				assertEquals(io.grpc.Status.Code.DEADLINE_EXCEEDED, io.grpc.Status.fromThrowable(failure.getCause()).getCode());
+				assertEquals(Status.Code.DEADLINE_EXCEEDED, Status.fromThrowable(failure.getCause()).getCode());
 				verify(client, never()).getAsyncApi(any());
 			}
 		}
@@ -321,7 +336,7 @@ class DeferredRockserverConnectionTest {
 	private static CompletableFuture<?> perform(int operation, RocksDBAsyncAPI api) {
 		return switch (operation) {
 			case 0 -> api.getColumnIdAsync("column");
-			case 1 -> Flux.from(api.requestAsync(new it.cavallium.rockserver.core.common.RocksDBAPICommand
+			case 1 -> Flux.from(api.requestAsync(new RocksDBAPICommand
 					.RocksDBAPICommandStream.ScanRaw(1, 0, 1))).collectList().toFuture();
 			default -> throw new AssertionError(operation);
 		};

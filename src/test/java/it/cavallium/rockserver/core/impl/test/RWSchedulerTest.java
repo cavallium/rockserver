@@ -8,15 +8,20 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.sun.management.ThreadMXBean;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.impl.WorkloadAdmission;
+import java.lang.management.ManagementFactory;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -44,7 +49,7 @@ class RWSchedulerTest {
 		var release = new CountDownLatch(1);
 		var queuedCompleted = new CountDownLatch(1);
 		try {
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(release);
@@ -88,8 +93,8 @@ class RWSchedulerTest {
 			for (int iteration = 0; iteration < 100_000; iteration++) {
 				scheduler.copyPoolTelemetry(RWScheduler.Pool.READ, telemetry);
 			}
-			java.util.Arrays.fill(telemetry, -1L);
-			var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory
+			Arrays.fill(telemetry, -1L);
+			var threads = (ThreadMXBean) ManagementFactory
 					.getThreadMXBean();
 			if (!threads.isThreadAllocatedMemoryEnabled()) threads.setThreadAllocatedMemoryEnabled(true);
 			long threadId = Thread.currentThread().threadId();
@@ -163,11 +168,11 @@ class RWSchedulerTest {
 
 	@Test
 	void everyAllowedProfileFamilyHasOneExactPhysicalPoolRoute() {
-		var seenFamilies = java.util.EnumSet.noneOf(OperationFamily.class);
-		var seenPools = java.util.EnumSet.noneOf(RWScheduler.Pool.class);
+		var seenFamilies = EnumSet.noneOf(OperationFamily.class);
+		var seenPools = EnumSet.noneOf(RWScheduler.Pool.class);
 		for (var profile : WorkloadProfile.values()) {
 			for (var family : OperationFamily.values()) {
-				if (it.cavallium.rockserver.core.impl.WorkloadAdmission.isAllowed(profile, family)) {
+				if (WorkloadAdmission.isAllowed(profile, family)) {
 					var expected = expectedPool(profile, family);
 					assertEquals(expected, RWScheduler.resourcePool(profile, family),
 							profile + "/" + family);
@@ -178,8 +183,8 @@ class RWSchedulerTest {
 				}
 			}
 		}
-		assertEquals(java.util.EnumSet.allOf(OperationFamily.class), seenFamilies);
-		assertEquals(java.util.EnumSet.allOf(RWScheduler.Pool.class), seenPools);
+		assertEquals(EnumSet.allOf(OperationFamily.class), seenFamilies);
+		assertEquals(EnumSet.allOf(RWScheduler.Pool.class), seenPools);
 	}
 
 	private static RWScheduler.Pool expectedPool(WorkloadProfile profile, OperationFamily family) {
@@ -202,15 +207,15 @@ class RWSchedulerTest {
 		var completed = new CountDownLatch(2);
 		var order = Collections.synchronizedList(new ArrayList<String>());
 		try {
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(release);
 					});
 			assertTrue(blockerStarted.await(5, SECONDS));
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(20)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(20)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("later", order, completed));
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(10)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(10)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("earlier", order, completed));
 			release.countDown();
 			assertTrue(completed.await(5, SECONDS));
@@ -233,7 +238,7 @@ class RWSchedulerTest {
 				awaitUninterruptibly(release);
 			});
 			assertTrue(blockerStarted.await(5, SECONDS));
-			var deadline = RequestContext.latency(java.time.Duration.ofMillis(100));
+			var deadline = RequestContext.latency(Duration.ofMillis(100));
 			scheduler.executor(deadline, OperationFamily.POINT_LOOKUP).execute(expired);
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
 			Thread.sleep(150L);
@@ -263,7 +268,7 @@ class RWSchedulerTest {
 		var order = Collections.synchronizedList(new ArrayList<String>());
 		var completed = new CountDownLatch(10);
 		try {
-			var latency = scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)),
+			var latency = scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)),
 					OperationFamily.POINT_LOOKUP);
 			latency.execute(() -> {
 				blockerStarted.countDown();
@@ -312,7 +317,7 @@ class RWSchedulerTest {
 			assertTrue(analyticalStarted.await(5, SECONDS));
 
 			batch.execute(() -> record("borrowed-batch", order, new CountDownLatch(0)));
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("latency", order, reservedDone));
 			scheduler.executor(RequestContext.ingest(), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("ingest", order, reservedDone));
@@ -450,7 +455,7 @@ class RWSchedulerTest {
 		var secondStarted = new CountDownLatch(1);
 		try {
 			scheduler.setStoragePressure(true);
-			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE,
+			scheduler.executor(WorkloadProfile.PHYSICAL_MAINTENANCE,
 					OperationFamily.COMPACTION, Long.MAX_VALUE).execute(physical);
 			scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE).execute(() -> {
 				firstStarted.countDown();
@@ -601,7 +606,7 @@ class RWSchedulerTest {
 				WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		try {
 			scheduler.setStoragePressure(true);
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(releaseBlocker);
@@ -726,7 +731,7 @@ class RWSchedulerTest {
 		var registry = new SimpleMeterRegistry();
 		var scheduler = RWScheduler.forTesting(1, 1, 1, 8, 8, "failure-test", registry, "failure-db");
 		try {
-			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
+			scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				throw new IllegalStateException("expected test failure");
 			});
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks() == 1L);
@@ -788,7 +793,7 @@ class RWSchedulerTest {
 		Runnable duplicate = runs::incrementAndGet;
 		var view = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
 		try {
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(release);
@@ -818,7 +823,7 @@ class RWSchedulerTest {
 		var release = new CountDownLatch(1);
 		var view = scheduler.executor(RequestContext.batch(), OperationFamily.RANGE_PAGE);
 		try {
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(release);
@@ -860,7 +865,7 @@ class RWSchedulerTest {
 		var analytical = scheduler.executor(RequestContext.analytical(),
 				OperationFamily.FULL_SCAN_AGGREGATE);
 		try {
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(5)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> {
 						blockerStarted.countDown();
 						awaitUninterruptibly(release);
@@ -918,7 +923,7 @@ class RWSchedulerTest {
 		assertEquals(1L, snapshot.failedTasks());
 		assertTrue(snapshot.terminated());
 		assertThrows(RejectedExecutionException.class,
-				() -> scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {}));
+				() -> scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {}));
 	}
 
 	@Test
@@ -927,7 +932,7 @@ class RWSchedulerTest {
 		var second = scheduler(1, "reentrant-second");
 		var result = new CompletableFuture<List<Boolean>>();
 		try {
-			first.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> result.complete(List.of(
+			first.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> result.complete(List.of(
 					first.isExecutingWorkloadTask(),
 					second.isExecutingWorkloadTask())));
 			assertEquals(List.of(true, false), result.get(5, SECONDS));
@@ -973,13 +978,13 @@ class RWSchedulerTest {
 		var controlDone = new CountDownLatch(1);
 		try {
 			for (int i = 0; i < 3; i++) {
-				scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
+				scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 					dataStarted.countDown();
 					awaitUninterruptibly(release);
 				});
 			}
 			assertTrue(dataStarted.await(5, SECONDS));
-			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.CONTROL, it.cavallium.rockserver.core.common.OperationFamily.CONTROL, Long.MAX_VALUE).execute(controlDone::countDown);
+			scheduler.executor(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE).execute(controlDone::countDown);
 			assertTrue(controlDone.await(2, SECONDS));
 		} finally {
 			release.countDown();
@@ -1168,8 +1173,8 @@ class RWSchedulerTest {
 	void productionConstructorsRequireAllThreeReservationsAndExposeNoUnmanagedVariant() {
 		assertThrows(IllegalArgumentException.class, () -> new RWScheduler(2, 3, "too-small-read"));
 		assertThrows(IllegalArgumentException.class, () -> new RWScheduler(3, 2, "too-small-write"));
-		assertTrue(java.util.Arrays.stream(RWScheduler.class.getConstructors())
-				.noneMatch(constructor -> java.util.Arrays.stream(constructor.getParameterTypes())
+		assertTrue(Arrays.stream(RWScheduler.class.getConstructors())
+				.noneMatch(constructor -> Arrays.stream(constructor.getParameterTypes())
 						.anyMatch(type -> type.getName().equals("reactor.core.scheduler.Scheduler"))));
 	}
 

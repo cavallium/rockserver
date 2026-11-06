@@ -8,7 +8,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
@@ -18,11 +20,16 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.reactivestreams.Subscription;
+import reactor.core.publisher.BaseSubscriber;
+import reactor.core.publisher.Flux;
 
 /** Iterators and replication: a column deletion does not wait for them, and an unknown one asks for a retry. */
 class ColumnIteratorsTest {
@@ -109,13 +116,13 @@ class ColumnIteratorsTest {
 			}
 			var streams = new ColumnStreams();
 			var api = store.connection().getAsyncApi(
-					it.cavallium.rockserver.core.common.RequestContext.batch(Duration.ofHours(1)));
+					RequestContext.batch(Duration.ofHours(1)));
 			var slow = new SlowSubscriber();
-			streams.track(column, reactor.core.publisher.Flux.from(api.getRangeAsync(0, column, null, null, false,
-					RequestType.<it.cavallium.rockserver.core.common.KV>allInRange()))).subscribe(slow);
+			streams.track(column, Flux.from(api.getRangeAsync(0, column, null, null, false,
+					RequestType.<KV>allInRange()))).subscribe(slow);
 			var kept = new SlowSubscriber();
-			streams.track(other, reactor.core.publisher.Flux.from(api.getRangeAsync(0, other, null, null, false,
-					RequestType.<it.cavallium.rockserver.core.common.KV>allInRange()))).subscribe(kept);
+			streams.track(other, Flux.from(api.getRangeAsync(0, other, null, null, false,
+					RequestType.<KV>allInRange()))).subscribe(kept);
 			// One item each, then no more demand: the streams stay open, holding their columns.
 			assertTrue(slow.first.await(10, TimeUnit.SECONDS));
 			assertTrue(kept.first.await(10, TimeUnit.SECONDS));
@@ -142,7 +149,7 @@ class ColumnIteratorsTest {
 			long again = db.createColumn("again", SCHEMA);
 			streams.deleting(again);
 			var refused = new SlowSubscriber();
-			streams.track(again, reactor.core.publisher.Flux.never()).subscribe(refused);
+			streams.track(again, Flux.never()).subscribe(refused);
 			assertInstanceOf(RocksDBException.class, refused.error.get(10, TimeUnit.SECONDS));
 			streams.deleted(again);
 			assertEquals(0, streams.running(again));
@@ -150,14 +157,14 @@ class ColumnIteratorsTest {
 	}
 
 	/** Asks for one item, then for nothing more until told. */
-	private static final class SlowSubscriber extends reactor.core.publisher.BaseSubscriber<Object> {
-		final java.util.concurrent.CountDownLatch first = new java.util.concurrent.CountDownLatch(1);
+	private static final class SlowSubscriber extends BaseSubscriber<Object> {
+		final CountDownLatch first = new CountDownLatch(1);
 		final CompletableFuture<Throwable> error = new CompletableFuture<>();
-		final java.util.concurrent.atomic.AtomicLong items = new java.util.concurrent.atomic.AtomicLong();
+		final AtomicLong items = new AtomicLong();
 		volatile boolean completed;
 
 		@Override
-		protected void hookOnSubscribe(org.reactivestreams.Subscription subscription) {
+		protected void hookOnSubscribe(Subscription subscription) {
 			request(1);
 		}
 

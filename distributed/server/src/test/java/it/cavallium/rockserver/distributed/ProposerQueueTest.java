@@ -20,9 +20,15 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import org.apache.ratis.protocol.ClientId;
+import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -145,14 +151,14 @@ class ProposerQueueTest {
 			var stamped = new byte[LogEntryCodec.stamp(0).length + batch.length];
 			System.arraycopy(LogEntryCodec.stamp(42), 0, stamped, 0, LogEntryCodec.stamp(42).length);
 			System.arraycopy(batch, 0, stamped, LogEntryCodec.stamp(42).length, batch.length);
-			var request = org.apache.ratis.protocol.RaftClientRequest.newBuilder()
-					.setClientId(org.apache.ratis.protocol.ClientId.randomId())
-					.setServerId(org.apache.ratis.protocol.RaftPeerId.valueOf("n0"))
+			var request = RaftClientRequest.newBuilder()
+					.setClientId(ClientId.randomId())
+					.setServerId(RaftPeerId.valueOf("n0"))
 					.setGroupId(RaftGroupId.valueOf(UUID.randomUUID()))
 					.setCallId(1)
-					.setMessage(org.apache.ratis.protocol.Message.valueOf(
-							org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(stamped)))
-					.setType(org.apache.ratis.protocol.RaftClientRequest.writeRequestType())
+					.setMessage(Message.valueOf(
+							ByteString.copyFrom(stamped)))
+					.setType(RaftClientRequest.writeRequestType())
 					.build();
 			var transaction = stateMachine.startTransaction(request);
 			assertTrue(transaction.getException() != null
@@ -175,12 +181,12 @@ class ProposerQueueTest {
 		var metrics = new NodeMetrics("n0");
 		var stateMachine = new RockserverStateMachine(config, _ -> {}, metrics);
 		try {
-			var clientId = org.apache.ratis.protocol.ClientId.randomId();
+			var clientId = ClientId.randomId();
 			// Genesis needs no store, which this state machine has not opened.
 			var entry = new LogEntry.Genesis("cluster", false);
 			var encoded = LogEntryCodec.encodeBatch(1, 0, new long[] {0}, null, List.of(entry),
 					LogEntryCodec.entrySize(entry), true);
-			var content = org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations.unsafeWrap(
+			var content = UnsafeByteOperations.unsafeWrap(
 					encoded.bytes());
 
 			stateMachine.offerLocal(clientId, 1, content, encoded.requests());
@@ -190,7 +196,7 @@ class ProposerQueueTest {
 
 			// Equal bytes, but not the content offered: decoded, and the offer is gone.
 			stateMachine.offerLocal(clientId, 2, content, encoded.requests());
-			var copy = org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(encoded.bytes());
+			var copy = ByteString.copyFrom(encoded.bytes());
 			assertNull(stateMachine.startTransaction(request(clientId, 2, copy)).getException());
 			assertEquals(1, stateMachine.localProposalsTaken());
 			assertEquals(0, stateMachine.localProposalsOffered());
@@ -214,15 +220,15 @@ class ProposerQueueTest {
 		}
 	}
 
-	private static org.apache.ratis.protocol.RaftClientRequest request(org.apache.ratis.protocol.ClientId clientId,
-			long callId, org.apache.ratis.thirdparty.com.google.protobuf.ByteString content) {
-		return org.apache.ratis.protocol.RaftClientRequest.newBuilder()
+	private static RaftClientRequest request(ClientId clientId,
+			long callId, ByteString content) {
+		return RaftClientRequest.newBuilder()
 				.setClientId(clientId)
-				.setServerId(org.apache.ratis.protocol.RaftPeerId.valueOf("n0"))
+				.setServerId(RaftPeerId.valueOf("n0"))
 				.setGroupId(RaftGroupId.valueOf(UUID.randomUUID()))
 				.setCallId(callId)
-				.setMessage(org.apache.ratis.protocol.Message.valueOf(content))
-				.setType(org.apache.ratis.protocol.RaftClientRequest.writeRequestType())
+				.setMessage(Message.valueOf(content))
+				.setType(RaftClientRequest.writeRequestType())
 				.build();
 	}
 

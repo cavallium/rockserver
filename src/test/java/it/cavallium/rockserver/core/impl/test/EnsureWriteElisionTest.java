@@ -26,6 +26,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -275,14 +276,14 @@ class EnsureWriteElisionTest {
 
 		var key = intKey(2);
 		var value = value("transactional");
-		long rollbackTx = api.openTransaction( java.time.Duration.ofMillis(5_000));
+		long rollbackTx = api.openTransaction( Duration.ofMillis(5_000));
 		assertNull(api.put(rollbackTx, columnId, key, value, RequestType.ensure()));
 		assertFalse(api.get(0, columnId, key, RequestType.exists()));
 		assertTrue(api.get(rollbackTx, columnId, key, RequestType.exists()));
 		assertTrue(api.closeTransaction(rollbackTx, false));
 		assertFalse(api.get(0, columnId, key, RequestType.exists()));
 
-		long commitTx = api.openTransaction( java.time.Duration.ofMillis(5_000));
+		long commitTx = api.openTransaction( Duration.ofMillis(5_000));
 		assertTrue(api.putMulti(commitTx,
 				columnId,
 				List.of(key),
@@ -292,7 +293,7 @@ class EnsureWriteElisionTest {
 		assertValue(value, api.get(0, columnId, key, RequestType.current()));
 		assertEquals(2.0, decisionCount("ensure", "bypass_writer"));
 
-		long equalCommitTx = api.openTransaction( java.time.Duration.ofMillis(5_000));
+		long equalCommitTx = api.openTransaction( Duration.ofMillis(5_000));
 		assertNull(api.put(equalCommitTx, columnId, key, value, RequestType.ensure()));
 		assertTrue(api.closeTransaction(equalCommitTx, true));
 

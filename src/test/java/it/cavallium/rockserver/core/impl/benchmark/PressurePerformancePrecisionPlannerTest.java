@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -81,7 +82,7 @@ class PressurePerformancePrecisionPlannerTest {
 		assertTrue(nextConfigurationValue(next, "scheduler-operations") <= Integer.MAX_VALUE);
 		assertEquals(2_000L, nextConfigurationValue(next, "signal-measured-columns"));
 		Path plannedRoot = temporary.resolve("planned-root");
-		var prepareArguments = new java.util.ArrayList<String>();
+		var prepareArguments = new ArrayList<String>();
 		prepareArguments.add("--mode=prepare");
 		prepareArguments.add("--root=" + plannedRoot);
 		next.lines().filter(line -> !line.isBlank()).map(line -> "--" + line).forEach(prepareArguments::add);

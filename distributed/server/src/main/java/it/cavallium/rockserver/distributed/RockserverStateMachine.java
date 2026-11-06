@@ -1,21 +1,40 @@
 package it.cavallium.rockserver.distributed;
 
+import it.cavallium.rockserver.core.common.ClientRequestId;
 import java.io.IOException;
 import it.unimi.dsi.fastutil.ints.IntList;
+import java.io.InterruptedIOException;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftGroupMemberId;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.protocol.SnapshotManagementRequest;
 import org.apache.ratis.protocol.exceptions.StateMachineException;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
+import org.apache.ratis.server.raftlog.RaftLog;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
@@ -119,10 +138,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	private record LocalKey(ClientId clientId, long callId) {}
 
-	private final java.util.concurrent.ConcurrentHashMap<LocalKey, LocalProposal> localProposals =
-			new java.util.concurrent.ConcurrentHashMap<>();
+	private final ConcurrentHashMap<LocalKey, LocalProposal> localProposals =
+			new ConcurrentHashMap<>();
 	/** Transactions started from a {@link LocalProposal}, without decoding; for tests. */
-	private final java.util.concurrent.atomic.LongAdder localProposalsTaken = new java.util.concurrent.atomic.LongAdder();
+	private final LongAdder localProposalsTaken = new LongAdder();
 
 	private final NodeConfig config;
 	private final CheckpointStorage storage = new CheckpointStorage();
@@ -156,7 +175,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * KiB of queued entries: Ratis' thread waits in {@link #applyTransaction} while the apply thread is this far
 	 * behind, so that a lagging replica keeps its backlog in the Raft log on disk, not decoded on the heap.
 	 */
-	private final java.util.concurrent.Semaphore queuedKiB = new java.util.concurrent.Semaphore(MAX_QUEUED_KIB);
+	private final Semaphore queuedKiB = new Semaphore(MAX_QUEUED_KIB);
 	private static final int MAX_QUEUED_KIB = 256 << 10;
 
 	/**
@@ -174,7 +193,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * applied index inline when a future completes), leader bookkeeping and the applied index, so that the apply
 	 * thread can go on with the next group meanwhile.
 	 */
-	private final java.util.concurrent.ExecutorService completer;
+	private final ExecutorService completer;
 	/** At most this many entries, and about this many bytes of entries, are applied in one local transaction. */
 	private static final int MAX_GROUP_ENTRIES = 256;
 	private static final long MAX_GROUP_BYTES = 16L << 20;
@@ -222,7 +241,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		});
 		metrics.gauge("heapUsedMiB", () -> (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) >> 20);
 		this.applyGroupEntries = metrics.amount("apply.groupEntries");
-		this.completer = java.util.concurrent.Executors.newSingleThreadExecutor(
+		this.completer = Executors.newSingleThreadExecutor(
 				Thread.ofPlatform().name(config.nodeId() + "-applied").daemon().factory());
 		this.applyLanes = config.parallelApplyThreads() >= 2
 				? new ApplyLanes(config.nodeId(), config.parallelApplyThreads()) : null;
@@ -254,7 +273,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			return 0;
 		}
 		try {
-			return java.nio.file.Files.getLastModifiedTime(dir).toMillis();
+			return Files.getLastModifiedTime(dir).toMillis();
 		} catch (IOException | RuntimeException ex) {
 			return 0;
 		}
@@ -399,7 +418,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	}
 
 	/** The result this replica recorded for write {@code id} of a client session, or null. Any thread. */
-	@Nullable ApplyResult recordedResult(it.cavallium.rockserver.core.common.ClientRequestId id) {
+	@Nullable ApplyResult recordedResult(ClientRequestId id) {
 		return Applier.recordedResult(store, id);
 	}
 
@@ -681,12 +700,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 
 		@Override
-		public void write(java.nio.ByteBuffer value) {
+		public void write(ByteBuffer value) {
 			whole = false;
 		}
 
 		@Override
-		public void writeLazy(java.nio.ByteBuffer value) {
+		public void writeLazy(ByteBuffer value) {
 			// A buffer may be pooled and reused once the message is processed: copy.
 			whole = false;
 		}
@@ -746,14 +765,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 			done.get();
 		} catch (InterruptedException ex) {
 			Thread.currentThread().interrupt();
-			throw new java.io.InterruptedIOException("Interrupted while waiting for the apply thread");
-		} catch (java.util.concurrent.ExecutionException ex) {
+			throw new InterruptedIOException("Interrupted while waiting for the apply thread");
+		} catch (ExecutionException ex) {
 			throw new IOException("The apply thread failed", ex.getCause());
 		}
 	}
 
 	private void applyLoop() {
-		var group = new java.util.ArrayList<Applying>();
+		var group = new ArrayList<Applying>();
 		while (true) {
 			Applying first;
 			try {
@@ -894,7 +913,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			return;
 		}
 		CrashPoints.reach(CrashPoints.Point.BEFORE_APPLY);
-		var completions = new java.util.ArrayList<Runnable>(group.size());
+		var completions = new ArrayList<Runnable>(group.size());
 		long start = System.nanoTime();
 		var applier = this.applier;
 		// Before any write of the group can be visible: terms do not decrease along the log.
@@ -965,11 +984,11 @@ final class RockserverStateMachine extends BaseStateMachine {
 	}
 
 	/** Bytes of log entries applied since the latest snapshot, or since the start: see {@link #snapshotByBytes}. */
-	private final java.util.concurrent.atomic.AtomicLong bytesSinceSnapshot = new java.util.concurrent.atomic.AtomicLong();
+	private final AtomicLong bytesSinceSnapshot = new AtomicLong();
 	/** True while a snapshot asked by {@link #snapshotByBytes} is pending. */
-	private final java.util.concurrent.atomic.AtomicBoolean snapshotByBytesPending =
-			new java.util.concurrent.atomic.AtomicBoolean();
-	private final java.util.concurrent.atomic.AtomicLong snapshotCalls = new java.util.concurrent.atomic.AtomicLong();
+	private final AtomicBoolean snapshotByBytesPending =
+			new AtomicBoolean();
+	private final AtomicLong snapshotCalls = new AtomicLong();
 	private static final long SNAPSHOT_REQUEST_TIMEOUT_MS = 10L * 60 * 1000;
 
 	/**
@@ -994,8 +1013,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 		LOG.info("{}: {} bytes of log entries applied since the latest snapshot, taking one", config.nodeId(),
 				bytesSinceSnapshot.get());
 		try {
-			var request = org.apache.ratis.protocol.SnapshotManagementRequest.newCreate(
-					org.apache.ratis.protocol.ClientId.randomId(), server.getId(), groupId, snapshotCalls.incrementAndGet(),
+			var request = SnapshotManagementRequest.newCreate(
+					ClientId.randomId(), server.getId(), groupId, snapshotCalls.incrementAndGet(),
 					SNAPSHOT_REQUEST_TIMEOUT_MS);
 			server.snapshotManagementAsync(request).whenComplete((reply, error) -> {
 				snapshotByBytesPending.set(false);
@@ -1047,7 +1066,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (position.getIndex() <= applied.get()) {
 			// Already applied before a restart: the database holds its effects and, unless its proposer already
 			// reported it complete, its result.
-			var recordedResults = new java.util.ArrayList<ApplyResult>(requests.size());
+			var recordedResults = new ArrayList<ApplyResult>(requests.size());
 			for (var request : requests) {
 				var recorded = applier.recordedResult(request);
 				recordedResults.add(recorded != null ? recorded
@@ -1103,7 +1122,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	}
 
 	private void failQueued(Throwable failure) {
-		var rest = new java.util.ArrayList<Applying>();
+		var rest = new ArrayList<Applying>();
 		applyQueue.drainTo(rest);
 		failAll(rest, failure);
 		releaseQueued(rest);
@@ -1120,7 +1139,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/** Tests only: a failure that the next snapshots throw before their checkpoint. */
 	volatile @Nullable IOException snapshotFailureForTests;
 	/** Snapshots that this replica tried (the checkpoint started), for tests. */
-	final java.util.concurrent.atomic.AtomicLong snapshotAttempts = new java.util.concurrent.atomic.AtomicLong();
+	final AtomicLong snapshotAttempts = new AtomicLong();
 
 	/**
 	 * Takes a snapshot, unless one failed recently. Ratis asks again after every applied entry while a snapshot is due,
@@ -1134,7 +1153,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			throw new IOException("Replica failed, not taking a snapshot");
 		}
 		if (snapshotBackoff.waiting(System.nanoTime())) {
-			return org.apache.ratis.server.raftlog.RaftLog.INVALID_LOG_INDEX;
+			return RaftLog.INVALID_LOG_INDEX;
 		}
 		snapshotAttempts.incrementAndGet();
 		try {
@@ -1168,8 +1187,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * minute, and at once after a success.
 	 */
 	static final class SnapshotBackoff {
-		static final long FIRST_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
-		static final long MAX_NANOS = java.util.concurrent.TimeUnit.MINUTES.toNanos(1);
+		static final long FIRST_NANOS = TimeUnit.SECONDS.toNanos(1);
+		static final long MAX_NANOS = TimeUnit.MINUTES.toNanos(1);
 		private int failures;
 		private long retryAtNanos;
 
@@ -1206,7 +1225,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		} catch (IOException | RuntimeException ex) {
 			// Ratis would only close this division and leave the process running: stop the node for good instead.
 			fail("install a snapshot", ex instanceof RuntimeException runtime ? runtime
-					: new java.io.UncheckedIOException((IOException) ex));
+					: new UncheckedIOException((IOException) ex));
 			throw ex;
 		}
 	}
@@ -1283,14 +1302,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/** Only a test hook: the configuration itself is Ratis' business. */
 	@Override
 	public void notifyConfigurationChanged(long term, long index,
-			org.apache.ratis.proto.RaftProtos.RaftConfigurationProto newRaftConfiguration) {
+			RaftProtos.RaftConfigurationProto newRaftConfiguration) {
 		if (newRaftConfiguration.getOldPeersCount() > 0) {
 			CrashPoints.reach(CrashPoints.Point.JOINT_CONFIGURATION_APPLIED);
 		}
 	}
 
 	@Override
-	public void notifyServerShutdown(org.apache.ratis.proto.RaftProtos.RoleInfoProto roleInfo, boolean allServer) {
+	public void notifyServerShutdown(RaftProtos.RoleInfoProto roleInfo, boolean allServer) {
 		LeaderSession session;
 		synchronized (this) {
 			session = leaderSession;
@@ -1322,7 +1341,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 				applyLanes.close();
 			}
 			completer.shutdown();
-			completer.awaitTermination(1, java.util.concurrent.TimeUnit.MINUTES);
+			completer.awaitTermination(1, TimeUnit.MINUTES);
 		} catch (InterruptedException ex) {
 			Thread.currentThread().interrupt();
 		}
@@ -1343,7 +1362,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	}
 
 	/** Waits until {@link #close()} ended, on whichever thread Ratis runs it; returns false if it did not in time. */
-	boolean awaitClosed(java.time.Duration timeout) throws InterruptedException {
-		return closed.await(timeout.toNanos(), java.util.concurrent.TimeUnit.NANOSECONDS);
+	boolean awaitClosed(Duration timeout) throws InterruptedException {
+		return closed.await(timeout.toNanos(), TimeUnit.NANOSECONDS);
 	}
 }

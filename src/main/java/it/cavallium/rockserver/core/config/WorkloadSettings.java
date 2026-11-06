@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.RangeBudget;
 import java.time.Duration;
 import java.util.EnumMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import org.github.gestalt.config.exceptions.GestaltException;
@@ -186,7 +187,7 @@ public record WorkloadSettings(
 	public static Map<String, WorkloadSettings> resolveGroups(DatabaseConfig config) throws GestaltException {
 		var parallelism = config.parallelism();
 		var global = resolve(config);
-		var result = new java.util.LinkedHashMap<String, WorkloadSettings>();
+		var result = new LinkedHashMap<String, WorkloadSettings>();
 		var groups = parallelism.workloadGroups();
 		if (groups != null) {
 			for (var group : groups) {

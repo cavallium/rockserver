@@ -19,10 +19,12 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.Random;
 import java.util.stream.LongStream;
 import java.util.stream.Stream;
@@ -122,7 +124,7 @@ class CodecEquivalenceTest {
 		}
 		var bodies = entries.stream().map(LogEntryCodec::encodeEntryBody).toList();
 		byte[] expected = LogEntryCodec.encodeBatch(proposerId, completedBelow, sequences, clients, bodies);
-		if (clients == null || Arrays.stream(clients).allMatch(java.util.Objects::isNull)) {
+		if (clients == null || Arrays.stream(clients).allMatch(Objects::isNull)) {
 			assertEquals(LogEntryCodec.BATCH_VERSION, expected[0]);
 			assertArrayEquals(OldLogEntryCodec.encodeBatch(proposerId, completedBelow, sequences, bodies), expected);
 		} else {
@@ -346,11 +348,11 @@ class CodecEquivalenceTest {
 		random.nextBytes(larger);
 		System.arraycopy(bytes, 0, larger, 3, bytes.length);
 		var offHeap = Arena.ofAuto().allocate(Math.max(1, bytes.length));
-		offHeap.copyFrom(java.lang.foreign.MemorySegment.ofArray(bytes));
+		offHeap.copyFrom(MemorySegment.ofArray(bytes));
 		return List.of(Buf.wrap(bytes),
 				Buf.wrap(larger, 3, 3 + bytes.length),
 				new MemorySegmentBuf(offHeap.asSlice(0, bytes.length)),
-				new MemorySegmentBuf(java.lang.foreign.MemorySegment.ofArray(larger).asSlice(3, bytes.length)));
+				new MemorySegmentBuf(MemorySegment.ofArray(larger).asSlice(3, bytes.length)));
 	}
 
 	private static Buf randomBuf(Random random) {

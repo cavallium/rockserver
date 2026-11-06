@@ -18,6 +18,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -214,7 +215,7 @@ final class ScenarioSupport {
 		Map<String, Map<String, String>> first = null;
 		String firstId = null;
 		for (var id : cluster.nodeIds()) {
-			if (!java.nio.file.Files.isDirectory(cluster.dataDir(id).resolve("db"))) {
+			if (!Files.isDirectory(cluster.dataDir(id).resolve("db"))) {
 				continue;
 			}
 			var contents = replicaContents(cluster.dataDir(id).resolve("db"), rockserverConfig);

@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Assumptions;
@@ -106,7 +107,7 @@ final class FaultFs {
 	/** Starts the faults: the shim reads the trigger at most 2 ms later. Written atomically. */
 	static void trigger(Path trigger, Errno errno, Ops ops) throws IOException {
 		var temp = trigger.resolveSibling(trigger.getFileName() + ".tmp");
-		Files.writeString(temp, errno.name() + " " + ops.name().toLowerCase(java.util.Locale.ROOT),
+		Files.writeString(temp, errno.name() + " " + ops.name().toLowerCase(Locale.ROOT),
 				StandardCharsets.UTF_8);
 		Files.move(temp, trigger, StandardCopyOption.ATOMIC_MOVE);
 	}

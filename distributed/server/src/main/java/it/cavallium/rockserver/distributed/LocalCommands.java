@@ -14,6 +14,7 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeoutException;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
@@ -30,10 +31,10 @@ final class LocalCommands {
 	private final ReadBarrier barrier;
 	private final NodeMetrics.Series localTime;
 	/** Runs short local commands, each on a virtual thread of its own ({@link NodeThreads#local()}); see {@link #local}. */
-	private final java.util.concurrent.ExecutorService inline;
+	private final ExecutorService inline;
 
 	LocalCommands(RockserverStateMachine stateMachine, ReadBarrier barrier, NodeMetrics metrics,
-			java.util.concurrent.ExecutorService inline) {
+			ExecutorService inline) {
 		this.stateMachine = stateMachine;
 		this.barrier = barrier;
 		this.inline = inline;

@@ -38,6 +38,8 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSt
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable;
 import it.cavallium.buffer.Buf;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -82,9 +84,9 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 	default CompletableFuture<Long> ensureMergeOperatorAsync(String name, String className, byte[] jarData) {
 		byte[] hash;
 		try {
-			java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+			MessageDigest digest = MessageDigest.getInstance("SHA-256");
 			hash = digest.digest(jarData);
-		} catch (java.security.NoSuchAlgorithmException e) {
+		} catch (NoSuchAlgorithmException e) {
 			return CompletableFuture.failedFuture(e);
 		}
 		return checkMergeOperatorAsync(name, hash).thenCompose(existing -> {

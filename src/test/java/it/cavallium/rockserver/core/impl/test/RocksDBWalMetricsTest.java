@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.WalFileType;
@@ -117,7 +118,7 @@ class RocksDBWalMetricsTest {
 		     var other = newWalMetrics(registry, "other", walDirectory, List.of(), 0L,
 				     _ -> 0L, Clock.systemUTC())) {
 			registry.counter("unrelated");
-			var remaining = java.util.Set.copyOf(registry.getMeters());
+			var remaining = Set.copyOf(registry.getMeters());
 			try (var metrics = newWalMetrics(registry, "visibility-test", walDirectory, List.of(), 0L,
 					_ -> 0L, Clock.systemUTC())) {
 				metrics.refresh();
@@ -125,7 +126,7 @@ class RocksDBWalMetricsTest {
 				metrics.close();
 				metrics.close();
 				metrics.refresh();
-				assertEquals(remaining, java.util.Set.copyOf(registry.getMeters()));
+				assertEquals(remaining, Set.copyOf(registry.getMeters()));
 				assertEquals(0, registry.get(LIVE_BYTES_METRIC).tag("database", "other").gauge().value());
 			}
 		}

@@ -15,13 +15,17 @@ import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.PutBatchMode;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.RockserverCapabilities;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -31,6 +35,7 @@ import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -38,6 +43,8 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -58,13 +65,13 @@ class EmbeddedConnectionAsyncRegressionTest {
 	@Test
 	void completedAsyncSeekReleasesAdmissionBeforeCompletionIsVisible() throws Exception {
 		try (var connection = singleThreadedConnection("seek-completion-order")) {
-			var syncApi = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-			var asyncApi = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			var syncApi = connection.getSyncApi(RequestContext.batch());
+			var asyncApi = connection.getAsyncApi(RequestContext.batch());
 			long columnId = syncApi.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			syncApi.put(0, columnId, key(1), value(1), RequestType.none());
 
-			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 10_000));
+			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, Duration.ofMillis( 10_000));
 			try {
 				for (int attempt = 0; attempt < 1_000; attempt++) {
 					asyncApi.seekToAsync(iteratorId, key(1)).join();
@@ -81,8 +88,8 @@ class EmbeddedConnectionAsyncRegressionTest {
 	@Test
 	void asyncIteratorAdmissionRemainsClaimedBetweenContinuationChunksAndThroughClose() throws Exception {
 		try (var connection = singleThreadedConnection("iterator-admission")) {
-			var syncApi = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-			var asyncApi = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			var syncApi = connection.getSyncApi(RequestContext.batch());
+			var asyncApi = connection.getAsyncApi(RequestContext.batch());
 			long columnId = syncApi.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var keys = new ArrayList<Keys>(ITERATOR_CHUNK_SIZE + 1);
@@ -95,9 +102,9 @@ class EmbeddedConnectionAsyncRegressionTest {
 					Flux.just(new KVBatchRef(keys, values)),
 					PutBatchMode.WRITE_BATCH_NO_WAL);
 
-			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 10_000));
+			long iteratorId = syncApi.openIterator(0, columnId, new Keys(), null, false, Duration.ofMillis( 10_000));
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
+			var readExecutor = scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var initialWorkerEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseInitialWorker = new CountDownLatch(1);
 			var betweenChunksEntered = new CountDownLatch(DATA_WORKERS);
@@ -141,11 +148,11 @@ class EmbeddedConnectionAsyncRegressionTest {
 	@Test
 	void queuedReadCancellationRemovesTheTaskWithoutExecutingNativeWork() throws Exception {
 		try (var connection = singleThreadedConnection("queued-cancel")) {
-			var syncApi = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			var syncApi = connection.getSyncApi(RequestContext.batch());
 			long columnId = syncApi.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
+			var readExecutor = scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			long completedBefore = scheduler.poolSnapshot(RWScheduler.Pool.READ).completedTasks();
 			var workerEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseWorker = new CountDownLatch(1);
@@ -155,7 +162,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 				occupyWorkers(readExecutor, workerEntered, releaseWorker);
 				assertTrue(workerEntered.await(5, SECONDS));
 
-				var queued = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
+				var queued = connection.getAsyncApi(RequestContext.batch()).existsMultiAsync(
 						0, columnId, List.of(key(1)));
 				assertTrue(awaitQueueSize(scheduler, 1), "the read never entered the executor queue");
 				assertTrue(queued.cancel(true));
@@ -176,7 +183,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 	@Test
 	void cancellingBetweenMultiGetChunksStopsContinuationAndReleasesLogicalState() throws Exception {
 		try (var connection = singleThreadedConnection("between-chunks-cancel")) {
-			var syncApi = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			var syncApi = connection.getSyncApi(RequestContext.batch());
 			long columnId = syncApi.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var keys = new ArrayList<Keys>(ITERATOR_CHUNK_SIZE + 1);
@@ -184,7 +191,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 				keys.add(key(i));
 			}
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
+			var readExecutor = scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var nativeChunks = new AtomicInteger();
 			var snapshotAcquisitions = new AtomicInteger();
 			var betweenChunksEntered = new CountDownLatch(DATA_WORKERS);
@@ -197,7 +204,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 				}
 			});
 			try {
-				var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
+				var request = connection.getAsyncApi(RequestContext.batch()).existsMultiAsync(
 						0, columnId, keys);
 				assertTrue(betweenChunksEntered.await(5, SECONDS));
 				assertTrue(awaitQueueSize(scheduler, 1),
@@ -231,7 +238,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 		CompletableFuture<Void> close = null;
 		try {
 			connection = singleThreadedConnection("between-chunks-shutdown");
-			var syncApi = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			var syncApi = connection.getSyncApi(RequestContext.batch());
 			long columnId = syncApi.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var keys = new ArrayList<Keys>(ITERATOR_CHUNK_SIZE + 1);
@@ -239,7 +246,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 				keys.add(key(i));
 			}
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
+			var readExecutor = scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var nativeChunks = new AtomicInteger();
 			var betweenChunksEntered = new CountDownLatch(DATA_WORKERS);
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(() -> {
@@ -248,7 +255,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 				}
 			});
 
-			var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
+			var request = connection.getAsyncApi(RequestContext.batch()).existsMultiAsync(
 					0, columnId, keys);
 			assertTrue(betweenChunksEntered.await(5, SECONDS));
 			assertTrue(awaitQueueSize(scheduler, 1),
@@ -301,17 +308,17 @@ class EmbeddedConnectionAsyncRegressionTest {
 		CompletableFuture<Void> close = null;
 		try {
 			connection = singleThreadedConnection("initial-queue-shutdown");
-			long columnId = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("entries",
+			long columnId = connection.getSyncApi(RequestContext.batch()).createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
+			var readExecutor = scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var workerEntered = new CountDownLatch(DATA_WORKERS);
 			var nativeChunks = new AtomicInteger();
 			connection.getInternalDB().setExistsMultiChunkObserverForTesting(nativeChunks::incrementAndGet);
 			occupyWorkers(readExecutor, workerEntered, releaseWorker);
 			assertTrue(workerEntered.await(5, SECONDS));
 
-			var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
+			var request = connection.getAsyncApi(RequestContext.batch()).existsMultiAsync(
 					0, columnId, List.of(key(1)));
 			assertTrue(awaitQueueSize(scheduler, 1), "the initial read never entered the executor queue");
 			assertEquals(1, connection.getInternalDB().getPendingOpsCount(),
@@ -357,11 +364,11 @@ class EmbeddedConnectionAsyncRegressionTest {
 	@Test
 	void multiGetDeadlineIncludesInitialSchedulerQueueWait() throws Exception {
 		try (var connection = singleThreadedConnection("queued-deadline")) {
-			var syncApi = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			var syncApi = connection.getSyncApi(RequestContext.batch());
 			long columnId = syncApi.createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var scheduler = connection.getScheduler();
-			var readExecutor = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
+			var readExecutor = scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 			var workerEntered = new CountDownLatch(DATA_WORKERS);
 			var releaseWorker = new CountDownLatch(1);
 			var nativeChunks = new AtomicInteger();
@@ -370,8 +377,8 @@ class EmbeddedConnectionAsyncRegressionTest {
 				occupyWorkers(readExecutor, workerEntered, releaseWorker);
 				assertTrue(workerEntered.await(5, SECONDS));
 
-				var request = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch(
-						java.time.Duration.ofMillis(25L))).existsMultiAsync(
+				var request = connection.getAsyncApi(RequestContext.batch(
+						Duration.ofMillis(25L))).existsMultiAsync(
 						0, columnId, List.of(key(1)));
 				assertTrue(awaitQueueSize(scheduler, 1));
 				Thread.sleep(75);
@@ -391,7 +398,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 	@Test
 	void cancellingARunningReadDoesNotReplaceItsRootFailure() throws Exception {
 		try (var connection = singleThreadedConnection("running-cancel")) {
-			long columnId = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("entries",
+			long columnId = connection.getSyncApi(RequestContext.batch()).createColumn("entries",
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 			var nativeCallFinished = new CountDownLatch(1);
 			var releaseNativeCall = new CountDownLatch(1);
@@ -402,7 +409,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 				throw rootFailure;
 			});
 			try {
-				var running = connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).existsMultiAsync(
+				var running = connection.getAsyncApi(RequestContext.batch()).existsMultiAsync(
 						0, columnId, List.of(key(1)));
 				assertTrue(nativeCallFinished.await(5, SECONDS));
 				assertFalse(running.cancel(true),
@@ -430,7 +437,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 		var request = new RocksDBAPICommand.RocksDBAPICommandSingle.Get<>(
 				0, 1, key(1), RequestType.current());
 
-		var actual = loggingClient.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).requestAsync(request);
+		var actual = loggingClient.getAsyncApi(RequestContext.batch()).requestAsync(request);
 
 		assertSame(delegateFuture, actual,
 				"TRACE observation must not change cancellation or completion identity");
@@ -452,7 +459,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 		return new EmbeddedConnection(tempDir.resolve(name + "-db"), name, config);
 	}
 
-	private static void occupyWorkers(java.util.concurrent.Executor executor,
+	private static void occupyWorkers(Executor executor,
 			CountDownLatch entered,
 			CountDownLatch release) {
 		for (int i = 0; i < DATA_WORKERS; i++) {
@@ -495,7 +502,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 	private static boolean awaitPendingOps(EmbeddedConnection connection,
 			long expected,
 			long timeout,
-			java.util.concurrent.TimeUnit unit) throws InterruptedException {
+			TimeUnit unit) throws InterruptedException {
 		long deadline = System.nanoTime() + unit.toNanos(timeout);
 		do {
 			if (connection.getInternalDB().getPendingOpsCount() == expected) {
@@ -551,8 +558,8 @@ class EmbeddedConnectionAsyncRegressionTest {
 
 	private static final class FixedFutureConnection implements RocksDBConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 
@@ -576,12 +583,12 @@ class EmbeddedConnectionAsyncRegressionTest {
 		}
 
 		@Override
-		public RocksDBSyncAPI getSyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+		public RocksDBSyncAPI getSyncApi(RequestContext context) {
 			return syncApi;
 		}
 
 		@Override
-		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
+		public RocksDBAsyncAPI getAsyncApi(RequestContext context) {
 			return asyncApi;
 		}
 

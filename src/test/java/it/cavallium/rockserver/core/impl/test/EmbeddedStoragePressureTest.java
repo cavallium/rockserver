@@ -19,6 +19,7 @@ import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -334,7 +335,7 @@ class EmbeddedStoragePressureTest {
 		}
 	}
 
-	private static boolean awaitCondition(java.util.function.BooleanSupplier condition) throws InterruptedException {
+	private static boolean awaitCondition(BooleanSupplier condition) throws InterruptedException {
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
 		do {
 			if (condition.getAsBoolean()) {

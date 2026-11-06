@@ -11,6 +11,8 @@ import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.OperationFamily;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
@@ -139,10 +141,10 @@ class GrpcShutdownTest {
 	void serverShutdownWithIdleConnectedClientsDoesNotHang() {
 		var client1 = newClient();
 		var client2 = newClient();
-		var colId = client1.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("idle-col",
+		var colId = client1.getSyncApi(RequestContext.batch()).createColumn("idle-col",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 
-		assertEquals(colId, client2.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnId("idle-col"));
+		assertEquals(colId, client2.getSyncApi(RequestContext.batch()).getColumnId("idle-col"));
 
 		assertTimeoutPreemptively(Duration.ofSeconds(10), this::closeGrpcServer);
 	}
@@ -166,24 +168,24 @@ class GrpcShutdownTest {
 	@Test
 	void requestAfterServerShutdownFailsPromptly() throws Exception {
 		var client = newClient();
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("closed-col",
+		client.getSyncApi(RequestContext.batch()).createColumn("closed-col",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 
 		closeGrpcServer();
 
-		var request = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnIdAsync("closed-col");
+		var request = client.getAsyncApi(RequestContext.batch()).getColumnIdAsync("closed-col");
 		assertThrows(ExecutionException.class, () -> request.get(3, TimeUnit.SECONDS));
 	}
 
 	@Test
 	void closingGrpcServerDoesNotDisposeEmbeddedScheduler() throws Exception {
 		var client = newClient();
-		var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("scheduler-col",
+		var colId = client.getSyncApi(RequestContext.batch()).createColumn("scheduler-col",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 
 		closeGrpcServer();
 
-		assertEquals(colId, embeddedConnection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnIdAsync("scheduler-col")
+		assertEquals(colId, embeddedConnection.getAsyncApi(RequestContext.batch()).getColumnIdAsync("scheduler-col")
 				.get(3, TimeUnit.SECONDS));
 	}
 
@@ -193,10 +195,10 @@ class GrpcShutdownTest {
 		// it must not consume this operation timeout during shutdown.
 		System.setProperty(DB_PENDING_OPS_TIMEOUT, "5000");
 		var client = newClient();
-		var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("tx-col",
+		var colId = client.getSyncApi(RequestContext.batch()).createColumn("tx-col",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
-		var txId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(5)));
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(txId,
+		var txId = client.getSyncApi(RequestContext.batch()).openTransaction( Duration.ofMillis(TimeUnit.MINUTES.toMillis(5)));
+		client.getSyncApi(RequestContext.batch()).put(txId,
 				colId,
 				key(1),
 				Buf.wrap(new byte[] {1}),
@@ -215,8 +217,8 @@ class GrpcShutdownTest {
 	@Test
 	void blockedMaintenanceDoesNotDelayRemoteIteratorClose() throws Exception {
 		var client = newClient();
-		var api = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-		var syncApi = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+		var api = client.getAsyncApi(RequestContext.batch());
+		var syncApi = client.getSyncApi(RequestContext.batch());
 		var colId = syncApi.createColumn("maintenance-close-col",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 		syncApi.put(0,
@@ -228,12 +230,12 @@ class GrpcShutdownTest {
 				colId,
 				new Keys(),
 				null,
-				false, java.time.Duration.ofMillis(
+				false, Duration.ofMillis(
 				TimeUnit.MINUTES.toMillis(1))).get(5, TimeUnit.SECONDS);
 
 		var maintenanceStarted = new CountDownLatch(1);
 		var releaseMaintenance = new CountDownLatch(1);
-		embeddedConnection.getScheduler().scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.PHYSICAL_MAINTENANCE, it.cavallium.rockserver.core.common.OperationFamily.COMPACTION, Long.MAX_VALUE).schedule(() -> {
+		embeddedConnection.getScheduler().scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE).schedule(() -> {
 			maintenanceStarted.countDown();
 			try {
 				releaseMaintenance.await();
@@ -254,11 +256,11 @@ class GrpcShutdownTest {
 	@Test
 	void remoteCleanupBypassesASaturatedWriteLane() throws Exception {
 		var client = newClient();
-		var api = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+		var api = client.getAsyncApi(RequestContext.batch());
 		var writeStarted = new CountDownLatch(DATA_WORKERS);
 		var releaseWrite = new CountDownLatch(1);
 		for (int i = 0; i < DATA_WORKERS; i++) {
-			embeddedConnection.getScheduler().executor(it.cavallium.rockserver.core.common.WorkloadProfile.INGEST, it.cavallium.rockserver.core.common.OperationFamily.MUTATION, Long.MAX_VALUE).execute(() -> {
+			embeddedConnection.getScheduler().executor(WorkloadProfile.INGEST, OperationFamily.MUTATION, Long.MAX_VALUE).execute(() -> {
 				writeStarted.countDown();
 				try {
 					releaseWrite.await();
@@ -286,10 +288,10 @@ class GrpcShutdownTest {
 	@Test
 	void cancelledQueuedRemoteIteratorCloseStillCompletes() throws Exception {
 		var client = newClient();
-		var api = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-		var colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("cancelled-close-col",
+		var api = client.getAsyncApi(RequestContext.batch());
+		var colId = client.getSyncApi(RequestContext.batch()).createColumn("cancelled-close-col",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0,
+		client.getSyncApi(RequestContext.batch()).put(0,
 				colId,
 				key(1),
 				Buf.wrap(new byte[] {1}),
@@ -299,7 +301,7 @@ class GrpcShutdownTest {
 		var releaseControl = new CountDownLatch(1);
 		var scheduler = embeddedConnection.getScheduler();
 		for (int i = 0; i < 2; i++) {
-			embeddedConnection.getScheduler().scheduler(it.cavallium.rockserver.core.common.WorkloadProfile.CONTROL, it.cavallium.rockserver.core.common.OperationFamily.CONTROL, Long.MAX_VALUE).schedule(() -> {
+			embeddedConnection.getScheduler().scheduler(WorkloadProfile.CONTROL, OperationFamily.CONTROL, Long.MAX_VALUE).schedule(() -> {
 				controlStarted.countDown();
 				try {
 					releaseControl.await();
@@ -316,7 +318,7 @@ class GrpcShutdownTest {
 					colId,
 					new Keys(),
 					null,
-					false, java.time.Duration.ofMillis(
+					false, Duration.ofMillis(
 					TimeUnit.MINUTES.toMillis(1))).get(5, TimeUnit.SECONDS);
 			assertEquals(1, embeddedConnection.getInternalDB().getOpenIteratorsCount());
 			assertEquals(1, embeddedConnection.getInternalDB().getPendingOpsCount());

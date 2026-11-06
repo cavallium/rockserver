@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.EnumSet;
 import java.util.Map;
@@ -141,7 +142,7 @@ class ClusterCheckTest {
 		var check = new ClusterCheck("leader", GROUP, Duration.ofMillis(500));
 		// A port nothing listens on: the call fails; then the follower comes up at a reachable address.
 		int closedPort;
-		try (var socket = new java.net.ServerSocket(0)) {
+		try (var socket = new ServerSocket(0)) {
 			closedPort = socket.getLocalPort();
 		}
 		check.check(3, "cluster-a", Map.of("a", "127.0.0.1:" + closedPort), 0);

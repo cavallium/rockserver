@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import org.github.gestalt.config.exceptions.GestaltException;
 
 import java.util.*;
+import org.rocksdb.CompressionType;
 
 public class ConfigPrinter {
 
@@ -421,7 +422,7 @@ public class ConfigPrinter {
 		);
 	}
 
-	private static String stringifyCompression(org.rocksdb.CompressionType compressionType) {
+	private static String stringifyCompression(CompressionType compressionType) {
 		return switch (compressionType.name()) {
 			case "NO_COMPRESSION" -> "PLAIN";
 			case "SNAPPY_COMPRESSION" -> "SNAPPY";

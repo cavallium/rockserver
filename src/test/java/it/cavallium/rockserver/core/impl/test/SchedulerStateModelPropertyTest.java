@@ -22,7 +22,9 @@ import java.util.Collections;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.SplittableRandom;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
@@ -159,7 +161,7 @@ class SchedulerStateModelPropertyTest {
 			model.submit(new SchedulerReferenceModel.Spec(-1L,
 					WorkloadProfile.BATCH, Long.MAX_VALUE, 1, false), 0L);
 			model.dispatch(0L, true);
-			scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
+			scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {
 				started.countDown();
 				await(release);
 			});
@@ -169,12 +171,12 @@ class SchedulerStateModelPropertyTest {
 				assertEquals(SchedulerReferenceModel.Admission.ACCEPTED,
 						model.submit(new SchedulerReferenceModel.Spec(
 								id, WorkloadProfile.BATCH, Long.MAX_VALUE, 1, false), 0L));
-				scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {});
+				scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {});
 			}
 			assertEquals(SchedulerReferenceModel.Admission.OVERLOAD,
 					model.submit(new SchedulerReferenceModel.Spec(
 							2L, WorkloadProfile.BATCH, Long.MAX_VALUE, 1, false), 0L));
-			var overload = assertThrows(RocksDBException.class, () -> scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {}));
+			var overload = assertThrows(RocksDBException.class, () -> scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE).execute(() -> {}));
 			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED, overload.getErrorUniqueId());
 
 			assertEquals(SchedulerReferenceModel.Admission.DEADLINE,
@@ -252,7 +254,7 @@ class SchedulerStateModelPropertyTest {
 		var task = new ScriptedCooperativeTask(actions, fail);
 		model.submit(new SchedulerReferenceModel.Spec(
 				1L, WorkloadProfile.BATCH, Long.MAX_VALUE, 1, fail), 0L);
-		var handle = scheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH, it.cavallium.rockserver.core.common.OperationFamily.RANGE_PAGE, Long.MAX_VALUE).executeCooperatively(task, 1L);
+		var handle = scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE).executeCooperatively(task, 1L);
 		boolean cancelled = false;
 		try {
 			for (int actionIndex = 0; actionIndex < actions.size(); actionIndex++) {
@@ -284,7 +286,7 @@ class SchedulerStateModelPropertyTest {
 					? SchedulerReferenceModel.Outcome.CANCELLATION
 					: fail ? SchedulerReferenceModel.Outcome.FAILURE : SchedulerReferenceModel.Outcome.RUN;
 			assertEquals(1L, model.outcomeCounts().get(expected));
-			assertEquals(cancelled, task.failure.get() instanceof java.util.concurrent.CancellationException);
+			assertEquals(cancelled, task.failure.get() instanceof CancellationException);
 		} finally {
 			handle.cancel();
 			scheduler.disposeNow();
@@ -450,7 +452,7 @@ class SchedulerStateModelPropertyTest {
 	private static int firstDifference(List<?> expected, List<?> actual) {
 		int shared = Math.min(expected.size(), actual.size());
 		for (int index = 0; index < shared; index++) {
-			if (!java.util.Objects.equals(expected.get(index), actual.get(index))) return index;
+			if (!Objects.equals(expected.get(index), actual.get(index))) return index;
 		}
 		return shared;
 	}
@@ -501,11 +503,11 @@ class SchedulerStateModelPropertyTest {
 			setQueued = accessible(type.getDeclaredMethod("setBatchQueued", RWScheduler.Pool.class, boolean.class));
 			var setDispatchabilitySources = accessible(type.getDeclaredMethod(
 					"setBatchDispatchabilitySources",
-					java.util.function.BooleanSupplier.class,
-					java.util.function.BooleanSupplier.class));
+					BooleanSupplier.class,
+					BooleanSupplier.class));
 			setDispatchabilitySources.invoke(controller,
-					(java.util.function.BooleanSupplier) readDispatchable::get,
-					(java.util.function.BooleanSupplier) writeDispatchable::get);
+					(BooleanSupplier) readDispatchable::get,
+					(BooleanSupplier) writeDispatchable::get);
 			dispatchabilityLost = accessible(type.getDeclaredMethod(
 					"batchDispatchabilityLost", RWScheduler.Pool.class));
 			setCompetition = accessible(type.getDeclaredMethod(

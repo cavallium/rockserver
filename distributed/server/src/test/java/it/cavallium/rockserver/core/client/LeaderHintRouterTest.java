@@ -14,11 +14,13 @@ import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.Status;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.jetbrains.annotations.Nullable;
@@ -213,19 +215,19 @@ class LeaderHintRouterTest {
 	 */
 	@Test
 	void everyServiceMethodIsClassified() {
-		var methods = new java.util.TreeSet<String>();
-		for (var method : it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.getServiceDescriptor()
+		var methods = new TreeSet<String>();
+		for (var method : RocksDBServiceGrpc.getServiceDescriptor()
 				.getMethods()) {
 			methods.add(method.getBareMethodName());
 		}
-		var both = new java.util.TreeSet<>(LeaderHintRouter.LEADER_METHODS);
+		var both = new TreeSet<>(LeaderHintRouter.LEADER_METHODS);
 		both.retainAll(LeaderHintRouter.ORDINARY_METHODS);
 		assertEquals(Set.of(), both, "in both sets");
-		var unclassified = new java.util.TreeSet<>(methods);
+		var unclassified = new TreeSet<>(methods);
 		unclassified.removeAll(LeaderHintRouter.LEADER_METHODS);
 		unclassified.removeAll(LeaderHintRouter.ORDINARY_METHODS);
 		assertEquals(Set.of(), unclassified, "methods in neither set");
-		var unknown = new java.util.TreeSet<>(LeaderHintRouter.LEADER_METHODS);
+		var unknown = new TreeSet<>(LeaderHintRouter.LEADER_METHODS);
 		unknown.addAll(LeaderHintRouter.ORDINARY_METHODS);
 		unknown.removeAll(methods);
 		assertEquals(Set.of(), unknown, "names that are not methods of the service");

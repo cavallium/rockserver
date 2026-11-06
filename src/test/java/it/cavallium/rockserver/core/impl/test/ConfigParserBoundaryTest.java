@@ -7,12 +7,15 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.config.ConfigPrinter;
 import it.cavallium.rockserver.core.config.DataSize;
 import it.cavallium.rockserver.core.config.WorkloadSettings;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -197,12 +200,12 @@ class ConfigParserBoundaryTest {
 
 		var settings = WorkloadSettings.resolve(ConfigParser.parse(asymmetric));
 		assertEquals(20, settings.analyticalActiveLimit());
-		var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+		var registry = new SimpleMeterRegistry();
 		try {
-			var scheduler = new it.cavallium.rockserver.core.impl.RWScheduler(
+			var scheduler = new RWScheduler(
 					settings, "asymmetric-analytical", registry, "asymmetric-analytical");
 			try {
-				assertEquals(777, scheduler.queueCapacity(it.cavallium.rockserver.core.common.WorkloadProfile.ANALYTICAL));
+				assertEquals(777, scheduler.queueCapacity(WorkloadProfile.ANALYTICAL));
 				assertTrue(registry.find("rockserver.workload.queue.capacity")
 						.tags("database", "asymmetric-analytical", "resource", "write",
 								"profile", "analytical")

@@ -10,12 +10,13 @@ import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
 import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
+import net.jpountz.xxhash.XXHashFactory;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 public class XXHash32Test {
 
-	private static final net.jpountz.xxhash.XXHash32 REFERENCE = net.jpountz.xxhash.XXHashFactory.safeInstance()
+	private static final net.jpountz.xxhash.XXHash32 REFERENCE = XXHashFactory.safeInstance()
 			.hash32();
 	private static final int MAX_LENGTH = 1100;
 

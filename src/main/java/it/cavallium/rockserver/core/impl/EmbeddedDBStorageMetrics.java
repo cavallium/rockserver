@@ -14,10 +14,15 @@ import java.util.Map.Entry;
 
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.HistogramType;
+import org.rocksdb.MutableDBOptions;
+import org.rocksdb.RateLimiter;
 import org.rocksdb.RocksDB;
 import org.rocksdb.Snapshot;
+import org.rocksdb.Statistics;
 import org.rocksdb.Status.Code;
 import it.cavallium.rockserver.core.impl.EmbeddedDB.*;
+import org.rocksdb.TickerType;
 
 /**
  * Metrics, storage-pressure and compaction-I/O sampling of {@link EmbeddedDB}: timers, storage-pressure columns
@@ -239,7 +244,7 @@ final class EmbeddedDBStorageMetrics {
 		edb.ops.beginOp();
 		try {
 			var nativeDb = edb.db.get();
-			nativeDb.setDBOptions(org.rocksdb.MutableDBOptions.builder().setCompactionReadaheadSize(bytes).build());
+			nativeDb.setDBOptions(MutableDBOptions.builder().setCompactionReadaheadSize(bytes).build());
 			// Successful JNI acknowledgement; the public options getter cannot parse absolute path values.
 			return bytes;
 		} catch (org.rocksdb.RocksDBException failure) {
@@ -303,7 +308,7 @@ final class EmbeddedDBStorageMetrics {
 		private static final CompactionReadCompletion UNAVAILABLE = new CompactionReadCompletion(-1, -1, -1);
 	}
 
-	private static CompactionReadCompletion sampleCompactionReadCompletion(org.rocksdb.Statistics statistics) {
+	private static CompactionReadCompletion sampleCompactionReadCompletion(Statistics statistics) {
 		try {
 			var completion = statistics.getCompactionReadCompletion();
 			if (completion == null || completion.length != 3) return CompactionReadCompletion.UNAVAILABLE;
@@ -317,12 +322,12 @@ final class EmbeddedDBStorageMetrics {
 		return CompactionReadCompletion.UNAVAILABLE;
 	}
 
-	CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter) {
+	CompactionIoBudget.Sample sampleCompactionIo(RateLimiter limiter) {
 		return sampleCompactionIo(limiter, new long[RWScheduler.POOL_TELEMETRY_LENGTH],
 				new long[RWScheduler.POOL_TELEMETRY_LENGTH]);
 	}
 
-	CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter, long[] readPoolTelemetry,
+	CompactionIoBudget.Sample sampleCompactionIo(RateLimiter limiter, long[] readPoolTelemetry,
 			long[] groupReadPoolTelemetry) {
 		edb.ops.beginOp();
 		boolean stopped = false;
@@ -366,10 +371,10 @@ final class EmbeddedDBStorageMetrics {
 				} finally { if (registered != null) registered.endUse(); }
 			}
 			try (var statistics = edb.dbOptions.statistics()) {
-				var histogram = statistics.getHistogramData(org.rocksdb.HistogramType.READ_BLOCK_GET_MICROS);
+				var histogram = statistics.getHistogramData(HistogramType.READ_BLOCK_GET_MICROS);
 				var compactionReads = sampleCompactionReadCompletion(statistics);
-				var prefetch = statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES);
-				var bulk = statistics.getHistogramData(org.rocksdb.HistogramType.DB_MULTIGET);
+				var prefetch = statistics.getHistogramData(HistogramType.COMPACTION_PREFETCH_BYTES);
+				var bulk = statistics.getHistogramData(HistogramType.DB_MULTIGET);
 				int readTopologyWorkers = edb.scheduler.copyCompactionReadTelemetryAndTopology(readPoolTelemetry, groupReadPoolTelemetry);
 				boolean background = nativeDb.getLongProperty("rocksdb.num-running-compactions") > 0
 						|| nativeDb.getLongProperty("rocksdb.num-running-flushes") > 0;
@@ -381,10 +386,10 @@ final class EmbeddedDBStorageMetrics {
 				return new CompactionIoBudget.Sample(System.nanoTime(), histogram.getCount(), histogram.getSum(),
 						limiter.getTotalBytesThrough(), background, pressure, stopped, complete,
 						foregroundPending,
-						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ)
-								+ statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN), recoveryClear, urgentPressure,
+						statistics.getTickerCount(TickerType.NUMBER_KEYS_READ)
+								+ statistics.getTickerCount(TickerType.NUMBER_KEYS_WRITTEN), recoveryClear, urgentPressure,
 						compactionReads.bytes(), compactionReads.micros(), compactionReads.count(), prefetch.getCount(), prefetch.getSum(),
-						bulk.getCount(), bulk.getSum(), statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ),
+						bulk.getCount(), bulk.getSum(), statistics.getTickerCount(TickerType.NUMBER_MULTIGET_KEYS_READ),
 						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_WORKER_COUNT],
 						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS],
 						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()],
@@ -394,8 +399,8 @@ final class EmbeddedDBStorageMetrics {
 						(long) Math.ceil(point.tailNanos() / 1000d),
 						(long) Math.ceil(edb.bulkReadTailNanos.getAndSet(0) / 1000d),
 						point.count(), edb.nativeBulkReadCompletions.get(), edb.nativeBulkReadKeys.get(), point.nanos(),
-						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND),
-						statistics.getHistogramData(org.rocksdb.HistogramType.BYTES_PER_MULTIGET).getSum(),
+						statistics.getTickerCount(TickerType.NUMBER_MULTIGET_KEYS_FOUND),
+						statistics.getHistogramData(HistogramType.BYTES_PER_MULTIGET).getSum(),
 						edb.workloadGroups.isEmpty() ? readPoolTelemetry[RWScheduler.POOL_TELEMETRY_FAILED_TASKS] : -1,
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS],
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES],

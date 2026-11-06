@@ -7,10 +7,14 @@ import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import java.time.Duration;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import java.util.concurrent.TimeUnit;
 import reactor.core.Disposable;
+import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
 /** A server in front of a non-embedded connection (a remote or replicated database). */
@@ -46,7 +50,7 @@ final class GrpcProxyMode {
 	}
 
 	/** The executor of the calls' callbacks, and the connection age, of a server in front of another connection. */
-	static void configureTransport(NettyServerBuilder builder, java.util.concurrent.ExecutorService callExecutor) {
+	static void configureTransport(NettyServerBuilder builder, ExecutorService callExecutor) {
 		builder.executor(callExecutor);
 		// Off by default. Ending a connection brings a client that moved away back to the first address of its list,
 		// but every client then starts again from the top of the list at every cycle, so a silent first address costs
@@ -66,20 +70,20 @@ final class GrpcProxyMode {
 	 * with a retryable {@code SERVER_OVERLOADED}: the caller maps it like any database error, instead of the generic
 	 * rejection (and the stack trace on the event loop) of Reactor's executor scheduler.
 	 */
-	static final class ProxyScheduler implements reactor.core.scheduler.Scheduler {
+	static final class ProxyScheduler implements Scheduler {
 
-		private final java.util.concurrent.Semaphore permits;
-		private final java.util.concurrent.ThreadFactory threads = Thread.ofVirtual().name("grpc-proxy-", 0).factory();
+		private final Semaphore permits;
+		private final ThreadFactory threads = Thread.ofVirtual().name("grpc-proxy-", 0).factory();
 		/** For Reactor operators that need a worker; requests themselves go through {@link #schedule}. */
-		private final reactor.core.scheduler.Scheduler workers = Schedulers.fromExecutor(
+		private final Scheduler workers = Schedulers.fromExecutor(
 				command -> threads.newThread(command).start());
 
 		ProxyScheduler(int limit) {
-			this.permits = new java.util.concurrent.Semaphore(limit);
+			this.permits = new Semaphore(limit);
 		}
 
 		@Override
-		public reactor.core.Disposable schedule(Runnable task) {
+		public Disposable schedule(Runnable task) {
 			if (!permits.tryAcquire()) {
 				throw RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "Too many requests in flight");
 			}
@@ -104,10 +108,10 @@ final class GrpcProxyMode {
 		}
 
 		/** A task that does not run if it is disposed before it starts. */
-		private final class ProxyTask implements Runnable, reactor.core.Disposable {
+		private final class ProxyTask implements Runnable, Disposable {
 
 			private final Runnable task;
-			private final java.util.concurrent.atomic.AtomicBoolean claimed = new java.util.concurrent.atomic.AtomicBoolean();
+			private final AtomicBoolean claimed = new AtomicBoolean();
 
 			ProxyTask(Runnable task) {
 				this.task = task;

@@ -5,6 +5,10 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.impl.rocksdb.LeakSafeWriteBatch;
 import it.cavallium.rockserver.core.impl.rocksdb.LeakSafeWriteOptions;
+import java.lang.reflect.InvocationTargetException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
@@ -61,9 +65,9 @@ public class MergeOperatorRegistry implements Closeable {
         
         byte[] hash;
         try {
-            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
             hash = digest.digest(jarData);
-        } catch (java.security.NoSuchAlgorithmException e) {
+        } catch (NoSuchAlgorithmException e) {
             throw new RuntimeException(e);
         }
 
@@ -160,7 +164,7 @@ public class MergeOperatorRegistry implements Closeable {
     }
 
     private byte[] encodeHashKey(String name, byte[] hash) {
-        String hashHex = java.util.HexFormat.of().formatHex(hash);
+        String hashHex = HexFormat.of().formatHex(hash);
         return ("hash:" + name + ":" + hashHex).getBytes(StandardCharsets.UTF_8);
     }
 
@@ -338,7 +342,7 @@ public class MergeOperatorRegistry implements Closeable {
      */
     private static RocksDBException cannotInstantiate(String className, Throwable failure) {
         Throwable reason = failure;
-        while ((reason instanceof java.lang.reflect.InvocationTargetException
+        while ((reason instanceof InvocationTargetException
                 || reason instanceof ExceptionInInitializerError) && reason.getCause() != null) {
             reason = reason.getCause();
         }

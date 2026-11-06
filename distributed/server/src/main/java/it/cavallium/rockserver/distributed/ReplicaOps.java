@@ -19,6 +19,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
@@ -34,6 +35,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.thirdparty.io.grpc.Status;
@@ -591,7 +593,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 								long millis = Instant.parse(parts[0]).toEpochMilli();
 								long first = recordedChecksumMillis.merge(index, millis, Math::min);
 								lastChecksumMillis = Math.max(lastChecksumMillis, first);
-							} catch (java.time.format.DateTimeParseException malformed) {
+							} catch (DateTimeParseException malformed) {
 								// The interval then counts from the start.
 							}
 						}
@@ -703,7 +705,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		}
 		for (var follower : division.getInfo().getRoleInfoProto().getLeaderInfo().getFollowerInfoList()) {
 			var id = follower.getId();
-			var name = org.apache.ratis.protocol.RaftPeerId.valueOf(id.getId()).toString();
+			var name = RaftPeerId.valueOf(id.getId()).toString();
 			if (!peers.containsKey(name) && !id.getAddress().isEmpty()) {
 				peers.put(name, RaftPeer.newBuilder().setId(name).setAddress(id.getAddress()).build());
 			}

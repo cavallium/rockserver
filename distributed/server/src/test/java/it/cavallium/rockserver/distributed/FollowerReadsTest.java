@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -13,8 +15,12 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.protocol.RaftPeer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -35,7 +41,7 @@ class FollowerReadsTest {
 			// per batch, deep enough to overflow the stack and leave a request in flight forever.
 			var futures = new ArrayList<CompletableFuture<ReadBarrier.ReadIndex>>();
 			try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-				var submitted = new ArrayList<java.util.concurrent.Future<CompletableFuture<ReadBarrier.ReadIndex>>>();
+				var submitted = new ArrayList<Future<CompletableFuture<ReadBarrier.ReadIndex>>>();
 				for (int i = 0; i < 20_000; i++) {
 					submitted.add(executor.submit(reads::readIndex));
 				}
@@ -72,11 +78,11 @@ class FollowerReadsTest {
 		var raft = new StubRaft();
 		raft.installInto(stateMachine);
 		// Accepts connections and never answers: the first request waits for its timeout.
-		try (var silent = new java.net.ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
+		try (var silent = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
 				var reads = new FollowerReads(stateMachine, RaftGroupId.valueOf(UUID.randomUUID()), "n0",
 						Duration.ofSeconds(2))) {
 			raft.leaderId = "n1";
-			raft.currentPeers = List.of(org.apache.ratis.protocol.RaftPeer.newBuilder().setId("n1")
+			raft.currentPeers = List.of(RaftPeer.newBuilder().setId("n1")
 					.setAddress("127.0.0.1:" + silent.getLocalPort()).build());
 			var first = reads.readIndex();
 			var second = reads.readIndex();
@@ -85,9 +91,9 @@ class FollowerReadsTest {
 			raft.leaderId = null;
 
 			int depth = 50_000;
-			var completed = new java.util.concurrent.atomic.AtomicInteger();
+			var completed = new AtomicInteger();
 			var done = new CompletableFuture<Void>();
-			var chain = new java.util.function.Consumer<CompletableFuture<ReadBarrier.ReadIndex>>() {
+			var chain = new Consumer<CompletableFuture<ReadBarrier.ReadIndex>>() {
 				@Override
 				public void accept(CompletableFuture<ReadBarrier.ReadIndex> read) {
 					read.whenComplete((_, error) -> {

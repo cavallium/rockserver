@@ -7,13 +7,22 @@ import it.cavallium.rockserver.core.impl.DelegatingMergeOperator;
 import it.cavallium.rockserver.core.impl.CompactionIoBudget;
 import it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator;
 import java.io.InputStream;
+import java.net.JarURLConnection;
+import java.net.URL;
+import java.net.URLConnection;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.*;
 
+import java.util.zip.CRC32;
+import java.util.zip.Checksum;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.VisibleForTesting;
 import org.rocksdb.*;
 import org.rocksdb.util.Environment;
 import org.rocksdb.util.SizeUnit;
@@ -128,12 +137,12 @@ public class RocksDBLoader {
      * temporary files older than {@link #STALE_EXTRACTION} (from a process killed mid-copy) are removed. A resource
      * that is not a jar entry (tests) is read once more to compute its CRC.
      */
-    @org.jetbrains.annotations.VisibleForTesting
-    public static Path extractLibrary(Path dir, String fileName, java.net.URL resource) throws IOException {
+    @VisibleForTesting
+    public static Path extractLibrary(Path dir, String fileName, URL resource) throws IOException {
         var connection = resource.openConnection();
         long size = -1;
         long crc = -1;
-        if (connection instanceof java.net.JarURLConnection jar) {
+        if (connection instanceof JarURLConnection jar) {
             var entry = jar.getJarEntry();
             if (entry != null) {
                 size = entry.getSize();
@@ -141,7 +150,7 @@ public class RocksDBLoader {
             }
         }
         if (size < 0 || crc < 0) {
-            var checksum = new java.util.zip.CRC32();
+            var checksum = new CRC32();
             size = copy(connection, null, checksum);
             crc = checksum.getValue();
             connection = resource.openConnection();
@@ -155,10 +164,10 @@ public class RocksDBLoader {
         }
         var temp = Files.createTempFile(contentDir, fileName + ".", ".tmp");
         try {
-            var checksum = new java.util.zip.CRC32();
+            var checksum = new CRC32();
             long written;
-            try (var channel = java.nio.channels.FileChannel.open(temp, java.nio.file.StandardOpenOption.WRITE,
-                    java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
+            try (var channel = FileChannel.open(temp, StandardOpenOption.WRITE,
+                    StandardOpenOption.TRUNCATE_EXISTING)) {
                 written = copy(connection, channel, checksum);
                 channel.force(true);
             }
@@ -172,8 +181,8 @@ public class RocksDBLoader {
         }
     }
 
-    private static long copy(java.net.URLConnection connection, @Nullable java.nio.channels.FileChannel channel,
-            java.util.zip.Checksum checksum) throws IOException {
+    private static long copy(URLConnection connection, @Nullable FileChannel channel,
+            Checksum checksum) throws IOException {
         long total = 0;
         try (InputStream is = connection.getInputStream()) {
             var buffer = new byte[1 << 16];
@@ -181,7 +190,7 @@ public class RocksDBLoader {
             while ((read = is.read(buffer)) >= 0) {
                 checksum.update(buffer, 0, read);
                 if (channel != null) {
-                    var wrapped = java.nio.ByteBuffer.wrap(buffer, 0, read);
+                    var wrapped = ByteBuffer.wrap(buffer, 0, read);
                     while (wrapped.hasRemaining()) {
                         channel.write(wrapped);
                     }
@@ -806,7 +815,7 @@ public class RocksDBLoader {
         try {
             var readahead = databaseOptions.global().adaptiveCompactionReadaheadMaxSize();
             if (readahead != null && (readahead.longValue() < 0
-                    || readahead.longValue() > it.cavallium.rockserver.core.impl.CompactionIoBudget.MAX_READAHEAD_BYTES)) {
+                    || readahead.longValue() > CompactionIoBudget.MAX_READAHEAD_BYTES)) {
                 throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
                         "adaptive-compaction-readahead-max-size must be between 0 and 16MiB");
             }

@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -164,7 +165,7 @@ class ClockSkewTest {
 	 * Merges {@code value}: on success the result must be the expected list plus it, exactly once; on failure (a
 	 * session that expired at the new clock may be refused) the value must not be there at all.
 	 */
-	private void mergeAtMostOnce(it.cavallium.rockserver.core.common.RocksDBAsyncAPI api, long column, String value,
+	private void mergeAtMostOnce(RocksDBAsyncAPI api, long column, String value,
 			StringBuilder expected) throws Exception {
 		String result = null;
 		Throwable failure = null;
@@ -189,7 +190,7 @@ class ClockSkewTest {
 		assertEquals(expected.toString(), result, failure == null ? "" : "after " + failure);
 	}
 
-	private static String merge(it.cavallium.rockserver.core.common.RocksDBAsyncAPI api, long column, String value) {
+	private static String merge(RocksDBAsyncAPI api, long column, String value) {
 		return api.mergeAsync(0, column, key(), text(value), RequestType.merged()).join()
 				.toString(StandardCharsets.UTF_8);
 	}

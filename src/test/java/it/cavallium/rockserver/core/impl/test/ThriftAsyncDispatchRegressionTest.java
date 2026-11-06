@@ -24,6 +24,9 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.common.api.RocksDB;
+import it.cavallium.rockserver.core.common.api.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.server.ThriftServer;
@@ -119,7 +122,7 @@ class ThriftAsyncDispatchRegressionTest {
 
 		assertEquals(expected, api.get(0, 1, key(1), RequestType.current()));
 		api.put(0, 1, key(1), expected, RequestType.none());
-		assertEquals(41L, api.openTransaction( java.time.Duration.ofMillis(10_000)));
+		assertEquals(41L, api.openTransaction( Duration.ofMillis(10_000)));
 		assertEquals(3, connection.syncRequests.size());
 		assertEquals(0, connection.asyncRequests.size());
 
@@ -172,8 +175,8 @@ class ThriftAsyncDispatchRegressionTest {
 						error.getErrorUniqueId());
 
 				var finite = it.cavallium.rockserver.core.common.RequestContext.batch(
-						java.time.Duration.ofSeconds(30));
-				long transactionId = client.getSyncApi(finite).openTransaction( java.time.Duration.ofMillis(10_000L));
+						Duration.ofSeconds(30));
+				long transactionId = client.getSyncApi(finite).openTransaction( Duration.ofMillis(10_000L));
 				assertTrue(connection.lastApiContextDeadline.get() > 0L);
 				assertTrue(connection.lastApiContextDeadline.get() <= finite.timeoutNanos());
 				assertTrue(client.getSyncApi(expired).closeTransaction(transactionId, false));
@@ -193,16 +196,16 @@ class ThriftAsyncDispatchRegressionTest {
 			try (var transport = new TFramedTransport(
 					new TSocket(configuration, "127.0.0.1", port))) {
 				transport.open();
-				var rawClient = new it.cavallium.rockserver.core.common.api.RocksDB.Client(
+				var rawClient = new RocksDB.Client(
 						new TBinaryProtocol(transport));
 				var v2Context = new it.cavallium.rockserver.core.common.api.RequestContext(
 						it.cavallium.rockserver.core.common.api.WorkloadProfile.BATCH,
 						2,
 						Long.MAX_VALUE);
 				var failure = assertThrows(
-						it.cavallium.rockserver.core.common.api.RocksDBThriftException.class,
+						RocksDBThriftException.class,
 						() -> rawClient.closeTransaction(72L, false, v2Context));
-				assertEquals(it.cavallium.rockserver.core.common.api.RocksDBErrorType.PUT_INVALID_REQUEST,
+				assertEquals(RocksDBErrorType.PUT_INVALID_REQUEST,
 						failure.getErrorType());
 				assertTrue(connection.asyncRequests.isEmpty(),
 						"v2 rollback reached the protected backend");
@@ -258,12 +261,12 @@ class ThriftAsyncDispatchRegressionTest {
 			try (var client = new ThriftConnection("thrift-running-cancel", "127.0.0.1", port)) {
 				var api = client.getAsyncApi(
 						it.cavallium.rockserver.core.common.RequestContext.batch());
-				var opened = api.openIteratorAsync(0, 1, key(0), null, false, java.time.Duration.ofMillis( 10_000));
+				var opened = api.openIteratorAsync(0, 1, key(0), null, false, Duration.ofMillis( 10_000));
 				boolean cancelled;
 				try {
 					assertTrue(connection.openIteratorRequested.await(5, SECONDS));
 					cancelled = opened.cancel(true);
-					var queued = api.openTransactionAsync( java.time.Duration.ofMillis(10_000));
+					var queued = api.openTransactionAsync( Duration.ofMillis(10_000));
 					assertTrue(queued.cancel(true),
 							"a queued transport call must be removable before it acquires a socket");
 				} finally {
@@ -510,7 +513,7 @@ class ThriftAsyncDispatchRegressionTest {
 
 	private static final class BoundaryJumpConnection implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public RockserverCapabilities getCapabilities() { return RockserverCapabilities.CURRENT; }
 
 		private final RWScheduler scheduler;
 		private final MutableClock clock;
@@ -537,7 +540,7 @@ class ThriftAsyncDispatchRegressionTest {
 				@Override
 				public long getColumnId(String name) {
 					clock.epochMillis.addAndGet(-30_000L);
-					clock.nanoTime.addAndGet(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(10_001L));
+					clock.nanoTime.addAndGet(TimeUnit.MILLISECONDS.toNanos(10_001L));
 					scheduler.executor(WorkloadProfile.BATCH, OperationFamily.METADATA, context)
 							.execute(() -> scheduledTaskRan.set(true));
 					return 1L;
@@ -600,8 +603,8 @@ class ThriftAsyncDispatchRegressionTest {
 
 	private static final class TrackingConnection implements RocksDBConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 

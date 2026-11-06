@@ -8,19 +8,25 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.unimi.dsi.fastutil.ints.IntList;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.lang.ref.WeakReference;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.concurrent.ExecutionException;
 import org.apache.ratis.grpc.GrpcUtil;
 import org.apache.ratis.grpc.util.StreamObserverWithTimeout;
 import org.apache.ratis.protocol.TransferLeadershipRequest;
 import org.apache.ratis.protocol.exceptions.NotLeaderException;
+import org.apache.ratis.server.raftlog.segmented.LogWorkerGate;
 import org.apache.ratis.thirdparty.io.grpc.CallOptions;
 import org.apache.ratis.thirdparty.io.grpc.ServerServiceDefinition;
 import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.apache.ratis.thirdparty.io.grpc.netty.NettyServerBuilder;
 import org.apache.ratis.thirdparty.io.grpc.stub.ClientCalls;
 import org.apache.ratis.thirdparty.io.grpc.stub.ServerCalls;
+import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
 import org.apache.ratis.util.LifeCycle;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -61,6 +67,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.CodedInputStream;
 import org.apache.ratis.util.PureJavaCrc32C;
 import org.apache.ratis.util.TimeDuration;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -154,7 +161,7 @@ class RatisContractTest {
 		RaftClientReply refused;
 		try {
 			refused = submitLocal("refused").get(WAIT.toSeconds(), TimeUnit.SECONDS);
-		} catch (java.util.concurrent.ExecutionException ex) {
+		} catch (ExecutionException ex) {
 			refused = null;
 			assertInstanceOf(ResourceUnavailableException.class, ReplicatedConnection.unwrap(ex));
 			assertTrue(Proposer.isRatisPendingLimit(ReplicatedConnection.unwrap(ex)), ex::toString);
@@ -183,7 +190,7 @@ class RatisContractTest {
 		start(Duration.ofMillis(300), RaftServerConfigKeys.Write.ELEMENT_LIMIT_DEFAULT);
 		awaitLeader();
 		// The blocking client throws the reply's exception.
-		var refusal = org.junit.jupiter.api.Assertions.assertThrows(StateMachineException.class,
+		var refusal = Assertions.assertThrows(StateMachineException.class,
 				() -> client.io().send(Message.valueOf("conflict")));
 		assertNotNull(refusal.getCause());
 		assertEquals(RockserverStateMachine.ConflictException.class.getName(), refusal.getCause().getClass().getName());
@@ -320,7 +327,7 @@ class RatisContractTest {
 	void aSnapshotChunkStaysOnTheHeapUntilItsTimeout() throws Exception {
 		var timeout = TimeDuration.valueOf(1_500, TimeUnit.MILLISECONDS);
 		var observer = StreamObserverWithTimeout.<Object>newInstance("contract", String::valueOf, () -> timeout, 8,
-				_ -> new org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver<>() {
+				_ -> new StreamObserver<>() {
 					@Override
 					public void onNext(Object value) {
 						// Replied at once: the chunk is still held.
@@ -365,7 +372,7 @@ class RatisContractTest {
 		waitUntil(() -> log.getFlushIndex() == log.getNextIndex() - 1
 				&& log.getLastCommittedIndex() == log.getFlushIndex(), "a settled log");
 		var disk = new CountDownLatch(1);
-		org.apache.ratis.server.raftlog.segmented.LogWorkerGate.block(log, disk);
+		LogWorkerGate.block(log, disk);
 		long committed = log.getLastCommittedIndex();
 		long flushed = log.getFlushIndex();
 		var held = submitLocal("held");
@@ -412,7 +419,7 @@ class RatisContractTest {
 		follower.close();
 		// Long enough for the stream to fail and be reset a few times.
 		Thread.sleep(2_000);
-		var threads = java.lang.management.ManagementFactory.getThreadMXBean();
+		var threads = ManagementFactory.getThreadMXBean();
 		long cpuBefore = appenderCpuNanos(threads, followerId);
 		long start = System.nanoTime();
 		Thread.sleep(3_000);
@@ -500,7 +507,7 @@ class RatisContractTest {
 	}
 
 	/** CPU time of the leader's threads that append to {@code followerId} (named {@code ...->followerId-...}). */
-	private static long appenderCpuNanos(java.lang.management.ThreadMXBean threads, String followerId) {
+	private static long appenderCpuNanos(ThreadMXBean threads, String followerId) {
 		long total = 0;
 		for (var info : threads.dumpAllThreads(false, false)) {
 			if (info.getThreadName().contains("->" + followerId)) {
@@ -513,8 +520,8 @@ class RatisContractTest {
 		return total;
 	}
 
-	private static long appenderThreads(java.lang.management.ThreadMXBean threads, String followerId) {
-		return java.util.Arrays.stream(threads.dumpAllThreads(false, false))
+	private static long appenderThreads(ThreadMXBean threads, String followerId) {
+		return Arrays.stream(threads.dumpAllThreads(false, false))
 				.filter(info -> info.getThreadName().contains("->" + followerId))
 				.count();
 	}

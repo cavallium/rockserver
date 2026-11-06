@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.client.GrpcConnection;
+import it.cavallium.rockserver.core.client.LoggingClient;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.api.proto.FlushRequest;
 import it.cavallium.rockserver.core.server.GrpcServer;
@@ -47,7 +48,7 @@ class WalFlushTest {
 	@Test
 	void embeddedWalBarrierDoesNotFlushMemtablesAndFullFlushStillDoes() throws Exception {
 		try (var connection = new EmbeddedConnection(tempDir.resolve("embedded"), "wal-barrier", null)) {
-			var logging = new it.cavallium.rockserver.core.client.LoggingClient(connection);
+			var logging = new LoggingClient(connection);
 			assertWalOnly(connection, logging.getSyncApi(RequestContext.batch()),
 					logging.getAsyncApi(RequestContext.batch()));
 		}

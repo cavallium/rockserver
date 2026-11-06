@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
@@ -328,7 +329,7 @@ final class NodeMonitor {
 	}
 
 	private static String bytes(double bytes) {
-		return Double.isNaN(bytes) ? "?" : String.format(java.util.Locale.ROOT, "%.1f GiB", bytes / (1L << 30));
+		return Double.isNaN(bytes) ? "?" : String.format(Locale.ROOT, "%.1f GiB", bytes / (1L << 30));
 	}
 
 	/** Tests only. */

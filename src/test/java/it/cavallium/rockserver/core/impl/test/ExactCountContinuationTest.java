@@ -21,6 +21,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -30,6 +31,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -156,7 +158,7 @@ class ExactCountContinuationTest {
 				}
 			});
 			try {
-				var deadline = RequestContext.analytical(java.time.Duration.ofMillis(500));
+				var deadline = RequestContext.analytical(Duration.ofMillis(500));
 				var count = connection.getAsyncApi(deadline).reduceRangeAsync(
 						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(firstContinuation.await(10, TimeUnit.SECONDS));
@@ -176,9 +178,9 @@ class ExactCountContinuationTest {
 	void nonPositiveExactCountTimeoutPoliciesAreRejectedBeforeDispatch() throws Exception {
 		try (var connection = populatedConnection("snapshot-invalid-timeout")) {
 			assertThrows(IllegalArgumentException.class,
-					() -> RequestContext.analytical(java.time.Duration.ofNanos(-1L)));
+					() -> RequestContext.analytical(Duration.ofNanos(-1L)));
 			assertThrows(IllegalArgumentException.class,
-					() -> RequestContext.analytical(java.time.Duration.ZERO));
+					() -> RequestContext.analytical(Duration.ZERO));
 			assertRetainedResourcesClosed(connection);
 		}
 	}
@@ -275,7 +277,7 @@ class ExactCountContinuationTest {
 				long acceptedBefore = connection.getScheduler()
 						.poolSnapshot(RWScheduler.Pool.READ).acceptedTasks();
 				var waiting = connection.getAsyncApi(
-						RequestContext.analytical(java.time.Duration.ofMillis(500))).reduceRangeAsync(
+						RequestContext.analytical(Duration.ofMillis(500))).reduceRangeAsync(
 						0, columnId, null, null, false, RequestType.entriesCount());
 				assertTrue(awaitCondition(
 						() -> connection.getInternalDB().getRetainedRangeWaiterCount() == 1, 2_000));
@@ -557,7 +559,7 @@ class ExactCountContinuationTest {
 		}
 	}
 
-	private static boolean awaitCondition(java.util.function.BooleanSupplier condition,
+	private static boolean awaitCondition(BooleanSupplier condition,
 			long timeoutMillis) throws InterruptedException {
 		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
 		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {

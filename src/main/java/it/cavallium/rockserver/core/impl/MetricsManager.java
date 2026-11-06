@@ -38,7 +38,9 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.jar.JarFile;
 import org.github.gestalt.config.exceptions.GestaltException;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -233,7 +235,7 @@ public class MetricsManager implements AutoCloseable {
 						var tmpDir = fs.createTempDirectoryBlocking("tmp");
 						fs.deleteRecursiveBlocking(tmpDir);
 					} finally {
-						vertx.close().blockingAwait(5, java.util.concurrent.TimeUnit.SECONDS);
+						vertx.close().blockingAwait(5, TimeUnit.SECONDS);
 					}
         } catch (Throwable t) {
             // best-effort; this is only to trigger classloading
@@ -278,7 +280,7 @@ public class MetricsManager implements AutoCloseable {
                         if (jarPath.startsWith("file:")) {
                             jarPath = jarPath.substring(5);
                         }
-                        try (var jarFile = new java.util.jar.JarFile(jarPath)) {
+                        try (var jarFile = new JarFile(jarPath)) {
                             var entries = jarFile.entries();
                             while (entries.hasMoreElements()) {
                                 var entry = entries.nextElement();
@@ -344,14 +346,14 @@ public class MetricsManager implements AutoCloseable {
 		}
 		if (httpClient != null) {
 			try {
-				httpClient.rxClose().blockingAwait(5, java.util.concurrent.TimeUnit.SECONDS);
+				httpClient.rxClose().blockingAwait(5, TimeUnit.SECONDS);
 			} catch (Throwable t) {
 				LOG.warn("Failed to close http client for metrics", t);
 			}
 		}
 		if (vertx != null) {
 			try {
-				vertx.rxClose().blockingAwait(5, java.util.concurrent.TimeUnit.SECONDS);
+				vertx.rxClose().blockingAwait(5, TimeUnit.SECONDS);
 			} catch (Throwable t) {
 				LOG.warn("Failed to close Vertx instance for metrics", t);
 			}

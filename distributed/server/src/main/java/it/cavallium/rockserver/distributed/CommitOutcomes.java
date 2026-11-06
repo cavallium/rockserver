@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.ClientRequestId;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
@@ -8,7 +9,14 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
+import java.util.function.LongPredicate;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import org.jetbrains.annotations.Nullable;
 
 import static it.cavallium.rockserver.distributed.ReplicatedConnection.unwrap;
@@ -36,22 +44,22 @@ final class CommitOutcomes {
 	 * is over, every entry of it this node's log holds is applied before the next term serves (see the read barrier),
 	 * so its markers say nothing more.
 	 */
-	private final java.util.concurrent.ConcurrentHashMap<SessionWrite, Long> unsettledCommits =
-			new java.util.concurrent.ConcurrentHashMap<>();
+	private final ConcurrentHashMap<SessionWrite, Long> unsettledCommits =
+			new ConcurrentHashMap<>();
 	/** Size of {@link #unsettledCommits} at which {@link #pruneUnsettled} runs next. */
 	private final AtomicLong pruneUnsettledAt = new AtomicLong(MIN_PRUNE_UNSETTLED);
 	private static final long MIN_PRUNE_UNSETTLED = 1024;
 	/** The newest term a commit was marked in: the first mark of a newer term drops every older mark. */
 	private final AtomicLong markedTerm = new AtomicLong();
 
-	private final java.util.function.Supplier<CompletableFuture<Void>> leadership;
-	private final java.util.function.LongSupplier currentTerm;
-	private final java.util.function.Function<it.cavallium.rockserver.core.common.ClientRequestId, ApplyResult> recorded;
-	private final java.util.function.LongPredicate sessionExists;
-	private final java.util.concurrent.ExecutorService inline;
+	private final Supplier<CompletableFuture<Void>> leadership;
+	private final LongSupplier currentTerm;
+	private final Function<ClientRequestId, ApplyResult> recorded;
+	private final LongPredicate sessionExists;
+	private final ExecutorService inline;
 
 	CommitOutcomes(RockserverStateMachine stateMachine, LocalCommands localCommands,
-			java.util.concurrent.ExecutorService inline) {
+			ExecutorService inline) {
 		this(localCommands::leadership, localCommands::currentTerm, stateMachine::recordedResult,
 				sessionId -> sessionLive(stateMachine.store(), sessionId), inline);
 	}
@@ -78,10 +86,10 @@ final class CommitOutcomes {
 	 * Over its sources: the leadership barrier, the current term, the record of a session write (null if none), and
 	 * whether a session exists. Tests give fakes.
 	 */
-	CommitOutcomes(java.util.function.Supplier<CompletableFuture<Void>> leadership,
-			java.util.function.LongSupplier currentTerm,
-			java.util.function.Function<it.cavallium.rockserver.core.common.ClientRequestId, ApplyResult> recorded,
-			java.util.function.LongPredicate sessionExists, java.util.concurrent.ExecutorService inline) {
+	CommitOutcomes(Supplier<CompletableFuture<Void>> leadership,
+			LongSupplier currentTerm,
+			Function<ClientRequestId, ApplyResult> recorded,
+			LongPredicate sessionExists, ExecutorService inline) {
 		this.leadership = leadership;
 		this.currentTerm = currentTerm;
 		this.recorded = recorded;
@@ -150,13 +158,13 @@ final class CommitOutcomes {
 			inline.execute(() -> {
 				try {
 					unsettledCommits.entrySet().removeIf(mark -> mark.getValue() < term
-							|| recorded.apply(new it.cavallium.rockserver.core.common.ClientRequestId(
+							|| recorded.apply(new ClientRequestId(
 									mark.getKey().sessionId(), mark.getKey().sequence(), 0)) != null);
 				} finally {
 					pruneUnsettledAt.set(Math.max(MIN_PRUNE_UNSETTLED, 2L * unsettledCommits.size()));
 				}
 			});
-		} catch (java.util.concurrent.RejectedExecutionException stopping) {
+		} catch (RejectedExecutionException stopping) {
 			pruneUnsettledAt.set(at);
 		}
 	}
@@ -183,7 +191,7 @@ final class CommitOutcomes {
 	 * runs the transaction again ({@code UPDATE_RETRY}), as without sessions. A session that is gone, or expired at the
 	 * replicated clock, which the applier treats as gone, has no records any more: {@code SESSION_EXPIRED}.
 	 */
-	CompletableFuture<?> settledCommit(it.cavallium.rockserver.core.common.ClientRequestId id) {
+	CompletableFuture<?> settledCommit(ClientRequestId id) {
 		long term = currentTerm();
 		var write = new SessionWrite(id.sessionId(), id.sequence());
 		return leadership().handle((_, error) -> {

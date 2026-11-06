@@ -10,6 +10,7 @@ import it.cavallium.rockserver.distributed.LogEntryCodec.Input;
 import it.cavallium.rockserver.distributed.LogEntryCodec.Output;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import org.jetbrains.annotations.Nullable;
@@ -109,7 +110,7 @@ final class ResultCodec {
 			for (int i = 0; i < count; i++) {
 				largestFirst[i] = i;
 			}
-			java.util.Arrays.sort(largestFirst, (a, b) -> sizes[a] != sizes[b] ? Long.compare(sizes[b], sizes[a])
+			Arrays.sort(largestFirst, (a, b) -> sizes[a] != sizes[b] ? Long.compare(sizes[b], sizes[a])
 					: Integer.compare(a, b));
 			long resendSize = encodedSize(ApplyResult.RESEND_ALONE);
 			for (int i : largestFirst) {

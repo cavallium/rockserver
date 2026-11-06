@@ -12,8 +12,10 @@ import java.lang.foreign.ValueLayout;
 import java.util.*;
 
 import org.jetbrains.annotations.Nullable;
+import org.rocksdb.ByteBufferGetStatus;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.ReadTier;
+import org.rocksdb.Status;
 
 /**
  * Write elision of {@link EmbeddedDB}: probes the cached logical value of keys before a write so that writes
@@ -152,7 +154,7 @@ final class EmbeddedDBWriteElision {
 		return RocksDBException.of(RocksDBErrorType.PUT_2, exception);
 	}
 
-	private static RocksDBException mapWriteElisionProbeFailure(org.rocksdb.Status status) {
+	private static RocksDBException mapWriteElisionProbeFailure(Status status) {
 		return mapWriteElisionProbeFailure(new org.rocksdb.RocksDBException(status));
 	}
 
@@ -371,7 +373,7 @@ final class EmbeddedDBWriteElision {
 		}
 	}
 
-	private List<org.rocksdb.ByteBufferGetStatus> runWriteElisionMultiGet(ColumnInstance col,
+	private List<ByteBufferGetStatus> runWriteElisionMultiGet(ColumnInstance col,
 			ReadOptions readOptions,
 			MemorySegment[] nativeKeys,
 			MemorySegment[] nativeValues) throws org.rocksdb.RocksDBException {

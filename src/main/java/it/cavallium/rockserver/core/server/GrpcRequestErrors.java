@@ -13,6 +13,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.api.proto.*;
 import java.util.List;
 import java.util.StringJoiner;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -77,7 +78,7 @@ final class GrpcRequestErrors {
 			return;
 		}
 		if (status.getCode() == Code.CANCELLED
-				|| error instanceof java.util.concurrent.CancellationException) {
+				|| error instanceof CancellationException) {
 			LOG.debug("Late gRPC cancellation after call termination without request context: description={}",
 					sanitizeForLog(status.getDescription()));
 			return;
@@ -171,7 +172,7 @@ final class GrpcRequestErrors {
 		}
 
 		if (status.getCode() == Code.CANCELLED
-				|| error instanceof java.util.concurrent.CancellationException) {
+				|| error instanceof CancellationException) {
 			LOG.debug("Late gRPC cancellation after call termination: operation={}, requestType={}, request={}, "
 					+ "description={}",
 					requestName,

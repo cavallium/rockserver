@@ -6,6 +6,7 @@ import com.google.protobuf.ByteString;
 import java.io.IOException;
 import it.cavallium.buffer.Buf;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -202,7 +203,7 @@ public class Utils {
 	 * are in brackets ({@code http://[::1]:5333,[::2]:5333}), which {@code URI} refuses: their brackets are
 	 * percent-encoded, and {@link #parseHostAndPorts(URI)} reads them back.
 	 */
-	public static URI parseConnectionUrl(String url) throws java.net.URISyntaxException {
+	public static URI parseConnectionUrl(String url) throws URISyntaxException {
 		int authorityStart = url.indexOf("://");
 		if (authorityStart > 0) {
 			authorityStart += 3;

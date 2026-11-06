@@ -14,14 +14,17 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.protocol.ClientId;
@@ -31,9 +34,11 @@ import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.SnapshotManagementRequest;
 import org.apache.ratis.protocol.TransferLeadershipRequest;
+import org.apache.ratis.server.RaftConfiguration;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.raftlog.RaftLog;
 import org.apache.ratis.server.storage.RaftStorage;
+import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.util.LifeCycle;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -371,7 +376,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	/** Answers {@link TermService#OPS}: see {@link ReplicaOps#answer}. */
 	private CompletableFuture<byte[]> answerOps(RaftGroupId requested, byte[] request) {
 		if (!requested.equals(group.getGroupId())) {
-			return CompletableFuture.failedFuture(org.apache.ratis.thirdparty.io.grpc.Status.NOT_FOUND
+			return CompletableFuture.failedFuture(Status.NOT_FOUND
 					.withDescription("No group " + requested).asRuntimeException());
 		}
 		return stateMachine.ops().answer(request);
@@ -586,7 +591,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * for ({@link RaftSettings#nodesUnderPendingLimit}): their attempts in flight can then fill it, and Ratis refuses
 	 * the rest before the append, which costs resends, not correctness. Maintenance thread only.
 	 */
-	private void warnAbovePendingLimit(org.apache.ratis.server.RaftServer.Division division) {
+	private void warnAbovePendingLimit(RaftServer.Division division) {
 		int members = division.getGroup().getPeers().size();
 		int limit = RaftSettings.nodesUnderPendingLimit(config);
 		if (members <= limit || !division.getInfo().isLeader()) {
@@ -689,7 +694,7 @@ public final class ReplicatedNode implements AutoCloseable {
 					askingMembers.set(false);
 				}
 			});
-		} catch (java.util.concurrent.RejectedExecutionException closing) {
+		} catch (RejectedExecutionException closing) {
 			askingMembers.set(false);
 		}
 	}
@@ -753,8 +758,8 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * Asks the other members of {@code conf} about this node, see {@link RemovalCheck}: the members that say it was
 	 * removed, if they are a majority, else null. Takes at most two election timeouts (at least a second).
 	 */
-	private @Nullable List<String> askMembers(org.apache.ratis.server.RaftConfiguration conf) {
-		var addresses = new java.util.HashMap<String, String>();
+	private @Nullable List<String> askMembers(RaftConfiguration conf) {
+		var addresses = new HashMap<String, String>();
 		for (var peer : config.peers()) {
 			addresses.put(peer.id(), peer.raftAddress());
 		}
@@ -765,8 +770,8 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 		var members = conf.getCurrentPeers().stream().map(peer -> peer.getId().toString()).toList();
 		var budget = config.electionTimeoutMax().multipliedBy(2);
-		if (budget.compareTo(java.time.Duration.ofSeconds(1)) < 0) {
-			budget = java.time.Duration.ofSeconds(1);
+		if (budget.compareTo(Duration.ofSeconds(1)) < 0) {
+			budget = Duration.ofSeconds(1);
 		}
 		return RemovalCheck.removedBy(config.nodeId(), group.getGroupId(), conf.getLogEntryIndex(), members.size(),
 				RemovalCheck.addressesOf(config.nodeId(), members, addresses), budget);
@@ -1069,11 +1074,11 @@ public final class ReplicatedNode implements AutoCloseable {
 		IOException failure = null;
 		// A replica can fail while the constructor is still starting the rest: skip what does not exist yet.
 		var order = (consensusFirst
-				? java.util.stream.Stream.<Closeable>of(server, apiServer, proposer, barrier, followerReads, forwarder,
+				? Stream.<Closeable>of(server, apiServer, proposer, barrier, followerReads, forwarder,
 						peerChannels)
-				: java.util.stream.Stream.<Closeable>of(apiServer, proposer, barrier, followerReads, forwarder, server,
+				: Stream.<Closeable>of(apiServer, proposer, barrier, followerReads, forwarder, server,
 						peerChannels))
-				.filter(java.util.Objects::nonNull)
+				.filter(Objects::nonNull)
 				.toList();
 		try {
 			failure = closeAll(order);

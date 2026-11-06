@@ -38,6 +38,8 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.GetRange;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -46,6 +48,7 @@ import java.util.stream.Stream;
 
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.reactivestreams.Publisher;
 
 public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 
@@ -82,9 +85,9 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 	default long ensureMergeOperator(String name, String className, byte[] jarData) throws RocksDBException {
 		byte[] hash;
 		try {
-			java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+			MessageDigest digest = MessageDigest.getInstance("SHA-256");
 			hash = digest.digest(jarData);
-		} catch (java.security.NoSuchAlgorithmException e) {
+		} catch (NoSuchAlgorithmException e) {
 			throw new RuntimeException(e);
 		}
 		Long existing = checkMergeOperator(name, hash);
@@ -193,14 +196,14 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 
 	/** See: {@link PutBatch}. */
 	default void putBatch(long columnId,
-					  @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+					  @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 					  @NotNull PutBatchMode mode) throws RocksDBException {
 		requestSync(new PutBatch(columnId, batchPublisher, mode));
 	}
 
 	/** See: {@link MergeBatch}. */
 	default void mergeBatch(long columnId,
-				   @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+				   @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 				   @NotNull MergeBatchMode mode) throws RocksDBException {
 		requestSync(new MergeBatch(columnId, batchPublisher, mode));
 	}

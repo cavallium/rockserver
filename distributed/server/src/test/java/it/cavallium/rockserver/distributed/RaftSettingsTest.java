@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import org.apache.ratis.conf.RaftProperties;
@@ -63,15 +64,15 @@ class RaftSettingsTest {
 	/** CR-10: a cluster of more than 4 nodes gets a byte limit that holds the attempts of every node of its peer list. */
 	@Test
 	void thePendingByteLimitGrowsWithThePeerList() {
-		var peers = new java.util.ArrayList<PeerConfig>();
+		var peers = new ArrayList<PeerConfig>();
 		for (int i = 0; i < 7; i++) {
 			peers.add(new PeerConfig("n" + i, "127.0.0.1", 9000 + 2 * i, "127.0.0.1", 9001 + 2 * i));
 		}
-		var config = NodeConfig.defaults("n0", peers, java.nio.file.Path.of("unused"));
+		var config = NodeConfig.defaults("n0", peers, Path.of("unused"));
 		assertEquals(7, RaftSettings.nodesUnderPendingLimit(config));
 		long bytes = RaftServerConfigKeys.Write.byteLimit(RaftSettings.server(config)).getSize();
 		assertEquals(8 * Proposer.ATTEMPT_BYTES_IN_FLIGHT, bytes);
-		var three = NodeConfig.defaults("n0", peers.subList(0, 3), java.nio.file.Path.of("unused"));
+		var three = NodeConfig.defaults("n0", peers.subList(0, 3), Path.of("unused"));
 		assertEquals(RaftSettings.NODES_UNDER_PENDING_LIMIT, RaftSettings.nodesUnderPendingLimit(three));
 		assertEquals(RaftSettings.PENDING_BYTES_LIMIT.getSize(),
 				RaftServerConfigKeys.Write.byteLimit(RaftSettings.server(three)).getSize());

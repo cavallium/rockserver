@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -49,7 +50,7 @@ class FaultFsTest {
 		var other = Files.createDirectories(temp.resolve("other"));
 		assertEquals(EXPECTED, runProbe(viaJava, other, trigger, FaultFs.environment(library, viaJava, trigger)));
 		var asGiven = temp.resolve("lib").resolve("..").resolve("late-raw").resolve("faulty").toAbsolutePath();
-		var raw = java.util.Map.of("LD_PRELOAD", library.toAbsolutePath().toString(), "FAULTFS_DIR", asGiven.toString(),
+		var raw = Map.of("LD_PRELOAD", library.toAbsolutePath().toString(), "FAULTFS_DIR", asGiven.toString(),
 				"FAULTFS_TRIGGER", trigger.toAbsolutePath().toString());
 		assertEquals(EXPECTED, runProbe(asGiven, other, trigger, raw));
 	}
@@ -62,7 +63,7 @@ class FaultFsTest {
 				"EIO-sync faulty write OK", "EIO-sync faulty force Input/output error",
 				"cleared faulty write OK", "cleared faulty force OK");
 
-	private List<String> runProbe(Path faulty, Path other, Path trigger, java.util.Map<String, String> environment)
+	private List<String> runProbe(Path faulty, Path other, Path trigger, Map<String, String> environment)
 			throws Exception {
 		var command = List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 				"-Xmx32m", "-XX:TieredStopAtLevel=1", "-cp", System.getProperty("java.class.path"),

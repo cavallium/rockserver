@@ -16,6 +16,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.PutMulti;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
@@ -233,7 +234,7 @@ final class UpdateProtocol {
 			long confirmedTerm,
 			boolean update,
 			Duration lease,
-			java.util.function.Function<Object, Long> idOf,
+			Function<Object, Long> idOf,
 			@Nullable Get<?> forUpdate,
 			@Nullable LeaderSession lockSession,
 			@Nullable LeaderSession.KeyLock keyLock,

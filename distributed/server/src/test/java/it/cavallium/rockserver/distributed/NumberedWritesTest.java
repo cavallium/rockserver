@@ -11,7 +11,9 @@ import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.ClientRequestId;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.KVBatch;
+import it.cavallium.rockserver.core.common.KVBatchChunks;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestContext;
@@ -35,11 +37,13 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongFunction;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
+import java.util.zip.ZipEntry;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -100,7 +104,7 @@ class NumberedWritesTest {
 		var out = new ByteArrayOutputStream();
 		try (var jar = new JarOutputStream(out, new Manifest())) {
 			if (entry != null) {
-				jar.putNextEntry(new java.util.zip.ZipEntry(entry));
+				jar.putNextEntry(new ZipEntry(entry));
 				jar.write(entry.getBytes(StandardCharsets.UTF_8));
 				jar.closeEntry();
 			}
@@ -123,7 +127,7 @@ class NumberedWritesTest {
 		var store = node.stateMachine().store();
 		try (var sessions = store.db().getRange(0L, store.metaColumnId(), NodeStore.sessionKey(0),
 				NodeStore.sessionKey(Long.MAX_VALUE), false,
-				RequestType.<it.cavallium.rockserver.core.common.KV>allInRange())) {
+				RequestType.<KV>allInRange())) {
 			return sessions.mapToLong(kv -> NodeStore.sessionId(kv.keys())).max().orElseThrow();
 		}
 	}
@@ -191,7 +195,7 @@ class NumberedWritesTest {
 			var refused = assertThrows(Exception.class, () -> client.getAsyncApi(RequestContext.batch(Duration.ofSeconds(3)))
 					.mergeMultiAsync(0, column, tooLarge, tooLargeValues, RequestType.none())
 					.get(30, TimeUnit.SECONDS));
-			var cause = refused instanceof java.util.concurrent.ExecutionException ? refused.getCause() : refused;
+			var cause = refused instanceof ExecutionException ? refused.getCause() : refused;
 			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(cause).getErrorUniqueId(), String.valueOf(cause));
 			// 20 writes of 100 items (about 13 KiB each, 260 KiB in all): fit only if each one's bytes went back.
 			var api = client.getAsyncApi(RequestContext.batch(TIMEOUT));
@@ -290,7 +294,7 @@ class NumberedWritesTest {
 				long column = api.createColumnAsync("b", SCHEMA).get(30, TimeUnit.SECONDS);
 				long session = newestSession(leader);
 				// Three chunks: values of half a chunk each.
-				var half = "h".repeat((int) (it.cavallium.rockserver.core.common.KVBatchChunks.CHUNK_BYTES / 2));
+				var half = "h".repeat((int) (KVBatchChunks.CHUNK_BYTES / 2));
 				api.putBatchAsync(column, Flux.just(kv(10, half, half, half, half, half)), PutBatchMode.WRITE_BATCH)
 						.get(30, TimeUnit.SECONDS);
 				api.putAsync(0, column, key(20), text("after"), RequestType.none()).get(30, TimeUnit.SECONDS);
@@ -305,7 +309,7 @@ class NumberedWritesTest {
 		for (var node : cluster.runningNodes()) {
 			for (int i = 0; i < 5; i++) {
 				var value = localValue(node, column, 10 + i);
-				assertEquals(it.cavallium.rockserver.core.common.KVBatchChunks.CHUNK_BYTES / 2,
+				assertEquals(KVBatchChunks.CHUNK_BYTES / 2,
 						value == null ? -1 : value.length(), "key " + (10 + i) + " on " + node.config().nodeId());
 			}
 			assertEquals("after", localValue(node, column, 20));
@@ -356,7 +360,7 @@ class NumberedWritesTest {
 			long filled = admission.limit() - admission.used();
 			assertTrue(admission.tryAcquire(filled));
 			try {
-				var refused = assertThrows(java.util.concurrent.ExecutionException.class,
+				var refused = assertThrows(ExecutionException.class,
 						() -> api.closeTransactionAsync(tx, true).get(30, TimeUnit.SECONDS));
 				var error = (RocksDBException) refused.getCause();
 				assertEquals(RocksDBErrorType.SERVER_OVERLOADED, error.getErrorUniqueId(), error.getMessage());

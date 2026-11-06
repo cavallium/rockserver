@@ -10,6 +10,7 @@ import it.cavallium.rockserver.core.impl.test.LegacyColumnKeyBuilder;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
@@ -141,7 +142,7 @@ public final class KeyBuildBenchmark {
 					}
 					default -> {
 						var segment = Arena.global().allocate(len);
-						segment.copyFrom(java.lang.foreign.MemorySegment.ofArray(data));
+						segment.copyFrom(MemorySegment.ofArray(data));
 						yield new MemorySegmentBuf(segment);
 					}
 				};

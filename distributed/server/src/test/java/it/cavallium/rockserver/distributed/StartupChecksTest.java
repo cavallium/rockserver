@@ -7,9 +7,15 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.RequestType;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -19,6 +25,8 @@ import java.util.stream.Stream;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.Options;
+import org.rocksdb.RocksDB;
 
 /** Checks a node makes on its own files before and while it starts: see "Disk layout" and "Heap" in the design. */
 class StartupChecksTest {
@@ -90,7 +98,7 @@ class StartupChecksTest {
 		var digest = NodeStore.recordSeedDigest(copyA);
 		assertEquals(digest, NodeStore.recordSeedDigest(copyB));
 		var sst = largestFile(truncated, ".sst");
-		Files.write(sst, java.util.Arrays.copyOf(Files.readAllBytes(sst), (int) Files.size(sst) - 1));
+		Files.write(sst, Arrays.copyOf(Files.readAllBytes(sst), (int) Files.size(sst) - 1));
 		assertNotEquals(digest, NodeStore.recordSeedDigest(truncated));
 
 		// Recorded once: the start-up check's open changes the files, not the recorded digest.
@@ -252,8 +260,8 @@ class StartupChecksTest {
 		public static void main(String[] args) throws Exception {
 			var dataDir = Path.of(args[0]);
 			ReplicatedServerMain.useNodeTemporaryDirectory(dataDir, false);
-			org.rocksdb.RocksDB.loadLibrary();
-			try (var options = new org.rocksdb.Options()) {
+			RocksDB.loadLibrary();
+			try (var options = new Options()) {
 				options.setCreateIfMissing(true);
 			}
 			System.out.println("node: " + names(dataDir.resolve("tmp")));
@@ -275,8 +283,8 @@ class StartupChecksTest {
 	@Test
 	void aDatabaseOfANewerClusterVersionIsRefused() throws Exception {
 		try (var cluster = new InProcessCluster(Files.createDirectories(tempDir.resolve("cluster")), 1, config -> config).startAll()) {
-			cluster.awaitLeader(java.time.Duration.ofSeconds(30));
-			InProcessCluster.await(java.time.Duration.ofSeconds(30),
+			cluster.awaitLeader(Duration.ofSeconds(30));
+			InProcessCluster.await(Duration.ofSeconds(30),
 					() -> cluster.node("n0").stateMachine().ops().clusterVersion() == Capabilities.SUPPORTED);
 			cluster.stop("n0");
 			var config = cluster.config("n0");
@@ -287,15 +295,15 @@ class StartupChecksTest {
 			// Nothing was changed by the refusal: the same database starts again once its version is known.
 			writeClusterVersion(config, Capabilities.SUPPORTED);
 			cluster.start("n0");
-			cluster.awaitLeader(java.time.Duration.ofSeconds(30));
+			cluster.awaitLeader(Duration.ofSeconds(30));
 		}
 	}
 
 	private static void writeClusterVersion(NodeConfig config, long version) throws IOException {
 		try (var store = NodeStore.open(config.dbDir(), config.rockserverConfig(), "test")) {
 			store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_VERSION),
-					it.cavallium.buffer.Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(version).array()),
-					it.cavallium.rockserver.core.common.RequestType.none());
+					Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(version).array()),
+					RequestType.none());
 			assertEquals(version, store.clusterVersion());
 		}
 	}
@@ -382,7 +390,7 @@ class StartupChecksTest {
 				try {
 					return Files.size(path);
 				} catch (IOException e) {
-					throw new java.io.UncheckedIOException(e);
+					throw new UncheckedIOException(e);
 				}
 			})).orElseThrow();
 		}

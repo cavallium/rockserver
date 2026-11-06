@@ -29,7 +29,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -42,6 +44,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -96,7 +100,7 @@ class PipelinedUpdatesTest {
 		start(c -> c);
 	}
 
-	private void start(java.util.function.UnaryOperator<NodeConfig> customize) throws Exception {
+	private void start(UnaryOperator<NodeConfig> customize) throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> customize.apply(c.withPipelinedUpdates(true))).startAll();
 		leader = cluster.awaitLeader(TIMEOUT);
 		column = api(leader).createColumn("c", SCHEMA);
@@ -161,7 +165,7 @@ class PipelinedUpdatesTest {
 	}
 
 	/** Waits for {@code action}'s write to be in the leader's log, past the index it had before. */
-	private <T> CompletableFuture<T> appended(java.util.function.Supplier<CompletableFuture<T>> action) {
+	private <T> CompletableFuture<T> appended(Supplier<CompletableFuture<T>> action) {
 		long before = lastLogIndex(leader);
 		var result = action.get();
 		InProcessCluster.await(TIMEOUT, () -> lastLogIndex(leader) > before || result.isDone());
@@ -302,7 +306,7 @@ class PipelinedUpdatesTest {
 		var update = await(next);
 		assertFalse(chained(update), "the next update is a head, which reads the database");
 		// It may run before the write is applied: the two were concurrent, and its commit would conflict.
-		assertTrue(java.util.Objects.equals(expected, text(update.previous())) || "v1".equals(text(update.previous())),
+		assertTrue(Objects.equals(expected, text(update.previous())) || "v1".equals(text(update.previous())),
 				text(update.previous()));
 		await(async(leader).closeFailedUpdateAsync(update.updateId()));
 		assertReplicasHold(1, expected);
@@ -897,7 +901,7 @@ class PipelinedUpdatesTest {
 		assertNull(commit.guard());
 		assertEquals(1, data[data.length - 1], "the entry ends with the boolean it always ended with");
 		byte[] body = LogEntryCodec.encodeEntryBody(commit);
-		assertArrayEquals(body, java.util.Arrays.copyOfRange(data, data.length - body.length, data.length));
+		assertArrayEquals(body, Arrays.copyOfRange(data, data.length - body.length, data.length));
 	}
 
 	/** Without the flag an update has no single commit to protect: its writes go to the log as they always did. */

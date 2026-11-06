@@ -177,7 +177,7 @@ final class EmbeddedDBIterators {
 		final RWScheduler workloadScheduler;
 		private final boolean reverse;
 		private RocksIterator iterator;
-		private java.util.ListIterator<Entry<Buf[], Buf>> bucketIterator;
+		private ListIterator<Entry<Buf[], Buf>> bucketIterator;
 		private boolean closed;
 
 		private IteratorState(ColumnInstance.ColumnUse columnUse, boolean reverse) {

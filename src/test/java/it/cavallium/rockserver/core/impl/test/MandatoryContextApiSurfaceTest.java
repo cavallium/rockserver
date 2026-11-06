@@ -15,6 +15,7 @@ import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -104,12 +105,12 @@ class MandatoryContextApiSurfaceTest {
 		}
 	}
 
-	private record MethodKey(String name, Class<?> returnType, java.util.List<Class<?>> parameterTypes) {
+	private record MethodKey(String name, Class<?> returnType, List<Class<?>> parameterTypes) {
 
 		private static MethodKey of(Method method) {
 			return new MethodKey(method.getName(),
 					method.getReturnType(),
-					java.util.List.of(method.getParameterTypes()));
+					List.of(method.getParameterTypes()));
 		}
 	}
 }

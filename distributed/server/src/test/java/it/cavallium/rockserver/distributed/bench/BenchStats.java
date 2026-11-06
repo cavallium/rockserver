@@ -1,10 +1,13 @@
 package it.cavallium.rockserver.distributed.bench;
 
+import io.grpc.Status;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.LongAdder;
 import org.HdrHistogram.Histogram;
 import org.HdrHistogram.Recorder;
@@ -109,8 +112,8 @@ final class BenchStats {
 
 	static Throwable unwrap(Throwable error) {
 		var cause = error;
-		while ((cause instanceof java.util.concurrent.CompletionException
-				|| cause instanceof java.util.concurrent.ExecutionException) && cause.getCause() != null) {
+		while ((cause instanceof CompletionException
+				|| cause instanceof ExecutionException) && cause.getCause() != null) {
 			cause = cause.getCause();
 		}
 		return cause;
@@ -121,8 +124,8 @@ final class BenchStats {
 		if (cause instanceof RocksDBException rocks) {
 			return rocks.getErrorUniqueId().name();
 		}
-		var status = io.grpc.Status.fromThrowable(cause);
-		if (status.getCode() != io.grpc.Status.Code.UNKNOWN) {
+		var status = Status.fromThrowable(cause);
+		if (status.getCode() != Status.Code.UNKNOWN) {
 			return "grpc-" + status.getCode();
 		}
 		return cause.getClass().getSimpleName();

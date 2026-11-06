@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core;
 import static it.cavallium.rockserver.core.client.EmbeddedConnection.PRIVATE_MEMORY_URL;
 import static java.util.Objects.requireNonNull;
 
+import it.cavallium.rockserver.core.client.ClientBuilder;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
@@ -67,7 +68,7 @@ public class Main {
 			parser.handleError(e);
 			System.exit(1);
 		}
-		var clientBuilder = new it.cavallium.rockserver.core.client.ClientBuilder();
+		var clientBuilder = new ClientBuilder();
 
 		if (ns.getBoolean("print_default_config")) {
 			requireNonNull(Main.class.getClassLoader()
@@ -115,9 +116,9 @@ public class Main {
 			case null, default -> throw new IllegalArgumentException("Invalid scheme \"" + databaseUrlScheme + "\" for database url url: " + databaseUrl);
 		}
 
-		var thriftServerBuilder = new it.cavallium.rockserver.core.server.ServerBuilder();
+		var thriftServerBuilder = new ServerBuilder();
 		buildServerAddress(thriftServerBuilder, thriftListenUrl, true);
-		var grpcServerBuilder = new it.cavallium.rockserver.core.server.ServerBuilder();
+		var grpcServerBuilder = new ServerBuilder();
 		buildServerAddress(grpcServerBuilder, grpcListenUrl, false);
 
 		clientBuilder.setName(name);

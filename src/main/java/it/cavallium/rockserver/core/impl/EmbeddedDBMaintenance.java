@@ -14,6 +14,7 @@ import java.util.Map.Entry;
 import java.util.concurrent.TimeUnit;
 
 import org.github.gestalt.config.exceptions.GestaltException;
+import org.rocksdb.Status;
 import org.rocksdb.TableProperties;
 import org.rocksdb.AbstractImmutableNativeReference;
 import org.rocksdb.ColumnFamilyOptions;
@@ -249,8 +250,8 @@ final class EmbeddedDBMaintenance {
                     selectiveMetadata(use.column(), request.columnId(), request.level()), request);
         } catch (org.rocksdb.RocksDBException e) {
             var status = e.getStatus();
-            var type = status != null && (status.getCode() == org.rocksdb.Status.Code.Aborted
-                    || status.getCode() == org.rocksdb.Status.Code.InvalidArgument)
+            var type = status != null && (status.getCode() == Status.Code.Aborted
+                    || status.getCode() == Status.Code.InvalidArgument)
                     ? RocksDBErrorType.COMPACTION_CONFLICT : RocksDBErrorType.COMPACTION_FAILED;
             throw RocksDBException.of(type, e);
         } finally {

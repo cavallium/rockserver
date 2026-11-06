@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit;
 
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.rocksdb.ByteBufferGetStatus;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.Snapshot;
 import reactor.core.scheduler.Scheduler;
@@ -299,7 +300,7 @@ final class EmbeddedDBExistsMulti {
 				}
 			}
 			if (cleanupQueuedRequest) {
-				completeTerminal(null, new java.util.concurrent.CancellationException());
+				completeTerminal(null, new CancellationException());
 			}
 			// Once a native chunk has run, keep the original future observable until
 			// cleanup finishes rather than reporting that cancellation won immediately.
@@ -422,7 +423,7 @@ final class EmbeddedDBExistsMulti {
 				}
 			}
 			if (initialize && cancelRequested) {
-				finishRunning(null, new java.util.concurrent.CancellationException());
+				finishRunning(null, new CancellationException());
 				return;
 			}
 			if (initialize) {
@@ -434,7 +435,7 @@ final class EmbeddedDBExistsMulti {
 				}
 			}
 			if (cancelRequested) {
-				finishRunning(null, new java.util.concurrent.CancellationException());
+				finishRunning(null, new CancellationException());
 				return;
 			}
 
@@ -442,7 +443,7 @@ final class EmbeddedDBExistsMulti {
 				var activeCursor = Objects.requireNonNull(cursor);
 				boolean exhausted = activeCursor.readChunk();
 				if (cancelRequested) {
-					finishRunning(null, new java.util.concurrent.CancellationException());
+					finishRunning(null, new CancellationException());
 				} else if (exhausted) {
 					finishRunning(activeCursor.result(), null);
 				} else {
@@ -500,7 +501,7 @@ final class EmbeddedDBExistsMulti {
 				}
 			}
 			if (cancelled) {
-				completeTerminal(null, new java.util.concurrent.CancellationException());
+				completeTerminal(null, new CancellationException());
 			} else if (schedulingFailure != null) {
 				completeTerminal(null, schedulingFailure);
 			}
@@ -797,7 +798,7 @@ final class EmbeddedDBExistsMulti {
 			var nativeDb = edb.db.get();
 			var columnHandles = List.of(col.cfh());
 			var sample = sampleLatency ? edb.existsMultiPerfSampler.begin(nativeDb) : null;
-			List<org.rocksdb.ByteBufferGetStatus> statuses;
+			List<ByteBufferGetStatus> statuses;
 			long readStarted = System.nanoTime();
 			edb.activeNativeMultiGets.incrementAndGet();
 			try {

@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import com.sun.management.ThreadMXBean;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.Delta;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -226,7 +227,7 @@ class ResultCodecTest {
 	}
 
 	static long allocatedBytes(Runnable action) {
-		var threads = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+		var threads = (ThreadMXBean) ManagementFactory.getThreadMXBean();
 		long before = threads.getCurrentThreadAllocatedBytes();
 		action.run();
 		return threads.getCurrentThreadAllocatedBytes() - before;

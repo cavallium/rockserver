@@ -13,6 +13,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -103,7 +104,7 @@ final class GrpcIteratorOperations {
 			return Flux.<KV>create(sink -> {
 				if (!iteratorLease.registerTask()) {
 					iteratorLease.operationTerminated();
-					sink.error(new java.util.concurrent.CancellationException(
+					sink.error(new CancellationException(
 							"Iterator operation terminated before its stream could start"));
 					return;
 				}
@@ -582,7 +583,7 @@ final class GrpcIteratorOperations {
 			iteratorLease.taskAndOperationTerminated();
 			if (cancellationRequested || sink.isCancelled()) {
 				if (failure != null
-						&& !(failure instanceof java.util.concurrent.CancellationException)) {
+						&& !(failure instanceof CancellationException)) {
 					lateErrors.accept(failure);
 				}
 			} else if (failure == null) {

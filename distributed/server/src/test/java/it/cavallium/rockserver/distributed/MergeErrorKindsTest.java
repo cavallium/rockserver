@@ -11,6 +11,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.FFMByteArrayMergeOperator;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -123,7 +124,7 @@ class MergeErrorKindsTest {
 					TermIndex.valueOf(1, 1));
 			assertThrows(Applier.ReplicaFailedException.class, () -> merge(applier, 1, column, "overflow"));
 		}
-		var wrapped = it.cavallium.rockserver.core.impl.EmbeddedDB.mergeOperatorFailed(new AssertionError("x"));
+		var wrapped = EmbeddedDB.mergeOperatorFailed(new AssertionError("x"));
 		assertTrue(!Applier.isLocalFailure(wrapped), "an AssertionError of the operator was taken as local");
 	}
 }

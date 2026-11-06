@@ -100,6 +100,7 @@ import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
 import org.rocksdb.Slice;
 import org.rocksdb.Status.Code;
+import org.rocksdb.Transaction;
 import org.rocksdb.util.SizeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -298,8 +299,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final AtomicLong resourceLeases = new AtomicLong();
 	final Object columnEditLock = new Object();
 	final DatabaseConfig config;
-	final Map<String, RWScheduler> workloadGroups = new java.util.LinkedHashMap<>();
-	final Map<String, StoragePressureSignal> workloadGroupPressure = new java.util.LinkedHashMap<>();
+	final Map<String, RWScheduler> workloadGroups = new LinkedHashMap<>();
+	final Map<String, StoragePressureSignal> workloadGroupPressure = new LinkedHashMap<>();
 	final Map<String, String> columnWorkloadGroups = new HashMap<>();
 	final ConcurrentHashMap<Long, String> columnWorkloadNames = new ConcurrentHashMap<>();
 	String fallbackWorkloadGroup = "default";
@@ -334,7 +335,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	final Timer getRangeTimer;
 	final Timer flushTimer;
 	final Timer compactTimer;
-	final String sstMaintenanceSession = java.util.UUID.randomUUID().toString();
+	final String sstMaintenanceSession = UUID.randomUUID().toString();
 	final Timer getAllColumnDefinitionsTimer;
 	final AtomicBoolean nativeDeleteRangeFallbackLogged = new AtomicBoolean();
 	final Counter storagePressureRefreshFailures;
@@ -594,8 +595,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			if (globalConfig.adaptiveCompactionIo()) {
 				compactionReadaheadBytes = dbOptions.useDirectReads() && !dbOptions.allowMmapReads()
-						? java.util.Optional.ofNullable(globalConfig.adaptiveCompactionReadaheadMaxSize())
-								.map(it.cavallium.rockserver.core.config.DataSize::longValue)
+						? Optional.ofNullable(globalConfig.adaptiveCompactionReadaheadMaxSize())
+								.map(DataSize::longValue)
 								.orElse(CompactionIoBudget.MAX_READAHEAD_BYTES) : 0;
 			}
 			int maxBackgroundJobs;
@@ -768,10 +769,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				long readaheadCeiling;
 				try {
 					readaheadCeiling = dbOptions.useDirectReads() && !dbOptions.allowMmapReads()
-							? java.util.Optional.ofNullable(config.global().adaptiveCompactionReadaheadMaxSize())
-									.map(it.cavallium.rockserver.core.config.DataSize::longValue)
+							? Optional.ofNullable(config.global().adaptiveCompactionReadaheadMaxSize())
+									.map(DataSize::longValue)
 									.orElse(CompactionIoBudget.MAX_READAHEAD_BYTES) : 0;
-				} catch (org.github.gestalt.config.exceptions.GestaltException failure) {
+				} catch (GestaltException failure) {
 					throw new RuntimeException("Failed to read adaptive readahead ceiling", failure);
 				}
 				var readPoolTelemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
@@ -1931,7 +1932,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			writeOpts.setDisableWAL(true);
 		}
 		var rocksObjects = new RocksDBObjects(writeOpts, txOpts);
-		org.rocksdb.Transaction transaction = null;
+		Transaction transaction = null;
 		try {
 			transaction = db.beginTransaction(writeOpts, txOpts);
 			if (captureSnapshot) {
@@ -3138,11 +3139,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * actual task completion. Cancellation stops delivery to the subscriber but does
 	 * not pretend that an already queued or running JNI call has finished.
 	 */
-	<T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target, Callable<T> callable) {
+	<T> Mono<T> scheduleTracked(Scheduler target, Callable<T> callable) {
 		return scheduleTracked(target, callable, null, 0L);
 	}
 
-	<T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target,
+	<T> Mono<T> scheduleTracked(Scheduler target,
 			Callable<T> callable,
 			@Nullable Consumer<? super T> lateSuccessCleanup,
 			long estimatedBytes) {

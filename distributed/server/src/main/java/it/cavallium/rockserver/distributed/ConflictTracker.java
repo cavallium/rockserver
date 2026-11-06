@@ -14,6 +14,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.function.Function;
 import org.jetbrains.annotations.Nullable;
@@ -132,7 +133,7 @@ final class ConflictTracker {
 	 */
 	record ChainCheck(long columnId, long hash, Token base) {
 		ChainCheck {
-			java.util.Objects.requireNonNull(base, "base");
+			Objects.requireNonNull(base, "base");
 		}
 	}
 

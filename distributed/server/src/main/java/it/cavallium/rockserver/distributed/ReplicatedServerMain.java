@@ -2,16 +2,24 @@ package it.cavallium.rockserver.distributed;
 
 import com.sun.management.HotSpotDiagnosticMXBean;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
+import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.IntConsumer;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftClientReply;
@@ -24,6 +32,7 @@ import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.apache.ratis.util.TimeDuration;
 import org.jetbrains.annotations.Nullable;
+import org.rocksdb.NativeLibraryLoader;
 
 /**
  * Command line entry point.
@@ -104,7 +113,7 @@ import org.jetbrains.annotations.Nullable;
 public final class ReplicatedServerMain {
 
 	private static final Duration DEFAULT_ADMIN_TIMEOUT = Duration.ofMinutes(10);
-	private static final TimeDuration ADMIN_RETRY_SLEEP = TimeDuration.valueOf(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+	private static final TimeDuration ADMIN_RETRY_SLEEP = TimeDuration.valueOf(500, TimeUnit.MILLISECONDS);
 	/** How long {@code add-peer} waits for an answer of the new node and of each member, per round. */
 	private static final Duration PEER_ANSWER_TIMEOUT = Duration.ofSeconds(3);
 	private static final long SEED_SNAPSHOT_POLL_MS = 200;
@@ -116,7 +125,7 @@ public final class ReplicatedServerMain {
 	 * command in its own JVM and read the exit code). The code after a call never runs: if the replacement returns,
 	 * {@link #exit} throws.
 	 */
-	static volatile java.util.function.IntConsumer exiter = System::exit;
+	static volatile IntConsumer exiter = System::exit;
 
 	private static void exit(int code) {
 		exiter.accept(code);
@@ -236,11 +245,11 @@ public final class ReplicatedServerMain {
 		}
 		try {
 			node.stopped().get(ReplicatedNode.DATABASE_CLOSE_TIMEOUT.multipliedBy(2).toMillis(),
-					java.util.concurrent.TimeUnit.MILLISECONDS);
-		} catch (java.util.concurrent.TimeoutException ex) {
+					TimeUnit.MILLISECONDS);
+		} catch (TimeoutException ex) {
 			System.err.println("Node " + node.config().nodeId() + " did not stop within "
 					+ ReplicatedNode.DATABASE_CLOSE_TIMEOUT.multipliedBy(2));
-		} catch (java.util.concurrent.ExecutionException ex) {
+		} catch (ExecutionException ex) {
 			// stopped() completes normally, with the cause as value.
 		} catch (InterruptedException ex) {
 			Thread.currentThread().interrupt();
@@ -318,7 +327,7 @@ public final class ReplicatedServerMain {
 		// RocksDB.loadLibrary() asks the same loader with the ROCKSDB_SHAREDLIB_DIR directory (by default none, which
 		// means File.createTempFile, in the start-up java.io.tmpdir); once this call has loaded the library, that call
 		// finds it loaded and extracts nothing.
-		org.rocksdb.NativeLibraryLoader.getInstance().loadLibrary(temporary.toString());
+		NativeLibraryLoader.getInstance().loadLibrary(temporary.toString());
 		System.setProperty("java.io.tmpdir", temporary.toString());
 	}
 
@@ -396,7 +405,7 @@ public final class ReplicatedServerMain {
 					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0], false, deadline);
 					System.out.println("checksum at log index " + index);
 					var results = awaitResults(peers, groupId, ReplicaOps.OP_CHECKSUM_RESULT,
-							java.nio.ByteBuffer.allocate(Long.BYTES).putLong(index).array(), deadline);
+							ByteBuffer.allocate(Long.BYTES).putLong(index).array(), deadline);
 					exitOn(checksumVerdict(index, peers.stream().map(PeerConfig::id).toList(), results, allowSkipped));
 					System.out.println("OK");
 					yield null;
@@ -407,7 +416,7 @@ public final class ReplicatedServerMain {
 						usage("invalid backup name " + name);
 					}
 					// A request id makes it safe to propose again after an answer that was lost.
-					long requestId = new java.security.SecureRandom().nextLong() | 1;
+					long requestId = new SecureRandom().nextLong() | 1;
 					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_BACKUP,
 							ReplicaOps.backupPayload(requestId, name), true, deadline);
 					System.out.println("backup " + name + " at log index " + index);
@@ -445,7 +454,7 @@ public final class ReplicatedServerMain {
 			for (PeerConfig peer : peers) {
 				try {
 					var reply = ReplicaOps.call(peer.raftAddress(), groupId, op, payload, remaining(deadlineNanos)).join();
-					return java.nio.ByteBuffer.wrap(reply).getLong();
+					return ByteBuffer.wrap(reply).getLong();
 				} catch (CompletionException ex) {
 					var status = Status.fromThrowable(ex.getCause());
 					if (status.getCode() == Status.Code.FAILED_PRECONDITION || status.getCode() == Status.Code.INVALID_ARGUMENT
@@ -484,7 +493,7 @@ public final class ReplicatedServerMain {
 	 * The verdict on a checksum at {@code index}: null (OK) only if every member gave a digest and all are equal. With
 	 * {@code allowSkipped}, a member that skipped the position ({@link ReplicaOps.State#NONE}) is not counted.
 	 */
-	static @Nullable Verdict checksumVerdict(long index, List<String> members, java.util.Map<String, ReplicaOps.Result> results,
+	static @Nullable Verdict checksumVerdict(long index, List<String> members, Map<String, ReplicaOps.Result> results,
 			boolean allowSkipped) {
 		var digests = results.values().stream().filter(r -> r.state() == ReplicaOps.State.DONE)
 				.map(r -> r.detail() + "/" + r.keys()).distinct().count();
@@ -505,7 +514,7 @@ public final class ReplicatedServerMain {
 	}
 
 	/** The verdict on a backup: null (OK) only if every member wrote it. */
-	static @Nullable Verdict backupVerdict(List<String> members, java.util.Map<String, ReplicaOps.Result> results) {
+	static @Nullable Verdict backupVerdict(List<String> members, Map<String, ReplicaOps.Result> results) {
 		var failed = members.stream().filter(id -> results.containsKey(id)
 				&& results.get(id).state() != ReplicaOps.State.DONE).toList();
 		if (!failed.isEmpty()) {
@@ -538,9 +547,9 @@ public final class ReplicatedServerMain {
 	 * Asks every member for its result of a cluster operation until each one has a final one, or until the deadline;
 	 * prints them.
 	 */
-	private static java.util.Map<String, ReplicaOps.Result> awaitResults(List<PeerConfig> peers, RaftGroupId groupId,
+	private static Map<String, ReplicaOps.Result> awaitResults(List<PeerConfig> peers, RaftGroupId groupId,
 			byte op, byte[] payload, long deadlineNanos) throws InterruptedException {
-		var results = new java.util.TreeMap<String, ReplicaOps.Result>();
+		var results = new TreeMap<String, ReplicaOps.Result>();
 		while (results.size() < peers.size() && System.nanoTime() - deadlineNanos < 0) {
 			for (PeerConfig peer : peers) {
 				if (results.containsKey(peer.id())) {
@@ -587,7 +596,7 @@ public final class ReplicatedServerMain {
 				continue;
 			}
 			try {
-				var reply = java.nio.ByteBuffer.wrap(ReplicaOps.call(member.raftAddress(), groupId,
+				var reply = ByteBuffer.wrap(ReplicaOps.call(member.raftAddress(), groupId,
 						ReplicaOps.OP_CAPABILITIES, new byte[0], PEER_ANSWER_TIMEOUT).join());
 				commonSupported &= reply.getLong();
 				clusterVersion |= reply.getLong();
@@ -603,7 +612,7 @@ public final class ReplicatedServerMain {
 		}
 		long supported;
 		try {
-			supported = java.nio.ByteBuffer.wrap(ReplicaOps.call(added.raftAddress(), groupId, ReplicaOps.OP_CAPABILITIES,
+			supported = ByteBuffer.wrap(ReplicaOps.call(added.raftAddress(), groupId, ReplicaOps.OP_CAPABILITIES,
 					new byte[0], PEER_ANSWER_TIMEOUT).join()).getLong();
 		} catch (CompletionException ex) {
 			if (Status.fromThrowable(ex.getCause()).getCode() != Status.Code.UNIMPLEMENTED) {

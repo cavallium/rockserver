@@ -49,6 +49,7 @@ import it.cavallium.rockserver.core.impl.rocksdb.RocksLeakDetector;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.GarbageCollectorMXBean;
@@ -64,6 +65,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.HexFormat;
@@ -75,6 +77,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.SplittableRandom;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -88,6 +91,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.ToDoubleFunction;
+import java.util.regex.Pattern;
 import org.rocksdb.RocksDB;
 
 /**
@@ -387,7 +391,7 @@ public final class GrpcOverloadBenchmark {
 			MessageDigest digest = MessageDigest.getInstance("SHA-256");
 			int files = 0;
 			for (String value : System.getProperty("java.class.path", "")
-					.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator))) {
+					.split(Pattern.quote(File.pathSeparator))) {
 				Path entry = Path.of(value).toAbsolutePath().normalize();
 				if (!Files.isRegularFile(entry)) {
 					continue;
@@ -425,7 +429,7 @@ public final class GrpcOverloadBenchmark {
 			} else if (Files.isDirectory(location)) {
 				try (var walked = Files.walk(location)) {
 					files = walked.filter(Files::isRegularFile)
-							.sorted(java.util.Comparator.comparing(path -> location.relativize(path).toString()))
+							.sorted(Comparator.comparing(path -> location.relativize(path).toString()))
 							.toList();
 				}
 			} else {
@@ -1151,7 +1155,7 @@ public final class GrpcOverloadBenchmark {
 
 	private static Throwable unwrap(Throwable failure) {
 		Throwable current = failure;
-		while ((current instanceof ExecutionException || current instanceof java.util.concurrent.CompletionException)
+		while ((current instanceof ExecutionException || current instanceof CompletionException)
 				&& current.getCause() != null) {
 			current = current.getCause();
 		}
@@ -1335,11 +1339,11 @@ public final class GrpcOverloadBenchmark {
 			long nativeLeaksDetected) {
 		List<PhaseResult> foreground = phases.stream()
 				.filter(phase -> phase.phase() == Phase.FOREGROUND_ONLY)
-				.sorted(java.util.Comparator.comparingInt(PhaseResult::round))
+				.sorted(Comparator.comparingInt(PhaseResult::round))
 				.toList();
 		List<PhaseResult> flood = phases.stream()
 				.filter(phase -> phase.phase() == Phase.MAINTENANCE_FLOOD)
-				.sorted(java.util.Comparator.comparingInt(PhaseResult::round))
+				.sorted(Comparator.comparingInt(PhaseResult::round))
 				.toList();
 		if (foreground.isEmpty() || foreground.size() != flood.size()) {
 			throw new IllegalArgumentException("Alternating benchmark phases are incomplete");
@@ -1975,7 +1979,7 @@ public final class GrpcOverloadBenchmark {
 	private static List<PhaseResult> phaseResults(List<PhaseResult> phases, Phase phase) {
 		return phases.stream()
 				.filter(result -> result.phase() == phase)
-				.sorted(java.util.Comparator.comparingInt(PhaseResult::round))
+				.sorted(Comparator.comparingInt(PhaseResult::round))
 				.toList();
 	}
 

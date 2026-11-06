@@ -14,6 +14,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.*;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
+import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -80,7 +81,7 @@ final class EmbeddedDBWrites {
 			} else {
 				// A slice of a larger array (such as a value decoded in place from a replicated log entry): passed with
 				// its offset, without a copy. Heap buffers both, as RocksDB's binding requires.
-				tx.val().mergeUntracked(column, java.nio.ByteBuffer.wrap(key), value.asHeapByteBuffer());
+				tx.val().mergeUntracked(column, ByteBuffer.wrap(key), value.asHeapByteBuffer());
 			}
 		} else {
 			tx.val().merge(column, key, EmbeddedDBWriteElision.jniArray(value));

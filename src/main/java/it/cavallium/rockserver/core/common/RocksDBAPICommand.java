@@ -669,7 +669,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param mode put batch mode
 		 */
 		record PutBatch(long columnId,
-					@NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+					@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 					@NotNull PutBatchMode mode) implements RocksDBAPICommandSingle<Void> {
 
 			@Override
@@ -794,7 +794,7 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 		 * @param mode merge batch mode
 		 */
 		record MergeBatch(long columnId,
-						 @NotNull org.reactivestreams.Publisher<@NotNull KVBatch> batchPublisher,
+						 @NotNull Publisher<@NotNull KVBatch> batchPublisher,
 						 @NotNull MergeBatchMode mode) implements RocksDBAPICommandSingle<Void> {
 
 			@Override

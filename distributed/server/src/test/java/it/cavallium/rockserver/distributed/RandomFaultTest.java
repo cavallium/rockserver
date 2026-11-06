@@ -17,6 +17,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.time.Duration;
@@ -24,6 +25,7 @@ import java.time.LocalTime;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,6 +38,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -61,6 +64,7 @@ import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.retry.RetryPolicies;
 import org.apache.ratis.util.TimeDuration;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.CleanupMode;
@@ -464,7 +468,7 @@ class RandomFaultTest {
 	/** The links held by the network faults of the running step, as {@code [src, dst]} pairs. */
 	private static final class HeldLinks {
 
-		private final Set<List<String>> links = new java.util.HashSet<>();
+		private final Set<List<String>> links = new HashSet<>();
 
 		synchronized void add(List<List<String>> faulted) {
 			links.addAll(faulted);
@@ -494,7 +498,7 @@ class RandomFaultTest {
 	 * same node; two network faults may touch the same links, and repairing the first heals both. A flapping link
 	 * never touches the links another network fault holds (see {@link HeldLinks}).
 	 */
-	private record CompoundStep(FaultStep first, @org.jetbrains.annotations.Nullable FaultStep second,
+	private record CompoundStep(FaultStep first, @Nullable FaultStep second,
 			Duration offset) {
 
 		static CompoundStep single(FaultStep step) {
@@ -1249,7 +1253,7 @@ class RandomFaultTest {
 	private static final class TermMonitor implements AutoCloseable {
 
 		private final ProcessCluster cluster;
-		private final Map<String, Long> last = new java.util.concurrent.ConcurrentHashMap<>();
+		private final Map<String, Long> last = new ConcurrentHashMap<>();
 		private final ConcurrentLinkedQueue<String> violations = new ConcurrentLinkedQueue<>();
 		private final AtomicLong samples = new AtomicLong();
 		private final AtomicLong changes = new AtomicLong();
@@ -1291,7 +1295,7 @@ class RandomFaultTest {
 		static Optional<Long> term(Path dataDir) {
 			var file = dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID).resolve("current")
 					.resolve("raft-meta");
-			try (var in = java.nio.file.Files.newInputStream(file)) {
+			try (var in = Files.newInputStream(file)) {
 				var properties = new Properties();
 				properties.load(in);
 				var term = properties.getProperty("term");

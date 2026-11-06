@@ -7,19 +7,25 @@ import static it.cavallium.rockserver.distributed.ScenarioSupport.READY_TIMEOUT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.SCHEMA;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.distributed.CrashPoints.Point;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import org.apache.ratis.proto.RaftProtos.RaftConfigurationProto;
 import org.apache.ratis.proto.RaftProtos.RaftPeerProto;
+import org.apache.ratis.proto.RaftProtos;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -96,7 +102,7 @@ class MembershipFaultTest {
 		}
 		cluster.waitReady(READY_TIMEOUT);
 		support = new ScenarioSupport(cluster);
-		var originals = new LinkedHashMap<String, it.cavallium.rockserver.core.common.Utils.HostAndPort>();
+		var originals = new LinkedHashMap<String, Utils.HostAndPort>();
 		ORIGINALS.forEach(id -> originals.put(id, cluster.apiAddress(id)));
 		client = new ClusterClient(originals, CLIENT_RETRY_TIMEOUT, false);
 		column = client.createColumn("data", SCHEMA, BATCH_CONTEXT).valueOrThrow();
@@ -120,8 +126,8 @@ class MembershipFaultTest {
 		return CompletableFuture.supplyAsync(() -> {
 			try {
 				return cluster.adminResult(members, "add-peer", cluster.peer("4").format());
-			} catch (java.io.IOException e) {
-				throw new java.io.UncheckedIOException(e);
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
 			}
 		});
 	}
@@ -216,7 +222,7 @@ class MembershipFaultTest {
 	private CompletableFuture<ProcessCluster.CommandResult> holdJointConfigurationUncommitted(String leader,
 			List<String> followers, boolean onNode4) {
 		followers.forEach(cluster::pause);
-		var order = new java.util.ArrayList<String>();
+		var order = new ArrayList<String>();
 		order.add(leader);
 		order.addAll(followers);
 		var command = addPeerAsync(order);
@@ -225,7 +231,7 @@ class MembershipFaultTest {
 						+ " while the old followers were paused");
 		// Still the leader of the same configuration: a step-down could only follow 15 s without a majority.
 		var info = support.groupInfo(leader);
-		assertTrue(info != null && info.getRoleInfoProto().getRole() == org.apache.ratis.proto.RaftProtos.RaftPeerRole.LEADER,
+		assertTrue(info != null && info.getRoleInfoProto().getRole() == RaftProtos.RaftPeerRole.LEADER,
 				"the leader stepped down before the kill");
 		return command;
 	}
@@ -253,7 +259,7 @@ class MembershipFaultTest {
 
 	private static String outcome(CompletableFuture<ProcessCluster.CommandResult> command) {
 		try {
-			var result = command.get(CRASH_TIMEOUT.toSeconds(), java.util.concurrent.TimeUnit.SECONDS);
+			var result = command.get(CRASH_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
 			var output = result.output().strip();
 			return "exit " + result.exitCode() + (output.isEmpty() ? "" : ": "
 					+ output.lines().reduce((a, b) -> b).orElse(""));

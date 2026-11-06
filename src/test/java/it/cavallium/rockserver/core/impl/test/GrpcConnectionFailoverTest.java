@@ -57,6 +57,8 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketAddress;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -72,7 +74,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -1074,7 +1078,7 @@ class GrpcConnectionFailoverTest {
 	}
 
 	/** Calls {@code call} until it fails, which it does once the failure of the node reached the channel. */
-	private static CompletableFuture<Long> awaitFailure(java.util.function.Supplier<CompletableFuture<Long>> call)
+	private static CompletableFuture<Long> awaitFailure(Supplier<CompletableFuture<Long>> call)
 			throws Exception {
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
 		while (System.nanoTime() < deadline) {
@@ -1217,7 +1221,7 @@ class GrpcConnectionFailoverTest {
 			return new HostAndPort("127.0.0.1", port());
 		}
 
-		byte @org.jetbrains.annotations.Nullable [] read(long key) {
+		byte @Nullable [] read(long key) {
 			var value = db.getSyncApi(RequestContext.batch()).get(0, column, key(key), RequestType.current());
 			return value != null ? value.toByteArray() : null;
 		}
@@ -1364,7 +1368,7 @@ class GrpcConnectionFailoverTest {
 				var filler = new Socket();
 				try {
 					filler.connect(listener.getLocalSocketAddress(), 200);
-				} catch (java.net.SocketTimeoutException full) {
+				} catch (SocketTimeoutException full) {
 					filler.close();
 					break;
 				}
@@ -1454,7 +1458,7 @@ class GrpcConnectionFailoverTest {
 				try {
 					socket.setSoLinger(true, 0);
 					socket.close();
-				} catch (java.net.SocketException alreadyClosed) {
+				} catch (SocketException alreadyClosed) {
 					// Its other direction closed it.
 				}
 			}

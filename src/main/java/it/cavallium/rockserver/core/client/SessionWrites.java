@@ -15,16 +15,20 @@ import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
@@ -230,7 +234,7 @@ final class SessionWrites {
 	/** Set by {@link #close}: nothing is sent or scheduled any more. */
 	private volatile boolean closed;
 	/** Calls without their answer yet, which {@link #close} ends. */
-	private final java.util.Set<Call> live = ConcurrentHashMap.newKeySet();
+	private final Set<Call> live = ConcurrentHashMap.newKeySet();
 
 	/**
 	 * Ends every call still waiting, as {@link Call#failClosed}: a call waiting for a resend or a session would
@@ -256,7 +260,7 @@ final class SessionWrites {
 			}
 			try {
 				executor.execute(task);
-			} catch (java.util.concurrent.RejectedExecutionException stopping) {
+			} catch (RejectedExecutionException stopping) {
 				onClosed.run();
 			}
 		});
@@ -276,7 +280,7 @@ final class SessionWrites {
 	 * {@link #MAX_REMEMBERED_UPDATES}: past that the oldest is forgotten ({@link #forgottenUpdates}), and the write that
 	 * ends it is then sent unnumbered, once, as without sessions. Guarded by itself.
 	 */
-	private final java.util.LinkedHashMap<Long, Long> updates = new java.util.LinkedHashMap<>();
+	private final LinkedHashMap<Long, Long> updates = new LinkedHashMap<>();
 	/** Updates forgotten while open because {@link #updates} was full. */
 	private final AtomicLong forgottenUpdates = new AtomicLong();
 	private volatile long nextForgottenLogNanos;
@@ -420,7 +424,7 @@ final class SessionWrites {
 		var appliedKeys = new AtomicLong();
 		// A chunk was sent: cancelling the batch then ends it unknown (see CallResult). A chunk that was applied was sent;
 		// the chunk in progress tells by its own flag, which it sets before it checks whether the batch is stopping.
-		var current = new java.util.concurrent.atomic.AtomicReference<Call>();
+		var current = new AtomicReference<Call>();
 		BooleanSupplier anySent = () -> {
 			if (appliedChunks.get() > 0) {
 				return true;
@@ -428,7 +432,7 @@ final class SessionWrites {
 			var chunk = current.get();
 			return chunk != null && chunk.sent;
 		};
-		var subscription = new java.util.concurrent.atomic.AtomicReference<Disposable>();
+		var subscription = new AtomicReference<Disposable>();
 		var result = new CallResult(anySent, () -> {
 			var running = subscription.get();
 			if (running != null) {

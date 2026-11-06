@@ -10,6 +10,7 @@ import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.time.Duration;
+import java.util.Locale;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -162,19 +163,19 @@ class SchedulerHighContentionBenchmarkTest {
 		assertTrue(report.contains("pressure.batch_read.pressured_runs="));
 		assertTrue(report.contains("pressure.foreground_write.unpressured_runs="));
 		for (var profile : WorkloadProfile.values()) {
-			assertTrue(report.contains("profile." + profile.name().toLowerCase(java.util.Locale.ROOT)
+			assertTrue(report.contains("profile." + profile.name().toLowerCase(Locale.ROOT)
 					+ ".queue_p99_nanos="));
-			assertTrue(report.contains("profile." + profile.name().toLowerCase(java.util.Locale.ROOT)
+			assertTrue(report.contains("profile." + profile.name().toLowerCase(Locale.ROOT)
 					+ ".end_to_end_p99_nanos="));
 		}
 		for (var family : OperationFamily.values()) {
-			assertTrue(report.contains("family." + family.name().toLowerCase(java.util.Locale.ROOT)
+			assertTrue(report.contains("family." + family.name().toLowerCase(Locale.ROOT)
 					+ ".queue_p99_nanos="));
-			assertTrue(report.contains("family." + family.name().toLowerCase(java.util.Locale.ROOT)
+			assertTrue(report.contains("family." + family.name().toLowerCase(Locale.ROOT)
 					+ ".maximum_progress_gap_nanos="));
 		}
 		for (var pool : RWScheduler.Pool.values()) {
-			assertTrue(report.contains("pool." + pool.name().toLowerCase(java.util.Locale.ROOT)
+			assertTrue(report.contains("pool." + pool.name().toLowerCase(Locale.ROOT)
 					+ ".peak_outstanding="));
 		}
 		var pairedMetrics = PressurePerformanceContract.schedulerMetrics(result);

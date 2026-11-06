@@ -6,6 +6,7 @@ import io.grpc.KnownLength;
 import it.cavallium.rockserver.core.common.MultiGetPage;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.api.proto.*;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -48,13 +49,13 @@ final class MultiGetInputStream extends InputStream implements Drainable, KnownL
 		if (slot < page.values().size()) {
 			var value = page.values().get(slot++);
 			valueStream = new FastGetInputStream(value != null, value, pinned);
-			current = new java.io.ByteArrayInputStream(
+			current = new ByteArrayInputStream(
 					FastGetInputStream.protobufBytesPrefix(valueStream.available()));
 			return true;
 		}
 		if (slot == page.values().size() && page.hasMore()) {
 			slot++;
-			current = new java.io.ByteArrayInputStream(new byte[]{0x10, 0x01});
+			current = new ByteArrayInputStream(new byte[]{0x10, 0x01});
 			return true;
 		}
 		return false;

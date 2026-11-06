@@ -30,6 +30,7 @@ import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.foreign.Arena;
@@ -49,12 +50,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -68,17 +71,20 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.ToDoubleFunction;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.agent.ByteBuddyAgent;
 import net.bytebuddy.asm.MemberSubstitution;
+import net.bytebuddy.dynamic.DynamicType;
 import net.bytebuddy.dynamic.loading.ClassReloadingStrategy;
 import net.bytebuddy.jar.asm.ClassReader;
 import net.bytebuddy.jar.asm.ClassVisitor;
@@ -410,7 +416,7 @@ public final class GrpcRetainedReadBenchmark {
 		Path selected = selectedClasses.toAbsolutePath().normalize();
 		List<String> entries = new ArrayList<>();
 		boolean replaced = false;
-		for (String entry : classPath.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator))) {
+		for (String entry : classPath.split(Pattern.quote(File.pathSeparator))) {
 			Path normalized = Path.of(entry).toAbsolutePath().normalize();
 			if (normalized.equals(candidate)) {
 				entries.add(selected.toString());
@@ -422,24 +428,24 @@ public final class GrpcRetainedReadBenchmark {
 		if (!replaced) {
 			throw new IllegalArgumentException("Current classpath does not contain candidate classes: " + candidate);
 		}
-		return String.join(java.io.File.pathSeparator, entries);
+		return String.join(File.pathSeparator, entries);
 	}
 
 	private static String normalizedClassPath(String classPath) {
-		return Arrays.stream(classPath.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator)))
+		return Arrays.stream(classPath.split(Pattern.quote(File.pathSeparator)))
 				.map(Path::of)
 				.map(Path::toAbsolutePath)
 				.map(Path::normalize)
 				.map(Path::toString)
-				.collect(Collectors.joining(java.io.File.pathSeparator));
+				.collect(Collectors.joining(File.pathSeparator));
 	}
 
 	private static String sha256(String value) {
 		try {
 			byte[] digest = MessageDigest.getInstance("SHA-256")
 					.digest(value.getBytes(StandardCharsets.UTF_8));
-			return java.util.HexFormat.of().formatHex(digest);
-		} catch (java.security.NoSuchAlgorithmException impossible) {
+			return HexFormat.of().formatHex(digest);
+		} catch (NoSuchAlgorithmException impossible) {
 			throw new IllegalStateException(impossible);
 		}
 	}
@@ -451,8 +457,8 @@ public final class GrpcRetainedReadBenchmark {
 				updateDigest(digest, value.length);
 				digest.update(value);
 			}
-			return java.util.HexFormat.of().formatHex(digest.digest());
-		} catch (java.security.NoSuchAlgorithmException impossible) {
+			return HexFormat.of().formatHex(digest.digest());
+		} catch (NoSuchAlgorithmException impossible) {
 			throw new IllegalStateException(impossible);
 		}
 	}
@@ -461,10 +467,10 @@ public final class GrpcRetainedReadBenchmark {
 		final MessageDigest digest;
 		try {
 			digest = MessageDigest.getInstance("SHA-256");
-		} catch (java.security.NoSuchAlgorithmException impossible) {
+		} catch (NoSuchAlgorithmException impossible) {
 			throw new IllegalStateException(impossible);
 		}
-		for (String value : classPath.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator))) {
+		for (String value : classPath.split(Pattern.quote(File.pathSeparator))) {
 			Path entry = Path.of(value).toAbsolutePath().normalize();
 			if (!Files.exists(entry)) {
 				throw new IOException("Classpath entry does not exist: " + entry);
@@ -498,11 +504,11 @@ public final class GrpcRetainedReadBenchmark {
 				throw new IOException("Unsupported classpath entry: " + entry);
 			}
 		}
-		return java.util.HexFormat.of().formatHex(digest.digest());
+		return HexFormat.of().formatHex(digest.digest());
 	}
 
 	private static String normalizedRelativePath(Path root, Path path) {
-		return root.relativize(path).toString().replace(java.io.File.separatorChar, '/');
+		return root.relativize(path).toString().replace(File.separatorChar, '/');
 	}
 
 	private static void hashFile(MessageDigest digest, Path file, String relativePath) throws IOException {
@@ -574,7 +580,7 @@ public final class GrpcRetainedReadBenchmark {
 			outputTask.cancel(true);
 			Thread.currentThread().interrupt();
 			throw interrupted;
-		} catch (java.util.concurrent.TimeoutException outputTimeout) {
+		} catch (TimeoutException outputTimeout) {
 			process.destroyForcibly();
 			outputTask.cancel(true);
 			throw new IllegalStateException("Git provenance output drain timed out for " + location,
@@ -999,7 +1005,7 @@ public final class GrpcRetainedReadBenchmark {
 
 	private static OperationResult executeIterator(WorkerContext context, Options options) {
 		long iteratorId = context.retainedApi().openIterator(0L, context.columnId(), new Keys(), null,
-				false, java.time.Duration.ofMillis( READ_TIMEOUT_MILLIS));
+				false, Duration.ofMillis( READ_TIMEOUT_MILLIS));
 		try {
 			List<Buf> values = context.retainedApi().subsequent(iteratorId, options.iteratorSkip(),
 					options.iteratorTake(), RequestType.multi());
@@ -1379,7 +1385,7 @@ public final class GrpcRetainedReadBenchmark {
 					agentHash.getBytes(StandardCharsets.UTF_8));
 		}
 
-		private record ArenaTransformation(net.bytebuddy.dynamic.DynamicType.Unloaded<?> unloaded,
+		private record ArenaTransformation(DynamicType.Unloaded<?> unloaded,
 		                                   byte[] bytes) {
 		}
 

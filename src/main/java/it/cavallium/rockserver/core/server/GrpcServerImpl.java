@@ -31,11 +31,13 @@ import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import it.cavallium.buffer.Buf;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Set;
 
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.ToLongFunction;
@@ -45,6 +47,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
 
 /**
  * The gRPC service: maps each request to its command and runs it through {@link GrpcRequestContexts},
@@ -113,7 +116,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 	public Mono<OpenTransactionResponse> openTransaction(OpenTransactionRequest request) {
 		return executeSync(request.getContext(), OperationFamily.METADATA, contextualApi -> {
 			var txId = contextualApi.openTransaction(
-					java.time.Duration.ofNanos(request.getTransactionLeaseTtlNanos()));
+					Duration.ofNanos(request.getTransactionLeaseTtlNanos()));
 			return OpenTransactionResponse.newBuilder().setTransactionId(txId).build();
 		}).transform(this.onErrorMapMonoWithRequestInfo("openTransaction", request));
 	}
@@ -992,7 +995,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 	 * Counted bytes the numbered multi writes being collected hold now, against {@link #numberedCollectLimit}. They
 	 * are held on the heap before the write reaches the node's write admission, so they need a budget of their own.
 	 */
-	private final java.util.concurrent.atomic.AtomicLong numberedCollectBytes = new java.util.concurrent.atomic.AtomicLong();
+	private final AtomicLong numberedCollectBytes = new AtomicLong();
 	private final long numberedCollectLimit = numberedCollectLimit();
 
 	private static long numberedCollectLimit() {
@@ -1148,7 +1151,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		}
 
 		private List<T> values() {
-			return java.util.Collections.unmodifiableList(values);
+			return Collections.unmodifiableList(values);
 		}
 	}
 
@@ -1337,7 +1340,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 					mapKeys(request.getStartKeysInclusiveList()),
 					mapKeys(request.getEndKeysExclusiveList()),
 					request.getReverse(),
-					java.time.Duration.ofNanos(request.getIteratorLeaseTtlNanos())
+					Duration.ofNanos(request.getIteratorLeaseTtlNanos())
 			);
 			return OpenIteratorResponse.newBuilder().setIteratorId(iteratorId).build();
 		}, response -> {
@@ -1544,7 +1547,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 	}
 
 	@Override
-	public Flux<it.cavallium.rockserver.core.common.api.proto.ScanRawResponse> scanRaw(ScanRawRequest request) {
+	public Flux<ScanRawResponse> scanRaw(ScanRawRequest request) {
 		return Flux.defer(() -> {
 			var api = contexts.asyncApi(request.getContext());
 			if (request.getResumable()) {
@@ -1590,19 +1593,19 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		return token == null || acceptsTagged ? token : token.untagged();
 	}
 
-	private static it.cavallium.rockserver.core.common.api.proto.ScanRawResponse rawScanBatchResponse(
+	private static ScanRawResponse rawScanBatchResponse(
 			Buf serialized) {
 		return rawScanBatchResponse(serialized, null);
 	}
 
-	private static it.cavallium.rockserver.core.common.api.proto.ScanRawResponse rawScanBatchResponse(
+	private static ScanRawResponse rawScanBatchResponse(
 			Buf serialized,
 			@Nullable RawSstToken completedSstToken) {
 		var serializedBatchValue = UnsafeByteOperations.unsafeWrap(
 				serialized.getBackingByteArray(),
 				serialized.getBackingByteArrayOffset(),
 				serialized.getBackingByteArrayLength());
-		var response = it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder()
+		var response = ScanRawResponse.newBuilder()
 				.setSerialized(serializedBatchValue);
 		if (completedSstToken != null) {
 			response.setCompletedSstTokenAfterBatch(completedSstToken.value());
@@ -1610,9 +1613,9 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		return response.build();
 	}
 
-	private static it.cavallium.rockserver.core.common.api.proto.ScanRawResponse rawScanCompletionResponse(
+	private static ScanRawResponse rawScanCompletionResponse(
 			RawSstToken completedSstToken) {
-		return it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.newBuilder()
+		return ScanRawResponse.newBuilder()
 				.setCompletedSstToken(completedSstToken.value())
 				.build();
 	}
@@ -1742,7 +1745,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 			OperationFamily family,
 			Function<RocksDBSyncAPI, T> operation,
 			Consumer<T> lateSuccessCleanup,
-			reactor.core.scheduler.Scheduler lateSuccessCleanupScheduler) {
+			Scheduler lateSuccessCleanupScheduler) {
 		return Mono.defer(() -> {
 			var context = contexts.mapRequestContext(wireContext);
 			var command = contexts.captureCommand(operation);

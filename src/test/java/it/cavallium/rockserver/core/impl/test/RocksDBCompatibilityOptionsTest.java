@@ -16,6 +16,7 @@ import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -150,7 +151,7 @@ class RocksDBCompatibilityOptionsTest {
 			var jarBytes = new ByteArrayOutputStream();
 			try (var jar = new JarOutputStream(jarBytes, new Manifest())) {
 			}
-			operatorHash = java.security.MessageDigest.getInstance("SHA-256").digest(jarBytes.toByteArray());
+			operatorHash = MessageDigest.getInstance("SHA-256").digest(jarBytes.toByteArray());
 			operatorVersion = db.uploadMergeOperator("reopen-operator", HotSwapMergeOperatorTest.OperatorA.class.getName(),
 					jarBytes.toByteArray());
 			db.flush();

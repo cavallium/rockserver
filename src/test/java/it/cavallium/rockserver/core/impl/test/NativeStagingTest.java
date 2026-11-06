@@ -11,6 +11,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.SplittableRandom;
 import org.junit.jupiter.api.Test;
@@ -136,7 +137,7 @@ class NativeStagingTest {
 					}
 					candidates.add(Buf.wrap(bytes, 0, size - 1));
 				}
-				candidates.add(Buf.wrap(java.util.Arrays.copyOf(bytes, size + 1)));
+				candidates.add(Buf.wrap(Arrays.copyOf(bytes, size + 1)));
 				for (var expected : candidates) {
 					for (int length : new int[] {size, Math.max(0, size - 1), size + 1}) {
 						assertEquals(scalarEquals(actual, expected, length),

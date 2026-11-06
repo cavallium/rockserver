@@ -28,6 +28,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -471,7 +472,7 @@ class LinkProxyTest {
 		}
 	}
 
-	private static void awaitTrue(java.util.function.BooleanSupplier condition, String message)
+	private static void awaitTrue(BooleanSupplier condition, String message)
 			throws InterruptedException {
 		long deadline = System.nanoTime() + PROMPT.toNanos();
 		while (!condition.getAsBoolean()) {

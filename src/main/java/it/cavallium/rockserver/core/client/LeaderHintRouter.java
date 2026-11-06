@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.client;
 
+import io.grpc.Attributes;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
@@ -13,9 +14,11 @@ import io.grpc.Status;
 import it.cavallium.rockserver.core.common.LeaderHint;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
@@ -103,7 +106,7 @@ final class LeaderHintRouter implements AutoCloseable {
 	private final Object lock = new Object();
 	private volatile @Nullable Hint current;
 	/** Addresses whose channel failed, with when: not taken again for {@link #FAILED_HINT_BACKOFF_NANOS}. Guarded by {@link #lock}. */
-	private final java.util.Map<String, Long> failedAt = new java.util.HashMap<>();
+	private final Map<String, Long> failedAt = new HashMap<>();
 	/** Guarded by {@link #lock}. */
 	private boolean closed;
 
@@ -306,7 +309,7 @@ final class LeaderHintRouter implements AutoCloseable {
 		}
 
 		@Override
-		public io.grpc.Attributes getAttributes() {
+		public Attributes getAttributes() {
 			synchronized (callLock) {
 				return current.getAttributes();
 			}

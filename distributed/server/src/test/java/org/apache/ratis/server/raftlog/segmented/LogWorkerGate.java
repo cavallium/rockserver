@@ -2,6 +2,7 @@ package org.apache.ratis.server.raftlog.segmented;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import org.apache.ratis.server.raftlog.RaftLog;
 
@@ -38,9 +39,9 @@ public final class LogWorkerGate {
 	 * The worker sleeps {@code millis} once it reaches this, as a disk that stalls for that long, then goes on. The
 	 * result completes after the sleep: a slow (not stopped) disk is a loop of short pauses.
 	 */
-	public static java.util.concurrent.CompletableFuture<Void> pause(RaftLog log, long millis)
+	public static CompletableFuture<Void> pause(RaftLog log, long millis)
 			throws ReflectiveOperationException {
-		var slept = new java.util.concurrent.CompletableFuture<Void>();
+		var slept = new CompletableFuture<Void>();
 		run(log, () -> {
 			try {
 				Thread.sleep(millis);

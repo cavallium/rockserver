@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
@@ -17,8 +18,13 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 import org.apache.ratis.server.protocol.TermIndex;
+import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
+import org.jetbrains.annotations.Nullable;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -65,7 +71,7 @@ class ApplierTest {
 			var failure = assertThrows(Applier.ReplicaFailedException.class, () -> applier.apply(
 					new Request(5, 1, 1, new LogEntry.ClusterVersion(Capabilities.SUPPORTED | (1L << 40))),
 					TermIndex.valueOf(1, 11)));
-			org.junit.jupiter.api.Assertions.assertTrue(ReplicatedNode.NewerVersionException.in(failure), failure.toString());
+			Assertions.assertTrue(ReplicatedNode.NewerVersionException.in(failure), failure.toString());
 			assertEquals(Capabilities.SUPPORTED, store.clusterVersion());
 			assertEquals(TermIndex.valueOf(1, 10), store.applied());
 
@@ -274,7 +280,7 @@ class ApplierTest {
 	}
 
 	/** A chained commit that writes {@code value} to {@code key}, if the key still holds {@code read}. */
-	private static LogEntry.Guarded chained(long column, long key, @org.jetbrains.annotations.Nullable String read,
+	private static LogEntry.Guarded chained(long column, long key, @Nullable String read,
 			String value) {
 		return new LogEntry.Guarded(1, 0, new long[0], new long[0],
 				List.of(new LogEntry.Put(column, key(key), text(value), RequestTypeId.NOTHING)), true, 99,
@@ -364,7 +370,7 @@ class ApplierTest {
 						new Request(1, 4, 0, new LogEntry.Delete(column, key(1), RequestTypeId.NOTHING)),
 						new Request(1, 5, 0, chained(column, 1, "c", "y")),
 						new Request(1, 6, 0, chained(column, 1, null, "d")));
-				var results = new java.util.ArrayList<ApplyResult>();
+				var results = new ArrayList<ApplyResult>();
 				long index = 0;
 				for (int i = 0; i < entries.size(); i++) {
 					if (i % groupSize == 0) {
@@ -408,7 +414,7 @@ class ApplierTest {
 	@Test
 	void aGuardOnABucketedColumnReadsItsOwnKey() throws Exception {
 		var bucketed = ColumnSchema.of(IntList.of(Long.BYTES),
-				ObjectList.of(it.cavallium.rockserver.core.common.ColumnHashType.XXHASH32), true);
+				ObjectList.of(ColumnHashType.XXHASH32), true);
 		try (var store = open()) {
 			var applier = new Applier(store);
 			long column = store.db().createColumn("b", bucketed);
@@ -476,7 +482,7 @@ class ApplierTest {
 	/** Two replicas applying the same log, one group by group and the other entry by entry, end up identical. */
 	@Test
 	void twoReplicasReachTheSameVerdicts() throws Exception {
-		var random = new java.util.Random(11);
+		var random = new Random(11);
 		Files.createDirectories(temp.resolve("a"));
 		Files.createDirectories(temp.resolve("b"));
 		try (var a = NodeStore.open(temp.resolve("a/db"), null, "a"); var b = NodeStore.open(temp.resolve("b/db"), null, "b")) {
@@ -819,11 +825,11 @@ class ApplierTest {
 			byte[] framed = new byte[encoded.length + 7];
 			System.arraycopy(encoded, 0, framed, 3, encoded.length);
 			var decoded = RockserverStateMachine.decodeBatch(
-					org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations.unsafeWrap(framed, 3,
+					UnsafeByteOperations.unsafeWrap(framed, 3,
 							encoded.length));
 			var value = ((LogEntry.Put) decoded.getFirst().entry()).value();
 			assertNull(value.asArrayStrict(), "decoded in place, not copied");
-			org.junit.jupiter.api.Assertions.assertArrayEquals(encoded, LogEntryCodec.encodeBatch(decoded));
+			Assertions.assertArrayEquals(encoded, LogEntryCodec.encodeBatch(decoded));
 			var results = applier.applyBatch(decoded, TermIndex.valueOf(1, 1));
 			assertEquals("a,b", ((Buf) ((ApplyResult.Ok) results.get(1)).value()).toString(StandardCharsets.UTF_8));
 			assertEquals("a,b", value(store, column, 1));

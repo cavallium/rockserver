@@ -10,17 +10,24 @@ import it.cavallium.rockserver.core.client.ThriftConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.impl.MyStringAppendOperator;
 import it.cavallium.rockserver.core.server.ThriftServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
 import org.apache.thrift.TException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -60,7 +67,7 @@ class ThriftDeleteRangeTest {
 		thriftServer = new ThriftServer(embeddedConnection, "127.0.0.1", port);
 		thriftServer.start();
 		client = new ThriftConnection("thrift-client", "127.0.0.1", port);
-		colId = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("test-col", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+		colId = client.getSyncApi(RequestContext.batch()).createColumn("test-col", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 	}
 
 	@AfterEach
@@ -89,17 +96,17 @@ class ThriftDeleteRangeTest {
 		var key3 = key(13);
 		var key4 = key(14);
 
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value(110), RequestType.none());
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value(120), RequestType.none());
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key3, value(130), RequestType.none());
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key4, value(140), RequestType.none());
+		client.getSyncApi(RequestContext.batch()).put(0, colId, key1, value(110), RequestType.none());
+		client.getSyncApi(RequestContext.batch()).put(0, colId, key2, value(120), RequestType.none());
+		client.getSyncApi(RequestContext.batch()).put(0, colId, key3, value(130), RequestType.none());
+		client.getSyncApi(RequestContext.batch()).put(0, colId, key4, value(140), RequestType.none());
 
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).deleteRange(colId, key2, key4);
+		client.getSyncApi(RequestContext.batch()).deleteRange(colId, key2, key4);
 
-		assertTrue(client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key1, RequestType.exists()));
-		assertFalse(client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key2, RequestType.exists()));
-		assertFalse(client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key3, RequestType.exists()));
-		assertTrue(client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, key4, RequestType.exists()));
+		assertTrue(client.getSyncApi(RequestContext.batch()).get(0, colId, key1, RequestType.exists()));
+		assertFalse(client.getSyncApi(RequestContext.batch()).get(0, colId, key2, RequestType.exists()));
+		assertFalse(client.getSyncApi(RequestContext.batch()).get(0, colId, key3, RequestType.exists()));
+		assertTrue(client.getSyncApi(RequestContext.batch()).get(0, colId, key4, RequestType.exists()));
 	}
 
 
@@ -110,15 +117,15 @@ class ThriftDeleteRangeTest {
 		var key3 = key(13);
 		var key4 = key(14);
 
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value(110), RequestType.none());
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, value(120), RequestType.none());
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key3, value(130), RequestType.none());
-		client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key4, value(140), RequestType.none());
+		client.getSyncApi(RequestContext.batch()).put(0, colId, key1, value(110), RequestType.none());
+		client.getSyncApi(RequestContext.batch()).put(0, colId, key2, value(120), RequestType.none());
+		client.getSyncApi(RequestContext.batch()).put(0, colId, key3, value(130), RequestType.none());
+		client.getSyncApi(RequestContext.batch()).put(0, colId, key4, value(140), RequestType.none());
 
-		var normal = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
+		var normal = client.getSyncApi(RequestContext.batch())
 				.getRange(0, colId, key2, key4, false, RequestType.allInRange())
 				.toList();
-		var noCache = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
+		var noCache = client.getSyncApi(RequestContext.batch())
 				.getRange(0, colId, key2, key4, false, RequestType.allInRangeNoCache())
 				.toList();
 
@@ -129,19 +136,19 @@ class ThriftDeleteRangeTest {
 	/** checkMergeOperator answers over Thrift as over gRPC: no version before the upload, its version after (CC-T7). */
 	@Test
 	void checkMergeOperatorOverThriftFindsTheUploadedVersion() throws Exception {
-		var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-		var jar = new java.io.ByteArrayOutputStream();
-		try (var ignored = new java.util.jar.JarOutputStream(jar, new java.util.jar.Manifest())) {
+		var api = client.getSyncApi(RequestContext.batch());
+		var jar = new ByteArrayOutputStream();
+		try (var ignored = new JarOutputStream(jar, new Manifest())) {
 			// An empty jar: the operator class is on the class path.
 		}
 		byte[] jarData = jar.toByteArray();
-		byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(jarData);
+		byte[] hash = MessageDigest.getInstance("SHA-256").digest(jarData);
 		assertEquals(null, api.checkMergeOperator("thrift-op", hash));
 		long version = api.uploadMergeOperator("thrift-op",
-				it.cavallium.rockserver.core.impl.MyStringAppendOperator.class.getName(), jarData);
+				MyStringAppendOperator.class.getName(), jarData);
 		assertEquals(version, api.checkMergeOperator("thrift-op", hash));
-		assertEquals(version, client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
-				.checkMergeOperatorAsync("thrift-op", hash).get(10, java.util.concurrent.TimeUnit.SECONDS));
+		assertEquals(version, client.getAsyncApi(RequestContext.batch())
+				.checkMergeOperatorAsync("thrift-op", hash).get(10, TimeUnit.SECONDS));
 	}
 
 	private static int findFreePort() throws IOException {

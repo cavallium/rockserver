@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.common;
 
+import java.io.IOError;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Comparator;
@@ -44,7 +45,7 @@ public final class Failures {
 	public static boolean isJvmFailure(@Nullable Throwable failure) {
 		int depth = 0;
 		for (Throwable t = failure; t != null && depth < MAX_DEPTH; t = t.getCause(), depth++) {
-			if (t instanceof VirtualMachineError || t instanceof java.io.IOError) {
+			if (t instanceof VirtualMachineError || t instanceof IOError) {
 				return true;
 			}
 			if ((t instanceof ExceptionInInitializerError || t instanceof NoClassDefFoundError) && namesJvmError(t)) {

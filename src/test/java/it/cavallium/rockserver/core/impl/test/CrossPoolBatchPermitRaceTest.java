@@ -12,6 +12,7 @@ import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 
 class CrossPoolBatchPermitRaceTest {
@@ -187,7 +188,7 @@ class CrossPoolBatchPermitRaceTest {
 		}
 	}
 
-	private static void assertEventually(java.util.function.BooleanSupplier condition) throws Exception {
+	private static void assertEventually(BooleanSupplier condition) throws Exception {
 		long deadline = System.nanoTime() + SECONDS.toNanos(5);
 		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
 			Thread.sleep(10);

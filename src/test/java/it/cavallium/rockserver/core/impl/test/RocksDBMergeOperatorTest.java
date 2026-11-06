@@ -1,8 +1,13 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator;
 import it.cavallium.rockserver.core.impl.FFMByteArrayMergeOperator;
 import it.cavallium.rockserver.core.impl.MyStringAppendOperator;
+import java.lang.invoke.MethodType;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.Options;
@@ -19,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 
+import org.rocksdb.RocksDBException;
 import sun.misc.Unsafe;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -93,7 +99,7 @@ public class RocksDBMergeOperatorTest {
 
                 // DB remains usable after merge failure.
                 // Since merge returns failure (null), RocksDB get() will likely throw RocksDBException (Corruption).
-                org.junit.jupiter.api.Assertions.assertThrows(org.rocksdb.RocksDBException.class, () -> {
+                Assertions.assertThrows(RocksDBException.class, () -> {
                     db.get(key);
                 });
 
@@ -119,7 +125,7 @@ public class RocksDBMergeOperatorTest {
                 assertDoesNotThrow(() -> db.merge(key, "boom".getBytes(UTF_8)));
 
                 // Should throw RocksDBException because merge failed
-                org.junit.jupiter.api.Assertions.assertThrows(org.rocksdb.RocksDBException.class, () -> {
+                Assertions.assertThrows(RocksDBException.class, () -> {
                     db.get(key);
                 });
 
@@ -147,7 +153,7 @@ public class RocksDBMergeOperatorTest {
                 assertDoesNotThrow(() -> db.merge(key, "boom".getBytes(UTF_8)));
 
                 // Should throw RocksDBException because merge failed
-                org.junit.jupiter.api.Assertions.assertThrows(org.rocksdb.RocksDBException.class, () -> {
+                Assertions.assertThrows(RocksDBException.class, () -> {
                     db.get(key);
                 });
             }
@@ -182,7 +188,7 @@ public class RocksDBMergeOperatorTest {
                     if (val != null) {
                         assertEquals("base", new String(val, UTF_8));
                     }
-                } catch (org.rocksdb.RocksDBException e) {
+                } catch (RocksDBException e) {
                     // Acceptable behavior if RocksDB decides to throw on failed merge
                 }
 
@@ -278,13 +284,13 @@ public class RocksDBMergeOperatorTest {
     void testPartialMergeEmptyResultSetsZeroLength() throws Exception {
         FFMAbstractMergeOperator op = new FFMAbstractMergeOperator("EmptyPartialResultOp") {
             @Override
-            public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+            public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
-            public it.cavallium.buffer.Buf partialMergeMulti(it.cavallium.buffer.Buf key, List<it.cavallium.buffer.Buf> operands) {
-                return it.cavallium.buffer.Buf.wrap(new byte[0]);
+            public Buf partialMergeMulti(Buf key, List<Buf> operands) {
+                return Buf.wrap(new byte[0]);
             }
         };
 
@@ -304,17 +310,17 @@ public class RocksDBMergeOperatorTest {
     void testPartialMergeMultiNullWithManyOperandsReturnsNull() throws Exception {
         FFMAbstractMergeOperator op = new FFMAbstractMergeOperator("NullPartialMergeOp") {
             @Override
-            public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+            public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
-            public it.cavallium.buffer.Buf partialMergeMulti(it.cavallium.buffer.Buf key, List<it.cavallium.buffer.Buf> operands) {
+            public Buf partialMergeMulti(Buf key, List<Buf> operands) {
                 return null;
             }
 
             @Override
-            public it.cavallium.buffer.Buf partialMerge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf leftOperand, it.cavallium.buffer.Buf rightOperand) {
+            public Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
                 return null;
             }
         };
@@ -336,7 +342,7 @@ public class RocksDBMergeOperatorTest {
     void testFullMergeReturnsNullWhenMergeReturnsNull() throws Exception {
         FFMAbstractMergeOperator op = new FFMAbstractMergeOperator("NullReturningMerge") {
             @Override
-            public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+            public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
                 return null; // force fallback
             }
         };
@@ -358,8 +364,8 @@ public class RocksDBMergeOperatorTest {
     void testFullMergeEmptyResultSetsZeroLength() throws Exception {
         FFMAbstractMergeOperator op = new FFMAbstractMergeOperator("EmptyFullResultOp") {
             @Override
-            public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
-                return it.cavallium.buffer.Buf.wrap(new byte[0]);
+            public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
+                return Buf.wrap(new byte[0]);
             }
         };
 
@@ -380,7 +386,7 @@ public class RocksDBMergeOperatorTest {
     void testFullMergeReturnsNullWhenNoExisting() throws Exception {
         FFMAbstractMergeOperator op = new FFMAbstractMergeOperator("NullReturningMergeNoExisting") {
             @Override
-            public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+            public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
                 return null; // force fallback
             }
         };
@@ -401,7 +407,7 @@ public class RocksDBMergeOperatorTest {
     void testFullMergeFallbackToEmptyWhenNoExistingAndNoOperands() throws Exception {
         FFMAbstractMergeOperator op = new FFMAbstractMergeOperator("NullReturningMergeEmpty") {
             @Override
-            public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+            public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
                 return null; // force fallback
             }
         };
@@ -419,17 +425,17 @@ public class RocksDBMergeOperatorTest {
     void testPartialMergeBothNullReturnsNull() throws Exception {
         FFMAbstractMergeOperator op = new FFMAbstractMergeOperator("NullPartialMergeTwoOps") {
             @Override
-            public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+            public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
-            public it.cavallium.buffer.Buf partialMergeMulti(it.cavallium.buffer.Buf key, List<it.cavallium.buffer.Buf> operands) {
+            public Buf partialMergeMulti(Buf key, List<Buf> operands) {
                 return null;
             }
 
             @Override
-            public it.cavallium.buffer.Buf partialMerge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf leftOperand, it.cavallium.buffer.Buf rightOperand) {
+            public Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
                 return null;
             }
         };
@@ -635,7 +641,7 @@ public class RocksDBMergeOperatorTest {
 
         MethodHandle original = swapHandle("CREATE_OP", replacement);
         try {
-            RuntimeException ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, () -> new NoopOp("NullCreateOp"));
+            RuntimeException ex = Assertions.assertThrows(RuntimeException.class, () -> new NoopOp("NullCreateOp"));
             assertTrue(ex.getMessage().contains("Failed to construct FFM MergeOperator"));
             assertNotNull(ex.getCause());
             assertTrue(ex.getCause().getMessage().contains("rocksdb_mergeoperator_create returned NULL"));
@@ -656,7 +662,7 @@ public class RocksDBMergeOperatorTest {
 
         MethodHandle original = swapHandle("CREATE_OP", replacement);
         try {
-            RuntimeException ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, () -> new NoopOp("ThrowingCreateOp"));
+            RuntimeException ex = Assertions.assertThrows(RuntimeException.class, () -> new NoopOp("ThrowingCreateOp"));
             assertTrue(ex.getMessage().contains("Failed to construct FFM MergeOperator"));
             assertTrue(ex.getCause() instanceof IllegalStateException);
         } finally {
@@ -666,13 +672,13 @@ public class RocksDBMergeOperatorTest {
 
     @Test
     void testConstructorFailsWhenNativeHandleInjectionBlocked() throws Exception {
-        RuntimeException ex = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, HandleInjectionFailOp::new);
+        RuntimeException ex = Assertions.assertThrows(RuntimeException.class, HandleInjectionFailOp::new);
         assertTrue(ex.getMessage().contains("Failed to construct FFM MergeOperator"));
         assertNotNull(ex.getCause());
         assertTrue(ex.getCause().getMessage().contains("Could not inject native handle"));
     }
 
-    private static final java.util.List<MemorySegment> DESTROYED = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private static final List<MemorySegment> DESTROYED = new CopyOnWriteArrayList<>();
     private static MethodHandle originalDestroy;
 
     private static void recordingDestroy(MemorySegment raw) throws Throwable {
@@ -683,13 +689,13 @@ public class RocksDBMergeOperatorTest {
     @Test
     void testConstructorDestroysNativeOperatorWhenHandleInjectionFails() throws Exception {
         MethodHandle recording = MethodHandles.lookup().findStatic(RocksDBMergeOperatorTest.class, "recordingDestroy",
-                java.lang.invoke.MethodType.methodType(void.class, MemorySegment.class));
+                MethodType.methodType(void.class, MemorySegment.class));
         DESTROYED.clear();
         originalDestroy = swapHandle("DESTROY_OP", recording);
         try {
-            org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, HandleInjectionFailOp::new);
+            Assertions.assertThrows(RuntimeException.class, HandleInjectionFailOp::new);
             assertEquals(1, DESTROYED.size(), "the native operator created before the failure must be destroyed once");
-            org.junit.jupiter.api.Assertions.assertNotEquals(MemorySegment.NULL, DESTROYED.getFirst());
+            Assertions.assertNotEquals(MemorySegment.NULL, DESTROYED.getFirst());
         } finally {
             swapHandle("DESTROY_OP", originalDestroy);
         }
@@ -698,7 +704,7 @@ public class RocksDBMergeOperatorTest {
     @Test
     void testConstructorDoesNotDestroyWhenCreateFails() throws Exception {
         MethodHandle recording = MethodHandles.lookup().findStatic(RocksDBMergeOperatorTest.class, "recordingDestroy",
-                java.lang.invoke.MethodType.methodType(void.class, MemorySegment.class));
+                MethodType.methodType(void.class, MemorySegment.class));
         MethodHandle nullCreate = MethodHandles.dropArguments(
                 MethodHandles.constant(MemorySegment.class, MemorySegment.NULL), 0,
                 MemorySegment.class, MemorySegment.class, MemorySegment.class,
@@ -707,7 +713,7 @@ public class RocksDBMergeOperatorTest {
         originalDestroy = swapHandle("DESTROY_OP", recording);
         MethodHandle originalCreate = swapHandle("CREATE_OP", nullCreate);
         try {
-            org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, () -> new NoopOp("NullCreateNoDestroy"));
+            Assertions.assertThrows(RuntimeException.class, () -> new NoopOp("NullCreateNoDestroy"));
             assertTrue(DESTROYED.isEmpty());
         } finally {
             swapHandle("CREATE_OP", originalCreate);
@@ -790,17 +796,17 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+        public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
             return null;
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMergeMulti(it.cavallium.buffer.Buf key, List<it.cavallium.buffer.Buf> operands) {
+        public Buf partialMergeMulti(Buf key, List<Buf> operands) {
             return null;
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMerge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf leftOperand, it.cavallium.buffer.Buf rightOperand) {
+        public Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
             return null;
         }
     }
@@ -816,7 +822,7 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+        public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
             return null;
         }
     }
@@ -831,22 +837,22 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
-            return it.cavallium.buffer.Buf.wrap("result".getBytes());
+        public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
+            return Buf.wrap("result".getBytes());
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMergeMulti(it.cavallium.buffer.Buf key, List<it.cavallium.buffer.Buf> operands) {
-            return it.cavallium.buffer.Buf.wrap("result".getBytes());
+        public Buf partialMergeMulti(Buf key, List<Buf> operands) {
+            return Buf.wrap("result".getBytes());
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMerge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf leftOperand, it.cavallium.buffer.Buf rightOperand) {
+        public Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
             return null;
         }
 
         @Override
-        protected void onMergeError(Throwable t, boolean partial, it.cavallium.buffer.Buf key) {
+        protected void onMergeError(Throwable t, boolean partial, Buf key) {
             this.errorSeen = true;
             this.partialSeen = partial;
             this.keySeen = key != null ? new String(key.asArray(), UTF_8) : null;
@@ -860,7 +866,7 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public byte[] merge(byte[] key, byte[] existingValue, java.util.List<byte[]> operands) {
+        public byte[] merge(byte[] key, byte[] existingValue, List<byte[]> operands) {
             throw new RuntimeException("merge boom");
         }
     }
@@ -874,12 +880,12 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public byte[] merge(byte[] key, byte[] existingValue, java.util.List<byte[]> operands) {
+        public byte[] merge(byte[] key, byte[] existingValue, List<byte[]> operands) {
             throw new IllegalStateException("merge kaboom");
         }
 
         @Override
-        protected void onMergeError(Throwable t, boolean partial, it.cavallium.buffer.Buf key) {
+        protected void onMergeError(Throwable t, boolean partial, Buf key) {
             this.errorSeen = true;
         }
     }
@@ -891,12 +897,12 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public byte[] merge(byte[] key, byte[] existingValue, java.util.List<byte[]> operands) {
+        public byte[] merge(byte[] key, byte[] existingValue, List<byte[]> operands) {
             throw new IllegalStateException("merge explode");
         }
 
         @Override
-        protected void onMergeError(Throwable t, boolean partial, it.cavallium.buffer.Buf key) {
+        protected void onMergeError(Throwable t, boolean partial, Buf key) {
             throw new RuntimeException("hook explode");
         }
     }
@@ -908,7 +914,7 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public byte[] merge(byte[] key, byte[] existingValue, java.util.List<byte[]> operands) {
+        public byte[] merge(byte[] key, byte[] existingValue, List<byte[]> operands) {
             throw new AssertionError("boom");
         }
     }
@@ -922,12 +928,12 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+        public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
             throw new IllegalStateException("boom");
         }
 
         @Override
-        protected void onMergeError(Throwable t, boolean partial, it.cavallium.buffer.Buf key) {
+        protected void onMergeError(Throwable t, boolean partial, Buf key) {
             this.keySeen = new String(key.asArray(), UTF_8);
         }
     }
@@ -941,22 +947,22 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+        public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMergeMulti(it.cavallium.buffer.Buf key, List<it.cavallium.buffer.Buf> operands) {
+        public Buf partialMergeMulti(Buf key, List<Buf> operands) {
             throw new IllegalStateException("partial boom");
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMerge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf leftOperand, it.cavallium.buffer.Buf rightOperand) {
+        public Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
             throw new IllegalStateException("pair boom");
         }
 
         @Override
-        protected void onMergeError(Throwable t, boolean partial, it.cavallium.buffer.Buf key) {
+        protected void onMergeError(Throwable t, boolean partial, Buf key) {
             this.keySeen = new String(key.asArray(), UTF_8);
         }
     }
@@ -970,22 +976,22 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+        public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMergeMulti(it.cavallium.buffer.Buf key, List<it.cavallium.buffer.Buf> operands) {
+        public Buf partialMergeMulti(Buf key, List<Buf> operands) {
             throw new AssertionError("partial multi boom");
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMerge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf leftOperand, it.cavallium.buffer.Buf rightOperand) {
+        public Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
             throw new AssertionError("partial pair boom");
         }
 
         @Override
-        protected void onMergeError(Throwable t, boolean partial, it.cavallium.buffer.Buf key) {
+        protected void onMergeError(Throwable t, boolean partial, Buf key) {
             errorSeen = true;
         }
     }
@@ -996,7 +1002,7 @@ public class RocksDBMergeOperatorTest {
 
         private final Mode mode;
         private volatile boolean errorSeen;
-        private final java.util.concurrent.atomic.AtomicReference<String> invocationOrder = new java.util.concurrent.atomic.AtomicReference<>("");
+        private final AtomicReference<String> invocationOrder = new AtomicReference<>("");
 
         private TestableMergeOp(Mode mode) {
             super("TestableMergeOp" + mode);
@@ -1004,16 +1010,16 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+        public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMergeMulti(it.cavallium.buffer.Buf key, List<it.cavallium.buffer.Buf> operands) {
+        public Buf partialMergeMulti(Buf key, List<Buf> operands) {
             return switch (mode) {
                 case MULTI_OK -> {
                     invocationOrder.compareAndSet("", "MULTI");
-                    yield it.cavallium.buffer.Buf.wrap(String.join("+", operands.stream().map(o -> new String(o.asArray(), UTF_8)).toList()).getBytes(UTF_8));
+                    yield Buf.wrap(String.join("+", operands.stream().map(o -> new String(o.asArray(), UTF_8)).toList()).getBytes(UTF_8));
                 }
                 case MULTI_NULL_PAIRWISE -> null;
                 case MULTI_THROW -> throw new IllegalStateException("boom");
@@ -1021,13 +1027,13 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMerge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf leftOperand, it.cavallium.buffer.Buf rightOperand) {
+        public Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
             invocationOrder.compareAndSet("", "PAIRWISE");
-            return it.cavallium.buffer.Buf.wrap((new String(leftOperand.asArray(), UTF_8) + "|" + new String(rightOperand.asArray(), UTF_8)).getBytes(UTF_8));
+            return Buf.wrap((new String(leftOperand.asArray(), UTF_8) + "|" + new String(rightOperand.asArray(), UTF_8)).getBytes(UTF_8));
         }
 
         @Override
-        protected void onMergeError(Throwable t, boolean partial, it.cavallium.buffer.Buf key) {
+        protected void onMergeError(Throwable t, boolean partial, Buf key) {
             errorSeen = true;
         }
     }
@@ -1043,22 +1049,22 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+        public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
             return null;
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMergeMulti(it.cavallium.buffer.Buf key, List<it.cavallium.buffer.Buf> operands) {
+        public Buf partialMergeMulti(Buf key, List<Buf> operands) {
             return null;
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMerge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf leftOperand, it.cavallium.buffer.Buf rightOperand) {
+        public Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
             return null;
         }
 
         @Override
-        protected void onMergeError(Throwable t, boolean partial, it.cavallium.buffer.Buf key) {
+        protected void onMergeError(Throwable t, boolean partial, Buf key) {
             this.errorSeen = true;
             this.partialSeen = partial;
             this.keyString = key != null ? new String(key.asArray(), UTF_8) : null;
@@ -1072,17 +1078,17 @@ public class RocksDBMergeOperatorTest {
         }
 
         @Override
-        public it.cavallium.buffer.Buf merge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf existingValue, List<it.cavallium.buffer.Buf> operands) {
+        public Buf merge(Buf key, Buf existingValue, List<Buf> operands) {
             return null;
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMergeMulti(it.cavallium.buffer.Buf key, List<it.cavallium.buffer.Buf> operands) {
+        public Buf partialMergeMulti(Buf key, List<Buf> operands) {
             return null;
         }
 
         @Override
-        public it.cavallium.buffer.Buf partialMerge(it.cavallium.buffer.Buf key, it.cavallium.buffer.Buf leftOperand, it.cavallium.buffer.Buf rightOperand) {
+        public Buf partialMerge(Buf key, Buf leftOperand, Buf rightOperand) {
             return null;
         }
     }
@@ -1280,14 +1286,14 @@ public class RocksDBMergeOperatorTest {
     private static Result invokePartialMergeCb(FFMAbstractMergeOperator op, byte[] key, byte[][] operands) throws Exception {
         Method m = FFMAbstractMergeOperator.class.getDeclaredMethod(
                 "partialMergeCb",
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class,
+                MemorySegment.class,
+                MemorySegment.class,
                 long.class,
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class,
+                MemorySegment.class,
+                MemorySegment.class,
                 int.class,
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class
+                MemorySegment.class,
+                MemorySegment.class
         );
         m.setAccessible(true);
 
@@ -1337,16 +1343,16 @@ public class RocksDBMergeOperatorTest {
     private static Result invokeFullMergeCb(FFMAbstractMergeOperator op, byte[] key, byte[] existing, byte[][] operands) throws Exception {
         Method m = FFMAbstractMergeOperator.class.getDeclaredMethod(
                 "fullMerge",
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class,
+                MemorySegment.class,
+                MemorySegment.class,
                 long.class,
-                java.lang.foreign.MemorySegment.class,
+                MemorySegment.class,
                 long.class,
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class,
+                MemorySegment.class,
+                MemorySegment.class,
                 int.class,
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class
+                MemorySegment.class,
+                MemorySegment.class
         );
         m.setAccessible(true);
 
@@ -1414,14 +1420,14 @@ public class RocksDBMergeOperatorTest {
                                                   int numOps) throws Exception {
         Method m = FFMAbstractMergeOperator.class.getDeclaredMethod(
                 "partialMergeCb",
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class,
+                MemorySegment.class,
+                MemorySegment.class,
                 long.class,
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class,
+                MemorySegment.class,
+                MemorySegment.class,
                 int.class,
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class
+                MemorySegment.class,
+                MemorySegment.class
         );
         m.setAccessible(true);
 
@@ -1459,16 +1465,16 @@ public class RocksDBMergeOperatorTest {
                                                int numOps) throws Exception {
         Method m = FFMAbstractMergeOperator.class.getDeclaredMethod(
                 "fullMerge",
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class,
+                MemorySegment.class,
+                MemorySegment.class,
                 long.class,
-                java.lang.foreign.MemorySegment.class,
+                MemorySegment.class,
                 long.class,
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class,
+                MemorySegment.class,
+                MemorySegment.class,
                 int.class,
-                java.lang.foreign.MemorySegment.class,
-                java.lang.foreign.MemorySegment.class
+                MemorySegment.class,
+                MemorySegment.class
         );
         m.setAccessible(true);
 

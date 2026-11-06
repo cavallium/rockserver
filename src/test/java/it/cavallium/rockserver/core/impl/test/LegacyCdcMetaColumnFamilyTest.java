@@ -9,15 +9,19 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBObjects;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.ColumnFamilyDescriptor;
@@ -48,19 +52,19 @@ class LegacyCdcMetaColumnFamilyTest {
 	@Test
 	void aWalArchiveLeftByTheOldCdcRetentionIsDeletedOnOpen(@TempDir Path dbPath) throws Exception {
 		new EmbeddedDB(dbPath, "archive-layout", null).closeTesting();
-		Path walDir = java.nio.file.Files.isDirectory(dbPath.resolve("wal")) ? dbPath.resolve("wal") : dbPath;
+		Path walDir = Files.isDirectory(dbPath.resolve("wal")) ? dbPath.resolve("wal") : dbPath;
 		Path archive = walDir.resolve("archive");
-		java.nio.file.Files.createDirectories(archive);
-		java.nio.file.Files.write(archive.resolve("000099.log"), new byte[1024]);
+		Files.createDirectories(archive);
+		Files.write(archive.resolve("000099.log"), new byte[1024]);
 
 		new EmbeddedDB(dbPath, "archive-cleanup", null).closeTesting();
-		assertFalse(java.nio.file.Files.exists(archive), "the archive of the removed CDC history must be deleted");
+		assertFalse(Files.exists(archive), "the archive of the removed CDC history must be deleted");
 	}
 
 	@Test
 	void aConfigFileWithTheRemovedCdcSettingsStillLoads(@TempDir Path dbPath) throws Exception {
 		Path config = dbPath.resolveSibling(dbPath.getFileName() + "-legacy.conf");
-		java.nio.file.Files.writeString(config, """
+		Files.writeString(config, """
 				database: {
 				  global: {
 				    wal-ttl-seconds: 86400
@@ -82,7 +86,7 @@ class LegacyCdcMetaColumnFamilyTest {
 		try {
 			new EmbeddedDB(dbPath, "legacy-config", config).closeTesting();
 		} finally {
-			java.nio.file.Files.deleteIfExists(config);
+			Files.deleteIfExists(config);
 		}
 	}
 
@@ -90,9 +94,9 @@ class LegacyCdcMetaColumnFamilyTest {
 	void theLegacyColumnNameCannotBeCreatedAsAUserColumn(@TempDir Path dbPath) throws Exception {
 		var db = new EmbeddedDB(dbPath, "reserved-name", null);
 		try {
-			org.junit.jupiter.api.Assertions.assertThrows(it.cavallium.rockserver.core.common.RocksDBException.class,
-					() -> db.createColumn(LEGACY_CDC_META_COLUMN, it.cavallium.rockserver.core.common.ColumnSchema.of(
-							it.unimi.dsi.fastutil.ints.IntList.of(1), it.unimi.dsi.fastutil.objects.ObjectList.of(), true)));
+			Assertions.assertThrows(RocksDBException.class,
+					() -> db.createColumn(LEGACY_CDC_META_COLUMN, ColumnSchema.of(
+							IntList.of(1), ObjectList.of(), true)));
 		} finally {
 			db.closeTesting();
 		}
@@ -148,7 +152,7 @@ class LegacyCdcMetaColumnFamilyTest {
 		byte[] name = LEGACY_CDC_META_COLUMN.getBytes(StandardCharsets.UTF_8);
 		return db.getDb().getStartupColumns().entrySet().stream()
 				.filter(entry -> Arrays.equals(entry.getKey().getName(), name))
-				.map(java.util.Map.Entry::getValue)
+				.map(Map.Entry::getValue)
 				.findAny()
 				.orElseThrow();
 	}

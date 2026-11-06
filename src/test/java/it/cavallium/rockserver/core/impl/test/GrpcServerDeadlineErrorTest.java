@@ -7,17 +7,30 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.google.protobuf.ByteString;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.Metadata;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
+import it.cavallium.rockserver.core.common.FirstAndLast;
+import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.common.api.proto.GetRangeRequest;
+import it.cavallium.rockserver.core.common.api.proto.KV;
+import it.cavallium.rockserver.core.common.api.proto.PutRequest;
+import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
+import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
 import it.cavallium.rockserver.core.impl.InternalConnection;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.server.GrpcServer;
@@ -29,6 +42,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
@@ -41,6 +55,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
 import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -81,7 +96,7 @@ class GrpcServerDeadlineErrorTest {
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				try {
 					var response = client.getAsyncApi(
-							it.cavallium.rockserver.core.common.RequestContext.batch(java.time.Duration.ofSeconds(2)))
+							it.cavallium.rockserver.core.common.RequestContext.batch(Duration.ofSeconds(2)))
 							.getColumnIdAsync("blocked");
 					assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 
@@ -125,28 +140,28 @@ class GrpcServerDeadlineErrorTest {
 		var backend = new ProtectedOperationBackendConnection();
 		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
 			server.start();
-			var channel = io.grpc.ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort())
+			var channel = ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort())
 					.usePlaintext()
 					.build();
 			try {
 				for (var profile : List.of(
 						it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.CONTROL,
 						it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.PHYSICAL_MAINTENANCE)) {
-					var request = it.cavallium.rockserver.core.common.api.proto.PutRequest.newBuilder()
+					var request = PutRequest.newBuilder()
 							.setColumnId(1L)
-							.setData(it.cavallium.rockserver.core.common.api.proto.KV.newBuilder()
-									.addKeys(com.google.protobuf.ByteString.copyFrom(new byte[] {1}))
-									.setValue(com.google.protobuf.ByteString.copyFrom(new byte[] {2})))
+							.setData(KV.newBuilder()
+									.addKeys(ByteString.copyFrom(new byte[] {1}))
+									.setValue(ByteString.copyFrom(new byte[] {2})))
 							.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 									.setProfile(profile)
 									.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE))
 							.build();
-					var error = assertThrows(io.grpc.StatusRuntimeException.class,
-							() -> it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc
+					var error = assertThrows(StatusRuntimeException.class,
+							() -> RocksDBServiceGrpc
 									.newBlockingStub(channel)
 									.put(request));
-					assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT, error.getStatus().getCode());
+					assertEquals(Status.Code.INVALID_ARGUMENT, error.getStatus().getCode());
 				}
 			} finally {
 				channel.shutdownNow();
@@ -161,33 +176,33 @@ class GrpcServerDeadlineErrorTest {
 	@Test
 	void notAppliedFailuresCarryTheAppliedTrailer() throws Exception {
 		var backend = new ProtectedOperationBackendConnection();
-		var key = io.grpc.Metadata.Key.of(RocksDBException.APPLIED_METADATA_KEY, io.grpc.Metadata.ASCII_STRING_MARSHALLER);
+		var key = Metadata.Key.of(RocksDBException.APPLIED_METADATA_KEY, Metadata.ASCII_STRING_MARSHALLER);
 		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
 			server.start();
-			var channel = io.grpc.ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort())
+			var channel = ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort())
 					.usePlaintext()
 					.build();
 			try {
-				var stub = it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.newBlockingStub(channel);
-				java.util.function.BiFunction<it.cavallium.rockserver.core.common.api.proto.WorkloadProfile, Long,
-						it.cavallium.rockserver.core.common.api.proto.PutRequest> put = (profile, timeout) ->
-						it.cavallium.rockserver.core.common.api.proto.PutRequest.newBuilder()
+				var stub = RocksDBServiceGrpc.newBlockingStub(channel);
+				BiFunction<it.cavallium.rockserver.core.common.api.proto.WorkloadProfile, Long,
+						PutRequest> put = (profile, timeout) ->
+						PutRequest.newBuilder()
 								.setColumnId(1L)
-								.setData(it.cavallium.rockserver.core.common.api.proto.KV.newBuilder()
-										.addKeys(com.google.protobuf.ByteString.copyFrom(new byte[] {1}))
-										.setValue(com.google.protobuf.ByteString.copyFrom(new byte[] {2})))
+								.setData(KV.newBuilder()
+										.addKeys(ByteString.copyFrom(new byte[] {1}))
+										.setValue(ByteString.copyFrom(new byte[] {2})))
 								.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 										.setProfile(profile)
 										.setWorkloadContractVersion(3)
 										.setTimeoutNanos(timeout))
 								.build();
-				var expired = assertThrows(io.grpc.StatusRuntimeException.class,
+				var expired = assertThrows(StatusRuntimeException.class,
 						() -> stub.put(put.apply(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY, 1L)));
-				assertEquals(io.grpc.Status.Code.DEADLINE_EXCEEDED, expired.getStatus().getCode(), expired.toString());
+				assertEquals(Status.Code.DEADLINE_EXCEEDED, expired.getStatus().getCode(), expired.toString());
 				assertTrue(expired.getStatus().getDescription().contains("expired"), expired.toString());
 				assertEquals(RocksDBException.NOT_APPLIED, expired.getTrailers().get(key));
 
-				var refused = assertThrows(io.grpc.StatusRuntimeException.class, () -> stub.put(put.apply(
+				var refused = assertThrows(StatusRuntimeException.class, () -> stub.put(put.apply(
 						it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.CONTROL, Long.MAX_VALUE)));
 				assertEquals(RocksDBException.MAYBE_APPLIED, refused.getTrailers().get(key));
 			} finally {
@@ -241,12 +256,12 @@ class GrpcServerDeadlineErrorTest {
 						false,
 						RequestType.firstAndLast());
 
-				assertTrue(backend.entered.await(5, java.util.concurrent.TimeUnit.SECONDS));
+				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 				assertTrue(response.cancel(true));
 				assertTrue(backend.cancelObserved.await(5, TimeUnit.SECONDS),
 						"the server did not observe RPC cancellation before native completion");
 				backend.release.countDown();
-				assertTrue(backend.finished.await(5, java.util.concurrent.TimeUnit.SECONDS));
+				assertTrue(backend.finished.await(5, TimeUnit.SECONDS));
 
 				assertTrue(lateWarningLogged.await(5, TimeUnit.SECONDS),
 						"the late native failure never reached the request-scoped logger");
@@ -258,7 +273,7 @@ class GrpcServerDeadlineErrorTest {
 				assertTrue(warning.arguments().get(1).toString().endsWith(".GetRangeRequest"));
 				assertTrue(warning.arguments().get(2).toString().contains("context"));
 				assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, warning.arguments().get(3));
-				assertEquals(io.grpc.Status.Code.DEADLINE_EXCEEDED, warning.arguments().get(4));
+				assertEquals(Status.Code.DEADLINE_EXCEEDED, warning.arguments().get(4));
 				assertEquals("Deadline exceeded", warning.arguments().get(5));
 			}
 		} finally {
@@ -293,16 +308,16 @@ class GrpcServerDeadlineErrorTest {
 		var backend = new RecordingTimeoutBackendConnection();
 		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
 			server.start();
-			var channel = io.grpc.ManagedChannelBuilder
+			var channel = ManagedChannelBuilder
 					.forAddress("127.0.0.1", server.getPort())
 					.directExecutor()
 					.usePlaintext()
 					.build();
 			try {
-				var request = it.cavallium.rockserver.core.common.api.proto.GetRangeRequest.newBuilder()
+				var request = GetRangeRequest.newBuilder()
 						.setContext(wireBatchContext())
 						.build();
-				it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.newFutureStub(channel)
+				RocksDBServiceGrpc.newFutureStub(channel)
 						.withDeadlineAfter(2, TimeUnit.SECONDS)
 						.reduceRangeFirstAndLast(request)
 						.get(5, TimeUnit.SECONDS);
@@ -322,21 +337,21 @@ class GrpcServerDeadlineErrorTest {
 		var backend = new RecordingTimeoutBackendConnection();
 		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
 			server.start();
-			var channel = io.grpc.ManagedChannelBuilder
+			var channel = ManagedChannelBuilder
 					.forAddress("127.0.0.1", server.getPort())
 					.directExecutor()
 					.usePlaintext()
 					.build();
 			try {
-				var request = it.cavallium.rockserver.core.common.api.proto.GetRangeRequest.newBuilder()
+				var request = GetRangeRequest.newBuilder()
 						.setContext(wireBatchContext())
 						.build();
-				it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc
+				ReactorRocksDBServiceGrpc
 						.newReactorStub(channel)
 						.withDeadlineAfter(2, TimeUnit.SECONDS)
 						.getAllInRange(request)
 						.collectList()
-						.block(java.time.Duration.ofSeconds(5));
+						.block(Duration.ofSeconds(5));
 
 				assertTrue(backend.observedTimeoutMs.get() >= 0);
 				assertTrue(backend.observedTimeoutMs.get() <= 2_000,
@@ -411,7 +426,7 @@ class GrpcServerDeadlineErrorTest {
 			try (var client = GrpcConnection.forHostAndPort("grpc-call-deadline",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch(
-						java.time.Duration.ofSeconds(1))).reduceRangeAsync(0,
+						Duration.ofSeconds(1))).reduceRangeAsync(0,
 						0,
 						null,
 						null,
@@ -439,8 +454,8 @@ class GrpcServerDeadlineErrorTest {
 			try (var client = GrpcConnection.forHostAndPort("grpc-exists-multi-deadline",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch(
-						java.time.Duration.ofSeconds(1))).existsMultiAsync(
-						0, 0, List.of(new it.cavallium.rockserver.core.common.Keys()));
+						Duration.ofSeconds(1))).existsMultiAsync(
+						0, 0, List.of(new Keys()));
 				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
 
 				var failure = assertThrows(ExecutionException.class,
@@ -464,7 +479,7 @@ class GrpcServerDeadlineErrorTest {
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				var response = client.getAsyncApi(
 						it.cavallium.rockserver.core.common.RequestContext.batch(
-								java.time.Duration.ofMillis(500)))
+								Duration.ofMillis(500)))
 						.reduceRangeAsync(0, 0, null, null, false,
 								RequestType.firstAndLast());
 				assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
@@ -535,7 +550,7 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class SchedulerBackedConnection implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public RockserverCapabilities getCapabilities() { return RockserverCapabilities.CURRENT; }
 
 		private final RWScheduler scheduler;
 
@@ -570,8 +585,8 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class DeadlineBackendConnection implements RocksDBConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 
@@ -610,8 +625,8 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class CountingBackendConnection implements RocksDBConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 
@@ -646,8 +661,8 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class BlockingDeadlineBackendConnection implements RocksDBConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 
@@ -705,8 +720,8 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class RecordingTimeoutBackendConnection implements RocksDBConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 
@@ -717,7 +732,7 @@ class GrpcServerDeadlineErrorTest {
 			public <R, RS, RA> RA requestAsync(RocksDBAPICommand<R, RS, RA> request) {
 				if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?>) {
 					return (RA) CompletableFuture.completedFuture(
-							new it.cavallium.rockserver.core.common.FirstAndLast<>(null, null));
+							new FirstAndLast<>(null, null));
 				}
 				if (request instanceof RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?>) {
 					return (RA) Flux.empty();
@@ -749,8 +764,8 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class CancellableNeverCompletingBackendConnection implements RocksDBConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 
@@ -799,8 +814,8 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class ProtectedOperationBackendConnection implements RocksDBConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 
@@ -840,9 +855,9 @@ class GrpcServerDeadlineErrorTest {
 		public RocksDBAsyncAPI getAsyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
 			return new RocksDBAsyncAPI() {
 				@Override
-				public java.util.concurrent.CompletableFuture<Void> closeFailedUpdateAsync(long updateId) {
+				public CompletableFuture<Void> closeFailedUpdateAsync(long updateId) {
 					closedUpdate.set(updateId);
-					return java.util.concurrent.CompletableFuture.completedFuture(null);
+					return CompletableFuture.completedFuture(null);
 				}
 			};
 		}
@@ -854,8 +869,8 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class GenericBlockingBackendConnection implements RocksDBConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 

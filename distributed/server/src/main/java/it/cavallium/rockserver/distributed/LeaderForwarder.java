@@ -10,6 +10,9 @@ import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -17,8 +20,10 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.ratis.protocol.RaftPeer;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -68,7 +73,7 @@ final class LeaderForwarder implements Closeable {
 	 * and so are all of a peer's connections once a call to it fails in transport ({@link #invalidate}).
 	 */
 	private final ConcurrentHashMap<String, CompletableFuture<GrpcConnection>> connections = new ConcurrentHashMap<>();
-	private final java.util.concurrent.atomic.AtomicInteger nextSlot = new java.util.concurrent.atomic.AtomicInteger();
+	private final AtomicInteger nextSlot = new AtomicInteger();
 	/** Until when each peer is considered down after a failed connection, in {@link System#nanoTime()} units. */
 	private final ConcurrentHashMap<String, Long> downUntil = new ConcurrentHashMap<>();
 	/** Closes connections, never on a thread of the connection itself (its close waits for its own executor). */
@@ -150,7 +155,7 @@ final class LeaderForwarder implements Closeable {
 		}
 		try {
 			connector.execute(() -> pendingLeaders.values().forEach(Runnable::run));
-		} catch (java.util.concurrent.RejectedExecutionException closing) {
+		} catch (RejectedExecutionException closing) {
 			// close() fails them.
 		}
 	}
@@ -246,7 +251,7 @@ final class LeaderForwarder implements Closeable {
 		if (connections.remove(target.key(), target.handle())) {
 			try {
 				closer.execute(target.connection()::close);
-			} catch (java.util.concurrent.RejectedExecutionException closing) {
+			} catch (RejectedExecutionException closing) {
 				Thread.ofVirtual().start(target.connection()::close);
 			}
 		}
@@ -268,10 +273,10 @@ final class LeaderForwarder implements Closeable {
 
 	/** The handshake retries a refused connection for seconds: fail at once on a peer that is down instead. */
 	private static void probe(HostAndPort address) {
-		try (var socket = new java.net.Socket()) {
-			socket.connect(new java.net.InetSocketAddress(address.host(), address.port()), PROBE_TIMEOUT_MS);
+		try (var socket = new Socket()) {
+			socket.connect(new InetSocketAddress(address.host(), address.port()), PROBE_TIMEOUT_MS);
 		} catch (IOException e) {
-			throw new java.io.UncheckedIOException(e);
+			throw new UncheckedIOException(e);
 		}
 	}
 

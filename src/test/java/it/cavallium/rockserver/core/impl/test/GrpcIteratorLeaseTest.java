@@ -18,6 +18,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
+import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
@@ -68,7 +69,7 @@ class GrpcIteratorLeaseTest {
 				List<Long> iteratorIds = new ArrayList<>(ITERATOR_COUNT);
 				try {
 					for (int i = 0; i < ITERATOR_COUNT; i++) {
-						iteratorIds.add(api.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 25)));
+						iteratorIds.add(api.openIterator(0, columnId, new Keys(), null, false, Duration.ofMillis( 25)));
 					}
 
 					assertEquals(0, server.getActiveIteratorOperationLeaseCountForTesting(),
@@ -109,7 +110,7 @@ class GrpcIteratorLeaseTest {
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				var asyncApi = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 				var syncApi = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-				long iteratorId = syncApi.openIterator(0, 0, new Keys(), null, false, java.time.Duration.ofMillis( 30_000));
+				long iteratorId = syncApi.openIterator(0, 0, new Keys(), null, false, Duration.ofMillis( 30_000));
 				var running = asyncApi.subsequentAsync(iteratorId, 4_097, 1, RequestType.exists());
 
 				try {
@@ -300,7 +301,7 @@ class GrpcIteratorLeaseTest {
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
 				var batchApi = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
 				var latencyApi = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.latency(
-						java.time.Duration.ofSeconds(30)));
+						Duration.ofSeconds(30)));
 
 				batchApi.subsequent(RecordingAsyncSubsequentConnection.ITERATOR_ID,
 						0, 1, RequestType.none());
@@ -333,7 +334,7 @@ class GrpcIteratorLeaseTest {
 			server.start();
 			try (var client = GrpcConnection.forHostAndPort("grpc-rejected-open-cleanup",
 					new Utils.HostAndPort("127.0.0.1", server.getPort()))) {
-				var open = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIteratorAsync(0, 0, new Keys(), null, false, java.time.Duration.ofMillis( 30_000));
+				var open = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).openIteratorAsync(0, 0, new Keys(), null, false, Duration.ofMillis( 30_000));
 				CompletableFuture<Void> schedulerShutdown = null;
 				try {
 					assertTrue(backend.entered.await(5, TimeUnit.SECONDS));
@@ -381,7 +382,7 @@ class GrpcIteratorLeaseTest {
 
 	private static final class BlockingSubsequentConnection implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public RockserverCapabilities getCapabilities() { return RockserverCapabilities.CURRENT; }
 
 		private static final long ITERATOR_ID = 17;
 
@@ -472,7 +473,7 @@ class GrpcIteratorLeaseTest {
 	private static final class RecordingAsyncSubsequentConnection
 			implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public RockserverCapabilities getCapabilities() { return RockserverCapabilities.CURRENT; }
 
 		private static final long ITERATOR_ID = 31L;
 		private static final String METRIC_DATABASE = "grpc-recording-subsequent";
@@ -631,7 +632,7 @@ class GrpcIteratorLeaseTest {
 
 	private static final class BlockingOpenIteratorConnection implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public RockserverCapabilities getCapabilities() { return RockserverCapabilities.CURRENT; }
 
 		private static final long ITERATOR_ID = 23;
 

@@ -6,6 +6,7 @@ import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -145,9 +146,9 @@ final class BenchNodes implements AutoCloseable {
 		command.add("-Dorg.slf4j.simpleLogger.log.it.cavallium.rockserver.distributed=info");
 		// In the node's directory: a killed JVM leaves its copy of the RocksDB library behind (17 MB each time).
 		try {
-			java.nio.file.Files.createDirectories(dir.resolve("tmp"));
-		} catch (java.io.IOException ex) {
-			throw new java.io.UncheckedIOException(ex);
+			Files.createDirectories(dir.resolve("tmp"));
+		} catch (IOException ex) {
+			throw new UncheckedIOException(ex);
 		}
 		command.add("-Djava.io.tmpdir=" + dir.resolve("tmp"));
 		for (var option : jvmOptions) {
@@ -186,7 +187,7 @@ final class BenchNodes implements AutoCloseable {
 			if (!node.process().isAlive()) {
 				throw new IOException("Node " + node.id() + " exited:\n" + tail(node.dir().resolve("stderr.log")));
 			}
-			try (var socket = new java.net.Socket()) {
+			try (var socket = new Socket()) {
 				socket.connect(new InetSocketAddress(node.api().host(), node.api().port()), 200);
 				return;
 			} catch (IOException notYet) {

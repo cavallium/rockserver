@@ -3,21 +3,43 @@ package it.cavallium.rockserver.core.impl.test;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.*;
 
+import com.google.protobuf.ByteString;
+import io.grpc.ManagedChannelBuilder;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.common.api.proto.GetRequest;
+import it.cavallium.rockserver.core.common.api.proto.PutMultiInitialRequest;
+import it.cavallium.rockserver.core.common.api.proto.PutMultiRequest;
+import it.cavallium.rockserver.core.common.api.proto.PutRequest;
+import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
+import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
 import it.cavallium.rockserver.core.config.ConfigParser;
+import it.cavallium.rockserver.core.config.ConfigPrinter;
 import it.cavallium.rockserver.core.config.WorkloadSettings;
+import it.cavallium.rockserver.core.impl.CompactionIoBudget;
 import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.api.parallel.Resources;
+import org.rocksdb.RateLimiter;
+import reactor.core.publisher.Flux;
 
 @Timeout(45)
 class WorkloadGroupsTest {
@@ -34,7 +56,7 @@ class WorkloadGroupsTest {
 		assertEquals(4, settings.readParallelism());
 		assertEquals(2, settings.latencyQueueCapacity());
 		assertEquals(WorkloadSettings.resolve(config).latencyBurst(), settings.latencyBurst());
-		var printed = it.cavallium.rockserver.core.config.ConfigPrinter.stringify(config);
+		var printed = ConfigPrinter.stringify(config);
 		assertTrue(printed.contains("\"workload-groups\""));
 		assertTrue(printed.contains("\"workload-group\": \"slow\""));
 		for (String extra : new String[] {
@@ -66,7 +88,7 @@ class WorkloadGroupsTest {
 				var cancelled = async.getAsync(0, slowId, KEY, RequestType.current());
 				var queued = async.getAsync(0, slowId, KEY, RequestType.current());
 				var rejected = async.getAsync(0, slowId, KEY, RequestType.current());
-				var failure = assertThrows(java.util.concurrent.ExecutionException.class, () -> rejected.get(5, SECONDS));
+				var failure = assertThrows(ExecutionException.class, () -> rejected.get(5, SECONDS));
 				assertInstanceOf(RocksDBException.class, failure.getCause());
 				assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 						((RocksDBException) failure.getCause()).getErrorUniqueId());
@@ -136,27 +158,27 @@ class WorkloadGroupsTest {
             for (int i = 0; i < 64; i++) {
                 for (long id : new long[]{slowId, hotId}) {
                     assertEquals(VALUE, api.get(0, id, KEY, RequestType.current()));
-                    assertEquals(java.util.List.of(true), api.existsMulti(0, id, java.util.List.of(KEY)));
+                    assertEquals(List.of(true), api.existsMulti(0, id, List.of(KEY)));
                 }
             }
             var internal = connection.getInternalDB();
             var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
             var controller = controllerField.get(internal);
             var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
-            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
-            var sampleMethod = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            var limiter = (RateLimiter) limiterField.get(controller);
+            var sampleMethod = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", RateLimiter.class);
             sampleMethod.setAccessible(true);
             var executorField = controller.getClass().getDeclaredField("executor"); executorField.setAccessible(true);
-            var sampler = (java.util.concurrent.ScheduledExecutorService) executorField.get(controller);
-            java.util.concurrent.Callable<it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample> sampleCall =
-                    () -> (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
+            var sampler = (ScheduledExecutorService) executorField.get(controller);
+            Callable<CompactionIoBudget.Sample> sampleCall =
+                    () -> (CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
             var budgetField = controller.getClass().getDeclaredField("budget"); budgetField.setAccessible(true);
             var budget = budgetField.get(controller);
             var previousField = budget.getClass().getDeclaredField("previous"); previousField.setAccessible(true);
-            var initial = sampler.submit(() -> (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) previousField.get(budget)).get(5, SECONDS);
+            var initial = sampler.submit(() -> (CompactionIoBudget.Sample) previousField.get(budget)).get(5, SECONDS);
             assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
                 while (true) {
-                    var polled = sampler.submit(() -> (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) previousField.get(budget)).get(5, SECONDS);
+                    var polled = sampler.submit(() -> (CompactionIoBudget.Sample) previousField.get(budget)).get(5, SECONDS);
                     if (polled != null && (initial == null || polled.nanos() > initial.nanos())) {
                         assertEquals(11, polled.readTopologyWorkers()); break;
                     }
@@ -176,8 +198,8 @@ class WorkloadGroupsTest {
                     assertTrue(started.await(5, SECONDS));
                 }
                 var async = connection.getAsyncApi(RequestContext.latency(Duration.ofSeconds(20)));
-                var hot = new java.util.ArrayList<java.util.concurrent.CompletableFuture<Buf>>();
-                var cold = new java.util.ArrayList<java.util.concurrent.CompletableFuture<Buf>>();
+                var hot = new ArrayList<CompletableFuture<Buf>>();
+                var cold = new ArrayList<CompletableFuture<Buf>>();
                 for (int i = 0; i < 17; i++) hot.add(async.getAsync(0, hotId, KEY, RequestType.current()));
                 for (int i = 0; i < 16; i++) cold.add(async.getAsync(0, slowId, KEY, RequestType.current()));
                 assertEquals(17, root.poolSnapshot(RWScheduler.Pool.READ).queuedByProfile().get(WorkloadProfile.LATENCY));
@@ -205,20 +227,20 @@ class WorkloadGroupsTest {
     }
 
 	@Test
-	@org.junit.jupiter.api.parallel.ResourceLock(org.junit.jupiter.api.parallel.Resources.SYSTEM_PROPERTIES)
+	@ResourceLock(Resources.SYSTEM_PROPERTIES)
 	void grpcLegacyAndFastReadsAndStreamedMutationsUseColumnGroups() throws Exception {
 		String previous = System.getProperty("rockserver.grpc.fast-get.strategy");
 		try {
 			for (String strategy : new String[] {"legacy", "automatic"}) {
 				System.setProperty("rockserver.grpc.fast-get.strategy", strategy);
 				try (var connection = new EmbeddedConnection(null, "grpc-groups-" + strategy, config(strategy, ""));
-						var server = new it.cavallium.rockserver.core.server.GrpcServer(connection,
-								new java.net.InetSocketAddress("127.0.0.1", 0))) {
+						var server = new GrpcServer(connection,
+								new InetSocketAddress("127.0.0.1", 0))) {
 					var api = connection.getSyncApi(RequestContext.batch());
 					long slowId = api.createColumn("slow-column", SCHEMA);
 					long hotId = api.createColumn("hot-column", SCHEMA);
 					server.start();
-					var channel = io.grpc.ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort()).usePlaintext().build();
+					var channel = ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort()).usePlaintext().build();
 					var release = new CountDownLatch(1);
 					try {
 						var slow = connection.getInternalDB().getSchedulerForColumn(slowId);
@@ -227,17 +249,17 @@ class WorkloadGroupsTest {
 						var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 								.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY)
 								.setWorkloadContractVersion(3).setTimeoutNanos(Duration.ofSeconds(10).toNanos()).build();
-						var get = it.cavallium.rockserver.core.common.api.proto.GetRequest.newBuilder()
-								.setColumnId(slowId).addKeys(com.google.protobuf.ByteString.copyFrom(new byte[] {1})).setContext(context);
-						var stub = it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.newFutureStub(channel);
+						var get = GetRequest.newBuilder()
+								.setColumnId(slowId).addKeys(ByteString.copyFrom(new byte[] {1})).setContext(context);
+						var stub = RocksDBServiceGrpc.newFutureStub(channel);
 						var slowGet = stub.get(get.build());
 						awaitQueued(slow, WorkloadProfile.LATENCY, 1);
 						assertFalse(slowGet.isDone());
 						assertFalse(stub.get(get.setColumnId(hotId).build()).get(5, SECONDS).hasValue());
 						var data = it.cavallium.rockserver.core.common.api.proto.KV.newBuilder()
-								.addKeys(com.google.protobuf.ByteString.copyFrom(new byte[] {1}))
-								.setValue(com.google.protobuf.ByteString.copyFrom(new byte[] {42})).build();
-						var put = it.cavallium.rockserver.core.common.api.proto.PutRequest.newBuilder()
+								.addKeys(ByteString.copyFrom(new byte[] {1}))
+								.setValue(ByteString.copyFrom(new byte[] {42})).build();
+						var put = PutRequest.newBuilder()
 								.setColumnId(slowId).setData(data).setContext(context);
 						var slowPut = stub.put(put.build());
 						awaitQueued(slow, WorkloadProfile.LATENCY, 2);
@@ -246,7 +268,7 @@ class WorkloadGroupsTest {
 						var batchContext = context.toBuilder()
 								.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
 								.setTimeoutNanos(Long.MAX_VALUE).build();
-						var reactorStub = it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc.newReactorStub(channel);
+						var reactorStub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
 						var slowStream = reactorStub.putMulti(putMulti(slowId, batchContext, data)).toFuture();
 						awaitQueued(slow, WorkloadProfile.BATCH, 1);
 						assertFalse(slowStream.isDone());
@@ -269,14 +291,14 @@ class WorkloadGroupsTest {
 		}
 	}
 
-	private static reactor.core.publisher.Flux<it.cavallium.rockserver.core.common.api.proto.PutMultiRequest> putMulti(
+	private static Flux<PutMultiRequest> putMulti(
 			long columnId, it.cavallium.rockserver.core.common.api.proto.RequestContext context,
 			it.cavallium.rockserver.core.common.api.proto.KV data) {
-		return reactor.core.publisher.Flux.just(
-				it.cavallium.rockserver.core.common.api.proto.PutMultiRequest.newBuilder().setInitialRequest(
-						it.cavallium.rockserver.core.common.api.proto.PutMultiInitialRequest.newBuilder()
+		return Flux.just(
+				PutMultiRequest.newBuilder().setInitialRequest(
+						PutMultiInitialRequest.newBuilder()
 								.setColumnId(columnId).setContext(context)).build(),
-				it.cavallium.rockserver.core.common.api.proto.PutMultiRequest.newBuilder().setData(data).build());
+				PutMultiRequest.newBuilder().setData(data).build());
 	}
 
 	private static void blockWorkers(RWScheduler scheduler, OperationFamily family, CountDownLatch release) throws Exception {

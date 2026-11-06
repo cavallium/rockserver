@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.ClientRequestId;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
@@ -260,14 +261,14 @@ class LogEntryCodecTest {
 		assertEquals(2, LogEntryCodec.decodeBatch(old).size());
 		assertFalse(LogEntryCodec.needsStamp(plain));
 
-		var id = new it.cavallium.rockserver.core.common.ClientRequestId(17, 8, 6);
+		var id = new ClientRequestId(17, 8, 6);
 		var mixed = List.of(new Request(9, 4, 3, put), new Request(9, 5, 3, merge, id),
 				new Request(9, 6, 3, new LogEntry.RegisterClient(60_000)));
 		byte[] encoded = LogEntryCodec.encodeBatch(mixed);
 		assertEquals(LogEntryCodec.BATCH_VERSION_CLIENTS, encoded[0]);
 		assertTrue(LogEntryCodec.needsStamp(mixed));
 		assertArrayEquals(encoded, LogEntryCodec.encodeBatch(9, 3, new long[] {4, 5, 6},
-				new it.cavallium.rockserver.core.common.ClientRequestId[] {null, id, null},
+				new ClientRequestId[] {null, id, null},
 				mixed.stream().map(r -> LogEntryCodec.encodeEntryBody(r.entry())).toList()));
 		var decoded = LogEntryCodec.decodeBatch(encoded);
 		assertEquals(mixed.size(), decoded.size());
@@ -504,11 +505,11 @@ class LogEntryCodecTest {
 		var guard = Guard.of(1, keys("k"), buf("abc"));
 		assertEquals(3, guard.length());
 		assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-				java.util.HexFormat.of().formatHex(guard.sha256()));
+				HexFormat.of().formatHex(guard.sha256()));
 		var empty = Guard.of(1, keys("k"), Buf.wrap());
 		assertEquals(0, empty.length());
 		assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-				java.util.HexFormat.of().formatHex(empty.sha256()));
+				HexFormat.of().formatHex(empty.sha256()));
 		var absent = Guard.of(1, keys("k"), null);
 		assertEquals(-1, absent.length());
 		assertEquals(null, absent.sha256());
@@ -534,8 +535,8 @@ class LogEntryCodecTest {
 		// A value inside a larger array digests only its own bytes.
 		byte[] backing = "__abc__".getBytes(UTF_8);
 		assertTrue(value.matches(Buf.wrap(backing, 2, 5)));
-		assertEquals(java.util.HexFormat.of().formatHex(value.sha256()),
-				java.util.HexFormat.of().formatHex(Guard.of(1, keys("k"), Buf.wrap(backing, 2, 5)).sha256()));
+		assertEquals(HexFormat.of().formatHex(value.sha256()),
+				HexFormat.of().formatHex(Guard.of(1, keys("k"), Buf.wrap(backing, 2, 5)).sha256()));
 	}
 
 	@Test
@@ -603,7 +604,7 @@ class LogEntryCodecTest {
 		byte[] encoded = LogEntryCodec.encode(new Guarded(1, 2, new long[] {1}, new long[] {2},
 				List.of(new Put(1, keys("k"), buf("v"), RequestTypeId.NOTHING)), true, 7, Guard.of(1, keys("k"), buf("abc"))));
 		for (int length = 0; length < encoded.length; length++) {
-			assertRejected(java.util.Arrays.copyOf(encoded, length), "truncated to " + length);
+			assertRejected(Arrays.copyOf(encoded, length), "truncated to " + length);
 		}
 	}
 

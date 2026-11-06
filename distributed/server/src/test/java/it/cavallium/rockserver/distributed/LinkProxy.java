@@ -17,6 +17,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -103,7 +104,7 @@ public final class LinkProxy implements AutoCloseable {
 	/** Set while a thread waits for the target to accept connections again ({@link #acceptWhenTargetUp()}). */
 	private final AtomicBoolean watchingTarget = new AtomicBoolean();
 	/** Calls of {@link #acceptWhenTargetUp()}: one that a running watcher may have missed starts a new watcher. */
-	private final java.util.concurrent.atomic.AtomicLong watchRequests = new java.util.concurrent.atomic.AtomicLong();
+	private final AtomicLong watchRequests = new AtomicLong();
 	private final InetSocketAddress target;
 	private final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 	private final Thread acceptor;

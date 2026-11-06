@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.rockserver.distributed.CrashPoints.Point;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -206,7 +207,7 @@ class LaggingInstallTest {
 						return Long.parseLong(dash < 0 ? rest : rest.substring(0, dash));
 					})
 					.min().orElse(-1);
-		} catch (IOException | java.io.UncheckedIOException | NumberFormatException e) {
+		} catch (IOException | UncheckedIOException | NumberFormatException e) {
 			return -1;
 		}
 	}
@@ -222,7 +223,7 @@ class LaggingInstallTest {
 			return paths.anyMatch(path -> path.getParent() != null && path.getParent().getFileName() != null
 					&& path.getParent().getFileName().toString().equals("tmp")
 					&& path.getFileName().toString().startsWith("snapshot-"));
-		} catch (IOException | java.io.UncheckedIOException e) {
+		} catch (IOException | UncheckedIOException e) {
 			return false;
 		}
 	}

@@ -11,6 +11,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.Measurement;
 import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
 import io.micrometer.core.instrument.distribution.HistogramSnapshot;
@@ -23,7 +24,10 @@ import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.WorkloadAdmission;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -34,6 +38,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.ToDoubleFunction;
@@ -162,21 +167,21 @@ class RWSchedulerMetricsTest {
 		var registry = new SimpleMeterRegistry();
 		var scheduler = scheduler(registry, "metric-task-routing-cardinality");
 		try {
-			var routes = new java.util.HashSet<String>();
-			var metersByRoute = new java.util.HashMap<String, List<Meter>>();
+			var routes = new HashSet<String>();
+			var metersByRoute = new HashMap<String, List<Meter>>();
 			for (var meter : registry.getMeters()) {
 				String operationTag = meter.getId().getTag(OPERATION);
 				if (operationTag == null) continue;
 				var profile = WorkloadProfile.valueOf(
-						meter.getId().getTag(PROFILE).toUpperCase(java.util.Locale.ROOT));
-				var family = OperationFamily.valueOf(operationTag.toUpperCase(java.util.Locale.ROOT));
+						meter.getId().getTag(PROFILE).toUpperCase(Locale.ROOT));
+				var family = OperationFamily.valueOf(operationTag.toUpperCase(Locale.ROOT));
 				String expectedResource = RWScheduler.resourcePool(profile, family)
-						.name().toLowerCase(java.util.Locale.ROOT);
+						.name().toLowerCase(Locale.ROOT);
 				assertEquals(expectedResource, meter.getId().getTag(RESOURCE), meter.getId().toString());
 				String route = profile + "/" + family + "/" + expectedResource;
 				routes.add(route);
 				metersByRoute.computeIfAbsent(route, ignored -> new ArrayList<>()).add(meter);
-				var expectedTagKeys = new java.util.HashSet<>(Set.of(
+				var expectedTagKeys = new HashSet<>(Set.of(
 						"database", RESOURCE, PROFILE, OPERATION));
 				switch (meter.getId().getName()) {
 					case "rockserver.workload.outcomes" -> expectedTagKeys.add("outcome");
@@ -190,7 +195,7 @@ class RWSchedulerMetricsTest {
 				}
 				assertEquals(expectedTagKeys,
 						meter.getId().getTags().stream()
-								.map(io.micrometer.core.instrument.Tag::getKey)
+								.map(Tag::getKey)
 								.collect(Collectors.toSet()),
 						meter.getId().toString());
 			}
@@ -365,9 +370,9 @@ class RWSchedulerMetricsTest {
 							.execute(() -> completed.complete(null));
 					completed.get(5, SECONDS);
 					String resource = RWScheduler.resourcePool(profile, family)
-							.name().toLowerCase(java.util.Locale.ROOT);
-					String profileTag = profile.name().toLowerCase(java.util.Locale.ROOT);
-					String operationTag = family.name().toLowerCase(java.util.Locale.ROOT);
+							.name().toLowerCase(Locale.ROOT);
+					String profileTag = profile.name().toLowerCase(Locale.ROOT);
+					String operationTag = family.name().toLowerCase(Locale.ROOT);
 					String[] routeTags = {
 							"database", DATABASE,
 							RESOURCE, resource,
@@ -385,7 +390,7 @@ class RWSchedulerMetricsTest {
 						double expected = outcome == RWScheduler.TerminalOutcome.RUN ? 1.0 : 0.0;
 						assertEquals(expected, registry.get("rockserver.workload.outcomes")
 								.tags(routeTags)
-								.tag("outcome", outcome.name().toLowerCase(java.util.Locale.ROOT))
+								.tag("outcome", outcome.name().toLowerCase(Locale.ROOT))
 								.counter().count(), profile + "/" + family + "/" + outcome);
 					}
 					for (String result : List.of("accepted", "deadline", "overload", "shutdown")) {
@@ -620,7 +625,7 @@ class RWSchedulerMetricsTest {
 	}
 
 	private static Map<String, String> with(Map<String, String> tags, String key, String value) {
-		var result = new java.util.HashMap<>(tags);
+		var result = new HashMap<>(tags);
 		result.put(key, value);
 		return Map.copyOf(result);
 	}
@@ -632,7 +637,7 @@ class RWSchedulerMetricsTest {
 		var meter = requireMeter(registry, name, tags);
 		assertEquals(type, meter.getId().getType());
 		assertEquals(tags.keySet(), meter.getId().getTags().stream()
-				.map(io.micrometer.core.instrument.Tag::getKey)
+				.map(Tag::getKey)
 				.collect(Collectors.toUnmodifiableSet()));
 	}
 
@@ -643,7 +648,7 @@ class RWSchedulerMetricsTest {
 		var meter = requireMeter(registry, name, tags);
 		assertEquals(Meter.Type.GAUGE, meter.getId().getType());
 		assertEquals(tags.keySet(), meter.getId().getTags().stream()
-				.map(io.micrometer.core.instrument.Tag::getKey)
+				.map(Tag::getKey)
 				.collect(Collectors.toUnmodifiableSet()));
 		assertEquals(expected, ((Gauge) meter).value());
 	}
@@ -870,7 +875,7 @@ class RWSchedulerMetricsTest {
 	}
 
 	private record GuardedCounter(Counter delegate,
-			java.util.function.Consumer<Meter.Id> beforeRecording) implements Counter {
+			Consumer<Meter.Id> beforeRecording) implements Counter {
 
 		@Override
 		public void increment(double amount) {
@@ -890,7 +895,7 @@ class RWSchedulerMetricsTest {
 	}
 
 	private record GuardedTimer(Timer delegate,
-			java.util.function.Consumer<Meter.Id> beforeRecording) implements Timer {
+			Consumer<Meter.Id> beforeRecording) implements Timer {
 
 		@Override
 		public void record(long amount, TimeUnit unit) {

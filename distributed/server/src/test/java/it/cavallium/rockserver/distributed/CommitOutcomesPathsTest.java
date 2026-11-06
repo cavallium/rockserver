@@ -13,6 +13,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -85,7 +86,7 @@ class CommitOutcomesPathsTest {
 	void anUnknownOutcomeKeepsTheMarkAndAnyOtherEndRemovesIt() {
 		var session = new LeaderSession(5, applied);
 		var unknown = outcomes.markUnsettled(numbered(1), session);
-		outcomes.settle(unknown, new java.util.concurrent.CompletionException(
+		outcomes.settle(unknown, new CompletionException(
 				RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN, "no answer")));
 		assertEquals(1, outcomes.unsettledCommitsForTesting());
 		var refused = outcomes.markUnsettled(numbered(2), session);

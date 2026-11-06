@@ -14,9 +14,12 @@ import java.io.IOException;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.foreign.Arena;
+import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
@@ -81,7 +84,7 @@ abstract class DBTest {
 	private @interface TestAllImplementations {
 	}
 
-	@org.junit.jupiter.api.BeforeEach
+	@BeforeEach
 	void setUp() throws IOException {
 		if (System.getProperty("rockserver.core.print-config", null) == null) {
 			System.setProperty("rockserver.core.print-config", "false");
@@ -183,19 +186,19 @@ database: {
 
 	private void createColumn(ColumnSchema schema) {
 		if (colId != 0L) {
-			db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).deleteColumn(colId);
+			db.getSyncApi(RequestContext.batch()).deleteColumn(colId);
 		}
-		colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("column-test", schema);
+		colId = db.getSyncApi(RequestContext.batch()).createColumn("column-test", schema);
 	}
 
 	void fillSomeKeys() {
-		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key1, value1, RequestType.none()));
-		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, collidingKey1, value2, RequestType.none()));
-		Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, key2, bigValue, RequestType.none()));
+		Assertions.assertNull(db.getSyncApi(RequestContext.batch()).put(0, colId, key1, value1, RequestType.none()));
+		Assertions.assertNull(db.getSyncApi(RequestContext.batch()).put(0, colId, collidingKey1, value2, RequestType.none()));
+		Assertions.assertNull(db.getSyncApi(RequestContext.batch()).put(0, colId, key2, bigValue, RequestType.none()));
 		for (int i = 0; i < Byte.MAX_VALUE; i++) {
 			var keyI = getKeyI(i);
 			var valueI = getValueI(i);
-			Assertions.assertNull(db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, keyI, valueI, RequestType.none()));
+			Assertions.assertNull(db.getSyncApi(RequestContext.batch()).put(0, colId, keyI, valueI, RequestType.none()));
 		}
 	}
 
@@ -223,9 +226,9 @@ database: {
 		return toBufSimple(i, i, i, i, i);
 	}
 
-	@org.junit.jupiter.api.AfterEach
+	@AfterEach
 	void tearDown() throws IOException {
-		db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).deleteColumn(colId);
+		db.getSyncApi(RequestContext.batch()).deleteColumn(colId);
 		db.close();
 		arena.close();
 		Files.deleteIfExists(configFile);
@@ -320,7 +323,7 @@ database: {
 			Assertions.assertTrue(api.get(0, colId, key2, RequestType.exists()));
 
 			var rolledBackKey = getNotFoundKeyI(100);
-			long rollbackTransaction = api.openTransaction( java.time.Duration.ofMillis(5_000));
+			long rollbackTransaction = api.openTransaction( Duration.ofMillis(5_000));
 			Assertions.assertTrue(api.putMulti(rollbackTransaction,
 					colId,
 					List.of(rolledBackKey),
@@ -332,7 +335,7 @@ database: {
 			Assertions.assertFalse(api.get(0, colId, rolledBackKey, RequestType.exists()));
 
 			var committedKey = getNotFoundKeyI(101);
-			long commitTransaction = api.openTransaction( java.time.Duration.ofMillis(5_000));
+			long commitTransaction = api.openTransaction( Duration.ofMillis(5_000));
 			Assertions.assertTrue(api.putMulti(commitTransaction,
 					colId,
 					List.of(committedKey),
@@ -894,19 +897,19 @@ database: {
 					ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
 
 			var key1 = new Keys(new Buf[]{Buf.wrap(new byte[]{0, 0, 0, 1})});
-			var val1 = Buf.wrap("Initial".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+			var val1 = Buf.wrap("Initial".getBytes(StandardCharsets.UTF_8));
 
 			// 1. Initial Put
 			api.putAsync(0, mergeColId, key1, val1, RequestType.none()).join();
 
 			// 2. Merge (Patch)
-			var patchVal = Buf.wrap("-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+			var patchVal = Buf.wrap("-Patched".getBytes(StandardCharsets.UTF_8));
 			api.mergeAsync(0, mergeColId, key1, patchVal, RequestType.none()).join();
 
 			// 3. Verify Final State in DB
 			Buf current = api.get(0, mergeColId, key1, RequestType.current());
 			// MyStringAppendOperator appends with a comma separator
-			Buf expected = Buf.wrap("Initial,-Patched".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+			Buf expected = Buf.wrap("Initial,-Patched".getBytes(StandardCharsets.UTF_8));
 			assertSegmentEquals(expected, current);
 		}
 	}
@@ -926,17 +929,17 @@ database: {
 			var key = new Keys(new Buf[]{Buf.wrap(new byte[]{1, 2, 3, 4})});
 
 			// 1. Put "Start"
-			api.put(0, mColId, key, Buf.wrap("Start".getBytes(java.nio.charset.StandardCharsets.UTF_8)), RequestType.none());
+			api.put(0, mColId, key, Buf.wrap("Start".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
 			// 2. Merge ", Middle"
-			api.merge(0, mColId, key, Buf.wrap("Middle".getBytes(java.nio.charset.StandardCharsets.UTF_8)), RequestType.none());
+			api.merge(0, mColId, key, Buf.wrap("Middle".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
 			// 3. Merge ", End"
-			api.merge(0, mColId, key, Buf.wrap("End".getBytes(java.nio.charset.StandardCharsets.UTF_8)), RequestType.none());
+			api.merge(0, mColId, key, Buf.wrap("End".getBytes(StandardCharsets.UTF_8)), RequestType.none());
 
 			// 4. Verify value
 			var current = api.get(0, mColId, key, RequestType.current());
-			assertSegmentEquals(Buf.wrap("Start,Middle,End".getBytes(java.nio.charset.StandardCharsets.UTF_8)), current);
+			assertSegmentEquals(Buf.wrap("Start,Middle,End".getBytes(StandardCharsets.UTF_8)), current);
 		}
 	}
 
@@ -948,9 +951,9 @@ database: {
 		try (var tdb = new TestDB(db, connection)) {
 			RocksDBAPI api = tdb.getAPI();
 			long colId = api.createColumn("scan-raw-col",
-					it.cavallium.rockserver.core.common.ColumnSchema.of(
-							it.unimi.dsi.fastutil.ints.IntList.of(8),
-							it.unimi.dsi.fastutil.objects.ObjectList.of(),
+					ColumnSchema.of(
+							IntList.of(8),
+							ObjectList.of(),
 							true));
 
 			int count = 10000;
@@ -962,7 +965,7 @@ database: {
 				List<Buf> values = new ArrayList<>();
 				for (int j = 0; j < batchSize; j++) {
 					long val = i + j;
-					java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(8);
+					ByteBuffer bb = ByteBuffer.allocate(8);
 					bb.putLong(val);
 					Keys k = new Keys(Buf.wrap(bb.array()));
 
@@ -980,7 +983,7 @@ database: {
 			api.flush();
 
 			// ScanRaw
-			List<it.cavallium.rockserver.core.common.SerializedKVBatch> resultBatches;
+			List<SerializedKVBatch> resultBatches;
 			try (var stream = api.scanRaw(colId, 0, 1)) {
 				resultBatches = stream.collect(Collectors.toList());
 			}
@@ -998,7 +1001,7 @@ database: {
 					Keys k = kv.keys();
 					Buf v = kv.value();
 
-					long kLong = java.nio.ByteBuffer.wrap(k.keys()[0].toByteArray()).getLong();
+					long kLong = ByteBuffer.wrap(k.keys()[0].toByteArray()).getLong();
 					String vStr = new String(v.toByteArray(), StandardCharsets.UTF_8);
 					Assertions.assertEquals("val-" + kLong, vStr);
 					foundKeys.add(kLong);
@@ -1017,14 +1020,14 @@ database: {
 	@Test
 	void testTranscodeBatchKeysRegression() throws Exception {
 		var schema = ColumnSchema.of(
-				it.unimi.dsi.fastutil.ints.IntList.of(Integer.BYTES),
-				it.unimi.dsi.fastutil.objects.ObjectList.of(ColumnHashType.XXHASH32),
+				IntList.of(Integer.BYTES),
+				ObjectList.of(ColumnHashType.XXHASH32),
 				true
 		);
-		long testColId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn("transcodeTest", schema);
+		long testColId = db.getSyncApi(RequestContext.batch()).createColumn("transcodeTest", schema);
 		try {
 			// Access ColumnInstance via InternalDB using Reflection
-			java.lang.reflect.Method getColumnMethod = EmbeddedDB.class.getDeclaredMethod("getColumn", long.class);
+			Method getColumnMethod = EmbeddedDB.class.getDeclaredMethod("getColumn", long.class);
 			getColumnMethod.setAccessible(true);
 			ColumnInstance col = (ColumnInstance) getColumnMethod.invoke(db.getInternalDB(), testColId);
 
@@ -1072,7 +1075,7 @@ database: {
 			}
 
 		} finally {
-			db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).deleteColumn(testColId);
+			db.getSyncApi(RequestContext.batch()).deleteColumn(testColId);
 		}
 	}
 }

@@ -4,9 +4,11 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.nio.ByteBuffer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -51,14 +53,14 @@ public class SchemaUpdateTest {
         // --- STEP 1: V1 ---
         try (EmbeddedConnection db = new EmbeddedConnection(tempDir, dbName, configV1)) {
             // Create column with V1 schema (explicit class name)
-            colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.MyStringAppendOperator"));
+            colId = db.getSyncApi(RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.MyStringAppendOperator"));
 
             // Put "A", Merge "B" -> "A,B"
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).put(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("A".getBytes()), RequestType.none());
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("B".getBytes()), RequestType.none());
+            db.getSyncApi(RequestContext.batch()).put(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("A".getBytes()), RequestType.none());
+            db.getSyncApi(RequestContext.batch()).merge(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("B".getBytes()), RequestType.none());
 
             // Verify
-            Buf val = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, new Keys(Buf.wrap(intToBytes(1))), RequestType.current());
+            Buf val = db.getSyncApi(RequestContext.batch()).get(0, colId, new Keys(Buf.wrap(intToBytes(1))), RequestType.current());
             assertEquals("A,B", new String(val.toByteArray()));
         }
 
@@ -66,12 +68,12 @@ public class SchemaUpdateTest {
         try (EmbeddedConnection db = new EmbeddedConnection(tempDir, dbName, configV2)) {
             // Call createColumn with V2 schema (New Class Name)
             // This exercises the fix: schema update on disk
-            colId = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.test.MyStringAppendOperatorV2"));
+            colId = db.getSyncApi(RequestContext.batch()).createColumn(colName, ColumnSchema.of(IntList.of(4), ObjectList.of(), true, null, null, "it.cavallium.rockserver.core.impl.test.MyStringAppendOperatorV2"));
 
             // Merge "C" -> Should use V2 (semicolon) -> "A,B;C"
-            db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).merge(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("C".getBytes()), RequestType.none());
+            db.getSyncApi(RequestContext.batch()).merge(0, colId, new Keys(Buf.wrap(intToBytes(1))), Buf.wrap("C".getBytes()), RequestType.none());
 
-            Buf val = db.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).get(0, colId, new Keys(Buf.wrap(intToBytes(1))), RequestType.current());
+            Buf val = db.getSyncApi(RequestContext.batch()).get(0, colId, new Keys(Buf.wrap(intToBytes(1))), RequestType.current());
             String valStr = new String(val.toByteArray());
             System.out.println("[DEBUG_LOG] Result value: " + valStr);
             assertTrue(valStr.contains(";"), "Result " + valStr + " should contain semicolon, proving V2 was used");
@@ -79,6 +81,6 @@ public class SchemaUpdateTest {
     }
 
     private byte[] intToBytes(int x) {
-        return java.nio.ByteBuffer.allocate(4).putInt(x).array();
+        return ByteBuffer.allocate(4).putInt(x).array();
     }
 }

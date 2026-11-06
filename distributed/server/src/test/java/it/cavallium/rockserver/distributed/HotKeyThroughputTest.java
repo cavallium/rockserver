@@ -12,6 +12,7 @@ import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -83,7 +84,7 @@ class HotKeyThroughputTest {
 	/** Runs {@code clients} clients updating one key, and one client of {@code transactions} if it is not null. */
 	private static double updatesPerSecond(Path root, boolean pipelined, int clients, Transactions transactions)
 			throws Exception {
-		java.nio.file.Files.createDirectories(root);
+		Files.createDirectories(root);
 		try (var cluster = new InProcessCluster(root, 3, c -> c.withPipelinedUpdates(pipelined)).startAll()) {
 			var leader = cluster.awaitLeader(Duration.ofSeconds(30));
 			var api = leader.connection().getSyncApi(CONTEXT);

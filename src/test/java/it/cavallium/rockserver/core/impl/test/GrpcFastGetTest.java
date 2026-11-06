@@ -32,9 +32,12 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.api.proto.CloseIteratorRequest;
+import it.cavallium.rockserver.core.common.api.proto.CloseTransactionRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetResponse;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
+import it.cavallium.rockserver.core.common.api.proto.WorkloadProfile;
 import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -46,10 +49,12 @@ import java.net.NetworkInterface;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -68,7 +73,7 @@ class GrpcFastGetTest {
 			"grpc-encoding", Metadata.ASCII_STRING_MARSHALLER);
 	private static final it.cavallium.rockserver.core.common.api.proto.RequestContext BATCH_CONTEXT =
 			it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
-					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+					.setProfile(WorkloadProfile.BATCH)
 					.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE)
 					.build();
@@ -82,13 +87,13 @@ class GrpcFastGetTest {
 			long columnId = populate(embedded);
 			var embeddedApi = embedded.getSyncApi(
 					it.cavallium.rockserver.core.common.RequestContext.batch());
-			long rollbackTransaction = embeddedApi.openTransaction(java.time.Duration.ofMinutes(1L));
+			long rollbackTransaction = embeddedApi.openTransaction(Duration.ofMinutes(1L));
 			try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 				server.start();
 				try (var client = ClientHandle.forTcp("127.0.0.1", server.getPort())) {
 					for (int version : new int[] {0, 2, 4}) {
 						var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
-								.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+								.setProfile(WorkloadProfile.BATCH)
 								.setTimeoutNanos(Long.MAX_VALUE);
 						if (version != 0) context.setWorkloadContractVersion(version);
 						var request = request(columnId, 0L, 0L).toBuilder().setContext(context).build();
@@ -98,13 +103,13 @@ class GrpcFastGetTest {
 					}
 					var protectedFailure = assertThrows(StatusRuntimeException.class,
 							() -> client.stub().closeIterator(
-									it.cavallium.rockserver.core.common.api.proto.CloseIteratorRequest
+									CloseIteratorRequest
 											.newBuilder().setIteratorId(1L).build()));
 					assertEquals(Status.Code.INVALID_ARGUMENT, protectedFailure.getStatus().getCode());
 					var v2Context = BATCH_CONTEXT.toBuilder().setWorkloadContractVersion(2).build();
 					var rollbackFailure = assertThrows(StatusRuntimeException.class,
 							() -> client.stub().closeTransaction(
-									it.cavallium.rockserver.core.common.api.proto.CloseTransactionRequest
+									CloseTransactionRequest
 											.newBuilder()
 											.setTransactionId(rollbackTransaction)
 											.setCommit(false)
@@ -196,7 +201,7 @@ class GrpcFastGetTest {
 		try (var embedded = openEmbedded("fallbacks")) {
 			long columnId = populate(embedded);
 			var api = embedded.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
-			long transactionId = api.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
+			long transactionId = api.openTransaction( Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
 			byte[] transactionValue = value(42, 513);
 			api.put(transactionId, columnId, keys(42), Buf.wrap(transactionValue), RequestType.none());
 			System.setProperty("rockserver.grpc.fast-get.strategy", "automatic");
@@ -402,7 +407,7 @@ class GrpcFastGetTest {
 	}
 
 	private record ClientHandle(ManagedChannel channel,
-			@org.jetbrains.annotations.Nullable EventLoopGroup eventLoop,
+			@Nullable EventLoopGroup eventLoop,
 			RocksDBServiceGrpc.RocksDBServiceBlockingStub stub,
 			AtomicReference<String> encoding) implements AutoCloseable {
 
@@ -418,7 +423,7 @@ class GrpcFastGetTest {
 		}
 
 		private static ClientHandle build(NettyChannelBuilder builder,
-				@org.jetbrains.annotations.Nullable EventLoopGroup eventLoop) {
+				@Nullable EventLoopGroup eventLoop) {
 			AtomicReference<String> encoding = new AtomicReference<>();
 			ManagedChannel channel = builder.directExecutor()
 					.usePlaintext()

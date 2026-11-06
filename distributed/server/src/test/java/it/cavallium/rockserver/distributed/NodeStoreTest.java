@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.typesafe.config.ConfigFactory;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
@@ -22,6 +23,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -33,6 +35,7 @@ import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.OptimisticTransactionDB;
 
 class NodeStoreTest {
 
@@ -99,7 +102,7 @@ class NodeStoreTest {
 		Files.writeString(config, "database.global.optimistic = false\n");
 		try (var store = NodeStore.open(tempDir.resolve("db"), config, "pessimistic")) {
 			assertTrue(store.db().getConfig().global().optimistic());
-			assertTrue(store.db().getDb().get() instanceof org.rocksdb.OptimisticTransactionDB,
+			assertTrue(store.db().getDb().get() instanceof OptimisticTransactionDB,
 					"opened as " + store.db().getDb().get().getClass().getName());
 		}
 	}
@@ -167,16 +170,16 @@ class NodeStoreTest {
 		Path latest;
 		try (var files = Files.list(dbDir)) {
 			latest = files.filter(file -> file.getFileName().toString().startsWith("OPTIONS-"))
-					.max(java.util.Comparator.comparingLong(file -> Long.parseLong(file.getFileName().toString().substring(8))))
+					.max(Comparator.comparingLong(file -> Long.parseLong(file.getFileName().toString().substring(8))))
 					.orElseThrow();
 		}
-		var columns = new java.util.HashMap<String, Map<String, String>>();
+		var columns = new HashMap<String, Map<String, String>>();
 		Map<String, String> current = null;
 		for (String line : Files.readAllLines(latest)) {
 			var trimmed = line.strip();
 			if (trimmed.startsWith("[CFOptions \"")) {
 				var column = trimmed.substring("[CFOptions \"".length(), trimmed.length() - 2);
-				current = new java.util.HashMap<>();
+				current = new HashMap<>();
 				columns.put(column.equals(NodeStore.META_COLUMN) ? "meta" : column, current);
 			} else if (trimmed.startsWith("[")) {
 				current = null;
@@ -189,12 +192,12 @@ class NodeStoreTest {
 
 	@Test
 	void theWriteBufferBudgetDefaultsLikeTheDatabase() {
-		assertEquals(128L << 20, NodeStore.writeBufferBudget(com.typesafe.config.ConfigFactory.empty()));
-		assertEquals(256L << 20, NodeStore.writeBufferBudget(com.typesafe.config.ConfigFactory.parseString("""
+		assertEquals(128L << 20, NodeStore.writeBufferBudget(ConfigFactory.empty()));
+		assertEquals(256L << 20, NodeStore.writeBufferBudget(ConfigFactory.parseString("""
 				database.global.write-buffer-manager = 0
 				database.global.block-cache = 512MiB
 				""")));
-		var resized = NodeStore.withReplicaWriteBuffers(com.typesafe.config.ConfigFactory.empty());
+		var resized = NodeStore.withReplicaWriteBuffers(ConfigFactory.empty());
 		assertEquals("134217728B", resized.getString("database.global.fallback-column-options.write-buffer-size"));
 		assertFalse(resized.hasPath("database.global.column-options"), "only the columns the config lists");
 	}

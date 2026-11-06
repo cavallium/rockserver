@@ -15,6 +15,9 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.Consumer;
+import java.util.function.DoubleSupplier;
+import java.util.function.LongSupplier;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -87,7 +90,7 @@ final class NodeMetrics {
 	private final Object exportLock = new Object();
 	private @Nullable MeterRegistry registry;
 	/** A gauge exported but not logged, see {@link #exportedGauge}; {@code tag} is a key and a value, or empty. */
-	private record ExportedGauge(String name, List<String> tag, java.util.function.DoubleSupplier value) {}
+	private record ExportedGauge(String name, List<String> tag, DoubleSupplier value) {}
 
 	/** Gauges exported but not logged, by name and tag. */
 	private final Map<List<String>, ExportedGauge> exportedGauges = new ConcurrentHashMap<>();
@@ -124,10 +127,10 @@ final class NodeMetrics {
 		return DistributedProperties.getLong(DEFAULT_LAG_SAMPLE_MS, LAG_SAMPLE_PROPERTY);
 	}
 
-	private final Map<String, java.util.function.LongSupplier> gauges = new ConcurrentHashMap<>();
+	private final Map<String, LongSupplier> gauges = new ConcurrentHashMap<>();
 
 	/** A value read and logged at every interval, such as a queue length. */
-	void gauge(String name, java.util.function.LongSupplier value) {
+	void gauge(String name, LongSupplier value) {
 		if (gauges.put(name, value) == null) {
 			export(registry -> registerGauge(registry, name, () -> value.getAsLong()));
 		}
@@ -137,12 +140,12 @@ final class NodeMetrics {
 	 * A value exported to the metrics pipeline only, not logged: the state that alerts read ({@link NodeMonitor}). Read
 	 * by the pipeline's own thread, so it must be cheap: NaN when unknown.
 	 */
-	void exportedGauge(String name, java.util.function.DoubleSupplier value) {
+	void exportedGauge(String name, DoubleSupplier value) {
 		exportedGauge(new ExportedGauge(name, List.of(), value));
 	}
 
 	/** {@link #exportedGauge(String, java.util.function.DoubleSupplier)} with one more tag, such as a follower's id. */
-	void exportedGauge(String name, String tagKey, String tagValue, java.util.function.DoubleSupplier value) {
+	void exportedGauge(String name, String tagKey, String tagValue, DoubleSupplier value) {
 		exportedGauge(new ExportedGauge(name, List.of(tagKey, tagValue), value));
 	}
 
@@ -199,7 +202,7 @@ final class NodeMetrics {
 		}
 	}
 
-	private void export(java.util.function.Consumer<MeterRegistry> registration) {
+	private void export(Consumer<MeterRegistry> registration) {
 		synchronized (exportLock) {
 			if (registry != null) {
 				registration.accept(registry);
@@ -230,12 +233,12 @@ final class NodeMetrics {
 				.register(registry);
 	}
 
-	private void registerGauge(MeterRegistry registry, String name, java.util.function.DoubleSupplier value) {
+	private void registerGauge(MeterRegistry registry, String name, DoubleSupplier value) {
 		registerGauge(registry, name, List.of(), value);
 	}
 
 	private void registerGauge(MeterRegistry registry, String name, List<String> tag,
-			java.util.function.DoubleSupplier value) {
+			DoubleSupplier value) {
 		var builder = Gauge.builder("rockserver.replication." + name, () -> {
 					try {
 						return value.getAsDouble();

@@ -19,6 +19,7 @@ import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -28,13 +29,16 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
@@ -825,7 +829,7 @@ class RWSchedulerIndexedQueueTest {
 
 			releaseBlocker.countDown();
 			assertTrue(completed.await(5, SECONDS));
-			assertEquals(java.util.stream.IntStream.range(0, 16).boxed().toList(), order);
+			assertEquals(IntStream.range(0, 16).boxed().toList(), order);
 			assertReadPoolDrained(scheduler);
 		} finally {
 			releaseBlocker.countDown();
@@ -1505,9 +1509,9 @@ class RWSchedulerIndexedQueueTest {
 
 		var poolField = RWScheduler.class.getDeclaredField("readPool");
 		poolField.setAccessible(true);
-		var pool = (java.util.concurrent.ExecutorService) poolField.get(scheduler);
-		assertTrue(pool.awaitTermination(0L, java.util.concurrent.TimeUnit.NANOSECONDS));
-		assertTrue(pool.awaitTermination(Long.MAX_VALUE, java.util.concurrent.TimeUnit.DAYS));
+		var pool = (ExecutorService) poolField.get(scheduler);
+		assertTrue(pool.awaitTermination(0L, TimeUnit.NANOSECONDS));
+		assertTrue(pool.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS));
 	}
 
 	@Test
@@ -1830,7 +1834,7 @@ class RWSchedulerIndexedQueueTest {
 		}
 
 		private Set<RWScheduler.TerminalOutcome> allowedOutcomes() {
-			var outcomes = java.util.EnumSet.noneOf(RWScheduler.TerminalOutcome.class);
+			var outcomes = EnumSet.noneOf(RWScheduler.TerminalOutcome.class);
 			for (var trigger : List.of(first, second)) {
 				outcomes.add(switch (trigger) {
 					case CANCELLATION -> RWScheduler.TerminalOutcome.CANCELLATION;

@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeoutException;
 import org.junit.jupiter.api.AfterEach;
@@ -29,7 +30,7 @@ class LocalCommandsTest {
 	@TempDir
 	Path temp;
 	private NodeMetrics metrics;
-	private java.util.concurrent.ExecutorService inline;
+	private ExecutorService inline;
 
 	@AfterEach
 	void tearDown() {

@@ -4,6 +4,7 @@ import static it.cavallium.rockserver.core.common.Utils.asByteBuffer;
 
 import it.cavallium.rockserver.core.client.RocksDBConnection;
 import it.cavallium.rockserver.core.common.KVBatch.KVBatchRef;
+import it.cavallium.rockserver.core.common.KVBatch;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.MultiGetPage;
 import it.cavallium.rockserver.core.common.RangeBudget;
@@ -18,15 +19,21 @@ import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.Utils;
+import it.cavallium.rockserver.core.common.WorkloadProfile;
+import it.cavallium.rockserver.core.common.api.Capabilities;
 import it.cavallium.rockserver.core.common.api.Column;
 import it.cavallium.rockserver.core.common.api.ColumnHashType;
 import it.cavallium.rockserver.core.common.api.ColumnSchema;
+import it.cavallium.rockserver.core.common.api.ColumnTablePropertiesData;
 import it.cavallium.rockserver.core.common.api.Delta;
 import it.cavallium.rockserver.core.common.api.FirstAndLast;
 import it.cavallium.rockserver.core.common.api.KV;
 import it.cavallium.rockserver.core.common.api.MergeBatchMode;
 import it.cavallium.rockserver.core.common.api.OptionalBinary;
+import it.cavallium.rockserver.core.common.api.OptionalI64;
 import it.cavallium.rockserver.core.common.api.PutBatchMode;
+import it.cavallium.rockserver.core.common.api.RangePage;
+import it.cavallium.rockserver.core.common.api.RangeRequestType;
 import it.cavallium.rockserver.core.common.api.RocksDB.Iface;
 import it.cavallium.rockserver.core.common.api.RocksDB.Processor;
 import it.cavallium.rockserver.core.common.api.RocksDBThriftException;
@@ -39,6 +46,7 @@ import java.io.IOException;
 import it.cavallium.buffer.Buf;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -215,29 +223,29 @@ public class ThriftServer extends Server {
 	private static RequestContext parseRequestContext(
 			it.cavallium.rockserver.core.common.api.RequestContext wireContext) {
 		if (wireContext == null || wireContext.profile == null) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(
-					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+			throw RocksDBException.of(
+					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Request context and workload profile are required");
 		}
 		if (wireContext.workloadContractVersion
 				!= RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(
-					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+			throw RocksDBException.of(
+					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Request context requires workload contract version "
 							+ RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		}
-		final it.cavallium.rockserver.core.common.WorkloadProfile profile;
+		final WorkloadProfile profile;
 		try {
-			profile = it.cavallium.rockserver.core.common.WorkloadProfile.fromWireValue(
+			profile = WorkloadProfile.fromWireValue(
 					wireContext.profile.getValue());
 		} catch (IllegalArgumentException unknown) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(
-					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+			throw RocksDBException.of(
+					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					unknown.getMessage(), unknown);
 		}
 		if (!profile.isClientSelectable()) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(
-					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+			throw RocksDBException.of(
+					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Workload profile " + profile + " is owned by Rockserver");
 		}
 		try {
@@ -251,8 +259,8 @@ public class ThriftServer extends Server {
 			}
 			return new RequestContext(profile, wireContext.timeoutNanos);
 		} catch (IllegalArgumentException invalid) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(
-					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+			throw RocksDBException.of(
+					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Invalid request context: " + invalid.getMessage(), invalid);
 		}
 	}
@@ -328,8 +336,8 @@ public class ThriftServer extends Server {
 						} catch (InterruptedException interrupted) {
 							handleInterruptedFuture(request, asyncApi, future);
 							Thread.currentThread().interrupt();
-							throw it.cavallium.rockserver.core.common.RocksDBException.of(
-									it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.INTERNAL_ERROR,
+							throw RocksDBException.of(
+									RocksDBException.RocksDBErrorType.INTERNAL_ERROR,
 									"Thrift request interrupted",
 									interrupted);
 						} catch (ExecutionException error) {
@@ -375,8 +383,8 @@ public class ThriftServer extends Server {
 						: context.value().timeoutNanos() - elapsedNanos;
 			}
 			if (remainingNanos == 0L) {
-				throw it.cavallium.rockserver.core.common.RocksDBException.of(
-						it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+				throw RocksDBException.of(
+						RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 						"Request deadline expired before downstream dispatch");
 			}
 			return context.value().withTimeoutNanos(remainingNanos);
@@ -497,7 +505,7 @@ public class ThriftServer extends Server {
 			int depth = 0;
 			for (var current = unwrapped; current != null && depth < 32;
 					current = current.getCause(), depth++) {
-				if (current instanceof it.cavallium.rockserver.core.common.RocksDBException rocksError) {
+				if (current instanceof RocksDBException rocksError) {
 					return rocksError;
 				}
 				if (current.getCause() == current) {
@@ -510,8 +518,8 @@ public class ThriftServer extends Server {
 			var cause = unwrapped != null
 					? unwrapped
 					: new IllegalStateException("Async request failed without a cause");
-			return it.cavallium.rockserver.core.common.RocksDBException.of(
-					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.INTERNAL_ERROR,
+			return RocksDBException.of(
+					RocksDBException.RocksDBErrorType.INTERNAL_ERROR,
 					"Thrift async request failed: " + operationName(request),
 					cause);
 		}
@@ -540,7 +548,7 @@ public class ThriftServer extends Server {
 			return request.getClass().getSimpleName();
 		}
 
-		private RocksDBThriftException mapException(it.cavallium.rockserver.core.common.RocksDBException e) {
+		private RocksDBThriftException mapException(RocksDBException e) {
 			return new RocksDBThriftException(
 					it.cavallium.rockserver.core.common.api.RocksDBErrorType.valueOf(e.getErrorUniqueId().name()),
 					e.getMessage()
@@ -548,9 +556,9 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public it.cavallium.rockserver.core.common.api.Capabilities getCapabilities() {
+		public Capabilities getCapabilities() {
 			var capabilities = RockserverCapabilities.CURRENT;
-			return new it.cavallium.rockserver.core.common.api.Capabilities(
+			return new Capabilities(
 					capabilities.workloadContractVersion());
 		}
 
@@ -558,8 +566,8 @@ public class ThriftServer extends Server {
 		public long openTransaction(long transactionLeaseTtlNanos,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
-				return api(context).openTransaction(java.time.Duration.ofNanos(transactionLeaseTtlNanos));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				return api(context).openTransaction(Duration.ofNanos(transactionLeaseTtlNanos));
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -572,7 +580,7 @@ public class ThriftServer extends Server {
 				}
 				requireV3(context == null ? 0 : context.workloadContractVersion);
 				return protectedApi().closeTransaction(transactionId, false);
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -582,7 +590,7 @@ public class ThriftServer extends Server {
 			try {
 				requireV3(workloadContractVersion);
 				protectedApi().closeFailedUpdate(updateId);
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -591,7 +599,7 @@ public class ThriftServer extends Server {
 		public long createColumn(String name, ColumnSchema schema, it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return api(context).createColumn(name, columnSchemaToRecord(schema));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -600,7 +608,7 @@ public class ThriftServer extends Server {
 		public void deleteColumn(long columnId, it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				api(context).deleteColumn(columnId);
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -609,7 +617,7 @@ public class ThriftServer extends Server {
 		public boolean deleteColumnIfExists(String name, it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return api(context).deleteColumnIfExists(name);
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -624,7 +632,7 @@ public class ThriftServer extends Server {
 				api(context).deleteRange(columnId,
 						keysToRecord(startKeysInclusive),
 						keysToRecord(endKeysExclusive));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -634,17 +642,17 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return api(context).getColumnId(name);
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
         @Override
-        public it.cavallium.rockserver.core.common.api.ColumnTablePropertiesData getTableProperties(long columnId,
+        public ColumnTablePropertiesData getTableProperties(long columnId,
                 it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
             try {
                 var p = api(context).getTableProperties(columnId);
-                return new it.cavallium.rockserver.core.common.api.ColumnTablePropertiesData()
+                return new ColumnTablePropertiesData()
                         .setTableCount(p.tableCount())
                         .setDataSize(p.dataSize())
                         .setIndexSize(p.indexSize())
@@ -674,7 +682,7 @@ public class ThriftServer extends Server {
                         .setPrefixExtractors(p.prefixExtractors())
                         .setPropertyCollectors(p.propertyCollectors())
                         .setCompressions(p.compressions());
-            } catch (it.cavallium.rockserver.core.common.RocksDBException e) { throw mapException(e); }
+            } catch (RocksDBException e) { throw mapException(e); }
         }
 
 		@Override
@@ -682,7 +690,7 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return api(context).estimateNumKeys(columnId);
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -708,7 +716,7 @@ public class ThriftServer extends Server {
 						keysToRecord(keys),
 						keyToRecord(value),
 						RequestType.none());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -725,7 +733,7 @@ public class ThriftServer extends Server {
 						keysToRecord(keys),
 						keyToRecord(value),
 						RequestType.ensure());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -742,7 +750,7 @@ public class ThriftServer extends Server {
 						keysToRecords(keysMulti),
 						keyToRecords(valueMulti),
 						RequestType.none());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -759,7 +767,7 @@ public class ThriftServer extends Server {
 						keysToRecords(keysMulti),
 						keyToRecords(valueMulti),
 						RequestType.ensure());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -773,7 +781,7 @@ public class ThriftServer extends Server {
 			try {
 				return ThriftServer.mapResult(api(context).put(transactionOrUpdateId, columnId, keysToRecord(keys),
 						keyToRecord(value), RequestType.previous()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -787,7 +795,7 @@ public class ThriftServer extends Server {
 			try {
 				return ThriftServer.mapResult(api(context).put(transactionOrUpdateId, columnId, keysToRecord(keys),
 						keyToRecord(value), RequestType.delta()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -801,7 +809,7 @@ public class ThriftServer extends Server {
 			try {
 				return api(context).put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value),
 						RequestType.changed());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -815,7 +823,7 @@ public class ThriftServer extends Server {
 			try {
 				return api(context).put(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value),
 						RequestType.previousPresence());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -828,7 +836,7 @@ public class ThriftServer extends Server {
 			try {
 				api(context).delete(
 						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.none());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -841,7 +849,7 @@ public class ThriftServer extends Server {
 			try {
 				return ThriftServer.mapResult(api(context).delete(
 						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.previous()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -854,7 +862,7 @@ public class ThriftServer extends Server {
 			try {
 				return api(context).delete(
 						transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.previousPresence());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -867,7 +875,7 @@ public class ThriftServer extends Server {
 			try {
 				api(context).deleteMulti(
 						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.none());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -880,7 +888,7 @@ public class ThriftServer extends Server {
 			try {
 				return ThriftServer.mapResult(api(context).deleteMulti(
 						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.previous()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -893,7 +901,7 @@ public class ThriftServer extends Server {
 			try {
 				return api(context).deleteMulti(
 						transactionOrUpdateId, columnId, keysToRecords(keysMulti), RequestType.previousPresence());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -905,7 +913,7 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return ThriftServer.mapResult(api(context).get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.current()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -917,7 +925,7 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return mapResult(api(context).get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.forUpdate()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -929,7 +937,7 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return api(context).get(transactionOrUpdateId, columnId, keysToRecord(keys), RequestType.exists());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -983,7 +991,7 @@ public class ThriftServer extends Server {
 				return api(context).existsMulti(transactionId,
 						columnId,
 						keysToRecords(keysMulti));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -999,8 +1007,8 @@ public class ThriftServer extends Server {
 			try {
 				return api(context).openIterator(transactionId, columnId, keysToRecord(startKeysInclusive),
 						keysToRecord(endKeysExclusive), reverse,
-						java.time.Duration.ofNanos(iteratorLeaseTtlNanos));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+						Duration.ofNanos(iteratorLeaseTtlNanos));
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1010,7 +1018,7 @@ public class ThriftServer extends Server {
 			try {
 				requireV3(workloadContractVersion);
 				protectedApi().closeIterator(iteratorId);
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1021,7 +1029,7 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				api(context).seekTo(iterationId, keysToRecord(keys));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1033,7 +1041,7 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				api(context).subsequent(iterationId, skipCount, takeCount, RequestType.none());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1045,7 +1053,7 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return api(context).subsequent(iterationId, skipCount, takeCount, RequestType.exists());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1057,7 +1065,7 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return mapResult(api(context).subsequent(iterationId, skipCount, takeCount, RequestType.multi()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1067,7 +1075,7 @@ public class ThriftServer extends Server {
 				throws RocksDBThriftException {
 			try {
 				api(context).putBatch(columnId, kvToBatch(data), mapPutBatchMode(mode));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1081,7 +1089,7 @@ public class ThriftServer extends Server {
 			try {
 				api(context).merge(transactionOrUpdateId, columnId, keysToRecord(keys), keyToRecord(value),
 						RequestType.none());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1095,7 +1103,7 @@ public class ThriftServer extends Server {
 			try {
 				api(context).mergeMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti), keyToRecords(valueMulti),
 						RequestType.none());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1105,7 +1113,7 @@ public class ThriftServer extends Server {
 				throws RocksDBThriftException {
 			try {
 				api(context).mergeBatch(columnId, kvToBatch(data), mapMergeBatchMode(mode));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1119,7 +1127,7 @@ public class ThriftServer extends Server {
 			try {
 				return ThriftServer.mapResult(api(context).merge(transactionOrUpdateId, columnId, keysToRecord(keys),
 						keyToRecord(value), RequestType.merged()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1133,7 +1141,7 @@ public class ThriftServer extends Server {
 			try {
 				return ThriftServer.mapResult(api(context).mergeMulti(transactionOrUpdateId, columnId,
 						keysToRecords(keysMulti), keyToRecords(valueMulti), RequestType.merged()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1145,23 +1153,23 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return api(context).uploadMergeOperator(operatorName, className, Utils.toByteArray(Utils.fromByteBuffer(jarPayload)));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public it.cavallium.rockserver.core.common.api.OptionalI64 checkMergeOperator(String operatorName,
+		public OptionalI64 checkMergeOperator(String operatorName,
 				ByteBuffer hash,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				var version = api(context).checkMergeOperator(operatorName, Utils.toByteArray(Utils.fromByteBuffer(hash)));
-				var result = new it.cavallium.rockserver.core.common.api.OptionalI64();
+				var result = new OptionalI64();
 				if (version != null) {
 					result.setValue(version);
 				}
 				return result;
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1175,7 +1183,7 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return mapFirstAndLast(api(context).reduceRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.firstAndLast()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1189,7 +1197,7 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				return api(context).reduceRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.entriesCount());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1205,7 +1213,7 @@ public class ThriftServer extends Server {
 				return api(context).getRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.allInRange())
 						.map(ThriftServer::mapKV)
 						.collect(Collectors.toList());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1221,37 +1229,37 @@ public class ThriftServer extends Server {
 				return api(context).getRange(transactionId, columnId, keysToRecord(startKeysInclusive), keysToRecord(endKeysExclusive), reverse, RequestType.allInRangeNoCache())
 						.map(ThriftServer::mapKV)
 						.collect(Collectors.toList());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
 
 		@Override
-		public it.cavallium.rockserver.core.common.api.RangePage getRangePage(long transactionId,
+		public RangePage getRangePage(long transactionId,
 				long columnId,
 				List<ByteBuffer> startKeysInclusive,
 				List<ByteBuffer> endKeysExclusive,
 				boolean reverse,
 				List<ByteBuffer> resumeAfter,
-				it.cavallium.rockserver.core.common.api.RangeRequestType requestType,
+				RangeRequestType requestType,
 				it.cavallium.rockserver.core.common.api.RangeBudget budget,
 				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
 			try {
 				if (requestType == null) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					throw RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 							"Range request type is required");
 				}
 				if (budget == null) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					throw RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 							"Range budget is required");
 				}
 				var mappedRequestType = switch (requestType.getValue()) {
 					case 1 -> RequestType.<it.cavallium.rockserver.core.common.KV>allInRange();
 					case 2 -> RequestType.<it.cavallium.rockserver.core.common.KV>allInRangeNoCache();
-					default -> throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					default -> throw RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 							"Unknown range request type: " + requestType.getValue());
 				};
 				final it.cavallium.rockserver.core.common.RangeBudget mappedBudget;
@@ -1259,8 +1267,8 @@ public class ThriftServer extends Server {
 					mappedBudget = new it.cavallium.rockserver.core.common.RangeBudget(
 							budget.getMaxItems(), budget.getMaxBytes());
 				} catch (IllegalArgumentException invalid) {
-					throw it.cavallium.rockserver.core.common.RocksDBException.of(
-							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+					throw RocksDBException.of(
+							RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 							invalid.getMessage(), invalid);
 				}
 				var page = api(context).getRangePage(transactionId,
@@ -1271,7 +1279,7 @@ public class ThriftServer extends Server {
 						keysToRecord(resumeAfter),
 						mappedRequestType,
 						mappedBudget);
-				var response = new it.cavallium.rockserver.core.common.api.RangePage(
+				var response = new RangePage(
 						page.items().stream().map(ThriftServer::mapKV).toList(), page.hasMore());
 				if (page.resumeAfter() != null) {
 					response.setResumeAfter(Arrays.stream(page.resumeAfter().keys())
@@ -1279,7 +1287,7 @@ public class ThriftServer extends Server {
 							.toList());
 				}
 				return response;
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1293,7 +1301,7 @@ public class ThriftServer extends Server {
 			try {
 				return mapResult(api(context).putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti),
 						keyToRecords(valueMulti), RequestType.previous()));
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1308,7 +1316,7 @@ public class ThriftServer extends Server {
 				return api(context).putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti),
 						keyToRecords(valueMulti), RequestType.delta())
 						.stream().map(ThriftServer::mapResult).collect(Collectors.toList());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1322,7 +1330,7 @@ public class ThriftServer extends Server {
 			try {
 				return api(context).putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti),
 						keyToRecords(valueMulti), RequestType.changed());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1336,7 +1344,7 @@ public class ThriftServer extends Server {
 			try {
 				return api(context).putMulti(transactionOrUpdateId, columnId, keysToRecords(keysMulti),
 						keyToRecords(valueMulti), RequestType.previousPresence());
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1346,7 +1354,7 @@ public class ThriftServer extends Server {
 			try {
 				requireV3(workloadContractVersion);
 				protectedApi().flush();
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1356,7 +1364,7 @@ public class ThriftServer extends Server {
 			try {
 				requireV3(workloadContractVersion);
 				protectedApi().compact();
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1369,7 +1377,7 @@ public class ThriftServer extends Server {
 				List<Column> columns = new ArrayList<>();
 				map.forEach((name, schema) -> columns.add(new Column(name, mapSchemaToThrift(schema))));
 				return columns;
-			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+			} catch (RocksDBException e) {
 				throw mapException(e);
 			}
 		}
@@ -1377,14 +1385,14 @@ public class ThriftServer extends Server {
 
 	private static void requireV3(int workloadContractVersion) {
 		if (workloadContractVersion != RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(
-					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
+			throw RocksDBException.of(
+					RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Request requires workload contract version "
 							+ RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		}
 	}
 
-	private static Flux<it.cavallium.rockserver.core.common.KVBatch> kvToBatch(List<KV> data) {
+	private static Flux<KVBatch> kvToBatch(List<KV> data) {
 		if (data == null || data.isEmpty()) return Flux.empty();
 		List<Keys> keysList = new ArrayList<>(data.size());
 		List<Buf> valuesList = new ArrayList<>(data.size());

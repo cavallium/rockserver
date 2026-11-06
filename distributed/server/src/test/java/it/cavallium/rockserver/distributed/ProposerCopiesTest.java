@@ -22,11 +22,14 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
@@ -96,7 +99,7 @@ class ProposerCopiesTest {
 	private static Proposer.Pending livePending(Proposer proposer) throws Exception {
 		var field = Proposer.class.getDeclaredField("live");
 		field.setAccessible(true);
-		var live = (java.util.Set<?>) field.get(proposer);
+		var live = (Set<?>) field.get(proposer);
 		assertEquals(1, live.size());
 		return (Proposer.Pending) live.iterator().next();
 	}
@@ -207,7 +210,7 @@ class ProposerCopiesTest {
 				Thread.ofVirtual().start(() -> submitted.complete(proposer.propose(entry)));
 				assertTrue(entered.await(10, TimeUnit.SECONDS), "the batch took the write");
 				var pending = livePending(proposer);
-				var write = java.util.Objects.requireNonNull(pending.callerCopy);
+				var write = Objects.requireNonNull(pending.callerCopy);
 				proposer.beforeEncodeForTesting = null;
 				assertTrue(pending.isEncoding());
 				var encodingAtAnswer = new CompletableFuture<Boolean>();
@@ -224,7 +227,7 @@ class ProposerCopiesTest {
 					var other = new CompletableFuture<Void>().orTimeout(50, TimeUnit.MILLISECONDS);
 					var otherError = assertThrows(ExecutionException.class, () -> other.get(2, TimeUnit.SECONDS),
 							"the delayer thread is free");
-					assertInstanceOf(java.util.concurrent.TimeoutException.class, otherError.getCause());
+					assertInstanceOf(TimeoutException.class, otherError.getCause());
 				}
 				Thread.sleep(300);
 				assertFalse(encodingAtAnswer.isDone(), "not answered while the batch has not read the buffers");

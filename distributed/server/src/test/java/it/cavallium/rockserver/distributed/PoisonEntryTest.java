@@ -17,11 +17,14 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.FFMByteArrayMergeOperator;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.io.PrintStream;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -31,10 +34,13 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.TreeMap;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.Status;
 
 /**
  * A log entry whose apply fails in the same way on every replica (a merge operator that throws, a bug in the apply
@@ -109,7 +115,7 @@ class PoisonEntryTest {
 	/** A JAR with no classes: the operator classes come from the test class path, the JAR's parent loader. */
 	private static byte[] emptyJar() throws IOException {
 		var out = new ByteArrayOutputStream();
-		try (var jar = new java.util.jar.JarOutputStream(out, new java.util.jar.Manifest())) {
+		try (var jar = new JarOutputStream(out, new Manifest())) {
 			// Nothing.
 		}
 		return out.toByteArray();
@@ -277,11 +283,11 @@ class PoisonEntryTest {
 		var lanes = new ApplyLanes("poison-test", 3);
 		// R2-PA-4: each failure is logged once, by the serial redo that records it, not also by the lane that cut.
 		var originalErr = System.err;
-		var captured = new java.io.ByteArrayOutputStream();
+		var captured = new ByteArrayOutputStream();
 		try (var store = open()) {
 			var applier = new Applier(store, null, lanes);
 			long column = store.db().createColumn("c", SCHEMA);
-			System.setErr(new java.io.PrintStream(new java.io.OutputStream() {
+			System.setErr(new PrintStream(new OutputStream() {
 				@Override
 				public void write(int b) {
 					originalErr.write(b);
@@ -339,13 +345,13 @@ class PoisonEntryTest {
 	@Test
 	void onlyLocalFailuresStopTheReplica() {
 		var ioError = new org.rocksdb.RocksDBException("disk",
-				new org.rocksdb.Status(org.rocksdb.Status.Code.IOError, org.rocksdb.Status.SubCode.None, "disk"));
+				new Status(Status.Code.IOError, Status.SubCode.None, "disk"));
 		var noSpace = new org.rocksdb.RocksDBException("full",
-				new org.rocksdb.Status(org.rocksdb.Status.Code.IOError, org.rocksdb.Status.SubCode.NoSpace, "full"));
+				new Status(Status.Code.IOError, Status.SubCode.NoSpace, "full"));
 		var corruption = new org.rocksdb.RocksDBException("bad block",
-				new org.rocksdb.Status(org.rocksdb.Status.Code.Corruption, org.rocksdb.Status.SubCode.None, "bad"));
+				new Status(Status.Code.Corruption, Status.SubCode.None, "bad"));
 		var invalid = new org.rocksdb.RocksDBException("key too large",
-				new org.rocksdb.Status(org.rocksdb.Status.Code.InvalidArgument, org.rocksdb.Status.SubCode.None, "k"));
+				new Status(Status.Code.InvalidArgument, Status.SubCode.None, "k"));
 		assertTrue(Applier.isLocalFailure(RocksDBException.of(RocksDBErrorType.PUT_1, ioError)));
 		assertTrue(Applier.isLocalFailure(RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, noSpace)));
 		assertTrue(Applier.isLocalFailure(RocksDBException.of(RocksDBErrorType.PUT_2, "read failed", corruption)));
@@ -360,7 +366,7 @@ class PoisonEntryTest {
 		assertFalse(Applier.isLocalFailure(RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "bug")));
 		assertFalse(Applier.isLocalFailure(new IllegalStateException("bug")));
 		// RocksDB reports a failed merge as a corruption: the operator's failure is named above it.
-		var merge = it.cavallium.rockserver.core.impl.EmbeddedDB.mergeOperatorFailed(new IllegalStateException("boom"));
+		var merge = EmbeddedDB.mergeOperatorFailed(new IllegalStateException("boom"));
 		merge.addSuppressed(corruption);
 		assertFalse(Applier.isLocalFailure(RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, merge)));
 	}
@@ -476,7 +482,7 @@ class PoisonEntryTest {
 			assertThrows(Applier.ReplicaFailedException.class, () -> applier.apply(new Request(1, 3, 0,
 					new LogEntry.Merge(bucketed, element, text("oom"), RequestTypeId.NOTHING)), TermIndex.valueOf(1, 4)));
 		}
-		var wrapped = it.cavallium.rockserver.core.impl.EmbeddedDB.mergeOperatorFailed(
+		var wrapped = EmbeddedDB.mergeOperatorFailed(
 				new RuntimeException(new StackOverflowError()));
 		assertTrue(Applier.isLocalFailure(wrapped));
 		assertTrue(Applier.isLocalFailure(new NoClassDefFoundError("Could not initialize class X")

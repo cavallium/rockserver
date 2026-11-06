@@ -15,6 +15,7 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -155,7 +156,7 @@ class ReplicaOpsTest {
 	}
 
 	private static Buf buf(String text) {
-		return Buf.wrap(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+		return Buf.wrap(text.getBytes(StandardCharsets.UTF_8));
 	}
 
 	@Test

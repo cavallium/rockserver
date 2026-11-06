@@ -66,6 +66,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.time.Duration;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -243,7 +244,7 @@ public final class GrpcConnection extends BaseConnection {
 	static URI httpUrl(List<HostAndPort> addresses) {
 		try {
 			return Utils.parseConnectionUrl("http://" + Utils.formatHostAndPorts(addresses));
-		} catch (java.net.URISyntaxException e) {
+		} catch (URISyntaxException e) {
 			throw new IllegalArgumentException("Invalid addresses: " + addresses, e);
 		}
 	}
@@ -468,7 +469,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		var leaderRouter = hintMode == LeaderHintRouter.Mode.OFF ? null : new LeaderHintRouter(hintMode, addresses,
 				automaticRetry ? AUTOMATIC_RETRY_METHOD_DESCRIPTORS.stream()
 						.map(MethodDescriptor::getBareMethodName)
-						.collect(java.util.stream.Collectors.toUnmodifiableSet()) : java.util.Set.of());
+						.collect(Collectors.toUnmodifiableSet()) : Set.of());
 		int maxInboundMessageSize = configuredMaxInboundMessageSize();
 
 		// A node that dies without closing its connections (power loss, partition, a frozen process) is noticed by
@@ -1402,7 +1403,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			if (response.getValuesCount() > Math.min(requestedKeys, responseBudget.maxItems())) {
 				throw new IllegalStateException("Invalid MultiGet response size");
 			}
-			var values = new java.util.ArrayList<Buf>(response.getValuesCount());
+			var values = new ArrayList<Buf>(response.getValuesCount());
 			for (var value : response.getValuesList()) {
 				values.add(value.hasValue() ? mapByteString(value.getValue()) : null);
 			}
@@ -1983,7 +1984,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private static final List<String> AUTOMATIC_RETRYABLE_STATUS_CODE_NAMES = List.of(Code.UNAVAILABLE.name());
 	private static final Set<Code> AUTOMATIC_RETRYABLE_STATUS_CODES = AUTOMATIC_RETRYABLE_STATUS_CODE_NAMES.stream()
 			.map(Code::valueOf)
-			.collect(java.util.stream.Collectors.toUnmodifiableSet());
+			.collect(Collectors.toUnmodifiableSet());
 
 	static boolean isAutomaticallyRetryableStatus(Code code) {
 		return AUTOMATIC_RETRYABLE_STATUS_CODES.contains(code);

@@ -24,9 +24,11 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.ReadTier;
+import org.rocksdb.RocksDBException;
 import org.rocksdb.Status;
 
 /** Opt-in release benchmark for the bounded Ensure PutMulti cache probe. */
@@ -175,10 +177,10 @@ public final class EnsureWriteElisionBenchmark {
 	}
 
 	private static void assertNativeMultiGetHonorsCacheTier(EmbeddedDB embedded, List<Keys> logicalKeys)
-			throws org.rocksdb.RocksDBException {
+			throws RocksDBException {
 		var column = embedded.getDb().getStartupColumns().entrySet().stream()
 				.filter(entry -> "cold".equals(new String(entry.getKey().getName())))
-				.map(java.util.Map.Entry::getValue)
+				.map(Map.Entry::getValue)
 				.findFirst()
 				.orElseThrow();
 		try (var options = new ReadOptions().setReadTier(ReadTier.BLOCK_CACHE_TIER).setFillCache(false);
@@ -188,7 +190,7 @@ public final class EnsureWriteElisionBenchmark {
 				var candidate = keys.keys()[0].toByteArray();
 				try {
 					embedded.getDb().get().get(column, options, candidate);
-				} catch (org.rocksdb.RocksDBException exception) {
+				} catch (RocksDBException exception) {
 					if (exception.getStatus().getCode() == Status.Code.Incomplete) {
 						coldKey = candidate;
 						break;

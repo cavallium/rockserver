@@ -19,6 +19,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongConsumer;
 import org.jetbrains.annotations.Nullable;
@@ -146,8 +147,8 @@ final class LeaderSession {
 		private volatile @Nullable ChainLink link;
 		private final AtomicBoolean commitStarted = new AtomicBoolean();
 		/** Commits of it in flight ({@link #commitProposed}): it does not expire meanwhile. */
-		private final java.util.concurrent.atomic.AtomicInteger commitsInFlight =
-				new java.util.concurrent.atomic.AtomicInteger();
+		private final AtomicInteger commitsInFlight =
+				new AtomicInteger();
 		private final long deadlineNanos;
 		private final List<LogEntry.Write> writes = new ArrayList<>();
 		private final LongArrayList conflictColumns = new LongArrayList();

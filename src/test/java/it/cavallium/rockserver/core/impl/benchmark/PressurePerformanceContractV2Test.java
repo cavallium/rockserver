@@ -8,10 +8,12 @@ import it.cavallium.rockserver.core.common.OperationFamily;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 
 class PressurePerformanceContractV2Test {
@@ -22,7 +24,7 @@ class PressurePerformanceContractV2Test {
 	void defaultPressureMetricSetClassifiesOnlyExactSignalAllocationAsDeterministic() {
 		var scheduler = PressurePerformanceContractV2.schedulerSpecifications();
 		var signal = PressurePerformanceContractV2.signalSpecifications(DEFAULT_SIGNAL_COUNTS);
-		long stochastic = java.util.stream.Stream.concat(scheduler.stream(), signal.stream())
+		long stochastic = Stream.concat(scheduler.stream(), signal.stream())
 				.filter(specification -> specification.direction()
 						!= PairedPerformanceContractV2.Direction.DETERMINISTIC_NO_INCREASE)
 				.count();
@@ -164,6 +166,6 @@ class PressurePerformanceContractV2Test {
 	}
 
 	private static List<Map<String, Double>> repeated(Map<String, Double> values) {
-		return java.util.Collections.nCopies(PairedPerformanceContractV2.REQUIRED_PAIRS, values);
+		return Collections.nCopies(PairedPerformanceContractV2.REQUIRED_PAIRS, values);
 	}
 }

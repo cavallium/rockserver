@@ -16,6 +16,7 @@ import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.cavallium.rockserver.core.impl.EmbeddedDB.ApplyWriter;
 import it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -23,9 +24,19 @@ import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
 import it.unimi.dsi.fastutil.longs.LongSortedSet;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.AbstractList;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -153,7 +164,7 @@ final class Applier {
 	 * Tests only: runs on the apply thread right after each database write of the apply, with what it committed
 	 * ("entry", "group", "prefix" before a segment, "segment"). A crash test flushes there, to keep exactly that point.
 	 */
-	@Nullable java.util.function.Consumer<String> afterCommit;
+	@Nullable Consumer<String> afterCommit;
 
 	private void committed(String what) {
 		var hook = afterCommit;
@@ -288,7 +299,7 @@ final class Applier {
 			// Nothing applied since the start yet (or no stamp ever): the clock this replica wrote last.
 			try {
 				Buf value = store.db().get(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLOCK), RequestType.<Buf>current());
-				clock = value == null ? 0 : java.nio.ByteBuffer.wrap(value.toByteArray()).getLong();
+				clock = value == null ? 0 : ByteBuffer.wrap(value.toByteArray()).getLong();
 			} catch (RuntimeException ex) {
 				return 0;
 			}
@@ -389,7 +400,7 @@ final class Applier {
 		var markerKey = NodeStore.key(NodeStore.DELETION);
 		Buf marker = db.get(0L, store.metaColumnId(), markerKey, RequestType.<Buf>current());
 		boolean existed;
-		if (marker != null && java.nio.ByteBuffer.wrap(marker.toByteArray()).getLong() == position.getIndex()) {
+		if (marker != null && ByteBuffer.wrap(marker.toByteArray()).getLong() == position.getIndex()) {
 			existed = marker.toByteArray()[Long.BYTES] == 1;
 		} else {
 			existed = switch (entry) {
@@ -400,7 +411,7 @@ final class Applier {
 						&& db.getAllColumnDefinitions().containsKey(delete.name());
 				default -> throw new IllegalArgumentException("Not a column deletion: " + entry);
 			};
-			db.put(0L, store.metaColumnId(), markerKey, Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES + 1)
+			db.put(0L, store.metaColumnId(), markerKey, Buf.wrap(ByteBuffer.allocate(Long.BYTES + 1)
 					.putLong(position.getIndex()).put((byte) (existed ? 1 : 0)).array()), RequestType.none());
 			syncWal();
 		}
@@ -644,7 +655,7 @@ final class Applier {
 		var toRun = new ArrayList<Request>(requests.size());
 		var runIndexes = new IntArrayList(requests.size());
 		var duplicates = new IntArrayList(0);
-		var seen = new java.util.HashSet<Identity>();
+		var seen = new HashSet<Identity>();
 		for (int i = 0; i < requests.size(); i++) {
 			var request = requests.get(i);
 			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
@@ -904,7 +915,7 @@ final class Applier {
 			var undo = undoLog;
 			if (undo != null) {
 				long floor = records.floor;
-				var dropped = new it.unimi.dsi.fastutil.longs.LongArrayList(records.recorded.headSet(completedBelow));
+				var dropped = new LongArrayList(records.recorded.headSet(completedBelow));
 				undo.add(() -> {
 					records.floor = floor;
 					records.recorded.addAll(dropped);
@@ -956,7 +967,7 @@ final class Applier {
 		var db = store.db();
 		long metaColumn = store.metaColumnId();
 		Buf clockValue = db.get(0L, metaColumn, NodeStore.key(NodeStore.CLOCK), RequestType.<Buf>current());
-		clock = clockValue == null ? 0 : java.nio.ByteBuffer.wrap(clockValue.toByteArray()).getLong();
+		clock = clockValue == null ? 0 : ByteBuffer.wrap(clockValue.toByteArray()).getLong();
 		visibleClock = clock;
 		try (var rows = db.getRange(0L, metaColumn, NodeStore.key(NodeStore.SESSION),
 				NodeStore.key((byte) (NodeStore.SESSION + 1)), false, RequestType.<KV>allInRange())) {
@@ -1025,7 +1036,7 @@ final class Applier {
 		try (var keys = db.getRange(0L, metaColumn, NodeStore.key(NodeStore.FLOOR),
 				NodeStore.key((byte) (NodeStore.FLOOR + 1)), false, RequestType.<KV>allInRange())) {
 			keys.forEach(kv -> floors.put(NodeStore.floorProposerId(kv.keys()),
-					java.nio.ByteBuffer.wrap(kv.value().toByteArray()).getLong()));
+					ByteBuffer.wrap(kv.value().toByteArray()).getLong()));
 		}
 		for (var floor : floors.long2LongEntrySet()) {
 			var start = NodeStore.requestKey(floor.getLongKey(), 0);
@@ -1131,7 +1142,7 @@ final class Applier {
 
 	private long floor(long proposerId) {
 		Buf value = store.db().get(0L, store.metaColumnId(), NodeStore.floorKey(proposerId), RequestType.<Buf>current());
-		return value == null ? 0 : java.nio.ByteBuffer.wrap(value.toByteArray()).getLong();
+		return value == null ? 0 : ByteBuffer.wrap(value.toByteArray()).getLong();
 	}
 
 	private void syncWal() {
@@ -1287,14 +1298,14 @@ final class Applier {
 			}
 			case LogEntry.Checksum _ -> {
 				requireNoTransaction(tx, entry);
-				var position = java.util.Objects.requireNonNull(alonePosition, "position");
+				var position = Objects.requireNonNull(alonePosition, "position");
 				maintenance.checksum(position, store);
 				// The log index names the check: the same on every replica.
 				yield position.getIndex();
 			}
 			case LogEntry.Backup backup -> {
 				requireNoTransaction(tx, entry);
-				var position = java.util.Objects.requireNonNull(alonePosition, "position");
+				var position = Objects.requireNonNull(alonePosition, "position");
 				maintenance.backup(backup.name(), backup.requestId(), position, store);
 				yield position.getIndex();
 			}
@@ -1343,7 +1354,7 @@ final class Applier {
 
 	private void writeClusterVersion(long version) {
 		store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_VERSION),
-				Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(version).array()), RequestType.none());
+				Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(version).array()), RequestType.none());
 	}
 
 	/**
@@ -1355,7 +1366,7 @@ final class Applier {
 		String own;
 		try {
 			own = store.seedDigest();
-		} catch (java.io.IOException ex) {
+		} catch (IOException ex) {
 			throw new ReplicaFailedException("Failed to read the digest of this replica's seed: " + ex);
 		}
 		if (own == null) {
@@ -1442,7 +1453,7 @@ final class Applier {
 		var first = requests.getFirst();
 		if (first.completedBelow() > records(first.proposerId()).floor) {
 			tx.put(NodeStore.floorKey(first.proposerId()),
-					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(first.completedBelow()).array()));
+					Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(first.completedBelow()).array()));
 		}
 		Long2LongOpenHashMap sessionFloors = null;
 		for (var request : requests) {
@@ -1476,7 +1487,7 @@ final class Applier {
 		tx.put(NodeStore.key(NodeStore.APPLIED), NodeStore.encodeTermIndex(position));
 		if (clockMoved) {
 			tx.put(NodeStore.key(NodeStore.CLOCK),
-					Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(clock).array()));
+					Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(clock).array()));
 			clockMoved = false;
 		}
 	}
@@ -1526,7 +1537,7 @@ final class Applier {
 	 * The results of an entry of a segment, known once the segment ends (at the latest when the group ends). Reading
 	 * them earlier throws.
 	 */
-	static final class PendingResults extends java.util.AbstractList<ApplyResult> {
+	static final class PendingResults extends AbstractList<ApplyResult> {
 		private @Nullable List<ApplyResult> value;
 
 		void set(List<ApplyResult> results) {
@@ -1610,13 +1621,13 @@ final class Applier {
 		/** Per lane: the ordinals of the entries before which it set a save point, in order. */
 		final IntArrayList[] savePoints;
 		/** The first entry with a rejected request: it and the entries after it are applied again. */
-		final java.util.concurrent.atomic.AtomicInteger cut =
-				new java.util.concurrent.atomic.AtomicInteger(Integer.MAX_VALUE);
+		final AtomicInteger cut =
+				new AtomicInteger(Integer.MAX_VALUE);
 		/** A failure of a lane that is not a result (a local failure, an Error): the replica stops. */
-		final java.util.concurrent.atomic.AtomicReference<Throwable> failure =
-				new java.util.concurrent.atomic.AtomicReference<>();
+		final AtomicReference<Throwable> failure =
+				new AtomicReference<>();
 		/** The requests run in this segment, by identity, for later copies of them, see {@link #requireRecorded}. */
-		final java.util.HashMap<Identity, Task> pending = new java.util.HashMap<>();
+		final HashMap<Identity, Task> pending = new HashMap<>();
 		final List<Runnable> undo = new ArrayList<>();
 
 		Segment(int lanes) {
@@ -1743,7 +1754,7 @@ final class Applier {
 			committed(requests, toRun);
 			groupPurges.addAll(owners(requests));
 			// One piece of work per lane, with the entry's requests of that lane in their order.
-			var byLane = new java.util.ArrayList[lanes.count()];
+			var byLane = new ArrayList[lanes.count()];
 			for (int j = 0; j < toRun.size(); j++) {
 				int lane = requestLanes[batch.runIndexes().getInt(j)];
 				if (byLane[lane] == null) {
@@ -1876,7 +1887,7 @@ final class Applier {
 					writer.close();
 				}
 			}
-			java.util.Arrays.fill(open.writers, null);
+			Arrays.fill(open.writers, null);
 			done = true;
 			if (cut == open.entries.size()) {
 				return List.of();
@@ -1953,7 +1964,7 @@ final class Applier {
 				used++;
 			}
 		}
-		var done = new java.util.concurrent.CountDownLatch(used);
+		var done = new CountDownLatch(used);
 		for (int lane = 0; lane < open.writers.length; lane++) {
 			if (open.writers[lane] != null) {
 				lanes.submit(lane, done::countDown);

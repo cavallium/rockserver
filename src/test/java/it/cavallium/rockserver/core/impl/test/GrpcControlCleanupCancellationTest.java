@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.grpc.BindableService;
 import io.grpc.ForwardingServerCallListener;
 import io.grpc.Metadata;
+import io.grpc.Server;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
@@ -26,6 +27,7 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
@@ -79,7 +81,7 @@ class GrpcControlCleanupCancellationTest {
 	private Path configFile;
 	private EmbeddedConnection embeddedConnection;
 	private GrpcServer grpcServer;
-	private io.grpc.Server observedServer;
+	private Server observedServer;
 
 	@BeforeEach
 	void setUp() throws IOException {
@@ -162,12 +164,12 @@ class GrpcControlCleanupCancellationTest {
 		long columnId = sync.createColumn("protected-cleanup",
 				ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
 		sync.put(0, columnId, key(1), Buf.wrap(new byte[] {1}), RequestType.none());
-		long transactionId = sync.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
+		long transactionId = sync.openTransaction( Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
 		long iteratorId = async.openIteratorAsync(0,
 				columnId,
 				new Keys(),
 				null,
-				false, java.time.Duration.ofMillis(
+				false, Duration.ofMillis(
 				TimeUnit.MINUTES.toMillis(1))).get(5, TimeUnit.SECONDS);
 		long updateId = sync.get(0, columnId, key(1), RequestType.forUpdate()).updateId();
 		var scheduler = embeddedConnection.getScheduler();
@@ -205,7 +207,7 @@ class GrpcControlCleanupCancellationTest {
 		var client = newClient();
 		var sync = client.getSyncApi(RequestContext.batch());
 		var async = client.getAsyncApi(RequestContext.batch());
-		long transactionId = sync.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
+		long transactionId = sync.openTransaction( Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
 		var scheduler = embeddedConnection.getScheduler();
 		var ingestWriteExecutor = scheduler.executor(RequestContext.ingest(), OperationFamily.MUTATION);
 		var blockedWrite = blockLane(3, ingestWriteExecutor::execute);
@@ -232,8 +234,8 @@ class GrpcControlCleanupCancellationTest {
 		replaceServer(recordingBackend);
 		var client = newClient();
 		long transactionId = client.getSyncApi(RequestContext.batch())
-				.openTransaction( java.time.Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
-		var expiredCallerContext = RequestContext.batch(java.time.Duration.ofNanos(1));
+				.openTransaction( Duration.ofMillis(TimeUnit.MINUTES.toMillis(1)));
+		var expiredCallerContext = RequestContext.batch(Duration.ofNanos(1));
 
 		assertTrue(client.getAsyncApi(expiredCallerContext)
 				.closeTransactionAsync(transactionId, false)
@@ -258,7 +260,7 @@ class GrpcControlCleanupCancellationTest {
 				columnId,
 				new Keys(),
 				null,
-				false, java.time.Duration.ofMillis(
+				false, Duration.ofMillis(
 				TimeUnit.MINUTES.toMillis(1))).get(5, TimeUnit.SECONDS);
 		var close = async.closeIteratorAsync(iteratorId);
 		Thread closeThread = null;
@@ -318,7 +320,7 @@ class GrpcControlCleanupCancellationTest {
 				columnId,
 				new Keys(),
 				null,
-				false, java.time.Duration.ofMillis(
+				false, Duration.ofMillis(
 				TimeUnit.MINUTES.toMillis(1))).get(5, TimeUnit.SECONDS);
 		var close = async.closeIteratorAsync(iteratorId);
 		assertTrue(blockingBackend.awaitCloseStarted(5, TimeUnit.SECONDS),
@@ -358,7 +360,7 @@ class GrpcControlCleanupCancellationTest {
 				columnId,
 				new Keys(),
 				null,
-				false, java.time.Duration.ofMillis(
+				false, Duration.ofMillis(
 				TimeUnit.MINUTES.toMillis(1))).get(5, TimeUnit.SECONDS);
 		var scheduler = embeddedConnection.getScheduler();
 		var controlExecutor = scheduler.executor(WorkloadProfile.CONTROL,
@@ -595,7 +597,7 @@ class GrpcControlCleanupCancellationTest {
 		}
 
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
+		public RockserverCapabilities getCapabilities() {
 			return delegate.getCapabilities();
 		}
 
@@ -694,8 +696,8 @@ class GrpcControlCleanupCancellationTest {
 
 	private static final class BlockingCloseIteratorConnection implements RocksDBConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 
@@ -764,8 +766,8 @@ class GrpcControlCleanupCancellationTest {
 
 	private static final class RecordingRollbackConnection implements RocksDBConnection, InternalConnection {
 
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+		public RockserverCapabilities getCapabilities() {
+			return RockserverCapabilities.CURRENT;
 		}
 
 

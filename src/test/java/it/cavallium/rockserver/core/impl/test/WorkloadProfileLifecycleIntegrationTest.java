@@ -74,7 +74,7 @@ class WorkloadProfileLifecycleIntegrationTest {
 				"embedded-profile-lifecycle", config)) {
 			var batch = connection.getSyncApi(RequestContext.batch());
 			var ingest = connection.getSyncApi(RequestContext.ingest());
-			var latency = connection.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(5)));
+			var latency = connection.getSyncApi(RequestContext.latency(Duration.ofSeconds(5)));
 			var analytical = connection.getSyncApi(RequestContext.analytical());
 
 			long columnId = batch.createColumn("entries",
@@ -88,9 +88,9 @@ class WorkloadProfileLifecycleIntegrationTest {
 					false,
 					RequestType.entriesCount()));
 
-			long transactionId = batch.openTransaction( java.time.Duration.ofMillis(5_000));
+			long transactionId = batch.openTransaction( Duration.ofMillis(5_000));
 			batch.closeTransaction(transactionId, false);
-			long iteratorId = batch.openIterator(0, columnId, new Keys(), null, false, java.time.Duration.ofMillis( 5_000));
+			long iteratorId = batch.openIterator(0, columnId, new Keys(), null, false, Duration.ofMillis( 5_000));
 			batch.closeIterator(iteratorId);
 
 			batch.flush();
@@ -136,7 +136,7 @@ class WorkloadProfileLifecycleIntegrationTest {
 			assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,
 					overload.getErrorUniqueId());
 
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("latency", order, reservedDone));
 			scheduler.executor(RequestContext.ingest(), OperationFamily.POINT_LOOKUP)
 					.execute(() -> record("ingest", order, reservedDone));
@@ -187,7 +187,7 @@ class WorkloadProfileLifecycleIntegrationTest {
 			});
 			batch.execute(recoveredBatchDone::countDown);
 
-			scheduler.executor(RequestContext.latency(java.time.Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
+			scheduler.executor(RequestContext.latency(Duration.ofSeconds(30)), OperationFamily.POINT_LOOKUP)
 					.execute(dataProgress::countDown);
 			scheduler.executor(RequestContext.ingest(), OperationFamily.MUTATION)
 					.execute(dataProgress::countDown);

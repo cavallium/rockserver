@@ -9,13 +9,17 @@ import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.concurrent.TimeUnit;
+import org.apache.ratis.server.protocol.TermIndex;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -42,7 +46,7 @@ class ChecksumTest {
 		return cluster.awaitLeader(TIMEOUT);
 	}
 
-	private static it.cavallium.rockserver.core.common.RocksDBSyncAPI api(ReplicatedNode node) {
+	private static RocksDBSyncAPI api(ReplicatedNode node) {
 		return node.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
 	}
 
@@ -153,18 +157,18 @@ class ChecksumTest {
 		cluster.stop(id);
 		var results = cluster.config(id).dataDir().resolve("replica-ops.log");
 		long old = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(3);
-		var lines = java.nio.file.Files.readAllLines(results).stream()
+		var lines = Files.readAllLines(results).stream()
 				.map(line -> line.contains(" checksum " + index + " ")
-						? java.time.Instant.ofEpochMilli(old) + line.substring(line.indexOf(' ')) : line)
+						? Instant.ofEpochMilli(old) + line.substring(line.indexOf(' ')) : line)
 				.toList();
-		java.nio.file.Files.write(results, lines);
+		Files.write(results, lines);
 
 		var restarted = cluster.start(id);
 		var ops = restarted.stateMachine().ops();
 		assertEquals(old, ops.lastChecksumMillisForTesting(), "loaded from the results file");
 		cluster.awaitConverged(TIMEOUT);
 		var term = restarted.stateMachine().division().getInfo().getCurrentTerm();
-		ops.checksum(org.apache.ratis.server.protocol.TermIndex.valueOf(term, index), restarted.stateMachine().store());
+		ops.checksum(TermIndex.valueOf(term, index), restarted.stateMachine().store());
 		InProcessCluster.await(TIMEOUT, () -> ops.checksumResult(index).state() == ReplicaOps.State.DONE);
 		assertEquals(old, ops.lastChecksumMillisForTesting(), "a replay does not move the schedule");
 

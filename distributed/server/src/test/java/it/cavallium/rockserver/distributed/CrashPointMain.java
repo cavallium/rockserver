@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.List;
 
 /**
@@ -26,7 +27,7 @@ public final class CrashPointMain {
 		var file = armFile(dataDir);
 		var temp = file.resolveSibling("crash-point.tmp");
 		Files.writeString(temp, point.name() + " " + skip, StandardCharsets.UTF_8);
-		Files.move(temp, file, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+		Files.move(temp, file, StandardCopyOption.ATOMIC_MOVE);
 	}
 
 	/** Disarms whatever point the running node of {@code dataDir} has armed. */
@@ -34,7 +35,7 @@ public final class CrashPointMain {
 		var file = armFile(dataDir);
 		var temp = file.resolveSibling("crash-point.tmp");
 		Files.writeString(temp, DISARM, StandardCharsets.UTF_8);
-		Files.move(temp, file, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+		Files.move(temp, file, StandardCopyOption.ATOMIC_MOVE);
 	}
 
 	private static final String DISARM = "DISARM";

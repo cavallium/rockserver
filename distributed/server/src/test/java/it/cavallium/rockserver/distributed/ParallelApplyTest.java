@@ -9,24 +9,33 @@ import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.jetbrains.annotations.Nullable;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.RocksDB;
+import org.rocksdb.WriteBatch;
 
 /**
  * The partitioned apply gives the results and the database of the serial apply, byte for byte: two replicas apply the
@@ -78,9 +87,9 @@ class ParallelApplyTest {
 	 */
 	@Test
 	void joinedWriteBatchesAreTheBatchOfAllTheirOperationsInOrder() throws Exception {
-		org.rocksdb.RocksDB.loadLibrary();
-		try (var first = new org.rocksdb.WriteBatch(); var second = new org.rocksdb.WriteBatch();
-				var third = new org.rocksdb.WriteBatch(); var all = new org.rocksdb.WriteBatch()) {
+		RocksDB.loadLibrary();
+		try (var first = new WriteBatch(); var second = new WriteBatch();
+				var third = new WriteBatch(); var all = new WriteBatch()) {
 			byte[] k1 = {1}, k2 = {2, 2}, k3 = {3}, k4 = {4, 4, 4}, k5 = {5}, k6 = {6};
 			first.put(k1, new byte[] {10});
 			first.delete(k2);
@@ -94,14 +103,14 @@ class ParallelApplyTest {
 			all.put(k4, new byte[] {40, 41});
 			all.deleteRange(k5, k6);
 			all.singleDelete(k1);
-			byte[] joined = it.cavallium.rockserver.core.impl.EmbeddedDB.ApplyWriter.joinWriteBatches(
+			byte[] joined = EmbeddedDB.ApplyWriter.joinWriteBatches(
 					List.of(first.data(), second.data(), third.data()));
-			org.junit.jupiter.api.Assertions.assertArrayEquals(all.data(), joined);
-			try (var reread = new org.rocksdb.WriteBatch(joined)) {
+			Assertions.assertArrayEquals(all.data(), joined);
+			try (var reread = new WriteBatch(joined)) {
 				assertEquals(6, reread.count());
 			}
-			org.junit.jupiter.api.Assertions.assertArrayEquals(first.data(),
-					it.cavallium.rockserver.core.impl.EmbeddedDB.ApplyWriter.joinWriteBatches(List.of(first.data())));
+			Assertions.assertArrayEquals(first.data(),
+					EmbeddedDB.ApplyWriter.joinWriteBatches(List.of(first.data())));
 		}
 	}
 
@@ -135,9 +144,9 @@ class ParallelApplyTest {
 				reference.put(b, key(3), text("b3"), RequestType.none());
 				reference.put(b, key(4), text("b4"), RequestType.none());
 				reference.delete(a, key(5), RequestType.none());
-				byte[] joined = it.cavallium.rockserver.core.impl.EmbeddedDB.ApplyWriter.joinWriteBatches(
+				byte[] joined = EmbeddedDB.ApplyWriter.joinWriteBatches(
 						List.of(first.batchDataForTesting(), second.batchDataForTesting()));
-				org.junit.jupiter.api.Assertions.assertArrayEquals(reference.batchDataForTesting(), joined,
+				Assertions.assertArrayEquals(reference.batchDataForTesting(), joined,
 						HexFormat.of().formatHex(joined));
 			} finally {
 				reference.close();
@@ -145,10 +154,10 @@ class ParallelApplyTest {
 			// commitWith writes the others first, then itself.
 			second.commitWith(List.of(first));
 			assertEquals("a1", string(db.get(0, a, key(1), RequestType.current())));
-			org.junit.jupiter.api.Assertions.assertNull(db.get(0, b, key(2), RequestType.current()));
+			Assertions.assertNull(db.get(0, b, key(2), RequestType.current()));
 			assertEquals("b3", string(db.get(0, b, key(3), RequestType.current())));
 			assertEquals("b4", string(db.get(0, b, key(4), RequestType.current())));
-			org.junit.jupiter.api.Assertions.assertNull(db.get(0, a, key(5), RequestType.current()));
+			Assertions.assertNull(db.get(0, a, key(5), RequestType.current()));
 		}
 	}
 
@@ -161,15 +170,15 @@ class ParallelApplyTest {
 		Files.createDirectories(temp.resolve("cluster"));
 		try (var cluster = new InProcessCluster(temp.resolve("cluster"), 3,
 				c -> c.nodeId().equals("n2") ? c : c.withParallelApplyThreads(3)).startAll()) {
-			var leader = cluster.awaitLeader(java.time.Duration.ofSeconds(30));
+			var leader = cluster.awaitLeader(Duration.ofSeconds(30));
 			var api = leader.connection().getSyncApi(
-					it.cavallium.rockserver.core.common.RequestContext.batch(java.time.Duration.ofSeconds(20)));
+					RequestContext.batch(Duration.ofSeconds(20)));
 			long[] columns = new long[3];
 			for (int i = 0; i < columns.length; i++) {
 				columns[i] = api.createColumn("c" + i, FIXED);
 			}
-			try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
-				var futures = new ArrayList<java.util.concurrent.Future<?>>();
+			try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+				var futures = new ArrayList<Future<?>>();
 				for (int t = 0; t < 8; t++) {
 					int thread = t;
 					futures.add(executor.submit(() -> {
@@ -182,7 +191,7 @@ class ParallelApplyTest {
 								api.put(0, column, key(k), text("t" + thread + "." + i), RequestType.none());
 							}
 							if (i % 20 == 0) {
-								long tx = api.openTransaction(java.time.Duration.ofSeconds(10));
+								long tx = api.openTransaction(Duration.ofSeconds(10));
 								api.put(tx, columns[0], key(100 + thread), text("tx" + i), RequestType.none());
 								api.put(tx, columns[1], key(100 + thread), text("tx" + i), RequestType.none());
 								api.closeTransaction(tx, true);
@@ -195,7 +204,7 @@ class ParallelApplyTest {
 					future.get();
 				}
 			}
-			cluster.awaitConverged(java.time.Duration.ofSeconds(30));
+			cluster.awaitConverged(Duration.ofSeconds(30));
 			var expected = userRows(leader.stateMachine().store(), columns);
 			assertTrue(expected.size() >= 48, expected.toString());
 			for (var node : cluster.runningNodes()) {
@@ -207,7 +216,7 @@ class ParallelApplyTest {
 			cluster.halt(restarted);
 			api.put(0, columns[2], key(1), text("after"), RequestType.none());
 			var node = cluster.start(restarted);
-			cluster.awaitConverged(java.time.Duration.ofSeconds(30));
+			cluster.awaitConverged(Duration.ofSeconds(30));
 			assertTrue(!node.isFailed());
 			assertEquals(userRows(leader.stateMachine().store(), columns), userRows(node.stateMachine().store(), columns));
 		}
@@ -359,7 +368,7 @@ class ParallelApplyTest {
 		TermIndex durablePosition;
 		var crashed = open(name);
 		try {
-			assertEquals(java.util.Arrays.toString(columns), java.util.Arrays.toString(createColumns(crashed)));
+			assertEquals(Arrays.toString(columns), Arrays.toString(createColumns(crashed)));
 			crashed.db().flush();
 			var flushed = new Object[] {null, null};
 			int[] seen = {0};
@@ -415,7 +424,7 @@ class ParallelApplyTest {
 		// A restarted applier deletes the records below every floor at its start: the internal column matches a serial
 		// replica restarted at the same position.
 		try (var restarted = open(name + "-serial")) {
-			assertEquals(java.util.Arrays.toString(columns), java.util.Arrays.toString(createColumns(restarted)));
+			assertEquals(Arrays.toString(columns), Arrays.toString(createColumns(restarted)));
 			applyLog(new Applier(restarted, null, 8, 2048), log, 0, applied);
 			applyLog(new Applier(restarted, null, 8, 2048), log, applied, Long.MAX_VALUE);
 			assertEquals(dump(restarted, columns), replayed, point + ": every row after the replay");

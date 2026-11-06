@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.grpc.netty.NettyChannelBuilder;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
@@ -17,6 +18,10 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.SstMaintenance;
+import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
+import it.cavallium.rockserver.core.common.api.proto.ScanRawRequest;
+import it.cavallium.rockserver.core.common.api.proto.ScanRawResponse;
+import it.cavallium.rockserver.core.common.api.proto.WorkloadProfile;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
@@ -148,22 +153,22 @@ class SstMaintenanceTest {
 	}
 
 	private static Set<RawSstToken> grpcTokens(ReplicatedNode node, long column, boolean acceptsTagged) {
-		var channel = io.grpc.netty.NettyChannelBuilder.forAddress(node.config().self().apiHost(),
+		var channel = NettyChannelBuilder.forAddress(node.config().self().apiHost(),
 				node.config().self().apiPort()).usePlaintext().build();
 		try {
 			var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
-					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+					.setProfile(WorkloadProfile.BATCH)
 					.setWorkloadContractVersion(3)
 					.setTimeoutNanos(Duration.ofSeconds(20).toNanos())
 					.build();
-			var request = it.cavallium.rockserver.core.common.api.proto.ScanRawRequest.newBuilder()
+			var request = ScanRawRequest.newBuilder()
 					.setColumnId(column)
 					.setShardCount(1)
 					.setContext(context)
 					.setResumable(true)
 					.setAcceptsTaggedSstTokens(acceptsTagged)
 					.build();
-			var responses = it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.newBlockingStub(channel)
+			var responses = RocksDBServiceGrpc.newBlockingStub(channel)
 					.scanRaw(request);
 			var result = new HashSet<RawSstToken>();
 			while (responses.hasNext()) {
@@ -172,7 +177,7 @@ class SstMaintenanceTest {
 					// The constructor of the clients built before tagged tokens accepts only plain filenames.
 					result.add(new RawSstToken(response.getCompletedSstTokenAfterBatch()));
 				}
-				if (response.getEventCase() == it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.EventCase.COMPLETEDSSTTOKEN) {
+				if (response.getEventCase() == ScanRawResponse.EventCase.COMPLETEDSSTTOKEN) {
 					result.add(new RawSstToken(response.getCompletedSstToken()));
 				}
 			}

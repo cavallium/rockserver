@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.distributed.bench.YotsubaWorkload.Kind;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -11,6 +12,7 @@ import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -152,7 +154,7 @@ public final class LoadBench {
 						? GrpcConnection.forHostsAndPorts(name, addresses)
 						: GrpcConnection.forHostAndPort(name, node.api()));
 			}
-			java.util.Collections.rotate(addresses, -1);
+			Collections.rotate(addresses, -1);
 		}
 		line("connections: " + connections.size() + " to nodes " + targets.stream().map(BenchNodes.Node::id).toList());
 		return connections;
@@ -183,7 +185,7 @@ public final class LoadBench {
 		if (start < 0) {
 			throw new IllegalArgumentException("--first " + first + ": no such node");
 		}
-		java.util.Collections.rotate(ordered, -start);
+		Collections.rotate(ordered, -start);
 		var addresses = ordered.stream().map(BenchNodes.Node::api).toList();
 		var connections = new ArrayList<GrpcConnection>();
 		for (int i = 0; i < perNode * all.size(); i++) {
@@ -376,7 +378,7 @@ public final class LoadBench {
 				new ProcessBuilder("jcmd", String.valueOf(node.process().pid()), "JFR.start", "settings=" + (option("--jfr", "true").equals("true") ? "profile" : option("--jfr", "profile")),
 						"duration=" + seconds + "s", "filename=" + file).redirectErrorStream(true)
 						.redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
-			} catch (java.io.IOException e) {
+			} catch (IOException e) {
 				line("JFR not started on node " + node.id() + ": " + e);
 			}
 		}

@@ -14,6 +14,7 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.GrpcConnection;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RangeBudget;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -92,7 +93,7 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void boundedPutMultiUsesOneUnaryListRpcAndPreservesTheTransaction() throws Exception {
-		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
+		var response = client.getAsyncApi(RequestContext.batch()).putMultiAsync(
 				BULK_TRANSACTION_ID, 17, keys(), values(), RequestType.none()).get(10, TimeUnit.SECONDS);
 
 		assertEquals(List.of(), response);
@@ -105,7 +106,7 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void boundedEnsurePutMultiUsesTheUnaryListEnsureRpc() throws Exception {
-		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
+		var response = client.getAsyncApi(RequestContext.batch()).putMultiAsync(
 				BULK_TRANSACTION_ID, 19, keys(), values(), RequestType.ensure()).get(10, TimeUnit.SECONDS);
 
 		assertEquals(List.of(), response);
@@ -117,7 +118,7 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void maximumItemCountStillUsesOneUnaryListRpc() throws Exception {
-		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
+		var response = client.getAsyncApi(RequestContext.batch()).putMultiAsync(
 				BULK_TRANSACTION_ID,
 				20,
 				keys(MAX_UNARY_PUT_MULTI_ITEMS),
@@ -133,7 +134,7 @@ class GrpcConnectionStreamingTest {
 	@Test
 	void putMultiAboveTheUnaryByteBudgetFallsBackToOneStreamingRpc() throws Exception {
 		int items = RangeBudget.DEFAULT_MAX_ITEMS;
-		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
+		var response = client.getAsyncApi(RequestContext.batch()).putMultiAsync(
 				BULK_TRANSACTION_ID, 21, keys(items), values(items, 2_048), RequestType.none())
 				.get(10, TimeUnit.SECONDS);
 
@@ -146,7 +147,7 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void mergeMultiAboveLegacyChunkSizeUsesOneStreamingRpc() throws Exception {
-		var response = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).mergeMultiAsync(
+		var response = client.getAsyncApi(RequestContext.batch()).mergeMultiAsync(
 				0, 23, keys(), values(), RequestType.none()).get(10, TimeUnit.SECONDS);
 
 		assertEquals(List.of(), response);
@@ -157,7 +158,7 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void rangeVariantsUseTransportDeadlineAndTypedErrorMapping() throws InterruptedException {
-		var context = it.cavallium.rockserver.core.common.RequestContext.batch(
+		var context = RequestContext.batch(
 				Duration.ofMillis(RANGE_TIMEOUT_MS));
 		expectReadDeadline(client.getAsyncApi(context).getRangeAsync(
 				0, 29, null, null, false, RequestType.allInRange()));
@@ -174,7 +175,7 @@ class GrpcConnectionStreamingTest {
 	void rangeLargerThanReactiveGrpcQueueCanWriteBatchesThroughSameConnection() throws Exception {
 		var callbacksOnVirtualThreads = new AtomicBoolean(true);
 		var callbackCount = new AtomicInteger();
-		Flux<it.cavallium.rockserver.core.common.KV> range = Flux.from(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
+		Flux<it.cavallium.rockserver.core.common.KV> range = Flux.from(client.getAsyncApi(RequestContext.batch()).getRangeAsync(
 				0, STREAMING_RANGE_COLUMN_ID, null, null, false,
 				RequestType.allInRange()));
 		var cleanup = range
@@ -185,7 +186,7 @@ class GrpcConnectionStreamingTest {
 					}
 				})
 				.buffer(CLEANUP_BATCH_SIZE)
-				.concatMap(batch -> Mono.fromFuture(client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).putMultiAsync(
+				.concatMap(batch -> Mono.fromFuture(client.getAsyncApi(RequestContext.batch()).putMultiAsync(
 						0,
 						CLEANUP_WRITE_COLUMN_ID,
 						batch.stream().map(it.cavallium.rockserver.core.common.KV::keys).toList(),
@@ -197,7 +198,7 @@ class GrpcConnectionStreamingTest {
 		assertTrue(service.firstCleanupWriteStarted.await(5, TimeUnit.SECONDS),
 				"the range did not start its nested cleanup write");
 		try {
-			assertEquals(73, client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnIdAsync("responsive-unary")
+			assertEquals(73, client.getAsyncApi(RequestContext.batch()).getColumnIdAsync("responsive-unary")
 					.get(5, TimeUnit.SECONDS));
 		} finally {
 			service.releaseFirstCleanupWrite();
@@ -215,7 +216,7 @@ class GrpcConnectionStreamingTest {
 
 	@Test
 	void backpressuredCancellationReachesServerAndLeavesConnectionHealthy() throws Exception {
-		var range = client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getRangeAsync(
+		var range = client.getAsyncApi(RequestContext.batch()).getRangeAsync(
 				0, CANCELLABLE_RANGE_COLUMN_ID, null, null, false,
 				RequestType.allInRange());
 
@@ -227,7 +228,7 @@ class GrpcConnectionStreamingTest {
 
 		assertTrue(service.cancellableRangeCancellation.await(5, TimeUnit.SECONDS),
 				"the server did not observe downstream cancellation");
-		assertEquals(73, client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnIdAsync("healthy-after-cancellation")
+		assertEquals(73, client.getAsyncApi(RequestContext.batch()).getColumnIdAsync("healthy-after-cancellation")
 				.get(5, TimeUnit.SECONDS));
 	}
 
@@ -238,7 +239,7 @@ class GrpcConnectionStreamingTest {
 		var channel = privateField(client, "channel", ManagedChannel.class);
 		assertEquals(1, StreamSupport.stream(eventLoopGroup.spliterator(), false).count());
 
-		assertEquals(73, client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch()).getColumnIdAsync("executor-started")
+		assertEquals(73, client.getAsyncApi(RequestContext.batch()).getColumnIdAsync("executor-started")
 				.get(5, TimeUnit.SECONDS));
 		client.close();
 		client = null;
