@@ -1487,7 +1487,10 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   the joint configuration of its removal, with the node in the old half only, since the final one goes to the members
   that stay), and it was started without `--join` or was a member once (it writes `raft/member` when a configuration
   from the log makes it one, after the leader checks of each maintenance tick and on its own, so that a failed write,
-  such as on a full disk, does not keep a stalled leader in place). With systemd, `RestartPreventExitStatus=4 5` keeps it down (5: a database of a newer cluster version, see "Exit codes" in runbooks.md). A node of a version before
+  such as on a full disk, does not keep a stalled leader in place). With systemd, `RestartPreventExitStatus=2 4 5` keeps it down (2: wrong usage or no `-XX:+ExitOnOutOfMemoryError`;
+  5: a database of a newer cluster version; see "Exit codes" in runbooks.md for the exit and stop settings of the
+  unit, with `SuccessExitStatus=143` for a stop by SIGTERM and `TimeoutStopSec=150` for a stop longer than systemd's
+  default of 90 s). A node of a version before
   this, started with `--join`, has no `raft/member` and still stays up in the initializing state, printing `READY`; it
   says so in its log as above. One start is refused wrongly: a node that holds a joint configuration of its own
   removal that its leader never committed before losing its leadership. Only a node that was being removed gets there;
@@ -1982,6 +1985,40 @@ forwarded at once, so a healed node is not still effectively throttled when the 
 did lose answers is reset when the link heals, since its stream is garbage after the gap. The client link makes the "committed but unanswered"
 case reproducible without killing the leader: the node commits and applies, only the reply is lost.
 
+**Why `LinkProxy` and not `tc netem` (RT-50).** A netem harness, in a user and network namespace (`unshare -rn`,
+which gives `CAP_NET_ADMIN` inside it without root) or with iptables on real hosts, would add what happens below and
+inside the kernel's TCP: packets lost, reordered, duplicated or corrupted at the IP level, and the kernel's own
+reaction to them (retransmission timeouts that double from 200 ms, congestion control shrinking the window,
+`tcp_retries2` closing a connection after about 15 minutes of unanswered retransmissions, SYN retries on a connect
+to a host that does not answer, keepalive probes). It is not built, because none of that reaches the nodes as
+anything but what `LinkProxy` already produces:
+
+- Loss, reordering, duplication and corruption are repaired by TCP (the checksum drops a corrupted segment, which
+  is then lost and resent). The nodes see only bytes that arrive later, in order, and a lower throughput: the
+  proxy's latency with jitter and its bandwidth cap. A burst of loss long enough to matter is a stall, which is a
+  blackhole that heals.
+- A connection that the kernel gives up on fails like a cut link (a reset, or an error on the next read or write),
+  after a time far beyond every timeout the nodes and clients set themselves (election 1-2 s, the request timeout,
+  gRPC keepalive, the forwarding deadlines). Those timeouts are what decides the outcome, and the blackhole
+  exercises them: a blackholed link keeps its connections open and moves nothing, as a dead network does.
+- What the nodes rely on is TCP's contract (order, no loss, no duplication inside a connection), never its timing.
+  Raft's safety does not depend on time, and the time-bound claims (the availability bound of the random fault
+  suites) are tested under latency, jitter, throttling, blackholes and flapping links.
+
+Two differences remain, both judged not worth a privileged harness. A blackholed proxy accepts a new connection
+(the TCP handshake with the proxy succeeds) and then holds it, where a real dead host leaves the connect hanging on
+SYN retries: a client then waits for the HTTP/2 preface instead of the connect, and both end on the same gRPC
+deadline or keepalive. And the gradual shape of a lossy link (throughput collapsing under congestion control,
+stalls of a few RTOs) is approximated by fixed jitter and a fixed cap, not reproduced. netem in a namespace would
+also need a one-time step by root on each machine that runs the tests: the kernel does not load a module on request
+from inside a user namespace, so `sch_netem` must be loaded beforehand (`modprobe sch_netem`, or a line in
+`/etc/modules-load.d/`). After that, `tc qdisc ... netem` inside `unshare -rn` should need no privilege. On the
+development machine `tc` in `unshare -rn` answers "Specified qdisc kind is unknown" for a reason of its own: the
+running kernel (7.3.0-5) has no module tree after an upgrade without a reboot (`modinfo sch_netem` finds nothing,
+while the installed 7.3.1-1 ships `sch_netem.ko.zst` and its config has `CONFIG_NET_SCH_NETEM=m`). So netem is
+feasible here after a reboot and that root step (needs-user), but the argument above does not depend on it. Faults
+that need several machines (a real switch, failure domains) stay with the multi-host item (RT-28).
+
 When two faults overlap, a flapping link cuts and restores only the links of its node that no other network fault of
 the step holds, so the other fault keeps its links for its whole planned hold instead of being healed by the flapper
 within 400 ms. The term check is not allowed to pass vacuously: every node's `raft-meta` term must have been read at
@@ -2058,7 +2095,7 @@ hook: the test cuts the leader's links, lets clients write to it directly, and k
 | `ProtocolPointKillTest` (processes) | Rounds drawn from a seeded generator (`-Drockserver.test.seed`, `-Drockserver.test.protocolKillRounds`, 12 by default): the leader halted before an append, between commit and apply, between apply and replies; any node halted at those points or in the middle of a snapshot; the winner of an election halted as it learns it won (both followers armed, the leader killed). After each round writes resume and the node restarts and catches up; at the end every acknowledged write is readable, no write answered "not applied" took effect, and the replicas are identical. A leader killed with entries in its log that no follower has loses only unacknowledged writes, and drops them from its log when it rejoins: its links are cut, the followers' last entries are read 100 ms later (still of the leader's term, so before any election), and the leader is killed only once its last entry is past both. At the end, with every node stopped, the log files are read (`LogTerms`, as a starting node reads them): wherever two logs hold an index they hold the same term (log matching), and every entry the killed leader had appended past the followers' last one is gone from its log or replaced by a later term (the truncation itself, not only its effect on the data). |
 | `LaggingInstallTest` (processes) | An existing member that lags past what the leader still holds catches up through a snapshot install. With the production settings no node purges past a member that lags (see "Log retention"), so the nodes run with a test-only setting (`rockserver.test.purgeUpToSnapshot`, set through `CrashPointMain`) that purges up to each snapshot. The lagging follower is cut off, and the link heals only once the leader's log, read from its segment files, starts past the follower's last entry. Variants: the lagging member halted after receiving the snapshot (`INSTALL_RECEIVED`) and while restoring it (`INSTALL_RESTORING`) restarts and catches up; the sending leader killed as soon as the lagging member starts receiving files leaves it to the next leader. The test fails if the lagging member caught up without an install. The leader-kill variant stays timed by the receiver's first file, without a crash point in the sender (R3-G4b-3): Ratis' snapshot sender (`GrpcLogAppender` reading the snapshot files) calls nothing of the state machine between the chunks, so a hook there means patching Ratis. What the kill does to the receiver, which is what Rockserver code handles, is pinned exactly by `INSTALL_RECEIVED` and `INSTALL_RESTORING` on the receiving side, and a sender that dies between chunks only breaks the stream, which a receiver sees the same way at any chunk; the timed kill lands somewhere in the transfer, which is the one case left, and prints where. |
 | `HungDiskTest` (processes) | R3-G2a-3 (DD-9): the shim's `HANG sync` on the leader and on a follower. The node does not exit, stops listening on its API port once its disk probe has not ended for the request timeout (3 s here), and the other two keep acknowledging writes; a leader on that disk is replaced (its log stops flushing, `LeaderStall`). Once the trigger goes, the node listens again and catches up; every acknowledged write is readable and the replicas are identical. Skipped without `gcc`. Written in round 6 and never run, so it runs only with `-Drockserver.test.hungDisk=true`, not in the nightly job: open are whether a leader whose log fsync hangs steps down within the phase timeout (while it still says it is the leader, `ScenarioSupport.leaderOrNull` sees two leaders and waits; each node's group-info query has a 1 s deadline, so a hung node does not block it), and whether teardown is clean. It joins the nightly job after one passing run on the user's machine. `DiskProbeTest` checks the API pause in process, with a test hook that holds one node's probe (`DiskProbe.HANGS_FOR_TESTING`): that node stops listening, a client given every address goes on writing, and it listens again once the probe ends. |
-| `DiskFaultTest` (processes) | A full disk and failing fsyncs, with the shim above preloaded into every node: ENOSPC on every write, and EIO on every fsync, of the leader and of a follower (and EIO on everything, of a follower). The node stops as a failed replica with exit code 3, the other two keep acknowledging writes, and once the trigger is gone the node starts again (after `repair-log` if Ratis refuses a torn tail of its open segment; safe here, since the write or fsync of that entry failed, so this node never acknowledged it) and catches up; every acknowledged write is readable and the replicas are identical. A write is acknowledged only once a majority fsynced it, so the node whose fsync failed never counted. DD-7h: a follower's disk starts failing right after a SIGCONT, and a SIGTERM follows either as soon as its log shows the failure (`hit exception`, `replica failed to`, `Raft closed`) or after 0-30 ms; whenever the failure showed before the signal the exit code is 3, never the 0 of a graceful stop, and at least one round must signal a node that was failing and still alive. A disk error that first shows during a graceful stop (the stop's own flush hits the failed disk) may exit 0: the stop was asked for, nothing acknowledged depends on that flush (an entry is acknowledged only once a majority fsynced it to its Raft log, and the database is rebuilt from the log), and the next start on that disk fails at its first write. Skipped without `gcc`. |
+| `DiskFaultTest` (processes) | A full disk and failing fsyncs, with the shim above preloaded into every node: ENOSPC on every write, and EIO on every fsync, of the leader and of a follower (and EIO on everything, of a follower). The node stops as a failed replica with exit code 3, the other two keep acknowledging writes, and once the trigger is gone the node starts again (after `repair-log` if Ratis refuses a torn tail of its open segment; safe here, since the write or fsync of that entry failed, so this node never acknowledged it) and catches up; every acknowledged write is readable and the replicas are identical. A write is acknowledged only once a majority fsynced it, so the node whose fsync failed never counted. DD-7h: a follower's disk starts failing right after a SIGCONT, and a SIGTERM follows either as soon as its log shows the failure (`hit exception`, `replica failed to`, `Raft closed`) or after 0-30 ms; whenever the failure showed before the signal the exit code is 3, never the 143 of a graceful stop (the JVM's status after SIGTERM), and at least one round must signal a node that was failing and still alive. A disk error that first shows during a graceful stop (the stop's own flush hits the failed disk) may exit 143: the stop was asked for, nothing acknowledged depends on that flush (an entry is acknowledged only once a majority fsynced it to its Raft log, and the database is rebuilt from the log), and the next start on that disk fails at its first write. Skipped without `gcc`. |
 | `PublicApiRecoveryTest` (processes) | Salvaged from the old public-quorum suite, through the public client (`GrpcConnection` with every node's address, sessions on). RT-70: the client link to the leader drops the reply of `deleteColumnIfExists` and of `uploadMergeOperator`; once applied, another client creates a column of the same name (or uploads another version), then the link is reset, or the leader is SIGKILLed: the client sends the request again under the same id and gets the first answer (`true`, the first version), and the new column stays, so the deletion ran once. The registry deduplicates uploads by content, so a second apply would answer the first version too; the nodes run with the registry's log at info, and no node may log the upload as applied again (`already exists as version`). RT-72: a transaction opened through a follower is refused at commit after its leader's SIGKILL, as safe to run again, its writes stay absent seconds later (never rebased onto the new leader), and the same transaction run again commits. |
 | `MembershipFaultTest` (processes) | Node 4 joins under writes and a node stops during the joint configuration. Halted where it applies the committed joint configuration: the leader (node 4 ends a member), or node 4 (the others complete the change without it, it rejoins after a restart). Killed while the joint configuration is appended and not committed: the old followers are paused before `add-peer` (long election timeouts keep the leader in place), so the leader catches node 4 up and appends the joint configuration, which cannot commit; the leader, or node 4, is killed once its own configuration shows the joint one, then the followers resume. The configuration ends plain, old or new, and node 4 can be added afterwards. The configuration never stays joint, no acknowledged write is lost, all members end identical. |
 | `SlowFollowerDiskTest` (in-process) | One follower's log worker sleeps 180 ms of every 200 ms (`LogWorkerGate.pause`) under 20 s of writes: the leader keeps its term, writes are acknowledged in every second, the follower falls behind (hundreds of entries) and catches up once its disk is fast again. Memory: the nodes use 1 MiB log segments, and the leader's Ratis log cache, read directly, must stay within Ratis' cached-segment limit plus three segments (9 MiB) while the load writes far more (about 200 MiB; the test fails below four times the bound, where the check could not fail). The appender's buffers are not measured. |
@@ -2137,7 +2174,34 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      callers' retries), the server has already ended the update, so the cleanup does not close it a second time
      and the double-close warning is gone. Every other failure, including an `UPDATE_RETRY` from the put or delete
      that ends the update, and a cancel still close it: a single node keeps the native transaction open after a
-     conflicting ending write, and the cluster answers a close of an update it has dropped quietly.
+     conflicting ending write. The cluster answers such a close quietly for an update without `--pipelined-updates`
+     (`UpdateProtocol.closeFailedUpdate` rolls back a native id and answers at once, whether or not it still holds
+     it), but not for a chained one. With `--pipelined-updates`, `UpdateProtocol.closeChained` answers `UPDATE_RETRY`
+     whenever it cannot confirm the chained read (see "Chained close"), and `RockserverUpdateTransactions` turns
+     that into a `NoChangeCloseRetryException` that `closeFailedUpdateQuietly` logs ("Failed to close RocksDB update
+     transaction", at most once a minute) and drops. The cleanup close of a chained update therefore warns:
+     - when the leader no longer holds the update: the commit of any chained ending write removes it, whatever its
+       error (`UpdateProtocol.stagedWrite`: `UPDATE_RETRY` from a chain conflict or a failed guard, a deadline or
+       `OUTCOME_UNKNOWN`, `NOT_LEADER`, a cancel), and so does the refusal of an ending write whose base commit
+       failed; the same when the update was opened under a previous leader, the close reaches a new one, or its
+       lease ended;
+     - when the leader still holds it but the commit it read from failed or is not known to have applied within
+       the close's wait: a body that throws its own error, or is cancelled, after reading a chained value whose
+       predecessor failed.
+
+     So under `--pipelined-updates` the warning follows leader changes, timeouts and body failures as well as refused
+     chained writes: it counts failed chained updates, and a pipelined cluster under contention makes some on purpose.
+     Nothing is written or left open in any of these cases, since a chained update has no native transaction and the
+     leader removes it before it answers. In the first case the caller already has the ending write's own error, and
+     runs the update again on an `UPDATE_RETRY`, as it would anyway. In the second the caller gets the body's error,
+     while the close's `UPDATE_RETRY`, which says the read was not real, is only logged: a body that fails because of
+     what it read has acted on a provisional value, which "Behavior differences from a single node" forbids, and the
+     warning is the only trace of it. Answering these closes quietly would be wrong (a clean close of an unconfirmed
+     chained read would confirm it), and the cleanup cannot skip them without knowing that the update already ended,
+     so the warning stays. Left on the Yotsuba side: the javadoc of `RockserverUpdateTransactions.updateAlreadyEnded`
+     still says the cluster answers a close of a dropped update quietly, which holds only without
+     `--pipelined-updates`; that repository is outside this branch's work. Not checked against a running replicated
+     server.
 
    On the Rockserver side, the core client's automatic gRPC retry of reads waits for its backoff before it sends a
    read to the next node: 50 ms, then growing, on a connection with several addresses (the next node is another one,
