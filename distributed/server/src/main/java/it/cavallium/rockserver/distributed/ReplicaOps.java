@@ -171,6 +171,17 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		this.proposer = proposer;
 	}
 
+	/**
+	 * Tests only: what the node with this id says it supports, instead of {@link Capabilities#SUPPORTED}: a node of an
+	 * older version, in a cluster run in one JVM.
+	 */
+	static final Map<String, Long> SUPPORTED_FOR_TESTING = new ConcurrentHashMap<>();
+
+	/** What this node supports: {@link Capabilities#SUPPORTED}, unless a test says otherwise. */
+	long supported() {
+		return SUPPORTED_FOR_TESTING.getOrDefault(config.nodeId(), Capabilities.SUPPORTED);
+	}
+
 	/** The cluster version of the database just opened. */
 	void opened(NodeStore store) {
 		clusterVersion = store.clusterVersion();
@@ -608,7 +619,8 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		long now = System.nanoTime();
 		long term = info.getCurrentTerm();
 		proposePeriodicChecksum(System.currentTimeMillis());
-		if ((Capabilities.SUPPORTED & ~clusterVersion) == 0 || versionCheckRunning
+		long supported = supported();
+		if ((supported & ~clusterVersion) == 0 || versionCheckRunning
 				|| (term == versionCheckTerm && now - nextVersionCheckNanos < 0)) {
 			return;
 		}
@@ -618,14 +630,14 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		var answers = new ArrayList<CompletableFuture<Long>>();
 		for (RaftPeer peer : pollPeers(division).values()) {
 			if (peer.getId().toString().equals(config.nodeId())) {
-				answers.add(CompletableFuture.completedFuture(Capabilities.SUPPORTED));
+				answers.add(CompletableFuture.completedFuture(supported));
 			} else {
 				answers.add(ask(peer, OP_CAPABILITIES, new byte[0]).thenApply(reply -> ByteBuffer.wrap(reply).getLong()));
 			}
 		}
 		// Ends on whichever thread answers last, without blocking it: versionCheckRunning is volatile for that.
 		CompletableFuture.allOf(answers.toArray(CompletableFuture[]::new)).thenCompose(_ -> {
-			long common = Capabilities.SUPPORTED;
+			long common = supported;
 			for (var answer : answers) {
 				common &= answer.join();
 			}
@@ -727,7 +739,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		switch (request[0]) {
 			case OP_CAPABILITIES -> {
 				return CompletableFuture.completedFuture(ByteBuffer.allocate(2 * Long.BYTES)
-						.putLong(Capabilities.SUPPORTED).putLong(clusterVersion).array());
+						.putLong(supported()).putLong(clusterVersion).array());
 			}
 			case OP_CHECKSUM_RESULT -> {
 				return CompletableFuture.completedFuture(encodeResult(checksumResult(payload.getLong())));
