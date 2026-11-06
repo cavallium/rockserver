@@ -1,8 +1,14 @@
 # Multi-Raft for replicated Rockserver: design (read-only study)
 
-Status: proposal, not implemented. Written as a read-only study while follower reads and the leader hint, the
-leaner apply path (`EmbeddedDB.ApplyWriter`) and client sessions were being built; those have since landed. The
-verdict below stands until the benchmarks after those changes say otherwise.
+Status: **decided, not built.** Follower reads and the leader hint, the leaner apply path (`EmbeddedDB.ApplyWriter`),
+client sessions and partitioned apply inside one group (`--parallel-apply-threads`, section 6) have all landed.
+Partitioned apply spreads the CPU of the single apply thread over lanes split by first key part, including inside
+`messages-v2`, so it lifts the ceiling that Multi-Raft by column would lift (at most 1.75x, section 0), without a
+second fsync stream, a second election, per-group membership, snapshots and monitoring. Multi-Raft is therefore
+not built. The gate to reopen it is measured, not argued: run `LoadBench` at 4x production with
+`--parallel-apply-threads 4` on every node (performance.md item 19); build phase 1 (section 5) only if the apply
+thread, or the single group commit it keeps, is still above 80% busy there, or if fsync latency of the one Raft log
+is the limit. Measure the idle cost per group (threads, RSS, CPU, file handles at 1/2/8 groups) first.
 
 Abbreviations:
 

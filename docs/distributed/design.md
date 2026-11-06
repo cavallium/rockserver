@@ -25,8 +25,10 @@ No acknowledged write may be lost or applied twice, and reads are linearizable.
 
 Every node holds the full dataset, like the single node today. If partitioning is ever needed, it can be
 added later as several independent copies of this design, with routing in the client. [multi-raft.md](multi-raft.md)
-studies that step: columns assigned to groups, no cross-group operation for Yotsuba, and a verdict that it pays
-only once the apply thread is still the limit above about 4x production load.
+studies that step: columns assigned to groups, no cross-group operation for Yotsuba. It is decided against for
+now: partitioned apply inside one group lifts the same apply ceiling without a second Raft log, and Multi-Raft is
+reopened only if a benchmark with partitioned apply on still shows the apply or the one log as the limit above about
+4x production load (see its status section).
 
 ## Shape
 
