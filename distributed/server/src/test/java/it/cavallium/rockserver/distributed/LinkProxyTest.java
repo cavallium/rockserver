@@ -2,10 +2,12 @@ package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -119,6 +121,41 @@ class LinkProxyTest {
 		try (var proxy = new LinkProxy(new InetSocketAddress(LOOPBACK, 0), deadTarget);
 				var socket = connect(proxy.listenAddress())) {
 			assertCutPromptly(socket);
+		}
+	}
+
+	/**
+	 * RT-N1: with {@link LinkProxy#refuseWhileTargetDown()}, a client of a dead target gets a refused connection (a
+	 * {@link ConnectException}, proof that nothing arrived), not an accepted connection that is then reset; the proxy
+	 * listens again once the target is back.
+	 */
+	@Test
+	void refusesConnectionsWhileTheTargetIsDown() throws Exception {
+		int targetPort = freePort();
+		var targetAddress = new InetSocketAddress(LOOPBACK, targetPort);
+		try (var proxy = new LinkProxy(new InetSocketAddress(LOOPBACK, 0), targetAddress)) {
+			proxy.refuseWhileTargetDown();
+			// The first connection finds the target down: accepted, then reset.
+			try (var first = connect(proxy.listenAddress())) {
+				assertCutPromptly(first);
+			}
+			awaitTrue(() -> !proxy.isAccepting(), "the proxy still listens");
+			assertThrows(ConnectException.class, () -> connect(proxy.listenAddress()).close());
+
+			try (var echo = new EchoServer(targetAddress)) {
+				awaitTrue(proxy::isAccepting, "the proxy does not listen again");
+				try (var socket = connect(proxy.listenAddress())) {
+					assertEchoes(socket, "back");
+				}
+				// Refused on demand (a harness that kills the target first), and back once asked.
+				proxy.refuseConnections();
+				assertThrows(ConnectException.class, () -> connect(proxy.listenAddress()).close());
+				proxy.acceptWhenTargetUp();
+				awaitTrue(proxy::isAccepting, "the proxy does not listen again");
+				try (var socket = connect(proxy.listenAddress())) {
+					assertEchoes(socket, "again");
+				}
+			}
 		}
 	}
 
