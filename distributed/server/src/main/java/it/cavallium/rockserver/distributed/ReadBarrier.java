@@ -23,6 +23,8 @@ import org.apache.ratis.thirdparty.io.grpc.ConnectivityState;
 import org.apache.ratis.thirdparty.io.grpc.ManagedChannel;
 import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Linearizable-read barrier for the leader, built on public Ratis APIs only.
@@ -49,6 +51,10 @@ import org.jetbrains.annotations.Nullable;
  * so callers may run blocking work, such as a database read, in their continuations.</p>
  */
 final class ReadBarrier implements Closeable {
+
+	private static final Logger LOG = LoggerFactory.getLogger(ReadBarrier.class);
+	/** Failures to send to one peer are logged at most this often. */
+	private static final long SEND_FAILURE_LOG_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
 
 	/** Thrown (as the future's failure) when this node is not, or no longer, a ready leader. */
 	static final class NotLeaderException extends Exception {
@@ -77,10 +83,13 @@ final class ReadBarrier implements Closeable {
 	private final Map<RaftPeerId, PeerLink> links = new ConcurrentHashMap<>();
 	/** Every future returned by {@link #await} and not completed yet, failed by {@link #close}. */
 	private final Set<CompletableFuture<Void>> outstanding = ConcurrentHashMap.newKeySet();
-	/** Completes the callers' futures and starts queued rounds; see {@link #execute}. */
-	private final ExecutorService executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
-			.name("rockserver-read-barrier-", 0)
-			.factory());
+	/**
+	 * Completes the callers' futures and starts queued rounds; see {@link #execute}. In a node, the platform threads of
+	 * its control plane ({@link NodeThreads#control()}), which the node shuts down.
+	 */
+	private final ExecutorService executor;
+	/** {@link #executor} is this barrier's own, shut down by {@link #close}. */
+	private final boolean ownsExecutor;
 
 	private final Object lock = new Object();
 	/** Waiters of the next round, whose RPCs have not been sent yet. Guarded by {@link #lock}. */
@@ -100,6 +109,19 @@ final class ReadBarrier implements Closeable {
 	 */
 	ReadBarrier(RaftServer server, RaftGroupId groupId, AppliedIndex applied, Duration roundTimeout,
 			java.util.function.LongUnaryOperator readyIndex) {
+		this(server, groupId, applied, roundTimeout, readyIndex, null);
+	}
+
+	/**
+	 * @param executor runs the rounds and completes the callers' futures; null for one of the barrier's own (virtual
+	 *                 threads). A given one is not shut down by {@link #close}
+	 */
+	ReadBarrier(RaftServer server, RaftGroupId groupId, AppliedIndex applied, Duration roundTimeout,
+			java.util.function.LongUnaryOperator readyIndex, @Nullable ExecutorService executor) {
+		this.ownsExecutor = executor == null;
+		this.executor = executor != null ? executor : Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
+				.name("rockserver-read-barrier-", 0)
+				.factory());
 		this.server = server;
 		this.groupId = groupId;
 		this.applied = applied;
@@ -178,7 +200,9 @@ final class ReadBarrier implements Closeable {
 			future.completeExceptionally(new NotLeaderException("Read barrier closed"));
 		}
 		closeChannels();
-		executor.shutdown();
+		if (ownsExecutor) {
+			executor.shutdown();
+		}
 	}
 
 	/** The waiters of the next round, if no round is running; the caller must then run it. */
@@ -393,6 +417,8 @@ final class ReadBarrier implements Closeable {
 		private boolean inFlight;
 		/** The round that found a query in flight and needs one of its own once that one ends. Guarded by this. */
 		private @Nullable Votes waiting;
+		/** When a failure to send to this peer was last logged, see {@link #SEND_FAILURE_LOG_INTERVAL_NANOS}. */
+		private volatile long lastSendFailureLogNanos = System.nanoTime() - SEND_FAILURE_LOG_INTERVAL_NANOS;
 
 		PeerLink(RaftPeerId id, String address) {
 			this.id = id;
@@ -433,7 +459,14 @@ final class ReadBarrier implements Closeable {
 								});
 						return;
 					} catch (RuntimeException e) {
-						// Such as an unusable address: this peer does not contribute to the round.
+						// Such as an unusable address: this peer does not contribute to the round. Said in the log, or
+						// a misconfigured peer would show only as rounds that time out.
+						long now = System.nanoTime();
+						if (now - lastSendFailureLogNanos >= SEND_FAILURE_LOG_INTERVAL_NANOS) {
+							lastSendFailureLogNanos = now;
+							LOG.warn("Read barrier: cannot ask peer {} at {} for its term; it does not count toward"
+									+ " leadership confirmations (logged at most once a minute per peer)", id, address, e);
+						}
 					}
 				}
 				votes = release();

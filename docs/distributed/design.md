@@ -82,6 +82,8 @@ forwards to a non-embedded connection:
 | `ReadBarrier`, `TermService` | Linearizable reads. `TermService` also answers what a node holds (`NodeState`). |
 | `ClusterCheck` | A leader tells its followers which cluster it leads, and a node of another cluster stops. |
 | `LeaderStall` | Tells a leader that cannot commit to step down. |
+| `NodeThreads` | The node's control-plane platform threads and the virtual threads of the leader's short local commands (see "Threads"). |
+| `ConflictPositions` | The text that carries a conflict's positions from the leader's refusal to the proposer. |
 | `NodeStore`, `CheckpointStorage` | Local database, internal metadata, checkpoint snapshots, restore. |
 | `LeaderForwarder` | Finds the leader's API and forwards to it. |
 | `LogEntry`, `Request`, `LogEntryCodec`, `ResultCodec` | Log entry model and its binary encoding. |
@@ -202,6 +204,20 @@ and the `LogEntry`.
   again under their own deadlines. A batch whose attempt ended without saying whether it was appended ends
   with an unknown outcome for every request instead: sending its requests again as a new batch would append
   them a second time while the first copy may still be pending.
+- **Byte admission.** A node holds at most a fixed number of bytes of writes, queued or in flight, from
+  `Proposer.submit` to their answer: an eighth of the maximum heap by default (each body is held about twice while
+  in flight), at least room for two entries of the largest size, or the system property
+  `it.cavallium.rockserver.replicated.write-admission-bytes`. Each request counts its encoded body plus 256 bytes. A
+  write that does not fit fails at once with `SERVER_OVERLOADED` and a message that says it was not applied
+  (metric `writes.admissionRejects`), instead of filling the heap: an out of memory error ends the node (see "Heap").
+- **Attempt permits.** Before an attempt is handed to Ratis, local or remote, it takes a permit for its bytes from
+  the proposer's own count: at most 32 MiB of attempts in flight per node (two entries of the largest size). An
+  attempt without a permit is not sent: it is refused before the append by the node's own decision, and resent
+  after 50 ms. The leader's Ratis pending-request limits (`RaftSettings`: Ratis' default 4096 requests, and
+  128 MiB instead of the 1 GiB this used to be) hold the attempts of every node of a cluster of up to 4 nodes, so
+  Ratis' own refusal (`ResourceUnavailableException`) should not happen. When it does it is an unknown outcome:
+  Ratis raises the same exception after an append, and only its message tells them apart, which an upgrade could
+  change. The retry cache of Ratis 3.3.1 has no size bound, only its expiry.
 - **Caller deadlines.** When the caller's request-context timeout ends before the node's request timeout, a
   write is resent only until the caller's deadline, less a margin of 20 ms (at most a tenth of the timeout). A
   write still queued at that point, or whose caller cancelled it before it was sent, is never sent; nor is one
@@ -457,10 +473,14 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
 - **On conflict** commit returns `false` and the transaction stays open, as on a single node. Commits share
   entries: the leader rejects the entry before appending it and names the commits that conflict (with history,
   or with an earlier write of the same entry); those fail and the others go again in the next entry.
-- **Outcome of a commit.** It is submitted once, to the local Raft server. Only a refusal that Ratis gives before
-  appending (leader not ready, no pending-request permit, or the state machine's own refusals) means "not
-  committed"; `NotLeaderException`, which a leader stepping down also returns for appended entries, is an
-  unknown outcome.
+- **Outcome of a commit.** It is submitted once, to the local Raft server. Only a refusal that is known to come
+  before appending (Ratis' leader not ready, no attempt permit of the proposer's own, or the state machine's own
+  refusals) means "not committed"; `NotLeaderException`, which a leader stepping down also returns for appended
+  entries, and Ratis' `ResourceUnavailableException` (see "Attempt permits") are an unknown outcome. The positions
+  of the conflicting commits travel as the text of the state machine's `ConflictException`, the only channel
+  Ratis offers (it rebuilds the exception from its class name and message): `ConflictPositions` formats and parses
+  it, and a text that does not parse, or names a position the entry does not have, fails the whole entry as a
+  conflict.
 - **Otherwise** the entry is appended and later applied atomically on every replica (unless a chained commit's
   guard rejects it: see above). The leader's native transaction is then rolled back, because its effects arrive
   through the log.
@@ -730,6 +750,20 @@ against an incomplete history.
   it cannot help once the queue is full under a heavy load, which blocks the server lock: then the heartbeats stop
   anyway, within seconds at that load. The node stays up with its hung disk, as a follower that does not answer.
 
+## Threads
+
+Virtual threads run what waits for I/O: gRPC calls, the blocking remote attempts of the proposer, forwarded calls
+and the leader's short local commands (`NodeThreads.local()`, one executor per node, shut down with it). A RocksDB
+call pins the carrier of its virtual thread (JEP 491 removed pinning by `synchronized`, not by native frames), so
+slow disk reads can hold every carrier at once. The Raft control plane does not wait behind them: the proposer's
+reply handling, resends and expiries and the read barrier's rounds run on `NodeThreads.control()`, 2 to 4 platform
+threads per node that run no database calls. The proposer hands each answer back to a new virtual thread, so that
+its callers' continuations never run on the control plane; the read barrier's callers hop to the local executor
+before touching the database. The leader forwarder's poll timer has a platform thread of its own. Cluster
+initialization (the genesis proposal, which can wait up to the request timeout) has a thread of its own, so that
+the API gate and the Raft watch (`LeaderStall`) keep running meanwhile. Why the local commands stay on virtual
+threads, and what to measure, is in [performance.md](performance.md), item 11.
+
 ## Behavior differences from a single node
 
 - **Leader changes.** Transactions, update ids and iterators do not survive one. Clients get `UPDATE_RETRY`.
@@ -756,7 +790,10 @@ against an incomplete history.
 - **Maintenance.** `flush` and `compact` act only on the node that receives them.
 - **Workload limits.** The replicated server's `GrpcServer` runs requests on virtual threads of their own (at
   most 16384 waiting on the leader), not through each column's workload scheduler. Streamed mutations run at
-  most 256 at once. On the leader, point reads, single-key writes staged in a transaction and transaction
+  most 256 at once. The 16384 is a count: the bytes of waiting writes are bounded by the byte admission (see
+  "Writes, exactly once"), and a waiting read holds only its key. A gRPC message may be up to 512 MiB, as on a
+  single node; the system property `it.cavallium.rockserver.grpc.server.max-inbound-message-bytes` lowers it.
+  On the leader, point reads, single-key writes staged in a transaction and transaction
   opens run each on a virtual thread of their own (one that waited past its deadline fails without running).
   Rollbacks (`closeTransaction` without commit, `closeFailedUpdate`) run at once on the thread that received
   them. Ranges, multi-key reads, multi-key staged writes and iterator calls use the embedded workload scheduler.
@@ -794,7 +831,9 @@ failover" below).
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history, hot counters included, is linearizable. |
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. A freeze longer than `--jvm-pause-limit-ms` ends the node with exit code 3, and it starts again. |
 | `ClusterIdentityTest` | Each genesis gets its own id, and a second `Genesis` in a log changes nothing. A node that elected itself under the same group id, added with Ratis' own client, stops before the configuration changes, and writes go on. What `add-peer` refuses. |
-| `LeaderStallTest` | The rule of `LeaderStall`, the bound that grows and comes back, and the rule of a log that stops, which a real leader with a stopped log worker follows within seconds. A graceful stop of the leader with one node down, followed by a restart at once, loses no reply and costs no step down. With one node down, the reply to a new leader's first entry is lost on a link, after the entry reached the follower's disk: nothing commits and the leader stays, until it steps down and a write gets through. The same loss after the first commit heals with the next write. A leader behind in applying does not step down. |
+| `RatisContractTest` | The Ratis 3.3.1 behaviors that the design relies on beyond its API, against a real single-node server: the bootstrap and configuration meta files that `--join` safety reads, the open segment format that `RaftLogRepair` rewrites, the type of the full-pending-queue refusal, and a state machine refusal that reaches a remote client by class name and message, without a step down. |
+| `RaftSettingsTest`, `ByteAdmissionTest`, `ConflictPositionsTest` | Snapshot chunks stay at most 4 s on the heap; Ratis' pending-request limits hold every node's attempts and stay near the defaults; one entry of the largest size fits every limit on its way. The byte admission never exceeds its limit and is sized from the heap. Conflict positions survive the exception that Ratis rebuilds, and a text that does not parse is a conflict of the whole entry. |
+| `LeaderStallTest` | The rule of `LeaderStall`; follower next indices, which Ratis gives without ids, pair with ids only when the follower list read before and after them is the same; the bound that grows and comes back, and the rule of a log that stops, which a real leader with a stopped log worker follows within seconds. A graceful stop of the leader with one node down, followed by a restart at once, loses no reply and costs no step down. With one node down, the reply to a new leader's first entry is lost on a link, after the entry reached the follower's disk: nothing commits and the leader stays, until it steps down and a write gets through. The same loss after the first commit heals with the next write. A leader behind in applying does not step down. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
 | `MembershipTest` | A node started with `--join` replaces a lost leader, however long before its `add-peer` it started and after a restart in between, catches up from a snapshot, and restarts with or without the option. A node removed while it runs exits. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. A node of a seeded cluster is replaced whichever node leads. One step replacement of a lost leader, a lost follower, seeded or not, and of a leader that runs. `add-peer` refuses a node with a log of its own and a node started without `--join`, and fails at once without its node; a change without a majority ends at its limit; `--join` after a start without it is refused; `admin snapshot`; the warnings of a node that stays outside. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |

@@ -67,17 +67,25 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final LeaderForwarder forwarder;
 	private final ReplicatedConnection connection;
 	private final GrpcServer apiServer;
+	/** Runs {@link #gateApi} and {@link #watchRaft}, which must keep running while the cluster is initialized. */
 	private final ScheduledExecutorService maintenance;
+	/**
+	 * Runs {@link #initializeCluster}, whose genesis proposal blocks for up to the request timeout: on a thread of its
+	 * own, so that it does not hold back {@link #gateApi} and {@link #watchRaft} (and {@link LeaderStall}).
+	 */
+	private final ScheduledExecutorService initialization;
+	/** The node's control plane and local command threads, see {@link NodeThreads}. */
+	private final NodeThreads threads;
 	/** Only used on the maintenance thread. */
 	private final ApiGate apiGate;
-	/** The id this node proposes, if it is the one that starts the cluster. Only used on the maintenance thread. */
+	/** The id this node proposes, if it is the one that starts the cluster. Only used on the initialization thread. */
 	private final String newClusterId = UUID.randomUUID().toString();
-	/** The cluster of this node, once it belongs to one. Only used on the maintenance thread. */
+	/** The cluster of this node, once it belongs to one. Only used on the initialization thread. */
 	private @Nullable String clusterId;
-	/** Only used on the maintenance thread. */
+	/** Only used on the initialization thread. */
 	private boolean snapshotSettled;
 	private volatile boolean takingSeedSnapshot;
-	/** Only used on the maintenance thread. */
+	/** Only used on the initialization thread. */
 	private final ClusterCheck clusterCheck;
 	/** Only used on the maintenance thread. */
 	private final LeaderStall leaderStall;
@@ -102,6 +110,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		this.leaderStallStepDowns = metrics.amount("leader.stall.stepdowns");
 		this.leaderLogStepDowns = metrics.amount("leader.log.stepdowns");
 		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure, metrics);
+		this.threads = new NodeThreads(config.nodeId());
 
 		var parameters = new Parameters();
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
@@ -134,13 +143,15 @@ public final class ReplicatedNode implements AutoCloseable {
 			server.start();
 			started.add(server);
 			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout(),
-					stateMachine::leaderReadyIndex);
+					stateMachine::leaderReadyIndex, threads.control());
 			started.add(barrier);
-			this.proposer = new Proposer(group, RaftSettings.client(config), config, this::raftServer, metrics);
+			this.proposer = new Proposer(group, RaftSettings.client(config), config, this::raftServer, metrics,
+					threads.control());
 			started.add(proposer);
 			this.forwarder = new LeaderForwarder(config);
 			started.add(forwarder);
-			this.connection = new ReplicatedConnection(config, stateMachine, proposer, barrier, forwarder, metrics);
+			this.connection = new ReplicatedConnection(config, stateMachine, proposer, barrier, forwarder, metrics,
+					threads.local());
 			var self = config.self();
 			var apiHost = config.apiBindHost() != null ? config.apiBindHost() : self.apiHost();
 			this.apiServer = new GrpcServer(connection, new InetSocketAddress(apiHost, self.apiPort()));
@@ -148,8 +159,11 @@ public final class ReplicatedNode implements AutoCloseable {
 			started.add(apiServer);
 			this.maintenance = Executors.newSingleThreadScheduledExecutor(
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-maintenance").factory());
+			this.initialization = Executors.newSingleThreadScheduledExecutor(
+					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-initialization").factory());
 			this.apiGate = ApiGate.forElectionTimeout(config.electionTimeoutMax(), hadLeaderBeforeStart(), System.nanoTime());
-			maintenance.scheduleWithFixedDelay(this::initializeCluster, 0, MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
+			initialization.scheduleWithFixedDelay(this::initializeCluster, 0, MAINTENANCE_INTERVAL_MS,
+					TimeUnit.MILLISECONDS);
 			maintenance.scheduleWithFixedDelay(this::gateApi, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
 			maintenance.scheduleWithFixedDelay(this::watchRaft, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
@@ -179,6 +193,7 @@ public final class ReplicatedNode implements AutoCloseable {
 					ex.addSuppressed(closeError);
 				}
 			}
+			threads.close();
 			throw ex;
 		}
 		LOG.info("{}: started, Raft {}, API {}:{}", config.nodeId(), config.self().raftAddress(),
@@ -639,6 +654,9 @@ public final class ReplicatedNode implements AutoCloseable {
 		if (maintenance != null) {
 			maintenance.shutdownNow();
 		}
+		if (initialization != null) {
+			initialization.shutdownNow();
+		}
 		metrics.close();
 		IOException failure = null;
 		// A replica can fail while the constructor is still starting the rest: skip what does not exist yet.
@@ -649,6 +667,10 @@ public final class ReplicatedNode implements AutoCloseable {
 				.toList();
 		try {
 			failure = closeAll(order);
+			// After everything that uses them: their remaining timers and reply handlers have nothing left to answer.
+			if (threads != null) {
+				threads.close();
+			}
 			awaitDatabaseClosed();
 		} finally {
 			stopped.complete(cause);

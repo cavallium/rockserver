@@ -24,6 +24,8 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSi
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.UpdateContext;
@@ -64,6 +66,8 @@ import reactor.core.publisher.Mono;
  * </ul>
  */
 final class ReplicatedConnection implements RocksDBConnection {
+
+	private static final Logger LOG = LoggerFactory.getLogger(ReplicatedConnection.class);
 
 	/**
 	 * Default lease of {@code getForUpdate} updates, as on a single node ({@code EmbeddedDB}); the native update
@@ -109,17 +113,18 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private final NodeMetrics.Series transactionConflicts;
 	private final NodeMetrics.Series transactionChainConflicts;
 	private final NodeMetrics.Series localTime;
-	/** Runs short local commands, each on a virtual thread of its own; see {@link #local}. */
-	private static final java.util.concurrent.ExecutorService INLINE = java.util.concurrent.Executors
-			.newThreadPerTaskExecutor(Thread.ofVirtual().name("replicated-local-", 0).factory());
+	/** Runs short local commands, each on a virtual thread of its own ({@link NodeThreads#local()}); see {@link #local}. */
+	private final java.util.concurrent.ExecutorService inline;
 
 	ReplicatedConnection(NodeConfig config,
 			RockserverStateMachine stateMachine,
 			Proposer proposer,
 			ReadBarrier barrier,
 			LeaderForwarder forwarder,
-			NodeMetrics metrics) {
+			NodeMetrics metrics,
+			java.util.concurrent.ExecutorService inline) {
 		this.config = config;
+		this.inline = inline;
 		this.barrierTime = metrics.duration("read.barrier");
 		this.updateOpenTime = metrics.duration("update.open");
 		this.commitTime = metrics.duration("commit");
@@ -528,7 +533,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	/**
 	 * Runs a command on the local database. Point reads, single-key staged writes and the opening of native
-	 * transactions run each on a virtual thread of its own ({@link #INLINE}), straight on the database: the requests
+	 * transactions run each on a virtual thread of its own ({@link #inline}), straight on the database: the requests
 	 * were admitted already ({@code GrpcServer}'s proxy scheduler), and the embedded workload scheduler's queues cost
 	 * milliseconds per request under load. (A pool of 4 platform threads per core, tried instead to keep RocksDB
 	 * calls off the virtual threads' carriers, stalled for seconds once slow disk reads blocked all its threads.)
@@ -542,7 +547,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		var connection = stateMachine.store().connection();
 		CompletableFuture<?> result;
 		if (isShort(command)) {
-			result = CompletableFuture.supplyAsync(() -> connection.requestInline(context, start, command), INLINE);
+			result = CompletableFuture.supplyAsync(() -> connection.requestInline(context, start, command), inline);
 		} else {
 			result = (CompletableFuture<?>) connection.getAsyncApi(context).requestAsync(command);
 		}
@@ -1144,8 +1149,15 @@ final class ReplicatedConnection implements RocksDBConnection {
 			} else {
 				db.closeTransaction(id, false);
 			}
-		} catch (RuntimeException ignored) {
-			// Already expired or closed.
+		} catch (RocksDBException ex) {
+			if (ex.getErrorUniqueId() != RocksDBErrorType.TX_NOT_FOUND
+					&& ex.getErrorUniqueId() != RocksDBErrorType.TRANSACTION_NOT_FOUND) {
+				LOG.warn("Failed to roll back native {} {}", update ? "update" : "transaction", id, ex);
+			}
+			// Otherwise already expired or closed.
+		} catch (RuntimeException ex) {
+			// Such as a database that is closing. Nothing else would close it: say so.
+			LOG.warn("Failed to roll back native {} {}", update ? "update" : "transaction", id, ex);
 		}
 	}
 
