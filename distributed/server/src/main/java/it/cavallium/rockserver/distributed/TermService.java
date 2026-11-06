@@ -40,8 +40,9 @@ import org.jetbrains.annotations.Nullable;
  *   {@link NodeState} encoded by {@link #encode}, or nothing if this server has no such group (or is not started
  *   yet).</li>
  *   <li>"what may a follower read up to?", for {@link FollowerReads}. Request: the 16-byte group UUID. Response: the
- *   8-byte big-endian read index ({@link ReadBarrier#readIndex()}), once this node confirmed its leadership after the
- *   request arrived; {@code FAILED_PRECONDITION} if it is not the ready leader, {@code UNIMPLEMENTED} on a node that
+ *   8-byte big-endian read index then the 8-byte big-endian term of the leader ({@link ReadBarrier#readIndex()}),
+ *   once this node confirmed its leadership after the request arrived (a node of round 1 answered the index alone, which
+ *   followers now refuse: they forward their reads instead); {@code FAILED_PRECONDITION} if it is not the ready leader, {@code UNIMPLEMENTED} on a node that
  *   predates the method or cannot serve it.</li>
  * </ul>
  */
@@ -105,7 +106,7 @@ final class TermService {
 	@FunctionalInterface
 	interface ReadIndexSource {
 		/** The read index of {@code groupId}, once this node confirmed its leadership; fails if it is not the leader. */
-		CompletableFuture<Long> readIndex(RaftGroupId groupId);
+		CompletableFuture<ReadBarrier.ReadIndex> readIndex(RaftGroupId groupId);
 	}
 
 	private TermService() {}
@@ -154,12 +155,13 @@ final class TermService {
 	}
 
 	/** Asks the leader behind {@code channel} for a read index of {@code groupId}: see {@link #READ_INDEX}. */
-	static CompletableFuture<Long> readIndex(Channel channel, RaftGroupId groupId, Duration timeout) {
+	static CompletableFuture<ReadBarrier.ReadIndex> readIndex(Channel channel, RaftGroupId groupId, Duration timeout) {
 		return call(channel, READ_INDEX, encodeGroupId(groupId), timeout).thenApply(value -> {
-			if (value.length != Long.BYTES) {
+			if (value.length != 2 * Long.BYTES) {
 				throw new CompletionException(new IOException("Bad read index reply size " + value.length));
 			}
-			return ByteBuffer.wrap(value).getLong();
+			var buffer = ByteBuffer.wrap(value);
+			return new ReadBarrier.ReadIndex(buffer.getLong(), buffer.getLong());
 		});
 	}
 
@@ -266,7 +268,7 @@ final class TermService {
 		}
 		var uuid = ByteBuffer.wrap(request);
 		var groupId = RaftGroupId.valueOf(new UUID(uuid.getLong(), uuid.getLong()));
-		CompletableFuture<Long> index;
+		CompletableFuture<ReadBarrier.ReadIndex> index;
 		try {
 			index = source.readIndex(groupId);
 		} catch (RuntimeException e) {
@@ -274,7 +276,7 @@ final class TermService {
 		}
 		index.whenComplete((value, error) -> {
 			if (error == null) {
-				response.onNext(ByteBuffer.allocate(Long.BYTES).putLong(value).array());
+				response.onNext(ByteBuffer.allocate(2 * Long.BYTES).putLong(value.index()).putLong(value.term()).array());
 				response.onCompleted();
 				return;
 			}

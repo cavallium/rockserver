@@ -131,6 +131,17 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private volatile RaftServer server;
 	private volatile RaftGroupId groupId;
 	private volatile NodeStore store;
+	/**
+	 * The highest term of a log entry whose effects may be visible in the local database: raised before the apply thread
+	 * commits an entry's writes, and before a restored database becomes {@link #store}, while the applied index follows
+	 * them. A follower read checks it once it has read ({@link Router}).
+	 */
+	private volatile long visibleTerm = -1;
+	/**
+	 * Raised before a snapshot install closes {@link #store}, and again once the restored one replaced it: odd while
+	 * the database is being replaced. Written by the state machine updater thread only.
+	 */
+	private volatile long storeGeneration;
 	private volatile Applier applier;
 	private volatile @Nullable LeaderSession leaderSession;
 	private volatile boolean failed;
@@ -260,6 +271,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			opened = NodeStore.open(config.dbDir(), config.rockserverConfig(), config.nodeId());
 		}
 		var position = opened.applied();
+		raiseVisibleTerm(position.getTerm());
 		this.store = opened;
 		this.applier = new Applier(opened, metrics);
 		setLastAppliedTermIndex(position);
@@ -278,6 +290,27 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	AppliedIndex appliedIndex() {
 		return applied;
+	}
+
+	/** See {@link #visibleTerm}. Any thread. */
+	long visibleTerm() {
+		return visibleTerm;
+	}
+
+	/** See {@link #storeGeneration}. Any thread. */
+	long storeGeneration() {
+		return storeGeneration;
+	}
+
+	private void raiseVisibleTerm(long term) {
+		if (term > visibleTerm) {
+			visibleTerm = term;
+		}
+	}
+
+	/** Tests only: as if an entry of {@code term} had been applied. */
+	void raiseVisibleTermForTesting(long term) {
+		raiseVisibleTerm(term);
 	}
 
 	/** The result this replica recorded for request {@code sequence} of {@code proposerId}, or null. Any thread. */
@@ -752,6 +785,11 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var completions = new java.util.ArrayList<Runnable>(group.size());
 		long start = System.nanoTime();
 		var applier = this.applier;
+		// Before any write of the group can be visible: terms do not decrease along the log.
+		var last = positionOf(group.getLast());
+		if (last != null) {
+			raiseVisibleTerm(last.getTerm());
+		}
 		applier.beginGroup();
 		try {
 			var injected = hooks != null ? hooks.applyFailure : null;
@@ -1009,9 +1047,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 					config.nodeId(), old.applied(), snapshot.getTermIndex());
 			return;
 		}
+		// Odd from here until the restored database replaced the old one: reads that fail meanwhile are retried elsewhere.
+		storeGeneration++;
 		old.close();
 		NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
 		openStore();
+		storeGeneration++;
 	}
 
 	@Override

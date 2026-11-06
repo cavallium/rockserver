@@ -455,9 +455,11 @@ class ReadBarrierTest {
 			waitUntil(() -> leader.commitIndex() > before, "write committed");
 			long committed = leader.commitIndex();
 
-			long index = barrier.readIndex().get(10, TimeUnit.SECONDS);
+			var readIndex = barrier.readIndex().get(10, TimeUnit.SECONDS);
+			long index = readIndex.index();
 
 			assertTrue(index >= committed, "read index " + index + " < commit index " + committed);
+			assertEquals(leader.division().getInfo().getCurrentTerm(), readIndex.term());
 			assertTrue(leader.stateMachine.applied.get() < committed, "the write was applied");
 		} finally {
 			gate.countDown();

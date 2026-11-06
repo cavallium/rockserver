@@ -64,6 +64,8 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final RaftServer server;
 	private final ReadBarrier barrier;
 	private final FollowerReads followerReads;
+	/** Sends the commit index to the followers when one of them asks for a read index. */
+	final CommitHeartbeats commitHeartbeats;
 	private final Proposer proposer;
 	private final LeaderForwarder forwarder;
 	private final ReplicatedConnection connection;
@@ -106,6 +108,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		var groupId = RaftGroupId.valueOf(UUID.fromString(config.groupId()));
 		this.group = RaftGroup.valueOf(groupId, raftPeers(config));
 		this.metrics = new NodeMetrics(config.nodeId());
+		this.commitHeartbeats = new CommitHeartbeats(this::raftServer, groupId);
 		this.leaderStall = LeaderStall.forElectionTimeout(config.electionTimeoutMax());
 		this.clusterCheck = new ClusterCheck(config.nodeId(), groupId, config.electionTimeoutMax());
 		this.leaderStallStepDowns = metrics.amount("leader.stall.stepdowns");
@@ -145,6 +148,8 @@ public final class ReplicatedNode implements AutoCloseable {
 			started.add(server);
 			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout(),
 					stateMachine::leaderReadyIndex, threads.control());
+			// Every node of a cluster should have follower reads on or off alike: see "Follower reads" in the design.
+			barrier.followerReads = Router.followerReadsConfigured();
 			started.add(barrier);
 			// A leader that cannot confirm its leadership within an election timeout is likely losing it: the read is
 			// forwarded instead, and waits for the next leader there.
@@ -301,14 +306,26 @@ public final class ReplicatedNode implements AutoCloseable {
 	}
 
 	/** Answers {@link TermService#NODE_STATE}, and stops this node if the caller speaks for another cluster. */
+	/** Tests only. */
+	ReadBarrier readBarrier() {
+		return barrier;
+	}
+
 	/** Answers a follower's {@link TermService#READ_INDEX}: see {@link ReadBarrier#readIndex()}. */
-	private CompletableFuture<Long> readIndex(RaftGroupId requested) {
+	private CompletableFuture<ReadBarrier.ReadIndex> readIndex(RaftGroupId requested) {
 		// Null until the constructor created it: term calls can arrive as soon as the Raft server started.
 		var readBarrier = this.barrier;
 		if (readBarrier == null || !requested.equals(group.getGroupId())) {
 			return CompletableFuture.failedFuture(new ReadBarrier.NotLeaderException("No read barrier for " + requested));
 		}
-		return readBarrier.readIndex();
+		// The commit index now: what the heartbeats sent below carry, at least.
+		var index = readBarrier.readIndex();
+		if (!index.isDone()) {
+			// The follower must apply up to the read index, so it must know that it is committed: tell it now, while the
+			// barrier confirms this node's leadership, rather than with the next append or heartbeat.
+			commitHeartbeats.send();
+		}
+		return index;
 	}
 
 	private @Nullable NodeState nodeState(RaftGroupId requested, @Nullable String callerClusterId) {

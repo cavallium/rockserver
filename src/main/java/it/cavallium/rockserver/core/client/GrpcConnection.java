@@ -136,6 +136,11 @@ public final class GrpcConnection extends BaseConnection {
 		this(name, new GrpcConnectionDelegate(name, socketAddress, address, automaticRetry));
 	}
 
+	private GrpcConnection(String name, SocketAddress socketAddress, URI address, boolean automaticRetry,
+			@Nullable GrpcClientTransport transport) {
+		this(name, new GrpcConnectionDelegate(name, socketAddress, address, automaticRetry, transport));
+	}
+
 	private GrpcConnection(String name, GrpcConnectionDelegate delegate) {
 		super(name);
 		this.delegate = delegate;
@@ -169,6 +174,19 @@ public final class GrpcConnection extends BaseConnection {
 				new InetSocketAddress(address.host(), address.port()),
 				URI.create("http://" + address.host() + ":" + address.port()),
 				false);
+	}
+
+	/**
+	 * Like {@link #forHostAndPortWithoutRetry(String, HostAndPort)}, on the event loop threads and callback executor of
+	 * {@code transport}, which the connection does not close.
+	 */
+	public static GrpcConnection forHostAndPortWithoutRetry(String name, HostAndPort address,
+			GrpcClientTransport transport) {
+		return new GrpcConnection(name,
+				new InetSocketAddress(address.host(), address.port()),
+				URI.create("http://" + address.host() + ":" + address.port()),
+				false,
+				transport);
 	}
 
 	/**
@@ -367,6 +385,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	final EventLoopGroup eventLoopGroup;
 	/** gRPC retries reads after a transport loss, and {@link SessionWrites} resends numbered writes. */
 	final boolean automaticRetry;
+	/** False when {@link #eventLoopGroup} and {@link #callbackExecutor} belong to a shared {@link GrpcClientTransport}. */
+	private final boolean ownsTransport;
 	private final RocksDBServiceFutureStub futureStub;
 	private final ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStub;
 	private final URI address;
@@ -396,6 +416,12 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
 
 	GrpcConnectionDelegate(String name, SocketAddress socketAddress, URI address, boolean automaticRetry) {
+		this(name, socketAddress, address, automaticRetry, null);
+	}
+
+	/** @param transport shared threads to use instead of the connection's own; ignored for a domain socket */
+	GrpcConnectionDelegate(String name, SocketAddress socketAddress, URI address, boolean automaticRetry,
+			@Nullable GrpcClientTransport transport) {
 		this(name,
 				socketAddress instanceof InetSocketAddress inetSocketAddress
 						? NettyChannelBuilder.forAddress(inetSocketAddress.getHostString(), inetSocketAddress.getPort())
@@ -403,7 +429,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				socketAddress instanceof DomainSocketAddress,
 				null,
 				address,
-				automaticRetry);
+				automaticRetry,
+				socketAddress instanceof DomainSocketAddress ? null : transport);
 	}
 
 	/** Several nodes, tried in order by {@code pick_first} (see {@link MultiAddressNameResolver}). */
@@ -414,18 +441,21 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				false,
 				addresses,
 				address,
-				automaticRetry);
+				automaticRetry,
+				null);
 	}
 
 	/**
 	 * @param addresses the nodes of a connection to several of them, null for one: see {@link LeaderHintRouter}
+	 * @param transport shared threads, which this connection does not close; null to make its own
 	 */
 	private GrpcConnectionDelegate(String name,
 			NettyChannelBuilder channelBuilder,
 			boolean domainSocket,
 			@Nullable List<HostAndPort> addresses,
 			URI address,
-			boolean automaticRetry) {
+			boolean automaticRetry,
+			@Nullable GrpcClientTransport transport) {
 		super(name);
 		boolean severalAddresses = addresses != null;
 		var hintMode = severalAddresses ? LeaderHintRouter.configuredMode() : LeaderHintRouter.Mode.OFF;
@@ -458,14 +488,19 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 		// Keep reactive-gRPC's bounded adapters off the transport loop: a backpressured
 		// application callback must not prevent the same channel from making progress.
-		var callbackExecutor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
-				.name("rockserver-grpc-" + name + "-callback-", 0)
-				.factory());
+		boolean ownsTransport = transport == null;
+		var callbackExecutor = transport != null ? transport.callbackExecutor
+				: Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
+						.name("rockserver-grpc-" + name + "-callback-", 0)
+						.factory());
 		EventLoopGroup eventLoopGroup = null;
 		ManagedChannel channel;
 		try {
 			channelBuilder.executor(callbackExecutor);
-			if (domainSocket) {
+			if (transport != null) {
+				eventLoopGroup = transport.eventLoopGroup;
+				channelBuilder.eventLoopGroup(eventLoopGroup).channelType(NioSocketChannel.class);
+			} else if (domainSocket) {
 				eventLoopGroup = new EpollEventLoopGroup(EVENT_LOOP_THREADS_PER_CONNECTION);
 				channelBuilder
 						.eventLoopGroup(eventLoopGroup)
@@ -495,9 +530,11 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			}
 			channel = channelBuilder.build();
 		} catch (RuntimeException | Error ex) {
-			callbackExecutor.shutdownNow();
-			if (eventLoopGroup != null) {
-				eventLoopGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS);
+			if (ownsTransport) {
+				callbackExecutor.shutdownNow();
+				if (eventLoopGroup != null) {
+					eventLoopGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS);
+				}
 			}
 			throw ex;
 		}
@@ -510,11 +547,13 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			capabilities.requireCompatible();
 		} catch (InterruptedException interrupted) {
 			Thread.currentThread().interrupt();
-			closeFailedConstruction(channel, eventLoopGroup, callbackExecutor);
+			closeFailedConstruction(channel, ownsTransport ? eventLoopGroup : null,
+					ownsTransport ? callbackExecutor : null);
 			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR,
 					"Interrupted during the Rockserver capability handshake", interrupted);
 		} catch (ExecutionException failure) {
-			closeFailedConstruction(channel, eventLoopGroup, callbackExecutor);
+			closeFailedConstruction(channel, ownsTransport ? eventLoopGroup : null,
+					ownsTransport ? callbackExecutor : null);
 			var cause = failure.getCause() != null ? failure.getCause() : failure;
 			if (Status.fromThrowable(cause).getCode() == Code.UNIMPLEMENTED) {
 				throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
@@ -526,13 +565,15 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR,
 					"Rockserver capability handshake failed", cause);
 		} catch (RuntimeException | Error failure) {
-			closeFailedConstruction(channel, eventLoopGroup, callbackExecutor);
+			closeFailedConstruction(channel, ownsTransport ? eventLoopGroup : null,
+					ownsTransport ? callbackExecutor : null);
 			throw failure;
 		}
 		this.channel = channel;
 		this.callbackExecutor = callbackExecutor;
 		this.eventLoopGroup = eventLoopGroup;
 		this.automaticRetry = automaticRetry;
+		this.ownsTransport = ownsTransport;
 		// The handshake stays on the ordinary channel; later calls may go to the leader's.
 		this.leaderRouter = leaderRouter;
 		if (leaderRouter != null) {
@@ -662,12 +703,14 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	private static void closeFailedConstruction(ManagedChannel channel,
 			@Nullable EventLoopGroup eventLoopGroup,
-			ExecutorService callbackExecutor) {
+			@Nullable ExecutorService callbackExecutor) {
 		channel.shutdownNow();
 		if (eventLoopGroup != null) {
 			eventLoopGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS);
 		}
-		callbackExecutor.shutdownNow();
+		if (callbackExecutor != null) {
+			callbackExecutor.shutdownNow();
+		}
 	}
 
 	public static int configuredMaxInboundMessageSize() {
@@ -2209,6 +2252,10 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			} catch (Exception ex) {
 				LOG.error("Failed to close channel", ex);
 			}
+		}
+		if (!ownsTransport) {
+			// The shared transport's owner closes its threads.
+			return;
 		}
 		this.callbackExecutor.shutdown();
 		try {
