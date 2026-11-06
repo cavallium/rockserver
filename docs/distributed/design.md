@@ -364,7 +364,14 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   the batch) to every entry that holds a session write or registration. A proposal that already starts with the
   stamp marker is refused as malformed: only the leader stamps. Apply keeps the highest stamp seen as the
   replicated clock (`CLOCK`), written with the applied position of the entry that moved it, so it never goes back,
-  even after a leader whose clock is behind, and every replica has the same clock at the same position.
+  even after a leader whose clock is behind, and every replica has the same clock at the same position. This stamp
+  is the only wall-clock time the replicated state reads: leader election, the read barrier, transaction and update
+  leases, forwarding deadlines and timeouts all run on `System.nanoTime()`, which a skewed wall clock does not move.
+  For tests the stamp can be skewed per node (`-Drockserver.test.clockSkewMillis`, or the state machine's test
+  hook); `ClockSkewTest` and `ClockSkewRandomFaultTest` use it. A different clock *rate* on one node (a monotonic
+  clock running fast or slow) is not simulated: the JVM gives no per-process hook for `nanoTime`, and since no
+  decision depends on a time-based lease (Ratis' lease reads are off, see "Reads"), a rate error can only make a
+  timeout fire early or late, which the fault suites already cover with pauses and slow links.
 - **Expiry.** A session's row holds its timeout, the clock of its last applied write and its floor. The timeout is
   in the `RegisterClient` entry (`-Drockserver.client-session-timeout-ms` of the node that opened it, 1 hour by
   default, at least 10 minutes and 30 request timeouts: well above the time a copy of a write may still be resent),
@@ -1239,9 +1246,12 @@ failover" below).
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
 | `MembershipTest` | A node started with `--join` replaces a lost leader, however long before its `add-peer` it started and after a restart in between, catches up from a snapshot, and restarts with or without the option. A node removed while it runs exits. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. A node of a seeded cluster is replaced whichever node leads. One step replacement of a lost leader, a lost follower, seeded or not, and of a leader that runs. `add-peer` refuses a node with a log of its own and a node started without `--join`, and fails at once without its node; a change without a majority ends at its limit; `--join` after a start without it is refused; `admin snapshot`; the warnings of a node that stays outside. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
-| `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories, with read-modify-write updates and hot counters in them, are linearizable, and the transactional bank-transfer invariant holds. |
+| `RandomFaultTest` | A seeded random schedule of kills, restarts, pauses, isolations, partitions, one-way and single-link cuts, slow links (20–200 ms each way with as much jitter), throttled links (64–512 KiB/s), blackholes (bytes held, nothing reset, as with dropped packets), flapping links (isolated and healed every 50–400 ms) and client-side faults (a node's client link that drops every answer, so committed writes go unacknowledged while the leader runs on, or that is cut). Register histories, with read-modify-write updates and hot counters in them, are linearizable; the transactional bank-transfer invariant holds; list-append transactions (every read a `getForUpdate`) show no anomaly at all to `ListAppendChecker` and lose no committed append; every node's persisted Raft term (`raft-meta`) never decreases. Adding faults changed which schedule a given seed produces. |
+| `OverlappingRandomFaultTest`, `ClockSkewRandomFaultTest` | `RandomFaultTest` with a second fault starting while the first holds (for example a pause plus a one-way cut, or two kills: the majority lost, then back), where availability is reported but not asserted and every safety check stays; and with node 1's wall clock 90 s ahead and node 2's 90 s behind. |
+| `ClockSkewTest` (in-process) | Leaders whose clocks are two hours behind or ahead of the others: the replicated clock never goes back and is the same on every replica, and session writes across the leader changes apply at most once (exactly once when acknowledged). |
+| `ListAppendCheckerTest` | The Elle-style checker finds and classifies known anomalous histories (G0, G1a, G1b, G1c, G-single, G2 as allowed by snapshot isolation, incompatible orders, duplicates, garbage, internal reads), treats an unknown transaction as committed only once it was seen, and passes random serial histories. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
-| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
+| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy (cuts, delay and jitter keeping byte order, bandwidth caps, blackholes that release held bytes, dropped answers resetting their connections when healed), linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
 
 Run them all (about 20 minutes on a real disk):
 
@@ -1261,6 +1271,24 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
 `-Drockserver.test.pipelinedUpdates=true` runs every test cluster with pipelined updates on. Hot counters also
 require, in both modes, that every key takes a new update well within a lease once the cluster settled, and, with the
 flag on, that an update chained after each fault, and with the flag off that none did. `HotKeyThroughputTest` runs only with `-Drockserver.test.slow=true`.
+
+### Fault harness
+
+`LinkProxy` sits on every directed node-to-node link (`Network`) and, since round 3, in front of every node's API
+port for the test clients (`ProcessCluster.clientLink`). Besides cutting a link (a TCP reset, so failures are seen
+at once), it can delay each chunk by a latency plus jitter, cap the bandwidth per direction, blackhole the link, or
+drop the answers. Bytes are never reordered or lost in the middle of a stream: TCP does neither, so reordering below
+it cannot be observed by the nodes, and a blackhole holds bytes (as TCP retransmissions would) and releases them on
+heal unless an endpoint's own timeout closed the connection first. A connection that did lose answers is reset when
+the link heals, since its stream is garbage after the gap. The client link makes the "committed but unanswered"
+case reproducible without killing the leader: the node commits and applies, only the reply is lost.
+
+`ListAppendChecker` is a port of Elle's list-append analysis: unique appended elements recover each key's version
+order from the longest read, from which it derives `ww`, `wr` and `rw` dependencies and searches for G0, G1c,
+G-single and G2 cycles, plus the cycle-free anomalies (G1a, G1b, garbage, duplicates, incompatible orders, internal
+reads). A list append is implemented by the workload as `getForUpdate` and put of the whole list, so every append
+also reads; that only adds constraints. Real-time order (strict serializability) is left to the register
+linearizability checks.
 
 ## Left before a first deployment
 

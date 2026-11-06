@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
@@ -43,6 +44,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import it.cavallium.rockserver.distributed.ListAppendChecker.MicroOp;
+import it.cavallium.rockserver.distributed.ListAppendChecker.Outcome;
+import it.cavallium.rockserver.distributed.ListAppendChecker.Transaction;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -66,16 +70,24 @@ import org.junit.jupiter.api.io.TempDir;
  * Three {@link ReplicatedServerMain} JVMs under a seeded random fault schedule, with clients that keep working.
  *
  * <p>The schedule runs one fault at a time (kill and restart, graceful restart, pause, isolation, a 2-1
- * partition with the target on the minority side, a one-way cut of the target's outgoing links, or a single cut
- * link), each followed by its repair, so at most one node is unavailable at any time and the majority keeps
- * serving. Meanwhile:</p>
+ * partition with the target on the minority side, a one-way cut of the target's outgoing links, a single cut
+ * link, slow or throttled links, a blackhole, a flapping link, or lost and cut client links), each followed by its
+ * repair, so at most one node is unavailable at any time and the majority keeps serving. With
+ * {@link #overlapping()} (the subclass {@code OverlappingRandomFaultTest}) a second fault starts while the first one
+ * holds, possibly costing the majority: then only safety is checked, not availability. Meanwhile:</p>
  * <ul>
  *   <li>register clients, each bound to one node or failing over across all of them, put unique values and read
  *   them back; the history must be linearizable;</li>
  *   <li>transfer clients move money between accounts with optimistic transactions ({@code getForUpdate}, puts,
  *   commit) and an auditor reads every balance in transactions; every consistent read, and the final state, must
- *   hold the initial total with no negative balance.</li>
+ *   hold the initial total with no negative balance;</li>
+ *   <li>list-append clients run transactions of reads and appends ({@code getForUpdate} and put) on a few lists;
+ *   {@link ListAppendChecker} must find no anomaly at all (every read is validated at commit, so committed
+ *   transactions must be serializable), and every committed append must be in the final lists.</li>
  * </ul>
+ * <p>Every node's persisted Raft term ({@code raft-meta}) is sampled throughout and must never decrease. Workload
+ * clients reach the nodes through {@link ProcessCluster#clientLink client links}, so client-side faults hit
+ * them; setup and final reads go direct.</p>
  * <p>Afterwards every replica must hold identical data. The fault schedule depends only on the seed, printed at the
  * start: rerun with {@code -D}{@value #SEED_PROPERTY}{@code =<seed>} to replay it (the workload interleaving still
  * varies). {@value #SECONDS_PROPERTY} sets the length of the schedule in seconds, and
@@ -89,6 +101,7 @@ class RandomFaultTest {
 	static final String SEED_PROPERTY = "rockserver.randomFault.seed";
 	static final String SECONDS_PROPERTY = "rockserver.randomFault.seconds";
 	static final String MAX_UNAVAILABILITY_PROPERTY = "rockserver.randomFault.maxUnavailableMillis";
+	static final String OVERLAP_PROPERTY = "rockserver.randomFault.overlap";
 	private static final long DEFAULT_SECONDS = 90;
 
 	private static final int NODES = 3;
@@ -121,6 +134,10 @@ class RandomFaultTest {
 	private static final int MAX_TRANSFER = 150;
 	private static final int CONFLICT_RETRIES = 20;
 	private static final Duration AUDIT_PERIOD = Duration.ofMillis(250);
+	private static final int LIST_KEYS = 6;
+	private static final int APPEND_WORKERS = 3;
+	private static final int MAX_MICRO_OPS = 4;
+	private static final Duration TERM_SAMPLE_PERIOD = Duration.ofMillis(100);
 
 	@TempDir(cleanup = CleanupMode.ON_SUCCESS)
 	Path root;
@@ -130,29 +147,48 @@ class RandomFaultTest {
 		return SERVER_ARGS;
 	}
 
+	/** Whether faults overlap (see the class comment): {@code OverlappingRandomFaultTest} turns it on. */
+	boolean overlapping() {
+		return Boolean.getBoolean(OVERLAP_PROPERTY);
+	}
+
+	/** Extra JVM options of a node: {@code ClockSkewRandomFaultTest} skews clocks with them. */
+	List<String> jvmOptions(String nodeId) {
+		return List.of();
+	}
+
 	@Test
 	void registersStayLinearizableAndTransfersKeepTheTotalUnderRandomFaults() throws Exception {
 		long seed = Long.getLong(SEED_PROPERTY, new SecureRandom().nextLong());
 		var length = Duration.ofSeconds(Long.getLong(SECONDS_PROPERTY, DEFAULT_SECONDS));
-		var schedule = FaultStep.schedule(new Random(seed), length);
+		boolean overlap = overlapping();
+		var schedule = overlap ? CompoundStep.schedule(new Random(seed), length)
+				: FaultStep.schedule(new Random(seed), length).stream().map(CompoundStep::single).toList();
 		var repro = "seed " + seed + " (rerun with -D" + SEED_PROPERTY + "=" + seed + ")";
-		log("RandomFaultTest " + repro + ", " + schedule.size() + " faults over " + length + ", data in " + root);
+		log(getClass().getSimpleName() + " " + repro + ", " + schedule.size() + (overlap ? " overlapping" : "")
+				+ " faults over " + length + ", data in " + root);
 		schedule.forEach(step -> log("  planned: " + step));
 
-		try (var cluster = ProcessCluster.start(root, NODES, serverArgs());
+		try (var cluster = ProcessCluster.create(root, NODES, 0, serverArgs());
 				var probe = new RaftProbe(cluster);
 				var setup = new ClusterClient(cluster.apiAddresses(), FINAL_RETRY, true)) {
+			for (var id : cluster.members()) {
+				cluster.setJvmOptions(id, jvmOptions(id));
+				cluster.start(id);
+			}
 			cluster.waitReady(READY_TIMEOUT);
+			var terms = new TermMonitor(cluster);
 			long registers = setup.createColumn("registers", SCHEMA, SETUP_CONTEXT).valueOrThrow();
 			long bank = setup.createColumn("bank", SCHEMA, SETUP_CONTEXT).valueOrThrow();
 			for (int account = 0; account < ACCOUNTS; account++) {
 				setup.put(bank, key(account), balance(INITIAL_BALANCE), SETUP_CONTEXT).valueOrThrow();
 			}
 
+			long lists = setup.createColumn("lists", SCHEMA, SETUP_CONTEXT).valueOrThrow();
 			long hotColumn = setup.createColumn("hot", SCHEMA, SETUP_CONTEXT).valueOrThrow();
 			var hot = new HotCounters(cluster.apiAddresses(), hotColumn, 0, HOT_COUNTERS, HOT_WORKERS);
 			hot.start();
-			var workload = new Workload(cluster, registers, bank, new Random(seed ^ 0x5DEECE66DL));
+			var workload = new Workload(cluster, registers, bank, lists, new Random(seed ^ 0x5DEECE66DL));
 			workload.start();
 			var executed = new ArrayList<ExecutedStep>();
 			try {
@@ -162,8 +198,10 @@ class RandomFaultTest {
 				}
 			} finally {
 				cluster.network().heal();
+				cluster.healClientLinks();
 				workload.stop();
 				hot.stop();
+				terms.close();
 			}
 			log("Faults done; " + workload.summary());
 			workload.rethrowWorkerFailures();
@@ -187,7 +225,17 @@ class RandomFaultTest {
 			log(linearizability.description() + " (checked in "
 					+ Duration.ofNanos(System.nanoTime() - checkStart).toMillis() + " ms)");
 
-			reportAvailability(executed, workload, repro);
+			var finalLists = workload.finalListReads(setup);
+			var appendCheck = ListAppendChecker.check(workload.appendHistory());
+			log(appendCheck.description());
+			assertTrue(appendCheck.valid(), () -> repro + "\n" + appendCheck.description());
+			assertTrue(workload.committedAppendTransactions.get() > 0, "no list-append transaction committed, " + repro);
+			workload.assertCommittedAppendsKept(finalLists, repro);
+
+			log(terms.summary());
+			assertEquals(List.of(), terms.violations(), "a node's Raft term went down, " + repro);
+
+			reportAvailability(executed, workload, repro, !overlap);
 
 			awaitConverged(cluster, probe, repro);
 			for (var id : cluster.nodeIds()) {
@@ -214,95 +262,150 @@ class RandomFaultTest {
 		/** Only the connections the target opens are cut: it still receives, and answers on, inbound ones. */
 		ONE_WAY,
 		/** One link pair cut, between the target and one other node; the third node still reaches both. */
-		CUT_LINK
+		CUT_LINK,
+		/** Every link from and to the target delayed by 20 to 200 ms each way, with as much jitter. */
+		SLOW,
+		/** Every link from and to the target capped at 64 to 512 KiB/s each way. */
+		THROTTLE,
+		/** Every link from and to the target silent (bytes held, nothing reset): failure seen only by timeouts. */
+		BLACKHOLE,
+		/** The target isolated and healed again every 50 to 400 ms: repeated elections, terms must still only grow. */
+		FLAP,
+		/** The target's client link carries requests but drops every answer: committed writes go unacknowledged. */
+		CLIENT_LOSS,
+		/** The target's client link cut: its clients fail over, the node itself is fine. */
+		CLIENT_CUT;
+
+		/** Whether it stops or freezes the target's process (two of them never hit one node at once). */
+		boolean process() {
+			return this == KILL || this == RESTART || this == PAUSE;
+		}
 	}
 
 	/** Which node a step hits, resolved when it runs (the leader is only known then). */
 	private enum Role { LEADER, FOLLOWER, ANY }
 
+	/** Undoes one injected fault. */
+	@FunctionalInterface
+	private interface Repair {
+		void run() throws IOException;
+	}
+
 	/**
-	 * One planned step. {@code pick} chooses among the nodes matching {@code role}, and the other node of a
-	 * {@link Fault#CUT_LINK}, so the schedule is a function of the seed alone.
+	 * One planned step. {@code pick} chooses among the nodes matching {@code role}, the other node of a
+	 * {@link Fault#CUT_LINK}, and the parameters of shaped and flapping links, so the schedule is a function of the
+	 * seed alone.
 	 */
 	private record FaultStep(Fault fault, Role role, int pick, Duration hold, Duration quiet) {
 
 		static List<FaultStep> schedule(Random random, Duration length) {
 			var steps = new ArrayList<FaultStep>();
-			var faults = Fault.values();
-			var roles = Role.values();
 			long planned = 0;
 			while (planned < length.toMillis()) {
-				var step = new FaultStep(faults[random.nextInt(faults.length)],
-						roles[random.nextInt(roles.length)],
-						random.nextInt(1_000),
-						Duration.ofMillis(500 + random.nextInt(4_500)),
-						Duration.ofMillis(500 + random.nextInt(2_500)));
+				var step = random(random);
 				steps.add(step);
 				planned += step.hold.toMillis() + step.quiet.toMillis();
 			}
 			return steps;
 		}
 
-		ExecutedStep run(ProcessCluster cluster, RaftProbe probe) throws IOException {
-			var leader = probe.leader(cluster.nodeIds());
-			var target = target(cluster.nodeIds(), leader);
+		static FaultStep random(Random random) {
+			var faults = Fault.values();
+			var roles = Role.values();
+			return new FaultStep(faults[random.nextInt(faults.length)],
+					roles[random.nextInt(roles.length)],
+					random.nextInt(1_000),
+					Duration.ofMillis(500 + random.nextInt(4_500)),
+					Duration.ofMillis(500 + random.nextInt(2_500)));
+		}
+
+		/** Starts the fault on {@code target} and returns how to end it. */
+		Repair inject(ProcessCluster cluster, String target) {
+			var network = cluster.network();
 			var others = cluster.nodeIds().stream().filter(id -> !id.equals(target)).toList();
-			long start = System.nanoTime();
-			log(String.format("[%s] %s node %s (role %s, leader %s), hold %d ms", clock(), fault, target, role,
-					leader.orElse("unknown"), hold.toMillis()));
 			switch (fault) {
 				case KILL -> {
 					cluster.kill(target);
-					waitFor(hold);
-					cluster.start(target);
-					cluster.waitReady(target, READY_TIMEOUT);
+					return () -> {
+						cluster.start(target);
+						cluster.waitReady(target, READY_TIMEOUT);
+					};
 				}
 				case RESTART -> {
 					cluster.stop(target);
-					waitFor(hold);
-					cluster.start(target);
-					cluster.waitReady(target, READY_TIMEOUT);
+					return () -> {
+						cluster.start(target);
+						cluster.waitReady(target, READY_TIMEOUT);
+					};
 				}
 				case PAUSE -> {
 					cluster.pause(target);
-					waitFor(hold);
-					cluster.resume(target);
+					return () -> cluster.resume(target);
 				}
-				case ISOLATE -> {
-					cluster.network().isolate(target);
-					waitFor(hold);
-					cluster.network().heal();
-				}
-				case PARTITION -> {
-					cluster.network().partition(Set.of(target), Set.copyOf(others));
-					waitFor(hold);
-					cluster.network().heal();
-				}
-				case ONE_WAY -> {
-					others.forEach(other -> cluster.network().blockLink(target, other));
-					waitFor(hold);
-					cluster.network().heal();
-				}
+				case ISOLATE -> network.isolate(target);
+				case PARTITION -> network.partition(Set.of(target), Set.copyOf(others));
+				case ONE_WAY -> others.forEach(other -> network.blockLink(target, other));
 				case CUT_LINK -> {
 					var other = others.get(pick % others.size());
-					cluster.network().blockLink(target, other);
-					cluster.network().blockLink(other, target);
-					waitFor(hold);
-					cluster.network().heal();
+					network.blockLink(target, other);
+					network.blockLink(other, target);
+				}
+				case SLOW -> {
+					var delay = Duration.ofMillis(20 + pick % 181);
+					var shaping = LinkProxy.Shaping.latency(delay, delay);
+					network.linksOf(target).forEach(link -> network.shapeLink(link.get(0), link.get(1), shaping));
+				}
+				case THROTTLE -> {
+					var shaping = LinkProxy.Shaping.bandwidth((64L << (pick % 4)) * 1024);
+					network.linksOf(target).forEach(link -> network.shapeLink(link.get(0), link.get(1), shaping));
+				}
+				case BLACKHOLE -> network.linksOf(target)
+						.forEach(link -> network.blackholeLink(link.get(0), link.get(1)));
+				case FLAP -> {
+					var flapping = new AtomicBoolean(true);
+					var flapRandom = new Random(pick);
+					var flapper = Thread.ofPlatform().name("random-fault-flap-" + target).daemon().start(() -> {
+						boolean cut = false;
+						while (flapping.get()) {
+							if (cut) {
+								network.heal();
+							} else {
+								network.isolate(target);
+							}
+							cut = !cut;
+							try {
+								Thread.sleep(50 + flapRandom.nextInt(351));
+							} catch (InterruptedException e) {
+								return;
+							}
+						}
+					});
+					return () -> {
+						flapping.set(false);
+						flapper.interrupt();
+						try {
+							flapper.join();
+						} catch (InterruptedException e) {
+							Thread.currentThread().interrupt();
+						}
+						network.heal();
+					};
+				}
+				case CLIENT_LOSS -> {
+					cluster.clientLink(target).dropReplies();
+					return () -> cluster.clientLink(target).unblock();
+				}
+				case CLIENT_CUT -> {
+					cluster.clientLink(target).block();
+					return () -> cluster.clientLink(target).unblock();
 				}
 			}
-			long repaired = System.nanoTime();
-			waitFor(quiet);
-			for (var id : cluster.nodeIds()) {
-				if (!cluster.isRunning(id)) {
-					throw new AssertionError("Node " + id + " died after " + fault + " of node " + target + "\n"
-							+ cluster.logTail(id));
-				}
-			}
-			return new ExecutedStep(this, target, leader.map(target::equals).orElse(false), start, repaired);
+			// Every other fault is in the network between nodes. Healing it all also ends an overlapping network
+			// fault early, which only shortens that one.
+			return network::heal;
 		}
 
-		private String target(List<String> ids, Optional<String> leader) {
+		String target(List<String> ids, Optional<String> leader) {
 			var candidates = switch (role) {
 				case LEADER -> leader.map(List::of).orElse(ids);
 				case FOLLOWER -> leader.map(l -> ids.stream().filter(id -> !id.equals(l)).toList()).orElse(ids);
@@ -315,6 +418,79 @@ class RandomFaultTest {
 		public String toString() {
 			return fault + " " + role + " (pick " + pick + "), hold " + hold.toMillis() + " ms, then quiet "
 					+ quiet.toMillis() + " ms";
+		}
+	}
+
+	/**
+	 * A fault, and optionally a second one that starts {@code offset} into the first one's hold and holds for its
+	 * own time. Both are repaired, the second first, once both holds are over. Two process faults never hit the
+	 * same node; two network faults may touch the same links, and repairing the first heals both.
+	 */
+	private record CompoundStep(FaultStep first, @org.jetbrains.annotations.Nullable FaultStep second,
+			Duration offset) {
+
+		static CompoundStep single(FaultStep step) {
+			return new CompoundStep(step, null, Duration.ZERO);
+		}
+
+		static List<CompoundStep> schedule(Random random, Duration length) {
+			var steps = new ArrayList<CompoundStep>();
+			long planned = 0;
+			while (planned < length.toMillis()) {
+				var first = FaultStep.random(random);
+				var second = FaultStep.random(random);
+				var offset = Duration.ofMillis(random.nextLong(first.hold().toMillis()));
+				var step = new CompoundStep(first, second, offset);
+				steps.add(step);
+				planned += step.holdMillis() + second.quiet().toMillis();
+			}
+			return steps;
+		}
+
+		long holdMillis() {
+			return second == null ? first.hold().toMillis()
+					: Math.max(first.hold().toMillis(), offset.toMillis() + second.hold().toMillis());
+		}
+
+		ExecutedStep run(ProcessCluster cluster, RaftProbe probe) throws IOException {
+			var ids = cluster.nodeIds();
+			var leader = probe.leader(ids);
+			var target = first.target(ids, leader);
+			long start = System.nanoTime();
+			log(String.format("[%s] %s node %s (role %s, leader %s), hold %d ms", clock(), first.fault(), target,
+					first.role(), leader.orElse("unknown"), first.hold().toMillis()));
+			var firstRepair = first.inject(cluster, target);
+			Repair secondRepair = null;
+			if (second != null) {
+				waitFor(offset);
+				var secondLeader = probe.leader(ids);
+				var candidates = first.fault().process() && second.fault().process()
+						? ids.stream().filter(id -> !id.equals(target)).toList() : ids;
+				var secondTarget = second.target(candidates, secondLeader.filter(candidates::contains));
+				log(String.format("[%s]   overlapping %s node %s (role %s, leader %s), hold %d ms", clock(),
+						second.fault(), secondTarget, second.role(), secondLeader.orElse("unknown"),
+						second.hold().toMillis()));
+				secondRepair = second.inject(cluster, secondTarget);
+			}
+			waitFor(Duration.ofMillis(Math.max(0, start / 1_000_000 + holdMillis() - System.nanoTime() / 1_000_000)));
+			if (secondRepair != null) {
+				secondRepair.run();
+			}
+			firstRepair.run();
+			long repaired = System.nanoTime();
+			waitFor((second != null ? second : first).quiet());
+			for (var id : ids) {
+				if (!cluster.isRunning(id)) {
+					throw new AssertionError("Node " + id + " died after " + this + "\n" + cluster.logTail(id));
+				}
+			}
+			return new ExecutedStep(first, target, leader.map(target::equals).orElse(false), start, repaired);
+		}
+
+		@Override
+		public String toString() {
+			return second == null ? first.toString()
+					: first + ", overlapped after " + offset.toMillis() + " ms by " + second;
 		}
 	}
 
@@ -331,6 +507,7 @@ class RandomFaultTest {
 		private final ProcessCluster cluster;
 		private final long registers;
 		private final long bank;
+		private final long lists;
 		private final Random random;
 		private final AtomicBoolean stopping = new AtomicBoolean();
 		private final List<ClusterClient> clients = new ArrayList<>();
@@ -357,11 +534,19 @@ class RandomFaultTest {
 		final AtomicLong failedTransfers = new AtomicLong();
 		final AtomicLong consistentAudits = new AtomicLong();
 		final AtomicLong failedAudits = new AtomicLong();
+		/** Every list-append transaction attempt, with what is known of its outcome. */
+		private final ConcurrentLinkedQueue<Transaction> appendTransactions = new ConcurrentLinkedQueue<>();
+		/** Makes every appended element unique. */
+		private final AtomicLong elementSequence = new AtomicLong();
+		final AtomicLong committedAppendTransactions = new AtomicLong();
+		final AtomicLong abortedAppendTransactions = new AtomicLong();
+		final AtomicLong unknownAppendTransactions = new AtomicLong();
 
-		Workload(ProcessCluster cluster, long registers, long bank, Random random) {
+		Workload(ProcessCluster cluster, long registers, long bank, long lists, Random random) {
 			this.cluster = cluster;
 			this.registers = registers;
 			this.bank = bank;
+			this.lists = lists;
 			this.random = random;
 		}
 
@@ -370,7 +555,7 @@ class RandomFaultTest {
 			// One register client bound to each node: it sees that node fail and recover.
 			for (var id : ids) {
 				var single = new LinkedHashMap<String, HostAndPort>();
-				single.put(id, cluster.apiAddress(id));
+				single.put(id, cluster.proxiedApiAddress(id));
 				spawn("register-" + id, client(single, false),
 						(client, rnd) -> registerOp("n" + id, client, rnd, false));
 			}
@@ -385,6 +570,11 @@ class RandomFaultTest {
 				spawn("transfer-" + i, client(rotated(i), true), this::transfer);
 			}
 			spawn("audit", client(rotated(2), true), this::audit);
+			// No ambiguous retries: a transaction run twice would append its elements twice.
+			for (int i = 0; i < APPEND_WORKERS; i++) {
+				var name = "append-" + i;
+				spawn(name, client(rotated(i), false), (client, rnd) -> appendTransaction(name, client, rnd));
+			}
 		}
 
 		private ClusterClient client(Map<String, HostAndPort> addresses,
@@ -400,7 +590,7 @@ class RandomFaultTest {
 			var result = new LinkedHashMap<String, HostAndPort>();
 			for (int i = 0; i < ids.size(); i++) {
 				var id = ids.get((first + i) % ids.size());
-				result.put(id, cluster.apiAddress(id));
+				result.put(id, cluster.proxiedApiAddress(id));
 			}
 			return result;
 		}
@@ -526,6 +716,112 @@ class RandomFaultTest {
 			return balance(update.previous());
 		}
 
+		/**
+		 * One list-append transaction of 1 to {@value #MAX_MICRO_OPS} reads and appends on random lists. Every list is
+		 * read with {@code getForUpdate} the first time the transaction touches it, then kept locally, so the
+		 * transaction never relies on reading its own writes. Each attempt appends fresh elements; attempts that the
+		 * client restarted (nothing applied) are recorded as aborted.
+		 */
+		private void appendTransaction(String worker, ClusterClient client, Random random) {
+			int count = 1 + random.nextInt(MAX_MICRO_OPS);
+			var keys = new int[count];
+			var appends = new boolean[count];
+			for (int i = 0; i < count; i++) {
+				keys[i] = random.nextInt(LIST_KEYS);
+				appends[i] = random.nextBoolean();
+			}
+			var attempts = new ArrayList<List<MicroOp>>();
+			var result = client.transaction(TX_CONTEXT, TX_LEASE, (api, tx) -> {
+				var ops = new ArrayList<MicroOp>();
+				synchronized (attempts) {
+					attempts.add(ops);
+				}
+				var local = new TreeMap<Integer, List<Long>>();
+				for (int i = 0; i < count; i++) {
+					var key = "l" + keys[i];
+					var list = local.get(keys[i]);
+					if (list == null) {
+						var update = api.get(tx, lists, key(keys[i]), RequestType.<Buf>forUpdate());
+						list = new ArrayList<>(elements(update.previous()));
+						local.put(keys[i], list);
+						ops.add(MicroOp.read(key, list));
+					} else if (!appends[i]) {
+						ops.add(MicroOp.read(key, list));
+					}
+					if (appends[i]) {
+						long element = elementSequence.incrementAndGet();
+						list.add(element);
+						api.put(tx, lists, key(keys[i]), elementsValue(list), RequestType.none());
+						ops.add(MicroOp.append(key, element));
+					}
+				}
+			});
+			var outcome = switch (result.status()) {
+				case OK -> Boolean.TRUE.equals(result.value()) ? Outcome.COMMITTED : Outcome.ABORTED;
+				case UNKNOWN -> Outcome.UNKNOWN;
+				case FAILED -> Outcome.ABORTED;
+			};
+			(switch (outcome) {
+				case COMMITTED -> committedAppendTransactions;
+				case ABORTED -> abortedAppendTransactions;
+				case UNKNOWN -> unknownAppendTransactions;
+			}).incrementAndGet();
+			synchronized (attempts) {
+				for (int i = 0; i < attempts.size(); i++) {
+					// Only the last attempt may have reached a commit: the client restarts a transaction only when
+					// nothing of it was applied.
+					var attemptOutcome = i == attempts.size() - 1 ? outcome : Outcome.ABORTED;
+					appendTransactions.add(new Transaction(worker + "#" + elementSequence.get() + "." + i,
+							attemptOutcome, attempts.get(i)));
+				}
+			}
+		}
+
+		List<Transaction> appendHistory() {
+			return List.copyOf(appendTransactions);
+		}
+
+		/** Reads every list in one validated transaction through the direct client, and adds it to the history. */
+		Map<String, List<Long>> finalListReads(ClusterClient client) {
+			long deadline = System.nanoTime() + FINAL_RETRY.toNanos();
+			while (true) {
+				var read = new TreeMap<String, List<Long>>();
+				var result = client.transaction(TX_CONTEXT, TX_LEASE, (api, tx) -> {
+					read.clear();
+					for (int index = 0; index < LIST_KEYS; index++) {
+						var update = api.get(tx, lists, key(index), RequestType.<Buf>forUpdate());
+						read.put("l" + index, elements(update.previous()));
+					}
+				});
+				if (result.status() == OpStatus.OK && Boolean.TRUE.equals(result.value())) {
+					appendTransactions.add(new Transaction("final", Outcome.COMMITTED, read.entrySet().stream()
+							.map(entry -> MicroOp.read(entry.getKey(), entry.getValue()))
+							.toList()));
+					return read;
+				}
+				if (System.nanoTime() - deadline > 0) {
+					throw new AssertionError("No final list read committed within " + FINAL_RETRY + ": " + result.error());
+				}
+			}
+		}
+
+		/** Every element appended by a committed transaction is in its list at the end. */
+		void assertCommittedAppendsKept(Map<String, List<Long>> finalLists, String repro) {
+			var lost = new ArrayList<String>();
+			for (var transaction : appendTransactions) {
+				if (transaction.outcome() != Outcome.COMMITTED) {
+					continue;
+				}
+				for (var op : transaction.ops()) {
+					if (op.append() && !finalLists.getOrDefault(op.key(), List.of()).contains(op.element())) {
+						lost.add(transaction.id() + " " + op);
+					}
+				}
+			}
+			assertEquals(List.of(), lost.stream().limit(10).toList(), "committed appends missing from the lists, "
+					+ repro);
+		}
+
 		/** Alternates snapshot reads (one range read) and validated reads ({@code getForUpdate} of all, commit). */
 		private void audit(ClusterClient client, Random random) throws InterruptedException {
 			boolean snapshot = random.nextBoolean();
@@ -621,10 +917,12 @@ class RandomFaultTest {
 		String summary() {
 			return String.format("registers: %d writes ok, %d reads ok, %d unknown, %d failed;"
 							+ " transfers: %d committed, %d skipped (low balance), %d conflicts, %d unknown, %d failed;"
-							+ " audits: %d consistent, %d incomplete",
+							+ " audits: %d consistent, %d incomplete;"
+							+ " list appends: %d committed, %d aborted, %d unknown",
 					registerWrites.get(), registerReads.get(), registerUnknown.get(), registerFailed.get(),
 					committedTransfers.get(), skippedTransfers.get(), conflicts.get(), unknownTransfers.get(),
-					failedTransfers.get(), consistentAudits.get(), failedAudits.get());
+					failedTransfers.get(), consistentAudits.get(), failedAudits.get(),
+					committedAppendTransactions.get(), abortedAppendTransactions.get(), unknownAppendTransactions.get());
 		}
 	}
 
@@ -655,7 +953,12 @@ class RandomFaultTest {
 	 * after the fault started (failover time when the target was the leader), and fails if those clients went
 	 * without any acknowledged operation for longer than {@link #MAX_UNAVAILABILITY}.
 	 */
-	private static void reportAvailability(List<ExecutedStep> steps, Workload workload, String repro) {
+	/** Faults that cost a targeted leader its leadership, so that clients must fail over. */
+	private static final Set<Fault> LEADER_LOSING_FAULTS = Set.of(Fault.KILL, Fault.RESTART, Fault.PAUSE, Fault.ISOLATE,
+			Fault.PARTITION, Fault.ONE_WAY, Fault.BLACKHOLE, Fault.FLAP);
+
+	private static void reportAvailability(List<ExecutedStep> steps, Workload workload, String repro,
+			boolean assertAvailable) {
 		var writes = new ArrayList<>(workload.acknowledgedWrites);
 		var completions = workload.acknowledged.stream().sorted().toList();
 		long worstGap = 0;
@@ -675,7 +978,7 @@ class RandomFaultTest {
 					.min()
 					.orElse(Long.MAX_VALUE);
 			long recovery = firstWrite == Long.MAX_VALUE ? -1 : (firstWrite - executed.startNanos()) / 1_000_000;
-			if (executed.targetWasLeader() && executed.step().fault() != Fault.CUT_LINK && recovery >= 0) {
+			if (executed.targetWasLeader() && LEADER_LOSING_FAULTS.contains(executed.step().fault()) && recovery >= 0) {
 				leaderFailovers.add(recovery);
 			}
 			log(String.format("  %-9s node %s%s: first acknowledged write after %d ms, fault lasted %d ms",
@@ -687,7 +990,8 @@ class RandomFaultTest {
 				+ (sortedFailovers.isEmpty() ? "" : ", median " + sortedFailovers.get(sortedFailovers.size() / 2)));
 		log("Longest gap between acknowledged multi-endpoint operations: " + worstGap / 1_000_000 + " ms, ending at "
 				+ clockOf(worstGapEnd));
-		assertTrue(worstGap < MAX_UNAVAILABILITY.toNanos(), "clients failing over saw no acknowledged operation for "
+		// Overlapping faults may take the majority away: then the gap is only reported.
+		assertTrue(!assertAvailable || worstGap < MAX_UNAVAILABILITY.toNanos(), "clients failing over saw no acknowledged operation for "
 				+ worstGap / 1_000_000 + " ms (ending at " + clockOf(worstGapEnd) + "), " + repro);
 	}
 
@@ -731,7 +1035,7 @@ class RandomFaultTest {
 		}
 		var reference = contents.values().iterator().next();
 		var referenceId = cluster.nodeIds().getFirst();
-		assertEquals(Set.of("registers", "bank", "hot"), reference.keySet(), "user columns of replica " + referenceId);
+		assertEquals(Set.of("registers", "bank", "lists", "hot"), reference.keySet(), "user columns of replica " + referenceId);
 		for (var entry : contents.entrySet()) {
 			var replica = entry.getValue();
 			assertEquals(reference.keySet(), replica.keySet(), "columns of replica " + entry.getKey() + ", " + repro);
@@ -865,6 +1169,93 @@ class RandomFaultTest {
 	}
 
 	// ---------------------------------------------------------------------------------------------------------
+	// Raft terms
+
+	/**
+	 * Samples every node's persisted current term, from the {@code term} line of the {@code raft-meta} file in its
+	 * Raft storage, which Ratis replaces atomically before it acts in a new term. The file is read even while the
+	 * node is down or frozen. A term lower than one seen before on the same node is a violation: a node that forgot
+	 * its term could vote twice in it.
+	 */
+	private static final class TermMonitor implements AutoCloseable {
+
+		private final ProcessCluster cluster;
+		private final Map<String, Long> last = new java.util.concurrent.ConcurrentHashMap<>();
+		private final ConcurrentLinkedQueue<String> violations = new ConcurrentLinkedQueue<>();
+		private final AtomicLong samples = new AtomicLong();
+		private final AtomicLong changes = new AtomicLong();
+		private final AtomicBoolean closed = new AtomicBoolean();
+		private final Thread thread;
+
+		TermMonitor(ProcessCluster cluster) {
+			this.cluster = cluster;
+			this.thread = Thread.ofPlatform().name("random-fault-terms").daemon().start(this::loop);
+		}
+
+		private void loop() {
+			while (!closed.get()) {
+				sample();
+				try {
+					Thread.sleep(TERM_SAMPLE_PERIOD);
+				} catch (InterruptedException e) {
+					return;
+				}
+			}
+		}
+
+		private void sample() {
+			samples.incrementAndGet();
+			for (var id : cluster.nodeIds()) {
+				var term = term(cluster.dataDir(id));
+				if (term.isEmpty()) {
+					continue;
+				}
+				var previous = last.put(id, term.get());
+				if (previous != null && term.get() < previous) {
+					violations.add("node " + id + " at " + clock() + ": term " + term.get() + " after " + previous);
+				} else if (previous != null && term.get() > previous) {
+					changes.incrementAndGet();
+				}
+			}
+		}
+
+		static Optional<Long> term(Path dataDir) {
+			var file = dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID).resolve("current")
+					.resolve("raft-meta");
+			try (var in = java.nio.file.Files.newInputStream(file)) {
+				var properties = new Properties();
+				properties.load(in);
+				var term = properties.getProperty("term");
+				return term == null ? Optional.empty() : Optional.of(Long.parseLong(term.strip()));
+			} catch (IOException | NumberFormatException e) {
+				// Not written yet, or being replaced.
+				return Optional.empty();
+			}
+		}
+
+		List<String> violations() {
+			return List.copyOf(violations);
+		}
+
+		String summary() {
+			return "Raft terms: " + last + " after " + samples.get() + " samples, " + changes.get()
+					+ " term increases seen, " + violations.size() + " decreases";
+		}
+
+		@Override
+		public void close() {
+			closed.set(true);
+			thread.interrupt();
+			try {
+				thread.join();
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+			sample();
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------------------
 	// Helpers
 
 	private static final long EPOCH_NANOS = System.nanoTime();
@@ -912,6 +1303,22 @@ class RandomFaultTest {
 
 	private static long balance(Buf value) {
 		return ByteBuffer.wrap(value.toByteArray()).getLong();
+	}
+
+	/** A list value: its elements in decimal, comma-separated; absent is the empty list. */
+	private static List<Long> elements(Buf value) {
+		if (value == null) {
+			return List.of();
+		}
+		var text = text(value);
+		if (text.isEmpty()) {
+			return List.of();
+		}
+		return Arrays.stream(text.split(",")).map(Long::parseLong).toList();
+	}
+
+	private static Buf elementsValue(List<Long> elements) {
+		return text(elements.stream().map(String::valueOf).collect(Collectors.joining(",")));
 	}
 
 	private static Buf text(String value) {
