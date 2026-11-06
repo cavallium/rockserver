@@ -73,10 +73,10 @@ class TablePropertiesTest {
             long column = db.createColumn("entries", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
             db.put(0, column, new Keys(toBufSimple(1)), toBufSimple(2), RequestType.none());
             db.flush();
-            var method = db.getClass().getDeclaredMethod("collectTablePropertiesMetrics");
+            var method = part(db, "maintenance").getClass().getDeclaredMethod("collectTablePropertiesMetrics");
             method.setAccessible(true);
             @SuppressWarnings("unchecked")
-            var collection = (reactor.core.publisher.Mono<java.util.Map<String, ColumnTableProperties>>) method.invoke(db);
+            var collection = (reactor.core.publisher.Mono<java.util.Map<String, ColumnTableProperties>>) method.invoke(part(db, "maintenance"));
             assertEquals(1, collection.block(Duration.ofSeconds(10)).get("entries").numEntries());
         }
         java.nio.file.Files.writeString(config, "database.metrics.table-properties-interval-seconds: 1");
@@ -96,7 +96,7 @@ class TablePropertiesTest {
 
     private static ColumnTableProperties aggregate(java.util.Collection<TableProperties> tables) {
         try {
-            var method = Class.forName("it.cavallium.rockserver.core.impl.EmbeddedDB")
+            var method = Class.forName("it.cavallium.rockserver.core.impl.EmbeddedDBMaintenance")
                     .getDeclaredMethod("aggregateTableProperties", java.util.Collection.class);
             method.setAccessible(true);
             return (ColumnTableProperties) method.invoke(null, tables);
@@ -142,5 +142,16 @@ class TablePropertiesTest {
         assertThrows(ArithmeticException.class, () -> aggregate(List.of(p, p)));
         when(p.getDataSize()).thenReturn(-1L);
         assertThrows(ArithmeticException.class, () -> aggregate(List.of(p)));
+    }
+
+    /** A package-private part of EmbeddedDB (for example its storage metrics), read through its field. */
+    private static Object part(Object db, String field) {
+        try {
+            var f = db.getClass().getDeclaredField(field);
+            f.setAccessible(true);
+            return f.get(db);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
     }
 }

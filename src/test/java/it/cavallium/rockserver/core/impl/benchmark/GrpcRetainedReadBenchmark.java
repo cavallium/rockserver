@@ -1256,8 +1256,10 @@ public final class GrpcRetainedReadBenchmark {
 			try {
 				Class<?> databaseType = database.getClass();
 				activeRequestsField = accessible(databaseType.getDeclaredField("activeExistsMultiRequests"));
-				Class<?> requestType = nestedClass(databaseType, "AsyncExistsMultiRequest");
-				Class<?> cursorType = nestedClass(databaseType, "ExistsMultiCursor");
+				// The existsMulti request types live in EmbeddedDBExistsMulti, a package-private part of EmbeddedDB.
+				Class<?> existsMultiType = Class.forName(EmbeddedDB.class.getPackageName() + ".EmbeddedDBExistsMulti");
+				Class<?> requestType = nestedClass(existsMultiType, "AsyncExistsMultiRequest");
+				Class<?> cursorType = nestedClass(existsMultiType, "ExistsMultiCursor");
 				cursorField = accessible(requestType.getDeclaredField("cursor"));
 				snapshotField = accessible(cursorType.getDeclaredField("snapshot"));
 				readOptionsField = accessible(cursorType.getDeclaredField("readOptions"));

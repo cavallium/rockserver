@@ -38,7 +38,7 @@ only once the apply thread is still the limit above about 4x production load.
  node A        node B (leader)               node C
  GrpcServer    GrpcServer                    GrpcServer        ← core server, unchanged
  ReplicatedConnection (implements RocksDBConnection; Router)    ← routes every API command
- EmbeddedDB    EmbeddedDB                    EmbeddedDB        ← core engine, unchanged
+ EmbeddedDB    EmbeddedDB                    EmbeddedDB        ← core engine (facade + package-private parts)
  Ratis server ═══ Raft log replication (stock Apache Ratis 3.3.1, gRPC) ═══
 ```
 
@@ -78,6 +78,24 @@ forwards to a non-embedded connection:
   waits for), `GrpcRequestContexts` (wire context to `RequestContext` and deadline), `GrpcScheduledCalls` and
   `GrpcIteratorOperations` (scheduling, cancellation and iterator leases), and `GrpcServerImpl` (the service
   methods). The split moved code only: behavior, status mapping and the `rockserver-leader` header are the same.
+- `EmbeddedDB` (12k lines) is split the same way. It keeps its public API, every field (state, locks, executors,
+  timers, test observers), the constructor, `close`, transactions with `ApplyWriter`, the shared read helpers
+  (`dbGet`, column leases) and `scheduleTracked`; its other public methods delegate to package-private parts in
+  the same package, each holding only a reference to the database: `EmbeddedDBColumns` (schemas, merge-operator
+  resolution, create/delete column), `EmbeddedDBWrites` (put/delete/merge, multi and range deletes),
+  `EmbeddedDBBatchWrites` (putBatch/mergeBatch, SST ingestion), `EmbeddedDBWriteElision`, `EmbeddedDBPointReads`
+  (get, fast get, getMulti), `EmbeddedDBExistsMulti`, `EmbeddedDBIterators`, `EmbeddedDBRanges` (reduce/get/count
+  range, range cursors, the retained query limiter), `EmbeddedDBRawScan` (SST pinning and raw scans),
+  `EmbeddedDBMaintenance` (flush, compaction, table properties) and `EmbeddedDBStorageMetrics` (timers, storage
+  pressure, compaction-I/O sampling). Code was moved, not rewritten: a sorted, trimmed comparison of the old
+  file's lines with the new files' lines (`scripts/embeddeddb-split-compare.py`) finds no old line missing once
+  call-site prefixes (`edb.`, `writes.`, ...) and `private` are ignored; what is new is the parts' headers,
+  imports and the one-line delegates. The only edited line is `EmbeddedDB.varHandle`, which now takes a private
+  lookup in the field's own class, because the classes that own those fields are no longer nested in
+  `EmbeddedDB`. `ApplyWriter` and the transaction map stay in `EmbeddedDB`: `ApplyWriter` is a public nested
+  type that `Applier` imports as `EmbeddedDB.ApplyWriter`, and the transaction methods are the facade's own
+  bookkeeping that every part uses. Changes made to `EmbeddedDB` while it was being split (`closeIteratorsOfColumn`,
+  the logging fixes, the removal of `openUnloggedTransaction`) were applied to the part that now holds the code.
 - `EmbeddedDB.openApplyWriter` (the apply thread's transaction: no snapshot, untracked, optionally without the WAL),
   `EmbeddedDB.deleteRangeUnlogged` (a range deletion without the WAL) and the `atomic-flush` global option (off
   by default; it turns pipelined writes off).
