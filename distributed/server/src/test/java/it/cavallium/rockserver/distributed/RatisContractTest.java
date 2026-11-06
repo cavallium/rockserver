@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -28,6 +29,7 @@ import org.apache.ratis.thirdparty.io.grpc.stub.ClientCalls;
 import org.apache.ratis.thirdparty.io.grpc.stub.ServerCalls;
 import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
 import org.apache.ratis.util.LifeCycle;
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -38,9 +40,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -51,6 +57,7 @@ import org.apache.ratis.client.impl.OrderedAsync;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
+import org.apache.ratis.grpc.metrics.MessageMetrics;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
@@ -70,6 +77,7 @@ import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.statemachine.impl.SimpleStateMachineStorage;
 import org.apache.ratis.thirdparty.com.google.protobuf.CodedInputStream;
+import org.apache.ratis.util.PeerProxyMap;
 import org.apache.ratis.util.PureJavaCrc32C;
 import org.apache.ratis.util.TimeDuration;
 import org.junit.jupiter.api.AfterEach;
@@ -747,6 +755,80 @@ class RatisContractTest {
 		assertTrue(wake.awaits() > 0, "Ratis waits on the appender's WakeSignal");
 		assertTrue(wake.kept() >= 5, "each round's wake came before the wait and was kept");
 		assertTrue(lags.stream().allMatch(lag -> lag < 600_000), lags::toString);
+	}
+
+	/**
+	 * R8-4: Ratis 3.3.1 can build a client proxy whose metric interceptor has no registry, and the proxy map lets the
+	 * failure of such a proxy's close out of its own close. Each {@code GrpcClientProtocolClient} makes a
+	 * {@link MessageMetrics} named after its client and peer ({@code MetricClientInterceptor}), and its close
+	 * unregisters it. {@code RatisMetrics.create} shares a registry that is already there without counting the new
+	 * holder, and {@code RefCountingMap.put} counts a new registry only after putting it in the map; so when a proxy
+	 * is made while the one before it to the same peer closes, a close that removes the registry between the put and
+	 * the count leaves the new proxy with {@code null}. Every call of that proxy then throws a
+	 * {@link NullPointerException} at its start ({@code MessageMetrics.rpcStarted}), its close too, and
+	 * {@code PeerProxyMap} catches only an {@link IOException} of a proxy's close: its own close throws a
+	 * {@link CompletionException} after closing the others. {@link Proposer} replaces such a proxy
+	 * ({@link Proposer#resetBrokenProxy}) and logs the failure of its client's close ({@link Proposer#closeClient}).
+	 * Here generations of one proxy name are made each while the one before closes, on two threads, until one has no
+	 * registry: a few thousand generations, under a second. A Ratis that fixes the race fails here after
+	 * {@link #WAIT}, and the proposer's handling can go.
+	 */
+	@Test
+	void aProxyMadeWhileTheOneBeforeItClosesCanGetNoMetricRegistry() throws Exception {
+		var name = ClientId.randomId() + "->h1";
+		var pool = Executors.newFixedThreadPool(2);
+		MessageMetrics broken = null;
+		int generations = 0;
+		try {
+			var previous = new MessageMetrics(name, "client");
+			long deadline = System.nanoTime() + WAIT.toNanos();
+			while (broken == null) {
+				int made = generations;
+				assertTrue(System.nanoTime() - deadline < 0, () -> "no proxy without a registry in " + made + " generations");
+				var closing = previous;
+				var start = new CyclicBarrier(2);
+				var closed = pool.submit(() -> {
+					start.await();
+					closing.unregister();
+					return null;
+				});
+				var next = pool.submit(() -> {
+					start.await();
+					return new MessageMetrics(name, "client");
+				});
+				closed.get();
+				previous = next.get();
+				generations++;
+				if (previous.getRegistry() == null) {
+					broken = previous;
+				}
+			}
+		} finally {
+			pool.shutdownNow();
+		}
+		System.out.println("A proxy without a metric registry after " + generations + " generations");
+		var found = broken;
+		var npe = assertThrows(NullPointerException.class, found::unregister);
+		assertTrue(String.valueOf(npe.getMessage()).contains("\"this.registry\" is null"), npe::getMessage);
+
+		var others = new ArrayList<AtomicBoolean>();
+		var proxies = new PeerProxyMap<Closeable>("r8-4", peer -> {
+			if (peer.getId().toString().equals("h1")) {
+				return found::unregister;
+			}
+			var closedFlag = new AtomicBoolean();
+			others.add(closedFlag);
+			return () -> closedFlag.set(true);
+		});
+		for (var id : List.of("h0", "h1", "h2")) {
+			var peer = RaftPeer.newBuilder().setId(id).setAddress("127.0.0.1:1").build();
+			proxies.addRaftPeers(List.of(peer));
+			proxies.getProxy(peer.getId());
+		}
+		var failure = assertThrows(CompletionException.class, proxies::close);
+		assertInstanceOf(NullPointerException.class, failure.getCause());
+		assertEquals(2, others.size());
+		assertTrue(others.stream().allMatch(AtomicBoolean::get), "the other proxies were closed");
 	}
 
 	/** CPU time of the leader's threads that append to {@code followerId} (named {@code ...->followerId-...}). */

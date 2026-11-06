@@ -1364,6 +1364,12 @@ final class Proposer implements Closeable {
 			// would hold this attempt's failure, and the resend to the next leader, that long.
 			resetConnection(rpc, leader, ex);
 			throw new CompletionException(ex);
+		} catch (RuntimeException ex) {
+			// The proxy threw instead of failing the call: it is broken, and Ratis would keep it (it resets a proxy only
+			// on connection errors), so every later attempt to this peer would fail the same way. Seen with a proxy
+			// whose metric interceptor has no registry (R8-4, see resetBrokenProxy). Replaced like a failed connection.
+			resetBrokenProxy(rpc, leader, ex);
+			throw new CompletionException(ex);
 		} finally {
 			permits.release(weight);
 		}
@@ -1382,10 +1388,28 @@ final class Proposer implements Closeable {
 	 */
 	static void resetConnection(RaftClientRpc rpc, RaftPeerId peer, IOException error) {
 		// Ratis' proxy map resets on these errors only (PeerProxyMap.handleException with reconnect false).
-		Object failed = IOUtils.shouldReconnect(error) ? currentProxy(rpc, peer) : null;
+		reset(rpc, peer, error, IOUtils.shouldReconnect(error));
+	}
+
+	/**
+	 * R8-4: replaces the proxy to {@code peer} whose call threw {@code error} instead of failing, as
+	 * {@link #resetConnection} does after a connection error. Ratis 3.3.1 can build a client proxy whose metric
+	 * interceptor has no registry: {@code RatisMetrics.create} shares a registry that already exists without counting
+	 * the new holder, and {@code RefCountingMap.put} counts a new one only after it is in the map, so the close of an
+	 * older proxy to the same peer, in that moment, removes it and the new proxy gets {@code null}. Every call of that
+	 * proxy then throws a {@link NullPointerException} when it starts (and so does its close), and no error of it is a
+	 * connection error. {@link #resetConnection} closes old proxies while new ones are made, so this node can meet it
+	 * after a leader loss ({@code RatisContractTest.aProxyMadeWhileTheOneBeforeItClosesCanGetNoMetricRegistry}).
+	 */
+	static void resetBrokenProxy(RaftClientRpc rpc, RaftPeerId peer, RuntimeException error) {
+		reset(rpc, peer, error, true);
+	}
+
+	private static void reset(RaftClientRpc rpc, RaftPeerId peer, Exception error, boolean reconnect) {
+		Object failed = reconnect ? currentProxy(rpc, peer) : null;
 		Thread.ofVirtual().name("rockserver-propose-reset-" + peer).start(() -> {
 			try {
-				rpc.handleException(peer, error, false);
+				rpc.handleException(peer, error, reconnect);
 			} catch (RuntimeException ex) {
 				LoggerFactory.getLogger(Proposer.class).debug("Could not reset the connection to {}", peer, ex);
 			}
@@ -1549,13 +1573,33 @@ final class Proposer implements Closeable {
 			}
 			fail(queued, RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping"));
 		}
-		try (client) {
+		try {
 			sender.shutdownNow();
 		} finally {
-			// Batches in flight lose their remote calls with the executor, and their reply handlers once the node stops
-			// its control plane: their outcome is unknown.
-			fail(List.copyOf(live), RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN,
-					"The node stopped before the write was acknowledged; its outcome is unknown"));
+			try {
+				closeClient(client);
+			} finally {
+				// Batches in flight lose their remote calls with the executor, and their reply handlers once the node
+				// stops its control plane: their outcome is unknown.
+				fail(List.copyOf(live), RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN,
+						"The node stopped before the write was acknowledged; its outcome is unknown"));
+			}
+		}
+	}
+
+	/**
+	 * Closes the client. A runtime failure is logged, not thrown (R8-4): Ratis closes every proxy of the client even
+	 * when one fails, then its event loops ({@code PeerProxyMap.close}, {@code GrpcClientRpc.close}), but it catches
+	 * only an {@link IOException} of each proxy and throws a {@link CompletionException} for any other. The one seen
+	 * is the close of a proxy without a metric registry ({@link #resetBrokenProxy}), never reset because it was to a
+	 * peer that no attempt reached again, such as a halted leader; it failed the node's whole stop.
+	 */
+	static void closeClient(Closeable client) throws IOException {
+		try {
+			client.close();
+		} catch (RuntimeException ex) {
+			LoggerFactory.getLogger(Proposer.class).warn("The Raft client failed to close one of its connections; "
+					+ "the others and its threads are closed", ex);
 		}
 	}
 }
