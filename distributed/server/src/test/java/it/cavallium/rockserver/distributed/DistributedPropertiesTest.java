@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -44,8 +45,21 @@ class DistributedPropertiesTest {
 	@Test
 	void everyReplicatedPropertyHasThePrefix() {
 		for (var name : new String[] {Proposer.WRITE_ADMISSION_BYTES_PROPERTY, ReplicatedConnection.SESSION_TIMEOUT_PROPERTY,
-				Router.FOLLOWER_READS_PROPERTY}) {
+				Router.FOLLOWER_READS_PROPERTY, ReplicaOps.CHECKSUM_EVERY_HOURS_PROPERTY, NodeMetrics.LAG_SAMPLE_PROPERTY}) {
 			assertTrue(name.startsWith(DistributedProperties.PREFIX), name);
 		}
+	}
+
+	/** CR2-10: booleans go through the same reader, strict about their values. */
+	@Test
+	void aBooleanIsTrueOrFalseElseTheDefault() {
+		assertTrue(DistributedProperties.getBoolean(true, NEW, OLD));
+		System.setProperty(OLD, "TRUE");
+		assertTrue(DistributedProperties.getBoolean(false, NEW, OLD));
+		System.setProperty(NEW, " false ");
+		assertFalse(DistributedProperties.getBoolean(true, NEW, OLD));
+		// Boolean.parseBoolean read "yes" as false: now the default, with a warning.
+		System.setProperty(NEW, "yes");
+		assertTrue(DistributedProperties.getBoolean(true, NEW, OLD));
 	}
 }

@@ -50,4 +50,22 @@ final class DistributedProperties {
 			return defaultValue;
 		}
 	}
+
+	/** {@link #get} as a boolean ({@code true} or {@code false}, any case), else {@code defaultValue}, with a warning. */
+	static boolean getBoolean(boolean defaultValue, String name, String... oldNames) {
+		var value = get(name, oldNames);
+		if (value == null) {
+			return defaultValue;
+		}
+		var trimmed = value.trim();
+		if (trimmed.equalsIgnoreCase("true")) {
+			return true;
+		}
+		if (trimmed.equalsIgnoreCase("false")) {
+			return false;
+		}
+		LOG.warn("System property {} must be true or false, but was \"{}\": using the default {}", name, value,
+				defaultValue);
+		return defaultValue;
+	}
 }

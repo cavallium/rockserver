@@ -62,11 +62,15 @@ import org.jetbrains.annotations.Nullable;
  * with 1 if it refuses.</p>
  *
  * <p>Run a node with {@code -XX:+ExitOnOutOfMemoryError}: {@code run} refuses to start without it, unless
- * {@code --allow-without-exit-on-oom} is given (for development only). Running out of direct memory stops the node too,
+ * {@code --allow-without-exit-on-oom} is given (for development only). Running out of direct memory on a thread of
+ * replication stops the node too,
  * with exit code 3, see {@link DirectMemoryWatch}. See "Heap" in the design document.</p>
  *
  * <p>{@code run} exits with 4, and does not start, if the configuration in its log no longer contains the node: it was
- * removed from the cluster, and a supervisor must not start it again. See "Replacing a node" in the design document.</p>
+ * removed from the cluster, and a supervisor must not start it again. See "Replacing a node" in the design document.
+ * It exits with 5, and does not start, if its database has a cluster version with capabilities this version lacks (a
+ * downgrade, or a newer cluster's backup). Every command's exit codes: "Exit codes" in
+ * {@code docs/distributed/runbooks.md}; 4 means "removed" for {@code run} and "incomplete" for {@code admin}.</p>
  *
  * <p>Unless {@code -Djava.io.tmpdir} is given, {@code run} extracts the RocksDB library into {@code DATA-DIR/tmp}, and
  * deletes the copies that earlier runs left there; a given one outside the data directory is warned about.</p>
@@ -167,6 +171,10 @@ public final class ReplicatedServerMain {
 			System.err.println("Node " + config.nodeId() + " does not start: " + e.getMessage());
 			System.exit(4);
 			return;
+		} catch (ReplicatedNode.NewerVersionException e) {
+			System.err.println("Node " + config.nodeId() + " does not start: " + e.getMessage());
+			System.exit(5);
+			return;
 		} catch (IOException | RuntimeException e) {
 			// Ratis and gRPC leave non-daemon threads behind, which would keep the JVM running without a node.
 			System.err.println("Failed to start node " + config.nodeId() + ":");
@@ -196,7 +204,9 @@ public final class ReplicatedServerMain {
 					+ (failure != null ? failure : "replica failed"));
 			// When a signal already started the shutdown, this blocks; the hook then halts with 3 once the node stopped.
 			// A node that found out, while it waited outside the cluster, that it was removed exits as at start.
-			System.exit(failure instanceof ReplicatedNode.RemovedException ? 4 : 3);
+			// A replica that met a cluster version it cannot read in its log or in an installed snapshot exits as at start.
+			System.exit(failure instanceof ReplicatedNode.RemovedException ? 4
+					: ReplicatedNode.NewerVersionException.in(failure) ? 5 : 3);
 		}
 	}
 

@@ -18,6 +18,16 @@ class RaftSettingsTest {
 		return RaftSettings.server(NodeConfig.defaults("a", List.of(peer), Path.of("unused")));
 	}
 
+	/** CR2-3: CommitHeartbeats triggers heartbeats through Ratis' linearizable read path with its heartbeat check. */
+	@Test
+	void theReadPathThatCommitHeartbeatsTriggersIsOn() {
+		var properties = server();
+		assertEquals(RaftServerConfigKeys.Read.Option.LINEARIZABLE, RaftServerConfigKeys.Read.option(properties));
+		assertTrue(RaftServerConfigKeys.Read.leaderHeartbeatCheckEnabled(properties));
+		assertTrue(properties.get(RaftServerConfigKeys.Read.LEADER_HEARTBEAT_CHECK_ENABLED_KEY) != null,
+				"set explicitly, not left to Ratis' default");
+	}
+
 	/**
 	 * Ratis keeps every chunk of a snapshot it sends on the heap for this long, and an out of memory error there ends the
 	 * catch-up of a new member as if it had finished.

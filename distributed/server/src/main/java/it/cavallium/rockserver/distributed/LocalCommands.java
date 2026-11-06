@@ -74,7 +74,15 @@ final class LocalCommands {
 
 	@SuppressWarnings("unchecked")
 	Flux<Object> localStream(RequestContext context, RocksDBAPICommandStream<?> command) {
-		return Flux.from((Publisher<Object>) stateMachine.store().connection().getAsyncApi(context).requestAsync(command));
+		var stream = Flux.from((Publisher<Object>) stateMachine.store().connection().getAsyncApi(context).requestAsync(command));
+		// A column deletion ends the streams of the column instead of waiting for them (DD-7a).
+		Long column = switch (command) {
+			case RocksDBAPICommandStream.GetRange<?> c -> c.columnId();
+			case RocksDBAPICommandStream.ScanRaw c -> c.columnId();
+			case RocksDBAPICommandStream.ScanRawResumable c -> c.columnId();
+			default -> null;
+		};
+		return column == null ? stream : stateMachine.columnStreams().track(column, stream);
 	}
 
 	/**

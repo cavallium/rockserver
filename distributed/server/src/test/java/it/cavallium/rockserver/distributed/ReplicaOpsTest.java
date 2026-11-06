@@ -119,7 +119,7 @@ class ReplicaOpsTest {
 	void addedNodeNeedsCurrentAndPendingCapabilities() {
 		long old = Capabilities.PIPELINED_UPDATES | Capabilities.CLIENT_SESSIONS;
 		assertEquals(0, ReplicatedServerMain.missingCapabilities(0, 0, 0));
-		assertEquals(Capabilities.CHECKSUM | Capabilities.BACKUP,
+		assertEquals(Capabilities.CHECKSUM | Capabilities.BACKUP | Capabilities.CHECKSUM_SCHEMAS,
 				ReplicatedServerMain.missingCapabilities(0, Capabilities.SUPPORTED, old), "a raise is pending");
 		assertEquals(Capabilities.CLIENT_SESSIONS,
 				ReplicatedServerMain.missingCapabilities(Capabilities.CLIENT_SESSIONS, 0, 0));
@@ -129,7 +129,8 @@ class ReplicaOpsTest {
 	@Test
 	void capabilities() {
 		assertEquals("none", Capabilities.describe(0));
-		assertEquals("pipelined-updates,client-sessions,checksum,backup", Capabilities.describe(Capabilities.SUPPORTED));
+		assertEquals("pipelined-updates,client-sessions,checksum,backup,checksum-schemas",
+				Capabilities.describe(Capabilities.SUPPORTED));
 		assertTrue(Capabilities.describe(1L << 40).contains("0x"));
 		assertTrue(Capabilities.has(Capabilities.GENESIS, Capabilities.CLIENT_SESSIONS));
 		assertFalse(Capabilities.has(Capabilities.CHECKSUM, Capabilities.CHECKSUM | Capabilities.BACKUP));

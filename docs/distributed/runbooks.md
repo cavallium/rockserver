@@ -129,7 +129,12 @@ equal. It exits with 1 if they differ, and with 4 if a node gave none (down, fai
 or it skipped the position because a snapshot install jumped over it): run it again. `--allow-skipped` accepts nodes
 that skipped the position. The digest reads every key of the
 database on every node at once, holding a snapshot meanwhile: run it at a quiet time on large databases. With
-`-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` on the nodes, the leader also runs one every N hours.
+`-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` on the nodes, the leader also runs one every N hours,
+counted from the last check of the cluster (also one run by hand), so a leader change does not start the count over.
+The digest covers each column's schema and merge operator too, once every member runs a version that does (the
+capability `checksum-schemas`): a column created or altered differently on one replica is a divergence even with the
+same data. A malformed value of this property, as of every `it.cavallium.rockserver.distributed.*` property, is logged
+as a warning at the start and the default is used.
 
 A difference (the log says `REPLICAS DIVERGED`, the alert `rockserver-checksum-mismatch` fires):
 
@@ -179,7 +184,11 @@ The cluster version keeps the new kinds of log entries off until every member ru
   sessions until it reconnects: restart the clients after the upgrade (or start them with
   `-Dit.cavallium.rockserver.grpc.client.session-writes=false` until then).
 - `admin checksum` and `admin backup` are refused until every member supports them.
-- Never downgrade a node below the cluster version: it would stop on the first entry it cannot read. `add-peer` refuses
+- Never downgrade a node below the cluster version: it would stop on the first entry it cannot read. A node whose
+  database has a cluster version with a capability its binary lacks (a downgrade, or a backup of a newer cluster restored
+  here) refuses to start, with exit code 5 and a message naming the unknown capabilities: start the newer version
+  again. A node rolled back after it took part in a raise can also meet it after the start, in the log it replays or
+  catches up on, or in a snapshot it installs: it stops then, with exit code 5 as well. `add-peer` refuses
   a new node that lacks a capability of the cluster, or one that every member supports already (the leader may turn it
   on at any moment): upgrade the new node first.
 - A cluster created before the cluster version has none until every member was upgraded to a version that has it and the
@@ -196,6 +205,23 @@ Upgrades across these versions need more care, because no gate covers them:
   the cluster version covers this from this version on.
 - **Pipelined updates** need every node on the version with the flags of `Guarded` entries; the cluster version covers
   this from this version on.
+
+## Exit codes
+
+Each command has its own codes; the same number can mean different things for different commands. Supervise `run`
+only: restart it on 1 and 3, never on 2, 4 or 5, which need an operator.
+
+| Code | `run` | `admin` | `repair-log` | `export-seed`, `restore-backup` |
+|---|---|---|---|---|
+| 0 | Stopped by SIGTERM (or SIGINT), after its hand-off | `OK` | The log is valid, or was (with `--dry-run`: could be) repaired | Done |
+| 1 | Did not start: a bad option value, a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`) | `FAILED: ...`: refused, a change failed, the replicas differ (`checksum`), a member failed (`backup`) | Refused: see its output | Failed: see the exception |
+| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError` | Wrong usage | Wrong usage | Wrong usage |
+| 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM | - | - | - |
+| 4 | Removed from the cluster: refused at the start, or found out while waiting outside the cluster. Do not start it again | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`): run it again | - | - |
+| 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | - |
+
+Code 4 is kept for both meanings: renumbering either would change what deployed supervisors and scripts, and the
+process tests, already expect, and a supervisor never runs `admin`, nor a script `run`.
 
 ## Alerts
 

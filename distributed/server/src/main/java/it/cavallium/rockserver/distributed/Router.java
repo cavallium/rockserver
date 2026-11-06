@@ -64,7 +64,7 @@ final class Router {
 	 * index (see {@link #followerRead}), so never an entry that a leader with the shortcut may not have applied yet. See
 	 * "Follower reads" in the design document.
 	 */
-	static final String FOLLOWER_READS_PROPERTY = "it.cavallium.rockserver.distributed.follower-reads";
+	static final String FOLLOWER_READS_PROPERTY = DistributedProperties.PREFIX + "follower-reads";
 
 	private final RockserverStateMachine stateMachine;
 	private final String nodeId;
@@ -110,7 +110,7 @@ final class Router {
 
 	/** Whether {@link #FOLLOWER_READS_PROPERTY} turns follower reads on. */
 	static boolean followerReadsConfigured() {
-		return Boolean.parseBoolean(System.getProperty(FOLLOWER_READS_PROPERTY, "false"));
+		return DistributedProperties.getBoolean(false, FOLLOWER_READS_PROPERTY);
 	}
 
 	private CompletableFuture<?> local(RequestContext context, RocksDBAPICommandSingle<?> command) {
@@ -431,13 +431,22 @@ final class Router {
 							followerReadTime.since(start);
 							return CompletableFuture.<Object>completedFuture(value);
 						}
-						long now = stateMachine.storeGeneration();
-						return (generation & 1) != 0 || now != generation
+						return replacedDuringRead(generation, stateMachine.storeGeneration())
 								? forwardFollowerRead(context, start, command)
 								: CompletableFuture.<Object>failedFuture(localError);
 					}).thenCompose(f -> f);
 				}, inline)
 				.thenCompose(f -> f);
+	}
+
+	/**
+	 * Whether a follower read that failed locally met a snapshot install, and is forwarded instead of failing: the
+	 * install was under way when it started ({@code before} odd: it did not even try), or began, and closed the database
+	 * it read, after it read {@code before} ({@code after} differs). The database waits for the reads it admitted before
+	 * it closes, so such a read fails as closed, never on freed memory.
+	 */
+	static boolean replacedDuringRead(long before, long after) {
+		return (before & 1) != 0 || after != before;
 	}
 
 	/** Forwards a point read this node tried to serve as a follower. */

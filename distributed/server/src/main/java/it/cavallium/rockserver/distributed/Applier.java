@@ -115,6 +115,11 @@ final class Applier {
 		/** The cluster version is now {@code version}. */
 		default void clusterVersion(long version) {}
 
+		/** The capabilities this node can read: a cluster version with any other bit stops the replica. */
+		default long supported() {
+			return Capabilities.SUPPORTED;
+		}
+
 		/** A {@link LogEntry.Checksum} at {@code position}. */
 		default void checksum(TermIndex position, NodeStore store) {}
 
@@ -129,6 +134,13 @@ final class Applier {
 	/** Sets what the maintenance entries do outside the database. */
 	void maintenance(Maintenance maintenance) {
 		this.maintenance = maintenance;
+	}
+
+	private volatile ColumnStreams columnStreams = new ColumnStreams();
+
+	/** The streams that a column deletion ends before it waits for the column's uses (DD-7a). */
+	void columnStreams(ColumnStreams columnStreams) {
+		this.columnStreams = columnStreams;
 	}
 
 	private final NodeMetrics.@Nullable Series openTime;
@@ -541,7 +553,8 @@ final class Applier {
 			long executeStart = System.nanoTime();
 			for (int j = 0; j < toRun.size(); j++) {
 				var request = toRun.get(j);
-				outcomes[j] = applyLogical(() -> execute(tx, request.entry()));
+				// With several requests a failure is not recorded here but run again one at a time, which logs it.
+				outcomes[j] = applyLogical(() -> execute(tx, request.entry()), toRun.size() == 1);
 				if (outcomes[j] instanceof ApplyResult.Failed failed && toRun.size() > 1) {
 					// Its partial writes are in the transaction with the others' writes: start over one at a time.
 					tx.close();
@@ -759,7 +772,8 @@ final class Applier {
 		var outcomes = new ApplyResult[toRun.size()];
 		for (int j = 0; j < toRun.size(); j++) {
 			var request = toRun.get(j);
-			outcomes[j] = applyLogical(() -> execute(tx, request.entry()));
+			// A failure here is not recorded but run again outside the group (applyData), which logs it.
+			outcomes[j] = applyLogical(() -> execute(tx, request.entry()), false);
 			if (outcomes[j] instanceof ApplyResult.Failed) {
 				tx.rollbackToSavePoint();
 				commitGroup();
@@ -1162,10 +1176,16 @@ final class Applier {
 			case LogEntry.DeleteColumn delete -> {
 				requireNoTransaction(tx, entry);
 				requireUserColumn(delete.columnId());
-				// The deletion waits for the column's iterators, which only the leader has: close them, instead of
-				// stopping this replica's apply until their clients close them or their leases end.
-				db.closeIteratorsOfColumn(delete.columnId());
-				db.deleteColumn(delete.columnId());
+				// The deletion waits for the column's iterators and streams, which only the leader has: end them, instead
+				// of stopping this replica's apply until their clients close them or their leases end.
+				var streams = columnStreams;
+				streams.deleting(delete.columnId());
+				try {
+					db.closeIteratorsOfColumn(delete.columnId());
+					db.deleteColumn(delete.columnId());
+				} finally {
+					streams.deleted(delete.columnId());
+				}
 				yield null;
 			}
 			case LogEntry.DeleteColumnIfExists delete -> {
@@ -1173,8 +1193,24 @@ final class Applier {
 				if (NodeStore.META_COLUMN.equals(delete.name())) {
 					throw new IllegalArgumentException("Reserved column name: " + delete.name());
 				}
-				db.closeIteratorsOfColumn(delete.name());
-				yield db.deleteColumnIfExists(delete.name());
+				Long columnId;
+				try {
+					columnId = db.getColumnId(delete.name());
+				} catch (RocksDBException missing) {
+					columnId = null;
+				}
+				var streams = columnStreams;
+				if (columnId != null) {
+					streams.deleting(columnId);
+				}
+				try {
+					db.closeIteratorsOfColumn(delete.name());
+					yield db.deleteColumnIfExists(delete.name());
+				} finally {
+					if (columnId != null) {
+						streams.deleted(columnId);
+					}
+				}
 			}
 			case LogEntry.UploadMergeOperator upload -> {
 				requireNoTransaction(tx, entry);
@@ -1235,6 +1271,16 @@ final class Applier {
 			case LogEntry.ClusterVersion version -> {
 				requireNoTransaction(tx, entry);
 				long raised = store.clusterVersion() | version.capabilities();
+				// A raise this node cannot read reaches it through the log too, not only in the database it starts with:
+				// a member of a newer version answered the leader's poll, then was rolled back to this version before its
+				// database kept the raise (a lost WAL tail, replayed), or before it applied it (catching up). The entries
+				// after it may use the capability: stop here, and leave the version as it was. Not an entry failure: a
+				// newer replica applies it.
+				long unknown = raised & ~maintenance.supported();
+				if (unknown != 0) {
+					throw new ReplicaFailedException("The log raises the cluster version to " + Capabilities.describe(raised)
+							+ ", with capabilities this version lacks", ReplicatedNode.NewerVersionException.of(raised, unknown));
+				}
 				writeClusterVersion(raised);
 				maintenance.clusterVersion(raised);
 				yield null;
@@ -1744,7 +1790,9 @@ final class Applier {
 			writer.setSavePoint();
 			open.savePoints[lane].add(ordinal);
 			for (var task : tasks) {
-				var outcome = applyLogical(() -> execute(writer, task.request.entry()));
+				// Not logged here: a failed outcome cuts the segment, and the entry runs again on the serial path, which
+				// decides and records it, and logs it once (R2-PA-4).
+				var outcome = applyLogical(() -> execute(writer, task.request.entry()), false);
 				task.outcome = outcome;
 				if (outcome instanceof ApplyResult.Failed) {
 					open.cut.accumulateAndGet(ordinal, Math::min);
@@ -1959,6 +2007,11 @@ final class Applier {
 	 * record a result that the others may not reach. An {@link Error} is not caught: it stops the replica too.
 	 */
 	private ApplyResult applyLogical(Operation operation) {
+		return applyLogical(operation, true);
+	}
+
+	/** {@link #applyLogical(Operation)}; {@code log} false leaves the failures it records unlogged. */
+	private ApplyResult applyLogical(Operation operation, boolean log) {
 		// Forget an operator failure of an earlier operation on this thread: only one of this operation counts.
 		FFMAbstractMergeOperator.takeFailureOnThisThread();
 		try {
@@ -1981,6 +2034,9 @@ final class Applier {
 				default -> new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR,
 						Failures.describeForReplica(failure, store.directories()));
 			};
+			if (!log) {
+				return result;
+			}
 			if (result.type() == RocksDBErrorType.INTERNAL_ERROR) {
 				// A bug of the apply code: worth its stack trace.
 				LOG.warn("Entry failed the same way on every replica, recorded as {}", result.type(), failure);

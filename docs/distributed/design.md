@@ -711,11 +711,24 @@ Raft log on disk instead of decoded on the heap. Any error on the apply or compl
   group, or before an entry that needs the serial path, it waits for the lanes, writes the records in log order,
   and commits the lanes' writers and its own in **one** atomic write (`ApplyWriter.commitWith` joins their
   native batches as RocksDB's `WriteBatchInternal::Append` does), so a crash keeps a prefix of the log as
-  before. A rejected request rolls back its whole entry in the serial path; here its lane marks the entry as a
+  before. RocksJava has no call for that append, so `ApplyWriter.joinWriteBatches` does it on the serialized
+  batches (R2-PA-5): a batch is a 12-byte header (sequence, which the database assigns on write, and count) and its
+  records, each one self-delimiting and independent of where it sits, so the records of every batch in turn under a
+  header with the summed count are the batch of all their operations in order. `ParallelApplyTest` checks it byte
+  for byte against a RocksJava batch made of the same puts, deletes, merges, range and single deletes in that order,
+  and with the batches `commitWith` really joins: two apply writers (transactions over a batch with index) on two
+  user columns (column-family records), one with writes rolled back to a save point, against one writer that made
+  the kept operations, and the database after `commitWith`. A transaction's batch has no other markers: those come
+  only with a two-phase prepare, which the apply never uses;
+  a wrong count would also be refused by RocksDB's own check on write, and a lost or doubled record would show in the
+  randomized comparison with the serial apply. A rejected request rolls back its whole entry in the serial path; here its lane marks the entry as a
   cut and the lanes skip what follows. At the end the lanes roll back to their save point before the cut (one
   per entry and lane), the entries before it commit, the in-memory changes of the entries from the cut on are
   undone, and those entries are applied again: the cut one on the serial path, which rejects it exactly as the
-  serial apply does (commit, then one request at a time), the next ones in lanes. Concurrent writers cannot share
+  serial apply does (commit, then one request at a time), the next ones in lanes. A failure is logged only where it
+  is recorded (R2-PA-4): not by the lane that cut, nor by a group or multi-request attempt that the serial path runs
+  again one request at a time, so a failing merge operator gives one warning per failed request, as without lanes
+  (`PoisonEntryTest` counts them). Concurrent writers cannot share
   one RocksDB transaction, and committing each lane on its own would let a crash keep a lane's writes without the
   position, whose replay would apply them twice: hence one writer per lane, joined at commit. Replies wait for
   the group's commit as before. A node in lanes and a serial one hold the same data, so nodes may differ in this
@@ -978,9 +991,19 @@ or a due heartbeat. So when the leader answers a read index request it also asks
 path does it (`raft.server.read.option=LINEARIZABLE`, set in `RaftSettings`, with the default leader heartbeat check),
 so the leader submits a Ratis read with its dummy message, which skips the state machine, and ignores the reply.
 Each heartbeat carries the commit index when it is sent, at least `c`. Ratis skips the round when one already
-confirmed a commit index at least as high, and coalesces triggers per follower, so it costs at most one empty append
-per follower per read index request (at most one in flight per follower). The read index itself still comes from
-`ReadBarrier`, never from Ratis' heartbeat confirmation.
+confirmed a commit index at least as high. The read index itself still comes from `ReadBarrier`, never from Ratis'
+heartbeat confirmation. The trigger does ride on Ratis' ReadIndex path, the one with the reuse bug that made this
+design use its own barrier; that bug only makes Ratis' read answer too early, and the trigger ignores the answer, so it
+costs nothing here but the heartbeats. It is kept small (CR2-3): `CommitHeartbeats` keeps at most one trigger in
+flight per commit index (a second confirms nothing more) and at most 4 in all. A dummy read completes only once the
+leader applied its read index, so under an apply lag they stay pending: without the bound, one per follower read
+index request would pile up in Ratis. A request that finds the bound reached is answered without a trigger, and its
+follower waits for the next append or heartbeat; with an apply lag, writes usually flow and appends carry the commit
+index anyway. The heartbeat check is set explicitly in `RaftSettings` (it is Ratis' default), and
+`RatisContractTest.aDummyReadOnTheLeaderSendsTheCommitIndexAtOnce` pins the behavior with the node's own Raft settings:
+with heartbeats every 3 s, a follower learned the commit index of a new write 1.6-3.0 ms after a trigger, and 3.0 s
+after the write without one (the next heartbeat; no commit metadata entries, which `RaftSettings` turns off, would
+have carried it).
 
 The read is forwarded to the leader instead, as without follower reads, when no read index comes (no leader known, the
 leader unreachable or not confirmed within a maximum election timeout, or a leader that predates the method), when the
@@ -989,7 +1012,21 @@ follower is more than 1024 entries behind `c`, or when its apply does not reach 
 and the read index round trip. A read that fails while a snapshot install replaces the database is forwarded too: the
 install raises a generation counter before it closes the old database and again once the new one is open
 (`RockserverStateMachine.storeGeneration`, odd in between), and a read that fails with the counter odd or changed is
-forwarded; a read that throws at once counts as failed.
+forwarded; a read that throws at once counts as failed. The database waits for the reads it admitted before it
+closes, so a read under way when the install closes it either completes or fails as closed, never on freed memory.
+`SnapshotInstallTest` holds an install and checks that a read seeing the odd counter is forwarded; the other case, a
+read that saw the counter even and then lost its database, needs a second install on a running member, which in
+process would need a partition (only the process suites have one): its decision (`Router.replacedDuringRead`) is
+checked on its own, where removing either half fails. Right after a cluster starts, the first follower read or two
+are forwarded (R2-RT-3; `FollowerReadTest` warms up first, which is why): traced on a fresh 3-node cluster in process,
+the read index (4) arrived 16-27 ms after the read, the first one paying for the connection to the leader, and the
+follower already knew that it was committed and had handed it to its apply thread, but its first apply group (the
+genesis, the column's creation, the first write) took another 30 ms: a schema change flushes the memtables and syncs
+the WAL, and the apply code runs cold. The 20 ms wait then ran out, and the read was forwarded, correctly. From the
+second read on every read was served (49 of 50, 3 runs alike); neither leader readiness nor the commit index was
+late. A read that arrives while the counter is odd is forwarded
+without touching the database: during the install the applied index already reaches the snapshot once the new
+database is open, before the counter is even again (`SnapshotInstallTest` holds an install there).
 
 **Why still off by default.** Measured in process (3 nodes on one machine and one disk, `FollowerReadLatencyTest`,
 100 rounds of a write on the leader and a read of it on a follower, in turn per mode):
@@ -1327,7 +1364,7 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   the joint configuration of its removal, with the node in the old half only, since the final one goes to the members
   that stay), and it was started without `--join` or was a member once (it writes `raft/member` when a configuration
   from the log makes it one, after the leader checks of each maintenance tick and on its own, so that a failed write,
-  such as on a full disk, does not keep a stalled leader in place). With systemd, `RestartPreventExitStatus=4` keeps it down. A node of a version before
+  such as on a full disk, does not keep a stalled leader in place). With systemd, `RestartPreventExitStatus=4 5` keeps it down (5: a database of a newer cluster version, see "Exit codes" in runbooks.md). A node of a version before
   this, started with `--join`, has no `raft/member` and still stays up in the initializing state, printing `READY`; it
   says so in its log as above. One start is refused wrongly: a node that holds a joint configuration of its own
   removal that its leader never committed before losing its leadership. Only a node that was being removed gets there;
@@ -1374,6 +1411,22 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   (`DirectMemoryWatch`). The limit is the heap size unless `-XX:MaxDirectMemorySize` (or `-Dio.netty.maxDirectMemory`)
   says otherwise; leave room for the snapshot chunks and the forwarded calls in flight. Without JFR in the JVM the node
   warns and runs without the watch.
+
+  Only such an error on a thread of replication is fatal: a thread of Ratis (`<peer>@group-...`: appenders, log
+  worker, state machine updater, leader and follower state; `<peer>-server-thread<n>` and the other executors of its
+  server; `grpc-default-...`, or `grpc-nio-...` where Netty runs without epoll, its shaded gRPC transport). Client traffic makes the same error on other threads: the
+  API's event loop (`rockserver-grpc-server-loop-...`, named for this) reading a large message, a thread encoding a large
+  reply, a forward to the leader (`rockserver-grpc-<node>-forward-...`). That error fails the one request, and halting
+  for it would do harm: the client retries on the next node, which halts too, until no majority is left. So it is
+  logged as an error, with its thread, and the node goes on (`DirectMemoryWatchTest` pins the names on a running
+  cluster, `DirectMemoryProcessTest` sends a message larger than the direct memory of every node). This does not keep
+  client traffic from using up the memory Ratis needs next: on this JDK both Netty copies, the API's and the shaded one
+  of Ratis, allocate through the JDK's direct buffers (neither uses a counter of its own: measured, `noCleaner` is
+  false for both), so they share one limit, and an append that fails for lack of it halts the node. A hard cap of the
+  API's direct memory below the limit would need a pooled allocator with its own limit for the API transport, which
+  gRPC's Netty transport does not offer per server; the bound instead is the configuration: set
+  `-XX:MaxDirectMemorySize` to at least the snapshot chunks in flight plus `max-inbound-message-bytes` (512 MiB by
+  default; lower it to what the clients really send) times the large requests expected at once.
 
   An out of memory error on a thread of Ratis does not stop the JVM. In the appender of a new member it ends the
   catch-up as if it had finished: `LeaderStateImpl.restart` starts a new appender only for a peer in the configuration,
@@ -1515,6 +1568,22 @@ What waits for it:
   downgraded below it.
 - The leader's question and proposal run on the threads of the answers, without blocking them; the flag that tells
   the next round whether one is running is volatile.
+- A node refuses to start on a database whose cluster version has a capability it lacks (exit code 5): see "Exit
+  codes" in runbooks.md (CR2-6). The check at the start sees only what the database kept, so it runs in two more
+  places. A member of a newer version that answered the leader's poll and was then rolled back can meet the raise in
+  its log: its database lost the unsynced WAL tail that held it and replays it, or it had not applied it yet and
+  catches up. The apply of a `ClusterVersion` entry to bits the node lacks stops the replica (the version stays as it
+  was; the failure carries `NewerVersionException`, and `run` exits with 5, not 3). The same member lagging past the
+  leader's log installs the leader's snapshot, whose version has the raise: the install checks the database it just
+  opened and stops the replica the same way. Not an entry failure: a replica of the newer version applies the entry.
+- `checksum-schemas` (CR2-9) puts the column schemas into the checksum digest: a bit of its own though it writes no new
+  entry, since replicas digest a position alike only if all of them include the schemas.
+
+The upgrade path from version 0 is tested in process (`CapabilityUpgradeTest`, R3-G3-1): a cluster whose replicas lost
+their version, with one member answering an older version (a test hook, `ReplicaOps.SUPPORTED_FOR_TESTING`), is raised
+only to what that member supports, and stays there across further checks: no sessions advertised, no pipelining. Once
+that member is upgraded the leader raises the version to everything within its 10 s check, sessions are advertised at
+once, the leader of the current term still does not pipeline, and the next leader does.
 
 Rejected: a check of the members' versions at each use instead of a version in the log. A node restarted during an
 upgrade would not know whether it may serve sessions until a leader asked everyone again, and pipelining would turn on
@@ -1530,7 +1599,12 @@ reported, and stops nothing.
 - **`Checksum`** (DD-32). Each replica opens a database transaction with a snapshot at that position, which takes no
   time on the apply thread, and lists its user columns. A thread of its own then reads every key and value of those
   columns at the snapshot, in key order, and digests them: SHA-256 over each column's name and entries, columns in name
-  order, each key part and value with its length. Equal histories give equal digests, whatever the files and
+  order, each key part and value with its length; with the capability `checksum-schemas` (CR2-9) also each column's
+  schema, as `ReplicaOps.describeSchema` writes it: key layout, whether it has values, and the merge operator's name,
+  version and class, so replicas whose columns were created or altered differently differ even with equal data. That is
+  a capability bit although it writes no new entry: replicas digest a position alike only if all include the schemas
+  or none does, and the cluster version, read at the entry's position on each replica, says which. An older member
+  would otherwise report every check as a divergence. Equal histories give equal digests, whatever the files and
   compactions of each replica. The meta column is left out: it holds things that are local by design (results purged
   at a start). Each replica then asks the others for their digest of that position every 10 s, until each one answered,
   skipped it (a snapshot install jumped over it, or it restarted while digesting: results are kept in
@@ -1538,7 +1612,16 @@ reported, and stops nothing.
   `REPLICAS DIVERGED` and counted in `checksum.mismatches`, with an alert. This is what finds a merge operator that is
   not deterministic, which nothing else detects. A check reads the whole database on every node at once and holds a
   snapshot meanwhile, which keeps the files that compactions replace: it runs when asked (`admin checksum`) or every N
-  hours with `-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` (off by default). `admin checksum` prints
+  hours with `-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` (off by default). The N hours count from
+  the last check the replica applied, whoever proposed it (CR2-2): each replica keeps the wall-clock time it applied
+  one, also in `replica-ops.log`, so a new leader goes on with the schedule instead of starting it over, and checks
+  still run when the leadership moves more often than every N hours. A leader that knows of no check counts from its
+  own start. Applying the same checksum entry again (a restart that replays it after a lost WAL tail, or the entries
+  after the snapshot) keeps the time of its first apply, the earliest line of that index in the file, instead of the
+  replay's. A member that applies an old check for the first time (catching up, or after an install) still takes its
+  own time for it: checksum entries carry no leader stamp (only session entries do, and adding one changes the log
+  format), so that member, if it leads next, waits at most one interval more than the history says. Nothing that
+  happens more often than the interval postpones checks for good. `admin checksum` prints
   `OK` only when every member it was given returned a digest and all are equal: a member down, failed, not done in
   time, or that skipped the position makes it exit with 4 ("incomplete"; `--allow-skipped` accepts a skipped one), a
   difference with 1. It proposes the check again through another member only after an answer that proves nothing was
@@ -1684,8 +1767,9 @@ failover" below).
 | Test | What it proves |
 |---|---|
 | `ReplicationTest` (in-process) | Replication through any node; results; leader loss, including a new leader that has not applied what the old one acknowledged yet; snapshot catch-up; batches; transactions, conflicts and updates; a transaction write too large for the commit refused at once; the capped transaction lease; updates whose caller timed out or cancelled while queued, or cancelled while the update opened, do not keep the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
-| `ParallelApplyTest` | Randomized logs over five columns (fixed keys, buckets whose tails all collide, a column without fixed key parts), with rejections, copies, sessions, `deleteRange` and positions without data, applied serially and in lanes: the results of every entry and every row of every column, the internal one included, are the same after every group. A 3-node cluster, two nodes in lanes and one serial, holds the same data, also after a restart. Crashes of a replica in lanes: a flush right after one of its commits (the serial prefix before a segment, a segment's joined batch, a group's end, an entry applied alone), more entries applied, then the database closed without a flush; reopened, it holds exactly what was committed at the flush, its position included, and replaying the rest of the log (serially or in lanes) gives the results and user rows of a replica that never crashed, and every row of a serial replica restarted at the same position. |
-| `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups. |
+| `ParallelApplyTest` | Randomized logs over five columns (fixed keys, buckets whose tails all collide, a column without fixed key parts), with rejections, copies, sessions, `deleteRange` and positions without data, applied serially and in lanes: the results of every entry and every row of every column, the internal one included, are the same after every group. A 3-node cluster, two nodes in lanes and one serial, holds the same data, also after a restart. Crashes of a replica in lanes: a flush right after one of its commits (the serial prefix before a segment, a segment's joined batch, a group's end, an entry applied alone), more entries applied, then the database closed without a flush; reopened, it holds exactly what was committed at the flush, its position included, and replaying the rest of the log (serially or in lanes) gives the results and user rows of a replica that never crashed, and every row of a serial replica restarted at the same position. The joined batch of `commitWith` equals, byte for byte, a RocksJava batch of all the operations in order. |
+| `SnapshotInstallTest` (in-process) | Every node applies in lanes, the log is purged up to each snapshot (test setting), and a member that was down past the leader's log comes back through a snapshot install. Held inside the install, after the new database opened and applied up to the snapshot but before it is published (`storeGeneration` odd), a follower read on it is forwarded, not served (a mutation that skips the generation check serves it and fails the test). After the install the member holds every write, the applier of the installed database sorts new entries into lanes (its segment counter grows), and it serves follower reads again. A read that failed locally is forwarded when the counter was odd or changed, and keeps its error otherwise. A member running a version without `checksum-schemas` (its database too) that installs the leader's snapshot stops, with `NewerVersionException` in its failure (removing the check after the install fails the test). A snapshot cannot meet an open segment of the lanes: segments end with their apply group, and the drain before a snapshot is handled between groups. |
+| `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups; a logged raise of the cluster version to a capability the node lacks stops the replica (`NewerVersionException` in the failure) and leaves the version and the position. |
 | `SessionApplierTest` | Client sessions at apply: a write resent through other proposers, alone or in an entry with other sessions' writes, takes effect once, also after a restart; the session's floor refuses late copies; unknown and expired sessions are rejected and not recorded, a leader clock behind does not revive them, and expired sessions are deleted; a leader whose wall clock is a year ahead, or jumps within its term, expires nothing (`LeaderClock`); two replicas, one restarting midway, give the same results. |
 | `SessionWritesTest` (core) | The client's numbering: which writes are numbered (staged writes not, schema changes, `deleteRange` and batches yes), update ids forgotten once the update ended; a first copy refused by an expired session re-issued under a new one, a later copy so refused ending unknown (also when that copy is flagged not applied), sessions that keep expiring ending at the deadline, flagged not applied; opening retried after an unknown outcome, and again by a write that waited on another write's opening, also when that opening ended "not applied" at the opener's deadline or overloaded; batches unnumbered when the server does not advertise `numberedBatches`; batches sent as numbered chunks in order, a chunk resent with its number, a later chunk's failure reported as partly applied; closing ends waiting writes; each answer of a copy (value, recorded failure, overload, flagged deadline: ends; unknown, then "not applied": same number again; a sender that throws: lost copy); a deadline without the "not applied" flag, gRPC's own included, on a first or a resent copy, ends unknown, whatever its message; a cancel after a copy was sent ends unknown and stops the resends and the copy in flight, before one was sent cancels it unsent, also for a batch (a batch whose chunk only waits for its session counts as unsent); a synchronous wait is bounded, unbounded without a deadline, and never overflows; the client's own expired-deadline check on a first copy ends "not applied"; past 65,536 open updates the oldest is forgotten and counted; a Reactor caller (`Mono.fromFuture`) that disposes its subscription or times out stops the resends and cancels the copy in flight. |
 | `ClientSessionTest` (in-process) | A merge and a transaction commit whose leader dies after its followers applied them and before it answered: the client sends them again with their request ids through the next node, the merge applies once and the commit answers `true` from its record. Copies of a commit and of the write that ends an update answer "unknown" while the first is in flight, then from the record. Copies of a numbered `mergeBatch` chunk, `deleteColumnIfExists`, `deleteColumn` and `deleteRange` take effect once; a numbered batch of two chunks is refused with nothing applied; the client library sends batches as numbered chunks over gRPC, a three-chunk batch of items that fill a chunk to the byte taking exactly one number per chunk (the client's and the server's split agree after encoding); a client batch whose leader dies after committing its first chunk, unanswered, resends that chunk with its number and every key is merged exactly once. |
@@ -1698,7 +1782,8 @@ failover" below).
 | `PipelinedUpdatesTest` (in-process, flag on) | With the leader's apply stopped: chained updates see each other's values and nothing is acknowledged; wrong guards; plain writes, transactions and `deleteRange` against a chain; closes in mid-chain, and more of them waiting than a server's CONTROL workers and queue hold; refused operations on chained ids; second writes; merges and multi-key commits; caller gone, abandon; a snapshot and a restart inside a chain, around a rejected entry; a leader change with a chain in flight; a commit that ends without an outcome; the flag on and off at restarts, and a chained id handed to a leader without it; concurrent counters. With the flag off: the commit of an update, read back from the Raft log, has the old bytes, and a second write goes to the log. |
 | `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. With `PipelinedUpdatesTest`, the only tests that chain in a default run: the suites below run the plain per-key queue unless the property below is set, and fail if an update chains there. After each fault these three wait for an update that chains. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, no acknowledged increment of a hot counter is lost, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
-| `FollowerReadTest` (in-process, follower reads on) | A follower serves reads of writes acknowledged on the leader, with writes flowing meanwhile and on a quiet cluster (thanks to `CommitHeartbeats`), some by itself (the share is printed, not asserted beyond a loose bound: it depends on the disk and load); once it knows the commit index it serves by itself. The option is set on every node through the property. A follower whose database may hold an entry of a term later than its read index forwards; reads stay linearizable on the follower and the new leader across a leader change. A read on the leader whose apply is held does not answer the old value after a follower served the new one. A follower whose apply is held forwards instead of answering with the old value, and one cut off from the rest fails instead of answering. A follower names the leader in its responses, and a client of several nodes listing the follower first reads its writes and its transaction through it. |
+| `FollowerReadTest` (in-process, follower reads on) | A follower serves reads of writes acknowledged on the leader, with writes flowing meanwhile and on a quiet cluster (thanks to `CommitHeartbeats`), some by itself (the share is printed, not asserted beyond a loose bound: it depends on the disk and load); once it knows the commit index it serves by itself. The option is set on every node through the property. A follower whose database may hold an entry of a term later than its read index forwards, also after a real leader change: a read index of term T whose apply (held by the test) is reached in one group with the entries of the next leader's term is forwarded, not served (a mutation without the check serves it); reads stay linearizable on the follower and the new leader across a leader change. A read on the leader whose apply is held does not answer the old value after a follower served the new one. A follower whose apply is held forwards instead of answering with the old value, and one cut off from the rest fails instead of answering. A follower names the leader in its responses, and a client of several nodes listing the follower first reads its writes and its transaction through it. |
+| `CommitHeartbeatsTest` | One commit heartbeat trigger in flight per commit index, a higher index triggers again, an ended trigger lets the same index trigger again, at most 4 in flight in all, nothing before a commit index or when disabled. |
 | `FollowerReadLatencyTest` (in-process, prints numbers) | Read-after-write latency on a follower, with and without `CommitHeartbeats`, against forwarded reads with and without the leader's apply wait, quiet and with a writer in the background; with the heartbeats the follower serves more than half of the quiet reads and some of the busy ones itself (loose bounds; the printed shares are the measurement). The numbers in "Follower reads" come from it. |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `ClientFailoverTest` | One client connection listing all three nodes, while the node it uses is killed (the leader, or a follower): only retryable errors, new calls succeed on another node of the same connection (about 1 s with an election, under 200 ms without), a new connection skips the dead node, and a transaction opened through a dead follower still commits. |
@@ -1711,7 +1796,7 @@ failover" below).
 | `RatisContractTest` | The Ratis 3.3.1 behaviors that the design relies on beyond its API, against real servers in the JVM: the bootstrap and configuration meta files that `--join` safety reads, and the initializing state of a server started with an empty group (no election, no bootstrap file); the open segment format that `RaftLogRepair` rewrites; the type of the full-pending-queue refusal; a state machine refusal that reaches a remote client by class name and message, without a step down; `NotLeaderException` for an entry appended by a leader that then steps down (three servers); a transfer without a new leader that steps down; the 3 s wait of `GrpcUtil.shutdownManagedChannel` with a call in flight; a snapshot chunk held on the heap until its timeout by `StreamObserverWithTimeout`; a leader whose log worker is stopped (`LogWorkerGate`) commits nothing until it flushes; the CPU of the appender to a dead follower (printed, bounded at half a core). The match index moving only on replies with entries, and the follower order of `LeaderStall`, are pinned by `LeaderStallTest`. |
 | `RaftSettingsTest`, `ByteAdmissionTest`, `ConflictPositionsTest` | Snapshot chunks stay at most 4 s on the heap; Ratis' pending-request limits hold every node's attempts and stay near the defaults, and the byte limit grows with a peer list of more than 4 nodes; one entry of the largest size fits every limit on its way. The byte admission never exceeds its limit and is sized from the heap. Conflict positions survive the exception that Ratis rebuilds, and a text that does not parse is a conflict of the whole entry. |
 | `SstMaintenanceTest` (in-process) | `scanRawResumable`, `getSstMetadata` and `getTableProperties` through a follower describe the leader's database; raw-scan tokens carry the leader and its term and skip their tables through any node, while tokens of another node or term, or untagged ones, scan them again; over gRPC a client that does not set `acceptsTaggedSstTokens` gets plain filenames; `compactFiles` of the internal column is refused. |
-| `ColumnIteratorsTest`, `SnapshotBackoffTest`, `DiskProbeTest`, `AddPeerCheckTest`, `ProposerResetTest`, `ShutdownSignalTest` | Applying a column deletion closes the column's iterators instead of waiting for them, and an unknown iterator answers `UPDATE_RETRY` (the database's error for it is pinned); a failing snapshot is tried again only after its delay (1 s doubling to a minute), on a cluster too; a disk probe that does not end within the limit means a hung disk, until it ends; `add-peer` waits for a majority of the members to answer; a proposer's connection reset returns once the failed proxy left Ratis' map, before its slow close, so a resend gets a new one; the shutdown hook's stop waits for a node whose replica failure was already stopping it, and gives 3. |
+| `ColumnIteratorsTest`, `SnapshotBackoffTest`, `DiskProbeTest`, `AddPeerCheckTest`, `ProposerResetTest`, `ShutdownSignalTest` | Applying a column deletion closes the column's iterators and ends its range streams with `COLUMN_NOT_FOUND` instead of waiting for them (a stream of another column goes on; one started during the deletion fails), and an unknown iterator answers `UPDATE_RETRY` (the database's error for it is pinned); a failing snapshot is tried again only after its delay (1 s doubling to a minute), on a cluster too; a disk probe that does not end within the limit means a hung disk, until it ends; `add-peer` waits for a majority of the members to answer; a proposer's connection reset returns once the failed proxy left Ratis' map, before its slow close, so a resend gets a new one; the shutdown hook's stop waits for a node whose replica failure was already stopping it, and gives 3. |
 | `LeaderStallTest` | The rule of `LeaderStall`; follower next indices, which Ratis gives without ids, pair with ids only when the follower list read before and after them is the same; the bound that grows and comes back, and the rule of a log that stops, which a real leader with a stopped log worker follows within seconds. A graceful stop of the leader with one node down, followed by a restart at once, loses no reply and costs no step down. With one node down, the reply to a new leader's first entry is lost on a link, after the entry reached the follower's disk: nothing commits and the leader stays, until it steps down and a write gets through. The same loss after the first commit heals with the next write. A leader behind in applying does not step down. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
 | `MembershipTest` | A node started with `--join` replaces a lost leader, however long before its `add-peer` it started and after a restart in between, catches up from a snapshot, and restarts with or without the option. A node removed while it runs exits. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. A node of a seeded cluster is replaced whichever node leads. One step replacement of a lost leader, a lost follower, seeded or not, and of a leader that runs. `add-peer` refuses a node with a log of its own and a node started without `--join`, and fails at once without its node; a change without a majority ends at its limit; `--join` after a start without it is refused; `admin snapshot`; the warnings of a node that stays outside. |
@@ -1722,6 +1807,8 @@ failover" below).
 | `ListAppendCheckerTest` | The Elle-style checker finds and classifies known anomalous histories (G0, G1a, G1b, G1c, G-single, G2 as allowed by snapshot isolation, incompatible orders, duplicates, garbage, internal reads), treats an unknown transaction as committed only once it was seen, and passes random serial histories. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
 | `ClusterOpsTest` (in-process) | A cluster created by this version has the full cluster version, and advertises sessions. A checksum proposed through a follower gives the same digest and key count on every replica, and every replica finds the others equal; the Raft port answers it. A backup asked through the Raft port is written by every replica at the same log index, and the port answers it by name and index; the same request proposed again is done again, another request with the name fails without changing the first result, and a query by another name or index never returns an older result. Restored with `restore-backup` into a new seeded cluster, through a data directory holding an old `replica-ops.log` and `backups/` (moved aside), it holds every key written before it and none written after. The monitor's gauges (one leader, a Raft log with bytes) and the replication timers reach each node's database registry, and the core meters carry the node tag. |
+| `CapabilityUpgradeTest` (in-process) | A version-0 cluster with one member of an older version is raised only to what that member has (no sessions advertised, no pipelining, also after another check); once that member is upgraded, the version reaches everything, sessions are advertised, the current term still runs without pipelining and the next leader pipelines. |
+| `ChecksumTest` (in-process) | A row written past the log on one replica makes its digest and key count differ, and every replica reports the divergence (`checksum.mismatches`, the index gauge). A column with the same name and no data but another merge operator on one replica digests differently (schemas are in the digest). With checks every 6 s and the leader stopped 3 s after one, the next check comes about 6 s after the last one, not 6 s after the change. A check applied again (its recorded time moved 3 hours back while the node was down) keeps that time, also across the next start. |
 | `ReplicaOpsTest` | The new entries round-trip and are applied alone; backup names; the wire form of results; capability names; digests that tell key parts and values apart; series and gauges exported cumulative, with their kind, and moved to a new registry; the lag sampling period; Raft log bytes counted from segment files only; the alarm's start, repeat and end; the verdicts of `admin checksum` and `admin backup` (OK only with a final result from every member), which failed proposals are retried, the capabilities `add-peer` requires (current and pending), the replication meters following a configured node name, and a blank `node-name` meaning the node id. |
 | Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped; every service method classified; two failing addresses each back off), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage` (partial installs deleted once replaced, at the start, and after 10 minutes without a change), `LeaderForwarder` (leader lookups still waiting fail on close; see also "Targeted faults and component tests" below), fault proxy (cuts, delay and jitter keeping byte order, bandwidth caps, blackholes that release held bytes, dropped answers resetting their connections when healed), linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
 
@@ -1911,8 +1998,14 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
 7. **Known limits, decided.**
    - `deleteColumn` no longer waits for the leader's iterators: apply closes the iterators of the column first
      (`EmbeddedDB.closeIteratorsOfColumn`; only the leader has any), and their next call gets `UPDATE_RETRY`, then
-     a missing column. A range stream or raw scan still running on the column can still hold its deletion until it
-     ends.
+     a missing column. Nor for its streams (DD-7a): every range stream and raw scan a node serves is tracked by column
+     (`ColumnStreams`, around `LocalCommands.localStream`), and the apply of the deletion cancels the column's streams
+     first, as a client's cancel would, which releases their use of the column; each one ends with
+     `COLUMN_NOT_FOUND`, never as a complete range, and one that starts while the deletion runs fails at once. Before,
+     a slow client or a long scan held the deletion, and with it the leader's whole apply, until the stream ended or
+     its deadline passed. A stream that acquired its use of the column in the instant between the cancel and the
+     deletion's own closing of admission is not cancelled; it is subscribed before then, so its start would have to
+     race the apply thread within microseconds, and it still ends at its deadline.
    - The result records that a stopped proposer process had in flight (at or above its floor) are never
      deleted; those below its floor are deleted when each replica next starts. Kept as is: a crash leaves at most
      the records of the requests that process had in flight, which its byte admission and attempt permits bound
@@ -1938,6 +2031,19 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
      100-300 ms pause of the apply. A failing snapshot is no longer tried at every applied entry: after a failure,
      `takeSnapshot` answers "no snapshot" (which Ratis passes over without an error or a purge) for 1 s, doubling with
      each failure in a row up to a minute; the snapshots by bytes wait for the same delay.
+   - Ratis' retry cache has no size bound (DD-12), only an expiry: `max(6 s, 4 × --election-timeout-ms max)`, 8 s
+     with the defaults (`RaftSettings`). Kept, because the expiry bounds it by traffic: it holds one entry per Ratis
+     invocation applied in the last 8 s, on every replica, and an invocation is one proposer batch, not one write. Each
+     entry keeps the batch's reply, the encoded results of its writes (`ResultCodec.encodeAll`: a few bytes per write,
+     plus the previous values a write asked for, at most 17 MiB per result). So the cache holds about 8 s of the
+     results the cluster answers: with a status per write, at the production peaks of `performance.md` (`put`,
+     update commits and `putMulti` together, about 30k writes/s), about 30k × 8 × ~20 bytes, under 5 MiB, plus a
+     few hundred bytes of Ratis per batch. Only
+     writes that ask for large previous values make it large, and those cost the same bytes again as replies to their
+     clients: 100 MB/s of previous values keeps about 800 MB on every replica, which such a workload must count in its
+     heap. A size bound is not offered by Ratis 3.3.1, and a shorter expiry would miss the resends it exists for (a
+     resend of a copy still pending, see `RaftSettings`); Rockserver deduplicates requests itself, so the cache is an
+     optimization, not what makes resends safe. To report upstream with the others (below).
    - Iterator calls after a leader change get `UPDATE_RETRY` (see "Leader changes").
    - The snapshot taken right after a seeded genesis is attempted once, on the leader only.
    - A SIGTERM that races a replica failure exits with 3: the shutdown hook closes the node, then waits until it
@@ -1952,6 +2058,8 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
      failed proxy out of its map (so a resend to the same peer gets a new channel, not the one being closed).
    - The two `ResourceUnavailableException`s of the pending-request limit (before and after the append) differ only
      by their message: a typed refusal before the append would let `Proposer` stop matching text.
+   - The retry cache has an expiry but no size bound (`RaftServerConfigKeys.RetryCache`): a bound in entries or
+     bytes would cap its heap under replies with large values (see "Known limits", DD-12).
    - `GrpcLogAppender.getWaitTimeMs` waits 0 ms while it has no stream to a follower, a spin until the next
      heartbeat after a stream reset (found in a review of the code). Not seen in practice: with a follower down,
      the leader's appender threads for it used 0.0% of a core over 3 s (`RatisContractTest`), since the retry policy

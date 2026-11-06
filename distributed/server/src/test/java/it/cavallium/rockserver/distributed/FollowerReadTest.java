@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -22,6 +23,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import io.grpc.Metadata;
@@ -202,6 +204,69 @@ class FollowerReadTest {
 		assertEquals("v", get(follower, column, 1));
 
 		assertEquals(servedBefore, routing(follower).followerReadsServedForTesting());
+		assertEquals(forwardedBefore + 1, routing(follower).followerReadsForwardedForTesting());
+	}
+
+	/**
+	 * R2-RT-5, with a real leader change instead of {@code raiseVisibleTermForTesting}: a follower holds a read index of
+	 * term T, and its apply reaches that index in the same group as an entry of term T+1 (its apply was held meanwhile,
+	 * here by the test's apply gate). The new leader may not have its follower reads on yet, so the follower forwards
+	 * the read instead of answering from a database that holds an entry of the later term.
+	 */
+	@Test
+	void aReadIndexOfTheOldTermReachedTogetherWithAnEntryOfTheNewTermIsForwarded() throws Exception {
+		start();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		long column = api(leader).createColumn("c", SCHEMA);
+		api(leader).put(0, column, key(1), text("v0"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		var follower = cluster.anyFollower();
+		var successor = cluster.runningNodes().stream().filter(node -> node != leader && node != follower).findFirst()
+				.orElseThrow();
+		// The read waits for the follower's apply as long as the test needs, not the 20 ms of production.
+		routing(follower).followerReadWaitNanos = TIMEOUT.toNanos();
+		long term = leader.stateMachine().division().getInfo().getCurrentTerm();
+
+		// The apply thread takes the next group, the entry of v1, and holds it at the gate.
+		var gate = new CountDownLatch(1);
+		follower.stateMachine().testHooks().applyGate = gate;
+		api(leader).put(0, column, key(1), text("v1"), RequestType.none());
+		var applyThread = follower.config().nodeId() + "-apply";
+		InProcessCluster.await(TIMEOUT, () -> Thread.getAllStackTraces().entrySet().stream()
+				.anyMatch(e -> e.getKey().getName().equals(applyThread) && e.getKey().getState() == Thread.State.WAITING
+						&& java.util.Arrays.stream(e.getValue()).anyMatch(f -> f.getMethodName().equals("applyGroup"))));
+		// Queued behind it: v2, of term T. The read index of the follower's read is at least its index, of term T.
+		api(leader).put(0, column, key(1), text("v2"), RequestType.none());
+		long servedBefore = routing(follower).followerReadsServedForTesting();
+		long forwardedBefore = routing(follower).followerReadsForwardedForTesting();
+		var read = java.util.concurrent.CompletableFuture.supplyAsync(() -> get(follower, column, 1));
+		// The read index arrives and the read waits for the apply.
+		Thread.sleep(300);
+		assertFalse(read.isDone());
+		assertTrue(follower.stateMachine().appliedIndex().get() < commitIndex(leader));
+
+		// A new leader in term T+1, on the third node; its first entries reach the follower's log, behind v2.
+		var transfer = leader.stateMachine().division().getRaftServer().transferLeadershipAsync(
+				new org.apache.ratis.protocol.TransferLeadershipRequest(org.apache.ratis.protocol.ClientId.randomId(),
+						leader.stateMachine().division().getId(), leader.stateMachine().division().getGroup().getGroupId(),
+						1, successor.stateMachine().division().getId(), 10_000));
+		assertTrue(transfer.get(30, TimeUnit.SECONDS).isSuccess());
+		InProcessCluster.await(TIMEOUT, () -> successor.isLeader()
+				&& successor.stateMachine().division().getInfo().getCurrentTerm() > term);
+		api(successor).put(0, column, key(2), text("t1"), RequestType.none());
+		InProcessCluster.await(TIMEOUT, () -> {
+			var log = follower.stateMachine().division().getRaftLog();
+			var last = log.getLastEntryTermIndex();
+			return last != null && last.getTerm() > term && log.getLastCommittedIndex() >= last.getIndex();
+		});
+		assertEquals(term, follower.stateMachine().visibleTerm(), "nothing of the new term applied yet");
+
+		// The rest of the queue, v2 and the entries of term T+1, is applied as one group: the read index is reached
+		// with an entry of the later term visible.
+		gate.countDown();
+		assertEquals("v2", read.get(30, TimeUnit.SECONDS));
+		assertTrue(follower.stateMachine().visibleTerm() > term);
+		assertEquals(servedBefore, routing(follower).followerReadsServedForTesting(), "not served by the follower");
 		assertEquals(forwardedBefore + 1, routing(follower).followerReadsForwardedForTesting());
 	}
 
