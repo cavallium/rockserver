@@ -1204,11 +1204,36 @@ final class Applier {
 		if (!genesis.seeded() && hasData) {
 			throw new ReplicaFailedException("The cluster started empty, but this replica's database has data");
 		}
+		if (genesis.seedDigest() != null) {
+			checkSeedDigest(genesis.seedDigest());
+		}
 		store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_ID),
 				Buf.wrap(genesis.clusterId().getBytes(StandardCharsets.UTF_8)), RequestType.none());
 		if (genesis.seeded()) {
 			store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.SEEDED), Buf.wrap(new byte[] {1}),
 					RequestType.none());
+		}
+	}
+
+	/**
+	 * Stops this replica if it started from another copy of the seed than the leader that proposed genesis: the copies
+	 * would differ for good, and nothing else compares them. A replica that recorded no digest (started by a version
+	 * without it) cannot tell, and goes on.
+	 */
+	private void checkSeedDigest(String leaderDigest) {
+		String own;
+		try {
+			own = store.seedDigest();
+		} catch (java.io.IOException ex) {
+			throw new ReplicaFailedException("Failed to read the digest of this replica's seed: " + ex);
+		}
+		if (own == null) {
+			LOG.warn("This replica recorded no digest of its seed, so it cannot check that it is the seed of the leader");
+		} else if (!own.equals(leaderDigest)) {
+			throw new ReplicaFailedException("This replica started from another seed than the leader that started the"
+					+ " cluster (seed digest " + own + ", the leader's " + leaderDigest + "): every node must start from a copy"
+					+ " of the same database, made while it was stopped. Stop every node, wipe every data directory, copy"
+					+ " the same seed to every node and start them again");
 		}
 	}
 

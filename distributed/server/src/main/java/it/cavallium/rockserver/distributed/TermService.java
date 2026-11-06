@@ -25,6 +25,8 @@ import org.apache.ratis.thirdparty.io.grpc.stub.ClientCalls;
 import org.apache.ratis.thirdparty.io.grpc.stub.ServerCalls;
 import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Tiny gRPC service on the Ratis server port, using the shaded gRPC that Ratis ships
@@ -44,6 +46,9 @@ import org.jetbrains.annotations.Nullable;
  *   once this node confirmed its leadership after the request arrived (a node of round 1 answered the index alone, which
  *   followers now refuse: they forward their reads instead); {@code FAILED_PRECONDITION} if it is not the ready leader, {@code UNIMPLEMENTED} on a node that
  *   predates the method or cannot serve it.</li>
+ *   <li>"which Rockserver config do you run?", for {@link ClusterCheck}. Request: the UTF-8 digest of the caller's
+ *   config ({@link NodeStore#configDigest}), possibly empty. Response: the UTF-8 digest of this node's config. Each side
+ *   logs a difference: every node must run the same config. {@code UNIMPLEMENTED} on a node that predates the method.</li>
  * </ul>
  */
 final class TermService {
@@ -87,6 +92,16 @@ final class TermService {
 			.setSafe(true)
 			.build();
 
+	static final MethodDescriptor<byte[], byte[]> CONFIG_DIGEST = MethodDescriptor.<byte[], byte[]>newBuilder()
+			.setType(MethodDescriptor.MethodType.UNARY)
+			.setFullMethodName(MethodDescriptor.generateFullMethodName(SERVICE_NAME, "ConfigDigest"))
+			.setRequestMarshaller(BytesMarshaller.INSTANCE)
+			.setResponseMarshaller(BytesMarshaller.INSTANCE)
+			.setIdempotent(true)
+			.setSafe(true)
+			.build();
+
+	private static final Logger LOG = LoggerFactory.getLogger(TermService.class);
 	private static final int GROUP_ID_BYTES = 16;
 	private static final byte SEEDED = 1;
 	private static final byte HAS_SNAPSHOT = 2;
@@ -125,6 +140,15 @@ final class TermService {
 	/** {@link #customizer(Supplier, HostAndPort, NodeStateSource)}, answering {@link #READ_INDEX} too. */
 	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
 			NodeStateSource nodeState, ReadIndexSource readIndex) {
+		return customizer(server, apiAddress, nodeState, readIndex, null);
+	}
+
+	/**
+	 * {@link #customizer(Supplier, HostAndPort, NodeStateSource, ReadIndexSource)}, answering {@link #CONFIG_DIGEST} too,
+	 * unless {@code configDigest} is null.
+	 */
+	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
+			NodeStateSource nodeState, ReadIndexSource readIndex, @Nullable String configDigest) {
 		ServerCalls.UnaryMethod<byte[], byte[]> handler = (request, response) -> answer(server, request, response);
 		var address = (apiAddress.host() + ":" + apiAddress.port()).getBytes(StandardCharsets.UTF_8);
 		ServerCalls.UnaryMethod<byte[], byte[]> addressHandler = (_, response) -> {
@@ -134,12 +158,17 @@ final class TermService {
 		ServerCalls.UnaryMethod<byte[], byte[]> stateHandler = (request, response) -> answerState(nodeState, request, response);
 		ServerCalls.UnaryMethod<byte[], byte[]> readIndexHandler = (request, response) ->
 				answerReadIndex(readIndex, request, response);
-		var service = ServerServiceDefinition.builder(SERVICE_NAME)
+		var definition = ServerServiceDefinition.builder(SERVICE_NAME)
 				.addMethod(CURRENT_TERM, ServerCalls.asyncUnaryCall(handler))
 				.addMethod(API_ADDRESS, ServerCalls.asyncUnaryCall(addressHandler))
 				.addMethod(NODE_STATE, ServerCalls.asyncUnaryCall(stateHandler))
-				.addMethod(READ_INDEX, ServerCalls.asyncUnaryCall(readIndexHandler))
-				.build();
+				.addMethod(READ_INDEX, ServerCalls.asyncUnaryCall(readIndexHandler));
+		if (configDigest != null) {
+			ServerCalls.UnaryMethod<byte[], byte[]> digestHandler = (request, response) ->
+					answerConfigDigest(configDigest, request, response);
+			definition.addMethod(CONFIG_DIGEST, ServerCalls.asyncUnaryCall(digestHandler));
+		}
+		var service = definition.build();
 		// Ratis may run admin and client services on separate ports; the peers' Raft address is the SERVER one.
 		return (builder, types) -> types.contains(GrpcServices.Type.SERVER) ? builder.addService(service) : builder;
 	}
@@ -163,6 +192,25 @@ final class TermService {
 			var buffer = ByteBuffer.wrap(value);
 			return new ReadBarrier.ReadIndex(buffer.getLong(), buffer.getLong());
 		});
+	}
+
+	/**
+	 * Tells the server behind {@code channel} the digest of this node's Rockserver config, and asks for its own. Fails
+	 * with {@code UNIMPLEMENTED} on a node that predates the method.
+	 */
+	static CompletableFuture<String> configDigest(Channel channel, String ownDigest, Duration timeout) {
+		return call(channel, CONFIG_DIGEST, ownDigest.getBytes(StandardCharsets.UTF_8), timeout)
+				.thenApply(value -> new String(value, StandardCharsets.UTF_8));
+	}
+
+	private static void answerConfigDigest(String own, byte[] request, StreamObserver<byte[]> response) {
+		var callerDigest = new String(request, StandardCharsets.UTF_8);
+		if (!callerDigest.isEmpty() && !callerDigest.equals(own)) {
+			LOG.warn("A leader of this cluster runs another Rockserver config (digest {}) than this node ({}): every node"
+					+ " must run the same config file", callerDigest, own);
+		}
+		response.onNext(own.getBytes(StandardCharsets.UTF_8));
+		response.onCompleted();
 	}
 
 	/** Asks the server behind {@code channel} for the address of its Rockserver API. */

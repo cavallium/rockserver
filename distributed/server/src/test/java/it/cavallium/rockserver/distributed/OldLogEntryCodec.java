@@ -226,7 +226,7 @@ final class OldLogEntryCodec {
 				writeString(out, name);
 				out.writeLong(columnId);
 			}
-			case LogEntry.Genesis(String clusterId, boolean seeded) -> {
+			case LogEntry.Genesis(String clusterId, boolean seeded, String _) -> {
 				out.writeByte(GENESIS);
 				writeString(out, clusterId);
 				out.writeBoolean(seeded);

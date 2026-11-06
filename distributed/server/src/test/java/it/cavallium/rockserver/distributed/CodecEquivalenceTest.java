@@ -52,6 +52,11 @@ class CodecEquivalenceTest {
 	@ParameterizedTest
 	@MethodSource("it.cavallium.rockserver.distributed.LogEntryCodecTest#entries")
 	void encodesEveryKnownEntryAsBefore(LogEntry entry) {
+		if (entry instanceof LogEntry.Genesis genesis && genesis.seedDigest() != null) {
+			// Newer than the frozen codec, which knows no seed digest.
+			assertEquals(LogEntryCodec.encodeEntryBody(entry).length, LogEntryCodec.entrySize(entry));
+			return;
+		}
 		assertArrayEquals(OldLogEntryCodec.encode(entry), LogEntryCodec.encode(entry));
 		assertArrayEquals(OldLogEntryCodec.encodeEntryBody(entry), LogEntryCodec.encodeEntryBody(entry));
 		assertEquals(LogEntryCodec.encodeEntryBody(entry).length, LogEntryCodec.entrySize(entry));

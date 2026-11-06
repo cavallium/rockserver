@@ -171,9 +171,15 @@ public sealed interface LogEntry {
 	/**
 	 * First entry of a cluster. Binds every replica's database to {@code clusterId}. {@code seeded} tells whether
 	 * the replicas started from a copy of an existing database; a replica with an empty database must then get
-	 * the data from a snapshot, never from replaying the log.
+	 * the data from a snapshot, never from replaying the log. {@code seedDigest}, on a seeded cluster, is the digest of
+	 * the proposing leader's seed ({@link NodeStore#recordSeedDigest}): a replica that recorded another one stops. Null
+	 * when the cluster is not seeded, when the leader recorded none, and in entries written before the digest existed.
 	 */
-	record Genesis(String clusterId, boolean seeded) implements LogEntry {}
+	record Genesis(String clusterId, boolean seeded, @Nullable String seedDigest) implements LogEntry {
+		Genesis(String clusterId, boolean seeded) {
+			this(clusterId, seeded, null);
+		}
+	}
 
 	/**
 	 * Opens a client session (Raft dissertation, section 6.3). Its id is the log index of this entry, the same on every
