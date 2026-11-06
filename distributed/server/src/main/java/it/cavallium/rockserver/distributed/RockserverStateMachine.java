@@ -274,8 +274,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return failed;
 	}
 
-	/** The leader session of the current term, if this node leads it; created on first use. */
+	/**
+	 * The leader session of the current term, if this node leads it; created on first use. The session of an earlier
+	 * term is closed outside the monitor, as in {@link #notifyLeaderChanged}: closing rolls back its native
+	 * transactions and updates, and {@link #preAppendTransaction} waits for this monitor under Ratis' append lock.
+	 */
 	@Nullable LeaderSession leaderSession(long term) {
+		LeaderSession replaced;
+		LeaderSession created;
 		synchronized (this) {
 			var current = leaderSession;
 			if (current != null && current.term() == term) {
@@ -285,18 +291,19 @@ final class RockserverStateMachine extends BaseStateMachine {
 			if (division == null || !division.getInfo().isLeader() || division.getInfo().getCurrentTerm() != term) {
 				return null;
 			}
-			if (current != null) {
-				current.close(store.db());
-			}
-			var created = new LeaderSession(term, applied, new ConflictTracker(), config.pipelinedUpdates(), metrics);
+			replaced = current;
+			created = new LeaderSession(term, applied, new ConflictTracker(), config.pipelinedUpdates(), metrics);
 			// The session tracks writes from this term on: a transaction whose snapshot misses an earlier leader's
 			// entries would not see them conflict. Reads wait for those entries (see leaderReadyIndex); this makes
 			// sure no commit validates against such a snapshot anyway.
 			created.tracker().prune(leaderReadyIndex(term));
 			leaderSession = created;
-			LOG.info("{}: leading term {}", config.nodeId(), term);
-			return created;
 		}
+		if (replaced != null) {
+			replaced.close(store.db());
+		}
+		LOG.info("{}: leading term {}", config.nodeId(), term);
+		return created;
 	}
 
 	@Nullable RaftServer.Division division() {
