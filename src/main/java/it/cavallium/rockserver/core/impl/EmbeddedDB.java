@@ -5320,7 +5320,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
 							}
 						} else if (RequestType.requiresGettingPreviousPresence(callback)) {
-							// todo: in the future this should be replaced with just keyExists
+							// A presence check stays a getForUpdate: it locks the key and records it for conflict
+							// validation, which no exists-style call of a RocksJava Transaction does (keyMayExist
+							// may also answer a false positive).
 							assert newTx instanceof Tx;
 							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray = pointGetForUpdate((Tx) newTx, readOptions, col.cfh(), calculatedKeyArray);
@@ -5477,7 +5479,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
 							}
 						} else if (RequestType.requiresGettingPreviousPresence(callback)) {
-							// todo: in the future this should be replaced with just keyExists
+							// A presence check stays a getForUpdate: it locks the key and records it for conflict
+							// validation, which no exists-style call of a RocksJava Transaction does (keyMayExist
+							// may also answer a false positive).
 							assert newTx instanceof Tx;
 							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray;
@@ -7417,7 +7421,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public void closeIterator(long iteratorId) throws RocksDBException {
 		var start = System.nanoTime();
 		try {
-			actionLogger.logAction("CloseIterator", start, null, null, null, null, null, null, null); // todo: improve logging
+			actionLogger.logAction("CloseIterator", start, null, null, null, iteratorId, null, null, null);
 			closeIteratorInternal(iteratorId);
 		} finally {
 			var end = System.nanoTime();
@@ -7877,10 +7881,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					startKeysInclusive,
 					endKeysExclusive,
 					transactionId,
-					null,
+					reverse,
 					null,
 					requestType
-			); // todo: log if reversed or not
+			);
 			col = beginColumnUse(columnId);
 
 
@@ -8163,10 +8167,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				startKeysInclusive,
 				endKeysExclusive,
 				transactionId,
-				null,
+				reverse,
 				null,
 				requestType
-		); // todo: log if reversed or not
+		);
 		if (!isCooperativeRetainedProfile(workloadProfile)) {
 			return Flux.usingWhen(
 					openOrdinaryRetainedRangeCursorAsync(transactionId,
@@ -8273,10 +8277,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				startKeysInclusive,
 				endKeysExclusive,
 				transactionId,
-				null,
+				reverse,
 				null,
 				RequestType.entriesCount()
-		); // todo: log if reversed or not
+		);
 		if (!isCooperativeRetainedProfile(workloadProfile)) {
 			return Flux.usingWhen(
 					openOrdinaryRetainedRangeCursorAsync(transactionId,
