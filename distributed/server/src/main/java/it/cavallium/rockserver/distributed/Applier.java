@@ -175,6 +175,8 @@ final class Applier {
 	 * is behind. Written ({@link NodeStore#CLOCK}) with the applied position of the entry that moved it.
 	 */
 	private long clock;
+	/** {@link #clock} as other threads may read it ({@link #clock()}): the leader caps its stamps with it. */
+	private volatile long visibleClock;
 	/** {@link #clock} moved since it was last written. */
 	private boolean clockMoved;
 	/** When {@link #sweepSessions} looks for expired sessions next: only this replica's pace, not replicated state. */
@@ -232,6 +234,26 @@ final class Applier {
 	/** Applies one request alone, see {@link #applyBatch}. */
 	ApplyResult apply(Request request, TermIndex position) {
 		return applyBatch(List.of(request), position).getFirst();
+	}
+
+	/**
+	 * The replicated clock as of the latest entry this replica applied, or as written before its start (0 before any
+	 * stamp), from any thread. It may
+	 * be ahead of a group that is later rolled back; the leader uses it only to bound its own stamps
+	 * ({@link LeaderClock}).
+	 */
+	long clock() {
+		long clock = visibleClock;
+		if (clock == 0) {
+			// Nothing applied since the start yet (or no stamp ever): the clock this replica wrote last.
+			try {
+				Buf value = store.db().get(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLOCK), RequestType.<Buf>current());
+				clock = value == null ? 0 : java.nio.ByteBuffer.wrap(value.toByteArray()).getLong();
+			} catch (RuntimeException ex) {
+				return 0;
+			}
+		}
+		return clock;
 	}
 
 	/** Applies one request alone, stamped by the leader with {@code leaderTimeMillis}, see {@link #applyBatch}. */
@@ -293,6 +315,7 @@ final class Applier {
 		if (leaderTimeMillis > clock) {
 			clock = leaderTimeMillis;
 			clockMoved = true;
+			visibleClock = clock;
 		}
 		List<ApplyResult> results;
 		if (requestLanes != null) {
@@ -891,6 +914,7 @@ final class Applier {
 		long metaColumn = store.metaColumnId();
 		Buf clockValue = db.get(0L, metaColumn, NodeStore.key(NodeStore.CLOCK), RequestType.<Buf>current());
 		clock = clockValue == null ? 0 : java.nio.ByteBuffer.wrap(clockValue.toByteArray()).getLong();
+		visibleClock = clock;
 		try (var rows = db.getRange(0L, metaColumn, NodeStore.key(NodeStore.SESSION),
 				NodeStore.key((byte) (NodeStore.SESSION + 1)), false, RequestType.<KV>allInRange())) {
 			rows.forEach(kv -> {
@@ -1109,6 +1133,9 @@ final class Applier {
 			case LogEntry.DeleteColumn delete -> {
 				requireNoTransaction(tx, entry);
 				requireUserColumn(delete.columnId());
+				// The deletion waits for the column's iterators, which only the leader has: close them, instead of
+				// stopping this replica's apply until their clients close them or their leases end.
+				db.closeIteratorsOfColumn(delete.columnId());
 				db.deleteColumn(delete.columnId());
 				yield null;
 			}
@@ -1117,6 +1144,7 @@ final class Applier {
 				if (NodeStore.META_COLUMN.equals(delete.name())) {
 					throw new IllegalArgumentException("Reserved column name: " + delete.name());
 				}
+				db.closeIteratorsOfColumn(delete.name());
 				yield db.deleteColumnIfExists(delete.name());
 			}
 			case LogEntry.UploadMergeOperator upload -> {

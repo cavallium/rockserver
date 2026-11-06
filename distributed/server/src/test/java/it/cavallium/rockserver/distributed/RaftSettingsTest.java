@@ -50,6 +50,23 @@ class RaftSettingsTest {
 		assertTrue(elements >= RaftSettings.NODES_UNDER_PENDING_LIMIT * 2 * Proposer.MAX_BATCHES_IN_FLIGHT);
 	}
 
+	/** CR-10: a cluster of more than 4 nodes gets a byte limit that holds the attempts of every node of its peer list. */
+	@Test
+	void thePendingByteLimitGrowsWithThePeerList() {
+		var peers = new java.util.ArrayList<PeerConfig>();
+		for (int i = 0; i < 7; i++) {
+			peers.add(new PeerConfig("n" + i, "127.0.0.1", 9000 + 2 * i, "127.0.0.1", 9001 + 2 * i));
+		}
+		var config = NodeConfig.defaults("n0", peers, java.nio.file.Path.of("unused"));
+		assertEquals(7, RaftSettings.nodesUnderPendingLimit(config));
+		long bytes = RaftServerConfigKeys.Write.byteLimit(RaftSettings.server(config)).getSize();
+		assertEquals(8 * Proposer.ATTEMPT_BYTES_IN_FLIGHT, bytes);
+		var three = NodeConfig.defaults("n0", peers.subList(0, 3), java.nio.file.Path.of("unused"));
+		assertEquals(RaftSettings.NODES_UNDER_PENDING_LIMIT, RaftSettings.nodesUnderPendingLimit(three));
+		assertEquals(RaftSettings.PENDING_BYTES_LIMIT.getSize(),
+				RaftServerConfigKeys.Write.byteLimit(RaftSettings.server(three)).getSize());
+	}
+
 	@Test
 	void oneEntryOfTheLargestSizeFitsEveryLimitOnItsWay() {
 		var properties = server();

@@ -143,6 +143,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 */
 	private volatile long storeGeneration;
 	private volatile Applier applier;
+	/** The clock this node stamps on session entries while it leads, see {@link LeaderClock}. */
+	private final LeaderClock leaderClock = new LeaderClock();
 	private volatile @Nullable LeaderSession leaderSession;
 	private volatile boolean failed;
 
@@ -451,7 +453,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 			var logData = request.getMessage().getContent();
 			if (LogEntryCodec.needsStamp(decoded)) {
 				// Session expiry reads the leader's clock, the same on every replica. Prepended: the batch is not copied.
-				proposal.leaderTimeMillis = System.currentTimeMillis();
+				var division = division();
+				var applier = this.applier;
+				proposal.leaderTimeMillis = leaderClock.stamp(division != null ? division.getInfo().getCurrentTerm() : -1,
+						applier != null ? applier.clock() : 0, System.currentTimeMillis(), System.nanoTime());
 				logData = UnsafeByteOperations.unsafeWrap(LogEntryCodec.stamp(proposal.leaderTimeMillis)).concat(logData);
 			}
 			return builder.setLogData(logData)
@@ -873,6 +878,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 */
 	private void snapshotByBytes(long appliedBytes) {
 		if (bytesSinceSnapshot.addAndGet(appliedBytes) < config.snapshotEveryBytes()
+				|| snapshotBackoff.waiting(System.nanoTime())
 				|| !snapshotByBytesPending.compareAndSet(false, true)) {
 			return;
 		}
@@ -1006,21 +1012,83 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 	}
 
+	/** After failed snapshots, when to try again; see {@link #takeSnapshot}. */
+	private final SnapshotBackoff snapshotBackoff = new SnapshotBackoff();
+	/** Tests only: a failure that the next snapshots throw before their checkpoint. */
+	volatile @Nullable IOException snapshotFailureForTests;
+	/** Snapshots that this replica tried (the checkpoint started), for tests. */
+	final java.util.concurrent.atomic.AtomicLong snapshotAttempts = new java.util.concurrent.atomic.AtomicLong();
+
+	/**
+	 * Takes a snapshot, unless one failed recently. Ratis asks again after every applied entry while a snapshot is due,
+	 * and each try drains the apply and flushes every memtable (100-300 ms) before it can fail: after a failure this
+	 * answers "no snapshot taken" ({@code -1}, which Ratis passes over without an error or a purge) until
+	 * {@link SnapshotBackoff} allows the next try, 1 s after the first failure, doubling up to a minute.
+	 */
 	@Override
 	public long takeSnapshot() throws IOException {
 		if (failed) {
 			throw new IOException("Replica failed, not taking a snapshot");
 		}
-		// Ratis waited for the entries it handed over; positions without data may still be queued.
-		drainApplyQueue();
-		long start = System.nanoTime();
-		// Before the checkpoint: entries applied while it runs count towards the next one.
-		long bytesBefore = bytesSinceSnapshot.get();
-		var position = storage.take(store);
-		bytesSinceSnapshot.addAndGet(-bytesBefore);
-		snapshotTime.since(start);
-		LOG.info("{}: snapshot taken at {} in {} ms", config.nodeId(), position, (System.nanoTime() - start) / 1_000_000);
-		return position.getIndex();
+		if (snapshotBackoff.waiting(System.nanoTime())) {
+			return org.apache.ratis.server.raftlog.RaftLog.INVALID_LOG_INDEX;
+		}
+		snapshotAttempts.incrementAndGet();
+		try {
+			// Ratis waited for the entries it handed over; positions without data may still be queued.
+			drainApplyQueue();
+			long start = System.nanoTime();
+			var injected = snapshotFailureForTests;
+			if (injected != null) {
+				throw injected;
+			}
+			// Before the checkpoint: entries applied while it runs count towards the next one.
+			long bytesBefore = bytesSinceSnapshot.get();
+			var position = storage.take(store);
+			bytesSinceSnapshot.addAndGet(-bytesBefore);
+			snapshotTime.since(start);
+			snapshotBackoff.succeeded();
+			LOG.info("{}: snapshot taken at {} in {} ms", config.nodeId(), position,
+					(System.nanoTime() - start) / 1_000_000);
+			return position.getIndex();
+		} catch (IOException | RuntimeException ex) {
+			long delay = snapshotBackoff.failed(System.nanoTime());
+			LOG.warn("{}: snapshot failed ({} in a row), not trying again for {} ms", config.nodeId(),
+					snapshotBackoff.failures(), delay / 1_000_000, ex);
+			throw ex;
+		}
+	}
+
+	/**
+	 * When to try a snapshot again after failures: 1 s after the first, doubling with each failure in a row up to a
+	 * minute, and at once after a success.
+	 */
+	static final class SnapshotBackoff {
+		static final long FIRST_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+		static final long MAX_NANOS = java.util.concurrent.TimeUnit.MINUTES.toNanos(1);
+		private int failures;
+		private long retryAtNanos;
+
+		synchronized boolean waiting(long nowNanos) {
+			return failures > 0 && nowNanos - retryAtNanos < 0;
+		}
+
+		/** Records a failure at {@code nowNanos}; returns the delay before the next try. */
+		synchronized long failed(long nowNanos) {
+			failures++;
+			long delay = FIRST_NANOS << Math.min(failures - 1, 16);
+			delay = Math.min(delay, MAX_NANOS);
+			retryAtNanos = nowNanos + delay;
+			return delay;
+		}
+
+		synchronized void succeeded() {
+			failures = 0;
+		}
+
+		synchronized int failures() {
+			return failures;
+		}
 	}
 
 	/** Called after Ratis installed a snapshot received from the leader, once {@link #pause} returned. */

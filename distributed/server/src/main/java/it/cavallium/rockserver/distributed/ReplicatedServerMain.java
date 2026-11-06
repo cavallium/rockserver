@@ -161,10 +161,13 @@ public final class ReplicatedServerMain {
 			return;
 		}
 		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-			try {
-				node.close();
-			} catch (IOException ex) {
-				System.err.println("Failed to stop cleanly: " + ex);
+			int status = closeOnSignal(node);
+			// A replica failure that raced the signal: its own stop found the node already closing, so the main thread
+			// below saw a normal stop, and the JVM would exit with the signal's status. Exit with the failure's.
+			if (status != 0) {
+				System.err.println("Node " + config.nodeId() + " stopped after a failure during its shutdown");
+				System.err.flush();
+				Runtime.getRuntime().halt(status);
 			}
 		}, "rockserver-shutdown"));
 		System.out.println("READY " + config.nodeId());
@@ -173,11 +176,46 @@ public final class ReplicatedServerMain {
 		if (directMemoryWatch != null) {
 			directMemoryWatch.close();
 		}
-		if (failure != null) {
+		if (failure != null || node.isFailed()) {
 			// The replica cannot apply the log, or Raft closed: exit, so that a supervisor notices.
-			System.err.println("Node " + config.nodeId() + " stopped after a failure: " + failure);
+			System.err.println("Node " + config.nodeId() + " stopped after a failure: "
+					+ (failure != null ? failure : "replica failed"));
+			// When a signal already started the shutdown, this blocks; the hook then halts with 3 once the node stopped.
 			System.exit(3);
 		}
+	}
+
+	/**
+	 * The shutdown hook's stop: closes the node, then waits until it stopped, also when a replica failure had already
+	 * started closing it (then {@link ReplicatedNode#close} returns at once). Halting before that would exit while RocksDB
+	 * still closes, whose destructors can hang the JVM (see {@code ReplicatedNode.awaitDatabaseClosed}). The wait is
+	 * bounded, twice the database's own close timeout. Returns {@link #failedExitStatus}.
+	 */
+	static int closeOnSignal(ReplicatedNode node) {
+		try {
+			node.close();
+		} catch (IOException ex) {
+			System.err.println("Failed to stop cleanly: " + ex);
+		}
+		try {
+			node.stopped().get(ReplicatedNode.DATABASE_CLOSE_TIMEOUT.multipliedBy(2).toMillis(),
+					java.util.concurrent.TimeUnit.MILLISECONDS);
+		} catch (java.util.concurrent.TimeoutException ex) {
+			System.err.println("Node " + node.config().nodeId() + " did not stop within "
+					+ ReplicatedNode.DATABASE_CLOSE_TIMEOUT.multipliedBy(2));
+		} catch (java.util.concurrent.ExecutionException ex) {
+			// stopped() completes normally, with the cause as value.
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
+		}
+		return failedExitStatus(node);
+	}
+
+	/** The exit status of a node that stopped: 3 if its replica failed or its Raft server closed by itself, else 0. */
+	static int failedExitStatus(ReplicatedNode node) {
+		var stopped = node.stopped();
+		boolean failedStop = stopped.isDone() && !stopped.isCompletedExceptionally() && stopped.join() != null;
+		return failedStop || node.isFailed() ? 3 : 0;
 	}
 
 	/**
@@ -386,7 +424,7 @@ public final class ReplicatedServerMain {
 				waitingFor = "node " + added.id() + ", which is installing a snapshot";
 			}
 			if (waitingFor == null) {
-				waitingFor = memberNotReady(known);
+				waitingFor = memberNotReady(known, members.size());
 			}
 			if (waitingFor == null) {
 				return;
@@ -401,9 +439,16 @@ public final class ReplicatedServerMain {
 
 	/**
 	 * What keeps a new member from getting a state from any member that may lead, null if nothing does. Until a member has
-	 * applied the genesis entry nobody can tell whether it needs a snapshot.
+	 * applied the genesis entry nobody can tell whether it needs a snapshot. {@code members} are the answers of the
+	 * members that answered, of {@code memberCount}: at least a majority must answer, since a check of the members that
+	 * answered says nothing when none or few did (a leader among the silent ones may have no snapshot, and the change
+	 * needs a majority anyway).
 	 */
-	private static @Nullable String memberNotReady(List<NodeState> members) {
+	static @Nullable String memberNotReady(List<NodeState> members, int memberCount) {
+		int majority = memberCount / 2 + 1;
+		if (members.size() < majority) {
+			return "answers from a majority of the members (" + members.size() + " of " + memberCount + " answered)";
+		}
 		if (members.stream().anyMatch(member -> member.clusterId() == null)) {
 			return "a member that has not applied the first entry of the cluster yet";
 		}

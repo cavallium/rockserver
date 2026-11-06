@@ -44,13 +44,30 @@ final class RaftSettings {
 	 */
 	private static final Duration INSTALL_SNAPSHOT_REQUEST_TIMEOUT = Duration.ofMillis(500);
 
-	/** Nodes whose attempts in flight together fit in {@link #PENDING_BYTES_LIMIT}. */
+	/**
+	 * Nodes whose attempts in flight together fit in {@link #PENDING_BYTES_LIMIT}, the smallest limit; a node started
+	 * with a longer peer list sizes its limit for that list ({@link #nodesUnderPendingLimit}).
+	 */
 	static final int NODES_UNDER_PENDING_LIMIT = 4;
 	/** Ratis' pending-request count limit on the leader: its default. */
 	static final int PENDING_REQUESTS_LIMIT = 4096;
-	/** Ratis' pending-request byte limit on the leader (default 64 MB), see {@link #server}. */
-	static final SizeInBytes PENDING_BYTES_LIMIT =
-			SizeInBytes.valueOf((NODES_UNDER_PENDING_LIMIT + 1) * Proposer.ATTEMPT_BYTES_IN_FLIGHT);
+	/** Ratis' pending-request byte limit on the leader (default 64 MB) of a cluster of up to 4 nodes, see {@link #server}. */
+	static final SizeInBytes PENDING_BYTES_LIMIT = pendingBytesLimit(NODES_UNDER_PENDING_LIMIT);
+
+	/**
+	 * Nodes whose attempts the leader's pending-request byte limit holds: those of its peer list, at least
+	 * {@link #NODES_UNDER_PENDING_LIMIT}. Ratis reads the limit once, at the start, so a cluster that grew past it by
+	 * {@code add-peer} keeps the smaller limit until each node restarts with the longer list; the leader warns meanwhile
+	 * ({@code ReplicatedNode.warnAbovePendingLimit}).
+	 */
+	static int nodesUnderPendingLimit(NodeConfig config) {
+		return Math.max(NODES_UNDER_PENDING_LIMIT, config.peers().size());
+	}
+
+	/** Every node's attempts in flight plus the leader's own transaction commits, which have permits of their own. */
+	static SizeInBytes pendingBytesLimit(int nodes) {
+		return SizeInBytes.valueOf((nodes + 1) * Proposer.ATTEMPT_BYTES_IN_FLIGHT);
+	}
 
 	private RaftSettings() {}
 
@@ -88,12 +105,12 @@ final class RaftSettings {
 		// that Proposer recognizes by its message (pinned by RatisContractTest) and resends, as a refusal before the
 		// append. Each node's proposer keeps at most 2 × Proposer.MAX_BATCHES_IN_FLIGHT batches and
 		// Proposer.ATTEMPT_BYTES_IN_FLIGHT bytes of attempts in flight per lane (its own permits), and its writers are
-		// batched: the element limit stays Ratis' default, and the byte limit covers the data writes of every node of a
-		// cluster of up to NODES_UNDER_PENDING_LIMIT nodes plus the leader's own transaction commits, at 160 MiB instead
-		// of the 1 GiB this used to be. A remote attempt's permit is given back when its node stops waiting, so a long
+		// batched: the element limit stays Ratis' default, and the byte limit covers the data writes of every node of the
+		// peer list (at least NODES_UNDER_PENDING_LIMIT) plus the leader's own transaction commits, 160 MiB for up to 4
+		// nodes instead of the 1 GiB this used to be. A remote attempt's permit is given back when its node stops waiting, so a long
 		// commit stall can still fill it. The heap of writes is bounded on each node by Proposer's byte admission.
 		RaftServerConfigKeys.Write.setElementLimit(properties, PENDING_REQUESTS_LIMIT);
-		RaftServerConfigKeys.Write.setByteLimit(properties, PENDING_BYTES_LIMIT);
+		RaftServerConfigKeys.Write.setByteLimit(properties, pendingBytesLimit(nodesUnderPendingLimit(config)));
 		// Every attempt at one proposer batch is the same Ratis invocation (see Proposer), so the retry cache answers a
 		// resend while the first copy is still pending instead of appending it again. Every replica caches every
 		// reply, with no size bound, so keep them only about two attempt timeouts, which covers the usual resend of a

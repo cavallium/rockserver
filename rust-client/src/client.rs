@@ -1551,6 +1551,7 @@ impl RockserverClient {
             context: Some(self.context.clone()),
             completed_sst_tokens: Vec::new(),
             resumable: false,
+            accepts_tagged_sst_tokens: false,
         };
         let resp = self
             .call_contextual(req, |mut client, request| async move {
@@ -1591,6 +1592,7 @@ impl RockserverClient {
                 .map(RawSstToken::into_string)
                 .collect(),
             resumable: true,
+            accepts_tagged_sst_tokens: true,
         };
         let resp = self
             .call_contextual(req, |mut client, request| async move {

@@ -1435,10 +1435,14 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 				}
 				var events = Flux.from(api.scanRawResumableAsync(request.getColumnId(),
 						request.getShardIndex(), request.getShardCount(), completedSsts));
+				// A client built before tagged tokens rejects them: it gets the plain filename, which a replicated
+				// server does not skip when it comes back (the file is scanned again), see RawSstToken.
+				boolean tagged = request.getAcceptsTaggedSstTokens();
 				return events.map(event -> switch (event) {
 					case RawScanEvent.Batch batch -> rawScanBatchResponse(
-							batch.serialized(), batch.completedSstToken());
-					case RawScanEvent.SstCompleted completed -> rawScanCompletionResponse(completed.token());
+							batch.serialized(), forClient(batch.completedSstToken(), tagged));
+					case RawScanEvent.SstCompleted completed ->
+							rawScanCompletionResponse(forClient(completed.token(), tagged));
 				});
 			}
 			if (request.getCompletedSstTokensCount() != 0) {
@@ -1454,6 +1458,10 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		})
 				.limitRate(17, 1)
 				.transform(this.onErrorMapFluxWithRequestInfo("scanRaw", request));
+	}
+
+	private static @Nullable RawSstToken forClient(@Nullable RawSstToken token, boolean acceptsTagged) {
+		return token == null || acceptsTagged ? token : token.untagged();
 	}
 
 	private static it.cavallium.rockserver.core.common.api.proto.ScanRawResponse rawScanBatchResponse(

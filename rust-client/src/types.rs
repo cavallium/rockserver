@@ -9,12 +9,29 @@ pub use crate::proto::{
 };
 
 /// Opaque, database-scoped identity of an immutable RocksDB SST file.
+///
+/// A server may tag the filename with its origin, as `<origin>@<filename>` (the replicated
+/// server names the node and Raft term that issued it); return tokens unchanged.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RawSstToken(String);
 
 impl RawSstToken {
     pub fn new(value: String) -> Result<Self, &'static str> {
-        let without_slash = value.strip_prefix('/').unwrap_or(&value);
+        let file_name = match value.split_once('@') {
+            Some((origin, file_name)) => {
+                if origin.is_empty()
+                    || origin.len() > 128
+                    || !origin
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._~-".contains(&byte))
+                {
+                    return Err("raw SST token origin must be ASCII letters, digits or ._~-");
+                }
+                file_name
+            }
+            None => value.as_str(),
+        };
+        let without_slash = file_name.strip_prefix('/').unwrap_or(file_name);
         let digits = without_slash
             .strip_suffix(".sst")
             .ok_or("raw SST token must end in .sst")?;

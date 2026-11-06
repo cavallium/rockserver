@@ -1172,11 +1172,57 @@ final class Proposer implements Closeable {
 		try {
 			return rpc.sendRequest(invocation(message, callId, leader));
 		} catch (IOException ex) {
-			// Resets the connection to that peer if the error calls for it, as the client's own calls do.
-			rpc.handleException(leader, ex, false);
+			// Resets the connection to that peer if the error calls for it, as the client's own calls do. On a thread
+			// of its own: closing the old channel waits up to 3 s (then 2 s more) for its calls to end
+			// (GrpcUtil.shutdownManagedChannel, see RatisContractTest), and a frozen leader ends none, so done here it
+			// would hold this attempt's failure, and the resend to the next leader, that long.
+			resetConnection(rpc, leader, ex);
 			throw new CompletionException(ex);
 		} finally {
 			permits.release(weight);
+		}
+	}
+
+	/** How long {@link #resetConnection} waits for Ratis to take the failed proxy out of its map. */
+	static final long RESET_REMOVAL_WAIT_NANOS = TimeUnit.SECONDS.toNanos(1);
+
+	/**
+	 * {@code rpc.handleException(peer, error, false)} on a virtual thread of its own: Ratis takes the peer's proxy out
+	 * of its map at once, under its lock, and then closes the old channel on the calling thread, which waits for the
+	 * calls in flight up to 3 s. This thread waits only for the first part: until the map no longer holds the proxy
+	 * that failed (bounded by {@link #RESET_REMOVAL_WAIT_NANOS}). So a resend to the same peer right after takes a new
+	 * channel, and is not sent on the old one that the reset then closes under it; attempts to other peers never
+	 * waited for the close (the map's lock is not held meanwhile).
+	 */
+	static void resetConnection(org.apache.ratis.client.RaftClientRpc rpc, RaftPeerId peer, IOException error) {
+		// Ratis' proxy map resets on these errors only (PeerProxyMap.handleException with reconnect false).
+		Object failed = org.apache.ratis.util.IOUtils.shouldReconnect(error) ? currentProxy(rpc, peer) : null;
+		Thread.ofVirtual().name("rockserver-propose-reset-" + peer).start(() -> {
+			try {
+				rpc.handleException(peer, error, false);
+			} catch (RuntimeException ex) {
+				org.slf4j.LoggerFactory.getLogger(Proposer.class).debug("Could not reset the connection to {}", peer, ex);
+			}
+		});
+		if (failed == null) {
+			return;
+		}
+		long deadline = System.nanoTime() + RESET_REMOVAL_WAIT_NANOS;
+		while (currentProxy(rpc, peer) == failed && System.nanoTime() - deadline < 0) {
+			java.util.concurrent.locks.LockSupport.parkNanos(50_000);
+		}
+	}
+
+	/** The proxy that {@code rpc} uses for {@code peer} now, or null if it has none or does not say. */
+	private static @Nullable Object currentProxy(org.apache.ratis.client.RaftClientRpc rpc, RaftPeerId peer) {
+		if (!(rpc instanceof org.apache.ratis.client.impl.RaftClientRpcWithProxy<?> withProxy)) {
+			return null;
+		}
+		try {
+			return withProxy.getProxies().getProxy(peer);
+		} catch (IOException | RuntimeException ex) {
+			// Between the removal and the new entry, or a peer that left: not the failed proxy.
+			return null;
 		}
 	}
 
@@ -1198,7 +1244,7 @@ final class Proposer implements Closeable {
 	 * entries, nor any other ResourceUnavailableException, such as the one for failing to add a pending request,
 	 * raised after the append: an unknown outcome.
 	 */
-	private static boolean isRefusedBeforeAppend(@Nullable Throwable error) {
+	static boolean isRefusedBeforeAppend(@Nullable Throwable error) {
 		return error instanceof LeaderNotReadyException || isBusyBeforeAppend(error);
 	}
 

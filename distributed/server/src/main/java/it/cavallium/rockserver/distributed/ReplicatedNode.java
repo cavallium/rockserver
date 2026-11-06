@@ -47,7 +47,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	private static final Logger LOG = LoggerFactory.getLogger(ReplicatedNode.class);
 	private static final long LEADERSHIP_TRANSFER_TIMEOUT_MS = 5_000;
 	private static final long MAINTENANCE_INTERVAL_MS = 200;
-	private static final Duration DATABASE_CLOSE_TIMEOUT = Duration.ofMinutes(1);
+	static final Duration DATABASE_CLOSE_TIMEOUT = Duration.ofMinutes(1);
 	/** How long a node that handed over its leadership waits for its successor's first commit. */
 	private static final Duration SUCCESSOR_COMMIT_WAIT = Duration.ofSeconds(3);
 	private static final long SUCCESSOR_COMMIT_POLL_MS = 10;
@@ -79,6 +79,12 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * own, so that it does not hold back {@link #gateApi} and {@link #watchRaft} (and {@link LeaderStall}).
 	 */
 	private final ScheduledExecutorService initialization;
+	/**
+	 * Runs {@link #discardFailedInstalls}, which lists, walks and renames in the data directory: on a thread of its own,
+	 * so that a hung disk or Ratis threads holding the install lock never hold back {@link #gateApi} and
+	 * {@link #watchRaft}, which must notice exactly that disk (see "Hung disk" in the design document).
+	 */
+	private final ScheduledExecutorService installCleanup;
 	/** The node's control plane and local command threads, see {@link NodeThreads}. */
 	private final NodeThreads threads;
 	/** Only used on the maintenance thread. */
@@ -92,6 +98,10 @@ public final class ReplicatedNode implements AutoCloseable {
 	private volatile boolean takingSeedSnapshot;
 	/** Only used on the initialization thread. */
 	private final ClusterCheck clusterCheck;
+	/** Finds a hung disk, which pauses the API like a missing leader does; see {@link #gateApi}. */
+	private final DiskProbe diskProbe;
+	/** Whether {@link #gateApi} last found the disk hung. Maintenance thread only. */
+	private boolean diskHung;
 	/** Only used on the maintenance thread. */
 	private final LeaderStall leaderStall;
 	private final NodeMetrics.Series leaderStallStepDowns;
@@ -117,6 +127,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		this.leaderStall = LeaderStall.forElectionTimeout(config.electionTimeoutMax());
 		var configDigest = NodeStore.configDigest(config.rockserverConfig());
 		this.clusterCheck = new ClusterCheck(config.nodeId(), groupId, config.electionTimeoutMax(), configDigest);
+		this.diskProbe = DiskProbe.forDirectory(config.nodeId(), config.dataDir());
 		this.leaderStallStepDowns = metrics.amount("leader.stall.stepdowns");
 		this.leaderLogStepDowns = metrics.amount("leader.log.stepdowns");
 		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure, metrics);
@@ -182,13 +193,18 @@ public final class ReplicatedNode implements AutoCloseable {
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-maintenance").factory());
 			this.initialization = Executors.newSingleThreadScheduledExecutor(
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-initialization").factory());
+			this.installCleanup = Executors.newSingleThreadScheduledExecutor(
+					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-install-cleanup").factory());
 			this.apiGate = ApiGate.forElectionTimeout(config.electionTimeoutMax(), hadLeaderBeforeStart(), System.nanoTime());
+			diskProbe.start();
 			initialization.scheduleWithFixedDelay(this::initializeCluster, 0, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
 			maintenance.scheduleWithFixedDelay(this::gateApi, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
 			maintenance.scheduleWithFixedDelay(this::watchRaft, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
+			installCleanup.scheduleWithFixedDelay(this::discardFailedInstalls, MAINTENANCE_INTERVAL_MS,
+					MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 			var appendLag = metrics.amount("lag.uncommitted");
 			var applyLag = metrics.amount("lag.unapplied");
 			var flushLag = metrics.amount("lag.unflushed");
@@ -383,7 +399,20 @@ public final class ReplicatedNode implements AutoCloseable {
 	/** Stops serving clients while the node is cut off from a leader (see {@link ApiGate}). */
 	private void gateApi() {
 		try {
-			if (apiGate.shouldServe(knowsLeader(), System.nanoTime())) {
+			long now = System.nanoTime();
+			boolean serve = apiGate.shouldServe(knowsLeader(), now);
+			// A write waits at most the request timeout: a disk that has not ended an fsync for that long fails them all.
+			boolean hung = diskProbe.hung(now, config.requestTimeout().toNanos());
+			if (hung != diskHung) {
+				diskHung = hung;
+				if (hung) {
+					LOG.warn("{}: an fsync in {} has not ended for more than {} ms: the disk hangs, pausing the API",
+							config.nodeId(), config.dataDir(), config.requestTimeout().toMillis());
+				} else {
+					LOG.info("{}: the disk answers again", config.nodeId());
+				}
+			}
+			if (serve && !hung) {
 				apiServer.resume();
 			} else {
 				apiServer.pause();
@@ -419,6 +448,7 @@ public final class ReplicatedNode implements AutoCloseable {
 				return;
 			}
 			warnWhileInitializing(division);
+			warnAbovePendingLimit(division);
 			var log = division.getRaftLog();
 			long commitIndex = log.getLastCommittedIndex();
 			long term = division.getInfo().getCurrentTerm();
@@ -451,6 +481,41 @@ public final class ReplicatedNode implements AutoCloseable {
 		} catch (IOException | RuntimeException ex) {
 			LOG.warn("{}: failed to record its membership in {}, retrying", config.nodeId(),
 					config.raftDir().resolve(MEMBER_FILE), ex);
+		}
+	}
+
+	/**
+	 * Deletes the partial copies of failed snapshot installations also while nothing else reads the snapshot. Install
+	 * cleanup thread only: it does disk I/O and takes the install lock, so it must stay off the maintenance thread.
+	 */
+	private void discardFailedInstalls() {
+		try {
+			if (!closed.get()) {
+				stateMachine.getLatestSnapshot();
+			}
+		} catch (RuntimeException ex) {
+			LOG.warn("{}: failed to discard abandoned snapshot installations, retrying", config.nodeId(), ex);
+		}
+	}
+
+	/** The member count of the configuration that {@link #warnAbovePendingLimit} last warned about. */
+	private int pendingLimitWarnedFor;
+
+	/**
+	 * Warns, on the leader, when the configuration has more members than its Ratis pending-request byte limit was sized
+	 * for ({@link RaftSettings#nodesUnderPendingLimit}): their attempts in flight can then fill it, and Ratis refuses
+	 * the rest before the append, which costs resends, not correctness. Maintenance thread only.
+	 */
+	private void warnAbovePendingLimit(org.apache.ratis.server.RaftServer.Division division) {
+		int members = division.getGroup().getPeers().size();
+		int limit = RaftSettings.nodesUnderPendingLimit(config);
+		if (members <= limit || !division.getInfo().isLeader()) {
+			return;
+		}
+		if (members != pendingLimitWarnedFor) {
+			pendingLimitWarnedFor = members;
+			LOG.warn("{}: the cluster has {} members, but this node's Ratis pending-request byte limit holds the attempts of"
+					+ " {} nodes: restart the nodes with every member in --peer", config.nodeId(), members, limit);
 		}
 	}
 
@@ -780,8 +845,14 @@ public final class ReplicatedNode implements AutoCloseable {
 		if (maintenance != null) {
 			maintenance.shutdownNow();
 		}
+		if (diskProbe != null) {
+			diskProbe.close();
+		}
 		if (initialization != null) {
 			initialization.shutdownNow();
+		}
+		if (installCleanup != null) {
+			installCleanup.shutdownNow();
 		}
 		metrics.close();
 		IOException failure = null;

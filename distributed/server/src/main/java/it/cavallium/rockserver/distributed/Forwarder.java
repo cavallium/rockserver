@@ -189,6 +189,10 @@ final class Forwarder {
 			case RocksDBAPICommandSingle.GetMulti _, RocksDBAPICommandSingle.GetColumnId _,
 					RocksDBAPICommandSingle.EstimateNumKeys _, RocksDBAPICommandSingle.CheckMergeOperator _,
 					RocksDBAPICommandSingle.GetAllColumnDefinitions _ -> true;
+			case it.cavallium.rockserver.core.common.RocksDBAPICommand.GetTableProperties _,
+					it.cavallium.rockserver.core.common.RocksDBAPICommand.GetSstMetadata _ -> true;
+			// Only a dry run: an executed compaction may have run on the old leader.
+			case it.cavallium.rockserver.core.common.RocksDBAPICommand.CompactFiles c -> !c.request().execute();
 			case RocksDBAPICommandSingle.ExistsMulti c -> c.transactionId() == 0;
 			case RocksDBAPICommandSingle.ReduceRange<?> c -> c.transactionId() == 0;
 			case RocksDBAPICommandSingle.GetRangePage<?> c -> c.transactionId() == 0;

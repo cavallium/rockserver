@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
+import it.cavallium.rockserver.core.common.RawScanEvent;
+import it.cavallium.rockserver.core.common.RawSstToken;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
@@ -65,6 +67,7 @@ final class Router {
 	static final String FOLLOWER_READS_PROPERTY = "it.cavallium.rockserver.distributed.follower-reads";
 
 	private final RockserverStateMachine stateMachine;
+	private final String nodeId;
 	private final FollowerReads followerReads;
 	private final LocalCommands localCommands;
 	private final ReplicatedWrites writes;
@@ -93,6 +96,7 @@ final class Router {
 			NodeMetrics metrics,
 			java.util.concurrent.ExecutorService inline) {
 		this.stateMachine = stateMachine;
+		this.nodeId = config.nodeId();
 		this.followerReads = followerReads;
 		this.localCommands = localCommands;
 		this.writes = writes;
@@ -182,8 +186,10 @@ final class Router {
 				case RocksDBAPICommandSingle.GetRangePage<?> c when c.transactionId() != 0 ->
 						leaderBound(context, c, () -> updates.inTransaction(context, c, c.transactionId()));
 				case RocksDBAPICommandSingle.CloseIterator c -> leaderBound(context, c, () -> local(context, c));
-				case RocksDBAPICommandSingle.SeekTo c -> leaderBound(context, c, () -> local(context, c));
-				case RocksDBAPICommandSingle.Subsequent<?> c -> leaderBound(context, c, () -> local(context, c));
+				case RocksDBAPICommandSingle.SeekTo c ->
+						leaderBound(context, c, () -> iteratorCall(local(context, c), c.iterationId()));
+				case RocksDBAPICommandSingle.Subsequent<?> c ->
+						leaderBound(context, c, () -> iteratorCall(local(context, c), c.iterationId()));
 
 				case RocksDBAPICommandSingle.GetAllColumnDefinitions c ->
 						leaderRead(context, c).thenApply(Router::hideMetaColumn);
@@ -199,9 +205,11 @@ final class Router {
 
 				case RocksDBAPICommand.Flush c -> local(context, c);
 				case RocksDBAPICommand.Compact c -> local(context, c);
-				case RocksDBAPICommand.GetTableProperties c -> local(context, c);
-				case RocksDBAPICommand.GetSstMetadata c -> local(context, c);
-				case RocksDBAPICommand.CompactFiles c -> local(context, c);
+				// The SST maintenance calls describe and change the files of the node that serves scanRaw, the leader, so
+				// that their names and session refer to the same database (see "SST maintenance" in the design document).
+				case RocksDBAPICommand.GetTableProperties c -> leaderRead(context, c);
+				case RocksDBAPICommand.GetSstMetadata c -> leaderRead(context, c);
+				case RocksDBAPICommand.CompactFiles c -> leaderBound(context, c, () -> local(context, c));
 				default -> CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
 						"Not supported by replicated Rockserver: " + command.getClass().getSimpleName()));
 			};
@@ -232,8 +240,59 @@ final class Router {
 			}
 			return Mono.fromFuture(this::leadership)
 					.onErrorMap(LocalCommands::barrierFailure)
-					.thenMany(Flux.defer(() -> localStream(context, command)));
+					.thenMany(Flux.defer(() -> command instanceof RocksDBAPICommandStream.ScanRawResumable scan
+							? scanRawResumable(context, scan)
+							: localStream(context, command)));
 		});
+	}
+
+	/**
+	 * A resumable raw scan on the leader. Its SST tokens name files of this node's database, whose file numbers mean
+	 * nothing on another node, nor here after a snapshot install replaced the database. They leave tagged with this node
+	 * and its current term ({@link #sstTokenOrigin}); tokens that come back with another tag, or none, are dropped, so
+	 * their files are scanned again instead of a different file of the same name being skipped. A node installs
+	 * snapshots only as a follower, so its database stays the same within one term of its leadership.
+	 */
+	private Flux<Object> scanRawResumable(RequestContext context, RocksDBAPICommandStream.ScanRawResumable command) {
+		String origin = sstTokenOrigin(localCommands.currentTerm());
+		var local = new java.util.HashSet<RawSstToken>();
+		for (var token : command.completedSsts()) {
+			if (origin.equals(token.origin())) {
+				local.add(token.untagged());
+			}
+		}
+		var untagged = new RocksDBAPICommandStream.ScanRawResumable(command.columnId(), command.shardIndex(),
+				command.shardCount(), local);
+		return localStream(context, untagged).map(event -> switch (event) {
+			case RawScanEvent.Batch batch when batch.completedSstToken() != null ->
+					new RawScanEvent.Batch(batch.serialized(), RawSstToken.tagged(origin, batch.completedSstToken()));
+			case RawScanEvent.SstCompleted completed ->
+					new RawScanEvent.SstCompleted(RawSstToken.tagged(origin, completed.token()));
+			default -> event;
+		});
+	}
+
+	/** The origin tag of the SST tokens this node issues in {@code term}: its node id (escaped) and the term. */
+	String sstTokenOrigin(long term) {
+		return sstTokenOrigin(nodeId, term);
+	}
+
+	static String sstTokenOrigin(String nodeId, long term) {
+		var origin = new StringBuilder();
+		for (byte b : nodeId.getBytes(java.nio.charset.StandardCharsets.UTF_8)) {
+			char c = (char) (b & 0xFF);
+			if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_'
+					|| c == '-') {
+				origin.append(c);
+			} else {
+				origin.append('~').append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+			}
+		}
+		if (origin.length() > RawSstToken.MAX_ORIGIN_CHARACTERS - 24) {
+			origin.setLength(0);
+			origin.append("h").append(Integer.toHexString(nodeId.hashCode()));
+		}
+		return origin.append("~t").append(term).toString();
 	}
 
 	/** Runs {@code onLeader} if this node leads, otherwise forwards {@code command} to the leader. */
@@ -249,6 +308,26 @@ final class Router {
 			}
 		}
 		return forwarding.forward(context, command);
+	}
+
+	/**
+	 * An iterator call on the leader: an iterator lives only on the node that opened it, so one this leader does not
+	 * know was opened on an earlier leader (or expired, or was closed). The database reports it as an internal error;
+	 * the caller gets {@code UPDATE_RETRY} instead, as for a transaction lost with its leader, and opens a new one.
+	 */
+	static CompletableFuture<?> iteratorCall(CompletableFuture<?> call, long iteratorId) {
+		return call.exceptionallyCompose(error -> CompletableFuture.failedFuture(
+				isUnknownIterator(unwrap(error), iteratorId) ? new it.cavallium.rockserver.core.common.RocksDBRetryException()
+						: unwrap(error)));
+	}
+
+	/**
+	 * The database's failure for an iterator id it does not hold ({@code EmbeddedDB.iteratorNotFound}). Read from its
+	 * type and text, which {@code RouterIteratorTest} pins against the database.
+	 */
+	static boolean isUnknownIterator(Throwable error, long iteratorId) {
+		return error instanceof RocksDBException ex && ex.getErrorUniqueId() == RocksDBErrorType.INTERNAL_ERROR
+				&& String.valueOf(ex.getMessage()).contains("No iterator with id " + iteratorId);
 	}
 
 	/** A linearizable read: on the leader after the read barrier, otherwise forwarded to the leader. */
@@ -405,6 +484,7 @@ final class Router {
 			case RocksDBAPICommandStream.ScanRawResumable c -> c.columnId();
 			case RocksDBAPICommand.GetTableProperties c -> c.columnId();
 			case RocksDBAPICommand.GetSstMetadata c -> c.columnId();
+			case RocksDBAPICommand.CompactFiles c -> c.request().columnId();
 			default -> null;
 		};
 		String name = switch (command) {
