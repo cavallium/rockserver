@@ -219,9 +219,11 @@ Other results:
 - **Client failover.** Create clients with every node's address (`GrpcConnection.forHostsAndPorts`, or
   `http://node-1:5333,node-2:5333,node-3:5333`), the expected leader first: without it, a dead node takes the
   clients pinned to it down with it. All the clients with the same list sit on its first node. After a leader change
-  they stay there, so all their calls that need the leader take a forwarding hop through what is now a follower,
-  which costs capacity (see above), until their connection is lost: a client stays on the node it failed over to
-  until that node goes away. The benchmark's `--route failover` spreads the lists, so it does not measure this. A
+  they stay there, but the nodes name their leader in every response, and the client sends the calls the leader
+  serves straight to it, on a second channel, once that is connected (see "Routing" in the design document): only
+  point reads still take the forwarding hop through what is now a follower, unless follower reads are on. This
+  needs the clients to list the nodes by the host names of the cluster's `--peer` configuration. Not measured yet. A
+  client stays on the node it failed over to until that node goes away. The benchmark's `--route failover` spreads the lists, so it does not measure this. A
   server option brings clients back to the first address, `max-connection-age-ms`, which is off by default. With it
   every client starts again from the top of its list at every age cycle, so a silent first address costs each of them
   the connect timeout at every cycle instead of once, and the grace of 10 minutes cuts any longer call, including

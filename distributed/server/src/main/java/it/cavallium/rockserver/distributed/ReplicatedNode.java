@@ -63,6 +63,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final RockserverStateMachine stateMachine;
 	private final RaftServer server;
 	private final ReadBarrier barrier;
+	private final FollowerReads followerReads;
 	private final Proposer proposer;
 	private final LeaderForwarder forwarder;
 	private final ReplicatedConnection connection;
@@ -106,7 +107,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		var parameters = new Parameters();
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
 		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress,
-				this::nodeState));
+				this::nodeState, this::readIndex));
 		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
 		if (!existing) {
 			requireNoClusterData(config);
@@ -136,12 +137,17 @@ public final class ReplicatedNode implements AutoCloseable {
 			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout(),
 					stateMachine::leaderReadyIndex);
 			started.add(barrier);
+			// A leader that cannot confirm its leadership within an election timeout is likely losing it: the read is
+			// forwarded instead, and waits for the next leader there.
+			this.followerReads = new FollowerReads(stateMachine, groupId, config.nodeId(), config.electionTimeoutMax());
+			started.add(followerReads);
 			this.proposer = new Proposer(group, RaftSettings.client(config), config, this::raftServer, metrics);
 			started.add(proposer);
 			this.forwarder = new LeaderForwarder(config);
 			started.add(forwarder);
 			stateMachine.onLeaderChange(forwarder::leaderChanged);
-			this.connection = new ReplicatedConnection(config, stateMachine, proposer, barrier, forwarder, metrics);
+			this.connection = new ReplicatedConnection(config, stateMachine, proposer, barrier, followerReads, forwarder,
+					metrics);
 			var self = config.self();
 			var apiHost = config.apiBindHost() != null ? config.apiBindHost() : self.apiHost();
 			this.apiServer = new GrpcServer(connection, new InetSocketAddress(apiHost, self.apiPort()));
@@ -281,6 +287,16 @@ public final class ReplicatedNode implements AutoCloseable {
 	}
 
 	/** Answers {@link TermService#NODE_STATE}, and stops this node if the caller speaks for another cluster. */
+	/** Answers a follower's {@link TermService#READ_INDEX}: see {@link ReadBarrier#readIndex()}. */
+	private CompletableFuture<Long> readIndex(RaftGroupId requested) {
+		// Null until the constructor created it: term calls can arrive as soon as the Raft server started.
+		var readBarrier = this.barrier;
+		if (readBarrier == null || !requested.equals(group.getGroupId())) {
+			return CompletableFuture.failedFuture(new ReadBarrier.NotLeaderException("No read barrier for " + requested));
+		}
+		return readBarrier.readIndex();
+	}
+
 	private @Nullable NodeState nodeState(RaftGroupId requested, @Nullable String callerClusterId) {
 		var division = stateMachine.division();
 		var store = stateMachine.store();
@@ -644,8 +660,8 @@ public final class ReplicatedNode implements AutoCloseable {
 		IOException failure = null;
 		// A replica can fail while the constructor is still starting the rest: skip what does not exist yet.
 		var order = (consensusFirst
-				? java.util.stream.Stream.<Closeable>of(server, apiServer, proposer, barrier, forwarder)
-				: java.util.stream.Stream.<Closeable>of(apiServer, proposer, barrier, forwarder, server))
+				? java.util.stream.Stream.<Closeable>of(server, apiServer, proposer, barrier, followerReads, forwarder)
+				: java.util.stream.Stream.<Closeable>of(apiServer, proposer, barrier, followerReads, forwarder, server))
 				.filter(java.util.Objects::nonNull)
 				.toList();
 		try {
