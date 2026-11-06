@@ -44,6 +44,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.impl.OrderedAsync;
@@ -653,6 +654,17 @@ class RatisContractTest {
 	 * {@link CommitHeartbeats.WakeSignal}: a Ratis that waited on its own field instead would fail here. With Ratis'
 	 * {@code AwaitForSignal} (drop the {@code getEventAwaitForSignal} override) the wake is lost and the commit index
 	 * comes with the next heartbeat, seconds later.
+	 *
+	 * <p>R8-3: the appender may not run at all between the commit and Ratis' heartbeat. The reply to the write's append
+	 * wakes it before the leader commits (the commit is updated later, on the leader's event thread,
+	 * {@code LeaderStateImpl.submitUpdateCommitEvent}), and the commit's own wake ({@code notifySenders}) can come while
+	 * it is between that pass and its wait, where both Ratis' signal and the {@code WakeSignal} drop it (no commit
+	 * heartbeat is wanted yet). The hook then never ran, and the round timed out once the heartbeat had told the
+	 * follower. So if the hook did not run within 100 ms of the write, the test wakes the appender itself ({@code notifyLogAppender}, which only wakes
+	 * it: with nothing wanted, a pass builds nothing). The hook and these wakes share a lock, and the hook marks itself
+	 * as run under it before it calls {@code send}, so no wake of the test comes after the {@code send} and could stand
+	 * in for one that the appender lost. A round whose commit index Ratis' heartbeat carried before the hook ran
+	 * proves nothing and is not counted.</p>
 	 */
 	@Test
 	void aCommitHeartbeatAskedForJustBeforeTheAppenderWaitsIsNotLost() throws Exception {
@@ -669,22 +681,59 @@ class RatisContractTest {
 		var followerLog = follower.getDivision(groupId).getRaftLog();
 		var leaderLog = cluster.leader().getDivision(groupId).getRaftLog();
 		var lags = new ArrayList<Long>();
-		for (int i = 0; i < 5; i++) {
+		int nudgedRounds = 0;
+		int skipped = 0;
+		for (int i = 0; lags.size() < 5; i++) {
+			assertTrue(i < 20, "rounds in which the hook ran before Ratis' heartbeat told the follower");
 			// Let Ratis' heartbeat after the previous round pass, so that it cannot carry this round's commit index.
 			Thread.sleep(200);
 			long before = leaderLog.getLastCommittedIndex();
 			var sentAt = new AtomicLong();
-			trigger.whenNothingToSend.set(nothing -> {
+			var nudges = new Object();
+			var ran = new boolean[1];
+			Predicate<CommitHeartbeats.Appender> hook = nothing -> {
 				if (nothing != appender || leaderLog.getLastCommittedIndex() <= before
 						|| nothing.getFollower().getCommitIndex() > before) {
 					return false;
 				}
+				synchronized (nudges) {
+					ran[0] = true;
+				}
 				trigger.send();
 				sentAt.set(System.nanoTime());
 				return true;
-			});
+			};
+			trigger.whenNothingToSend.set(hook);
 			long target = write(cluster.leader(), "j" + i);
-			waitUntil(() -> sentAt.get() != 0, "the appender built nothing after the commit, and send() ran then");
+			long written = System.nanoTime();
+			long deadline = written + WAIT.toNanos();
+			boolean told = false;
+			boolean nudged = false;
+			while (sentAt.get() == 0) {
+				if (followerLog.getLastCommittedIndex() >= target) {
+					told = true;
+					break;
+				}
+				assertTrue(System.nanoTime() - deadline < 0,
+						"the appender built nothing after the commit, and send() ran then");
+				// The appender's own pass after the commit takes well under 100 ms; past that its wake was lost.
+				synchronized (nudges) {
+					if (!ran[0] && System.nanoTime() - written > TimeUnit.MILLISECONDS.toNanos(100)) {
+						appender.notifyLogAppender();
+						nudged = true;
+					}
+				}
+				Thread.sleep(5);
+			}
+			if (told) {
+				// Ratis' heartbeat came first: nothing for the commit heartbeat to do in this round.
+				trigger.whenNothingToSend.compareAndSet(hook, null);
+				skipped++;
+				continue;
+			}
+			if (nudged) {
+				nudgedRounds++;
+			}
 			long start = sentAt.get();
 			while (followerLog.getLastCommittedIndex() < target) {
 				assertTrue(System.nanoTime() - start < WAIT.toNanos(), "the follower learns the commit index");
@@ -693,7 +742,8 @@ class RatisContractTest {
 			lags.add(TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start));
 		}
 		System.out.println("Commit index on the follower after a send() just before the appender's wait, us: " + lags
-				+ "; early wakes kept: " + wake.kept() + ", waits: " + wake.awaits());
+				+ "; early wakes kept: " + wake.kept() + ", waits: " + wake.awaits() + "; rounds whose hook ran only after a wake by the test: "
+				+ nudgedRounds + ", rounds told by Ratis' heartbeat first: " + skipped);
 		assertTrue(wake.awaits() > 0, "Ratis waits on the appender's WakeSignal");
 		assertTrue(wake.kept() >= 5, "each round's wake came before the wait and was kept");
 		assertTrue(lags.stream().allMatch(lag -> lag < 600_000), lags::toString);
