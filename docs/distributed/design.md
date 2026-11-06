@@ -1895,6 +1895,19 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
      100-300 ms pause of the apply. A failing snapshot is no longer tried at every applied entry: after a failure,
      `takeSnapshot` answers "no snapshot" (which Ratis passes over without an error or a purge) for 1 s, doubling with
      each failure in a row up to a minute; the snapshots by bytes wait for the same delay.
+   - Ratis' retry cache has no size bound (DD-12), only an expiry: `max(6 s, 4 × --election-timeout-ms max)`, 8 s
+     with the defaults (`RaftSettings`). Kept, because the expiry bounds it by traffic: it holds one entry per Ratis
+     invocation applied in the last 8 s, on every replica, and an invocation is one proposer batch, not one write. Each
+     entry keeps the batch's reply, the encoded results of its writes (`ResultCodec.encodeAll`: a few bytes per write,
+     plus the previous values a write asked for, at most 17 MiB per result). So the cache holds about 8 s of the
+     results the cluster answers: with a status per write, at the production peaks of `performance.md` (`put`,
+     update commits and `putMulti` together, about 30k writes/s), about 30k × 8 × ~20 bytes, under 5 MiB, plus a
+     few hundred bytes of Ratis per batch. Only
+     writes that ask for large previous values make it large, and those cost the same bytes again as replies to their
+     clients: 100 MB/s of previous values keeps about 800 MB on every replica, which such a workload must count in its
+     heap. A size bound is not offered by Ratis 3.3.1, and a shorter expiry would miss the resends it exists for (a
+     resend of a copy still pending, see `RaftSettings`); Rockserver deduplicates requests itself, so the cache is an
+     optimization, not what makes resends safe. To report upstream with the others (below).
    - Iterator calls after a leader change get `UPDATE_RETRY` (see "Leader changes").
    - The snapshot taken right after a seeded genesis is attempted once, on the leader only.
    - A SIGTERM that races a replica failure exits with 3: the shutdown hook closes the node, then waits until it
@@ -1909,6 +1922,8 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
      failed proxy out of its map (so a resend to the same peer gets a new channel, not the one being closed).
    - The two `ResourceUnavailableException`s of the pending-request limit (before and after the append) differ only
      by their message: a typed refusal before the append would let `Proposer` stop matching text.
+   - The retry cache has an expiry but no size bound (`RaftServerConfigKeys.RetryCache`): a bound in entries or
+     bytes would cap its heap under replies with large values (see "Known limits", DD-12).
    - `GrpcLogAppender.getWaitTimeMs` waits 0 ms while it has no stream to a follower, a spin until the next
      heartbeat after a stream reset (found in a review of the code). Not seen in practice: with a follower down,
      the leader's appender threads for it used 0.0% of a core over 3 s (`RatisContractTest`), since the retry policy
