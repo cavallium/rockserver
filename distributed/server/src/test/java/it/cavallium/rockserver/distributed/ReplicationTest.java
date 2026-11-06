@@ -853,6 +853,40 @@ class ReplicationTest {
 		assertNull(api(through).get(0, column, key(2), RequestType.current()));
 	}
 
+	/**
+	 * The leader's own batches, data writes and transaction commits, are started from the requests its proposer
+	 * encoded, without decoding them again; none of them stays offered once answered. Every replica applies the same.
+	 */
+	@Test
+	void theLeaderStartsItsOwnBatchesWithoutDecodingThem() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = api(leader);
+		long column = api.createColumn("c", SCHEMA);
+		long before = leader.stateMachine().localProposalsTaken();
+		for (int i = 0; i < 20; i++) {
+			api.put(0, column, key(i), text("v" + i), RequestType.none());
+		}
+		long tx = api.openTransaction(Duration.ofSeconds(30));
+		api.get(tx, column, key(100), RequestType.forUpdate());
+		api.put(tx, column, key(100), text("tx"), RequestType.none());
+		assertTrue(api.closeTransaction(tx, true));
+		assertTrue(leader.stateMachine().localProposalsTaken() - before >= 21,
+				() -> "taken: " + (leader.stateMachine().localProposalsTaken() - before));
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		while (leader.stateMachine().localProposalsOffered() != 0 && System.nanoTime() < deadline) {
+			Thread.sleep(10);
+		}
+		assertEquals(0, leader.stateMachine().localProposalsOffered());
+		cluster.awaitConverged(TIMEOUT);
+		for (ReplicatedNode node : cluster.runningNodes()) {
+			for (int i = 0; i < 20; i++) {
+				assertEquals("v" + i, localValue(node, column, i));
+			}
+			assertEquals("tx", localValue(node, column, 100));
+		}
+	}
+
 	@Test
 	void transactionsCommitAtomicallyAndDetectConflicts() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();

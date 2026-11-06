@@ -210,6 +210,66 @@ final class LogEntryCodec {
 		return out.finish();
 	}
 
+	/**
+	 * A batch encoded by {@link #encodeBatch(long, long, long[], ClientRequestId[], List, long, boolean)}: its bytes
+	 * and, if asked for, its requests as {@link #decodeBatchInPlace} would read them back from those bytes, or null.
+	 */
+	record EncodedBatch(byte[] bytes, @Nullable List<Request> requests) {}
+
+	/**
+	 * {@link #encodeBatch(long, long, long[], ClientRequestId[], List)} with each entry written straight into the
+	 * batch, with no body of its own. {@code entriesSize} is the sum of their {@link #entrySize}s, which the caller
+	 * computed already.
+	 *
+	 * <p>With {@code withRequests}, it also returns the requests as {@link #decodeBatchInPlace} would decode them from
+	 * the returned bytes, without decoding anything: each key and value of a write is a slice of the bytes, written
+	 * there just now, and every array of a commit is a copy. A leader hands them to its own state machine instead of
+	 * having it decode the batch it just encoded (see {@link RockserverStateMachine#offerLocal}). They are null if the
+	 * batch holds a schema change ({@link LogEntry.CreateColumn}, {@link LogEntry.UploadMergeOperator}), whose mutable
+	 * fields would not be copies: the state machine then decodes the bytes.</p>
+	 *
+	 * @throws IllegalArgumentException if a sequence is below {@code completedBelow}, or the batch is empty
+	 * @throws IllegalStateException if the entries encode to fewer than {@code entriesSize} bytes
+	 * @throws IndexOutOfBoundsException if they encode to more
+	 */
+	static EncodedBatch encodeBatch(long proposerId, long completedBelow, long[] sequences,
+			@Nullable ClientRequestId @Nullable [] clients, List<LogEntry> entries, long entriesSize,
+			boolean withRequests) {
+		if (sequences.length != entries.size() || sequences.length == 0
+				|| (clients != null && clients.length != sequences.length)) {
+			throw new IllegalArgumentException("A batch needs one entry per sequence, and at least one");
+		}
+		boolean withClients = clients != null && Arrays.stream(clients).anyMatch(Objects::nonNull);
+		long size = BATCH_HEADER_BYTES + entriesSize;
+		for (int i = 0; i < sequences.length; i++) {
+			checkSequence(completedBelow, sequences[i]);
+			size += requestOverhead(withClients, withClients ? clients[i] : null);
+		}
+		if (withRequests) {
+			for (var entry : entries) {
+				if (entry instanceof LogEntry.CreateColumn || entry instanceof LogEntry.UploadMergeOperator) {
+					withRequests = false;
+					break;
+				}
+			}
+		}
+		var out = new Output(size, withRequests);
+		var requests = withRequests ? new Request[sequences.length] : null;
+		writeBatchHeader(out, withClients, proposerId, completedBelow, sequences.length);
+		for (int i = 0; i < sequences.length; i++) {
+			out.writeLong(sequences[i]);
+			var client = withClients ? clients[i] : null;
+			if (withClients) {
+				writeClient(out, client);
+			}
+			var written = writeEntry(out, entries.get(i));
+			if (requests != null) {
+				requests[i] = new Request(proposerId, sequences[i], completedBelow, written, client);
+			}
+		}
+		return new EncodedBatch(out.finish(), requests != null ? List.of(requests) : null);
+	}
+
 	private static int requestOverhead(boolean withClients, @Nullable ClientRequestId client) {
 		return Long.BYTES + (withClients ? 1 + (client != null ? 3 * Long.BYTES : 0) : 0);
 	}
@@ -330,9 +390,17 @@ final class LogEntryCodec {
 		return entry;
 	}
 
-	private static void writeEntry(Output out, LogEntry entry) {
+	/**
+	 * Writes {@code entry}'s body. With {@link Output#slices}, returns {@code entry} as decoding the bytes in place
+	 * would read it back: its keys and values as slices of the output, its arrays as copies; otherwise, or for an entry
+	 * with no byte strings, {@code entry} itself.
+	 */
+	private static LogEntry writeEntry(Output out, LogEntry entry) {
 		switch (entry) {
-			case LogEntry.Write write -> writeWrite(out, write);
+			case LogEntry.Write write -> {
+				var written = writeWrite(out, write);
+				return written != null ? written : write;
+			}
 			case LogEntry.CreateColumn(String name, ColumnSchema schema) -> {
 				out.writeByte(CREATE_COLUMN);
 				writeString(out, name);
@@ -352,7 +420,10 @@ final class LogEntryCodec {
 				writeString(out, className);
 				out.writeBytes(jarData);
 			}
-			case LogEntry.Guarded guarded -> writeGuarded(out, guarded);
+			case LogEntry.Guarded guarded -> {
+				var written = writeGuarded(out, guarded);
+				return written != null ? written : guarded;
+			}
 			case LogEntry.VerifyColumn(String name, long columnId) -> {
 				out.writeByte(VERIFY_COLUMN);
 				writeString(out, name);
@@ -368,73 +439,98 @@ final class LogEntryCodec {
 				out.writeLong(timeoutMillis);
 			}
 		}
+		return entry;
 	}
 
-	private static void writeWrite(Output out, LogEntry.Write write) {
-		switch (write) {
-			case LogEntry.Put(long columnId, Keys keys, Buf value, RequestTypeId requestType) ->
-					writeSingle(out, PUT, columnId, keys, value, requestType);
-			case LogEntry.PutMulti(long columnId, List<Keys> keys, List<Buf> values, RequestTypeId requestType) ->
-					writeMulti(out, PUT_MULTI, columnId, keys, values, requestType);
-			case LogEntry.Delete(long columnId, Keys keys, RequestTypeId requestType) -> {
-				out.writeByte(DELETE);
-				out.writeLong(columnId);
-				writeKeys(out, keys);
+	/** Writes {@code write}; with {@link Output#slices}, returns it as read back in place, otherwise null. */
+	private static LogEntry.@Nullable Write writeWrite(Output out, LogEntry.Write write) {
+		return switch (write) {
+			case LogEntry.Put(long columnId, Keys keys, Buf value, RequestTypeId requestType) -> {
+				writeHead(out, PUT, columnId);
+				var writtenKeys = writeKeys(out, keys);
+				var writtenValue = out.writeNullableBuf(value);
 				writeRequestType(out, requestType);
+				yield out.slices ? new LogEntry.Put(columnId, writtenKeys, writtenValue, requestType) : null;
+			}
+			case LogEntry.PutMulti(long columnId, List<Keys> keys, List<Buf> values, RequestTypeId requestType) -> {
+				var writtenKeys = out.slices ? new ArrayList<Keys>(keys.size()) : null;
+				var writtenValues = out.slices ? new ArrayList<Buf>(keys.size()) : null;
+				writeMulti(out, PUT_MULTI, columnId, keys, values, requestType, writtenKeys, writtenValues);
+				yield out.slices ? new LogEntry.PutMulti(columnId, writtenKeys, writtenValues, requestType) : null;
+			}
+			case LogEntry.Delete(long columnId, Keys keys, RequestTypeId requestType) -> {
+				writeHead(out, DELETE, columnId);
+				var writtenKeys = writeKeys(out, keys);
+				writeRequestType(out, requestType);
+				yield out.slices ? new LogEntry.Delete(columnId, writtenKeys, requestType) : null;
 			}
 			case LogEntry.DeleteMulti(long columnId, List<Keys> keys, RequestTypeId requestType) -> {
-				out.writeByte(DELETE_MULTI);
-				out.writeLong(columnId);
+				writeHead(out, DELETE_MULTI, columnId);
 				out.writeInt(keys.size());
+				var writtenKeys = out.slices ? new ArrayList<Keys>(keys.size()) : null;
 				for (Keys key : keys) {
-					writeKeys(out, key);
+					var written = writeKeys(out, key);
+					if (writtenKeys != null) {
+						writtenKeys.add(written);
+					}
 				}
 				writeRequestType(out, requestType);
+				yield out.slices ? new LogEntry.DeleteMulti(columnId, writtenKeys, requestType) : null;
 			}
-			case LogEntry.Merge(long columnId, Keys keys, Buf value, RequestTypeId requestType) ->
-					writeSingle(out, MERGE, columnId, keys, value, requestType);
-			case LogEntry.MergeMulti(long columnId, List<Keys> keys, List<Buf> values, RequestTypeId requestType) ->
-					writeMulti(out, MERGE_MULTI, columnId, keys, values, requestType);
+			case LogEntry.Merge(long columnId, Keys keys, Buf value, RequestTypeId requestType) -> {
+				writeHead(out, MERGE, columnId);
+				var writtenKeys = writeKeys(out, keys);
+				var writtenValue = out.writeNullableBuf(value);
+				writeRequestType(out, requestType);
+				yield out.slices ? new LogEntry.Merge(columnId, writtenKeys, writtenValue, requestType) : null;
+			}
+			case LogEntry.MergeMulti(long columnId, List<Keys> keys, List<Buf> values, RequestTypeId requestType) -> {
+				var writtenKeys = out.slices ? new ArrayList<Keys>(keys.size()) : null;
+				var writtenValues = out.slices ? new ArrayList<Buf>(keys.size()) : null;
+				writeMulti(out, MERGE_MULTI, columnId, keys, values, requestType, writtenKeys, writtenValues);
+				yield out.slices ? new LogEntry.MergeMulti(columnId, writtenKeys, writtenValues, requestType) : null;
+			}
 			case LogEntry.DeleteRange(long columnId, Keys start, Keys end) -> {
-				out.writeByte(DELETE_RANGE);
-				out.writeLong(columnId);
-				writeNullableKeys(out, start);
-				writeNullableKeys(out, end);
+				writeHead(out, DELETE_RANGE, columnId);
+				var writtenStart = writeNullableKeys(out, start);
+				var writtenEnd = writeNullableKeys(out, end);
+				yield out.slices ? new LogEntry.DeleteRange(columnId, writtenStart, writtenEnd) : null;
 			}
-		}
+		};
 	}
 
-	private static void writeSingle(Output out,
-			byte tag,
-			long columnId,
-			Keys keys,
-			@Nullable Buf value,
-			RequestTypeId requestType) {
+	private static void writeHead(Output out, byte tag, long columnId) {
 		out.writeByte(tag);
 		out.writeLong(columnId);
-		writeKeys(out, keys);
-		out.writeNullableBuf(value);
-		writeRequestType(out, requestType);
 	}
 
-	/** Keys and values are written as pairs, so a decoded entry always has matching sizes. Values are non-null. */
+	/**
+	 * Keys and values are written as pairs, so a decoded entry always has matching sizes. Values are non-null. With
+	 * {@link Output#slices}, what was written is added to {@code writtenKeys} and {@code writtenValues}.
+	 */
 	private static void writeMulti(Output out,
 			byte tag,
 			long columnId,
 			List<Keys> keys,
 			List<Buf> values,
-			RequestTypeId requestType) {
-		out.writeByte(tag);
-		out.writeLong(columnId);
+			RequestTypeId requestType,
+			@Nullable List<Keys> writtenKeys,
+			@Nullable List<Buf> writtenValues) {
+		writeHead(out, tag, columnId);
 		out.writeInt(keys.size());
 		for (int i = 0; i < keys.size(); i++) {
-			writeKeys(out, keys.get(i));
-			out.writeBuf(values.get(i));
+			var key = writeKeys(out, keys.get(i));
+			var value = out.writeBuf(values.get(i));
+			if (writtenKeys != null) {
+				writtenKeys.add(key);
+				writtenValues.add(value);
+			}
 		}
 		writeRequestType(out, requestType);
 	}
 
-	private static void writeGuarded(Output out, LogEntry.Guarded guarded) {
+	/** Writes {@code guarded}; with {@link Output#slices}, returns it as read back in place, otherwise null. */
+	private static LogEntry.@Nullable Guarded writeGuarded(Output out, LogEntry.Guarded guarded) {
 		out.writeByte(GUARDED);
 		out.writeLong(guarded.leaderEpoch());
 		out.writeLong(guarded.snapshotIndex());
@@ -446,8 +542,12 @@ final class LogEntryCodec {
 			out.writeLong(hashes[i]);
 		}
 		out.writeInt(guarded.writes().size());
+		var writtenWrites = out.slices ? new ArrayList<LogEntry.Write>(guarded.writes().size()) : null;
 		for (LogEntry.Write write : guarded.writes()) {
-			writeWrite(out, write);
+			var written = writeWrite(out, write);
+			if (writtenWrites != null) {
+				writtenWrites.add(written);
+			}
 		}
 		long updateId = guarded.updateId();
 		var guard = guarded.guard();
@@ -457,14 +557,22 @@ final class LogEntryCodec {
 		if (updateId != 0) {
 			out.writeLong(updateId);
 		}
+		Keys writtenGuardKeys = null;
 		if (guard != null) {
 			out.writeLong(guard.columnId());
-			writeKeys(out, guard.keys());
+			writtenGuardKeys = writeKeys(out, guard.keys());
 			out.writeInt(guard.length());
 			if (guard.sha256() != null) {
 				out.write(guard.sha256(), 0, LogEntry.Guard.DIGEST_BYTES);
 			}
 		}
+		if (!out.slices) {
+			return null;
+		}
+		var writtenGuard = guard == null ? null : new LogEntry.Guard(guard.columnId(), writtenGuardKeys, guard.length(),
+				guard.sha256() != null ? guard.sha256().clone() : null);
+		return new LogEntry.Guarded(guarded.leaderEpoch(), guarded.snapshotIndex(), columns.clone(), hashes.clone(),
+				writtenWrites, guarded.singleResult(), updateId, writtenGuard);
 	}
 
 	/** Encoded size of a {@link LogEntry.Guarded} body without conflict keys, writes, update id and guard. */
@@ -473,9 +581,10 @@ final class LogEntryCodec {
 	static final int CONFLICT_KEY_BYTES = 2 * Long.BYTES;
 
 	/**
-	 * Encoded size of {@code entry}'s body as {@link #writeEntry} writes it, computed without encoding it.
+	 * Encoded size of {@code entry}'s body as {@link #writeEntry} writes it, computed without encoding it. An entry
+	 * whose size it returns encodes without failing, as long as its buffers do not change meanwhile.
 	 *
-	 * @throws IllegalArgumentException if a string of it is not valid Unicode
+	 * @throws IllegalArgumentException if a string of it is not valid Unicode, or a request type has no log code
 	 */
 	static long entrySize(LogEntry entry) {
 		return switch (entry) {
@@ -515,13 +624,17 @@ final class LogEntryCodec {
 		// Tag, column id and, except for deleteRange, the request type.
 		long size = 1 + Long.BYTES;
 		switch (write) {
-			case LogEntry.Put(_, Keys keys, Buf value, _) -> size += keysSize(keys) + nullableBufSize(value) + 1;
-			case LogEntry.Merge(_, Keys keys, Buf value, _) -> size += keysSize(keys) + nullableBufSize(value) + 1;
-			case LogEntry.Delete(_, Keys keys, _) -> size += keysSize(keys) + 1;
-			case LogEntry.PutMulti(_, List<Keys> keys, List<Buf> values, _) -> size += multiSize(keys, values) + 1;
-			case LogEntry.MergeMulti(_, List<Keys> keys, List<Buf> values, _) -> size += multiSize(keys, values) + 1;
-			case LogEntry.DeleteMulti(_, List<Keys> keys, _) -> {
-				size += Integer.BYTES + 1;
+			case LogEntry.Put(_, Keys keys, Buf value, RequestTypeId type) ->
+					size += keysSize(keys) + nullableBufSize(value) + requestTypeSize(type);
+			case LogEntry.Merge(_, Keys keys, Buf value, RequestTypeId type) ->
+					size += keysSize(keys) + nullableBufSize(value) + requestTypeSize(type);
+			case LogEntry.Delete(_, Keys keys, RequestTypeId type) -> size += keysSize(keys) + requestTypeSize(type);
+			case LogEntry.PutMulti(_, List<Keys> keys, List<Buf> values, RequestTypeId type) ->
+					size += multiSize(keys, values) + requestTypeSize(type);
+			case LogEntry.MergeMulti(_, List<Keys> keys, List<Buf> values, RequestTypeId type) ->
+					size += multiSize(keys, values) + requestTypeSize(type);
+			case LogEntry.DeleteMulti(_, List<Keys> keys, RequestTypeId type) -> {
+				size += Integer.BYTES + requestTypeSize(type);
 				for (Keys key : keys) {
 					size += keysSize(key);
 				}
@@ -530,6 +643,19 @@ final class LogEntryCodec {
 					size += 2 + (start != null ? keysSize(start) : 0) + (end != null ? keysSize(end) : 0);
 		}
 		return size;
+	}
+
+	/**
+	 * Size of a request type: one byte. Checked here, so that an entry whose size is known also encodes without
+	 * failing, as the proposer needs: it encodes a request only when its batch goes out (see {@link Proposer}).
+	 *
+	 * @throws IllegalArgumentException if it has no log code
+	 */
+	private static int requestTypeSize(RequestTypeId requestType) {
+		if (!REQUEST_TYPE_CODES.containsKey(Objects.requireNonNull(requestType, "requestType"))) {
+			throw new IllegalArgumentException("Request type has no log code: " + requestType);
+		}
+		return 1;
 	}
 
 	private static long multiSize(List<Keys> keys, List<Buf> values) {
@@ -571,19 +697,23 @@ final class LogEntryCodec {
 		return 1 + (value != null ? stringSize(value) : 0);
 	}
 
-	private static void writeKeys(Output out, Keys keys) {
+	/** Writes {@code keys}; with {@link Output#slices}, returns them as slices of the output, otherwise null. */
+	private static @Nullable Keys writeKeys(Output out, Keys keys) {
 		Buf[] segments = keys.keys();
 		out.writeInt(segments.length);
-		for (Buf segment : segments) {
-			out.writeBuf(segment);
+		var written = out.slices ? new Buf[segments.length] : null;
+		for (int i = 0; i < segments.length; i++) {
+			var segment = out.writeBuf(segments[i]);
+			if (written != null) {
+				written[i] = segment;
+			}
 		}
+		return written != null ? new Keys(written) : null;
 	}
 
-	private static void writeNullableKeys(Output out, @Nullable Keys keys) {
+	private static @Nullable Keys writeNullableKeys(Output out, @Nullable Keys keys) {
 		out.writeBoolean(keys != null);
-		if (keys != null) {
-			writeKeys(out, keys);
-		}
+		return keys != null ? writeKeys(out, keys) : null;
 	}
 
 	private static void writeRequestType(Output out, RequestTypeId requestType) {
@@ -801,15 +931,28 @@ final class LogEntryCodec {
 
 		private final byte[] array;
 		private final MemorySegment segment;
+		/**
+		 * True if {@link #writeBuf} returns a slice of the output over the bytes it wrote, as decoding in place reads
+		 * them back, so that the encoder can return what it wrote without decoding it (see
+		 * {@link #encodeBatch(long, long, long[], ClientRequestId[], List, long, boolean)}); the output must then never
+		 * change once finished.
+		 */
+		final boolean slices;
 		private int position;
 
 		/** @throws IllegalArgumentException if {@code size} is too large for an array */
 		Output(long size) {
+			this(size, false);
+		}
+
+		/** @throws IllegalArgumentException if {@code size} is too large for an array */
+		Output(long size, boolean slices) {
 			if (size > MAX_LENGTH) {
 				throw new IllegalArgumentException("Encoding too large: " + size + " bytes");
 			}
 			this.array = new byte[(int) size];
 			this.segment = MemorySegment.ofArray(array);
+			this.slices = slices;
 		}
 
 		void writeByte(int value) {
@@ -842,8 +985,11 @@ final class LogEntryCodec {
 			write(bytes, 0, bytes.length);
 		}
 
-		/** A byte string, copied straight from the buffer's backing array or segment. */
-		void writeBuf(Buf buf) {
+		/**
+		 * A byte string, copied straight from the buffer's backing array or segment. Returns the slice of the output
+		 * it was copied to if {@link #slices}, otherwise null.
+		 */
+		@Nullable Buf writeBuf(Buf buf) {
 			int size = buf.size();
 			writeInt(size);
 			byte[] backing = buf.getBackingByteArrayStrict();
@@ -852,15 +998,17 @@ final class LogEntryCodec {
 			} else {
 				MemorySegment.copy(buf.asMemorySegment(), 0, segment, position, size);
 			}
+			int from = position;
 			position += size;
+			return slices ? Buf.wrap(array, from, position) : null;
 		}
 
-		void writeNullableBuf(@Nullable Buf buf) {
+		@Nullable Buf writeNullableBuf(@Nullable Buf buf) {
 			if (buf == null) {
 				writeInt(-1);
-			} else {
-				writeBuf(buf);
+				return null;
 			}
+			return writeBuf(buf);
 		}
 
 		/** The encoding. @throws IllegalStateException if fewer bytes were written than the computed size */

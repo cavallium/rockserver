@@ -2,10 +2,14 @@ package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.buffer.MemorySegmentBuf;
+import it.cavallium.rockserver.core.common.ClientRequestId;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Delta;
@@ -76,6 +80,159 @@ class CodecEquivalenceTest {
 		// same bytes with the old codec.
 		assertArrayEquals(expected, OldLogEntryCodec.encodeBatch(LogEntryCodec.decodeBatch(expected)));
 		assertArrayEquals(expected, OldLogEntryCodec.encodeBatch(LogEntryCodec.decodeBatch(view(expected, random))));
+	}
+
+	/**
+	 * The proposer writes each entry straight into its batch: the bytes are those of the entry bodies encoded one by
+	 * one and then joined, with or without client request ids, and so the bytes the old codec wrote. The requests it
+	 * returns for the leader's own state machine are what decoding those bytes in place reads, every key and value a
+	 * slice of the bytes; for a batch with a schema change there are none. The leader's stamp before the bytes changes
+	 * nothing of what a follower decodes.
+	 */
+	@ParameterizedTest
+	@MethodSource("seeds")
+	void encodesEntriesStraightIntoTheBatchAsFromTheirBodies(long seed) {
+		var random = new Random(seed);
+		long proposerId = random.nextLong();
+		long completedBelow = random.nextInt(1000);
+		int count = 1 + random.nextInt(12);
+		var entries = new ArrayList<LogEntry>();
+		var sequences = new long[count];
+		var clients = seed % 2 == 0 ? null : new ClientRequestId[count];
+		long size = 0;
+		for (int i = 0; i < count; i++) {
+			var entry = randomEntry(random);
+			// Half of the batches without schema changes, which have requests.
+			while (seed % 4 >= 2
+					&& (entry instanceof LogEntry.CreateColumn || entry instanceof LogEntry.UploadMergeOperator)) {
+				entry = randomEntry(random);
+			}
+			entries.add(entry);
+			size += LogEntryCodec.entrySize(entry);
+			sequences[i] = completedBelow + random.nextInt(1000);
+			if (clients != null && random.nextBoolean()) {
+				long sequence = random.nextInt(100);
+				clients[i] = new ClientRequestId(1 + random.nextInt(1000), sequence, random.nextLong(sequence + 1));
+			}
+		}
+		var bodies = entries.stream().map(LogEntryCodec::encodeEntryBody).toList();
+		byte[] expected = LogEntryCodec.encodeBatch(proposerId, completedBelow, sequences, clients, bodies);
+		if (clients == null || Arrays.stream(clients).allMatch(java.util.Objects::isNull)) {
+			assertEquals(LogEntryCodec.BATCH_VERSION, expected[0]);
+			assertArrayEquals(OldLogEntryCodec.encodeBatch(proposerId, completedBelow, sequences, bodies), expected);
+		} else {
+			assertEquals(LogEntryCodec.BATCH_VERSION_CLIENTS, expected[0]);
+		}
+
+		var plain = LogEntryCodec.encodeBatch(proposerId, completedBelow, sequences, clients, entries, size, false);
+		assertArrayEquals(expected, plain.bytes());
+		assertNull(plain.requests());
+
+		var encoded = LogEntryCodec.encodeBatch(proposerId, completedBelow, sequences, clients, entries, size, true);
+		byte[] bytes = encoded.bytes();
+		assertArrayEquals(expected, bytes);
+		var requests = encoded.requests();
+		if (entries.stream().anyMatch(e -> e instanceof LogEntry.CreateColumn || e instanceof LogEntry.UploadMergeOperator)) {
+			assertNull(requests);
+			return;
+		}
+		var decoded = LogEntryCodec.decodeBatchInPlace(bytes, 0, bytes.length);
+		assertEquals(decoded.size(), requests.size());
+		for (int i = 0; i < count; i++) {
+			var request = requests.get(i);
+			var read = decoded.get(i);
+			assertEquals(read.proposerId(), request.proposerId());
+			assertEquals(read.sequence(), request.sequence());
+			assertEquals(read.completedBelow(), request.completedBelow());
+			assertEquals(read.client(), request.client());
+			assertEquals(read.entry().getClass(), request.entry().getClass());
+			if (!(read.entry() instanceof LogEntry.Guarded)) {
+				// A commit's arrays compare by identity: compared through its bytes below.
+				assertEquals(read.entry(), request.entry());
+			}
+			assertArrayEquals(LogEntryCodec.encodeEntryBody(read.entry()), LogEntryCodec.encodeEntryBody(request.entry()));
+			for (Buf buf : bufs(request.entry())) {
+				if (buf != null && buf.size() > 0) {
+					assertSame(bytes, buf.getBackingByteArrayStrict(), "a slice of the batch, not a copy");
+				}
+			}
+			if (request.entry() instanceof LogEntry.Guarded written) {
+				var original = (LogEntry.Guarded) entries.get(i);
+				assertNotSame(original.conflictColumns(), written.conflictColumns());
+				assertNotSame(original.conflictHashes(), written.conflictHashes());
+			}
+		}
+		assertArrayEquals(expected, LogEntryCodec.encodeBatch(requests));
+
+		// The leader's stamp before the same bytes: a follower decodes the same requests, and the leader's clock.
+		var stamped = new byte[LogEntryCodec.STAMP_BYTES + bytes.length];
+		System.arraycopy(LogEntryCodec.stamp(42), 0, stamped, 0, LogEntryCodec.STAMP_BYTES);
+		System.arraycopy(bytes, 0, stamped, LogEntryCodec.STAMP_BYTES, bytes.length);
+		assertEquals(42, LogEntryCodec.leaderTime(ByteBuffer.wrap(stamped)));
+		assertArrayEquals(expected, LogEntryCodec.encodeBatch(LogEntryCodec.decodeBatch(stamped)));
+		assertArrayEquals(expected, LogEntryCodec.encodeBatch(
+				LogEntryCodec.decodeBatchInPlace(stamped, 0, stamped.length)));
+	}
+
+	/** The size the caller gives must be the entries' size: a write that changed meanwhile is caught, not sent. */
+	@Test
+	void encodingEntriesIntoABatchChecksTheirSize() {
+		var entry = new LogEntry.Put(1, new Keys(Buf.wrap(new byte[] {1})), Buf.wrap(new byte[] {2}),
+				RequestTypeId.NOTHING);
+		long size = LogEntryCodec.entrySize(entry);
+		assertThrows(IndexOutOfBoundsException.class, () -> LogEntryCodec.encodeBatch(1, 0, new long[] {0}, null,
+				List.of(entry), size - 1, true));
+		assertThrows(IllegalStateException.class, () -> LogEntryCodec.encodeBatch(1, 0, new long[] {0}, null,
+				List.of(entry), size + 1, true));
+		assertThrows(IllegalArgumentException.class, () -> LogEntryCodec.encodeBatch(1, 5, new long[] {4}, null,
+				List.of(entry), size, true));
+	}
+
+	/** Every key and value of {@code entry}. */
+	private static List<Buf> bufs(LogEntry entry) {
+		var bufs = new ArrayList<Buf>();
+		switch (entry) {
+			case LogEntry.Write write -> writeBufs(write, bufs);
+			case LogEntry.Guarded guarded -> {
+				guarded.writes().forEach(write -> writeBufs(write, bufs));
+				if (guarded.guard() != null) {
+					bufs.addAll(List.of(guarded.guard().keys().keys()));
+				}
+			}
+			default -> {}
+		}
+		return bufs;
+	}
+
+	private static void writeBufs(LogEntry.Write write, List<Buf> bufs) {
+		switch (write) {
+			case LogEntry.Put(_, Keys keys, Buf value, _) -> {
+				bufs.addAll(List.of(keys.keys()));
+				bufs.add(value);
+			}
+			case LogEntry.Merge(_, Keys keys, Buf value, _) -> {
+				bufs.addAll(List.of(keys.keys()));
+				bufs.add(value);
+			}
+			case LogEntry.Delete(_, Keys keys, _) -> bufs.addAll(List.of(keys.keys()));
+			case LogEntry.PutMulti(_, List<Keys> keys, List<Buf> values, _) -> {
+				keys.forEach(k -> bufs.addAll(List.of(k.keys())));
+				bufs.addAll(values);
+			}
+			case LogEntry.MergeMulti(_, List<Keys> keys, List<Buf> values, _) -> {
+				keys.forEach(k -> bufs.addAll(List.of(k.keys())));
+				bufs.addAll(values);
+			}
+			case LogEntry.DeleteMulti(_, List<Keys> keys, _) -> keys.forEach(k -> bufs.addAll(List.of(k.keys())));
+			case LogEntry.DeleteRange(_, Keys start, Keys end) -> {
+				if (start != null) {
+					bufs.addAll(List.of(start.keys()));
+				}
+				if (end != null) {
+					bufs.addAll(List.of(end.keys()));
+				}
+			}
+		}
 	}
 
 	@Test

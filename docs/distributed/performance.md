@@ -161,6 +161,12 @@ with 11–18 s write latency. In order of discovery:
     counters or timers per write. `deleteRange` no longer flushes every memtable and syncs the WAL (hundreds of
     milliseconds on the apply thread, and small L0 files in every column). Keys and values are decoded as slices
     of the log entry instead of one array each, and merges pass their slice to RocksDB without a copy.
+16. **Leader-side copies.** Not measured yet. A local write was copied into a body of its own at submit, then into
+    the batch, and the leader then decoded the batch it had just encoded, on Ratis' request thread. Each entry is
+    now written once, straight into the batch, from its size computed at submit; on the leader the encoder returns
+    the requests as slices of the batch, and `startTransaction` takes them instead of decoding (see "Encoded once" in
+    [design.md](design.md)). Batches from followers are still decoded on the leader, as before. Compare the
+    `writes.batch` and `commits.batch` timers, the leader's CPU per operation and its allocation rate at 4×.
 
 ## Results
 

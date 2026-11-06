@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -104,8 +105,72 @@ class ProposerQueueTest {
 		}
 	}
 
+	/**
+	 * The leader starts a batch its own proposer offered from the offered requests, only for the very content they
+	 * were encoded into, and takes the offer out either way; without an offer, or after a withdrawal, it decodes.
+	 */
+	@Test
+	void theLeaderTakesAnOfferedBatchOnlyForItsOwnContent() throws Exception {
+		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
+		var config = NodeConfig.defaults("n0", peers, temp);
+		var metrics = new NodeMetrics("n0");
+		var stateMachine = new RockserverStateMachine(config, _ -> {}, metrics);
+		try {
+			var clientId = org.apache.ratis.protocol.ClientId.randomId();
+			// Genesis needs no store, which this state machine has not opened.
+			var entry = new LogEntry.Genesis("cluster", false);
+			var encoded = LogEntryCodec.encodeBatch(1, 0, new long[] {0}, null, List.of(entry),
+					LogEntryCodec.entrySize(entry), true);
+			var content = org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations.unsafeWrap(
+					encoded.bytes());
+
+			stateMachine.offerLocal(clientId, 1, content, encoded.requests());
+			assertNull(stateMachine.startTransaction(request(clientId, 1, content)).getException());
+			assertEquals(1, stateMachine.localProposalsTaken());
+			assertEquals(0, stateMachine.localProposalsOffered());
+
+			// Equal bytes, but not the content offered: decoded, and the offer is gone.
+			stateMachine.offerLocal(clientId, 2, content, encoded.requests());
+			var copy = org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(encoded.bytes());
+			assertNull(stateMachine.startTransaction(request(clientId, 2, copy)).getException());
+			assertEquals(1, stateMachine.localProposalsTaken());
+			assertEquals(0, stateMachine.localProposalsOffered());
+
+			// Withdrawn before Ratis started it (a refusal, a retry-cache answer): decoded.
+			stateMachine.offerLocal(clientId, 3, content, encoded.requests()).withdraw();
+			assertEquals(0, stateMachine.localProposalsOffered());
+			assertNull(stateMachine.startTransaction(request(clientId, 3, content)).getException());
+			assertEquals(1, stateMachine.localProposalsTaken());
+
+			// Another invocation does not take it; withdrawing the offer leaves nothing behind.
+			var offered = stateMachine.offerLocal(clientId, 4, content, encoded.requests());
+			assertNull(stateMachine.startTransaction(request(clientId, 5, content)).getException());
+			assertEquals(1, stateMachine.localProposalsOffered());
+			offered.withdraw();
+			assertEquals(0, stateMachine.localProposalsOffered());
+			assertEquals(1, stateMachine.localProposalsTaken());
+		} finally {
+			stateMachine.close();
+			metrics.close();
+		}
+	}
+
+	private static org.apache.ratis.protocol.RaftClientRequest request(org.apache.ratis.protocol.ClientId clientId,
+			long callId, org.apache.ratis.thirdparty.com.google.protobuf.ByteString content) {
+		return org.apache.ratis.protocol.RaftClientRequest.newBuilder()
+				.setClientId(clientId)
+				.setServerId(org.apache.ratis.protocol.RaftPeerId.valueOf("n0"))
+				.setGroupId(RaftGroupId.valueOf(UUID.randomUUID()))
+				.setCallId(callId)
+				.setMessage(org.apache.ratis.protocol.Message.valueOf(content))
+				.setType(org.apache.ratis.protocol.RaftClientRequest.writeRequestType())
+				.build();
+	}
+
 	private static Proposer.Pending pending() {
-		return new Proposer.Pending(1, null, new byte[1], true, System.nanoTime() + 1_000_000_000L, false, 0, -1);
+		var entry = new LogEntry.DeleteColumn(1);
+		return new Proposer.Pending(1, null, entry, (int) LogEntryCodec.entrySize(entry), true,
+				System.nanoTime() + 1_000_000_000L, false, 0, -1);
 	}
 
 	private static RocksDBErrorType failure(Proposer.Pending pending) {
