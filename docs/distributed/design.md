@@ -343,8 +343,23 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   `completedBelow`) in the request context; forwarding keeps it. Apply identifies such a request by that id instead
   of its proposer's numbering, with the session's own floor and records (`SESSION_REQUEST` keys), loaded like a
   proposer's, deleted in bulk like a proposer's. So a copy proposed by another node, after a leader change, or in an
-  entry with writes of many sessions, gets the result of the first copy. `putBatch` and `mergeBatch` chunks are not
-  numbered.
+  entry with writes of many sessions, gets the result of the first copy.
+- **What is numbered.** Writes outside transactions, commits, the write that ends an update, `deleteRange` (a copy
+  sent after later writes into the range would delete them), schema changes, and batch chunks. Schema changes:
+  `createColumn` (same name and schema) and `uploadMergeOperator` (same content) are idempotent at apply already, so
+  numbering them only lets the client resend them itself after an unknown outcome instead of failing with it; a copy
+  of `deleteColumn` or `deleteColumnIfExists` would answer "not found" or `false` for a deletion that took effect, so
+  they need it. Each costs one small record under the session. `putBatch` and `mergeBatch` are numbered per chunk:
+  the client splits its batches with the same rule as the server (`KVBatchChunks`: greedy, at most 4 MiB counting 16
+  bytes per key segment and value, so a chunk split again is that chunk) and sends each chunk as a call of its own,
+  one at a time, in order, all within the call's deadline. A node that gets a numbered batch call proposes it as one
+  entry under its request id, and refuses one that is more than one chunk (`INVALID_REQUEST`) before anything is
+  proposed, as soon as the second chunk arrives: the rest of the stream is cancelled, not read into memory (byte
+  admission only counts proposals, so a large numbered stream would otherwise sit in the heap). Batches are numbered
+  only by a server that advertises `numberedBatches` in its capabilities (besides `clientSessions`); a client talking
+  to a server without it (an older one, which ignores the id of a batch and would apply a resent chunk twice) sends
+  batches unnumbered, streamed once and never resent. A chunk that fails for good after an earlier one took effect ends the call with `INVALID_REQUEST`
+  ("partly applied"), as on the server.
 - **Leader time.** The leader prepends its clock (`LogEntryCodec.stamp`: a marker byte and 8 bytes, without copying
   the batch) to every entry that holds a session write or registration. A proposal that already starts with the
   stamp marker is refused as malformed: only the leader stamps. Apply keeps the highest stamp seen as the
@@ -364,7 +379,8 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   entry, and the record goes under the session. A copy that reaches a leader where its transaction or update is
   gone (it was committed, it expired, or another leader had it) waits for the read barrier, so every entry of
   earlier leaders is applied, and answers from the record. Without one, the commit never applied, unless a copy is
-  still unsettled on this leader in this term (in flight, or ended without an answer), which gives
+  still unsettled on this leader in this term (in flight, or ended without an answer; a mark of a later term counts
+  too, since the term is read before the barrier and the node may have lost and won leadership meanwhile), which gives
   `OUTCOME_UNKNOWN`; otherwise `UPDATE_RETRY` as before, or `SESSION_EXPIRED` if the session is gone. A copy that
   arrives while the first is in flight gets `OUTCOME_UNKNOWN` instead of a second entry, which would conflict with
   the first. The leader marks a numbered commit unsettled before anything can refuse it, and clears the mark only
@@ -374,13 +390,19 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   thread. The lookups run on the node's virtual threads, never on the control threads that complete the read
   barrier. A write staged in a transaction that carries a request id is refused (`INVALID_REQUEST`): a resent copy
   would be staged twice.
-- **The client** (`GrpcConnection`, `SessionWrites`) opens the session on its first write, numbers writes outside
-  transactions, commits, and the write that ends an update opened through it. On an unknown outcome (`UNAVAILABLE`,
+- **The client** (`GrpcConnection`, `SessionWrites`) opens the session on its first write, numbers the writes listed
+  above, the write that ends an update only when the update was opened through it. On an unknown outcome (`UNAVAILABLE`,
   `CANCELLED`, `OUTCOME_UNKNOWN`, a deadline error that does not say "not applied") it sends the same numbered
   write again, after 50 ms doubling to 1 s, to whichever node its channel reaches, until the caller's deadline (30 s
   without one). After such an outcome, a "not applied" answer (overload, deadline) also leads to another copy. A first
-  copy refused with `SESSION_EXPIRED` was not applied, and goes again under a new session; a later copy refused so
-  ends with `OUTCOME_UNKNOWN`. The caller sees `OUTCOME_UNKNOWN` only when the deadline ended the copies without an
+  copy refused with `SESSION_EXPIRED` was not applied, and goes again under a new session (at once the first time, then
+  after the same growing pause, and within the deadline: a server whose sessions keep expiring ends the write with
+  `SESSION_EXPIRED`, not applied); a later copy refused so ends with `OUTCOME_UNKNOWN`. Opening a session is retried
+  like a write after an unknown outcome (two openings only leave an unused session, which expires); writes waiting
+  for an opening that another write started open again within their own deadline, with the same growing pause, when
+  that opening ended without refusing sessions for good: an unknown outcome, overload, or a "not applied" deadline
+  error (the opener's deadline, for example while the proposer still had the registration queued). Only a definitive
+  refusal (`NOT_IMPLEMENTED`, for example) ends every write waiting for it. The caller sees `OUTCOME_UNKNOWN` only when the deadline ended the copies without an
   answer. Only a `getForUpdate` that opens an update (no transaction id) makes its id one whose write is numbered.
   Closing the connection ends the writes waiting for a resend: `OUTCOME_UNKNOWN` if a copy was sent, else
   `SERVER_OVERLOADED` (not sent).
@@ -1123,7 +1145,8 @@ threads, and what to measure, is in [performance.md](performance.md), item 11.
   failure stay applied. When a chunk fails after an earlier one was applied, the call fails with
   `INVALID_REQUEST`, whose message gives the number of chunks and keys applied, instead of the chunk's own error.
   That error could be retryable, and resending the whole batch would apply the first chunks twice. A failure of
-  the first chunk keeps its own error.
+  the first chunk keeps its own error. The core client with sessions sends each chunk as a numbered call of its own
+  (see "Client sessions"), so a lost connection mid-batch resends the chunk instead of failing the batch.
 - **Size limit.** One replicated entry (one write, multi-write or transaction commit) is limited to 16 MiB. A
   transaction write that would take its commit past that fails with `INVALID_REQUEST` when it is made.
 - **Transaction leases** are at most 60 s by default (`--max-transaction-lease-ms`), whatever the client asks
@@ -1168,7 +1191,9 @@ failover" below).
 | `ReplicationTest` (in-process) | Replication through any node; results; leader loss, including a new leader that has not applied what the old one acknowledged yet; snapshot catch-up; batches; transactions, conflicts and updates; a transaction write too large for the commit refused at once; the capped transaction lease; updates whose caller timed out or cancelled while queued, or cancelled while the update opened, do not keep the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups. |
 | `SessionApplierTest` | Client sessions at apply: a write resent through other proposers, alone or in an entry with other sessions' writes, takes effect once, also after a restart; the session's floor refuses late copies; unknown and expired sessions are rejected and not recorded, a leader clock behind does not revive them, and expired sessions are deleted; two replicas, one restarting midway, give the same results. |
-| `ClientSessionTest` (in-process) | A merge and a transaction commit whose leader dies after its followers applied them and before it answered: the client sends them again with their request ids through the next node, the merge applies once and the commit answers `true` from its record. |
+| `SessionWritesTest` (core) | The client's numbering: which writes are numbered (staged writes not, schema changes, `deleteRange` and batches yes), update ids forgotten once the update ended; a first copy refused by an expired session re-issued under a new one, a later copy so refused ending unknown, sessions that keep expiring ending at the deadline; opening retried after an unknown outcome, and again by a write that waited on another write's opening, also when that opening ended "not applied" at the opener's deadline or overloaded; batches unnumbered when the server does not advertise `numberedBatches`; batches sent as numbered chunks in order, a chunk resent with its number, a later chunk's failure reported as partly applied; closing ends waiting writes. |
+| `ClientSessionTest` (in-process) | A merge and a transaction commit whose leader dies after its followers applied them and before it answered: the client sends them again with their request ids through the next node, the merge applies once and the commit answers `true` from its record. Copies of a commit and of the write that ends an update answer "unknown" while the first is in flight, then from the record. Copies of a numbered `mergeBatch` chunk, `deleteColumnIfExists`, `deleteColumn` and `deleteRange` take effect once; a numbered batch of two chunks is refused with nothing applied; the client library sends batches as numbered chunks over gRPC, a three-chunk batch of items that fill a chunk to the byte taking exactly one number per chunk (the client's and the server's split agree after encoding); a client batch whose leader dies after committing its first chunk, unanswered, resends that chunk with its number and every key is merged exactly once. |
+| `CommitOutcomesTest` | The answer to a copy of a numbered commit whose transaction is gone: unknown while a mark of this term exists, also for a mark of a term that started while the copy's leadership barrier ran (the term is read before the barrier), "run it again" with no mark or a mark of an earlier term, the record when there is one. |
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); chains (handoff at admission, the caps on links and on the readers of one, breaks and their end, a pause for a conflicting transaction, duplicates, expiry, close, no session monitor under the log lock); history kept for open transactions and in-flight commits, up to the key cap; the commit size limit of staged writes. |
 | `PipelinedUpdatesTest` (in-process, flag on) | With the leader's apply stopped: chained updates see each other's values and nothing is acknowledged; wrong guards; plain writes, transactions and `deleteRange` against a chain; closes in mid-chain, and more of them waiting than a server's CONTROL workers and queue hold; refused operations on chained ids; second writes; merges and multi-key commits; caller gone, abandon; a snapshot and a restart inside a chain, around a rejected entry; a leader change with a chain in flight; a commit that ends without an outcome; the flag on and off at restarts, and a chained id handed to a leader without it; concurrent counters. With the flag off: the commit of an update, read back from the Raft log, has the old bytes, and a second write goes to the log. |
 | `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. With `PipelinedUpdatesTest`, the only tests that chain in a default run: the suites below run the plain per-key queue unless the property below is set, and fail if an update chains there. After each fault these three wait for an update that chains. |
@@ -1240,8 +1265,8 @@ flag on, that an update chained after each fault, and with the flag off that non
      a stamp or a `RegisterClient` entry. Start the clients after the upgrade, or with
      `-Dit.cavallium.rockserver.grpc.client.session-writes=false` until it is done.
    - Not done: writes staged in a transaction are not numbered (a resent `merge` in a transaction could stage it
-     twice), nor are `putBatch`/`mergeBatch`, `deleteRange` and schema changes; a caller that cancels its future does
-     not stop the resends; the rust client has no sessions.
+     twice); a caller that cancels its future does not stop the resends; the rust client has the proto fields,
+     `open_client_session` and `RequestContext::with_request_id`, but numbers and resends nothing by itself.
 3. **Capacity.** See [performance.md](performance.md) for the measurements on one PC and the load benchmark.
    Still to measure on the production machines and data: their fsync latency, snapshot creation and install
    time at 171 GB and at the multi-TB datasets, and log retention in bytes. Raise Yotsuba's in-flight request

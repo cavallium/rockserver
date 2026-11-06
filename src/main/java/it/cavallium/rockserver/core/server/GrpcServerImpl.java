@@ -97,6 +97,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		return Mono.just(CapabilitiesResponse.newBuilder()
 				.setWorkloadContractVersion(capabilities.workloadContractVersion())
 				.setClientSessions(capabilities.clientSessions())
+				.setNumberedBatches(capabilities.numberedBatches())
 				.build());
 	}
 

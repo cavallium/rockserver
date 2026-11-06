@@ -1,17 +1,14 @@
 package it.cavallium.rockserver.distributed;
 
-import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.KVBatch;
-import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.KVBatchChunks;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.MergeMulti;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.PutMulti;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 import org.reactivestreams.Publisher;
@@ -23,11 +20,6 @@ import static it.cavallium.rockserver.distributed.ReplicatedConnection.unwrap;
 
 /** Replicated writes proposed from this node: single writes, column creation, and batches split into chunks. */
 final class ReplicatedWrites {
-
-	/** Bytes of keys and values per replicated chunk of a batch write. */
-	private static final long BATCH_CHUNK_BYTES = 4L * 1024 * 1024;
-	/** Encoding overhead counted per key segment and per value, so many tiny items still fit in one entry. */
-	private static final long ITEM_OVERHEAD_BYTES = 16;
 
 	private final Proposer proposer;
 
@@ -55,22 +47,45 @@ final class ReplicatedWrites {
 	}
 
 	/**
-	 * Splits a batch stream into bounded replicated entries, applied in order. The caller's deadline counts from
-	 * the start of the call for every chunk. Each chunk is applied on its own, so once one was acknowledged, a later
-	 * failure (even a retryable one, such as a chunk refused before being sent) leaves the call partly applied: it
-	 * fails with {@code INVALID_REQUEST}, which clients do not resend, and says how much was applied.
+	 * Splits a batch stream into bounded replicated entries ({@link KVBatchChunks}), applied in order. The caller's
+	 * deadline counts from the start of the call for every chunk. Each chunk is applied on its own, so once one was
+	 * acknowledged, a later failure (even a retryable one, such as a chunk refused before being sent) leaves the call
+	 * partly applied: it fails with {@code INVALID_REQUEST}, which clients do not resend, and says how much was applied.
+	 *
+	 * <p>A call with a client request id is one numbered chunk of a client session (the client splits its batches the
+	 * same way and numbers each chunk): it is proposed as one entry under that id, so a copy of it takes effect once. A
+	 * numbered call that is more than one chunk is refused before anything is proposed, as soon as its second chunk
+	 * arrives: the rest of its stream is cancelled, not read.</p>
 	 */
 	CompletableFuture<Void> batch(RequestContext context, long columnId, Publisher<? extends KVBatch> batches,
 			boolean merge) {
 		long start = System.nanoTime();
+		if (context.requestId() != null) {
+			return Flux.from(batches)
+					.concatMapIterable(KVBatchChunks::split)
+					// A second chunk is enough to refuse the call: the rest of the stream is not read (and not held in memory,
+					// which byte admission, later, would not cover).
+					.take(2)
+					.collectList()
+					.toFuture()
+					.thenCompose(chunks -> {
+						if (chunks.isEmpty()) {
+							return CompletableFuture.completedFuture(null);
+						}
+						if (chunks.size() > 1) {
+							return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
+									"A numbered " + (merge ? "mergeBatch" : "putBatch") + " must fit one replicated chunk of "
+											+ KVBatchChunks.CHUNK_BYTES + " bytes; it has more than one; nothing was applied"));
+						}
+						return propose(context, start, entry(columnId, chunks.getFirst(), merge)).thenApply(_ -> null);
+					});
+		}
 		var appliedChunks = new AtomicLong();
 		var appliedKeys = new AtomicLong();
 		return Flux.from(batches)
-				.concatMapIterable(ReplicatedWrites::chunks)
+				.concatMapIterable(KVBatchChunks::split)
 				// One chunk at a time: a later chunk must not overtake an earlier one writing the same key.
-				.concatMap(chunk -> Mono.fromFuture(() -> propose(context.withRequestId(null), start, merge
-								? new LogEntry.MergeMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING)
-								: new LogEntry.PutMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING)))
+				.concatMap(chunk -> Mono.fromFuture(() -> propose(context, start, entry(columnId, chunk, merge)))
 						.doOnSuccess(_ -> {
 							appliedChunks.incrementAndGet();
 							appliedKeys.addAndGet(chunk.keys().size());
@@ -84,32 +99,9 @@ final class ReplicatedWrites {
 				.toFuture();
 	}
 
-	private static List<KVBatch.KVBatchRef> chunks(KVBatch batch) {
-		var result = new ArrayList<KVBatch.KVBatchRef>();
-		var keys = batch.keys();
-		var values = batch.values();
-		int start = 0;
-		long bytes = 0;
-		for (int i = 0; i < keys.size(); i++) {
-			long size = size(keys.get(i)) + values.get(i).size() + ITEM_OVERHEAD_BYTES;
-			if (i > start && bytes + size > BATCH_CHUNK_BYTES) {
-				result.add(new KVBatch.KVBatchRef(keys.subList(start, i), values.subList(start, i)));
-				start = i;
-				bytes = 0;
-			}
-			bytes += size;
-		}
-		if (start < keys.size()) {
-			result.add(new KVBatch.KVBatchRef(keys.subList(start, keys.size()), values.subList(start, values.size())));
-		}
-		return result;
-	}
-
-	private static long size(Keys keys) {
-		long size = 0;
-		for (Buf key : keys.keys()) {
-			size += key.size() + ITEM_OVERHEAD_BYTES;
-		}
-		return size;
+	private static LogEntry entry(long columnId, KVBatch chunk, boolean merge) {
+		return merge
+				? new LogEntry.MergeMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING)
+				: new LogEntry.PutMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING);
 	}
 }

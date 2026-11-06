@@ -130,7 +130,7 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 
 	@Override
 	public RockserverCapabilities getCapabilities() {
-		return RockserverCapabilities.CURRENT.withClientSessions(true);
+		return RockserverCapabilities.CURRENT.withClientSessions(true).withNumberedBatches(true);
 	}
 
 	/**

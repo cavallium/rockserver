@@ -5,6 +5,7 @@ use std::time::Duration;
 pub use crate::proto::{
     Changed, ColumnHashType, Delta, FirstAndLast, Kv, KvBatch, MergeBatchMode, Merged, Operation,
     Previous, PreviousPresence, PutBatchMode, RequestContext, UpdateBegin, WorkloadProfile,
+    ClientRequestId,
 };
 
 /// Opaque, database-scoped identity of an immutable RocksDB SST file.
@@ -85,7 +86,32 @@ impl RequestContext {
             profile,
             workload_contract_version: crate::REQUIRED_WORKLOAD_CONTRACT_VERSION,
             timeout_nanos,
+            request_id: None,
         }
+    }
+
+    /// This context with the number of a write of a client session (see
+    /// `RockserverClient::open_client_session`), on a replicated server that advertises `client_sessions`.
+    /// Every copy of one write must carry the same `session_id` and `sequence`: the server applies it at most
+    /// once and answers every copy with the first result. `completed_below` tells the server that every write
+    /// of the session numbered below it has its final answer and is never sent again. A write staged in a
+    /// transaction must not be numbered. Answers to watch for: gRPC `UNKNOWN` (`OUTCOME_UNKNOWN`: the write may
+    /// or may not have been applied; send the same numbered write again to learn which) and
+    /// `FAILED_PRECONDITION` with `SESSION_EXPIRED` in its message (the session is gone; a first copy was not
+    /// applied and can be sent again under a new session, a later copy's outcome stays unknown).
+    ///
+    /// A numbered `putBatch` or `mergeBatch` (only on a server that also advertises `numbered_batches`) must be
+    /// one `KVBatch` message that is one replicated chunk: the sum, over its items, of every key segment's length
+    /// plus 16, the value's length plus 16, at most 4 MiB (4194304 bytes), or a single item. The server refuses
+    /// (`INVALID_ARGUMENT`, nothing applied) a numbered call holding more, as soon as a second chunk arrives. Split
+    /// a larger batch the same way (greedy, in order) and number each chunk as its own write.
+    pub fn with_request_id(mut self, session_id: i64, sequence: i64, completed_below: i64) -> Self {
+        self.request_id = Some(ClientRequestId {
+            session_id,
+            sequence,
+            completed_below,
+        });
+        self
     }
 
     pub fn latency(timeout: Duration) -> Self {
