@@ -123,9 +123,10 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
   name and port), the connection opens a second channel to it, and sends there every call the leader serves: writes,
   transactions, updates, iterators and ranges. Point reads (`get`, `exists`, `existsMulti`, `getMulti`), maintenance
   and the handshake stay on the node of the ordinary channel. The leader's channel is used only while it is
-  connected; until then, and once a call on it ends with `UNAVAILABLE`, calls go through the ordinary channel, and a
-  follower forwards them as before. A call in flight on the leader's channel when it fails fails as on any lost
-  connection. List the nodes with the host names their peer configuration uses (`--peer`), or set the property below
+  connected; until then, and once a call on it ends with `UNAVAILABLE` or the node stops naming itself as the
+  leader, calls go through the ordinary channel, and a follower forwards them as before. A read that the retry policy
+  allows and that fails on the leader's channel before any answer runs again on the ordinary channel; any other call
+  in flight on it when it fails fails as on any lost connection. List the nodes with the host names their peer configuration uses (`--peer`), or set the property below
   to `any`.
 - When the connection to its node is lost, calls in flight fail as they do with one address: the reads that the
   automatic retry policy allows run again, on the next node, and the others surface `UNAVAILABLE`, because a write

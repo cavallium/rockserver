@@ -80,36 +80,65 @@ final class FollowerReads implements Closeable {
 		return future;
 	}
 
-	/** Sends one request for {@code batch}, then one for the reads that arrived meanwhile, until none is left. */
-	private void send(List<CompletableFuture<Long>> batch) {
-		CompletableFuture<Long> reply;
-		try {
-			reply = TermService.readIndex(channel(leaderRaftAddress()), groupId, timeout);
-		} catch (IOException | RuntimeException e) {
-			reply = CompletableFuture.failedFuture(e);
+	/**
+	 * Sends one request for {@code batch}, then one for the reads that arrived meanwhile, until none is left. A loop,
+	 * not a recursion: while no leader is known every request fails at once, and reads keep arriving meanwhile. Each
+	 * request that is still in flight continues on the thread that completes it. Whatever happens, the reads of a
+	 * batch are completed and {@link #inFlight} is cleared once nothing is left to send.
+	 */
+	private void send(@Nullable List<CompletableFuture<Long>> batch) {
+		while (batch != null) {
+			CompletableFuture<Long> reply;
+			try {
+				reply = TermService.readIndex(channel(leaderRaftAddress()), groupId, timeout);
+			} catch (Throwable e) {
+				reply = CompletableFuture.failedFuture(e);
+			}
+			if (!reply.isDone()) {
+				var sent = batch;
+				reply.whenComplete((index, error) -> send(finish(sent, index, error)));
+				return;
+			}
+			Long index = null;
+			Throwable error = null;
+			try {
+				index = reply.join();
+			} catch (Throwable e) {
+				error = ReplicatedConnection.unwrap(e);
+			}
+			batch = finish(batch, index, error);
 		}
-		reply.whenComplete((index, error) -> {
-			for (var future : batch) {
-				if (error == null) {
-					future.complete(index);
-				} else {
-					future.completeExceptionally(error);
-				}
+	}
+
+	/**
+	 * Completes the reads of {@code batch}; returns the reads that arrived meanwhile, which the caller must send, or
+	 * null after clearing {@link #inFlight}.
+	 */
+	private @Nullable List<CompletableFuture<Long>> finish(List<CompletableFuture<Long>> batch, @Nullable Long index,
+			@Nullable Throwable error) {
+		for (var future : batch) {
+			if (error == null) {
+				future.complete(index);
+			} else {
+				future.completeExceptionally(error);
 			}
-			List<CompletableFuture<Long>> following;
-			synchronized (lock) {
-				if (next.isEmpty() || closed) {
-					inFlight = false;
-					following = null;
-				} else {
-					following = next;
-					next = new ArrayList<>();
-				}
+		}
+		synchronized (lock) {
+			if (next.isEmpty() || closed) {
+				inFlight = false;
+				return null;
 			}
-			if (following != null) {
-				send(following);
-			}
-		});
+			var following = next;
+			next = new ArrayList<>();
+			return following;
+		}
+	}
+
+	/** Tests only: whether a request is in flight, or being sent. */
+	boolean inFlightForTesting() {
+		synchronized (lock) {
+			return inFlight;
+		}
 	}
 
 	/** The Raft address of the leader this node knows. */
