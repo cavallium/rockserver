@@ -56,8 +56,9 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 					estimatedBytes(page.startKeysInclusive(), page.endKeysExclusive(), page.resumeAfter()));
 			case RocksDBAPICommandStream.GetRange<?> range -> estimatedBytes(
 					range.startKeysInclusive(), range.endKeysExclusive());
-			case RocksDBAPICommandStream.ScanRawResumable scan ->
-					saturatedMultiply(scan.completedSsts().size(), RawSstToken.MAX_CHARACTERS * Character.BYTES);
+			// The tokens' own lengths: a tagged token (replicated servers only) is several times longer than a filename.
+			case RocksDBAPICommandStream.ScanRawResumable scan -> scan.completedSsts().stream()
+					.mapToLong(token -> (long) token.value().length() * Character.BYTES).sum();
 			case RocksDBAPICommandSingle.OpenTransaction _, RocksDBAPICommandSingle.CloseTransaction _,
 					RocksDBAPICommandSingle.CloseFailedUpdate _, RocksDBAPICommandSingle.CreateColumn _,
 					RocksDBAPICommandSingle.DeleteColumn _, RocksDBAPICommandSingle.DeleteColumnIfExists _,
@@ -120,12 +121,6 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 			}
 		}
 		return total;
-	}
-
-	private static long saturatedMultiply(long left, long right) {
-		return left != 0L && right > WorkloadCost.MAX_ESTIMATED_BYTES / left
-				? WorkloadCost.MAX_ESTIMATED_BYTES
-				: Math.min(WorkloadCost.MAX_ESTIMATED_BYTES, left * right);
 	}
 
 	private static long saturatedAdd(long left, long right) {

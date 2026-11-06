@@ -124,7 +124,13 @@ the Raft term that issued it (`<node>~t<term>@/000123.sst`; `RawSstToken.tagged`
 on another node, nor on the same node after a snapshot install replaced its database, which happens only while it
 follows. Tokens that come back with another tag, or none, are dropped, so their tables are scanned again (the
 consumer gets those rows twice) instead of a different table of the same name being skipped. The core client and the
-rust client accept tagged tokens; a plain server never issues them and ignores them.
+rust client accept tagged tokens and say so in the request (`ScanRawRequest.acceptsTaggedSstTokens`); a plain server
+never issues them and ignores them. Clients built before tagged tokens reject them (their token parser takes a
+filename only), so the gRPC server sends a client that does not set the flag the plain filename instead: it can
+parse it and resume, but the replicated server drops the untagged token when it comes back, so every resume of such a
+client scans the column again. Upgrade order: servers first is safe (old clients keep working, without skipping),
+then the clients, which get their skips back. The admission estimate of a resumable scan counts its tokens' own
+lengths, so a plain server's scans are not charged for tags they never carry.
 
 Forwarding uses the leader's ordinary Rockserver API through the core `GrpcConnection` (4 connections per
 peer, without gRPC's own retries; a port probe first, so a dead peer fails in milliseconds). The forwarding
@@ -967,7 +973,9 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   replaced them in the database. Budget disk space for the database plus at least one older snapshot's
   compacted-away files, more while installs run. On a follower, a failed install leaves its partial copy until
   the server restarts, a newer install starts, or its files did not change for 10 minutes (the leader's own read
-  lease of a snapshot being sent): the maintenance loop then deletes it. An install that is only that slow fails at
+  lease of a snapshot being sent): a cleanup thread of its own then deletes it. It is not the maintenance thread,
+  which pauses the API on a hung disk and steps down a leader whose log stopped: that thread does no disk I/O and
+  takes no install lock, so a hung disk cannot hold it back. An install that is only that slow fails at
   its next chunk and Ratis starts it over.
 - **Damaged installs.** A snapshot that a crash damaged during install makes the replica fail loudly; it is not
   silently ignored.
@@ -1284,8 +1292,8 @@ failover" below).
 | `ClusterIdentityTest` | Each genesis gets its own id, and a second `Genesis` in a log changes nothing. A node that elected itself under the same group id, added with Ratis' own client, stops before the configuration changes, and writes go on. What `add-peer` refuses. |
 | `RatisContractTest` | The Ratis 3.3.1 behaviors that the design relies on beyond its API, against real servers in the JVM: the bootstrap and configuration meta files that `--join` safety reads, and the initializing state of a server started with an empty group (no election, no bootstrap file); the open segment format that `RaftLogRepair` rewrites; the type of the full-pending-queue refusal; a state machine refusal that reaches a remote client by class name and message, without a step down; `NotLeaderException` for an entry appended by a leader that then steps down (three servers); a transfer without a new leader that steps down; the 3 s wait of `GrpcUtil.shutdownManagedChannel` with a call in flight; a snapshot chunk held on the heap until its timeout by `StreamObserverWithTimeout`; a leader whose log worker is stopped (`LogWorkerGate`) commits nothing until it flushes; the CPU of the appender to a dead follower (printed, bounded at half a core). The match index moving only on replies with entries, and the follower order of `LeaderStall`, are pinned by `LeaderStallTest`. |
 | `RaftSettingsTest`, `ByteAdmissionTest`, `ConflictPositionsTest` | Snapshot chunks stay at most 4 s on the heap; Ratis' pending-request limits hold every node's attempts and stay near the defaults, and the byte limit grows with a peer list of more than 4 nodes; one entry of the largest size fits every limit on its way. The byte admission never exceeds its limit and is sized from the heap. Conflict positions survive the exception that Ratis rebuilds, and a text that does not parse is a conflict of the whole entry. |
-| `SstMaintenanceTest` (in-process) | `scanRawResumable`, `getSstMetadata` and `getTableProperties` through a follower describe the leader's database; raw-scan tokens carry the leader and its term and skip their tables through any node, while tokens of another node or term, or untagged ones, scan them again; `compactFiles` of the internal column is refused. |
-| `ColumnIteratorsTest`, `SnapshotBackoffTest`, `DiskProbeTest`, `AddPeerCheckTest` | Applying a column deletion closes the column's iterators instead of waiting for them, and an unknown iterator answers `UPDATE_RETRY` (the database's error for it is pinned); a failing snapshot is tried again only after its delay (1 s doubling to a minute), on a cluster too; a disk probe that does not end within the limit means a hung disk, until it ends; `add-peer` waits for a majority of the members to answer. |
+| `SstMaintenanceTest` (in-process) | `scanRawResumable`, `getSstMetadata` and `getTableProperties` through a follower describe the leader's database; raw-scan tokens carry the leader and its term and skip their tables through any node, while tokens of another node or term, or untagged ones, scan them again; over gRPC a client that does not set `acceptsTaggedSstTokens` gets plain filenames; `compactFiles` of the internal column is refused. |
+| `ColumnIteratorsTest`, `SnapshotBackoffTest`, `DiskProbeTest`, `AddPeerCheckTest`, `ProposerResetTest`, `ShutdownSignalTest` | Applying a column deletion closes the column's iterators instead of waiting for them, and an unknown iterator answers `UPDATE_RETRY` (the database's error for it is pinned); a failing snapshot is tried again only after its delay (1 s doubling to a minute), on a cluster too; a disk probe that does not end within the limit means a hung disk, until it ends; `add-peer` waits for a majority of the members to answer; a proposer's connection reset returns once the failed proxy left Ratis' map, before its slow close, so a resend gets a new one; the shutdown hook's stop waits for a node whose replica failure was already stopping it, and gives 3. |
 | `LeaderStallTest` | The rule of `LeaderStall`; follower next indices, which Ratis gives without ids, pair with ids only when the follower list read before and after them is the same; the bound that grows and comes back, and the rule of a log that stops, which a real leader with a stopped log worker follows within seconds. A graceful stop of the leader with one node down, followed by a restart at once, loses no reply and costs no step down. With one node down, the reply to a new leader's first entry is lost on a link, after the entry reached the follower's disk: nothing commits and the leader stays, until it steps down and a write gets through. The same loss after the first commit heals with the next write. A leader behind in applying does not step down. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
 | `MembershipTest` | A node started with `--join` replaces a lost leader, however long before its `add-peer` it started and after a restart in between, catches up from a snapshot, and restarts with or without the option. A node removed while it runs exits. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. A node of a seeded cluster is replaced whichever node leads. One step replacement of a lost leader, a lost follower, seeded or not, and of a leader that runs. `add-peer` refuses a node with a log of its own and a node started without `--join`, and fails at once without its node; a change without a majority ends at its limit; `--join` after a start without it is refused; `admin snapshot`; the warnings of a node that stays outside. |
@@ -1397,22 +1405,31 @@ flag on, that an update chained after each fault, and with the flag off that non
      travels in Ratis' reply (at most 18 MiB on the wire) and is recorded for copies of the write, so a larger one
      would need a channel of its own from the leader's apply to the caller's node, and a record kept outside the
      database. A caller that needs previous values of that size splits the write.
-   - The log kept behind a snapshot is counted in entries (`--snapshot-every`), not bytes: Ratis 3.3.1 keeps the
-     last N entries of the log at every purge (`purgePreservation`, read once at the start and counted from the end
-     of the log), and offers no bound in bytes, nor a hook to purge further. So with entries near the 16 MiB maximum,
-     lower `--snapshot-every`: the log kept is at most that many entries of that size, besides what the members that
-     are behind hold back. A failing snapshot is no longer tried at every applied entry: after a failure,
+   - The log kept behind a snapshot is counted in entries, not bytes. Ratis 3.3.1 keeps the last N entries of the
+     log at every purge (`purgePreservation`, read once at the start and counted from the end of the log) and has no
+     byte limit of its own; N is this project's choice, set to `--snapshot-every`. A count derived from a byte
+     budget, min(`--snapshot-every`, budget / 16 MiB), would bound the worst case, but only through the largest
+     entry: a 4 GiB budget gives 256 entries, which with the usual entries of a few KiB to a few hundred KiB is
+     seconds of writes, and a node restarted during a deploy would then need a snapshot install instead of catching
+     up from the log, which is what the margin is for. Ratis cannot size the count from the entries actually
+     written, so the margin stays a count tied to the snapshot interval. A deployment whose entries are near the
+     16 MiB maximum bounds the retained log by lowering `--snapshot-every` (at most that many entries of that size,
+     besides what the members that are behind hold back), at the cost of more frequent checkpoints, each a
+     100-300 ms pause of the apply. A failing snapshot is no longer tried at every applied entry: after a failure,
      `takeSnapshot` answers "no snapshot" (which Ratis passes over without an error or a purge) for 1 s, doubling with
      each failure in a row up to a minute; the snapshots by bytes wait for the same delay.
    - Iterator calls after a leader change get `UPDATE_RETRY` (see "Leader changes").
    - The snapshot taken right after a seeded genesis is attempted once, on the leader only.
-   - A SIGTERM that races a replica failure exits with 3: the shutdown hook halts with 3 once the node closed if
-     the replica had failed meanwhile (the failure's own stop found the node already closing). Not tested in a
-     process yet.
+   - A SIGTERM that races a replica failure exits with 3: the shutdown hook closes the node, then waits until it
+     stopped (also when the failure's own stop was already closing it, for at most twice the database's 1-minute
+     close timeout), so that the JVM does not exit while RocksDB still closes, and halts with 3 if the replica had
+     failed meanwhile. `ShutdownSignalTest` checks the hook's stop in process; a real SIGTERM in a process test is
+     still to run.
 8. **Upstream.** Report the Ratis ReadIndex reuse bug, and switch back to Ratis ReadIndex once it is fixed
    upstream. Also to report (drafts in the round-3 notes), none of them blocking:
    - `GrpcUtil.shutdownManagedChannel` waits 3 s, then 2 s more, on the thread that resets a peer's proxy; worked
-     around by `Proposer.resetConnection`.
+     around by `Proposer.resetConnection`, which resets on a thread of its own and waits only until Ratis took the
+     failed proxy out of its map (so a resend to the same peer gets a new channel, not the one being closed).
    - The two `ResourceUnavailableException`s of the pending-request limit (before and after the append) differ only
      by their message: a typed refusal before the append would let `Proposer` stop matching text.
    - `GrpcLogAppender.getWaitTimeMs` waits 0 ms while it has no stream to a follower, a spin until the next

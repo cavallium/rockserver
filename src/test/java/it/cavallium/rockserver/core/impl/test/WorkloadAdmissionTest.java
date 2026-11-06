@@ -233,9 +233,10 @@ class WorkloadAdmissionTest {
 				RequestType.allInRange(), new RangeBudget(8, 64)).estimatedBytes());
 		assertEquals(7L, new RocksDBAPICommandStream.GetRange<>(
 				0, 1, keys(3), keys(4), false, RequestType.allInRange()).estimatedBytes());
-		assertEquals((long) RawSstToken.MAX_CHARACTERS * Character.BYTES,
-				new RocksDBAPICommandStream.ScanRawResumable(
-						1, 0, 1, Set.of(new RawSstToken("000123.sst"))).estimatedBytes());
+		assertEquals(20L, new RocksDBAPICommandStream.ScanRawResumable(
+				1, 0, 1, Set.of(new RawSstToken("000123.sst"))).estimatedBytes());
+		assertEquals(2L * "n1~t7@/000123.sst".length() + 20L, new RocksDBAPICommandStream.ScanRawResumable(
+				1, 0, 1, Set.of(new RawSstToken("n1~t7@/000123.sst"), new RawSstToken("000124.sst"))).estimatedBytes());
 
 		var saturated = new RocksDBAPICommandSingle.GetRangePage<>(
 				0, 1, keys(1), null, false, null,

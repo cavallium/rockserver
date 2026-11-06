@@ -251,6 +251,9 @@ message ScanRawRequest {
   repeated string completedSstTokens = 5;
   bool resumable = 6;
   reserved 7;
+  // The client accepts completion tokens tagged with their origin, <origin>@<filename> (see RawSstToken). A server
+  // sends a client that does not set it plain filenames only, which clients built before tagged tokens can parse.
+  bool acceptsTaggedSstTokens = 8;
 }
 /*
 

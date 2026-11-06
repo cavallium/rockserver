@@ -90,6 +90,11 @@ class SstMaintenanceTest {
 		var untagged = tokens.stream().map(RawSstToken::untagged).collect(Collectors.toSet());
 		assertEquals(batches(first), batches(viaLeader.scanRawResumable(column, 0, 1, untagged).toList()));
 
+		// Over gRPC, through the follower: a client that does not accept tagged tokens (built before them) gets plain
+		// filenames, which it can parse; one that does gets the leader's tags.
+		assertEquals(untagged, grpcTokens(follower, column, false));
+		assertEquals(tokens, grpcTokens(follower, column, true));
+
 		// The metadata comes from the leader, whichever node is asked: the same session and files.
 		var fromLeader = viaLeader.getSstMetadata(column, -1);
 		var fromFollower = viaFollower.getSstMetadata(column, -1);
@@ -140,6 +145,41 @@ class SstMaintenanceTest {
 
 	private static long batches(List<RawScanEvent> events) {
 		return events.stream().filter(RawScanEvent.Batch.class::isInstance).count();
+	}
+
+	private static Set<RawSstToken> grpcTokens(ReplicatedNode node, long column, boolean acceptsTagged) {
+		var channel = io.grpc.netty.NettyChannelBuilder.forAddress(node.config().self().apiHost(),
+				node.config().self().apiPort()).usePlaintext().build();
+		try {
+			var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
+					.setWorkloadContractVersion(3)
+					.setTimeoutNanos(Duration.ofSeconds(20).toNanos())
+					.build();
+			var request = it.cavallium.rockserver.core.common.api.proto.ScanRawRequest.newBuilder()
+					.setColumnId(column)
+					.setShardCount(1)
+					.setContext(context)
+					.setResumable(true)
+					.setAcceptsTaggedSstTokens(acceptsTagged)
+					.build();
+			var responses = it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.newBlockingStub(channel)
+					.scanRaw(request);
+			var result = new HashSet<RawSstToken>();
+			while (responses.hasNext()) {
+				var response = responses.next();
+				if (response.hasCompletedSstTokenAfterBatch()) {
+					// The constructor of the clients built before tagged tokens accepts only plain filenames.
+					result.add(new RawSstToken(response.getCompletedSstTokenAfterBatch()));
+				}
+				if (response.getEventCase() == it.cavallium.rockserver.core.common.api.proto.ScanRawResponse.EventCase.COMPLETEDSSTTOKEN) {
+					result.add(new RawSstToken(response.getCompletedSstToken()));
+				}
+			}
+			return result;
+		} finally {
+			channel.shutdownNow();
+		}
 	}
 
 	private static Set<RawSstToken> retag(Set<RawSstToken> tokens, String origin) {

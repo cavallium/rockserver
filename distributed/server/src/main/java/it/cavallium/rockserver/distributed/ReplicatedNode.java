@@ -47,7 +47,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	private static final Logger LOG = LoggerFactory.getLogger(ReplicatedNode.class);
 	private static final long LEADERSHIP_TRANSFER_TIMEOUT_MS = 5_000;
 	private static final long MAINTENANCE_INTERVAL_MS = 200;
-	private static final Duration DATABASE_CLOSE_TIMEOUT = Duration.ofMinutes(1);
+	static final Duration DATABASE_CLOSE_TIMEOUT = Duration.ofMinutes(1);
 	/** How long a node that handed over its leadership waits for its successor's first commit. */
 	private static final Duration SUCCESSOR_COMMIT_WAIT = Duration.ofSeconds(3);
 	private static final long SUCCESSOR_COMMIT_POLL_MS = 10;
@@ -77,6 +77,12 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * own, so that it does not hold back {@link #gateApi} and {@link #watchRaft} (and {@link LeaderStall}).
 	 */
 	private final ScheduledExecutorService initialization;
+	/**
+	 * Runs {@link #discardFailedInstalls}, which lists, walks and renames in the data directory: on a thread of its own,
+	 * so that a hung disk or Ratis threads holding the install lock never hold back {@link #gateApi} and
+	 * {@link #watchRaft}, which must notice exactly that disk (see "Hung disk" in the design document).
+	 */
+	private final ScheduledExecutorService installCleanup;
 	/** The node's control plane and local command threads, see {@link NodeThreads}. */
 	private final NodeThreads threads;
 	/** Only used on the maintenance thread. */
@@ -177,6 +183,8 @@ public final class ReplicatedNode implements AutoCloseable {
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-maintenance").factory());
 			this.initialization = Executors.newSingleThreadScheduledExecutor(
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-initialization").factory());
+			this.installCleanup = Executors.newSingleThreadScheduledExecutor(
+					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-install-cleanup").factory());
 			this.apiGate = ApiGate.forElectionTimeout(config.electionTimeoutMax(), hadLeaderBeforeStart(), System.nanoTime());
 			diskProbe.start();
 			initialization.scheduleWithFixedDelay(this::initializeCluster, 0, MAINTENANCE_INTERVAL_MS,
@@ -185,6 +193,8 @@ public final class ReplicatedNode implements AutoCloseable {
 					TimeUnit.MILLISECONDS);
 			maintenance.scheduleWithFixedDelay(this::watchRaft, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
+			installCleanup.scheduleWithFixedDelay(this::discardFailedInstalls, MAINTENANCE_INTERVAL_MS,
+					MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 			var appendLag = metrics.amount("lag.uncommitted");
 			var applyLag = metrics.amount("lag.unapplied");
 			var flushLag = metrics.amount("lag.unflushed");
@@ -425,8 +435,6 @@ public final class ReplicatedNode implements AutoCloseable {
 				return;
 			}
 			warnWhileInitializing(division);
-			// Deletes the partial copies of failed snapshot installations also while nothing else reads the snapshot.
-			stateMachine.getLatestSnapshot();
 			warnAbovePendingLimit(division);
 			var log = division.getRaftLog();
 			long commitIndex = log.getLastCommittedIndex();
@@ -450,6 +458,20 @@ public final class ReplicatedNode implements AutoCloseable {
 			}
 		} catch (IOException | RuntimeException ex) {
 			LOG.warn("{}: failed to check Raft, retrying", config.nodeId(), ex);
+		}
+	}
+
+	/**
+	 * Deletes the partial copies of failed snapshot installations also while nothing else reads the snapshot. Install
+	 * cleanup thread only: it does disk I/O and takes the install lock, so it must stay off the maintenance thread.
+	 */
+	private void discardFailedInstalls() {
+		try {
+			if (!closed.get()) {
+				stateMachine.getLatestSnapshot();
+			}
+		} catch (RuntimeException ex) {
+			LOG.warn("{}: failed to discard abandoned snapshot installations, retrying", config.nodeId(), ex);
 		}
 	}
 
@@ -735,6 +757,9 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 		if (initialization != null) {
 			initialization.shutdownNow();
+		}
+		if (installCleanup != null) {
+			installCleanup.shutdownNow();
 		}
 		metrics.close();
 		IOException failure = null;

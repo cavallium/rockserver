@@ -1240,7 +1240,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				.setShardIndex(shardIndex)
 				.setShardCount(shardCount)
 				.setContext(currentWireRequestContext())
-				.setResumable(true);
+				.setResumable(true)
+				.setAcceptsTaggedSstTokens(true);
 		for (RawSstToken completedSst : completedSsts) {
 			request.addCompletedSstTokens(completedSst.value());
 		}
