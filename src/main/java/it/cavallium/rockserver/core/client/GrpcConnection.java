@@ -278,7 +278,15 @@ public final class GrpcConnection extends BaseConnection {
 
 	@Override
 	public void close() {
-		delegate.close();
+		var writes = sessionWrites;
+		try {
+			delegate.close();
+		} finally {
+			// After the channel: the calls it fails end as unknown, and those waiting for a resend end here.
+			if (writes != null) {
+				writes.close();
+			}
+		}
 	}
 }
 

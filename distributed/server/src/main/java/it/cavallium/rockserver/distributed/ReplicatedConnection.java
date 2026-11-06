@@ -119,6 +119,9 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 	 */
 	private final java.util.concurrent.ConcurrentHashMap<SessionWrite, Long> unsettledCommits =
 			new java.util.concurrent.ConcurrentHashMap<>();
+	/** Size of {@link #unsettledCommits} at which {@link #pruneUnsettled} runs next. */
+	private final AtomicLong pruneUnsettledAt = new AtomicLong(MIN_PRUNE_UNSETTLED);
+	private static final long MIN_PRUNE_UNSETTLED = 1024;
 	/** A follower further behind the leader's read index than this many log entries forwards a read instead. */
 	private static final long FOLLOWER_READ_MAX_LAG = 1024;
 	/**
@@ -412,7 +415,7 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 			if (!isLeader()) {
 				return forwardStream(context, command);
 			}
-			return Mono.fromFuture(barrier::awaitLeadership)
+			return Mono.fromFuture(this::leadership)
 					.onErrorMap(ReplicatedConnection::barrierFailure)
 					.thenMany(Flux.defer(() -> localStream(context, command)));
 		});
@@ -445,7 +448,7 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 					: forward(context, command);
 		}
 		long start = System.nanoTime();
-		return barrier.awaitLeadership().handle((_, error) -> {
+		return leadership().handle((_, error) -> {
 			barrierTime.since(start);
 			if (error == null) {
 				// The time spent confirming leadership counts toward the read's timeout.
@@ -937,7 +940,7 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 		// native transaction gets the same lease, so that both expire together.
 		var lease = transactionLease(command.transactionLeaseTtl(), config.maxTransactionLease());
 		var open = lease.equals(command.transactionLeaseTtl()) ? command : new OpenTransaction(lease);
-		return barrier.awaitLeadership().handle((_, error) -> {
+		return leadership().handle((_, error) -> {
 			if (error != null) {
 				throw new CompletionException(barrierFailure(unwrap(error)));
 			}
@@ -971,7 +974,7 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 		// Leadership is confirmed while the update waits for its key: any confirmation after the request arrived will
 		// do, and the session's term is checked again when the update opens.
 		long term = currentTerm();
-		var leadership = barrier.awaitLeadership().whenComplete((_, _) -> barrierTime.since(start));
+		var leadership = leadership().whenComplete((_, _) -> barrierTime.since(start));
 		long hash = ConflictTracker.keyHash(command.columnId(), command.keys());
 		var waiter = new CompletableFuture<LeaderSession.KeyLock>();
 		if (session.pipelined()) {
@@ -1163,23 +1166,28 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 			throw new RocksDBRetryException();
 		}
 		if (transaction.update) {
-			if (unsettled(context, session)) {
-				// A copy of this write whose commit is in flight: the update stays as it is.
-				throw earlierCopyInFlight();
-			}
-			if (session.pipelined() && !transaction.startCommit()) {
-				// A second write on this id: the first commit stays in flight, and the update with it.
-				throw new RocksDBRetryException();
-			}
-			if (transaction.chained() && transaction.base.failed()) {
-				// It read a value that was never written: its guard would reject it.
-				session.remove(transaction);
-				throw new RocksDBRetryException();
+			// Marked before anything can refuse it, and until the update left the session: a copy of this write that
+			// arrives meanwhile answers "unknown", never "not applied" nor a second commit.
+			var marked = markUnsettled(context, session);
+			try {
+				if (session.pipelined() && !transaction.startCommit()) {
+					// A second write on this id: the first commit stays in flight, and the update with it.
+					throw new RocksDBRetryException();
+				}
+				if (transaction.chained() && transaction.base.failed()) {
+					// It read a value that was never written: its guard would reject it.
+					session.remove(transaction);
+					throw new RocksDBRetryException();
+				}
+			} catch (RuntimeException refused) {
+				settle(marked, null);
+				throw refused;
 			}
 			var entry = transaction.updateEntry(session.term(), write, keys, session.pipelined());
 			return commit(context, session, transaction, entry).handle((result, error) -> {
 				session.remove(transaction);
 				rollBackNativeQuietly(transaction.id, true);
+				settle(marked, error);
 				// After remove: the commit can be admitted up to the moment its key is released. The link can only be this
 				// commit's own, see startCommit.
 				var link = transaction.link();
@@ -1197,6 +1205,11 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 				throw new CompletionException(cause instanceof Proposer.ConflictException
 						? new RocksDBRetryException() : cause);
 			});
+		}
+		if (context.requestId() != null) {
+			// A client resends a numbered write after an unknown outcome: a staged write sent twice would be staged twice.
+			throw RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
+					"A write staged in a transaction cannot carry a client request id");
 		}
 		var staged = stagedOnly(write);
 		// Refused before it is staged if the commit could not carry it, instead of failing the commit at the end.
@@ -1252,14 +1265,19 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 			rollBackNativeQuietly(transaction.id, false);
 			return CompletableFuture.completedFuture(true);
 		}
-		if (unsettled(context, session)) {
-			// A copy of this commit is in flight: the transaction stays as it is.
-			throw earlierCopyInFlight();
+		// Marked until the transaction left the session (see stagedWrite).
+		var marked = markUnsettled(context, session);
+		LogEntry.Guarded entry;
+		try {
+			entry = transaction.commitEntry(session.term());
+		} catch (RuntimeException refused) {
+			settle(marked, null);
+			throw refused;
 		}
-		var entry = transaction.commitEntry(session.term());
 		if (entry.writes().isEmpty() && entry.conflictHashes().length == 0) {
 			session.remove(transaction);
 			rollBackNativeQuietly(transaction.id, false);
+			settle(marked, null);
 			return CompletableFuture.completedFuture(true);
 		}
 		return commit(context, session, transaction, entry).handle((_, error) -> {
@@ -1269,10 +1287,12 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 				if (session.yieldChainsTo(entry)) {
 					transactionChainConflicts.record(1);
 				}
+				settle(marked, null);
 				return false;
 			}
 			session.remove(transaction);
 			rollBackNativeQuietly(transaction.id, false);
+			settle(marked, error);
 			if (error != null) {
 				throw new CompletionException(unwrap(error));
 			}
@@ -1288,35 +1308,78 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 			LeaderSession session,
 			LeaderSession.OpenTransaction transaction,
 			LogEntry.Guarded entry) {
-		var write = SessionWrite.of(context);
-		long term = session.term();
-		if (write != null) {
-			var previous = unsettledCommits.put(write, term);
-			if (previous != null && previous == term) {
-				// A copy of this commit is in flight on this leader: a second entry would conflict with the first.
-				return CompletableFuture.failedFuture(earlierCopyInFlight());
-			}
-			if (unsettledCommits.size() > 4096) {
-				unsettledCommits.values().removeIf(markTerm -> markTerm < term);
-			}
-		}
 		var pin = session.pin(transaction.snapshotIndex);
 		long start = System.nanoTime();
 		return proposer.proposeOnce(entry, remainingNanos(context, start), context.requestId())
 				.whenComplete((_, error) -> {
 					commitTime.since(start);
 					session.unpin(pin);
-					if (write != null && (error == null || !isOutcomeUnknown(unwrap(error)))) {
-						unsettledCommits.remove(write, term);
-					}
 				});
 	}
 
-	/** True if a commit of the client session write of {@code context} is unsettled in this leader's term. */
-	private boolean unsettled(RequestContext context, LeaderSession session) {
+	/** A commit of a client session write, marked unsettled in a term. */
+	private record Marked(SessionWrite write, long term) {}
+
+	/**
+	 * Marks the commit of the client session write of {@code context} unsettled in {@code session}'s term, until
+	 * {@link #settle}: null for a commit without a request id. Throws {@code OUTCOME_UNKNOWN} if a copy of it is
+	 * unsettled in this term already, leaving that copy's transaction as it is.
+	 */
+	private @Nullable Marked markUnsettled(RequestContext context, LeaderSession session) {
 		var write = SessionWrite.of(context);
-		Long term = write == null ? null : unsettledCommits.get(write);
-		return term != null && term == session.term();
+		if (write == null) {
+			return null;
+		}
+		long term = session.term();
+		var previous = unsettledCommits.put(write, term);
+		if (previous != null && previous == term) {
+			throw earlierCopyInFlight();
+		}
+		if (unsettledCommits.size() >= pruneUnsettledAt.get()) {
+			pruneUnsettled(term);
+		}
+		return new Marked(write, term);
+	}
+
+	/**
+	 * Ends the mark of a commit once its transaction or update left the session: unless its outcome is unknown, in
+	 * which case its entry may still be applied in this term, and the mark stays until its record exists
+	 * ({@link #settledCommit}, {@link #pruneUnsettled}) or the term ends.
+	 */
+	private void settle(@Nullable Marked marked, @Nullable Throwable error) {
+		if (marked != null && (error == null || !isOutcomeUnknown(unwrap(error)))) {
+			unsettledCommits.remove(marked.write(), marked.term());
+		}
+	}
+
+	/**
+	 * Drops the marks of earlier terms and those whose record exists, on a virtual thread (it reads the database).
+	 * Runs once the map doubled since the last run, so a commit does not scan it each time.
+	 */
+	private void pruneUnsettled(long term) {
+		long size = unsettledCommits.size();
+		long at = pruneUnsettledAt.get();
+		if (size < at || !pruneUnsettledAt.compareAndSet(at, Long.MAX_VALUE)) {
+			return;
+		}
+		try {
+			inline.execute(() -> {
+				try {
+					unsettledCommits.entrySet().removeIf(mark -> mark.getValue() < term
+							|| stateMachine.recordedResult(new it.cavallium.rockserver.core.common.ClientRequestId(
+									mark.getKey().sessionId(), mark.getKey().sequence(), 0)) != null);
+				} finally {
+					pruneUnsettledAt.set(Math.max(MIN_PRUNE_UNSETTLED, 2L * unsettledCommits.size()));
+				}
+			});
+		} catch (java.util.concurrent.RejectedExecutionException stopping) {
+			pruneUnsettledAt.set(at);
+		}
+	}
+
+	/** Test hook: the commits of session writes marked unsettled. */
+	int unsettledCommitsForTesting() {
+		return unsettledCommits.size();
 	}
 
 	private static boolean isOutcomeUnknown(Throwable error) {
@@ -1336,13 +1399,29 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 	 * runs the transaction again ({@code UPDATE_RETRY}), as without sessions. A session that is gone has no records
 	 * any more: {@code SESSION_EXPIRED}.
 	 */
+	/**
+	 * {@link ReadBarrier#awaitLeadership}, completed on a virtual thread of {@link #inline}: the barrier completes its
+	 * futures on the node's few control threads, which must never wait for the database, and its continuations here
+	 * read the database, open transactions or start streams.
+	 */
+	private CompletableFuture<Void> leadership() {
+		return barrier.awaitLeadership().whenCompleteAsync((_, _) -> {}, inline);
+	}
+
 	private CompletableFuture<?> settledCommit(it.cavallium.rockserver.core.common.ClientRequestId id) {
 		long term = currentTerm();
-		return barrier.awaitLeadership().handle((_, error) -> {
+		var write = new SessionWrite(id.sessionId(), id.sequence());
+		return leadership().handle((_, error) -> {
 			if (error != null) {
 				throw new CompletionException(barrierFailure(error));
 			}
+			// The mark first: a commit removes it only after its record is in the database, so no mark and then no record
+			// proves that no copy applied in this term.
+			Long unsettledTerm = unsettledCommits.get(write);
 			var recorded = stateMachine.recordedResult(id);
+			if (recorded != null && unsettledTerm != null) {
+				unsettledCommits.remove(write, unsettledTerm);
+			}
 			if (recorded != null) {
 				return switch (recorded) {
 					case ApplyResult.Ok ok -> ok.value();
@@ -1353,7 +1432,6 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 							RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Invalid record"));
 				};
 			}
-			Long unsettledTerm = unsettledCommits.get(new SessionWrite(id.sessionId(), id.sequence()));
 			if (unsettledTerm != null && unsettledTerm == term) {
 				throw new CompletionException(earlierCopyInFlight());
 			}

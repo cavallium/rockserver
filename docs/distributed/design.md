@@ -317,7 +317,13 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   still unsettled on this leader in this term (in flight, or ended without an answer), which gives
   `OUTCOME_UNKNOWN`; otherwise `UPDATE_RETRY` as before, or `SESSION_EXPIRED` if the session is gone. A copy that
   arrives while the first is in flight gets `OUTCOME_UNKNOWN` instead of a second entry, which would conflict with
-  the first.
+  the first. The leader marks a numbered commit unsettled before anything can refuse it, and clears the mark only
+  after the transaction or update left its session, unless the outcome was unknown: then the mark stays until the
+  record exists or the term ends. A copy reads the mark before the record, so "no mark, no record" proves that no
+  copy applied. Marks of earlier terms and marks whose record exists are dropped once the map doubled, on a virtual
+  thread. The lookups run on the node's virtual threads, never on the control threads that complete the read
+  barrier. A write staged in a transaction that carries a request id is refused (`INVALID_REQUEST`): a resent copy
+  would be staged twice.
 - **The client** (`GrpcConnection`, `SessionWrites`) opens the session on its first write, numbers writes outside
   transactions, commits, and the write that ends an update opened through it. On an unknown outcome (`UNAVAILABLE`,
   `CANCELLED`, `OUTCOME_UNKNOWN`, a deadline error that does not say "not applied") it sends the same numbered
@@ -325,7 +331,9 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   without one). After such an outcome, a "not applied" answer (overload, deadline) also leads to another copy. A first
   copy refused with `SESSION_EXPIRED` was not applied, and goes again under a new session; a later copy refused so
   ends with `OUTCOME_UNKNOWN`. The caller sees `OUTCOME_UNKNOWN` only when the deadline ended the copies without an
-  answer.
+  answer. Only a `getForUpdate` that opens an update (no transaction id) makes its id one whose write is numbered.
+  Closing the connection ends the writes waiting for a resend: `OUTCOME_UNKNOWN` if a copy was sent, else
+  `SERVER_OVERLOADED` (not sent).
 
 **Apply.** Every replica applies entries in log order, on an apply thread of its own, through
 `EmbeddedDB.ApplyWriter`: a native transaction held by the apply thread itself, which runs the same code as the
