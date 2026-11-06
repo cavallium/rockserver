@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
 import java.time.Duration;
@@ -89,6 +90,11 @@ class PollPeersTest {
 			ops.onLeader(raft.division(), groupId);
 			Thread.sleep(100);
 		}
+		// The node's own initialization thread runs onLeader too, with the real division, and a check of either one
+		// skips the other while it runs: at least one check must have polled the stub, and it must have ended (only
+		// one check runs at a time, so a moment with none running means every earlier one ended).
+		assertTrue(raft.roleInfoReads.get() > 0, "no check polled the stub division");
+		InProcessCluster.await(TIMEOUT, () -> !ops.versionCheckRunningForTesting());
 		assertEquals(OLDER, ops.clusterVersion(), "raised past what the staging peer supports");
 
 		// The control: without the staging peer the same check raises the version (the member that lacks bits then fails

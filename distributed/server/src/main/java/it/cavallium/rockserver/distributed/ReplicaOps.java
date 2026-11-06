@@ -6,6 +6,7 @@ import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import java.io.IOException;
@@ -29,6 +30,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -196,6 +198,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	/** Tests only: see {@link #lastChecksumMillis}. */
 	long lastChecksumMillisForTesting() {
 		return lastChecksumMillis;
+	}
+
+	/** Tests only: whether a cluster version check is running (asking the members, or proposing its raise). */
+	boolean versionCheckRunningForTesting() {
+		return versionCheckRunning;
 	}
 
 	/** Tests only: see {@link #scheduleStartMillis}. */
@@ -769,7 +776,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 * history, so a new leader goes on with the schedule of the old one), or since it proposed one itself (applied
 	 * later), or since the start of its schedule ({@link #scheduleStartMillis}) if it knows of neither. Wall clock: it
 	 * outlives a restart through the results file and the schedule file. A proposal that fails is tried again after
-	 * {@link #PROPOSAL_RETRY}, not a full interval later.
+	 * {@link #PROPOSAL_RETRY} if its error says it was not applied, a full interval later otherwise.
 	 */
 	private void proposePeriodicChecksum(long nowMillis) {
 		if (!periodicChecksumDue(nowMillis)) {
@@ -778,10 +785,12 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		var proposer = this.proposer;
 		if (proposer != null) {
 			proposer.propose(new LogEntry.Checksum()).whenComplete((index, error) -> {
-				if (error != null) {
-					periodicChecksumFailed(nowMillis);
+				if (error != null && periodicChecksumFailed(nowMillis, error)) {
 					LOG.warn("{}: periodic checksum not proposed, trying again in {} s", config.nodeId(),
 							Math.min(checksumEvery.toMillis(), PROPOSAL_RETRY.toMillis()) / 1000, error);
+				} else if (error != null) {
+					LOG.warn("{}: periodic checksum proposal ended with an unknown outcome, next try in one interval",
+							config.nodeId(), error);
 				} else {
 					LOG.info("{}: periodic checksum at log index {}", config.nodeId(), index);
 				}
@@ -807,14 +816,23 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	}
 
 	/**
-	 * The periodic checksum proposed at {@code proposedAtMillis} failed (a lost leadership, a full queue): the next try
-	 * comes {@link #PROPOSAL_RETRY} later, unless a newer proposal happened meanwhile.
+	 * The periodic checksum proposed at {@code proposedAtMillis} failed with {@code error}. If the error says that the
+	 * entry was not applied ({@link RocksDBException#isNotApplied()}: no leader accepted it in time, a full queue), the
+	 * next try comes {@link #PROPOSAL_RETRY} later, unless a newer proposal happened meanwhile, and this returns true.
+	 * Any other error (a timeout after it was sent, a lost leadership after it was appended: {@code OUTCOME_UNKNOWN})
+	 * leaves the next try a full interval after the proposal and returns false: the entry may still commit and apply
+	 * later than the retry would come, and a second full-database digest so soon is the load the schedule avoids.
 	 */
-	void periodicChecksumFailed(long proposedAtMillis) {
+	boolean periodicChecksumFailed(long proposedAtMillis, Throwable error) {
+		var cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+		if (!(cause instanceof RocksDBException rocks) || !rocks.isNotApplied()) {
+			return false;
+		}
 		if (proposedChecksumMillis == proposedAtMillis) {
 			long every = checksumEvery.toMillis();
 			proposedChecksumMillis = Math.max(1, proposedAtMillis - every + Math.min(every, PROPOSAL_RETRY.toMillis()));
 		}
+		return true;
 	}
 
 	// The Raft port

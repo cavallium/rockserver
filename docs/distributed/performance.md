@@ -53,7 +53,8 @@ distributed/bench/load-bench.sh --target replicated --root /path/on/a/real/disk/
 ```
 
 Other options: `--target single`, `--closed 64,512`, `--only UPDATE,GET` (or `BULK_PUT`, 1 MiB `putMulti`
-calls for bandwidth, or `MERGE`, single merges of an 8-byte operand that each cost a read at apply), `--merge-rate R`
+calls for bandwidth, or `MERGE`, single merges of an 8-byte operand that each cost a read at apply; each key takes 64
+merges only, so values stay under 600 bytes and the cost per merge does not drift during a run), `--merge-rate R`
 (adds `MERGE` to the mix at R per second at scale 1; whenever it runs, every column gets the string-append merge
 operator through `<root>/merge.conf`, unless a `--server-arg --rockserver-config` is given), `--max-in-flight N`, `--route all` (clients spread over every node, so most requests are
 forwarded), `--route failover` (spread over every node too, each connection listing every node, starting from a

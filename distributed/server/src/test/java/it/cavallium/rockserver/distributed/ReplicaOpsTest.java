@@ -15,6 +15,8 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,6 +26,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import org.apache.ratis.thirdparty.io.grpc.Status;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -295,13 +298,22 @@ class ReplicaOpsTest {
 			assertFalse(ops.periodicChecksumDue(due - 1));
 			assertTrue(ops.periodicChecksumDue(due));
 			assertFalse(ops.periodicChecksumDue(due + 1), "proposed already");
-			ops.periodicChecksumFailed(due);
+			var notApplied = new CompletionException(RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED, "x"));
+			assertTrue(ops.periodicChecksumFailed(due, notApplied));
 			long retry = ReplicaOps.PROPOSAL_RETRY.toMillis();
 			assertFalse(ops.periodicChecksumDue(due + retry - 1));
 			assertTrue(ops.periodicChecksumDue(due + retry), "tried again after a failure");
 			// A failure of an older proposal does not move the newer one.
-			ops.periodicChecksumFailed(due);
+			assertTrue(ops.periodicChecksumFailed(due, notApplied));
 			assertFalse(ops.periodicChecksumDue(due + 2 * retry));
+			// An unknown outcome (the entry may still commit and apply late): no early retry, one interval as before.
+			long second = due + retry;
+			var unknown = new CompletionException(RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN, "x"));
+			assertFalse(ops.periodicChecksumFailed(second, unknown));
+			assertFalse(ops.periodicChecksumDue(second + retry), "no retry after an unknown outcome");
+			assertFalse(ops.periodicChecksumFailed(second, new IllegalStateException("closing")));
+			assertFalse(ops.periodicChecksumDue(second + every.toMillis() - 1));
+			assertTrue(ops.periodicChecksumDue(second + every.toMillis()), "due one interval after the unknown one");
 		}
 		Thread.sleep(20);
 		// A restart before the first check: the schedule goes on from the first start.

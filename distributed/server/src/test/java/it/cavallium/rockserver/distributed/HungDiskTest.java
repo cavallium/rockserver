@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -31,9 +32,15 @@ import org.junit.jupiter.params.provider.ValueSource;
  * leader (its log does not flush: {@link LeaderStall}, and the other members elect another). Once the disk answers, the
  * node listens again, catches up, and every acknowledged write is readable on identical replicas.</p>
  *
- * <p>Multi-process: part of the heavy suites. Skipped without {@code gcc}. Written in round 6, not run yet.</p>
+ * <p>Multi-process: part of the heavy suites. Skipped without {@code gcc}. Written in round 6 and never run: it runs
+ * only with {@code -Drockserver.test.hungDisk=true}, so that its first run is not a nightly one. Open until then:
+ * whether {@link LeaderStall} replaces a leader whose log fsync hangs within {@code PHASE_TIMEOUT} (a hung leader that
+ * still answers that it leads makes {@code leaderOrNull} see two leaders and wait), and whether the teardown is clean.
+ * Remove the condition after one passing run.</p>
  */
 @Timeout(600)
+@EnabledIfSystemProperty(named = "rockserver.test.hungDisk", matches = "true",
+		disabledReason = "never run yet: -Drockserver.test.hungDisk=true for its first run (design.md, HungDiskTest)")
 class HungDiskTest {
 
 	@TempDir

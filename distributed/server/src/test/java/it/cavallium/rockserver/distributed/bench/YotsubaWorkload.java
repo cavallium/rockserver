@@ -24,6 +24,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -38,8 +39,8 @@ import java.util.concurrent.atomic.AtomicReference;
  *   chunk;</li>
  *   <li>{@code file-locations}: key [4] + two XXHASH32 tails, no value, written with {@code putMulti};</li>
  *   <li>{@code monitor-log}: key [8, 8], small transactions of two {@code putMulti}.</li>
- *   <li>{@code merge-appends}: key [8 chat, 4 slot], single {@code merge} calls of a short operand (not in the
- *   production mix, see {@link Kind#MERGE}).</li>
+ *   <li>{@code merge-appends}: key [8 chat, 4 slot], single {@code merge} calls of a short operand, at most
+ *   {@link #MERGES_PER_SLOT} per key (not in the production mix, see {@link Kind#MERGE}).</li>
  * </ul>
  * Chats are picked with a Zipf-like skew so that hot chats produce real update conflicts. {@link #hotKeys} sends a
  * share of the updates to a few single keys instead, to measure what one key sustains.
@@ -60,11 +61,13 @@ final class YotsubaWorkload {
 		/** Not in the production mix: 1 MiB putMulti calls, to measure bandwidth (use with --only). */
 		BULK_PUT(0),
 		/**
-		 * Not in the production mix: a {@code merge} with {@code RequestType.none()} of an 8-byte operand into one of 16
-		 * slots of a skewed chat, for the cost of the read that checks each merge at apply (WA-15, "Every merge is
-		 * checked at apply" in the design). The column needs a merge operator: {@code LoadBench} gives every column the
-		 * string-append operator when MERGE runs. With that operator a value grows by 9 bytes per merge, so hot slots
-		 * grow over a long run.
+		 * Not in the production mix: a {@code merge} with {@code RequestType.none()} of an 8-byte operand into a slot of
+		 * a skewed chat, for the cost of the read that checks each merge at apply (WA-15, "Every merge is checked at
+		 * apply" in the design). The column needs a merge operator: {@code LoadBench} gives every column the
+		 * string-append operator when MERGE runs. With that operator a value grows by 9 bytes per merge, so that the read
+		 * and merge at apply would cost more as a run goes on: each slot therefore takes {@link #MERGES_PER_SLOT} merges
+		 * only (at most 575 bytes), and a chat's merges go round-robin over 16 slots at a time, then on to the next 16
+		 * ({@link #mergeSlot}). The cost per merge stays the same from the first step of a run to the last.
 		 */
 		MERGE(0);
 
@@ -76,6 +79,10 @@ final class YotsubaWorkload {
 	}
 
 	static final Duration TIMEOUT = Duration.ofSeconds(30);
+	/** How many merges one {@link Kind#MERGE} slot takes before its chat moves on to new slots. */
+	static final int MERGES_PER_SLOT = 64;
+	/** How many slots of a chat take {@link Kind#MERGE} merges at a time. */
+	static final int MERGE_SLOTS = 16;
 	private static final int UPDATE_RETRY_ATTEMPTS = 16;
 
 	final int chats;
@@ -91,6 +98,8 @@ final class YotsubaWorkload {
 	long files;
 	long monitorLog;
 	long mergeAppends;
+	/** Per chat: how many {@link Kind#MERGE} merges this workload sent to it, see {@link #mergeSlot}. */
+	private final AtomicIntegerArray mergesPerChat;
 
 	YotsubaWorkload(int chats, int messagesPerChat, int valueBytes, double skew) {
 		this(chats, messagesPerChat, valueBytes, skew, 0, 0);
@@ -106,6 +115,7 @@ final class YotsubaWorkload {
 		this.skew = skew;
 		this.hotKeys = hotKeys;
 		this.hotShare = hotShare;
+		this.mergesPerChat = new AtomicIntegerArray(chats);
 	}
 
 	/** Creates (or finds) the columns. */
@@ -238,8 +248,10 @@ final class YotsubaWorkload {
 			case MERGE -> {
 				// ASCII digits: the string-append operator reads operands as UTF-8.
 				var operand = String.format("%08d", random.nextInt(100_000_000)).getBytes(StandardCharsets.US_ASCII);
-				api.mergeAsync(0, mergeAppends, new Keys(fixed(8, chat(random)), fixed(4, random.nextInt(16))),
-						Buf.wrap(operand), RequestType.none()).join();
+				int chat = chat(random);
+				int slot = mergeSlot(mergesPerChat.getAndIncrement(chat));
+				api.mergeAsync(0, mergeAppends, new Keys(fixed(8, chat), fixed(4, slot)), Buf.wrap(operand),
+						RequestType.none()).join();
 				yield 12 + operand.length;
 			}
 		};
@@ -336,6 +348,16 @@ final class YotsubaWorkload {
 	}
 
 	/** Chat index with a Zipf-like skew: a few chats get most of the traffic. */
+	/**
+	 * The slot of a chat's {@code n}-th merge: round-robin over {@link #MERGE_SLOTS} slots, and after
+	 * {@link #MERGES_PER_SLOT} merges each, the next {@link #MERGE_SLOTS} slots. So no value grows past
+	 * {@link #MERGES_PER_SLOT} operands, however long the run.
+	 */
+	static int mergeSlot(int n) {
+		int window = MERGE_SLOTS * MERGES_PER_SLOT;
+		return (n / window) * MERGE_SLOTS + n % MERGE_SLOTS;
+	}
+
 	int chat(ThreadLocalRandom random) {
 		if (skew <= 0) {
 			return random.nextInt(chats);

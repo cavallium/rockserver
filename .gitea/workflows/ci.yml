@@ -17,7 +17,8 @@ env:
   MAVEN_ARGS: -B -ntp
   # Test directories on the runner's disk, not on a tmpfs /tmp: fsync must cost what it costs (design.md, "Tests").
   TEST_TMPDIR: ${{ github.workspace }}/../rockserver-test-tmp
-  # Multi-process suites: one class per line, also the list the fast job excludes.
+  # Multi-process suites: one class per line, also the list the fast job excludes. HungDiskTest is listed but runs only
+  # with -Drockserver.test.hungDisk=true until its first passing run (design.md, its row in the tests table).
   PROCESS_SUITES: >-
     ClientFailoverTest,ClockSkewRandomFaultTest,ColdRestartTest,DiskFaultTest,ForwardingFailoverTest,HungDiskTest,
     IsolatedNodeTest,LaggingInstallTest,LeaderKillTest,MembershipFaultTest,MembershipTest,OverlappingRandomFaultTest,

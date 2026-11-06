@@ -46,7 +46,9 @@ import java.util.concurrent.locks.LockSupport;
  * scale 1; {@code --only MERGE} runs merges alone. Whenever MERGE runs, every node gets a Rockserver config that gives
  * every column the string-append merge operator ({@code <root>/merge.conf}), unless {@code --server-arg} already names
  * a {@code --rockserver-config}. For the merge-heavy benchmark (WA-15): compare the merge rate a node sustains with
- * {@code --only MERGE} against {@code --only HISTORY_PUT_MULTI} or a put-only mix of the same rate.</p>
+ * {@code --only MERGE} against {@code --only HISTORY_PUT_MULTI} or a put-only mix of the same rate. Each key takes
+ * {@link YotsubaWorkload#MERGES_PER_SLOT} merges only, so values stay under 600 bytes and later steps of a run measure
+ * the same read and merge as earlier ones.</p>
  *
  * <p>{@code --hot-keys N:SHARE} sends that share of the updates to N single keys, for what one key sustains; compare
  * with and without {@code --server-arg --pipelined-updates}. {@code --only UPDATE --hot-keys 1:1} isolates it.</p>
