@@ -6,7 +6,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.thirdparty.io.grpc.ManagedChannel;
 import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,6 +21,10 @@ import org.slf4j.LoggerFactory;
  * check needs no entry and looks at no position in the log, so it works during the catch-up of {@code add-peer}, while
  * the node is not a member yet, and the node leaves before the configuration changes.</p>
  *
+ * <p>It also compares the digest of the Rockserver config of each follower with its own ({@link NodeStore#configDigest}):
+ * every node must run the same config file. A difference is logged on both nodes, once per term, and stops nothing: a
+ * rolling change of the config passes through it, and some settings (such as cache sizes) may differ on purpose.</p>
+ *
  * <p>Runs on the maintenance thread of the node.</p>
  */
 final class ClusterCheck {
@@ -30,14 +36,21 @@ final class ClusterCheck {
 	private final String nodeId;
 	private final RaftGroupId groupId;
 	private final Duration timeout;
+	private final @Nullable String configDigest;
 	private final Set<String> checked = ConcurrentHashMap.newKeySet();
 	private final Map<String, Long> nextTryNanos = new HashMap<>();
 	private long term = -1;
 
 	ClusterCheck(String nodeId, RaftGroupId groupId, Duration timeout) {
+		this(nodeId, groupId, timeout, null);
+	}
+
+	/** @param configDigest the digest of this node's Rockserver config, null to compare none */
+	ClusterCheck(String nodeId, RaftGroupId groupId, Duration timeout, @Nullable String configDigest) {
 		this.nodeId = nodeId;
 		this.groupId = groupId;
 		this.timeout = timeout;
+		this.configDigest = configDigest;
 	}
 
 	/**
@@ -63,14 +76,33 @@ final class ClusterCheck {
 	private void tell(String id, String address, String clusterId) {
 		var channel = NettyChannelBuilder.forTarget(address).usePlaintext().build();
 		TermService.nodeState(channel, groupId, clusterId, timeout).whenComplete((state, error) -> {
-			channel.shutdown();
 			if (error != null) {
+				channel.shutdown();
 				LOG.debug("{}: follower {} did not answer the cluster check", nodeId, id, error);
 			} else if (state != null && state.clusterId() != null && !state.clusterId().equals(clusterId)) {
+				channel.shutdown();
 				LOG.error("{}: follower {} belongs to cluster {}, not to cluster {}: it stops", nodeId, id, state.clusterId(),
 						clusterId);
 			} else {
 				checked.add(id);
+				compareConfig(id, channel);
+			}
+		});
+	}
+
+	private void compareConfig(String id, ManagedChannel channel) {
+		if (configDigest == null) {
+			channel.shutdown();
+			return;
+		}
+		TermService.configDigest(channel, configDigest, timeout).whenComplete((digest, error) -> {
+			channel.shutdown();
+			if (error != null) {
+				// UNIMPLEMENTED on a node of an older version: nothing to compare.
+				LOG.debug("{}: follower {} did not tell its config digest", nodeId, id, error);
+			} else if (!digest.equals(configDigest)) {
+				LOG.error("{}: follower {} runs another Rockserver config (digest {}) than this node ({}): every node must run"
+						+ " the same config file", nodeId, id, digest, configDigest);
 			}
 		});
 	}

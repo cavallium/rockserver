@@ -57,6 +57,8 @@ public final class ReplicatedNode implements AutoCloseable {
 	private static final String BOOTSTRAP_FILE = "raft-meta.bootstrap";
 	/** Ratis keeps here the configuration from the log. */
 	private static final String CONFIGURATION_FILE = "raft-meta.conf";
+	/** In the Raft directory, once a configuration from the log made this node a member: see {@link #requireNotRemoved}. */
+	private static final String MEMBER_FILE = "member";
 
 	private final NodeConfig config;
 	private final RaftGroup group;
@@ -100,17 +102,21 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final AtomicLong snapshotCalls = new AtomicLong();
 	private final CompletableFuture<@Nullable Throwable> stopped = new CompletableFuture<>();
 	private final NodeMetrics metrics;
+	/** Whether {@link #MEMBER_FILE} exists. Maintenance thread only. */
+	private boolean memberRecorded;
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
 		this.config = config;
 		Files.createDirectories(config.dbDir().getParent());
 		Files.createDirectories(config.raftDir());
+		requireSameFileSystem(config.raftDir(), config.dbDir().getParent());
 		var groupId = RaftGroupId.valueOf(UUID.fromString(config.groupId()));
 		this.group = RaftGroup.valueOf(groupId, raftPeers(config));
 		this.metrics = new NodeMetrics(config.nodeId());
 		this.commitHeartbeats = new CommitHeartbeats(this::raftServer, groupId);
 		this.leaderStall = LeaderStall.forElectionTimeout(config.electionTimeoutMax());
-		this.clusterCheck = new ClusterCheck(config.nodeId(), groupId, config.electionTimeoutMax());
+		var configDigest = NodeStore.configDigest(config.rockserverConfig());
+		this.clusterCheck = new ClusterCheck(config.nodeId(), groupId, config.electionTimeoutMax(), configDigest);
 		this.leaderStallStepDowns = metrics.amount("leader.stall.stepdowns");
 		this.leaderLogStepDowns = metrics.amount("leader.log.stepdowns");
 		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure, metrics);
@@ -119,9 +125,11 @@ public final class ReplicatedNode implements AutoCloseable {
 		var parameters = new Parameters();
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
 		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress,
-				this::nodeState, this::readIndex));
+				this::nodeState, this::readIndex, configDigest));
 		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
 		if (!existing) {
+			// Before anything opens the database: copies of a seed are the same only until then.
+			NodeStore.recordSeedDigest(config.dbDir());
 			requireNoClusterData(config);
 		} else if (config.join() && startedOutsideJoin()) {
 			throw new IOException("Node " + config.nodeId() + " was started without --join: "
@@ -146,6 +154,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		try {
 			server.start();
 			started.add(server);
+			requireNotRemoved();
 			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout(),
 					stateMachine::leaderReadyIndex, threads.control());
 			// Every node of a cluster should have follower reads on or off alike: see "Follower reads" in the design.
@@ -266,8 +275,11 @@ public final class ReplicatedNode implements AutoCloseable {
 			return;
 		}
 		boolean seeded = store.hasUserColumns();
-		LOG.info("{}: initializing cluster {} (seeded: {})", config.nodeId(), newClusterId, seeded);
-		proposer.propose(new LogEntry.Genesis(newClusterId, seeded)).get(config.requestTimeout().toMillis(),
+		// Every replica of a seeded cluster checks that it started from the same seed as this leader.
+		var seedDigest = seeded ? store.seedDigest() : null;
+		LOG.info("{}: initializing cluster {} (seeded: {}, seed digest {})", config.nodeId(), newClusterId, seeded,
+				seedDigest);
+		proposer.propose(new LogEntry.Genesis(newClusterId, seeded, seedDigest)).get(config.requestTimeout().toMillis(),
 				TimeUnit.MILLISECONDS);
 	}
 
@@ -406,6 +418,7 @@ public final class ReplicatedNode implements AutoCloseable {
 				return;
 			}
 			warnWhileInitializing(division);
+			recordMembership(division);
 			var log = division.getRaftLog();
 			long commitIndex = log.getLastCommittedIndex();
 			long term = division.getInfo().getCurrentTerm();
@@ -497,6 +510,76 @@ public final class ReplicatedNode implements AutoCloseable {
 	 */
 	private void stopAfterRaftClosed() {
 		onReplicaFailure(new IOException("Raft closed on node " + config.nodeId() + " while the node was running"));
+	}
+
+	/**
+	 * Fails the start of a node that a configuration from its log left out, which a supervisor started again after its
+	 * removal: it would otherwise print {@code READY} and stay up in Ratis' initializing state, with no leader to serve
+	 * from. A node counts as removed if the new half of that configuration does not hold it, and either it was started
+	 * without {@code --join} (its own peer list holds it, so only a removal can have left it out) or it was a member once
+	 * ({@link #MEMBER_FILE}). A removed node usually holds the joint configuration of its removal, with itself in the old
+	 * half only: the leader sends the final one to the members that stay. A node started with {@code --join} that never was
+	 * a member is not removed: it may hold the configuration of a snapshot from before its {@code add-peer}.
+	 *
+	 * <p>One case is refused wrongly: a joint configuration that leaves the node out, which the node wrote but the leader
+	 * never committed before it lost its leadership, so that the next leader drops it. Only a node that was being removed
+	 * gets there, and it can be removed again with {@code remove-peer}.</p>
+	 */
+	private void requireNotRemoved() throws IOException {
+		var conf = server.getDivision(group.getGroupId()).getRaftConf();
+		boolean leftOut = conf.getLogEntryIndex() >= 0
+				&& conf.getCurrentPeers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()));
+		if (leftOut && (!config.join() || Files.exists(config.raftDir().resolve(MEMBER_FILE)))) {
+			throw new RemovedException("Node " + config.nodeId() + " is not in the new configuration of its log, " + conf
+					+ ": it was removed from the cluster. Take it out of its supervisor. To add it again, wipe its data"
+					+ " directory, start it with --join and run add-peer");
+		}
+	}
+
+	/** Records, once, that a configuration from the log made this node a member: see {@link #requireNotRemoved}. */
+	private void recordMembership(RaftServer.Division division) throws IOException {
+		if (memberRecorded) {
+			return;
+		}
+		var conf = division.getRaftConf();
+		if (conf.getLogEntryIndex() < 0 || !conf.getPreviousPeers().isEmpty()
+				|| conf.getCurrentPeers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()))) {
+			return;
+		}
+		var file = config.raftDir().resolve(MEMBER_FILE);
+		if (!Files.exists(file)) {
+			Files.writeString(file, config.nodeId() + "\n");
+			NodeStore.syncFile(file);
+			NodeStore.syncDirectory(config.raftDir());
+		}
+		memberRecorded = true;
+	}
+
+	/** Thrown by {@link #start} for a node that was removed from the cluster: see {@link #requireNotRemoved}. */
+	public static final class RemovedException extends IOException {
+		RemovedException(String message) {
+			super(message);
+		}
+	}
+
+	/**
+	 * Fails unless {@code raftDir} and every directory under it are on the file system of {@code dataDir}, which holds the
+	 * database directory: a snapshot hard-links the database's table files into the Raft directory, and on another file
+	 * system it would copy the whole database instead, every time, while the apply waits.
+	 */
+	private static void requireSameFileSystem(Path raftDir, Path dataDir) throws IOException {
+		var dataStore = Files.getFileStore(dataDir);
+		List<Path> directories;
+		try (var walk = Files.walk(raftDir)) {
+			directories = walk.filter(Files::isDirectory).toList();
+		}
+		for (Path directory : directories) {
+			if (!Files.getFileStore(directory).equals(dataStore)) {
+				throw new IOException(directory + " is on a different file system than " + dataDir + ": every snapshot would"
+						+ " copy the whole database instead of linking its files, while the apply waits. Keep the Raft"
+						+ " directory and the database on one file system: mount the data directory itself");
+			}
+		}
 	}
 
 	/**

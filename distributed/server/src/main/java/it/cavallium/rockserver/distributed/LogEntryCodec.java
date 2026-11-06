@@ -58,6 +58,8 @@ final class LogEntryCodec {
 	private static final byte GENESIS = 13;
 	private static final byte VERIFY_COLUMN = 14;
 	private static final byte REGISTER_CLIENT = 15;
+	/** {@link #GENESIS} with a seed digest: only written for one, so other genesis entries keep their bytes. */
+	private static final byte GENESIS_WITH_SEED_DIGEST = 16;
 
 	/** Flags of a {@link LogEntry.Guarded}: {@link LogEntry.Guarded#singleResult()}. */
 	private static final int GUARDED_SINGLE_RESULT = 1;
@@ -429,10 +431,13 @@ final class LogEntryCodec {
 				writeString(out, name);
 				out.writeLong(columnId);
 			}
-			case LogEntry.Genesis(String clusterId, boolean seeded) -> {
-				out.writeByte(GENESIS);
+			case LogEntry.Genesis(String clusterId, boolean seeded, String seedDigest) -> {
+				out.writeByte(seedDigest == null ? GENESIS : GENESIS_WITH_SEED_DIGEST);
 				writeString(out, clusterId);
 				out.writeBoolean(seeded);
+				if (seedDigest != null) {
+					writeString(out, seedDigest);
+				}
 			}
 			case LogEntry.RegisterClient(long timeoutMillis) -> {
 				out.writeByte(REGISTER_CLIENT);
@@ -608,7 +613,8 @@ final class LogEntryCodec {
 				yield size;
 			}
 			case LogEntry.VerifyColumn(String name, long _) -> 1 + stringSize(name) + Long.BYTES;
-			case LogEntry.Genesis(String clusterId, boolean _) -> 1 + stringSize(clusterId) + 1;
+			case LogEntry.Genesis(String clusterId, boolean _, String seedDigest) ->
+					1 + stringSize(clusterId) + 1 + (seedDigest == null ? 0 : stringSize(seedDigest));
 			case LogEntry.RegisterClient _ -> 1 + Long.BYTES;
 		};
 	}
@@ -775,6 +781,7 @@ final class LogEntryCodec {
 					new LogEntry.UploadMergeOperator(in.readString(), in.readString(), in.readBytes());
 			case GUARDED -> readGuarded(in);
 			case GENESIS -> new LogEntry.Genesis(in.readString(), in.readBoolean());
+			case GENESIS_WITH_SEED_DIGEST -> new LogEntry.Genesis(in.readString(), in.readBoolean(), in.readString());
 			case VERIFY_COLUMN -> new LogEntry.VerifyColumn(in.readString(), in.readLong());
 			case REGISTER_CLIENT -> new LogEntry.RegisterClient(in.readLong());
 			default -> readWrite(in, tag);

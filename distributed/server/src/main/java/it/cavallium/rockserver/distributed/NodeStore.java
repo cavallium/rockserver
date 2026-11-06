@@ -145,7 +145,7 @@ final class NodeStore implements Closeable {
 	static NodeStore open(Path dbDir, @Nullable Path rockserverConfig, String name) throws IOException {
 		dbDir = dbDir.toAbsolutePath().normalize();
 		RestoreDirs.of(dbDir).recover();
-		Path config = replicaConfig(rockserverConfig);
+		Path config = replicaConfig(rockserverConfig, dbDir);
 		EmbeddedConnection connection;
 		try {
 			connection = new EmbeddedConnection(dbDir, name, config);
@@ -173,7 +173,7 @@ final class NodeStore implements Closeable {
 	 * Writes the config the replica opens its database with to a new temporary file: {@link #REPLICA_OVERRIDES} over
 	 * the given Rockserver config (HOCON), or over the defaults when there is none.
 	 */
-	private static Path replicaConfig(@Nullable Path rockserverConfig) throws IOException {
+	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir) throws IOException {
 		var config = ConfigFactory.parseString(REPLICA_OVERRIDES);
 		try {
 			if (rockserverConfig != null) {
@@ -184,6 +184,7 @@ final class NodeStore implements Closeable {
 		} catch (ConfigException | IllegalArgumentException e) {
 			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
 		}
+		checkVolumesInside(config, dbDir);
 		Path file = Files.createTempFile("rockserver-replica-", ".conf");
 		try {
 			Files.writeString(file, config.root().render(ConfigRenderOptions.concise()), StandardCharsets.UTF_8);
@@ -228,15 +229,78 @@ final class NodeStore implements Closeable {
 		return result;
 	}
 
-	/** The size of the database's {@code WriteBufferManager} for {@code config}, computed as the database does. */
-	static long writeBufferBudget(Config config) {
-		Config defaults;
+	/**
+	 * Fails if a column volume ({@code volumes[].volume-path} of {@code fallback-column-options} or of an entry of
+	 * {@code column-options}, which RocksDB gets as {@code cf_paths}) resolves outside {@code dbDir}: a snapshot links
+	 * only files under the database directory, so every snapshot would fail, and the database opens such a volume (and
+	 * creates its directory) before anything would notice. Relative paths resolve against {@code dbDir}, as the database
+	 * resolves them.
+	 */
+	static void checkVolumesInside(Config config, Path dbDir) throws IOException {
+		Config effective;
+		try {
+			effective = config.withFallback(defaultConfig()).resolve();
+		} catch (ConfigException e) {
+			throw new IOException("Failed to read the Rockserver config", e);
+		}
+		var columns = new ArrayList<Config>();
+		if (effective.hasPath("database.global.fallback-column-options")) {
+			columns.add(effective.getConfig("database.global.fallback-column-options"));
+		}
+		if (effective.hasPath("database.global.column-options")) {
+			for (ConfigObject column : effective.getObjectList("database.global.column-options")) {
+				columns.add(column.toConfig());
+			}
+		}
+		Path root = dbDir.toAbsolutePath().normalize();
+		for (Config column : columns) {
+			if (!column.hasPath("volumes")) {
+				continue;
+			}
+			for (ConfigObject volume : column.getObjectList("volumes")) {
+				var path = volume.toConfig();
+				if (!path.hasPath("volume-path")) {
+					continue;
+				}
+				Path resolved = root.resolve(path.getString("volume-path")).normalize();
+				if (!resolved.startsWith(root)) {
+					throw new IOException("Column volume " + path.getString("volume-path") + " resolves to " + resolved
+							+ ", outside the database directory " + root + ": every snapshot would fail. Put each volume-path"
+							+ " under the database directory, such as the default ./volume");
+				}
+			}
+		}
+	}
+
+	private static Config defaultConfig() {
 		try (var reader = new InputStreamReader(DefaultConfig.getDefaultConfig(), StandardCharsets.UTF_8)) {
-			defaults = ConfigFactory.parseReader(reader);
+			return ConfigFactory.parseReader(reader);
 		} catch (IOException e) {
 			throw new IllegalArgumentException("Failed to read the default Rockserver config", e);
 		}
-		Config effective = config.withFallback(defaults).resolve();
+	}
+
+	/**
+	 * A digest of the Rockserver config file as parsed, with substitutions resolved: comments, layout and key order do
+	 * not change it. Members compare it through {@link ClusterCheck}, since every node must run the same config. A node
+	 * without a config file has the digest of an empty config.
+	 */
+	static String configDigest(@Nullable Path rockserverConfig) throws IOException {
+		Config config = ConfigFactory.empty();
+		try {
+			if (rockserverConfig != null) {
+				config = ConfigFactory.parseFile(rockserverConfig.toFile(), ConfigParseOptions.defaults().setAllowMissing(false))
+						.resolve();
+			}
+		} catch (ConfigException e) {
+			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
+		}
+		return sha256(config.root().render(ConfigRenderOptions.concise()).getBytes(StandardCharsets.UTF_8));
+	}
+
+	/** The size of the database's {@code WriteBufferManager} for {@code config}, computed as the database does. */
+	static long writeBufferBudget(Config config) {
+		Config effective = config.withFallback(defaultConfig()).resolve();
 		long manager = dataSize(effective, "database.global.write-buffer-manager");
 		if (manager > 0) {
 			return manager;
@@ -321,6 +385,155 @@ final class NodeStore implements Closeable {
 	boolean seeded() {
 		return readMeta(SEEDED) != null;
 	}
+
+	/**
+	 * The digest of the seed this database started from, as {@link #recordSeedDigest} recorded it at the first start of
+	 * the node; null if none was recorded (the node started empty, or with a version that did not record it).
+	 */
+	@Nullable String seedDigest() throws IOException {
+		return readSeedDigest(dbDir);
+	}
+
+	static @Nullable String readSeedDigest(Path dbDir) throws IOException {
+		Path file = seedDigestFile(dbDir);
+		return Files.exists(file) ? Files.readString(file, StandardCharsets.UTF_8).strip() : null;
+	}
+
+	/** Next to the database directory, so that a restore, which swaps the database directory, keeps it. */
+	private static Path seedDigestFile(Path dbDir) {
+		Path absolute = dbDir.toAbsolutePath().normalize();
+		return absolute.resolveSibling(absolute.getFileName() + ".seed-digest");
+	}
+
+	/**
+	 * Records a digest of the database in {@code dbDir} as it is before it is ever opened as a replica, if it holds one
+	 * and none was recorded yet. Called at the first start of a node, the only moment when every copy of a seed is still
+	 * the same: opening a database writes a new MANIFEST and lets compactions run, at times that differ on each node.
+	 *
+	 * <p>The digest covers every file under the database directory (volumes and WAL directory included), by path: table
+	 * and blob files ({@code *.sst}, {@code *.blob}, immutable and large) by size, every other file (MANIFEST, CURRENT,
+	 * OPTIONS, WAL files) by content. It finds a copy that misses files or holds others, a copy of the database taken at
+	 * another moment and a truncated copy; a table file damaged without a change of size goes unnoticed. {@code LOCK}
+	 * and the info logs ({@code LOG*}) are skipped.</p>
+	 *
+	 * @return the recorded digest, null if {@code dbDir} holds no database
+	 */
+	static @Nullable String recordSeedDigest(Path dbDir) throws IOException {
+		var recorded = readSeedDigest(dbDir);
+		if (recorded != null || !Files.isRegularFile(dbDir.resolve("CURRENT"))) {
+			return recorded;
+		}
+		String digest = databaseFilesDigest(dbDir);
+		Path file = seedDigestFile(dbDir);
+		Path building = file.resolveSibling(file.getFileName() + ".tmp");
+		Files.writeString(building, digest + "\n", StandardCharsets.UTF_8);
+		syncFile(building);
+		Files.move(building, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+				java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+		syncDirectory(file.getParent());
+		return digest;
+	}
+
+	/** See {@link #recordSeedDigest}. */
+	static String databaseFilesDigest(Path dbDir) throws IOException {
+		Path root = dbDir.toAbsolutePath().normalize();
+		List<Path> files;
+		try (Stream<Path> walk = Files.walk(root)) {
+			files = walk.filter(Files::isRegularFile)
+					.map(root::relativize)
+					.sorted(Comparator.comparing(Path::toString))
+					.toList();
+		}
+		java.security.MessageDigest digest = sha256();
+		for (Path relative : files) {
+			String name = relative.getFileName().toString();
+			if (name.equals("LOCK") || name.startsWith("LOG")) {
+				continue;
+			}
+			Path file = root.resolve(relative);
+			update(digest, relative.toString().replace('\\', '/'));
+			if (name.endsWith(".sst") || name.endsWith(".blob")) {
+				update(digest, "size " + Files.size(file));
+			} else {
+				update(digest, "content");
+				try (var in = Files.newInputStream(file)) {
+					var buffer = new byte[64 * 1024];
+					int read;
+					while ((read = in.read(buffer)) > 0) {
+						digest.update(buffer, 0, read);
+					}
+				}
+				update(digest, "end " + Files.size(file));
+			}
+		}
+		return java.util.HexFormat.of().formatHex(digest.digest());
+	}
+
+	private static void update(java.security.MessageDigest digest, String value) {
+		var bytes = value.getBytes(StandardCharsets.UTF_8);
+		digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(bytes.length).array());
+		digest.update(bytes);
+	}
+
+	private static java.security.MessageDigest sha256() {
+		try {
+			return java.security.MessageDigest.getInstance("SHA-256");
+		} catch (java.security.NoSuchAlgorithmException e) {
+			throw new IllegalStateException(e);
+		}
+	}
+
+	private static String sha256(byte[] value) {
+		return java.util.HexFormat.of().formatHex(sha256().digest(value));
+	}
+
+	/**
+	 * Writes to {@code target} (must not exist) a copy of the stopped replica's database in {@code dbDir} that can seed a
+	 * new cluster, the last resort of "No quorum" in the design document: a checkpoint of what the replica holds (its
+	 * flushed state plus what its RocksDB WAL replays), without the replication metadata ({@link #META_COLUMN}: the
+	 * cluster id, the applied position, results and sessions), whose cluster id would make every node of a new cluster
+	 * refuse it. The source is opened as a replica, which also finishes a restore that a crash interrupted; it must not
+	 * run. Table files are hard-linked when {@code target} is on the same file system.
+	 *
+	 * @return what the copy held: the applied position and cluster of the replica
+	 */
+	static ExportedSeed exportSeed(Path dbDir, @Nullable Path rockserverConfig, Path target) throws IOException {
+		target = target.toAbsolutePath().normalize();
+		if (Files.exists(target)) {
+			throw new IOException("The target " + target + " already exists");
+		}
+		if (!Files.isRegularFile(dbDir.resolve("CURRENT"))) {
+			throw new IOException("No database in " + dbDir);
+		}
+		TermIndex applied;
+		String clusterId;
+		try (var store = open(dbDir, rockserverConfig, "export-source")) {
+			clusterId = store.clusterId();
+			applied = store.checkpoint(target);
+		}
+		Path config = replicaConfig(rockserverConfig, target);
+		try (var copy = new EmbeddedConnection(target, "export-target", config)) {
+			var db = copy.getEmbeddedDB();
+			if (db.getAllColumnDefinitions().containsKey(META_COLUMN)) {
+				db.deleteColumn(db.getColumnId(META_COLUMN));
+			}
+			db.flush();
+		} catch (IOException | RuntimeException e) {
+			try {
+				deleteRecursively(target);
+			} catch (IOException deleteFailure) {
+				e.addSuppressed(deleteFailure);
+			}
+			throw e;
+		} finally {
+			Files.deleteIfExists(config);
+		}
+		syncTree(target);
+		return new ExportedSeed(applied, clusterId);
+	}
+
+	/** What {@link #exportSeed} copied: the applied position and the cluster (null if none) of the replica. */
+	record ExportedSeed(TermIndex applied, @Nullable String clusterId) {}
 
 	private @Nullable Buf readMeta(byte metaKey) {
 		return db().get(0, metaColumnId, key(metaKey), RequestType.<Buf>current());

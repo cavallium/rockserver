@@ -2,6 +2,7 @@ package it.cavallium.rockserver.distributed;
 
 import com.sun.management.HotSpotDiagnosticMXBean;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -33,9 +34,11 @@ import org.jetbrains.annotations.Nullable;
  *       [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
  *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
  *       [--jvm-pause-limit-ms N] [--snapshot-every-bytes N] [--parallel-apply-threads N]
+ *       [--allow-without-exit-on-oom]
  * admin --peer ... [--group-id UUID] [--timeout-ms N]
  *       status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
+ * export-seed --data-dir DIR --target DIR [--rockserver-config FILE]
  * </pre>
  *
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
@@ -45,7 +48,19 @@ import org.jetbrains.annotations.Nullable;
  * {@link RaftLogRepair}. It exits with 0 if the log is valid or was repaired (with {@code --dry-run}: could be) and
  * with 1 if it refuses.</p>
  *
- * <p>Run a node with {@code -XX:+ExitOnOutOfMemoryError}: it warns without it. See "Heap" in the design document.</p>
+ * <p>Run a node with {@code -XX:+ExitOnOutOfMemoryError}: {@code run} refuses to start without it, unless
+ * {@code --allow-without-exit-on-oom} is given (for development only). Running out of direct memory stops the node too,
+ * with exit code 3, see {@link DirectMemoryWatch}. See "Heap" in the design document.</p>
+ *
+ * <p>{@code run} exits with 4, and does not start, if the configuration in its log no longer contains the node: it was
+ * removed from the cluster, and a supervisor must not start it again. See "Replacing a node" in the design document.</p>
+ *
+ * <p>Unless {@code -Djava.io.tmpdir} is given, {@code run} uses {@code DATA-DIR/tmp} as the temporary directory, and
+ * deletes the copies of the RocksDB library that earlier runs left there; a given one outside the data directory is
+ * warned about.</p>
+ *
+ * <p>{@code export-seed} runs on a stopped node and copies its database into a new directory that can seed a new
+ * cluster, the last resort of "No quorum" in the design document (see {@link NodeStore#exportSeed}).</p>
  *
  * <p>{@code admin} changes end with {@code OK}, or with {@code FAILED: ...} and exit code 1, within {@code --timeout-ms}
  * (10 minutes by default), which must cover the catch-up of a new member. A leader that started a change goes on with it
@@ -94,11 +109,14 @@ public final class ReplicatedServerMain {
 			case "run" -> run(new Options(rest));
 			case "admin" -> admin(new Options(rest));
 			case "repair-log" -> repairLog(new Options(rest));
+			case "export-seed" -> exportSeed(new Options(rest));
 			default -> usage("unknown command " + args[0]);
 		}
 	}
 
 	private static void run(Options options) throws IOException, InterruptedException {
+		// Before anything makes a temporary file: the JDK reads the property once.
+		useNodeTemporaryDirectory(Path.of(options.required("--data-dir")));
 		var config = new NodeConfig(options.required("--node-id"),
 				options.peers(),
 				Path.of(options.required("--data-dir")),
@@ -120,11 +138,22 @@ public final class ReplicatedServerMain {
 				Long.parseLong(options.value("--snapshot-every-bytes",
 						String.valueOf(NodeConfig.DEFAULT_SNAPSHOT_EVERY_BYTES))),
 				Integer.parseInt(options.value("--parallel-apply-threads", "0")));
+		boolean allowWithoutExitOnOom = options.flag("--allow-without-exit-on-oom");
 		options.requireConsumed();
-		warnWithoutExitOnOutOfMemory();
+		requireExitOnOutOfMemory(allowWithoutExitOnOom);
+		var directMemoryWatch = DirectMemoryWatch.start(error -> {
+			// Like -XX:+ExitOnOutOfMemoryError: at once, without shutdown hooks.
+			System.err.println("Node " + config.nodeId() + " ran out of direct memory, exiting: " + error);
+			System.err.flush();
+			Runtime.getRuntime().halt(3);
+		});
 		ReplicatedNode node;
 		try {
 			node = ReplicatedNode.start(config);
+		} catch (ReplicatedNode.RemovedException e) {
+			System.err.println("Node " + config.nodeId() + " does not start: " + e.getMessage());
+			System.exit(4);
+			return;
 		} catch (IOException | RuntimeException e) {
 			// Ratis and gRPC leave non-daemon threads behind, which would keep the JVM running without a node.
 			System.err.println("Failed to start node " + config.nodeId() + ":");
@@ -142,6 +171,9 @@ public final class ReplicatedServerMain {
 		System.out.println("READY " + config.nodeId());
 		System.out.flush();
 		var failure = node.stopped().join();
+		if (directMemoryWatch != null) {
+			directMemoryWatch.close();
+		}
 		if (failure != null) {
 			// The replica cannot apply the log, or Raft closed: exit, so that a supervisor notices.
 			System.err.println("Node " + config.nodeId() + " stopped after a failure: " + failure);
@@ -151,15 +183,68 @@ public final class ReplicatedServerMain {
 
 	/**
 	 * An {@link OutOfMemoryError} on a thread of Ratis does not stop the JVM, and Ratis goes on without what it was doing.
-	 * In the appender that sends a snapshot, that ends the catch-up of a new member as if it had finished. See "Heap" in
-	 * the design document.
+	 * In the appender that sends a snapshot, that ends the catch-up of a new member as if it had finished, and with
+	 * {@code add-peer} leaving a lost node in the configuration the cluster ends with no leader. See "Heap" in the design
+	 * document. So a node refuses to start without {@code -XX:+ExitOnOutOfMemoryError}, unless told otherwise.
 	 */
-	private static void warnWithoutExitOnOutOfMemory() {
+	private static void requireExitOnOutOfMemory(boolean allowWithout) {
 		var diagnostics = ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
-		if (diagnostics != null && !Boolean.parseBoolean(diagnostics.getVMOption("ExitOnOutOfMemoryError").getValue())) {
-			System.err.println("WARNING: this JVM runs without -XX:+ExitOnOutOfMemoryError: an out of memory error on a"
-					+ " thread of Ratis can leave a cluster without a leader. See \"Heap\" in the design document");
+		if (diagnostics == null) {
+			System.err.println("WARNING: cannot tell whether this JVM runs with -XX:+ExitOnOutOfMemoryError");
+			return;
 		}
+		if (Boolean.parseBoolean(diagnostics.getVMOption("ExitOnOutOfMemoryError").getValue())) {
+			return;
+		}
+		var problem = "this JVM runs without -XX:+ExitOnOutOfMemoryError: an out of memory error on a thread of Ratis can"
+				+ " leave a cluster without a leader. See \"Heap\" in the design document";
+		if (allowWithout) {
+			System.err.println("WARNING: " + problem);
+			return;
+		}
+		System.err.println("Error: " + problem + ". Add the option, or --allow-without-exit-on-oom (development only)");
+		System.exit(2);
+	}
+
+	/**
+	 * RocksDB's Java binding extracts its native library (17 MB) into the temporary directory at every start, and a killed
+	 * JVM leaves it behind: on a shared {@code /tmp} with a quota, nodes then stop being able to start. Without an explicit
+	 * {@code -Djava.io.tmpdir} the node uses {@code DATA-DIR/tmp}, and deletes the copies left there by earlier runs (a
+	 * loaded library stays usable when its file is deleted).
+	 */
+	private static void useNodeTemporaryDirectory(Path dataDir) throws IOException {
+		boolean explicit = ManagementFactory.getRuntimeMXBean().getInputArguments().stream()
+				.anyMatch(argument -> argument.startsWith("-Djava.io.tmpdir="));
+		var dataRoot = dataDir.toAbsolutePath().normalize();
+		if (explicit) {
+			var given = Path.of(System.getProperty("java.io.tmpdir")).toAbsolutePath().normalize();
+			if (!given.startsWith(dataRoot)) {
+				System.err.println("WARNING: -Djava.io.tmpdir=" + given + " is outside the data directory " + dataRoot
+						+ ": every start leaves a 17 MB copy of the RocksDB library there if the node is killed");
+			}
+			return;
+		}
+		var temporary = dataRoot.resolve("tmp");
+		Files.createDirectories(temporary);
+		try (var entries = Files.list(temporary)) {
+			for (var entry : entries.filter(Files::isRegularFile)
+					.filter(file -> file.getFileName().toString().contains("rocksdbjni")).toList()) {
+				Files.deleteIfExists(entry);
+			}
+		}
+		System.setProperty("java.io.tmpdir", temporary.toString());
+	}
+
+	private static void exportSeed(Options options) throws IOException {
+		var dataDir = Path.of(options.required("--data-dir"));
+		var target = Path.of(options.required("--target"));
+		var rockserverConfig = options.value("--rockserver-config") != null
+				? Path.of(options.value("--rockserver-config")) : null;
+		options.requireConsumed();
+		var exported = NodeStore.exportSeed(dataDir.resolve("db"), rockserverConfig, target);
+		System.out.println("Exported the database of cluster " + exported.clusterId() + ", applied up to index "
+				+ exported.applied().getIndex() + " of term " + exported.applied().getTerm() + ", to " + target
+				+ ". Compare the applied index with the other replicas' before seeding a new cluster with it");
 	}
 
 	private static void admin(Options options) throws IOException, InterruptedException {
@@ -360,16 +445,19 @@ public final class ReplicatedServerMain {
 				        [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
 				        [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
 				        [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
-				        [--jvm-pause-limit-ms N]
+				        [--jvm-pause-limit-ms N] [--snapshot-every-bytes N] [--parallel-apply-threads N]
+				        [--allow-without-exit-on-oom]
 				  admin --peer ... [--group-id UUID] [--timeout-ms N]
 				        status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
-				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]""");
+				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]
+				  export-seed --data-dir DIR --target DIR [--rockserver-config FILE]""");
 		System.exit(2);
 	}
 
 	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
 	private static final class Options {
-		private static final List<String> FLAGS = List.of("--pipelined-updates", "--join", "--dry-run");
+		private static final List<String> FLAGS = List.of("--pipelined-updates", "--join", "--dry-run",
+				"--allow-without-exit-on-oom");
 
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();

@@ -120,7 +120,8 @@ class LogEntryCodecTest {
 						List.of(new Put(3, keys("a"), buf("1"), RequestTypeId.NOTHING)), true, 42,
 						Guard.of(3, keys(), Buf.wrap()))),
 				Named.of("genesis", new Genesis("cluster-1", false)),
-				Named.of("genesis, seeded", new Genesis(UNICODE, true)));
+				Named.of("genesis, seeded", new Genesis(UNICODE, true)),
+				Named.of("genesis, seeded, with a seed digest", new Genesis("cluster-2", true, "ab01")));
 	}
 
 	@ParameterizedTest

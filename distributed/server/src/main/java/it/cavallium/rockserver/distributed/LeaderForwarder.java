@@ -10,6 +10,7 @@ import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.io.Closeable;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -85,6 +86,11 @@ final class LeaderForwarder implements Closeable {
 	private final ConcurrentHashMap<CompletableFuture<String>, Runnable> pendingLeaders = new ConcurrentHashMap<>();
 	/** API addresses learned from members missing from this node's peer list, by peer id. */
 	private final ConcurrentHashMap<String, HostAndPort> learnedAddresses = new ConcurrentHashMap<>();
+	/**
+	 * API addresses that members of this node's peer list told about themselves: they win over the list, which may
+	 * be wrong on this node (see {@link #listedApiAddress}).
+	 */
+	private final ConcurrentHashMap<String, HostAndPort> answeredAddresses = new ConcurrentHashMap<>();
 	/** The event loop threads and callback executor of every forwarding connection; closed after them. */
 	private final GrpcClientTransport transport;
 	private volatile boolean closed;
@@ -140,6 +146,10 @@ final class LeaderForwarder implements Closeable {
 	 * null if unknown yet.
 	 */
 	@Nullable HostAndPort apiAddress(String peerId) {
+		var answered = answeredAddresses.get(peerId);
+		if (answered != null) {
+			return answered;
+		}
 		for (var peer : config.peers()) {
 			if (peer.id().equals(peerId)) {
 				return new HostAndPort(peer.apiHost(), peer.apiPort());
@@ -233,9 +243,7 @@ final class LeaderForwarder implements Closeable {
 			return CompletableFuture.failedFuture(new IOException("Node is closing"));
 		}
 		var known = config.peers().stream().filter(p -> p.id().equals(peerId)).findFirst();
-		var address = known.isPresent()
-				? CompletableFuture.completedFuture(new HostAndPort(known.get().apiHost(), known.get().apiPort()))
-				: askApiAddress(peerId, stateMachine);
+		var address = known.isPresent() ? listedApiAddress(known.get()) : askApiAddress(peerId, stateMachine);
 		return address.thenApplyAsync(api -> {
 			LOG.debug("{}: connecting to {} at {}:{}", config.nodeId(), peerId, api.host(), api.port());
 			probe(api);
@@ -253,6 +261,34 @@ final class LeaderForwarder implements Closeable {
 		}
 	}
 
+
+	/**
+	 * The API address of a member of this node's peer list, checked once against what the member answers at its Raft
+	 * address: a node started with wrong API ports for its peers would otherwise fail every call that it forwards. The
+	 * answer wins, and a difference is logged. A member that does not answer within {@link #PROBE_TIMEOUT_MS} is likely
+	 * down: the listed address is used, and it is asked again at the next connection.
+	 */
+	private CompletableFuture<HostAndPort> listedApiAddress(PeerConfig peer) {
+		var listed = new HostAndPort(peer.apiHost(), peer.apiPort());
+		var answered = answeredAddresses.get(peer.id());
+		if (answered != null) {
+			return CompletableFuture.completedFuture(answered);
+		}
+		var channel = NettyChannelBuilder.forTarget(peer.raftAddress()).usePlaintext().build();
+		return TermService.apiAddress(channel, Duration.ofMillis(PROBE_TIMEOUT_MS)).handle((address, error) -> {
+			channel.shutdown();
+			if (error != null) {
+				LOG.debug("{}: member {} did not tell its API address", config.nodeId(), peer.id(), error);
+				return listed;
+			}
+			if (answeredAddresses.put(peer.id(), address) == null && !address.equals(listed)) {
+				LOG.error("{}: member {} serves its API at {}:{}, but the peer list of this node says {}:{}: using the"
+						+ " member's. Fix --peer {}", config.nodeId(), peer.id(), address.host(), address.port(), listed.host(),
+						listed.port(), peer.format());
+			}
+			return address;
+		});
+	}
 
 	/** Asks a member that is not in this node's peer list for its API address, at its Raft address. */
 	private CompletableFuture<HostAndPort> askApiAddress(String peerId, RockserverStateMachine stateMachine) {
