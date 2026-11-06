@@ -313,7 +313,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 				.setStateMachine(this)
 				.setClientRequest(request);
 		try {
-			var decoded = decodeBatch(request.getMessage().getContent());
+			var content = request.getMessage().getContent();
+			if (!content.isEmpty() && content.byteAt(0) == LogEntryCodec.STAMPED) {
+				// Only the leader stamps, below: a stamped proposal would make an entry that followers cannot decode.
+				throw new IllegalArgumentException("A proposal must not carry a leader stamp");
+			}
+			var decoded = decodeBatch(content);
 			if (decoded.size() > 1 && !decoded.stream().allMatch(r -> Applier.isBatchable(r.entry()))) {
 				throw new IllegalArgumentException("Only data writes can share a log entry");
 			}

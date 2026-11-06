@@ -99,8 +99,18 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 	 * opens a session, and written in its log entry, so nodes may differ.
 	 */
 	static final String SESSION_TIMEOUT_PROPERTY = "rockserver.client-session-timeout-ms";
-	static final long SESSION_TIMEOUT_MILLIS = Math.max(1, Long.getLong(SESSION_TIMEOUT_PROPERTY,
-			TimeUnit.HOURS.toMillis(1)));
+	static final long SESSION_TIMEOUT_MILLIS = Long.getLong(SESSION_TIMEOUT_PROPERTY, TimeUnit.HOURS.toMillis(1));
+	/**
+	 * Shortest client session: a session that expires while a copy of one of its writes is still being resent (a
+	 * request timeout, plus the client's own retries) could have that copy refused as expired after an earlier copy
+	 * took effect. Well above both, and above the clock skew a new leader may bring.
+	 */
+	static final long MIN_SESSION_TIMEOUT_MILLIS = TimeUnit.MINUTES.toMillis(10);
+
+	/** The session timeout this node writes in a registration: the property, at least the minimum and 30 timeouts. */
+	static long sessionTimeoutMillis(long configuredMillis, java.time.Duration requestTimeout) {
+		return Math.max(configuredMillis, Math.max(MIN_SESSION_TIMEOUT_MILLIS, 30 * requestTimeout.toMillis()));
+	}
 
 	/** A write of a client session, without its {@code completedBelow}, which differs between copies. */
 	private record SessionWrite(long sessionId, long sequence) {
@@ -251,7 +261,8 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 	@Override
 	public CompletableFuture<Long> openClientSessionAsync(RequestContext context) {
 		long start = System.nanoTime();
-		return propose(context.withRequestId(null), start, new LogEntry.RegisterClient(SESSION_TIMEOUT_MILLIS))
+		return propose(context.withRequestId(null), start, new LogEntry.RegisterClient(
+				sessionTimeoutMillis(SESSION_TIMEOUT_MILLIS, config.requestTimeout())))
 				.thenApply(id -> (Long) id);
 	}
 

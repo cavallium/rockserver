@@ -138,11 +138,18 @@ class RatisContractTest {
 		} catch (java.util.concurrent.ExecutionException ex) {
 			refused = null;
 			assertInstanceOf(ResourceUnavailableException.class, ReplicatedConnection.unwrap(ex));
+			assertTrue(Proposer.isRatisPendingLimit(ReplicatedConnection.unwrap(ex)), ex::toString);
 		}
 		if (refused != null) {
 			assertFalse(refused.isSuccess());
 			assertInstanceOf(ResourceUnavailableException.class, refused.getException());
+			// Proposer resends it as refused before the append by this text alone.
+			var refusal = refused.getException();
+			assertTrue(Proposer.isRatisPendingLimit(refusal), refusal::toString);
 		}
+		// The refusal after the append must not read as one before it.
+		assertFalse(Proposer.isRatisPendingLimit(new ResourceUnavailableException(
+				"n0@group-1: Failed to add a pending write request for request")));
 		stateMachine.gate.countDown();
 		assertTrue(first.get(WAIT.toSeconds(), TimeUnit.SECONDS).isSuccess());
 	}
