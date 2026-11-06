@@ -1597,8 +1597,9 @@ What waits for it:
   supports: the leader may raise the version to it at any moment, also while the new node catches up and before the
   CLI's check could see it. The leader closes the same race from its side: it also asks every peer it sends the log to,
   which includes a peer that `add-peer` is bringing in and that is still catching up (Ratis' staging peers, which are
-  not in the configuration yet), and does not raise the version past what that peer supports. A member must not be
-  downgraded below it.
+  not in the configuration yet), and does not raise the version past what that peer supports (`PollPeersTest`, in
+  process with a stub division that lists a real member as staging: R3-G3-4). A member must not be downgraded below
+  it.
 - The leader's question and proposal run on the threads of the answers, without blocking them; the flag that tells
   the next round whether one is running is volatile.
 - A node refuses to start on a database whose cluster version has a capability it lacks (exit code 5): see "Exit
