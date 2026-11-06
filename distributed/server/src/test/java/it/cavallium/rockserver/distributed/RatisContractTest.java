@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -28,6 +29,7 @@ import org.apache.ratis.thirdparty.io.grpc.stub.ClientCalls;
 import org.apache.ratis.thirdparty.io.grpc.stub.ServerCalls;
 import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
 import org.apache.ratis.util.LifeCycle;
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -38,18 +40,24 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.impl.OrderedAsync;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
+import org.apache.ratis.grpc.metrics.MessageMetrics;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
@@ -69,6 +77,7 @@ import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.statemachine.impl.SimpleStateMachineStorage;
 import org.apache.ratis.thirdparty.com.google.protobuf.CodedInputStream;
+import org.apache.ratis.util.PeerProxyMap;
 import org.apache.ratis.util.PureJavaCrc32C;
 import org.apache.ratis.util.TimeDuration;
 import org.junit.jupiter.api.AfterEach;
@@ -653,6 +662,17 @@ class RatisContractTest {
 	 * {@link CommitHeartbeats.WakeSignal}: a Ratis that waited on its own field instead would fail here. With Ratis'
 	 * {@code AwaitForSignal} (drop the {@code getEventAwaitForSignal} override) the wake is lost and the commit index
 	 * comes with the next heartbeat, seconds later.
+	 *
+	 * <p>R8-3: the appender may not run at all between the commit and Ratis' heartbeat. The reply to the write's append
+	 * wakes it before the leader commits (the commit is updated later, on the leader's event thread,
+	 * {@code LeaderStateImpl.submitUpdateCommitEvent}), and the commit's own wake ({@code notifySenders}) can come while
+	 * it is between that pass and its wait, where both Ratis' signal and the {@code WakeSignal} drop it (no commit
+	 * heartbeat is wanted yet). The hook then never ran, and the round timed out once the heartbeat had told the
+	 * follower. So if the hook did not run within 100 ms of the write, the test wakes the appender itself ({@code notifyLogAppender}, which only wakes
+	 * it: with nothing wanted, a pass builds nothing). The hook and these wakes share a lock, and the hook marks itself
+	 * as run under it before it calls {@code send}, so no wake of the test comes after the {@code send} and could stand
+	 * in for one that the appender lost. A round whose commit index Ratis' heartbeat carried before the hook ran
+	 * proves nothing and is not counted.</p>
 	 */
 	@Test
 	void aCommitHeartbeatAskedForJustBeforeTheAppenderWaitsIsNotLost() throws Exception {
@@ -669,22 +689,59 @@ class RatisContractTest {
 		var followerLog = follower.getDivision(groupId).getRaftLog();
 		var leaderLog = cluster.leader().getDivision(groupId).getRaftLog();
 		var lags = new ArrayList<Long>();
-		for (int i = 0; i < 5; i++) {
+		int nudgedRounds = 0;
+		int skipped = 0;
+		for (int i = 0; lags.size() < 5; i++) {
+			assertTrue(i < 20, "rounds in which the hook ran before Ratis' heartbeat told the follower");
 			// Let Ratis' heartbeat after the previous round pass, so that it cannot carry this round's commit index.
 			Thread.sleep(200);
 			long before = leaderLog.getLastCommittedIndex();
 			var sentAt = new AtomicLong();
-			trigger.whenNothingToSend.set(nothing -> {
+			var nudges = new Object();
+			var ran = new boolean[1];
+			Predicate<CommitHeartbeats.Appender> hook = nothing -> {
 				if (nothing != appender || leaderLog.getLastCommittedIndex() <= before
 						|| nothing.getFollower().getCommitIndex() > before) {
 					return false;
 				}
+				synchronized (nudges) {
+					ran[0] = true;
+				}
 				trigger.send();
 				sentAt.set(System.nanoTime());
 				return true;
-			});
+			};
+			trigger.whenNothingToSend.set(hook);
 			long target = write(cluster.leader(), "j" + i);
-			waitUntil(() -> sentAt.get() != 0, "the appender built nothing after the commit, and send() ran then");
+			long written = System.nanoTime();
+			long deadline = written + WAIT.toNanos();
+			boolean told = false;
+			boolean nudged = false;
+			while (sentAt.get() == 0) {
+				if (followerLog.getLastCommittedIndex() >= target) {
+					told = true;
+					break;
+				}
+				assertTrue(System.nanoTime() - deadline < 0,
+						"the appender built nothing after the commit, and send() ran then");
+				// The appender's own pass after the commit takes well under 100 ms; past that its wake was lost.
+				synchronized (nudges) {
+					if (!ran[0] && System.nanoTime() - written > TimeUnit.MILLISECONDS.toNanos(100)) {
+						appender.notifyLogAppender();
+						nudged = true;
+					}
+				}
+				Thread.sleep(5);
+			}
+			if (told) {
+				// Ratis' heartbeat came first: nothing for the commit heartbeat to do in this round.
+				trigger.whenNothingToSend.compareAndSet(hook, null);
+				skipped++;
+				continue;
+			}
+			if (nudged) {
+				nudgedRounds++;
+			}
 			long start = sentAt.get();
 			while (followerLog.getLastCommittedIndex() < target) {
 				assertTrue(System.nanoTime() - start < WAIT.toNanos(), "the follower learns the commit index");
@@ -693,10 +750,85 @@ class RatisContractTest {
 			lags.add(TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start));
 		}
 		System.out.println("Commit index on the follower after a send() just before the appender's wait, us: " + lags
-				+ "; early wakes kept: " + wake.kept() + ", waits: " + wake.awaits());
+				+ "; early wakes kept: " + wake.kept() + ", waits: " + wake.awaits() + "; rounds whose hook ran only after a wake by the test: "
+				+ nudgedRounds + ", rounds told by Ratis' heartbeat first: " + skipped);
 		assertTrue(wake.awaits() > 0, "Ratis waits on the appender's WakeSignal");
 		assertTrue(wake.kept() >= 5, "each round's wake came before the wait and was kept");
 		assertTrue(lags.stream().allMatch(lag -> lag < 600_000), lags::toString);
+	}
+
+	/**
+	 * R8-4: Ratis 3.3.1 can build a client proxy whose metric interceptor has no registry, and the proxy map lets the
+	 * failure of such a proxy's close out of its own close. Each {@code GrpcClientProtocolClient} makes a
+	 * {@link MessageMetrics} named after its client and peer ({@code MetricClientInterceptor}), and its close
+	 * unregisters it. {@code RatisMetrics.create} shares a registry that is already there without counting the new
+	 * holder, and {@code RefCountingMap.put} counts a new registry only after putting it in the map; so when a proxy
+	 * is made while the one before it to the same peer closes, a close that removes the registry between the put and
+	 * the count leaves the new proxy with {@code null}. Every call of that proxy then throws a
+	 * {@link NullPointerException} at its start ({@code MessageMetrics.rpcStarted}), its close too, and
+	 * {@code PeerProxyMap} catches only an {@link IOException} of a proxy's close: its own close throws a
+	 * {@link CompletionException} after closing the others. {@link Proposer} replaces such a proxy
+	 * ({@link Proposer#resetBrokenProxy}) and logs the failure of its client's close ({@link Proposer#closeClient}).
+	 * Here generations of one proxy name are made each while the one before closes, on two threads, until one has no
+	 * registry: a few thousand generations, under a second. A Ratis that fixes the race fails here after
+	 * {@link #WAIT}, and the proposer's handling can go.
+	 */
+	@Test
+	void aProxyMadeWhileTheOneBeforeItClosesCanGetNoMetricRegistry() throws Exception {
+		var name = ClientId.randomId() + "->h1";
+		var pool = Executors.newFixedThreadPool(2);
+		MessageMetrics broken = null;
+		int generations = 0;
+		try {
+			var previous = new MessageMetrics(name, "client");
+			long deadline = System.nanoTime() + WAIT.toNanos();
+			while (broken == null) {
+				int made = generations;
+				assertTrue(System.nanoTime() - deadline < 0, () -> "no proxy without a registry in " + made + " generations");
+				var closing = previous;
+				var start = new CyclicBarrier(2);
+				var closed = pool.submit(() -> {
+					start.await();
+					closing.unregister();
+					return null;
+				});
+				var next = pool.submit(() -> {
+					start.await();
+					return new MessageMetrics(name, "client");
+				});
+				closed.get();
+				previous = next.get();
+				generations++;
+				if (previous.getRegistry() == null) {
+					broken = previous;
+				}
+			}
+		} finally {
+			pool.shutdownNow();
+		}
+		System.out.println("A proxy without a metric registry after " + generations + " generations");
+		var found = broken;
+		var npe = assertThrows(NullPointerException.class, found::unregister);
+		assertTrue(String.valueOf(npe.getMessage()).contains("\"this.registry\" is null"), npe::getMessage);
+
+		var others = new ArrayList<AtomicBoolean>();
+		var proxies = new PeerProxyMap<Closeable>("r8-4", peer -> {
+			if (peer.getId().toString().equals("h1")) {
+				return found::unregister;
+			}
+			var closedFlag = new AtomicBoolean();
+			others.add(closedFlag);
+			return () -> closedFlag.set(true);
+		});
+		for (var id : List.of("h0", "h1", "h2")) {
+			var peer = RaftPeer.newBuilder().setId(id).setAddress("127.0.0.1:1").build();
+			proxies.addRaftPeers(List.of(peer));
+			proxies.getProxy(peer.getId());
+		}
+		var failure = assertThrows(CompletionException.class, proxies::close);
+		assertInstanceOf(NullPointerException.class, failure.getCause());
+		assertEquals(2, others.size());
+		assertTrue(others.stream().allMatch(AtomicBoolean::get), "the other proxies were closed");
 	}
 
 	/** CPU time of the leader's threads that append to {@code followerId} (named {@code ...->followerId-...}). */
