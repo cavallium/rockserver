@@ -35,8 +35,9 @@ import org.jetbrains.annotations.Nullable;
  * <p>Applying a {@link Request} makes three things durable together: the entry's effects, its result (recorded under
  * the request's identity, see {@link Request}) and the new applied position. The data writes of a group of entries
  * run inside one local transaction without the WAL that writes all three (see {@link #beginGroup}), so a crash keeps
- * all or none of them. Schema changes and {@code deleteRange} cannot run in a transaction: the memtables are flushed
- * first, then their record and position are written in one logged write and the WAL is synced.</p>
+ * all or none of them. A {@code deleteRange} runs alone without the WAL, followed by its record and position (see
+ * {@link #applyAlone}). Schema changes cannot run in a transaction: the memtables are flushed first, then their record
+ * and position are written in one logged write and the WAL is synced.</p>
  *
  * <p>A failure that follows from the entry (a logical rejection, a failing merge operator, an exception of the apply
  * code) happens the same way on every replica: that becomes an {@link ApplyResult.Failed} and the log moves on. A
@@ -258,9 +259,17 @@ final class Applier {
 		if (existingId != null) {
 			// Creating a column that exists with the same schema changes nothing: it needs no flush nor fsync.
 			ApplyResult outcome = new ApplyResult.Ok(existingId);
-			inApplyTransaction(position, tx -> finish(tx, records, request, floor, outcome, position, true));
-			committed(request.proposerId(), records, List.of(request), request.completedBelow());
-			purge(request.proposerId(), records);
+			finishUnlogged(records, request, floor, outcome, position);
+			return outcome;
+		}
+		if (entry instanceof LogEntry.DeleteRange) {
+			// A plain write, which changes no MANIFEST: neither a flush nor the WAL. The range deletion skips the WAL
+			// like the apply transactions, after the group before it committed (see applyBatch), and its record and
+			// position follow it. With atomic flush a crash keeps a prefix of these writes: the deletion without its
+			// record makes the entry run again, and deleting the same range again removes nothing that the later
+			// writes (lost with the record) could have added, with the same result as the first run.
+			var outcome = ResultCodec.bounded(applyLogical(() -> execute(null, entry)));
+			finishUnlogged(records, request, floor, outcome, position);
 			return outcome;
 		}
 		// Schema changes write the RocksDB MANIFEST synchronously, while their schema rows, record and position go to
@@ -280,6 +289,23 @@ final class Applier {
 		committed(request.proposerId(), records, List.of(request), request.completedBelow());
 		purge(request.proposerId(), records);
 		return outcome;
+	}
+
+	/**
+	 * Writes the record, floor and position of an entry applied alone without the WAL: into the open group, if any,
+	 * else in a transaction of its own.
+	 */
+	private void finishUnlogged(ProposerRecords records, Request request, long floor, ApplyResult outcome,
+			TermIndex position) {
+		if (grouping) {
+			finish(openGroupTx(position), records, request, floor, outcome, position, true);
+			committed(request.proposerId(), records, List.of(request), request.completedBelow());
+			groupPurges.add(request.proposerId());
+		} else {
+			inApplyTransaction(position, tx -> finish(tx, records, request, floor, outcome, position, true));
+			committed(request.proposerId(), records, List.of(request), request.completedBelow());
+			purge(request.proposerId(), records);
+		}
 	}
 
 	/**
@@ -729,7 +755,8 @@ final class Applier {
 					.mergeMulti(merge.columnId(), merge.keys(), merge.values(), mergeType(merge.requestType()));
 			case LogEntry.DeleteRange range -> {
 				requireNoTransaction(tx, entry);
-				db.deleteRange(range.columnId(), range.start(), range.end());
+				// Without the WAL, like every data write of the apply: see applyAlone.
+				db.deleteRangeUnlogged(range.columnId(), range.start(), range.end());
 				yield null;
 			}
 			case LogEntry.CreateColumn create -> {

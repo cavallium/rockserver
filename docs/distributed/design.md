@@ -259,7 +259,14 @@ Raft log on disk instead of decoded on the heap. Any error on the apply or compl
   back, the group so far is committed, and the entry is applied again on its own, one request at a time, only
   its last request recording the position. Positions without data (configuration entries, leader no-ops) are
   written in the group too.
-- **Schema changes and `deleteRange`** cannot run in a transaction. All memtables are flushed first, so that
+- **`deleteRange`** cannot run in a transaction either, but it is a plain write: the group before it is
+  committed, the range deletion is written without the WAL, and its record and position go into the group
+  that follows, without a flush and without a WAL sync. A crash replay is still correct: with atomic flush a crash
+  keeps a prefix of the writes made without the WAL, so the deletion survives either with its record (the entry is
+  not replayed) or without it, and then without anything written after it. The replay deletes the same range
+  again from the state right after the first deletion, which removes nothing more, and computes the same result
+  (a range deletion returns nothing, or a rejection that depends only on the column and the keys).
+- **Schema changes** cannot run in a transaction. All memtables are flushed first, so that
   everything applied without the WAL is on disk before a logged write follows it; their record and position
   are then written in one logged transaction, and the WAL is synced, because RocksDB writes column family
   changes to the MANIFEST synchronously: a crash cannot keep one without the other. A column deletion first

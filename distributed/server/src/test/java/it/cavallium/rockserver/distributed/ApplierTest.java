@@ -726,4 +726,49 @@ class ApplierTest {
 			store.db().getColumnId("d");
 		}
 	}
+
+	@Test
+	void aDeleteRangeIsAppliedWithoutFlushAndAReplayGivesTheSameResult() throws Exception {
+		long column;
+		try (var store = open()) {
+			column = store.db().createColumn("c", SCHEMA);
+		}
+		var deleteRange = new Request(12, 6, 0, new LogEntry.DeleteRange(column, key(2), key(4)));
+		var crashed = open();
+		var applier = new Applier(crashed);
+		for (int i = 1; i <= 5; i++) {
+			applier.apply(new Request(12, i, 0, new LogEntry.Put(column, key(i), text("v" + i), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, i));
+		}
+		crashed.db().flush();
+		applier.beginGroup();
+		assertEquals(ApplyResult.OK_NULL, applier.applyBatch(List.of(deleteRange), TermIndex.valueOf(1, 6)).getFirst());
+		applier.applyBatch(List.of(new Request(12, 7, 0, new LogEntry.Put(column, key(3), text("after"),
+				RequestTypeId.NOTHING))), TermIndex.valueOf(1, 7));
+		applier.endGroup();
+		assertNull(value(crashed, column, 2));
+		assertEquals("after", value(crashed, column, 3));
+		assertEquals(TermIndex.valueOf(1, 7), crashed.applied());
+		// Kill: nothing after the flush is durable, the range deletion included (it flushed nothing, and wrote no WAL).
+		crashed.connection().close();
+		try (var store = open()) {
+			assertEquals(TermIndex.valueOf(1, 5), store.applied());
+			assertEquals("v2", value(store, column, 2));
+			// The deletion survives a crash without its record: replaying the entry deletes the range again, with the
+			// same result, and the later entry follows.
+			store.db().deleteRangeUnlogged(column, key(2), key(4));
+			store.db().flush();
+			var replay = new Applier(store);
+			assertEquals(ApplyResult.OK_NULL, replay.apply(deleteRange, TermIndex.valueOf(1, 6)));
+			replay.apply(new Request(12, 7, 0, new LogEntry.Put(column, key(3), text("after"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 7));
+			assertNull(value(store, column, 2));
+			assertEquals("after", value(store, column, 3));
+			assertEquals("v4", value(store, column, 4));
+			assertEquals(TermIndex.valueOf(1, 7), store.applied());
+			// A copy of the entry gets the recorded result.
+			assertEquals(ApplyResult.OK_NULL, replay.apply(deleteRange, TermIndex.valueOf(1, 8)));
+			assertEquals("after", value(store, column, 3));
+		}
+	}
 }
