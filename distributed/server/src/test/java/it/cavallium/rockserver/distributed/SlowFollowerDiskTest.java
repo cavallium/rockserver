@@ -28,10 +28,13 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * Scenario 14 of the design: one follower's disk is slow, not stopped (its log worker sleeps three quarters of the
  * time, {@link LogWorkerGate#pause}), under sustained writes. The leader must stay the leader of the same term, writes
- * must keep being acknowledged in every second (the other follower makes the majority), and the leader's memory must
- * stay bounded while the slow follower falls behind: the heap may not grow by anything like the bytes written, which
- * it would if the leader held the entries that the slow follower has not taken yet. Once the disk is fast again the
- * follower catches up.
+ * must keep being acknowledged in every second (the other follower makes the majority), and the slow follower must
+ * really fall behind. Once the disk is fast again the follower catches up.
+ *
+ * <p>Memory: the three nodes share this JVM, whose heap holds their Ratis log caches (bounded by Ratis); the test
+ * prints the heap and only checks that it grows by less than those caches from the middle of the load to its end.
+ * That is a weak check at the few MiB per second one JVM writes here; a leader in a JVM of its own under a long load
+ * is the real measurement (see the design document, "Tests").</p>
  */
 @Timeout(300)
 class SlowFollowerDiskTest {
@@ -41,9 +44,14 @@ class SlowFollowerDiskTest {
 	private static final int WRITERS = 8;
 	private static final int VALUE_BYTES = 8 * 1024;
 	private static final int LOAD_SECONDS = Integer.getInteger("rockserver.test.slowDiskSeconds", 20);
-	/** Each pause of the slow worker, and the time it then runs. */
-	private static final long PAUSE_MILLIS = 30;
-	private static final long RUN_MILLIS = 10;
+	/** Each pause of the slow worker, and the time it then runs: about a tenth of a disk. */
+	private static final long PAUSE_MILLIS = 180;
+	private static final long RUN_MILLIS = 20;
+	/**
+	 * What the heap may grow by from the middle of the load to its end: the Ratis log caches of the three nodes of this
+	 * JVM fill up to their bound (Ratis' default, 200 MiB each) whatever the follower does.
+	 */
+	private static final long CACHE_BOUND_BYTES = 3 * (200L << 20);
 
 	@TempDir
 	Path temp;
@@ -103,10 +111,19 @@ class SlowFollowerDiskTest {
 				}
 			}));
 		}
-		// The heap once the load runs, and at its end, each after a full collection.
-		Thread.sleep(Duration.ofSeconds(LOAD_SECONDS / 4));
-		long bytesAtFirst = bytes.get();
-		long heapAtFirst = usedHeapAfterGc();
+		// How far the slow follower falls behind, sampled while the load runs.
+		long maxLag = 0;
+		long middle = start + Duration.ofSeconds(LOAD_SECONDS / 2).toNanos();
+		long bytesAtFirst = -1;
+		long heapAtFirst = -1;
+		while (System.nanoTime() - end < 0) {
+			maxLag = Math.max(maxLag, leader.appliedIndex() - slow.appliedIndex());
+			if (heapAtFirst < 0 && System.nanoTime() - middle >= 0) {
+				bytesAtFirst = bytes.get();
+				heapAtFirst = usedHeapAfterGc();
+			}
+			Thread.sleep(100);
+		}
 		for (var writer : writers) {
 			writer.join();
 		}
@@ -124,14 +141,15 @@ class SlowFollowerDiskTest {
 		}
 		System.out.println("Writes per second: " + seconds + "; heap " + (heapAtFirst >> 20) + " MiB -> "
 				+ (heapAtEnd >> 20) + " MiB while " + (bytesInBetween >> 20) + " MiB were written; slow follower applied "
-				+ slowApplied + " of " + leaderApplied);
+				+ slowApplied + " of " + leaderApplied + ", at most " + maxLag + " entries behind");
 		assertTrue(failures.isEmpty(), () -> "writes failed: " + failures);
 		assertTrue(leaderInfo.isLeader(), "the leader stepped down");
 		assertEquals(term, leaderInfo.getCurrentTerm(), "an election took place");
 		for (int i = 0; i < LOAD_SECONDS; i++) {
 			assertTrue(seconds.get(i) > 0, "no write was acknowledged in second " + i + ": " + seconds);
 		}
-		assertTrue(heapAtEnd - heapAtFirst < Math.max(64L << 20, bytesInBetween / 2),
+		assertTrue(maxLag >= 10, "the slow follower never fell behind: the scenario did not happen");
+		assertTrue(heapAtEnd - heapAtFirst < CACHE_BOUND_BYTES,
 				"the heap grew by " + ((heapAtEnd - heapAtFirst) >> 20) + " MiB while " + (bytesInBetween >> 20)
 						+ " MiB were written");
 
