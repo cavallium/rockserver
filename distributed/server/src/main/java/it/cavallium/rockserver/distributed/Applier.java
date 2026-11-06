@@ -1848,7 +1848,7 @@ final class Applier {
 	 * ({@link #isLocalFailure}) is thrown, as {@link ReplicaFailedException}: it stops this replica, which must not
 	 * record a result that the others may not reach. An {@link Error} is not caught: it stops the replica too.
 	 */
-	private static ApplyResult applyLogical(Operation operation) {
+	private ApplyResult applyLogical(Operation operation) {
 		// Forget an operator failure of an earlier operation on this thread: only one of this operation counts.
 		FFMAbstractMergeOperator.takeFailureOnThisThread();
 		try {
@@ -1860,14 +1860,16 @@ final class Applier {
 			if (isLocalFailure(failure)) {
 				throw new ReplicaFailedException("Storage failure while applying", failure);
 			}
-			// The recorded text must be the same on every replica: without addresses, identity hashes or thread names
+			// The recorded text must be the same on every replica: without addresses, identity hashes, thread names or paths
 			// (see Failures). The full failure is only logged here.
 			var result = switch (failure) {
 				case RocksDBException rocksDBException -> new ApplyResult.Failed(rocksDBException.getErrorUniqueId(),
-						Failures.sanitize(String.valueOf(failure.getMessage())));
+						Failures.sanitizeForReplica(String.valueOf(failure.getMessage()), store.directories()));
 				case IllegalArgumentException _, UnsupportedOperationException _ -> new ApplyResult.Failed(
-						RocksDBErrorType.INVALID_REQUEST, Failures.sanitize(String.valueOf(failure.getMessage())));
-				default -> new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR, Failures.describe(failure));
+						RocksDBErrorType.INVALID_REQUEST,
+						Failures.sanitizeForReplica(String.valueOf(failure.getMessage()), store.directories()));
+				default -> new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR,
+						Failures.describeForReplica(failure, store.directories()));
 			};
 			if (result.type() == RocksDBErrorType.INTERNAL_ERROR) {
 				// A bug of the apply code: worth its stack trace.

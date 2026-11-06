@@ -124,11 +124,11 @@ pin them, and a format change must keep reading the old bytes. The client API an
 - **Puts without the apply copy.** A put still copies its key and value once at apply, into the `byte[]` that
   RocksJava's `Transaction.putUntracked` takes. RocksJava has a `ByteBuffer` put only for tracked writes, which would
   lock every key and track it for a validation the apply does not need, so removing this copy needs a change to
-  rocksdbjni itself. The branch deliberately depends
-  on the published rocksdbjni only (the Codex branch's dependence on an unpublished JNI fork was one of its
-  production risks), and the copy has not been measured as a bottleneck (performance.md, item 15, lists the apply
-  timers to compare first). If a profile shows the copy, the change belongs upstream in
-  RocksJava (an untracked `ByteBuffer` put), not in a fork.
+  rocksdbjni itself. rocksdbjni is already the project's own published fork (`it.cavallium:rocksdbjni`), so an
+  untracked `ByteBuffer` put (`putUntracked(ColumnFamilyHandle, ByteBuffer, ByteBuffer)`) would be a small addition
+  there, released as a new published version; what the Codex branch risked was depending on an unpublished commit
+  of the JNI submodule, missing from the published jar. The change is deferred only because the copy has not been
+  measured as a bottleneck (performance.md, item 15, lists the apply timers to compare first).
 - **A presence check with an exists call instead of `getForUpdate`.** `EmbeddedDB`'s previous-presence path (a put
   or delete that returns whether the key existed) reads the whole value with `getForUpdate` and keeps only whether
   it was found. It stays: the call also locks the key and records it for conflict validation, which no exists-style
@@ -138,9 +138,13 @@ pin them, and a format change must keep reading the old bytes. The client API an
   use: `getTableProperties` is a local command on a cluster. Master changed the same regions since, so it is better
   re-done on master on its own, with the single-node tests, than carried in this branch.
 - Two Codex core fixes were kept in a simpler form: a merge operator whose constructor fails destroys the native
-  object it created, and the JNI library is extracted to a temporary file in the version-keyed directory and renamed
-  into place atomically, so concurrent starts never truncate a library another process has loaded. An existing file
-  is reused when its size matches the jar entry, with no hashing at start.
+  object it created, and the JNI library is extracted to a temporary file, checked against the jar entry's CRC-32,
+  forced to disk and renamed into place atomically, so concurrent starts never truncate a library another process
+  has loaded and a power loss never leaves a library of the right size with wrong content. The file lives in a
+  directory named after the jar entry's size and CRC-32 (inside the version directory), both read from the jar's
+  directory: a fork rebuilt under the same version, even with the same size, is extracted again instead of reusing
+  the stale library, and no hashing happens at start. Temporary files older than ten minutes, left by a process
+  killed mid-copy, are removed.
 
 ## Routing
 
@@ -545,7 +549,9 @@ Raft log on disk instead of decoded on the heap. Any error on the apply or compl
   The recorded text of these failures is the same on every replica: the exception's class and message, without
   native addresses, identity hashes (as in class loader names), thread names, which differ between processes, or
   absolute file paths (a RocksDB status names the node's own data directory), which differ between nodes: each
-  becomes `<path>`. The full failure is only logged. The messages themselves come from the JDK, RocksDB and the
+  becomes `<path>`. A path under the node's own directories (database, WAL, and the directory holding the database)
+  is removed whole even when it contains white space; any other path ends at white space. Only these recorded texts
+  lose their paths: the error messages of a single node (`Failures.sanitize`) keep them. The full failure is only logged. The messages themselves come from the JDK, RocksDB and the
   Rockserver code, so every replica must run the same Rockserver build on the same JDK build: during a rolling
   upgrade a deterministic failure may be recorded with different text on the replicas of the two versions (its
   error type is still the same).

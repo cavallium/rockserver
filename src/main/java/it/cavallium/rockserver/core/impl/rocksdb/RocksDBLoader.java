@@ -90,9 +90,9 @@ public class RocksDBLoader {
             if (Files.notExists(jniPath)) {
                 Files.createDirectories(jniPath);
             }
-            loadLibraryFromJarToTemp(jniPath);
+            var extracted = loadLibraryFromJarToTemp(jniPath);
 
-            RocksDB.loadLibrary(List.of(jniPath.toAbsolutePath().toString()));
+            RocksDB.loadLibrary(List.of(extracted.getParent().toAbsolutePath().toString()));
         } catch (IOException e) {
             RocksDB.loadLibrary();
         }
@@ -114,32 +114,98 @@ public class RocksDBLoader {
         throw new RuntimeException("rocksdb was not found inside JAR.");
     }
 
+    /** A temporary file older than this was left by a process killed while extracting, and is removed. */
+    private static final Duration STALE_EXTRACTION = Duration.ofMinutes(10);
+
     /**
-     * Extracts a native library into {@code dir} (already keyed by the RocksDB version hash) without ever exposing a
-     * partly written file: the bytes go to a temporary file in the same directory, which is then renamed into place
-     * atomically. Several processes starting at once each write their own temporary file; the last rename wins and
-     * replaces the directory entry only, so a process that already mapped the previous file keeps a valid inode (the
-     * old copy-with-REPLACE_EXISTING truncated a library another process had loaded). An existing file is reused when
-     * its size matches the resource's, which the jar's directory gives without reading or hashing the library; any
-     * other file (a crash mid-copy by an older version) is replaced.
+     * Extracts a native library into a subdirectory of {@code dir} named after the library's content (its size and
+     * CRC-32, read from the jar's directory without reading the library), so a library rebuilt under the same version
+     * is never mistaken for the one already extracted, even when its size is the same. The bytes go to a temporary
+     * file in that subdirectory, are checked against the CRC, forced to disk and then renamed into place atomically:
+     * the file under the final name is always complete. Several processes starting at once each write their own
+     * temporary file; the last rename wins and replaces the directory entry only, so a process that already mapped the
+     * previous file keeps a valid inode. An existing file of the right size under the final name is reused, and
+     * temporary files older than {@link #STALE_EXTRACTION} (from a process killed mid-copy) are removed. A resource
+     * that is not a jar entry (tests) is read once more to compute its CRC.
      */
     @org.jetbrains.annotations.VisibleForTesting
     public static Path extractLibrary(Path dir, String fileName, java.net.URL resource) throws IOException {
-        var target = dir.resolve(fileName);
         var connection = resource.openConnection();
-        long expectedSize = connection.getContentLengthLong();
-        if (expectedSize >= 0 && Files.isRegularFile(target) && Files.size(target) == expectedSize) {
+        long size = -1;
+        long crc = -1;
+        if (connection instanceof java.net.JarURLConnection jar) {
+            var entry = jar.getJarEntry();
+            if (entry != null) {
+                size = entry.getSize();
+                crc = entry.getCrc();
+            }
+        }
+        if (size < 0 || crc < 0) {
+            var checksum = new java.util.zip.CRC32();
+            size = copy(connection, null, checksum);
+            crc = checksum.getValue();
+            connection = resource.openConnection();
+        }
+        var contentDir = dir.resolve(String.format("%d-%08x", size, crc));
+        Files.createDirectories(contentDir);
+        removeStaleExtractions(contentDir, fileName);
+        var target = contentDir.resolve(fileName);
+        if (Files.isRegularFile(target) && Files.size(target) == size) {
             return target;
         }
-        var temp = Files.createTempFile(dir, fileName + ".", ".tmp");
+        var temp = Files.createTempFile(contentDir, fileName + ".", ".tmp");
         try {
-            try (InputStream is = connection.getInputStream()) {
-                Files.copy(is, temp, StandardCopyOption.REPLACE_EXISTING);
+            var checksum = new java.util.zip.CRC32();
+            long written;
+            try (var channel = java.nio.channels.FileChannel.open(temp, java.nio.file.StandardOpenOption.WRITE,
+                    java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
+                written = copy(connection, channel, checksum);
+                channel.force(true);
+            }
+            if (written != size || checksum.getValue() != crc) {
+                throw new IOException("Native library " + resource + " changed while it was extracted");
             }
             Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE);
             return target;
         } finally {
             Files.deleteIfExists(temp);
+        }
+    }
+
+    private static long copy(java.net.URLConnection connection, @Nullable java.nio.channels.FileChannel channel,
+            java.util.zip.Checksum checksum) throws IOException {
+        long total = 0;
+        try (InputStream is = connection.getInputStream()) {
+            var buffer = new byte[1 << 16];
+            int read;
+            while ((read = is.read(buffer)) >= 0) {
+                checksum.update(buffer, 0, read);
+                if (channel != null) {
+                    var wrapped = java.nio.ByteBuffer.wrap(buffer, 0, read);
+                    while (wrapped.hasRemaining()) {
+                        channel.write(wrapped);
+                    }
+                }
+                total += read;
+            }
+        }
+        return total;
+    }
+
+    private static void removeStaleExtractions(Path contentDir, String fileName) {
+        var cutoff = System.currentTimeMillis() - STALE_EXTRACTION.toMillis();
+        try (var files = Files.newDirectoryStream(contentDir, fileName + ".*.tmp")) {
+            for (var file : files) {
+                try {
+                    if (Files.getLastModifiedTime(file).toMillis() < cutoff) {
+                        Files.deleteIfExists(file);
+                    }
+                } catch (IOException ignored) {
+                    // Another process removed or renamed it.
+                }
+            }
+        } catch (IOException ignored) {
+            // Best effort: a stale temporary file only wastes space.
         }
     }
 

@@ -288,6 +288,16 @@ final class NodeStore implements Closeable {
 		}
 	}
 
+	/**
+	 * The absolute directories this node's files live in (the database, its WAL and the node directory holding the
+	 * database), which differ between nodes: removed from the failure texts replicas record (see
+	 * {@link it.cavallium.rockserver.core.common.Failures#sanitizeForReplica}).
+	 */
+	List<Path> directories() {
+		var parent = dbDir.getParent();
+		return parent == null ? List.of(dbDir, walDir) : List.of(dbDir, walDir, parent);
+	}
+
 	EmbeddedConnection connection() {
 		return connection;
 	}

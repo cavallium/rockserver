@@ -1,5 +1,9 @@
 package it.cavallium.rockserver.core.common;
 
+import java.nio.file.Path;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.jetbrains.annotations.Nullable;
 
@@ -19,11 +23,12 @@ public final class Failures {
 	/**
 	 * Absolute file paths, which name each node's own data directory (as in a RocksDB status such as {@code IO error:
 	 * /var/lib/node1/db/000012.sst: No such file}): a Unix path of at least two segments not glued to a word before it
-	 * (so {@code a/b} and {@code 1/2} stay), or a Windows path. A path ends at white space, a quote, a bracket, a comma,
-	 * a semicolon or a colon followed by white space.
+	 * (so {@code a/b} and {@code 1/2} stay), or a Windows path (with either separator). A path ends at white space, a
+	 * quote, a bracket, a comma, a semicolon or a colon followed by white space; a path with white space in it is only
+	 * removed whole when it starts with one of the directories given to {@link #sanitizeForReplica}.
 	 */
 	private static final Pattern PATH = Pattern.compile(
-			"(?<![\\w.~])(?:[A-Za-z]:\\\\|/)[^\\s\"'()\\[\\]<>,;:/\\\\]+(?:[/\\\\][^\\s\"'()\\[\\]<>,;:/\\\\]+)+[/\\\\]?");
+			"(?<![\\w.~])(?:[A-Za-z]:[\\\\/]|/)[^\\s\"'()\\[\\]<>,;:/\\\\]+(?:[/\\\\][^\\s\"'()\\[\\]<>,;:/\\\\]+)+[/\\\\]?");
 	private static final String[] JVM_ERRORS = {"java.lang.OutOfMemoryError", "java.lang.StackOverflowError",
 			"java.lang.InternalError", "java.lang.UnknownError"};
 
@@ -83,13 +88,37 @@ public final class Failures {
 				: failure.getClass().getName() + ": " + sanitize(message);
 	}
 
+	/** The class name of {@code failure} and its message, {@link #sanitizeForReplica}d. */
+	public static String describeForReplica(Throwable failure, Collection<Path> nodeDirectories) {
+		var message = failure.getMessage();
+		return message == null ? failure.getClass().getName()
+				: failure.getClass().getName() + ": " + sanitizeForReplica(message, nodeDirectories);
+	}
+
 	/**
-	 * {@code text} without native addresses, identity hashes, thread names and absolute file paths, which differ
-	 * between processes and nodes.
+	 * {@link #sanitize}, and also without absolute file paths, which differ between nodes: for the failure text a
+	 * replica records, which must be the same on every replica. A path starting with one of {@code nodeDirectories}
+	 * (the node's own absolute directories, which may contain white space) is removed up to the next white space or
+	 * delimiter after that directory, then any other absolute path. Each becomes {@code <path>}. Client messages of a
+	 * single node keep their paths: only {@link #sanitize} applies there.
+	 */
+	public static String sanitizeForReplica(String text, Collection<Path> nodeDirectories) {
+		var result = text;
+		var directories = nodeDirectories.stream().map(Path::toString).filter(dir -> dir.length() > 1)
+				.distinct().sorted(Comparator.comparingInt(String::length).reversed()).toList();
+		for (String directory : directories) {
+			result = Pattern.compile(Pattern.quote(directory) + "[^\\s\"'()\\[\\]<>,;:]*").matcher(result)
+					.replaceAll(Matcher.quoteReplacement("<path>"));
+		}
+		result = PATH.matcher(result).replaceAll("<path>");
+		return sanitize(result);
+	}
+
+	/**
+	 * {@code text} without native addresses, identity hashes and thread names, which differ between processes.
 	 */
 	public static String sanitize(String text) {
-		var result = PATH.matcher(text).replaceAll("<path>");
-		result = ADDRESS.matcher(result).replaceAll("0x?");
+		var result = ADDRESS.matcher(text).replaceAll("0x?");
 		result = IDENTITY_HASH.matcher(result).replaceAll("@?");
 		return THREAD.matcher(result).replaceAll("[in thread ?]");
 	}
