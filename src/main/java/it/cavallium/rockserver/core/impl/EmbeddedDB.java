@@ -2,8 +2,6 @@ package it.cavallium.rockserver.core.impl;
 
 import it.cavallium.rockserver.core.common.SstMaintenance;
 
-import static it.cavallium.rockserver.core.common.Utils.dummyRocksDBEmptyValue;
-import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
 import io.micrometer.core.instrument.Meter;
@@ -14,10 +12,8 @@ import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.util.NamedThreadFactory;
 import it.cavallium.buffer.Buf;
-import it.cavallium.buffer.MemorySegmentBuf;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
-import it.cavallium.rockserver.core.common.RequestType.RequestEntriesCount;
 import it.cavallium.rockserver.core.common.RequestType.RequestGet;
 import it.cavallium.rockserver.core.common.RequestType.RequestGetRange;
 import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
@@ -50,22 +46,11 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.config.*;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
 import it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB.TransactionalOptions;
-import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
-import it.unimi.dsi.fastutil.objects.ObjectArrayList;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -75,11 +60,9 @@ import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Callable;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
@@ -92,15 +75,10 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.function.LongConsumer;
-import java.util.function.Supplier;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.cliffc.high_scale_lib.NonBlockingHashMapLong;
@@ -110,29 +88,17 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.VisibleForTesting;
 import org.reactivestreams.Publisher;
-import org.rocksdb.TableProperties;
-import org.rocksdb.AbstractImmutableNativeReference;
 import org.rocksdb.AbstractSlice;
 import org.rocksdb.Cache;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
-import org.rocksdb.CompactRangeOptions;
-import org.rocksdb.CompactRangeOptions.BottommostLevelCompaction;
 import org.rocksdb.DBOptions;
-import org.rocksdb.FlushOptions;
 import org.rocksdb.PinnedMultiGet;
 import org.rocksdb.ReadOptions;
-import org.rocksdb.ReadTier;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksIterator;
-import org.rocksdb.Snapshot;
 import org.rocksdb.Slice;
-import org.rocksdb.SstFileReaderIterator;
-import org.rocksdb.SstFileReader;
-import org.rocksdb.LiveFileMetaData;
-import org.rocksdb.Options;
-import org.rocksdb.OptimisticTransactionDB;
 import org.rocksdb.Status.Code;
 import org.rocksdb.util.SizeUnit;
 import org.slf4j.Logger;
@@ -140,19 +106,25 @@ import org.slf4j.LoggerFactory;
 import org.slf4j.MarkerFactory;
 import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
-import reactor.util.concurrent.Queues;
 import reactor.util.retry.Retry;
-import org.rocksdb.TransactionLogIterator;
 import org.rocksdb.WriteBatch;
+
+import it.cavallium.rockserver.core.impl.EmbeddedDBStorageMetrics.*;
+import it.cavallium.rockserver.core.impl.EmbeddedDBWriteElision.*;
+import it.cavallium.rockserver.core.impl.EmbeddedDBExistsMulti.*;
+import it.cavallium.rockserver.core.impl.EmbeddedDBIterators.*;
+import it.cavallium.rockserver.core.impl.EmbeddedDBRanges.*;
+import it.cavallium.rockserver.core.impl.EmbeddedDBRawScan.*;
 
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
-	private static VarHandle varHandle(Class<?> owner, String field, Class<?> type) {
+	static VarHandle varHandle(Class<?> owner, String field, Class<?> type) {
 		try {
-			return MethodHandles.lookup().findVarHandle(owner, field, type);
+			// The owners are nested classes of EmbeddedDB and of its package-private parts (EmbeddedDBRanges, ...);
+			// a private lookup in the owner reaches their private fields across those classes.
+			return MethodHandles.privateLookupIn(owner, MethodHandles.lookup()).findVarHandle(owner, field, type);
 		} catch (NoSuchFieldException | IllegalAccessException failure) {
 			throw new ExceptionInInitializerError(failure);
 		}
@@ -177,7 +149,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final @Nullable Runnable closeAction;
 		private final AtomicBoolean closed = new AtomicBoolean();
 
-		private FastGetResult(boolean present,
+		FastGetResult(boolean present,
 				@Nullable Buf value,
 				boolean pinned,
 				@Nullable Runnable closeAction) {
@@ -210,129 +182,58 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private enum WriteElisionRequest {
-		ENSURE("ensure"),
-		PREVIOUS_PRESENCE("previous_presence");
-
-		private final String tag;
-
-		WriteElisionRequest(String tag) {
-			this.tag = tag;
-		}
-
-		private static @Nullable WriteElisionRequest from(RequestPut<?, ?> requestType) {
-			if (requestType instanceof RequestType.RequestEnsure<?>) {
-				return ENSURE;
-			}
-			if (requestType instanceof RequestType.RequestPreviousPresence<?>) {
-				return PREVIOUS_PRESENCE;
-			}
-			return null;
-		}
-	}
-
-	private enum WriteElisionDecision {
-		ELIDED("elided"),
-		FALLBACK_NOT_FOUND("fallback_not_found"),
-		FALLBACK_DIFFERENT("fallback_different"),
-		FALLBACK_INCOMPLETE("fallback_incomplete"),
-		BYPASS_OVERSIZED("bypass_oversized"),
-		BYPASS_WRITER("bypass_writer");
-
-		private final String tag;
-
-		WriteElisionDecision(String tag) {
-			this.tag = tag;
-		}
-	}
-
-	private static final class PhysicalKey {
-
-		private final byte[] bytes;
-		private final int hashCode;
-
-		private PhysicalKey(byte[] bytes) {
-			this.bytes = bytes;
-			this.hashCode = Arrays.hashCode(bytes);
-		}
-
-		@Override
-		public boolean equals(Object other) {
-			return this == other || other instanceof PhysicalKey key && Arrays.equals(bytes, key.bytes);
-		}
-
-		@Override
-		public int hashCode() {
-			return hashCode;
-		}
-	}
-
-	private record MultiWriteElisionProbe(PhysicalKey[] physicalKeys, WriteElisionDecision[] decisions) {
-	}
-
-	private static final class BucketWriteElisionProbe {
-
-		private final PhysicalKey physicalKey;
-		private final ArrayList<Integer> logicalIndexes = new ArrayList<>();
-		private int requiredSize;
-
-		private BucketWriteElisionProbe(PhysicalKey physicalKey) {
-			this.physicalKey = physicalKey;
-		}
-	}
-
-	private static final int PINNED_GET_MIN_BYTES_OVERRIDE = Integer.getInteger(
+	static final int PINNED_GET_MIN_BYTES_OVERRIDE = Integer.getInteger(
 			"rockserver.fast-get.pinned-min-bytes", -1);
 
 	private static final String STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_PROPERTY =
 			"it.cavallium.rockserver.workload.storage-pressure-pending-compaction-bytes";
-	private static final long STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_OVERRIDE =
+	static final long STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_OVERRIDE =
 			storagePressurePendingCompactionBytesOverride();
-	private static final String ROCKSDB_IS_WRITE_STOPPED_PROPERTY =
+	static final String ROCKSDB_IS_WRITE_STOPPED_PROPERTY =
 			RocksDBLongProperty.IS_WRITE_STOPPED.getName();
-	private static final String ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY =
+	static final String ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY =
 			RocksDBLongProperty.ACTUAL_DELAYED_WRITE_RATE.getName();
-	private static final String ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY =
+	static final String ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY =
 			RocksDBLongProperty.ESTIMATE_PENDING_COMPACTION_BYTES.getName();
-	private static final StoragePressureColumn[] EMPTY_STORAGE_PRESSURE_COLUMNS = new StoragePressureColumn[0];
-	private static final int EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL = 4_096;
-	private static final long EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
-	private static final int EXISTS_MULTI_MAX_VARIABLE_HASH_BYTES = Arrays.stream(ColumnHashType.values())
+	static final StoragePressureColumn[] EMPTY_STORAGE_PRESSURE_COLUMNS = new StoragePressureColumn[0];
+	static final int EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL = 4_096;
+	static final long EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
+	static final int EXISTS_MULTI_MAX_VARIABLE_HASH_BYTES = Arrays.stream(ColumnHashType.values())
 			.mapToInt(ColumnHashType::bytesSize)
 			.max()
 			.orElse(0);
-	private static final int WRITE_ELISION_MAX_KEYS_PER_NATIVE_CALL = 4_096;
-	private static final long WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
-	private static final int RAW_SCAN_MAX_ENTRIES_PER_CHUNK = 65_536;
-	private static final long RAW_SCAN_MAX_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
+	static final int WRITE_ELISION_MAX_KEYS_PER_NATIVE_CALL = 4_096;
+	static final long WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL = 2 * SizeUnit.MB;
+	static final int RAW_SCAN_MAX_ENTRIES_PER_CHUNK = 65_536;
+	static final long RAW_SCAN_MAX_BYTES_PER_CHUNK = 2 * SizeUnit.MB;
 	// A logical raw scan spans many independently scheduled SST readers. Once its
 	// immutable snapshot is pinned, transient queue pressure between files must pause
 	// that scan rather than tear down and recapture the multi-terabyte snapshot.
-	private static final Retry RAW_SCAN_ADMISSION_RETRY = Retry
+	static final Retry RAW_SCAN_ADMISSION_RETRY = Retry
 			.backoff(Long.MAX_VALUE, Duration.ofMillis(10))
 			.maxBackoff(Duration.ofSeconds(1))
 			.jitter(0.5d)
-			.filter(EmbeddedDB::isRetryableRawScanAdmissionOverload);
+			.filter(EmbeddedDBRawScan::isRetryableRawScanAdmissionOverload);
 	private static final long RAW_SCAN_PIN_MAX_DURATION_NANOS = TimeUnit.MILLISECONDS.toNanos(Math.max(1L,
 			Long.getLong("it.cavallium.rockserver.raw-scan.pin-max-duration-ms", 120_000L)));
-	private static final String RAW_SCAN_PIN_DIRECTORY_NAME = ".rockserver-raw-scan-pins";
+	static final String RAW_SCAN_PIN_DIRECTORY_NAME = ".rockserver-raw-scan-pins";
 	public static final long MAX_TRANSACTION_DURATION_MS = 10_000L;
 	private static final String SHUTDOWN_PENDING_OPS_TIMEOUT_MS_PROPERTY
 			= "it.cavallium.rockserver.db.shutdown-pending-ops-timeout-ms";
-	private static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
-	private static final byte[] MERGE_OPERATORS_COLUMN = "_merge_operators_".getBytes(StandardCharsets.UTF_8);
+	static final byte[] COLUMN_SCHEMAS_COLUMN = "_column_schemas_".getBytes(StandardCharsets.UTF_8);
+	static final byte[] MERGE_OPERATORS_COLUMN = "_merge_operators_".getBytes(StandardCharsets.UTF_8);
 	/**
 	 * Column family of the removed CDC feature. Databases created by older versions still contain it, and RocksDB
 	 * must open every column family: it is opened if present, never created, and never read or written.
 	 */
 	private static final byte[] LEGACY_CDC_META_COLUMN = "_cdc_meta_".getBytes(StandardCharsets.UTF_8);
-	private static final List<byte[]> SYSTEM_COLUMNS = List.of(RocksDB.DEFAULT_COLUMN_FAMILY,
+	static final List<byte[]> SYSTEM_COLUMNS = List.of(RocksDB.DEFAULT_COLUMN_FAMILY,
 			COLUMN_SCHEMAS_COLUMN,
 			MERGE_OPERATORS_COLUMN,
 			LEGACY_CDC_META_COLUMN
 	);
 
-	private record StoragePressureColumn(long id,
+	record StoragePressureColumn(long id,
 			ColumnFamilyHandle handle,
 			@Nullable ColumnInstance registeredColumn,
 			long effectiveSoftPendingCompactionBytesLimit, int effectiveLevel0SlowdownWritesTrigger,
@@ -344,122 +245,133 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return configured == null ? 0L : Math.max(1L, configured);
 	}
 
-	private final Logger logger;
-	private final ActionLoggerConsumer actionLogger;
-	private final @Nullable Path path;
-	private final @NotNull Path definitiveDbPath;
-	private final TransactionalDB db;
-	private final DBOptions dbOptions;
-	private final RWScheduler scheduler;
-	private final ThreadPoolExecutor rawScanPinCaptureExecutor;
-	private final ScheduledExecutorService leakScheduler;
+	final EmbeddedDBColumns columnOps = new EmbeddedDBColumns(this);
+	final EmbeddedDBStorageMetrics storageMetrics = new EmbeddedDBStorageMetrics(this);
+	final EmbeddedDBWriteElision writeElision = new EmbeddedDBWriteElision(this);
+	final EmbeddedDBWrites writes = new EmbeddedDBWrites(this);
+	final EmbeddedDBBatchWrites batchWrites = new EmbeddedDBBatchWrites(this);
+	final EmbeddedDBPointReads pointReads = new EmbeddedDBPointReads(this);
+	final EmbeddedDBExistsMulti existsMultiOps = new EmbeddedDBExistsMulti(this);
+	final EmbeddedDBIterators iterators = new EmbeddedDBIterators(this);
+	final EmbeddedDBRanges ranges = new EmbeddedDBRanges(this);
+	final EmbeddedDBRawScan rawScan = new EmbeddedDBRawScan(this);
+	final EmbeddedDBMaintenance maintenance = new EmbeddedDBMaintenance(this);
+	final Logger logger;
+	final ActionLoggerConsumer actionLogger;
+	final @Nullable Path path;
+	final @NotNull Path definitiveDbPath;
+	final TransactionalDB db;
+	final DBOptions dbOptions;
+	final RWScheduler scheduler;
+	final ThreadPoolExecutor rawScanPinCaptureExecutor;
+	final ScheduledExecutorService leakScheduler;
 	private final ScheduledFuture<?> expiredRangeCleanupTask;
-	private final ColumnFamilyHandle columnSchemasColumnDescriptorHandle;
-	private final ColumnFamilyHandle mergeOperatorsColumnDescriptorHandle;
+	final ColumnFamilyHandle columnSchemasColumnDescriptorHandle;
+	final ColumnFamilyHandle mergeOperatorsColumnDescriptorHandle;
 	private final @Nullable ColumnFamilyHandle legacyCdcMetaColumnHandle;
-	private final MergeOperatorRegistry mergeOperatorRegistry;
-	private final NonBlockingHashMapLong<ColumnInstance> columns;
-	private volatile StoragePressureColumn[] storagePressureColumns = EMPTY_STORAGE_PRESSURE_COLUMNS;
-	private final Map<String, ColumnFamilyOptions> columnsConifg;
-	private final ConcurrentMap<String, Long> columnNamesIndex;
-	private final ConcurrentMap<String, ColumnFamilyHandle> unconfiguredColumns;
+	final MergeOperatorRegistry mergeOperatorRegistry;
+	final NonBlockingHashMapLong<ColumnInstance> columns;
+	volatile StoragePressureColumn[] storagePressureColumns = EMPTY_STORAGE_PRESSURE_COLUMNS;
+	final Map<String, ColumnFamilyOptions> columnsConifg;
+	final ConcurrentMap<String, Long> columnNamesIndex;
+	final ConcurrentMap<String, ColumnFamilyHandle> unconfiguredColumns;
 	private final NonBlockingHashMapLong<Tx> txs;
-	private final NonBlockingHashMapLong<REntry<RocksIterator>> its;
-	private final Set<ActiveRangeResource> activeRangeResources = ConcurrentHashMap.newKeySet();
-	private final AtomicInteger retainedRangeSnapshots = new AtomicInteger();
-	private final AtomicInteger activeNativeMultiGets = new AtomicInteger();
-	private final PointReadCompletionCounters pointReadCompletions = new PointReadCompletionCounters();
-	private final AtomicLong bulkReadTailNanos = new AtomicLong();
-	private final AtomicLong nativeBulkReadCompletions = new AtomicLong();
-	private final AtomicLong nativeBulkReadKeys = new AtomicLong();
-	private final RetainedQueryLimiter retainedQueryLimiter;
-	private final long maxRetainedSnapshotAgeMs;
-	private final Set<AsyncExistsMultiRequest> activeExistsMultiRequests = ConcurrentHashMap.newKeySet();
-	private final RawScanFileDeletionRecovery rawScanFileDeletionRecovery = new RawScanFileDeletionRecovery();
-	private final Object rawScanPinAcquisitionLock = new Object();
-	private final Object rawScanPinInitializationLock = new Object();
-	private final Set<Path> initializedRawScanPinRoots = new HashSet<>();
-	private final Set<Path> activeRawScanPinnedFiles = ConcurrentHashMap.newKeySet();
-	private final AtomicLong activeRawScanPinnedBytes = new AtomicLong();
-	private final Object asyncExistsMultiAdmissionLock = new Object();
-	private final SafeShutdown ops;
+	final NonBlockingHashMapLong<REntry<RocksIterator>> its;
+	final Set<ActiveRangeResource> activeRangeResources = ConcurrentHashMap.newKeySet();
+	final AtomicInteger retainedRangeSnapshots = new AtomicInteger();
+	final AtomicInteger activeNativeMultiGets = new AtomicInteger();
+	final PointReadCompletionCounters pointReadCompletions = new PointReadCompletionCounters();
+	final AtomicLong bulkReadTailNanos = new AtomicLong();
+	final AtomicLong nativeBulkReadCompletions = new AtomicLong();
+	final AtomicLong nativeBulkReadKeys = new AtomicLong();
+	final RetainedQueryLimiter retainedQueryLimiter;
+	final long maxRetainedSnapshotAgeMs;
+	final Set<AsyncExistsMultiRequest> activeExistsMultiRequests = ConcurrentHashMap.newKeySet();
+	final RawScanFileDeletionRecovery rawScanFileDeletionRecovery = rawScan.new RawScanFileDeletionRecovery();
+	final Object rawScanPinAcquisitionLock = new Object();
+	final Object rawScanPinInitializationLock = new Object();
+	final Set<Path> initializedRawScanPinRoots = new HashSet<>();
+	final Set<Path> activeRawScanPinnedFiles = ConcurrentHashMap.newKeySet();
+	final AtomicLong activeRawScanPinnedBytes = new AtomicLong();
+	final Object asyncExistsMultiAdmissionLock = new Object();
+	final SafeShutdown ops;
 	private final AtomicLong resourceLeases = new AtomicLong();
-	private final Object columnEditLock = new Object();
-	private final DatabaseConfig config;
-	private final Map<String, RWScheduler> workloadGroups = new java.util.LinkedHashMap<>();
-	private final Map<String, StoragePressureSignal> workloadGroupPressure = new java.util.LinkedHashMap<>();
-	private final Map<String, String> columnWorkloadGroups = new HashMap<>();
-	private final ConcurrentHashMap<Long, String> columnWorkloadNames = new ConcurrentHashMap<>();
-	private String fallbackWorkloadGroup = "default";
+	final Object columnEditLock = new Object();
+	final DatabaseConfig config;
+	final Map<String, RWScheduler> workloadGroups = new java.util.LinkedHashMap<>();
+	final Map<String, StoragePressureSignal> workloadGroupPressure = new java.util.LinkedHashMap<>();
+	final Map<String, String> columnWorkloadGroups = new HashMap<>();
+	final ConcurrentHashMap<Long, String> columnWorkloadNames = new ConcurrentHashMap<>();
+	String fallbackWorkloadGroup = "default";
 
-	private final WorkloadSettings workloadSettings;
-	private final RocksDBObjects refs;
-	private final Map<String, Cache> caches;
-	private final Map<String, Cache> metadataCaches;
-	private final MetricsManager metrics;
-	private final ExistsMultiPerfSampler existsMultiPerfSampler;
-	private final String name;
-	private final List<Meter> meters = new ArrayList<>();
+	final WorkloadSettings workloadSettings;
+	final RocksDBObjects refs;
+	final Map<String, Cache> caches;
+	final Map<String, Cache> metadataCaches;
+	final MetricsManager metrics;
+	final ExistsMultiPerfSampler existsMultiPerfSampler;
+	final String name;
+	final List<Meter> meters = new ArrayList<>();
 	private final Timer openTransactionTimer;
 	private final Timer closeTransactionTimer;
 	private final Timer closeFailedUpdateTimer;
-	private final Timer createColumnTimer;
-	private final Timer deleteColumnTimer;
-	private final Timer deleteColumnIfExistsTimer;
-	private final Timer getColumnIdTimer;
-	private final Timer estimateNumKeysTimer;
-	private final Timer putTimer;
-	private final Timer putMultiTimer;
-	private final Timer putBatchTimer;
-	private final Timer deleteRangeTimer;
-	private final Timer getTimer;
-	private final Timer existsMultiTimer;
-	private final Timer openIteratorTimer;
-	private final Timer closeIteratorTimer;
-	private final Timer seekToTimer;
-	private final Timer subsequentTimer;
-	private final Timer reduceRangeTimer;
-	private final Timer getRangeTimer;
-	private final Timer flushTimer;
-	private final Timer compactTimer;
-	private final String sstMaintenanceSession = java.util.UUID.randomUUID().toString();
-	private final Timer getAllColumnDefinitionsTimer;
-	private final AtomicBoolean nativeDeleteRangeFallbackLogged = new AtomicBoolean();
-	private final Counter storagePressureRefreshFailures;
-	private final StoragePressureSignal storagePressureSignal;
-	private final Counter rawScanPinAcquisitionFailures;
-	private final Timer rawScanPinAcquisitionTimer;
-	private final EnumMap<WriteElisionRequest, EnumMap<WriteElisionDecision, Counter>> writeElisionDecisionCounters;
+	final Timer createColumnTimer;
+	final Timer deleteColumnTimer;
+	final Timer deleteColumnIfExistsTimer;
+	final Timer getColumnIdTimer;
+	final Timer estimateNumKeysTimer;
+	final Timer putTimer;
+	final Timer putMultiTimer;
+	final Timer putBatchTimer;
+	final Timer deleteRangeTimer;
+	final Timer getTimer;
+	final Timer existsMultiTimer;
+	final Timer openIteratorTimer;
+	final Timer closeIteratorTimer;
+	final Timer seekToTimer;
+	final Timer subsequentTimer;
+	final Timer reduceRangeTimer;
+	final Timer getRangeTimer;
+	final Timer flushTimer;
+	final Timer compactTimer;
+	final String sstMaintenanceSession = java.util.UUID.randomUUID().toString();
+	final Timer getAllColumnDefinitionsTimer;
+	final AtomicBoolean nativeDeleteRangeFallbackLogged = new AtomicBoolean();
+	final Counter storagePressureRefreshFailures;
+	final StoragePressureSignal storagePressureSignal;
+	final Counter rawScanPinAcquisitionFailures;
+	final Timer rawScanPinAcquisitionTimer;
+	final EnumMap<WriteElisionRequest, EnumMap<WriteElisionDecision, Counter>> writeElisionDecisionCounters;
 	private final RocksDBStatistics rocksDBStatistics;
-	private @Nullable CompactionIoController compactionIoController;
-	private volatile @Nullable Runnable compactionIoSampleObserver;
-	private final boolean fastGet;
-	private final @Nullable NativeRocksDBGet fastGetReader;
+	@Nullable CompactionIoController compactionIoController;
+	volatile @Nullable Runnable compactionIoSampleObserver;
+	final boolean fastGet;
+	final @Nullable NativeRocksDBGet fastGetReader;
 	private volatile @Nullable Consumer<Boolean> rangeReadOptionsObserver;
-	private volatile @Nullable Consumer<Boolean> reduceRangeAsyncIoObserver;
+	volatile @Nullable Consumer<Boolean> reduceRangeAsyncIoObserver;
 	private volatile @Nullable Runnable rangeIteratorOpenObserver;
-	private volatile @Nullable Consumer<Integer> rangeReadChunkSizeObserver;
-	private volatile @Nullable Runnable rangeCountChunkObserver;
-	private volatile @Nullable LongConsumer rangeCountQuantumItemsObserver;
-	private volatile @Nullable Runnable rangeContinuationObserver;
-	private volatile @Nullable LongConsumer retainedQueryPermitGrantedObserver;
-	private volatile @Nullable Runnable retainedRangeCleanupObserver;
-	private volatile @Nullable Runnable iteratorAdvanceStepCompletedObserver;
+	volatile @Nullable Consumer<Integer> rangeReadChunkSizeObserver;
+	volatile @Nullable Runnable rangeCountChunkObserver;
+	volatile @Nullable LongConsumer rangeCountQuantumItemsObserver;
+	volatile @Nullable Runnable rangeContinuationObserver;
+	volatile @Nullable LongConsumer retainedQueryPermitGrantedObserver;
+	volatile @Nullable Runnable retainedRangeCleanupObserver;
+	volatile @Nullable Runnable iteratorAdvanceStepCompletedObserver;
 	private volatile @Nullable Runnable forcedShutdownObserver;
-	private volatile @Nullable Runnable existsMultiChunkObserver;
-	private volatile @Nullable Runnable batchWriteObserver;
-	private volatile @Nullable Runnable batchFinalWriteObserver;
-	private volatile @Nullable Runnable existsMultiSnapshotObserver;
-	private volatile @Nullable Consumer<Boolean> existsMultiArenaObserver;
-	private volatile @Nullable BiConsumer<Integer, Long> writeElisionMultiGetObserver;
-	private volatile @Nullable Runnable rawScanFilesCapturedObserver;
+	volatile @Nullable Runnable existsMultiChunkObserver;
+	volatile @Nullable Runnable batchWriteObserver;
+	volatile @Nullable Runnable batchFinalWriteObserver;
+	volatile @Nullable Runnable existsMultiSnapshotObserver;
+	volatile @Nullable Consumer<Boolean> existsMultiArenaObserver;
+	volatile @Nullable BiConsumer<Integer, Long> writeElisionMultiGetObserver;
+	volatile @Nullable Runnable rawScanFilesCapturedObserver;
 	private volatile @Nullable Runnable rawScanHardLinkObserver;
-	private volatile @Nullable Runnable rawScanReaderOpenedObserver;
-	private volatile @Nullable Runnable rawScanCleanupObserver;
-	private volatile @Nullable Runnable columnMaintenanceObserver;
+	volatile @Nullable Runnable rawScanReaderOpenedObserver;
+	volatile @Nullable Runnable rawScanCleanupObserver;
+	volatile @Nullable Runnable columnMaintenanceObserver;
 	private volatile @Nullable LongConsumer columnUseAcquiredObserver;
-	private volatile @Nullable Runnable storagePressurePollAdmittedObserver;
-	private Path tempSSTsPath;
+	volatile @Nullable Runnable storagePressurePollAdmittedObserver;
+	Path tempSSTsPath;
 
 	public EmbeddedDB(@Nullable Path path, String name, @Nullable Path embeddedConfigPath) throws IOException {
 		this(path, name, embeddedConfigPath, null);
@@ -516,30 +428,30 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 		this.metrics = new MetricsManager(config);
 		this.existsMultiPerfSampler = ExistsMultiPerfSampler.configured(metrics.getRegistry(), name);
-		Timer loadTimer = createTimer(Tags.of("action", "load"));
-		this.openTransactionTimer = createActionTimer(OpenTransaction.class);
-		this.closeTransactionTimer = createActionTimer(CloseTransaction.class);
-		this.closeFailedUpdateTimer = createActionTimer(CloseFailedUpdate.class);
-		this.createColumnTimer = createActionTimer(CreateColumn.class);
-		this.deleteColumnTimer = createActionTimer(DeleteColumn.class);
-		this.deleteColumnIfExistsTimer = createActionTimer(DeleteColumnIfExists.class);
-		this.getColumnIdTimer = createActionTimer(GetColumnId.class);
-		this.estimateNumKeysTimer = createActionTimer(EstimateNumKeys.class);
-		this.putTimer = createActionTimer(Put.class);
-		this.putMultiTimer = createActionTimer(PutMulti.class);
-		this.putBatchTimer = createActionTimer(PutBatch.class);
-		this.deleteRangeTimer = createActionTimer(DeleteRange.class);
-		this.getTimer = createActionTimer(Get.class);
-		this.existsMultiTimer = createActionTimer(ExistsMulti.class);
-		this.openIteratorTimer = createActionTimer(OpenIterator.class);
-		this.closeIteratorTimer = createActionTimer(CloseIterator.class);
-		this.seekToTimer = createActionTimer(SeekTo.class);
-		this.subsequentTimer = createActionTimer(Subsequent.class);
-		this.reduceRangeTimer = createActionTimer(ReduceRange.class);
-		this.getRangeTimer = createActionTimer(GetRange.class);
-		this.flushTimer = createActionTimer(Flush.class);
-		this.compactTimer = createActionTimer(Compact.class);
-		this.getAllColumnDefinitionsTimer = createActionTimer(GetAllColumnDefinitions.class);
+		Timer loadTimer = storageMetrics.createTimer(Tags.of("action", "load"));
+		this.openTransactionTimer = storageMetrics.createActionTimer(OpenTransaction.class);
+		this.closeTransactionTimer = storageMetrics.createActionTimer(CloseTransaction.class);
+		this.closeFailedUpdateTimer = storageMetrics.createActionTimer(CloseFailedUpdate.class);
+		this.createColumnTimer = storageMetrics.createActionTimer(CreateColumn.class);
+		this.deleteColumnTimer = storageMetrics.createActionTimer(DeleteColumn.class);
+		this.deleteColumnIfExistsTimer = storageMetrics.createActionTimer(DeleteColumnIfExists.class);
+		this.getColumnIdTimer = storageMetrics.createActionTimer(GetColumnId.class);
+		this.estimateNumKeysTimer = storageMetrics.createActionTimer(EstimateNumKeys.class);
+		this.putTimer = storageMetrics.createActionTimer(Put.class);
+		this.putMultiTimer = storageMetrics.createActionTimer(PutMulti.class);
+		this.putBatchTimer = storageMetrics.createActionTimer(PutBatch.class);
+		this.deleteRangeTimer = storageMetrics.createActionTimer(DeleteRange.class);
+		this.getTimer = storageMetrics.createActionTimer(Get.class);
+		this.existsMultiTimer = storageMetrics.createActionTimer(ExistsMulti.class);
+		this.openIteratorTimer = storageMetrics.createActionTimer(OpenIterator.class);
+		this.closeIteratorTimer = storageMetrics.createActionTimer(CloseIterator.class);
+		this.seekToTimer = storageMetrics.createActionTimer(SeekTo.class);
+		this.subsequentTimer = storageMetrics.createActionTimer(Subsequent.class);
+		this.reduceRangeTimer = storageMetrics.createActionTimer(ReduceRange.class);
+		this.getRangeTimer = storageMetrics.createActionTimer(GetRange.class);
+		this.flushTimer = storageMetrics.createActionTimer(Flush.class);
+		this.compactTimer = storageMetrics.createActionTimer(Compact.class);
+		this.getAllColumnDefinitionsTimer = storageMetrics.createActionTimer(GetAllColumnDefinitions.class);
 		this.storagePressureRefreshFailures = metrics.getRegistry().counter(
 				"rockserver.workload.storage.pressure.refresh.failures",
 				"database",
@@ -644,7 +556,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var beforeLoad = Instant.now();
 		var loadedDb = RocksDBLoader.load(path, config, logger, metrics.getRegistry(), name);
 		try {
-			recoverRawScanPinsAtStartup(loadedDb.db().get(), loadedDb.definitiveDbPath(), config);
+			rawScan.recoverRawScanPinsAtStartup(loadedDb.db().get(), loadedDb.definitiveDbPath(), config);
 		} catch (IOException | RuntimeException | Error recoveryFailure) {
 			try {
 				loadedDb.db().close();
@@ -708,7 +620,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				db.get(), walDirectory, dbOptions.maxTotalWalSize());
 		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics,
 				caches, loadedDb.cacheCapacities(), metadataCaches, loadedDb.metadataCacheCapacities(),
-				this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig, walMetricsConfig);
+				storageMetrics::getLongProperty, storageMetrics::getPerCfLongProperty, memoryUpperBoundConfig, walMetricsConfig);
 		this.scheduler = schedulerOverride != null
 				? schedulerOverride
 				: new RWScheduler(
@@ -723,13 +635,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						name, group.getKey());
 				workloadGroups.put(group.getKey(), groupScheduler);
 				scheduler.ownGroup(groupScheduler);
-				workloadGroupPressure.put(group.getKey(), newWorkloadGroupPressureSignal());
+				workloadGroupPressure.put(group.getKey(), EmbeddedDBStorageMetrics.newWorkloadGroupPressureSignal());
 			}
 		} catch (GestaltException failure) {
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, failure);
 		}
-		if (!workloadGroups.isEmpty()) workloadGroupPressure.put("default", newWorkloadGroupPressureSignal());
-		registerStoragePressureSignalMetrics(metrics.getRegistry());
+		if (!workloadGroups.isEmpty()) workloadGroupPressure.put("default", EmbeddedDBStorageMetrics.newWorkloadGroupPressureSignal());
+		storageMetrics.registerStoragePressureSignalMetrics(metrics.getRegistry());
 		// Pin capture performs filesystem work while RocksDB file deletion is
 		// disabled. Keep that serialized critical section on one owned thread so
 		// capture waiters never occupy the latency-sensitive read pool.
@@ -748,7 +660,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var leakScheduler = new ScheduledThreadPoolExecutor(1, new NamedThreadFactory("db-leak-scheduler"));
 		leakScheduler.setRemoveOnCancelPolicy(true);
 		this.leakScheduler = leakScheduler;
-		this.retainedQueryLimiter = new RetainedQueryLimiter(
+		this.retainedQueryLimiter = ranges.new RetainedQueryLimiter(
 				workloadSettings.retainedAnalyticalSnapshots(), leakScheduler);
 
 		leakScheduler.scheduleWithFixedDelay(this::cleanupExpiredTransactionsNow, 1, 1, TimeUnit.MINUTES);
@@ -819,7 +731,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				.map(Map.Entry::getValue)
 				.findAny()
 				.orElse(null);
-		registerSystemStoragePressureColumns();
+		storageMetrics.registerSystemStoragePressureColumns();
 
 		// Metrics for merge-operator cache sizes (diagnostics to detect leaks in uploaded operators)
 		try {
@@ -836,18 +748,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			logger.error("Failed to load metrics", ex);
 		}
 
-		loadExistingColumns(loadedDb.mergeOperators());
+		columnOps.loadExistingColumns(loadedDb.mergeOperators());
         if (tablePropertiesEnabled) {
             rocksDBStatistics.setTablePropertiesMetrics(new TablePropertiesMetrics(name, metrics.getRegistry(),
-                    tablePropertiesIntervalSeconds, this::collectTablePropertiesMetrics));
+                    tablePropertiesIntervalSeconds, maintenance::collectTablePropertiesMetrics));
         }
 		// Do not publish this object to the polling thread until column options,
 		// system handles, and registered-column pressure entries are complete.
-		leakScheduler.scheduleWithFixedDelay(this::refreshStoragePressure, 1, 1, TimeUnit.SECONDS);
+		leakScheduler.scheduleWithFixedDelay(storageMetrics::refreshStoragePressure, 1, 1, TimeUnit.SECONDS);
 		if (Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {
 			logger.info("Database configuration: {}", ConfigPrinter.stringify(config));
 		}
-		printStartupInfo();
+		columnOps.printStartupInfo();
 		var afterLoad = Instant.now();
 
 		loadTimer.record(Duration.between(beforeLoad, afterLoad));
@@ -865,505 +777,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				var readPoolTelemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
 				var groupReadPoolTelemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
 				compactionIoController = new CompactionIoController(name, loadedDb.compactionIoLimiter(),
-						() -> sampleCompactionIo(loadedDb.compactionIoLimiter(), readPoolTelemetry, groupReadPoolTelemetry), metrics.getRegistry(),
-						readaheadCeiling, this::applyCompactionReadahead);
+						() -> storageMetrics.sampleCompactionIo(loadedDb.compactionIoLimiter(), readPoolTelemetry, groupReadPoolTelemetry), metrics.getRegistry(),
+						readaheadCeiling, storageMetrics::applyCompactionReadahead);
 			} catch (RuntimeException | Error failure) {
 				try { close(); } catch (Throwable cleanupFailure) { failure.addSuppressed(cleanupFailure); }
 				throw failure;
 			}
-		}
-	}
-
-	private Timer createActionTimer(Class<? extends RocksDBAPICommand> className) {
-		return createTimer(Tags.of("action", className.getSimpleName()));
-	}
-
-	private Timer createTimer(Tags tags) {
-		var t = Timer
-				.builder("rocksdb.operation.timer")
-				.publishPercentiles(0.3, 0.5, 0.95)
-				.publishPercentileHistogram()
-				.tag("database", this.name)
-				.tags(tags)
-				.register(metrics.getRegistry());
-		meters.add(t);
-		return t;
-	}
-
-	private void registerStoragePressureSignalMetrics(MeterRegistry registry) {
-		registerStoragePressureReasonGauge(registry,
-				"write_stopped",
-				StoragePressureSignal.REASON_WRITE_STOPPED);
-		registerStoragePressureReasonGauge(registry,
-				"delayed_write",
-				StoragePressureSignal.REASON_DELAYED_WRITE);
-		registerStoragePressureReasonGauge(registry,
-				"pending_compaction",
-				StoragePressureSignal.REASON_PENDING_COMPACTION);
-		registerStoragePressureReasonGauge(registry,
-				"signal_failure",
-				StoragePressureSignal.REASON_SIGNAL_FAILURE);
-		meters.add(Gauge.builder("rockserver.workload.storage.pressure.actual.delayed.write.rate",
-					storagePressureSignal,
-					signal -> unsignedLongToDouble(signal.actualDelayedWriteRate()))
-				.description("RocksDB's current database-wide delayed-write rate")
-				.baseUnit("bytes")
-				.tag("database", name)
-				.register(registry));
-		meters.add(Gauge.builder("rockserver.workload.storage.pressure.pending.compaction.observed.max",
-					storagePressureSignal,
-					signal -> unsignedLongToDouble(signal.maximumPendingCompactionBytes()))
-				.description("Largest pending-compaction byte count observed before pressure short-circuited the poll")
-				.baseUnit("bytes")
-				.tag("database", name)
-				.register(registry));
-		meters.add(Gauge.builder("rockserver.workload.storage.pressure.pending.compaction.trigger.limit",
-					storagePressureSignal,
-					signal -> unsignedLongToDouble(signal.triggeringPendingCompactionLimit()))
-				.description("Effective per-column pending-compaction limit that triggered scheduler pressure")
-				.baseUnit("bytes")
-				.tag("database", name)
-				.register(registry));
-	}
-
-	private void registerStoragePressureReasonGauge(MeterRegistry registry, String reason, int reasonBit) {
-		meters.add(Gauge.builder("rockserver.workload.storage.pressure.reason",
-					storagePressureSignal,
-					signal -> signal.hasReason(reasonBit) ? 1.0d : 0.0d)
-				.description("Active RocksDB storage-pressure reasons")
-				.tag("database", name)
-				.tag("reason", reason)
-				.register(registry));
-	}
-
-	private static double unsignedLongToDouble(long value) {
-		return value >= 0L ? value : (double) (value & Long.MAX_VALUE) + 0x1.0p63;
-	}
-
-	private ColumnSchema decodeColumnSchema(byte[] value) {
-		try (var is = new ByteArrayInputStream(value); var dis = new DataInputStream(is)) {
-			var check = dis.readByte();
-			if (check == 2) {
-				var size = dis.readInt();
-				var keys = new IntArrayList(size);
-				for (int i = 0; i < size; i++) {
-					keys.add(dis.readInt());
-				}
-				size = dis.readInt();
-				var colHashTypes = new ObjectArrayList<ColumnHashType>(size);
-				for (int i = 0; i < size; i++) {
-					colHashTypes.add(ColumnHashType.values()[dis.readUnsignedByte()]);
-				}
-				var hasValue = dis.readBoolean();
-				return new ColumnSchema(keys, colHashTypes, hasValue, null, null, null);
-			} else if (check == 3) {
-				var size = dis.readInt();
-				var keys = new IntArrayList(size);
-				for (int i = 0; i < size; i++) {
-					keys.add(dis.readInt());
-				}
-				size = dis.readInt();
-				var colHashTypes = new ObjectArrayList<ColumnHashType>(size);
-				for (int i = 0; i < size; i++) {
-					colHashTypes.add(ColumnHashType.values()[dis.readUnsignedByte()]);
-				}
-				var hasValue = dis.readBoolean();
-				String mergeOperatorName = dis.readBoolean() ? dis.readUTF() : null;
-				Long mergeOperatorVersion = dis.readBoolean() ? dis.readLong() : null;
-				String mergeOperatorClass = dis.readBoolean() ? dis.readUTF() : null;
-				return new ColumnSchema(keys,
-						colHashTypes,
-						hasValue,
-						mergeOperatorName,
-						mergeOperatorVersion,
-						mergeOperatorClass
-				);
-			} else {
-				throw new IllegalStateException("Unknown schema version: " + check);
-			}
-		} catch (IOException e) {
-			throw new RuntimeException(e);
-		}
-	}
-
-	private byte[] encodeColumnSchema(ColumnSchema schema) {
-		try (var baos = new ByteArrayOutputStream(); var daos = new DataOutputStream(baos)) {
-			daos.writeByte(3);
-			daos.writeInt(schema.keys().size());
-			for (int key : schema.keys()) {
-				daos.writeInt(key);
-			}
-			daos.writeInt(schema.variableTailKeys().size());
-			for (ColumnHashType variableTailKey : schema.variableTailKeys()) {
-				daos.writeByte(variableTailKey.ordinal());
-			}
-			daos.writeBoolean(schema.hasValue());
-			var mergeOperatorName = schema.mergeOperatorName();
-			var mergeOperatorVersion = schema.mergeOperatorVersion();
-			var mergeOperatorClass = schema.mergeOperatorClass();
-			daos.writeBoolean(mergeOperatorName != null);
-			if (mergeOperatorName != null) {
-				daos.writeUTF(mergeOperatorName);
-			}
-			daos.writeBoolean(mergeOperatorVersion != null);
-			if (mergeOperatorVersion != null) {
-				daos.writeLong(mergeOperatorVersion);
-			}
-			daos.writeBoolean(mergeOperatorClass != null);
-			if (mergeOperatorClass != null) {
-				daos.writeUTF(mergeOperatorClass);
-			}
-			baos.close();
-			return baos.toByteArray();
-		} catch (IOException e) {
-			throw new RuntimeException(e);
-		}
-	}
-
-	@Nullable
-	private FFMAbstractMergeOperator resolveMergeOperator(ColumnSchema schema,
-			@Nullable FFMAbstractMergeOperator configuredMergeOperator) throws RocksDBException {
-		if (configuredMergeOperator != null) {
-			return configuredMergeOperator;
-		}
-		String mergeOperatorName = schema.mergeOperatorName();
-		Long mergeOperatorVersion = schema.mergeOperatorVersion();
-		String mergeOperatorClass = schema.mergeOperatorClass();
-		if ((mergeOperatorName != null || mergeOperatorVersion != null) && mergeOperatorClass != null) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Merge operator name/version and merge operator class cannot be both specified"
-			);
-		}
-		if (mergeOperatorName != null || mergeOperatorVersion != null) {
-			if (mergeOperatorName == null || mergeOperatorVersion == null) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Merge operator name and version must both be specified when one of them is set"
-				);
-			}
-			return mergeOperatorRegistry.get(mergeOperatorName, mergeOperatorVersion);
-		}
-		if (mergeOperatorClass != null && !mergeOperatorClass.isBlank()) {
-			try {
-				Class<?> clazz = Class.forName(mergeOperatorClass);
-				if (!FFMAbstractMergeOperator.class.isAssignableFrom(clazz)) {
-					throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
-							"Merge operator class does not extend FFMAbstractMergeOperator: " + mergeOperatorClass
-					);
-				}
-				@SuppressWarnings("unchecked") Class<? extends FFMAbstractMergeOperator> typed = (Class<? extends FFMAbstractMergeOperator>) clazz;
-				return typed.getConstructor().newInstance();
-			} catch (ReflectiveOperationException e) {
-				throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
-						"Failed to instantiate merge operator: " + mergeOperatorClass,
-						e
-				);
-			}
-		}
-		return configuredMergeOperator;
-	}
-
-	private void registerSystemStoragePressureColumns() {
-		ColumnFamilyHandle defaultColumn = db.getStartupColumns()
-				.entrySet()
-				.stream()
-				.filter(entry -> Arrays.equals(entry.getKey().getName(), RocksDB.DEFAULT_COLUMN_FAMILY))
-				.map(Entry::getValue)
-				.findFirst()
-				.orElseThrow(() -> new IllegalStateException("RocksDB default column family was not opened"));
-		upsertStoragePressureColumn(storagePressureColumn("default", defaultColumn));
-		upsertStoragePressureColumn(storagePressureColumn(
-				new String(COLUMN_SCHEMAS_COLUMN, StandardCharsets.UTF_8),
-				columnSchemasColumnDescriptorHandle));
-		upsertStoragePressureColumn(storagePressureColumn(
-				new String(MERGE_OPERATORS_COLUMN, StandardCharsets.UTF_8),
-				mergeOperatorsColumnDescriptorHandle));
-	}
-
-	private StoragePressureColumn storagePressureColumn(String name, ColumnFamilyHandle handle) {
-		ColumnFamilyOptions options = Objects.requireNonNull(columnsConifg.get(name),
-				() -> "Column config not found while registering storage-pressure signal: " + name);
-		return new StoragePressureColumn(handle.getID(),
-				handle,
-				null,
-				options.softPendingCompactionBytesLimit(), options.level0SlowdownWritesTrigger(),
-				options.maxWriteBufferNumber(), options.minWriteBufferNumberToMerge());
-	}
-
-	private void upsertStoragePressureColumn(StoragePressureColumn replacement) {
-		synchronized (columnEditLock) {
-			StoragePressureColumn[] current = storagePressureColumns;
-			for (int i = 0; i < current.length; i++) {
-				if (current[i].id() == replacement.id()) {
-					StoragePressureColumn[] updated = current.clone();
-					updated[i] = replacement;
-					storagePressureColumns = updated;
-					return;
-				}
-			}
-			StoragePressureColumn[] updated = Arrays.copyOf(current, current.length + 1);
-			updated[current.length] = replacement;
-			storagePressureColumns = updated;
-		}
-	}
-
-	private void removeStoragePressureColumn(long columnId) {
-		StoragePressureColumn[] current = storagePressureColumns;
-		for (int i = 0; i < current.length; i++) {
-			if (current[i].id() != columnId) {
-				continue;
-			}
-			if (current.length == 1) {
-				storagePressureColumns = EMPTY_STORAGE_PRESSURE_COLUMNS;
-			} else {
-				StoragePressureColumn[] updated = new StoragePressureColumn[current.length - 1];
-				System.arraycopy(current, 0, updated, 0, i);
-				System.arraycopy(current, i + 1, updated, i, current.length - i - 1);
-				storagePressureColumns = updated;
-			}
-			return;
-		}
-	}
-
-
-	private long internalRegisterColumn(@NotNull String name,
-			@NotNull ColumnFamilyHandle cfh,
-			@NotNull ColumnSchema schema,
-			@Nullable FFMAbstractMergeOperator mergeOp) {
-		long id = cfh.getID();
-		var pressureColumn = storagePressureColumn(name, cfh);
-
-		if (this.columns.containsKey(id)) {
-			throw new IllegalStateException("Column ID already registered: " + id);
-		}
-
-		Long previous = this.columnNamesIndex.putIfAbsent(name, id);
-		if (previous != null) {
-			throw new UnsupportedOperationException("Column already registered: " + name);
-		}
-
-		var column = new ColumnInstance(cfh, schema, mergeOp);
-		columnWorkloadNames.put(id, columnWorkloadGroups.getOrDefault(name, fallbackWorkloadGroup));
-		this.columns.put(id, column);
-		upsertStoragePressureColumn(new StoragePressureColumn(
-				pressureColumn.id(),
-				pressureColumn.handle(),
-				column,
-				pressureColumn.effectiveSoftPendingCompactionBytesLimit(), pressureColumn.effectiveLevel0SlowdownWritesTrigger(),
-				pressureColumn.effectiveMaxWriteBufferNumber(), pressureColumn.effectiveMinWriteBufferNumberToMerge()));
-
-		logger.info("Registered column: " + column);
-		return id;
-	}
-
-	private void loadExistingColumns(Map<String, FFMAbstractMergeOperator> initialMergeOperators) {
-		Map<String, ColumnFamilyHandle> startupHandles = new HashMap<>();
-		for (var entry : db.getStartupColumns().entrySet()) {
-			try {
-				startupHandles.put(new String(entry.getKey().getName(), StandardCharsets.UTF_8), entry.getValue());
-			} catch (Exception e) {
-				logger.warn("Failed to decode column name", e);
-			}
-		}
-
-		try (var it = this.db.get().newIterator(columnSchemasColumnDescriptorHandle)) {
-			it.seekToFirst();
-			while (it.isValid()) {
-				var key = it.key();
-				var name = new String(key, StandardCharsets.UTF_8);
-				ColumnSchema value = decodeColumnSchema(it.value());
-
-				var cfh = startupHandles.get(name);
-				if (cfh != null) {
-					FFMAbstractMergeOperator mergeOp = resolveMergeOperator(value, initialMergeOperators.get(name));
-					internalRegisterColumn(name, cfh, value, mergeOp);
-				}
-				it.next();
-			}
-		}
-
-		colIt:
-		for (var entry : startupHandles.entrySet()) {
-			String name = entry.getKey();
-			ColumnFamilyHandle cfh = entry.getValue();
-			long id = cfh.getID();
-
-			if (this.columns.containsKey(id)) {
-				continue;
-			}
-
-			// Skip system columns
-			byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
-			for (byte[] systemColumn : SYSTEM_COLUMNS) {
-				if (Arrays.equals(nameBytes, systemColumn)) {
-					continue colIt;
-				}
-			}
-
-			// Column exists in RocksDB but has no stored schema metadata.
-			// Mark as unconfigured — operations are forbidden until createColumn sets the schema.
-			logger.info("Found column without stored schema, marking as unconfigured: {}", name);
-			unconfiguredColumns.put(name, cfh);
-		}
-	}
-
-	private Mono<RawScanPinnedSstSet> scheduleRawScanPinCapture(
-			Callable<RawScanPinnedSstSet> capture) {
-		return Mono.create(sink -> {
-			var task = new RawScanPinCaptureTask(capture, sink);
-			sink.onCancel(task::cancelDelivery);
-			sink.onDispose(task::deliveryDisposed);
-			try {
-				rawScanPinCaptureExecutor.execute(task);
-				// Cancellation may win before execute() publishes the task to the
-				// queue. Retry removal after publication so canceled entries never
-				// consume the bounded capture admission budget.
-				task.removeIfCancelled();
-			} catch (RejectedExecutionException rejection) {
-				task.reject(rejection);
-			}
-		});
-	}
-
-	private final class RawScanPinCaptureTask implements Runnable {
-
-		private static final int QUEUED = 0;
-		private static final int RUNNING = 1;
-		private static final int FINISHED = 2;
-		private static final int CANCELLED = 3;
-
-		private final Callable<RawScanPinnedSstSet> capture;
-		private final reactor.core.publisher.MonoSink<RawScanPinnedSstSet> sink;
-		private final AtomicInteger state = new AtomicInteger(QUEUED);
-		private @Nullable Object pendingResult;
-		private boolean deliveryCancelled;
-
-		private RawScanPinCaptureTask(Callable<RawScanPinnedSstSet> capture,
-				reactor.core.publisher.MonoSink<RawScanPinnedSstSet> sink) {
-			this.capture = capture;
-			this.sink = sink;
-		}
-
-		private void cancelDelivery() {
-			Object cancelledResult;
-			synchronized (this) {
-				deliveryCancelled = true;
-				cancelledResult = pendingResult;
-				pendingResult = null;
-			}
-			cleanupCancelledResult(cancelledResult);
-			if (state.compareAndSet(QUEUED, CANCELLED)) {
-				rawScanPinCaptureExecutor.remove(this);
-			}
-		}
-
-		private void deliveryDisposed() {
-			Object cancelledResult = null;
-			synchronized (this) {
-				if (deliveryCancelled) {
-					cancelledResult = pendingResult;
-				}
-				pendingResult = null;
-			}
-			cleanupCancelledResult(cancelledResult);
-		}
-
-		private void removeIfCancelled() {
-			if (state.get() == CANCELLED) {
-				rawScanPinCaptureExecutor.remove(this);
-			}
-		}
-
-		private void reject(RejectedExecutionException rejection) {
-			if (!state.compareAndSet(QUEUED, FINISHED)) {
-				return;
-			}
-			if (!isDeliveryCancelled()) {
-				sink.error(RocksDBException.of(
-							RocksDBErrorType.SERVER_OVERLOADED,
-							rawScanPinCaptureExecutor.isShutdown()
-									? "Raw-scan pin capture executor is shutting down"
-									: "Raw-scan pin capture queue is full",
-							rejection));
-			}
-		}
-
-		@Override
-		public void run() {
-			if (!state.compareAndSet(QUEUED, RUNNING)) {
-				return;
-			}
-			try {
-				RawScanPinnedSstSet result = capture.call();
-				publishResult(result);
-			} catch (Throwable captureFailure) {
-				if (!isDeliveryCancelled()) {
-					sink.error(captureFailure);
-				} else {
-					logger.debug("Raw-scan pin capture failed after subscriber cancellation", captureFailure);
-				}
-			} finally {
-				state.set(FINISHED);
-			}
-		}
-
-		private boolean isDeliveryCancelled() {
-			synchronized (this) {
-				return deliveryCancelled;
-			}
-		}
-
-		private void publishResult(RawScanPinnedSstSet result) {
-			Object cancelledResult = null;
-			boolean emit;
-			synchronized (this) {
-				pendingResult = ReactorResultOwnership.encode(result);
-				emit = !deliveryCancelled;
-				if (!emit) {
-					cancelledResult = pendingResult;
-					pendingResult = null;
-				}
-			}
-			if (emit) {
-				sink.success(result);
-			} else {
-				cleanupCancelledResult(cancelledResult);
-			}
-		}
-
-		private void cleanupCancelledResult(@Nullable Object encodedResult) {
-			if (encodedResult == null) return;
-			try {
-				ReactorResultOwnership.<RawScanPinnedSstSet>decode(encodedResult).close();
-			} catch (Throwable cleanupFailure) {
-				logger.warn("Failed to clean raw-scan pins captured after subscriber cancellation",
-						cleanupFailure);
-			}
-		}
-	}
-
-	/**
-	 * The column must be unregistered once!!! Do not try to unregister a column that may already be unregistered, or that
-	 * may not be registered
-	 */
-	private ColumnInstance unregisterColumn(long id, @NotNull String name) {
-		columnWorkloadNames.remove(id);
-		synchronized (columnEditLock) {
-			var col = this.columns.remove(id);
-			Objects.requireNonNull(col, () -> "Column does not exist: " + id);
-			removeStoragePressureColumn(id);
-
-			if (this.columnNamesIndex.remove(name) == null) {
-				logger.warn("Column name not found in index during unregister: {}", name);
-			}
-
-			ColumnFamilyOptions columnConfig = this.columnsConifg.remove(name);
-			if (columnConfig != null) {
-				columnConfig.close();
-			} else {
-				logger.warn("Column config not found during unregister: {}", name);
-			}
-
-			return col;
 		}
 	}
 
@@ -1538,7 +957,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			logger.info("Closing {} open iterators", its.size());
 			for (long iteratorId : new ArrayList<>(its.keySet())) {
 				try {
-					closeIteratorInternal(iteratorId);
+					iterators.closeIteratorInternal(iteratorId);
 				} catch (Throwable t) {
 					logger.error("Error closing remaining iterator", t);
 				}
@@ -1741,7 +1160,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// Iterators
 			for (long iteratorId : new ArrayList<>(its.keySet())) {
 				try {
-					if (closeIteratorInternal(iteratorId)) {
+					if (iterators.closeIteratorInternal(iteratorId)) {
 						closedIts++;
 					}
 				} catch (Throwable t) {
@@ -1867,7 +1286,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}));
 			idsToRemove.forEach(id -> {
 				try {
-					closeIteratorInternal(id);
+					iterators.closeIteratorInternal(id);
 				} catch (Throwable ex) {
 					logger.error("Failed to close an iteration", ex);
 				}
@@ -1916,333 +1335,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private ReadOptions newReadOptions(String label) {
+	ReadOptions newReadOptions(String label) {
 		var ro = new LeakSafeReadOptions(label);
 		ro.setAsyncIo(true);
 		return ro;
 	}
 
-	private ReadOptions newPointReadOptions(String label) {
+	ReadOptions newPointReadOptions(String label) {
 		var ro = newReadOptions(label);
 		ro.setAsyncIo(false);
 		return ro;
 	}
 
-	private ReadOptions newWriteElisionReadOptions() {
-		var readOptions = newReadOptions("write-elision-cache-probe");
-		readOptions.setReadTier(ReadTier.BLOCK_CACHE_TIER);
-		readOptions.setFillCache(false);
-		return readOptions;
-	}
-
-	private void recordWriteElisionDecision(WriteElisionRequest request, WriteElisionDecision decision) {
-		writeElisionDecisionCounters.get(request).get(decision).increment();
-	}
-
-	private WriteElisionDecision probeCachedLogicalValue(ColumnInstance col,
-			PhysicalKey physicalKey,
-			Keys logicalKeys,
-			Buf requestedValue) {
-		try (var readOptions = newWriteElisionReadOptions()) {
-			byte[] rawValue;
-			try {
-				rawValue = db.get().get(col.cfh(), readOptions, physicalKey.bytes);
-			} catch (org.rocksdb.RocksDBException exception) {
-				return switch (exception.getStatus().getCode()) {
-					case NotFound -> WriteElisionDecision.FALLBACK_NOT_FOUND;
-					case Incomplete -> WriteElisionDecision.FALLBACK_INCOMPLETE;
-					default -> throw mapWriteElisionProbeFailure(exception);
-				};
-			}
-			if (rawValue == null) {
-				return WriteElisionDecision.FALLBACK_NOT_FOUND;
-			}
-			return cachedLogicalValueEquals(col, logicalKeys, requestedValue, Buf.wrap(rawValue))
-					? WriteElisionDecision.ELIDED
-					: WriteElisionDecision.FALLBACK_DIFFERENT;
-		}
-	}
-
-	private static boolean cachedLogicalValueEquals(ColumnInstance col,
-			Keys logicalKeys,
-			Buf requestedValue,
-			Buf rawValue) {
-		if (col.hasBuckets()) {
-			var bucket = new Bucket(col, rawValue);
-			var existing = bucket.getElement(col.getBucketElementKeys(logicalKeys.keys()));
-			return existing != null && (!col.schema().hasValue() || Utils.valueEquals(existing, requestedValue));
-		}
-		return !col.schema().hasValue() || Utils.valueEquals(rawValue, requestedValue);
-	}
-
-	private static RocksDBException mapWriteElisionProbeFailure(org.rocksdb.RocksDBException exception) {
-		return RocksDBException.of(RocksDBErrorType.PUT_2, exception);
-	}
-
-	private static RocksDBException mapWriteElisionProbeFailure(org.rocksdb.Status status) {
-		return mapWriteElisionProbeFailure(new org.rocksdb.RocksDBException(status));
-	}
-
-	private MultiWriteElisionProbe probeCachedLogicalValues(ColumnInstance col,
-			List<Keys> logicalKeys,
-			List<Buf> requestedValues) {
-		var physicalKeys = new PhysicalKey[logicalKeys.size()];
-		var decisions = new WriteElisionDecision[logicalKeys.size()];
-		for (int i = 0; i < logicalKeys.size(); i++) {
-			col.checkNullableValue(requestedValues.get(i));
-			physicalKeys[i] = new PhysicalKey(col.calculateKeyBytes(logicalKeys.get(i).keys()));
-		}
-		if (col.hasBuckets()) {
-			probeCachedBuckets(col, logicalKeys, requestedValues, physicalKeys, decisions);
-		} else {
-			probeCachedDirectValues(col, requestedValues, physicalKeys, decisions);
-		}
-		return new MultiWriteElisionProbe(physicalKeys, decisions);
-	}
-
-	private void probeCachedDirectValues(ColumnInstance col,
-			List<Buf> requestedValues,
-			PhysicalKey[] physicalKeys,
-			WriteElisionDecision[] decisions) {
-		int offset = 0;
-		try (var readOptions = newWriteElisionReadOptions()) {
-			while (offset < physicalKeys.length) {
-				var indexes = new ArrayList<Integer>();
-				long probeBytes = 0L;
-				while (offset < physicalKeys.length && indexes.size() < WRITE_ELISION_MAX_KEYS_PER_NATIVE_CALL) {
-					var physicalKey = physicalKeys[offset];
-					var requestedValue = requestedValues.get(offset);
-					long entryBytes = saturatingAdd(physicalKey.bytes.length,
-							col.schema().hasValue() ? requestedValue.size() : 0L);
-					if (entryBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL) {
-						decisions[offset++] = WriteElisionDecision.BYPASS_OVERSIZED;
-						continue;
-					}
-					if (!indexes.isEmpty()
-							&& entryBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL - probeBytes) {
-						break;
-					}
-					indexes.add(offset);
-					probeBytes += entryBytes;
-					offset++;
-				}
-				if (indexes.isEmpty()) {
-					continue;
-				}
-				try (var arena = Arena.ofConfined()) {
-					var keyBytes = new byte[indexes.size()][];
-					// Each value slot is exactly the requested size, so a longer stored value reports its requiredSize
-					var valueSizes = new long[indexes.size()];
-					for (int i = 0; i < indexes.size(); i++) {
-						int logicalIndex = indexes.get(i);
-						keyBytes[i] = physicalKeys[logicalIndex].bytes;
-						valueSizes[i] = col.schema().hasValue() ? requestedValues.get(logicalIndex).size() : 0;
-					}
-					var nativeKeys = NativeStaging.stageKeys(arena, keyBytes);
-					var nativeValues = NativeStaging.allocateSlices(arena, valueSizes);
-					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
-					for (int i = 0; i < statuses.size(); i++) {
-						int logicalIndex = indexes.get(i);
-						var status = statuses.get(i);
-						decisions[logicalIndex] = switch (status.status.getCode()) {
-							case Ok -> !col.schema().hasValue()
-									|| status.requiredSize == requestedValues.get(logicalIndex).size()
-									&& NativeStaging.contentEquals(nativeValues[i],
-									requestedValues.get(logicalIndex), status.requiredSize)
-									? WriteElisionDecision.ELIDED
-									: WriteElisionDecision.FALLBACK_DIFFERENT;
-							case NotFound -> WriteElisionDecision.FALLBACK_NOT_FOUND;
-							case Incomplete -> WriteElisionDecision.FALLBACK_INCOMPLETE;
-							default -> throw mapWriteElisionProbeFailure(status.status);
-						};
-					}
-				}
-			}
-		} catch (org.rocksdb.RocksDBException exception) {
-			throw mapWriteElisionProbeFailure(exception);
-		}
-	}
-
-	private void probeCachedBuckets(ColumnInstance col,
-			List<Keys> logicalKeys,
-			List<Buf> requestedValues,
-			PhysicalKey[] physicalKeys,
-			WriteElisionDecision[] decisions) {
-		var groupsByKey = new LinkedHashMap<PhysicalKey, BucketWriteElisionProbe>();
-		for (int i = 0; i < physicalKeys.length; i++) {
-			long individualProbeBytes = saturatingAdd(physicalKeys[i].bytes.length, requestedValues.get(i).size());
-			if (individualProbeBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL) {
-				decisions[i] = WriteElisionDecision.BYPASS_OVERSIZED;
-				continue;
-			}
-			groupsByKey.computeIfAbsent(physicalKeys[i], BucketWriteElisionProbe::new).logicalIndexes.add(i);
-		}
-		var groups = new ArrayList<>(groupsByKey.values());
-		var valuePassGroups = new ArrayList<BucketWriteElisionProbe>();
-		try (var readOptions = newWriteElisionReadOptions()) {
-			int offset = 0;
-			while (offset < groups.size()) {
-				var chunk = new ArrayList<BucketWriteElisionProbe>();
-				long probeBytes = 0L;
-				while (offset < groups.size() && chunk.size() < WRITE_ELISION_MAX_KEYS_PER_NATIVE_CALL) {
-					var group = groups.get(offset);
-					long entryBytes = group.physicalKey.bytes.length;
-					if (entryBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL) {
-						setBucketDecision(group, decisions, WriteElisionDecision.BYPASS_OVERSIZED);
-						offset++;
-						continue;
-					}
-					if (!chunk.isEmpty()
-							&& entryBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL - probeBytes) {
-						break;
-					}
-					chunk.add(group);
-					probeBytes += entryBytes;
-					offset++;
-				}
-				if (chunk.isEmpty()) {
-					continue;
-				}
-				try (var arena = Arena.ofConfined()) {
-					var keyBytes = new byte[chunk.size()][];
-					for (int i = 0; i < chunk.size(); i++) {
-						keyBytes[i] = chunk.get(i).physicalKey.bytes;
-					}
-					var nativeKeys = NativeStaging.stageKeys(arena, keyBytes);
-					// Size-only pass: one shared zero-capacity value segment
-					var nativeValues = new MemorySegment[chunk.size()];
-					Arrays.fill(nativeValues, arena.allocate(0));
-					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
-					for (int i = 0; i < statuses.size(); i++) {
-						var group = chunk.get(i);
-						var status = statuses.get(i);
-						switch (status.status.getCode()) {
-							case Ok -> {
-								group.requiredSize = status.requiredSize;
-								long valuePassBytes = saturatingAdd(group.physicalKey.bytes.length,
-										status.requiredSize);
-								if (valuePassBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL) {
-									setBucketDecision(group, decisions, WriteElisionDecision.BYPASS_OVERSIZED);
-								} else {
-									valuePassGroups.add(group);
-								}
-							}
-							case NotFound -> setBucketDecision(group, decisions, WriteElisionDecision.FALLBACK_NOT_FOUND);
-							case Incomplete -> setBucketDecision(group, decisions, WriteElisionDecision.FALLBACK_INCOMPLETE);
-							default -> throw mapWriteElisionProbeFailure(status.status);
-						}
-					}
-				}
-			}
-
-			offset = 0;
-			while (offset < valuePassGroups.size()) {
-				var chunk = new ArrayList<BucketWriteElisionProbe>();
-				long probeBytes = 0L;
-				while (offset < valuePassGroups.size() && chunk.size() < WRITE_ELISION_MAX_KEYS_PER_NATIVE_CALL) {
-					var group = valuePassGroups.get(offset);
-					long entryBytes = saturatingAdd(group.physicalKey.bytes.length, group.requiredSize);
-					if (!chunk.isEmpty()
-							&& entryBytes > WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL - probeBytes) {
-						break;
-					}
-					chunk.add(group);
-					probeBytes += entryBytes;
-					offset++;
-				}
-				try (var arena = Arena.ofConfined()) {
-					var keyBytes = new byte[chunk.size()][];
-					var valueSizes = new long[chunk.size()];
-					for (int i = 0; i < chunk.size(); i++) {
-						var group = chunk.get(i);
-						keyBytes[i] = group.physicalKey.bytes;
-						valueSizes[i] = group.requiredSize;
-					}
-					var nativeKeys = NativeStaging.stageKeys(arena, keyBytes);
-					var nativeValues = NativeStaging.allocateSlices(arena, valueSizes);
-					var statuses = runWriteElisionMultiGet(col, readOptions, nativeKeys, nativeValues);
-					for (int i = 0; i < statuses.size(); i++) {
-						var group = chunk.get(i);
-						var status = statuses.get(i);
-						switch (status.status.getCode()) {
-							case Ok -> {
-								if (status.requiredSize > nativeValues[i].byteSize()) {
-									var decision = saturatingAdd(group.physicalKey.bytes.length, status.requiredSize)
-											> WRITE_ELISION_MAX_PROBE_BYTES_PER_NATIVE_CALL
-											? WriteElisionDecision.BYPASS_OVERSIZED
-											: WriteElisionDecision.FALLBACK_DIFFERENT;
-									setBucketDecision(group, decisions, decision);
-									continue;
-								}
-								var rawBucket = Buf.wrap(copyMemorySegment(nativeValues[i], status.requiredSize));
-								var bucket = new Bucket(col, rawBucket);
-								for (int logicalIndex : group.logicalIndexes) {
-									var existing = bucket.getElement(
-											col.getBucketElementKeys(logicalKeys.get(logicalIndex).keys()));
-									decisions[logicalIndex] = existing != null
-											&& (!col.schema().hasValue()
-											|| Utils.valueEquals(existing, requestedValues.get(logicalIndex)))
-											? WriteElisionDecision.ELIDED
-											: WriteElisionDecision.FALLBACK_DIFFERENT;
-								}
-							}
-							case NotFound -> setBucketDecision(group, decisions, WriteElisionDecision.FALLBACK_NOT_FOUND);
-							case Incomplete -> setBucketDecision(group, decisions, WriteElisionDecision.FALLBACK_INCOMPLETE);
-							default -> throw mapWriteElisionProbeFailure(status.status);
-						}
-					}
-				}
-			}
-		} catch (org.rocksdb.RocksDBException exception) {
-			throw mapWriteElisionProbeFailure(exception);
-		}
-	}
-
-	private List<org.rocksdb.ByteBufferGetStatus> runWriteElisionMultiGet(ColumnInstance col,
-			ReadOptions readOptions,
-			MemorySegment[] nativeKeys,
-			MemorySegment[] nativeValues) throws org.rocksdb.RocksDBException {
-		var observer = writeElisionMultiGetObserver;
-		if (observer != null) {
-			long probeBytes = 0L;
-			for (int i = 0; i < nativeKeys.length; i++) {
-				probeBytes = saturatingAdd(probeBytes, nativeKeys[i].byteSize());
-				probeBytes = saturatingAdd(probeBytes, nativeValues[i].byteSize());
-			}
-			observer.accept(nativeKeys.length, probeBytes);
-		}
-		long readStarted = System.nanoTime();
-		activeNativeMultiGets.incrementAndGet();
-		try {
-			return db.get().multiGetByteBuffers(readOptions, List.of(col.cfh()), nativeKeys, nativeValues);
-		} finally {
-			activeNativeMultiGets.decrementAndGet();
-			recordCompactionForegroundRead(readStarted, nativeKeys.length);
-		}
-	}
-
-	private static void setBucketDecision(BucketWriteElisionProbe group,
-			WriteElisionDecision[] decisions,
-			WriteElisionDecision decision) {
-		for (int logicalIndex : group.logicalIndexes) {
-			decisions[logicalIndex] = decision;
-		}
-	}
-
-	/**
-	 * The bytes of {@code value} for a JNI call that only reads them during the call: the backing array itself when
-	 * it is exact, a copy otherwise. Never store the result, since it may alias the caller's buffer.
-	 */
-	private static byte[] jniArray(Buf value) {
-		byte[] array = value.asArrayStrict();
-		return array != null ? array : value.toByteArray();
-	}
-
-	private static byte[] copyMemorySegment(MemorySegment source, int length) {
-		return source.asSlice(0, length).toArray(ValueLayout.JAVA_BYTE);
-	}
-
-	private ReadOptions newRangeReadOptions(long deadlineMicros,
+	ReadOptions newRangeReadOptions(long deadlineMicros,
 			boolean fillCache,
 			@Nullable AbstractSlice<?> startKeySlice,
 			@Nullable AbstractSlice<?> endKeySlice) {
@@ -2416,12 +1521,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@VisibleForTesting
 	public void refreshStoragePressureForTesting() {
-		refreshStoragePressure();
+		storageMetrics.refreshStoragePressure();
 	}
 
 	@VisibleForTesting
 	public void failStoragePressureRefreshForTesting(Throwable failure) {
-		handleStoragePressureRefreshFailure(failure);
+		storageMetrics.handleStoragePressureRefreshFailure(failure);
 	}
 
 	@VisibleForTesting
@@ -2454,7 +1559,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		throw new IllegalArgumentException("Column is not registered for storage-pressure polling: " + columnId);
 	}
 
-	private void notifyRangeIteratorOpened() {
+	void notifyRangeIteratorOpened() {
 		var observer = rangeIteratorOpenObserver;
 		if (observer != null) {
 			observer.run();
@@ -2545,7 +1650,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		public <T> T put(long columnId, @NotNull Keys keys, @NotNull Buf value, RequestPut<? super Buf, T> requestType) {
-			return EmbeddedDB.this.put(tx, getColumn(columnId), 0L, keys, value, requestType);
+			return writes.put(tx, getColumn(columnId), 0L, keys, value, requestType);
 		}
 
 		/** Like {@link EmbeddedDB#putMulti} with a transaction. */
@@ -2560,7 +1665,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				List<T> responses = requestType instanceof RequestType.RequestNothing<?>
 						|| requestType instanceof RequestType.RequestEnsure<?> ? null : new ArrayList<>(keysList.size());
 				for (int i = 0; i < keysList.size(); i++) {
-					T result = EmbeddedDB.this.put(tx, col, 0L, keysList.get(i), valueList.get(i), requestType);
+					T result = writes.put(tx, col, 0L, keysList.get(i), valueList.get(i), requestType);
 					if (responses != null) {
 						responses.add(result);
 					}
@@ -2574,7 +1679,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		public <T> T delete(long columnId, @NotNull Keys keys, RequestDelete<? super Buf, T> requestType) {
-			return EmbeddedDB.this.delete(tx, getColumn(columnId), 0L, keys, requestType);
+			return writes.delete(tx, getColumn(columnId), 0L, keys, requestType);
 		}
 
 		/** Like {@link EmbeddedDB#deleteMulti} with a transaction. */
@@ -2584,7 +1689,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			List<T> responses =
 					requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
 			for (Keys keys : keysList) {
-				T result = EmbeddedDB.this.delete(tx, col, 0L, keys, requestType);
+				T result = writes.delete(tx, col, 0L, keys, requestType);
 				if (responses != null) {
 					responses.add(result);
 				}
@@ -2599,7 +1704,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		public <T> T merge(long columnId, @NotNull Keys keys, @NotNull Buf value,
 				RequestMerge<? super Buf, T> requestType) {
 			var col = getColumn(columnId);
-			T result = EmbeddedDB.this.merge(tx, col, 0L, keys, value, requestType);
+			T result = writes.merge(tx, col, 0L, keys, value, requestType);
 			checkMerge(col, keys, requestType);
 			return result;
 		}
@@ -2618,7 +1723,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			FFMAbstractMergeOperator.takeFailureOnThisThread();
 			try {
-				EmbeddedDB.this.get(tx, 0L, col, keys, RequestType.exists());
+				pointReads.get(tx, 0L, col, keys, RequestType.exists());
 			} catch (RuntimeException ex) {
 				var operatorFailure = FFMAbstractMergeOperator.takeFailureOnThisThread();
 				if (operatorFailure == null) {
@@ -2642,7 +1747,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				List<T> responses =
 						requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
 				for (int i = 0; i < keysList.size(); i++) {
-					T result = EmbeddedDB.this.merge(tx, col, 0L, keysList.get(i), valueList.get(i), requestType);
+					T result = writes.merge(tx, col, 0L, keysList.get(i), valueList.get(i), requestType);
 					checkMerge(col, keysList.get(i), requestType);
 					if (responses != null) {
 						responses.add(result);
@@ -2661,7 +1766,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			if (requestType instanceof RequestType.RequestForUpdate<?>) {
 				throw new UnsupportedOperationException("An apply writer does not run updates");
 			}
-			return EmbeddedDB.this.get(tx, 0L, getColumn(columnId), keys, requestType);
+			return pointReads.get(tx, 0L, getColumn(columnId), keys, requestType);
 		}
 
 		/** Marks the current state: {@link #rollbackToSavePoint} undoes the writes made after it. */
@@ -2774,7 +1879,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	/** Bytes of the header of a serialized {@link WriteBatch}: an 8-byte sequence and a 4-byte count. */
 	private static final int WRITE_BATCH_HEADER = 12;
 
-	private long allocateTransactionInternal(Tx tx) {
+	long allocateTransactionInternal(Tx tx) {
 		try {
 			return FastRandomUtils.allocateNewValue(txs, tx, Long.MIN_VALUE, -2);
 		} catch (Throwable error) {
@@ -2787,18 +1892,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private Tx openTransactionInternal(long timeoutMs, boolean isFromGetForUpdate) {
+	Tx openTransactionInternal(long timeoutMs, boolean isFromGetForUpdate) {
 		return openTransactionInternal(timeoutMs, isFromGetForUpdate, WorkloadProfile.BATCH, false);
 	}
 
-	private Tx openTransactionInternal(long timeoutMs,
+	Tx openTransactionInternal(long timeoutMs,
 			boolean isFromGetForUpdate,
 			WorkloadProfile workloadProfile,
 			boolean captureSnapshot) {
 		return openTransactionInternal(timeoutMs, isFromGetForUpdate, workloadProfile, captureSnapshot, false, false);
 	}
 
-	private Tx openTransactionInternal(long timeoutMs,
+	Tx openTransactionInternal(long timeoutMs,
 			boolean isFromGetForUpdate,
 			WorkloadProfile workloadProfile,
 			boolean captureSnapshot,
@@ -2908,7 +2013,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * @return false if failed optimistic commit
 	 */
 	@Contract("_, false -> true; _, true -> _")
-	private boolean closeTransactionInternal(long transactionId, boolean commit) {
+	boolean closeTransactionInternal(long transactionId, boolean commit) {
 		var tx = txs.get(transactionId);
 		if (tx == null) {
 			return handleMissingTransaction(transactionId, commit);
@@ -2946,7 +2051,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * @return false if failed optimistic commit
 	 */
 	@Contract("_, false -> true; _, true -> _")
-	private boolean closeTransactionInternal(@NotNull Tx tx, boolean commit) {
+	boolean closeTransactionInternal(@NotNull Tx tx, boolean commit) {
 		synchronized (tx) {
 			return closeTransactionExclusively(tx, commit);
 		}
@@ -3018,264 +2123,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private boolean isCompatibleSchemaChange(ColumnSchema oldSchema, ColumnSchema newSchema) {
-		return Objects.equals(oldSchema.keys(), newSchema.keys()) &&
-				Objects.equals(oldSchema.variableTailKeys(), newSchema.variableTailKeys()) &&
-				oldSchema.hasValue() == newSchema.hasValue();
-	}
-
-	private void updateColumnSchema(long colId, String name, ColumnSchema newSchema, FFMAbstractMergeOperator newOp) {
-		// Persist to disk
-		try {
-			byte[] key = name.getBytes(StandardCharsets.UTF_8);
-			byte[] value = encodeColumnSchema(newSchema);
-			db.get().put(columnSchemasColumnDescriptorHandle, key, value);
-		} catch (org.rocksdb.RocksDBException e) {
-			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Failed to persist updated schema for column: " + name, e);
-		}
-
-		// Update in-memory
-		synchronized (columnEditLock) {
-			ColumnInstance oldCol = columns.get(colId);
-			if (oldCol == null) return;
-
-			FFMAbstractMergeOperator currentOp = oldCol.mergeOperator();
-			if (currentOp instanceof DelegatingMergeOperator delegateOp && newOp != null) {
-				delegateOp.setDelegate(newOp);
-				newOp = delegateOp;
-			} else if (newOp != null && currentOp != null) {
-				logger.warn("Existing merge operator for column {} is not a DelegatingMergeOperator. Hot swap will only take effect after restart.", name);
-			}
-
-			ColumnInstance newCol = oldCol.withSchema(newSchema, newOp);
-			columns.put(colId, newCol);
-		}
-		logger.info("Updated schema for column: {} (MergeOperator changed)", name);
-	}
-
 	@Override
 	public long createColumn(String name, @NotNull ColumnSchema schema) throws RocksDBException {
-		var nameBytes = name.getBytes(StandardCharsets.UTF_8);
-		if (SYSTEM_COLUMNS.stream().anyMatch(system -> Arrays.equals(system, nameBytes))) {
-			throw RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, "Reserved column name: " + name);
-		}
-		var start = System.nanoTime();
-		actionLogger.logAction("CreateColumn", start, name, null, schema, null, null, null, null);
-		ops.beginOp();
-		try {
-			synchronized (columnEditLock) {
-				var colId = getColumnIdOrNull(name);
-				var col = colId != null ? getColumn(colId) : null;
-				if (col != null) {
-					if (schema.equals(col.schema())) {
-						return colId;
-					} else if (isCompatibleSchemaChange(col.schema(), schema)) {
-						GlobalDatabaseConfig globalConfig;
-						try {
-							globalConfig = this.config.global();
-						} catch (GestaltException e) {
-							throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, "Failed to get global config", e);
-						}
-						var options = RocksDBLoader.getColumnOptions(name,
-								path,
-								definitiveDbPath,
-								globalConfig,
-								logger,
-								refs,
-								this.path == null,
-								caches, metadataCaches
-						);
-						// Force use of configured merge operator if available, or resolve from new schema
-						var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
-						updateColumnSchema(colId, name, schema, mergeOp);
-						return colId;
-						} else {
-						throw RocksDBException.of(RocksDBErrorType.COLUMN_EXISTS,
-								"Column exists, with a different schema: " + name
-						);
-					}
-				} else {
-					// Check if this column exists in RocksDB but was loaded without a stored schema
-					var unconfiguredCfh = unconfiguredColumns.remove(name);
-					if (unconfiguredCfh != null) {
-						// Column exists in RocksDB but had no schema. Configure it now.
-						logger.info("Configuring schema for previously unconfigured column: {}", name);
-						try {
-							var options = RocksDBLoader.getColumnOptions(name,
-									path,
-									definitiveDbPath,
-									this.config.global(),
-									logger,
-									this.refs,
-									path == null,
-									caches, metadataCaches
-							);
-							var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
-							if (mergeOp != null && !(mergeOp instanceof DelegatingMergeOperator)) {
-								mergeOp = new DelegatingMergeOperator("Delegating-" + name, mergeOp);
-							}
-							var prev = columnsConifg.put(name, options.options());
-							if (prev != null) {
-								prev.close();
-							}
-							byte[] key = name.getBytes(StandardCharsets.UTF_8);
-							byte[] value = encodeColumnSchema(schema);
-							db.get().put(columnSchemasColumnDescriptorHandle, key, value);
-							return internalRegisterColumn(name, unconfiguredCfh, schema, mergeOp);
-						} catch (org.rocksdb.RocksDBException | GestaltException e) {
-							// Put it back if we failed
-							unconfiguredColumns.put(name, unconfiguredCfh);
-							throw RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, e);
-						}
-					}
-					try {
-						var options = RocksDBLoader.getColumnOptions(name,
-								path,
-								definitiveDbPath,
-								this.config.global(),
-								logger,
-								this.refs,
-								path == null,
-								caches, metadataCaches
-						);
-						var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
-						if (mergeOp != null && !(mergeOp instanceof DelegatingMergeOperator)) {
-							mergeOp = new DelegatingMergeOperator("Delegating-" + name, mergeOp);
-						}
-						if (mergeOp != null) {
-							options.options().setMergeOperator(mergeOp);
-						}
-
-						var prev = columnsConifg.put(name, options.options());
-						if (prev != null) {
-							throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL,
-									"ColumnsConfig already exists with name \"" + name + "\""
-							);
-						}
-						byte[] key = name.getBytes(StandardCharsets.UTF_8);
-						var cf = db.get().createColumnFamily(new ColumnFamilyDescriptor(key, options.options()));
-						byte[] value = encodeColumnSchema(schema);
-						db.get().put(columnSchemasColumnDescriptorHandle, key, value);
-						return internalRegisterColumn(name, cf, schema, mergeOp);
-					} catch (org.rocksdb.RocksDBException | GestaltException e) {
-						throw RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, e);
-					}
-				}
-			}
-		} finally {
-			ops.endOp();
-			var end = System.nanoTime();
-			createColumnTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		return columnOps.createColumn(name, schema);
 	}
 
 	@Override
 	public long uploadMergeOperator(String name, String className, byte[] jarData) {
-		return mergeOperatorRegistry.upload(name, className, jarData);
+		return columnOps.uploadMergeOperator(name, className, jarData);
 	}
 
 	@Override
 	public Long checkMergeOperator(String name, byte[] hash) {
-		return mergeOperatorRegistry.check(name, hash);
+		return columnOps.checkMergeOperator(name, hash);
 	}
 
 	@Override
 	public void deleteColumn(long columnId) throws RocksDBException {
-		var start = System.nanoTime();
-		actionLogger.logAction("DeleteColumn", start, columnId, null, null, null, null, null, null);
-		ops.beginOp();
-		try {
-			synchronized (columnEditLock) {
-				var col = getColumn(columnId);
-				try {
-					var columnName = new String(col.cfh().getName(), StandardCharsets.UTF_8);
-					deleteRegisteredColumnLocked(columnId, columnName, col);
-				} catch (org.rocksdb.RocksDBException e) {
-					throw RocksDBException.of(RocksDBErrorType.COLUMN_DELETE_FAIL, e);
-				}
-			}
-		} finally {
-			ops.endOp();
-			var end = System.nanoTime();
-			deleteColumnTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		columnOps.deleteColumn(columnId);
 	}
 
 	@Override
 	public boolean deleteColumnIfExists(@NotNull String name) throws RocksDBException {
-		Objects.requireNonNull(name, "name");
-		var start = System.nanoTime();
-		actionLogger.logAction("DeleteColumnIfExists", start, name, null, null, null, null, null, null);
-		ops.beginOp();
-		try {
-			synchronized (columnEditLock) {
-				try {
-					var columnId = getRegisteredColumnIdOrNull(name);
-					if (columnId != null) {
-						deleteRegisteredColumnLocked(columnId, name, getColumn(columnId));
-						return true;
-					}
-
-					var unconfiguredColumn = unconfiguredColumns.get(name);
-					if (unconfiguredColumn != null) {
-						db.get().dropColumnFamily(unconfiguredColumn);
-						unconfiguredColumns.remove(name);
-						unconfiguredColumn.close();
-						var columnConfig = columnsConifg.remove(name);
-						if (columnConfig != null) {
-							columnConfig.close();
-						} else {
-							logger.warn("Column config not found while deleting unconfigured column: {}", name);
-						}
-						deleteColumnSchemaMetadata(name);
-						return true;
-					}
-
-					// A previous attempt may have dropped the physical column before metadata cleanup failed.
-					deleteColumnSchemaMetadata(name);
-					return false;
-				} catch (org.rocksdb.RocksDBException e) {
-					throw RocksDBException.of(RocksDBErrorType.COLUMN_DELETE_FAIL, e);
-				}
-			}
-		} finally {
-			ops.endOp();
-			var end = System.nanoTime();
-			deleteColumnIfExistsTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
-	}
-
-	private void deleteRegisteredColumnLocked(long columnId,
-			@NotNull String name,
-			@NotNull ColumnInstance column) throws org.rocksdb.RocksDBException {
-		// Closing admission linearizes deletion against every data-path acquisition.
-		// Existing owners retain the native handle until they finish; holding the edit
-		// lock prevents a same-name replacement from overlapping that retirement.
-		column.stopNewUsesAndWait();
-		db.get().dropColumnFamily(column.cfh());
-		unregisterColumn(columnId, name).closeHandle();
-		deleteColumnSchemaMetadata(name);
-	}
-
-	private void deleteColumnSchemaMetadata(@NotNull String name) throws org.rocksdb.RocksDBException {
-		db.get().delete(columnSchemasColumnDescriptorHandle, name.getBytes(StandardCharsets.UTF_8));
+		return columnOps.deleteColumnIfExists(name);
 	}
 
 	@Override
 	public long getColumnId(@NotNull String name) {
-		var start = System.nanoTime();
-		actionLogger.logAction("GetColumnId", start, name, null, null, null, null, null, null);
-		try {
-			var columnId = getColumnIdOrNull(name);
-			if (columnId == null) {
-				throw RocksDBException.of(RocksDBErrorType.COLUMN_NOT_FOUND, "Column not found: " + name);
-			} else {
-				return columnId;
-			}
-		} finally {
-			var end = System.nanoTime();
-			getColumnIdTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		return columnOps.getColumnId(name);
 	}
 
 	/**
@@ -3284,454 +2159,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 */
 	@Override
 	public long estimateNumKeys(long columnId) {
-		var start = System.nanoTime();
-		ops.beginOp();
-		actionLogger.logAction("EstimateNumKeys", start, columnId, null, null, null, null, null, null);
-		ColumnInstance col = null;
-		try {
-			col = beginColumnUse(columnId);
-			try {
-				return db.get().getLongProperty(col.cfh(), RocksDBLongProperty.ESTIMATE_NUM_KEYS.getName());
-			} catch (org.rocksdb.RocksDBException e) {
-				throw RocksDBException.of(RocksDBErrorType.GET_PROPERTY_ERROR, e);
-			}
-		} finally {
-			if (col != null) {
-				col.endUse();
-			}
-			ops.endOp();
-			var end = System.nanoTime();
-			estimateNumKeysTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
-	}
-
-	private Long getColumnIdOrNull(@NotNull String name) {
-		var columnId = getRegisteredColumnIdOrNull(name);
-		if (columnId == null) {
-			return null;
-		}
-		var col = columns.get(columnId);
-		return col != null && col.isAcceptingUses() ? columnId : null;
-	}
-
-	private Long getRegisteredColumnIdOrNull(@NotNull String name) {
-		var columnId = (long) columnNamesIndex.getOrDefault(name, -1L);
-		ColumnInstance col;
-		if (columnId == -1L || (col = columns.get(columnId)) == null || !col.cfh().isOwningHandle()) {
-			return null;
-		} else {
-			return columnId;
-		}
-	}
-
-	/**
-	 * Return long property based on the aggregation mode:
-	 * - PER_CF: sum values across all column families
-	 * - DB_WIDE: query once without a CF handle
-	 * - SINGLE_CF: query once with any single CF handle (for shared-resource properties like block cache)
-	 */
-	private BigInteger getLongProperty(String name, RocksDBLongProperty.AggregationMode aggregationMode) {
-		ops.beginOp();
-		try {
-			return switch (aggregationMode) {
-				case PER_CF -> {
-					var val = BigInteger.ZERO;
-					for (Entry<Long, ColumnInstance> entry : columns.entrySet()) {
-						ColumnInstance ci = entry.getValue();
-						if (!tryBeginColumnUse(ci)) {
-							continue;
-						}
-						try {
-							long value = name.startsWith("rocksdb.num-files-at-level")
-									? Long.parseUnsignedLong(db.get().getProperty(ci.cfh(), name))
-									: db.get().getLongProperty(ci.cfh(), name);
-							val = val.add(new BigInteger(Long.toUnsignedString(value)));
-						} catch (org.rocksdb.RocksDBException e) {
-							if (e.getStatus().getCode() == Code.NotFound) {
-								// skip
-							} else {
-								throw new RuntimeException(e);
-							}
-						} finally {
-							ci.endUse();
-						}
-					}
-					yield val;
-				}
-				case DB_WIDE -> {
-					try {
-						yield new BigInteger(Long.toUnsignedString(db.get().getLongProperty(name)));
-					} catch (org.rocksdb.RocksDBException e) {
-						if (e.getStatus().getCode() == Code.NotFound) {
-							yield BigInteger.ZERO;
-						} else {
-							throw new RuntimeException(e);
-						}
-					}
-				}
-				case SINGLE_CF -> {
-					// Shared-resource properties (e.g. block cache) return the same value
-					// for every CF handle, so query with any single one.
-					BigInteger value = BigInteger.ZERO;
-					for (var entry : columns.entrySet()) {
-						var ci = entry.getValue();
-						if (!tryBeginColumnUse(ci)) {
-							continue;
-						}
-						try {
-							value = new BigInteger(Long.toUnsignedString(db.get().getLongProperty(ci.cfh(), name)));
-							break;
-						} catch (org.rocksdb.RocksDBException e) {
-							if (e.getStatus().getCode() != Code.NotFound) {
-								throw new RuntimeException(e);
-							}
-						} finally {
-							ci.endUse();
-						}
-					}
-					yield value;
-				}
-			};
-		} finally {
-			ops.endOp();
-		}
-	}
-
-	private long applyCompactionReadahead(long bytes) {
-		ops.beginOp();
-		try {
-			var nativeDb = db.get();
-			nativeDb.setDBOptions(org.rocksdb.MutableDBOptions.builder().setCompactionReadaheadSize(bytes).build());
-			// Successful JNI acknowledgement; the public options getter cannot parse absolute path values.
-			return bytes;
-		} catch (org.rocksdb.RocksDBException failure) {
-			throw new RuntimeException("Failed to apply compaction readahead", failure);
-		} finally { ops.endOp(); }
+		return columnOps.estimateNumKeys(columnId);
 	}
 
 	@VisibleForTesting
 	public void setCompactionIoSampleObserverForTesting(@Nullable Runnable observer) {
 		compactionIoSampleObserver = observer;
-	}
-
-	private byte[] pointGetForUpdate(Tx tx, ReadOptions options,
-			ColumnFamilyHandle column, byte[] key) throws org.rocksdb.RocksDBException {
-		long started = System.nanoTime();
-		try {
-			// An untracked transaction has no concurrent writer to conflict with: a plain read of its batch and the DB.
-			return tx.untracked() ? tx.val().get(options, column, key) : tx.val().getForUpdate(options, column, key, true);
-		}
-		finally { recordCompactionForegroundRead(started, 0); }
-	}
-
-	private static void txPut(Tx tx, ColumnFamilyHandle column, byte[] key, byte[] value)
-			throws org.rocksdb.RocksDBException {
-		if (tx.untracked()) {
-			tx.val().putUntracked(column, key, value);
-		} else {
-			tx.val().put(column, key, value);
-		}
-	}
-
-	private static void txDelete(Tx tx, ColumnFamilyHandle column, byte[] key) throws org.rocksdb.RocksDBException {
-		if (tx.untracked()) {
-			tx.val().deleteUntracked(column, key);
-		} else {
-			tx.val().delete(column, key);
-		}
-	}
-
-	private static void txMerge(Tx tx, ColumnFamilyHandle column, byte[] key, Buf value)
-			throws org.rocksdb.RocksDBException {
-		if (tx.untracked()) {
-			byte[] array = value.asArrayStrict();
-			if (array != null) {
-				tx.val().mergeUntracked(column, key, array);
-			} else {
-				// A slice of a larger array (such as a value decoded in place from a replicated log entry): passed with
-				// its offset, without a copy. Heap buffers both, as RocksDB's binding requires.
-				tx.val().mergeUntracked(column, java.nio.ByteBuffer.wrap(key), value.asHeapByteBuffer());
-			}
-		} else {
-			tx.val().merge(column, key, jniArray(value));
-		}
-	}
-
-	private void recordCompactionForegroundRead(long started, int bulkKeys) {
-		if (compactionIoController == null) return;
-		long elapsed = Math.max(0, System.nanoTime() - started);
-		if (bulkKeys <= 0) {
-			pointReadCompletions.record(elapsed);
-		}
-		else {
-			bulkReadTailNanos.accumulateAndGet(elapsed, Math::max);
-			nativeBulkReadCompletions.incrementAndGet();
-			nativeBulkReadKeys.addAndGet(bulkKeys);
-		}
-	}
-
-	// Each stripe publishes and drains a completed POINT cohort. The aggregate is a
-	// vector cut: count, duration and tail agree, although stripe cut times differ.
-	// Native calls and elapsed-time measurement stay outside the critical sections.
-	private static final class PointReadCompletionCounters {
-		private final Stripe[] stripes = new Stripe[64];
-
-		PointReadCompletionCounters() {
-			for (int i = 0; i < stripes.length; i++) stripes[i] = new Stripe();
-		}
-
-		void record(long elapsed) {
-			var stripe = stripes[(int) Thread.currentThread().threadId() & (stripes.length - 1)];
-			synchronized (stripe) {
-				stripe.nanos += elapsed;
-				stripe.count++;
-				stripe.tailNanos = Math.max(stripe.tailNanos, elapsed);
-			}
-		}
-
-		synchronized Snapshot sample() {
-			long count = 0, nanos = 0, tailNanos = 0;
-			for (var stripe : stripes) {
-				synchronized (stripe) {
-					count += stripe.count;
-					nanos += stripe.nanos;
-					tailNanos = Math.max(tailNanos, stripe.tailNanos);
-					stripe.tailNanos = 0;
-				}
-			}
-			return new Snapshot(count, nanos, tailNanos);
-		}
-
-		private static final class Stripe {
-			private long count, nanos, tailNanos;
-		}
-
-		record Snapshot(long count, long nanos, long tailNanos) {}
-	}
-
-	private record CompactionReadCompletion(long bytes, long micros, long count) {
-		private static final CompactionReadCompletion UNAVAILABLE = new CompactionReadCompletion(-1, -1, -1);
-	}
-
-	private static CompactionReadCompletion sampleCompactionReadCompletion(org.rocksdb.Statistics statistics) {
-		try {
-			var completion = statistics.getCompactionReadCompletion();
-			if (completion == null || completion.length != 3) return CompactionReadCompletion.UNAVAILABLE;
-			long count = completion[0], bytes = completion[1], micros = completion[2];
-			if (count < 0 || bytes < 0 || micros < 0 || count == 0 && (bytes != 0 || micros != 0))
-				return CompactionReadCompletion.UNAVAILABLE;
-			return new CompactionReadCompletion(bytes, micros, count);
-		} catch (RuntimeException unavailable) {
-			// Optional read-service telemetry must not fail pressure/foreground sampling.
-		}
-		return CompactionReadCompletion.UNAVAILABLE;
-	}
-
-	private CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter) {
-		return sampleCompactionIo(limiter, new long[RWScheduler.POOL_TELEMETRY_LENGTH],
-				new long[RWScheduler.POOL_TELEMETRY_LENGTH]);
-	}
-
-	private CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter, long[] readPoolTelemetry,
-			long[] groupReadPoolTelemetry) {
-		ops.beginOp();
-		boolean stopped = false;
-		boolean pressure = false;
-		boolean urgentPressure = false;
-		try {
-			var observer = compactionIoSampleObserver;
-			if (observer != null) observer.run();
-			var nativeDb = db.get();
-			stopped = nativeDb.getLongProperty(ROCKSDB_IS_WRITE_STOPPED_PROPERTY) != 0;
-			urgentPressure = stopped || nativeDb.getLongProperty(ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY) != 0;
-			pressure = urgentPressure;
-			boolean recoveryClear = !pressure;
-			// Unlike admission polling, inspect every column even after a pressure trigger.
-			boolean complete = true;
-			for (var column : storagePressureColumns) {
-				var registered = column.registeredColumn();
-				if (registered != null && !tryBeginColumnUse(registered)) { complete = false; continue; }
-				try {
-					long debt = nativeDb.getLongProperty(column.handle(), ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY);
-					long limit = column.effectiveSoftPendingCompactionBytesLimit();
-					pressure |= limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit) >= 0;
-					recoveryClear &= !(limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit - limit / 5) >= 0);
-					long levelZeroFiles = Long.parseUnsignedLong(nativeDb.getProperty(column.handle(), "rocksdb.num-files-at-level0"));
-					int slowdownTrigger = column.effectiveLevel0SlowdownWritesTrigger();
-					urgentPressure |= slowdownTrigger >= 0 && Long.compareUnsigned(levelZeroFiles, slowdownTrigger) >= 0;
-					int maxWriteBuffers = column.effectiveMaxWriteBufferNumber();
-					// Native delay cannot precede stop for small maxima or large merge batches.
-					// NumNotFlushed includes in-flight flushes even when flush-pending is false.
-					if (maxWriteBuffers <= 3 || column.effectiveMinWriteBufferNumberToMerge() > maxWriteBuffers - 2) {
-						long immutableTables = nativeDb.getLongProperty(column.handle(),
-								RocksDBLongProperty.NUM_IMMUTABLE_MEM_TABLE.getName());
-						boolean flushHeadroomPressure = Long.compareUnsigned(immutableTables,
-								Math.max(1L, (long) maxWriteBuffers - 1)) >= 0;
-						urgentPressure |= flushHeadroomPressure;
-						recoveryClear &= !flushHeadroomPressure;
-					}
-					pressure |= urgentPressure;
-					recoveryClear &= slowdownTrigger < 0
-							|| Long.compareUnsigned(levelZeroFiles, slowdownTrigger - slowdownTrigger / 5) < 0;
-				} finally { if (registered != null) registered.endUse(); }
-			}
-			try (var statistics = dbOptions.statistics()) {
-				var histogram = statistics.getHistogramData(org.rocksdb.HistogramType.READ_BLOCK_GET_MICROS);
-				var compactionReads = sampleCompactionReadCompletion(statistics);
-				var prefetch = statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES);
-				var bulk = statistics.getHistogramData(org.rocksdb.HistogramType.DB_MULTIGET);
-				int readTopologyWorkers = scheduler.copyCompactionReadTelemetryAndTopology(readPoolTelemetry, groupReadPoolTelemetry);
-				boolean background = nativeDb.getLongProperty("rocksdb.num-running-compactions") > 0
-						|| nativeDb.getLongProperty("rocksdb.num-running-flushes") > 0;
-				boolean foregroundPending = ops.getPendingOpsCount() > 1;
-				for (var profile : WorkloadProfile.values()) {
-					foregroundPending |= scheduler.activeTasks(profile) + scheduler.queuedTasks(profile) > 0;
-				}
-				var point = pointReadCompletions.sample();
-				return new CompactionIoBudget.Sample(System.nanoTime(), histogram.getCount(), histogram.getSum(),
-						limiter.getTotalBytesThrough(), background, pressure, stopped, complete,
-						foregroundPending,
-						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ)
-								+ statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN), recoveryClear, urgentPressure,
-						compactionReads.bytes(), compactionReads.micros(), compactionReads.count(), prefetch.getCount(), prefetch.getSum(),
-						bulk.getCount(), bulk.getSum(), statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ),
-						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_WORKER_COUNT],
-						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS],
-						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()],
-						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()],
-						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_COMPLETED_TASKS],
-						activeNativeMultiGets.get() > 0 || !activeExistsMultiRequests.isEmpty(),
-						(long) Math.ceil(point.tailNanos() / 1000d),
-						(long) Math.ceil(bulkReadTailNanos.getAndSet(0) / 1000d),
-						point.count(), nativeBulkReadCompletions.get(), nativeBulkReadKeys.get(), point.nanos(),
-						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND),
-						statistics.getHistogramData(org.rocksdb.HistogramType.BYTES_PER_MULTIGET).getSum(),
-						workloadGroups.isEmpty() ? readPoolTelemetry[RWScheduler.POOL_TELEMETRY_FAILED_TASKS] : -1,
-						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS],
-						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES],
-						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES], readTopologyWorkers);
-			}
-		} catch (org.rocksdb.RocksDBException failure) {
-			if (pressure || urgentPressure) {
-				return new CompactionIoBudget.Sample(System.nanoTime(), 0, 0, 0,
-						false, pressure, stopped, false, false, 0, false, urgentPressure);
-			}
-			throw new RuntimeException(failure);
-		} finally { ops.endOp(); }
-	}
-
-	private void refreshStoragePressure() {
-		if (!ops.isOpen()) {
-			return;
-		}
-		boolean operationStarted = false;
-		try {
-			ops.beginOp();
-			operationStarted = true;
-			StoragePressureColumn[] pressureColumns = storagePressureColumns;
-			var pollAdmittedObserver = storagePressurePollAdmittedObserver;
-			if (pollAdmittedObserver != null) {
-				pollAdmittedObserver.run();
-			}
-			storagePressureSignal.reset(0L, 0L);
-			var rocksDb = db.get();
-			long writeStopped = rocksDb.getLongProperty(ROCKSDB_IS_WRITE_STOPPED_PROPERTY);
-			long actualDelayedWriteRate = rocksDb.getLongProperty(ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY);
-			storagePressureSignal.reset(writeStopped, actualDelayedWriteRate);
-			for (var signal : workloadGroupPressure.values()) signal.reset(writeStopped, actualDelayedWriteRate);
-			boolean databasePressure = storagePressureSignal.pressured();
-
-			// The DB-wide signals already prove pressure. Avoid one JNI call per
-			// column until RocksDB reports that writes are flowing normally again.
-			if (!databasePressure) {
-				for (StoragePressureColumn pressureColumn : pressureColumns) {
-					ColumnInstance registeredColumn = pressureColumn.registeredColumn();
-					if (registeredColumn != null && !tryBeginColumnUse(registeredColumn)) {
-						continue;
-					}
-					try {
-						long pendingCompactionBytes = rocksDb.getLongProperty(
-								pressureColumn.handle(),
-								ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY);
-						var groupSignal = workloadGroupPressure.get(columnWorkloadNames.getOrDefault(pressureColumn.id(), "default"));
-						if (groupSignal != null) groupSignal.observeColumn(pressureColumn.id(), pendingCompactionBytes,
-								pressureColumn.effectiveSoftPendingCompactionBytesLimit());
-						storagePressureSignal.observeColumn(pressureColumn.id(),
-								pendingCompactionBytes,
-								pressureColumn.effectiveSoftPendingCompactionBytesLimit());
-					} finally {
-						if (registeredColumn != null) {
-							registeredColumn.endUse();
-						}
-					}
-					if (workloadGroups.isEmpty() && storagePressureSignal.pressured()) {
-						break;
-					}
-				}
-			}
-			scheduler.setStoragePressure(workloadGroups.isEmpty() ? storagePressureSignal.pressured()
-					: workloadGroupPressure.get("default").pressured());
-			for (var group : workloadGroups.entrySet()) {
-				group.getValue().setStoragePressure(workloadGroupPressure.get(group.getKey()).pressured());
-			}
-		} catch (VirtualMachineError fatal) {
-			throw fatal;
-		} catch (Throwable error) {
-			if (!operationStarted && !ops.isOpen()) {
-				return;
-			}
-			handleStoragePressureRefreshFailure(error);
-		} finally {
-			if (operationStarted) {
-				ops.endOp();
-			}
-		}
-	}
-
-	private static StoragePressureSignal newWorkloadGroupPressureSignal() {
-		return STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_OVERRIDE == 0L
-				? new StoragePressureSignal() : new StoragePressureSignal(STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_OVERRIDE);
-	}
-
-	private void handleStoragePressureRefreshFailure(Throwable error) {
-		storagePressureSignal.markSignalFailure();
-		scheduler.setStoragePressure(true);
-		for (var group : workloadGroups.values()) group.setStoragePressure(true);
-		storagePressureRefreshFailures.increment();
-		logger.debug("Unable to refresh workload storage-pressure state", error);
-	}
-
-	/**
-	 * Return per-column-family long property values as a map from column name to value.
-	 * Only meaningful for PER_CF properties.
-	 */
-	private Map<String, Long> getPerCfLongProperty(String name) {
-		ops.beginOp();
-		try {
-			var result = new LinkedHashMap<String, Long>();
-			for (Entry<Long, ColumnInstance> entry : columns.entrySet()) {
-				ColumnInstance ci = entry.getValue();
-				if (!tryBeginColumnUse(ci)) {
-					continue;
-				}
-				try {
-					String colName = new String(ci.cfh().getName());
-					long value = name.startsWith("rocksdb.num-files-at-level")
-							? Long.parseUnsignedLong(db.get().getProperty(ci.cfh(), name))
-							: db.get().getLongProperty(ci.cfh(), name);
-					result.merge(colName, value, Long::sum);
-				} catch (org.rocksdb.RocksDBException e) {
-					if (e.getStatus().getCode() != Code.NotFound) {
-						throw new RuntimeException(e);
-					}
-				} finally {
-					ci.endUse();
-				}
-			}
-			return result;
-		} finally {
-			ops.endOp();
-		}
 	}
 
 	@Override
@@ -3740,41 +2173,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
-		var start = System.nanoTime();
-		actionLogger.logAction("Put", start, columnId, keys, value, transactionOrUpdateId, null, null, requestType);
-		ops.beginOp();
-		ColumnInstance col = null;
-		try {
-			// Column id
-			col = beginColumnUse(columnId);
-			Tx tx;
-			if (transactionOrUpdateId != 0) {
-				tx = getTransaction(transactionOrUpdateId, true);
-			} else {
-				tx = null;
-			}
-			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-			if (tx != null) {
-				synchronized (tx) {
-					requireLiveTransaction(transactionOrUpdateId, tx);
-					return put(tx, col, updateId, keys, value, requestType);
-				}
-			}
-			return put(tx, col, updateId, keys, value, requestType);
-		} catch (RocksDBRetryException ex) {
-			throw ex;
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} finally {
-			if (col != null) {
-				col.endUse();
-			}
-			ops.endOp();
-			var end = System.nanoTime();
-			putTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		return writes.<T>put(transactionOrUpdateId, columnId, keys, value, requestType);
 	}
 
 	@Override
@@ -3782,41 +2181,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long columnId,
 			@NotNull Keys keys,
 			@NotNull RequestType.RequestDelete<? super Buf, T> requestType) throws RocksDBException {
-		var start = System.nanoTime();
-		actionLogger.logAction("Delete", start, columnId, keys, null, transactionOrUpdateId, null, null, requestType);
-		ops.beginOp();
-		ColumnInstance col = null;
-		try {
-			// Column id
-			col = beginColumnUse(columnId);
-			Tx tx;
-			if (transactionOrUpdateId != 0) {
-				tx = getTransaction(transactionOrUpdateId, true);
-			} else {
-				tx = null;
-			}
-			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-			if (tx != null) {
-				synchronized (tx) {
-					requireLiveTransaction(transactionOrUpdateId, tx);
-					return delete(tx, col, updateId, keys, requestType);
-				}
-			}
-			return delete(tx, col, updateId, keys, requestType);
-		} catch (RocksDBRetryException ex) {
-			throw ex;
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} finally {
-			if (col != null) {
-				col.endUse();
-			}
-			ops.endOp();
-			var end = System.nanoTime();
-			putTimer.record(end - start, TimeUnit.NANOSECONDS); // Re-use put timer? or new timer? using putTimer for now
-		}
+		return writes.<T>delete(transactionOrUpdateId, columnId, keys, requestType);
 	}
 
 	@Override
@@ -3825,40 +2190,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Keys keys,
 			@NotNull Buf value,
 			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
-		var start = System.nanoTime();
-		actionLogger.logAction("Merge", start, columnId, keys, value, transactionOrUpdateId, null, null, requestType);
-		ops.beginOp();
-		ColumnInstance col = null;
-		try {
-			col = beginColumnUse(columnId);
-			Tx tx;
-			if (transactionOrUpdateId != 0) {
-				tx = getTransaction(transactionOrUpdateId, true);
-			} else {
-				tx = null;
-			}
-			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-			if (tx != null) {
-				synchronized (tx) {
-					requireLiveTransaction(transactionOrUpdateId, tx);
-					return merge(tx, col, updateId, keys, value, requestType);
-				}
-			}
-			return merge(tx, col, updateId, keys, value, requestType);
-		} catch (RocksDBRetryException ex) {
-			throw ex;
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} finally {
-			if (col != null) {
-				col.endUse();
-			}
-			ops.endOp();
-			var end = System.nanoTime();
-			putTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		return writes.<T>merge(transactionOrUpdateId, columnId, keys, value, requestType);
 	}
 
 	@Override
@@ -3866,162 +2198,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long columnId,
 			@NotNull List<Keys> keysList,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
-		var start = System.nanoTime();
-		ops.beginOp();
-		ColumnInstance col = null;
-		try {
-			col = beginColumnUse(columnId);
-			actionLogger.logAction("deleteMulti (begin)",
-					start,
-					columnId,
-					keysList.size(),
-					0,
-					transactionOrUpdateId,
-					null,
-					null,
-					requestType
-			);
-
-			Tx tx;
-			if (transactionOrUpdateId != 0) {
-				tx = getTransaction(transactionOrUpdateId, true);
-			} else {
-				tx = null;
-			}
-			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-
-			if (updateId != 0) {
-				synchronized (tx) {
-					requireLiveTransaction(updateId, tx);
-					return deleteMultiWithUpdateId(tx, updateId, col, keysList, requestType);
-				}
-			}
-
-			if (tx != null) {
-				synchronized (tx) {
-					requireLiveTransaction(transactionOrUpdateId, tx);
-					return deleteMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, requestType);
-				}
-			}
-			return deleteMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, requestType);
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} finally {
-			if (col != null) {
-				col.endUse();
-			}
-			ops.endOp();
-			var end = System.nanoTime();
-			putMultiTimer.record(end - start, TimeUnit.NANOSECONDS); // Re-use putMultiTimer
-		}
-	}
-
-	private <T> List<T> deleteMultiWithoutUpdateId(long start,
-			long columnId,
-			long transactionOrUpdateId,
-			@Nullable Tx tx,
-			ColumnInstance col,
-			List<Keys> keysList,
-			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
-		List<T> responses =
-				requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
-		for (int i = 0; i < keysList.size(); i++) {
-			var keys = keysList.get(i);
-			actionLogger.logAction("deleteMulti (next)",
-					start,
-					columnId,
-					keys,
-					null,
-					transactionOrUpdateId,
-					null,
-					null,
-					requestType
-			);
-			T result = delete(tx, col, 0L, keys, requestType);
-			if (responses != null) {
-				responses.add(result);
-			}
-		}
-		return responses != null ? responses : List.of();
-	}
-
-	private <T> List<T> deleteMultiWithUpdateId(Tx tx,
-			long updateId,
-			ColumnInstance col,
-			List<Keys> keysList,
-			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
-		try {
-			boolean committedOwnedTx;
-			List<T> responses;
-			do {
-				boolean savePointSet = false;
-				try {
-					tx.val().setSavePoint();
-					savePointSet = true;
-				} catch (org.rocksdb.RocksDBException e) {
-					// Handle case where setSavePoint might not be supported or fails
-					logger.debug("Failed to set savepoint", e);
-				}
-				responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
-				try {
-					for (int i = 0; i < keysList.size(); i++) {
-						var keys = keysList.get(i);
-						T result = delete(tx, col, 0L, keys, requestType);
-						if (responses != null) {
-							responses.add(result);
-						}
-					}
-
-					boolean committed = closeTransaction(updateId, true);
-					if (!committed) {
-						if (savePointSet) {
-							try {
-								tx.val().rollbackToSavePoint();
-							} catch (org.rocksdb.RocksDBException | AssertionError e) {
-								logger.debug("Failed to rollback to savepoint during commit failure in deleteMultiWithUpdateId", e);
-							}
-						}
-						closeTransaction(updateId, false);
-						throw new RocksDBRetryException();
-					}
-					committedOwnedTx = true;
-				} catch (RocksDBRetryException e) {
-					if (savePointSet && tx.val().isOwningHandle()) {
-						try {
-							tx.val().rollbackToSavePoint();
-						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
-							logger.debug("Failed to rollback to savepoint during retry in deleteMultiWithUpdateId", ex);
-						}
-					}
-					throw e;
-				} catch (Throwable t) {
-					if (savePointSet && tx.val().isOwningHandle()) {
-						try {
-							tx.val().rollbackToSavePoint();
-						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
-							logger.debug("Failed to rollback to savepoint during error in deleteMultiWithUpdateId", ex);
-						}
-					}
-					throw t;
-				}
-			} while (!committedOwnedTx);
-			return responses != null ? responses : List.of();
-		} catch (RocksDBRetryException e) {
-			throw e;
-		} catch (Throwable t) {
-			closeTransaction(updateId, false);
-			if (t instanceof RocksDBException r) throw r;
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, t);
-		}
+		return writes.<T>deleteMulti(transactionOrUpdateId, columnId, keysList, requestType);
 	}
 
 	@Override
 	public void deleteRange(long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive) throws RocksDBException {
-		deleteRange(columnId, startKeysInclusive, endKeysExclusive, false);
+		writes.deleteRange(columnId, startKeysInclusive, endKeysExclusive);
 	}
 
 	/**
@@ -4031,140 +2215,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public void deleteRangeUnlogged(long columnId,
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive) throws RocksDBException {
-		deleteRange(columnId, startKeysInclusive, endKeysExclusive, true);
-	}
-
-	private void deleteRange(long columnId,
-			@Nullable Keys startKeysInclusive,
-			@Nullable Keys endKeysExclusive,
-			boolean disableWal) throws RocksDBException {
-		var start = System.nanoTime();
-		actionLogger.logAction("DeleteRange",
-				start,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				null,
-				null,
-				null,
-				null
-		);
-		ops.beginOp();
-		ColumnInstance col = null;
-		try {
-			col = beginColumnUse(columnId);
-			var beginKey = calculateDeleteRangeBeginKey(col, startKeysInclusive);
-			var endKey = calculateDeleteRangeEndKey(col, endKeysExclusive);
-			if (Arrays.compareUnsigned(beginKey, endKey) >= 0) {
-				return;
-			}
-			try {
-				deleteRangeNative(col, beginKey, endKey, disableWal);
-			} catch (org.rocksdb.RocksDBException e) {
-				if (!isDeleteRangeUnsupported(e)) {
-					throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
-				}
-				if (nativeDeleteRangeFallbackLogged.compareAndSet(false, true)) {
-					logger.warn("Native RocksDB range delete is not supported by this database handle; falling back to batched point deletes. Further deleteRange fallback messages are suppressed");
-				}
-				deleteRangeByIterating(col, beginKey, endKey, disableWal);
-			}
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} finally {
-			if (col != null) {
-				col.endUse();
-			}
-			ops.endOp();
-			var end = System.nanoTime();
-			deleteRangeTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
-	}
-
-	private static boolean isDeleteRangeUnsupported(org.rocksdb.RocksDBException e) {
-		if (e.getStatus() != null && e.getStatus().getCode() == Code.NotSupported) {
-			return true;
-		}
-		String message = e.getMessage();
-		return message != null
-				&& message.contains("DeleteRange")
-				&& (message.contains("not implemented") || message.contains("NotSupported"));
-	}
-
-	private void deleteRangeNative(ColumnInstance col, byte[] beginKey, byte[] endKey, boolean disableWal)
-			throws org.rocksdb.RocksDBException {
-		var rocks = db.get();
-		if (rocks instanceof OptimisticTransactionDB optimisticTransactionDB) {
-			rocks = optimisticTransactionDB.getBaseDB();
-		}
-		try (var w = new LeakSafeWriteOptions(null); var wb = new LeakSafeWriteBatch()) {
-			w.setDisableWAL(disableWal);
-			wb.deleteRange(col.cfh(), beginKey, endKey);
-			rocks.write(w, wb);
-		}
-	}
-
-	private void deleteRangeByIterating(ColumnInstance col, byte[] beginKey, byte[] endKey, boolean disableWal)
-			throws RocksDBException {
-		var snapshot = db.get().getSnapshot();
-		try (var ro = newReadOptions("delete-range-fallback-read-options");
-				var startKeySlice = new Slice(beginKey);
-				var endKeySlice = new Slice(endKey)) {
-			ro.setSnapshot(snapshot);
-			ro.setIterateLowerBound(startKeySlice);
-			ro.setIterateUpperBound(endKeySlice);
-			try (var it = db.get().newIterator(col.cfh(), ro); var wb = new LeakSafeWriteBatch()) {
-				int pendingDeletes = 0;
-				it.seekToFirst();
-				while (it.isValid()) {
-					wb.delete(col.cfh(), it.key());
-					pendingDeletes++;
-					if (pendingDeletes >= 10_000) {
-						writeDeleteRangeFallbackBatch(wb, disableWal);
-						wb.clear();
-						pendingDeletes = 0;
-					}
-					it.next();
-				}
-				if (pendingDeletes > 0) {
-					writeDeleteRangeFallbackBatch(wb, disableWal);
-				}
-			} catch (org.rocksdb.RocksDBException e) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
-			}
-		} finally {
-			db.get().releaseSnapshot(snapshot);
-		}
-	}
-
-	private void writeDeleteRangeFallbackBatch(LeakSafeWriteBatch wb, boolean disableWal)
-			throws org.rocksdb.RocksDBException {
-		try (var w = new LeakSafeWriteOptions(null)) {
-			w.setDisableWAL(disableWal);
-			db.get().write(w, wb);
-		}
-	}
-
-	private byte[] calculateDeleteRangeBeginKey(ColumnInstance col, @Nullable Keys startKeysInclusive) {
-		if (startKeysInclusive != null && startKeysInclusive.keys().length > 0) {
-			return col.calculateKeyBytes(startKeysInclusive.keys());
-		}
-		return new byte[0];
-	}
-
-	private byte[] calculateDeleteRangeEndKey(ColumnInstance col, @Nullable Keys endKeysExclusive) {
-		if (endKeysExclusive != null && endKeysExclusive.keys().length > 0) {
-			return col.calculateKeyBytes(endKeysExclusive.keys());
-		}
-		return encodedKeyUpperBound(col.finalKeySizeBytes());
-	}
-
-	private static byte[] encodedKeyUpperBound(int keySizeBytes) {
-		var endKey = new byte[keySizeBytes + 1];
-		Arrays.fill(endKey, 0, keySizeBytes, (byte) 0xff);
-		return endKey;
+		writes.deleteRangeUnlogged(columnId, startKeysInclusive, endKeysExclusive);
 	}
 
 	@Override
@@ -4173,223 +2224,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull List<Keys> keysList,
 			@NotNull List<@NotNull Buf> valueList,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
-		var start = System.nanoTime();
-		ops.beginOp();
-		ColumnInstance col = null;
-		try {
-			col = beginColumnUse(columnId);
-			actionLogger.logAction("putMulti (begin)",
-					start,
-					columnId,
-					keysList.size(),
-					valueList.size(),
-					transactionOrUpdateId,
-					null,
-					null,
-					requestType
-			);
-			if (keysList.size() != valueList.size()) {
-				throw new IllegalArgumentException(
-						"keys length is different than values length: " + keysList.size() + " != " + valueList.size());
-			}
-
-			Tx tx;
-			if (transactionOrUpdateId != 0) {
-				tx = getTransaction(transactionOrUpdateId, true);
-			} else {
-				tx = null;
-			}
-			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-
-			if (updateId != 0) {
-				synchronized (tx) {
-					requireLiveTransaction(updateId, tx);
-					return putMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
-				}
-			}
-			if (tx == null && WriteElisionRequest.from(requestType) != null) {
-				return putMultiWithWriteElision(start, columnId, col, keysList, valueList, requestType);
-			}
-
-			if (tx != null) {
-				synchronized (tx) {
-					requireLiveTransaction(transactionOrUpdateId, tx);
-					return putMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, valueList, requestType);
-				}
-			}
-			return putMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, valueList, requestType);
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} finally {
-			if (col != null) {
-				col.endUse();
-			}
-			ops.endOp();
-			var end = System.nanoTime();
-			putMultiTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
-	}
-
-	private <T> List<T> putMultiWithWriteElision(long start,
-			long columnId,
-			ColumnInstance col,
-			List<Keys> keysList,
-			List<Buf> valueList,
-			RequestPut<? super Buf, T> requestType) {
-		var writeElisionRequest = Objects.requireNonNull(WriteElisionRequest.from(requestType));
-		var probe = probeCachedLogicalValues(col, keysList, valueList);
-		var dirtyPhysicalKeys = new HashSet<PhysicalKey>();
-		List<T> responses = requestType instanceof RequestType.RequestEnsure<?>
-				? null
-				: new ArrayList<>(keysList.size());
-		for (int i = 0; i < keysList.size(); i++) {
-			var keys = keysList.get(i);
-			var value = valueList.get(i);
-			actionLogger.logAction("putMulti (next)",
-					start,
-					columnId,
-					keys,
-					value,
-					0L,
-					null,
-					null,
-					requestType
-			);
-			var physicalKey = probe.physicalKeys()[i];
-			var decision = probe.decisions()[i];
-			if (decision != WriteElisionDecision.BYPASS_OVERSIZED
-					&& dirtyPhysicalKeys.contains(physicalKey)) {
-				decision = probeCachedLogicalValues(col, List.of(keys), List.of(value)).decisions()[0];
-			}
-			recordWriteElisionDecision(writeElisionRequest, decision);
-			T result;
-			if (decision == WriteElisionDecision.ELIDED) {
-				result = RequestType.safeCast(requestType instanceof RequestType.RequestPreviousPresence<?>
-						? Boolean.TRUE
-						: null);
-			} else {
-				result = put(null, col, 0L, keys, value, requestType, false);
-				dirtyPhysicalKeys.add(physicalKey);
-			}
-			if (responses != null) {
-				responses.add(result);
-			}
-		}
-		return responses != null ? responses : List.of();
-	}
-
-	private <T> List<T> putMultiWithoutUpdateId(long start,
-			long columnId,
-			long transactionOrUpdateId,
-			@Nullable Tx tx,
-			ColumnInstance col,
-			List<Keys> keysList,
-			List<@NotNull Buf> valueList,
-			RequestPut<? super Buf, T> requestType) throws RocksDBException {
-		List<T> responses =
-				requestType instanceof RequestType.RequestNothing<?>
-						|| requestType instanceof RequestType.RequestEnsure<?>
-						? null
-						: new ArrayList<>(keysList.size());
-		for (int i = 0; i < keysList.size(); i++) {
-			var keys = keysList.get(i);
-			var value = valueList.get(i);
-			actionLogger.logAction("putMulti (next)",
-					start,
-					columnId,
-					keys,
-					value,
-					transactionOrUpdateId,
-					null,
-					null,
-					requestType
-			);
-			T result = put(tx, col, 0L, keys, value, requestType);
-			if (responses != null) {
-				responses.add(result);
-			}
-		}
-		return responses != null ? responses : List.of();
-	}
-
-	private <T> List<T> putMultiWithUpdateId(Tx tx,
-			long updateId,
-			ColumnInstance col,
-			List<Keys> keysList,
-			List<Buf> valueList,
-			RequestPut<? super Buf, T> requestType) throws RocksDBException {
-		try {
-			boolean committedOwnedTx;
-			List<T> responses;
-			do {
-				boolean savePointSet = false;
-				try {
-					tx.val().setSavePoint();
-					savePointSet = true;
-				} catch (org.rocksdb.RocksDBException e) {
-					logger.debug("Failed to set savepoint", e);
-				}
-				responses = requestType instanceof RequestType.RequestNothing<?>
-						|| requestType instanceof RequestType.RequestEnsure<?>
-						? null
-						: new ArrayList<>(keysList.size());
-				try {
-					for (int i = 0; i < keysList.size(); i++) {
-						var keys = keysList.get(i);
-						var value = valueList.get(i);
-						T result = put(tx, col, 0L, keys, value, requestType);
-						if (responses != null) {
-							responses.add(result);
-						}
-					}
-
-					boolean committed = closeTransaction(updateId, true);
-					if (!committed) {
-						if (savePointSet) {
-							try {
-								tx.val().rollbackToSavePoint();
-							} catch (org.rocksdb.RocksDBException | AssertionError e) {
-								logger.debug("Failed to rollback to savepoint during commit failure in putMultiWithUpdateId", e);
-							}
-						}
-						closeTransaction(updateId, false);
-						// We don't know which keys were locked internally by put() because we passed updateId=0 to it.
-						// However, if we are here, it means we are in an updateId transaction.
-						// Conflict happened during commit.
-						// We must throw retry exception so the caller can retry.
-						throw new RocksDBRetryException();
-					}
-					committedOwnedTx = true;
-				} catch (RocksDBRetryException e) {
-					if (savePointSet && tx.val().isOwningHandle()) {
-						try {
-							tx.val().rollbackToSavePoint();
-						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
-							logger.debug("Failed to rollback to savepoint during retry in putMultiWithUpdateId", ex);
-						}
-					}
-					throw e;
-				} catch (Throwable t) {
-					if (savePointSet && tx.val().isOwningHandle()) {
-						try {
-							tx.val().rollbackToSavePoint();
-						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
-							logger.debug("Failed to rollback to savepoint during error in putMultiWithUpdateId", ex);
-						}
-					}
-					throw t;
-				}
-			} while (!committedOwnedTx);
-			return responses != null ? responses : List.of();
-		} catch (RocksDBRetryException e) {
-			throw e;
-		} catch (Throwable t) {
-			closeTransaction(updateId, false);
-			if (t instanceof RocksDBException r) throw r;
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, t);
-		}
+		return writes.<T>putMulti(transactionOrUpdateId, columnId, keysList, valueList, requestType);
 	}
 
 	@Override
@@ -4398,727 +2233,29 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull List<Keys> keysList,
 			@NotNull List<@NotNull Buf> valueList,
 			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
-		var start = System.nanoTime();
-		ops.beginOp();
-		ColumnInstance col = null;
-		try {
-			col = beginColumnUse(columnId);
-			actionLogger.logAction("mergeMulti (begin)",
-					start,
-					columnId,
-					keysList.size(),
-					valueList.size(),
-					transactionOrUpdateId,
-					null,
-					null,
-					requestType
-			);
-			if (keysList.size() != valueList.size()) {
-				throw new IllegalArgumentException(
-						"keys length is different than values length: " + keysList.size() + " != " + valueList.size());
-			}
-
-			Tx tx;
-			if (transactionOrUpdateId != 0) {
-				tx = getTransaction(transactionOrUpdateId, true);
-			} else {
-				tx = null;
-			}
-			long updateId = tx != null && tx.isFromGetForUpdate() ? transactionOrUpdateId : 0L;
-
-			if (updateId != 0) {
-				synchronized (tx) {
-					requireLiveTransaction(updateId, tx);
-					return mergeMultiWithUpdateId(tx, updateId, col, keysList, valueList, requestType);
-				}
-			}
-
-			if (tx != null) {
-				synchronized (tx) {
-					requireLiveTransaction(transactionOrUpdateId, tx);
-					return mergeMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, valueList, requestType);
-				}
-			}
-			return mergeMultiWithoutUpdateId(start, columnId, transactionOrUpdateId, tx, col, keysList, valueList, requestType);
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} finally {
-			if (col != null) {
-				col.endUse();
-			}
-			ops.endOp();
-			var end = System.nanoTime();
-			putMultiTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		return writes.<T>mergeMulti(transactionOrUpdateId, columnId, keysList, valueList, requestType);
 	}
-
-	private <T> List<T> mergeMultiWithoutUpdateId(long start,
-			long columnId,
-			long transactionOrUpdateId,
-			@Nullable Tx tx,
-			ColumnInstance col,
-			List<Keys> keysList,
-			List<@NotNull Buf> valueList,
-			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
-		List<T> responses =
-				requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
-		for (int i = 0; i < keysList.size(); i++) {
-			var keys = keysList.get(i);
-			var value = valueList.get(i);
-			actionLogger.logAction("mergeMulti (next)",
-					start,
-					columnId,
-					keys,
-					value,
-					transactionOrUpdateId,
-					null,
-					null,
-					requestType
-			);
-			T result = merge(tx, col, 0L, keys, value, requestType);
-			if (responses != null) {
-				responses.add(result);
-			}
-		}
-		return responses != null ? responses : List.of();
-	}
-
-	private <T> List<T> mergeMultiWithUpdateId(Tx tx,
-			long updateId,
-			ColumnInstance col,
-			List<Keys> keysList,
-			List<Buf> valueList,
-			RequestMerge<? super Buf, T> requestType) throws RocksDBException {
-		try {
-			boolean committedOwnedTx;
-			List<T> responses;
-			do {
-				boolean savePointSet = false;
-				try {
-					tx.val().setSavePoint();
-					savePointSet = true;
-				} catch (org.rocksdb.RocksDBException e) {
-					logger.debug("Failed to set savepoint", e);
-				}
-				responses = requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
-				try {
-					for (int i = 0; i < keysList.size(); i++) {
-						var keys = keysList.get(i);
-						var value = valueList.get(i);
-						T result = merge(tx, col, 0L, keys, value, requestType);
-						if (responses != null) {
-							responses.add(result);
-						}
-					}
-
-					boolean committed = closeTransaction(updateId, true);
-					if (!committed) {
-						if (savePointSet) {
-							try {
-								tx.val().rollbackToSavePoint();
-							} catch (org.rocksdb.RocksDBException | AssertionError e) {
-								logger.debug("Failed to rollback to savepoint during commit failure in mergeMultiWithUpdateId", e);
-							}
-						}
-						closeTransaction(updateId, false);
-						throw new RocksDBRetryException();
-					}
-					committedOwnedTx = true;
-				} catch (RocksDBRetryException e) {
-					if (savePointSet && tx.val().isOwningHandle()) {
-						try {
-							tx.val().rollbackToSavePoint();
-						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
-							logger.debug("Failed to rollback to savepoint during retry in mergeMultiWithUpdateId", ex);
-						}
-					}
-					throw e;
-				} catch (Throwable t) {
-					if (savePointSet && tx.val().isOwningHandle()) {
-						try {
-							tx.val().rollbackToSavePoint();
-						} catch (org.rocksdb.RocksDBException | AssertionError ex) {
-							logger.debug("Failed to rollback to savepoint during error in mergeMultiWithUpdateId", ex);
-						}
-					}
-					throw t;
-				}
-			} while (!committedOwnedTx);
-			return responses != null ? responses : List.of();
-		} catch (RocksDBRetryException e) {
-			throw e;
-		} catch (Throwable t) {
-			closeTransaction(updateId, false);
-			if (t instanceof RocksDBException r) throw r;
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, t);
-		}
-	}
-
 	public CompletableFuture<Void> putBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode) throws RocksDBException {
-		return putBatchInternal(columnId, batchPublisher, mode,
-				getSchedulerForColumn(columnId).scheduler(WorkloadProfile.INGEST, OperationFamily.MUTATION, Long.MAX_VALUE));
+		return batchWrites.putBatchInternal(columnId, batchPublisher, mode);
 	}
-
 	public CompletableFuture<Void> putBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode,
 			@NotNull Scheduler workloadScheduler) throws RocksDBException {
-		var start = System.nanoTime();
-		actionLogger.logAction("PutBatch (begin)",
-				start,
-				columnId,
-				"multiple (async)",
-				"multiple (async)",
-				null,
-				null,
-				null,
-				mode
-		);
-
-		// A queued task dropped by the view, or its deadline, ends the batch with an error instead of a stall.
-		// The deadline ends a running batch only between two client batches, and no longer once the client has
-		// ended its stream. Once the final write has started, neither the deadline nor a dropped task ends it,
-		// and a failure that comes once every batch was applied is not reported.
-		return Mono.defer(() -> {
-					var progress = new StreamedBatchProgress();
-					return RWScheduler.<Void>subscribeOn(commit -> Mono.using(
-									() -> new PutBatchState(columnId, mode, start, progress),
-									state -> RWScheduler.publishBatchesOn(progress.track(Flux.from(batchPublisher)),
-													Function.identity(),
-													workloadScheduler,
-													Queues.SMALL_BUFFER_SIZE)
-											.doOnNext(state::write)
-											.then(Mono.fromRunnable(() -> commit.run(state::writePending))),
-									BatchWriteState::close,
-									true
-							), workloadScheduler)
-							.onErrorResume(failure -> progress.applied() ? Mono.empty() : Mono.error(failure));
-				})
-				.onErrorMap(EmbeddedDB::mapBatchWriteFailure)
-				.doFinally(ignored -> putBatchTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS))
-				.toFuture();
+		return batchWrites.putBatchInternal(columnId, batchPublisher, mode, workloadScheduler);
 	}
-
 	public CompletableFuture<Void> mergeBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode) throws RocksDBException {
-		return mergeBatchInternal(columnId, batchPublisher, mode,
-				getSchedulerForColumn(columnId).scheduler(WorkloadProfile.INGEST, OperationFamily.MUTATION, Long.MAX_VALUE));
+		return batchWrites.mergeBatchInternal(columnId, batchPublisher, mode);
 	}
-
 	public CompletableFuture<Void> mergeBatchInternal(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode,
 			@NotNull Scheduler workloadScheduler) throws RocksDBException {
-		final boolean ingestBehindEnabled;
-		try {
-			ingestBehindEnabled = config.global().ingestBehind();
-		} catch (GestaltException e) {
-			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
-		}
-		var start = System.nanoTime();
-		actionLogger.logAction("MergeBatch (begin)",
-				start,
-				columnId,
-				"multiple (async)",
-				"multiple (async)",
-				null,
-				null,
-				null,
-				mode
-		);
-
-		// A queued task dropped by the view, or its deadline, ends the batch with an error instead of a stall.
-		// The deadline ends a running batch only between two batches, and no longer once the client has ended its
-		// stream. Once the final write has started, neither the deadline nor a dropped task ends it, and a
-		// failure that comes once every batch was applied is not reported.
-		return Mono.defer(() -> {
-					var progress = new StreamedBatchProgress();
-					return RWScheduler.<Void>subscribeOn(commit -> Mono.using(
-									() -> new MergeBatchState(columnId, mode, ingestBehindEnabled, start, progress),
-									// The batcher flushes partial batches from a timer of another scheduler, so the
-									// writes move onto the workload scheduler after batching, one batch at a time
-									state -> RWScheduler.publishBatchesOn(progress.track(Flux.from(batchPublisher)),
-													batches -> AdaptiveBatcher.buffer(batches, 128, 4096, Duration.ofMillis(10)),
-													workloadScheduler,
-													1)
-											.doOnNext(state::write)
-											.then(Mono.fromRunnable(() -> commit.run(state::writePending))),
-									BatchWriteState::close,
-									true
-							), workloadScheduler)
-							.onErrorResume(failure -> progress.applied() ? Mono.empty() : Mono.error(failure));
-				})
-				.onErrorMap(EmbeddedDB::mapBatchWriteFailure)
-				.toFuture();
-	}
-
-	private static Throwable mapBatchWriteFailure(Throwable failure) {
-		var current = failure;
-		for (int depth = 0; current != null && depth < 32; depth++) {
-			if (current instanceof RocksDBException rocksError) {
-				return rocksError;
-			}
-			if (current.getCause() == current) {
-				break;
-			}
-			current = current.getCause();
-		}
-		return RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, failure);
-	}
-
-	/**
-	 * Tells whether a streamed putBatch or mergeBatch was applied in full: the client ended its stream, every
-	 * batch it sent was written, and the final write has nothing left to apply. Every batch can be applied before
-	 * the end of the stream is delivered, when each write applies its batch (merge write batches of a column
-	 * without buckets, write batches past the flush thresholds). A failure that comes after that, such as a
-	 * dropped or refused drain that only carried the end of the stream, does not undo those writes, so the call
-	 * reports success instead.
-	 */
-	private static final class StreamedBatchProgress {
-
-		private final AtomicLong received = new AtomicLong();
-		private final AtomicLong written = new AtomicLong();
-		private volatile boolean clientCompleted;
-		// Unknown until the first write
-		private volatile boolean finalWritePending = true;
-
-		private <T> Flux<T> track(Flux<T> clientStream) {
-			return clientStream
-					.doOnNext(_ -> received.incrementAndGet())
-					.doOnComplete(() -> clientCompleted = true);
-		}
-
-		/** Records written client batches, after the write that applied them returned. */
-		private void written(int batches, boolean finalWritePending) {
-			// Published by the counter, which applied() reads first
-			this.finalWritePending = finalWritePending;
-			written.addAndGet(batches);
-		}
-
-		private boolean applied() {
-			// The received count is final once the client completed
-			return clientCompleted && received.get() == written.get() && !finalWritePending;
-		}
-	}
-
-	private abstract class BatchWriteState implements AutoCloseable {
-
-		private static final VarHandle LIFECYCLE =
-				varHandle(BatchWriteState.class, "lifecycle", int.class);
-		private static final int ACTIVE = 1;
-		private static final int CLOSE_REQUESTED = 1 << 1;
-		private static final int CLOSED = 1 << 2;
-
-		private volatile int lifecycle;
-		private final StreamedBatchProgress progress;
-
-		private BatchWriteState(StreamedBatchProgress progress) {
-			this.progress = progress;
-			ops.beginOp();
-		}
-
-		protected final void runWhileOpen(Runnable operation) {
-			if (!tryEnter()) {
-				return;
-			}
-			try {
-				operation.run();
-			} finally {
-				exit();
-			}
-		}
-
-		private boolean tryEnter() {
-			for (;;) {
-				int state = lifecycle;
-				if ((state & (CLOSE_REQUESTED | CLOSED)) != 0) {
-					return false;
-				}
-				if (LIFECYCLE.compareAndSet(this, state, state | ACTIVE)) {
-					return true;
-				}
-			}
-		}
-
-		private void exit() {
-			for (;;) {
-				int state = lifecycle;
-				int next = state & ~ACTIVE;
-				if (LIFECYCLE.compareAndSet(this, state, next)) {
-					if ((next & CLOSE_REQUESTED) != 0) {
-						closeNow();
-					}
-					return;
-				}
-			}
-		}
-
-		@Override
-		public final void close() {
-			for (;;) {
-				int state = lifecycle;
-				if ((state & CLOSED) != 0) {
-					return;
-				}
-				int next = state | CLOSE_REQUESTED;
-				if (LIFECYCLE.compareAndSet(this, state, next)) {
-					if ((state & ACTIVE) == 0) {
-						closeNow();
-					}
-					return;
-				}
-			}
-		}
-
-		private void closeNow() {
-			for (;;) {
-				int state = lifecycle;
-				if ((state & CLOSED) != 0) {
-					return;
-				}
-				if ((state & ACTIVE) != 0) {
-					return;
-				}
-				if (LIFECYCLE.compareAndSet(this, state, state | CLOSED)) {
-					break;
-				}
-			}
-
-			try {
-				closeResources();
-			} catch (Throwable error) {
-				logger.error("Failed to close asynchronous batch-write resources", error);
-			} finally {
-				ops.endOp();
-			}
-		}
-
-		protected final void observeWrite() {
-			var observer = batchWriteObserver;
-			if (observer != null) {
-				observer.run();
-			}
-		}
-
-		/** Records that a write of {@code batches} client batches returned. */
-		protected final void written(int batches) {
-			progress.written(batches, hasFinalWritePending());
-		}
-
-		/** Whether the final write still has something to apply. */
-		protected abstract boolean hasFinalWritePending();
-
-		protected final void observeFinalWrite() {
-			var observer = batchFinalWriteObserver;
-			if (observer != null) {
-				observer.run();
-			}
-		}
-
-		protected abstract void closeResources();
-	}
-
-	private final class PutBatchState extends BatchWriteState {
-
-		private final long columnId;
-		private final PutBatchMode mode;
-		private final long start;
-		private ColumnInstance.ColumnUse columnUse;
-		private ColumnInstance col;
-		private DBWriter writer;
-		private boolean sstEntriesWritten;
-
-		private PutBatchState(long columnId, PutBatchMode mode, long start, StreamedBatchProgress progress) {
-			super(progress);
-			this.columnId = columnId;
-			this.mode = mode;
-			this.start = start;
-			try {
-				this.columnUse = acquireColumnUse(columnId);
-				this.col = columnUse.column();
-				this.writer = switch (mode) {
-					case WRITE_BATCH, WRITE_BATCH_NO_WAL ->
-							new WB(db.get(), new LeakSafeWriteBatch(), mode == PutBatchMode.WRITE_BATCH_NO_WAL);
-					case SST_INGESTION, SST_INGEST_BEHIND ->
-							getSSTWriter(columnId, null, false, mode == PutBatchMode.SST_INGEST_BEHIND);
-				};
-			} catch (Throwable error) {
-				close();
-				throw error;
-			}
-		}
-
-		private void write(KVBatch batch) {
-			runWhileOpen(() -> {
-				observeWrite();
-				validateBatch(batch);
-				var keyIt = batch.keys().iterator();
-				var valueIt = batch.values().iterator();
-				while (keyIt.hasNext()) {
-					var keys = keyIt.next();
-					var value = valueIt.next();
-					actionLogger.logAction("PutBatch (next)", start, columnId, keys, value, null, null, null, mode);
-					put(writer, col, 0, keys, value, RequestType.none());
-					if (writer instanceof SSTWriter) {
-						sstEntriesWritten = true;
-					}
-					flushFullWriteBatch(writer);
-				}
-				written(1);
-			});
-		}
-
-		@Override
-		protected boolean hasFinalWritePending() {
-			return switch (writer) {
-				case WB wb -> wb.wb().count() > 0;
-				case SSTWriter _ -> sstEntriesWritten;
-				default -> true;
-			};
-		}
-
-		private void writePending() {
-			runWhileOpen(() -> {
-				observeFinalWrite();
-				switch (writer) {
-					case WB wb -> {
-						if (wb.wb().count() > 0) {
-							wb.writePending();
-						}
-					}
-					case SSTWriter sst -> {
-						if (sstEntriesWritten) {
-							sst.writePending();
-						}
-					}
-					case null -> { }
-					default -> {
-						writer.writePending();
-					}
-				}
-			});
-		}
-
-		@Override
-		protected void closeResources() {
-			try {
-				if (writer != null) {
-					writer.close();
-				}
-			} catch (Exception error) {
-				throw new RuntimeException(error);
-			} finally {
-				if (columnUse != null) {
-					columnUse.close();
-				}
-			}
-		}
-	}
-
-	private final class MergeBatchState extends BatchWriteState {
-
-		private final long columnId;
-		private final MergeBatchMode mode;
-		private final long start;
-		private ColumnInstance.ColumnUse columnUse;
-		private ColumnInstance col;
-		private DBWriter writer;
-		private ArrayList<Map.Entry<Keys, Buf>> pendingSstEntries;
-
-		private MergeBatchState(long columnId,
-				MergeBatchMode mode,
-				boolean ingestBehindEnabled,
-				long start,
-				StreamedBatchProgress progress) {
-			super(progress);
-			this.columnId = columnId;
-			this.mode = mode;
-			this.start = start;
-			try {
-				this.columnUse = acquireColumnUse(columnId);
-				this.col = columnUse.column();
-				this.writer = switch (mode) {
-					case MERGE_WRITE_BATCH, MERGE_WRITE_BATCH_NO_WAL -> {
-						if (col.hasBuckets()) {
-							yield openTransactionInternal(120_000, false);
-						}
-						yield new WB(db.get(), new LeakSafeWriteBatch(),
-								mode == MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL);
-					}
-					case MERGE_SST_INGESTION -> {
-						pendingSstEntries = new ArrayList<>();
-						yield getSSTWriter(columnId, null, false, false);
-					}
-					case MERGE_SST_INGEST_BEHIND -> {
-						if (!ingestBehindEnabled) {
-							throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-									"MERGE_SST_INGEST_BEHIND requires database.global.ingest-behind=true");
-						}
-						pendingSstEntries = new ArrayList<>();
-						yield getSSTWriter(columnId, null, false, true);
-					}
-				};
-			} catch (Throwable error) {
-				close();
-				throw error;
-			}
-		}
-
-		private void write(List<KVBatch> batches) {
-			runWhileOpen(() -> {
-				observeWrite();
-				for (var batch : batches) {
-					validateBatch(batch);
-					var keyIt = batch.keys().iterator();
-					var valueIt = batch.values().iterator();
-					while (keyIt.hasNext()) {
-						var keys = keyIt.next();
-						var value = valueIt.next();
-						actionLogger.logAction("MergeBatch (next)", start, columnId, keys, value, null, null, null, mode);
-						if (writer instanceof SSTWriter) {
-							pendingSstEntries.add(Map.entry(keys, value));
-						} else {
-							merge(writer, col, 0L, keys, value, RequestType.none());
-						}
-						flushFullWriteBatch(writer);
-					}
-				}
-				if (writer instanceof WB wb && wb.wb().count() > 0) {
-					wb.flushAndReset();
-				}
-				written(batches.size());
-			});
-		}
-
-		@Override
-		protected boolean hasFinalWritePending() {
-			return switch (writer) {
-				case WB wb -> wb.wb().count() > 0;
-				case SSTWriter _ -> !pendingSstEntries.isEmpty();
-				// A transaction applies its writes only when committed
-				default -> true;
-			};
-		}
-
-		private void writePending() {
-			runWhileOpen(() -> {
-				observeFinalWrite();
-				switch (writer) {
-					case WB wb -> {
-						if (wb.wb().count() > 0) {
-							wb.writePending();
-						}
-					}
-					case Tx tx -> {
-						if (!closeTransactionInternal(tx, true)) {
-							throw new RocksDBRetryException();
-						}
-					}
-					case SSTWriter sst -> {
-						if (writeSstEntries(col, sst, pendingSstEntries)) {
-							sst.writePending();
-						}
-					}
-					case null -> { }
-				}
-			});
-		}
-
-		@Override
-		protected void closeResources() {
-			try {
-				if (writer instanceof Tx tx) {
-					if (tx.val().isOwningHandle()) {
-						closeTransactionInternal(tx, false);
-					}
-				} else if (writer != null) {
-					try {
-						writer.close();
-					} catch (Exception error) {
-						throw new RuntimeException(error);
-					}
-				}
-			} finally {
-				if (columnUse != null) {
-					columnUse.close();
-				}
-			}
-		}
-	}
-
-	private static void validateBatch(KVBatch batch) {
-		int keyCount = batch.keys().size();
-		int valueCount = batch.values().size();
-		if (keyCount != valueCount) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Batch key/value count mismatch: " + keyCount + " keys, " + valueCount + " values");
-		}
-	}
-
-	private void flushFullWriteBatch(DBWriter writer) {
-		if (writer instanceof WB wb
-				&& (wb.wb().count() >= 10_000 || wb.wb().getDataSize() >= 4 * 1024 * 1024)) {
-			wb.flushAndReset();
-		}
-	}
-
-	private boolean writeSstEntries(ColumnInstance col,
-			SSTWriter sst,
-			@Nullable List<Map.Entry<Keys, Buf>> entries) throws RocksDBException {
-		if (entries == null || entries.isEmpty()) {
-			return false;
-		}
-		boolean wroteEntry = false;
-		entries.sort((a, b) -> {
-			var ka = col.calculateKeyBytes(a.getKey().keys());
-			var kb = col.calculateKeyBytes(b.getKey().keys());
-			return Arrays.compareUnsigned(ka, kb);
-		});
-		try (var ro = newPointReadOptions(null)) {
-			for (var entry : entries) {
-				var keys = entry.getKey();
-				var value = entry.getValue();
-				byte[] keyBytes = col.calculateKeyBytes(keys.keys());
-				Buf calculatedKey = Buf.wrap(keyBytes);
-				if (col.hasBuckets()) {
-					var existingRawBucket = dbGet(null, col, ro, calculatedKey);
-					var bucket = existingRawBucket != null ? new Bucket(col, existingRawBucket) : new Bucket(col);
-					var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-					var existing = bucket.getElement(bucketElementKeys);
-					Buf mergedValue;
-					if (existing != null) {
-						var mergedRes = col.mergeOperator().merge(calculatedKey, existing, List.of(value));
-						mergedValue = mergedRes != null ? mergedRes : existing;
-					} else {
-						mergedValue = value;
-					}
-					bucket.addElement(bucketElementKeys, mergedValue);
-					byte[] valBytes = jniArray(bucket.toSegment());
-					sst.put(keyBytes, valBytes);
-					wroteEntry = true;
-				} else {
-					Buf existing = dbGet(null, col, ro, calculatedKey);
-					var mergeOp = col.mergeOperator();
-					if (mergeOp == null) {
-						throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "MergeBatch SST requires a merge operator");
-					}
-					Buf merged = existing != null ? mergeOp.merge(calculatedKey, existing, List.of(value)) : value;
-					if (merged != null) {
-						byte[] valBytes = Utils.toByteArray(merged);
-						sst.put(keyBytes, valBytes);
-						wroteEntry = true;
-					}
-				}
-			}
-		} catch (org.rocksdb.RocksDBException e) {
-			throw RocksDBException.of(RocksDBErrorType.SST_WRITE_3, e);
-		}
-		return wroteEntry;
+		return batchWrites.mergeBatchInternal(columnId, batchPublisher, mode, workloadScheduler);
 	}
 
 	@VisibleForTesting
@@ -5126,630 +2263,20 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable GlobalDatabaseConfig globalDatabaseConfigOverride,
 			boolean forceNoOptions,
 			boolean ingestBehind) throws RocksDBException {
-		RocksDBLoader.ColumnOptionsWithMerge columnConifg = null;
-		RocksDBObjects refs = null;
-		try {
-			var col = getColumn(colId);
-			if (!forceNoOptions) {
-				var name = new String(col.cfh().getName(), StandardCharsets.UTF_8);
-				refs = new RocksDBObjects();
-				if (globalDatabaseConfigOverride != null) {
-					columnConifg = RocksDBLoader.getColumnOptions(name,
-							path,
-							definitiveDbPath,
-							globalDatabaseConfigOverride,
-							logger,
-							refs,
-							false,
-							caches, metadataCaches
-					);
-				} else {
-					try {
-						columnConifg = RocksDBLoader.getColumnOptions(name,
-								path,
-								definitiveDbPath,
-								this.config.global(),
-								logger,
-								refs,
-								false,
-								caches, metadataCaches
-						);
-					} catch (GestaltException e) {
-						throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
-					}
-				}
-			}
-			if (Files.notExists(tempSSTsPath)) {
-				Files.createDirectories(tempSSTsPath);
-			}
-			return SSTWriter.open(tempSSTsPath,
-					db,
-					col,
-					columnConifg != null ? columnConifg.options() : null,
-					forceNoOptions,
-					ingestBehind,
-					refs
-			);
-		} catch (IOException ex) {
-			if (refs != null) {
-				refs.close();
-			}
-			if (columnConifg != null) {
-				columnConifg.options().close();
-			}
-			if (columnConifg != null && columnConifg.mergeOperator() != null) {
-				columnConifg.mergeOperator().close();
-			}
-			throw RocksDBException.of(RocksDBErrorType.SST_WRITE_2, ex);
-		} catch (org.rocksdb.RocksDBException ex) {
-			if (refs != null) {
-				refs.close();
-			}
-			if (columnConifg != null) {
-				columnConifg.options().close();
-			}
-			if (columnConifg != null && columnConifg.mergeOperator() != null) {
-				columnConifg.mergeOperator().close();
-			}
-			throw RocksDBException.of(RocksDBErrorType.SST_WRITE_3, ex);
-		} catch (Throwable ex) {
-			if (refs != null) {
-				refs.close();
-			}
-			if (columnConifg != null) {
-				columnConifg.options().close();
-			}
-			if (columnConifg != null && columnConifg.mergeOperator() != null) {
-				columnConifg.mergeOperator().close();
-			}
-			throw ex;
-		}
+		return batchWrites.getSSTWriter(colId, globalDatabaseConfigOverride, forceNoOptions, ingestBehind);
 	}
 
 	@Override
 	public void putBatch(long columnId, @NotNull Publisher<@NotNull KVBatch> batchPublisher, @NotNull PutBatchMode mode)
 			throws RocksDBException {
-		try {
-			putBatchInternal(columnId, batchPublisher, mode).get();
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (InterruptedException ex) {
-			Thread.currentThread().interrupt();
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} catch (Exception ex) {
-			throw (RocksDBException) mapBatchWriteFailure(ex);
-		}
+		batchWrites.putBatch(columnId, batchPublisher, mode);
 	}
 
 	@Override
 	public void mergeBatch(long columnId,
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode) throws RocksDBException {
-		try {
-			mergeBatchInternal(columnId, batchPublisher, mode).get();
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (InterruptedException ex) {
-			Thread.currentThread().interrupt();
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		} catch (Exception ex) {
-			throw (RocksDBException) mapBatchWriteFailure(ex);
-		}
-	}
-
-	private <U> U put(@Nullable DBWriter optionalDbWriter,
-			ColumnInstance col,
-			long updateId,
-			@NotNull Keys keys,
-			@NotNull Buf value,
-			RequestPut<? super Buf, U> callback) throws RocksDBException {
-		return put(optionalDbWriter, col, updateId, keys, value, callback, true);
-	}
-
-	private <U> U put(@Nullable DBWriter optionalDbWriter,
-			ColumnInstance col,
-			long updateId,
-			@NotNull Keys keys,
-			@NotNull Buf value,
-			RequestPut<? super Buf, U> callback,
-			boolean allowWriteElisionProbe) throws RocksDBException {
-		// Check for null value
-		col.checkNullableValue(value);
-		try {
-			var writeElisionRequest = WriteElisionRequest.from(callback);
-			if (writeElisionRequest != null && allowWriteElisionProbe) {
-				if (optionalDbWriter == null && updateId == 0L) {
-					var physicalKey = new PhysicalKey(col.calculateKeyBytes(keys.keys()));
-					var decision = probeCachedLogicalValue(col, physicalKey, keys, value);
-					recordWriteElisionDecision(writeElisionRequest, decision);
-					if (decision == WriteElisionDecision.ELIDED) {
-						return RequestType.safeCast(callback instanceof RequestType.RequestPreviousPresence<?>
-								? Boolean.TRUE
-								: null);
-					}
-				} else {
-					recordWriteElisionDecision(writeElisionRequest, WriteElisionDecision.BYPASS_WRITER);
-				}
-			}
-			boolean requirePreviousValue = RequestType.requiresGettingPreviousValue(callback);
-			boolean requirePreviousPresence = RequestType.requiresGettingPreviousPresence(callback);
-			boolean needsTx = col.hasBuckets() || requirePreviousValue || requirePreviousPresence;
-			if (optionalDbWriter instanceof Tx tx && tx.isFromGetForUpdate() && (requirePreviousValue
-					|| requirePreviousPresence)) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"You can't get the previous value or delta, when you are already updating that value"
-				);
-			}
-			if (updateId != 0L && !(optionalDbWriter instanceof Tx)) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Update id must be accompanied with a valid transaction"
-				);
-			}
-			if (col.hasBuckets() && (optionalDbWriter != null && !(optionalDbWriter instanceof Tx))) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Column with buckets don't support write batches"
-				);
-			}
-
-			U result;
-			DBWriter newTx;
-			boolean owningNewTx = needsTx && optionalDbWriter == null;
-			// Retry using a transaction: transactions are required to handle this kind of data
-			newTx = owningNewTx ? this.openTransactionInternal(120_000, false) : optionalDbWriter;
-			try {
-				boolean didGetForUpdateInternally = false;
-				boolean committedOwnedTx;
-				do {
-					Buf previousValue;
-					byte[] calculatedKeyArray = col.calculateKeyBytes(keys.keys());
-					if (updateId != 0L) {
-						assert !owningNewTx;
-						((Tx) newTx).val().setSavePoint();
-					}
-					if (col.hasBuckets()) {
-						assert newTx instanceof Tx;
-						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-						try (var readOptions = newPointReadOptions(null)) {
-							var previousRawBucketByteArray
-									= pointGetForUpdate((Tx) newTx, readOptions, col.cfh(), calculatedKeyArray);
-							didGetForUpdateInternally = true;
-							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
-							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
-							previousValue = transformResultValue(col, bucket.addElement(bucketElementKeys, value));
-							var v = jniArray(bucket.toSegment());
-							txPut((Tx) newTx, col.cfh(), calculatedKeyArray, v);
-						} catch (org.rocksdb.RocksDBException e) {
-							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
-						}
-					} else {
-						if (RequestType.requiresGettingPreviousValue(callback)) {
-							assert newTx instanceof Tx;
-							try (var readOptions = newPointReadOptions(null)) {
-								byte[] previousValueByteArray
-										= pointGetForUpdate((Tx) newTx, readOptions, col.cfh(), calculatedKeyArray);
-								didGetForUpdateInternally = true;
-								previousValue = transformResultValue(col, toBuf(previousValueByteArray));
-							} catch (org.rocksdb.RocksDBException e) {
-								throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
-							}
-						} else if (RequestType.requiresGettingPreviousPresence(callback)) {
-							// todo: in the future this should be replaced with just keyExists
-							assert newTx instanceof Tx;
-							try (var readOptions = newPointReadOptions(null)) {
-								byte[] previousValueByteArray = pointGetForUpdate((Tx) newTx, readOptions, col.cfh(), calculatedKeyArray);
-								didGetForUpdateInternally = true;
-								previousValue = previousValueByteArray != null ? emptyBuf() : null;
-							} catch (org.rocksdb.RocksDBException e) {
-								throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
-							}
-						} else {
-							previousValue = null;
-						}
-						switch (newTx) {
-							case WB wb -> wb.wb().put(col.cfh(), calculatedKeyArray, jniArray(value));
-							case SSTWriter sstWriter -> {
-								var valueBB = jniArray(col.schema().hasValue() ? value : dummyRocksDBEmptyValue());
-								sstWriter.put(calculatedKeyArray, valueBB);
-							}
-							case Tx t -> txPut(t, col.cfh(), calculatedKeyArray, jniArray(value));
-							case null -> {
-								try (var w = new LeakSafeWriteOptions(null)) {
-									var valueBB = jniArray(col.schema().hasValue() ? value : dummyRocksDBEmptyValue());
-									db.get().put(col.cfh(), w, calculatedKeyArray, valueBB);
-								}
-							}
-						}
-					}
-					result = RequestType.safeCast(switch (callback) {
-						case RequestType.RequestNothing<?> ignored -> null;
-						case RequestType.RequestEnsure<?> ignored -> null;
-						case RequestType.RequestPrevious<?> ignored -> previousValue;
-						case RequestType.RequestPreviousPresence<?> ignored -> previousValue != null;
-						case RequestType.RequestChanged<?> ignored -> !Utils.valueEquals(previousValue, value);
-						case RequestType.RequestDelta<?> ignored -> new Delta<>(previousValue, value);
-					});
-
-					if (updateId != 0L) {
-						boolean committed = closeTransaction(updateId, true);
-						if (!committed) {
-							try {
-								((Tx) newTx).val().rollbackToSavePoint();
-							} catch (org.rocksdb.RocksDBException | AssertionError e) {
-								logger.debug("Failed to rollback to savepoint during commit failure in put", e);
-							}
-							int undosCount = 0;
-							if (((Tx) newTx).isFromGetForUpdate()) {
-								undosCount++;
-							}
-							if (didGetForUpdateInternally) {
-								undosCount++;
-							}
-							for (int i = 0; i < undosCount; i++) {
-								((Tx) newTx).val().undoGetForUpdate(col.cfh(), calculatedKeyArray);
-							}
-							throw new RocksDBRetryException();
-						}
-					}
-
-					if (owningNewTx) {
-						committedOwnedTx = this.closeTransactionInternal((Tx) newTx, true);
-						if (!committedOwnedTx) {
-							// FIX: We MUST close the failed transaction and open a fresh one.
-							// If we reuse it, the C++ WriteBatch grows indefinitely on every retry!
-							this.closeTransactionInternal((Tx) newTx, false);
-							newTx = this.openTransactionInternal(120_000, false);
-							didGetForUpdateInternally = false;
-							Thread.yield();
-						}
-					} else {
-						committedOwnedTx = true;
-					}
-				} while (!committedOwnedTx);
-			} finally {
-				if (owningNewTx) {
-					this.closeTransactionInternal((Tx) newTx, false);
-				}
-			}
-			return result;
-		} catch (Exception ex) {
-			if (updateId != 0L && !(ex instanceof RocksDBRetryException)) {
-				closeTransaction(updateId, false);
-			}
-			if (ex instanceof RocksDBException rocksDBException) {
-				throw rocksDBException;
-			} else {
-				throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-			}
-		}
-	}
-
-	private <U> U delete(@Nullable DBWriter optionalDbWriter,
-			ColumnInstance col,
-			long updateId,
-			@NotNull Keys keys,
-			RequestType.RequestDelete<? super Buf, U> callback) throws RocksDBException {
-		try {
-			boolean requirePreviousValue = RequestType.requiresGettingPreviousValue(callback);
-			boolean requirePreviousPresence = RequestType.requiresGettingPreviousPresence(callback);
-			boolean needsTx = col.hasBuckets() || requirePreviousValue || requirePreviousPresence;
-			if (optionalDbWriter instanceof Tx tx && tx.isFromGetForUpdate() && (requirePreviousValue
-					|| requirePreviousPresence)) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"You can't get the previous value or delta, when you are already updating that value"
-				);
-			}
-			if (updateId != 0L && !(optionalDbWriter instanceof Tx)) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Update id must be accompanied with a valid transaction"
-				);
-			}
-			if (col.hasBuckets() && (optionalDbWriter != null && !(optionalDbWriter instanceof Tx))) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Column with buckets don't support write batches"
-				);
-			}
-
-			U result;
-			DBWriter newTx;
-			boolean owningNewTx = needsTx && optionalDbWriter == null;
-			// Retry using a transaction: transactions are required to handle this kind of data
-			newTx = owningNewTx ? this.openTransactionInternal(120_000, false) : optionalDbWriter;
-			try {
-				boolean didGetForUpdateInternally = false;
-				boolean committedOwnedTx;
-				do {
-					Buf previousValue;
-					byte[] calculatedKeyArray = col.calculateKeyBytes(keys.keys());
-					if (updateId != 0L) {
-						assert !owningNewTx;
-						((Tx) newTx).val().setSavePoint();
-					}
-					if (col.hasBuckets()) {
-						assert newTx instanceof Tx;
-						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-						try (var readOptions = newPointReadOptions(null)) {
-							var previousRawBucketByteArray = pointGetForUpdate((Tx) newTx, readOptions, col.cfh(), calculatedKeyArray);
-							didGetForUpdateInternally = true;
-							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
-							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
-							previousValue = transformResultValue(col, bucket.removeElement(bucketElementKeys));
-							var v = jniArray(bucket.toSegment());
-							txPut((Tx) newTx, col.cfh(), calculatedKeyArray, v);
-						} catch (org.rocksdb.RocksDBException e) {
-							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
-						}
-					} else {
-						if (RequestType.requiresGettingPreviousValue(callback)) {
-							assert newTx instanceof Tx;
-							try (var readOptions = newPointReadOptions(null)) {
-								byte[] previousValueByteArray;
-								previousValueByteArray = pointGetForUpdate((Tx) newTx, readOptions, col.cfh(), calculatedKeyArray);
-								didGetForUpdateInternally = true;
-								previousValue = transformResultValue(col, toBuf(previousValueByteArray));
-							} catch (org.rocksdb.RocksDBException e) {
-								throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
-							}
-						} else if (RequestType.requiresGettingPreviousPresence(callback)) {
-							// todo: in the future this should be replaced with just keyExists
-							assert newTx instanceof Tx;
-							try (var readOptions = newPointReadOptions(null)) {
-								byte[] previousValueByteArray;
-								previousValueByteArray = pointGetForUpdate((Tx) newTx, readOptions, col.cfh(), calculatedKeyArray);
-								didGetForUpdateInternally = true;
-								previousValue = previousValueByteArray != null ? emptyBuf() : null;
-							} catch (org.rocksdb.RocksDBException e) {
-								throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
-							}
-						} else {
-							previousValue = null;
-						}
-						switch (newTx) {
-							case WB wb -> wb.wb().delete(col.cfh(), calculatedKeyArray);
-							case SSTWriter sstWriter -> {
-								// SSTWriter doesn't support delete in standard way if using ingest, but here we can't delete from SST.
-								// Actually SST ingestion is usually for loading new data.
-								// RocksDB SstFileWriter doesn't seem to support delete explicitly?
-								// Actually it does if we put empty value? No.
-								// Delete is not supported in SST ingestion usually for update-in-place.
-								// But we can check if we should support it.
-								throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Delete not supported in SST writer mode");
-							}
-							case Tx t -> txDelete(t, col.cfh(), calculatedKeyArray);
-							case null -> {
-								try (var w = new LeakSafeWriteOptions(null)) {
-									db.get().delete(col.cfh(), w, calculatedKeyArray);
-								}
-							}
-						}
-					}
-					result = RequestType.safeCast(switch (callback) {
-						case RequestType.RequestNothing<?> ignored -> null;
-						case RequestType.RequestPrevious<?> ignored -> previousValue;
-						case RequestType.RequestPreviousPresence<?> ignored -> previousValue != null;
-						default -> throw new IllegalStateException("Unexpected value: " + callback);
-					});
-
-					if (updateId != 0L) {
-						boolean committed = closeTransaction(updateId, true);
-						if (!committed) {
-							try {
-								((Tx) newTx).val().rollbackToSavePoint();
-							} catch (org.rocksdb.RocksDBException | AssertionError e) {
-								logger.debug("Failed to rollback to savepoint during commit failure in delete", e);
-							}
-							int undosCount = 0;
-							if (((Tx) newTx).isFromGetForUpdate()) {
-								undosCount++;
-							}
-							if (didGetForUpdateInternally) {
-								undosCount++;
-							}
-							for (int i = 0; i < undosCount; i++) {
-								((Tx) newTx).val().undoGetForUpdate(col.cfh(), calculatedKeyArray);
-							}
-							throw new RocksDBRetryException();
-						}
-					}
-
-					if (owningNewTx) {
-						committedOwnedTx = this.closeTransactionInternal((Tx) newTx, true);
-						if (!committedOwnedTx) {
-							// FIX: We MUST close the failed transaction and open a fresh one.
-							// If we reuse it, the C++ WriteBatch grows indefinitely on every retry!
-							this.closeTransactionInternal((Tx) newTx, false);
-							newTx = this.openTransactionInternal(120_000, false);
-							didGetForUpdateInternally = false;
-							Thread.yield();
-						}
-					} else {
-						committedOwnedTx = true;
-					}
- 			} while (!committedOwnedTx);
-			} finally {
-				if (owningNewTx) {
-					this.closeTransactionInternal((Tx) newTx, false);
-				}
-			}
-			return result;
-		} catch (Exception ex) {
-			if (updateId != 0L && !(ex instanceof RocksDBRetryException)) {
-				closeTransaction(updateId, false);
-			}
-			if (ex instanceof RocksDBException rocksDBException) {
-				throw rocksDBException;
-			} else {
-				throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-			}
-		}
-	}
-
-	private <U> U merge(@Nullable DBWriter optionalDbWriter,
-			ColumnInstance col,
-			long updateId,
-			@NotNull Keys keys,
-			@NotNull Buf value,
-			RequestMerge<? super Buf, U> callback) throws RocksDBException {
-		// Forget a failure of an earlier merge on this thread: only one of this merge may name the operator.
-		FFMAbstractMergeOperator.takeFailureOnThisThread();
-		try {
-			boolean needsTx = col.hasBuckets() || !(callback instanceof RequestType.RequestNothing<?>);
-			if (optionalDbWriter instanceof Tx tx && tx.isFromGetForUpdate() && callback instanceof RequestType.RequestMerged<?>) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"You can't get the merged value, when you are already updating that value"
-				);
-			}
-			if (updateId != 0L && !(optionalDbWriter instanceof Tx)) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Update id must be accompanied with a valid transaction"
-				);
-			}
-
-			U result;
-			DBWriter newTx;
-			boolean owningNewTx = needsTx && optionalDbWriter == null;
-			// Retry using a transaction: transactions are required to handle this kind of data
-			newTx = owningNewTx ? this.openTransactionInternal(120_000, false) : optionalDbWriter;
-			try {
-				boolean didGetForUpdateInternally = false;
-				boolean committedOwnedTx;
-				do {
-					byte[] calculatedKeyArray = col.calculateKeyBytes(keys.keys());
-					Buf calculatedKey = Buf.wrap(calculatedKeyArray);
-					if (updateId != 0L) {
-						assert !owningNewTx;
-						((Tx) newTx).val().setSavePoint();
-					}
-					if (col.hasBuckets()) {
-						assert newTx instanceof Tx;
-						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-						try (var readOptions = newPointReadOptions(null)) {
-							var previousRawBucketByteArray = pointGetForUpdate((Tx) newTx, readOptions, col.cfh(), calculatedKeyArray);
-							didGetForUpdateInternally = true;
-							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
-							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
-							var existing = bucket.getElement(bucketElementKeys);
-							Buf mergedValue;
-							if (existing != null) {
-								var mergedRes = mergeInJava(col, calculatedKey, existing, value);
-								mergedValue = mergedRes != null ? mergedRes : existing;
-							} else {
-								mergedValue = value;
-							}
-							bucket.addElement(bucketElementKeys, mergedValue);
-							var v = jniArray(bucket.toSegment());
-							txPut((Tx) newTx, col.cfh(), calculatedKeyArray, v);
-							if (callback instanceof RequestType.RequestMerged<?>) {
-								var merged = bucket.getElement(col.getBucketElementKeys(keys.keys()));
-								result = RequestType.safeCast(transformResultValue(col, merged));
-							} else {
-								result = null;
-							}
-						} catch (org.rocksdb.RocksDBException e) {
-							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
-						}
-					} else {
-						switch (newTx) {
-							case WB wb -> wb.wb().merge(col.cfh(), calculatedKeyArray, jniArray(value));
-							case SSTWriter ignored ->
-									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Merge not supported with SST writer");
-							case Tx t -> txMerge(t, col.cfh(), calculatedKeyArray, value);
-							case null -> {
-								try (var w = new LeakSafeWriteOptions(null)) {
-									db.get().merge(col.cfh(), w, calculatedKeyArray, jniArray(value));
-								}
-							}
-						}
-						if (callback instanceof RequestType.RequestMerged<?>) {
-							Buf merged;
-							try (var readOptions = newPointReadOptions(null)) {
-								merged = dbGet(newTx instanceof Tx ? (Tx) newTx : null, col, readOptions, calculatedKey);
-							}
-							result = RequestType.safeCast(merged);
-						} else {
-							result = null;
-						}
-					}
-
-					if (updateId != 0L) {
-						boolean committed = closeTransaction(updateId, true);
-						if (!committed) {
-							try {
-								((Tx) newTx).val().rollbackToSavePoint();
-							} catch (org.rocksdb.RocksDBException | AssertionError e) {
-								logger.debug("Failed to rollback to savepoint during commit failure in merge", e);
-							}
-							int undosCount = 0;
-							if (((Tx) newTx).isFromGetForUpdate()) {
-								undosCount++;
-							}
-							if (didGetForUpdateInternally) {
-								undosCount++;
-							}
-							for (int i = 0; i < undosCount; i++) {
-								((Tx) newTx).val().undoGetForUpdate(col.cfh(), calculatedKeyArray);
-							}
-							throw new RocksDBRetryException();
-						}
-					}
-
-					if (owningNewTx) {
-						committedOwnedTx = this.closeTransactionInternal((Tx) newTx, true);
-						if (!committedOwnedTx) {
-							this.closeTransactionInternal((Tx) newTx, false);
-							newTx = this.openTransactionInternal(120_000, false);
-							didGetForUpdateInternally = false;
-							Thread.yield();
-						}
-					} else {
-						committedOwnedTx = true;
-					}
-				} while (!committedOwnedTx);
-			} finally {
-				if (owningNewTx) {
-					this.closeTransactionInternal((Tx) newTx, false);
-				}
-			}
-			return result;
-		} catch (Exception ex) {
-			if (updateId != 0L && !(ex instanceof RocksDBRetryException)) {
-				closeTransaction(updateId, false);
-			}
-			// A read of the merged value runs the operator on this thread, and RocksDB reports its failure as a
-			// corruption: name the operator instead, so that the failure is not taken for a storage one.
-			var operatorFailure = FFMAbstractMergeOperator.takeFailureOnThisThread();
-			if (operatorFailure != null && !(ex instanceof RocksDBException rocksDBException
-					&& rocksDBException.getErrorUniqueId() == RocksDBErrorType.MERGE_OPERATOR_FAILED)) {
-				var failure = mergeOperatorFailed(operatorFailure);
-				failure.addSuppressed(ex);
-				throw failure;
-			}
-			if (ex instanceof RocksDBException rocksDBException) {
-				throw rocksDBException;
-			} else {
-				throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-			}
-		}
-	}
-
-	/**
-	 * Merges {@code value} into {@code existing} with the column's operator, called from Java (bucketed columns keep
-	 * their elements inside one RocksDB value, so RocksDB cannot merge them). A failure of the operator is reported
-	 * as {@link RocksDBErrorType#MERGE_OPERATOR_FAILED}; a failure of the JVM itself is not the operator's.
-	 */
-	private static @Nullable Buf mergeInJava(ColumnInstance col, Buf key, Buf existing, Buf value) {
-		var operator = col.mergeOperator();
-		if (operator == null) {
-			throw RocksDBException.of(RocksDBErrorType.MERGE_OPERATOR_FAILED, "The column has no merge operator");
-		}
-		try {
-			return operator.merge(key, existing, List.of(value));
-		} catch (Throwable operatorFailure) {
-			if (Failures.isJvmFailure(operatorFailure)) {
-				// Anywhere in the chain: an operator may wrap it.
-				throw Failures.rethrow(operatorFailure);
-			}
-			throw mergeOperatorFailed(operatorFailure);
-		}
+		batchWrites.mergeBatch(columnId, batchPublisher, mode);
 	}
 
 	/**
@@ -5762,10 +2289,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				"Merge operator failed: " + Failures.describe(operatorFailure), operatorFailure);
 	}
 
-	private Buf transformResultValue(ColumnInstance col, Buf realPreviousValue) {
-		return col.schema().hasValue() ? realPreviousValue : (realPreviousValue != null ? emptyBuf() : null);
-	}
-
 	/**
 	 * Attempts the embedded fast path for a current-value Get.
 	 *
@@ -5773,263 +2296,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 *     column/database must use the ordinary API path.
 	 */
 	public @Nullable FastGetResult tryGetFast(long columnId, Keys keys, FastGetOutput output) {
-		Objects.requireNonNull(keys, "keys");
-		Objects.requireNonNull(output, "output");
-		if (!fastGet) {
-			return null;
-		}
-
-		long start = System.nanoTime();
-		ColumnInstance col = null;
-		boolean operationStarted = false;
-		boolean ownershipTransferred = false;
-		try {
-			col = beginColumnUse(columnId);
-			if (col.hasBuckets() || !col.schema().hasValue()) {
-				return null;
-			}
-			ops.beginOp();
-			operationStarted = true;
-
-			Buf calculatedKey = col.calculateKey(keys.keys());
-			var reader = Objects.requireNonNull(fastGetReader);
-			byte[] keyArray = calculatedKey.getBackingByteArray();
-			int keyOffset = calculatedKey.getBackingByteArrayOffset();
-			int keyLength = calculatedKey.getBackingByteArrayLength();
-
-			if (output == FastGetOutput.EXACT_HEAP) {
-				byte[] value = reader.getHeap(col.cfh(), keyArray, keyOffset, keyLength);
-				return value == null
-						? new FastGetResult(false, null, false, null)
-						: new FastGetResult(true, Buf.wrap(value), false, null);
-			}
-
-			NativeRocksDBGet.PinnedGetLease lease = reader.getPinned(
-					col.cfh(), keyArray, keyOffset, keyLength);
-			if (lease == null) {
-				return new FastGetResult(false, null, false, null);
-			}
-			boolean leaseTransferred = false;
-			try {
-					if (output != FastGetOutput.PINNED
-							&& !prefersPinnedFastGet(lease.value().size())) {
-						byte[] value = lease.copyAndClose();
-						return new FastGetResult(true, Buf.wrap(value), false, null);
-					}
-
-					var pinnedValue = lease.value();
-					ColumnInstance leasedColumn = col;
-				var result = new FastGetResult(true,
-						pinnedValue,
-						true,
-						() -> closePinnedFastGet(lease, leasedColumn, start));
-				ownershipTransferred = true;
-				leaseTransferred = true;
-				return result;
-			} finally {
-				if (!leaseTransferred) {
-					lease.close();
-				}
-			}
-		} catch (org.rocksdb.RocksDBException exception) {
-			throw RocksDBException.of(RocksDBErrorType.GET_1, exception);
-		} finally {
-			if (operationStarted) recordCompactionForegroundRead(start, 0);
-			if (!ownershipTransferred) {
-				if (operationStarted) {
-					ops.endOp();
-				}
-				if (col != null) {
-					col.endUse();
-				}
-				getTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
-			}
-		}
-	}
-
-	private static boolean prefersPinnedFastGet(int valueBytes) {
-		if (PINNED_GET_MIN_BYTES_OVERRIDE >= 0) {
-			return valueBytes >= PINNED_GET_MIN_BYTES_OVERRIDE;
-		}
-		return valueBytes >= 32 * 1024;
-	}
-
-	private void closePinnedFastGet(NativeRocksDBGet.PinnedGetLease lease,
-			ColumnInstance col,
-			long start) {
-		Throwable failure = null;
-		try {
-			lease.close();
-		} catch (Throwable exception) {
-			failure = exception;
-		}
-		try {
-			ops.endOp();
-		} catch (Throwable exception) {
-			if (failure == null) {
-				failure = exception;
-			} else {
-				failure.addSuppressed(exception);
-			}
-		}
-		try {
-			col.endUse();
-		} catch (Throwable exception) {
-			if (failure == null) {
-				failure = exception;
-			} else {
-				failure.addSuppressed(exception);
-			}
-		} finally {
-			getTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
-		}
-		if (failure instanceof RuntimeException runtimeException) {
-			throw runtimeException;
-		}
-		if (failure instanceof Error error) {
-			throw error;
-		}
-		if (failure != null) {
-			throw new IllegalStateException("Failed to close pinned gRPC Get", failure);
-		}
+		return pointReads.tryGetFast(columnId, keys, output);
 	}
 
 	@Override
 	public <T> T get(long transactionOrUpdateId, long columnId, Keys keys, RequestGet<? super Buf, T> requestType)
 			throws RocksDBException {
-		return get(transactionOrUpdateId,
-				columnId,
-				keys,
-				requestType,
-				WorkloadProfile.BATCH);
+		return pointReads.<T>get(transactionOrUpdateId, columnId, keys, requestType);
 	}
-
 	public <T> T get(long transactionOrUpdateId,
 			long columnId,
 			Keys keys,
 			RequestGet<? super Buf, T> requestType,
 			WorkloadProfile workloadProfile) throws RocksDBException {
-		var start = System.nanoTime();
-		ColumnInstance col = null;
-		ops.beginOp();
-		try {
-			actionLogger.logAction("Get", start, columnId, keys, null, transactionOrUpdateId, null, null, requestType);
-			// Column id
-			col = beginColumnUse(columnId);
-			Tx prevTx = transactionOrUpdateId != 0
-					? getTransaction(transactionOrUpdateId, true, workloadProfile)
-					: null;
-			Tx tx;
-			long updateId;
-			if (requestType instanceof RequestType.RequestForUpdate<?>) {
-				if (prevTx == null) {
-					tx = openTransactionInternal(MAX_TRANSACTION_DURATION_MS,
-							true,
-							workloadProfile,
-							false);
-					updateId = allocateTransactionInternal(tx);
-				} else {
-					tx = prevTx;
-					updateId = transactionOrUpdateId;
-				}
-			} else {
-				tx = prevTx;
-				updateId = 0;
-			}
-
-			try {
-				T result;
-				if (tx != null) {
-					synchronized (tx) {
-						requireLiveTransaction(transactionOrUpdateId != 0L ? transactionOrUpdateId : updateId, tx);
-						result = get(tx, updateId, col, keys, requestType);
-					}
-				} else {
-					result = get(tx, updateId, col, keys, requestType);
-				}
-				actionLogger.logAction("Get (result)",
-						start,
-						columnId,
-						keys,
-						result,
-						transactionOrUpdateId,
-						null,
-						null,
-						requestType
-				);
-				return result;
-			} catch (Throwable ex) {
-				actionLogger.logAction("Get (result)",
-						start,
-						columnId,
-						keys,
-						"failure (exception)",
-						transactionOrUpdateId,
-						null,
-						null,
-						requestType
-				);
-				if (tx != prevTx) {
-					closeTransaction(updateId, false);
-				}
-				throw ex;
-			}
-		} finally {
-			if (col != null) {
-				col.endUse();
-			}
-			ops.endOp();
-			var end = System.nanoTime();
-			getTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		return pointReads.<T>get(transactionOrUpdateId, columnId, keys, requestType, workloadProfile);
 	}
 
 	@Override
 	public MultiGetPage getMulti(long columnId, @NotNull List<Keys> keys, @NotNull RangeBudget budget) {
-		return getMulti(columnId, keys, budget, WorkloadProfile.BATCH, Long.MAX_VALUE);
+		return pointReads.getMulti(columnId, keys, budget);
 	}
-
 	public MultiGetPage getMulti(long columnId, @NotNull List<Keys> keys, @NotNull RangeBudget budget,
 			WorkloadProfile workloadProfile, long contextMonotonicDeadlineNanos) {
-		checkMultiGetDeadline(contextMonotonicDeadlineNanos);
-		var requestKeys = MultiGetPage.copyRequestKeys(keys, budget);
-		return readMultiGetPage(columnId, requestKeys, budget, workloadProfile, contextMonotonicDeadlineNanos, () -> false);
+		return pointReads.getMulti(columnId, keys, budget, workloadProfile, contextMonotonicDeadlineNanos);
 	}
-
 	public CompletableFuture<MultiGetPage> getMultiAsyncInternal(long columnId, @NotNull List<Keys> keys,
 			@NotNull RangeBudget budget, WorkloadProfile workloadProfile, Executor executor,
 			long contextMonotonicDeadlineNanos) {
-		try {
-			checkMultiGetDeadline(contextMonotonicDeadlineNanos);
-			var requestKeys = MultiGetPage.copyRequestKeys(keys, budget);
-			Objects.requireNonNull(workloadProfile, "workloadProfile");
-			Objects.requireNonNull(executor, "executor");
-			var request = new AsyncGetMultiRequest(columnId, requestKeys, budget, workloadProfile,
-					executor, contextMonotonicDeadlineNanos);
-			try {
-				executor.execute(request);
-			} catch (Throwable failure) {
-				request.rejectBeforeRun(failure);
-			}
-			return request;
-		} catch (Throwable failure) {
-			return CompletableFuture.failedFuture(failure);
-		}
-	}
-
-	private MultiGetPage readMultiGetPage(long columnId, List<Keys> keys, RangeBudget budget,
-			WorkloadProfile workloadProfile, long monotonicDeadlineNanos, BooleanSupplier cancelled) {
-		try (var lease = readMultiGetPinned(columnId, keys, budget, workloadProfile,
-				monotonicDeadlineNanos, cancelled)) {
-			var page = lease.page();
-			var values = new ArrayList<Buf>(page.values().size());
-			for (var value : page.values()) {
-				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				values.add(value == null ? null : Buf.wrap(value.toByteArray()));
-			}
-			checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-			return new MultiGetPage(values, page.hasMore());
-		}
+		return pointReads.getMultiAsyncInternal(columnId, keys, budget, workloadProfile, executor, contextMonotonicDeadlineNanos);
 	}
 
 	/**
@@ -6039,147 +2333,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	public PinnedMultiGetResult getMultiPinned(long columnId, @NotNull List<Keys> keys,
 			@NotNull RangeBudget budget, WorkloadProfile workloadProfile,
 			long monotonicDeadlineNanos, BooleanSupplier cancelled) {
-		Objects.requireNonNull(cancelled, "cancelled");
-		checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-		var requestKeys = MultiGetPage.copyRequestKeys(keys, budget);
-		return readMultiGetPinned(columnId, requestKeys, budget, workloadProfile,
-				monotonicDeadlineNanos, cancelled);
-	}
-
-	private PinnedMultiGetResult readMultiGetPinned(long columnId, List<Keys> keys, RangeBudget budget,
-			WorkloadProfile workloadProfile, long monotonicDeadlineNanos, BooleanSupplier cancelled) {
-		Objects.requireNonNull(workloadProfile, "workloadProfile");
-		checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-		ops.beginOp();
-		ColumnInstance.ColumnUse columnUse = null;
-		PinnedMultiGet pinned = null;
-		boolean transferred = false;
-		try {
-			columnUse = acquireColumnUse(columnId);
-			var col = columnUse.column();
-			if (!col.schema().hasValue()) {
-				throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
-						"MultiGet requires a column with values");
-			}
-			if (keys.isEmpty()) {
-				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				var result = new PinnedMultiGetResult(MultiGetPage.empty(), null, columnUse);
-				transferred = true;
-				return result;
-			}
-			checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-			// Even missing values consume a response slot; do not read keys that cannot fit.
-			long maximumSlots = Math.max(0L,
-					(budget.maxBytes() - MultiGetPage.RESPONSE_BASE_BYTES) / MultiGetPage.RESPONSE_ITEM_BYTES);
-			int count = (int) Math.min(Math.min(keys.size(), budget.maxItems()), maximumSlots);
-			if (count == 0) {
-				throw RocksDBException.of(RocksDBErrorType.GET_MULTI_ITEM_TOO_LARGE,
-						"MultiGet byte budget cannot hold one response slot");
-			}
-			var nativeKeys = new byte[count][];
-			long physicalKeyBytes = 0;
-			for (int i = 0; i < count; i++) {
-				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				var calculatedKey = col.calculateKeyBytes(keys.get(i).keys());
-				physicalKeyBytes += calculatedKey.length;
-				if (physicalKeyBytes > MultiGetPage.MAX_KEY_BYTES) {
-					throw RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
-							"MultiGet physical keys exceed server byte limit");
-				}
-				nativeKeys[i] = calculatedKey;
-			}
-			// Retain one snapshot for the uncommon first-key retry after native key sorting.
-			var nativeDb = db.get();
-			var snapshot = nativeDb.getSnapshot();
-			MultiGetPage page;
-			try (var readOptions = newReadOptions("get-multi-read-options")) {
-				readOptions.setSnapshot(snapshot);
-				readOptions.setDeadline(nativeReadDeadlineMicros(monotonicDeadlineNanos));
-				readOptions.setFillCache(true);
-				// This is a soft value limit, not a hard native allocation bound: a
-				// native chunk can retain the value which crosses it before aborting.
-				readOptions.setValueSizeSoftLimit(Math.max(1L, budget.maxBytes()
-						- MultiGetPage.RESPONSE_BASE_BYTES - count * MultiGetPage.RESPONSE_ITEM_BYTES));
-				pinned = new PinnedMultiGet();
-				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				runPinnedValueMultiGet(col, readOptions, nativeKeys, pinned);
-				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				if (pinned.isAborted(0)) {
-					// RocksDB may sort keys internally. An aborted first input must
-					// still make progress, rather than publish an empty continuation.
-					pinned.close();
-					pinned = null;
-					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-					pinned = new PinnedMultiGet();
-					// Resolve this one value so an oversized first item receives
-					// the page-budget error below instead of another soft-limit abort.
-					readOptions.setValueSizeSoftLimit(Long.MAX_VALUE);
-					runPinnedValueMultiGet(col, readOptions, new byte[][] { nativeKeys[0] }, pinned);
-					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				}
-				int accepted = 0;
-				long responseBytes = MultiGetPage.RESPONSE_BASE_BYTES;
-				for (int i = 0; i < pinned.size(); i++) {
-					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-					if (pinned.isAborted(i)) {
-						if (i == 0) {
-							throw new IllegalStateException("Single-key pinned MultiGet aborted without progress");
-						}
-						break;
-					}
-					long physicalValueBytes = pinned.isPresent(i) ? pinned.valueSize(i) : 0L;
-					long itemBytes = saturatingAdd(MultiGetPage.RESPONSE_ITEM_BYTES, physicalValueBytes);
-					if (itemBytes > budget.maxBytes() - responseBytes) {
-						if (accepted == 0) {
-							throw RocksDBException.of(RocksDBErrorType.GET_MULTI_ITEM_TOO_LARGE,
-									"First MultiGet physical value exceeds the page byte budget");
-						}
-						break;
-					}
-					responseBytes += itemBytes;
-					accepted++;
-				}
-				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				// Drop rejected pins before creating views: truncation invalidates
-				// existing views, and only the accepted prefix must survive serialization.
-				pinned.retainPrefix(accepted);
-				var values = new ArrayList<Buf>(accepted);
-				for (int i = 0; i < accepted; i++) {
-					checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-					Buf value = pinned.isPresent(i) ? new MemorySegmentBuf(pinned.value(i)) : null;
-					if (value != null && col.hasBuckets()) {
-						value = new Bucket(col, value).getElement(col.getBucketElementKeys(keys.get(i).keys()));
-					}
-					values.add(value);
-				}
-				checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-				page = new MultiGetPage(values, accepted < keys.size());
-			} finally {
-				nativeDb.releaseSnapshot(snapshot);
-			}
-			checkMultiGetActive(monotonicDeadlineNanos, cancelled);
-			var result = new PinnedMultiGetResult(page, pinned, columnUse);
-			transferred = true;
-			return result;
-		} catch (org.rocksdb.RocksDBException failure) {
-			throw mapIteratorStatusException(failure);
-		} finally {
-			if (!transferred) {
-				try {
-					if (pinned != null) {
-						pinned.close();
-					}
-				} finally {
-					try {
-						if (columnUse != null) {
-							columnUse.close();
-						}
-					} finally {
-						ops.endOp();
-					}
-				}
-			}
-		}
+		return pointReads.getMultiPinned(columnId, keys, budget, workloadProfile, monotonicDeadlineNanos, cancelled);
 	}
 
 	/** Owns the native pins; page access and serialization must finish before close. */
@@ -6189,7 +2343,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private final ColumnInstance.ColumnUse columnUse;
 		private final AtomicBoolean closed = new AtomicBoolean();
 
-		private PinnedMultiGetResult(MultiGetPage page, @Nullable PinnedMultiGet pinned,
+		PinnedMultiGetResult(MultiGetPage page, @Nullable PinnedMultiGet pinned,
 				ColumnInstance.ColumnUse columnUse) {
 			this.page = page;
 			this.pinned = pinned;
@@ -6222,180 +2376,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private void checkMultiGetActive(long deadline, BooleanSupplier cancelled) {
-		checkMultiGetDeadline(deadline);
-		if (cancelled.getAsBoolean()) {
-			throw new CancellationException();
-		}
-	}
-
-	private void checkMultiGetDeadline(long monotonicDeadlineNanos) {
-		if (scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
-			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded");
-		}
-	}
-
-	private void runPinnedValueMultiGet(ColumnInstance col, ReadOptions readOptions,
-			byte[][] keys, PinnedMultiGet pinned) throws org.rocksdb.RocksDBException {
-		long start = System.nanoTime();
-		activeNativeMultiGets.incrementAndGet();
-		try {
-			pinned.read(db.get(), col.cfh(), readOptions, keys);
-		} finally {
-			activeNativeMultiGets.decrementAndGet();
-			recordCompactionForegroundRead(start, keys.length);
-		}
-	}
-
-	private final class AsyncGetMultiRequest extends CompletableFuture<MultiGetPage>
-			implements Runnable, RWScheduler.RejectionAwareTask, RWScheduler.EstimatedWork {
-		private final long columnId;
-		private final List<Keys> keys;
-		private final RangeBudget budget;
-		private final WorkloadProfile workloadProfile;
-		private final Executor executor;
-		private final long deadline;
-		private final long estimatedBytes;
-		private boolean running;
-		private boolean finished;
-		private boolean cancelRequested;
-
-		@Override
-		public long estimatedBytes() {
-			return estimatedBytes;
-		}
-
-		private AsyncGetMultiRequest(long columnId, List<Keys> keys, RangeBudget budget,
-				WorkloadProfile workloadProfile, Executor executor, long deadline) {
-			this.columnId = columnId;
-			this.keys = keys;
-			this.budget = budget;
-			this.workloadProfile = workloadProfile;
-			this.executor = executor;
-			this.deadline = deadline;
-			this.estimatedBytes = new RocksDBAPICommand.RocksDBAPICommandSingle.GetMulti(
-					columnId, keys, budget).estimatedBytes();
-		}
-
-		@Override
-		public void run() {
-			synchronized (this) {
-				if (finished || running) {
-					return;
-				}
-				running = true;
-			}
-			MultiGetPage result = null;
-			Throwable failure = null;
-			try {
-				result = readMultiGetPage(columnId, keys, budget, workloadProfile, deadline, this::isCancellationRequested);
-			} catch (Throwable error) {
-				failure = error;
-			}
-			synchronized (this) {
-				finished = true;
-				if (cancelRequested && failure == null) {
-					failure = new CancellationException();
-				}
-			}
-			// readMultiGetPage has copied its values and released native ownership before publication.
-			if (failure != null) {
-				completeExceptionally(failure);
-			} else {
-				complete(Objects.requireNonNull(result));
-			}
-		}
-
-		private synchronized boolean isCancellationRequested() {
-			return cancelRequested;
-		}
-
-		@Override
-		public boolean cancel(boolean mayInterruptIfRunning) {
-			synchronized (this) {
-				if (finished) {
-					return false;
-				}
-				if (running) {
-					cancelRequested = true;
-					return false;
-				}
-				finished = true;
-			}
-			scheduler.removeQueuedTask(executor, this);
-			return super.cancel(false);
-		}
-
-		private void rejectBeforeRun(Throwable failure) {
-			synchronized (this) {
-				if (finished || running) {
-					return;
-				}
-				finished = true;
-			}
-			completeExceptionally(failure);
-		}
-
-		@Override
-		public void reject(RuntimeException failure) {
-			rejectBeforeRun(failure);
-		}
-	}
-
 	@Override
 	public List<Boolean> existsMulti(long transactionId,
 			long columnId,
 			@NotNull List<@NotNull Keys> keys) throws RocksDBException {
-		return existsMulti(transactionId,
-				columnId,
-				keys,
-				WorkloadProfile.BATCH,
-				Long.MAX_VALUE);
+		return existsMultiOps.existsMulti(transactionId, columnId, keys);
 	}
-
 	public List<Boolean> existsMulti(long transactionId,
 			long columnId,
 			@NotNull List<@NotNull Keys> keys,
 			WorkloadProfile workloadProfile,
 			long contextMonotonicDeadlineNanos) throws RocksDBException {
-		var start = System.nanoTime();
-		ops.beginOp();
-		try {
-			if (keys == null) {
-				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "keys");
-			}
-			actionLogger.logAction("ExistsMulti",
-					start,
-					columnId,
-					keys.size(),
-					null,
-					transactionId,
-					null,
-					null,
-					null
-			);
-
-			var deadlineMicros = nativeReadDeadlineMicros(contextMonotonicDeadlineNanos);
-			var columnUse = acquireColumnUse(columnId);
-			try (columnUse) {
-				Tx tx = transactionId != 0
-						? getTransaction(transactionId, false, workloadProfile)
-						: null;
-				try (var cursor = new ExistsMultiCursor(columnUse, tx, keys, deadlineMicros, workloadProfile == WorkloadProfile.LATENCY)) {
-				while (!cursor.readChunk()) {
-					// The synchronous API intentionally keeps processing on its caller thread.
-				}
-				return cursor.result();
-				}
-			}
-		} catch (RocksDBException exception) {
-			throw exception;
-		} catch (Exception exception) {
-			throw RocksDBException.of(RocksDBErrorType.GET_1, exception);
-		} finally {
-			ops.endOp();
-			existsMultiTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
-		}
+		return existsMultiOps.existsMulti(transactionId, columnId, keys, workloadProfile, contextMonotonicDeadlineNanos);
 	}
 
 	/**
@@ -6408,842 +2400,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			WorkloadProfile workloadProfile,
 			Executor executor,
 			long contextMonotonicDeadlineNanos) {
-		long requestStartNanos = System.nanoTime();
-		if (keys == null) {
-			return CompletableFuture.failedFuture(
-					RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "keys"));
-		}
-		final long deadlineMicros;
-		try {
-			// Establish the request deadline before validation/copying so admission work
-			// for a very large logical request cannot grant the native reads fresh time.
-			deadlineMicros = nativeReadDeadlineMicros(contextMonotonicDeadlineNanos);
-		} catch (Throwable error) {
-			return CompletableFuture.failedFuture(error);
-		}
-		// Yielding between native chunks lengthens the interval in which a caller could
-		// mutate its list. Retain a stable logical request just as we retain its snapshot.
-		final List<Keys> requestKeys;
-		try {
-			requestKeys = List.copyOf(keys);
-		} catch (NullPointerException nullKey) {
-			return CompletableFuture.failedFuture(
-					RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "keys contains null"));
-		} catch (Throwable error) {
-			return CompletableFuture.failedFuture(error);
-		}
-		var request = new AsyncExistsMultiRequest(
-				transactionId,
-				columnId,
-				requestKeys,
-				0L,
-				requestStartNanos,
-				deadlineMicros,
-				contextMonotonicDeadlineNanos,
-				workloadProfile,
-				executor,
-				isCooperativeRetainedProfile(workloadProfile)
-						&& !isExistsMultiProvablySingleChunk(requestKeys)
-						&& executor instanceof RWScheduler.WorkloadExecutor workloadExecutor
-						? workloadExecutor
-						: null);
-		request.scheduleInitial();
-		return request;
-	}
-
-	/**
-	 * A column-independent upper bound is enough to preserve the ordinary fast path:
-	 * fixed key parts retain their input length and variable-key hashes have a known
-	 * bounded output. A request below both native limits therefore cannot split.
-	 */
-	private static boolean isExistsMultiProvablySingleChunk(List<Keys> keys) {
-		if (keys.size() > EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL) {
-			return false;
-		}
-		long maximumCalculatedBytes = 0L;
-		for (var logicalKeys : keys) {
-			for (var key : logicalKeys.keys()) {
-				if (key == null) {
-					return false;
-				}
-				maximumCalculatedBytes = saturatingAdd(maximumCalculatedBytes,
-						Math.max(EXISTS_MULTI_MAX_VARIABLE_HASH_BYTES, key.size()));
-				if (maximumCalculatedBytes > EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL) {
-					return false;
-				}
-			}
-		}
-		return true;
-	}
-
-	private static boolean isCooperativeRetainedProfile(WorkloadProfile profile) {
-		return switch (profile) {
-			case ANALYTICAL, INGEST, BATCH -> true;
-			case LATENCY, CONTROL, PHYSICAL_MAINTENANCE -> false;
-		};
-	}
-
-	private final class AsyncExistsMultiRequest extends CompletableFuture<List<Boolean>>
-			implements Runnable, RWScheduler.CooperativeCompletionTask {
-
-		private static final VarHandle RESOURCES_CLEANED =
-				varHandle(AsyncExistsMultiRequest.class, "resourcesCleaned", boolean.class);
-		private static final int INITIAL_QUEUED = 0;
-		private static final int CHUNK_RUNNING = 1;
-		private static final int FINISHED = 2;
-		private static final int CHUNK_QUEUED = 3;
-
-		private final long transactionId;
-		private final long columnId;
-		private final List<Keys> keys;
-		private final long timeoutMs;
-		private final long requestStartNanos;
-		private final long deadlineMicros;
-		private final long monotonicDeadlineNanos;
-		private final WorkloadProfile workloadProfile;
-		private final Executor executor;
-		private final @Nullable RWScheduler.WorkloadExecutor cooperativeExecutor;
-		private final Object lifecycleLock = new Object();
-		private volatile boolean cancelRequested;
-		private volatile boolean resourcesCleaned;
-		private int state = INITIAL_QUEUED;
-		private @Nullable ExistsMultiCursor cursor;
-		private volatile @Nullable RWScheduler.CooperativeHandle cooperativeHandle;
-		private boolean operationStarted;
-		private boolean cooperativeCompletionPrepared;
-		private @Nullable List<Boolean> cooperativeResult;
-		private @Nullable Throwable resourceCleanupFailure;
-
-		private AsyncExistsMultiRequest(long transactionId,
-				long columnId,
-				List<Keys> keys,
-				long timeoutMs,
-				long requestStartNanos,
-				long deadlineMicros,
-				long monotonicDeadlineNanos,
-				WorkloadProfile workloadProfile,
-				Executor executor,
-				@Nullable RWScheduler.WorkloadExecutor cooperativeExecutor) {
-			this.transactionId = transactionId;
-			this.columnId = columnId;
-			this.keys = keys;
-			this.timeoutMs = timeoutMs;
-			this.requestStartNanos = requestStartNanos;
-			this.deadlineMicros = deadlineMicros;
-			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
-			this.workloadProfile = Objects.requireNonNull(workloadProfile, "workloadProfile");
-			this.executor = Objects.requireNonNull(executor, "executor");
-			this.cooperativeExecutor = cooperativeExecutor;
-		}
-
-		private void scheduleInitial() {
-			Throwable schedulingFailure = null;
-			synchronized (asyncExistsMultiAdmissionLock) {
-				synchronized (lifecycleLock) {
-					if (state != INITIAL_QUEUED) {
-						return;
-					}
-					try {
-						// Count queue residence as part of the operation. Besides making the
-						// request deadline honest, this makes admission linearizable with close().
-						ops.beginOp();
-						operationStarted = true;
-						activeExistsMultiRequests.add(this);
-						if (cooperativeExecutor == null) {
-							executor.execute(this);
-						} else {
-							cooperativeHandle = cooperativeExecutor.executeCooperatively(this,
-									EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL);
-						}
-					} catch (Throwable error) {
-						state = FINISHED;
-						activeExistsMultiRequests.remove(this);
-						schedulingFailure = error;
-					}
-				}
-			}
-			if (schedulingFailure != null) {
-				completeTerminal(null, schedulingFailure);
-			}
-		}
-
-		@Override
-		public boolean cancel(boolean mayInterruptIfRunning) {
-			if (cooperativeExecutor != null) {
-				synchronized (lifecycleLock) {
-					if (state == FINISHED) {
-						return false;
-					}
-					boolean beforeFirstRun = state == INITIAL_QUEUED;
-					var handle = Objects.requireNonNull(cooperativeHandle, "cooperativeHandle");
-					// Let the scheduler's terminal CAS choose between cancellation,
-					// deadline, shutdown, and a concurrently completed RUN before the
-					// local flag is published for idempotency.
-					boolean cancellationWon = handle.cancel();
-					if (cancellationWon) {
-						cancelRequested = true;
-					}
-					return beforeFirstRun && cancellationWon;
-				}
-			}
-			boolean cleanupQueuedRequest = false;
-			boolean initialQueuedCancellation = false;
-			synchronized (lifecycleLock) {
-				switch (state) {
-					case INITIAL_QUEUED -> {
-						state = FINISHED;
-						removeQueuedTask();
-						cleanupQueuedRequest = true;
-						initialQueuedCancellation = true;
-					}
-					case CHUNK_RUNNING -> {
-						cancelRequested = true;
-						return false;
-					}
-					case CHUNK_QUEUED -> {
-						cancelRequested = true;
-						state = FINISHED;
-						removeQueuedTask();
-						cleanupQueuedRequest = true;
-					}
-					default -> {
-						return false;
-					}
-				}
-			}
-			if (cleanupQueuedRequest) {
-				completeTerminal(null, new java.util.concurrent.CancellationException());
-			}
-			// Once a native chunk has run, keep the original future observable until
-			// cleanup finishes rather than reporting that cancellation won immediately.
-			return initialQueuedCancellation;
-		}
-
-		@Override
-		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
-			final boolean initialize;
-			synchronized (lifecycleLock) {
-				if (state == INITIAL_QUEUED) {
-					state = CHUNK_RUNNING;
-					initialize = true;
-				} else if (state == CHUNK_QUEUED) {
-					state = CHUNK_RUNNING;
-					initialize = false;
-				} else {
-					return RWScheduler.CooperativeResult.COMPLETE;
-				}
-			}
-			if (context.terminationRequested()) {
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-			if (initialize) {
-				try {
-					initialize();
-				} catch (VirtualMachineError fatal) {
-					throw fatal;
-				} catch (Throwable error) {
-					context.fail(cooperativeFailure(mapExistsMultiFailure(error),
-							"Cooperative existsMulti initialization failed"));
-					return RWScheduler.CooperativeResult.COMPLETE;
-				}
-			}
-
-			try {
-				var activeCursor = Objects.requireNonNull(cursor);
-				while (true) {
-					if (context.terminationRequested()) {
-						return RWScheduler.CooperativeResult.COMPLETE;
-					}
-					boolean exhausted = activeCursor.readChunk();
-					if (context.terminationRequested()) {
-						return RWScheduler.CooperativeResult.COMPLETE;
-					}
-					if (exhausted) {
-						prepareCooperativeCompletion(context, activeCursor.result());
-						return RWScheduler.CooperativeResult.COMPLETE;
-					}
-					if (context.preemptionRequested()) {
-						synchronized (lifecycleLock) {
-							if (state == CHUNK_RUNNING) {
-								state = CHUNK_QUEUED;
-							}
-						}
-						return RWScheduler.CooperativeResult.YIELD;
-					}
-				}
-			} catch (VirtualMachineError fatal) {
-				throw fatal;
-			} catch (Throwable error) {
-				context.fail(cooperativeFailure(mapExistsMultiFailure(error),
-						"Cooperative existsMulti native read failed"));
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-		}
-
-		private void prepareCooperativeCompletion(RWScheduler.CooperativeContext context,
-				List<Boolean> result) {
-			var cleanupFailure = cleanupTerminalResources(null);
-			if (cleanupFailure != null) {
-				if (cleanupFailure instanceof VirtualMachineError fatal) {
-					throw fatal;
-				}
-				context.fail(cooperativeFailure(cleanupFailure,
-						"Cooperative existsMulti cleanup failed"));
-				return;
-			}
-			synchronized (lifecycleLock) {
-				if (state != CHUNK_RUNNING) {
-					return;
-				}
-				if (cooperativeCompletionPrepared) {
-					throw new IllegalStateException("existsMulti completion was prepared twice");
-				}
-				cooperativeResult = result;
-				cooperativeCompletionPrepared = true;
-			}
-		}
-
-		@Override
-		public void completeCooperatively() {
-			final List<Boolean> result;
-			synchronized (lifecycleLock) {
-				if (state == FINISHED) {
-					return;
-				}
-				if (state != CHUNK_RUNNING || !cooperativeCompletionPrepared) {
-					throw new IllegalStateException("Scheduler selected RUN without an existsMulti result");
-				}
-				state = FINISHED;
-				result = Objects.requireNonNull(cooperativeResult,
-						"Prepared existsMulti result");
-			}
-			complete(result);
-		}
-
-		@Override
-		public void run() {
-			boolean initialize;
-			synchronized (lifecycleLock) {
-				if (state == INITIAL_QUEUED) {
-					state = CHUNK_RUNNING;
-					initialize = true;
-				} else if (state == CHUNK_QUEUED) {
-					state = CHUNK_RUNNING;
-					initialize = false;
-				} else {
-					return;
-				}
-			}
-			if (initialize && cancelRequested) {
-				finishRunning(null, new java.util.concurrent.CancellationException());
-				return;
-			}
-			if (initialize) {
-				try {
-					initialize();
-				} catch (Throwable error) {
-					finishRunning(null, mapExistsMultiFailure(error));
-					return;
-				}
-			}
-			if (cancelRequested) {
-				finishRunning(null, new java.util.concurrent.CancellationException());
-				return;
-			}
-
-			try {
-				var activeCursor = Objects.requireNonNull(cursor);
-				boolean exhausted = activeCursor.readChunk();
-				if (cancelRequested) {
-					finishRunning(null, new java.util.concurrent.CancellationException());
-				} else if (exhausted) {
-					finishRunning(activeCursor.result(), null);
-				} else {
-					scheduleNext();
-				}
-			} catch (Throwable error) {
-				finishRunning(null, mapExistsMultiFailure(error));
-			}
-		}
-
-		private void initialize() {
-			actionLogger.logAction("ExistsMulti",
-					requestStartNanos,
-					columnId,
-					keys.size(),
-					null,
-					transactionId,
-					null,
-					timeoutMs,
-					null);
-			if (monotonicDeadlineNanos != Long.MAX_VALUE
-					&& scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
-				throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded");
-			}
-			var columnUse = acquireColumnUse(columnId);
-			try {
-				Tx tx = transactionId != 0
-						? getTransaction(transactionId, false, workloadProfile)
-						: null;
-				cursor = new ExistsMultiCursor(columnUse, tx, keys, deadlineMicros, workloadProfile == WorkloadProfile.LATENCY);
-			} catch (Throwable error) {
-				columnUse.close();
-				throw error;
-			}
-		}
-
-		private void scheduleNext() {
-			Throwable schedulingFailure = null;
-			boolean cancelled = false;
-			synchronized (lifecycleLock) {
-				if (state != CHUNK_RUNNING) {
-					return;
-				}
-				if (cancelRequested) {
-					state = FINISHED;
-					cancelled = true;
-				} else {
-					state = CHUNK_QUEUED;
-					try {
-						executor.execute(this);
-					} catch (Throwable error) {
-						state = FINISHED;
-						schedulingFailure = error;
-					}
-				}
-			}
-			if (cancelled) {
-				completeTerminal(null, new java.util.concurrent.CancellationException());
-			} else if (schedulingFailure != null) {
-				completeTerminal(null, schedulingFailure);
-			}
-		}
-
-		private void finishRunning(@Nullable List<Boolean> result, @Nullable Throwable failure) {
-			synchronized (lifecycleLock) {
-				if (state != CHUNK_RUNNING) {
-					return;
-				}
-				state = FINISHED;
-			}
-			completeTerminal(result, failure);
-		}
-
-		private void completeTerminal(@Nullable List<Boolean> result, @Nullable Throwable failure) {
-			var terminalFailure = cleanupTerminalResources(failure);
-			if (terminalFailure != null) {
-				completeExceptionally(terminalFailure);
-			} else {
-				complete(Objects.requireNonNull(result));
-			}
-		}
-
-		private @Nullable Throwable cleanupTerminalResources(@Nullable Throwable originalFailure) {
-			if (!RESOURCES_CLEANED.compareAndSet(this, false, true)) {
-				var existingCleanupFailure = resourceCleanupFailure;
-				return existingCleanupFailure == null
-						? originalFailure
-						: appendFailure(originalFailure, existingCleanupFailure);
-			}
-			Throwable cleanupFailure = null;
-			if (cursor != null) {
-				try {
-					cursor.close();
-				} catch (Throwable closeFailure) {
-					cleanupFailure = appendFailure(cleanupFailure, closeFailure);
-				}
-			}
-			if (operationStarted) {
-				try {
-					existsMultiTimer.record(System.nanoTime() - requestStartNanos, TimeUnit.NANOSECONDS);
-				} catch (Throwable timerFailure) {
-					cleanupFailure = appendFailure(cleanupFailure, timerFailure);
-				}
-				activeExistsMultiRequests.remove(this);
-				try {
-					// End last: close() may release meters and native handles as soon as
-					// this request is the final SafeShutdown operation. The request must
-					// no longer be visible as active before publishing that final release.
-					ops.endOp();
-				} catch (Throwable endFailure) {
-					cleanupFailure = appendFailure(cleanupFailure, endFailure);
-				}
-			} else {
-				activeExistsMultiRequests.remove(this);
-			}
-			resourceCleanupFailure = cleanupFailure;
-			return cleanupFailure == null
-					? originalFailure
-					: appendFailure(originalFailure, cleanupFailure);
-		}
-
-		private void removeQueuedTask() {
-			scheduler.removeQueuedTask(executor, this);
-		}
-
-		@Override
-		public void reject(RuntimeException failure) {
-			synchronized (lifecycleLock) {
-				if (state == FINISHED) {
-					return;
-				}
-				state = FINISHED;
-			}
-			completeTerminal(null, failure);
-		}
-	}
-
-	private final class ExistsMultiCursor implements AutoCloseable {
-
-		private final ColumnInstance.ColumnUse columnUse;
-		private final ColumnInstance col;
-		private final @Nullable Tx tx;
-		private final List<Keys> keys;
-		private final ArrayList<Boolean> result;
-		private final @Nullable Snapshot snapshot;
-		private final @Nullable ReadOptions readOptions;
-		private @Nullable ExistsMultiChunk chunk;
-		private boolean exhausted;
-		private boolean closed;
-		private final boolean sampleLatency;
-
-		private ExistsMultiCursor(ColumnInstance.ColumnUse columnUse,
-				@Nullable Tx tx,
-				List<Keys> keys,
-				long deadlineMicros, boolean sampleLatency) {
-			this.sampleLatency = sampleLatency;
-			this.columnUse = columnUse;
-			this.col = columnUse.column();
-			this.tx = tx;
-			this.keys = keys;
-			this.result = new ArrayList<>(keys.size());
-			for (var logicalKeys : keys) {
-				if (logicalKeys == null) {
-					throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "keys contains null");
-				}
-			}
-			if (keys.isEmpty()) {
-				this.snapshot = null;
-				this.readOptions = null;
-				this.exhausted = true;
-				return;
-			}
-
-			this.chunk = calculateExistsMultiChunk(col, keys, 0);
-			Snapshot createdSnapshot = null;
-			ReadOptions createdReadOptions = null;
-			try {
-				if (chunk.nextOffset() < keys.size()) {
-					createdSnapshot = db.get().getSnapshot();
-					var snapshotObserver = existsMultiSnapshotObserver;
-					if (snapshotObserver != null) {
-						snapshotObserver.run();
-					}
-				}
-				createdReadOptions = newReadOptions("exists-multi-read-options");
-				createdReadOptions.setDeadline(deadlineMicros);
-				// Bounded point lookups should warm SST metadata; data admission also uses the existing bounded cache.
-				createdReadOptions.setFillCache(true);
-				if (createdSnapshot != null) {
-					createdReadOptions.setSnapshot(createdSnapshot);
-				}
-			} catch (Throwable error) {
-				if (createdReadOptions != null) {
-					try {
-						createdReadOptions.close();
-					} catch (Throwable closeFailure) {
-						error.addSuppressed(closeFailure);
-					}
-				}
-				if (createdSnapshot != null) {
-					try {
-						db.get().releaseSnapshot(createdSnapshot);
-					} catch (Throwable closeFailure) {
-						error.addSuppressed(closeFailure);
-					}
-				}
-				throw error;
-			}
-			this.snapshot = createdSnapshot;
-			this.readOptions = createdReadOptions;
-		}
-
-		private boolean readChunk() {
-			if (exhausted) {
-				return true;
-			}
-			var currentChunk = Objects.requireNonNull(chunk);
-			try {
-				if (tx == null && !col.hasBuckets()) {
-					result.addAll(existsMultiStatusOnly(col,
-							Objects.requireNonNull(readOptions),
-							currentChunk.calculatedKeys(), sampleLatency));
-				} else {
-					result.addAll(existsMultiWithValues(tx,
-							col,
-							Objects.requireNonNull(readOptions),
-							currentChunk.logicalKeys(),
-							currentChunk.calculatedKeys()));
-				}
-			} catch (org.rocksdb.RocksDBException exception) {
-				throw mapIteratorStatusException(exception);
-			}
-			var chunkObserver = existsMultiChunkObserver;
-			if (chunkObserver != null) {
-				chunkObserver.run();
-			}
-			if (currentChunk.nextOffset() >= keys.size()) {
-				exhausted = true;
-				return true;
-			}
-			chunk = calculateExistsMultiChunk(col, keys, currentChunk.nextOffset());
-			return false;
-		}
-
-		private List<Boolean> result() {
-			if (!exhausted) {
-				throw new IllegalStateException("ExistsMulti result requested before exhaustion");
-			}
-			return result;
-		}
-
-		@Override
-		public void close() {
-			if (closed) {
-				return;
-			}
-			closed = true;
-			Throwable failure = null;
-			if (readOptions != null) {
-				try {
-					readOptions.close();
-				} catch (Throwable error) {
-					failure = error;
-				}
-			}
-			if (snapshot != null) {
-				try {
-					db.get().releaseSnapshot(snapshot);
-				} catch (Throwable error) {
-					failure = appendFailure(failure, error);
-				}
-			}
-			try {
-				columnUse.close();
-			} catch (Throwable error) {
-				failure = appendFailure(failure, error);
-			}
-			if (failure instanceof RuntimeException runtimeException) {
-				throw runtimeException;
-			}
-			if (failure instanceof Error error) {
-				throw error;
-			}
-		}
-	}
-
-	private static Throwable mapExistsMultiFailure(Throwable error) {
-		if (error instanceof RocksDBException) {
-			return error;
-		}
-		return error instanceof Exception
-				? RocksDBException.of(RocksDBErrorType.GET_1, error)
-				: error;
-	}
-
-	private static RuntimeException cooperativeFailure(Throwable failure, String message) {
-		if (failure instanceof RuntimeException runtimeException) {
-			return runtimeException;
-		}
-		if (failure instanceof org.rocksdb.RocksDBException rocksDBException) {
-			return mapIteratorStatusException(rocksDBException);
-		}
-		return new RejectedExecutionException(message, failure);
-	}
-
-	private static Throwable appendFailure(@Nullable Throwable current, Throwable next) {
-		if (current == null) {
-			return next;
-		}
-		if (current != next) {
-			current.addSuppressed(next);
-		}
-		return current;
-	}
-
-	private record ExistsMultiChunk(List<Keys> logicalKeys, List<Buf> calculatedKeys, int nextOffset) {
-	}
-
-	private ExistsMultiChunk calculateExistsMultiChunk(ColumnInstance col, List<Keys> keys, int offset) {
-		int chunkCapacity = Math.min(EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL, keys.size() - offset);
-		var logicalChunk = new ArrayList<Keys>(chunkCapacity);
-		var calculatedChunk = new ArrayList<Buf>(chunkCapacity);
-		long calculatedKeyBytes = 0L;
-		while (offset < keys.size() && calculatedChunk.size() < EXISTS_MULTI_MAX_KEYS_PER_NATIVE_CALL) {
-			var logicalKey = keys.get(offset++);
-			var calculatedKey = col.calculateKey(logicalKey.keys());
-			logicalChunk.add(logicalKey);
-			calculatedChunk.add(calculatedKey);
-			calculatedKeyBytes = saturatingAdd(calculatedKeyBytes, calculatedKey.size());
-			if (calculatedKeyBytes >= EXISTS_MULTI_MAX_KEY_BYTES_PER_NATIVE_CALL) {
-				break;
-			}
-		}
-		return new ExistsMultiChunk(logicalChunk, calculatedChunk, offset);
-	}
-
-	private List<Boolean> existsMultiStatusOnly(ColumnInstance col,
-			ReadOptions readOptions,
-			List<Buf> calculatedKeys, boolean sampleLatency) throws org.rocksdb.RocksDBException {
-		var arena = Arena.ofConfined();
-		var arenaObserver = existsMultiArenaObserver;
-		try {
-			if (arenaObserver != null) {
-				arenaObserver.accept(true);
-			}
-			// One native block for all keys, sliced per key
-			var nativeKeys = NativeStaging.stageKeys(arena, calculatedKeys);
-			var emptyValues = new MemorySegment[calculatedKeys.size()];
-			// The MemorySegment overload creates a distinct ByteBuffer per entry; zero capacity prevents writes.
-			Arrays.fill(emptyValues, arena.allocate(0));
-
-			var nativeDb = db.get();
-			var columnHandles = List.of(col.cfh());
-			var sample = sampleLatency ? existsMultiPerfSampler.begin(nativeDb) : null;
-			List<org.rocksdb.ByteBufferGetStatus> statuses;
-			long readStarted = System.nanoTime();
-			activeNativeMultiGets.incrementAndGet();
-			try {
-				statuses = nativeDb.multiGetByteBuffers(readOptions, columnHandles, nativeKeys, emptyValues);
-			} finally {
-				activeNativeMultiGets.decrementAndGet();
-				recordCompactionForegroundRead(readStarted, nativeKeys.length);
-				if (sample != null) existsMultiPerfSampler.finish(sample);
-			}
-			var result = new ArrayList<Boolean>(statuses.size());
-			for (var status : statuses) {
-				result.add(switch (status.status.getCode()) {
-					case Ok -> true;
-					case NotFound -> false;
-					default -> throw mapIteratorStatusException(new org.rocksdb.RocksDBException(status.status));
-				});
-			}
-			return result;
-		} finally {
-			try {
-				arena.close();
-			} finally {
-				if (arenaObserver != null) {
-					arenaObserver.accept(false);
-				}
-			}
-		}
-	}
-
-	private List<Boolean> existsMultiWithValues(@Nullable Tx tx,
-			ColumnInstance col,
-			ReadOptions readOptions,
-			List<Keys> logicalKeys,
-			List<Buf> calculatedKeys) throws org.rocksdb.RocksDBException {
-		var nativeKeys = calculatedKeys.stream().map(EmbeddedDB::jniArray).toList();
-		List<byte[]> values;
-		long readStarted = System.nanoTime();
-		activeNativeMultiGets.incrementAndGet();
-		try {
-			if (tx == null) {
-				values = db.get().multiGetAsList(readOptions,
-						Collections.nCopies(nativeKeys.size(), col.cfh()),
-						nativeKeys);
-			} else {
-				values = tx.val().multiGetAsList(readOptions, col.cfh(), nativeKeys);
-			}
-		} finally {
-			activeNativeMultiGets.decrementAndGet();
-			recordCompactionForegroundRead(readStarted, nativeKeys.size());
-		}
-
-		var result = new ArrayList<Boolean>(values.size());
-		for (int i = 0; i < values.size(); i++) {
-			var value = values.get(i);
-			if (value == null) {
-				result.add(false);
-			} else if (col.hasBuckets()) {
-				var bucket = new Bucket(col, Buf.wrap(value));
-				result.add(bucket.getElement(col.getBucketElementKeys(logicalKeys.get(i).keys())) != null);
-			} else {
-				result.add(true);
-			}
-		}
-		return result;
-	}
-
-	private <T> T get(Tx tx, long updateId, ColumnInstance col, Keys keys, RequestGet<? super Buf, T> callback)
-			throws RocksDBException {
-		try {
-			if (!col.schema().hasValue() && RequestType.requiresGettingCurrentValue(callback)) {
-				throw RocksDBException.of(RocksDBErrorType.VALUE_MUST_BE_NULL,
-						"The specified callback requires a return value, but this column does not have values!"
-				);
-			}
-			Buf foundValue;
-			boolean existsValue;
-
-			Buf calculatedKey = col.calculateKey(keys.keys());
-			if (col.hasBuckets()) {
-				var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-				try {
-					Buf previousRawBucket = dbGetWithDefaultOptions(tx, col, calculatedKey, callback instanceof RequestType.RequestForUpdate<?>);
-					if (previousRawBucket != null) {
-						var bucket = new Bucket(col, previousRawBucket);
-						foundValue = bucket.getElement(bucketElementKeys);
-					} else {
-						foundValue = null;
-					}
-					existsValue = foundValue != null;
-				} catch (org.rocksdb.RocksDBException e) {
-					throw RocksDBException.of(RocksDBErrorType.GET_1, e);
-				}
-			} else {
-				boolean shouldGetCurrent = RequestType.requiresGettingCurrentValue(callback) || (tx != null
-						&& callback instanceof RequestType.RequestExists<?>);
-				if (shouldGetCurrent) {
-					try {
-						foundValue = dbGetWithDefaultOptions(tx, col, calculatedKey, callback instanceof RequestType.RequestForUpdate<?>);
-						existsValue = foundValue != null;
-					} catch (org.rocksdb.RocksDBException e) {
-						throw RocksDBException.of(RocksDBErrorType.PUT_2, e);
-					}
-				} else if (callback instanceof RequestType.RequestExists<?>) {
-					// tx is always null here
-					//noinspection ConstantValue
-					assert tx == null;
-					foundValue = null;
-					existsValue = db
-							.get()
-							.keyExists(col.cfh(),
-									calculatedKey.getBackingByteArray(),
-									calculatedKey.getBackingByteArrayOffset(),
-									calculatedKey.getBackingByteArrayLength()
-							);
-				} else {
-					foundValue = null;
-					existsValue = false;
-				}
-			}
-			return RequestType.safeCast(switch (callback) {
-				case RequestType.RequestNothing<?> ignored -> null;
-				case RequestType.RequestCurrent<?> ignored -> foundValue;
-				case RequestType.RequestForUpdate<?> ignored -> {
-					assert updateId != 0;
-					yield new UpdateContext<>(foundValue, updateId);
-				}
-				case RequestType.RequestExists<?> ignored -> existsValue;
-			});
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_UNKNOWN_ERROR, ex);
-		}
+		return existsMultiOps.existsMultiAsyncInternal(transactionId, columnId, keys, workloadProfile, executor, contextMonotonicDeadlineNanos);
 	}
 
 	@Override
@@ -7253,15 +2410,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			Duration iteratorLeaseTtl) throws RocksDBException {
-		return openIterator(transactionId,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				reverse,
-				LeaseTtl.toMillisCeil(iteratorLeaseTtl, "iteratorLeaseTtl"),
-				WorkloadProfile.BATCH);
+		return iterators.openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, iteratorLeaseTtl);
 	}
-
 	public long openIterator(long transactionId,
 			long columnId,
 			@Nullable Keys startKeysInclusive,
@@ -7269,239 +2419,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean reverse,
 			long timeoutMs,
 			WorkloadProfile workloadProfile) throws RocksDBException {
-		var start = System.nanoTime();
-		// Protect iterator construction as active work; the installed iterator's
-		// longer lifetime is accounted separately from shutdown admission.
-		ops.beginOp();
-		boolean resourceLeaseRetained = false;
-		try {
-			actionLogger.logAction("OpenIterator",
-					start,
-					columnId,
-					startKeysInclusive,
-					endKeysExclusive,
-					transactionId,
-					reverse,
-					timeoutMs,
-					null
-			);
-			var expirationTimestamp = iteratorExpirationTimestamp(timeoutMs);
-			var columnUse = acquireColumnUse(columnId);
-			var col = columnUse.column();
-			var state = new IteratorState(columnUse, reverse);
-			RocksIterator it = null;
-			REntry<RocksIterator> itEntry = null;
-			try {
-				var calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0
-						? col.calculateKey(startKeysInclusive.keys())
-						: null;
-				var calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0
-						? col.calculateKey(endKeysExclusive.keys())
-						: null;
-				var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null;
-				if (startKeySlice != null) {
-					state.add(startKeySlice);
-				}
-				var endKeySlice = calculatedEndKey != null ? toSlice(calculatedEndKey) : null;
-				if (endKeySlice != null) {
-					state.add(endKeySlice);
-				}
-
-				var ro = newReadOptions("open-iterator-read-options");
-				state.add(ro);
-				ro.setAsyncIo(false);
-				ro.setDeadline(iteratorReadDeadlineMicros(timeoutMs));
-				if (startKeySlice != null) {
-					ro.setIterateLowerBound(startKeySlice);
-				}
-				if (endKeySlice != null) {
-					ro.setIterateUpperBound(endKeySlice);
-				}
-				if (transactionId != 0L) {
-					//noinspection resource
-					it = getTransaction(transactionId, false, workloadProfile).val().getIterator(ro, col.cfh());
-				} else {
-					it = db.get().newIterator(col.cfh(), ro);
-				}
-				state.iterator = it;
-				if (reverse) {
-					it.seekToLast();
-				} else {
-					it.seekToFirst();
-				}
-				checkIteratorStatusIfInvalid(it);
-
-				itEntry = new REntry<>(it, expirationTimestamp, state, workloadProfile);
-				retainResourceLease();
-				resourceLeaseRetained = true;
-				long iteratorId = FastRandomUtils.allocateNewValue(its, itEntry, 1, Long.MAX_VALUE);
-				return iteratorId;
-			} catch (Throwable ex) {
-				try {
-					if (itEntry != null) {
-						itEntry.close();
-					} else {
-						if (it != null) {
-							it.close();
-						}
-						state.close();
-					}
-				} catch (Throwable closeError) {
-					ex.addSuppressed(closeError);
-				} finally {
-					if (resourceLeaseRetained) {
-						releaseResourceLease();
-					}
-				}
-				throw ex;
-			}
-		} finally {
-			ops.endOp();
-			var end = System.nanoTime();
-			openIteratorTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
-	}
-
-	private static long iteratorExpirationTimestamp(long timeoutMs) {
-		if (timeoutMs < 0) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Iterator timeout must be non-negative");
-		}
-		long now = System.currentTimeMillis();
-		return timeoutMs >= Long.MAX_VALUE - now ? Long.MAX_VALUE : now + timeoutMs;
-	}
-
-	private static long iteratorReadDeadlineMicros(long timeoutMs) {
-		if (timeoutMs < 0) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Read timeout must be non-negative");
-		}
-		long nowMicros = TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis());
-		long timeoutMicros = TimeUnit.MILLISECONDS.toMicros(timeoutMs);
-		return timeoutMicros >= Long.MAX_VALUE - nowMicros ? Long.MAX_VALUE : nowMicros + timeoutMicros;
-	}
-
-	private long nativeReadDeadlineMicros(long contextMonotonicDeadlineNanos) {
-		if (contextMonotonicDeadlineNanos == Long.MAX_VALUE) {
-			return Long.MAX_VALUE;
-		}
-		long nowMicros = TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis());
-		long remainingNanos = scheduler.remainingMonotonicDeadlineNanos(contextMonotonicDeadlineNanos);
-		long remainingMicros = TimeUnit.NANOSECONDS.toMicros(remainingNanos);
-		long contextDeadlineMicros = remainingMicros >= Long.MAX_VALUE - nowMicros
-				? Long.MAX_VALUE
-				: nowMicros + remainingMicros;
-		return contextDeadlineMicros;
-	}
-
-	/** Compute the one immutable deadline shared by permit waiting, admission and native reads. */
-	private ReadDeadline retainedReadDeadline(RequestContext context) {
-		long localBudgetNanos = TimeUnit.MILLISECONDS.toNanos(maxRetainedSnapshotAgeMs);
-		long localDeadlineNanos = scheduler.bindTimeoutNanos(localBudgetNanos);
-		long contextDeadlineNanos = scheduler.resolveMonotonicDeadline(context);
-		long monotonicDeadlineNanos = Math.min(localDeadlineNanos, contextDeadlineNanos);
-		long deadlineMicros = nativeReadDeadlineMicros(monotonicDeadlineNanos);
-		return new ReadDeadline(deadlineMicros, monotonicDeadlineNanos);
-	}
-
-	private final class IteratorState extends RocksDBObjects {
-
-		private final ColumnInstance column;
-		private final RWScheduler workloadScheduler;
-		private final boolean reverse;
-		private RocksIterator iterator;
-		private java.util.ListIterator<Entry<Buf[], Buf>> bucketIterator;
-		private boolean closed;
-
-		private IteratorState(ColumnInstance.ColumnUse columnUse, boolean reverse) {
-			super(columnUse);
-			this.column = columnUse.column();
-			this.workloadScheduler = getSchedulerForColumn(column.cfh().getID());
-			this.reverse = reverse;
-		}
-	}
-
-	private record LogicalIteratorStep(boolean present, @Nullable Buf value) {
-
-		private static final LogicalIteratorStep END = new LogicalIteratorStep(false, null);
+		return iterators.openIterator(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, timeoutMs, workloadProfile);
 	}
 
 	@Override
 	public void closeIterator(long iteratorId) throws RocksDBException {
-		var start = System.nanoTime();
-		try {
-			actionLogger.logAction("CloseIterator", start, null, null, null, null, null, null, null); // todo: improve logging
-			closeIteratorInternal(iteratorId);
-		} finally {
-			var end = System.nanoTime();
-			closeIteratorTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
-	}
-
-	/**
-	 * Atomically claims an iterator before closing it. Removing the map entry is the ownership
-	 * transfer that guarantees both the native handle and its resource lease are completed
-	 * exactly once when explicit close, leak cleanup, and forced shutdown race.
-	 */
-	private boolean closeIteratorInternal(long iteratorId) {
-		var entry = its.remove(iteratorId);
-		if (entry == null) {
-			return false;
-		}
-		try {
-			if (entry.objs() instanceof IteratorState state) {
-				synchronized (state) {
-					state.closed = true;
-					state.bucketIterator = null;
-					entry.close();
-				}
-			} else {
-				// Compatibility with synthetic entries used by close-race tests.
-				entry.close();
-			}
-		} finally {
-			releaseResourceLease();
-		}
-		return true;
+		iterators.closeIterator(iteratorId);
 	}
 
 	@Override
 	public void seekTo(long iterationId, @NotNull Keys keys) throws RocksDBException {
-		var start = System.nanoTime();
-		ops.beginOp();
-		try {
-			actionLogger.logAction("SeekTo", start, null, keys, null, iterationId, null, null, null);
-			if (keys == null) {
-				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Iterator seek keys cannot be null");
-			}
-			withIterator(iterationId, state -> {
-				state.bucketIterator = null;
-				if (keys.keys().length == 0) {
-					if (state.reverse) {
-						state.iterator.seekToLast();
-					} else {
-						state.iterator.seekToFirst();
-					}
-					checkIteratorStatusIfInvalid(state.iterator);
-					positionBucketCursor(state, null, null);
-					return null;
-				}
-
-				var target = state.column.calculateKeyBytes(keys.keys());
-				if (state.reverse) {
-					state.iterator.seekForPrev(target);
-				} else {
-					state.iterator.seek(target);
-				}
-				checkIteratorStatusIfInvalid(state.iterator);
-				positionBucketCursor(state, keys, target);
-				return null;
-			});
-		} finally {
-			ops.endOp();
-			var end = System.nanoTime();
-			seekToTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		iterators.seekTo(iterationId, keys);
 	}
 
 	@Override
@@ -7509,63 +2437,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long skipCount,
 			long takeCount,
 			@NotNull RequestType.RequestIterate<? super Buf, T> requestType) throws RocksDBException {
-		var start = System.nanoTime();
-		ops.beginOp();
-		try {
-			actionLogger.logAction("Subsequent", start, null, skipCount, takeCount, iterationId, null, null, requestType);
-			if (requestType == null) {
-				throw RocksDBException.of(RocksDBErrorType.NULL_ARGUMENT, "Iterator request type cannot be null");
-			}
-			if (skipCount < 0 || takeCount < 0) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Iterator skip and take counts must be non-negative");
-			}
-
-			return withIterator(iterationId, state -> {
-				for (long i = 0; i < skipCount; i++) {
-					if (!advanceIterator(state, false).present()) {
-						break;
-					}
-				}
-
-				Object result = switch (requestType) {
-					case RequestType.RequestNothing<?> _ -> {
-						for (long i = 0; i < takeCount; i++) {
-							if (!advanceIterator(state, false).present()) {
-								break;
-							}
-						}
-						yield null;
-					}
-					case RequestType.RequestExists<?> _ -> {
-						boolean found = false;
-						for (long i = 0; i < takeCount; i++) {
-							if (!advanceIterator(state, false).present()) {
-								break;
-							}
-							found = true;
-						}
-						yield found;
-					}
-					case RequestType.RequestMulti<?> _ -> {
-						var values = new ArrayList<Buf>((int) Math.min(takeCount, 1_024));
-						for (long i = 0; i < takeCount; i++) {
-							var step = advanceIterator(state, true);
-							if (!step.present()) {
-								break;
-							}
-							values.add(Objects.requireNonNull(step.value()));
-						}
-						yield values;
-					}
-				};
-				return RequestType.safeCast(result);
-			});
-		} finally {
-			ops.endOp();
-			var end = System.nanoTime();
-			subsequentTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		return iterators.<T>subsequent(iterationId, skipCount, takeCount, requestType);
 	}
 
 	/**
@@ -7574,28 +2446,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * scheduling slices immediately when the iterator is exhausted.
 	 */
 	public long advanceIteratorInternal(long iterationId, long maxCount) {
-		var start = System.nanoTime();
-		ops.beginOp();
-		try {
-			if (maxCount < 0) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Iterator advance count must be non-negative");
-			}
-			return withIterator(iterationId, state -> {
-				long advanced = 0L;
-				while (advanced < maxCount && advanceIterator(state, false).present()) {
-					advanced++;
-				}
-				var observer = iteratorAdvanceStepCompletedObserver;
-				if (observer != null) {
-					observer.run();
-				}
-				return advanced;
-			});
-		} finally {
-			ops.endOp();
-			subsequentTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
-		}
+		return iterators.advanceIteratorInternal(iterationId, maxCount);
 	}
 
 	/**
@@ -7608,47 +2459,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long maxCount,
 			long maximumDurationNanos,
 			RWScheduler.CooperativeContext context) {
-		Objects.requireNonNull(context, "context");
-		if (maxCount < 0L) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Iterator quantum count must be non-negative");
-		}
-		if (maximumDurationNanos <= 0L) {
-			throw new IllegalArgumentException("Iterator quantum duration must be positive");
-		}
-		var start = System.nanoTime();
-		ops.beginOp();
-		try {
-			return withIterator(iterationId, state -> {
-				long advanced = 0L;
-				boolean exhausted = false;
-				boolean checkpoint = false;
-				// Cancellation keeps the established item-quantum granularity. The continuation
-				// checks again after this call; polling it for every item would add a second
-				// volatile signal read to the peer-preemption hot path without improving the
-				// non-preemptible native-step bound.
-				if (context.terminationRequested()) {
-					return new IteratorAdvanceQuantum(0L, false, false);
-				}
-				while (advanced < maxCount) {
-					if (!advanceIterator(state, false).present()) {
-						exhausted = true;
-						break;
-					}
-					advanced++;
-					if (context.preemptionRequested()
-							&& System.nanoTime() - start >= maximumDurationNanos) {
-						checkpoint = true;
-						break;
-					}
-				}
-				notifyIteratorQuantumCompleted();
-				return new IteratorAdvanceQuantum(advanced, exhausted, checkpoint);
-			});
-		} finally {
-			ops.endOp();
-			subsequentTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
-		}
+		return iterators.advanceIteratorQuantumInternal(iterationId, maxCount, maximumDurationNanos, context);
 	}
 
 	/**
@@ -7662,57 +2473,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long maximumBytes,
 			long maximumDurationNanos,
 			RWScheduler.CooperativeContext context) {
-		Objects.requireNonNull(context, "context");
-		if (maxCount < 0L) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Iterator quantum count must be non-negative");
-		}
-		if (maximumBytes <= 0L || maximumDurationNanos <= 0L) {
-			throw new IllegalArgumentException("Iterator quantum byte and duration limits must be positive");
-		}
-		var start = System.nanoTime();
-		ops.beginOp();
-		try {
-			return withIterator(iterationId, state -> {
-				var values = new ArrayList<Buf>((int) Math.min(maxCount, 1_024L));
-				long decodedBytes = 0L;
-				boolean exhausted = false;
-				boolean checkpoint = false;
-				// See advanceIteratorQuantumInternal: cancellation is rechecked by the logical
-				// continuation at this item-quantum boundary; peer preemption remains per item.
-				if (context.terminationRequested()) {
-					return new IteratorMultiQuantum(values, 0L, false, false);
-				}
-				while (values.size() < maxCount) {
-					var step = advanceIterator(state, true);
-					if (!step.present()) {
-						exhausted = true;
-						break;
-					}
-					var value = Objects.requireNonNull(step.value());
-					values.add(value);
-					decodedBytes = saturatingAdd(decodedBytes, value.size());
-					if (context.preemptionRequested()
-							&& (decodedBytes >= maximumBytes
-							|| System.nanoTime() - start >= maximumDurationNanos)) {
-						checkpoint = true;
-						break;
-					}
-				}
-				notifyIteratorQuantumCompleted();
-				return new IteratorMultiQuantum(values, decodedBytes, exhausted, checkpoint);
-			});
-		} finally {
-			ops.endOp();
-			subsequentTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);
-		}
-	}
-
-	private void notifyIteratorQuantumCompleted() {
-		var observer = iteratorAdvanceStepCompletedObserver;
-		if (observer != null) {
-			observer.run();
-		}
+		return iterators.readIteratorQuantumInternal(iterationId, maxCount, maximumBytes, maximumDurationNanos, context);
 	}
 
 	public record IteratorAdvanceQuantum(long advanced, boolean exhausted, boolean checkpointRequested) {
@@ -7722,134 +2483,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long decodedBytes,
 			boolean exhausted,
 			boolean checkpointRequested) {
-	}
-
-	private <T> T withIterator(long iteratorId, Function<IteratorState, T> action) {
-		var entry = its.get(iteratorId);
-		if (entry == null || !(entry.objs() instanceof IteratorState state)) {
-			throw iteratorNotFound(iteratorId);
-		}
-		// The embedded API historically serializes operations on the same iterator.
-		// Remote adapters may reject overlapping requests before queueing them, but the
-		// native ownership boundary itself must remain race-safe and blocking.
-		synchronized (state) {
-			if (state.closed || its.get(iteratorId) != entry) {
-				throw iteratorNotFound(iteratorId);
-			}
-			Long expirationTimestamp = entry.expirationTimestamp();
-			if (expirationTimestamp != null && System.currentTimeMillis() >= expirationTimestamp) {
-				var removed = its.remove(iteratorId);
-				if (removed == entry) {
-					state.closed = true;
-					state.bucketIterator = null;
-					try {
-						entry.close();
-					} finally {
-						releaseResourceLease();
-					}
-				}
-				throw iteratorNotFound(iteratorId);
-			}
-			return action.apply(state);
-		}
-	}
-
-	private static RocksDBException iteratorNotFound(long iteratorId) {
-		return RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "No iterator with id " + iteratorId);
-	}
-
-	private LogicalIteratorStep advanceIterator(IteratorState state, boolean materializeValue) {
-		while (true) {
-			if (state.bucketIterator != null) {
-				boolean hasNext = state.reverse ? state.bucketIterator.hasPrevious() : state.bucketIterator.hasNext();
-				if (hasNext) {
-					var entry = state.reverse ? state.bucketIterator.previous() : state.bucketIterator.next();
-					boolean hasMoreInBucket = state.reverse
-							? state.bucketIterator.hasPrevious()
-							: state.bucketIterator.hasNext();
-					if (!hasMoreInBucket) {
-						state.bucketIterator = null;
-						advanceNativeIterator(state);
-						checkIteratorStatusIfInvalid(state.iterator);
-					}
-					return new LogicalIteratorStep(true, materializeValue ? entry.getValue() : null);
-				}
-				state.bucketIterator = null;
-				advanceNativeIterator(state);
-				continue;
-			}
-
-			if (!state.iterator.isValid()) {
-				checkIteratorStatusIfInvalid(state.iterator);
-				return LogicalIteratorStep.END;
-			}
-
-			if (state.column.hasBuckets()) {
-				var bucket = new Bucket(state.column, toBuf(state.iterator.value()));
-				var elements = bucket.getElements();
-				state.bucketIterator = elements.listIterator(state.reverse ? elements.size() : 0);
-				continue;
-			}
-
-			Buf value = null;
-			if (materializeValue) {
-				value = state.column.schema().hasValue() ? toBuf(state.iterator.value()) : emptyBuf();
-			}
-			advanceNativeIterator(state);
-			checkIteratorStatusIfInvalid(state.iterator);
-			return new LogicalIteratorStep(true, value);
-		}
-	}
-
-	private static void advanceNativeIterator(IteratorState state) {
-		if (state.reverse) {
-			state.iterator.prev();
-		} else {
-			state.iterator.next();
-		}
-	}
-
-	private void positionBucketCursor(IteratorState state, @Nullable Keys exactKeys, @Nullable byte[] target) {
-		if (!state.iterator.isValid() || !state.column.hasBuckets()) {
-			return;
-		}
-		var bucket = new Bucket(state.column, toBuf(state.iterator.value()));
-		var elements = bucket.getElements();
-		int cursor = state.reverse ? elements.size() : 0;
-		if (exactKeys != null && target != null && Arrays.equals(state.iterator.key(), target)) {
-			var variableKeys = state.column.getBucketElementKeys(exactKeys.keys());
-			for (int i = 0; i < elements.size(); i++) {
-				var candidate = elements.get(i).getKey();
-				if (bucketKeysEqual(candidate, variableKeys)) {
-					cursor = state.reverse ? i + 1 : i;
-					break;
-				}
-			}
-		}
-		state.bucketIterator = elements.listIterator(cursor);
-	}
-
-	private static boolean bucketKeysEqual(Buf[] left, Buf[] right) {
-		if (left.length != right.length) {
-			return false;
-		}
-		for (int i = 0; i < left.length; i++) {
-			if (!Utils.valueEquals(left[i], right[i])) {
-				return false;
-			}
-		}
-		return true;
-	}
-
-	private static void checkIteratorStatusIfInvalid(RocksIterator iterator) {
-		if (iterator.isValid()) {
-			return;
-		}
-		try {
-			iterator.status();
-		} catch (org.rocksdb.RocksDBException exception) {
-			throw mapIteratorStatusException(exception);
-		}
 	}
 
 	@VisibleForTesting
@@ -7869,10 +2502,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			@NotNull RequestReduceRange<? super KV, T> requestType) throws RocksDBException {
-		return reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive,
-				reverse, requestType, Long.MAX_VALUE);
+		return ranges.<T>reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType);
 	}
-
 	public <T> T reduceRange(long transactionId,
 			long columnId,
 			@Nullable Keys startKeysInclusive,
@@ -7880,165 +2511,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean reverse,
 			@NotNull RequestReduceRange<? super KV, T> requestType,
 			long monotonicDeadlineNanos) throws RocksDBException {
-		var start = System.nanoTime();
-		ops.beginOp();
-		ColumnInstance col = null;
-		try {
-			actionLogger.logAction("ReduceRange",
-					start,
-					columnId,
-					startKeysInclusive,
-					endKeysExclusive,
-					transactionId,
-					null,
-					null,
-					requestType
-			); // todo: log if reversed or not
-			col = beginColumnUse(columnId);
-
-
-			// A bounded endpoint seek still fans out to every relevant RocksDB merge child.
-			// With many SSTs, async_io lets RocksDB submit those child reads together before
-			// polling them; disabling it serializes cold index/data-block misses.
-			try (var ro = newReadOptions(null)) {
-				var asyncIoObserver = reduceRangeAsyncIoObserver;
-				if (asyncIoObserver != null) {
-					asyncIoObserver.accept(ro.asyncIo());
-				}
-				long deadlineMicros = nativeReadDeadlineMicros(monotonicDeadlineNanos);
-				if (deadlineMicros != Long.MAX_VALUE) ro.setDeadline(deadlineMicros);
-				Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0 ? col.calculateKey(
-						startKeysInclusive.keys()) : null;
-				Buf calculatedEndKey =
-						endKeysExclusive != null && endKeysExclusive.keys().length > 0 ? col.calculateKey(endKeysExclusive.keys())
-								: null;
-				try (var startKeySlice = calculatedStartKey != null ? toSlice(calculatedStartKey) : null; var endKeySlice =
-						calculatedEndKey != null ? toSlice(calculatedEndKey) : null) {
-					boolean endpointSeek = requestType instanceof RequestType.RequestGetFirstAndLast<?>;
-					if (!endpointSeek) {
-						if (startKeySlice != null) {
-							ro.setIterateLowerBound(startKeySlice);
-						}
-						if (endKeySlice != null) {
-							ro.setIterateUpperBound(endKeySlice);
-						}
-					}
-
-					RocksIterator it;
-					if (transactionId != 0L) {
-						//noinspection resource
-						it = getTransaction(transactionId, false).val().getIterator(ro, col.cfh());
-					} else {
-						it = db.get().newIterator(col.cfh(), ro);
-					}
-					try (it) {
-						notifyRangeIteratorOpened();
-						return (T) switch (requestType) {
-							case RequestEntriesCount<?> _ -> {
-								long count = 0;
-								it.seekToFirst();
-								while (it.isValid()) {
-									if (col.hasBuckets()) {
-										count += Bucket.readElementCount(toBuf(it.value()));
-									} else {
-										count++;
-									}
-									it.next();
-								}
-								checkIteratorStatusIfInvalid(it);
-								yield count;
-							}
-							case RequestType.RequestGetFirstAndLast<?> _ -> {
-								var first = seekLogicalEndpoint(it,
-										col,
-										reverse,
-										calculatedStartKey,
-										calculatedEndKey);
-								if (first == null) {
-									yield new FirstAndLast<>(null, null);
-								}
-								var last = Objects.requireNonNull(seekLogicalEndpoint(it,
-										col,
-										!reverse,
-										calculatedStartKey,
-										calculatedEndKey));
-								yield new FirstAndLast<>(first, last);
-							}
-						};
-					}
-				}
-			}
-		} finally {
-			if (col != null) {
-				col.endUse();
-			}
-			ops.endOp();
-			var end = System.nanoTime();
-			reduceRangeTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
-	}
-
-	private @Nullable KV seekLogicalEndpoint(RocksIterator iterator,
-			ColumnInstance column,
-			boolean fromEnd,
-			@Nullable Buf startKeyInclusive,
-			@Nullable Buf endKeyExclusive) {
-		byte[] inclusiveStart = startKeyInclusive != null ? startKeyInclusive.toByteArray() : null;
-		byte[] exclusiveEnd = endKeyExclusive != null ? endKeyExclusive.toByteArray() : null;
-		if (fromEnd) {
-			if (exclusiveEnd == null) {
-				iterator.seekToLast();
-			} else {
-				iterator.seek(exclusiveEnd);
-				if (iterator.isValid()) {
-					iterator.prev();
-				} else {
-					iterator.seekToLast();
-				}
-			}
-		} else {
-			if (inclusiveStart == null) {
-				iterator.seekToFirst();
-			} else {
-				iterator.seek(inclusiveStart);
-			}
-		}
-		while (iterator.isValid()) {
-			byte[] rawKey = iterator.key();
-			if (inclusiveStart != null && Arrays.compareUnsigned(rawKey, inclusiveStart) < 0) {
-				if (fromEnd) {
-					return null;
-				}
-				iterator.next();
-				continue;
-			}
-			if (exclusiveEnd != null && Arrays.compareUnsigned(rawKey, exclusiveEnd) >= 0) {
-				if (!fromEnd) {
-					return null;
-				}
-				iterator.prev();
-				continue;
-			}
-			var calculatedKey = toBuf(rawKey);
-			var calculatedValue = (column.schema().hasValue() || column.hasBuckets())
-					? toBuf(iterator.value())
-					: emptyBuf();
-			if (!column.hasBuckets()) {
-				return decodeKV(column, calculatedKey, calculatedValue);
-			}
-			var elements = new Bucket(column, calculatedValue).getElements();
-			if (!elements.isEmpty()) {
-				var entry = fromEnd ? elements.getLast() : elements.getFirst();
-				return decodeBucketEntry(column, calculatedKey, entry);
-			}
-			if (fromEnd) {
-				iterator.prev();
-			} else {
-				iterator.next();
-			}
-		}
-		checkIteratorStatusIfInvalid(iterator);
-		return null;
+		return ranges.<T>reduceRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, monotonicDeadlineNanos);
 	}
 
 	@Override
@@ -8050,10 +2523,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys resumeAfter,
 			@NotNull RequestGetRange<? super KV, T> requestType,
 			@NotNull RangeBudget budget) throws RocksDBException {
-		return getRangePage(transactionId, columnId, startKeysInclusive, endKeysExclusive,
-				reverse, resumeAfter, requestType, budget, Long.MAX_VALUE);
+		return ranges.<T>getRangePage(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, resumeAfter, requestType, budget);
 	}
-
 	public <T> RangePage<T> getRangePage(long transactionId,
 			long columnId,
 			@Nullable Keys startKeysInclusive,
@@ -8063,59 +2534,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull RequestGetRange<? super KV, T> requestType,
 			@NotNull RangeBudget budget,
 			long monotonicDeadlineNanos) throws RocksDBException {
-		Objects.requireNonNull(requestType, "requestType");
-		Objects.requireNonNull(budget, "budget");
-		if (budget.maxItems() > RangeBudget.DEFAULT_MAX_ITEMS) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Range maxItems exceeds the server maximum of " + RangeBudget.DEFAULT_MAX_ITEMS);
-		}
-		if (budget.maxBytes() > RangeBudget.DEFAULT_MAX_BYTES) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Range maxBytes exceeds the server maximum of " + RangeBudget.DEFAULT_MAX_BYTES);
-		}
-
-		LongAdder totalTime = new LongAdder();
-		long start = System.nanoTime();
-		long deadlineMicros = nativeReadDeadlineMicros(monotonicDeadlineNanos);
-		boolean fillCache = !(requestType instanceof RequestType.RequestGetAllInRangeNoCache<?>);
-		actionLogger.logAction("GetRangePage",
-				start,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				transactionId,
-				budget.maxItems(),
-				null,
-				requestType);
-
-		RangeCursor cursor = openRangeCursor(transactionId,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				reverse,
-				deadlineMicros,
-				monotonicDeadlineNanos,
-				fillCache,
-				false,
-				totalTime,
-				resumeAfter,
-				true,
-				null,
-				true);
-		try {
-			var page = cursor.readPage(totalTime, budget);
-			@SuppressWarnings("unchecked")
-			var typedItems = (List<T>) (List<?>) page.items();
-			return new RangePage<>(typedItems, page.resumeAfter(), page.hasMore());
-		} finally {
-			var closeStart = System.nanoTime();
-			try {
-				cursor.close();
-			} finally {
-				totalTime.add(System.nanoTime() - closeStart);
-				getRangeTimer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
-			}
-		}
+		return ranges.<T>getRangePage(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, resumeAfter, requestType, budget, monotonicDeadlineNanos);
 	}
 
 	@Override
@@ -8125,15 +2544,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			@NotNull RequestType.RequestGetRange<? super KV, T> requestType) throws RocksDBException {
-		return Flux
-				.from(this.getRangeAsyncInternal(transactionId,
-						columnId,
-						startKeysInclusive,
-						endKeysExclusive,
-						reverse,
-						requestType
-				))
-				.toStream();
+		return ranges.<T>getRange(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType);
 	}
 
 	/**
@@ -8145,16 +2556,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys endKeysExclusive,
 			boolean reverse,
 			RequestGetRange<? super KV, T> requestType) throws RocksDBException {
-		return getRangeAsyncInternal(transactionId,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				reverse,
-				requestType,
-				RequestContext.batch(),
-				WorkloadProfile.BATCH);
+		return ranges.<T>getRangeAsyncInternal(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType);
 	}
-
 	public <T> Publisher<T> getRangeAsyncInternal(long transactionId,
 			long columnId,
 			@Nullable Keys startKeysInclusive,
@@ -8163,93 +2566,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			RequestGetRange<? super KV, T> requestType,
 			RequestContext context,
 			@NotNull WorkloadProfile workloadProfile) throws RocksDBException {
-		LongAdder totalTime = new LongAdder();
-		long start = System.nanoTime();
-		var deadline = retainedReadDeadline(context);
-		var workloadExecutor = getSchedulerForColumn(columnId).executor(workloadProfile,
-				OperationFamily.RANGE_PAGE,
-				deadline.monotonicNanos());
-		boolean fillCache = !(requestType instanceof RequestType.RequestGetAllInRangeNoCache<?>);
-		actionLogger.logAction("GetRange (begin)",
-				start,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				transactionId,
-				null,
-				null,
-				requestType
-		); // todo: log if reversed or not
-		if (!isCooperativeRetainedProfile(workloadProfile)) {
-			return Flux.usingWhen(
-					openOrdinaryRetainedRangeCursorAsync(transactionId,
-							columnId,
-							startKeysInclusive,
-							endKeysExclusive,
-							reverse,
-							deadline,
-							fillCache,
-							false,
-							totalTime,
-							workloadExecutor),
-					cursor -> Flux.defer(() -> scheduleOrdinaryRangeStep(workloadExecutor,
-								() -> cursor.readChunk(totalTime)))
-							.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
-							.doOnNext(chunk -> {
-								var chunkObserver = rangeReadChunkSizeObserver;
-								if (chunkObserver != null) {
-									chunkObserver.accept(chunk.items().size());
-								}
-								if (!chunk.exhausted()) {
-									notifyRangeContinuation();
-								}
-							})
-							.repeat()
-							.takeUntil(RangeReadChunk::exhausted)
-							.concatMap(chunk -> Flux.fromIterable(EmbeddedDB.<T>castRangeItems(chunk.items())), 0)
-							.takeUntilOther(retainedRangeDeadlineSignal(deadline)),
-					cursor -> closeRangeCursor(cursor, totalTime, getRangeTimer),
-					(cursor, _) -> closeRangeCursor(cursor, totalTime, getRangeTimer),
-					cursor -> closeRangeCursor(cursor, totalTime, getRangeTimer));
-		}
-
-		return retainedQueryLimiter.acquire(deadline.monotonicNanos())
-				.flatMapMany(permit -> Flux.<RangeReadChunk>create(sink -> {
-					var state = new RetainedRangeReadTask(transactionId,
-							columnId,
-							startKeysInclusive,
-							endKeysExclusive,
-							reverse,
-							deadline,
-							fillCache,
-							totalTime,
-							workloadExecutor,
-							permit,
-							sink);
-					sink.onRequest(state);
-					sink.onCancel(state::cancelDelivery);
-					sink.onDispose(state::cancelDelivery);
-					state.start();
-				}, FluxSink.OverflowStrategy.ERROR)
-						.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
-						.doOnNext(chunk -> {
-							var chunkObserver = rangeReadChunkSizeObserver;
-							if (chunkObserver != null) {
-								chunkObserver.accept(chunk.items().size());
-							}
-							if (!chunk.exhausted()) {
-								notifyRangeContinuation();
-							}
-						})
-						// A single decoded chunk is in flight. Its items drain before publishOn
-						// requests another chunk and resumes the same parked scheduler node.
-						.concatMap(chunk -> Flux.fromIterable(EmbeddedDB.<T>castRangeItems(chunk.items())), 0)
-						.takeUntilOther(retainedRangeDeadlineSignal(deadline)));
-	}
-
-	@SuppressWarnings("unchecked")
-	private static <T> List<T> castRangeItems(List<KV> items) {
-		return (List<T>) (List<?>) items;
+		return ranges.<T>getRangeAsyncInternal(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, requestType, context, workloadProfile);
 	}
 
 	/** Count logical entries in bounded physical slices without materializing one signal per entry. */
@@ -8258,15 +2575,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@Nullable Keys startKeysInclusive,
 			@Nullable Keys endKeysExclusive,
 			boolean reverse) {
-		return countRangeAsyncInternal(transactionId,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				reverse,
-				RequestContext.batch(),
-				WorkloadProfile.BATCH);
+		return ranges.countRangeAsyncInternal(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse);
 	}
-
 	public Mono<Long> countRangeAsyncInternal(long transactionId,
 			long columnId,
 			@Nullable Keys startKeysInclusive,
@@ -8274,1788 +2584,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			boolean reverse,
 			RequestContext context,
 			@NotNull WorkloadProfile workloadProfile) {
-		LongAdder totalTime = new LongAdder();
-		long start = System.nanoTime();
-		var deadline = retainedReadDeadline(context);
-		var workloadExecutor = getSchedulerForColumn(columnId).executor(workloadProfile,
-				OperationFamily.FULL_SCAN_AGGREGATE,
-				deadline.monotonicNanos());
-		actionLogger.logAction("ReduceRange (begin)",
-				start,
-				columnId,
-				startKeysInclusive,
-				endKeysExclusive,
-				transactionId,
-				null,
-				null,
-				RequestType.entriesCount()
-		); // todo: log if reversed or not
-		if (!isCooperativeRetainedProfile(workloadProfile)) {
-			return Flux.usingWhen(
-					openOrdinaryRetainedRangeCursorAsync(transactionId,
-							columnId,
-							startKeysInclusive,
-							endKeysExclusive,
-							reverse,
-							deadline,
-							false,
-							true,
-							totalTime,
-							workloadExecutor),
-					cursor -> Flux.defer(() -> scheduleOrdinaryRangeStep(workloadExecutor, () -> {
-						var chunk = cursor.countChunk(totalTime);
-						var chunkObserver = rangeCountChunkObserver;
-						if (chunkObserver != null) {
-							chunkObserver.run();
-						}
-						return chunk;
-					}))
-							.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1)
-							.doOnNext(chunk -> {
-								var sizeObserver = rangeCountQuantumItemsObserver;
-								if (sizeObserver != null) {
-									sizeObserver.accept(chunk.count());
-								}
-								if (!chunk.exhausted()) {
-									notifyRangeContinuation();
-								}
-							})
-							.repeat()
-							.takeUntil(RangeCountChunk::exhausted)
-							.takeUntilOther(retainedRangeDeadlineSignal(deadline)),
-					cursor -> closeRangeCursor(cursor, totalTime, reduceRangeTimer),
-					(cursor, _) -> closeRangeCursor(cursor, totalTime, reduceRangeTimer),
-					cursor -> closeRangeCursor(cursor, totalTime, reduceRangeTimer))
-					.reduce(0L, (total, chunk) -> total + chunk.count());
-		}
-
-		return retainedQueryLimiter.acquire(deadline.monotonicNanos())
-				.flatMap(permit -> Mono.create(sink -> {
-					var state = new RetainedRangeCountTask(transactionId,
-							columnId,
-							startKeysInclusive,
-							endKeysExclusive,
-							reverse,
-							deadline,
-							totalTime,
-							workloadExecutor,
-							permit,
-							sink);
-					sink.onCancel(state::cancelDelivery);
-					sink.onDispose(state::cancelDelivery);
-					state.start();
-				}));
-	}
-
-	/** Keep the immutable logical-read deadline active while decoded items await demand. */
-	private Mono<Void> retainedRangeDeadlineSignal(ReadDeadline deadline) {
-		return Mono.defer(() -> {
-			long delayNanos = scheduler.remainingMonotonicDeadlineNanos(deadline.monotonicNanos());
-			return Mono.delay(Duration.ofNanos(delayNanos))
-					.then(Mono.error(retainedRangeDeadlineExceeded()));
-		});
-	}
-
-	private void notifyRangeContinuation() {
-		var observer = rangeContinuationObserver;
-		if (observer != null) {
-			observer.run();
-		}
-	}
-
-	/** Preserve bounded ordinary submissions for profiles that cannot execute cooperatively. */
-	private Mono<RangeCursor> openOrdinaryRetainedRangeCursorAsync(long transactionId,
-			long columnId,
-			@Nullable Keys startKeysInclusive,
-			@Nullable Keys endKeysExclusive,
-			boolean reverse,
-			ReadDeadline deadline,
-			boolean fillCache,
-			boolean retainSnapshot,
-			LongAdder totalTime,
-			RWScheduler.WorkloadExecutor workloadExecutor) {
-		return retainedQueryLimiter.acquire(deadline.monotonicNanos())
-				.flatMap(permit -> scheduleOrdinaryRangeStep(workloadExecutor,
-						() -> permit.open(() -> openRangeCursor(transactionId,
-								columnId,
-								startKeysInclusive,
-								endKeysExclusive,
-								reverse,
-								deadline.micros(),
-								deadline.monotonicNanos(),
-								fillCache,
-								retainSnapshot,
-								totalTime,
-								null,
-								false,
-								permit,
-								true)),
-						RangeCursor::close)
-						.doOnError(_ -> permit.close())
-						.doOnCancel(permit::close));
-	}
-
-	private Mono<Void> closeRangeCursor(RangeCursor cursor, LongAdder totalTime, Timer timer) {
-		return Mono.fromRunnable(() -> {
-			var closeStart = System.nanoTime();
-			try {
-				cursor.close();
-			} finally {
-				totalTime.add(System.nanoTime() - closeStart);
-				timer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
-			}
-		});
-	}
-
-	private <T> Mono<T> scheduleOrdinaryRangeStep(RWScheduler.WorkloadExecutor target,
-			Callable<T> callable) {
-		return scheduleOrdinaryRangeStep(target, callable, null);
-	}
-
-	private <T> Mono<T> scheduleOrdinaryRangeStep(RWScheduler.WorkloadExecutor target,
-			Callable<T> callable,
-			@Nullable Consumer<? super T> lateSuccessCleanup) {
-		return Mono.create(sink -> {
-			var task = new OrdinaryRetainedRangeTask<>(target, callable, lateSuccessCleanup, sink);
-			sink.onCancel(task::cancelDelivery);
-			sink.onDispose(task::deliveryDisposed);
-			try {
-				target.execute(task);
-			} catch (Throwable error) {
-				task.reject(error instanceof RuntimeException runtime
-						? runtime
-						: new RejectedExecutionException("Range quantum submission failed", error));
-			}
-		});
-	}
-
-	private final class OrdinaryRetainedRangeTask<T> extends CompletableFuture<T>
-			implements Runnable, RWScheduler.RejectionAwareTask {
-
-		private static final VarHandle STATE =
-				varHandle(OrdinaryRetainedRangeTask.class, "state", int.class);
-		private static final int QUEUED = 0;
-		private static final int RUNNING = 1;
-		private static final int FINISHED = 2;
-		private static final int CANCELLED = 3;
-
-		private final RWScheduler.WorkloadExecutor target;
-		private final Callable<T> callable;
-		private final @Nullable Consumer<? super T> lateSuccessCleanup;
-		private final reactor.core.publisher.MonoSink<T> sink;
-		private volatile int state = QUEUED;
-		private @Nullable Object pendingResult;
-		private boolean deliveryCancelled;
-
-		private OrdinaryRetainedRangeTask(RWScheduler.WorkloadExecutor target,
-				Callable<T> callable,
-				@Nullable Consumer<? super T> lateSuccessCleanup,
-				reactor.core.publisher.MonoSink<T> sink) {
-			this.target = target;
-			this.callable = callable;
-			this.lateSuccessCleanup = lateSuccessCleanup;
-			this.sink = sink;
-		}
-
-		private void cancelDelivery() {
-			Object cancelledResult;
-			synchronized (this) {
-				deliveryCancelled = true;
-				cancelledResult = pendingResult;
-				pendingResult = null;
-			}
-			cleanupCancelledResult(cancelledResult);
-			if (STATE.compareAndSet(this, QUEUED, CANCELLED)) {
-				super.cancel(false);
-				scheduler.removeQueuedTask(target, this);
-			}
-		}
-
-		private void deliveryDisposed() {
-			Object cancelledResult = null;
-			synchronized (this) {
-				if (deliveryCancelled) {
-					cancelledResult = pendingResult;
-				}
-				pendingResult = null;
-			}
-			cleanupCancelledResult(cancelledResult);
-		}
-
-		@Override
-		public void run() {
-			if (!STATE.compareAndSet(this, QUEUED, RUNNING)) {
-				return;
-			}
-			try {
-				var result = callable.call();
-				complete(result);
-				publishResult(result);
-			} catch (Throwable error) {
-				completeExceptionally(error);
-				if (!isDeliveryCancelled()) {
-					sink.error(error);
-				} else {
-					logger.debug("Range quantum failed after subscriber cancellation", error);
-				}
-			} finally {
-				state = FINISHED;
-			}
-		}
-
-		private boolean isDeliveryCancelled() {
-			synchronized (this) {
-				return deliveryCancelled;
-			}
-		}
-
-		private void publishResult(T result) {
-			Object cancelledResult = null;
-			boolean emit;
-			synchronized (this) {
-				pendingResult = ReactorResultOwnership.encode(result);
-				emit = !deliveryCancelled;
-				if (!emit) {
-					cancelledResult = pendingResult;
-					pendingResult = null;
-				}
-			}
-			if (emit) {
-				sink.success(result);
-			} else {
-				cleanupCancelledResult(cancelledResult);
-			}
-		}
-
-		private void cleanupCancelledResult(@Nullable Object encodedResult) {
-			if (encodedResult == null || lateSuccessCleanup == null) return;
-			try {
-				lateSuccessCleanup.accept(ReactorResultOwnership.decode(encodedResult));
-			} catch (Throwable cleanupError) {
-				logger.warn("Failed to clean a retained range result after cancellation", cleanupError);
-			}
-		}
-
-		@Override
-		public void reject(RuntimeException failure) {
-			if (!STATE.compareAndSet(this, QUEUED, FINISHED)) {
-				return;
-			}
-			completeExceptionally(failure);
-			if (!isDeliveryCancelled()) {
-				sink.error(failure);
-			}
-		}
-	}
-
-	private RangeCursor openRangeCursor(long transactionId,
-			long columnId,
-			@Nullable Keys startKeysInclusive,
-			@Nullable Keys endKeysExclusive,
-			boolean reverse,
-			long deadlineMicros,
-			long monotonicDeadlineNanos,
-			boolean fillCache,
-			boolean retainSnapshot,
-			LongAdder totalTime,
-			@Nullable Keys resumeAfter,
-			boolean deterministicBucketOrder,
-			@Nullable RetainedQueryPermit retainedPermit,
-			boolean registerActiveResource) {
-		ops.beginOp();
-		var initializationStart = System.nanoTime();
-		ColumnInstance.ColumnUse columnUse = null;
-		try {
-			columnUse = acquireColumnUse(columnId);
-			var col = columnUse.column();
-			Buf calculatedStartKey = startKeysInclusive != null && startKeysInclusive.keys().length > 0
-					? col.calculateKey(startKeysInclusive.keys())
-					: null;
-			Buf calculatedEndKey = endKeysExclusive != null && endKeysExclusive.keys().length > 0
-					? col.calculateKey(endKeysExclusive.keys())
-					: null;
-			Buf calculatedResumeKey = resumeAfter != null
-					? col.calculateKey(resumeAfter.keys())
-					: null;
-			validateResumeBounds(calculatedStartKey, calculatedEndKey, calculatedResumeKey);
-			var cursor = new RangeCursor(transactionId,
-					columnUse,
-					calculatedStartKey,
-					calculatedEndKey,
-					reverse,
-					deadlineMicros,
-					monotonicDeadlineNanos,
-					fillCache,
-					retainSnapshot,
-					calculatedResumeKey,
-					resumeAfter,
-					deterministicBucketOrder,
-					retainedPermit);
-			try {
-				if (registerActiveResource) {
-					activeRangeResources.add(cursor);
-				}
-				return cursor;
-			} catch (Throwable error) {
-				cursor.close();
-				throw error;
-			}
-		} catch (Throwable error) {
-			if (columnUse != null) {
-				columnUse.close();
-			}
-			throw error;
-		} finally {
-			totalTime.add(System.nanoTime() - initializationStart);
-			ops.endOp();
-		}
-	}
-
-	private static void validateResumeBounds(@Nullable Buf startKey,
-			@Nullable Buf endKey,
-			@Nullable Buf resumeKey) {
-		if (resumeKey == null) {
-			return;
-		}
-		var resumeBytes = resumeKey.toByteArray();
-		if (startKey != null && Arrays.compareUnsigned(resumeBytes, startKey.toByteArray()) < 0) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"resumeAfter is before the original inclusive range bound");
-		}
-		if (endKey != null && Arrays.compareUnsigned(resumeBytes, endKey.toByteArray()) >= 0) {
-			throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-					"resumeAfter is at or after the original exclusive range bound");
-		}
-	}
-
-	private abstract class RetainedRangeCooperativeTask
-			implements RWScheduler.CooperativeCompletionTask,
-			ActiveRangeResource,
-			LongConsumer,
-			reactor.core.Disposable {
-
-		private static final VarHandle TERMINATED =
-				varHandle(RetainedRangeCooperativeTask.class, "terminated", boolean.class);
-		private final long transactionId;
-		private final long columnId;
-		private final @Nullable Keys startKeysInclusive;
-		private final @Nullable Keys endKeysExclusive;
-		private final boolean reverse;
-		private final ReadDeadline deadline;
-		private final boolean fillCache;
-		private final boolean retainSnapshot;
-		protected final LongAdder totalTime;
-		private final RWScheduler.WorkloadExecutor workloadExecutor;
-		private final RetainedQueryPermit retainedPermit;
-		private final Timer timer;
-		private final Object admissionLock = new Object();
-		private final Object resourceLock = new Object();
-		private volatile boolean terminated;
-		private final CountDownLatch cleanupFinished = new CountDownLatch(1);
-		private volatile boolean deliveryCancelled;
-		protected volatile @Nullable RWScheduler.CooperativeHandle handle;
-		private @Nullable RangeCursor cursor;
-		private boolean completionPrepared;
-		private boolean cleanupStarted;
-		private @Nullable Throwable cleanupFailure;
-
-		private RetainedRangeCooperativeTask(long transactionId,
-				long columnId,
-				@Nullable Keys startKeysInclusive,
-				@Nullable Keys endKeysExclusive,
-				boolean reverse,
-				ReadDeadline deadline,
-				boolean fillCache,
-				boolean retainSnapshot,
-				LongAdder totalTime,
-				RWScheduler.WorkloadExecutor workloadExecutor,
-				RetainedQueryPermit retainedPermit,
-				Timer timer) {
-			this.transactionId = transactionId;
-			this.columnId = columnId;
-			this.startKeysInclusive = startKeysInclusive;
-			this.endKeysExclusive = endKeysExclusive;
-			this.reverse = reverse;
-			this.deadline = deadline;
-			this.fillCache = fillCache;
-			this.retainSnapshot = retainSnapshot;
-			this.totalTime = totalTime;
-			this.workloadExecutor = workloadExecutor;
-			this.retainedPermit = retainedPermit;
-			this.timer = timer;
-		}
-
-		protected final void start() {
-			if (terminated) {
-				return;
-			}
-			activeRangeResources.add(this);
-			synchronized (admissionLock) {
-				if (terminated) {
-					activeRangeResources.remove(this);
-					return;
-				}
-				try {
-					handle = workloadExecutor.executeCooperatively(this,
-							workloadSettings.rangeQuantumMaxBytes());
-				} catch (RuntimeException admissionFailure) {
-					reject(admissionFailure);
-				}
-			}
-		}
-
-		protected final @Nullable RangeCursor cursor(RWScheduler.CooperativeContext context) {
-			// The worker can dispatch immediately after admission. Waiting for this
-			// short monitor handoff guarantees that the stable handle is installed first.
-			synchronized (admissionLock) {
-				if (terminated) {
-					return null;
-				}
-			}
-			if (context.terminationRequested()) {
-				return null;
-			}
-			synchronized (resourceLock) {
-				if (cursor != null) {
-					return cursor;
-				}
-				RangeCursor created = retainedPermit.open(() -> openRangeCursor(transactionId,
-						columnId,
-						startKeysInclusive,
-						endKeysExclusive,
-						reverse,
-						deadline.micros(),
-						deadline.monotonicNanos(),
-						fillCache,
-						retainSnapshot,
-						totalTime,
-						null,
-						false,
-						null,
-						false));
-				if (terminated) {
-					created.close();
-					return null;
-				}
-				cursor = created;
-				return created;
-			}
-		}
-
-		protected final boolean schedulerTerminationRequested(RWScheduler.CooperativeContext context) {
-			return context.terminationRequested();
-		}
-
-		protected final void cancelDelivery() {
-			if (terminated) {
-				return;
-			}
-			deliveryCancelled = true;
-			if (scheduler.isMonotonicDeadlineExpired(deadline.monotonicNanos())) {
-				var failure = retainedRangeDeadlineExceeded();
-				cancelAndFinish(failure, false, RWScheduler.TerminalOutcome.DEADLINE);
-			} else {
-				cancelAndFinish(null, false, null);
-			}
-		}
-
-		@Override
-		public final void dispose() {
-			cancelDelivery();
-		}
-
-		@Override
-		public final boolean isDisposed() {
-			return terminated;
-		}
-
-		@Override
-		public final void close() {
-			var failure = new RejectedExecutionException("Database is shutting down");
-			cancelAndFinish(failure, !deliveryCancelled, RWScheduler.TerminalOutcome.SHUTDOWN);
-			awaitCleanupFinished();
-		}
-
-		@Override
-		public final void expireIfDeadlinePassed() {
-			if (!scheduler.isMonotonicDeadlineExpired(deadline.monotonicNanos()) || terminated) {
-				return;
-			}
-			var failure = retainedRangeDeadlineExceeded();
-			cancelAndFinish(failure, !deliveryCancelled, RWScheduler.TerminalOutcome.DEADLINE);
-		}
-
-		private void cancelAndFinish(@Nullable RuntimeException failure,
-				boolean signalTerminal,
-				@Nullable RWScheduler.TerminalOutcome outcome) {
-			// Serialize cancellation with admission. Otherwise cancellation can observe no
-			// handle, release the permit, and then race a late cooperative submission.
-			synchronized (admissionLock) {
-				if (terminated) {
-					return;
-				}
-				var currentHandle = handle;
-				if (currentHandle != null) {
-					if (outcome != null && currentHandle instanceof CooperativeTerminationHandle classifiedHandle) {
-						classifiedHandle.terminate(outcome, Objects.requireNonNull(failure));
-					} else {
-						currentHandle.dispose();
-					}
-					// A queued or parked task is rejected synchronously by the scheduler. An active
-					// task is rejected only after its current quantum returns, which keeps cursor
-					// cleanup from racing an in-flight JNI call.
-					return;
-				}
-				finish(failure, signalTerminal);
-			}
-		}
-
-		@Override
-		public final void reject(RuntimeException failure) {
-			// The scheduler owns first-cause arbitration for admitted tasks. A later
-			// deadline, shutdown, or cancellation request must not change the public
-			// failure after the scheduler has already selected a terminal outcome.
-			finish(failure, !deliveryCancelled);
-		}
-
-		protected final void prepareCompletion(RWScheduler.CooperativeContext context) {
-			var failure = cleanupResources(null);
-			if (failure != null) {
-				if (failure instanceof VirtualMachineError fatal) {
-					throw fatal;
-				}
-				context.fail(cooperativeFailure(failure,
-						"Cooperative retained range cleanup failed"));
-				return;
-			}
-			synchronized (admissionLock) {
-				if (terminated) {
-					return;
-				}
-				if (completionPrepared) {
-					throw new IllegalStateException("Retained range completion was prepared twice");
-				}
-				completionPrepared = true;
-			}
-		}
-
-		@Override
-		public final void completeCooperatively() {
-			synchronized (admissionLock) {
-				if (terminated) {
-					return;
-				}
-				if (!completionPrepared) {
-					throw new IllegalStateException("Scheduler selected RUN without a retained range result");
-				}
-			}
-			if (!TERMINATED.compareAndSet(this, false, true)) {
-				return;
-			}
-			signalTerminal(null);
-		}
-
-		protected final void finish(@Nullable Throwable originalFailure, boolean signalTerminal) {
-			if (!TERMINATED.compareAndSet(this, false, true)) {
-				return;
-			}
-			var failure = cleanupResources(originalFailure);
-			if (signalTerminal) {
-				signalTerminal(failure);
-			}
-		}
-
-		private @Nullable Throwable cleanupResources(@Nullable Throwable originalFailure) {
-			if (cleanupStarted) {
-				awaitCleanupFinished();
-				var existingCleanupFailure = cleanupFailure;
-				return existingCleanupFailure == null
-						? originalFailure
-						: appendFailure(originalFailure, existingCleanupFailure);
-			}
-			cleanupStarted = true;
-			Throwable currentCleanupFailure = null;
-			try {
-				var cleanupObserver = retainedRangeCleanupObserver;
-				if (cleanupObserver != null) {
-					try {
-						cleanupObserver.run();
-					} catch (Throwable observerFailure) {
-						currentCleanupFailure = appendFailure(currentCleanupFailure, observerFailure);
-					}
-				}
-				RangeCursor localCursor;
-				synchronized (resourceLock) {
-					localCursor = cursor;
-					cursor = null;
-				}
-				var closeStart = System.nanoTime();
-				try {
-					if (localCursor != null) {
-						localCursor.close();
-					}
-				} catch (Throwable closeError) {
-					currentCleanupFailure = appendFailure(currentCleanupFailure, closeError);
-				} finally {
-					totalTime.add(System.nanoTime() - closeStart);
-					try {
-						retainedPermit.close();
-					} catch (Throwable closeError) {
-						currentCleanupFailure = appendFailure(currentCleanupFailure, closeError);
-					}
-					activeRangeResources.remove(this);
-					try {
-						timer.record(totalTime.sum(), TimeUnit.NANOSECONDS);
-					} catch (Throwable timerFailure) {
-						currentCleanupFailure = appendFailure(currentCleanupFailure, timerFailure);
-					}
-				}
-			} finally {
-				cleanupFailure = currentCleanupFailure;
-				cleanupFinished.countDown();
-			}
-			return currentCleanupFailure == null
-					? originalFailure
-					: appendFailure(originalFailure, currentCleanupFailure);
-		}
-
-		private void awaitCleanupFinished() {
-			boolean interrupted = false;
-			while (true) {
-				try {
-					cleanupFinished.await();
-					break;
-				} catch (InterruptedException ignored) {
-					interrupted = true;
-				}
-			}
-			if (interrupted) {
-				Thread.currentThread().interrupt();
-			}
-		}
-
-		protected abstract void signalTerminal(@Nullable Throwable failure);
-
-		protected final boolean isTerminated() {
-			return terminated;
-		}
-
-		private boolean hasOpenCursor() {
-			synchronized (resourceLock) {
-				return cursor != null;
-			}
-		}
-
-		@Override
-		public abstract void accept(long requested);
-	}
-
-	private final class RetainedRangeReadTask extends RetainedRangeCooperativeTask {
-
-		private static final VarHandle DEMAND =
-				varHandle(RetainedRangeReadTask.class, "demand", long.class);
-		private final FluxSink<RangeReadChunk> sink;
-		private volatile long demand;
-
-		private RetainedRangeReadTask(long transactionId,
-				long columnId,
-				@Nullable Keys startKeysInclusive,
-				@Nullable Keys endKeysExclusive,
-				boolean reverse,
-				ReadDeadline deadline,
-				boolean fillCache,
-				LongAdder totalTime,
-				RWScheduler.WorkloadExecutor workloadExecutor,
-				RetainedQueryPermit retainedPermit,
-				FluxSink<RangeReadChunk> sink) {
-			super(transactionId,
-					columnId,
-					startKeysInclusive,
-					endKeysExclusive,
-					reverse,
-					deadline,
-					fillCache,
-					false,
-					totalTime,
-					workloadExecutor,
-					retainedPermit,
-					getRangeTimer);
-			this.sink = sink;
-		}
-
-		@Override
-		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
-			if (isTerminated()) {
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-			if (schedulerTerminationRequested(context)) {
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-			if (demand == 0L) {
-				return RWScheduler.CooperativeResult.PARK;
-			}
-			try {
-				var activeCursor = cursor(context);
-				if (activeCursor == null) {
-					return RWScheduler.CooperativeResult.COMPLETE;
-				}
-				var chunk = activeCursor.readChunk(totalTime);
-				if (isTerminated() || schedulerTerminationRequested(context)) {
-					return RWScheduler.CooperativeResult.COMPLETE;
-				}
-				producedOne();
-				sink.next(chunk);
-				if (chunk.exhausted()) {
-					prepareCompletion(context);
-					return RWScheduler.CooperativeResult.COMPLETE;
-				}
-				if (schedulerTerminationRequested(context)) {
-					return RWScheduler.CooperativeResult.COMPLETE;
-				}
-				// Backpressure is stronger than scheduler competition here. If delivery has
-				// not requested another decoded chunk, queueing this node for a competitive
-				// redispatch only makes it run once more to discover zero demand and park.
-				// A concurrent request records resume while this quantum is active, so the
-				// scheduler still requeues the node atomically when PARK is committed.
-				return demand == 0L
-						? RWScheduler.CooperativeResult.PARK
-						: RWScheduler.CooperativeResult.YIELD;
-			} catch (VirtualMachineError fatal) {
-				throw fatal;
-			} catch (Throwable failure) {
-				context.fail(cooperativeFailure(failure,
-						"Cooperative retained range read failed"));
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-		}
-
-		private void producedOne() {
-			while (true) {
-				long current = demand;
-				if (current == Long.MAX_VALUE) {
-					return;
-				}
-				if (current <= 0L) {
-					throw new IllegalStateException("Range chunk produced without downstream demand");
-				}
-				if (DEMAND.compareAndSet(this, current, current - 1L)) {
-					return;
-				}
-			}
-		}
-
-		@Override
-		public void accept(long requested) {
-			if (requested <= 0L || isTerminated()) {
-				return;
-			}
-			while (true) {
-				long current = demand;
-				long updated = current + requested;
-				if (updated < 0L) {
-					updated = Long.MAX_VALUE;
-				}
-				if (DEMAND.compareAndSet(this, current, updated)) {
-					break;
-				}
-			}
-			var currentHandle = handle;
-			if (currentHandle != null) {
-				currentHandle.resume();
-			}
-		}
-
-		@Override
-		protected void signalTerminal(@Nullable Throwable failure) {
-			if (failure == null) {
-				sink.complete();
-			} else {
-				sink.error(failure);
-			}
-		}
-	}
-
-	private final class RetainedRangeCountTask extends RetainedRangeCooperativeTask {
-
-		private final reactor.core.publisher.MonoSink<Long> sink;
-		private long count;
-
-		private RetainedRangeCountTask(long transactionId,
-				long columnId,
-				@Nullable Keys startKeysInclusive,
-				@Nullable Keys endKeysExclusive,
-				boolean reverse,
-				ReadDeadline deadline,
-				LongAdder totalTime,
-				RWScheduler.WorkloadExecutor workloadExecutor,
-				RetainedQueryPermit retainedPermit,
-				reactor.core.publisher.MonoSink<Long> sink) {
-			super(transactionId,
-					columnId,
-					startKeysInclusive,
-					endKeysExclusive,
-					reverse,
-					deadline,
-					false,
-					true,
-					totalTime,
-					workloadExecutor,
-					retainedPermit,
-					reduceRangeTimer);
-			this.sink = sink;
-		}
-
-		@Override
-		public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context) {
-			if (isTerminated()) {
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-			if (schedulerTerminationRequested(context)) {
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-			try {
-				var activeCursor = cursor(context);
-				if (activeCursor == null) {
-					return RWScheduler.CooperativeResult.COMPLETE;
-				}
-				while (true) {
-					var chunk = activeCursor.countChunk(totalTime);
-					count += chunk.count();
-					var chunkObserver = rangeCountChunkObserver;
-					if (chunkObserver != null) {
-						chunkObserver.run();
-					}
-					var sizeObserver = rangeCountQuantumItemsObserver;
-					if (sizeObserver != null) {
-						sizeObserver.accept(chunk.count());
-					}
-					if (isTerminated() || schedulerTerminationRequested(context)) {
-						return RWScheduler.CooperativeResult.COMPLETE;
-					}
-					if (chunk.exhausted()) {
-						prepareCompletion(context);
-						return RWScheduler.CooperativeResult.COMPLETE;
-					}
-					if (notifyRangeContinuationAndPark()) {
-						return RWScheduler.CooperativeResult.PARK;
-					}
-					if (context.preemptionRequested()) {
-						return RWScheduler.CooperativeResult.YIELD;
-					}
-				}
-			} catch (VirtualMachineError fatal) {
-				throw fatal;
-			} catch (Throwable failure) {
-				context.fail(cooperativeFailure(failure,
-						"Cooperative retained range count failed"));
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-		}
-
-		private boolean notifyRangeContinuationAndPark() {
-			var observer = rangeContinuationObserver;
-			if (observer == null) {
-				return false;
-			}
-			try {
-				reactor.core.scheduler.Schedulers.parallel().schedule(() -> {
-					try {
-						observer.run();
-					} finally {
-						var currentHandle = handle;
-						if (currentHandle != null) {
-							currentHandle.resume();
-						}
-					}
-				});
-				return true;
-			} catch (RuntimeException schedulingFailure) {
-				throw new RejectedExecutionException("Failed to notify a retained count continuation",
-						schedulingFailure);
-			}
-		}
-
-		@Override
-		public void accept(long requested) {
-			// Mono demand is terminal-result demand, not a native-count quantum budget.
-		}
-
-		@Override
-		protected void signalTerminal(@Nullable Throwable failure) {
-			if (failure == null) {
-				sink.success(count);
-			} else {
-				sink.error(failure);
-			}
-		}
-	}
-
-	/** FIFO admission for logical reads that retain a native point-in-time view between quanta. */
-	private final class RetainedQueryLimiter implements AutoCloseable {
-
-		private static final int WAITING = 0;
-		private static final int GRANTED = 1;
-		private static final int TERMINAL = 2;
-
-		private final int capacity;
-		private final ScheduledExecutorService deadlineScheduler;
-		private final ArrayDeque<RetainedQueryWaiter> waiters = new ArrayDeque<>();
-		private final Set<RetainedQueryPermit> activePermits = new HashSet<>();
-		private long nextTicket;
-		private boolean closed;
-
-		private RetainedQueryLimiter(int capacity, ScheduledExecutorService deadlineScheduler) {
-			this.capacity = capacity;
-			this.deadlineScheduler = deadlineScheduler;
-		}
-
-		private Mono<RetainedQueryPermit> acquire(long monotonicDeadlineNanos) {
-			return Mono.create(sink -> {
-				final RetainedQueryWaiter waiter;
-				final Runnable action;
-				final boolean queued;
-				synchronized (this) {
-					waiter = new RetainedQueryWaiter(nextTicket++, monotonicDeadlineNanos, sink);
-					sink.onCancel(waiter::cancel);
-					sink.onDispose(waiter::deliveryDisposed);
-					if (closed) {
-						waiter.state = TERMINAL;
-						action = () -> sink.error(new RejectedExecutionException("Database is shutting down"));
-						queued = false;
-					} else if (scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
-						waiter.state = TERMINAL;
-						action = () -> sink.error(retainedRangeDeadlineExceeded());
-						queued = false;
-					} else if (activePermits.size() < capacity && waiters.isEmpty()) {
-						action = grantUnsafe(waiter);
-						queued = false;
-					} else {
-						waiters.addLast(waiter);
-						action = null;
-						queued = true;
-					}
-				}
-				if (queued) {
-					waiter.scheduleExpiration();
-				} else if (action != null) {
-					action.run();
-				}
-			});
-		}
-
-		private Runnable grantUnsafe(RetainedQueryWaiter waiter) {
-			var permit = new RetainedQueryPermit(this, waiter.ticket);
-			waiter.state = GRANTED;
-			waiter.permit = permit;
-			activePermits.add(permit);
-			return waiter::deliverGrant;
-		}
-
-		private void cancel(RetainedQueryWaiter waiter) {
-			RetainedQueryPermit permit = null;
-			synchronized (this) {
-				if (waiter.state == WAITING) {
-					waiters.remove(waiter);
-					waiter.state = TERMINAL;
-				} else if (waiter.state == GRANTED) {
-					waiter.state = TERMINAL;
-					permit = waiter.permit;
-				}
-			}
-			waiter.cancelExpiration();
-			if (permit != null) {
-				permit.close();
-			}
-		}
-
-		private void expire(RetainedQueryWaiter waiter) {
-			boolean expired = false;
-			synchronized (this) {
-				if (waiter.state == WAITING && waiters.remove(waiter)) {
-					waiter.state = TERMINAL;
-					expired = true;
-				}
-			}
-			if (expired) {
-				waiter.sink.error(retainedRangeDeadlineExceeded());
-			}
-		}
-
-		private void release(RetainedQueryPermit permit) {
-			var actions = new ArrayList<Runnable>();
-			synchronized (this) {
-				if (!activePermits.remove(permit) || closed) {
-					return;
-				}
-				while (activePermits.size() < capacity && !waiters.isEmpty()) {
-					var waiter = waiters.removeFirst();
-					if (waiter.state != WAITING) {
-						continue;
-					}
-					if (scheduler.isMonotonicDeadlineExpired(waiter.monotonicDeadlineNanos)) {
-						waiter.state = TERMINAL;
-						actions.add(() -> waiter.sink.error(retainedRangeDeadlineExceeded()));
-					} else {
-						actions.add(grantUnsafe(waiter));
-					}
-				}
-			}
-			if (!actions.isEmpty()) {
-				try {
-					deadlineScheduler.execute(() -> actions.forEach(Runnable::run));
-				} catch (RejectedExecutionException shutdown) {
-					actions.forEach(Runnable::run);
-				}
-			}
-		}
-
-		private synchronized int activeCount() {
-			return activePermits.size();
-		}
-
-		private synchronized int waitingCount() {
-			return waiters.size();
-		}
-
-		@Override
-		public void close() {
-			final List<RetainedQueryWaiter> pending;
-			final List<RetainedQueryPermit> permits;
-			synchronized (this) {
-				if (closed) {
-					return;
-				}
-				closed = true;
-				pending = new ArrayList<>(waiters);
-				waiters.clear();
-				for (var waiter : pending) {
-					waiter.state = TERMINAL;
-				}
-				permits = new ArrayList<>(activePermits);
-			}
-			for (var waiter : pending) {
-				waiter.cancelExpiration();
-				waiter.sink.error(new RejectedExecutionException("Database is shutting down"));
-			}
-			permits.forEach(RetainedQueryPermit::close);
-		}
-
-		private final class RetainedQueryWaiter {
-
-			private final long ticket;
-			private final long monotonicDeadlineNanos;
-			private final reactor.core.publisher.MonoSink<RetainedQueryPermit> sink;
-			private int state = WAITING;
-			private @Nullable RetainedQueryPermit permit;
-			private @Nullable ScheduledFuture<?> expiration;
-			private @Nullable Object pendingResult;
-			private boolean deliveryCancelled;
-
-			private RetainedQueryWaiter(long ticket,
-					long monotonicDeadlineNanos,
-					reactor.core.publisher.MonoSink<RetainedQueryPermit> sink) {
-				this.ticket = ticket;
-				this.monotonicDeadlineNanos = monotonicDeadlineNanos;
-				this.sink = sink;
-			}
-
-			private void scheduleExpiration() {
-				long delayNanos = scheduler.remainingMonotonicDeadlineNanos(monotonicDeadlineNanos);
-				final ScheduledFuture<?> scheduled;
-				try {
-					scheduled = deadlineScheduler.schedule(this::expire, delayNanos, TimeUnit.NANOSECONDS);
-				} catch (RejectedExecutionException shutdown) {
-					expire();
-					return;
-				}
-				synchronized (RetainedQueryLimiter.this) {
-					if (state == WAITING) {
-						expiration = scheduled;
-					} else {
-						scheduled.cancel(false);
-					}
-				}
-			}
-
-			private void deliverGrant() {
-				cancelExpiration();
-				var granted = Objects.requireNonNull(permit);
-				try {
-					var observer = retainedQueryPermitGrantedObserver;
-					if (observer != null) {
-						observer.accept(ticket);
-					}
-				} catch (Throwable error) {
-					granted.close();
-					sink.error(error);
-					return;
-				}
-				publishResult(granted);
-			}
-
-			private void cancel() {
-				Object cancelledResult;
-				synchronized (this) {
-					deliveryCancelled = true;
-					cancelledResult = pendingResult;
-					pendingResult = null;
-				}
-				cleanupCancelledResult(cancelledResult);
-				RetainedQueryLimiter.this.cancel(this);
-			}
-
-			private void deliveryDisposed() {
-				Object cancelledResult = null;
-				synchronized (this) {
-					if (deliveryCancelled) {
-						cancelledResult = pendingResult;
-					}
-					pendingResult = null;
-				}
-				cleanupCancelledResult(cancelledResult);
-			}
-
-			private void publishResult(RetainedQueryPermit result) {
-				Object cancelledResult = null;
-				boolean emit;
-				synchronized (this) {
-					pendingResult = ReactorResultOwnership.encode(result);
-					emit = !deliveryCancelled;
-					if (!emit) {
-						cancelledResult = pendingResult;
-						pendingResult = null;
-					}
-				}
-				if (emit) {
-					sink.success(result);
-				} else {
-					cleanupCancelledResult(cancelledResult);
-				}
-			}
-
-			private void cleanupCancelledResult(@Nullable Object encodedResult) {
-				if (encodedResult == null) return;
-				try {
-					ReactorResultOwnership.<RetainedQueryPermit>decode(encodedResult).close();
-				} catch (Throwable cleanupFailure) {
-					logger.warn("Failed to release a retained range permit after cancellation", cleanupFailure);
-				}
-			}
-
-			private void expire() {
-				RetainedQueryLimiter.this.expire(this);
-			}
-
-			private void cancelExpiration() {
-				var scheduled = expiration;
-				if (scheduled != null) {
-					scheduled.cancel(false);
-				}
-			}
-		}
-	}
-
-	private static final class RetainedQueryPermit implements AutoCloseable {
-
-		private final RetainedQueryLimiter owner;
-		private final long ticket;
-		private boolean closed;
-
-		private RetainedQueryPermit(RetainedQueryLimiter owner, long ticket) {
-			this.owner = owner;
-			this.ticket = ticket;
-		}
-
-		private synchronized <T> T open(Supplier<T> resourceFactory) {
-			if (closed) {
-				throw new CancellationException("Retained range permit " + ticket + " was cancelled");
-			}
-			return resourceFactory.get();
-		}
-
-		@Override
-		public void close() {
-			boolean release;
-			synchronized (this) {
-				release = !closed;
-				closed = true;
-			}
-			if (release) {
-				owner.release(this);
-			}
-		}
-	}
-
-	private static RocksDBException retainedRangeDeadlineExceeded() {
-		return RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded");
-	}
-
-	private interface ActiveRangeResource {
-
-		void close();
-
-		void expireIfDeadlinePassed();
-	}
-
-	private record RangeCountChunk(long count, boolean exhausted) {
-	}
-
-	private record RangeReadChunk(List<KV> items, boolean exhausted) {
-	}
-
-	private record ReadDeadline(long micros, long monotonicNanos) {
-	}
-
-	private final class RangeCursor implements ActiveRangeResource {
-
-		private final long transactionId;
-		private final ColumnInstance.ColumnUse columnUse;
-		private final ColumnInstance col;
-		private final boolean reverse;
-		private final long monotonicDeadlineNanos;
-		private final boolean deterministicBucketOrder;
-		private final AbstractSlice<?> startKeySlice;
-		private final AbstractSlice<?> endKeySlice;
-		private final @Nullable Snapshot snapshot;
-		private final @Nullable RetainedQueryPermit retainedPermit;
-		private final ReadOptions readOptions;
-		private final RocksIterator iterator;
-		private java.util.ListIterator<Entry<Buf[], Buf>> bucketIterator;
-		private @Nullable KV pendingRangeItem;
-		private long pendingCountItems;
-		private long pendingCountBytes;
-		private boolean exhausted;
-		private boolean expired;
-		private boolean closed;
-
-		private RangeCursor(long transactionId,
-				ColumnInstance.ColumnUse columnUse,
-				@Nullable Buf startKey,
-				@Nullable Buf endKey,
-				boolean reverse,
-				long deadlineMicros,
-				long monotonicDeadlineNanos,
-				boolean fillCache,
-				boolean retainSnapshot,
-				@Nullable Buf resumeKey,
-				@Nullable Keys resumeAfter,
-				boolean deterministicBucketOrder,
-				@Nullable RetainedQueryPermit retainedPermit) {
-			this.transactionId = transactionId;
-			this.columnUse = columnUse;
-			this.col = columnUse.column();
-			this.reverse = reverse;
-			this.monotonicDeadlineNanos = monotonicDeadlineNanos;
-			this.deterministicBucketOrder = deterministicBucketOrder;
-			this.retainedPermit = retainedPermit;
-
-			AbstractSlice<?> createdStartKeySlice = null;
-			AbstractSlice<?> createdEndKeySlice = null;
-			ReadOptions createdReadOptions = null;
-			Snapshot createdSnapshot = null;
-			RocksIterator createdIterator = null;
-			try {
-				createdStartKeySlice = startKey != null ? toSlice(startKey) : null;
-				createdEndKeySlice = endKey != null ? toSlice(endKey) : null;
-				createdReadOptions = newRangeReadOptions(deadlineMicros, fillCache, createdStartKeySlice,
-						createdEndKeySlice);
-				if (transactionId != 0L) {
-					var transactionSnapshot = getTransaction(transactionId, false).val().getSnapshot();
-					if (transactionSnapshot != null) {
-						createdReadOptions.setSnapshot(transactionSnapshot);
-					}
-				}
-				if (retainSnapshot && transactionId == 0L) {
-					createdSnapshot = db.get().getSnapshot();
-					retainedRangeSnapshots.incrementAndGet();
-					createdReadOptions.setSnapshot(createdSnapshot);
-				}
-				createdIterator = createIterator(createdReadOptions);
-				positionIterator(createdIterator, resumeKey, resumeAfter);
-			} catch (Throwable error) {
-				if (createdIterator != null) {
-					createdIterator.close();
-				}
-				if (createdReadOptions != null) {
-					createdReadOptions.close();
-				}
-				if (createdSnapshot != null) {
-					try {
-						db.get().releaseSnapshot(createdSnapshot);
-					} finally {
-						retainedRangeSnapshots.decrementAndGet();
-					}
-				}
-				if (createdEndKeySlice != null) {
-					createdEndKeySlice.close();
-				}
-				if (createdStartKeySlice != null) {
-					createdStartKeySlice.close();
-				}
-				throw error;
-			}
-			this.startKeySlice = createdStartKeySlice;
-			this.endKeySlice = createdEndKeySlice;
-			this.snapshot = createdSnapshot;
-			this.readOptions = createdReadOptions;
-			this.iterator = createdIterator;
-		}
-
-		private void positionIterator(RocksIterator createdIterator,
-				@Nullable Buf resumeKey,
-				@Nullable Keys resumeAfter) {
-			if (resumeKey == null) {
-				if (reverse) {
-					createdIterator.seekToLast();
-				} else {
-					createdIterator.seekToFirst();
-				}
-				return;
-			}
-
-			byte[] resumeBytes = resumeKey.toByteArray();
-			if (reverse) {
-				createdIterator.seekForPrev(resumeBytes);
-			} else {
-				createdIterator.seek(resumeBytes);
-			}
-			if (!createdIterator.isValid()
-					|| Arrays.compareUnsigned(createdIterator.key(), resumeBytes) != 0) {
-				return;
-			}
-			if (!col.hasBuckets()) {
-				advanceIterator(createdIterator);
-				return;
-			}
-
-			var elements = orderedBucketElements(createdIterator);
-			var resumeVariableKeys = col.getBucketElementKeys(Objects.requireNonNull(resumeAfter).keys());
-			int insertionPoint = 0;
-			while (insertionPoint < elements.size()
-					&& compareKeys(elements.get(insertionPoint).getKey(), resumeVariableKeys) < 0) {
-				insertionPoint++;
-			}
-			while (insertionPoint < elements.size()
-					&& compareKeys(elements.get(insertionPoint).getKey(), resumeVariableKeys) == 0) {
-				insertionPoint++;
-			}
-			if (reverse) {
-				int beforeResume = insertionPoint;
-				while (beforeResume > 0
-						&& compareKeys(elements.get(beforeResume - 1).getKey(), resumeVariableKeys) >= 0) {
-					beforeResume--;
-				}
-				if (beforeResume == 0) {
-					advanceIterator(createdIterator);
-				} else {
-					bucketIterator = elements.listIterator(beforeResume);
-				}
-			} else if (insertionPoint == elements.size()) {
-				advanceIterator(createdIterator);
-			} else {
-				bucketIterator = elements.listIterator(insertionPoint);
-			}
-		}
-
-		private void advanceIterator(RocksIterator target) {
-			if (reverse) {
-				target.prev();
-			} else {
-				target.next();
-			}
-		}
-
-		private ArrayList<Entry<Buf[], Buf>> orderedBucketElements(RocksIterator target) {
-			var elements = new ArrayList<>(new Bucket(col, toBuf(target.value())).getElements());
-			if (deterministicBucketOrder) {
-				elements.sort((left, right) -> compareKeys(left.getKey(), right.getKey()));
-			}
-			return elements;
-		}
-
-		private int compareKeys(Buf[] left, Buf[] right) {
-			for (int i = 0; i < left.length; i++) {
-				int compared = Arrays.compareUnsigned(left[i].toByteArray(), right[i].toByteArray());
-				if (compared != 0) {
-					return compared;
-				}
-			}
-			return Integer.compare(left.length, right.length);
-		}
-
-		private RocksIterator createIterator(ReadOptions options) {
-			var created = transactionId != 0L
-					? getTransaction(transactionId, false).val().getIterator(options, col.cfh())
-					: db.get().newIterator(col.cfh(), options);
-			try {
-				notifyRangeIteratorOpened();
-				return created;
-			} catch (Throwable error) {
-				created.close();
-				throw error;
-			}
-		}
-
-		private RangePage<KV> readPage(LongAdder totalTime, RangeBudget budget) {
-			ops.beginOp();
-			var sliceStart = System.nanoTime();
-			try {
-				synchronized (this) {
-					if (expired) {
-						throw rangeDeadlineExceeded();
-					}
-					if (closed || exhausted) {
-						return RangePage.empty();
-					}
-
-					var results = new ArrayList<KV>(budget.maxItems());
-					long encodedBytes = 0L;
-					boolean hasMore = false;
-					while (results.size() < budget.maxItems()) {
-						var next = nextPageItem();
-						if (next == null) {
-							break;
-						}
-						long nextBytes = decodedKVBytes(next);
-						if (nextBytes > budget.maxBytes() - encodedBytes) {
-							if (results.isEmpty()) {
-								throw RocksDBException.of(RocksDBErrorType.RANGE_ITEM_TOO_LARGE,
-										"Range item requires " + nextBytes
-												+ " encoded key/value bytes, exceeding page budget "
-												+ budget.maxBytes());
-							}
-							hasMore = true;
-							break;
-						}
-						results.add(next);
-						encodedBytes += nextBytes;
-					}
-					if (!hasMore && results.size() == budget.maxItems()) {
-						hasMore = nextPageItem() != null;
-					}
-					if (results.isEmpty()) {
-						return RangePage.empty();
-					}
-					return new RangePage<>(results, results.getLast().keys(), hasMore);
-				}
-			} finally {
-				totalTime.add(System.nanoTime() - sliceStart);
-				ops.endOp();
-			}
-		}
-
-		private @Nullable KV nextPageItem() {
-			while (!exhausted) {
-				if (scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
-					throw rangeDeadlineExceeded();
-				}
-				if (bucketIterator != null) {
-					if (reverse ? bucketIterator.hasPrevious() : bucketIterator.hasNext()) {
-						var entry = reverse ? bucketIterator.previous() : bucketIterator.next();
-						var result = decodeBucketEntry(col, toBuf(iterator.key()), entry);
-						boolean bucketHasMore = reverse
-								? bucketIterator.hasPrevious()
-								: bucketIterator.hasNext();
-						if (!bucketHasMore) {
-							bucketIterator = null;
-							advanceIterator();
-						}
-						return Objects.requireNonNull(result);
-					}
-					bucketIterator = null;
-					advanceIterator();
-					continue;
-				}
-
-				if (!iterator.isValid()) {
-					checkIteratorStatusIfInvalid(iterator);
-					exhausted = true;
-					return null;
-				}
-				if (col.hasBuckets()) {
-					var elements = orderedBucketElements(iterator);
-					bucketIterator = elements.listIterator(reverse ? elements.size() : 0);
-					if (elements.isEmpty()) {
-						bucketIterator = null;
-						advanceIterator();
-					}
-					continue;
-				}
-
-				var calculatedKey = toBuf(iterator.key());
-				var calculatedValue = col.schema().hasValue() ? toBuf(iterator.value()) : emptyBuf();
-				var result = Objects.requireNonNull(decodeKV(col, calculatedKey, calculatedValue));
-				advanceIterator();
-				return result;
-			}
-			return null;
-		}
-
-		private RangeReadChunk readChunk(LongAdder totalTime) {
-			ops.beginOp();
-			var sliceStart = System.nanoTime();
-			try {
-				synchronized (this) {
-					if (expired) {
-						throw rangeDeadlineExceeded();
-					}
-					if (closed || exhausted) {
-						return new RangeReadChunk(List.of(), true);
-					}
-					int maximumItems = workloadSettings.rangeQuantumMaxItems();
-					long maximumBytes = workloadSettings.rangeQuantumMaxBytes();
-					long maximumDurationNanos = workloadSettings.rangeQuantumMaxDuration().toNanos();
-					var results = new ArrayList<KV>(Math.min(maximumItems, 1_024));
-					long decodedBytes = 0L;
-					while (results.size() < maximumItems && !exhausted) {
-						if (!results.isEmpty() && System.nanoTime() - sliceStart >= maximumDurationNanos) {
-							break;
-						}
-						var next = pendingRangeItem;
-						if (next != null) {
-							pendingRangeItem = null;
-						} else {
-							next = nextPageItem();
-							if (next == null) {
-								break;
-							}
-						}
-						long nextBytes = decodedKVBytes(next);
-						if (nextBytes > maximumBytes) {
-							throw RocksDBException.of(RocksDBErrorType.RANGE_ITEM_TOO_LARGE,
-									"Range item requires " + nextBytes
-											+ " encoded key/value bytes, exceeding quantum maximum "
-											+ maximumBytes);
-						}
-						if (!results.isEmpty() && nextBytes > maximumBytes - decodedBytes) {
-							pendingRangeItem = next;
-							break;
-						}
-						results.add(next);
-						decodedBytes += nextBytes;
-					}
-					return new RangeReadChunk(results, exhausted && pendingRangeItem == null);
-				}
-			} finally {
-				totalTime.add(System.nanoTime() - sliceStart);
-				ops.endOp();
-			}
-		}
-
-		private RangeCountChunk countChunk(LongAdder totalTime) {
-			ops.beginOp();
-			var sliceStart = System.nanoTime();
-			try {
-				synchronized (this) {
-					if (expired) {
-						throw rangeDeadlineExceeded();
-					}
-					if (closed || exhausted) {
-						return new RangeCountChunk(0L, true);
-					}
-					long maximumItems = workloadSettings.rangeQuantumMaxItems();
-					long maximumBytes = workloadSettings.rangeQuantumMaxBytes();
-					long maximumDurationNanos = workloadSettings.rangeQuantumMaxDuration().toNanos();
-					long count = 0L;
-					long scannedBytes = 0L;
-					while (count < maximumItems) {
-						if (scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
-							throw rangeDeadlineExceeded();
-						}
-						if (count != 0L && System.nanoTime() - sliceStart >= maximumDurationNanos) {
-							break;
-						}
-						if (pendingCountItems == 0L) {
-							if (!iterator.isValid()) {
-								checkIteratorStatusIfInvalid(iterator);
-								exhausted = true;
-								break;
-							}
-							pendingCountBytes = saturatingAdd(iterator.key().length, iterator.value().length);
-							pendingCountItems = col.hasBuckets()
-									? Bucket.readElementCount(toBuf(iterator.value()))
-									: 1L;
-							advanceIterator();
-							if (pendingCountItems == 0L) {
-								pendingCountBytes = 0L;
-								continue;
-							}
-						}
-						if (pendingCountBytes > maximumBytes) {
-							throw RocksDBException.of(RocksDBErrorType.RANGE_ITEM_TOO_LARGE,
-									"Count input requires " + pendingCountBytes
-											+ " encoded bytes, exceeding quantum maximum " + maximumBytes);
-						}
-						if (count != 0L && pendingCountBytes > maximumBytes - scannedBytes) {
-							break;
-						}
-						scannedBytes += pendingCountBytes;
-						pendingCountBytes = 0L;
-						long taken = Math.min(maximumItems - count, pendingCountItems);
-						count += taken;
-						pendingCountItems -= taken;
-					}
-					if (pendingCountItems == 0L && !iterator.isValid()) {
-						checkIteratorStatusIfInvalid(iterator);
-						exhausted = true;
-					}
-					return new RangeCountChunk(count, exhausted && pendingCountItems == 0L);
-				}
-			} finally {
-				totalTime.add(System.nanoTime() - sliceStart);
-				ops.endOp();
-			}
-		}
-
-		private void advanceIterator() {
-			if (reverse) {
-				iterator.prev();
-			} else {
-				iterator.next();
-			}
-		}
-
-		@Override
-		public void expireIfDeadlinePassed() {
-			synchronized (this) {
-				if (closed || !scheduler.isMonotonicDeadlineExpired(monotonicDeadlineNanos)) {
-					return;
-				}
-				expired = true;
-			}
-			close();
-		}
-
-		private RocksDBException rangeDeadlineExceeded() {
-			return RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded");
-		}
-
-		@Override
-		public void close() {
-			try {
-				synchronized (this) {
-					if (closed) {
-						return;
-					}
-					closed = true;
-					exhausted = true;
-					bucketIterator = null;
-					try {
-						iterator.close();
-					} finally {
-						try {
-							readOptions.close();
-						} finally {
-							try {
-								if (snapshot != null) {
-									try {
-										db.get().releaseSnapshot(snapshot);
-									} finally {
-										retainedRangeSnapshots.decrementAndGet();
-									}
-								}
-							} finally {
-								try {
-									if (endKeySlice != null) {
-										endKeySlice.close();
-									}
-								} finally {
-									try {
-										if (startKeySlice != null) {
-											startKeySlice.close();
-										}
-									} finally {
-										columnUse.close();
-									}
-								}
-							}
-						}
-					}
-				}
-			} finally {
-				try {
-					activeRangeResources.remove(this);
-				} finally {
-					if (retainedPermit != null) {
-						retainedPermit.close();
-					}
-				}
-			}
-		}
-	}
-
-	private static void ensureCapacity(Buf buf, int offset, int len) {
-		int required = offset + len;
-		if (buf.size() < required) {
-			int newSize = buf.size() + (buf.size() >> 1);
-			if (newSize < required) {
-				newSize = required;
-			}
-			buf.size(newSize);
-		}
-	}
-
-	/**
-	 * RocksDB counts disable/enable file-deletion calls. A failed enable must therefore
-	 * be retried, otherwise one transient error leaves obsolete-file deletion disabled
-	 * for the rest of the process lifetime.
-	 */
-	private final class RawScanFileDeletionRecovery {
-		private static final long RETRY_DELAY_MILLIS = 1_000L;
-
-		private int pendingEnables;
-		private boolean retryScheduled;
-		private boolean stopped;
-
-		private synchronized void release(RocksDB rocksDB) {
-			if (stopped) {
-				return;
-			}
-			pendingEnables++;
-			drain(rocksDB);
-		}
-
-		private void drain(RocksDB rocksDB) {
-			while (!stopped && pendingEnables > 0) {
-				try {
-					enableRawScanFileDeletions(rocksDB);
-					pendingEnables--;
-				} catch (org.rocksdb.RocksDBException error) {
-					logger.warn("Failed to re-enable RocksDB file deletions after raw-scan SST pinning; "
-							+ "retrying in {} ms",
-							RETRY_DELAY_MILLIS,
-							error);
-					scheduleRetry(rocksDB);
-					return;
-				}
-			}
-		}
-
-		private void scheduleRetry(RocksDB rocksDB) {
-			if (retryScheduled || stopped) {
-				return;
-			}
-			retryScheduled = true;
-			try {
-				leakScheduler.schedule(() -> retry(rocksDB), RETRY_DELAY_MILLIS, TimeUnit.MILLISECONDS);
-			} catch (RuntimeException schedulingFailure) {
-				retryScheduled = false;
-				if (!stopped) {
-					logger.error("Failed to schedule recovery of RocksDB file deletions; "
-							+ "the next raw-scan release will retry", schedulingFailure);
-				}
-			}
-		}
-
-		private synchronized void retry(RocksDB rocksDB) {
-			retryScheduled = false;
-			drain(rocksDB);
-		}
-
-		private synchronized void stop() {
-			stopped = true;
-			pendingEnables = 0;
-		}
+		return ranges.countRangeAsyncInternal(transactionId, columnId, startKeysInclusive, endKeysExclusive, reverse, context, workloadProfile);
 	}
 
 	@VisibleForTesting
@@ -10072,1135 +2601,45 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		Files.createLink(target, source);
 	}
 
-	private static Path rawScanSourcePath(LiveFileMetaData file) {
-		String filePath = file.path();
-		if (!filePath.endsWith(".sst")) {
-			filePath += file.fileName();
-		}
-		return Path.of(filePath).toAbsolutePath().normalize();
-	}
-
-	private static boolean isRawScanAdmissionOverload(Throwable failure) {
-		return failure instanceof RocksDBException rocksDBException
-				&& rocksDBException.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED;
-	}
-
-	private static boolean isRetryableRawScanAdmissionOverload(Throwable failure) {
-		// ScanState appends every failed cleanup stage to the original admission
-		// failure before publishing it. Retrying is safe only when releasing the pin
-		// claim, column use, operation lease, and test/metric hooks all succeeded.
-		return isRawScanAdmissionOverload(failure) && failure.getSuppressed().length == 0;
-	}
-
-	private static boolean isSelectedRawScanFile(LiveFileMetaData file,
-			String cfName,
-			int shardIndex,
-			int shardCount) {
-		return file.fileName().endsWith(".sst")
-				&& new String(file.columnFamilyName(), StandardCharsets.UTF_8).equals(cfName)
-				&& (shardCount == 1
-						|| Math.floorMod(file.fileName().hashCode(), shardCount)
-						== Math.floorMod(shardIndex, shardCount));
-	}
-
-	private List<LiveFileMetaData> selectedRawScanFiles(RocksDB rocksDB,
-			String cfName,
-			int shardIndex,
-			int shardCount) {
-		return rocksDB.getLiveFilesMetaData()
-				.stream()
-				.filter(file -> isSelectedRawScanFile(file, cfName, shardIndex, shardCount))
-				.sorted(Comparator.comparingInt(LiveFileMetaData::level)
-						.thenComparingLong(LiveFileMetaData::smallestSeqno)
-						.thenComparing(LiveFileMetaData::fileName))
-				.toList();
-	}
-
-	private static Path rawScanDatabasePinRoot(Path sourceDirectory, Path databasePath) {
-		return sourceDirectory
-				.toAbsolutePath()
-				.normalize()
-				.resolve(RAW_SCAN_PIN_DIRECTORY_NAME)
-				.resolve(UUID.nameUUIDFromBytes(databasePath
-						.toAbsolutePath()
-						.normalize()
-						.toString()
-						.getBytes(StandardCharsets.UTF_8)).toString());
-	}
-
-	private void recoverRawScanPinsAtStartup(RocksDB rocksDB,
-			Path databasePath,
-			DatabaseConfig databaseConfig) throws IOException {
-		var sourceDirectories = new LinkedHashSet<Path>();
-		sourceDirectories.add(databasePath.toAbsolutePath().normalize());
-		try {
-			GlobalDatabaseConfig globalConfig = databaseConfig.global();
-			addRawScanConfiguredSourceDirectories(sourceDirectories,
-					databasePath,
-					globalConfig.fallbackColumnOptions());
-			for (NamedColumnConfig columnConfig : globalConfig.columnOptions()) {
-				addRawScanConfiguredSourceDirectories(sourceDirectories, databasePath, columnConfig);
-			}
-		} catch (GestaltException configFailure) {
-			throw new IOException("Failed to resolve raw-scan SST volumes during startup recovery", configFailure);
-		}
-		for (LiveFileMetaData file : rocksDB.getLiveFilesMetaData()) {
-			Path source = rawScanSourcePath(file);
-			Path sourceDirectory = source.getParent();
-			if (sourceDirectory != null) {
-				sourceDirectories.add(sourceDirectory);
-			}
-		}
-
-		long recoveredFiles = 0L;
-		int recoveredRoots = 0;
-		for (Path sourceDirectory : sourceDirectories) {
-			Path databasePinRoot = rawScanDatabasePinRoot(sourceDirectory, databasePath);
-			if (Files.notExists(databasePinRoot)) {
-				continue;
-			}
-			long filesInRoot;
-			try (var paths = Files.walk(databasePinRoot)) {
-				filesInRoot = paths.filter(Files::isRegularFile).count();
-			}
-			deleteRawScanPinTree(databasePinRoot);
-			recoveredFiles += filesInRoot;
-			recoveredRoots++;
-		}
-		if (recoveredRoots > 0) {
-			logger.warn("Removed {} orphaned raw-scan SST hard links from {} pin roots during startup",
-					recoveredFiles,
-					recoveredRoots);
-		}
-	}
-
-	private static void addRawScanConfiguredSourceDirectories(Set<Path> sourceDirectories,
-			Path databasePath,
-			FallbackColumnConfig columnConfig) throws GestaltException {
-		for (RocksDBLoader.DbPathRecord volume : RocksDBLoader.getVolumeConfigs(databasePath, columnConfig)) {
-			sourceDirectories.add(volume.path().toAbsolutePath().normalize());
-		}
-	}
-
-	private Path prepareRawScanPinRoot(Path sourceDirectory) throws IOException {
-		Path databasePinRoot = rawScanDatabasePinRoot(sourceDirectory, definitiveDbPath);
-		synchronized (rawScanPinInitializationLock) {
-			if (initializedRawScanPinRoots.add(databasePinRoot)) {
-				// A process crash cannot run Reactor cleanup. Remove only this database's
-				// prior pin namespace, before entering the deletion-disabled critical section.
-				deleteRawScanPinTree(databasePinRoot);
-			}
-			Files.createDirectories(databasePinRoot);
-		}
-		return databasePinRoot;
-	}
-
-	private static void deleteRawScanPinTree(Path root) throws IOException {
-		if (Files.notExists(root)) {
-			return;
-		}
-		try (var paths = Files.walk(root)) {
-			for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
-				Files.deleteIfExists(path);
-			}
-		}
-	}
-
 	@VisibleForTesting
 	protected long rawScanPinMaxDurationNanos() {
 		return RAW_SCAN_PIN_MAX_DURATION_NANOS;
 	}
-
-	private void checkRawScanPinDeadline(long startedNanos) throws IOException {
-		long maximumDurationNanos = rawScanPinMaxDurationNanos();
-		if (System.nanoTime() - startedNanos > maximumDurationNanos) {
-			throw new IOException("Raw-scan SST pinning exceeded the configured maximum duration of "
-					+ TimeUnit.NANOSECONDS.toMillis(maximumDurationNanos)
-					+ " ms");
-		}
-	}
-
-	private static final class RawScanPinDirectory implements AutoCloseable {
-		private final Path path;
-		private int retainedFiles;
-		private boolean closeRequested;
-		private boolean closed;
-
-		private RawScanPinDirectory(Path path) {
-			this.path = path;
-		}
-
-		private synchronized void retainFile() {
-			if (closed || closeRequested) {
-				throw new IllegalStateException("Raw-scan pin directory is already closing: " + path);
-			}
-			retainedFiles++;
-		}
-
-		private synchronized void releaseFile() {
-			if (retainedFiles <= 0) {
-				throw new IllegalStateException("Raw-scan pin directory released without ownership: " + path);
-			}
-			retainedFiles--;
-			if (closeRequested && retainedFiles == 0) {
-				deleteDirectory();
-			}
-		}
-
-		@Override
-		public synchronized void close() {
-			if (closed) {
-				return;
-			}
-			closeRequested = true;
-			if (retainedFiles == 0) {
-				deleteDirectory();
-			}
-		}
-
-		private void deleteDirectory() {
-			try {
-				Files.deleteIfExists(path);
-			} catch (IOException failure) {
-				throw new UncheckedIOException("Failed to release raw-scan pin directory " + path, failure);
-			}
-			closed = true;
-		}
-	}
-
-	private final class PinnedSstFile implements AutoCloseable {
-		private final LiveFileMetaData metadata;
-		private final Path path;
-		private final long size;
-		private final @Nullable RawSstToken token;
-		private final RawScanPinDirectory directory;
-		private boolean claimed;
-		private boolean closeRequested;
-		private boolean closed;
-
-		private PinnedSstFile(LiveFileMetaData metadata,
-				Path path,
-				@Nullable RawSstToken token,
-				RawScanPinDirectory directory) {
-			this.metadata = metadata;
-			this.path = path;
-			this.size = metadata.size();
-			this.token = token;
-			this.directory = directory;
-			if (!activeRawScanPinnedFiles.add(path)) {
-				throw new IllegalStateException("Raw-scan SST pin path is already active: " + path);
-			}
-			try {
-				directory.retainFile();
-			} catch (RuntimeException | Error failure) {
-				activeRawScanPinnedFiles.remove(path);
-				throw failure;
-			}
-			activeRawScanPinnedBytes.addAndGet(size);
-		}
-
-		private String fileName() {
-			return metadata.fileName();
-		}
-
-		private Path path() {
-			return path;
-		}
-
-		private RawSstToken resumableToken() {
-			return Objects.requireNonNull(token, "Resumable raw scan SST token");
-		}
-
-		private synchronized Claim claim() {
-			if (closed || closeRequested || claimed) {
-				throw new IllegalStateException("Raw-scan SST pin cannot be claimed: " + path);
-			}
-			claimed = true;
-			return new Claim(this);
-		}
-
-		@Override
-		public synchronized void close() {
-			// The scan-set owns unclaimed files. Once a ScanState claims a pin, only
-			// that state may unlink it after its iterator, reader, and options close.
-			if (closed) {
-				return;
-			}
-			if (claimed) {
-				closeRequested = true;
-				return;
-			}
-			closeClaimedOrUnclaimed();
-		}
-
-		private synchronized void releaseClaim() {
-			if (closed) {
-				return;
-			}
-			if (!claimed) {
-				throw new IllegalStateException("Raw-scan SST pin released without a claim: " + path);
-			}
-			closeClaimedOrUnclaimed();
-		}
-
-		private synchronized void releaseClaimForAdmissionRetry() {
-			if (closed) {
-				return;
-			}
-			if (!claimed) {
-				throw new IllegalStateException("Raw-scan SST pin retry released without a claim: " + path);
-			}
-			claimed = false;
-			// Cancellation may close the owning scan set while scheduler rejection is
-			// unwinding. Honor that deferred close instead of leaving an unowned pin.
-			if (closeRequested) {
-				closeClaimedOrUnclaimed();
-			}
-		}
-
-		private void closeClaimedOrUnclaimed() {
-			try {
-				Files.deleteIfExists(path);
-			} catch (IOException failure) {
-				throw new UncheckedIOException("Failed to release raw-scan SST pin " + path, failure);
-			}
-			closed = true;
-			claimed = false;
-			activeRawScanPinnedFiles.remove(path);
-			activeRawScanPinnedBytes.addAndGet(-size);
-			directory.releaseFile();
-		}
-
-		private static final class Claim implements AutoCloseable {
-
-			private final PinnedSstFile file;
-			private final AtomicBoolean closed = new AtomicBoolean();
-
-			private Claim(PinnedSstFile file) {
-				this.file = file;
-			}
-
-			@Override
-			public void close() {
-				if (closed.compareAndSet(false, true)) {
-					file.releaseClaim();
-				}
-			}
-
-			private void releaseForAdmissionRetry() {
-				if (closed.compareAndSet(false, true)) {
-					file.releaseClaimForAdmissionRetry();
-				}
-			}
-		}
-	}
-
-	/**
-	 * Captures immutable SST contents without holding RocksDB's database-wide
-	 * file-deletion switch for the lifetime of the scan. Targets live beside their
-	 * source files, so hard links cannot cross a filesystem. There is deliberately no
-	 * copy fallback: copying a multi-terabyte column while deletion is disabled would
-	 * recreate the unbounded WAL/obsolete-file retention this lease is meant to avoid.
-	 */
-	private final class RawScanPinnedSstSet implements AutoCloseable {
-		private final List<PinnedSstFile> files;
-		private final Set<RawScanPinDirectory> scanDirectories;
-		private boolean closed;
-
-		private RawScanPinnedSstSet(String cfName,
-				int shardIndex,
-				int shardCount,
-				@Nullable Set<String> completedSstFileNames)
-				throws IOException, org.rocksdb.RocksDBException {
-			var pinnedFiles = new ArrayList<PinnedSstFile>();
-			var createdScanDirectories = new LinkedHashSet<RawScanPinDirectory>();
-			var scanId = UUID.randomUUID().toString();
-			Throwable captureFailure = null;
-			synchronized (rawScanPinAcquisitionLock) {
-				RocksDB rocksDB = db.get();
-				for (LiveFileMetaData file : selectedRawScanFiles(rocksDB, cfName, shardIndex, shardCount)) {
-					if (completedSstFileNames != null && completedSstFileNames.contains(file.fileName())) {
-						continue;
-					}
-					Path source = rawScanSourcePath(file);
-					Path sourceDirectory = Objects.requireNonNull(source.getParent(),
-							"Raw-scan SST has no parent directory: " + source);
-					prepareRawScanPinRoot(sourceDirectory);
-				}
-
-				rocksDB.disableFileDeletions();
-				long startedNanos = System.nanoTime();
-				try {
-					var scanDirectoriesBySource = new HashMap<Path, RawScanPinDirectory>();
-					for (LiveFileMetaData file : selectedRawScanFiles(rocksDB,
-							cfName,
-							shardIndex,
-							shardCount)) {
-						if (completedSstFileNames != null && completedSstFileNames.contains(file.fileName())) {
-							continue;
-						}
-						Path source = rawScanSourcePath(file);
-						RawSstToken token = completedSstFileNames == null
-								? null
-								: new RawSstToken(file.fileName());
-						checkRawScanPinDeadline(startedNanos);
-						Path sourceDirectory = Objects.requireNonNull(source.getParent(),
-								"Raw-scan SST has no parent directory: " + source);
-						RawScanPinDirectory scanDirectory = scanDirectoriesBySource.get(sourceDirectory);
-						if (scanDirectory == null) {
-							Path scanDirectoryPath = prepareRawScanPinRoot(sourceDirectory).resolve(scanId);
-							Files.createDirectories(scanDirectoryPath);
-							scanDirectory = new RawScanPinDirectory(scanDirectoryPath);
-							scanDirectoriesBySource.put(sourceDirectory, scanDirectory);
-							createdScanDirectories.add(scanDirectory);
-						}
-						Path pinnedPath = scanDirectory.path.resolve(source.getFileName().toString());
-						createRawScanHardLink(source, pinnedPath);
-						pinnedFiles.add(new PinnedSstFile(file, pinnedPath, token, scanDirectory));
-						checkRawScanPinDeadline(startedNanos);
-					}
-				} catch (Throwable failure) {
-					captureFailure = failure;
-					rawScanPinAcquisitionFailures.increment();
-				} finally {
-					rawScanFileDeletionRecovery.release(rocksDB);
-					rawScanPinAcquisitionTimer.record(System.nanoTime() - startedNanos, TimeUnit.NANOSECONDS);
-				}
-			}
-
-			if (captureFailure != null) {
-				captureFailure = cleanupPinnedFiles(pinnedFiles, createdScanDirectories, captureFailure);
-				if (captureFailure instanceof IOException ioFailure) {
-					throw ioFailure;
-				}
-				if (captureFailure instanceof RuntimeException runtimeFailure) {
-					throw runtimeFailure;
-				}
-				if (captureFailure instanceof Error error) {
-					throw error;
-				}
-				throw new IOException("Failed to pin raw-scan SST files", captureFailure);
-			}
-			this.files = List.copyOf(pinnedFiles);
-			this.scanDirectories = Set.copyOf(createdScanDirectories);
-		}
-
-		private List<PinnedSstFile> files() {
-			return files;
-		}
-
-		@Override
-		public synchronized void close() {
-			if (closed) {
-				return;
-			}
-			closed = true;
-			Throwable failure = cleanupPinnedFiles(files, scanDirectories, null);
-			if (failure != null) {
-				throw new IllegalStateException("Failed to clean up raw-scan SST pins", failure);
-			}
-		}
-	}
-
-	private static @Nullable Throwable cleanupPinnedFiles(Collection<PinnedSstFile> files,
-			Collection<RawScanPinDirectory> scanDirectories,
-			@Nullable Throwable originalFailure) {
-		Throwable failure = originalFailure;
-		for (PinnedSstFile file : files) {
-			try {
-				file.close();
-			} catch (Throwable cleanupFailure) {
-				failure = appendFailure(failure, cleanupFailure);
-			}
-		}
-		for (RawScanPinDirectory scanDirectory : scanDirectories) {
-			try {
-				scanDirectory.close();
-			} catch (Throwable cleanupFailure) {
-				failure = appendFailure(failure, cleanupFailure);
-			}
-		}
-		return failure;
-	}
-
-	@FunctionalInterface
-	private interface RawScanTerminalMapper<T> {
-
-		T map(@Nullable SerializedKVBatch finalBatch, RawSstToken token);
-	}
-
-	private final class ScanState<T> implements RWScheduler.CooperativeCompletionTask,
-			LongConsumer,
-			reactor.core.Disposable {
-		private static final VarHandle DEMAND =
-				varHandle(ScanState.class, "demand", long.class);
-		private static final VarHandle TERMINATED =
-				varHandle(ScanState.class, "terminated", boolean.class);
-		private final ColumnInstance col;
-		private final ColumnInstance.ColumnUse retainedColumnUse;
-		private final String cfName;
-		private final PinnedSstFile file;
-		private final PinnedSstFile.Claim fileClaim;
-		private final FluxSink<T> sink;
-		private final long maximumQuantumNanos;
-		private final Function<SerializedKVBatch, T> batchMapper;
-		private final @Nullable RawScanTerminalMapper<T> terminalMapper;
-		private volatile long demand;
-		private volatile boolean terminated;
-		private volatile boolean cancellationRequested;
-		private volatile boolean dispatched;
-		private volatile @Nullable RWScheduler.CooperativeHandle handle;
-		private @Nullable SstFileReader reader;
-		private @Nullable SstFileReaderIterator it;
-		private @Nullable ReadOptions readOptions;
-		private @Nullable Options options;
-		private final Buf outBuf = Buf.create(Math.toIntExact(SizeUnit.MB));
-		private int batchSize;
-		private int currentBatchBytes;
-		private int currentSerializedBatchBytes = Integer.BYTES;
-		private boolean completionPrepared;
-		private boolean resourcesCleaned;
-		private @Nullable Throwable resourceCleanupFailure;
-		private @Nullable T pendingSuccessfulEmission;
-
-		private ScanState(ColumnInstance col,
-		                  String cfName,
-		                  PinnedSstFile file,
-		                  FluxSink<T> sink,
-		                  long maximumQuantumNanos,
-		                  Function<SerializedKVBatch, T> batchMapper,
-		                  @Nullable RawScanTerminalMapper<T> terminalMapper) {
-			// Reactor eagerly releases the outer scan/session resources on cancellation.
-			// Retain the database, column, and this specific pin until the scheduler has
-			// returned from the last JNI quantum and closeNativeResources finishes.
-			ops.beginOp();
-			ColumnInstance.ColumnUse acquiredColumnUse = null;
-			PinnedSstFile.Claim acquiredFileClaim = null;
-			try {
-				acquiredColumnUse = col.acquireUse();
-				acquiredFileClaim = file.claim();
-				this.col = col;
-				this.retainedColumnUse = acquiredColumnUse;
-				this.cfName = cfName;
-				this.file = file;
-				this.fileClaim = acquiredFileClaim;
-				this.sink = sink;
-				this.maximumQuantumNanos = maximumQuantumNanos;
-				this.batchMapper = batchMapper;
-				this.terminalMapper = terminalMapper;
-			} catch (RuntimeException | Error failure) {
-				if (acquiredFileClaim != null) {
-					acquiredFileClaim.close();
-				}
-				if (acquiredColumnUse != null) {
-					acquiredColumnUse.close();
-				}
-				ops.endOp();
-				throw failure;
-			}
-		}
-
-		private void attach(RWScheduler.CooperativeHandle handle) {
-			this.handle = Objects.requireNonNull(handle, "handle");
-			if (cancellationRequested) {
-				handle.dispose();
-			} else if (demand > 0L) {
-				handle.resume();
-			}
-		}
-
-		private void open() throws org.rocksdb.RocksDBException {
-			if (it != null) {
-				return;
-			}
-			String filePath = file.path().toString();
-
-			Options createdOptions = null;
-			SstFileReader createdReader = null;
-			ReadOptions createdReadOptions = null;
-			SstFileReaderIterator createdIterator = null;
-			try {
-				ColumnFamilyOptions cfOpts = columnsConifg.get(cfName);
-				createdOptions = cfOpts != null ? new Options(dbOptions, cfOpts) : new Options();
-				createdOptions.setAllowMmapReads(true);
-				createdOptions.setUseDirectReads(false);
-				createdOptions.setUseDirectIoForFlushAndCompaction(false);
-				createdOptions.setParanoidChecks(false);
-
-				createdReader = new SstFileReader(createdOptions);
-				createdReader.open(filePath);
-				createdReadOptions = new ReadOptions()
-						.setFillCache(false)
-						.setIgnoreRangeDeletions(true)
-						.setVerifyChecksums(true)
-						.setReadaheadSize(workloadSettings.rawScanReadaheadBytes());
-
-				createdIterator = createdReader.newIterator(createdReadOptions);
-				createdIterator.seekToFirst();
-			} catch (org.rocksdb.RocksDBException | RuntimeException | Error e) {
-				logger.warn("Failed to open captured SST file: " + file.fileName(), e);
-				try {
-					if (createdIterator != null) createdIterator.close();
-				} catch (Throwable closeFailure) {
-					e.addSuppressed(closeFailure);
-				}
-				try {
-					if (createdReadOptions != null) createdReadOptions.close();
-				} catch (Throwable closeFailure) {
-					e.addSuppressed(closeFailure);
-				}
-				try {
-					if (createdReader != null) createdReader.close();
-				} catch (Throwable closeFailure) {
-					e.addSuppressed(closeFailure);
-				}
-				try {
-					if (createdOptions != null) createdOptions.close();
-				} catch (Throwable closeFailure) {
-					e.addSuppressed(closeFailure);
-				}
-				throw e;
-			}
-			options = createdOptions;
-			reader = createdReader;
-			readOptions = createdReadOptions;
-			it = createdIterator;
-			var readerOpenedObserver = rawScanReaderOpenedObserver;
-			if (readerOpenedObserver != null) {
-				readerOpenedObserver.run();
-			}
-		}
-
-		@Override
-		public synchronized RWScheduler.CooperativeResult runCooperatively(
-				RWScheduler.CooperativeContext context) {
-			dispatched = true;
-			// RocksJava native iterators have no protection against a concurrent close.
-			// Serialize each JNI quantum with reject/terminal cleanup because gRPC
-			// cancellation arrives on a transport thread while this worker may still be
-			// inside isValid/key/value/next.
-			if (terminated) {
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-			// executeCooperatively may dispatch before it returns the stable handle. Park
-			// that first quantum so cancellation and demand can only act through the
-			// scheduler-owned logical submission before any native handle is opened.
-			if (handle == null) {
-				return RWScheduler.CooperativeResult.PARK;
-			}
-			if (context.terminationRequested()) {
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-			if (demand == 0L) {
-				return RWScheduler.CooperativeResult.PARK;
-			}
-			try {
-				open();
-				long preemptionStartNanos = 0L;
-				while (true) {
-					if (context.terminationRequested()) {
-						return RWScheduler.CooperativeResult.COMPLETE;
-					}
-					var iterator = Objects.requireNonNull(it, "Raw scan iterator");
-					if (!iterator.isValid()) {
-						iterator.status();
-						return prepareEndOfFile(context);
-					}
-
-					batchSize++;
-					byte[] k = iterator.key();
-					byte[] v = iterator.value();
-					var kBuf = Buf.wrap(k);
-					var vBuf = Buf.wrap(v);
-					currentBatchBytes += k.length + v.length;
-
-					currentSerializedBatchBytes += col.transcodeBatchKeys(kBuf, vBuf, currentSerializedBatchBytes, outBuf);
-
-					if (col.schema().hasValue()) {
-						Buf userValue = col.decodeValue(vBuf);
-						var valLen = userValue.size();
-						ensureCapacity(outBuf, currentSerializedBatchBytes, Integer.BYTES);
-						outBuf.setIntLE(currentSerializedBatchBytes, valLen);
-						currentSerializedBatchBytes += Integer.BYTES;
-						if (valLen > 0) {
-							ensureCapacity(outBuf, currentSerializedBatchBytes, valLen);
-							outBuf.setBytesFromBuf(currentSerializedBatchBytes, userValue, 0, valLen);
-							currentSerializedBatchBytes += userValue.size();
-						}
-					} else {
-						ensureCapacity(outBuf, currentSerializedBatchBytes, Integer.BYTES);
-						outBuf.setIntLE(currentSerializedBatchBytes, 0);
-						currentSerializedBatchBytes += Integer.BYTES;
-					}
-
-					iterator.next();
-					if (batchSize >= RAW_SCAN_MAX_ENTRIES_PER_CHUNK
-							|| currentBatchBytes >= RAW_SCAN_MAX_BYTES_PER_CHUNK) {
-						if (!iterator.isValid()) {
-							iterator.status();
-							return prepareEndOfFile(context);
-						}
-						emitBatch();
-						if (demand == 0L) {
-							return RWScheduler.CooperativeResult.PARK;
-						}
-					}
-
-					if (context.preemptionRequested()) {
-						long nowNanos = System.nanoTime();
-						if (preemptionStartNanos == 0L) {
-							preemptionStartNanos = nowNanos;
-						} else if (nowNanos - preemptionStartNanos >= maximumQuantumNanos) {
-							// Publish useful progress at the same bounded checkpoint where the
-							// scheduler yields. Retaining a partial 2 MiB/65,536-row wire batch
-							// across paced BATCH turns can make a healthy raw scan appear idle
-							// for minutes even though every quantum advances its SST iterator.
-							if (batchSize > 0) {
-								emitBatch();
-								if (demand == 0L) {
-									return RWScheduler.CooperativeResult.PARK;
-								}
-							}
-							return RWScheduler.CooperativeResult.YIELD;
-						}
-					} else {
-						preemptionStartNanos = 0L;
-					}
-				}
-			} catch (VirtualMachineError fatal) {
-				throw fatal;
-			} catch (Throwable failure) {
-				context.fail(cooperativeFailure(failure,
-						"Cooperative raw scan failed"));
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-		}
-
-		private RWScheduler.CooperativeResult prepareEndOfFile(RWScheduler.CooperativeContext context) {
-			var localTerminalMapper = terminalMapper;
-			if (localTerminalMapper == null) {
-				if (batchSize > 0) {
-					emitBatch();
-				}
-			} else {
-				var finalBatch = batchSize > 0 ? takeBatch() : null;
-				T terminalEmission = Objects.requireNonNull(
-						localTerminalMapper.map(finalBatch, file.resumableToken()),
-						"Raw scan terminal mapper returned null");
-				producedOne();
-				pendingSuccessfulEmission = terminalEmission;
-			}
-			if (context.terminationRequested()) {
-				return RWScheduler.CooperativeResult.COMPLETE;
-			}
-			prepareSuccessfulCompletion(context);
-			return RWScheduler.CooperativeResult.COMPLETE;
-		}
-
-		private void prepareSuccessfulCompletion(RWScheduler.CooperativeContext context) {
-			var failure = cleanupNativeResources(null, false);
-			if (failure != null) {
-				if (failure instanceof VirtualMachineError fatal) {
-					throw fatal;
-				}
-				context.fail(cooperativeFailure(failure,
-						"Cooperative raw scan cleanup failed"));
-				return;
-			}
-			completionPrepared = true;
-		}
-
-		@Override
-		public synchronized void completeCooperatively() {
-			if (!completionPrepared) {
-				throw new IllegalStateException("Scheduler selected RUN before raw scan cleanup completed");
-			}
-			if (TERMINATED.compareAndSet(this, false, true)) {
-				var terminalEmission = pendingSuccessfulEmission;
-				pendingSuccessfulEmission = null;
-				if (terminalEmission != null) {
-					sink.next(terminalEmission);
-				}
-				sink.complete();
-			}
-		}
-
-		private void emitBatch() {
-			producedOne();
-			sink.next(batchMapper.apply(takeBatch()));
-		}
-
-		private SerializedKVBatch takeBatch() {
-			outBuf.setIntLE(0, batchSize);
-			var batch = new SerializedKVBatch.SerializedKVBatchRef(
-					outBuf.copyOfRange(0, currentSerializedBatchBytes));
-			batchSize = 0;
-			currentBatchBytes = 0;
-			currentSerializedBatchBytes = Integer.BYTES;
-			return batch;
-		}
-
-		private void producedOne() {
-			while (true) {
-				long current = demand;
-				if (current == Long.MAX_VALUE) {
-					return;
-				}
-				if (current <= 0L) {
-					throw new IllegalStateException("Raw scan produced without downstream demand");
-				}
-				if (DEMAND.compareAndSet(this, current, current - 1L)) {
-					return;
-				}
-			}
-		}
-
-		@Override
-		public void accept(long requested) {
-			if (requested <= 0L || terminated) {
-				return;
-			}
-			while (true) {
-				long current = demand;
-				long updated = current + requested;
-				if (updated < 0L) {
-					updated = Long.MAX_VALUE;
-				}
-				if (DEMAND.compareAndSet(this, current, updated)) {
-					break;
-				}
-			}
-			var currentHandle = handle;
-			if (currentHandle != null) {
-				currentHandle.resume();
-			}
-		}
-
-		@Override
-		public void reject(RuntimeException failure) {
-			boolean admissionRetry = !dispatched && isRawScanAdmissionOverload(failure);
-			finish(failure, !(failure instanceof CancellationException), admissionRetry);
-		}
-
-		@Override
-		public void dispose() {
-			if (terminated) {
-				return;
-			}
-			cancellationRequested = true;
-			var currentHandle = handle;
-			if (currentHandle != null) {
-				currentHandle.dispose();
-			}
-		}
-
-		@Override
-		public boolean isDisposed() {
-			return terminated;
-		}
-
-		private synchronized void finish(@Nullable Throwable originalFailure,
-				boolean signalTerminal,
-				boolean admissionRetry) {
-			if (!TERMINATED.compareAndSet(this, false, true)) {
-				return;
-			}
-			pendingSuccessfulEmission = null;
-			var failure = cleanupNativeResources(originalFailure, admissionRetry);
-			if (!signalTerminal) {
-				return;
-			}
-			if (failure == null) {
-				sink.complete();
-			} else {
-				sink.error(failure);
-			}
-		}
-
-		private @Nullable Throwable cleanupNativeResources(@Nullable Throwable originalFailure,
-				boolean admissionRetry) {
-			if (resourcesCleaned) {
-				return resourceCleanupFailure == null
-						? originalFailure
-						: appendFailure(originalFailure, resourceCleanupFailure);
-			}
-			resourcesCleaned = true;
-			Throwable cleanupFailure = null;
-			try {
-				closeNativeResources(admissionRetry);
-			} catch (Throwable closeFailure) {
-				cleanupFailure = appendFailure(cleanupFailure, closeFailure);
-			}
-			resourceCleanupFailure = cleanupFailure;
-			return cleanupFailure == null
-					? originalFailure
-					: appendFailure(originalFailure, cleanupFailure);
-		}
-
-		private void closeNativeResources(boolean admissionRetry) {
-			Throwable failure = null;
-			var iterator = it;
-			it = null;
-			if (iterator != null) {
-				try {
-					iterator.close();
-				} catch (Throwable error) {
-					failure = error;
-				}
-			}
-			var localReadOptions = readOptions;
-			readOptions = null;
-			if (localReadOptions != null) {
-				try {
-					localReadOptions.close();
-				} catch (Throwable error) {
-					failure = appendFailure(failure, error);
-				}
-			}
-			var localReader = reader;
-			reader = null;
-			if (localReader != null) {
-				try {
-					localReader.close();
-				} catch (Throwable error) {
-					failure = appendFailure(failure, error);
-				}
-			}
-			var localOptions = options;
-			options = null;
-			if (localOptions != null) {
-				try {
-					localOptions.close();
-				} catch (Throwable error) {
-					failure = appendFailure(failure, error);
-				}
-			}
-			try {
-				if (admissionRetry) {
-					fileClaim.releaseForAdmissionRetry();
-				} else {
-					fileClaim.close();
-				}
-			} catch (Throwable error) {
-				failure = appendFailure(failure, error);
-			}
-			try {
-				retainedColumnUse.close();
-			} catch (Throwable error) {
-				failure = appendFailure(failure, error);
-			}
-			try {
-				ops.endOp();
-			} catch (Throwable error) {
-				failure = appendFailure(failure, error);
-			}
-			var cleanupObserver = rawScanCleanupObserver;
-			if (cleanupObserver != null) {
-				try {
-					cleanupObserver.run();
-				} catch (Throwable error) {
-					failure = appendFailure(failure, error);
-				}
-			}
-			if (failure instanceof RuntimeException runtimeException) {
-				throw runtimeException;
-			}
-			if (failure instanceof Error error) {
-				throw error;
-			}
-			if (failure != null) {
-				throw new IllegalStateException("Failed to close raw scan state", failure);
-			}
-		}
-	}
-
 	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId, int shardIndex, int shardCount) {
-		return scanRawAsyncInternal(columnId,
-				shardIndex,
-				shardCount,
-				null,
-				Function.identity(),
-				null,
-				getSchedulerForColumn(columnId).scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE),
-				getSchedulerForColumn(columnId).executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE));
+		return rawScan.scanRawAsyncInternal(columnId, shardIndex, shardCount);
 	}
-
 	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId,
 			int shardIndex,
 			int shardCount,
 			@NotNull Scheduler workloadScheduler) {
-		var workloadExecutor = workloadScheduler instanceof IndexedWorkloadScheduler indexedScheduler
-				? indexedScheduler.workloadExecutor()
-				: getSchedulerForColumn(columnId).executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
-		return scanRawAsyncInternal(columnId,
-				shardIndex,
-				shardCount,
-				null,
-				Function.identity(),
-				null,
-				workloadScheduler,
-				workloadExecutor);
+		return rawScan.scanRawAsyncInternal(columnId, shardIndex, shardCount, workloadScheduler);
 	}
-
 	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId,
 			int shardIndex,
 			int shardCount,
 			@NotNull Scheduler workloadScheduler,
 			@NotNull RWScheduler.WorkloadExecutor workloadExecutor) {
-		return scanRawAsyncInternal(columnId,
-				shardIndex,
-				shardCount,
-				null,
-				Function.identity(),
-				null,
-				workloadScheduler,
-				workloadExecutor);
+		return rawScan.scanRawAsyncInternal(columnId, shardIndex, shardCount, workloadScheduler, workloadExecutor);
 	}
-
-	private <T> Flux<T> scanRawAsyncInternal(long columnId,
-			int shardIndex,
-			int shardCount,
-			@Nullable Set<String> completedSstFileNames,
-			Function<SerializedKVBatch, T> batchMapper,
-			@Nullable RawScanTerminalMapper<T> terminalMapper,
-			@NotNull Scheduler workloadScheduler,
-			@NotNull RWScheduler.WorkloadExecutor workloadExecutor) {
-		long maximumQuantumNanos = workloadSettings.rangeQuantumMaxDuration().toNanos();
-		Flux<T> scan = Flux.using(
-				() -> {
-					ops.beginOp();
-					try {
-						return acquireColumnUse(columnId);
-					} catch (Throwable error) {
-						ops.endOp();
-						throw error;
-					}
-				},
-				columnUse -> Flux.defer(() -> {
-					ColumnInstance col = columnUse.column();
-					String cfName;
-					try {
-						cfName = new String(col.cfh().getName(), StandardCharsets.UTF_8);
-					} catch (RocksDBException | org.rocksdb.RocksDBException e) {
-						return Flux.error(e);
-					}
-
-					return scheduleRawScanPinCapture(
-								() -> new RawScanPinnedSstSet(cfName, shardIndex, shardCount, completedSstFileNames))
-							.flatMapMany(capturedPins -> Flux.using(
-									() -> capturedPins,
-									pinnedSsts -> {
-										var observer = rawScanFilesCapturedObserver;
-										if (observer != null) {
-											observer.run();
-										}
-
-										Function<PinnedSstFile, Publisher<T>> mapper = file ->
-												Flux.defer(() -> Flux.<T>create(rawSink -> {
-													var state = new ScanState<>(col, cfName, file, rawSink,
-															maximumQuantumNanos, batchMapper, terminalMapper);
-													rawSink.onRequest(state);
-													rawSink.onCancel(state);
-													rawSink.onDispose(state);
-													try {
-														state.attach(workloadExecutor.executeCooperatively(
-																state,
-																RAW_SCAN_MAX_BYTES_PER_CHUNK));
-													} catch (RuntimeException admissionFailure) {
-														state.reject(admissionFailure);
-													}
-												}, FluxSink.OverflowStrategy.ERROR))
-														// Retry only pre-dispatch queue rejection. ScanState keeps the
-														// same hard link available, while native/data failures remain terminal.
-														.retryWhen(RAW_SCAN_ADMISSION_RETRY)
-														.publishOn(reactor.core.scheduler.Schedulers.parallel(), 1);
-
-										var ssts = Flux.fromIterable(pinnedSsts.files());
-										if (shardCount == 1) {
-											return ssts.flatMap(mapper, workloadSettings.rawScanFileConcurrency(), 1);
-										} else {
-											return ssts.concatMap(mapper, 2);
-										}
-									},
-									RawScanPinnedSstSet::close,
-									true))
-							.doOnDiscard(RawScanPinnedSstSet.class, RawScanPinnedSstSet::close);
-				}),
-				columnUse -> {
-					try {
-						columnUse.close();
-					} finally {
-						ops.endOp();
-					}
-				},
-				true);
-		return subscribeOnInitialAdmission(scan, workloadScheduler);
-	}
-
-	private static <T> Flux<T> subscribeOnInitialAdmission(Flux<T> scan, Scheduler workloadScheduler) {
-		if (!(workloadScheduler instanceof IndexedWorkloadScheduler indexedScheduler)) {
-			return scan.subscribeOn(workloadScheduler);
-		}
-		return Mono.<Void>create(sink -> {
-			var registration = Disposables.swap();
-			sink.onCancel(registration);
-			var initialAdmission = new RawScanInitialAdmission(sink);
-			try {
-				registration.update(indexedScheduler.executeWhenCapacity(initialAdmission));
-			} catch (Throwable failure) {
-				sink.error(failure);
-			}
-		}).thenMany(scan);
-	}
-
-	private record RawScanInitialAdmission(reactor.core.publisher.MonoSink<Void> sink)
-			implements Runnable, RWScheduler.RejectionAwareTask {
-
-		@Override
-		public void run() {
-			sink.success();
-		}
-
-		@Override
-		public void reject(RuntimeException failure) {
-			sink.error(failure);
-		}
-	}
-
 	public Flux<RawScanEvent> scanRawResumableAsyncInternal(long columnId,
 			int shardIndex,
 			int shardCount,
 			Set<RawSstToken> completedSsts,
 			@NotNull Scheduler workloadScheduler) {
-		var workloadExecutor = workloadScheduler instanceof IndexedWorkloadScheduler indexedScheduler
-				? indexedScheduler.workloadExecutor()
-				: getSchedulerForColumn(columnId).executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
-		return scanRawAsyncInternal(columnId,
-				shardIndex,
-				shardCount,
-				completedSsts.stream()
-						.map(RawSstToken::value)
-						.collect(Collectors.toUnmodifiableSet()),
-				batch -> new RawScanEvent.Batch(batch.serialized()),
-				(finalBatch, token) -> finalBatch != null
-						? new RawScanEvent.Batch(finalBatch.serialized(), token)
-						: new RawScanEvent.SstCompleted(token),
-				workloadScheduler,
-				workloadExecutor);
+		return rawScan.scanRawResumableAsyncInternal(columnId, shardIndex, shardCount, completedSsts, workloadScheduler);
 	}
-
 	public Stream<SerializedKVBatch> scanRaw(long columnId, int shardIndex, int shardCount) {
-		return scanRawAsyncInternal(columnId, shardIndex, shardCount).toStream();
+		return rawScan.scanRaw(columnId, shardIndex, shardCount);
 	}
 
 	@Override
 	public void flush() {
-		flush(false);
+		maintenance.flush();
 	}
 
 	@Override
 	public void flushWal() {
-		flush(true);
+		maintenance.flushWal();
 	}
 
 	/**
@@ -11208,262 +2647,27 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * synchronously soon (a checkpoint) and wants that flush to find little left to write.
 	 */
 	public void requestFlush() {
-		ops.beginOp();
-		try {
-			synchronized (columnEditLock) {
-				try (var fo = new FlushOptions().setWaitForFlush(false).setAllowWriteStall(true)) {
-					db.get().flush(fo, columns.values().stream()
-							.map(ColumnInstance::cfh)
-							.filter(AbstractImmutableNativeReference::isOwningHandle)
-							.toList());
-				}
-			}
-		} catch (org.rocksdb.RocksDBException ex) {
-			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
-		} finally {
-			ops.endOp();
-		}
+		maintenance.requestFlush();
 	}
-
-	private void flush(boolean walOnly) {
-		var start = System.nanoTime();
-		ops.beginOp();
-		try {
-			actionLogger.logAction(walOnly ? "FlushWal" : "Flush", start, null, null, null, null, null, null, null);
-			if (walOnly) {
-				db.get().flushWal(true);
-				return;
-			}
-			synchronized (columnEditLock) {
-				var observer = columnMaintenanceObserver;
-				if (observer != null) {
-					observer.run();
-				}
-				db.get().flushWal(true);
-				try (var fo = new FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
-					db
-							.get()
-							.flush(fo,
-									columns
-											.values()
-											.stream()
-											.map(ColumnInstance::cfh)
-											.filter(AbstractImmutableNativeReference::isOwningHandle)
-											.toList()
-							);
-				}
-			}
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
-		} finally {
-			ops.endOp();
-			var end = System.nanoTime();
-			flushTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
-	}
-
-    private static ColumnTableProperties aggregateTableProperties(Collection<TableProperties> tables) {
-        long tableCount = 0;
-        long dataSize = 0;
-        long indexSize = 0;
-        long indexPartitions = 0;
-        long topLevelIndexSize = 0;
-        long filterSize = 0;
-        long rawKeySize = 0;
-        long rawValueSize = 0;
-        long numDataBlocks = 0;
-        long numEntries = 0;
-        long numDeletions = 0;
-        long numMergeOperands = 0;
-        long numRangeDeletions = 0;
-        long slowCompressionEstimatedDataSize = 0;
-        long fastCompressionEstimatedDataSize = 0;
-        long oldestCreationTime = 0;
-        long newestCreationTime = 0;
-        long oldestKeyTime = 0;
-        Map<Long, Long> formatVersions = new HashMap<>();
-        Map<Long, Long> fixedKeyLengths = new HashMap<>();
-        Map<Long, Long> indexKeysAreUserKeys = new HashMap<>();
-        Map<Long, Long> indexValuesAreDeltaEncoded = new HashMap<>();
-        Map<Long, Long> columnFamilyIds = new HashMap<>();
-        Map<String, Long> filterPolicies = new HashMap<>();
-        Map<String, Long> comparators = new HashMap<>();
-        Map<String, Long> mergeOperators = new HashMap<>();
-        Map<String, Long> prefixExtractors = new HashMap<>();
-        Map<String, Long> propertyCollectors = new HashMap<>();
-        Map<String, Long> compressions = new HashMap<>();
-        for (var p : tables) {
-            tableCount = Math.addExact(tableCount, 1);
-            dataSize = Math.addExact(dataSize, checkedTableProperty(p.getDataSize()));
-            indexSize = Math.addExact(indexSize, checkedTableProperty(p.getIndexSize()));
-            indexPartitions = Math.addExact(indexPartitions, checkedTableProperty(p.getIndexPartitions()));
-            topLevelIndexSize = Math.addExact(topLevelIndexSize, checkedTableProperty(p.getTopLevelIndexSize()));
-            filterSize = Math.addExact(filterSize, checkedTableProperty(p.getFilterSize()));
-            rawKeySize = Math.addExact(rawKeySize, checkedTableProperty(p.getRawKeySize()));
-            rawValueSize = Math.addExact(rawValueSize, checkedTableProperty(p.getRawValueSize()));
-            numDataBlocks = Math.addExact(numDataBlocks, checkedTableProperty(p.getNumDataBlocks()));
-            numEntries = Math.addExact(numEntries, checkedTableProperty(p.getNumEntries()));
-            numDeletions = Math.addExact(numDeletions, checkedTableProperty(p.getNumDeletions()));
-            numMergeOperands = Math.addExact(numMergeOperands, checkedTableProperty(p.getNumMergeOperands()));
-            numRangeDeletions = Math.addExact(numRangeDeletions, checkedTableProperty(p.getNumRangeDeletions()));
-            slowCompressionEstimatedDataSize = Math.addExact(slowCompressionEstimatedDataSize, checkedTableProperty(p.getSlowCompressionEstimatedDataSize()));
-            fastCompressionEstimatedDataSize = Math.addExact(fastCompressionEstimatedDataSize, checkedTableProperty(p.getFastCompressionEstimatedDataSize()));
-            oldestCreationTime = minimumKnownTableTime(oldestCreationTime, checkedTableProperty(p.getCreationTime()));
-            newestCreationTime = Math.max(newestCreationTime, checkedTableProperty(p.getCreationTime()));
-            oldestKeyTime = minimumKnownTableTime(oldestKeyTime, checkedTableProperty(p.getOldestKeyTime()));
-            formatVersions.merge(checkedTableProperty(p.getFormatVersion()), 1L, Math::addExact);
-            fixedKeyLengths.merge(checkedTableProperty(p.getFixedKeyLen()), 1L, Math::addExact);
-            indexKeysAreUserKeys.merge(checkedTableProperty(p.getIndexKeyIsUserKey()), 1L, Math::addExact);
-            indexValuesAreDeltaEncoded.merge(checkedTableProperty(p.getIndexValueIsDeltaEncoded()), 1L, Math::addExact);
-            columnFamilyIds.merge(checkedTableProperty(p.getColumnFamilyId()), 1L, Math::addExact);
-            filterPolicies.merge(p.getFilterPolicyName() == null ? "" : p.getFilterPolicyName(), 1L, Math::addExact);
-            comparators.merge(p.getComparatorName() == null ? "" : p.getComparatorName(), 1L, Math::addExact);
-            mergeOperators.merge(p.getMergeOperatorName() == null ? "" : p.getMergeOperatorName(), 1L, Math::addExact);
-            prefixExtractors.merge(p.getPrefixExtractorName() == null ? "" : p.getPrefixExtractorName(), 1L, Math::addExact);
-            propertyCollectors.merge(p.getPropertyCollectorsNames() == null ? "" : p.getPropertyCollectorsNames(), 1L, Math::addExact);
-            compressions.merge(p.getCompressionName() == null ? "" : p.getCompressionName(), 1L, Math::addExact);
-        }
-        return new ColumnTableProperties(
-                tableCount, dataSize, indexSize, indexPartitions,
-                topLevelIndexSize, filterSize, rawKeySize, rawValueSize,
-                numDataBlocks, numEntries, numDeletions, numMergeOperands,
-                numRangeDeletions, slowCompressionEstimatedDataSize, fastCompressionEstimatedDataSize, oldestCreationTime,
-                newestCreationTime, oldestKeyTime, formatVersions, fixedKeyLengths,
-                indexKeysAreUserKeys, indexValuesAreDeltaEncoded, columnFamilyIds, filterPolicies,
-                comparators, mergeOperators, prefixExtractors, propertyCollectors,
-                compressions);
-    }
-
-    private static long checkedTableProperty(long value) {
-        if (value < 0) throw new ArithmeticException("Unsigned table property exceeds signed long range");
-        return value;
-    }
-
-    private static long minimumKnownTableTime(long a, long b) {
-        return a == 0 ? b : b == 0 ? a : Math.min(a, b);
-    }
-
-    private Mono<Map<String, ColumnTableProperties>> collectTablePropertiesMetrics() {
-        // Schedule each column separately, so batch admission/pressure is rechecked between columns.
-        return Flux.fromIterable(List.copyOf(columns.entrySet()))
-                .concatMap(entry -> scheduleTracked(getSchedulerForColumn(entry.getKey()).scheduler(WorkloadProfile.BATCH,
-                        OperationFamily.FULL_SCAN_AGGREGATE, Long.MAX_VALUE), () -> {
-                    var column = entry.getValue();
-                    if (!tryBeginColumnUse(column)) return null; // An empty Mono skips retired columns.
-                    try {
-                        var properties = aggregateTableProperties(
-                                db.get().getPropertiesOfAllTables(column.cfh()).values());
-                        return Map.entry(new String(column.cfh().getName(), StandardCharsets.UTF_8), properties);
-                    } finally { column.endUse(); }
-                }), 1)
-                .collectMap(Map.Entry::getKey, Map.Entry::getValue);
-    }
 
     @Override
     public ColumnTableProperties getTableProperties(long columnId) {
-        ops.beginOp();
-        try (var use = acquireColumnUse(columnId)) {
-            // RocksDB owns a version reference during this call; the column lease prevents drop/close.
-            return aggregateTableProperties(db.get().getPropertiesOfAllTables(use.column().cfh()).values());
-        } catch (org.rocksdb.RocksDBException | ArithmeticException e) {
-            throw RocksDBException.of(RocksDBErrorType.GET_PROPERTY_ERROR, e);
-        } finally {
-            ops.endOp();
-        }
+    	return maintenance.getTableProperties(columnId);
     }
 
     @Override
     public SstMaintenance.Metadata getSstMetadata(long columnId, int level) {
-        ops.beginOp();
-        try (var use = acquireColumnUse(columnId)) {
-            return selectiveMetadata(use.column(), columnId, level);
-        } catch (org.rocksdb.RocksDBException e) {
-            throw RocksDBException.of(RocksDBErrorType.GET_PROPERTY_ERROR, e);
-        } finally { ops.endOp(); }
-    }
-
-    private SstMaintenance.Metadata selectiveMetadata(ColumnInstance column, long columnId, int level)
-            throws org.rocksdb.RocksDBException {
-        var name = new String(column.cfh().getName(), StandardCharsets.UTF_8);
-        // Resolve the same immutable volume configuration used when this CF was opened.
-        // Do not take columnEditLock after acquiring a lease: deletion holds it while draining.
-        try {
-            var global = config.global();
-            FallbackColumnConfig columnConfig = global.fallbackColumnOptions();
-            for (var named : global.columnOptions()) {
-                if (named.name().equals(name)) { columnConfig = named; break; }
-            }
-            var paths = path == null ? List.<String>of()
-                    : RocksDBLoader.getVolumeConfigs(definitiveDbPath, columnConfig).stream()
-                            .map(p -> p.path().toAbsolutePath().normalize().toString()).toList();
-            return SelectiveCompaction.metadata(db.get(), column.cfh(), paths,
-                    sstMaintenanceSession, columnId, level);
-        } catch (GestaltException e) {
-            throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);
-        }
+    	return maintenance.getSstMetadata(columnId, level);
     }
 
     @Override
     public SstMaintenance.Result compactFiles(SstMaintenance.Request request) {
-        Objects.requireNonNull(request, "request");
-        long start = System.nanoTime();
-        ops.beginOp();
-        try (var use = acquireColumnUse(request.columnId())) {
-            var observer = columnMaintenanceObserver;
-            if (observer != null) observer.run();
-            return SelectiveCompaction.compact(db.get(), use.column().cfh(),
-                    selectiveMetadata(use.column(), request.columnId(), request.level()), request);
-        } catch (org.rocksdb.RocksDBException e) {
-            var status = e.getStatus();
-            var type = status != null && (status.getCode() == org.rocksdb.Status.Code.Aborted
-                    || status.getCode() == org.rocksdb.Status.Code.InvalidArgument)
-                    ? RocksDBErrorType.COMPACTION_CONFLICT : RocksDBErrorType.COMPACTION_FAILED;
-            throw RocksDBException.of(type, e);
-        } finally {
-            ops.endOp();
-            compactTimer.record(System.nanoTime()-start, TimeUnit.NANOSECONDS);
-        }
+    	return maintenance.compactFiles(request);
     }
 
 	@Override
 	public void compact() {
-		var start = System.nanoTime();
-		ops.beginOp();
-		try {
-			actionLogger.logAction("Compact", start, null, null, null, null, null, null, null);
-			synchronized (columnEditLock) {
-				var observer = columnMaintenanceObserver;
-				if (observer != null) {
-					observer.run();
-				}
-				var db = this.db.get();
-				for (ColumnInstance value : columns.values()) {
-					if (value.cfh().isOwningHandle()) {
-						String columnName = new String(value.cfh().getName(), StandardCharsets.UTF_8);
-						ColumnFamilyOptions columnOptions = columnsConifg.get(columnName);
-						try (var cro = new CompactRangeOptions()
-								.setAllowWriteStall(false)
-								.setExclusiveManualCompaction(true)
-								.setChangeLevel(false)
-								.setTargetPathId(bottommostCompactionTargetPathId(columnOptions))
-								.setMaxSubcompactions(16)
-								.setBottommostLevelCompaction(BottommostLevelCompaction.kForceOptimized)) {
-							db.compactRange(value.cfh(), null, null, cro);
-						}
-					}
-				}
-			}
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
-		} finally {
-			ops.endOp();
-			var end = System.nanoTime();
-			compactTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		maintenance.compact();
 	}
 
 	@VisibleForTesting
@@ -11476,40 +2680,24 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@Override
 	public Map<String, ColumnSchema> getAllColumnDefinitions() throws RocksDBException {
-		var start = System.nanoTime();
-		ops.beginOp();
-		try {
-			actionLogger.logAction("GetAllColumnDefinitions", start, null, null, null, null, null, null, null);
-			return columnNamesIndex
-					.entrySet()
-					.stream()
-					.collect(Collectors.toMap(Entry::getKey, e -> columns.get(e.getValue()).schema()));
-		} catch (RocksDBException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, ex);
-		} finally {
-			ops.endOp();
-			var end = System.nanoTime();
-			getAllColumnDefinitionsTimer.record(end - start, TimeUnit.NANOSECONDS);
-		}
+		return columnOps.getAllColumnDefinitions();
 	}
 
-	private Buf dbGet(Tx tx, ColumnInstance col, ReadOptions readOptions, Buf calculatedKey)
+	Buf dbGet(Tx tx, ColumnInstance col, ReadOptions readOptions, Buf calculatedKey)
 			throws org.rocksdb.RocksDBException {
 		return dbGet(tx, col, readOptions, calculatedKey, false);
 	}
 
-	private Buf dbGet(Tx tx, ColumnInstance col, ReadOptions readOptions, Buf calculatedKey, boolean forUpdate)
+	Buf dbGet(Tx tx, ColumnInstance col, ReadOptions readOptions, Buf calculatedKey, boolean forUpdate)
 			throws org.rocksdb.RocksDBException {
 		long readStarted = System.nanoTime();
 		boolean recordRead = tx != null ? !(forUpdate || tx.isFromGetForUpdate()) : !fastGet;
 		try {
 			if (tx != null) {
 				byte[] previousRawBucketByteArray;
-				byte[] calculatedKeyArray = jniArray(calculatedKey);
+				byte[] calculatedKeyArray = EmbeddedDBWriteElision.jniArray(calculatedKey);
 				if (forUpdate || tx.isFromGetForUpdate()) {
-					previousRawBucketByteArray = pointGetForUpdate(tx, readOptions, col.cfh(), calculatedKeyArray);
+					previousRawBucketByteArray = writes.pointGetForUpdate(tx, readOptions, col.cfh(), calculatedKeyArray);
 				} else {
 					previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKeyArray);
 				}
@@ -11529,17 +2717,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 			}
 
-		} finally { if (recordRead) recordCompactionForegroundRead(readStarted, 0); }
+		} finally { if (recordRead) storageMetrics.recordCompactionForegroundRead(readStarted, 0); }
 	}
 
 	@Nullable
-	private Buf dbGetWithDefaultOptions(@Nullable Tx tx, ColumnInstance col, Buf calculatedKey)
+	Buf dbGetWithDefaultOptions(@Nullable Tx tx, ColumnInstance col, Buf calculatedKey)
 			throws org.rocksdb.RocksDBException {
 		return dbGetWithDefaultOptions(tx, col, calculatedKey, false);
 	}
 
 	@Nullable
-	private Buf dbGetWithDefaultOptions(@Nullable Tx tx, ColumnInstance col, Buf calculatedKey, boolean forUpdate)
+	Buf dbGetWithDefaultOptions(@Nullable Tx tx, ColumnInstance col, Buf calculatedKey, boolean forUpdate)
 			throws org.rocksdb.RocksDBException {
 		if (tx == null && fastGet) {
 			return dbGetFast(col.cfh(), calculatedKey);
@@ -11582,10 +2770,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							calculatedKey.getBackingByteArrayLength());
 			return toBuf(value);
 
-		} finally { recordCompactionForegroundRead(readStarted, 0); }
+		} finally { storageMetrics.recordCompactionForegroundRead(readStarted, 0); }
 	}
 
-	private ColumnInstance getColumn(long columnId) {
+	ColumnInstance getColumn(long columnId) {
 		var col = columns.get(columnId);
 		if (col != null) {
 			return col;
@@ -11594,7 +2782,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private ColumnInstance beginColumnUse(long columnId) {
+	ColumnInstance beginColumnUse(long columnId) {
 		var col = getColumn(columnId);
 		try {
 			col.beginUse();
@@ -11614,7 +2802,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private static boolean tryBeginColumnUse(ColumnInstance column) {
+	static boolean tryBeginColumnUse(ColumnInstance column) {
 		try {
 			column.beginUse();
 			return true;
@@ -11623,7 +2811,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private ColumnInstance.ColumnUse acquireColumnUse(long columnId) {
+	ColumnInstance.ColumnUse acquireColumnUse(long columnId) {
 		var col = getColumn(columnId);
 		final ColumnInstance.ColumnUse use;
 		try {
@@ -11644,13 +2832,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private void requireLiveTransaction(long updateId, Tx tx) {
+	void requireLiveTransaction(long updateId, Tx tx) {
 		if (txs.get(updateId) != tx || !tx.val().isOwningHandle()) {
 			throw RocksDBException.of(RocksDBErrorType.TRANSACTION_NOT_FOUND, "No transaction with id " + updateId);
 		}
 	}
 
-	private Tx getTransaction(long transactionId, boolean allowGetForUpdate) {
+	Tx getTransaction(long transactionId, boolean allowGetForUpdate) {
 		var tx = txs.get(transactionId);
 		if (tx != null) {
 			if (!allowGetForUpdate && tx.isFromGetForUpdate()) {
@@ -11664,7 +2852,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private Tx getTransaction(long transactionId,
+	Tx getTransaction(long transactionId,
 			boolean allowGetForUpdate,
 			WorkloadProfile requestedProfile) {
 		var tx = getTransaction(transactionId, allowGetForUpdate);
@@ -11716,7 +2904,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private void retainResourceLease() {
+	void retainResourceLease() {
 		for (;;) {
 			long current = resourceLeases.get();
 			if (current == Long.MAX_VALUE) {
@@ -11728,7 +2916,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private void releaseResourceLease() {
+	void releaseResourceLease() {
 		for (;;) {
 			long current = resourceLeases.get();
 			if (current == 0) {
@@ -11860,17 +3048,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return workloadSettings;
 	}
 
-	private AbstractSlice<?> toSlice(Buf calculatedKey) {
+	AbstractSlice<?> toSlice(Buf calculatedKey) {
 		return new Slice(calculatedKey.asArray());
 	}
 
-	private KV decodeKV(ColumnInstance col, Buf calculatedKey, Buf calculatedValue) {
+	KV decodeKV(ColumnInstance col, Buf calculatedKey, Buf calculatedValue) {
 		var keys = col.decodeKeys(calculatedKey, calculatedValue);
 		var value = col.decodeValue(calculatedValue);
 		return new KV(new Keys(keys), value);
 	}
 
-	private KV decodeBucketEntry(ColumnInstance col, Buf calculatedKey, Entry<Buf[], Buf> bucketEntry) {
+	KV decodeBucketEntry(ColumnInstance col, Buf calculatedKey, Entry<Buf[], Buf> bucketEntry) {
 		int keysCount = col.schema().keysCount();
 		Buf[] keys = new Buf[keysCount];
 		int firstVariableKeyIndex = keysCount - col.schema().variableLengthKeysCount();
@@ -11885,7 +3073,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return new KV(new Keys(keys), bucketEntry.getValue());
 	}
 
-	private static long decodedKVBytes(KV kv) {
+	static long decodedKVBytes(KV kv) {
 		long bytes = kv.value() != null ? kv.value().size() : 0L;
 		for (var key : kv.keys().keys()) {
 			bytes = saturatingAdd(bytes, key.size());
@@ -11893,7 +3081,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return bytes;
 	}
 
-	private static long saturatingAdd(long left, long right) {
+	static long saturatingAdd(long left, long right) {
 		return right >= Long.MAX_VALUE - left ? Long.MAX_VALUE : left + right;
 	}
 
@@ -11907,7 +3095,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return metrics.getRegistry();
 	}
 
-	private static interface ActionLoggerConsumer {
+	static interface ActionLoggerConsumer {
 
 		void logAction(String action,
 				long actionId,
@@ -11925,11 +3113,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * actual task completion. Cancellation stops delivery to the subscriber but does
 	 * not pretend that an already queued or running JNI call has finished.
 	 */
-	private <T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target, Callable<T> callable) {
+	<T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target, Callable<T> callable) {
 		return scheduleTracked(target, callable, null, 0L);
 	}
 
-	private <T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target,
+	<T> Mono<T> scheduleTracked(reactor.core.scheduler.Scheduler target,
 			Callable<T> callable,
 			@Nullable Consumer<? super T> lateSuccessCleanup,
 			long estimatedBytes) {
@@ -12071,87 +3259,5 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						"Task scheduling failed after subscriber cancellation");
 			}
 		});
-	}
-	private void printStartupInfo() {
-		if (!Boolean.parseBoolean(System.getProperty("rockserver.core.print-config", "true"))) {
-			return;
-		}
-
-		StringBuilder sb = new StringBuilder();
-
-		// Columns
-		sb.append("\n");
-		ConsoleTable columnsTable = new ConsoleTable();
-		columnsTable.setHeaders("ID", "Name", "Schema", "Merge Operator");
-
-		var sortedCols = new ArrayList<>(this.columns.values());
-		sortedCols.sort(Comparator.comparingLong(c -> c.cfh().getID()));
-
-		for (var col : sortedCols) {
-			long id = col.cfh().getID();
-			String name;
-			try {
-				name = new String(col.cfh().getName(), StandardCharsets.UTF_8);
-			} catch (Exception e) {
-				name = "???";
-			}
-			String schema = formatSchema(col.schema());
-			String mergeOp = formatMergeOp(col);
-
-			columnsTable.addRow(String.valueOf(id), name, schema, mergeOp);
-		}
-
-		// Show unconfigured columns (exist in RocksDB but have no stored schema)
-		for (var entry : unconfiguredColumns.entrySet()) {
-			long id = entry.getValue().getID();
-			columnsTable.addRow(String.valueOf(id), entry.getKey(), "<unconfigured>", "-");
-		}
-
-		sb.append(columnsTable.toString());
-
-		// Merge Operators
-		sb.append("\n");
-		ConsoleTable opsTable = new ConsoleTable();
-		opsTable.setHeaders("Name", "Version", "Class");
-
-		var ops = mergeOperatorRegistry.listAll();
-		ops.sort(Comparator.comparing(MergeOperatorRegistry.MergeOperatorInfo::name).thenComparingLong(MergeOperatorRegistry.MergeOperatorInfo::version));
-
-		for (var op : ops) {
-			opsTable.addRow(op.name(), String.valueOf(op.version()), op.className());
-		}
-		sb.append(opsTable.toString());
-
-		logger.info("Startup Information:{}", sb.toString());
-	}
-
-	private String formatSchema(ColumnSchema s) {
-		StringBuilder sb = new StringBuilder();
-		sb.append("Fixed:").append(s.fixedLengthKeysCount());
-		if (!s.variableTailKeys().isEmpty()) {
-			sb.append(", Var:[");
-			for (int i=0; i<s.variableTailKeys().size(); i++) {
-				if (i>0) sb.append(",");
-				sb.append(s.variableTailKeys().get(i).name());
-			}
-			sb.append("]");
-		}
-		sb.append(", Val:").append(s.hasValue() ? "Y" : "N");
-		return sb.toString();
-	}
-
-	private String formatMergeOp(ColumnInstance col) {
-		var s = col.schema();
-		if (s.mergeOperatorName() != null) {
-			return s.mergeOperatorName() + " (v" + s.mergeOperatorVersion() + ")";
-		}
-		if (s.mergeOperatorClass() != null) {
-			String cls = s.mergeOperatorClass();
-			return cls.substring(cls.lastIndexOf('.') + 1);
-		}
-		if (col.mergeOperator() != null) {
-			return "Configured (" + col.mergeOperator().getClass().getSimpleName() + ")";
-		}
-		return "-";
 	}
 }

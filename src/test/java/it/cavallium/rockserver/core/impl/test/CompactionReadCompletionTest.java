@@ -8,7 +8,9 @@ import static org.mockito.Mockito.*;
 
 class CompactionReadCompletionTest {
     private long[] sample(Statistics statistics) throws Exception {
-        var method = EmbeddedDB.class.getDeclaredMethod("sampleCompactionReadCompletion", Statistics.class);
+        // Lives in EmbeddedDBStorageMetrics, the package-private metrics part of EmbeddedDB.
+        var owner = Class.forName(EmbeddedDB.class.getPackageName() + ".EmbeddedDBStorageMetrics");
+        var method = owner.getDeclaredMethod("sampleCompactionReadCompletion", Statistics.class);
         method.setAccessible(true);
         var result = method.invoke(null, statistics);
         var values = new long[3];

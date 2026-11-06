@@ -144,12 +144,12 @@ class WorkloadGroupsTest {
             var controller = controllerField.get(internal);
             var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
             var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
-            var sampleMethod = internal.getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            var sampleMethod = part(internal, "storageMetrics").getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
             sampleMethod.setAccessible(true);
             var executorField = controller.getClass().getDeclaredField("executor"); executorField.setAccessible(true);
             var sampler = (java.util.concurrent.ScheduledExecutorService) executorField.get(controller);
             java.util.concurrent.Callable<it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample> sampleCall =
-                    () -> (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
+                    () -> (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
             var budgetField = controller.getClass().getDeclaredField("budget"); budgetField.setAccessible(true);
             var budget = budgetField.get(controller);
             var previousField = budget.getClass().getDeclaredField("previous"); previousField.setAccessible(true);
@@ -337,4 +337,15 @@ class WorkloadGroupsTest {
 			""" + extra);
 		return path;
 	}
+
+    /** A package-private part of EmbeddedDB (for example its storage metrics), read through its field. */
+    private static Object part(Object db, String field) {
+        try {
+            var f = db.getClass().getDeclaredField(field);
+            f.setAccessible(true);
+            return f.get(db);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
 }
