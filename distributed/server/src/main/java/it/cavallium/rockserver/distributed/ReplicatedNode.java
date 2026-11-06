@@ -150,6 +150,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		this.threads = new NodeThreads(config.nodeId());
 
 		var parameters = new Parameters();
+		parameters.put(CommitHeartbeats.PARAMETER, commitHeartbeats, CommitHeartbeats.class);
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
 		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress,
 				this::nodeState, this::readIndex, configDigest, this::answerOps));

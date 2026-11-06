@@ -39,10 +39,13 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.client.impl.OrderedAsync;
+import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.protocol.ClientId;
@@ -431,16 +434,23 @@ class RatisContractTest {
 	}
 
 	/**
-	 * CR2-3: {@link CommitHeartbeats} relies on this. With the node's Raft settings ({@link RaftSettings}: no commit
-	 * metadata entries, whose appends would carry the commit index by themselves; the read option LINEARIZABLE and the
-	 * leader's heartbeat check on), a follower learns that a new write is committed only with the next append or
-	 * heartbeat, and a read with Ratis' dummy message on the leader makes the appenders send that heartbeat at once.
-	 * Heartbeats come every 3 s here (half the minimum election timeout of 6 s); five times in a row, a follower must
-	 * learn the commit index of a new write within 600 ms of the trigger. The system property
-	 * {@code rockserver.test.commitTrigger=false} runs the same without the trigger, to see the wait it saves.
+	 * CR2-3, R6-1: {@link CommitHeartbeats} relies on this. With the node's Raft settings ({@link RaftSettings}: no commit
+	 * metadata entries, whose appends would carry the commit index by themselves, and {@link CommitHeartbeats.Rpc} as the
+	 * transport), a follower learns that a new write is committed only with the next append or heartbeat, and
+	 * {@link CommitHeartbeats#send} on the leader makes its appenders send that heartbeat at once. Heartbeats come every
+	 * 3 s here (half the minimum election timeout of 6 s); twenty times in a row, both followers must learn the commit
+	 * index of a new write within 600 ms of the trigger, and a write without a trigger must reach them only with the
+	 * heartbeat, after more than a second (if Ratis ever sends the commit index alone, the class is no longer needed).
+	 *
+	 * <p>The system property {@code rockserver.test.commitTrigger} picks the trigger: {@code appender} (the default) is
+	 * {@link CommitHeartbeats}; {@code ratis} is what it did before R6-1, a read with Ratis' dummy message on the leader,
+	 * whose heartbeat round ({@code LogAppender.triggerHeartbeat}) carries commit index 0 to a follower with an append in
+	 * flight, so that follower waits for the next heartbeat (with this, the test fails nearly every run); {@code none}
+	 * sends no trigger, to see the wait it saves, and asserts nothing.</p>
 	 */
 	@Test
-	void aDummyReadOnTheLeaderSendsTheCommitIndexAtOnce() throws Exception {
+	void aCommitHeartbeatSendsTheCommitIndexAtOnce() throws Exception {
+		var mode = System.getProperty("rockserver.test.commitTrigger", "appender");
 		var peerConfigs = new ArrayList<PeerConfig>();
 		var ports = ProcessCluster.freePorts(3, List.of());
 		for (int port : ports) {
@@ -451,16 +461,32 @@ class RatisContractTest {
 			peers.add(RaftPeer.newBuilder().setId(peer.id()).setAddress(peer.raftHost() + ":" + peer.raftPort()).build());
 		}
 		var group = RaftGroup.valueOf(groupId, peers);
+		var heartbeats = new ArrayList<CommitHeartbeats>();
 		for (int i = 0; i < peers.size(); i++) {
 			var config = NodeConfig.defaults(peerConfigs.get(i).id(), peerConfigs, tempDir.resolve(peerConfigs.get(i).id()))
 					.withElectionTimeouts(Duration.ofSeconds(6), Duration.ofSeconds(12));
 			var properties = RaftSettings.server(config);
 			assertFalse(RaftServerConfigKeys.Log.logMetadataEnabled(properties));
-			assertEquals(RaftServerConfigKeys.Read.Option.LINEARIZABLE, RaftServerConfigKeys.Read.option(properties));
-			assertTrue(RaftServerConfigKeys.Read.leaderHeartbeatCheckEnabled(properties));
+			assertInstanceOf(CommitHeartbeats.Rpc.class, RaftConfigKeys.Rpc.type(properties, _ -> {}));
 			RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMin(properties, TimeDuration.valueOf(300, TimeUnit.MILLISECONDS));
 			RaftServerConfigKeys.Rpc.setFirstElectionTimeoutMax(properties, TimeDuration.valueOf(600, TimeUnit.MILLISECONDS));
-			others.add(start(peers.get(i), group, properties, new GateStateMachine()));
+			var server = new AtomicReference<RaftServer>();
+			var memberHeartbeats = new CommitHeartbeats(server::get, groupId);
+			memberHeartbeats.enabled = mode.equals("appender");
+			heartbeats.add(memberHeartbeats);
+			var parameters = new Parameters();
+			parameters.put(CommitHeartbeats.PARAMETER, memberHeartbeats, CommitHeartbeats.class);
+			var member = RaftServer.newBuilder()
+					.setServerId(peers.get(i).getId())
+					.setGroup(group)
+					.setProperties(properties)
+					.setParameters(parameters)
+					.setStateMachine(new GateStateMachine())
+					.setOption(RaftStorage.StartupOption.FORMAT)
+					.build();
+			server.set(member);
+			member.start();
+			others.add(member);
 		}
 		RaftServer leader = null;
 		long deadline = System.nanoTime() + WAIT.toNanos();
@@ -475,11 +501,12 @@ class RatisContractTest {
 		}
 		assertNotNull(leader, "a ready leader");
 		var leaderServer = leader;
-		var follower = others.stream().filter(member -> member != leaderServer).findFirst().orElseThrow();
-		var trigger = new CommitHeartbeats(() -> leaderServer, groupId);
-		trigger.enabled = Boolean.parseBoolean(System.getProperty("rockserver.test.commitTrigger", "true"));
+		var trigger = heartbeats.get(others.indexOf(leaderServer));
+		assertEquals(2, trigger.appenders(), "the leader appends to its followers with CommitHeartbeats.Appender");
+		var followers = others.stream().filter(member -> member != leaderServer).toList();
+		var dummyReads = new AtomicLong();
 		var lags = new ArrayList<Long>();
-		for (int i = 0; i < 5; i++) {
+		for (int i = 0; i < 21; i++) {
 			var reply = leaderServer.submitClientRequestAsync(RaftClientRequest.newBuilder()
 					.setClientId(ClientId.randomId())
 					.setServerId(leaderServer.getId())
@@ -491,18 +518,40 @@ class RatisContractTest {
 			assertTrue(reply.isSuccess());
 			long target = leaderServer.getDivision(groupId).getRaftLog().getLastCommittedIndex();
 			long start = System.nanoTime();
-			trigger.send();
-			var followerLog = follower.getDivision(groupId).getRaftLog();
-			while (followerLog.getLastCommittedIndex() < target) {
-				assertTrue(System.nanoTime() - start < WAIT.toNanos(), "the follower learns the commit index");
-				Thread.sleep(0, 200_000);
+			// The last write gets no trigger: it shows the wait that the trigger saves.
+			boolean last = i == 20;
+			if (!last && mode.equals("appender")) {
+				trigger.send();
+			} else if (!last && mode.equals("ratis")) {
+				leaderServer.submitClientRequestAsync(RaftClientRequest.newBuilder()
+						.setClientId(ClientId.randomId())
+						.setServerId(leaderServer.getId())
+						.setGroupId(groupId)
+						.setCallId(dummyReads.incrementAndGet())
+						.setMessage(OrderedAsync.DUMMY)
+						.setType(RaftClientRequest.readRequestType())
+						.build());
+			}
+			for (var follower : followers) {
+				var followerLog = follower.getDivision(groupId).getRaftLog();
+				while (followerLog.getLastCommittedIndex() < target) {
+					assertTrue(System.nanoTime() - start < WAIT.toNanos(), "the follower learns the commit index");
+					Thread.sleep(0, 200_000);
+				}
 			}
 			lags.add(TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start));
 		}
-		System.out.println("Commit index on a follower after " + (trigger.enabled ? "a trigger" : "no trigger") + ", us: "
-				+ lags);
-		if (trigger.enabled) {
-			assertTrue(lags.stream().allMatch(lag -> lag < 600_000), lags::toString);
+		var triggered = lags.subList(0, 20);
+		long untriggered = lags.getLast();
+		System.out.println("Commit index on both followers after a trigger (" + mode + "), us: " + triggered
+				+ "; without one: " + untriggered + " us; heartbeats sent for it: " + trigger.heartbeats());
+		if (!mode.equals("none")) {
+			assertTrue(triggered.stream().allMatch(lag -> lag < 600_000), triggered::toString);
+		}
+		if (mode.equals("appender")) {
+			assertTrue(trigger.heartbeats() > 0, "the appenders sent heartbeats of their own");
+			assertTrue(untriggered > 1_000_000, () -> "without a trigger, the commit index came after " + untriggered
+					+ " us, before the heartbeat: Ratis sends it by itself now, and CommitHeartbeats may be unneeded");
 		}
 	}
 

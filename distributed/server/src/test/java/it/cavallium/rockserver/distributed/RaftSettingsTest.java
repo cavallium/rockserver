@@ -1,12 +1,14 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.server.RaftServerConfigKeys;
@@ -19,9 +21,15 @@ class RaftSettingsTest {
 		return RaftSettings.server(NodeConfig.defaults("a", List.of(peer), Path.of("unused")));
 	}
 
-	/** CR2-3: CommitHeartbeats triggers heartbeats through Ratis' linearizable read path with its heartbeat check. */
+	/** R6-1: the leader appends with CommitHeartbeats' appender, which can send the commit index to a follower at once. */
 	@Test
-	void theReadPathThatCommitHeartbeatsTriggersIsOn() {
+	void theServerAppendsWithCommitHeartbeats() {
+		assertInstanceOf(CommitHeartbeats.Rpc.class, RaftConfigKeys.Rpc.type(server(), _ -> {}));
+	}
+
+	/** Reads use ReadBarrier, but Ratis' own read path stays strict. */
+	@Test
+	void ratisOwnReadPathStaysStrict() {
 		var properties = server();
 		assertEquals(RaftServerConfigKeys.Read.Option.LINEARIZABLE, RaftServerConfigKeys.Read.option(properties));
 		assertTrue(RaftServerConfigKeys.Read.leaderHeartbeatCheckEnabled(properties));
