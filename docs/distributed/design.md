@@ -961,7 +961,11 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   instead of keeping another database for good. A missing file, an extra one, a truncated copy or a copy taken at
   another moment differ; a table file damaged without a change of size does not. Copies made with `cp -a` or `rsync`
   of the stopped database agree. A replica that recorded nothing (its first start was of an older version) logs that
-  it cannot check and goes on. Older `Genesis` entries, and those of clusters that are not seeded, carry no digest, and
+  it cannot check and goes on. A first start can fail after the digest is recorded but before Raft made its group
+  directory (a partial copy that RocksDB refuses, a refused config, the start-up check found a cluster id): the
+  operator may then copy the seed again. So the start-up check, after it opened and closed the database, also records
+  the digest of the files as it left them, and a later first start keeps the recorded digest only while `db/` holds the
+  files of either digest; otherwise it takes the digest again and logs it. Older `Genesis` entries, and those of clusters that are not seeded, carry no digest, and
   keep their bytes (the digest comes with a new entry tag that older versions cannot read, which matters only for a
   cluster created while nodes of an older version run).
 - **Migrating from a single node.** Stop it and copy its database directory to every node. Every replica takes a
@@ -1036,7 +1040,8 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   supervisor starts again exits with 4 before it serves anything: the configuration in its log leaves it out (usually
   the joint configuration of its removal, with the node in the old half only, since the final one goes to the members
   that stay), and it was started without `--join` or was a member once (it writes `raft/member` when a configuration
-  from the log makes it one). With systemd, `RestartPreventExitStatus=4` keeps it down. A node of a version before
+  from the log makes it one, after the leader checks of each maintenance tick and on its own, so that a failed write,
+  such as on a full disk, does not keep a stalled leader in place). With systemd, `RestartPreventExitStatus=4` keeps it down. A node of a version before
   this, started with `--join`, has no `raft/member` and still stays up in the initializing state, printing `READY`; it
   says so in its log as above. One start is refused wrongly: a node that holds a joint configuration of its own
   removal that its leader never committed before losing its leadership. Only a node that was being removed gets there;
@@ -1110,7 +1115,9 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
      is, since it belongs to the old cluster and a node without Raft state refuses it. On a stopped node,
      `ReplicatedServerMain export-seed --data-dir DIR --target NEW [--rockserver-config FILE]` writes a copy (table files
      hard-linked when `NEW` is on the same file system) without the replication metadata, cluster id, applied position,
-     results and sessions, and prints the applied index and term of the replica. Pick the replica with the highest one,
+     results and sessions, and prints the applied index and term of the replica. It builds the copy's config before
+     it writes anything (an absolute `volume-path` under the source `db/` becomes the same path relative to the copy),
+     so a refused config leaves no half-made target. Pick the replica with the highest one,
      and seed a new cluster with its copy ("Migrating from a single node"). What the replica had not flushed, and all that
      only a Raft log holds, is lost: no tool reads it out. `StartupChecksTest` checks that the copy holds the data and
      no cluster; seeding a whole cluster from it is the seeded start that `MembershipTest` covers. This is a last
@@ -1269,7 +1276,7 @@ failover" below).
 | `IsolatedNodeTest` | A client listing every node, connected to a node that gets isolated (the leader, or a follower), moves to the majority and keeps working, and the isolated node listens and serves again after the heal. With every node isolated all pause, and after the heal all resume and the client recovers by itself. An election shorter than the bound pauses no node. A follower restarted while cut off pauses too, and the client that lists it first moves. A cluster killed or stopped as a whole and restarted at once serves again, a paused node takes part in the election, and a node of a new cluster does not pause. A node that lost its database and kept its log pauses, and a client that starts during a cold start waits for the cluster, also past a frozen node. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history, hot counters included, is linearizable. |
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. A freeze longer than `--jvm-pause-limit-ms` ends the node with exit code 3, and it starts again. |
-| `StartupChecksTest`, `StartupClusterTest` (in-process) | The config digest ignores layout and key order; a column volume outside `db/` is refused before it is created; copies of one seed share a digest that a truncated copy and an opened database do not, and a replica with another seed than the leader stops at genesis while copies of one seed start a cluster; `export-seed`'s copy holds the data with no cluster and no position; a direct-memory error made in Java code reaches the JFR watch; `run` refuses a JVM without `-XX:+ExitOnOutOfMemoryError`; a removed node refuses to start again, also with `--join`; a node with a wrong API port for the leader forwards to the port the leader names. |
+| `StartupChecksTest`, `StartupClusterTest` (in-process) | The config digest ignores layout and key order; a column volume outside `db/` is refused before it is created; copies of one seed share a digest that a truncated copy and an opened database do not, and a digest recorded by a failed first start is kept after the start-up check opened the database but taken again after `db/` is replaced, and a replica with another seed than the leader stops at genesis while copies of one seed start a cluster; `export-seed`'s copy holds the data with no cluster and no position, also with an absolute volume path inside `db/`, and a refused target config leaves no target; a direct-memory error made in Java code reaches the JFR watch; `run` refuses a JVM without `-XX:+ExitOnOutOfMemoryError`; a removed node refuses to start again, also with `--join`; a node with a wrong API port for the leader forwards to the port the leader names. |
 | `ClusterIdentityTest` | Each genesis gets its own id, and a second `Genesis` in a log changes nothing. A node that elected itself under the same group id, added with Ratis' own client, stops before the configuration changes, and writes go on. What `add-peer` refuses. |
 | `RatisContractTest` | The Ratis 3.3.1 behaviors that the design relies on beyond its API, against a real single-node server: the bootstrap and configuration meta files that `--join` safety reads, the open segment format that `RaftLogRepair` rewrites, the type of the full-pending-queue refusal, and a state machine refusal that reaches a remote client by class name and message, without a step down. |
 | `RaftSettingsTest`, `ByteAdmissionTest`, `ConflictPositionsTest` | Snapshot chunks stay at most 4 s on the heap; Ratis' pending-request limits hold every node's attempts and stay near the defaults; one entry of the largest size fits every limit on its way. The byte admission never exceeds its limit and is sized from the heap. Conflict positions survive the exception that Ratis rebuilds, and a text that does not parse is a conflict of the whole entry. |
@@ -1351,9 +1358,14 @@ flag on, that an update chained after each fault, and with the flag off that non
 6. **Operations.**
    - RocksDB's Java binding extracts its 17 MB native library into the temporary directory at every start, and a
      killed JVM leaves it behind: on a test machine 2,099 such files filled a `/tmp` quota, and new nodes then could
-     not start. So `run` uses `DATA-DIR/tmp` as its temporary directory unless `-Djava.io.tmpdir` is given, and deletes
-     the copies of the library that earlier runs left there (a loaded library stays usable when its file is deleted). A
-     given `-Djava.io.tmpdir` outside the data directory is warned about.
+     not start. So, unless `-Djava.io.tmpdir` is given, `run` extracts the library into `DATA-DIR/tmp` itself
+     (`NativeLibraryLoader.loadLibrary(dir)`, before any RocksDB class loads; `RocksDB.loadLibrary()` then finds it
+     loaded), and deletes the copies that earlier runs left there (a loaded library stays usable when its file is
+     deleted). Setting `java.io.tmpdir` while the JVM runs would not do this: the JDK reads the property once, at
+     start-up, and `File.createTempFile`, which RocksDB uses when no directory is given, keeps the start-up value.
+     `run` still sets the property to `DATA-DIR/tmp`, for libraries that read it later (Netty's native transports);
+     the replica's own config file is written next to the database, not in the temporary directory. A given
+     `-Djava.io.tmpdir` outside the data directory is warned about.
    - Metrics and alerts: role, term, commit and apply lag, snapshot age, follower lag, replica failure exit.
      Today the replication timers (`NodeMetrics`) are only logged. The existing `rocksdb_operation_timer`
      changes meaning on a cluster: replicated writes are counted on every node when applied (with the internal

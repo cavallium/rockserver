@@ -93,14 +93,46 @@ class StartupChecksTest {
 		Files.write(sst, java.util.Arrays.copyOf(Files.readAllBytes(sst), (int) Files.size(sst) - 1));
 		assertNotEquals(digest, NodeStore.recordSeedDigest(truncated));
 
-		// Recorded once: opening the database changes its files, not the recorded digest.
+		// Recorded once: the start-up check's open changes the files, not the recorded digest.
 		NodeStore.open(copyA, null, "a").close();
+		NodeStore.noteSeedOpened(copyA);
 		assertNotEquals(digest, NodeStore.databaseFilesDigest(copyA));
+		assertEquals(digest, NodeStore.recordSeedDigest(copyA));
 		assertEquals(digest, NodeStore.recordSeedDigest(copyA));
 		try (var store = NodeStore.open(copyA, null, "a")) {
 			assertEquals(digest, store.seedDigest());
 		}
 		assertNull(NodeStore.recordSeedDigest(tempDir.resolve("empty/db")));
+	}
+
+	/**
+	 * A first start that failed after recording the digest of a partial copy: the operator copies the seed again, and the
+	 * next first start takes the digest of what db/ holds now, not the stale one.
+	 */
+	@Test
+	void aSeedCopiedAgainAfterAFailedFirstStartGetsANewDigest() throws IOException {
+		var seed = tempDir.resolve("seed");
+		try (var store = NodeStore.open(seed, null, "seed")) {
+			long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			for (int i = 0; i < 100; i++) {
+				NodeStoreTest.put(store, column, i, "v" + i);
+			}
+		}
+		var good = tempDir.resolve("good/db");
+		copy(seed, good);
+		var digest = NodeStore.recordSeedDigest(good);
+
+		var node = tempDir.resolve("node/db");
+		copy(seed, node);
+		Files.delete(largestFile(node, ".sst"));
+		var partial = NodeStore.recordSeedDigest(node);
+		assertNotEquals(digest, partial);
+		assertEquals(partial, NodeStore.recordSeedDigest(node), "a retry with the same files changed the digest");
+
+		deleteTree(node);
+		copy(seed, node);
+		assertEquals(digest, NodeStore.recordSeedDigest(node));
+		assertEquals(digest, NodeStore.readSeedDigest(node));
 	}
 
 	/** DD-19: a replica's database becomes a seed: same data, no replication metadata, so a new cluster accepts it. */
@@ -135,6 +167,104 @@ class StartupChecksTest {
 		try (var store = NodeStore.open(replica, null, "replica")) {
 			assertEquals("old-cluster", store.clusterId());
 			assertEquals(Map.of(0, "v0"), Map.of(0, NodeStoreTest.contents(store, column).get(0)));
+		}
+	}
+
+	/**
+	 * export-seed with an absolute volume path inside the source database: the copy opens its own volume. A config the
+	 * copy cannot use is refused before anything is written.
+	 */
+	@Test
+	void exportSeedHandlesAbsoluteVolumePathsAndLeavesNoTargetWhenRefused() throws IOException {
+		var replica = tempDir.resolve("node/db").toAbsolutePath();
+		var config = tempDir.resolve("absolute.conf");
+		Files.writeString(config, """
+				database.global.fallback-column-options.volumes = [
+				  { volume-path: "%s", target-size: "10TiB" }
+				]
+				""".formatted(replica.resolve("volume")));
+		long column;
+		try (var store = NodeStore.open(replica, config, "replica")) {
+			column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			for (int i = 0; i < 20; i++) {
+				NodeStoreTest.put(store, column, i, "v" + i);
+			}
+			NodeStoreTest.setClusterId(store, "old-cluster");
+			store.db().flush();
+		}
+		var target = tempDir.resolve("seed").toAbsolutePath();
+		NodeStore.exportSeed(replica, config, target);
+		// The source's volume holds the source's tables; the copy has its own under target/volume.
+		var relative = tempDir.resolve("relative.conf");
+		Files.writeString(relative, """
+				database.global.fallback-column-options.volumes = [
+				  { volume-path: "./volume", target-size: "10TiB" }
+				]
+				""");
+		try (var seed = NodeStore.open(target, relative, "seed")) {
+			assertNull(seed.clusterId());
+			assertEquals(20, NodeStoreTest.contents(seed, seed.db().getColumnId(NodeStoreTest.DATA_COLUMN)).size());
+		}
+		try (var store = NodeStore.open(replica, config, "replica")) {
+			assertEquals("old-cluster", store.clusterId());
+		}
+
+		// A volume outside both databases: refused before the checkpoint, so the export can be run again.
+		var outside = tempDir.resolve("outside.conf");
+		Files.writeString(outside, """
+				database.global.column-options = [
+				  { name: "other", volumes: [ { volume-path: "%s", target-size: "10TiB" } ] }
+				]
+				""".formatted(tempDir.resolve("elsewhere").toAbsolutePath()));
+		var refused = tempDir.resolve("refused");
+		assertThrows(IOException.class, () -> NodeStore.exportSeed(replica, outside, refused));
+		assertFalse(Files.exists(refused), "a half-made target");
+		try (var leftovers = Files.list(tempDir)) {
+			assertTrue(leftovers.noneMatch(path -> path.getFileName().toString().startsWith("rockserver-replica-")));
+		}
+	}
+
+	/**
+	 * DD-6a: without -Djava.io.tmpdir the RocksDB library is extracted into DATA-DIR/tmp, not into the JDK's temporary
+	 * directory, which a property set while the JVM runs does not move. One short JVM that loads the library.
+	 */
+	@Test
+	void theRocksDbLibraryIsExtractedIntoTheDataDirectory() throws Exception {
+		var jdkTemporary = Files.createDirectories(tempDir.resolve("jdk-tmp"));
+		var dataDir = tempDir.resolve("node");
+		Files.createDirectories(dataDir.resolve("tmp"));
+		var stale = Files.writeString(dataDir.resolve("tmp/librocksdbjni123456.so"), "left by a killed JVM");
+		var command = List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+				"-cp", System.getProperty("java.class.path"),
+				"-Djava.io.tmpdir=" + jdkTemporary,
+				LoadLibrary.class.getName(), dataDir.toString(), jdkTemporary.toString());
+		var process = new ProcessBuilder(command).redirectErrorStream(true).start();
+		var output = new String(process.getInputStream().readAllBytes());
+		assertTrue(process.waitFor(60, TimeUnit.SECONDS));
+		assertEquals(0, process.exitValue(), output);
+		assertTrue(output.contains("node: [librocksdbjni"), output);
+		assertTrue(output.contains("jdk: []"), output);
+		assertFalse(Files.exists(stale), "the copy of an earlier run is still there");
+	}
+
+	/** Run by {@link #theRocksDbLibraryIsExtractedIntoTheDataDirectory} in its own JVM, where RocksDB is not loaded. */
+	public static final class LoadLibrary {
+		public static void main(String[] args) throws Exception {
+			var dataDir = Path.of(args[0]);
+			ReplicatedServerMain.useNodeTemporaryDirectory(dataDir, false);
+			org.rocksdb.RocksDB.loadLibrary();
+			try (var options = new org.rocksdb.Options()) {
+				options.setCreateIfMissing(true);
+			}
+			System.out.println("node: " + names(dataDir.resolve("tmp")));
+			System.out.println("jdk: " + names(Path.of(args[1])));
+		}
+
+		private static List<String> names(Path directory) throws IOException {
+			try (var files = Files.list(directory)) {
+				return files.map(path -> path.getFileName().toString()).filter(name -> name.contains("rocksdbjni"))
+						.sorted().toList();
+			}
 		}
 	}
 
@@ -198,6 +328,14 @@ class StartupChecksTest {
 				} else {
 					Files.copy(path, destination);
 				}
+			}
+		}
+	}
+
+	private static void deleteTree(Path root) throws IOException {
+		try (Stream<Path> walk = Files.walk(root)) {
+			for (Path path : walk.sorted(Comparator.reverseOrder()).toList()) {
+				Files.delete(path);
 			}
 		}
 	}

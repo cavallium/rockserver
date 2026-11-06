@@ -131,6 +131,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			// Before anything opens the database: copies of a seed are the same only until then.
 			NodeStore.recordSeedDigest(config.dbDir());
 			requireNoClusterData(config);
+			NodeStore.noteSeedOpened(config.dbDir());
 		} else if (config.join() && startedOutsideJoin()) {
 			throw new IOException("Node " + config.nodeId() + " was started without --join: "
 					+ raftMetaFile(BOOTSTRAP_FILE) + " holds the peer list of that start, and Ratis uses it whatever this start"
@@ -418,7 +419,6 @@ public final class ReplicatedNode implements AutoCloseable {
 				return;
 			}
 			warnWhileInitializing(division);
-			recordMembership(division);
 			var log = division.getRaftLog();
 			long commitIndex = log.getLastCommittedIndex();
 			long term = division.getInfo().getCurrentTerm();
@@ -441,6 +441,16 @@ public final class ReplicatedNode implements AutoCloseable {
 			}
 		} catch (IOException | RuntimeException ex) {
 			LOG.warn("{}: failed to check Raft, retrying", config.nodeId(), ex);
+		}
+		// After the checks above, and on its own: a write that fails (a full disk) must not keep a stalled leader in place.
+		try {
+			var division = stateMachine.division();
+			if (!closed.get() && division != null && division.getInfo().isAlive()) {
+				recordMembership(division);
+			}
+		} catch (IOException | RuntimeException ex) {
+			LOG.warn("{}: failed to record its membership in {}, retrying", config.nodeId(),
+					config.raftDir().resolve(MEMBER_FILE), ex);
 		}
 	}
 

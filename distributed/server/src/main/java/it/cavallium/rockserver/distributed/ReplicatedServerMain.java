@@ -55,9 +55,8 @@ import org.jetbrains.annotations.Nullable;
  * <p>{@code run} exits with 4, and does not start, if the configuration in its log no longer contains the node: it was
  * removed from the cluster, and a supervisor must not start it again. See "Replacing a node" in the design document.</p>
  *
- * <p>Unless {@code -Djava.io.tmpdir} is given, {@code run} uses {@code DATA-DIR/tmp} as the temporary directory, and
- * deletes the copies of the RocksDB library that earlier runs left there; a given one outside the data directory is
- * warned about.</p>
+ * <p>Unless {@code -Djava.io.tmpdir} is given, {@code run} extracts the RocksDB library into {@code DATA-DIR/tmp}, and
+ * deletes the copies that earlier runs left there; a given one outside the data directory is warned about.</p>
  *
  * <p>{@code export-seed} runs on a stopped node and copies its database into a new directory that can seed a new
  * cluster, the last resort of "No quorum" in the design document (see {@link NodeStore#exportSeed}).</p>
@@ -209,12 +208,21 @@ public final class ReplicatedServerMain {
 	/**
 	 * RocksDB's Java binding extracts its native library (17 MB) into the temporary directory at every start, and a killed
 	 * JVM leaves it behind: on a shared {@code /tmp} with a quota, nodes then stop being able to start. Without an explicit
-	 * {@code -Djava.io.tmpdir} the node uses {@code DATA-DIR/tmp}, and deletes the copies left there by earlier runs (a
-	 * loaded library stays usable when its file is deleted).
+	 * {@code -Djava.io.tmpdir} the node extracts it into {@code DATA-DIR/tmp} itself, before any RocksDB class loads, and
+	 * deletes the copies left there by earlier runs (a loaded library stays usable when its file is deleted).
+	 *
+	 * <p>Setting {@code java.io.tmpdir} here does not move the JDK's own temporary files: the JDK reads the property once,
+	 * at VM start-up ({@code File.createTempFile} and {@code Files.createTempFile} keep the start-up value). It is set
+	 * for the libraries that read it when they need it, such as Netty for its native transports. Pass
+	 * {@code -Djava.io.tmpdir=DATA-DIR/tmp} to move everything.</p>
 	 */
 	private static void useNodeTemporaryDirectory(Path dataDir) throws IOException {
-		boolean explicit = ManagementFactory.getRuntimeMXBean().getInputArguments().stream()
-				.anyMatch(argument -> argument.startsWith("-Djava.io.tmpdir="));
+		useNodeTemporaryDirectory(dataDir, ManagementFactory.getRuntimeMXBean().getInputArguments().stream()
+				.anyMatch(argument -> argument.startsWith("-Djava.io.tmpdir=")));
+	}
+
+	/** See {@link #useNodeTemporaryDirectory(Path)}; {@code explicit} if {@code -Djava.io.tmpdir} was given. */
+	static void useNodeTemporaryDirectory(Path dataDir, boolean explicit) throws IOException {
 		var dataRoot = dataDir.toAbsolutePath().normalize();
 		if (explicit) {
 			var given = Path.of(System.getProperty("java.io.tmpdir")).toAbsolutePath().normalize();
@@ -232,6 +240,10 @@ public final class ReplicatedServerMain {
 				Files.deleteIfExists(entry);
 			}
 		}
+		// RocksDB.loadLibrary() asks the same loader with the ROCKSDB_SHAREDLIB_DIR directory (by default none, which
+		// means File.createTempFile, in the start-up java.io.tmpdir); once this call has loaded the library, that call
+		// finds it loaded and extracts nothing.
+		org.rocksdb.NativeLibraryLoader.getInstance().loadLibrary(temporary.toString());
 		System.setProperty("java.io.tmpdir", temporary.toString());
 	}
 

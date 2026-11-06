@@ -174,6 +174,17 @@ final class NodeStore implements Closeable {
 	 * the given Rockserver config (HOCON), or over the defaults when there is none.
 	 */
 	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir) throws IOException {
+		return replicaConfig(rockserverConfig, dbDir, null);
+	}
+
+	/**
+	 * Like {@link #replicaConfig(Path, Path)}, for a copy in {@code dbDir} of the database in {@code sourceDbDir} (when
+	 * not null): an absolute {@code volume-path} under {@code sourceDbDir} becomes the same path relative to the
+	 * database directory, so that the copy opens its own volumes. The file is made next to {@code dbDir}, not in the
+	 * JDK's temporary directory (see {@code ReplicatedServerMain}).
+	 */
+	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir)
+			throws IOException {
 		var config = ConfigFactory.parseString(REPLICA_OVERRIDES);
 		try {
 			if (rockserverConfig != null) {
@@ -181,11 +192,16 @@ final class NodeStore implements Closeable {
 						ConfigParseOptions.defaults().setAllowMissing(false)));
 			}
 			config = withReplicaWriteBuffers(config.resolve());
+			if (sourceDbDir != null) {
+				config = withRelativeVolumes(config, sourceDbDir);
+			}
 		} catch (ConfigException | IllegalArgumentException e) {
 			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
 		}
 		checkVolumesInside(config, dbDir);
-		Path file = Files.createTempFile("rockserver-replica-", ".conf");
+		Path parent = dbDir.toAbsolutePath().normalize().getParent();
+		Files.createDirectories(parent);
+		Path file = Files.createTempFile(parent, "rockserver-replica-", ".conf");
 		try {
 			Files.writeString(file, config.root().render(ConfigRenderOptions.concise()), StandardCharsets.UTF_8);
 		} catch (IOException | RuntimeException e) {
@@ -227,6 +243,48 @@ final class NodeStore implements Closeable {
 			result = result.withValue(columnsPath, ConfigValueFactory.fromIterable(columns));
 		}
 		return result;
+	}
+
+	/**
+	 * Rewrites every absolute {@code volume-path} (of {@code fallback-column-options} and of the entries of
+	 * {@code column-options}) that lies under {@code dbDir} into the same path relative to the database directory.
+	 */
+	static Config withRelativeVolumes(Config config, Path dbDir) {
+		Path root = dbDir.toAbsolutePath().normalize();
+		String fallbackPath = "database.global.fallback-column-options.volumes";
+		Config result = config;
+		if (config.hasPath(fallbackPath)) {
+			result = result.withValue(fallbackPath, relativeVolumes(config.getObjectList(fallbackPath), root));
+		}
+		String columnsPath = "database.global.column-options";
+		if (config.hasPath(columnsPath)) {
+			var columns = new ArrayList<ConfigValue>();
+			for (ConfigObject column : config.getObjectList(columnsPath)) {
+				if (column.toConfig().hasPath("volumes")) {
+					column = column.withValue("volumes", relativeVolumes(column.toConfig().getObjectList("volumes"), root));
+				}
+				columns.add(column);
+			}
+			result = result.withValue(columnsPath, ConfigValueFactory.fromIterable(columns));
+		}
+		return result;
+	}
+
+	private static ConfigValue relativeVolumes(List<? extends ConfigObject> volumes, Path root) {
+		var rewritten = new ArrayList<ConfigValue>();
+		for (ConfigObject volume : volumes) {
+			var config = volume.toConfig();
+			if (config.hasPath("volume-path")) {
+				Path path = Path.of(config.getString("volume-path"));
+				if (path.isAbsolute() && path.normalize().startsWith(root)) {
+					String relative = root.relativize(path.normalize()).toString();
+					volume = volume.withValue("volume-path",
+							ConfigValueFactory.fromAnyRef(relative.isEmpty() ? "." : "./" + relative));
+				}
+			}
+			rewritten.add(volume);
+		}
+		return ConfigValueFactory.fromIterable(rewritten);
 	}
 
 	/**
@@ -395,8 +453,17 @@ final class NodeStore implements Closeable {
 	}
 
 	static @Nullable String readSeedDigest(Path dbDir) throws IOException {
+		var lines = readSeedDigestLines(dbDir);
+		return lines.isEmpty() ? null : lines.getFirst();
+	}
+
+	/** The seed digest, then, once {@link #noteSeedOpened} ran, {@code opened <digest>}. Empty if there is no file. */
+	private static List<String> readSeedDigestLines(Path dbDir) throws IOException {
 		Path file = seedDigestFile(dbDir);
-		return Files.exists(file) ? Files.readString(file, StandardCharsets.UTF_8).strip() : null;
+		if (!Files.exists(file)) {
+			return List.of();
+		}
+		return Files.readString(file, StandardCharsets.UTF_8).strip().lines().map(String::strip).toList();
 	}
 
 	/** Next to the database directory, so that a restore, which swaps the database directory, keeps it. */
@@ -416,22 +483,55 @@ final class NodeStore implements Closeable {
 	 * another moment and a truncated copy; a table file damaged without a change of size goes unnoticed. {@code LOCK}
 	 * and the info logs ({@code LOG*}) are skipped.</p>
 	 *
+	 * <p>A first start can fail after the digest is recorded: before the database opens (a partial copy that RocksDB
+	 * refuses, a refused config), or after the start-up check opened and closed it ({@link #noteSeedOpened}) but before
+	 * Raft made its group directory. A recorded digest is kept only while the files are those it was taken from, or
+	 * those the start-up check left: otherwise the database was replaced since (the operator copied the seed again) and
+	 * the digest is taken again. Once Raft has its group directory the node no longer calls this.</p>
+	 *
 	 * @return the recorded digest, null if {@code dbDir} holds no database
 	 */
 	static @Nullable String recordSeedDigest(Path dbDir) throws IOException {
-		var recorded = readSeedDigest(dbDir);
-		if (recorded != null || !Files.isRegularFile(dbDir.resolve("CURRENT"))) {
+		var lines = readSeedDigestLines(dbDir);
+		String recorded = lines.isEmpty() ? null : lines.getFirst();
+		if (!Files.isRegularFile(dbDir.resolve("CURRENT"))) {
 			return recorded;
 		}
 		String digest = databaseFilesDigest(dbDir);
+		if (recorded != null) {
+			String opened = lines.size() > 1 && lines.get(1).startsWith("opened ")
+					? lines.get(1).substring("opened ".length()) : null;
+			if (digest.equals(recorded) || digest.equals(opened)) {
+				return recorded;
+			}
+			LOG.warn("The database in {} changed since its seed digest was recorded by an earlier first start that failed:"
+					+ " recording the digest of the files it holds now", dbDir);
+		}
+		writeSeedDigestFile(dbDir, digest + "\n");
+		return digest;
+	}
+
+	/**
+	 * Notes, next to the recorded seed digest, the digest of the files as the start-up check left them after it opened and
+	 * closed the database: a first start that fails after this point still keeps the seed digest (see
+	 * {@link #recordSeedDigest}). Does nothing when no seed digest was recorded.
+	 */
+	static void noteSeedOpened(Path dbDir) throws IOException {
+		String recorded = readSeedDigest(dbDir);
+		if (recorded == null || !Files.isRegularFile(dbDir.resolve("CURRENT"))) {
+			return;
+		}
+		writeSeedDigestFile(dbDir, recorded + "\nopened " + databaseFilesDigest(dbDir) + "\n");
+	}
+
+	private static void writeSeedDigestFile(Path dbDir, String content) throws IOException {
 		Path file = seedDigestFile(dbDir);
 		Path building = file.resolveSibling(file.getFileName() + ".tmp");
-		Files.writeString(building, digest + "\n", StandardCharsets.UTF_8);
+		Files.writeString(building, content, StandardCharsets.UTF_8);
 		syncFile(building);
 		Files.move(building, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
 				java.nio.file.StandardCopyOption.ATOMIC_MOVE);
 		syncDirectory(file.getParent());
-		return digest;
 	}
 
 	/** See {@link #recordSeedDigest}. */
@@ -505,13 +605,17 @@ final class NodeStore implements Closeable {
 		if (!Files.isRegularFile(dbDir.resolve("CURRENT"))) {
 			throw new IOException("No database in " + dbDir);
 		}
+		// The copy's config first: when it is refused, nothing has been written yet.
+		Path config = replicaConfig(rockserverConfig, target, dbDir);
 		TermIndex applied;
 		String clusterId;
 		try (var store = open(dbDir, rockserverConfig, "export-source")) {
 			clusterId = store.clusterId();
 			applied = store.checkpoint(target);
+		} catch (IOException | RuntimeException e) {
+			Files.deleteIfExists(config);
+			throw e;
 		}
-		Path config = replicaConfig(rockserverConfig, target);
 		try (var copy = new EmbeddedConnection(target, "export-target", config)) {
 			var db = copy.getEmbeddedDB();
 			if (db.getAllColumnDefinitions().containsKey(META_COLUMN)) {
