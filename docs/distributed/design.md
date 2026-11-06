@@ -1241,7 +1241,7 @@ failover" below).
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories, with read-modify-write updates and hot counters in them, are linearizable, and the transactional bank-transfer invariant holds. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
-| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
+| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close; see also "Targeted faults and component tests" below), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
 
 Run them all (about 20 minutes on a real disk):
 
@@ -1261,6 +1261,69 @@ mvn -o -B -f distributed/pom.xml -pl server -am test -Dtest='it.cavallium.rockse
 `-Drockserver.test.pipelinedUpdates=true` runs every test cluster with pipelined updates on. Hot counters also
 require, in both modes, that every key takes a new update well within a lease once the cluster settled, and, with the
 flag on, that an update chained after each fault, and with the flag off that none did. `HotKeyThroughputTest` runs only with `-Drockserver.test.slow=true`.
+
+### Targeted faults and component tests
+
+The suites above kill and cut at moments the test picks, but a kill there lands at a random point of the protocol.
+`CrashPoints` names the points that matter, and a test can halt a node exactly there: the node prints `CRASH POINT
+<name>` and calls `Runtime.halt` with exit code 99, which skips shutdown hooks, flushes and the leadership hand-off,
+as a SIGKILL at that instruction would. The points are: on the leader, in `preAppendTransaction` before Ratis appends
+a proposal (`BEFORE_APPEND`); a group of committed entries on the apply thread before it is applied (`BEFORE_APPLY`,
+on the leader the entries a majority holds and no client has an answer for); after the group was committed to the
+local database and before its replies and applied index are published (`AFTER_APPLY_BEFORE_REPLY`); as the node
+learns it won an election (`ELECTED`); a snapshot's checkpoint built and synced but not yet published
+(`SNAPSHOT_BUILT`); a snapshot published before Ratis learns of it (`SNAPSHOT_TAKEN`); a snapshot received from the
+leader before the database is closed for it (`INSTALL_RECEIVED`), and with the old database closed and the new one not
+restored yet (`INSTALL_RESTORING`); a joint configuration applied (`JOINT_CONFIGURATION_APPLIED`). Nothing is armed in
+production: each point costs one volatile read. The process tests start their nodes through `CrashPointMain`, which
+arms the point named in a file next to the node's data directory, so a test arms the node that holds a role at that
+moment (the current leader, the follower that won). The point "appended on the leader but not replicated" needs no
+hook: the test cuts the leader's links, lets clients write to it directly, and kills it.
+
+| Test | What it proves |
+|---|---|
+| `ProtocolPointKillTest` (processes) | Rounds drawn from a seeded generator (`-Drockserver.test.seed`, `-Drockserver.test.protocolKillRounds`, 12 by default): the leader halted before an append, between commit and apply, between apply and replies; any node halted at those points or in the middle of a snapshot; the winner of an election halted as it learns it won (both followers armed, the leader killed). After each round writes resume and the node restarts and catches up; at the end every acknowledged write is readable, no write answered "not applied" took effect, and the replicas are identical. A leader killed with entries in its log that no follower has (links cut first; the test checks its log is ahead) loses only unacknowledged writes, and drops them from its log when it rejoins. |
+| `LaggingInstallTest` (processes) | An existing member that lags past what the leader still holds catches up through a snapshot install. The leader of this cluster keeps its log for a follower that lags (purge only up to what every member committed), so the test builds the case where it cannot: the lagging follower is cut off while the other follower takes snapshots and purges its own log, and leadership moves to that follower. Variants: the lagging member halted after receiving the snapshot (`INSTALL_RECEIVED`) and while restoring it (`INSTALL_RESTORING`) restarts and catches up; the sending leader killed as soon as the lagging member starts receiving files leaves it to the next leader. The test fails if the lagging member caught up without an install. |
+| `MembershipFaultTest` (processes) | Node 4 joins under writes and a node halts in the joint configuration: the leader once the joint configuration is committed (node 4 ends a member), node 4 itself (the others complete the change without it, it rejoins after a restart), or the leader killed at a random moment of the change (the configuration ends plain, old or new, and node 4 can be added afterwards). The configuration never stays joint, no acknowledged write is lost, all members end identical. |
+| `SlowFollowerDiskTest` (in-process) | One follower's log worker sleeps 180 ms of every 200 ms (`LogWorkerGate.pause`) under 20 s of writes: the leader keeps its term, writes are acknowledged in every second, the follower falls behind (hundreds of entries) and catches up once its disk is fast again. The heap is printed; with three nodes in one JVM it only checks that it grows by less than their Ratis log caches. |
+| `LogWorkerGateContractTest` | The Ratis-private members that `LogWorkerGate` uses still exist, and on a real single node a blocked worker holds a write back and a pause delays one: a Ratis upgrade that breaks the gate fails here by name. |
+| `LongStreamSemanticsTest` (in-process) | A range stream outside a transaction is one point-in-time view of the leader's database, taken when its cursor opens: writes acknowledged while it runs (updates, deletes, inserts ahead of the cursor) are not in it, also when a follower forwards the stream. |
+| `ProposerCommitRetryTest` | Commits refused before the append for lack of room (Ratis' pending-request limit, or the commit lane's attempt permits held by commits Ratis has not answered) go back to the queue: they succeed once there is room, are not sent while there is none, and fail at their caller's deadline as not applied (`READ_DEADLINE_EXCEEDED`), never as unknown. |
+| `LeaderForwarderTest` | Leader lookups: another node is answered at once, this node only as a ready leader; a change wakes waiting lookups well before the poll; a leader that appears between the first check and the registration (its notification finding nobody) is seen by the check after the registration; no leader within the request timeout is a retryable overload. Connections: four per peer, used in turn; an invalidated connection is replaced while the other slots stay, and a stale invalidation does not drop a newer one; a refused port fails at once (the probe) and the peer is not tried again for 200 ms. |
+| `ClusterCheckTest`, `CommitOutcomesPathsTest`, `LocalCommandsTest`, `ReplicatedWritesTest`, `UpdateProtocolPathsTest` | The classes split out of `ReplicatedConnection`: the cluster check tells each follower once per term, retries a silent one only after its pause and asks again in a new term; commit outcomes (a second copy marked in the same term, settling by outcome, pruning of marks, every kind of record, a gone session, barrier failures); who leads and gets the session of its term; column creation and its check, and batches split, refused when numbered and too large, reported when partly applied; the update protocol's answers for transactions and updates that are gone (also for copies of numbered commits), staged writes carrying a request id, empty commits, the end of an update and a failed update. |
+| `MergeErrorKindsTest`, `CrashPointsTest`, `ConflictTrackerPropertyTest` | A merge operator's `AssertionError` or `LinkageError` is a recorded `MERGE_OPERATOR_FAILED` result and the replica goes on, a `StackOverflowError` stops it. The arming rules of the crash points. `ConflictTracker` against a model of the log, with jqwik (failures shrink to the shortest sequence of steps): a write after a transaction's snapshot always conflicts, also with dropped entries, pruning and tiny history caps, and without those it conflicts exactly then. |
+
+`FollowerReadsTest` also has a deterministic version of its stack test: reads made from each other's completions,
+50,000 deep, while the reader finishes its batch; the recursion that the loop replaced overflowed there.
+
+The crash-point, install and membership process tests are written and compile; like the other process suites they
+run only in the nightly job below (and they were not yet run on the development machine, for lack of memory).
+
+**Kept as they are, with reasons.**
+
+- *Tests that pin mechanisms rather than behavior* (exact RPC counts, timer counts, pins in `LeaderStallTest`,
+  `LeaderSessionTest`, `ProposerQueueTest` and the like). They are component tests: their job is to hold a mechanism
+  in place (a lost wake-up, a slot given back, a bound that comes back), which a behavior test sees only as a rare
+  timing. Each such mechanism also has a behavior test above it (the scenario suites, `ReplicationTest`), so a
+  refactor that rewrites a component rewrites its component test and keeps the behavior suites as the check. Turning
+  them into behavior tests would lose exactly the cases they were written for.
+- *Hooks that hold a thread at a call site* (the state machine's `applyGate` latch, `LogWorkerGate.block`, the core's
+  test observers on range continuations). They depend on the call structure by design: they stop a thread at one step to make an interleaving
+  happen every time. Where they reach into Ratis-private code, `LogWorkerGateContractTest` now fails by name when
+  Ratis changes; the crash points above halt instead of holding a thread, so they cannot deadlock a test.
+- *Codecs stay on seeded random fuzzing* (`CodecEquivalenceTest`, `LogEntryCodecTest`), not jqwik: they compare whole
+  random batches against the old codec, where shrinking adds little, and a failure prints its seed. jqwik is used
+  where a minimal failing sequence matters: the conflict tracker's steps.
+
+### Continuous integration
+
+`.gitea/workflows/ci.yml` runs on the Gitea instance that hosts the repository (Gitea Actions). On every push and pull
+request: the core module's tests, then the distributed module's tests without the multi-process suites (they are listed
+in the file, and excluded by name), on the runner's disk. Every night, and on demand: the whole distributed suite, the
+process suites included, twice (pipelined updates off and on), keeping the surefire reports and the node logs. The
+runner needs Linux (the process tests give every link its own loopback address), Docker for the
+`maven:3.9-eclipse-temurin-27` image, access to the Maven repositories of the root `pom.xml`, and several GiB of
+memory for the nightly job. Nothing was pushed: the runner and the schedule are for the repository owner to enable.
 
 ## Left before a first deployment
 
