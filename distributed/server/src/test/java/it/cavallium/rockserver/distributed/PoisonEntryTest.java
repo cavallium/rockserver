@@ -271,6 +271,51 @@ class PoisonEntryTest {
 		}
 	}
 
+	/** The same in lanes (partitioned apply): the failing entry runs again on the serial path, the others in lanes. */
+	@Test
+	void aFailingMergeOperatorInALaneIsTheResultAndTheGroupGoesOn() throws Exception {
+		var lanes = new ApplyLanes("poison-test", 3);
+		try (var store = open()) {
+			var applier = new Applier(store, null, lanes);
+			long column = store.db().createColumn("c", SCHEMA);
+			applier.beginGroup();
+			var before = applier.applyBatch(List.of(
+					new Request(1, 0, 0, new LogEntry.Put(column, key(1), text("a"), RequestTypeId.NOTHING)),
+					new Request(1, 1, 0, new LogEntry.Put(column, key(5), text("e"), RequestTypeId.NOTHING))),
+					TermIndex.valueOf(1, 1));
+			var batch = applier.applyBatch(List.of(
+					new Request(1, 2, 0, new LogEntry.Merge(column, key(2), text("x"), RequestTypeId.NOTHING)),
+					new Request(1, 3, 0, new LogEntry.Merge(column, key(1), text("boom"), RequestTypeId.MERGED)),
+					new Request(1, 4, 0, new LogEntry.Merge(column, key(3), text("y"), RequestTypeId.NOTHING))),
+					TermIndex.valueOf(1, 2));
+			var after = applier.applyBatch(List.of(
+					new Request(1, 5, 0, new LogEntry.Merge(column, key(1), text("b"), RequestTypeId.MERGED)),
+					new Request(1, 6, 0, new LogEntry.Merge(column, key(5), text("void"), RequestTypeId.NOTHING))),
+					TermIndex.valueOf(1, 3));
+			var last = applier.applyBatch(List.of(
+					new Request(1, 7, 0, new LogEntry.Put(column, key(4), text("z"), RequestTypeId.NOTHING))),
+					TermIndex.valueOf(1, 4));
+			applier.endGroup();
+			assertEquals(List.of(ApplyResult.OK_NULL, ApplyResult.OK_NULL), List.copyOf(before));
+			assertInstanceOf(ApplyResult.Ok.class, batch.get(0));
+			assertMergeFailure(batch.get(1));
+			assertInstanceOf(ApplyResult.Ok.class, batch.get(2));
+			assertEquals("a,b", text((Buf) ((ApplyResult.Ok) after.get(0)).value()));
+			assertMergeFailure(after.get(1));
+			assertInstanceOf(ApplyResult.Ok.class, last.getFirst());
+			assertEquals("a,b", text(store.db().get(0, column, key(1), RequestType.current())));
+			assertEquals("x", text(store.db().get(0, column, key(2), RequestType.current())));
+			assertEquals("y", text(store.db().get(0, column, key(3), RequestType.current())));
+			assertEquals("z", text(store.db().get(0, column, key(4), RequestType.current())));
+			assertEquals("e", text(store.db().get(0, column, key(5), RequestType.current())));
+			store.db().flush();
+			assertEquals(TermIndex.valueOf(1, 4), store.applied());
+			assertTrue(applier.segmentCuts >= 2, "both rejected entries cut their segment: " + applier.segmentCuts);
+		} finally {
+			lanes.close();
+		}
+	}
+
 	@Test
 	void onlyLocalFailuresStopTheReplica() {
 		var ioError = new org.rocksdb.RocksDBException("disk",

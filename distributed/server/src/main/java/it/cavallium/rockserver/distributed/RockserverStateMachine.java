@@ -220,9 +220,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 		this.applyGroupEntries = metrics.amount("apply.groupEntries");
 		this.completer = java.util.concurrent.Executors.newSingleThreadExecutor(
 				Thread.ofPlatform().name(config.nodeId() + "-applied").daemon().factory());
+		this.applyLanes = config.parallelApplyThreads() >= 2
+				? new ApplyLanes(config.nodeId(), config.parallelApplyThreads()) : null;
 		this.applyThread = Thread.ofPlatform().name(config.nodeId() + "-apply").daemon().unstarted(this::applyLoop);
 		applyThread.start();
 	}
+
+	/** Threads of the partitioned apply ({@link NodeConfig#parallelApplyThreads()}), or null for the serial apply. */
+	private final @Nullable ApplyLanes applyLanes;
 
 	private final NodeMetrics.Series applyGroupEntries;
 
@@ -273,7 +278,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var position = opened.applied();
 		raiseVisibleTerm(position.getTerm());
 		this.store = opened;
-		this.applier = new Applier(opened, metrics);
+		this.applier = new Applier(opened, metrics, applyLanes);
 		setLastAppliedTermIndex(position);
 		applied.advance(Math.max(applied.get(), position.getIndex()));
 		LOG.info("{}: database open, applied position {}", config.nodeId(), position);
@@ -944,6 +949,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (proposal != null && proposal.appendedNanos != 0) {
 			commitWait.record(System.nanoTime() - proposal.appendedNanos);
 		}
+		// With the partitioned apply the results are known only once the group is committed: read them only below.
 		var results = applier.applyBatch(requests, position, entry.leaderTimeMillis());
 		applyRequests.record(requests.size());
 		return () -> {
@@ -1099,6 +1105,9 @@ final class RockserverStateMachine extends BaseStateMachine {
 		applyQueue.add(new Stop());
 		try {
 			applyThread.join();
+			if (applyLanes != null) {
+				applyLanes.close();
+			}
 			completer.shutdown();
 			completer.awaitTermination(1, java.util.concurrent.TimeUnit.MINUTES);
 		} catch (InterruptedException ex) {

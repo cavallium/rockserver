@@ -181,6 +181,17 @@ with 11–18 s write latency. In order of discovery:
     or not, builds those requests (objects and slices, no byte copies), so that a request sent again is encoded from
     its first batch and not from its caller's buffers. Compare the
     `writes.batch` and `commits.batch` timers, the leader's CPU per operation and its allocation rate at 4×.
+19. **One apply thread per replica.** Not measured yet (benchmarks are off for now). `--parallel-apply-threads N`
+    (off by default) runs the data writes of each group on N lanes split by first key part, with one commit per
+    group as before: see "Partitioned apply" in the design document. It parallelizes what costs on the apply
+    thread (key encoding, reads for guards, previous values and merge checks, the merge operator, the index of
+    the native batch); the commit (memtable inserts) and the records stay on one thread. Yotsuba's writes are
+    single-key updates and single-key or one-owner multi-key puts, so nearly all of them run in lanes; the
+    multi-column transactions (monitors, invites, about 0.03k/s) take the serial path. What can make it slower
+    than the serial apply: rejected requests (`update.guardRejected`), each of which cuts its group
+    (`apply.parallelCuts`), and the commits added between lanes and the serial path. Compare `apply`,
+    `apply.execute` and `apply.commit` per entry with and without it, at 3.5× with 2048 in flight, where the
+    apply was 70–81% busy.
 
 ## Results
 
@@ -281,6 +292,8 @@ Other results:
   server already waited for chunk by chunk. Each batch the caller publishes is split on its own and chunks are not
   merged across batches: publish batches of a few MiB, not many tiny ones. Not measured; Yotsuba does not use these
   calls today.
+- **Partitioned apply.** Off. Turn it on (`--parallel-apply-threads 4`) only after a back-to-back run shows it
+  helps, see item 19; nodes may differ in this setting.
 - **Snapshots.** One every 500k entries (`--snapshot-every`), about every 100 s at 2×, or every 4 GiB of
   applied log entries (`--snapshot-every-bytes`), whichever comes first. A snapshot flushes the
   memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.

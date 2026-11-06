@@ -431,6 +431,31 @@ Raft log on disk instead of decoded on the heap. Any error on the apply or compl
   back, the group so far is committed, and the entry is applied again on its own, one request at a time, only
   its last request recording the position. Positions without data (configuration entries, leader no-ops) are
   written in the group too.
+- **Partitioned apply** (`parallelApplyThreads`, `--parallel-apply-threads N`, off by default) runs the data
+  writes of a group on N lanes, each a platform thread with an `ApplyWriter` of its own, and gives the results
+  and the database of the serial apply, byte for byte, whatever the timing. Each request gets a lane from the
+  RocksDB keys it can touch: the first key part of a column whose schema has fixed key parts (every RocksDB key
+  of such a column starts with it, a bucket too), or else the whole column. Two requests that can touch the same
+  key are in the same lane, so each reads every earlier write to its keys, in log order, in its lane's writer. An
+  entry with a request that touches two lanes (a multi-key write over different first key parts, a transaction
+  over two columns), a `VerifyColumn` and every entry applied alone take the serial path, after what came before
+  them is committed. The apply thread sorts each entry out as the serial path does (floors, records, sessions,
+  clock), writes down its floor, session and position writes and hands its requests to their lanes, then goes on
+  with the next entry: none of that depends on the results, which only the records hold. At the end of the
+  group, or before an entry that needs the serial path, it waits for the lanes, writes the records in log order,
+  and commits the lanes' writers and its own in **one** atomic write (`ApplyWriter.commitWith` joins their
+  native batches as RocksDB's `WriteBatchInternal::Append` does), so a crash keeps a prefix of the log as
+  before. A rejected request rolls back its whole entry in the serial path; here its lane marks the entry as a
+  cut and the lanes skip what follows. At the end the lanes roll back to their save point before the cut (one
+  per entry and lane), the entries before it commit, the in-memory changes of the entries from the cut on are
+  undone, and those entries are applied again: the cut one on the serial path, which rejects it exactly as the
+  serial apply does (commit, then one request at a time), the next ones in lanes. Concurrent writers cannot share
+  one RocksDB transaction, and committing each lane on its own would let a crash keep a lane's writes without the
+  position, whose replay would apply them twice: hence one writer per lane, joined at commit. Replies wait for
+  the group's commit as before. A node in lanes and a serial one hold the same data, so nodes may differ in this
+  setting. What it costs: a rejected request (a guard that no longer holds, a failing merge operator) runs its
+  entry twice and the entries after it in the same group again, and each change between lanes and the serial
+  path adds a commit; `apply.parallelCuts` counts the cuts. See [performance.md](performance.md), item 16.
 - **`deleteRange`** cannot run in a transaction either, but it is a plain write: the group before it is
   committed, the range deletion is written without the WAL, and its record and position go into the group
   that follows, without a flush and without a WAL sync. A crash replay is still correct: with atomic flush a crash
@@ -1127,7 +1152,8 @@ its callers' continuations never run on the control plane; the read barrier's ca
 before touching the database. The leader forwarder's poll timer has a platform thread of its own. Cluster
 initialization (the genesis proposal, which can wait up to the request timeout) has a thread of its own, so that
 the API gate and the Raft watch (`LeaderStall`) keep running meanwhile. Why the local commands stay on virtual
-threads, and what to measure, is in [performance.md](performance.md), item 11.
+threads, and what to measure, is in [performance.md](performance.md), item 11. The partitioned apply, when on,
+adds its lanes: platform threads (`<node>-apply-lane-N`) that run RocksDB calls only for the apply thread.
 
 ## Behavior differences from a single node
 
@@ -1189,6 +1215,7 @@ failover" below).
 | Test | What it proves |
 |---|---|
 | `ReplicationTest` (in-process) | Replication through any node; results; leader loss, including a new leader that has not applied what the old one acknowledged yet; snapshot catch-up; batches; transactions, conflicts and updates; a transaction write too large for the commit refused at once; the capped transaction lease; updates whose caller timed out or cancelled while queued, or cancelled while the update opened, do not keep the key; transactions lost on a leader change; whole-cluster restart; recovery after a proposal timeout. |
+| `ParallelApplyTest` | Randomized logs over five columns (fixed keys, buckets whose tails all collide, a column without fixed key parts), with rejections, copies, sessions, `deleteRange` and positions without data, applied serially and in lanes: the results of every entry and every row of every column, the internal one included, are the same after every group. A 3-node cluster, two nodes in lanes and one serial, holds the same data, also after a restart. Crashes of a replica in lanes: a flush right after one of its commits (the serial prefix before a segment, a segment's joined batch, a group's end, an entry applied alone), more entries applied, then the database closed without a flush; reopened, it holds exactly what was committed at the flush, its position included, and replaying the rest of the log (serially or in lanes) gives the results and user rows of a replica that never crashed, and every row of a serial replica restarted at the same position. |
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups. |
 | `SessionApplierTest` | Client sessions at apply: a write resent through other proposers, alone or in an entry with other sessions' writes, takes effect once, also after a restart; the session's floor refuses late copies; unknown and expired sessions are rejected and not recorded, a leader clock behind does not revive them, and expired sessions are deleted; two replicas, one restarting midway, give the same results. |
 | `SessionWritesTest` (core) | The client's numbering: which writes are numbered (staged writes not, schema changes, `deleteRange` and batches yes), update ids forgotten once the update ended; a first copy refused by an expired session re-issued under a new one, a later copy so refused ending unknown, sessions that keep expiring ending at the deadline; opening retried after an unknown outcome, and again by a write that waited on another write's opening, also when that opening ended "not applied" at the opener's deadline or overloaded; batches unnumbered when the server does not advertise `numberedBatches`; batches sent as numbered chunks in order, a chunk resent with its number, a later chunk's failure reported as partly applied; closing ends waiting writes. |
