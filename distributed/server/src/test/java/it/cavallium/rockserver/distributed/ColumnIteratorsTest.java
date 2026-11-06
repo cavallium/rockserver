@@ -19,6 +19,7 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -26,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.reactivestreams.Subscription;
 import reactor.core.publisher.BaseSubscriber;
@@ -153,6 +155,62 @@ class ColumnIteratorsTest {
 			assertInstanceOf(RocksDBException.class, refused.error.get(10, TimeUnit.SECONDS));
 			streams.deleted(again);
 			assertEquals(0, streams.running(again));
+		}
+	}
+
+	/**
+	 * R3-G2a-5: raw scans ({@code scanRaw}, {@code scanRawResumable}) hold their column like range streams, and a
+	 * replicated column deletion ends them with COLUMN_NOT_FOUND too, through the node's public API. Three flushes give
+	 * three SST files, so each scan has more to send after its first item.
+	 */
+	@Test
+	@Timeout(120)
+	void aReplicatedColumnDeletionEndsTheColumnsRawScans() throws Exception {
+		var raw = new SlowSubscriber();
+		var resumable = new SlowSubscriber();
+		var kept = new SlowSubscriber();
+		try (var cluster = new InProcessCluster(temp, 1, c -> c).startAll()) {
+			try {
+				var node = cluster.awaitLeader(Duration.ofSeconds(30));
+				var sync = node.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
+				long column = sync.createColumn("c", SCHEMA);
+				long other = sync.createColumn("other", SCHEMA);
+				for (int file = 0; file < 3; file++) {
+					for (long i = 0; i < 100; i++) {
+						sync.put(0, column, key(file * 100 + i), Buf.wrap(new byte[] {1}), RequestType.none());
+						sync.put(0, other, key(file * 100 + i), Buf.wrap(new byte[] {2}), RequestType.none());
+					}
+					node.stateMachine().store().db().flush();
+				}
+				var api = node.connection().getAsyncApi(RequestContext.batch(Duration.ofHours(1)));
+				Flux.from(api.scanRawAsync(column, 0, 1)).subscribe(raw);
+				Flux.from(api.scanRawResumableAsync(column, 0, 1, Set.of())).subscribe(resumable);
+				Flux.from(api.scanRawAsync(other, 0, 1)).subscribe(kept);
+				assertTrue(raw.first.await(10, TimeUnit.SECONDS));
+				assertTrue(resumable.first.await(10, TimeUnit.SECONDS));
+				assertTrue(kept.first.await(10, TimeUnit.SECONDS));
+				var streams = node.stateMachine().columnStreams();
+				assertEquals(2, streams.running(column));
+
+				// Before DD-7a, the apply of the deletion waited for the scans until their deadline, an hour here.
+				CompletableFuture.runAsync(() -> sync.deleteColumn(column)).get(10, TimeUnit.SECONDS);
+				for (var scan : new SlowSubscriber[] {raw, resumable}) {
+					var error = scan.error.get(10, TimeUnit.SECONDS);
+					var rocks = assertInstanceOf(RocksDBException.class, error);
+					assertEquals(RocksDBException.RocksDBErrorType.COLUMN_NOT_FOUND, rocks.getErrorUniqueId());
+					assertFalse(scan.completed, "never as if the scan had ended");
+				}
+				assertEquals(0, streams.running(column));
+				// The other column's scan goes on to its end.
+				kept.request(Long.MAX_VALUE);
+				assertEquals(null, kept.error.get(10, TimeUnit.SECONDS));
+				assertTrue(kept.completed);
+			} finally {
+				// A failed check leaves scans open, and closing the database would wait for them.
+				raw.cancel();
+				resumable.cancel();
+				kept.cancel();
+			}
 		}
 	}
 

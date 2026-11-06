@@ -7,6 +7,7 @@ import java.io.InterruptedIOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -22,6 +23,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
+import java.util.regex.Pattern;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.protocol.ClientId;
@@ -303,6 +305,77 @@ final class RockserverStateMachine extends BaseStateMachine {
 			openStore();
 			requireKnownClusterVersion();
 		});
+		seedBytesSinceSnapshot(raftStorage.getStorageDir().getCurrentDir().toPath());
+	}
+
+	/**
+	 * Starts the count of {@link #snapshotByBytes} from the Raft log that this database applied past the latest
+	 * snapshot, instead of 0: otherwise restarts more frequent than {@code snapshotEveryBytes} of writes (a few deploys
+	 * a day) would leave only Ratis' entry-count trigger. Entries past the database's applied position are counted
+	 * again when Ratis applies them after the start.
+	 */
+	private void seedBytesSinceSnapshot(Path raftLogDir) {
+		var snapshot = storage.getLatestSnapshot();
+		long from = snapshot != null ? snapshot.getIndex() : -1;
+		long seed = logBytesBetween(raftLogDir, from, store.applied().getIndex());
+		bytesSinceSnapshot.set(seed);
+		if (seed > 0) {
+			LOG.info("{}: {} bytes of Raft log applied past the snapshot at {}", config.nodeId(), seed, from);
+		}
+	}
+
+	private static final Pattern CLOSED_SEGMENT = Pattern.compile("log_(\\d+)-(\\d+)");
+	private static final Pattern OPEN_SEGMENT = Pattern.compile("log_inprogress_(\\d+)");
+
+	/**
+	 * The bytes of the Raft log segments in {@code dir} that hold the entries after {@code fromExclusive} up to
+	 * {@code toInclusive}. A closed segment that holds both entries in and out of the range counts in proportion to
+	 * its entries in it; the open segment, whose end is unknown here, counts from its start to {@code toInclusive} as
+	 * if that were its end. Files that vanish meanwhile count 0.
+	 */
+	static long logBytesBetween(Path dir, long fromExclusive, long toInclusive) {
+		if (toInclusive <= fromExclusive) {
+			return 0;
+		}
+		long total = 0;
+		try (var files = Files.list(dir)) {
+			for (var file : (Iterable<Path>) files::iterator) {
+				var name = file.getFileName().toString();
+				long start;
+				long end;
+				var closed = CLOSED_SEGMENT.matcher(name);
+				var open = OPEN_SEGMENT.matcher(name);
+				if (closed.matches()) {
+					start = Long.parseLong(closed.group(1));
+					end = Long.parseLong(closed.group(2));
+				} else if (open.matches()) {
+					start = Long.parseLong(open.group(1));
+					end = Math.max(start, toInclusive);
+				} else {
+					continue;
+				}
+				long first = Math.max(start, fromExclusive + 1);
+				long last = Math.min(end, toInclusive);
+				if (last < first) {
+					continue;
+				}
+				long size;
+				try {
+					size = Files.size(file);
+				} catch (IOException vanished) {
+					continue;
+				}
+				total += (long) ((double) size * (last - first + 1) / (end - start + 1));
+			}
+		} catch (IOException | RuntimeException ex) {
+			LOG.warn("Could not measure the Raft log in {}", dir, ex);
+		}
+		return total;
+	}
+
+	/** Tests only: see {@link #bytesSinceSnapshot}. */
+	long bytesSinceSnapshotForTesting() {
+		return bytesSinceSnapshot.get();
 	}
 
 	/**

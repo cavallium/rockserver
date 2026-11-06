@@ -5,6 +5,7 @@ import java.lang.reflect.Proxy;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import org.apache.ratis.proto.RaftProtos;
@@ -35,6 +36,8 @@ final class StubRaft {
 	/** The followers a leader replicates to besides the configuration, such as a peer being added (staging). */
 	volatile List<RaftPeer> stagingFollowers = List.of();
 	volatile long lastCommittedIndex;
+	/** How many times {@code getRoleInfoProto} was read: once per {@link ReplicaOps#pollPeers} on this division. */
+	final AtomicInteger roleInfoReads = new AtomicInteger();
 	/** Answers {@code submitClientRequestAsync}. */
 	volatile Function<RaftClientRequest, CompletableFuture<RaftClientReply>> submit =
 			_ -> CompletableFuture.failedFuture(new UnsupportedOperationException("submit"));
@@ -71,6 +74,7 @@ final class StubRaft {
 		case "isLeaderReady" -> leaderReady;
 		case "getCurrentTerm" -> term;
 		case "getRoleInfoProto" -> {
+			roleInfoReads.incrementAndGet();
 			var leaderInfo = RaftProtos.LeaderInfoProto.newBuilder();
 			for (var follower : stagingFollowers) {
 				leaderInfo.addFollowerInfo(RaftProtos.ServerRpcProto.newBuilder().setId(follower.getRaftPeerProto()));

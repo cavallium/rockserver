@@ -14,8 +14,8 @@ import org.junit.jupiter.api.Assumptions;
 /**
  * Tests only (RT-23, RT-64): the fault-injecting storage shim {@code faultfs.c} (a test resource), loaded into a node's
  * JVM with {@code LD_PRELOAD}. While a trigger file exists, every write, fsync, fdatasync and fallocate of a file under
- * one directory (the node's data directory) fails with EIO or ENOSPC, as a failing or full disk would; nothing else
- * changes, and no root is needed. See the comment at the top of {@code faultfs.c} for what it covers.
+ * one directory (the node's data directory) fails with EIO or ENOSPC, as a failing or full disk would, or blocks until
+ * the trigger changes, as a hung disk would ({@link Errno#HANG}); nothing else changes, and no root is needed. See the comment at the top of {@code faultfs.c} for what it covers.
  *
  * <p>{@link #build} compiles it with {@code gcc}; a test without {@code gcc} on the path is skipped, not failed, unless
  * {@code -Drockserver.test.requireFaultFs=true} (set in CI's nightly process job), which makes it a failure.</p>
@@ -25,9 +25,9 @@ final class FaultFs {
 	private static final String SOURCE = "/faultfs/faultfs.c";
 	private static final long COMPILE_TIMEOUT_SECONDS = 60;
 
-	/** The error the faulty calls return. */
+	/** The error the faulty calls return; {@link #HANG}: they block instead, until the trigger changes or goes. */
 	enum Errno {
-		EIO, ENOSPC
+		EIO, ENOSPC, HANG
 	}
 
 	/** Which calls fail: all of them, the writes (and fallocate) only, as on a full disk, or the syncs only. */

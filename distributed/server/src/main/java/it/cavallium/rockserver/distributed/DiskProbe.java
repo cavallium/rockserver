@@ -2,11 +2,15 @@ package it.cavallium.rockserver.distributed;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -49,10 +53,26 @@ final class DiskProbe implements Closeable {
 		this.nanoClock = nanoClock;
 	}
 
+	/**
+	 * Tests only: while a latch is set for a directory, the probe of that directory waits for it before writing, as on a
+	 * disk whose fsync does not end. Keyed by the absolute, normalized directory.
+	 */
+	static final Map<Path, CountDownLatch> HANGS_FOR_TESTING = new ConcurrentHashMap<>();
+
 	/** A probe that writes and fsyncs {@code dir}/{@value #FILE_NAME}. */
 	static DiskProbe forDirectory(String name, Path dir) {
 		Path file = dir.resolve(FILE_NAME);
+		Path key = dir.toAbsolutePath().normalize();
 		return new DiskProbe(name, () -> {
+			var hang = HANGS_FOR_TESTING.get(key);
+			if (hang != null) {
+				try {
+					hang.await();
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+					throw new InterruptedIOException("closed while the disk hangs");
+				}
+			}
 			try (var channel = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
 				channel.write(ByteBuffer.allocate(Long.BYTES).putLong(0, System.nanoTime()), 0);
 				channel.force(true);
