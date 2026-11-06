@@ -493,7 +493,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 				var division = division();
 				var applier = this.applier;
 				proposal.leaderTimeMillis = leaderClock.stamp(division != null ? division.getInfo().getCurrentTerm() : -1,
-						applier != null ? applier.clock() : 0, System.currentTimeMillis(), System.nanoTime());
+						applier != null ? applier.clock() : 0, leaderClockMillis(), System.nanoTime());
 				logData = UnsafeByteOperations.unsafeWrap(LogEntryCodec.stamp(proposal.leaderTimeMillis)).concat(logData);
 			}
 			return builder.setLogData(logData)
@@ -780,11 +780,29 @@ final class RockserverStateMachine extends BaseStateMachine {
 		volatile java.util.concurrent.@Nullable CountDownLatch applyGate;
 		/** While set, applying a group throws it, as a failing apply would. */
 		volatile @Nullable RuntimeException applyFailure;
+		/** Added to this node's wall clock where it stamps entries as leader, like {@link #CLOCK_SKEW_PROPERTY}. */
+		volatile long clockSkewMillis;
 
 		/** Lowers the limit of {@link #queuedKiB} to {@code kib}; it waits until that much is free. */
 		void limitApplyQueue(int kib) {
 			queuedKiB.acquireUninterruptibly(MAX_QUEUED_KIB - kib);
 		}
+	}
+
+	/**
+	 * Tests only: system property adding a fixed offset, in milliseconds (negative = behind), to the wall clock this
+	 * node stamps entries with as leader ({@link LogEntryCodec#stamp}). That stamp is the only wall-clock time the
+	 * replicated state reads (session expiry); leader leases, read barriers, transaction leases and timeouts all use
+	 * {@link System#nanoTime()}, which a wall-clock skew does not move. Lets a process test run one node with a
+	 * skewed clock without faking the operating system's.
+	 */
+	static final String CLOCK_SKEW_PROPERTY = "rockserver.test.clockSkewMillis";
+	private static final long CLOCK_SKEW_MILLIS = Long.getLong(CLOCK_SKEW_PROPERTY, 0);
+
+	/** This node's wall clock as a leader stamps it: the system clock plus any test skew. */
+	private long leaderClockMillis() {
+		var hooks = testHooks;
+		return System.currentTimeMillis() + CLOCK_SKEW_MILLIS + (hooks != null ? hooks.clockSkewMillis : 0);
 	}
 
 	/** Null unless a test asked for them: the apply thread then reads one field per group, and nothing else. */

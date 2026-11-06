@@ -139,6 +139,32 @@ public final class Network implements AutoCloseable {
 		link(src, dst).proxies().forEach(LinkProxy::block);
 	}
 
+	/**
+	 * Silently holds every byte on the connections {@code src} opens to {@code dst}, in both directions, until
+	 * {@link #heal()} or {@link #restoreLink}: a blackhole instead of a reset, see {@link LinkProxy#blackhole()}.
+	 */
+	public void blackholeLink(String src, String dst) {
+		link(src, dst).proxies().forEach(LinkProxy::blackhole);
+	}
+
+	/** Delays and throttles the connections {@code src} opens to {@code dst}, both ways, until {@link #heal()}. */
+	public void shapeLink(String src, String dst, LinkProxy.Shaping shaping) {
+		link(src, dst).proxies().forEach(proxy -> proxy.shape(shaping));
+	}
+
+	/** Ends every fault of the link {@code src -> dst} only (see {@link LinkProxy#unblock()}). */
+	public void restoreLink(String src, String dst) {
+		link(src, dst).proxies().forEach(LinkProxy::unblock);
+	}
+
+	/** Every directed link from or to {@code nodeId}, as {@code [src, dst]} pairs. */
+	public List<List<String>> linksOf(String nodeId) {
+		return links.keySet().stream()
+				.filter(link -> link.src().equals(nodeId) || link.dst().equals(nodeId))
+				.map(link -> List.of(link.src(), link.dst()))
+				.toList();
+	}
+
 	/** Drops what {@code dst} answers on the connections {@code src} opens to it, until {@link #heal()}. */
 	public void dropReplies(String src, String dst) {
 		link(src, dst).proxies().forEach(LinkProxy::dropReplies);

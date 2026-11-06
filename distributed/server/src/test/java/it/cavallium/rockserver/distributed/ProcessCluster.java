@@ -54,6 +54,8 @@ public final class ProcessCluster implements AutoCloseable {
 	private final List<String> serverArgs;
 	private final Network network;
 	private final Map<String, Node> nodes;
+	/** One proxy per node in front of its API port, for clients that should see faults too ({@link #clientLink}). */
+	private final Map<String, LinkProxy> clientLinks;
 	/** The peer list given to nodes when they start. Guarded by this. */
 	private List<String> members;
 	private final Thread shutdownHook = new Thread(this::killAllNow, "process-cluster-shutdown");
@@ -71,6 +73,8 @@ public final class ProcessCluster implements AutoCloseable {
 		boolean shouldRun;
 		boolean paused;
 		int starts;
+		/** Extra JVM options for the next starts, e.g. a clock skew ({@link #setJvmOptions}). */
+		List<String> jvmOptions = List.of();
 
 		Node(String id, int raftPort, int apiPort, Path dir) {
 			this.id = id;
@@ -97,12 +101,13 @@ public final class ProcessCluster implements AutoCloseable {
 	}
 
 	private ProcessCluster(String mainClass, List<String> serverArgs, Network network, Map<String, Node> nodes,
-			List<String> members) {
+			List<String> members, Map<String, LinkProxy> clientLinks) {
 		this.mainClass = mainClass;
 		this.serverArgs = serverArgs;
 		this.network = network;
 		this.nodes = nodes;
 		this.members = members;
+		this.clientLinks = clientLinks;
 	}
 
 	/**
@@ -153,8 +158,20 @@ public final class ProcessCluster implements AutoCloseable {
 			ports.put(id, List.of(node.raftPort, node.apiPort));
 		}
 		var network = Network.start(ports, root.resolve("network"));
+		var clientLinks = new LinkedHashMap<String, LinkProxy>();
+		try {
+			for (var node : nodes.values()) {
+				// Port 0 on 127.0.0.1: an ephemeral port is fine, the proxy keeps it bound for the cluster's lifetime.
+				clientLinks.put(node.id, new LinkProxy(new InetSocketAddress(InetAddress.getByName(LOOPBACK), 0),
+						new InetSocketAddress(InetAddress.getByName(LOOPBACK), node.apiPort)));
+			}
+		} catch (IOException | RuntimeException e) {
+			clientLinks.values().forEach(LinkProxy::close);
+			network.close();
+			throw e;
+		}
 		var members = List.copyOf(nodes.keySet()).subList(0, size);
-		var cluster = new ProcessCluster(mainClass, List.copyOf(serverArgs), network, nodes, members);
+		var cluster = new ProcessCluster(mainClass, List.copyOf(serverArgs), network, nodes, members, clientLinks);
 		Runtime.getRuntime().addShutdownHook(cluster.shutdownHook);
 		return cluster;
 	}
@@ -275,6 +292,36 @@ public final class ProcessCluster implements AutoCloseable {
 		var result = new LinkedHashMap<String, HostAndPort>();
 		nodes.keySet().forEach(id -> result.put(id, apiAddress(id)));
 		return result;
+	}
+
+	/**
+	 * The proxy between test clients and the node's API port. Clients that connect through
+	 * {@link #proxiedApiAddress} see its faults: a cut ({@link LinkProxy#block}), a slow link ({@link LinkProxy#shape}),
+	 * or lost answers ({@link LinkProxy#dropReplies}: the node carries out a request, commits it, and the client never
+	 * hears back, without the node or its leadership being disturbed). {@link Network#heal()} does not touch these.
+	 */
+	public LinkProxy clientLink(String id) {
+		node(id);
+		return clientLinks.get(id);
+	}
+
+	/** Address of the node's API through its {@link #clientLink}. */
+	public HostAndPort proxiedApiAddress(String id) {
+		var address = clientLink(id).listenAddress();
+		return new HostAndPort(LOOPBACK, address.getPort());
+	}
+
+	/** Restores every client link. */
+	public void healClientLinks() {
+		clientLinks.values().forEach(LinkProxy::unblock);
+	}
+
+	/**
+	 * Extra JVM options for the node's next starts, for example {@code -Drockserver.test.clockSkewMillis=60000}
+	 * (see {@code RockserverStateMachine.CLOCK_SKEW_PROPERTY}).
+	 */
+	public synchronized void setJvmOptions(String id, List<String> options) {
+		node(id).jvmOptions = List.copyOf(options);
 	}
 
 	public Path dataDir(String id) {
@@ -491,6 +538,7 @@ public final class ProcessCluster implements AutoCloseable {
 				awaitExit(node);
 			}
 		}
+		clientLinks.values().forEach(LinkProxy::close);
 		network.close();
 		try {
 			Runtime.getRuntime().removeShutdownHook(shutdownHook);
@@ -544,6 +592,7 @@ public final class ProcessCluster implements AutoCloseable {
 				.filter(name -> name.startsWith("org.slf4j.simpleLogger."))
 				.sorted()
 				.forEach(name -> command.add("-D" + name + "=" + System.getProperty(name)));
+		command.addAll(node.jvmOptions);
 		command.add(mainClass);
 		command.add("run");
 		command.add("--node-id");
