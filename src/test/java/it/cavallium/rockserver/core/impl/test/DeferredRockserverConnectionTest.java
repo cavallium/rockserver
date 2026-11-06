@@ -173,6 +173,22 @@ class DeferredRockserverConnectionTest {
 		}
 	}
 
+	/** A deferred connection to a server with client sessions opens them through the real connection (CC-4.8). */
+	@Test
+	void forwardsClientSessionOpeningWithRemainingBudget() throws Exception {
+		var clock = new AtomicLong();
+		var client = client();
+		when(client.openClientSessionAsync(any())).thenReturn(CompletableFuture.completedFuture(42L));
+		try (var deferred = deferred(URL, () -> {
+			clock.set(Duration.ofSeconds(1).toNanos());
+			return client;
+		}, clock::get)) {
+			assertEquals(42L, deferred.openClientSessionAsync(RequestContext.batch(Duration.ofSeconds(3)))
+					.get(5, TimeUnit.SECONDS));
+			verify(client).openClientSessionAsync(argThat(context -> context.timeoutNanos() == Duration.ofSeconds(2).toNanos()));
+		}
+	}
+
 	@Test
 	void concurrentWaitersShareConstructionAndOneCancellationDoesNotDiscardIt() throws Exception {
 		var entered = new CountDownLatch(1);

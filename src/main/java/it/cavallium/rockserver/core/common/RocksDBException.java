@@ -2,7 +2,20 @@ package it.cavallium.rockserver.core.common;
 
 public class RocksDBException extends RuntimeException {
 
+	/**
+	 * gRPC trailer that a server adds to every call that fails with a {@link RocksDBException}: {@link #NOT_APPLIED} if
+	 * the failure says that the write was not applied ({@link #isNotApplied()}), {@link #MAYBE_APPLIED} otherwise. A
+	 * client reads whether a write took effect from it, not from the message, which stays the same for older clients.
+	 */
+	public static final String APPLIED_METADATA_KEY = "rockserver-applied";
+	/** {@link #APPLIED_METADATA_KEY} value: this copy of the write was not applied. */
+	public static final String NOT_APPLIED = "no";
+	/** {@link #APPLIED_METADATA_KEY} value: the failure does not say that the write was not applied. */
+	public static final String MAYBE_APPLIED = "maybe";
+
 	private final RocksDBErrorType errorUniqueId;
+	/** The failure says that this copy of the write was not applied: see {@link #notApplied}. */
+	private final boolean notApplied;
 
 	public enum RocksDBErrorType {
 		PUT_UNKNOWN_ERROR,
@@ -89,6 +102,16 @@ public class RocksDBException extends RuntimeException {
 		}
 	}
 
+	/**
+	 * A failure that says that this copy of the write was not applied, for example a deadline that came before the
+	 * write was sent: a client may send it again without applying it twice. Carried on the wire by
+	 * {@link #APPLIED_METADATA_KEY}.
+	 */
+	public static RocksDBException notApplied(RocksDBErrorType errorUniqueId, String message) {
+		checkStaticInvocationType(errorUniqueId);
+		return new RocksDBException(errorUniqueId, message, true);
+	}
+
 	private static void checkStaticInvocationType(RocksDBErrorType errorUniqueId) {
 		if (errorUniqueId == RocksDBErrorType.UPDATE_RETRY) {
 			throw new UnsupportedOperationException("Please use new RocksDBRetryException()");
@@ -96,18 +119,25 @@ public class RocksDBException extends RuntimeException {
 	}
 
 	protected RocksDBException(RocksDBErrorType errorUniqueId, String message) {
+		this(errorUniqueId, message, false);
+	}
+
+	protected RocksDBException(RocksDBErrorType errorUniqueId, String message, boolean notApplied) {
 		super(message);
 		this.errorUniqueId = errorUniqueId;
+		this.notApplied = notApplied;
 	}
 
 	protected RocksDBException(RocksDBErrorType errorUniqueId, String message, Throwable ex) {
 		super(message, ex);
 		this.errorUniqueId = errorUniqueId;
+		this.notApplied = false;
 	}
 
 	protected RocksDBException(RocksDBErrorType errorUniqueId, Throwable ex) {
 		super(ex.toString(), ex);
 		this.errorUniqueId = errorUniqueId;
+		this.notApplied = false;
 	}
 
 	protected RocksDBException(RocksDBErrorType errorUniqueId, org.rocksdb.RocksDBException ex) {
@@ -123,6 +153,11 @@ public class RocksDBException extends RuntimeException {
 
 	public RocksDBErrorType getErrorUniqueId() {
 		return errorUniqueId;
+	}
+
+	/** True if this failure says that this copy of the write was not applied: see {@link #notApplied}. */
+	public boolean isNotApplied() {
+		return notApplied;
 	}
 
 	@Override

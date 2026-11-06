@@ -84,6 +84,25 @@ class LeaderSessionTest {
 		assertTrue(waiter.isDone());
 	}
 
+	/**
+	 * An update whose commit is in flight when its lease ends keeps its key and stays in the session: the commit may
+	 * still apply, and its handler removes it (F13).
+	 */
+	@Test
+	void anUpdateWhoseCommitIsInFlightDoesNotExpire() throws Exception {
+		var lock = session.lockKey(KEY).join();
+		var waiter = session.lockKey(KEY);
+		var update = session.register(session.reserve(applied), 80, true, lock, 1);
+		update.commitProposed();
+		Thread.sleep(5);
+		session.expire();
+		assertFalse(waiter.isDone(), "the key stays with the commit in flight");
+		assertTrue(session.get(80) == update, "still in the session");
+		update.commitEnded();
+		session.expire();
+		assertTrue(waiter.isDone(), "expires once the commit ended");
+	}
+
 	@Test
 	void aQueuedUpdateGetsTheKeyWhenTheAbandonedOneExpiresWithoutOtherTraffic() throws Exception {
 		var lock = session.lockKey(KEY).join();

@@ -23,11 +23,16 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -49,8 +54,14 @@ import reactor.core.publisher.Mono;
  * ({@link #sendBatch}) when the server numbers batches. A write staged in a transaction is not: sending it again could stage it twice. A write whose first copy is refused because its
  * session expired was not applied, and goes again under a new session; a copy sent again after an unknown outcome that
  * meets an expired session ends with {@code OUTCOME_UNKNOWN}.</p>
+ *
+ * <p>A caller that cancels the future of a write stops it: no copy is sent any more, and the copy in flight is
+ * cancelled. If a copy was sent, the future does not become cancelled but ends with {@code OUTCOME_UNKNOWN}, since
+ * that copy may have been applied; otherwise it is cancelled, and the write was not applied.</p>
  */
 final class SessionWrites {
+
+	private static final Logger LOG = LoggerFactory.getLogger(SessionWrites.class);
 
 	/** How long a write of a caller without a deadline is sent again after an unknown outcome. */
 	static final String RETRY_WINDOW_PROPERTY = "it.cavallium.rockserver.grpc.client.write-retry-window-ms";
@@ -59,7 +70,11 @@ final class SessionWrites {
 	private static final long MAX_PAUSE_NANOS = TimeUnit.SECONDS.toNanos(1);
 	/** How long an update id is remembered: longer than any update lease. */
 	private static final long UPDATE_MEMORY_NANOS = TimeUnit.MINUTES.toNanos(10);
-	private static final int MAX_REMEMBERED_UPDATES = 1 << 16;
+	static final int MAX_REMEMBERED_UPDATES = 1 << 16;
+	/** Extra wait of a synchronous caller beyond the deadline, for the answer that ends its write ({@link #syncWaitNanos}). */
+	static final long SYNC_WAIT_MARGIN_NANOS = TimeUnit.SECONDS.toNanos(5);
+	/** {@link #syncWaitNanos} of a caller without a deadline: it waits until the write ends (still interruptible). */
+	static final long NO_SYNC_WAIT_BOUND = Long.MAX_VALUE;
 
 	/** The numbering of one session. */
 	private static final class Session {
@@ -86,12 +101,55 @@ final class SessionWrites {
 		}
 	}
 
+	/**
+	 * The future a caller gets for a write. Cancelling it stops the write ({@code stop}): if a copy was sent
+	 * ({@code sent}), the write may have been applied, so the future is not cancelled but ends with
+	 * {@code OUTCOME_UNKNOWN}, and {@code cancel} returns false; otherwise it is cancelled, and the write was not applied.
+	 */
+	static final class CallResult extends CompletableFuture<Object> {
+		private final BooleanSupplier sent;
+		private final Runnable stop;
+		/**
+		 * Set by {@link #cancel} before it reads {@code sent}; a sender sets its {@code sent} flag before it reads this one
+		 * ({@link SessionWrites#attempt}). With both volatile, either the caller sees the copy as sent (and the write ends
+		 * unknown), or the sender sees the cancel and sends nothing.
+		 */
+		volatile boolean stopping;
+
+		CallResult(BooleanSupplier sent, Runnable stop) {
+			this.sent = sent;
+			this.stop = stop;
+		}
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			if (isDone()) {
+				return isCancelled();
+			}
+			stopping = true;
+			boolean cancelled;
+			if (sent.getAsBoolean()) {
+				completeExceptionally(RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN,
+						"The caller cancelled the write after a copy of it was sent; it may or may not be applied"));
+				cancelled = false;
+			} else {
+				cancelled = super.cancel(mayInterruptIfRunning);
+			}
+			stop.run();
+			return cancelled;
+		}
+	}
+
 	/** One numbered write and its copies. */
 	private static final class Call {
 		final BoundRequestContext context;
 		final RocksDBAPICommandSingle<?> command;
 		final long deadlineNanos;
-		final CompletableFuture<Object> result = new CompletableFuture<>();
+		final CallResult result;
+		/** The batch this write is a chunk of ({@link #sendBatch}), or null. */
+		final @Nullable CallResult batch;
+		/** The copy in flight, cancelled if the caller cancels the write. */
+		volatile @Nullable CompletableFuture<?> inFlight;
 		@Nullable Session session;
 		long sequence;
 		/** A copy was sent and its outcome is unknown: no "not applied" answer can end the call any more. */
@@ -100,14 +158,35 @@ final class SessionWrites {
 		int reissues;
 		long pauseNanos = FIRST_PAUSE_NANOS;
 
-		Call(BoundRequestContext context, RocksDBAPICommandSingle<?> command, long deadlineNanos) {
+		Call(BoundRequestContext context, RocksDBAPICommandSingle<?> command, long deadlineNanos,
+				@Nullable CallResult batch) {
 			this.context = context;
 			this.command = command;
 			this.deadlineNanos = deadlineNanos;
+			this.batch = batch;
+			this.result = new CallResult(() -> this.sent, this::stopped);
 		}
 
 		/** A copy of it was handed to the channel: if it ends without an answer, its outcome is unknown. */
 		volatile boolean sent;
+
+		/** The caller cancelled it: its number is final, and the copy in flight is cancelled. */
+		private void stopped() {
+			finish();
+			var copy = inFlight;
+			if (copy != null) {
+				copy.cancel(true);
+			}
+		}
+
+		/** It has its answer, or the caller cancelled it: nothing more is sent. */
+		boolean ended() {
+			if (result.isDone()) {
+				finish();
+				return true;
+			}
+			return false;
+		}
 
 		/** Its number is final: no copy of it is sent any more. */
 		synchronized void finish() {
@@ -192,8 +271,15 @@ final class SessionWrites {
 	private final Object sessionLock = new Object();
 	/** The current session, or its opening; null before the first write and after it expired. Guarded by sessionLock. */
 	private @Nullable CompletableFuture<Session> session;
-	/** Update ids returned by {@code getForUpdate}, with the time they are forgotten. */
-	private final Map<Long, Long> updates = new ConcurrentHashMap<>();
+	/**
+	 * Update ids returned by {@code getForUpdate}, with the time they are forgotten, oldest first. At most
+	 * {@link #MAX_REMEMBERED_UPDATES}: past that the oldest is forgotten ({@link #forgottenUpdates}), and the write that
+	 * ends it is then sent unnumbered, once, as without sessions. Guarded by itself.
+	 */
+	private final java.util.LinkedHashMap<Long, Long> updates = new java.util.LinkedHashMap<>();
+	/** Updates forgotten while open because {@link #updates} was full. */
+	private final AtomicLong forgottenUpdates = new AtomicLong();
+	private volatile long nextForgottenLogNanos;
 
 	SessionWrites(Function<RequestContext, CompletableFuture<Long>> opener,
 			BiFunction<BoundRequestContext, RocksDBAPICommandSingle<?>, CompletableFuture<?>> sender,
@@ -237,7 +323,17 @@ final class SessionWrites {
 	}
 
 	private boolean isReplicatedOrUpdateEnd(long id) {
-		return id == 0 || updates.containsKey(id);
+		if (id == 0) {
+			return true;
+		}
+		synchronized (updates) {
+			return updates.containsKey(id);
+		}
+	}
+
+	/** Updates forgotten while open because too many were remembered: their final write was not numbered. */
+	long forgottenUpdates() {
+		return forgottenUpdates.get();
 	}
 
 	/**
@@ -254,18 +350,36 @@ final class SessionWrites {
 	/** Remembers the update a {@code getForUpdate} opened, forgets one that a close ended. */
 	void observe(RocksDBAPICommand<?, ?, ?> command, @Nullable Object result) {
 		if (command instanceof RocksDBAPICommandSingle.CloseFailedUpdate close) {
-			updates.remove(close.updateId());
+			synchronized (updates) {
+				updates.remove(close.updateId());
+			}
 		} else if (observes(command) && result instanceof UpdateContext<?> update && update.updateId() != 0) {
 			long now = System.nanoTime();
-			if (updates.size() >= MAX_REMEMBERED_UPDATES) {
+			boolean forgotOne = false;
+			synchronized (updates) {
+				// Oldest first, and every id is remembered for the same time: the expired ones are at the head.
 				for (Iterator<Long> it = updates.values().iterator(); it.hasNext(); ) {
-					if (it.next() - now < 0) {
-						it.remove();
+					if (it.next() - now >= 0) {
+						break;
 					}
+					it.remove();
 				}
-			}
-			if (updates.size() < MAX_REMEMBERED_UPDATES) {
+				updates.remove(update.updateId());
+				if (updates.size() >= MAX_REMEMBERED_UPDATES) {
+					var oldest = updates.keySet().iterator();
+					oldest.next();
+					oldest.remove();
+					forgotOne = true;
+				}
 				updates.put(update.updateId(), now + UPDATE_MEMORY_NANOS);
+			}
+			if (forgotOne) {
+				long forgotten = forgottenUpdates.incrementAndGet();
+				if (now - nextForgottenLogNanos >= 0) {
+					nextForgottenLogNanos = now + TimeUnit.MINUTES.toNanos(1);
+					LOG.warn("More than {} updates are open on this connection: the oldest is forgotten, and the write that"
+							+ " ends it is sent unnumbered, once ({} so far)", MAX_REMEMBERED_UPDATES, forgotten);
+				}
 			}
 		}
 	}
@@ -275,7 +389,7 @@ final class SessionWrites {
 		if (command instanceof RocksDBAPICommandSingle.PutBatch || command instanceof RocksDBAPICommandSingle.MergeBatch) {
 			return sendBatch(context, command);
 		}
-		return sendOne(context, command);
+		return sendOne(context, command, null, null);
 	}
 
 	/**
@@ -304,10 +418,27 @@ final class SessionWrites {
 		}
 		var appliedChunks = new AtomicLong();
 		var appliedKeys = new AtomicLong();
-		return Flux.from(batches)
+		// A chunk was sent: cancelling the batch then ends it unknown (see CallResult). A chunk that was applied was sent;
+		// the chunk in progress tells by its own flag, which it sets before it checks whether the batch is stopping.
+		var current = new java.util.concurrent.atomic.AtomicReference<Call>();
+		BooleanSupplier anySent = () -> {
+			if (appliedChunks.get() > 0) {
+				return true;
+			}
+			var chunk = current.get();
+			return chunk != null && chunk.sent;
+		};
+		var subscription = new java.util.concurrent.atomic.AtomicReference<Disposable>();
+		var result = new CallResult(anySent, () -> {
+			var running = subscription.get();
+			if (running != null) {
+				running.dispose();
+			}
+		});
+		var running = Flux.from(batches)
 				.concatMapIterable(KVBatchChunks::split)
 				// One chunk at a time: a later chunk must not overtake an earlier one writing the same key.
-				.concatMap(chunk -> Mono.fromFuture(() -> sendOne(context, chunkCommand.apply(chunk)))
+				.concatMap(chunk -> Mono.fromFuture(() -> sendOne(context, chunkCommand.apply(chunk), result, current::set))
 						.then(Mono.fromRunnable(() -> {
 							appliedChunks.incrementAndGet();
 							appliedKeys.addAndGet(chunk.keys().size());
@@ -318,18 +449,27 @@ final class SessionWrites {
 						(merge ? "mergeBatch" : "putBatch") + " on column " + columnId + " was partly applied: "
 								+ appliedChunks.get() + " chunks (" + appliedKeys.get() + " keys) were applied before it"
 								+ " failed, so it is not safe to resend as a whole: " + describe(unwrap(error))))
-				.<Object>then(Mono.empty())
-				.toFuture();
+				.subscribe(null, result::completeExceptionally, () -> result.complete(null));
+		subscription.set(running);
+		if (result.isDone()) {
+			// Cancelled while subscribing.
+			running.dispose();
+		}
+		return result;
 	}
 
-	private CompletableFuture<Object> sendOne(BoundRequestContext context, RocksDBAPICommandSingle<?> command) {
+	private CompletableFuture<Object> sendOne(BoundRequestContext context, RocksDBAPICommandSingle<?> command,
+			@Nullable CallResult batch, java.util.function.@Nullable Consumer<Call> created) {
 		long now = System.nanoTime();
 		long remaining = context.remainingNanosAt(now);
 		long deadline = remaining == RequestContext.NO_TIMEOUT ? now + retryWindowNanos : now + remaining;
 		if (closed) {
 			return CompletableFuture.failedFuture(closedBeforeSent());
 		}
-		var call = new Call(context, command, deadline);
+		var call = new Call(context, command, deadline, batch);
+		if (created != null) {
+			created.accept(call);
+		}
 		live.add(call);
 		call.result.whenComplete((_, _) -> {
 			live.remove(call);
@@ -355,13 +495,21 @@ final class SessionWrites {
 			default -> 0;
 		};
 		if (id != 0) {
-			updates.remove(id);
+			synchronized (updates) {
+				updates.remove(id);
+			}
 		}
 	}
 
 	/** Numbers the write in the current session, opening one if needed, and sends its first copy. */
 	private void start(Call call) {
+		if (call.ended()) {
+			return;
+		}
 		session(call).whenComplete((session, error) -> {
+			if (call.ended()) {
+				return;
+			}
 			if (error != null) {
 				// Not sent: whatever the opening's own outcome, this write was not applied.
 				var cause = unwrap(error);
@@ -435,6 +583,9 @@ final class SessionWrites {
 	}
 
 	private void attempt(Call call, Session session) {
+		if (call.ended()) {
+			return;
+		}
 		var id = new ClientRequestId(session.id, call.sequence, session.completedBelow());
 		var context = new BoundRequestContext(call.context.value().withRequestId(id), call.context.startedNanos());
 		if (closed) {
@@ -442,13 +593,35 @@ final class SessionWrites {
 			return;
 		}
 		CompletableFuture<?> answer;
+		// Published before the cancel check below (see CallResult#stopping): a caller that cancels from now on sees the
+		// copy as sent.
 		call.sent = true;
+		if (call.result.stopping || call.result.isDone()) {
+			// The caller cancelled before this copy left: nothing is sent, and its cancel ends the write.
+			call.ended();
+			return;
+		}
+		if (call.batch != null && call.batch.stopping) {
+			// The batch was cancelled before this chunk left: nothing is sent. The batch decided its own outcome; this
+			// chunk only has to end (unknown, since its flag is set), which is never seen.
+			call.result.cancel(true);
+			return;
+		}
 		try {
 			answer = sender.apply(context, call.command);
 		} catch (RuntimeException ex) {
 			answer = CompletableFuture.failedFuture(ex);
 		}
+		call.inFlight = answer;
+		if (call.result.isDone()) {
+			// Cancelled while this copy was being sent.
+			answer.cancel(true);
+		}
 		answer.whenComplete((value, error) -> {
+			call.inFlight = null;
+			if (call.ended()) {
+				return;
+			}
 			if (error == null) {
 				call.succeed(value);
 				return;
@@ -503,33 +676,81 @@ final class SessionWrites {
 	/** The copy may have been applied, and the server did not say: a lost call, or {@code OUTCOME_UNKNOWN}. */
 	static boolean isUnknownOutcome(Throwable cause) {
 		if (cause instanceof RocksDBException rocks) {
-			// A deadline error is unknown too, unless it says the write was not sent (gRPC's own deadline is one).
+			// A deadline error is unknown too, unless the server says the write was not applied
+			// (RocksDBException#isNotApplied, carried by a trailer). gRPC's own deadline, which the client maps to
+			// READ_DEADLINE_EXCEEDED, says nothing: the copy may have been applied.
 			return rocks.getErrorUniqueId() == RocksDBErrorType.OUTCOME_UNKNOWN
-					|| (rocks.getErrorUniqueId() == RocksDBErrorType.READ_DEADLINE_EXCEEDED && !saysNotApplied(rocks));
+					|| (rocks.getErrorUniqueId() == RocksDBErrorType.READ_DEADLINE_EXCEEDED && !rocks.isNotApplied());
 		}
 		var code = Status.fromThrowable(cause).getCode();
-		// CANCELLED: a server whose API stops resets the calls still running.
-		return code == Code.UNAVAILABLE || code == Code.CANCELLED;
+		// CANCELLED: a server whose API stops resets the calls still running. DEADLINE_EXCEEDED: gRPC's own deadline,
+		// should it reach here unmapped.
+		return code == Code.UNAVAILABLE || code == Code.CANCELLED || code == Code.DEADLINE_EXCEEDED;
 	}
 
 	/**
-	 * The server says that this copy was not applied, but it might be if sent again: overload, or a deadline that came
-	 * before the write was sent. After an unknown outcome such an answer says nothing about the earlier copies, so the
-	 * write is sent again.
+	 * The server says that this copy was not applied, but it might be if sent again: overload, or a failure flagged
+	 * {@link RocksDBException#isNotApplied()} (a deadline that came before the write was sent). After an unknown outcome
+	 * such an answer says nothing about the earlier copies, so the write is sent again.
 	 */
 	private static boolean isNotApplied(Throwable cause) {
 		if (cause instanceof RocksDBRetryException) {
 			return false;
 		}
 		return cause instanceof RocksDBException rocks
-				&& (rocks.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED
-						|| rocks.getErrorUniqueId() == RocksDBErrorType.READ_DEADLINE_EXCEEDED);
+				&& (rocks.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED || rocks.isNotApplied());
 	}
 
-	private static boolean saysNotApplied(RocksDBException error) {
-		var message = String.valueOf(error.getMessage());
-		return message.contains("not applied") || message.contains("already expired")
-				|| message.contains("before downstream dispatch");
+	/**
+	 * How long a synchronous caller waits for the answer to {@code context}'s write: its deadline plus
+	 * {@link #SYNC_WAIT_MARGIN_NANOS}, saturated. The write ends by then on its own; the bound only keeps a lost callback
+	 * from blocking the caller forever. A caller without a deadline is not bounded ({@link #NO_SYNC_WAIT_BOUND}): its
+	 * copies have no gRPC deadline, and a batch sends its chunks one after the other with no bound on the whole, so
+	 * any fixed bound would cut a long but healthy write and end it unknown.
+	 */
+	static long syncWaitNanos(BoundRequestContext context) {
+		long remaining = context.remainingNanosAt(System.nanoTime());
+		if (remaining == RequestContext.NO_TIMEOUT) {
+			return NO_SYNC_WAIT_BOUND;
+		}
+		remaining = Math.max(0, remaining);
+		// Saturated: a huge finite timeout (RequestContext clamps "forever" to Long.MAX_VALUE - 1) must not overflow.
+		return remaining > NO_SYNC_WAIT_BOUND - SYNC_WAIT_MARGIN_NANOS ? NO_SYNC_WAIT_BOUND
+				: remaining + SYNC_WAIT_MARGIN_NANOS;
+	}
+
+	/**
+	 * Waits for {@code answer} for at most {@code waitNanos}. Past that, or if the thread is interrupted (its interrupt
+	 * status is kept), the write is cancelled ({@link CallResult}): {@code OUTCOME_UNKNOWN} if a copy was sent.
+	 */
+	static Object await(CompletableFuture<Object> answer, long waitNanos) {
+		try {
+			return waitNanos == NO_SYNC_WAIT_BOUND ? answer.get() : answer.get(waitNanos, TimeUnit.NANOSECONDS);
+		} catch (ExecutionException ex) {
+			throw rethrow(ex.getCause());
+		} catch (TimeoutException ex) {
+			answer.cancel(true);
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
+			answer.cancel(true);
+		}
+		if (answer.isCancelled()) {
+			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					"No answer came within the deadline of the request");
+		}
+		try {
+			return answer.join();
+		} catch (CompletionException ex) {
+			throw rethrow(ex.getCause());
+		}
+	}
+
+	private static RuntimeException rethrow(Throwable cause) {
+		cause = unwrap(cause);
+		if (cause instanceof RuntimeException runtime) {
+			return runtime;
+		}
+		return new CompletionException(cause);
 	}
 
 	private static Throwable unwrap(Throwable error) {

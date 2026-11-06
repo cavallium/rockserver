@@ -41,6 +41,8 @@ final class CommitOutcomes {
 	/** Size of {@link #unsettledCommits} at which {@link #pruneUnsettled} runs next. */
 	private final AtomicLong pruneUnsettledAt = new AtomicLong(MIN_PRUNE_UNSETTLED);
 	private static final long MIN_PRUNE_UNSETTLED = 1024;
+	/** The newest term a commit was marked in: the first mark of a newer term drops every older mark. */
+	private final AtomicLong markedTerm = new AtomicLong();
 
 	private final java.util.function.Supplier<CompletableFuture<Void>> leadership;
 	private final java.util.function.LongSupplier currentTerm;
@@ -50,11 +52,26 @@ final class CommitOutcomes {
 
 	CommitOutcomes(RockserverStateMachine stateMachine, LocalCommands localCommands,
 			java.util.concurrent.ExecutorService inline) {
-		this(localCommands::leadership, localCommands::currentTerm, stateMachine::recordedResult, sessionId -> {
-			var store = stateMachine.store();
-			return store.db().get(0L, store.metaColumnId(), NodeStore.sessionKey(sessionId),
-					RequestType.<it.cavallium.buffer.Buf>current()) != null;
-		}, inline);
+		this(localCommands::leadership, localCommands::currentTerm, stateMachine::recordedResult,
+				sessionId -> sessionLive(stateMachine.store(), sessionId), inline);
+	}
+
+	/**
+	 * True if client session {@code sessionId} exists and is not expired at the replicated clock, as the applier sees
+	 * it: a session expired at the clock is gone even before the sweep deletes its row. The row is read before the
+	 * clock and both only move forward, so the answer can only err toward "expired" (a write of the session applied in
+	 * between), never toward "live": either way the copy asking was not applied, and the client is told so.
+	 */
+	static boolean sessionLive(NodeStore store, long sessionId) {
+		var db = store.db();
+		Buf row = db.get(0L, store.metaColumnId(), NodeStore.sessionKey(sessionId), RequestType.<Buf>current());
+		if (row == null) {
+			return false;
+		}
+		var fields = NodeStore.decodeSession(row);
+		long clock = NodeStore.decodeClock(db.get(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLOCK),
+				RequestType.<Buf>current()));
+		return !NodeStore.sessionExpired(fields[0], fields[1], clock);
 	}
 
 	/**
@@ -94,6 +111,10 @@ final class CommitOutcomes {
 			return null;
 		}
 		long term = session.term();
+		if (markedTerm.getAndAccumulate(term, Math::max) < term) {
+			// A new term: every entry of earlier terms is applied before it serves, so their marks say nothing more.
+			unsettledCommits.values().removeIf(markTerm -> markTerm < term);
+		}
 		var previous = unsettledCommits.put(write, term);
 		if (previous != null && previous == term) {
 			throw earlierCopyInFlight();
@@ -159,8 +180,8 @@ final class CommitOutcomes {
 	 * update is not on this leader: the transaction ended, or another leader had it. After the read barrier every
 	 * entry of earlier leaders is applied, so the record of an earlier copy that took effect is there, and is the
 	 * answer. Without a record, and with no copy unsettled in this term, the commit was never applied: the client
-	 * runs the transaction again ({@code UPDATE_RETRY}), as without sessions. A session that is gone has no records
-	 * any more: {@code SESSION_EXPIRED}.
+	 * runs the transaction again ({@code UPDATE_RETRY}), as without sessions. A session that is gone, or expired at the
+	 * replicated clock, which the applier treats as gone, has no records any more: {@code SESSION_EXPIRED}.
 	 */
 	CompletableFuture<?> settledCommit(it.cavallium.rockserver.core.common.ClientRequestId id) {
 		long term = currentTerm();

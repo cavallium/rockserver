@@ -60,7 +60,9 @@ class MandatoryContextApiSurfaceTest {
 		var publicMethods = Arrays.stream(RocksDBConnection.class.getMethods())
 				.map(Method::getName)
 				.collect(Collectors.toUnmodifiableSet());
-		assertEquals(Set.of("close", "getUrl", "getCapabilities", "getSyncApi", "getAsyncApi"), publicMethods);
+		// openClientSessionAsync takes a request context too: it registers a client session of a replicated server.
+		assertEquals(Set.of("close", "getUrl", "getCapabilities", "getSyncApi", "getAsyncApi", "openClientSessionAsync"),
+				publicMethods);
 	}
 
 	@Test

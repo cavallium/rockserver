@@ -11,6 +11,14 @@ async fn ensure_api_compiles(client: &RockserverClient) {
         .put_multi_ensure(0, 1, futures::stream::empty::<Kv>())
         .await
         .unwrap();
+    let _version: Option<i64> = client
+        .check_merge_operator("op".to_owned(), rockserver_client::merge_operator_hash(b"jar"))
+        .await
+        .unwrap();
+    let _ensured: i64 = client
+        .ensure_merge_operator("op".to_owned(), "a.B".to_owned(), b"jar".to_vec())
+        .await
+        .unwrap();
     let _resumable = client.scan_raw_resumable(
         1,
         0,

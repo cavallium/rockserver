@@ -76,6 +76,10 @@ struct OptionalBinary {
   1: optional binary value
 }
 
+struct OptionalI64 {
+  1: optional i64 value
+}
+
 struct UpdateBegin {
   1: optional binary previous,
   2: optional i64 updateId
@@ -294,6 +298,9 @@ service RocksDB {
    list<KV> getAllInRangeNoCache(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
    i64 uploadMergeOperator(1: required string operatorName, 2: required string className, 3: required binary jarPayload, 4: required RequestContext context) throws (1: RocksDBThriftException e),
+
+   // The version of the uploaded merge operator with this name and content hash, unset if there is none.
+   OptionalI64 checkMergeOperator(1: required string operatorName, 2: required binary hash, 3: required RequestContext context) throws (1: RocksDBThriftException e),
 
    list<OptionalBinary> putMultiGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),
 

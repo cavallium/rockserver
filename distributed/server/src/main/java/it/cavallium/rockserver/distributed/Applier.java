@@ -783,7 +783,7 @@ final class Applier {
 	}
 
 	private boolean expired(ProposerRecords session) {
-		return clock - session.lastActiveMillis > session.timeoutMillis;
+		return NodeStore.sessionExpired(session.timeoutMillis, session.lastActiveMillis, clock);
 	}
 
 	/** The proposer of {@code requests} and the live sessions of their client requests, each once. */

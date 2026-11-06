@@ -1151,6 +1151,22 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
+		public it.cavallium.rockserver.core.common.api.OptionalI64 checkMergeOperator(String operatorName,
+				ByteBuffer hash,
+				it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
+			try {
+				var version = api(context).checkMergeOperator(operatorName, Utils.toByteArray(Utils.fromByteBuffer(hash)));
+				var result = new it.cavallium.rockserver.core.common.api.OptionalI64();
+				if (version != null) {
+					result.setValue(version);
+				}
+				return result;
+			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
+				throw mapException(e);
+			}
+		}
+
+		@Override
 		public FirstAndLast reduceRangeFirstAndLast(long transactionId,
 				long columnId,
 				List<ByteBuffer> startKeysInclusive,

@@ -339,7 +339,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	private <T> T withEmbeddedContext(BoundRequestContext context, java.util.function.Supplier<T> operation) {
 		long remainingNanos = context.remainingNanos();
 		if (remainingNanos == 0L) {
-			throw RocksDBException.of(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+			throw RocksDBException.notApplied(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"Request deadline already expired");
 		}
 		var requestContext = context.value();

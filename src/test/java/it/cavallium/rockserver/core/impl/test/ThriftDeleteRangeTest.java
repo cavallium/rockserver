@@ -126,6 +126,24 @@ class ThriftDeleteRangeTest {
 		assertEquals(normal, noCache);
 	}
 
+	/** checkMergeOperator answers over Thrift as over gRPC: no version before the upload, its version after (CC-T7). */
+	@Test
+	void checkMergeOperatorOverThriftFindsTheUploadedVersion() throws Exception {
+		var api = client.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+		var jar = new java.io.ByteArrayOutputStream();
+		try (var ignored = new java.util.jar.JarOutputStream(jar, new java.util.jar.Manifest())) {
+			// An empty jar: the operator class is on the class path.
+		}
+		byte[] jarData = jar.toByteArray();
+		byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest(jarData);
+		assertEquals(null, api.checkMergeOperator("thrift-op", hash));
+		long version = api.uploadMergeOperator("thrift-op",
+				it.cavallium.rockserver.core.impl.MyStringAppendOperator.class.getName(), jarData);
+		assertEquals(version, api.checkMergeOperator("thrift-op", hash));
+		assertEquals(version, client.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.batch())
+				.checkMergeOperatorAsync("thrift-op", hash).get(10, java.util.concurrent.TimeUnit.SECONDS));
+	}
+
 	private static int findFreePort() throws IOException {
 		try (var socket = new ServerSocket(0)) {
 			socket.setReuseAddress(true);
