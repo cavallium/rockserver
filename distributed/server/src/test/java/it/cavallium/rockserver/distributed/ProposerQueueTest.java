@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -231,6 +232,11 @@ class ProposerQueueTest {
 				System.nanoTime() + 1_000_000_000L, false, 0, -1);
 	}
 
+	private static RocksDBException exception(Proposer.Pending pending) {
+		var error = assertThrows(ExecutionException.class, () -> pending.result.get(1, TimeUnit.SECONDS));
+		return assertInstanceOf(RocksDBException.class, error.getCause());
+	}
+
 	private static RocksDBErrorType failure(Proposer.Pending pending) {
 		var error = assertThrows(ExecutionException.class, () -> pending.result.get(1, TimeUnit.SECONDS));
 		return assertInstanceOf(RocksDBException.class, error.getCause()).getErrorUniqueId();
@@ -245,10 +251,12 @@ class ProposerQueueTest {
 		var only = pending();
 		only.complete(Applier.SESSION_GONE, false);
 		assertEquals(RocksDBErrorType.SESSION_EXPIRED, failure(only));
+		assertTrue(exception(only).isNotApplied(), "the only copy was refused before it ran");
 
 		var afterAmbiguousAttempt = pending();
 		afterAmbiguousAttempt.complete(Applier.SESSION_GONE, true);
 		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, failure(afterAmbiguousAttempt));
+		assertFalse(exception(afterAmbiguousAttempt).isNotApplied());
 
 		var afterAppendedBatch = pending();
 		afterAppendedBatch.maybeAppended = true;

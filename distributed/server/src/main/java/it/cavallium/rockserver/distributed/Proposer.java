@@ -397,11 +397,16 @@ final class Proposer implements Closeable {
 		 * have been appended. A session that expired before this copy applied ({@code SESSION_EXPIRED}, not recorded)
 		 * says nothing about an earlier copy, which may have taken effect: then the outcome is unknown (or, resent
 		 * alone, applied with its result lost), never the final "not applied" that would make the client write again.
+		 * Without an earlier copy, {@code SESSION_EXPIRED} carries the not-applied flag ({@link
+		 * RocksDBException#isNotApplied()}): this copy, the only one, was refused before it ran.
 		 */
 		void complete(ApplyResult result, boolean earlierCopy) {
 			switch (result) {
 				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.SESSION_EXPIRED
 						&& (earlierCopy || maybeAppended || resentAlone) -> fail(unavailable(failed.toException()));
+				// The only copy of this request, refused unexecuted: flagged, so that the client's trailer says so.
+				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.SESSION_EXPIRED ->
+						this.result.completeExceptionally(RocksDBException.notApplied(failed.type(), failed.message()));
 				case ApplyResult.Ok ok -> this.result.complete(ok.value());
 				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.UPDATE_RETRY ->
 						this.result.completeExceptionally(new RocksDBRetryException());

@@ -168,7 +168,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		try {
 			server.start();
 			started.add(server);
-			requireNotRemoved();
+			requireNotRemoved(existing);
 			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout(),
 					stateMachine::leaderReadyIndex, threads.control());
 			// Every node of a cluster should have follower reads on or off alike: see "Follower reads" in the design.
@@ -601,11 +601,47 @@ public final class ReplicatedNode implements AutoCloseable {
 		} else if (now - initializingSinceNanos >= config.electionTimeoutMax().multipliedBy(ELECTION_TIMEOUTS_TO_WARN)
 				.toNanos()) {
 			initializingSinceNanos = now;
+			if (!config.join() || Files.exists(config.raftDir().resolve(MEMBER_FILE))) {
+				askMembersWhileOutside(division);
+			}
 			LOG.warn("{}: this node is outside the cluster, with no election timer, and waits for a leader. {}", config.nodeId(),
 					config.join() ? "It was started with --join, so it waits for add-peer. If no node of the cluster started"
 							+ " without --join, nothing elects a leader: --join is only for a node that joins a running cluster"
 							: "Its configuration does not contain it: it was removed from the cluster, or it never was a member."
 							+ " A removed node has nothing to do: stop it. To bring it back, wipe its data directory and add it again");
+		}
+	}
+
+	/** Whether {@link #askMembersWhileOutside} has a check queued or running. */
+	private final AtomicBoolean askingMembers = new AtomicBoolean();
+
+	/**
+	 * For a node that was a member and waits outside the cluster: asks the members, on the initialization thread, and
+	 * stops the node if a majority of them removed it ({@link RemovalCheck}), which the start-up check could not tell
+	 * when they were not reachable then. The process then exits as a removed node.
+	 */
+	private void askMembersWhileOutside(RaftServer.Division division) {
+		if (!askingMembers.compareAndSet(false, true)) {
+			return;
+		}
+		try {
+			initialization.execute(() -> {
+				try {
+					var conf = division.getRaftConf();
+					var removedBy = closed.get() ? null : askMembers(conf);
+					if (removedBy != null) {
+						onReplicaFailure(new RemovedException("Node " + config.nodeId() + " waits outside the cluster, and members "
+								+ removedBy + ", a majority of its configuration " + conf + ", hold a newer committed one without"
+								+ " it: it was removed from the cluster. " + REMOVED_ADVICE));
+					}
+				} catch (RuntimeException ex) {
+					LOG.warn("{}: failed to ask the members whether it was removed", config.nodeId(), ex);
+				} finally {
+					askingMembers.set(false);
+				}
+			});
+		} catch (java.util.concurrent.RejectedExecutionException closing) {
+			askingMembers.set(false);
 		}
 	}
 
@@ -630,16 +666,57 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * <p>One case is refused wrongly: a joint configuration that leaves the node out, which the node wrote but the leader
 	 * never committed before it lost its leadership, so that the next leader drops it. Only a node that was being removed
 	 * gets there, and it can be removed again with {@code remove-peer}.</p>
+	 *
+	 * <p>The configuration that removes a node commits with the other members alone, so the removed node's log may
+	 * never receive it: a node that was stopped, slow or cut off during its removal still holds itself in its log. So a
+	 * node that restarts ({@code existing}) and is or was a member also asks the members of its own configuration for
+	 * theirs, see {@link RemovalCheck}: it is refused once a majority of them hold a committed configuration, newer than
+	 * its own, that leaves it out. A first start, or a {@code --join} node that never was a member, skips this.</p>
 	 */
-	private void requireNotRemoved() throws IOException {
+	private void requireNotRemoved(boolean existing) throws IOException {
 		var conf = server.getDivision(group.getGroupId()).getRaftConf();
 		boolean leftOut = conf.getLogEntryIndex() >= 0
 				&& conf.getCurrentPeers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()));
-		if (leftOut && (!config.join() || Files.exists(config.raftDir().resolve(MEMBER_FILE)))) {
+		boolean memberOnce = !config.join() || Files.exists(config.raftDir().resolve(MEMBER_FILE));
+		if (leftOut && memberOnce) {
 			throw new RemovedException("Node " + config.nodeId() + " is not in the new configuration of its log, " + conf
-					+ ": it was removed from the cluster. Take it out of its supervisor. To add it again, wipe its data"
-					+ " directory, start it with --join and run add-peer");
+					+ ": it was removed from the cluster. " + REMOVED_ADVICE);
 		}
+		if (leftOut || !existing || !memberOnce) {
+			return;
+		}
+		var removedBy = askMembers(conf);
+		if (removedBy != null) {
+			throw new RemovedException("Node " + config.nodeId() + " is in the configuration of its log, " + conf
+					+ ", but members " + removedBy + ", a majority of it, hold a newer committed one without this node: it was"
+					+ " removed from the cluster while its log did not follow. " + REMOVED_ADVICE);
+		}
+	}
+
+	private static final String REMOVED_ADVICE = "Take it out of its supervisor. To add it again, wipe its data"
+			+ " directory, start it with --join and run add-peer";
+
+	/**
+	 * Asks the other members of {@code conf} about this node, see {@link RemovalCheck}: the members that say it was
+	 * removed, if they are a majority, else null. Takes at most two election timeouts (at least a second).
+	 */
+	private @Nullable List<String> askMembers(org.apache.ratis.server.RaftConfiguration conf) {
+		var addresses = new java.util.HashMap<String, String>();
+		for (var peer : config.peers()) {
+			addresses.put(peer.id(), peer.raftAddress());
+		}
+		for (var peer : conf.getAllPeers()) {
+			if (peer.getAddress() != null) {
+				addresses.put(peer.getId().toString(), peer.getAddress());
+			}
+		}
+		var members = conf.getCurrentPeers().stream().map(peer -> peer.getId().toString()).toList();
+		var budget = config.electionTimeoutMax().multipliedBy(2);
+		if (budget.compareTo(java.time.Duration.ofSeconds(1)) < 0) {
+			budget = java.time.Duration.ofSeconds(1);
+		}
+		return RemovalCheck.removedBy(config.nodeId(), group.getGroupId(), conf.getLogEntryIndex(), members.size(),
+				RemovalCheck.addressesOf(config.nodeId(), members, addresses), budget);
 	}
 
 	/** Records, once, that a configuration from the log made this node a member: see {@link #requireNotRemoved}. */

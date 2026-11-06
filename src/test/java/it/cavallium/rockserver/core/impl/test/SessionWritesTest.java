@@ -284,13 +284,16 @@ class SessionWritesTest {
 			ids.add(idOf(bound));
 			return switch (attempts.getAndIncrement()) {
 				case 0 -> CompletableFuture.failedFuture(Status.UNAVAILABLE.asRuntimeException());
-				case 1 -> CompletableFuture.failedFuture(expired());
+				// Flagged, as a server sends it: only this copy was not applied, the first may have been.
+				case 1 -> CompletableFuture.failedFuture(RocksDBException.notApplied(RocksDBErrorType.SESSION_EXPIRED,
+						expired().getMessage()));
 				default -> CompletableFuture.completedFuture("ok");
 			};
 		}, executor);
 		var context = RequestContext.latency(Duration.ofSeconds(10));
 		var error = assertThrows(ExecutionException.class, () -> writes.send(context, put(0)).get(5, TimeUnit.SECONDS));
 		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId());
+		assertFalse(rocks(error).isNotApplied());
 		assertEquals(List.of(new ClientRequestId(5, 0, 0), new ClientRequestId(5, 0, 0)), ids,
 				"the same number twice, never a new one");
 		assertEquals("ok", writes.send(context, put(0)).get(5, TimeUnit.SECONDS));
@@ -311,6 +314,7 @@ class SessionWritesTest {
 		var error = assertThrows(ExecutionException.class,
 				() -> writes.send(RequestContext.latency(Duration.ofMillis(600)), put(0)).get(5, TimeUnit.SECONDS));
 		assertEquals(RocksDBErrorType.SESSION_EXPIRED, rocks(error).getErrorUniqueId(), "not applied");
+		assertTrue(rocks(error).isNotApplied(), "flagged, though the server's failures were not");
 		assertTrue(attempts.get() >= 2 && attempts.get() < 20, "attempts: " + attempts.get());
 		executor.shutdownNow();
 	}

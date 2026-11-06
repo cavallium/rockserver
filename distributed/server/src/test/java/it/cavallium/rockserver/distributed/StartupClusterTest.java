@@ -102,6 +102,34 @@ class StartupClusterTest {
 		assertThrows(ReplicatedNode.RemovedException.class, () -> cluster.start(removedId));
 	}
 
+	/**
+	 * R4-6: the configuration that removes a node commits with the other members alone, so the removed node's log may
+	 * never receive it (here it is stopped meanwhile, which a slow or partitioned node does by chance). Its own log still
+	 * holds it; the members it asks at start tell it that it was removed.
+	 */
+	@Test
+	void aNodeRemovedWhileStoppedDoesNotStartAgain() throws Exception {
+		cluster = new InProcessCluster(root, 3, config -> config).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var removed = cluster.anyFollower();
+		var removedId = removed.config().nodeId();
+		InProcessCluster.await(TIMEOUT, () -> Files.exists(removed.config().raftDir().resolve("member")));
+		cluster.stop(removedId);
+
+		var remaining = leader.config().peers().stream().filter(peer -> !peer.id().equals(removedId))
+				.map(peer -> RaftPeer.newBuilder().setId(peer.id()).setAddress(peer.raftAddress()).build()).toList();
+		try (var client = admin(leader.config())) {
+			assertTrue(client.admin().setConfiguration(remaining).isSuccess());
+		}
+
+		var error = assertThrows(ReplicatedNode.RemovedException.class, () -> cluster.start(removedId));
+		assertTrue(error.getMessage().contains("removed from the cluster while its log did not follow"),
+				error.getMessage());
+		// Refused again, also the second time (nothing of the refused start makes it look like a member). A --join
+		// restart is not tried here: the raft-meta.bootstrap check may refuse it first, with another error.
+		assertThrows(ReplicatedNode.RemovedException.class, () -> cluster.start(removedId));
+	}
+
 	/** DD-31: a node given a wrong API port for a peer learns the right one from the peer and forwards there. */
 	@Test
 	void aWrongApiPortInThePeerListIsCorrectedByThePeer() throws Exception {
