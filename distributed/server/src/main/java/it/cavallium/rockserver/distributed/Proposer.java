@@ -1169,12 +1169,31 @@ final class Proposer implements Closeable {
 		try {
 			return rpc.sendRequest(invocation(message, callId, leader));
 		} catch (IOException ex) {
-			// Resets the connection to that peer if the error calls for it, as the client's own calls do.
-			rpc.handleException(leader, ex, false);
+			// Resets the connection to that peer if the error calls for it, as the client's own calls do. On a thread
+			// of its own: closing the old channel waits up to 3 s (then 2 s more) for its calls to end
+			// (GrpcUtil.shutdownManagedChannel, see RatisContractTest), and a frozen leader ends none, so done here it
+			// would hold this attempt's failure, and the resend to the next leader, that long.
+			resetConnection(rpc, leader, ex);
 			throw new CompletionException(ex);
 		} finally {
 			permits.release(weight);
 		}
+	}
+
+	/**
+	 * {@code rpc.handleException(peer, error, false)} on a virtual thread of its own: Ratis takes the peer's proxy out
+	 * of its map at once, under its lock, and then closes the old channel on the calling thread. A new attempt to the
+	 * same peer meanwhile opens a new channel; attempts to other peers never waited for it (the map's lock is not held
+	 * while the channel closes).
+	 */
+	static void resetConnection(org.apache.ratis.client.RaftClientRpc rpc, RaftPeerId peer, IOException error) {
+		Thread.ofVirtual().name("rockserver-propose-reset-" + peer).start(() -> {
+			try {
+				rpc.handleException(peer, error, false);
+			} catch (RuntimeException ex) {
+				org.slf4j.LoggerFactory.getLogger(Proposer.class).debug("Could not reset the connection to {}", peer, ex);
+			}
+		});
 	}
 
 	/**
@@ -1195,7 +1214,7 @@ final class Proposer implements Closeable {
 	 * entries, nor any other ResourceUnavailableException, such as the one for failing to add a pending request,
 	 * raised after the append: an unknown outcome.
 	 */
-	private static boolean isRefusedBeforeAppend(@Nullable Throwable error) {
+	static boolean isRefusedBeforeAppend(@Nullable Throwable error) {
 		return error instanceof LeaderNotReadyException || isBusyBeforeAppend(error);
 	}
 

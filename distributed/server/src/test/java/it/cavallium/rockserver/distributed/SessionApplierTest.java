@@ -142,6 +142,52 @@ class SessionApplierTest {
 	}
 
 	/**
+	 * A new leader whose wall clock is a year ahead stamps at most {@link LeaderClock#MAX_TERM_START_STEP_MILLIS} past the
+	 * replicated clock, then the time elapsed on its monotonic clock: a session that is alive stays alive on every replica
+	 * (the stamps are in the log, so a replay reads the same). A wall clock that jumps within a term changes nothing.
+	 */
+	@Test
+	void aLeaderWithAClockFarAheadDoesNotExpireTheSessions() throws Exception {
+		long timeout = LeaderClock.MAX_TERM_START_STEP_MILLIS * 3;
+		long year = 365L * 24 * 3600 * 1000;
+		try (var store = open("db")) {
+			long column = store.db().createColumn("c", SCHEMA);
+			var applier = new Applier(store);
+			var oldLeader = new LeaderClock();
+			long t0 = 1_000_000;
+			long session = (Long) ((ApplyResult.Ok) applier.apply(new Request(1, 0, 0,
+					new LogEntry.RegisterClient(timeout)), TermIndex.valueOf(1, 1),
+					oldLeader.stamp(1, applier.clock(), t0, 0))).value();
+			assertEquals(t0, applier.clock());
+			// Term 2: the new leader's wall clock is a year ahead.
+			var skewed = new LeaderClock();
+			long first = skewed.stamp(2, applier.clock(), t0 + year, 5_000_000_000L);
+			assertEquals(t0 + LeaderClock.MAX_TERM_START_STEP_MILLIS, first);
+			assertEquals("a", merged(applier.apply(merge(2, 1, column, "a", new ClientRequestId(session, 0, 0)),
+					TermIndex.valueOf(2, 2), first)));
+			// Ten seconds later on its monotonic clock, while its wall clock jumps another year.
+			long later = skewed.stamp(2, applier.clock(), t0 + 2 * year, 15_000_000_000L);
+			assertEquals(first + 10_000, later);
+			assertEquals("a,b", merged(applier.apply(merge(2, 2, column, "b", new ClientRequestId(session, 1, 0)),
+					TermIndex.valueOf(2, 3), later)));
+			assertEquals(later, applier.clock());
+			// Without the cap the first stamp alone would have expired it.
+			assertGone(new Applier(store).apply(merge(2, 3, column, "c", new ClientRequestId(session, 2, 0)),
+					TermIndex.valueOf(2, 4), t0 + year));
+		}
+		try (var store = open("db")) {
+			// A leader whose clock is behind stamps from the replicated clock on, so the clock keeps moving.
+			var applier = new Applier(store);
+			long clock = applier.clock();
+			var behind = new LeaderClock();
+			assertEquals(clock, behind.stamp(3, clock, 5, 0));
+			assertEquals(clock + 2_000, behind.stamp(3, clock, 6, 2_000_000_000L));
+			// No clock yet (a new cluster): the wall clock.
+			assertEquals(42, new LeaderClock().stamp(1, 0, 42, 0));
+		}
+	}
+
+	/**
 	 * Two replicas apply the same entries, one of them restarting in the middle and sweeping expired sessions at other
 	 * moments: every result is the same, because expiry reads only the leader time in the entries.
 	 */

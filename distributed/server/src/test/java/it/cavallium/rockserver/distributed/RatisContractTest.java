@@ -8,6 +8,20 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.unimi.dsi.fastutil.ints.IntList;
+import java.lang.ref.WeakReference;
+import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import org.apache.ratis.grpc.GrpcUtil;
+import org.apache.ratis.grpc.util.StreamObserverWithTimeout;
+import org.apache.ratis.protocol.TransferLeadershipRequest;
+import org.apache.ratis.protocol.exceptions.NotLeaderException;
+import org.apache.ratis.thirdparty.io.grpc.CallOptions;
+import org.apache.ratis.thirdparty.io.grpc.ServerServiceDefinition;
+import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
+import org.apache.ratis.thirdparty.io.grpc.netty.NettyServerBuilder;
+import org.apache.ratis.thirdparty.io.grpc.stub.ClientCalls;
+import org.apache.ratis.thirdparty.io.grpc.stub.ServerCalls;
+import org.apache.ratis.util.LifeCycle;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -51,11 +65,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Behaviors of Ratis 3.3.1 that the design depends on, beyond its compile-time API, pinned against one real
- * single-node server. A Ratis upgrade that changes one of them fails here, instead of silently in production. Not
- * pinned here (they need several nodes, see the cluster tests): {@code NotLeaderException} for appended entries of a
- * leader that steps down, the follower order behind {@link LeaderStall#pairById}, the match index moving only on
- * replies with entries.
+ * Behaviors of Ratis 3.3.1 that the design depends on, beyond its compile-time API, pinned against real servers in
+ * this JVM (one, or three for a leader that steps down). A Ratis upgrade that changes one of them fails here, instead
+ * of silently in production. Pinned elsewhere, because they need links that lose replies: the follower order behind
+ * {@link LeaderStall#pairById} and the match index moving only on replies with entries ({@code LeaderStallTest}).
  */
 class RatisContractTest {
 
@@ -69,9 +82,15 @@ class RatisContractTest {
 	private RaftClient client;
 	private final GateStateMachine stateMachine = new GateStateMachine();
 
+	/** Servers of the tests with several members. */
+	private final List<RaftServer> others = new ArrayList<>();
+
 	@AfterEach
 	void tearDown() throws IOException {
 		stateMachine.gate.countDown();
+		for (var member : others) {
+			member.close();
+		}
 		if (client != null) {
 			client.close();
 		}
@@ -175,6 +194,277 @@ class RatisContractTest {
 		assertArrayEquals(new int[] {1, 3}, ConflictPositions.parse(localRefusal.getCause().getMessage(), 4));
 		assertTrue(server.getDivision(groupId).getInfo().isLeader(), "still the leader");
 		assertTrue(client.io().send(Message.valueOf("write")).isSuccess());
+	}
+
+	/**
+	 * A leader that steps down fails the entries it appended and could not commit with {@link NotLeaderException}, the
+	 * same type as a refusal before the append: {@link Proposer} must not take it for "not applied".
+	 */
+	@Test
+	void aLeaderThatStepsDownFailsItsAppendedEntriesWithNotLeaderException() throws Exception {
+		var peers = new ArrayList<RaftPeer>();
+		for (int port : ProcessCluster.freePorts(3, List.of())) {
+			peers.add(RaftPeer.newBuilder().setId("m" + peers.size()).setAddress("127.0.0.1:" + port).build());
+		}
+		var group = RaftGroup.valueOf(groupId, peers);
+		for (var peer : peers) {
+			others.add(startMember(peer, group, new GateStateMachine()));
+		}
+		RaftServer leader = null;
+		long deadline = System.nanoTime() + WAIT.toNanos();
+		while (leader == null && System.nanoTime() - deadline < 0) {
+			for (var member : others) {
+				var info = member.getDivision(groupId).getInfo();
+				if (info.isLeader() && info.isLeaderReady()) {
+					leader = member;
+				}
+			}
+			Thread.sleep(20);
+		}
+		assertNotNull(leader, "a ready leader");
+		for (var member : others) {
+			if (member != leader) {
+				member.close();
+			}
+		}
+		var reply = leader.submitClientRequestAsync(RaftClientRequest.newBuilder()
+				.setClientId(ClientId.randomId())
+				.setServerId(leader.getId())
+				.setGroupId(groupId)
+				.setCallId(1)
+				.setMessage(Message.valueOf("appended"))
+				.setType(RaftClientRequest.writeRequestType())
+				.build());
+		var leaderLog = leader.getDivision(groupId).getRaftLog();
+		long before = leaderLog.getLastCommittedIndex();
+		// Appended to the leader's log, never committed: no follower is left.
+		waitUntil(() -> leaderLog.getNextIndex() - 1 > before, "the entry appended");
+		var answer = reply.get(WAIT.toSeconds(), TimeUnit.SECONDS);
+		assertFalse(answer.isSuccess());
+		assertInstanceOf(NotLeaderException.class, answer.getException());
+		assertFalse(Proposer.isRefusedBeforeAppend(answer.getException()), "an unknown outcome, not a refusal");
+		assertEquals(before, leaderLog.getLastCommittedIndex());
+	}
+
+	/**
+	 * A server started with an empty group, as {@code --join} does, stays in the initializing state ({@code STARTING}):
+	 * no election timer, so no term of its own, and no bootstrap file that a later start would read.
+	 */
+	@Test
+	void aServerWithAnEmptyGroupStaysInitializingWithoutElections() throws Exception {
+		var peer = RaftPeer.newBuilder().setId("j0")
+				.setAddress("127.0.0.1:" + ProcessCluster.freePorts(1, List.of()).getFirst()).build();
+		var joining = startMember(peer, RaftGroup.valueOf(groupId), new GateStateMachine());
+		others.add(joining);
+		// Three maximum election timeouts of startMember's settings.
+		Thread.sleep(3 * 600);
+		var division = joining.getDivision(groupId);
+		assertEquals(LifeCycle.State.STARTING, division.getInfo().getLifeCycleState());
+		assertEquals(0, division.getInfo().getCurrentTerm(), "no election");
+		assertFalse(division.getInfo().isLeader());
+		var current = tempDir.resolve(peer.getId().toString()).resolve(groupId.getUuid().toString()).resolve("current");
+		assertFalse(Files.exists(current.resolve("raft-meta.bootstrap")), "nothing for a later start");
+	}
+
+	/**
+	 * A {@link TransferLeadershipRequest} with no new leader makes a leader step down, also one that is not ready
+	 * ({@code LeaderStall} relies on that): with a single member, it is elected again in a later term.
+	 */
+	@Test
+	void aTransferWithoutANewLeaderStepsDown() throws Exception {
+		start(Duration.ofMillis(300), RaftServerConfigKeys.Write.ELEMENT_LIMIT_DEFAULT);
+		awaitLeader();
+		long term = server.getDivision(groupId).getInfo().getCurrentTerm();
+		var reply = server.transferLeadershipAsync(new TransferLeadershipRequest(ClientId.randomId(), server.getId(),
+				groupId, 0, null, 3_000)).get(WAIT.toSeconds(), TimeUnit.SECONDS);
+		assertTrue(reply.isSuccess(), () -> String.valueOf(reply.getException()));
+		awaitLeader();
+		assertTrue(server.getDivision(groupId).getInfo().getCurrentTerm() > term, "a new term");
+	}
+
+	/**
+	 * Closing a client channel with a call in flight waits 3 s for it before forcing it
+	 * ({@code GrpcUtil.shutdownManagedChannel}), which is what Ratis' clients and proxies do when they reset a peer: so
+	 * {@link Proposer#resetConnection} runs it on a thread of its own, and a frozen leader does not hold the resend.
+	 */
+	@Test
+	void closingAChannelWithACallInFlightWaitsThreeSeconds() throws Exception {
+		var reached = new CountDownLatch(1);
+		var silent = ServerServiceDefinition.builder(TermService.SERVICE_NAME)
+				.addMethod(TermService.CURRENT_TERM, ServerCalls.asyncUnaryCall((request, observer) -> reached.countDown()))
+				.build();
+		var grpcServer = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0)).addService(silent).build()
+				.start();
+		try {
+			var channel = NettyChannelBuilder.forAddress("127.0.0.1", grpcServer.getPort()).usePlaintext().build();
+			var call = ClientCalls.futureUnaryCall(channel.newCall(TermService.CURRENT_TERM, CallOptions.DEFAULT),
+					new byte[0]);
+			assertTrue(reached.await(WAIT.toSeconds(), TimeUnit.SECONDS), "the call reached the server");
+			long start = System.nanoTime();
+			GrpcUtil.shutdownManagedChannel(channel);
+			long millis = (System.nanoTime() - start) / 1_000_000;
+			assertTrue(millis >= 2_900 && millis < 6_000, () -> "took " + millis + " ms");
+			assertTrue(channel.isTerminated());
+			assertTrue(call.isDone());
+		} finally {
+			grpcServer.shutdownNow();
+		}
+	}
+
+	/**
+	 * {@code StreamObserverWithTimeout}, which sends snapshot chunks, keeps each chunk it sends in the timer of the
+	 * chunk's timeout until that timeout, whether or not a reply came: the heap a leader needs while it sends a
+	 * snapshot ({@link RaftSettings}, "Heap" in the design document).
+	 */
+	@Test
+	void aSnapshotChunkStaysOnTheHeapUntilItsTimeout() throws Exception {
+		var timeout = TimeDuration.valueOf(1_500, TimeUnit.MILLISECONDS);
+		var observer = StreamObserverWithTimeout.<Object>newInstance("contract", String::valueOf, () -> timeout, 8,
+				_ -> new org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver<>() {
+					@Override
+					public void onNext(Object value) {
+						// Replied at once: the chunk is still held.
+					}
+
+					@Override
+					public void onError(Throwable t) {
+					}
+
+					@Override
+					public void onCompleted() {
+					}
+				});
+		var chunk = new byte[8 << 20];
+		var held = new WeakReference<>(chunk);
+		long start = System.nanoTime();
+		observer.onNext(chunk);
+		chunk = null;
+		System.gc();
+		if (System.nanoTime() - start < timeout.toLong(TimeUnit.NANOSECONDS) / 2) {
+			assertNotNull(held.get(), "held before its timeout");
+		}
+		Thread.sleep(timeout.toLong(TimeUnit.MILLISECONDS) * 2);
+		waitUntil(() -> {
+			System.gc();
+			return held.get() == null;
+		}, "the chunk released after its timeout");
+	}
+
+	/**
+	 * A leader commits only what its own log flushed (whatever its followers hold), and its log worker can be stopped by
+	 * a task in its queue ({@code LogWorkerGate}, which {@code LeaderStallTest} uses for a hung disk): the rule of a
+	 * leader whose log stops in {@link LeaderStall}.
+	 */
+	@Test
+	void aLeaderWhoseLogWorkerStopsCommitsNothing() throws Exception {
+		start(Duration.ofMillis(300), RaftServerConfigKeys.Write.ELEMENT_LIMIT_DEFAULT);
+		awaitLeader();
+		assertTrue(submitLocal("first").get(WAIT.toSeconds(), TimeUnit.SECONDS).isSuccess());
+		var log = server.getDivision(groupId).getRaftLog();
+		// Everything appended so far flushed and committed first.
+		waitUntil(() -> log.getFlushIndex() == log.getNextIndex() - 1
+				&& log.getLastCommittedIndex() == log.getFlushIndex(), "a settled log");
+		var disk = new CountDownLatch(1);
+		org.apache.ratis.server.raftlog.segmented.LogWorkerGate.block(log, disk);
+		long committed = log.getLastCommittedIndex();
+		long flushed = log.getFlushIndex();
+		var held = submitLocal("held");
+		Thread.sleep(1_000);
+		assertFalse(held.isDone(), "nothing commits");
+		assertEquals(committed, log.getLastCommittedIndex());
+		assertEquals(flushed, log.getFlushIndex());
+		assertTrue(log.getNextIndex() - 1 > flushed, "an entry waits for its flush");
+		disk.countDown();
+		assertTrue(held.get(WAIT.toSeconds(), TimeUnit.SECONDS).isSuccess());
+	}
+
+	/**
+	 * RF-2d.1: Ratis' gRPC log appender has no wait while it has no stream to a follower
+	 * ({@code GrpcLogAppender.getWaitTimeMs}), a spin until the next heartbeat after a stream reset. Measured here for a
+	 * follower that is down: the appender threads of the leader must not take a whole core. The share is printed.
+	 */
+	@Test
+	void theAppenderOfADeadFollowerDoesNotSpin() throws Exception {
+		var peers = new ArrayList<RaftPeer>();
+		for (int port : ProcessCluster.freePorts(3, List.of())) {
+			peers.add(RaftPeer.newBuilder().setId("a" + peers.size()).setAddress("127.0.0.1:" + port).build());
+		}
+		var group = RaftGroup.valueOf(groupId, peers);
+		for (var peer : peers) {
+			others.add(startMember(peer, group, new GateStateMachine()));
+		}
+		RaftServer leader = null;
+		long deadline = System.nanoTime() + WAIT.toNanos();
+		while (leader == null && System.nanoTime() - deadline < 0) {
+			for (var member : others) {
+				var info = member.getDivision(groupId).getInfo();
+				if (info.isLeader() && info.isLeaderReady()) {
+					leader = member;
+				}
+			}
+			Thread.sleep(20);
+		}
+		assertNotNull(leader, "a ready leader");
+		var leaderServer = leader;
+		// One follower down: the leader keeps its majority and its appender to the dead one.
+		var follower = others.stream().filter(member -> member != leaderServer).findFirst().orElseThrow();
+		var followerId = follower.getId().toString();
+		follower.close();
+		// Long enough for the stream to fail and be reset a few times.
+		Thread.sleep(2_000);
+		var threads = java.lang.management.ManagementFactory.getThreadMXBean();
+		long cpuBefore = appenderCpuNanos(threads, followerId);
+		long start = System.nanoTime();
+		Thread.sleep(3_000);
+		long cpu = appenderCpuNanos(threads, followerId) - cpuBefore;
+		assertTrue(appenderThreads(threads, followerId) > 0, "the appender threads are found by name");
+		double share = (double) cpu / (System.nanoTime() - start);
+		System.out.printf("Appender CPU for a dead follower: %.1f%% of a core%n", share * 100);
+		assertTrue(share < 0.5, () -> "the appender takes " + share * 100 + "% of a core");
+	}
+
+	/** CPU time of the leader's threads that append to {@code followerId} (named {@code ...->followerId-...}). */
+	private static long appenderCpuNanos(java.lang.management.ThreadMXBean threads, String followerId) {
+		long total = 0;
+		for (var info : threads.dumpAllThreads(false, false)) {
+			if (info.getThreadName().contains("->" + followerId)) {
+				long cpu = threads.getThreadCpuTime(info.getThreadId());
+				if (cpu > 0) {
+					total += cpu;
+				}
+			}
+		}
+		return total;
+	}
+
+	private static long appenderThreads(java.lang.management.ThreadMXBean threads, String followerId) {
+		return java.util.Arrays.stream(threads.dumpAllThreads(false, false))
+				.filter(info -> info.getThreadName().contains("->" + followerId))
+				.count();
+	}
+
+	/** A member of a group of several servers in this JVM, with this test's timeouts. */
+	private RaftServer startMember(RaftPeer peer, RaftGroup group, GateStateMachine machine) throws IOException {
+		var properties = new RaftProperties();
+		RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.GRPC);
+		var address = peer.getAddress();
+		GrpcConfigKeys.Server.setHost(properties, "127.0.0.1");
+		GrpcConfigKeys.Server.setPort(properties, Integer.parseInt(address.substring(address.lastIndexOf(':') + 1)));
+		RaftServerConfigKeys.setStorageDir(properties, List.of(tempDir.resolve(peer.getId().toString()).toFile()));
+		RaftServerConfigKeys.Rpc.setTimeoutMin(properties, TimeDuration.valueOf(300, TimeUnit.MILLISECONDS));
+		RaftServerConfigKeys.Rpc.setTimeoutMax(properties, TimeDuration.valueOf(600, TimeUnit.MILLISECONDS));
+		RaftServerConfigKeys.LeaderElection.setLeaderStepDownWaitTime(properties,
+				TimeDuration.valueOf(600, TimeUnit.MILLISECONDS));
+		RaftServerConfigKeys.Log.Appender.setRetryPolicy(properties, RaftSettings.APPENDER_RETRY_POLICY);
+		var member = RaftServer.newBuilder()
+				.setServerId(peer.getId())
+				.setGroup(group)
+				.setProperties(properties)
+				.setStateMachine(machine)
+				.setOption(RaftStorage.StartupOption.FORMAT)
+				.build();
+		member.start();
+		return member;
 	}
 
 	private RaftPeer start(Duration firstElection, int pendingLimit) throws IOException {

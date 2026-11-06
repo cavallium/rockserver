@@ -90,6 +90,10 @@ public final class ReplicatedNode implements AutoCloseable {
 	private volatile boolean takingSeedSnapshot;
 	/** Only used on the initialization thread. */
 	private final ClusterCheck clusterCheck;
+	/** Finds a hung disk, which pauses the API like a missing leader does; see {@link #gateApi}. */
+	private final DiskProbe diskProbe;
+	/** Whether {@link #gateApi} last found the disk hung. Maintenance thread only. */
+	private boolean diskHung;
 	/** Only used on the maintenance thread. */
 	private final LeaderStall leaderStall;
 	private final NodeMetrics.Series leaderStallStepDowns;
@@ -111,6 +115,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		this.commitHeartbeats = new CommitHeartbeats(this::raftServer, groupId);
 		this.leaderStall = LeaderStall.forElectionTimeout(config.electionTimeoutMax());
 		this.clusterCheck = new ClusterCheck(config.nodeId(), groupId, config.electionTimeoutMax());
+		this.diskProbe = DiskProbe.forDirectory(config.nodeId(), config.dataDir());
 		this.leaderStallStepDowns = metrics.amount("leader.stall.stepdowns");
 		this.leaderLogStepDowns = metrics.amount("leader.log.stepdowns");
 		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure, metrics);
@@ -173,6 +178,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			this.initialization = Executors.newSingleThreadScheduledExecutor(
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-initialization").factory());
 			this.apiGate = ApiGate.forElectionTimeout(config.electionTimeoutMax(), hadLeaderBeforeStart(), System.nanoTime());
+			diskProbe.start();
 			initialization.scheduleWithFixedDelay(this::initializeCluster, 0, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
 			maintenance.scheduleWithFixedDelay(this::gateApi, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
@@ -370,7 +376,20 @@ public final class ReplicatedNode implements AutoCloseable {
 	/** Stops serving clients while the node is cut off from a leader (see {@link ApiGate}). */
 	private void gateApi() {
 		try {
-			if (apiGate.shouldServe(knowsLeader(), System.nanoTime())) {
+			long now = System.nanoTime();
+			boolean serve = apiGate.shouldServe(knowsLeader(), now);
+			// A write waits at most the request timeout: a disk that has not ended an fsync for that long fails them all.
+			boolean hung = diskProbe.hung(now, config.requestTimeout().toNanos());
+			if (hung != diskHung) {
+				diskHung = hung;
+				if (hung) {
+					LOG.warn("{}: an fsync in {} has not ended for more than {} ms: the disk hangs, pausing the API",
+							config.nodeId(), config.dataDir(), config.requestTimeout().toMillis());
+				} else {
+					LOG.info("{}: the disk answers again", config.nodeId());
+				}
+			}
+			if (serve && !hung) {
 				apiServer.resume();
 			} else {
 				apiServer.pause();
@@ -406,6 +425,9 @@ public final class ReplicatedNode implements AutoCloseable {
 				return;
 			}
 			warnWhileInitializing(division);
+			// Deletes the partial copies of failed snapshot installations also while nothing else reads the snapshot.
+			stateMachine.getLatestSnapshot();
+			warnAbovePendingLimit(division);
 			var log = division.getRaftLog();
 			long commitIndex = log.getLastCommittedIndex();
 			long term = division.getInfo().getCurrentTerm();
@@ -428,6 +450,27 @@ public final class ReplicatedNode implements AutoCloseable {
 			}
 		} catch (IOException | RuntimeException ex) {
 			LOG.warn("{}: failed to check Raft, retrying", config.nodeId(), ex);
+		}
+	}
+
+	/** The member count of the configuration that {@link #warnAbovePendingLimit} last warned about. */
+	private int pendingLimitWarnedFor;
+
+	/**
+	 * Warns, on the leader, when the configuration has more members than its Ratis pending-request byte limit was sized
+	 * for ({@link RaftSettings#nodesUnderPendingLimit}): their attempts in flight can then fill it, and Ratis refuses
+	 * the rest before the append, which costs resends, not correctness. Maintenance thread only.
+	 */
+	private void warnAbovePendingLimit(org.apache.ratis.server.RaftServer.Division division) {
+		int members = division.getGroup().getPeers().size();
+		int limit = RaftSettings.nodesUnderPendingLimit(config);
+		if (members <= limit || !division.getInfo().isLeader()) {
+			return;
+		}
+		if (members != pendingLimitWarnedFor) {
+			pendingLimitWarnedFor = members;
+			LOG.warn("{}: the cluster has {} members, but this node's Ratis pending-request byte limit holds the attempts of"
+					+ " {} nodes: restart the nodes with every member in --peer", config.nodeId(), members, limit);
 		}
 	}
 
@@ -686,6 +729,9 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 		if (maintenance != null) {
 			maintenance.shutdownNow();
+		}
+		if (diskProbe != null) {
+			diskProbe.close();
 		}
 		if (initialization != null) {
 			initialization.shutdownNow();

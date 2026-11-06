@@ -285,7 +285,8 @@ Other results:
   not closing connections on shorter pauses; each such node before the first live one in the list then costs 3 s
   (the connect timeout), once, when the client moves past it. A node cut off from the Raft majority stops listening
   after 3 maximum election timeouts without a leader, at least 6 s (about 8 s in all by default), so its clients move,
-  and listens again once it knows a leader. A hung disk is not detected. See the
+  and listens again once it knows a leader. A node whose disk hangs (an fsync of its probe that does not end within
+  the request timeout) stops listening too, until the probe ends. See the
   [README](../../README.md#client-connections).
 - **Batch writes with client sessions.** The core client sends a `putBatch` or `mergeBatch` as one call per chunk
   of at most 4 MiB, one after the other, so each chunk costs a client round trip on top of its commit, which the

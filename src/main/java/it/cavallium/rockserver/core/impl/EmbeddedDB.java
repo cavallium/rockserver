@@ -7465,6 +7465,40 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return true;
 	}
 
+	/**
+	 * Closes every iterator open on the column named {@code name}, if it exists, and returns how many it closed. A
+	 * column deletion waits for the iterators of the column to end ({@code stopNewUsesAndWait}): a replicated server
+	 * calls this before it applies one, so that its apply does not stop until a client closes them or their lease ends.
+	 * Their owners then get "no iterator" on their next call, as after an expiry.
+	 */
+	public int closeIteratorsOfColumn(@NotNull String name) {
+		Long columnId = getColumnIdOrNull(name);
+		return columnId == null ? 0 : closeIteratorsOfColumn(columnId);
+	}
+
+	/** {@link #closeIteratorsOfColumn(String)} by column id; 0 if the column does not exist. */
+	public int closeIteratorsOfColumn(long columnId) {
+		ColumnInstance column;
+		try {
+			column = getColumn(columnId);
+		} catch (RocksDBException missing) {
+			return 0;
+		}
+		var ids = new LongArrayList();
+		its.forEach((id, entry) -> {
+			if (entry.objs() instanceof IteratorState state && state.column.cfh() == column.cfh()) {
+				ids.add((long) id);
+			}
+		});
+		int closed = 0;
+		for (int i = 0; i < ids.size(); i++) {
+			if (closeIteratorInternal(ids.getLong(i))) {
+				closed++;
+			}
+		}
+		return closed;
+	}
+
 	@Override
 	public void seekTo(long iterationId, @NotNull Keys keys) throws RocksDBException {
 		var start = System.nanoTime();

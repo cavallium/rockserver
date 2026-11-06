@@ -82,7 +82,12 @@ fn typed_context_constructor_rejects_protected_profiles() {
 
 #[test]
 fn raw_sst_tokens_accept_only_canonical_opaque_table_names() {
-    for valid in ["000001.sst", "/000001.sst", "18446744073709551615.sst"] {
+    for valid in [
+        "000001.sst",
+        "/000001.sst",
+        "18446744073709551615.sst",
+        "n1~7@/000001.sst",
+    ] {
         assert_eq!(RawSstToken::new(valid.to_owned()).unwrap().as_str(), valid);
     }
     for invalid in [
@@ -92,6 +97,9 @@ fn raw_sst_tokens_accept_only_canonical_opaque_table_names() {
         "../000001.sst",
         "/000001.ldb",
         "18446744073709551616.sst",
+        "@/000001.sst",
+        "n 1@/000001.sst",
+        "n1@n2@/000001.sst",
     ] {
         assert!(
             RawSstToken::new(invalid.to_owned()).is_err(),

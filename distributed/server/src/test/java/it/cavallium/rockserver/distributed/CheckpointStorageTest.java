@@ -355,6 +355,40 @@ class CheckpointStorageTest {
 		awaitFileNames(tmp, Set.of("snapshot-retried"));
 	}
 
+	/** DD-20: an installation that writes nothing more is deleted, without waiting for a newer one or a restart. */
+	@Test
+	void anInstallationThatStopsWritingIsDeleted() throws IOException {
+		var clock = new AtomicLong();
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT, clock);
+		Path tmp = follower.getTmpDir().toPath();
+		Path install = writePartialInstall(tmp, "snapshot-stopped");
+		long step = CheckpointStorage.INSTALL_PROGRESS_INTERVAL.toNanos();
+		follower.getLatestSnapshot();
+		// It goes on writing for a while: kept.
+		for (int i = 0; i < 5; i++) {
+			clock.addAndGet(step);
+			Files.write(install.resolve("snapshot-1-10").resolve("db").resolve("0000" + (20 + i) + ".sst"), new byte[16]);
+			follower.getLatestSnapshot();
+		}
+		assertTrue(Files.exists(install));
+		// Then nothing more, for almost the limit: still kept.
+		long idle = 0;
+		while (idle + step < CheckpointStorage.INSTALL_ABANDONED_AFTER.toNanos()) {
+			clock.addAndGet(step);
+			idle += step;
+			follower.getLatestSnapshot();
+		}
+		assertTrue(Files.exists(install), "not yet");
+		clock.addAndGet(2 * step);
+		follower.getLatestSnapshot();
+		awaitFileNames(tmp, Set.of());
+		// A new installation after that is a current one again.
+		Path next = writePartialInstall(tmp, "snapshot-next");
+		clock.addAndGet(step);
+		follower.getLatestSnapshot();
+		assertTrue(Files.exists(next));
+	}
+
 	@Test
 	void initDeletesPartialInstalls() throws IOException {
 		Path raftDir = tempDir.resolve("raft");

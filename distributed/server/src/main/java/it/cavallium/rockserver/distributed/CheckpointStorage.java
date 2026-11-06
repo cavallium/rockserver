@@ -50,9 +50,9 @@ import org.slf4j.LoggerFactory;
  * {@code tmp/snapshot-<request id>/}, at the same paths relative to {@link #getSnapshotDir()}, and when complete
  * moves {@code snapshots/} aside, renames the new directory into its place and deletes the old one. An
  * installation that fails is restarted under a new request id and leaves its partial copy behind: the copies are
- * deleted when the server starts, and when a newer installation starts writing (Ratis reads the latest snapshot
+ * deleted when the server starts, when a newer installation starts writing (Ratis reads the latest snapshot
  * for every chunk it receives; installations on one follower never overlap, a new one invalidates the older
- * ones).</p>
+ * ones), and once their files did not change for {@link #INSTALL_ABANDONED_AFTER}.</p>
  *
  * <p>Ratis saves a {@code <file>.md5} next to every received file but syncs nothing, so an installed snapshot is
  * used only once each file matches its saved digest; it is then fsynced and marked as verified. A snapshot that
@@ -68,6 +68,14 @@ final class CheckpointStorage implements StateMachineStorage {
 	static final Duration DEFAULT_INSTALL_READ_LEASE = Duration.ofMinutes(10);
 	/** Minimum interval between two checks for partial installations to delete. */
 	static final Duration INSTALL_SCAN_INTERVAL = Duration.ofSeconds(1);
+	/**
+	 * An installation whose files did not change for this long failed: its partial copy is deleted, without waiting for
+	 * a newer installation or a restart. The leader keeps the snapshot of an installation that read nothing for
+	 * {@link #DEFAULT_INSTALL_READ_LEASE} no longer either.
+	 */
+	static final Duration INSTALL_ABANDONED_AFTER = DEFAULT_INSTALL_READ_LEASE;
+	/** Minimum interval between two looks at the files of the current installations, see {@link #INSTALL_ABANDONED_AFTER}. */
+	static final Duration INSTALL_PROGRESS_INTERVAL = Duration.ofSeconds(10);
 	private static final String SNAPSHOTS_DIR = "snapshots";
 	private static final String TMP_DIR = "tmp";
 	private static final String SNAPSHOT_PREFIX = "snapshot-";
@@ -94,6 +102,9 @@ final class CheckpointStorage implements StateMachineStorage {
 	/** Every installation directory seen in {@link #tmpDir}, and the ones of the newest installation. */
 	private final Set<String> seenInstalls = new HashSet<>();
 	private Set<String> currentInstalls = Set.of();
+	/** Of each current installation, its files (count and bytes) when last looked at, and since when they are so. */
+	private final Map<String, long[]> installProgress = new HashMap<>();
+	private long lastProgressCheck = NEVER;
 
 	CheckpointStorage() {
 		this(DEFAULT_INSTALL_READ_LEASE, System::nanoTime);
@@ -309,9 +320,57 @@ final class CheckpointStorage implements StateMachineStorage {
 						discard(tmp.resolve(name));
 					}
 				}
+				discardAbandonedInstalls(tmp, present, now);
 			} catch (IOException ex) {
 				LOG.warn("Cannot delete the partial copies of replaced snapshot installations in {}", tmp, ex);
 			}
+		}
+	}
+
+	/**
+	 * Deletes the current installations whose files did not change for {@link #INSTALL_ABANDONED_AFTER}: Ratis gave up
+	 * on them (the leader stopped sending, or this follower failed to write), and only a newer installation or a restart
+	 * would delete them otherwise. One that is only slow and gets another chunk after this fails, and Ratis starts it
+	 * over. Looks at the files at most every {@link #INSTALL_PROGRESS_INTERVAL}.
+	 */
+	private void discardAbandonedInstalls(Path tmp, Set<String> present, long now) throws IOException {
+		installProgress.keySet().retainAll(currentInstalls);
+		if (lastProgressCheck != NEVER && now - lastProgressCheck < INSTALL_PROGRESS_INTERVAL.toNanos()) {
+			return;
+		}
+		lastProgressCheck = now;
+		var abandoned = new ArrayList<String>();
+		for (String name : currentInstalls) {
+			if (!present.contains(name)) {
+				continue;
+			}
+			long files = 0;
+			long bytes = 0;
+			try (Stream<Path> walk = Files.walk(tmp.resolve(name))) {
+				for (Path file : (Iterable<Path>) walk.filter(Files::isRegularFile)::iterator) {
+					files++;
+					bytes += Files.size(file);
+				}
+			} catch (java.io.UncheckedIOException | java.nio.file.NoSuchFileException ex) {
+				// Changing under the walk: it is alive.
+				installProgress.remove(name);
+				continue;
+			}
+			long[] known = installProgress.get(name);
+			if (known == null || known[0] != files || known[1] != bytes) {
+				installProgress.put(name, new long[] {files, bytes, now});
+			} else if (now - known[2] >= INSTALL_ABANDONED_AFTER.toNanos()) {
+				abandoned.add(name);
+			}
+		}
+		for (String name : abandoned) {
+			LOG.warn("The snapshot installation in {} wrote nothing for {}: it failed", tmp.resolve(name),
+					INSTALL_ABANDONED_AFTER);
+			installProgress.remove(name);
+			var rest = new HashSet<>(currentInstalls);
+			rest.remove(name);
+			currentInstalls = Set.copyOf(rest);
+			discard(tmp.resolve(name));
 		}
 	}
 

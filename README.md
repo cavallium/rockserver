@@ -149,7 +149,7 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 | Dies, its host stays up (crash, SIGKILL) | At once: the connection is reset | In milliseconds: the port refuses connections |
 | Stops answering with its host down, cut off from the client or frozen (power loss, SIGSTOP) | By keepalive, in at most 15 s | After that, plus one connect timeout for each such node listed before the one that works |
 | Is cut off from the Raft majority, and the client still reaches it | The node stops serving: it loses its leader within one election timeout, and after 3 maximum election timeouts without one, at least 6 s (about 8 s in all by default), it stops listening and sends GOAWAY. A node that restarts while cut off does the same, counted from its start. Calls running on it end as they do | In milliseconds. Until then calls fail with the errors of a node without a leader |
-| Has a hung disk | **Not detected**: the process still answers the connection handshake and keepalive. Calls wait for their deadline, and calls without one wait for the node. A leader with such a disk hands over its leadership after 3 maximum election timeouts, at least 5 s, and the client still stays on this node | Never: the client stays on this node |
+| Has a hung disk | The node's disk probe (an fsync in its data directory, once a second) does not end within the request timeout (10 s by default): the node stops listening and sends GOAWAY, as when it is cut off. Calls running on it wait for their deadline. A leader with such a disk also hands over its leadership after 3 maximum election timeouts, at least 5 s | In milliseconds after the pause. Until then calls wait |
 
 | System property | Default | Effect |
 |---|---|---|
