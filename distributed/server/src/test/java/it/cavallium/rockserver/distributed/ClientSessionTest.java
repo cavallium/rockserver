@@ -1,10 +1,16 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.GrpcConnection;
+import it.cavallium.rockserver.core.common.ClientRequestId;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestContext;
@@ -19,6 +25,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.jetbrains.annotations.Nullable;
@@ -144,5 +151,57 @@ class ClientSessionTest {
 				System.setProperty(GRPC_GRACEFUL_SHUTDOWN, graceful);
 			}
 		}
+	}
+
+	/**
+	 * Copies of a numbered commit sent straight to the leader: a copy that arrives while the first is in flight answers
+	 * "unknown" and leaves the transaction alone; once it applied, a copy answers {@code true} from the record, and the
+	 * mark is gone. A commit of a transaction the leader never had answers "run it again". A write staged in a
+	 * transaction cannot carry a request id.
+	 */
+	@Test
+	void copiesOfACommitAnswerUnknownWhileInFlightThenFromTheRecord() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var connection = (ReplicatedConnection) leader.connection();
+		var context = RequestContext.batch(TIMEOUT);
+		var api = connection.getAsyncApi(context);
+		long session = connection.openClientSessionAsync(context).join();
+		long column = api.createColumnAsync("c", SCHEMA).join();
+		long tx = api.openTransactionAsync(Duration.ofSeconds(60)).join();
+		api.mergeAsync(tx, column, key(3), text("t"), RequestType.none()).join();
+		var staged = connection.getAsyncApi(context.withRequestId(new ClientRequestId(session, 0, 0)))
+				.mergeAsync(tx, column, key(3), text("again"), RequestType.none());
+		var refused = assertThrows(java.util.concurrent.CompletionException.class, staged::join);
+		assertEquals(RocksDBErrorType.INVALID_REQUEST, ((RocksDBException) refused.getCause()).getErrorUniqueId());
+
+		cluster.awaitConverged(TIMEOUT);
+		var numbered = connection.getAsyncApi(context.withRequestId(new ClientRequestId(session, 1, 1)));
+		var gate = new CountDownLatch(1);
+		leader.stateMachine().testHooks().applyGate = gate;
+		CompletableFuture<Boolean> first;
+		try {
+			first = numbered.closeTransactionAsync(tx, true);
+			var followers = cluster.runningNodes().stream().filter(node -> node != leader).toList();
+			InProcessCluster.await(TIMEOUT, () -> followers.stream().allMatch(node ->
+					"t".equals(localValue(node, column, 3))));
+			var second = assertThrows(java.util.concurrent.CompletionException.class,
+					() -> numbered.closeTransactionAsync(tx, true).join());
+			assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, ((RocksDBException) second.getCause()).getErrorUniqueId());
+			assertTrue(connection.unsettledCommitsForTesting() == 1);
+		} finally {
+			gate.countDown();
+			leader.stateMachine().testHooks().applyGate = null;
+		}
+		assertTrue(first.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		assertTrue(numbered.closeTransactionAsync(tx, true).get(TIMEOUT.toSeconds(), TimeUnit.SECONDS),
+				"a copy after the commit answers from its record");
+		assertEquals(0, connection.unsettledCommitsForTesting());
+		assertEquals("t", localValue(leader, column, 3));
+
+		var never = connection.getAsyncApi(context.withRequestId(new ClientRequestId(session, 2, 2)))
+				.closeTransactionAsync(123_456, true);
+		var retry = assertThrows(java.util.concurrent.CompletionException.class, never::join);
+		assertInstanceOf(RocksDBRetryException.class, retry.getCause());
 	}
 }

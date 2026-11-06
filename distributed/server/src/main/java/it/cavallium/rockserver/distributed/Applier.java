@@ -839,9 +839,11 @@ final class Applier {
 		for (var it = sessions.values().iterator(); it.hasNext(); ) {
 			var session = it.next();
 			if (expired(session)) {
+				// The row first: a reader that finds no record of a write must not find its session alive (it would take
+				// the write for never applied).
+				db.deleteRangeUnlogged(metaColumn, NodeStore.sessionKey(session.id), NodeStore.sessionKey(session.id + 1));
 				db.deleteRangeUnlogged(metaColumn, NodeStore.sessionRequestKey(session.id, 0),
 						NodeStore.sessionRequestKey(session.id + 1, 0));
-				db.deleteRangeUnlogged(metaColumn, NodeStore.sessionKey(session.id), NodeStore.sessionKey(session.id + 1));
 				it.remove();
 			}
 		}

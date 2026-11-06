@@ -13,6 +13,7 @@ import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -96,8 +97,11 @@ final class SessionWrites {
 			this.deadlineNanos = deadlineNanos;
 		}
 
+		/** A copy of it was handed to the channel: if it ends without an answer, its outcome is unknown. */
+		volatile boolean sent;
+
 		/** Its number is final: no copy of it is sent any more. */
-		void finish() {
+		synchronized void finish() {
 			if (session != null) {
 				session.finish(sequence);
 				session = null;
@@ -118,6 +122,56 @@ final class SessionWrites {
 			fail(RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN,
 					"The write was sent, and no answer settled its outcome before its deadline: " + describe(cause)));
 		}
+
+		/** Ends it because the connection closed: unknown if a copy was sent, else not applied. */
+		void failClosed() {
+			if (sent) {
+				fail(RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN,
+						"The connection closed before an answer settled the outcome of the write"));
+			} else {
+				fail(closedBeforeSent());
+			}
+		}
+	}
+
+	private static RocksDBException closedBeforeSent() {
+		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+				"The connection is closed; the write was not sent");
+	}
+
+	/** Set by {@link #close}: nothing is sent or scheduled any more. */
+	private volatile boolean closed;
+	/** Calls without their answer yet, which {@link #close} ends. */
+	private final java.util.Set<Call> live = ConcurrentHashMap.newKeySet();
+
+	/**
+	 * Ends every call still waiting, as {@link Call#failClosed}: a call waiting for a resend or a session would
+	 * otherwise never complete once the connection's executor and channel are gone.
+	 */
+	void close() {
+		closed = true;
+		for (var call : List.copyOf(live)) {
+			call.failClosed();
+		}
+	}
+
+	/**
+	 * Runs {@code task} after {@code pauseNanos} on {@link #executor}, or ends {@code onClosed} if the connection closed
+	 * meanwhile. The timer is the JDK's shared one, which outlives the connection: a task refused by a closed executor
+	 * is not dropped in silence.
+	 */
+	private void later(long pauseNanos, Runnable task, Runnable onClosed) {
+		CompletableFuture.delayedExecutor(pauseNanos, TimeUnit.NANOSECONDS).execute(() -> {
+			if (closed) {
+				onClosed.run();
+				return;
+			}
+			try {
+				executor.execute(task);
+			} catch (java.util.concurrent.RejectedExecutionException stopping) {
+				onClosed.run();
+			}
+		});
 	}
 
 	private final Function<RequestContext, CompletableFuture<Long>> opener;
@@ -158,10 +212,14 @@ final class SessionWrites {
 		return id == 0 || updates.containsKey(id);
 	}
 
-	/** True if the answer to {@code command} has to be seen by {@link #observe}. */
+	/**
+	 * True if the answer to {@code command} has to be seen by {@link #observe}: a {@code getForUpdate} that opens an
+	 * update, not one inside a transaction, which answers with the transaction's own id (the transaction's later writes
+	 * are staged, and must not be numbered).
+	 */
 	static boolean observes(RocksDBAPICommand<?, ?, ?> command) {
 		return command instanceof RocksDBAPICommandSingle.CloseFailedUpdate
-				|| (command instanceof RocksDBAPICommandSingle.Get<?> get
+				|| (command instanceof RocksDBAPICommandSingle.Get<?> get && get.transactionOrUpdateId() == 0
 						&& get.requestType() instanceof RequestType.RequestForUpdate<?>);
 	}
 
@@ -169,7 +227,7 @@ final class SessionWrites {
 	void observe(RocksDBAPICommand<?, ?, ?> command, @Nullable Object result) {
 		if (command instanceof RocksDBAPICommandSingle.CloseFailedUpdate close) {
 			updates.remove(close.updateId());
-		} else if (result instanceof UpdateContext<?> update && update.updateId() != 0) {
+		} else if (observes(command) && result instanceof UpdateContext<?> update && update.updateId() != 0) {
 			long now = System.nanoTime();
 			if (updates.size() >= MAX_REMEMBERED_UPDATES) {
 				for (Iterator<Long> it = updates.values().iterator(); it.hasNext(); ) {
@@ -189,8 +247,20 @@ final class SessionWrites {
 		long now = System.nanoTime();
 		long remaining = context.remainingNanosAt(now);
 		long deadline = remaining == RequestContext.NO_TIMEOUT ? now + retryWindowNanos : now + remaining;
+		if (closed) {
+			return CompletableFuture.failedFuture(closedBeforeSent());
+		}
 		var call = new Call(context, command, deadline);
-		call.result.whenComplete((_, _) -> forgetUpdate(command));
+		live.add(call);
+		call.result.whenComplete((_, _) -> {
+			live.remove(call);
+			forgetUpdate(command);
+		});
+		if (closed) {
+			// close() may have run before the call was added.
+			call.failClosed();
+			return call.result;
+		}
 		start(call);
 		return call.result;
 	}
@@ -259,8 +329,8 @@ final class SessionWrites {
 			var cause = unwrap(error);
 			// Opening twice only leaves an unused session, which expires.
 			if (isUnknownOutcome(cause) && canPause(call, pauseNanos)) {
-				CompletableFuture.delayedExecutor(pauseNanos, TimeUnit.NANOSECONDS, executor)
-						.execute(() -> open(call, opening, Math.min(MAX_PAUSE_NANOS, pauseNanos * 2)));
+				later(pauseNanos, () -> open(call, opening, Math.min(MAX_PAUSE_NANOS, pauseNanos * 2)),
+						() -> opening.completeExceptionally(closedBeforeSent()));
 				return;
 			}
 			opening.completeExceptionally(cause);
@@ -279,7 +349,12 @@ final class SessionWrites {
 	private void attempt(Call call, Session session) {
 		var id = new ClientRequestId(session.id, call.sequence, session.completedBelow());
 		var context = new BoundRequestContext(call.context.value().withRequestId(id), call.context.startedNanos());
+		if (closed) {
+			call.failClosed();
+			return;
+		}
 		CompletableFuture<?> answer;
+		call.sent = true;
 		try {
 			answer = sender.apply(context, call.command);
 		} catch (RuntimeException ex) {
@@ -310,14 +385,17 @@ final class SessionWrites {
 				return;
 			}
 			call.maybeApplied = true;
+			if (closed) {
+				call.failClosed();
+				return;
+			}
 			if (!canPause(call, call.pauseNanos)) {
 				call.failUnknown(cause);
 				return;
 			}
 			long pause = call.pauseNanos;
 			call.pauseNanos = Math.min(MAX_PAUSE_NANOS, pause * 2);
-			CompletableFuture.delayedExecutor(pause, TimeUnit.NANOSECONDS, executor)
-					.execute(() -> attempt(call, session));
+			later(pause, () -> attempt(call, session), call::failClosed);
 		});
 	}
 

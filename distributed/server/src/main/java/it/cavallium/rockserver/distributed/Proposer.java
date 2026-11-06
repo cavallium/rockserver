@@ -890,7 +890,12 @@ final class Proposer implements Closeable {
 				}
 				pending.resentAlone = true;
 				if (commits) {
-					completeFromLocalRecord(pending);
+					// A database read: off the control threads, which this reply handler runs on.
+					try {
+						sender.execute(() -> completeFromLocalRecord(pending));
+					} catch (java.util.concurrent.RejectedExecutionException stopping) {
+						pending.fail(unavailable(stopping));
+					}
 				} else {
 					pending.queuedNanos = System.nanoTime();
 					pending.copyBatchLimit = Math.max(1, carried);
