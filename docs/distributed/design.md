@@ -1291,6 +1291,22 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   says otherwise; leave room for the snapshot chunks and the forwarded calls in flight. Without JFR in the JVM the node
   warns and runs without the watch.
 
+  Only such an error on a thread of replication is fatal: a thread of Ratis (`<peer>@group-...`: appenders, log
+  worker, state machine updater, leader and follower state; `<peer>-server-thread<n>` and the other executors of its
+  server; `grpc-default-...`, its shaded gRPC transport). Client traffic makes the same error on other threads: the
+  API's event loop (`rockserver-grpc-server-loop-...`, named for this) reading a large message, a thread encoding a large
+  reply, a forward to the leader (`rockserver-grpc-<node>-forward-...`). That error fails the one request, and halting
+  for it would do harm: the client retries on the next node, which halts too, until no majority is left. So it is
+  logged as an error, with its thread, and the node goes on (`DirectMemoryWatchTest` pins the names on a running
+  cluster, `DirectMemoryProcessTest` sends a message larger than the direct memory of every node). This does not keep
+  client traffic from using up the memory Ratis needs next: on this JDK both Netty copies, the API's and the shaded one
+  of Ratis, allocate through the JDK's direct buffers (neither uses a counter of its own: measured, `noCleaner` is
+  false for both), so they share one limit, and an append that fails for lack of it halts the node. A hard cap of the
+  API's direct memory below the limit would need a pooled allocator with its own limit for the API transport, which
+  gRPC's Netty transport does not offer per server; the bound instead is the configuration: set
+  `-XX:MaxDirectMemorySize` to at least the snapshot chunks in flight plus `max-inbound-message-bytes` (512 MiB by
+  default; lower it to what the clients really send) times the large requests expected at once.
+
   An out of memory error on a thread of Ratis does not stop the JVM. In the appender of a new member it ends the
   catch-up as if it had finished: `LeaderStateImpl.restart` starts a new appender only for a peer in the configuration,
   and `checkStaging` then finds nobody lagging and appends the joint configuration, with a member that has nothing.

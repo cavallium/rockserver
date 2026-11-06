@@ -1054,7 +1054,8 @@ class GrpcConnectionFailoverTest {
 	/** The threads of the event loop groups of gRPC clients and servers: a closed channel leaves none. */
 	private static Set<Thread> eventLoopThreads() {
 		return Thread.getAllStackTraces().keySet().stream()
-				.filter(thread -> thread.getName().startsWith("nioEventLoopGroup"))
+				.filter(thread -> thread.getName().startsWith("nioEventLoopGroup")
+						|| thread.getName().startsWith("rockserver-grpc-server-loop"))
 				.collect(Collectors.toSet());
 	}
 

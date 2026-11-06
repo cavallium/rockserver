@@ -291,8 +291,12 @@ class StartupChecksTest {
 			var unrelated = new StackOverflowError("unrelated");
 			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
 			while (!seen.isDone() && System.nanoTime() - deadline < 0) {
-				var error = new OutOfMemoryError("Cannot reserve 8 bytes of direct buffer memory (allocated: 1, limit: 2)");
-				assertTrue(error.getMessage().contains("direct"), unrelated.getMessage());
+				// On a thread named like an appender of Ratis: only those are fatal (CR2-1, see DirectMemoryWatchTest).
+				var thread = Thread.ofPlatform().name("n0@group-1->n1-GrpcLogAppender-LogAppenderDaemon").start(() -> {
+					var error = new OutOfMemoryError("Cannot reserve 8 bytes of direct buffer memory (allocated: 1, limit: 2)");
+					assertTrue(error.getMessage().contains("direct"), unrelated.getMessage());
+				});
+				thread.join();
 				Thread.sleep(200);
 			}
 			var description = seen.get(1, TimeUnit.SECONDS);

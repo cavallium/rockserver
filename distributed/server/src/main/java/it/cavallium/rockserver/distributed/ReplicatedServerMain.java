@@ -62,7 +62,8 @@ import org.jetbrains.annotations.Nullable;
  * with 1 if it refuses.</p>
  *
  * <p>Run a node with {@code -XX:+ExitOnOutOfMemoryError}: {@code run} refuses to start without it, unless
- * {@code --allow-without-exit-on-oom} is given (for development only). Running out of direct memory stops the node too,
+ * {@code --allow-without-exit-on-oom} is given (for development only). Running out of direct memory on a thread of
+ * replication stops the node too,
  * with exit code 3, see {@link DirectMemoryWatch}. See "Heap" in the design document.</p>
  *
  * <p>{@code run} exits with 4, and does not start, if the configuration in its log no longer contains the node: it was

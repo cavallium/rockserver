@@ -103,11 +103,14 @@ public class GrpcServer extends Server {
 		this.grpc = new GrpcServerImpl(this, this.getClient());
 		EventLoopGroup elg;
 		Class<? extends ServerChannel> channelType;
+		// Named, so that a replicated node tells the API's transport threads from those of Ratis' own (shaded) gRPC,
+		// which keeps Netty's default names: a direct memory error is fatal only on the latter (DirectMemoryWatch).
+		var threads = new io.netty.util.concurrent.DefaultThreadFactory("rockserver-grpc-server-loop", false);
 		if (socketAddress instanceof DomainSocketAddress _) {
-			elg = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
+			elg = new EpollEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2, threads);
 			channelType = EpollServerDomainSocketChannel.class;
 		} else {
-			elg = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2);
+			elg = new NioEventLoopGroup(Runtime.getRuntime().availableProcessors() * 2, threads);
 			channelType = NioServerSocketChannel.class;
 		}
 		this.elg = elg;
