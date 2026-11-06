@@ -188,7 +188,7 @@ class ClientSessionTest {
 			var second = assertThrows(java.util.concurrent.CompletionException.class,
 					() -> numbered.closeTransactionAsync(tx, true).join());
 			assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, ((RocksDBException) second.getCause()).getErrorUniqueId());
-			assertTrue(connection.unsettledCommitsForTesting() == 1);
+			assertTrue(connection.outcomes.unsettledCommitsForTesting() == 1);
 		} finally {
 			gate.countDown();
 			leader.stateMachine().testHooks().applyGate = null;
@@ -196,7 +196,7 @@ class ClientSessionTest {
 		assertTrue(first.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS));
 		assertTrue(numbered.closeTransactionAsync(tx, true).get(TIMEOUT.toSeconds(), TimeUnit.SECONDS),
 				"a copy after the commit answers from its record");
-		assertEquals(0, connection.unsettledCommitsForTesting());
+		assertEquals(0, connection.outcomes.unsettledCommitsForTesting());
 		assertEquals("t", localValue(leader, column, 3));
 
 		var never = connection.getAsyncApi(context.withRequestId(new ClientRequestId(session, 2, 2)))

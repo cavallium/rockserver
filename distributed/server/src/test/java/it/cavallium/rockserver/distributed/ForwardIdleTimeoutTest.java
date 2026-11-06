@@ -55,7 +55,7 @@ class ForwardIdleTimeoutTest {
 	@Test
 	void sourceThatStopsDeliveringFails() throws Exception {
 		var subscriber = new SlowSubscriber(0);
-		ReplicatedConnection.idleTimeout(Flux.concat(Flux.range(0, 3), Flux.never()), IDLE).subscribe(subscriber);
+		Forwarder.idleTimeout(Flux.concat(Flux.range(0, 3), Flux.never()), IDLE).subscribe(subscriber);
 		var error = subscriber.end.get(10, TimeUnit.SECONDS);
 		assertInstanceOf(TimeoutException.class, error);
 		assertEquals(3, subscriber.received.get());
@@ -65,7 +65,7 @@ class ForwardIdleTimeoutTest {
 	void slowConsumerIsNotTimedOut() throws Exception {
 		// The consumer waits longer than the idle timeout before asking for each next element.
 		var subscriber = new SlowSubscriber(IDLE.toMillis() * 2);
-		ReplicatedConnection.idleTimeout(Flux.range(0, 4), IDLE).subscribe(subscriber);
+		Forwarder.idleTimeout(Flux.range(0, 4), IDLE).subscribe(subscriber);
 		assertNull(subscriber.end.get(10, TimeUnit.SECONDS));
 		assertEquals(4, subscriber.received.get());
 	}

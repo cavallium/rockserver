@@ -15,7 +15,7 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
  * at once. The control plane must not wait behind them: the proposer's reply handling, resends and expiries, and the
  * read barrier's rounds run on {@link #control()}, a few platform threads that never run database calls. Their
  * callers' own continuations are handed back to virtual threads (see {@link Proposer}), or hop to {@link #local()}
- * before touching the database (see {@link ReplicatedConnection}).</p>
+ * before touching the database (see {@link LocalCommands}).</p>
  */
 final class NodeThreads implements Closeable {
 

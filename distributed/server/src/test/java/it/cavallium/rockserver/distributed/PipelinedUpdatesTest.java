@@ -777,7 +777,7 @@ class PipelinedUpdatesTest {
 	@Test
 	void closesThatWaitForTheirBaseHoldNoWorkerOfTheServer() throws Exception {
 		start();
-		connection().chainedCloseWaitForTesting = TIMEOUT.multipliedBy(2);
+		connection().updates.chainedCloseWaitForTesting = TIMEOUT.multipliedBy(2);
 		var self = leader.config().self();
 		try (var client = GrpcConnection.forHostAndPort("closes", new HostAndPort(self.apiHost(), self.apiPort()))) {
 			var grpc = client.getAsyncApi(CONTEXT);
@@ -828,7 +828,7 @@ class PipelinedUpdatesTest {
 	@Test
 	void aCommitThatEndsWithoutAnOutcomeFailsItsLink() throws Exception {
 		start();
-		connection().chainedCloseWaitForTesting = TIMEOUT.multipliedBy(2);
+		connection().updates.chainedCloseWaitForTesting = TIMEOUT.multipliedBy(2);
 		closeGate(leader);
 		var head = forUpdate(1);
 		var shortCaller = leader.connection().getAsyncApi(RequestContext.latency(Duration.ofMillis(1500)));

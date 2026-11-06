@@ -80,8 +80,8 @@ class FollowerReadTest {
 		return node.connection().getSyncApi(CONTEXT);
 	}
 
-	private static ReplicatedConnection routing(ReplicatedNode node) {
-		return (ReplicatedConnection) node.connection();
+	private static Router routing(ReplicatedNode node) {
+		return ((ReplicatedConnection) node.connection()).router;
 	}
 
 	private static String get(ReplicatedNode node, long column, long key) {
@@ -162,8 +162,8 @@ class FollowerReadTest {
 			}
 		}
 		var leaderAddress = leader.config().self().apiHost() + ":" + leader.config().self().apiPort();
-		assertEquals(leaderAddress, routing(follower).leaderApiAddress());
-		assertEquals(leaderAddress, routing(leader).leaderApiAddress());
+		assertEquals(leaderAddress, ((ReplicatedConnection) follower.connection()).leaderApiAddress());
+		assertEquals(leaderAddress, ((ReplicatedConnection) leader.connection()).leaderApiAddress());
 
 		// The follower names the leader in its responses.
 		var channel = NettyChannelBuilder.forAddress(addresses.getFirst().host(), addresses.getFirst().port())

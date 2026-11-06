@@ -37,7 +37,7 @@ only once the apply thread is still the limit above about 4x production load.
    ▼             ▼                             ▼
  node A        node B (leader)               node C
  GrpcServer    GrpcServer                    GrpcServer        ← core server, unchanged
- ReplicatedConnection (implements RocksDBConnection)            ← routes every API command
+ ReplicatedConnection (implements RocksDBConnection; Router)    ← routes every API command
  EmbeddedDB    EmbeddedDB                    EmbeddedDB        ← core engine, unchanged
  Ratis server ═══ Raft log replication (stock Apache Ratis 3.3.1, gRPC) ═══
 ```
@@ -75,7 +75,11 @@ forwards to a non-embedded connection:
 | Class | Role |
 |---|---|
 | `ReplicatedNode` | Wiring and lifecycle: database, Raft server, API server, cluster initialization, graceful hand-off. |
-| `ReplicatedConnection` | Routes each `RocksDBAPICommand` (see below). |
+| `ReplicatedConnection` | The node's `RocksDBConnection`: client sessions, the leader hint, and the API, which hands each `RocksDBAPICommand` to `Router`. |
+| `Router` | Chooses each command's path (see below), including follower reads. |
+| `Forwarder` | Forwards a command or stream to the leader: deadlines, idle timeout of streams, which commands are sent again after the leader became unreachable, and the retryable or unknown outcome of the others. |
+| `UpdateProtocol`, `CommitOutcomes` | Transactions and updates on the leader: opening, staged writes, commits, chained updates; which commits of client session writes are unsettled, and the answer to a copy of one. |
+| `ReplicatedWrites`, `LocalCommands` | Writes proposed to the log, with batches split into chunks; commands on the node's own database, and the leadership checks the others share. |
 | `Proposer` | Batches numbered requests into log entries and submits them to the leader: straight to the local Raft server on the leader, through a Ratis client elsewhere. |
 | `RockserverStateMachine` | Ratis state machine. Leader admission in `startTransaction`/`preAppendTransaction`; entries are queued to an apply thread of its own, which applies them in groups; snapshots. |
 | `Applier` | Applies the requests of log entries to the local database, a group of entries in one transaction without the WAL, with their result records and the applied position. |
@@ -95,7 +99,7 @@ forwards to a non-embedded connection:
 
 ## Routing
 
-`ReplicatedConnection` sends every API command down one of four paths:
+`Router` (behind `ReplicatedConnection`) sends every API command down one of four paths:
 
 | Path | Commands | Handling |
 |---|---|---|

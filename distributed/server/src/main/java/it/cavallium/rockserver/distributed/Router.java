@@ -1,0 +1,388 @@
+package it.cavallium.rockserver.distributed;
+
+import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Delete;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.DeleteMulti;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Get;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Merge;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.MergeMulti;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.OpenTransaction;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.Put;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.PutMulti;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandStream;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
+import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import it.cavallium.rockserver.distributed.LocalCommands.NotLeader;
+
+import static it.cavallium.rockserver.distributed.ReplicatedConnection.remainingContext;
+import static it.cavallium.rockserver.distributed.ReplicatedConnection.remainingNanos;
+import static it.cavallium.rockserver.distributed.ReplicatedConnection.unwrap;
+import static it.cavallium.rockserver.distributed.LocalCommands.barrierFailure;
+
+/**
+ * Chooses the path of each command of a replicated node (see {@link ReplicatedConnection}): a replicated write, a
+ * linearizable read (on the leader after the read barrier, on a follower after a read index, or forwarded), a
+ * leader-bound command ({@link UpdateProtocol}, or forwarded by {@link Forwarder}), or a local one.
+ */
+final class Router {
+
+	private static final int ROUTING_ATTEMPTS = 3;
+	/** A follower further behind the leader's read index than this many log entries forwards a read instead. */
+	private static final long FOLLOWER_READ_MAX_LAG = 1024;
+	/**
+	 * How long a follower that knows the read index is committed waits for its apply to reach it, before it forwards
+	 * the read instead.
+	 */
+	private static final Duration FOLLOWER_READ_APPLY_WAIT = Duration.ofMillis(500);
+	/**
+	 * How long a follower that does not know yet that the read index is committed waits for it, before it forwards the
+	 * read instead. Ratis tells followers the commit index with its next append: at once while writes flow, but on a
+	 * quiet cluster only with the next heartbeat, half an election timeout later. Forwarding costs about two round
+	 * trips, so waiting longer than that for the heartbeat is not worth it.
+	 */
+	private static final Duration FOLLOWER_READ_COMMIT_WAIT = Duration.ofMillis(5);
+	/**
+	 * {@code true} turns follower reads on for this node; off by default, a follower forwards every read to the leader.
+	 * Nodes may differ. See "Reads" in the design document for what they cost on a quiet cluster.
+	 */
+	static final String FOLLOWER_READS_PROPERTY = "it.cavallium.rockserver.distributed.follower-reads";
+
+	private final RockserverStateMachine stateMachine;
+	private final FollowerReads followerReads;
+	private final LocalCommands localCommands;
+	private final ReplicatedWrites writes;
+	private final UpdateProtocol updates;
+	private final Forwarder forwarding;
+	/** Whether this node serves point reads as a follower; see {@link #FOLLOWER_READS_PROPERTY}. */
+	volatile boolean followerReadsEnabled = Boolean.getBoolean(FOLLOWER_READS_PROPERTY);
+	/** Point reads this node served as a follower, and those it forwarded after trying. */
+	private final AtomicLong followerReadsServed = new AtomicLong();
+	private final AtomicLong followerReadsForwarded = new AtomicLong();
+	private final NodeMetrics.Series followerReadTime;
+	private final NodeMetrics.Series followerReadFallbacks;
+	private final NodeMetrics.Series barrierTime;
+	/** Runs short local commands, each on a virtual thread of its own ({@link NodeThreads#local()}). */
+	private final java.util.concurrent.ExecutorService inline;
+
+	Router(NodeConfig config,
+			RockserverStateMachine stateMachine,
+			FollowerReads followerReads,
+			LeaderForwarder forwarder,
+			LocalCommands localCommands,
+			ReplicatedWrites writes,
+			UpdateProtocol updates,
+			NodeMetrics metrics,
+			java.util.concurrent.ExecutorService inline) {
+		this.stateMachine = stateMachine;
+		this.followerReads = followerReads;
+		this.localCommands = localCommands;
+		this.writes = writes;
+		this.updates = updates;
+		this.inline = inline;
+		this.followerReadTime = metrics.duration("read.follower");
+		this.followerReadFallbacks = metrics.amount("read.follower.forwarded");
+		this.barrierTime = metrics.duration("read.barrier");
+		this.forwarding = new Forwarder(config, stateMachine, forwarder, localCommands, this, metrics);
+	}
+
+	private CompletableFuture<?> local(RequestContext context, RocksDBAPICommandSingle<?> command) {
+		return localCommands.local(context, command);
+	}
+
+	private Flux<Object> localStream(RequestContext context, RocksDBAPICommandStream<?> command) {
+		return localCommands.localStream(context, command);
+	}
+
+	private CompletableFuture<Void> leadership() {
+		return localCommands.leadership();
+	}
+
+	private boolean isLeader() {
+		return localCommands.isLeader();
+	}
+
+	CompletableFuture<?> single(RequestContext context, RocksDBAPICommandSingle<?> command) {
+		long start = System.nanoTime();
+		try {
+			requireUserColumn(command);
+			return switch (command) {
+				case Put<?> c when c.transactionOrUpdateId() == 0 -> writes.propose(context, start,
+						new LogEntry.Put(c.columnId(), c.keys(), c.value(), id(c.requestType())));
+				case PutMulti<?> c when c.transactionOrUpdateId() == 0 -> writes.propose(context, start,
+						new LogEntry.PutMulti(c.columnId(), c.keys(), c.values(), id(c.requestType())));
+				case Delete<?> c when c.transactionOrUpdateId() == 0 -> writes.propose(context, start,
+						new LogEntry.Delete(c.columnId(), c.keys(), id(c.requestType())));
+				case DeleteMulti<?> c when c.transactionOrUpdateId() == 0 -> writes.propose(context, start,
+						new LogEntry.DeleteMulti(c.columnId(), c.keys(), id(c.requestType())));
+				case Merge<?> c when c.transactionOrUpdateId() == 0 -> writes.propose(context, start,
+						new LogEntry.Merge(c.columnId(), c.keys(), c.value(), id(c.requestType())));
+				case MergeMulti<?> c when c.transactionOrUpdateId() == 0 -> writes.propose(context, start,
+						new LogEntry.MergeMulti(c.columnId(), c.keys(), c.values(), id(c.requestType())));
+				case Put<?> c -> leaderBound(context, c, () -> updates.stagedWrite(context, c, c.transactionOrUpdateId(),
+						new LogEntry.Put(c.columnId(), c.keys(), c.value(), id(c.requestType())), List.of(c.keys())));
+				case PutMulti<?> c -> leaderBound(context, c, () -> updates.stagedWrite(context, c, c.transactionOrUpdateId(),
+						new LogEntry.PutMulti(c.columnId(), c.keys(), c.values(), id(c.requestType())), c.keys()));
+				case Delete<?> c -> leaderBound(context, c, () -> updates.stagedWrite(context, c, c.transactionOrUpdateId(),
+						new LogEntry.Delete(c.columnId(), c.keys(), id(c.requestType())), List.of(c.keys())));
+				case DeleteMulti<?> c -> leaderBound(context, c, () -> updates.stagedWrite(context, c, c.transactionOrUpdateId(),
+						new LogEntry.DeleteMulti(c.columnId(), c.keys(), id(c.requestType())), c.keys()));
+				case Merge<?> c -> leaderBound(context, c, () -> updates.stagedWrite(context, c, c.transactionOrUpdateId(),
+						new LogEntry.Merge(c.columnId(), c.keys(), c.value(), id(c.requestType())), List.of(c.keys())));
+				case MergeMulti<?> c -> leaderBound(context, c, () -> updates.stagedWrite(context, c, c.transactionOrUpdateId(),
+						new LogEntry.MergeMulti(c.columnId(), c.keys(), c.values(), id(c.requestType())), c.keys()));
+				case RocksDBAPICommandSingle.DeleteRange c -> writes.propose(context, start,
+						new LogEntry.DeleteRange(c.columnId(), c.startKeysInclusive(), c.endKeysExclusive()));
+				case RocksDBAPICommandSingle.PutBatch c -> writes.batch(context, c.columnId(), c.batchPublisher(), false);
+				case RocksDBAPICommandSingle.MergeBatch c -> writes.batch(context, c.columnId(), c.batchPublisher(), true);
+				case RocksDBAPICommandSingle.CreateColumn c -> writes.createColumn(context, start, c.name(), c.schema());
+				case RocksDBAPICommandSingle.DeleteColumn c ->
+						writes.propose(context, start, new LogEntry.DeleteColumn(c.columnId()));
+				case RocksDBAPICommandSingle.DeleteColumnIfExists c ->
+						writes.propose(context, start, new LogEntry.DeleteColumnIfExists(c.name()));
+				case RocksDBAPICommandSingle.UploadMergeOperator c -> writes.propose(context, start,
+						new LogEntry.UploadMergeOperator(c.name(), c.className(), c.jarData()));
+
+				case OpenTransaction c -> leaderBound(context, c, () -> updates.openTransaction(context, c));
+				case CloseTransaction c -> leaderBound(context, c, () -> updates.closeTransaction(context, c));
+				case CloseFailedUpdate c -> leaderBound(context, c, () -> updates.closeFailedUpdate(context, c));
+				case Get<?> c when c.requestType() instanceof RequestType.RequestForUpdate<?> ->
+						leaderBound(context, c, () -> updates.getForUpdate(context, c));
+				case Get<?> c when c.transactionOrUpdateId() != 0 ->
+						leaderBound(context, c, () -> updates.inTransaction(context, c, c.transactionOrUpdateId()));
+				case RocksDBAPICommandSingle.ExistsMulti c when c.transactionId() != 0 ->
+						leaderBound(context, c, () -> updates.inTransaction(context, c, c.transactionId()));
+				case RocksDBAPICommandSingle.OpenIterator c when c.transactionId() != 0 ->
+						leaderBound(context, c, () -> updates.inTransaction(context, c, c.transactionId()));
+				case RocksDBAPICommandSingle.ReduceRange<?> c when c.transactionId() != 0 ->
+						leaderBound(context, c, () -> updates.inTransaction(context, c, c.transactionId()));
+				case RocksDBAPICommandSingle.GetRangePage<?> c when c.transactionId() != 0 ->
+						leaderBound(context, c, () -> updates.inTransaction(context, c, c.transactionId()));
+				case RocksDBAPICommandSingle.CloseIterator c -> leaderBound(context, c, () -> local(context, c));
+				case RocksDBAPICommandSingle.SeekTo c -> leaderBound(context, c, () -> local(context, c));
+				case RocksDBAPICommandSingle.Subsequent<?> c -> leaderBound(context, c, () -> local(context, c));
+
+				case RocksDBAPICommandSingle.GetAllColumnDefinitions c ->
+						leaderRead(context, c).thenApply(Router::hideMetaColumn);
+				case Get<?> c -> leaderRead(context, c);
+				case RocksDBAPICommandSingle.GetMulti c -> leaderRead(context, c);
+				case RocksDBAPICommandSingle.ExistsMulti c -> leaderRead(context, c);
+				case RocksDBAPICommandSingle.OpenIterator c -> leaderRead(context, c);
+				case RocksDBAPICommandSingle.ReduceRange<?> c -> leaderRead(context, c);
+				case RocksDBAPICommandSingle.GetRangePage<?> c -> leaderRead(context, c);
+				case RocksDBAPICommandSingle.GetColumnId c -> leaderRead(context, c);
+				case RocksDBAPICommandSingle.EstimateNumKeys c -> leaderRead(context, c);
+				case RocksDBAPICommandSingle.CheckMergeOperator c -> leaderRead(context, c);
+
+				case RocksDBAPICommand.Flush c -> local(context, c);
+				case RocksDBAPICommand.Compact c -> local(context, c);
+				case RocksDBAPICommand.GetTableProperties c -> local(context, c);
+				case RocksDBAPICommand.GetSstMetadata c -> local(context, c);
+				case RocksDBAPICommand.CompactFiles c -> local(context, c);
+				default -> CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
+						"Not supported by replicated Rockserver: " + command.getClass().getSimpleName()));
+			};
+		} catch (RuntimeException ex) {
+			return CompletableFuture.failedFuture(ex);
+		}
+	}
+
+	Publisher<Object> stream(RequestContext context, RocksDBAPICommandStream<?> command) {
+		try {
+			requireUserColumn(command);
+		} catch (RocksDBException ex) {
+			return Flux.error(ex);
+		}
+		if (command instanceof RocksDBAPICommandStream.GetRange<?> range && range.transactionId() != 0) {
+			// Iterates inside a transaction: only the leader that opened it can serve it.
+			return Flux.defer(() -> {
+				if (!isLeader()) {
+					return forwarding.forwardStream(context, command);
+				}
+				updates.requireLeaderTransaction(range.transactionId());
+				return localStream(context, command);
+			});
+		}
+		return Flux.defer(() -> {
+			if (!isLeader()) {
+				return forwarding.forwardStream(context, command);
+			}
+			return Mono.fromFuture(this::leadership)
+					.onErrorMap(LocalCommands::barrierFailure)
+					.thenMany(Flux.defer(() -> localStream(context, command)));
+		});
+	}
+
+	/** Runs {@code onLeader} if this node leads, otherwise forwards {@code command} to the leader. */
+	private CompletableFuture<?> leaderBound(RequestContext context,
+			RocksDBAPICommandSingle<?> command,
+			Supplier<CompletableFuture<?>> onLeader) {
+		if (isLeader()) {
+			try {
+				return onLeader.get();
+			} catch (NotLeader ex) {
+				// Lost leadership just now: the new leader cannot know this node's transactions, but it can
+				// serve requests that do not refer to them.
+			}
+		}
+		return forwarding.forward(context, command);
+	}
+
+	/** A linearizable read: on the leader after the read barrier, otherwise forwarded to the leader. */
+	private CompletableFuture<?> leaderRead(RequestContext context, RocksDBAPICommandSingle<?> command) {
+		return leaderRead(context, command, ROUTING_ATTEMPTS);
+	}
+
+	private CompletableFuture<?> leaderRead(RequestContext context, RocksDBAPICommandSingle<?> command, int attempts) {
+		if (!isLeader()) {
+			return followerReadsEnabled && isFollowerReadable(command)
+					? followerRead(context, command)
+					: forwarding.forward(context, command);
+		}
+		long start = System.nanoTime();
+		return leadership().handle((_, error) -> {
+			barrierTime.since(start);
+			if (error == null) {
+				// The time spent confirming leadership counts toward the read's timeout.
+				return local(remainingContext(context, start), command);
+			}
+			var cause = unwrap(error);
+			if (cause instanceof ReadBarrier.NotLeaderException && attempts > 1) {
+				// Leadership moved while confirming it: route again, most likely to the new leader.
+				return leaderRead(context, command, attempts - 1);
+			}
+			return CompletableFuture.failedFuture(barrierFailure(cause));
+		}).thenCompose(f -> f);
+	}
+
+	/**
+	 * Point reads that a follower serves from its own database once it applied up to a read index from the leader
+	 * ({@link FollowerReads}): not reads in a transaction or for an update, which live on the leader.
+	 */
+	private static boolean isFollowerReadable(RocksDBAPICommandSingle<?> command) {
+		return switch (command) {
+			case Get<?> c -> c.transactionOrUpdateId() == 0 && !(c.requestType() instanceof RequestType.RequestForUpdate<?>);
+			case RocksDBAPICommandSingle.ExistsMulti c -> c.transactionId() == 0;
+			case RocksDBAPICommandSingle.GetMulti _ -> true;
+			default -> false;
+		};
+	}
+
+	/**
+	 * A point read on a follower: once this node applied up to a read index the leader confirmed after the read arrived,
+	 * it has every write acknowledged before the read arrived, and serves it from its own database. Unlike the leader's
+	 * {@link ReadBarrier#awaitLeadership()}, it waits for the whole index: this node did not acknowledge those writes
+	 * itself. If no read index comes, or this node is too far behind, it forwards the read to the leader instead.
+	 */
+	private CompletableFuture<?> followerRead(RequestContext context, RocksDBAPICommandSingle<?> command) {
+		if (stateMachine.isFailed()) {
+			return forwarding.forward(context, command);
+		}
+		long start = System.nanoTime();
+		var applied = stateMachine.appliedIndex();
+		var readIndex = followerReads.readIndex();
+		if (context.hasTimeout()) {
+			// This caller's copy: the request is shared with other reads.
+			readIndex = readIndex.copy().orTimeout(Math.max(0, remainingNanos(context, start)), TimeUnit.NANOSECONDS);
+		}
+		return readIndex.thenCompose(index -> {
+					if (index - applied.get() > FOLLOWER_READ_MAX_LAG) {
+						return CompletableFuture.failedFuture(new ReadBarrier.ApplyLagException(index, applied.get()));
+					}
+					var division = stateMachine.division();
+					boolean committedHere = division != null && division.getRaftLog().getLastCommittedIndex() >= index;
+					long wait = Math.min((committedHere ? FOLLOWER_READ_APPLY_WAIT : FOLLOWER_READ_COMMIT_WAIT).toNanos(),
+							remainingNanos(context, start));
+					return applied.await(index).orTimeout(Math.max(0, wait), TimeUnit.NANOSECONDS);
+				})
+				// Off gRPC and apply threads: the read runs here.
+				.handleAsync((_, error) -> {
+					var remaining = remainingContext(context, start);
+					if (error != null) {
+						followerReadsForwarded.incrementAndGet();
+						followerReadFallbacks.record(1);
+						return forwarding.forward(remaining, command);
+					}
+					followerReadsServed.incrementAndGet();
+					followerReadTime.since(start);
+					return local(remaining, command);
+				}, inline)
+				.thenCompose(f -> f);
+	}
+
+	/** Tests only: point reads this node served as a follower. */
+	long followerReadsServedForTesting() {
+		return followerReadsServed.get();
+	}
+
+	/** Tests only: point reads this node tried to serve as a follower, then forwarded. */
+	long followerReadsForwardedForTesting() {
+		return followerReadsForwarded.get();
+	}
+
+	/** Rejects commands that name the internal replication column, whose contents only the log may change. */
+	private void requireUserColumn(RocksDBAPICommand<?, ?, ?> command) {
+		long internal = stateMachine.store().metaColumnId();
+		Long column = switch (command) {
+			case Put<?> c -> c.columnId();
+			case PutMulti<?> c -> c.columnId();
+			case Delete<?> c -> c.columnId();
+			case DeleteMulti<?> c -> c.columnId();
+			case Merge<?> c -> c.columnId();
+			case MergeMulti<?> c -> c.columnId();
+			case Get<?> c -> c.columnId();
+			case RocksDBAPICommandSingle.DeleteRange c -> c.columnId();
+			case RocksDBAPICommandSingle.PutBatch c -> c.columnId();
+			case RocksDBAPICommandSingle.MergeBatch c -> c.columnId();
+			case RocksDBAPICommandSingle.DeleteColumn c -> c.columnId();
+			case RocksDBAPICommandSingle.EstimateNumKeys c -> c.columnId();
+			case RocksDBAPICommandSingle.GetMulti c -> c.columnId();
+			case RocksDBAPICommandSingle.ExistsMulti c -> c.columnId();
+			case RocksDBAPICommandSingle.OpenIterator c -> c.columnId();
+			case RocksDBAPICommandSingle.ReduceRange<?> c -> c.columnId();
+			case RocksDBAPICommandSingle.GetRangePage<?> c -> c.columnId();
+			case RocksDBAPICommandStream.GetRange<?> c -> c.columnId();
+			case RocksDBAPICommandStream.ScanRaw c -> c.columnId();
+			case RocksDBAPICommandStream.ScanRawResumable c -> c.columnId();
+			case RocksDBAPICommand.GetTableProperties c -> c.columnId();
+			case RocksDBAPICommand.GetSstMetadata c -> c.columnId();
+			default -> null;
+		};
+		String name = switch (command) {
+			case RocksDBAPICommandSingle.GetColumnId c -> c.name();
+			case RocksDBAPICommandSingle.DeleteColumnIfExists c -> c.name();
+			case RocksDBAPICommandSingle.CreateColumn c -> c.name();
+			default -> null;
+		};
+		if ((column != null && column == internal) || NodeStore.META_COLUMN.equals(name)) {
+			throw RocksDBException.of(RocksDBErrorType.INVALID_REQUEST, "The column is internal to replication");
+		}
+	}
+
+	static RequestTypeId id(RequestType<?, ?> requestType) {
+		return requestType.getRequestTypeId();
+	}
+
+	@SuppressWarnings("unchecked")
+	private static Object hideMetaColumn(Object definitions) {
+		var map = new LinkedHashMap<>((Map<String, ?>) definitions);
+		map.remove(NodeStore.META_COLUMN);
+		return map;
+	}
+}

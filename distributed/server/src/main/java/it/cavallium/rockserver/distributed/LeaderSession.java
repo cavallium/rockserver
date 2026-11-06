@@ -426,7 +426,7 @@ final class LeaderSession {
 	 * stay queued until the links settle, and the next one is then a head, which reads the database.
 	 *
 	 * <p>The grant runs under {@link #chainLock}, which appends can wait for, so a waiter's dependent stages must be
-	 * cheap: {@link ReplicatedConnection} has only its timeout's cancellation and an async stage there.</p>
+	 * cheap: {@link UpdateProtocol} has only its timeout's cancellation and an async stage there.</p>
 	 */
 	private void grantNext(long key, KeyState state) {
 		if (state.held) {
