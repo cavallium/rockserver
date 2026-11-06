@@ -97,21 +97,27 @@ class CommitOutcomesPathsTest {
 		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, type(failure(outcomes.settledCommit(new ClientRequestId(7, 1, 0)))));
 	}
 
-	/** Marks of earlier terms and marks with a record go, once the map reached the pruning size. */
+	/**
+	 * Marks of earlier terms go at the first mark of a newer term; marks with a record go once the map reached the
+	 * pruning size.
+	 */
 	@Test
 	void pruningDropsMarksOfEarlierTermsAndMarksWithARecord() throws Exception {
 		var old = new LeaderSession(4, applied);
 		for (int i = 0; i < 1000; i++) {
 			outcomes.markUnsettled(numbered(i), old);
 		}
+		assertEquals(1000, outcomes.unsettledCommitsForTesting());
 		var current = new LeaderSession(5, applied);
-		for (int i = 1000; i < 1023; i++) {
+		outcomes.markUnsettled(numbered(1000), current);
+		assertEquals(1, outcomes.unsettledCommitsForTesting());
+		for (int i = 1001; i < 2023; i++) {
 			outcomes.markUnsettled(numbered(i), current);
 		}
 		records.put(new ClientRequestId(7, 1000, 0), new ApplyResult.Ok(true));
 		// The 1024th mark starts the prune, on a virtual thread.
-		outcomes.markUnsettled(numbered(1023), current);
-		InProcessCluster.await(Duration.ofSeconds(10), () -> outcomes.unsettledCommitsForTesting() == 23);
+		outcomes.markUnsettled(numbered(2023), current);
+		InProcessCluster.await(Duration.ofSeconds(10), () -> outcomes.unsettledCommitsForTesting() == 1023);
 	}
 
 	@Test

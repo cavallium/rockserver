@@ -88,6 +88,17 @@ class ClockSkewTest {
 			for (var node : cluster.runningNodes()) {
 				node.stateMachine().testHooks().clockSkewMillis = 0;
 			}
+			// LeaderClock reads the wall clock only at the start of a term and then moves with the monotonic clock, so a
+			// leader whose skew ended within its term keeps stamping behind. A new term is needed: unless the restarted
+			// node, never skewed, leads already, stop the skewed leader and bring it back once another one leads.
+			var current = cluster.awaitLeader(TIMEOUT);
+			if (current != cluster.node(leaderId)) {
+				var currentId = current.config().nodeId();
+				cluster.stop(currentId);
+				cluster.awaitLeader(TIMEOUT);
+				cluster.start(currentId);
+				cluster.awaitConverged(TIMEOUT);
+			}
 			long wallBeforeMerge = System.currentTimeMillis();
 			assertTrue(wallBeforeMerge > frozen, "the wall clock is behind the replicated clock");
 			assertEquals("a,b,c", merge(api, column, "c"));
