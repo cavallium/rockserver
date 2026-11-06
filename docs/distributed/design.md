@@ -24,7 +24,9 @@ No acknowledged write may be lost or applied twice, and reads are linearizable.
 - CDC, which was removed from Rockserver altogether.
 
 Every node holds the full dataset, like the single node today. If partitioning is ever needed, it can be
-added later as several independent copies of this design, with routing in the client.
+added later as several independent copies of this design, with routing in the client. [multi-raft.md](multi-raft.md)
+studies that step: columns assigned to groups, no cross-group operation for Yotsuba, and a verdict that it pays
+only once the apply thread is still the limit above about 4x production load.
 
 ## Shape
 
@@ -675,6 +677,23 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
 leader is not one of them: its client sends it again with its request id and gets its recorded result. A commit of a transaction that
 another leader opened is refused before it is appended (the term check), so it can never be validated
 against an incomplete history.
+
+### Hot keys: why not parallel commits or deterministic ordering
+
+A hot key's throughput is bounded by one commit cycle per update (the per-key FIFO lock held until apply), or less
+with pipelined updates. Two newer techniques were considered and rejected for this design:
+
+- **Parallel commits** (CockroachDB) make a transaction that spans several ranges commit in one consensus round
+  instead of two, by writing its intents and a staging record in parallel. With one Raft group every commit is
+  already one consensus round, so there is nothing to save. It becomes relevant only if [Multi-Raft](multi-raft.md)
+  is built and transactions cross groups, which Yotsuba's do not.
+- **Deterministic ordering** (Calvin) removes locks by ordering whole transactions before execution, which needs
+  their read and write sets up front. Rockserver updates are interactive: the client reads, decides, then writes,
+  so the sets are not known until the client has run. The part of Calvin that does fit is already here: a merge
+  operator is a deterministic read-modify-write ordered by the log, with no lock and no round trip back to the
+  client. A hot counter is best written as a merge, not as an update.
+
+So the per-key lock stays, with pipelined updates as the measured option to shorten the cycle.
 
 ## Snapshots, catch-up and membership
 
