@@ -235,14 +235,22 @@ and the `LogEntry`.
   `it.cavallium.rockserver.replicated.write-admission-bytes`. Each request counts its encoded body plus 256 bytes. A
   write that does not fit fails at once with `SERVER_OVERLOADED` and a message that says it was not applied
   (metric `writes.admissionRejects`), instead of filling the heap: an out of memory error ends the node (see "Heap").
+  A queued write whose caller gives up (deadline or cancellation) drops its body at once and gives it back; its
+  256 bytes stay counted until a batch takes it out of the queue, which may wait for a free batch slot.
 - **Attempt permits.** Before an attempt is handed to Ratis, local or remote, it takes a permit for its bytes from
-  the proposer's own count: at most 32 MiB of attempts in flight per node (two entries of the largest size). An
-  attempt without a permit is not sent: it is refused before the append by the node's own decision, and resent
-  after 50 ms. The leader's Ratis pending-request limits (`RaftSettings`: Ratis' default 4096 requests, and
-  128 MiB instead of the 1 GiB this used to be) hold the attempts of every node of a cluster of up to 4 nodes, so
-  Ratis' own refusal (`ResourceUnavailableException`) should not happen. When it does it is an unknown outcome:
-  Ratis raises the same exception after an append, and only its message tells them apart, which an upgrade could
-  change. The retry cache of Ratis 3.3.1 has no size bound, only its expiry.
+  the proposer's own count: at most 32 MiB of attempts in flight per node and per queue, one for data writes and one
+  for transaction commits, so that bulk writes never take the room of commits. An attempt without a permit is not
+  sent: it is refused before the append by the node's own decision, and sent again after 50 ms (a commit goes back
+  through its queue, under its caller's deadline). A local attempt keeps its permit until Ratis answers it, not
+  only until the node stops waiting, since the entry stays pending in Ratis until then; a remote attempt gives it
+  back when its node stops waiting. The leader's Ratis pending-request limits (`RaftSettings`: Ratis' default 4096
+  requests, and 160 MiB instead of the 1 GiB this used to be) hold the data writes of every node of a cluster of up
+  to 4 nodes and the leader's own commits. A long commit stall can still fill them with remote attempts that their
+  nodes gave up on. Ratis' refusal then (`ResourceUnavailableException`, "Failed to acquire a pending write
+  request") is a refusal before the append, resent like the node's own; Ratis raises the same type after an append
+  ("add a pending write request"), an unknown outcome, and only the message tells them apart:
+  `RatisContractTest` pins it, and a changed message falls back to an unknown outcome. The retry cache of Ratis 3.3.1
+  has no size bound, only its expiry.
 - **Caller deadlines.** When the caller's request-context timeout ends before the node's request timeout, a
   write is resent only until the caller's deadline, less a margin of 20 ms (at most a tenth of the timeout). A
   write still queued at that point, or whose caller cancelled it before it was sent, is never sent; nor is one
@@ -293,12 +301,16 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   entry with writes of many sessions, gets the result of the first copy. `putBatch` and `mergeBatch` chunks are not
   numbered.
 - **Leader time.** The leader prepends its clock (`LogEntryCodec.stamp`: a marker byte and 8 bytes, without copying
-  the batch) to every entry that holds a session write or registration. Apply keeps the highest stamp seen as the
+  the batch) to every entry that holds a session write or registration. A proposal that already starts with the
+  stamp marker is refused as malformed: only the leader stamps. Apply keeps the highest stamp seen as the
   replicated clock (`CLOCK`), written with the applied position of the entry that moved it, so it never goes back,
   even after a leader whose clock is behind, and every replica has the same clock at the same position.
 - **Expiry.** A session's row holds its timeout, the clock of its last applied write and its floor. The timeout is
   in the `RegisterClient` entry (`-Drockserver.client-session-timeout-ms` of the node that opened it, 1 hour by
-  default), so replicas agree whatever their own settings. A session idle longer than its timeout at an entry's
+  default, at least 10 minutes and 30 request timeouts: well above the time a copy of a write may still be resent),
+  so replicas agree whatever their own settings. A proposer that gets `SESSION_EXPIRED` for a copy of a write whose
+  earlier copy may have been appended answers `OUTCOME_UNKNOWN` (or, for a write resent alone after it applied,
+  "applied, result lost"), never the "not applied" that would make the client write it again. A session idle longer than its timeout at an entry's
   clock is gone for good: its requests are rejected with `SESSION_EXPIRED` and not recorded, copies of writes it
   applied too. Each replica deletes expired sessions and their records without the WAL, once the entry that expired
   them committed, when it likes: what a request sees depends only on the clock and the row, and a lost deletion
@@ -651,9 +663,10 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
   entries: the leader rejects the entry before appending it and names the commits that conflict (with history,
   or with an earlier write of the same entry); those fail and the others go again in the next entry.
 - **Outcome of a commit.** It is submitted once, to the local Raft server. Only a refusal that is known to come
-  before appending (Ratis' leader not ready, no attempt permit of the proposer's own, or the state machine's own
-  refusals) means "not committed"; `NotLeaderException`, which a leader stepping down also returns for appended
-  entries, and Ratis' `ResourceUnavailableException` (see "Attempt permits") are an unknown outcome
+  before appending (Ratis' leader not ready, or the state machine's own refusals) means "not committed"; no room
+  (no attempt permit, Ratis' full pending queue) sends it again through its queue until its caller's deadline;
+  `NotLeaderException`, which a leader stepping down also returns for appended entries, and any other
+  `ResourceUnavailableException` (see "Attempt permits") are an unknown outcome
   (`OUTCOME_UNKNOWN`). A client with a session sends the commit again with the same request id, and the copy
   answers from the commit's record (see "Client sessions"). The positions
   of the conflicting commits travel as the text of the state machine's `ConflictException`, the only channel

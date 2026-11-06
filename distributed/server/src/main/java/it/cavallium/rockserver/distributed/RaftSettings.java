@@ -50,7 +50,7 @@ final class RaftSettings {
 	static final int PENDING_REQUESTS_LIMIT = 4096;
 	/** Ratis' pending-request byte limit on the leader (default 64 MB), see {@link #server}. */
 	static final SizeInBytes PENDING_BYTES_LIMIT =
-			SizeInBytes.valueOf(NODES_UNDER_PENDING_LIMIT * Proposer.ATTEMPT_BYTES_IN_FLIGHT);
+			SizeInBytes.valueOf((NODES_UNDER_PENDING_LIMIT + 1) * Proposer.ATTEMPT_BYTES_IN_FLIGHT);
 
 	private RaftSettings() {}
 
@@ -84,13 +84,14 @@ final class RaftSettings {
 		// the fsync ran, which it did not cover.
 		RaftServerConfigKeys.Log.setForceSyncNum(properties, 4096);
 		RaftServerConfigKeys.Log.setQueueElementLimit(properties, 65536);
-		// Pending client requests on the leader. Ratis refuses more with a ResourceUnavailableException, which it also
-		// raises after an append, so Proposer takes it as an unknown outcome: these limits must not be reached. Each
-		// node's proposer keeps at most 2 × Proposer.MAX_BATCHES_IN_FLIGHT batches and Proposer.ATTEMPT_BYTES_IN_FLIGHT
-		// bytes of attempts in flight (its own permit, a refusal before the append by its own decision), and its
-		// writers are batched: the element limit stays Ratis' default, and the byte limit covers every node of a
-		// cluster of up to NODES_UNDER_PENDING_LIMIT nodes, at 128 MiB instead of the 1 GiB this used to be. The heap
-		// of writes is bounded on each node by Proposer's byte admission instead.
+		// Pending client requests on the leader. Ratis refuses more before the append with a ResourceUnavailableException
+		// that Proposer recognizes by its message (pinned by RatisContractTest) and resends, as a refusal before the
+		// append. Each node's proposer keeps at most 2 × Proposer.MAX_BATCHES_IN_FLIGHT batches and
+		// Proposer.ATTEMPT_BYTES_IN_FLIGHT bytes of attempts in flight per lane (its own permits), and its writers are
+		// batched: the element limit stays Ratis' default, and the byte limit covers the data writes of every node of a
+		// cluster of up to NODES_UNDER_PENDING_LIMIT nodes plus the leader's own transaction commits, at 160 MiB instead
+		// of the 1 GiB this used to be. A remote attempt's permit is given back when its node stops waiting, so a long
+		// commit stall can still fill it. The heap of writes is bounded on each node by Proposer's byte admission.
 		RaftServerConfigKeys.Write.setElementLimit(properties, PENDING_REQUESTS_LIMIT);
 		RaftServerConfigKeys.Write.setByteLimit(properties, PENDING_BYTES_LIMIT);
 		// Every attempt at one proposer batch is the same Ratis invocation (see Proposer), so the retry cache answers a

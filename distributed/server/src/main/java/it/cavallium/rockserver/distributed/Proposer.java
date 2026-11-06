@@ -151,12 +151,6 @@ final class Proposer implements Closeable {
 	 * A request that does not fit is refused at once as not applied, instead of filling the heap.
 	 */
 	private final ByteAdmission admission = new ByteAdmission(writeAdmissionBytes());
-	/**
-	 * Bytes of the attempts in flight, local or remote, counted before they are handed to Ratis (see
-	 * {@link #ATTEMPT_BYTES_IN_FLIGHT}). An attempt that does not fit is not sent: it is refused before the append by
-	 * this node's own decision, and resent after {@link #NOT_READY_RETRY_MS}.
-	 */
-	private final ByteAdmission attemptPermits = new ByteAdmission(ATTEMPT_BYTES_IN_FLIGHT);
 	private final NodeMetrics.Series admissionRejects;
 	private final long requestTimeoutNanos;
 	/** How long one client attempt waits for its reply. */
@@ -200,6 +194,11 @@ final class Proposer implements Closeable {
 
 	RaftClient client() {
 		return client;
+	}
+
+	/** Bytes the byte admission holds now, for tests. */
+	long admittedBytes() {
+		return admission.used();
 	}
 
 	/**
@@ -259,7 +258,7 @@ final class Proposer implements Closeable {
 	}
 
 	/** A request waiting for its answer. */
-	private static final class Pending {
+	static final class Pending {
 
 		private static final int QUEUED = 0;
 		private static final int SENT = 1;
@@ -268,7 +267,8 @@ final class Proposer implements Closeable {
 		final long sequence;
 		/** Its id in a client session, which identifies it at apply instead of {@link #sequence}; null if none. */
 		final @Nullable ClientRequestId client;
-		final byte[] body;
+		/** Null once abandoned: the queue may hold it a while longer, its body need not (see {@link #abandon}). */
+		volatile byte @Nullable [] body;
 		final boolean batchable;
 		/** When resends stop: the node's request timeout, or the caller's deadline if earlier. */
 		final long deadlineNanos;
@@ -350,8 +350,14 @@ final class Proposer implements Closeable {
 		 */
 		void abandon(Throwable error) {
 			if (state.compareAndSet(QUEUED, ABANDONED)) {
+				// Its body is given back to the admission now; the rest of its weight once it leaves its queue.
+				body = null;
 				result.completeExceptionally(error);
 			}
+		}
+
+		boolean isAbandoned() {
+			return state.get() == ABANDONED;
 		}
 
 		/** True if it goes in a batch of its own. */
@@ -359,9 +365,16 @@ final class Proposer implements Closeable {
 			return !batchable;
 		}
 
-		/** Completes it with {@code result}, its final answer. */
-		void complete(ApplyResult result) {
+		/**
+		 * Completes it with {@code result}, its final answer. {@code earlierCopy}: an earlier attempt of its batch may
+		 * have been appended. A session that expired before this copy applied ({@code SESSION_EXPIRED}, not recorded)
+		 * says nothing about an earlier copy, which may have taken effect: then the outcome is unknown (or, resent
+		 * alone, applied with its result lost), never the final "not applied" that would make the client write again.
+		 */
+		void complete(ApplyResult result, boolean earlierCopy) {
 			switch (result) {
+				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.SESSION_EXPIRED
+						&& (earlierCopy || maybeAppended || resentAlone) -> fail(unavailable(failed.toException()));
 				case ApplyResult.Ok ok -> this.result.complete(ok.value());
 				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.UPDATE_RETRY ->
 						this.result.completeExceptionally(new RocksDBRetryException());
@@ -429,7 +442,8 @@ final class Proposer implements Closeable {
 			synchronized (numbering) {
 				inFlight.remove(sequence);
 			}
-			admission.release(weight);
+			// An abandoned request is still in its queue: its overhead is given back when it leaves it (see take()).
+			admission.release(pending.isAbandoned() ? weight - REQUEST_OVERHEAD_BYTES : weight);
 		});
 		lane.enqueue(pending);
 		if (closed) {
@@ -494,6 +508,15 @@ final class Proposer implements Closeable {
 
 		/** Sends transaction commits once to this node's Raft server, instead of to any leader until answered. */
 		private final boolean commits;
+		/**
+		 * Bytes of this lane's attempts in flight, counted before they are handed to Ratis (see
+		 * {@link #ATTEMPT_BYTES_IN_FLIGHT}); each lane has its own, so that data writes never take the permits of
+		 * transaction commits. An attempt that does not fit is not sent: it is refused before the append by this
+		 * node's own decision, and sent again after {@link #NOT_READY_RETRY_MS}, data writes as the same batch,
+		 * commits back through the queue. A local attempt keeps its permit until Ratis answers it, not only until
+		 * this node stops waiting: the entry stays pending in Ratis until then.
+		 */
+		final ByteAdmission permits = new ByteAdmission(ATTEMPT_BYTES_IN_FLIGHT);
 		/** Guarded by this. */
 		private final ArrayDeque<Pending> queue = new ArrayDeque<>();
 		/** Guarded by this. */
@@ -574,8 +597,10 @@ final class Proposer implements Closeable {
 			boolean anyCaller = false;
 			while (!queue.isEmpty()) {
 				var next = queue.peekFirst();
-				if (next.result.isDone()) {
+				var body = next.body;
+				if (next.result.isDone() || body == null) {
 					queue.pollFirst();
+					leftQueue(next);
 					continue;
 				}
 				if (closed || next.deadlineNanos - now < next.minTimeLeftNanos) {
@@ -589,7 +614,7 @@ final class Proposer implements Closeable {
 				if (!batch.isEmpty() && (next.alone() || batch.getFirst().alone()
 						|| next.resentAlone != batch.getFirst().resentAlone || next.epoch != batch.getFirst().epoch
 						|| (next.resentAlone && batch.size() >= Math.min(copyLimit, next.copyBatchLimit))
-						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.body.length > MAX_BATCH_BYTES
+						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + body.length > MAX_BATCH_BYTES
 						|| ((anyCaller || next.callerDeadline) && Math.max(latest, next.deadlineNanos)
 								- Math.min(earliest, next.deadlineNanos) > attemptTimeoutNanos))) {
 					break;
@@ -597,10 +622,11 @@ final class Proposer implements Closeable {
 				queue.pollFirst();
 				if (!next.markSent()) {
 					// Abandoned just now.
+					leftQueue(next);
 					continue;
 				}
 				batch.add(next);
-				bytes += next.body.length + Long.BYTES;
+				bytes += body.length + Long.BYTES;
 				earliest = Math.min(earliest, next.deadlineNanos);
 				latest = Math.max(latest, next.deadlineNanos);
 				anyCaller |= next.callerDeadline;
@@ -612,6 +638,13 @@ final class Proposer implements Closeable {
 				}
 			}
 			return batch;
+		}
+
+		/** {@code pending} left the queue without being sent: an abandoned one gives back the rest of its weight. */
+		private void leftQueue(Pending pending) {
+			if (pending.isAbandoned()) {
+				admission.release(REQUEST_OVERHEAD_BYTES);
+			}
 		}
 
 		private void finished() {
@@ -672,8 +705,8 @@ final class Proposer implements Closeable {
 		 */
 		private void attempt(List<Pending> batch, Message message, long callId, long deadlineNanos, long sentNanos,
 				boolean ambiguous) {
-			var reply = isLocalLeader() ? submitLocal(message, callId, deadlineNanos)
-					: CompletableFuture.supplyAsync(() -> sendToLeader(message, callId), sender);
+			var reply = isLocalLeader() ? submitLocal(message, callId, deadlineNanos, permits)
+					: CompletableFuture.supplyAsync(() -> sendToLeader(message, callId, permits), sender);
 			reply.handleAsync((answer, error) -> {
 				var refusal = error != null ? stateMachineException(error)
 						: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
@@ -743,7 +776,7 @@ final class Proposer implements Closeable {
 					} else if (isReplyTooLarge(error)) {
 						fail(batch, replyTooLarge(error));
 					} else {
-						complete(batch, answer);
+						complete(batch, answer, ambiguous);
 					}
 				} catch (Throwable unexpected) {
 					fail(batch, unavailable(unexpected));
@@ -807,7 +840,7 @@ final class Proposer implements Closeable {
 		 */
 		private void sendCommits(List<Pending> batch, Message message, long callId, long deadlineNanos,
 				long sentNanos) {
-			submitLocal(message, callId, deadlineNanos).handleAsync((answer, error) -> {
+			submitLocal(message, callId, deadlineNanos, permits).handleAsync((answer, error) -> {
 				roundTrip.since(sentNanos);
 				try {
 					var refusal = error != null ? stateMachineException(error)
@@ -827,6 +860,10 @@ final class Proposer implements Closeable {
 						}
 					} else if (refusal != null) {
 						fail(batch, refusal(refusal));
+					} else if (isBusyBeforeAppend(error != null ? ReplicatedConnection.unwrap(error)
+							: answer.isSuccess() ? null : answer.getException())) {
+						// Not appended, only no room yet: back through the queue, under the commits' own deadlines.
+						retryLater(batch);
 					} else if (isRefusedBeforeAppend(error != null ? ReplicatedConnection.unwrap(error)
 							: answer.isSuccess() ? null : answer.getException())) {
 						fail(batch, new RocksDBRetryException());
@@ -837,7 +874,7 @@ final class Proposer implements Closeable {
 						// which the next leader may still commit. The outcome is unknown, never "not applied".
 						fail(batch, unavailable(answer.getException()));
 					} else {
-						complete(batch, answer);
+						complete(batch, answer, false);
 					}
 				} catch (Throwable unexpected) {
 					fail(batch, unavailable(unexpected));
@@ -849,6 +886,23 @@ final class Proposer implements Closeable {
 		}
 
 		/**
+		 * Puts the commits of a batch that was not appended back in the queue after {@link #NOT_READY_RETRY_MS}, as if
+		 * never sent: their deadlines and cancellations apply again, and {@link #take} fails them as not applied once
+		 * their deadline comes.
+		 */
+		private void retryLater(List<Pending> batch) {
+			for (var pending : batch) {
+				pending.queuedNanos = System.nanoTime();
+				pending.unsend();
+			}
+			try {
+				control.schedule(() -> requeue(batch), NOT_READY_RETRY_MS, TimeUnit.MILLISECONDS);
+			} catch (RejectedExecutionException stopping) {
+				fail(batch, RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping"));
+			}
+		}
+
+		/**
 		 * Completes each request of {@code batch} with its own result from {@code reply}. A request whose result did
 		 * not fit in the reply ({@link ApplyResult#RESEND_ALONE}) took effect, and its sequence is still in flight, so
 		 * its record is kept: a data write is sent again in a batch of such copies only, no larger than the number of
@@ -857,7 +911,7 @@ final class Proposer implements Closeable {
 		 * or reach another leader), but this node's own Raft server applied it before answering: its record is read
 		 * here.
 		 */
-		private void complete(List<Pending> batch, RaftClientReply reply) {
+		private void complete(List<Pending> batch, RaftClientReply reply, boolean ambiguous) {
 			if (!reply.isSuccess()) {
 				fail(batch, unavailable(reply.getException()));
 				return;
@@ -885,7 +939,7 @@ final class Proposer implements Closeable {
 				var pending = batch.get(i);
 				var result = results.get(i);
 				if (!(result instanceof ApplyResult.ResendAlone) || batch.size() == 1) {
-					pending.complete(result);
+					pending.complete(result, ambiguous);
 					continue;
 				}
 				pending.resentAlone = true;
@@ -916,7 +970,7 @@ final class Proposer implements Closeable {
 						+ (pending.client != null ? pending.client : pending.sequence))));
 			} else {
 				aloneResends.record(1);
-				pending.complete(recorded);
+				pending.complete(recorded, false);
 			}
 		}
 	}
@@ -943,23 +997,28 @@ final class Proposer implements Closeable {
 	}
 
 	/** Submits straight to the local Raft server, with no client in between that could redirect it elsewhere. */
-	private CompletableFuture<RaftClientReply> submitLocal(Message message, long callId, long deadlineNanos) {
+	private CompletableFuture<RaftClientReply> submitLocal(Message message, long callId, long deadlineNanos,
+			ByteAdmission permits) {
 		long weight = message.size();
-		if (!attemptPermits.tryAcquire(weight)) {
+		if (!permits.tryAcquire(weight)) {
 			return CompletableFuture.failedFuture(new NoPermitException(weight));
 		}
 		CompletableFuture<RaftClientReply> reply;
 		try {
 			reply = localServer.get().submitClientRequestAsync(invocation(message, callId, self));
 		} catch (IOException | RuntimeException ex) {
-			attemptPermits.release(weight);
+			permits.release(weight);
 			return CompletableFuture.failedFuture(ex);
 		}
-		reply.whenComplete((_, _) -> attemptPermits.release(weight));
+		// Given back when Ratis answers, which it does once the entry is no longer pending (applied, or failed by a
+		// step down), not when this node stops waiting below: until then the entry holds room in Ratis' limits.
+		reply.whenComplete((_, _) -> permits.release(weight));
 		// The deadline only stops new copies (see attempt): a copy already submitted here runs to its end, so
 		// wait for its answer at least as long as a remote attempt would, or a healthy commit of a batch holding
-		// one short caller deadline would end as "outcome unknown" for every member.
-		return reply.orTimeout(Math.max(deadlineNanos - System.nanoTime(), attemptTimeoutNanos), TimeUnit.NANOSECONDS);
+		// one short caller deadline would end as "outcome unknown" for every member. A copy, so that the timeout
+		// does not complete Ratis' own future.
+		return reply.copy().orTimeout(Math.max(deadlineNanos - System.nanoTime(), attemptTimeoutNanos),
+				TimeUnit.NANOSECONDS);
 	}
 
 	/**
@@ -968,7 +1027,7 @@ final class Proposer implements Closeable {
 	 * a new invocation. With no leader known (an election), nothing is sent: the attempt fails as refused before
 	 * the append.
 	 */
-	private RaftClientReply sendToLeader(Message message, long callId) {
+	private RaftClientReply sendToLeader(Message message, long callId, ByteAdmission permits) {
 		var rpc = client.getClientRpc();
 		RaftPeerId leader;
 		try {
@@ -985,8 +1044,10 @@ final class Proposer implements Closeable {
 		} catch (IOException ex) {
 			throw new CompletionException(ex);
 		}
+		// Per attempt: the remote leader's pending requests cannot be seen from here. Ratis' own refusal when its
+		// limit is full is recognized as before the append (see isRatisPendingLimit).
 		long weight = message.size();
-		if (!attemptPermits.tryAcquire(weight)) {
+		if (!permits.tryAcquire(weight)) {
 			throw new CompletionException(new NoPermitException(weight));
 		}
 		try {
@@ -996,7 +1057,7 @@ final class Proposer implements Closeable {
 			rpc.handleException(leader, ex, false);
 			throw new CompletionException(ex);
 		} finally {
-			attemptPermits.release(weight);
+			permits.release(weight);
 		}
 	}
 
@@ -1012,14 +1073,35 @@ final class Proposer implements Closeable {
 	}
 
 	/**
-	 * Errors that come only before the entry is appended: a leader not ready yet (Ratis' typed refusal), or no
-	 * permit of this node's own ({@link NoPermitException}). Not NotLeaderException, which a leader stepping down also
-	 * returns for appended entries, nor Ratis' ResourceUnavailableException, which it raises both before the append
-	 * (no pending-request permit) and after it (failing to add the pending request), with only the message to tell
-	 * them apart: it is an unknown outcome. {@link RaftSettings} sizes Ratis' limits so that it does not happen.
+	 * Errors that come only before the entry is appended: a leader not ready yet (Ratis' typed refusal), no permit of
+	 * this node's own ({@link NoPermitException}), or Ratis' own full pending-request queue
+	 * ({@link #isRatisPendingLimit}). Not NotLeaderException, which a leader stepping down also returns for appended
+	 * entries, nor any other ResourceUnavailableException, such as the one for failing to add a pending request,
+	 * raised after the append: an unknown outcome.
 	 */
 	private static boolean isRefusedBeforeAppend(@Nullable Throwable error) {
-		return error instanceof LeaderNotReadyException || error instanceof NoPermitException;
+		return error instanceof LeaderNotReadyException || isBusyBeforeAppend(error);
+	}
+
+	/** Refusals before the append for lack of room, which a resend shortly after may get past. */
+	private static boolean isBusyBeforeAppend(@Nullable Throwable error) {
+		return error instanceof NoPermitException || isRatisPendingLimit(error);
+	}
+
+	/** The text of Ratis' refusal before the append when its pending-request limits are full. */
+	static final String RATIS_PENDING_LIMIT_MESSAGE = "acquire a pending write request";
+
+	/**
+	 * Ratis' refusal when its pending-request limits are full, which it raises before appending. Ratis uses the same
+	 * exception type after the append ("... add a pending write request"), so only the message tells them
+	 * apart: {@code RatisContractTest} pins both against the Ratis version in use. A message that changed fails that
+	 * test, and here falls back to an unknown outcome, which is safe. The leader can reach those limits although each
+	 * node's own permits stay below them: a remote attempt's permit is given back when its node stops waiting, while
+	 * the entry may stay pending until it commits.
+	 */
+	static boolean isRatisPendingLimit(@Nullable Throwable error) {
+		return error instanceof ResourceUnavailableException
+				&& String.valueOf(error.getMessage()).contains(RATIS_PENDING_LIMIT_MESSAGE);
 	}
 
 	/**

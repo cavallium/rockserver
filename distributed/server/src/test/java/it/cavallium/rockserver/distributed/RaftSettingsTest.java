@@ -38,9 +38,11 @@ class RaftSettingsTest {
 	void thePendingRequestLimitsHoldTheAttemptsOfEveryNodeAndStayNearRatisDefaults() {
 		var properties = server();
 		long bytes = RaftServerConfigKeys.Write.byteLimit(properties).getSize();
-		assertTrue(bytes >= RaftSettings.NODES_UNDER_PENDING_LIMIT * Proposer.ATTEMPT_BYTES_IN_FLIGHT, () -> bytes + " bytes");
+		// Every node's data writes, and the leader's own commits, which have permits of their own.
+		assertTrue(bytes >= (RaftSettings.NODES_UNDER_PENDING_LIMIT + 1) * Proposer.ATTEMPT_BYTES_IN_FLIGHT,
+				() -> bytes + " bytes");
 		assertTrue(RaftSettings.NODES_UNDER_PENDING_LIMIT >= 3, "a cluster of 3 never reaches it");
-		assertTrue(bytes <= 2 * RaftServerConfigKeys.Write.BYTE_LIMIT_DEFAULT.getSize(), () -> bytes + " bytes");
+		assertTrue(bytes <= 3 * RaftServerConfigKeys.Write.BYTE_LIMIT_DEFAULT.getSize(), () -> bytes + " bytes");
 
 		int elements = RaftServerConfigKeys.Write.elementLimit(properties);
 		assertEquals(RaftServerConfigKeys.Write.ELEMENT_LIMIT_DEFAULT, elements);
