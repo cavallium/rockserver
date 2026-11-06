@@ -190,6 +190,14 @@ before: if its outcome is unknown, roll the transaction back and run it again, n
 The connection decides whether it uses sessions once, at its handshake, and logs it: recreate it after upgrading
 the cluster. With a single server, which has no sessions, nothing changes.
 
+The Rust client (`rust-client`) does the same when the server advertises client sessions at `connect`: the same
+writes are numbered and resent with the same pauses, until the context's deadline, or for 30 s
+(`with_session_retry_window`) with a context without one. Its own failures use the server's message format
+(`RocksDBError: [uid:OUTCOME_UNKNOWN] ...`); `sessions::is_outcome_unknown`, `sessions::is_not_applied` and
+`sessions::rocksdb_error_type` read any failure. Dropping a write's future stops its resends. A numbered streamed multi
+write reads its input stream whole before sending it (and its results whole before returning them).
+`client_sessions()` tells whether a view numbers; `without_client_sessions()` gives one that sends every write once.
+
 A replicated node without a leader for that long serves again by itself: once it has known a leader for one maximum
 election timeout it listens again, on its own or with every other node after a period when the whole cluster had no
 leader. An election shorter than the bound stops nothing. A client with a single address has nowhere to go: while

@@ -46,6 +46,7 @@ pub mod proto {
 }
 
 mod client;
+pub mod sessions;
 mod types;
 
 pub use client::*;
