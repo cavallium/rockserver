@@ -988,31 +988,47 @@ nodes upgraded) one node at a time; a round-1 node answers no usable read index,
 
 **The commit index reaches the follower at once.** The follower cannot apply an entry it does not know is committed,
 and Ratis sends the commit index only with appends: at once while writes flow, but on a quiet cluster only with the
-next heartbeat, a quarter to a half of the minimum election timeout later. An appender whose follower lags in commit
-index wakes on every commit and on every reply (`GrpcLogAppender.run` checks `isFollowerCommitBehindLastCommitIndex`),
-but `LogAppenderBase.newAppendEntriesRequest` builds nothing without new entries or a due heartbeat. So the node's
+next heartbeat, a quarter to a half of the minimum election timeout later. Ratis wakes every appender on every commit
+and on every change of a follower's commit index (`LeaderStateImpl.updateCommit` and `onFollowerCommitIndex` call
+`commitIndexChanged`, which calls `notifySenders`), and an appender on every reply to it; an appender whose follower
+lags in commit index then tries to send (`GrpcLogAppender.run` checks `isFollowerCommitBehindLastCommitIndex`), but
+`LogAppenderBase.newAppendEntriesRequest` builds nothing without new entries or a due heartbeat. So the node's
 Raft server uses Ratis' gRPC transport with an appender of its own (`CommitHeartbeats.Rpc`, set as `raft.rpc.type` by
 `RaftSettings`; the node's `CommitHeartbeats` reaches it through Ratis' `Parameters`). When the leader answers a read
-index request it records the commit index `c` as wanted and wakes its appenders (`CommitHeartbeats.send`). An appender
-with nothing else to send then sends a heartbeat, which carries the commit index, when its follower is known to lag
-below `c`, no request carrying `c` went to it yet, and no append to it waits for a reply. The last condition matters:
-a heartbeat sent while an append is in flight goes without its previous entry (`LogAppenderBase.newAppendEntriesRequest`),
-so it carries commit index 0 (`ServerImplUtils.effectiveCommitIndex`) and tells the follower nothing. The appender
-waits for that append's reply instead, which wakes it again. The read index itself still comes from `ReadBarrier`.
+index request it records the commit index `c` as wanted and wakes the appenders whose follower is known to lag below
+`c` and that have no append in flight (`CommitHeartbeats.send`). An appender with nothing else to send then sends a
+heartbeat, which carries the commit index, when its follower lags below `c`, no request carrying `c` went to it on its
+current stream, and no append to it waits for a reply. The last condition matters: a heartbeat sent while an append is
+in flight goes without its previous entry (`LogAppenderBase.newAppendEntriesRequest`), so it carries commit index 0
+(`ServerImplUtils.effectiveCommitIndex`) and tells the follower nothing. The appender waits for that append's reply
+instead, which wakes it again. For the same reason `send` does not wake an appender with appends in flight: woken with
+too many in flight, `GrpcLogAppender.run` calls `appendLog(true)`, which sends exactly that empty heartbeat to the
+follower that is already behind. The read index itself still comes from `ReadBarrier`.
+
+If the stream to the follower breaks before the heartbeat arrives, Ratis drops the requests in flight
+(`GrpcLogAppender.resetClient`) and opens a new stream with the next request, but does not wake the appender, which
+would send nothing more for `c` until its own heartbeat is due. So while a request that carried `c` waits for its
+reply, and for at most half the minimum election timeout after it, the appender waits at most 10 ms at a time
+(`Appender.getWaitTimeMs`); when it finds its stream gone (Ratis' `shouldSendAppendEntries` true with no entries to
+send and no heartbeat due, which leaves only the missing stream), it sends the heartbeat again on the new stream. A
+heartbeat that only times out is not sent again: Ratis' request timeout (the maximum election timeout) is longer than
+the interval of its own heartbeats, which carry the commit index too, and a gRPC stream that loses a message breaks.
 
 Until R6-1 the trigger was a Ratis read with its dummy message on the leader, whose linearizable read path asks the
 appenders for a heartbeat round (`LogAppender.triggerHeartbeat`, from `ReadIndexHeartbeats.AppendEntriesListener`).
 That round is the heartbeat above: with 3 nodes the leader commits and answers on the first follower's reply, so the
 other follower often still had its append in flight, got commit index 0, and learned the commit index only with the
 next heartbeat, 3 s later in `RatisContractTest` (one or more of its 5 writes in 4 of 18 runs, which watched one
-follower). The appender
-needs no read on the leader, so nothing waits for the leader's apply and no bound on reads in flight is needed: the
-cost is at most one heartbeat per follower per wanted commit index, only while follower reads ask for it, and none for
-a follower that an append of new entries already told. `RatisContractTest.aCommitHeartbeatSendsTheCommitIndexAtOnce`
+follower). The appender needs no read on the leader, so nothing waits for the leader's apply and no bound on reads in
+flight is needed: the cost is at most one heartbeat per follower per wanted commit index (and per broken stream), only
+while follower reads ask for it, and none for a follower that an append of new entries already told. `RatisContractTest.aCommitHeartbeatSendsTheCommitIndexAtOnce`
 pins it with the node's own Raft settings, with heartbeats every 3 s: over 20 writes in a row both followers learned
 the commit index of each within 0.5-7.3 ms of the trigger (20 runs out of 20), and 3.0 s after a write without one
-(the next heartbeat; no commit metadata entries, which `RaftSettings` turns off, would have carried it). With the old
-dummy read in its place, the same test fails every run (5 of 5). `FollowerReadLatencyTest` after the change, one run
+(the next heartbeat; no commit metadata entries, which `RaftSettings` turns off, would have carried it).
+`RatisContractTest.aCommitHeartbeatLostWithItsStreamIsSentAgain` holds the heartbeat in a `LinkProxy` and then resets
+the link: the follower learned the commit index 5-30 ms after the reset (10 runs of 5 writes), and 2.85 s after it
+without the resend (`-Drockserver.test.commitResend=false`). With the old dummy read in place of `send`,
+`aCommitHeartbeatSendsTheCommitIndexAtOnce` fails every run (5 of 5). `FollowerReadLatencyTest` after the change, one run
 on a busier machine: quiet follower reads 100/100 served by the follower, p50 2.2 / p90 3.8 ms.
 
 The read is forwarded to the leader instead, as without follower reads, when no read index comes (no leader known, the
@@ -1806,7 +1822,7 @@ failover" below).
 | `StartupChecksTest`, `StartupClusterTest` (in-process) | The config digest ignores layout and key order; a column volume outside `db/` is refused before it is created; copies of one seed share a digest that a truncated copy and an opened database do not, and a digest recorded by a failed first start is kept after the start-up check opened the database but taken again after `db/` is replaced, and a replica with another seed than the leader stops at genesis while copies of one seed start a cluster; `export-seed`'s copy holds the data with no cluster and no position, also with an absolute volume path inside `db/`, and a refused target config leaves no target; a direct-memory error made in Java code reaches the JFR watch; `run` refuses a JVM without `-XX:+ExitOnOutOfMemoryError`; a removed node refuses to start again, also with `--join`, and so does one stopped before its removal, whose log never received it (the members tell it); a node with a wrong API port for the leader forwards to the port the leader names. |
 | `RemovalCheckTest` | Only a committed configuration newer than the node's own and without it says "removed"; one not committed, or a member with no group yet, is asked again; a majority of the configuration the node knows decides; members that cannot be reached let the node start at once. |
 | `ClusterIdentityTest` | Each genesis gets its own id, and a second `Genesis` in a log changes nothing. A node that elected itself under the same group id, added with Ratis' own client, stops before the configuration changes, and writes go on. What `add-peer` refuses. |
-| `RatisContractTest` | The Ratis 3.3.1 behaviors that the design relies on beyond its API, against real servers in the JVM: the bootstrap and configuration meta files that `--join` safety reads, and the initializing state of a server started with an empty group (no election, no bootstrap file); the open segment format that `RaftLogRepair` rewrites; the type of the full-pending-queue refusal; a state machine refusal that reaches a remote client by class name and message, without a step down; `NotLeaderException` for an entry appended by a leader that then steps down (three servers); a transfer without a new leader that steps down; the 3 s wait of `GrpcUtil.shutdownManagedChannel` with a call in flight; a snapshot chunk held on the heap until its timeout by `StreamObserverWithTimeout`; a leader whose log worker is stopped (`LogWorkerGate`) commits nothing until it flushes; the CPU of the appender to a dead follower (printed, bounded at half a core); with the node's Raft settings, a follower learns a new commit index only with the next append or heartbeat (3 s), and within 600 ms of `CommitHeartbeats.send` on the leader, for both followers, 20 writes in a row. The match index moving only on replies with entries, and the follower order of `LeaderStall`, are pinned by `LeaderStallTest`. |
+| `RatisContractTest` | The Ratis 3.3.1 behaviors that the design relies on beyond its API, against real servers in the JVM: the bootstrap and configuration meta files that `--join` safety reads, and the initializing state of a server started with an empty group (no election, no bootstrap file); the open segment format that `RaftLogRepair` rewrites; the type of the full-pending-queue refusal; a state machine refusal that reaches a remote client by class name and message, without a step down; `NotLeaderException` for an entry appended by a leader that then steps down (three servers); a transfer without a new leader that steps down; the 3 s wait of `GrpcUtil.shutdownManagedChannel` with a call in flight; a snapshot chunk held on the heap until its timeout by `StreamObserverWithTimeout`; a leader whose log worker is stopped (`LogWorkerGate`) commits nothing until it flushes; the CPU of the appender to a dead follower (printed, bounded at half a core); with the node's Raft settings, a follower learns a new commit index only with the next append or heartbeat (3 s), and within 600 ms of `CommitHeartbeats.send` on the leader, for both followers, 20 writes in a row, also when the link to a follower drops that heartbeat and breaks its stream (sent again on the new stream). The match index moving only on replies with entries, and the follower order of `LeaderStall`, are pinned by `LeaderStallTest`. |
 | `RaftSettingsTest`, `ByteAdmissionTest`, `ConflictPositionsTest` | Snapshot chunks stay at most 4 s on the heap; Ratis' pending-request limits hold every node's attempts and stay near the defaults, and the byte limit grows with a peer list of more than 4 nodes; one entry of the largest size fits every limit on its way. The byte admission never exceeds its limit and is sized from the heap. Conflict positions survive the exception that Ratis rebuilds, and a text that does not parse is a conflict of the whole entry. |
 | `SstMaintenanceTest` (in-process) | `scanRawResumable`, `getSstMetadata` and `getTableProperties` through a follower describe the leader's database; raw-scan tokens carry the leader and its term and skip their tables through any node, while tokens of another node or term, or untagged ones, scan them again; over gRPC a client that does not set `acceptsTaggedSstTokens` gets plain filenames; `compactFiles` of the internal column is refused. |
 | `ColumnIteratorsTest`, `SnapshotBackoffTest`, `DiskProbeTest`, `AddPeerCheckTest`, `ProposerResetTest`, `ShutdownSignalTest` | Applying a column deletion closes the column's iterators and ends its range streams with `COLUMN_NOT_FOUND` instead of waiting for them (a stream of another column goes on; one started during the deletion fails), and an unknown iterator answers `UPDATE_RETRY` (the database's error for it is pinned); a failing snapshot is tried again only after its delay (1 s doubling to a minute), on a cluster too; a disk probe that does not end within the limit means a hung disk, until it ends; `add-peer` waits for a majority of the members to answer; a proposer's connection reset returns once the failed proxy left Ratis' map, before its slow close, so a resend gets a new one; the shutdown hook's stop waits for a node whose replica failure was already stopping it, and gives 3. |
