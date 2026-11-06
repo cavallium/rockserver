@@ -3,7 +3,6 @@ package it.cavallium.rockserver.distributed;
 import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.FunctionTimer;
 import io.micrometer.core.instrument.Gauge;
-import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.util.ArrayList;
 import java.util.List;
@@ -84,10 +83,9 @@ final class NodeMetrics {
 	private final Map<String, Series> durations = new ConcurrentHashMap<>();
 	private final Map<String, Series> amounts = new ConcurrentHashMap<>();
 	private final ScheduledExecutorService logger;
-	/** Guards {@link #registry} and {@link #registered}. */
+	/** Guards {@link #registry}. */
 	private final Object exportLock = new Object();
 	private @Nullable MeterRegistry registry;
-	private final List<Meter> registered = new ArrayList<>();
 	/** A gauge exported but not logged, see {@link #exportedGauge}; {@code tag} is a key and a value, or empty. */
 	private record ExportedGauge(String name, List<String> tag, java.util.function.DoubleSupplier value) {}
 
@@ -203,18 +201,10 @@ final class NodeMetrics {
 			}
 			this.registry = registry;
 			this.nodeTag = nodeTag;
-			registered.clear();
 			durations.forEach((name, series) -> registerDuration(registry, name, series));
 			amounts.forEach((name, series) -> registerAmount(registry, name, series));
 			gauges.forEach((name, value) -> registerGauge(registry, name, () -> value.getAsLong()));
 			exportedGauges.values().forEach(gauge -> registerGauge(registry, gauge.name(), gauge.tag(), gauge.value()));
-		}
-	}
-
-	/** The meters exported to the registry bound last, for tests. */
-	List<Meter> exportedMeters() {
-		synchronized (exportLock) {
-			return List.copyOf(registered);
 		}
 	}
 
@@ -227,26 +217,26 @@ final class NodeMetrics {
 	}
 
 	private void registerDuration(MeterRegistry registry, String name, Series series) {
-		registered.add(FunctionTimer.builder("rockserver.replication.duration", series, Series::count, Series::sum,
+		FunctionTimer.builder("rockserver.replication.duration", series, Series::count, Series::sum,
 						TimeUnit.NANOSECONDS)
 				.tag("node", nodeTag)
 				.tag("name", name)
 				.tag("kind", kindOf(name))
 				.description("Replication timings of this node, see NodeMetrics")
-				.register(registry));
+				.register(registry);
 	}
 
 	private void registerAmount(MeterRegistry registry, String name, Series series) {
-		registered.add(FunctionCounter.builder("rockserver.replication.count", series, s -> s.count())
+		FunctionCounter.builder("rockserver.replication.count", series, s -> s.count())
 				.tag("node", nodeTag)
 				.tag("name", name)
 				.tag("kind", kindOf(name))
-				.register(registry));
-		registered.add(FunctionCounter.builder("rockserver.replication.amount", series, s -> s.sum())
+				.register(registry);
+		FunctionCounter.builder("rockserver.replication.amount", series, s -> s.sum())
 				.tag("node", nodeTag)
 				.tag("name", name)
 				.tag("kind", kindOf(name))
-				.register(registry));
+				.register(registry);
 	}
 
 	private void registerGauge(MeterRegistry registry, String name, java.util.function.DoubleSupplier value) {
@@ -266,7 +256,7 @@ final class NodeMetrics {
 		if (!tag.isEmpty()) {
 			builder.tag(tag.get(0), tag.get(1));
 		}
-		registered.add(builder.register(registry));
+		builder.register(registry);
 	}
 
 	/**

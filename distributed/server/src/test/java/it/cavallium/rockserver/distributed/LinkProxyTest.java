@@ -2,6 +2,7 @@ package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -88,6 +89,8 @@ class LinkProxyTest {
 			var serverSideEnded = echo.nextConnectionEnd();
 
 			proxy.block();
+			assertTrue(proxy.isBlocked());
+			assertFalse(proxy.isBlackholed());
 			assertCutPromptly(existing);
 			serverSideEnded.get(PROMPT.toMillis(), TimeUnit.MILLISECONDS);
 			try (var duringBlock = new Socket()) {
@@ -104,6 +107,7 @@ class LinkProxyTest {
 			assertEquals(1, echo.connections(), "a connection reached the server while blocked");
 
 			proxy.unblock();
+			assertFalse(proxy.isBlocked());
 			try (var after = connect(proxy.listenAddress())) {
 				assertEchoes(after, "after");
 			}
@@ -185,6 +189,7 @@ class LinkProxyTest {
 				var existing = connect(proxy.listenAddress())) {
 			assertEchoes(existing, "before");
 			proxy.blackhole();
+			assertTrue(proxy.isBlackholed());
 			existing.getOutputStream().write("held\n".getBytes(StandardCharsets.UTF_8));
 			var during = new Socket();
 			// Accepted: a blackhole does not refuse, it just never answers.
@@ -202,6 +207,7 @@ class LinkProxyTest {
 			assertEquals(1, echo.connections(), "a connection reached the server through the blackhole");
 
 			proxy.unblock();
+			assertFalse(proxy.isBlackholed());
 			existing.setSoTimeout(READ_TIMEOUT_MILLIS);
 			during.setSoTimeout(READ_TIMEOUT_MILLIS);
 			assertArrayEquals("held\n".getBytes(StandardCharsets.UTF_8), existing.getInputStream().readNBytes(5));

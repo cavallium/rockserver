@@ -74,6 +74,7 @@ class ClusterOpsTest {
 		for (var node : cluster.runningNodes()) {
 			var result = node.stateMachine().ops().checksumResult(checksumIndex);
 			assertEquals(500, result.keys());
+			assertTrue(node.stateMachine().ops().checksumResults().contains(result), node.config().nodeId());
 			digests.add(result.detail());
 		}
 		assertEquals(1, digests.size(), "digests " + digests);
