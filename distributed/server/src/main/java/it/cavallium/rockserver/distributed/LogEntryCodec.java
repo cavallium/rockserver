@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.ClientRequestId;
 import it.cavallium.rockserver.core.common.ColumnHashType;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
@@ -56,6 +57,7 @@ final class LogEntryCodec {
 	private static final byte GUARDED = 12;
 	private static final byte GENESIS = 13;
 	private static final byte VERIFY_COLUMN = 14;
+	private static final byte REGISTER_CLIENT = 15;
 
 	/** Flags of a {@link LogEntry.Guarded}: {@link LogEntry.Guarded#singleResult()}. */
 	private static final int GUARDED_SINGLE_RESULT = 1;
@@ -115,6 +117,21 @@ final class LogEntryCodec {
 	 * {@link #encodeBatch}.
 	 */
 	static final byte BATCH_VERSION = 2;
+	/**
+	 * Leading byte of a batch that holds writes of client sessions: after each request's sequence, a byte that tells
+	 * whether a {@link ClientRequestId} (session id, sequence, {@code completedBelow}) follows. A batch with none keeps
+	 * {@link #BATCH_VERSION} and its bytes.
+	 */
+	static final byte BATCH_VERSION_CLIENTS = 3;
+	/**
+	 * Leading byte of a batch stamped by the leader ({@link #stamp}): the leader's clock in milliseconds follows, then the
+	 * batch itself, with its own version byte.
+	 */
+	static final byte STAMPED = 4;
+	/** Size of a {@link #stamp}. */
+	static final int STAMP_BYTES = 1 + Long.BYTES;
+	/** Bytes a request adds to a batch besides its entry body, at most: its sequence and its client request id. */
+	static final int MAX_REQUEST_OVERHEAD_BYTES = Long.BYTES + 1 + 3 * Long.BYTES;
 
 	/** The body of {@code entry} (its tag and fields, no version byte), to be put in a batch by {@link #encodeBatch}. */
 	static byte[] encodeEntryBody(LogEntry entry) {
@@ -125,7 +142,7 @@ final class LogEntryCodec {
 	}
 
 	/** Size of a batch header: {@link #BATCH_VERSION}, proposer id, {@code completedBelow} and request count. */
-	private static final int BATCH_HEADER_BYTES = 1 + 2 * Long.BYTES + Integer.BYTES;
+	static final int BATCH_HEADER_BYTES = 1 + 2 * Long.BYTES + Integer.BYTES;
 
 	/**
 	 * Encodes requests of one proposer as one log entry: {@link #BATCH_VERSION}, the proposer id, the batch's
@@ -133,19 +150,33 @@ final class LogEntryCodec {
 	 * entry body ({@link #encodeEntryBody}).
 	 */
 	static byte[] encodeBatch(long proposerId, long completedBelow, long[] sequences, List<byte[]> entryBodies) {
-		if (sequences.length != entryBodies.size() || sequences.length == 0) {
+		return encodeBatch(proposerId, completedBelow, sequences, null, entryBodies);
+	}
+
+	/**
+	 * {@link #encodeBatch(long, long, long[], List)} for requests of which some may carry a client request id
+	 * ({@code clients}, null or null elements for none): with any, the batch is {@link #BATCH_VERSION_CLIENTS}.
+	 */
+	static byte[] encodeBatch(long proposerId, long completedBelow, long[] sequences,
+			@Nullable ClientRequestId @Nullable [] clients, List<byte[]> entryBodies) {
+		if (sequences.length != entryBodies.size() || sequences.length == 0
+				|| (clients != null && clients.length != sequences.length)) {
 			throw new IllegalArgumentException("A batch needs one entry per sequence, and at least one");
 		}
+		boolean withClients = clients != null && Arrays.stream(clients).anyMatch(Objects::nonNull);
 		long size = BATCH_HEADER_BYTES;
-		for (byte[] body : entryBodies) {
-			size += Long.BYTES + body.length;
+		for (int i = 0; i < sequences.length; i++) {
+			size += requestOverhead(withClients, withClients ? clients[i] : null) + entryBodies.get(i).length;
 		}
 		var out = new Output(size);
-		writeBatchHeader(out, proposerId, completedBelow, sequences.length);
+		writeBatchHeader(out, withClients, proposerId, completedBelow, sequences.length);
 		for (int i = 0; i < sequences.length; i++) {
 			checkSequence(completedBelow, sequences[i]);
 			byte[] body = entryBodies.get(i);
 			out.writeLong(sequences[i]);
+			if (withClients) {
+				writeClient(out, clients[i]);
+			}
 			out.write(body, 0, body.length);
 		}
 		return out.finish();
@@ -157,25 +188,44 @@ final class LogEntryCodec {
 	 */
 	static byte[] encodeBatch(List<Request> requests) {
 		var first = requests.getFirst();
+		boolean withClients = requests.stream().anyMatch(r -> r.client() != null);
 		long size = BATCH_HEADER_BYTES;
 		for (var request : requests) {
 			if (request.proposerId() != first.proposerId() || request.completedBelow() != first.completedBelow()) {
 				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
 			}
 			checkSequence(first.completedBelow(), request.sequence());
-			size += Long.BYTES + entrySize(Objects.requireNonNull(request.entry(), "entry"));
+			size += requestOverhead(withClients, request.client())
+					+ entrySize(Objects.requireNonNull(request.entry(), "entry"));
 		}
 		var out = new Output(size);
-		writeBatchHeader(out, first.proposerId(), first.completedBelow(), requests.size());
+		writeBatchHeader(out, withClients, first.proposerId(), first.completedBelow(), requests.size());
 		for (var request : requests) {
 			out.writeLong(request.sequence());
+			if (withClients) {
+				writeClient(out, request.client());
+			}
 			writeEntry(out, request.entry());
 		}
 		return out.finish();
 	}
 
-	private static void writeBatchHeader(Output out, long proposerId, long completedBelow, int count) {
-		out.writeByte(BATCH_VERSION);
+	private static int requestOverhead(boolean withClients, @Nullable ClientRequestId client) {
+		return Long.BYTES + (withClients ? 1 + (client != null ? 3 * Long.BYTES : 0) : 0);
+	}
+
+	private static void writeClient(Output out, @Nullable ClientRequestId client) {
+		out.writeBoolean(client != null);
+		if (client != null) {
+			out.writeLong(client.sessionId());
+			out.writeLong(client.sequence());
+			out.writeLong(client.completedBelow());
+		}
+	}
+
+	private static void writeBatchHeader(Output out, boolean withClients, long proposerId, long completedBelow,
+			int count) {
+		out.writeByte(withClients ? BATCH_VERSION_CLIENTS : BATCH_VERSION);
 		out.writeLong(proposerId);
 		out.writeLong(completedBelow);
 		out.writeInt(count);
@@ -187,6 +237,33 @@ final class LogEntryCodec {
 		}
 	}
 
+	/**
+	 * The prefix the leader puts before a batch that needs its clock ({@link #needsStamp}): {@link #STAMPED} and
+	 * {@code leaderTimeMillis}. The batch's own bytes follow unchanged, so the leader can prepend it without copying
+	 * them. Applying the entry then reads the same time on every replica.
+	 */
+	static byte[] stamp(long leaderTimeMillis) {
+		return ByteBuffer.allocate(STAMP_BYTES).put(STAMPED).putLong(leaderTimeMillis).array();
+	}
+
+	/** True if applying {@code requests} reads the leader's clock: client session writes and registrations. */
+	static boolean needsStamp(List<Request> requests) {
+		for (var request : requests) {
+			if (request.client() != null || request.entry() instanceof LogEntry.RegisterClient) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** The leader's clock stamped on the batch in {@code data}'s remaining bytes, or -1 if it has none. */
+	static long leaderTime(ByteBuffer data) {
+		if (data.remaining() >= STAMP_BYTES && data.get(data.position()) == STAMPED) {
+			return data.duplicate().order(ByteOrder.BIG_ENDIAN).getLong(data.position() + 1);
+		}
+		return -1;
+	}
+
 	/** @throws IllegalArgumentException on malformed input or unknown version */
 	static List<Request> decodeBatch(byte[] data) {
 		return decodeBatch(new Input(data));
@@ -194,7 +271,8 @@ final class LogEntryCodec {
 
 	/**
 	 * Decodes a batch read from {@code data}'s remaining bytes, such as a read-only view of a Raft log entry's
-	 * payload: nothing of the whole batch is copied, only each field into its own array.
+	 * payload: nothing of the whole batch is copied, only each field into its own array. A {@link #stamp} before it is
+	 * skipped: see {@link #leaderTime}.
 	 *
 	 * @throws IllegalArgumentException on malformed input or unknown version
 	 */
@@ -212,9 +290,14 @@ final class LogEntryCodec {
 
 	private static List<Request> decodeBatch(Input in) {
 		byte version = in.readByte();
-		if (version != BATCH_VERSION) {
+		if (version == STAMPED) {
+			in.readLong();
+			version = in.readByte();
+		}
+		if (version != BATCH_VERSION && version != BATCH_VERSION_CLIENTS) {
 			throw new IllegalArgumentException("Unknown log entry version: " + version);
 		}
+		boolean withClients = version == BATCH_VERSION_CLIENTS;
 		long proposerId = in.readLong();
 		long completedBelow = in.readLong();
 		// A request takes at least its sequence and an entry tag.
@@ -225,7 +308,11 @@ final class LogEntryCodec {
 		var requests = new Request[count];
 		for (int i = 0; i < count; i++) {
 			long sequence = in.readLong();
-			requests[i] = new Request(proposerId, sequence, completedBelow, readEntry(in));
+			ClientRequestId client = null;
+			if (withClients && in.readBoolean()) {
+				client = new ClientRequestId(in.readLong(), in.readLong(), in.readLong());
+			}
+			requests[i] = new Request(proposerId, sequence, completedBelow, readEntry(in), client);
 		}
 		in.finish();
 		return List.of(requests);
@@ -275,6 +362,10 @@ final class LogEntryCodec {
 				out.writeByte(GENESIS);
 				writeString(out, clusterId);
 				out.writeBoolean(seeded);
+			}
+			case LogEntry.RegisterClient(long timeoutMillis) -> {
+				out.writeByte(REGISTER_CLIENT);
+				out.writeLong(timeoutMillis);
 			}
 		}
 	}
@@ -409,6 +500,7 @@ final class LogEntryCodec {
 			}
 			case LogEntry.VerifyColumn(String name, long _) -> 1 + stringSize(name) + Long.BYTES;
 			case LogEntry.Genesis(String clusterId, boolean _) -> 1 + stringSize(clusterId) + 1;
+			case LogEntry.RegisterClient _ -> 1 + Long.BYTES;
 		};
 	}
 
@@ -554,6 +646,7 @@ final class LogEntryCodec {
 			case GUARDED -> readGuarded(in);
 			case GENESIS -> new LogEntry.Genesis(in.readString(), in.readBoolean());
 			case VERIFY_COLUMN -> new LogEntry.VerifyColumn(in.readString(), in.readLong());
+			case REGISTER_CLIENT -> new LogEntry.RegisterClient(in.readLong());
 			default -> readWrite(in, tag);
 		};
 	}

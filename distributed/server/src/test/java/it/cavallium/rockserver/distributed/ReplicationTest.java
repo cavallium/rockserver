@@ -109,10 +109,10 @@ class ReplicationTest {
 		});
 	}
 
-	/** A write that may have taken effect: SERVER_OVERLOADED with an unknown outcome, never "not applied". */
+	/** A write that may have taken effect: OUTCOME_UNKNOWN, never "not applied". */
 	private static void assertOutcomeUnknown(Throwable error) {
 		var rocks = assertInstanceOf(RocksDBException.class, error);
-		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks.getErrorUniqueId(), rocks.getMessage());
+		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks.getErrorUniqueId(), rocks.getMessage());
 		assertTrue(rocks.getMessage().contains("outcome is unknown"), rocks.getMessage());
 		assertFalse(rocks.getMessage().contains("not applied"), rocks.getMessage());
 	}
@@ -1028,7 +1028,7 @@ class ReplicationTest {
 			assertFalse(error.getCause() instanceof RocksDBRetryException, "a commit that may have been applied"
 					+ " reported as safe to run again: " + error.getCause());
 			var cause = (RocksDBException) error.getCause();
-			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, cause.getErrorUniqueId(), cause.getMessage());
+			assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, cause.getErrorUniqueId(), cause.getMessage());
 			assertTrue(cause.getMessage().contains("outcome of the commit is unknown"), cause.getMessage());
 		} finally {
 			gate.countDown();

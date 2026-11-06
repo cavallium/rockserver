@@ -122,7 +122,7 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 		}
 
 		RequestContext remainingContext() {
-			return new RequestContext(context.profile(), remainingNanos());
+			return context.withTimeoutNanos(remainingNanos());
 		}
 	}
 

@@ -18,6 +18,7 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
@@ -200,8 +201,10 @@ class ForwardingFailoverTest {
 			cluster.kill(leader);
 			var error = assertThrows(ExecutionException.class, () -> commit.get(60, TimeUnit.SECONDS));
 			var cause = assertInstanceOf(RocksDBException.class, error.getCause(), () -> String.valueOf(error.getCause()));
-			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, cause.getErrorUniqueId(), cause.getMessage());
-			assertTrue(cause.getMessage().contains("outcome of the commit is unknown"), cause.getMessage());
+			// The client resends the numbered commit until its deadline: the next leader finds no record of it and
+			// answers "run it again", which is now safe; if that leader is not ready in time, the outcome is unknown.
+			assertTrue(cause instanceof RocksDBRetryException
+					|| cause.getErrorUniqueId() == RocksDBErrorType.OUTCOME_UNKNOWN, cause.getMessage());
 
 			cluster.start(leader);
 			cluster.waitReady(leader, READY_TIMEOUT);
@@ -502,6 +505,7 @@ class ForwardingFailoverTest {
 	private static boolean isRetryable(Throwable error) {
 		return error instanceof RocksDBException rocks
 				&& (rocks.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED
+				|| rocks.getErrorUniqueId() == RocksDBErrorType.OUTCOME_UNKNOWN
 				|| rocks.getErrorUniqueId() == RocksDBErrorType.UPDATE_RETRY);
 	}
 

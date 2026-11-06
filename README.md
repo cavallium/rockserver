@@ -122,7 +122,8 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
   that hop, until their connection is lost.
 - When the connection to its node is lost, calls in flight fail as they do with one address: the reads that the
   automatic retry policy allows run again, on the next node, and the others surface `UNAVAILABLE`, because a write
-  may already have been applied. New calls wait for the next connection, which starts from the top of the list.
+  may already have been applied. On a replicated cluster, writes are sent again instead (see below). New calls wait
+  for the next connection, which starts from the top of the list.
 - It stays on its node when an earlier one comes back, until that connection is lost or the channel goes idle (30
   minutes without calls). So a client that failed over stays on that node until the node goes away, even if the
   first address returned long before. A server can end connections at a maximum age instead, which brings clients
@@ -149,10 +150,23 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 | `it.cavallium.rockserver.grpc.client.keep-alive-timeout-ms` | `5000` | Wait for the answer to a ping, with one address too. |
 | `it.cavallium.rockserver.grpc.client.max-reconnect-delay-ms` | `2000` | The longest wait between two attempts on the list, or on the only address, while they all fail. Each client picks a period between half of this and this. |
 | `it.cavallium.rockserver.grpc.client.handshake-wait-ms` | `30000` with several addresses, `0` with one | How long a new connection keeps asking for the capabilities of a server, before it fails, while the answer is `UNAVAILABLE` or no answer comes within 10 s. It ends at this time, or with the first attempt, which takes up to 10 s, if that is later: `0` means one attempt. |
+| `it.cavallium.rockserver.grpc.client.write-retry-window-ms` | `30000` | On a replicated cluster, how long a write of a caller without a deadline is sent again after an unknown outcome. A caller's deadline bounds it otherwise. |
+| `it.cavallium.rockserver.grpc.client.session-writes` | `true` | `false` turns off client sessions (below) for connections made afterwards: writes are sent once, as to a single server. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-ms` | `0` (off) | On a server in front of another connection, such as a replicated node, the age at which a connection ends, +/-10%. The client then starts again from the top of its list, which is what brings it back to the first address. It has two costs: a silent first address costs every client the connect timeout at every cycle, not once, and calls that outlive the grace below fail with `UNAVAILABLE`, which includes `Compact` and long scans, on a healthy cluster too. Left off, a client stays on the node it failed over to until that node goes away. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms` | `600000` | With a maximum age, the time left to the calls running on a connection that reached it. |
 
 On a replicated cluster, when the node that died was the leader, the new calls also wait for the election.
+
+A replicated cluster advertises client sessions, and the connection uses them (the forwarding connections between
+nodes do not). Its first write opens a session through the replicated log. Every write outside a transaction, every
+transaction commit and the write that ends an update opened through the connection then carries the session id and a
+number of its own. When its outcome is unknown, because the connection was lost (`UNAVAILABLE`, or `CANCELLED` by a
+server that stops) or the server answered `OUTCOME_UNKNOWN`, the connection sends the same numbered write again,
+after a pause of 50 ms that doubles up to 1 s, to whichever node it reaches, until the caller's deadline. The cluster
+applies a numbered write once and answers every copy with the first result. Only when the deadline ends that does the
+caller get `OUTCOME_UNKNOWN`: the write may or may not be applied, and sending it again as a new write could apply
+it twice. A write staged in a transaction is sent once, as before. With a single server, which has no sessions,
+nothing changes.
 
 A replicated node without a leader for that long serves again by itself: once it has known a leader for one maximum
 election timeout it listens again, on its own or with every other node after a period when the whole cluster had no

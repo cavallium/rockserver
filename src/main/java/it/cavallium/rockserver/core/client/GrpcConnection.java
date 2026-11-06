@@ -114,7 +114,15 @@ public final class GrpcConnection extends BaseConnection {
 	public static final int MIN_MAX_INBOUND_MESSAGE_SIZE =
 			GrpcConnectionDelegate.MIN_MAX_INBOUND_MESSAGE_SIZE;
 
+	/**
+	 * System property: {@code false} turns off {@link SessionWrites} on connections made afterwards: writes are then
+	 * sent once, as to a server without client sessions.
+	 */
+	public static final String SESSION_WRITES_PROPERTY = "it.cavallium.rockserver.grpc.client.session-writes";
+
 	private final GrpcConnectionDelegate delegate;
+	/** Numbered writes, on a replicated server that has client sessions and a connection that retries. */
+	private final @Nullable SessionWrites sessionWrites;
 	// Retained as test-observable lifecycle handles; ownership stays with the raw delegate.
 	private final ManagedChannel channel;
 	private final ExecutorService callbackExecutor;
@@ -131,6 +139,12 @@ public final class GrpcConnection extends BaseConnection {
 	private GrpcConnection(String name, GrpcConnectionDelegate delegate) {
 		super(name);
 		this.delegate = delegate;
+		this.sessionWrites = delegate.automaticRetry && delegate.getCapabilities().clientSessions()
+				&& !"false".equalsIgnoreCase(System.getProperty(SESSION_WRITES_PROPERTY))
+				? new SessionWrites(delegate::openClientSessionAsync,
+						(context, command) -> (CompletableFuture<?>) delegate.requestAsync(context, command),
+						delegate.callbackExecutor)
+				: null;
 		this.channel = delegate.channel;
 		this.callbackExecutor = delegate.callbackExecutor;
 		this.eventLoopGroup = delegate.eventLoopGroup;
@@ -224,12 +238,41 @@ public final class GrpcConnection extends BaseConnection {
 	}
 
 	@Override
+	public CompletableFuture<Long> openClientSessionAsync(RequestContext context) {
+		return delegate.openClientSessionAsync(context);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Override
 	<R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+		var writes = sessionWrites;
+		if (writes != null && (writes.numbers(request) || SessionWrites.observes(request))) {
+			try {
+				return (RS) ((CompletableFuture<Object>) requestAsync(context, request)).join();
+			} catch (CompletionException ex) {
+				if (ex.getCause() instanceof RuntimeException cause) {
+					throw cause;
+				}
+				throw ex;
+			}
+		}
 		return delegate.requestSync(context, request);
 	}
 
+	@SuppressWarnings("unchecked")
 	@Override
 	<R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
+		var writes = sessionWrites;
+		if (writes != null && writes.numbers(request)) {
+			return (RA) writes.send(context, (RocksDBAPICommand.RocksDBAPICommandSingle<?>) request);
+		}
+		if (writes != null && SessionWrites.observes(request)) {
+			return (RA) ((CompletableFuture<Object>) delegate.requestAsync(context, request))
+					.thenApply(result -> {
+						writes.observe(request, result);
+						return result;
+					});
+		}
 		return delegate.requestAsync(context, request);
 	}
 
@@ -314,6 +357,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	final ManagedChannel channel;
 	final ExecutorService callbackExecutor;
 	final EventLoopGroup eventLoopGroup;
+	/** gRPC retries reads after a transport loss, and {@link SessionWrites} resends numbered writes. */
+	final boolean automaticRetry;
 	private final RocksDBServiceFutureStub futureStub;
 	private final ReactorRocksDBServiceGrpc.ReactorRocksDBServiceStub reactiveStub;
 	private final URI address;
@@ -437,7 +482,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		RockserverCapabilities capabilities;
 		try {
 			var response = handshake(channel, futureStub, severalAddresses);
-			capabilities = new RockserverCapabilities(response.getWorkloadContractVersion());
+			capabilities = new RockserverCapabilities(response.getWorkloadContractVersion(),
+					response.getClientSessions());
 			capabilities.requireCompatible();
 		} catch (InterruptedException interrupted) {
 			Thread.currentThread().interrupt();
@@ -463,6 +509,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		this.channel = channel;
 		this.callbackExecutor = callbackExecutor;
 		this.eventLoopGroup = eventLoopGroup;
+		this.automaticRetry = automaticRetry;
 		this.futureStub = futureStub;
 		this.reactiveStub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
 		this.address = address;
@@ -718,6 +765,15 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	@Override
 	public <R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> req) {
 		return withRequestContext(context, () -> req.handleAsync(this));
+	}
+
+	/** Opens a client session on a replicated server (see {@link RockserverCapabilities#clientSessions()}). */
+	@Override
+	public CompletableFuture<Long> openClientSessionAsync(RequestContext context) {
+		return withRequestContext(BoundRequestContext.bind(context), () -> toResponse(futureStubWithRequestDeadline()
+				.openClientSession(OpenClientSessionRequest.newBuilder()
+						.setContext(currentWireRequestContext())
+						.build()), OpenClientSessionResponse::getSessionId));
 	}
 
 	@Override
@@ -1663,17 +1719,24 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"Request deadline already expired");
 		}
-		if (remainingNanos == RequestContext.NO_TIMEOUT) {
+		var requestId = context.requestId();
+		if (remainingNanos == RequestContext.NO_TIMEOUT && requestId == null) {
 			var cached = NO_TIMEOUT_WIRE_CONTEXTS[context.profile().ordinal()];
 			if (cached != null) {
 				return cached;
 			}
 		}
-		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+		var wire = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfileValue(context.profile().wireValue())
 				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
-				.setTimeoutNanos(remainingNanos)
-				.build();
+				.setTimeoutNanos(remainingNanos);
+		if (requestId != null) {
+			wire.setRequestId(it.cavallium.rockserver.core.common.api.proto.ClientRequestId.newBuilder()
+					.setSessionId(requestId.sessionId())
+					.setSequence(requestId.sequence())
+					.setCompletedBelow(requestId.completedBelow()));
+		}
+		return wire.build();
 	}
 
 	private static KV mapKV(@NotNull Keys keys, @NotNull Buf value) {

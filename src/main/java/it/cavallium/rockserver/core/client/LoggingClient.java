@@ -51,6 +51,11 @@ public class LoggingClient implements RocksDBConnection {
 	}
 
 	@Override
+	public CompletableFuture<Long> openClientSessionAsync(RequestContext context) {
+		return client.openClientSessionAsync(context);
+	}
+
+	@Override
 	public void close() throws IOException {
 		client.close();
 	}

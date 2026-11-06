@@ -86,12 +86,27 @@ message RequestContext {
   reserved 2;
   int32 workloadContractVersion = 3;
   int64 timeoutNanos = 4;
+  // Set only on writes of a client session of a replicated server (see openClientSession).
+  ClientRequestId requestId = 5;
+}
+
+// A write of a client session: every copy of a write keeps its number, so it takes effect at most once.
+message ClientRequestId {
+  int64 sessionId = 1;
+  int64 sequence = 2;
+  // Every write of the session numbered below this has its final answer, and is never sent again.
+  int64 completedBelow = 3;
 }
 
 message CapabilitiesRequest {}
 message CapabilitiesResponse {
   int32 workloadContractVersion = 1;
+  // The server is replicated and numbers client writes: see openClientSession.
+  bool clientSessions = 2;
 }
+
+message OpenClientSessionRequest {RequestContext context = 1;}
+message OpenClientSessionResponse {int64 sessionId = 1;}
 
 enum PutBatchMode {
   WRITE_BATCH = 0;
@@ -285,6 +300,8 @@ message GetAllColumnDefinitionsResponse {repeated Column columns = 1;}
 
 service RocksDBService {
   rpc getCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  // Replicated servers only (CapabilitiesResponse.clientSessions): registers a client session through the log.
+  rpc openClientSession(OpenClientSessionRequest) returns (OpenClientSessionResponse);
   rpc openTransaction(OpenTransactionRequest) returns (OpenTransactionResponse);
   rpc closeTransaction(CloseTransactionRequest) returns (CloseTransactionResponse);
   rpc closeFailedUpdate(CloseFailedUpdateRequest) returns (google.protobuf.Empty);

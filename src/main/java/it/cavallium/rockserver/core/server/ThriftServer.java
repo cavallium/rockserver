@@ -379,7 +379,7 @@ public class ThriftServer extends Server {
 						it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 						"Request deadline expired before downstream dispatch");
 			}
-			return new RequestContext(context.value().profile(), remainingNanos);
+			return context.value().withTimeoutNanos(remainingNanos);
 		}
 
 		private RocksDBSyncAPI protectedApi() {

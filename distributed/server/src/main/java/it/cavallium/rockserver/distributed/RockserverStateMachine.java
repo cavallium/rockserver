@@ -75,6 +75,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/** State attached to a log entry on the leader between admission and apply. */
 	private static final class Proposal {
 		final List<Request> requests;
+		/** The leader's clock stamped on the entry ({@link LogEntryCodec#stamp}), -1 if it has none. */
+		long leaderTimeMillis = -1;
 		final long startedNanos = System.nanoTime();
 		long appendedNanos;
 		@Nullable LeaderSession session;
@@ -135,8 +137,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private sealed interface Applying {}
 
 	/** A data entry to apply; {@code reply} completes once it is committed. It holds {@code kib} of {@link #queuedKiB}. */
-	private record ApplyEntry(TermIndex position, List<Request> requests, @Nullable Proposal proposal, long bytes,
-			int kib, CompletableFuture<Message> reply) implements Applying {}
+	private record ApplyEntry(TermIndex position, List<Request> requests, long leaderTimeMillis,
+			@Nullable Proposal proposal, long bytes, int kib, CompletableFuture<Message> reply) implements Applying {}
 
 	/** A position without data (configuration entries, leader no-ops) to record. */
 	private record MarkPosition(TermIndex position) implements Applying {}
@@ -252,6 +254,11 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return Applier.recordedResult(store, proposerId, sequence);
 	}
 
+	/** The result this replica recorded for write {@code id} of a client session, or null. Any thread. */
+	@Nullable ApplyResult recordedResult(it.cavallium.rockserver.core.common.ClientRequestId id) {
+		return Applier.recordedResult(store, id);
+	}
+
 	boolean isFailed() {
 		return failed;
 	}
@@ -325,8 +332,15 @@ final class RockserverStateMachine extends BaseStateMachine {
 					}
 				}
 			}
-			return builder.setLogData(request.getMessage().getContent())
-					.setStateMachineContext(new Proposal(decoded))
+			var proposal = new Proposal(decoded);
+			var logData = request.getMessage().getContent();
+			if (LogEntryCodec.needsStamp(decoded)) {
+				// Session expiry reads the leader's clock, the same on every replica. Prepended: the batch is not copied.
+				proposal.leaderTimeMillis = System.currentTimeMillis();
+				logData = UnsafeByteOperations.unsafeWrap(LogEntryCodec.stamp(proposal.leaderTimeMillis)).concat(logData);
+			}
+			return builder.setLogData(logData)
+					.setStateMachineContext(proposal)
 					.build();
 		} catch (IllegalArgumentException ex) {
 			return builder.build().setException(new IOException("Malformed log entry: " + ex.getMessage(), ex));
@@ -393,8 +407,15 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var proposal = trx.getStateMachineContext() instanceof Proposal p ? p : null;
 		var data = logEntry.getStateMachineLogEntry().getLogData();
 		List<Request> requests;
+		long leaderTime;
 		try {
-			requests = proposal != null ? proposal.requests : decodeBatch(data);
+			if (proposal != null) {
+				requests = proposal.requests;
+				leaderTime = proposal.leaderTimeMillis;
+			} else {
+				leaderTime = LogEntryCodec.leaderTime(data.asReadOnlyByteBuffer());
+				requests = decodeBatch(data);
+			}
 		} catch (RuntimeException ex) {
 			return CompletableFuture.failedFuture(fail("decode entry " + position, ex));
 		}
@@ -406,7 +427,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			return CompletableFuture.failedFuture(ex);
 		}
 		var reply = new CompletableFuture<Message>();
-		applyQueue.add(new ApplyEntry(position, requests, proposal, data.size(), kib, reply));
+		applyQueue.add(new ApplyEntry(position, requests, leaderTime, proposal, data.size(), kib, reply));
 		handedOver = position.getIndex();
 		return reply;
 	}
@@ -799,7 +820,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (proposal != null && proposal.appendedNanos != 0) {
 			commitWait.record(System.nanoTime() - proposal.appendedNanos);
 		}
-		var results = applier.applyBatch(requests, position);
+		var results = applier.applyBatch(requests, position, entry.leaderTimeMillis());
 		applyRequests.record(requests.size());
 		return () -> {
 			if (proposal != null && proposal.token != null && proposal.session != null) {

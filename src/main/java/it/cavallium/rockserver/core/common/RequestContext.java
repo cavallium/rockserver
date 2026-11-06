@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.common;
 
 import java.time.Duration;
 import java.util.Objects;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Mandatory caller-supplied workload contract for generic Rockserver operations.
@@ -14,8 +15,10 @@ import java.util.Objects;
  *
  * @param profile client-selectable service profile
  * @param timeoutNanos positive relative timeout in nanoseconds, or {@link #NO_TIMEOUT}
+ * @param requestId the identity of a write in a client session of a replicated server, set by the client library;
+ *                  null for every other request
  */
-public record RequestContext(WorkloadProfile profile, long timeoutNanos) {
+public record RequestContext(WorkloadProfile profile, long timeoutNanos, @Nullable ClientRequestId requestId) {
 
 	public static final long NO_TIMEOUT = Long.MAX_VALUE;
 	private static final long MAX_FINITE_TIMEOUT_NANOS = Long.MAX_VALUE - 1L;
@@ -37,6 +40,20 @@ public record RequestContext(WorkloadProfile profile, long timeoutNanos) {
 		if (profile == WorkloadProfile.LATENCY && timeoutNanos == NO_TIMEOUT) {
 			throw new IllegalArgumentException("LATENCY requires a finite timeout");
 		}
+	}
+
+	public RequestContext(WorkloadProfile profile, long timeoutNanos) {
+		this(profile, timeoutNanos, null);
+	}
+
+	/** This context for the write {@code requestId} of a client session. */
+	public RequestContext withRequestId(@Nullable ClientRequestId requestId) {
+		return new RequestContext(profile, timeoutNanos, requestId);
+	}
+
+	/** This context with another timeout, the same request id. */
+	public RequestContext withTimeoutNanos(long timeoutNanos) {
+		return new RequestContext(profile, timeoutNanos, requestId);
 	}
 
 	public static RequestContext latency(Duration timeout) {

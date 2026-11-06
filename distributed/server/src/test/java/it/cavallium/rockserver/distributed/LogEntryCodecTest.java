@@ -249,6 +249,52 @@ class LogEntryCodecTest {
 	}
 
 	@Test
+	void roundTripsClientSessionWritesAndKeepsTheOldBytesWithoutThem() {
+		var put = new Put(3, keys("k"), buf("v"), RequestTypeId.NOTHING);
+		var merge = new Merge(3, keys("k"), buf("m"), RequestTypeId.MERGED);
+		var plain = List.of(new Request(9, 4, 3, put), new Request(9, 5, 3, merge));
+		// Without a client request id a batch keeps the format of logs written before sessions, byte for byte.
+		byte[] old = OldLogEntryCodec.encodeBatch(plain);
+		assertArrayEquals(old, LogEntryCodec.encodeBatch(plain));
+		assertEquals(2, LogEntryCodec.decodeBatch(old).size());
+		assertFalse(LogEntryCodec.needsStamp(plain));
+
+		var id = new it.cavallium.rockserver.core.common.ClientRequestId(17, 8, 6);
+		var mixed = List.of(new Request(9, 4, 3, put), new Request(9, 5, 3, merge, id),
+				new Request(9, 6, 3, new LogEntry.RegisterClient(60_000)));
+		byte[] encoded = LogEntryCodec.encodeBatch(mixed);
+		assertEquals(LogEntryCodec.BATCH_VERSION_CLIENTS, encoded[0]);
+		assertTrue(LogEntryCodec.needsStamp(mixed));
+		assertArrayEquals(encoded, LogEntryCodec.encodeBatch(9, 3, new long[] {4, 5, 6},
+				new it.cavallium.rockserver.core.common.ClientRequestId[] {null, id, null},
+				mixed.stream().map(r -> LogEntryCodec.encodeEntryBody(r.entry())).toList()));
+		var decoded = LogEntryCodec.decodeBatch(encoded);
+		assertEquals(mixed.size(), decoded.size());
+		for (int i = 0; i < mixed.size(); i++) {
+			assertEquals(mixed.get(i).sequence(), decoded.get(i).sequence());
+			assertEquals(mixed.get(i).client(), decoded.get(i).client());
+			assertSameEntry(mixed.get(i).entry(), decoded.get(i).entry());
+		}
+		assertArrayEquals(encoded, LogEntryCodec.encodeBatch(decoded));
+
+		// The leader's stamp goes before the batch, which keeps its bytes.
+		byte[] stamp = LogEntryCodec.stamp(1_700_000_000_123L);
+		byte[] stamped = ByteBuffer.allocate(stamp.length + encoded.length).put(stamp).put(encoded).array();
+		assertEquals(1_700_000_000_123L, LogEntryCodec.leaderTime(ByteBuffer.wrap(stamped)));
+		assertEquals(-1, LogEntryCodec.leaderTime(ByteBuffer.wrap(encoded)));
+		assertEquals(-1, LogEntryCodec.leaderTime(ByteBuffer.wrap(old)));
+		var fromStamped = LogEntryCodec.decodeBatch(ByteBuffer.wrap(stamped));
+		assertArrayEquals(encoded, LogEntryCodec.encodeBatch(fromStamped));
+		for (int length = 0; length < stamped.length; length++) {
+			byte[] truncated = Arrays.copyOf(stamped, length);
+			assertThrows(IllegalArgumentException.class, () -> LogEntryCodec.decodeBatch(truncated), "length " + length);
+		}
+		// Two stamps are not a batch.
+		byte[] twice = ByteBuffer.allocate(stamp.length + stamped.length).put(stamp).put(stamped).array();
+		assertThrows(IllegalArgumentException.class, () -> LogEntryCodec.decodeBatch(twice));
+	}
+
+	@Test
 	void rejectsMalformedBatches() {
 		var request = new Request(1, 3, 2, new Genesis("x", false));
 		byte[] encoded = LogEntryCodec.encodeBatch(List.of(request));

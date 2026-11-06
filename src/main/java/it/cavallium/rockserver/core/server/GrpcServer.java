@@ -1451,6 +1451,11 @@ public class GrpcServer extends Server {
 				} else {
 					context = new it.cavallium.rockserver.core.common.RequestContext(profile, timeoutNanos);
 				}
+				if (wireContext.hasRequestId()) {
+					var id = wireContext.getRequestId();
+					context = context.withRequestId(new it.cavallium.rockserver.core.common.ClientRequestId(
+							id.getSessionId(), id.getSequence(), id.getCompletedBelow()));
+				}
 				return new ResolvedRequestContext(context, scheduler.bindTimeoutNanos(timeoutNanos));
 			} catch (IllegalArgumentException invalid) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
@@ -1507,8 +1512,7 @@ public class GrpcServer extends Server {
 				throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 						"Request deadline expired before downstream dispatch");
 			}
-			return new it.cavallium.rockserver.core.common.RequestContext(
-					context.profile(), remainingNanos);
+			return context.value().withTimeoutNanos(remainingNanos);
 		}
 
 		/**
@@ -1602,7 +1606,16 @@ public class GrpcServer extends Server {
 			var capabilities = client.getCapabilities();
 			return Mono.just(CapabilitiesResponse.newBuilder()
 					.setWorkloadContractVersion(capabilities.workloadContractVersion())
+					.setClientSessions(capabilities.clientSessions())
 					.build());
+		}
+
+		@Override
+		public Mono<OpenClientSessionResponse> openClientSession(OpenClientSessionRequest request) {
+			return Mono.defer(() -> Mono.fromFuture(client.openClientSessionAsync(
+							mapRequestContext(request.getContext()).value())))
+					.map(id -> OpenClientSessionResponse.newBuilder().setSessionId(id).build())
+					.transform(this.onErrorMapMonoWithRequestInfo("openClientSession", request));
 		}
 
 		@Override
@@ -4620,6 +4633,12 @@ public class GrpcServer extends Server {
 						case READ_DEADLINE_EXCEEDED -> Status.DEADLINE_EXCEEDED
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						case SERVER_OVERLOADED -> Status.RESOURCE_EXHAUSTED
+								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
+						// Not UNAVAILABLE nor RESOURCE_EXHAUSTED: a client that does not know these types must not take
+						// them for a failure it can resend blindly.
+						case OUTCOME_UNKNOWN -> Status.UNKNOWN
+								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
+						case SESSION_EXPIRED -> Status.FAILED_PRECONDITION
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);
 						default -> Status.INTERNAL
 								.withDescription(rocksError.getLocalizedMessage()).withCause(rocksError);

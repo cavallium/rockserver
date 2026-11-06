@@ -53,6 +53,9 @@ import org.slf4j.LoggerFactory;
  *   proposer reports it complete</li>
  *   <li>{@link #FLOOR} + proposer id: the highest {@link Request#completedBelow()} applied for that proposer</li>
  *   <li>{@link #DELETION}: log index and outcome of a column deletion whose record is not written yet</li>
+ *   <li>{@link #SESSION} + session id: a client session, see {@link #encodeSession}</li>
+ *   <li>{@link #SESSION_REQUEST} + session id + sequence: the encoded result of an applied write of that session</li>
+ *   <li>{@link #CLOCK}: the latest leader time stamped on an applied entry, see {@link LogEntryCodec#stamp}</li>
  * </ul>
  *
  * <p>The meta column is created locally when a database is first opened, before any log entry is applied, so it
@@ -80,6 +83,9 @@ final class NodeStore implements Closeable {
 	/** A column deletion in progress: its log index and whether the column existed before it ran. */
 	static final byte DELETION = 5;
 	static final byte SEEDED = 6;
+	static final byte SESSION = 7;
+	static final byte SESSION_REQUEST = 8;
+	static final byte CLOCK = 9;
 
 	private static final int META_KEY_BYTES = 1 + 2 * Long.BYTES;
 	private static final ColumnSchema META_SCHEMA = ColumnSchema.of(IntList.of(META_KEY_BYTES), ObjectList.of(), true);
@@ -521,6 +527,33 @@ final class NodeStore implements Closeable {
 	/** The sequence in a key made by {@link #requestKey}. */
 	static long requestSequence(Keys key) {
 		return java.nio.ByteBuffer.wrap(key.keys()[0].toByteArray()).getLong(1 + Long.BYTES);
+	}
+
+	/** Key of client session {@code sessionId}. */
+	static Keys sessionKey(long sessionId) {
+		return metaKey(SESSION, sessionId, 0);
+	}
+
+	/** The session id in a key made by {@link #sessionKey} or {@link #sessionRequestKey}. */
+	static long sessionId(Keys key) {
+		return java.nio.ByteBuffer.wrap(key.keys()[0].toByteArray()).getLong(1);
+	}
+
+	/** Key of the recorded result of write {@code sequence} of client session {@code sessionId}. */
+	static Keys sessionRequestKey(long sessionId, long sequence) {
+		return metaKey(SESSION_REQUEST, sessionId, sequence);
+	}
+
+	/** A session's row: its timeout, the leader time of its last applied write (or registration), and its floor. */
+	static Buf encodeSession(long timeoutMillis, long lastActiveMillis, long floor) {
+		return Buf.wrap(ByteBuffer.allocate(3 * Long.BYTES).putLong(timeoutMillis).putLong(lastActiveMillis)
+				.putLong(floor).array());
+	}
+
+	/** {@link #encodeSession}'s fields, in order. */
+	static long[] decodeSession(Buf value) {
+		var buffer = ByteBuffer.wrap(value.toByteArray());
+		return new long[] {buffer.getLong(), buffer.getLong(), buffer.getLong()};
 	}
 
 	private static Keys metaKey(byte kind, long first, long second) {

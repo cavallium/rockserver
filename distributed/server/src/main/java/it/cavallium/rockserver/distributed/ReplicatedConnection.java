@@ -94,6 +94,31 @@ final class ReplicatedConnection implements RocksDBConnection {
 	/** Encoding overhead counted per key segment and per value, so many tiny items still fit in one entry. */
 	private static final long ITEM_OVERHEAD_BYTES = 16;
 	private static final int ROUTING_ATTEMPTS = 3;
+	/**
+	 * System property: how long a client session lives without a write applied, in milliseconds. Read by the node that
+	 * opens a session, and written in its log entry, so nodes may differ.
+	 */
+	static final String SESSION_TIMEOUT_PROPERTY = "rockserver.client-session-timeout-ms";
+	static final long SESSION_TIMEOUT_MILLIS = Math.max(1, Long.getLong(SESSION_TIMEOUT_PROPERTY,
+			TimeUnit.HOURS.toMillis(1)));
+
+	/** A write of a client session, without its {@code completedBelow}, which differs between copies. */
+	private record SessionWrite(long sessionId, long sequence) {
+		static @Nullable SessionWrite of(RequestContext context) {
+			var id = context.requestId();
+			return id == null ? null : new SessionWrite(id.sessionId(), id.sequence());
+		}
+	}
+
+	/**
+	 * Commits of client session writes that this node proposed as the leader of the term they map to, and whose
+	 * outcome is not settled: still in flight, or ended without an answer. Their entry may still be applied in that
+	 * term, so a copy of the same write that finds no record must not be told that it was not applied. Once the term
+	 * is over, every entry of it this node's log holds is applied before the next term serves (see the read barrier),
+	 * so its markers say nothing more.
+	 */
+	private final java.util.concurrent.ConcurrentHashMap<SessionWrite, Long> unsettledCommits =
+			new java.util.concurrent.ConcurrentHashMap<>();
 
 	private final NodeConfig config;
 	private final RockserverStateMachine stateMachine;
@@ -152,7 +177,19 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	@Override
 	public RockserverCapabilities getCapabilities() {
-		return RockserverCapabilities.CURRENT;
+		return RockserverCapabilities.CURRENT.withClientSessions(true);
+	}
+
+	/**
+	 * Opens a client session: proposes a {@link LogEntry.RegisterClient}, whose log index becomes the session id on
+	 * every replica. The session expires once none of its writes was applied for {@link #SESSION_TIMEOUT_PROPERTY} of
+	 * leader time.
+	 */
+	@Override
+	public CompletableFuture<Long> openClientSessionAsync(RequestContext context) {
+		long start = System.nanoTime();
+		return propose(context.withRequestId(null), start, new LogEntry.RegisterClient(SESSION_TIMEOUT_MILLIS))
+				.thenApply(id -> (Long) id);
 	}
 
 	@Override
@@ -469,7 +506,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 			default -> false;
 		};
 		if (commits) {
-			return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+			return RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN,
 					"The leader became unreachable, the outcome of the commit is unknown: " + cause);
 		}
 		return new RocksDBRetryException();
@@ -616,7 +653,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 	 * caller's deadline, and is not sent at all once that passed.
 	 */
 	private CompletableFuture<Object> propose(RequestContext context, long startNanos, LogEntry entry) {
-		return proposer.propose(entry, remainingNanos(context, startNanos));
+		return proposer.propose(entry, remainingNanos(context, startNanos), context.requestId());
 	}
 
 	private CompletableFuture<?> createColumn(RequestContext context, long startNanos, String name,
@@ -644,7 +681,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		return Flux.from(batches)
 				.concatMapIterable(ReplicatedConnection::chunks)
 				// One chunk at a time: a later chunk must not overtake an earlier one writing the same key.
-				.concatMap(chunk -> Mono.fromFuture(() -> propose(context, start, merge
+				.concatMap(chunk -> Mono.fromFuture(() -> propose(context.withRequestId(null), start, merge
 								? new LogEntry.MergeMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING)
 								: new LogEntry.PutMulti(columnId, chunk.keys(), chunk.values(), RequestTypeId.NOTHING)))
 						.doOnSuccess(_ -> {
@@ -811,7 +848,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		if (!context.hasTimeout()) {
 			return context;
 		}
-		return new RequestContext(context.profile(), Math.max(1, remainingNanos(context, startNanos)));
+		return context.withTimeoutNanos(Math.max(1, remainingNanos(context, startNanos)));
 	}
 
 	/**
@@ -921,9 +958,17 @@ final class ReplicatedConnection implements RocksDBConnection {
 		var session = currentSession();
 		var transaction = session.get(transactionId);
 		if (transaction == null) {
+			if (context.requestId() != null) {
+				// A copy of the write that ended an update may have been applied already.
+				return settledCommit(context.requestId());
+			}
 			throw new RocksDBRetryException();
 		}
 		if (transaction.update) {
+			if (unsettled(context, session)) {
+				// A copy of this write whose commit is in flight: the update stays as it is.
+				throw earlierCopyInFlight();
+			}
 			if (session.pipelined() && !transaction.startCommit()) {
 				// A second write on this id: the first commit stays in flight, and the update with it.
 				throw new RocksDBRetryException();
@@ -987,6 +1032,10 @@ final class ReplicatedConnection implements RocksDBConnection {
 	private CompletableFuture<?> closeTransaction(RequestContext context, CloseTransaction command) {
 		var session = currentSession();
 		var transaction = session.get(command.transactionId());
+		if (transaction == null && command.commit() && context.requestId() != null) {
+			// A copy of a commit that may have been applied already.
+			return settledCommit(context.requestId());
+		}
 		if (transaction == null) {
 			if (command.commit() || command.transactionId() > 0) {
 				// Expired, or opened by a previous leader: the client must run the transaction again. A positive id is a
@@ -1004,6 +1053,10 @@ final class ReplicatedConnection implements RocksDBConnection {
 			session.remove(transaction);
 			rollBackNativeQuietly(transaction.id, false);
 			return CompletableFuture.completedFuture(true);
+		}
+		if (unsettled(context, session)) {
+			// A copy of this commit is in flight: the transaction stays as it is.
+			throw earlierCopyInFlight();
 		}
 		var entry = transaction.commitEntry(session.term());
 		if (entry.writes().isEmpty() && entry.conflictHashes().length == 0) {
@@ -1037,11 +1090,81 @@ final class ReplicatedConnection implements RocksDBConnection {
 			LeaderSession session,
 			LeaderSession.OpenTransaction transaction,
 			LogEntry.Guarded entry) {
+		var write = SessionWrite.of(context);
+		long term = session.term();
+		if (write != null) {
+			var previous = unsettledCommits.put(write, term);
+			if (previous != null && previous == term) {
+				// A copy of this commit is in flight on this leader: a second entry would conflict with the first.
+				return CompletableFuture.failedFuture(earlierCopyInFlight());
+			}
+			if (unsettledCommits.size() > 4096) {
+				unsettledCommits.values().removeIf(markTerm -> markTerm < term);
+			}
+		}
 		var pin = session.pin(transaction.snapshotIndex);
 		long start = System.nanoTime();
-		return proposer.proposeOnce(entry, remainingNanos(context, start)).whenComplete((_, _) -> {
-			commitTime.since(start);
-			session.unpin(pin);
+		return proposer.proposeOnce(entry, remainingNanos(context, start), context.requestId())
+				.whenComplete((_, error) -> {
+					commitTime.since(start);
+					session.unpin(pin);
+					if (write != null && (error == null || !isOutcomeUnknown(unwrap(error)))) {
+						unsettledCommits.remove(write, term);
+					}
+				});
+	}
+
+	/** True if a commit of the client session write of {@code context} is unsettled in this leader's term. */
+	private boolean unsettled(RequestContext context, LeaderSession session) {
+		var write = SessionWrite.of(context);
+		Long term = write == null ? null : unsettledCommits.get(write);
+		return term != null && term == session.term();
+	}
+
+	private static boolean isOutcomeUnknown(Throwable error) {
+		return error instanceof RocksDBException rocks && rocks.getErrorUniqueId() == RocksDBErrorType.OUTCOME_UNKNOWN;
+	}
+
+	private static RocksDBException earlierCopyInFlight() {
+		return RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN,
+				"An earlier copy of this commit is in flight or unsettled; its outcome is unknown yet");
+	}
+
+	/**
+	 * The answer to a copy of a commit (or of the write that ends an update) of a client session whose transaction or
+	 * update is not on this leader: the transaction ended, or another leader had it. After the read barrier every
+	 * entry of earlier leaders is applied, so the record of an earlier copy that took effect is there, and is the
+	 * answer. Without a record, and with no copy unsettled in this term, the commit was never applied: the client
+	 * runs the transaction again ({@code UPDATE_RETRY}), as without sessions. A session that is gone has no records
+	 * any more: {@code SESSION_EXPIRED}.
+	 */
+	private CompletableFuture<?> settledCommit(it.cavallium.rockserver.core.common.ClientRequestId id) {
+		long term = currentTerm();
+		return barrier.awaitLeadership().handle((_, error) -> {
+			if (error != null) {
+				throw new CompletionException(barrierFailure(error));
+			}
+			var recorded = stateMachine.recordedResult(id);
+			if (recorded != null) {
+				return switch (recorded) {
+					case ApplyResult.Ok ok -> ok.value();
+					case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.UPDATE_RETRY ->
+							throw new CompletionException(new RocksDBRetryException());
+					case ApplyResult.Failed failed -> throw new CompletionException(failed.toException());
+					case ApplyResult.ResendAlone _ -> throw new CompletionException(
+							RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Invalid record"));
+				};
+			}
+			Long unsettledTerm = unsettledCommits.get(new SessionWrite(id.sessionId(), id.sequence()));
+			if (unsettledTerm != null && unsettledTerm == term) {
+				throw new CompletionException(earlierCopyInFlight());
+			}
+			var store = stateMachine.store();
+			if (store.db().get(0L, store.metaColumnId(), NodeStore.sessionKey(id.sessionId()),
+					RequestType.<it.cavallium.buffer.Buf>current()) == null) {
+				throw new CompletionException(((ApplyResult.Failed) Applier.SESSION_GONE).toException());
+			}
+			throw new CompletionException(new RocksDBRetryException());
 		});
 	}
 
@@ -1247,7 +1370,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 
 	/**
 	 * {@link #join(CompletableFuture)}, but waits at most {@code timeoutNanos}. Then the caller's copy is cancelled
-	 * (a write not sent yet is then never sent) and the call fails with {@code READ_DEADLINE_EXCEEDED}: a write
+	 * (a write not sent yet is then never sent) and the call fails with {@code OUTCOME_UNKNOWN}: a write
 	 * still queued before that deadline already failed as not applied, so this one was sent and its outcome is
 	 * unknown.
 	 */
@@ -1256,12 +1379,12 @@ final class ReplicatedConnection implements RocksDBConnection {
 			future.get(Math.max(0, timeoutNanos), TimeUnit.NANOSECONDS);
 		} catch (TimeoutException ex) {
 			future.cancel(false);
-			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+			throw RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN,
 					"The request deadline passed before the replicated write was acknowledged; its outcome is unknown");
 		} catch (InterruptedException ex) {
 			Thread.currentThread().interrupt();
 			future.cancel(false);
-			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,
+			throw RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN,
 					"Interrupted while waiting for a replicated write; its outcome is unknown");
 		} catch (ExecutionException | CancellationException ex) {
 			// Rethrown as join() does.
