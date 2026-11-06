@@ -280,6 +280,13 @@ public final class GrpcConnection extends BaseConnection {
 			return (RS) SessionWrites.await((CompletableFuture<Object>) requestAsync(context, request),
 					SessionWrites.syncWaitNanos(context));
 		}
+		if (writes != null && writes.endsUpdateUnnumbered(request)) {
+			try {
+				return delegate.requestSync(context, request);
+			} finally {
+				writes.forgetUpdate(request);
+			}
+		}
 		return delegate.requestSync(context, request);
 	}
 
@@ -289,6 +296,12 @@ public final class GrpcConnection extends BaseConnection {
 		var writes = sessionWrites;
 		if (writes != null && writes.numbers(request)) {
 			return (RA) writes.send(context, (RocksDBAPICommand.RocksDBAPICommandSingle<?>) request);
+		}
+		if (writes != null && writes.endsUpdateUnnumbered(request)) {
+			// A multi write over the numbering limit that ends an update: the update is forgotten once it ended, as
+			// after a numbered one.
+			return (RA) ((CompletableFuture<Object>) delegate.requestAsync(context, request))
+					.whenComplete((_, _) -> writes.forgetUpdate(request));
 		}
 		if (writes != null && SessionWrites.observes(request)) {
 			return (RA) ((CompletableFuture<Object>) delegate.requestAsync(context, request))

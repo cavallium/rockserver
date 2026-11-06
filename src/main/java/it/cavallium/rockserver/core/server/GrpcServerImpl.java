@@ -1040,10 +1040,20 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		if (context.profile() == WorkloadProfile.LATENCY) {
 			return collectLatencyMulti(dataFlux, encodedInputBytes, requestName);
 		}
+		return collectNumbered(dataFlux, numberedCollectBytes, numberedCollectLimit, encodedInputBytes, requestName);
+	}
+
+	/**
+	 * The collection of {@link #collectMulti} outside LATENCY, against the collect budget {@code budget} of at most
+	 * {@code limit} bytes: each item takes its bytes through a {@link CollectHold}, which gives them back on every end of
+	 * the collection, a cancel included (static for tests).
+	 */
+	static <T> Mono<List<T>> collectNumbered(Flux<T> dataFlux, AtomicLong budget, long limit,
+			ToLongFunction<T> encodedInputBytes, String requestName) {
 		return Mono.defer(() -> {
 			var buffer = new LatencyMultiBuffer<T>(NUMBERED_MULTI_MAX_ITEMS, NUMBERED_MULTI_MAX_BYTES,
 					"numbered " + requestName);
-			var hold = new CollectHold(numberedCollectBytes, numberedCollectLimit);
+			var hold = new CollectHold(budget, limit);
 			return dataFlux
 					.doOnNext(value -> {
 						long bytes = numberedItemBytes(value, encodedInputBytes.applyAsLong(value));
@@ -1051,7 +1061,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 						if (!hold.take(bytes)) {
 							throw RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
 									"numbered " + requestName + ": the server is collecting too many multi writes ("
-											+ numberedCollectLimit + " bytes), retry later");
+											+ limit + " bytes), retry later");
 						}
 					})
 					.then(Mono.fromSupplier(buffer::values))

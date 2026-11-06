@@ -86,6 +86,14 @@ class SessionWritesTest {
 			return (Boolean) call(target, "numbers", new Class<?>[] {RocksDBAPICommand.class}, command);
 		}
 
+		boolean endsUpdateUnnumbered(RocksDBAPICommand<?, ?, ?> command) {
+			return (Boolean) call(target, "endsUpdateUnnumbered", new Class<?>[] {RocksDBAPICommand.class}, command);
+		}
+
+		void forgetUpdate(RocksDBAPICommand<?, ?, ?> command) {
+			call(target, "forgetUpdate", new Class<?>[] {RocksDBAPICommand.class}, command);
+		}
+
 		@SuppressWarnings("unchecked")
 		CompletableFuture<Object> send(RequestContext context, RocksDBAPICommand<?, ?, ?> command) {
 			Object bound = callOn(BOUND, null, "bind", new Class<?>[] {RequestContext.class}, context);
@@ -292,6 +300,35 @@ class SessionWritesTest {
 		assertTrue(writes.numbers(put(-12)));
 		writes.observe(new RocksDBAPICommandSingle.CloseFailedUpdate(-12), null);
 		assertFalse(writes.numbers(put(-12)), "forgotten once the update was closed as failed");
+	}
+
+	/**
+	 * R6-3 review: a multi write that ends an update but goes unnumbered, over the numbering limit, is recognized as
+	 * ending a remembered update (the connection then forgets the update when it ended); one of an update this client
+	 * does not remember, or with no id, is not.
+	 */
+	@Test
+	void anUnnumberedMultiWriteThatEndsAnUpdateIsRecognized() throws Exception {
+		var writes = new Writes(_ -> new CompletableFuture<>(), (_, _) -> new CompletableFuture<>(), Runnable::run);
+		var bigKeys = new ArrayList<Keys>();
+		var bigValues = new ArrayList<Buf>();
+		for (int i = 0; i < 9; i++) {
+			bigKeys.add(KEY);
+			bigValues.add(Buf.wrap(new byte[1024 * 1024]));
+		}
+		writes.observe(new Get<>(0, 1, KEY, RequestType.forUpdate()), new UpdateContext<>(null, -21L));
+		var ending = new RocksDBAPICommandSingle.PutMulti<>(-21, 1, bigKeys, bigValues, RequestType.previous());
+		assertFalse(writes.numbers(ending), "over the numbering limit");
+		assertTrue(writes.endsUpdateUnnumbered(ending));
+		assertTrue(writes.endsUpdateUnnumbered(new RocksDBAPICommandSingle.MergeMulti<>(-21, 1, bigKeys, bigValues,
+				RequestType.none())));
+		assertFalse(writes.endsUpdateUnnumbered(new RocksDBAPICommandSingle.PutMulti<>(-22, 1, bigKeys, bigValues,
+				RequestType.previous())), "an update this client did not open");
+		assertFalse(writes.endsUpdateUnnumbered(new RocksDBAPICommandSingle.PutMulti<>(0, 1, bigKeys, bigValues,
+				RequestType.previous())), "no update");
+		writes.forgetUpdate(ending);
+		assertFalse(writes.numbers(put(-21)), "forgotten");
+		assertFalse(writes.endsUpdateUnnumbered(ending));
 	}
 
 	/**

@@ -7,15 +7,27 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.ToLongFunction;
 import org.junit.jupiter.api.Test;
+import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * R6-6a: the collect budget of numbered multi writes ({@code GrpcServerImpl.CollectHold}, through reflection). A cancel ends the collection
- * while a late item may still arrive on another thread: whatever the order, every byte taken is given back.
+ * while a late item may still arrive on another thread: whatever the order, every byte taken is given back. The
+ * Reactor wiring ({@code GrpcServerImpl.collectNumbered}, which {@code collectMulti} uses outside LATENCY) is tested too:
+ * a cancel gives the bytes back, and an item that arrives after it takes none.
  */
 class CollectHoldTest {
 
@@ -126,6 +138,96 @@ class CollectHoldTest {
 			for (var thread : threads) {
 				thread.join();
 			}
+			assertEquals(0, budget.get(), "round " + round);
+		}
+	}
+
+	/** {@code GrpcServerImpl.collectNumbered}: the collection of a numbered streamed multi write. */
+	@SuppressWarnings("unchecked")
+	private static Mono<List<Long>> collectNumbered(Flux<Long> items, AtomicLong budget, long limit) {
+		try {
+			var type = Class.forName("it.cavallium.rockserver.core.server.GrpcServerImpl");
+			Method method = type.getDeclaredMethod("collectNumbered", Flux.class, AtomicLong.class, long.class,
+					ToLongFunction.class, String.class);
+			method.setAccessible(true);
+			ToLongFunction<Long> bytes = _ -> 100;
+			return (Mono<List<Long>>) method.invoke(null, items, budget, limit, bytes, "putMulti");
+		} catch (InvocationTargetException ex) {
+			throw new IllegalStateException(ex.getCause());
+		} catch (ReflectiveOperationException ex) {
+			throw new IllegalStateException(ex);
+		}
+	}
+
+	/** A collection that completes, or fails, gives its bytes back. */
+	@Test
+	void aCollectionThatEndsGivesItsBytesBack() {
+		var budget = new AtomicLong();
+		var values = collectNumbered(Flux.range(0, 10).map(Long::valueOf), budget, Long.MAX_VALUE / 2)
+				.block(Duration.ofSeconds(10));
+		assertEquals(10, values.size());
+		assertEquals(0, budget.get());
+		var failing = Flux.concat(Flux.range(0, 10).map(Long::valueOf), Flux.<Long>error(new IllegalStateException("x")));
+		try {
+			collectNumbered(failing, budget, Long.MAX_VALUE / 2).block(Duration.ofSeconds(10));
+		} catch (IllegalStateException expected) {
+			// the stream's own failure
+		}
+		assertEquals(0, budget.get());
+	}
+
+	/**
+	 * A stream that keeps sending items on its own thread while its call is cancelled, as a gRPC inbound stream can:
+	 * the cancel gives back what the collection took, and the late items that reach the collection after it take
+	 * nothing, many times over.
+	 */
+	@Test
+	void aCancelWhileItemsArriveLeavesNothingTaken() throws Exception {
+		var budget = new AtomicLong();
+		for (int round = 0; round < 500; round++) {
+			var cancelled = new AtomicBoolean();
+			var emitted = new CountDownLatch(1);
+			var started = new CountDownLatch(1);
+			// Ignores demand and keeps sending after the cancel: a few more items arrive late.
+			Publisher<Long> stream = (Subscriber<? super Long> subscriber) -> {
+				subscriber.onSubscribe(new Subscription() {
+					@Override
+					public void request(long n) {
+					}
+
+					@Override
+					public void cancel() {
+						cancelled.set(true);
+					}
+				});
+				Thread.ofPlatform().start(() -> {
+					try {
+						long i = 0;
+						int late = 0;
+						while (late < 5) {
+							subscriber.onNext(i++);
+							if (i == 3) {
+								started.countDown();
+							}
+							if (cancelled.get()) {
+								late++;
+							}
+						}
+					} finally {
+						started.countDown();
+						emitted.countDown();
+					}
+				});
+			};
+			var subscription = collectNumbered(Flux.from(stream), budget, Long.MAX_VALUE / 2).subscribe(_ -> {
+			}, _ -> {
+			});
+			assertTrue(started.await(10, TimeUnit.SECONDS));
+			if (ThreadLocalRandom.current().nextBoolean()) {
+				Thread.onSpinWait();
+			}
+			subscription.dispose();
+			assertTrue(emitted.await(10, TimeUnit.SECONDS));
 			assertEquals(0, budget.get(), "round " + round);
 		}
 	}

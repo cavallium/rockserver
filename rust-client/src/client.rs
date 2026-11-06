@@ -1849,6 +1849,9 @@ impl RockserverClient {
         } else {
             read.await
         };
+        // A caller without a deadline reads its input without a bound; its retry window starts when the write is
+        // sent, as for a batch chunk and in the Java client, not when the call began.
+        let deadline = chunk_deadline(deadline, finite, self.session_retry_window);
         Ok((items, (deadline, finite)))
     }
 
@@ -2728,18 +2731,39 @@ mod numbered_multi_tests {
     /// as an unknown outcome by the call's deadline, not by one counted from the end of the input.
     #[tokio::test]
     async fn a_numbered_multi_write_keeps_the_deadline_of_its_call() {
-        let client = numbering_client(Duration::from_millis(1000));
+        let client = numbering_client(Duration::from_millis(2000));
         let start = std::time::Instant::now();
         let error = client
-            .put_multi(0, 1, slow_items(5, Duration::from_millis(100)))
+            .put_multi(0, 1, slow_items(10, Duration::from_millis(150)))
             .await
             .unwrap_err();
         let elapsed = start.elapsed();
-        // The input takes 500 ms: the call's deadline is at 1000 ms, one counted from the input's end at 1500 ms.
+        // The input takes 1.5 s: the call's deadline is at 2 s, one counted from the input's end at 3.5 s. The bound
+        // leaves 1 s for sleep overshoot and connect attempts on a loaded machine.
         assert!(
-            elapsed < Duration::from_millis(1150),
+            elapsed < Duration::from_millis(3000),
             "ended after {elapsed:?}: the deadline started after the input"
         );
         assert!(is_outcome_unknown(&error) || is_not_applied(&error), "{error:?}");
+    }
+
+    /// R6-4 review: a caller without a deadline gets its retry window from the moment the write is sent, not from
+    /// the call. An input that takes longer than the window to read still leaves the write a full window of resends.
+    #[tokio::test]
+    async fn a_numbered_multi_write_without_a_deadline_starts_its_retry_window_when_sent() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut client = RockserverClient::new_unchecked(channel, RequestContext::batch());
+        client.sessions = Some(Arc::new(SessionWrites::with_open_session(true, 7)));
+        let client = client.with_session_retry_window(Duration::from_millis(1000));
+        // The input takes 1.5 s, longer than the 1 s window.
+        let error = client
+            .put_multi(0, 1, slow_items(10, Duration::from_millis(150)))
+            .await
+            .unwrap_err();
+        assert!(is_outcome_unknown(&error), "{error:?}");
+        assert!(
+            client.numbered_resends() > 0,
+            "the write was sent once and never resent: its window ran out while the input was read"
+        );
     }
 }

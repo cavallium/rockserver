@@ -536,8 +536,9 @@ final class SessionWrites {
 		return call.result;
 	}
 
-	private void forgetUpdate(RocksDBAPICommandSingle<?> command) {
-		long id = switch (command) {
+	/** The transaction or update id of a write that can end an update, else 0. */
+	private static long updateIdOf(RocksDBAPICommand<?, ?, ?> command) {
+		return switch (command) {
 			case RocksDBAPICommandSingle.Put<?> c -> c.transactionOrUpdateId();
 			case RocksDBAPICommandSingle.PutMulti<?> c -> c.transactionOrUpdateId();
 			case RocksDBAPICommandSingle.Delete<?> c -> c.transactionOrUpdateId();
@@ -546,6 +547,22 @@ final class SessionWrites {
 			case RocksDBAPICommandSingle.MergeMulti<?> c -> c.transactionOrUpdateId();
 			default -> 0;
 		};
+	}
+
+	/**
+	 * True if {@code command}, which {@link #numbers} does not number, ends an update this connection remembers: a
+	 * multi write over {@link #NUMBERED_MULTI_MAX_BYTES} counted. It is sent unnumbered, and its update has to be
+	 * forgotten ({@link #forgetUpdate}) once it ended, as a numbered one is, or the id stays numbered for a later
+	 * transaction that gets it, whose staged writes would then be refused.
+	 */
+	boolean endsUpdateUnnumbered(RocksDBAPICommand<?, ?, ?> command) {
+		long id = updateIdOf(command);
+		return id != 0 && isReplicatedOrUpdateEnd(id);
+	}
+
+	/** Forgets the update that {@code command} ended, if it carries one. */
+	void forgetUpdate(RocksDBAPICommand<?, ?, ?> command) {
+		long id = updateIdOf(command);
 		if (id != 0) {
 			synchronized (updates) {
 				updates.remove(id);

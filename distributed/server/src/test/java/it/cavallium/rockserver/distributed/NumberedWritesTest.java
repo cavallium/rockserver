@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -17,6 +18,8 @@ import it.cavallium.rockserver.core.common.KVBatchChunks;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.PutBatchMode;
 import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
@@ -27,7 +30,9 @@ import it.cavallium.rockserver.core.server.GrpcServer;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.ByteArrayOutputStream;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -204,6 +209,53 @@ class NumberedWritesTest {
 				assertEquals(19, last.getByte(0));
 			}
 		}
+	}
+
+	/**
+	 * R6-3 review: a multi write that ends an update (its transaction or update id is one a {@code getForUpdate} of
+	 * this client opened) and goes unnumbered over the numbering limit still makes the client forget the update once it
+	 * ended, as a numbered one does: otherwise a transaction that later gets the same id would have its staged writes
+	 * numbered and refused.
+	 */
+	@Test
+	void anUnnumberedMultiWriteThatEndsAnUpdateForgetsIt() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var addresses = cluster.runningNodes().stream().map(NumberedWritesTest::apiAddress).toList();
+		try (var client = GrpcConnection.forHostsAndPorts("large-update-end", addresses)) {
+			assertTrue(client.getCapabilities().clientSessions());
+			var api = client.getAsyncApi(RequestContext.batch(TIMEOUT));
+			long column = api.createColumnAsync("u", SCHEMA).get(30, TimeUnit.SECONDS);
+			var update = api.getAsync(0, column, key(0), RequestType.forUpdate()).get(30, TimeUnit.SECONDS);
+			long updateId = update.updateId();
+			assertTrue(updateId != 0);
+			var writes = sessionWritesOf(client);
+			assertTrue(numbers(writes, new RocksDBAPICommandSingle.Put<>(updateId, column, key(0), Buf.wrap(new byte[1]),
+					RequestType.none())), "the update is remembered");
+			// The update's key with a 5 MiB value and its previous value: over 4 MiB counted, streamed, unnumbered.
+			var keys = List.of(key(0));
+			var values = List.of(Buf.wrap(new byte[5 * 1024 * 1024]));
+			var ending = new RocksDBAPICommandSingle.PutMulti<>(updateId, column, keys, values, RequestType.previous());
+			assertFalse(numbers(writes, ending), "over the numbering limit");
+			List<@Nullable Buf> previous = api.putMultiAsync(updateId, column, keys, values, RequestType.previous())
+					.get(60, TimeUnit.SECONDS);
+			assertEquals(1, previous.size());
+			assertNull(previous.getFirst(), "no previous value");
+			assertFalse(numbers(writes, new RocksDBAPICommandSingle.Put<>(updateId, column, key(0), Buf.wrap(new byte[1]),
+					RequestType.none())), "the update is forgotten once the write that ended it ended");
+		}
+	}
+
+	private static Object sessionWritesOf(GrpcConnection client) throws Exception {
+		Field field = GrpcConnection.class.getDeclaredField("sessionWrites");
+		field.setAccessible(true);
+		return field.get(client);
+	}
+
+	private static boolean numbers(Object writes, RocksDBAPICommand<?, ?, ?> command) throws Exception {
+		Method method = writes.getClass().getDeclaredMethod("numbers", RocksDBAPICommand.class);
+		method.setAccessible(true);
+		return (Boolean) method.invoke(writes, command);
 	}
 
 	/**
