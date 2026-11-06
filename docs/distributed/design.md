@@ -67,6 +67,12 @@ forwards to a non-embedded connection:
   (`RWScheduler.withVirtualWorkers`, `WorkloadSettings.proxy`), which runs at most 256 of these streams at
   once and refuses more once its queues are full. A stream that waits in a queue past its request-context
   timeout ends with `DEADLINE_EXCEEDED`, even when the client set no gRPC deadline.
+  These parts live in classes of their own next to `GrpcServer`, which keeps only the lifecycle: `GrpcProxyMode`
+  (the proxy scheduler, its limits and the connection age), `GrpcTransport` (the listening gRPC server that
+  `pause` stops and `resume` replaces), `MustCompleteOperationTracker` (the rollbacks and closes that `close`
+  waits for), `GrpcRequestContexts` (wire context to `RequestContext` and deadline), `GrpcScheduledCalls` and
+  `GrpcIteratorOperations` (scheduling, cancellation and iterator leases), and `GrpcServerImpl` (the service
+  methods). The split moved code only: behavior, status mapping and the `rockserver-leader` header are the same.
 - `EmbeddedDB.openUnloggedTransaction` (a transaction without snapshot, untracked, optionally without the WAL),
   `EmbeddedDB.deleteRangeUnlogged` (a range deletion without the WAL) and the `atomic-flush` global option (off
   by default; it turns pipelined writes off).
