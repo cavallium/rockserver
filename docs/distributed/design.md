@@ -389,14 +389,22 @@ Raft log on disk instead of decoded on the heap. Any error on the apply or compl
   - its Raft server stops first, so a failed leader stops leading;
   - the process exits with code 3 (also when Raft closes under a running node: see "Long pauses");
   - it never skips the entry.
-- **An operand that fails to merge later.** A merge whose request type does not return the merged value
-  (`none()`) stores its operand without running the operator. If the operator then fails on it, every read of the
-  key fails with `MERGE_OPERATOR_FAILED`, and so does every write that reads the key (a previous value, a guard),
-  until a put or delete replaces it. The memtable flush that has to merge it fails too: RocksDB stops the
-  database with a background error, on each replica in turn, and replaying the log stores the operand again. Both
-  merge operator fixes below avoid this: an operator that never fails, or one built with RocksDB's `kMustMerge`
-  failure scope (flush and compaction then keep the operands), which the C API that the Java operators go
-  through does not offer yet.
+- **Every merge is checked at apply.** A merge whose request type does not return the merged value (`none()`)
+  would store its operand without running the operator; if the operator failed on it later, every read of the
+  key would fail, and so would the memtable flush that merges it: RocksDB stops the database with a background
+  error, on each replica in turn, and replaying the log stores the operand again, a crash loop. So right after
+  staging the operand (single merges, multi-merges and the chunks of `mergeBatch`, in columns with a merge
+  operator), the apply reads the key through its transaction (the batch over the database), which runs the
+  operator. If it fails, the entry is rolled back to its savepoint and the request gets `MERGE_OPERATOR_FAILED`,
+  as a merge that returns its value does. This costs one read per merge (in the memtable or block cache when the
+  key is hot, a disk read otherwise); merges that return the merged value, and bucketed columns, which merge in
+  Java, already merge and skip it. A later flush or compaction then only merges operand sequences that a read
+  already merged at apply: each operand was checked over the base and every operand before it, which is what a
+  full merge at flush or compaction computes, and a partial merge that the operator declines leaves the operands
+  as they are. With a deterministic operator, that cannot fail. An operator that is not deterministic (it depends
+  on time, randomness or state outside its inputs) can still fail at flush or compaction on an operand that passed
+  at apply, or pass on one replica and fail on another: the replicas then diverge or stop, which is why merge
+  operators must be deterministic.
 
 Runbook: **every replica stops at the same entry** (each exits with code 3, its log names the same position and
 the same cause, and each restart stops there again). That is a deterministic failure still classified as local.

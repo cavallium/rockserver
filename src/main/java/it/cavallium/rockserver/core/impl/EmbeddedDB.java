@@ -2581,12 +2581,45 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return responses != null ? responses : List.of();
 		}
 
+		/**
+		 * Like {@link EmbeddedDB#merge} with a transaction, and the operand is checked at once: see
+		 * {@link #checkMerge}.
+		 */
 		public <T> T merge(long columnId, @NotNull Keys keys, @NotNull Buf value,
 				RequestMerge<? super Buf, T> requestType) {
-			return EmbeddedDB.this.merge(tx, getColumn(columnId), 0L, keys, value, requestType);
+			var col = getColumn(columnId);
+			T result = EmbeddedDB.this.merge(tx, col, 0L, keys, value, requestType);
+			checkMerge(col, keys, requestType);
+			return result;
 		}
 
-		/** Like {@link EmbeddedDB#mergeMulti} with a transaction. */
+		/**
+		 * Runs the merge operator on {@code keys} right after an operand was staged for it, by reading the key through
+		 * this transaction (its batch over the database), unless the merge did that already: a request that returns
+		 * the merged value, or a bucketed column, merged in Java. An operator that fails here throws
+		 * {@link RocksDBErrorType#MERGE_OPERATOR_FAILED}, so the caller rolls the operand back instead of storing one
+		 * that every later read, flush and compaction of the key would fail to merge. One read per merge.
+		 */
+		private void checkMerge(ColumnInstance col, Keys keys, RequestMerge<? super Buf, ?> requestType) {
+			if (!(requestType instanceof RequestType.RequestNothing<?>) || col.hasBuckets()
+					|| col.mergeOperator() == null) {
+				return;
+			}
+			FFMAbstractMergeOperator.takeFailureOnThisThread();
+			try {
+				EmbeddedDB.this.get(tx, 0L, col, keys, RequestType.exists());
+			} catch (RuntimeException ex) {
+				var operatorFailure = FFMAbstractMergeOperator.takeFailureOnThisThread();
+				if (operatorFailure == null) {
+					throw ex;
+				}
+				var failure = mergeOperatorFailed(operatorFailure);
+				failure.addSuppressed(ex);
+				throw failure;
+			}
+		}
+
+		/** Like {@link EmbeddedDB#mergeMulti} with a transaction; each operand is checked, see {@link #checkMerge}. */
 		public <T> List<T> mergeMulti(long columnId, @NotNull List<Keys> keysList,
 				@NotNull List<@NotNull Buf> valueList, RequestMerge<? super Buf, T> requestType) {
 			try {
@@ -2599,6 +2632,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						requestType instanceof RequestType.RequestNothing<?> ? null : new ArrayList<>(keysList.size());
 				for (int i = 0; i < keysList.size(); i++) {
 					T result = EmbeddedDB.this.merge(tx, col, 0L, keysList.get(i), valueList.get(i), requestType);
+					checkMerge(col, keysList.get(i), requestType);
 					if (responses != null) {
 						responses.add(result);
 					}
