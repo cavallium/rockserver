@@ -252,11 +252,13 @@ public class ConfigPrinter {
 		return """
 				{
 				    "database-name": %s,
+				    "node-name": %s,
 				    "influx": %s,
 				    "jmx": %s
 				  }\
 				""".formatted(
 				quote(o.databaseName()),
+				quote(o.nodeName()),
 				stringifyInflux(o.influx()),
 				stringifyJmx(o.jmx())
 		);

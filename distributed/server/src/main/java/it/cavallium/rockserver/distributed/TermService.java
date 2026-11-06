@@ -49,6 +49,9 @@ import org.slf4j.LoggerFactory;
  *   <li>"which Rockserver config do you run?", for {@link ClusterCheck}. Request: the UTF-8 digest of the caller's
  *   config ({@link NodeStore#configDigest}), possibly empty. Response: the UTF-8 digest of this node's config. Each side
  *   logs a difference: every node must run the same config. {@code UNIMPLEMENTED} on a node that predates the method.</li>
+ *   <li>the cluster operations of {@link ReplicaOps} (capabilities, checksums, backups). Request: the 16-byte group
+ *   UUID, then an operation byte and its payload. Response: see {@link ReplicaOps#answer}; {@code UNIMPLEMENTED} on a
+ *   node that predates the method.</li>
  * </ul>
  */
 final class TermService {
@@ -102,6 +105,24 @@ final class TermService {
 			.build();
 
 	private static final Logger LOG = LoggerFactory.getLogger(TermService.class);
+
+	static final MethodDescriptor<byte[], byte[]> OPS = MethodDescriptor.<byte[], byte[]>newBuilder()
+			.setType(MethodDescriptor.MethodType.UNARY)
+			.setFullMethodName(MethodDescriptor.generateFullMethodName(SERVICE_NAME, "Ops"))
+			.setRequestMarshaller(BytesMarshaller.INSTANCE)
+			.setResponseMarshaller(BytesMarshaller.INSTANCE)
+			.build();
+
+	/** Answers {@link #OPS} on a node. */
+	@FunctionalInterface
+	interface OpsSource {
+		/** The answer to {@code request} (operation byte and payload) about {@code groupId}. */
+		CompletableFuture<byte[]> answer(RaftGroupId groupId, byte[] request);
+	}
+
+	private static final OpsSource NO_OPS = (_, _) -> CompletableFuture.failedFuture(
+			Status.UNIMPLEMENTED.withDescription("This node runs no cluster operations").asRuntimeException());
+
 	private static final int GROUP_ID_BYTES = 16;
 	private static final byte SEEDED = 1;
 	private static final byte HAS_SNAPSHOT = 2;
@@ -140,7 +161,7 @@ final class TermService {
 	/** {@link #customizer(Supplier, HostAndPort, NodeStateSource)}, answering {@link #READ_INDEX} too. */
 	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
 			NodeStateSource nodeState, ReadIndexSource readIndex) {
-		return customizer(server, apiAddress, nodeState, readIndex, null);
+		return customizer(server, apiAddress, nodeState, readIndex, null, NO_OPS);
 	}
 
 	/**
@@ -149,6 +170,21 @@ final class TermService {
 	 */
 	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
 			NodeStateSource nodeState, ReadIndexSource readIndex, @Nullable String configDigest) {
+		return customizer(server, apiAddress, nodeState, readIndex, configDigest, NO_OPS);
+	}
+
+	/** {@link #customizer(Supplier, HostAndPort, NodeStateSource, ReadIndexSource)}, answering {@link #OPS} too. */
+	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
+			NodeStateSource nodeState, ReadIndexSource readIndex, OpsSource ops) {
+		return customizer(server, apiAddress, nodeState, readIndex, null, ops);
+	}
+
+	/**
+	 * {@link #customizer(Supplier, HostAndPort, NodeStateSource, ReadIndexSource)}, answering {@link #OPS} and, unless
+	 * {@code configDigest} is null, {@link #CONFIG_DIGEST} too.
+	 */
+	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
+			NodeStateSource nodeState, ReadIndexSource readIndex, @Nullable String configDigest, OpsSource ops) {
 		ServerCalls.UnaryMethod<byte[], byte[]> handler = (request, response) -> answer(server, request, response);
 		var address = (apiAddress.host() + ":" + apiAddress.port()).getBytes(StandardCharsets.UTF_8);
 		ServerCalls.UnaryMethod<byte[], byte[]> addressHandler = (_, response) -> {
@@ -162,7 +198,8 @@ final class TermService {
 				.addMethod(CURRENT_TERM, ServerCalls.asyncUnaryCall(handler))
 				.addMethod(API_ADDRESS, ServerCalls.asyncUnaryCall(addressHandler))
 				.addMethod(NODE_STATE, ServerCalls.asyncUnaryCall(stateHandler))
-				.addMethod(READ_INDEX, ServerCalls.asyncUnaryCall(readIndexHandler));
+				.addMethod(READ_INDEX, ServerCalls.asyncUnaryCall(readIndexHandler))
+				.addMethod(OPS, ServerCalls.asyncUnaryCall((request, response) -> answerOps(ops, request, response)));
 		if (configDigest != null) {
 			ServerCalls.UnaryMethod<byte[], byte[]> digestHandler = (request, response) ->
 					answerConfigDigest(configDigest, request, response);
@@ -359,6 +396,43 @@ final class TermService {
 		}
 		response.onNext(state == null ? new byte[0] : encode(state));
 		response.onCompleted();
+	}
+
+	/** Runs a cluster operation on the node behind {@code channel}: see {@link #OPS}. */
+	static CompletableFuture<byte[]> ops(Channel channel, RaftGroupId groupId, byte[] request, Duration timeout) {
+		var message = ByteBuffer.allocate(GROUP_ID_BYTES + request.length).put(encodeGroupId(groupId)).put(request).array();
+		return call(channel, OPS, message, timeout);
+	}
+
+	private static void answerOps(OpsSource source, byte[] request, StreamObserver<byte[]> response) {
+		if (request.length < GROUP_ID_BYTES) {
+			response.onError(Status.INVALID_ARGUMENT
+					.withDescription("Expected a 16-byte group id, got " + request.length + " bytes")
+					.asRuntimeException());
+			return;
+		}
+		var buffer = ByteBuffer.wrap(request);
+		var groupId = RaftGroupId.valueOf(new UUID(buffer.getLong(), buffer.getLong()));
+		var rest = java.util.Arrays.copyOfRange(request, GROUP_ID_BYTES, request.length);
+		CompletableFuture<byte[]> answer;
+		try {
+			answer = source.answer(groupId, rest);
+		} catch (RuntimeException e) {
+			answer = CompletableFuture.failedFuture(e);
+		}
+		answer.whenComplete((value, error) -> {
+			if (error == null) {
+				response.onNext(value);
+				response.onCompleted();
+				return;
+			}
+			var cause = ReplicatedConnection.unwrap(error);
+			var status = Status.fromThrowable(cause);
+			if (status.getCode() == Status.Code.UNKNOWN) {
+				status = Status.ABORTED.withDescription(String.valueOf(cause));
+			}
+			response.onError(status.asRuntimeException());
+		});
 	}
 
 	private static byte[] encodeGroupId(RaftGroupId groupId) {

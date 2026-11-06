@@ -103,6 +103,34 @@ final class Applier {
 		this.guardRejected = metrics == null ? null : metrics.amount("update.guardRejected");
 	}
 
+	/**
+	 * What the apply of the maintenance entries ({@link LogEntry.ClusterVersion}, {@link LogEntry.Checksum},
+	 * {@link LogEntry.Backup}) does outside the database: see {@link ReplicaOps}. Called on the apply thread, with
+	 * everything before the entry applied and nothing after it. It must not fail for a reason of this node only: the
+	 * entry's result is the same on every replica.
+	 */
+	interface Maintenance {
+		Maintenance NONE = new Maintenance() {};
+
+		/** The cluster version is now {@code version}. */
+		default void clusterVersion(long version) {}
+
+		/** A {@link LogEntry.Checksum} at {@code position}. */
+		default void checksum(TermIndex position, NodeStore store) {}
+
+		/** A {@link LogEntry.Backup} at {@code position}. */
+		default void backup(String name, long requestId, TermIndex position, NodeStore store) {}
+	}
+
+	private volatile Maintenance maintenance = Maintenance.NONE;
+	/** The position of the entry that {@link #applyAlone} applies. Apply thread only. */
+	private @Nullable TermIndex alonePosition;
+
+	/** Sets what the maintenance entries do outside the database. */
+	void maintenance(Maintenance maintenance) {
+		this.maintenance = maintenance;
+	}
+
 	private final NodeMetrics.@Nullable Series openTime;
 	private final NodeMetrics.@Nullable Series executeTime;
 	private final NodeMetrics.@Nullable Series commitTime;
@@ -409,6 +437,7 @@ final class Applier {
 	}
 
 	private ApplyResult applyAlone(Request request, TermIndex position) {
+		alonePosition = position;
 		var records = owner(request);
 		if (records == null) {
 			inApplyTransaction(position, tx -> markApplied(tx, position));
@@ -1203,6 +1232,26 @@ final class Applier {
 				verifyColumn(verify);
 				yield null;
 			}
+			case LogEntry.ClusterVersion version -> {
+				requireNoTransaction(tx, entry);
+				long raised = store.clusterVersion() | version.capabilities();
+				writeClusterVersion(raised);
+				maintenance.clusterVersion(raised);
+				yield null;
+			}
+			case LogEntry.Checksum _ -> {
+				requireNoTransaction(tx, entry);
+				var position = java.util.Objects.requireNonNull(alonePosition, "position");
+				maintenance.checksum(position, store);
+				// The log index names the check: the same on every replica.
+				yield position.getIndex();
+			}
+			case LogEntry.Backup backup -> {
+				requireNoTransaction(tx, entry);
+				var position = java.util.Objects.requireNonNull(alonePosition, "position");
+				maintenance.backup(backup.name(), backup.requestId(), position, store);
+				yield position.getIndex();
+			}
 		};
 	}
 
@@ -1241,6 +1290,14 @@ final class Applier {
 			store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.SEEDED), Buf.wrap(new byte[] {1}),
 					RequestType.none());
 		}
+		// A cluster created by this version: every member runs it (see Capabilities).
+		writeClusterVersion(Capabilities.GENESIS);
+		maintenance.clusterVersion(Capabilities.GENESIS);
+	}
+
+	private void writeClusterVersion(long version) {
+		store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_VERSION),
+				Buf.wrap(java.nio.ByteBuffer.allocate(Long.BYTES).putLong(version).array()), RequestType.none());
 	}
 
 	/**

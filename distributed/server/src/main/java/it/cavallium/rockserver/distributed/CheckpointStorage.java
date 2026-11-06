@@ -235,6 +235,11 @@ final class CheckpointStorage implements StateMachineStorage {
 		return termIndex;
 	}
 
+	/** Directory of the latest snapshot, null if none: for its age. */
+	synchronized @Nullable Path latestSnapshotDir() {
+		return latestDir;
+	}
+
 	/** Directory of the latest snapshot's checkpoint, for {@link NodeStore#restore}. */
 	synchronized Path snapshotDbDir() {
 		if (latestDir == null) {
