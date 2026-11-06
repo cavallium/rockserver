@@ -7,9 +7,9 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -19,6 +19,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.protocol.ClientId;
@@ -26,10 +27,12 @@ import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.protocol.SnapshotManagementRequest;
 import org.apache.ratis.protocol.TransferLeadershipRequest;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.raftlog.RaftLog;
 import org.apache.ratis.server.storage.RaftStorage;
+import org.apache.ratis.util.LifeCycle;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,6 +48,15 @@ public final class ReplicatedNode implements AutoCloseable {
 	private static final long LEADERSHIP_TRANSFER_TIMEOUT_MS = 5_000;
 	private static final long MAINTENANCE_INTERVAL_MS = 200;
 	private static final Duration DATABASE_CLOSE_TIMEOUT = Duration.ofMinutes(1);
+	/** How long a node that handed over its leadership waits for its successor's first commit. */
+	private static final Duration SUCCESSOR_COMMIT_WAIT = Duration.ofSeconds(3);
+	private static final long SUCCESSOR_COMMIT_POLL_MS = 10;
+	/** Maximum election timeouts in the initializing state before a node says so, and again every as many. */
+	private static final int ELECTION_TIMEOUTS_TO_WARN = 15;
+	/** Ratis keeps here the peer list of a start with one, until the node has a configuration from a log. */
+	private static final String BOOTSTRAP_FILE = "raft-meta.bootstrap";
+	/** Ratis keeps here the configuration from the log. */
+	private static final String CONFIGURATION_FILE = "raft-meta.conf";
 
 	private final NodeConfig config;
 	private final RaftGroup group;
@@ -58,12 +70,23 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final ScheduledExecutorService maintenance;
 	/** Only used on the maintenance thread. */
 	private final ApiGate apiGate;
+	/** The id this node proposes, if it is the one that starts the cluster. Only used on the maintenance thread. */
+	private final String newClusterId = UUID.randomUUID().toString();
+	/** The cluster of this node, once it belongs to one. Only used on the maintenance thread. */
+	private @Nullable String clusterId;
 	/** Only used on the maintenance thread. */
-	private boolean clusterInitialized;
+	private boolean snapshotSettled;
+	private volatile boolean takingSeedSnapshot;
+	/** Only used on the maintenance thread. */
+	private final ClusterCheck clusterCheck;
 	/** Only used on the maintenance thread. */
 	private final LeaderStall leaderStall;
 	private final NodeMetrics.Series leaderStallStepDowns;
+	private final NodeMetrics.Series leaderLogStepDowns;
+	/** When this node last entered or warned about the initializing state, 0 if out of it. Maintenance thread only. */
+	private long initializingSinceNanos;
 	private final AtomicBoolean closed = new AtomicBoolean();
+	private final AtomicLong snapshotCalls = new AtomicLong();
 	private final CompletableFuture<@Nullable Throwable> stopped = new CompletableFuture<>();
 	private final NodeMetrics metrics;
 
@@ -75,15 +98,24 @@ public final class ReplicatedNode implements AutoCloseable {
 		this.group = RaftGroup.valueOf(groupId, raftPeers(config));
 		this.metrics = new NodeMetrics(config.nodeId());
 		this.leaderStall = LeaderStall.forElectionTimeout(config.electionTimeoutMax());
+		this.clusterCheck = new ClusterCheck(config.nodeId(), groupId, config.electionTimeoutMax());
 		this.leaderStallStepDowns = metrics.amount("leader.stall.stepdowns");
+		this.leaderLogStepDowns = metrics.amount("leader.log.stepdowns");
 		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure, metrics);
 
 		var parameters = new Parameters();
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
-		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress));
+		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress,
+				this::nodeState));
 		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
 		if (!existing) {
 			requireNoClusterData(config);
+		} else if (config.join() && startedOutsideJoin()) {
+			throw new IOException("Node " + config.nodeId() + " was started without --join: "
+					+ raftMetaFile(BOOTSTRAP_FILE) + " holds the peer list of that start, and Ratis uses it whatever this start"
+					+ " says, so --join would change nothing. Wipe the data directory " + config.dataDir()
+					+ " and start the node again with --join. Do not do it if an add-peer already reached this node: it is then"
+					+ " a member, see \"Replacing a node\" in the design document");
 		}
 		this.server = RaftServer.newBuilder()
 				.setServerId(RaftPeerId.valueOf(config.nodeId()))
@@ -169,35 +201,110 @@ public final class ReplicatedNode implements AutoCloseable {
 	}
 
 	/**
-	 * Proposes the {@link LogEntry.Genesis} entry once, from the first ready leader, then stops. On a cluster
-	 * seeded from an existing database it also takes a snapshot right away, so that members added later receive
-	 * the data as a snapshot rather than by replaying a log that does not contain it.
+	 * Proposes the {@link LogEntry.Genesis} entry from the first ready leader. On a cluster seeded from an existing
+	 * database every replica then takes a snapshot: a member added later gets its data from the snapshot of whichever
+	 * node leads by then, and a log that does not contain the seed is useless to it. Any leader tells its followers which
+	 * cluster they follow.
 	 */
 	private void initializeCluster() {
-		if (clusterInitialized) {
-			return;
-		}
 		try {
-			var store = stateMachine.store();
-			if (store.clusterId() != null) {
-				clusterInitialized = true;
+			if (clusterId == null) {
+				clusterId = stateMachine.store().clusterId();
+			}
+			if (clusterId == null) {
+				proposeGenesis();
 				return;
 			}
 			var division = stateMachine.division();
-			if (division == null || !division.getInfo().isLeader() || !division.getInfo().isLeaderReady()) {
-				return;
-			}
-			boolean seeded = store.hasUserColumns();
-			LOG.info("{}: initializing cluster {} (seeded: {})", config.nodeId(), config.groupId(), seeded);
-			proposer.propose(new LogEntry.Genesis(config.groupId(), seeded)).get(config.requestTimeout().toMillis(),
-					TimeUnit.MILLISECONDS);
-			if (seeded) {
-				proposer.client().getSnapshotManagementApi(RaftPeerId.valueOf(config.nodeId()))
-						.create(config.requestTimeout().toMillis());
+			if (division != null) {
+				takeSeedSnapshot(division);
+				checkFollowers(division);
 			}
 		} catch (Exception ex) {
 			LOG.warn("{}: cluster initialization attempt failed, retrying", config.nodeId(), ex);
 		}
+	}
+
+	/**
+	 * Everything from earlier leaders is applied first: if one of them got an entry of this kind into the log, the
+	 * cluster has its id. This node proposes the same id at every attempt, so that a cluster gets one id.
+	 */
+	private void proposeGenesis() throws Exception {
+		var division = stateMachine.division();
+		if (division == null || !division.getInfo().isLeader() || !division.getInfo().isLeaderReady()
+				|| stateMachine.appliedIndex().get() < stateMachine.leaderReadyIndex(division.getInfo().getCurrentTerm())) {
+			return;
+		}
+		var store = stateMachine.store();
+		if (store.clusterId() != null) {
+			return;
+		}
+		boolean seeded = store.hasUserColumns();
+		LOG.info("{}: initializing cluster {} (seeded: {})", config.nodeId(), newClusterId, seeded);
+		proposer.propose(new LogEntry.Genesis(newClusterId, seeded)).get(config.requestTimeout().toMillis(),
+				TimeUnit.MILLISECONDS);
+	}
+
+	/** A replica of a seeded cluster takes a snapshot as soon as it has none, on every start until it has one. */
+	private void takeSeedSnapshot(RaftServer.Division division) throws IOException {
+		if (snapshotSettled || takingSeedSnapshot) {
+			return;
+		}
+		if (stateMachine.getLatestSnapshot() != null || !stateMachine.store().seeded()) {
+			snapshotSettled = true;
+			return;
+		}
+		takingSeedSnapshot = true;
+		long timeoutMs = config.requestTimeout().toMillis();
+		var request = SnapshotManagementRequest.newCreate(ClientId.randomId(), server.getId(), group.getGroupId(),
+				snapshotCalls.incrementAndGet(), timeoutMs);
+		server.snapshotManagementAsync(request).whenComplete((reply, error) -> {
+			takingSeedSnapshot = false;
+			if (error != null || !reply.isSuccess()) {
+				LOG.warn("{}: failed to take the snapshot of the seed, retrying", config.nodeId(),
+						error != null ? error : reply.getException());
+			}
+		});
+	}
+
+	private void checkFollowers(RaftServer.Division division) {
+		var info = division.getInfo();
+		if (!info.isLeader()) {
+			return;
+		}
+		var followers = new HashMap<String, String>();
+		for (var follower : info.getRoleInfoProto().getLeaderInfo().getFollowerInfoList()) {
+			followers.put(RaftPeerId.valueOf(follower.getId().getId()).toString(), follower.getId().getAddress());
+		}
+		clusterCheck.check(info.getCurrentTerm(), clusterId, followers, System.nanoTime());
+	}
+
+	/** Answers {@link TermService#NODE_STATE}, and stops this node if the caller speaks for another cluster. */
+	private @Nullable NodeState nodeState(RaftGroupId requested, @Nullable String callerClusterId) {
+		var division = stateMachine.division();
+		var store = stateMachine.store();
+		if (!requested.equals(group.getGroupId()) || division == null || store == null) {
+			return null;
+		}
+		var own = store.clusterId();
+		if (callerClusterId != null && own != null && !own.equals(callerClusterId)) {
+			var error = new IOException("Node " + config.nodeId() + " belongs to cluster " + own + ", but a leader of this"
+					+ " group leads cluster " + callerClusterId + ". Its Raft log and database are of another cluster: wipe its"
+					+ " data directory and start it with --join");
+			LOG.error("{}: another cluster reached this node", config.nodeId(), error);
+			onReplicaFailure(error);
+		}
+		return new NodeState(division.getRaftLog().getNextIndex(), store.seeded(), stateMachine.getLatestSnapshot() != null,
+				startedOutsideJoin(), own);
+	}
+
+	private Path raftMetaFile(String name) {
+		return config.raftDir().resolve(group.getGroupId().getUuid().toString()).resolve("current").resolve(name);
+	}
+
+	/** The first start of this node had a peer list, and no log gave it a configuration since. */
+	private boolean startedOutsideJoin() {
+		return Files.exists(raftMetaFile(BOOTSTRAP_FILE)) && !Files.exists(raftMetaFile(CONFIGURATION_FILE));
 	}
 
 	/**
@@ -250,60 +357,89 @@ public final class ReplicatedNode implements AutoCloseable {
 				stopAfterRaftClosed();
 				return;
 			}
+			warnWhileInitializing(division);
 			var log = division.getRaftLog();
 			long commitIndex = log.getLastCommittedIndex();
 			long term = division.getInfo().getCurrentTerm();
-			if (leaderStall.shouldStepDown(waitsForReplyOfSentEntry(division), term, commitIndex, System.nanoTime())) {
+			long now = System.nanoTime();
+			boolean waiting = LeaderStall.waitsForReplyOfSentEntry(division, config.nodeId(),
+					config.electionTimeoutMax().toMillis());
+			if (leaderStall.shouldStepDown(waiting, term, commitIndex, now)) {
 				LOG.warn("{}: leader of term {}: no entry of this term committed, commit index {} did not move and the log"
 						+ " up to {} went to a majority, stepping down to restart replication", config.nodeId(), term,
 						commitIndex, log.getNextIndex() - 1);
 				leaderStallStepDowns.record(1);
-				// With no new leader Ratis only steps down, which needs no ready leader.
-				var request = new TransferLeadershipRequest(ClientId.randomId(), server.getId(), group.getGroupId(), 0, null,
-						LEADERSHIP_TRANSFER_TIMEOUT_MS);
-				server.transferLeadershipAsync(request).whenComplete((reply, error) -> {
-					if (error != null || !reply.isSuccess()) {
-						LOG.warn("{}: failed to step down", config.nodeId(), error != null ? error : reply.getException());
-					}
-				});
+				stepDown();
+			} else if (leaderStall.logStopped(division.getInfo().isLeader(), log.getFlushIndex(), log.getNextIndex() - 1,
+					now)) {
+				LOG.warn("{}: leader of term {}: its Raft log flushed nothing past {} with entries up to {} waiting, and a"
+						+ " leader commits only what it flushed: stepping down", config.nodeId(), term, log.getFlushIndex(),
+						log.getNextIndex() - 1);
+				leaderLogStepDowns.record(1);
+				handOverOrStepDown();
 			}
 		} catch (IOException | RuntimeException ex) {
 			LOG.warn("{}: failed to check Raft, retrying", config.nodeId(), ex);
 		}
 	}
 
-	/**
-	 * This node leads, no entry of its term is committed, and a majority of members has been sent all of its log and
-	 * still answers: see {@link LeaderStall}.
-	 */
-	private boolean waitsForReplyOfSentEntry(RaftServer.Division division) {
-		var info = division.getInfo();
-		var log = division.getRaftLog();
-		if (!info.isLeader()) {
-			return false;
-		}
-		var committed = log.getTermIndex(log.getLastCommittedIndex());
-		if (committed != null && committed.getTerm() == info.getCurrentTerm()) {
-			return false;
-		}
-		var nextIndices = info.getFollowerNextIndices();
-		var replies = info.getRoleInfoProto().getLeaderInfo().getFollowerInfoList();
-		if (nextIndices == null || nextIndices.length != replies.size()) {
-			return false;
-		}
-		var followers = new ArrayList<LeaderStall.Follower>();
-		for (int i = 0; i < nextIndices.length; i++) {
-			var reply = replies.get(i);
-			followers.add(new LeaderStall.Follower(RaftPeerId.valueOf(reply.getId().getId()).toString(), nextIndices[i],
-					reply.getLastRpcElapsedTimeMs()));
-		}
-		var conf = division.getRaftConf();
-		return LeaderStall.sentToMajority(followers, log.getNextIndex(), config.electionTimeoutMax().toMillis(),
-				config.nodeId(), peerIds(conf.getCurrentPeers()), peerIds(conf.getPreviousPeers()));
+	private void stepDown() throws IOException {
+		// With no new leader Ratis only steps down, which needs no ready leader.
+		var request = new TransferLeadershipRequest(ClientId.randomId(), server.getId(), group.getGroupId(), 0, null,
+				LEADERSHIP_TRANSFER_TIMEOUT_MS);
+		server.transferLeadershipAsync(request).whenComplete((reply, error) -> {
+			if (error != null || !reply.isSuccess()) {
+				LOG.warn("{}: failed to step down", config.nodeId(), error != null ? error : reply.getException());
+			}
+		});
 	}
 
-	private static List<String> peerIds(Collection<RaftPeer> peers) {
-		return peers.stream().map(peer -> peer.getId().toString()).toList();
+	/**
+	 * For a leader that cannot flush. It stays a good candidate after a step down: its followers hold what it holds, and
+	 * they wait for their election timers. So it hands over if it can: the follower elects itself at once.
+	 */
+	private void handOverOrStepDown() throws IOException {
+		var transferee = transferee();
+		if (transferee == null) {
+			stepDown();
+			return;
+		}
+		var request = new TransferLeadershipRequest(ClientId.randomId(), server.getId(), group.getGroupId(), 0, transferee,
+				config.electionTimeoutMax().multipliedBy(2).toMillis());
+		server.transferLeadershipAsync(request).whenComplete((reply, error) -> {
+			if (error != null || !reply.isSuccess()) {
+				LOG.warn("{}: failed to hand over to {}, stepping down", config.nodeId(), transferee,
+						error != null ? error : reply.getException());
+				try {
+					stepDown();
+				} catch (IOException | RuntimeException ex) {
+					LOG.warn("{}: failed to step down", config.nodeId(), ex);
+				}
+			}
+		});
+	}
+
+	/**
+	 * A node in Ratis' initializing state has no election timer, and nothing shows that but the log: it printed READY and
+	 * it listens. It leaves that state when a leader sends it a request that is not part of bringing it up to date.
+	 */
+	private void warnWhileInitializing(RaftServer.Division division) {
+		if (division.getInfo().getLifeCycleState() != LifeCycle.State.STARTING) {
+			initializingSinceNanos = 0;
+			return;
+		}
+		long now = System.nanoTime();
+		if (initializingSinceNanos == 0) {
+			initializingSinceNanos = now;
+		} else if (now - initializingSinceNanos >= config.electionTimeoutMax().multipliedBy(ELECTION_TIMEOUTS_TO_WARN)
+				.toNanos()) {
+			initializingSinceNanos = now;
+			LOG.warn("{}: this node is outside the cluster, with no election timer, and waits for a leader. {}", config.nodeId(),
+					config.join() ? "It was started with --join, so it waits for add-peer. If no node of the cluster started"
+							+ " without --join, nothing elects a leader: --join is only for a node that joins a running cluster"
+							: "Its configuration does not contain it: it was removed from the cluster, or it never was a member."
+							+ " A removed node has nothing to do: stop it. To bring it back, wipe its data directory and add it again");
+		}
 	}
 
 	/**
@@ -404,10 +540,39 @@ public final class ReplicatedNode implements AutoCloseable {
 		if (closed.get()) {
 			return;
 		}
-		if (isLeader()) {
-			transferLeadership();
+		var division = stateMachine.division();
+		if (isLeader() && division != null) {
+			long term = division.getInfo().getCurrentTerm();
+			if (transferLeadership()) {
+				awaitSuccessorCommit(division, term);
+			}
 		}
 		shutdown(false, null);
+	}
+
+	/**
+	 * Waits until the commit index of this node reaches an entry of a later term, for at most
+	 * {@link #SUCCESSOR_COMMIT_WAIT}. With one node of three down this node is the only partner of its successor: if it
+	 * closes before the reply to the successor's first entry gets out, that reply is lost and the successor stalls until
+	 * {@link LeaderStall} ends it, unless the node took long enough to come back. This node learns of the commit from the
+	 * successor's next request, which also says that the reply arrived.
+	 */
+	private void awaitSuccessorCommit(RaftServer.Division division, long term) {
+		var log = division.getRaftLog();
+		long deadline = System.nanoTime() + SUCCESSOR_COMMIT_WAIT.toNanos();
+		try {
+			while (System.nanoTime() - deadline < 0) {
+				var committed = log.getTermIndex(log.getLastCommittedIndex());
+				if (committed != null && committed.getTerm() > term) {
+					return;
+				}
+				Thread.sleep(SUCCESSOR_COMMIT_POLL_MS);
+			}
+		} catch (InterruptedException ex) {
+			Thread.currentThread().interrupt();
+			return;
+		}
+		LOG.warn("{}: no commit of the new leader within {}, stopping anyway", config.nodeId(), SUCCESSOR_COMMIT_WAIT);
 	}
 
 	/** Abrupt stop for tests: no leadership hand-off. */
@@ -420,12 +585,14 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * index. Only one attempt is made: while a transfer is pending, Ratis refuses writes and refuses transfers to
 	 * any other peer, and a failed attempt can stay pending until its timeout. The request goes straight to the
 	 * local Raft server, not through a client that may still route it to a stopped former leader.
+	 *
+	 * @return whether another node leads now
 	 */
-	private void transferLeadership() {
+	private boolean transferLeadership() {
 		var transferee = transferee();
 		if (transferee == null) {
 			LOG.warn("{}: no follower answered recently, stopping as leader without a hand-off", config.nodeId());
-			return;
+			return false;
 		}
 		try {
 			var request = new TransferLeadershipRequest(ClientId.randomId(), server.getId(), group.getGroupId(),
@@ -433,13 +600,14 @@ public final class ReplicatedNode implements AutoCloseable {
 			var reply = server.transferLeadership(request);
 			if (reply.isSuccess()) {
 				LOG.info("{}: leadership transferred to {}", config.nodeId(), transferee);
-				return;
+				return true;
 			}
 			LOG.warn("{}: leadership transfer to {} failed", config.nodeId(), transferee, reply.getException());
 		} catch (IOException | RuntimeException ex) {
 			LOG.warn("{}: leadership transfer to {} failed", config.nodeId(), transferee, ex);
 		}
 		LOG.warn("{}: stopping as leader without a hand-off", config.nodeId());
+		return false;
 	}
 
 	/** The most up-to-date follower that answered this leader within an election timeout, null if none. */

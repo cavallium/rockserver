@@ -48,6 +48,7 @@ import org.slf4j.LoggerFactory;
  * <ul>
  *   <li>{@link #APPLIED}: the last applied {@link TermIndex}, encoded by {@link #encodeTermIndex}</li>
  *   <li>{@link #CLUSTER_ID}: UTF-8 cluster id, written when the {@link LogEntry.Genesis} entry is applied</li>
+ *   <li>{@link #SEEDED}: present if that entry said that the cluster was seeded from an existing database</li>
  *   <li>{@link #REQUEST} + proposer id + sequence: the encoded result of an applied {@link Request}, kept until its
  *   proposer reports it complete</li>
  *   <li>{@link #FLOOR} + proposer id: the highest {@link Request#completedBelow()} applied for that proposer</li>
@@ -78,6 +79,7 @@ final class NodeStore implements Closeable {
 	static final byte FLOOR = 4;
 	/** A column deletion in progress: its log index and whether the column existed before it ran. */
 	static final byte DELETION = 5;
+	static final byte SEEDED = 6;
 
 	private static final int META_KEY_BYTES = 1 + 2 * Long.BYTES;
 	private static final ColumnSchema META_SCHEMA = ColumnSchema.of(IntList.of(META_KEY_BYTES), ObjectList.of(), true);
@@ -239,6 +241,11 @@ final class NodeStore implements Closeable {
 	@Nullable String clusterId() {
 		Buf value = readMeta(CLUSTER_ID);
 		return value == null ? null : value.toString(StandardCharsets.UTF_8);
+	}
+
+	/** True if the {@link LogEntry.Genesis} entry applied here said that the cluster started from a seed database. */
+	boolean seeded() {
+		return readMeta(SEEDED) != null;
 	}
 
 	private @Nullable Buf readMeta(byte metaKey) {

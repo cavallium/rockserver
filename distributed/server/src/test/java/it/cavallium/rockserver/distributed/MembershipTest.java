@@ -39,6 +39,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 /**
  * Membership changes on a multi-process cluster, through the {@code admin} command line: permanent loss and
@@ -67,6 +69,7 @@ class MembershipTest {
 	/** Longer than any election timeout of {@link #SERVER_ARGS}: the time a new node waits for its {@code add-peer}. */
 	private static final Duration WAIT_BEFORE_ADD_PEER = Duration.ofSeconds(5);
 	private static final String SNAPSHOT_INSTALLED = "installing snapshot";
+	private static final String OUTSIDE = "this node is outside the cluster";
 	private static final String REPLICA_FAILED = "replica failed";
 	private static final String SEEDED_BUT_EMPTY = "The cluster was seeded with an existing database, but this"
 			+ " replica's database is empty";
@@ -267,7 +270,279 @@ class MembershipTest {
 		assertEquals(3, cluster.awaitExit(removed, TIMEOUT), () -> cluster.logTail(removed));
 	}
 
+	/**
+	 * Whichever node leads when a node of a seeded cluster is lost, the documented procedure works: every replica took a
+	 * snapshot of the seed, so a new member never replays a log that does not hold it. What is lost is the leader, so the
+	 * node that leads afterwards is a follower of the time of genesis.
+	 */
+	@Test
+	void aNodeOfASeededClusterIsReplacedWhicheverNodeLeads() throws Exception {
+		var seed = startSeededCluster();
+		var originals = List.of("1", "2", "3");
+		long column = client.getColumnId("seeded", CONTEXT).valueOrThrow();
+		client.put(column, key(1_000_000), text("after"), CONTEXT).valueOrThrow();
+
+		var lost = leaderOf(originals);
+		cluster.kill(lost);
+		deleteRecursively(cluster.dataDir(lost));
+		var members = new ArrayList<>(originals);
+		members.remove(lost);
+		members.add("4");
+		cluster.setMembers(members);
+		cluster.start("4", JOIN);
+		cluster.waitReady("4", READY_TIMEOUT);
+
+		assertOk(cluster.admin(originals, "add-peer", cluster.peer("4").format()));
+		assertOk(cluster.admin(List.of("1", "2", "3", "4"), "remove-peer", lost));
+		assertTrue(cluster.output("4").contains(SNAPSHOT_INSTALLED), "node 4 did not receive a snapshot");
+		assertFalse(cluster.output("4").contains(REPLICA_FAILED), () -> "node 4 failed:\n" + cluster.logTail("4"));
+		client.put(column, key(1_000_001), text("later"), CONTEXT).valueOrThrow();
+		awaitAppliedEverywhere(members, column, key(1_000_001), text("later"));
+		assertSeedServed(seed, List.of("4"));
+		stopAll(members);
+		var expected = new TreeMap<String, Long>(seed.keysByColumn);
+		expected.merge("seeded", 2L, Long::sum);
+		assertReplicasEqual(members, expected);
+	}
+
+	/**
+	 * Leaving the lost node out of {@code --peer} replaces it in one step: two of the three members answer before, during
+	 * and after the change, so a failure of the new node cannot stop the cluster.
+	 */
+	@ParameterizedTest(name = "seeded: {0}, the leader is lost: {1}")
+	@CsvSource({"false,true", "false,false", "true,true", "true,false"})
+	void aLostNodeIsReplacedInOneStep(boolean seeded, boolean leaderLost) throws Exception {
+		var originals = List.of("1", "2", "3");
+		long column;
+		if (seeded) {
+			startSeededCluster();
+			column = client.getColumnId("seeded", CONTEXT).valueOrThrow();
+		} else {
+			cluster = ProcessCluster.create(root, 3, 1, serverArgs());
+			startAll(originals);
+			client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
+			column = client.createColumn("data", SCHEMA, CONTEXT).valueOrThrow();
+		}
+		client.put(column, key(2_000_000), text("before"), CONTEXT).valueOrThrow();
+		var leader = leaderOf(originals);
+		var lost = leaderLost ? leader : originals.stream().filter(id -> !id.equals(leader)).findFirst().orElseThrow();
+		cluster.kill(lost);
+		deleteRecursively(cluster.dataDir(lost));
+		var survivors = originals.stream().filter(id -> !id.equals(lost)).toList();
+		var members = new ArrayList<>(survivors);
+		members.add("4");
+		cluster.setMembers(members);
+		cluster.start("4", JOIN);
+		cluster.waitReady("4", READY_TIMEOUT);
+
+		assertOk(cluster.admin(survivors, "add-peer", cluster.peer("4").format()));
+		assertFalse(cluster.output("4").contains(REPLICA_FAILED), () -> "node 4 failed:\n" + cluster.logTail("4"));
+		var status = cluster.admin(members, "status");
+		assertFalse(status.contains("unreachable"), status);
+
+		// Node 4 counts now: with it stopped the other two still commit, and so do they with one of them stopped instead.
+		client.put(column, key(2_000_001), text("after"), CONTEXT).valueOrThrow();
+		cluster.stop(survivors.getFirst());
+		client.put(column, key(2_000_002), text("later"), CONTEXT).valueOrThrow();
+		cluster.start(survivors.getFirst());
+		cluster.waitReady(survivors.getFirst(), READY_TIMEOUT);
+		client.put(column, key(2_000_003), text("end"), CONTEXT).valueOrThrow();
+		awaitAppliedEverywhere(members, column, key(2_000_003), text("end"));
+		stopAll(members);
+		var dumps = new TreeMap<String, Long>();
+		dump(cluster.dataDir(members.getFirst()).resolve("db")).forEach((name, dump) -> dumps.put(name, dump.keys()));
+		assertReplicasEqual(members, dumps);
+	}
+
+	/** A planned replacement: the node to replace is the leader and it runs. It closes Raft and exits when it is out. */
+	@Test
+	void aRunningLeaderIsReplacedInOneStep() throws Exception {
+		cluster = ProcessCluster.create(root, 3, 1, serverArgs());
+		var originals = List.of("1", "2", "3");
+		startAll(originals);
+		client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
+		long column = client.createColumn("data", SCHEMA, CONTEXT).valueOrThrow();
+		client.put(column, key(1), text("before"), CONTEXT).valueOrThrow();
+		var leader = leaderOf(originals);
+		var others = originals.stream().filter(id -> !id.equals(leader)).toList();
+		var members = new ArrayList<>(others);
+		members.add("4");
+		cluster.setMembers(members);
+		cluster.start("4", JOIN);
+		cluster.waitReady("4", READY_TIMEOUT);
+
+		assertOk(cluster.admin(others, "add-peer", cluster.peer("4").format()));
+		assertEquals(3, cluster.awaitExit(leader, TIMEOUT), () -> cluster.logTail(leader));
+		client.put(column, key(2), text("after"), CONTEXT).valueOrThrow();
+		awaitAppliedEverywhere(members, column, key(2), text("after"));
+		stopAll(members);
+		assertReplicasEqual(members, Map.of("data", 2L));
+	}
+
+	/**
+	 * A node that forgot {@code --join} and lists only itself elected itself and took writes: {@code add-peer} refuses it,
+	 * and also under a new attempt with the node stopped and started again.
+	 */
+	@Test
+	void addPeerRefusesANodeWithALogOfItsOwn() throws Exception {
+		cluster = ProcessCluster.create(root, 3, 1, serverArgs());
+		var members = List.of("1", "2", "3");
+		startAll(members);
+		client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
+		long column = client.createColumn("data", SCHEMA, CONTEXT).valueOrThrow();
+		client.put(column, key(1), text("real"), CONTEXT).valueOrThrow();
+
+		cluster.setMembers(List.of("4"));
+		cluster.start("4");
+		cluster.waitReady("4", READY_TIMEOUT);
+		InProcessCluster.await(TIMEOUT, () -> {
+			try {
+				return leaderOf(List.of("4")).equals("4");
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+		});
+		InProcessCluster.await(TIMEOUT, () -> {
+			try {
+				return cluster.admin(List.of("4"), "status").contains("commitIndex: 1");
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+		});
+		var result = cluster.adminResult(members, "add-peer", cluster.peer("4").format());
+		assertEquals(1, result.exitCode(), result.output());
+		assertTrue(result.output().contains("log of its own"), result.output());
+		var status = cluster.admin(members, "status");
+		assertFalse(status.contains("id: \"4\""), status);
+	}
+
+	/**
+	 * A start without {@code --join} leaves the peer list of that start in the data directory, and Ratis then uses it
+	 * whatever the next start says: {@code --join} must not look as if it helped. {@code add-peer} refuses such a node too:
+	 * it may run just then, in the middle of its exits, and it would become a member.
+	 */
+	@Test
+	void joinIsRefusedAfterAStartWithoutIt() throws Exception {
+		cluster = ProcessCluster.create(root, 3, 1, serverArgs());
+		var originals = List.of("1", "2", "3");
+		startAll(originals);
+		client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
+		client.createColumn("data", SCHEMA, CONTEXT).valueOrThrow();
+
+		var members = List.of("1", "2", "3", "4");
+		cluster.setMembers(members);
+		cluster.start("4");
+		cluster.waitReady("4", READY_TIMEOUT);
+		var result = cluster.adminResult(originals, "add-peer", cluster.peer("4").format());
+		assertEquals(1, result.exitCode(), result.output());
+		assertTrue(result.output().contains("without --join"), result.output());
+		if (cluster.isRunning("4")) {
+			cluster.kill("4");
+		}
+
+		cluster.start("4", JOIN);
+		assertEquals(1, cluster.awaitExit("4", TIMEOUT), () -> cluster.logTail("4"));
+		assertTrue(cluster.output("4").contains("Wipe the data directory"), () -> cluster.logTail("4"));
+
+		deleteRecursively(cluster.dataDir("4"));
+		cluster.start("4", JOIN);
+		cluster.waitReady("4", READY_TIMEOUT);
+		assertOk(cluster.admin(originals, "add-peer", cluster.peer("4").format()));
+	}
+
+	/** It would never end, and flood the leader with requests: a node that is not there is told at once. */
+	@Test
+	void addPeerFailsAtOnceWithoutItsNode() throws Exception {
+		cluster = ProcessCluster.create(root, 3, 1, serverArgs());
+		var members = List.of("1", "2", "3");
+		startAll(members);
+		var result = cluster.adminResult(members, "add-peer", cluster.peer("4").format());
+		assertEquals(1, result.exitCode(), result.output());
+		assertTrue(result.output().contains("does not answer"), result.output());
+		assertFalse(cluster.output(leaderOf(members)).contains("receive setConfiguration"));
+	}
+
+	/** Without a majority no change can end. The command ends at its limit, with an error. */
+	@Test
+	void aChangeWithoutAMajorityEndsAtItsTimeLimit() throws Exception {
+		cluster = ProcessCluster.create(root, 3, 0, serverArgs());
+		var members = List.of("1", "2", "3");
+		startAll(members);
+		cluster.kill("2");
+		cluster.kill("3");
+		long start = System.nanoTime();
+		var result = cluster.adminResult(members, "--timeout-ms", "3000", "remove-peer", "3");
+		var elapsed = Duration.ofNanos(System.nanoTime() - start);
+		assertEquals(1, result.exitCode(), result.output());
+		assertTrue(result.output().contains("FAILED"), result.output());
+		assertTrue(elapsed.compareTo(Duration.ofSeconds(30)) < 0, () -> "took " + elapsed);
+	}
+
+	@Test
+	void aMemberTakesASnapshotOnRequest() throws Exception {
+		cluster = ProcessCluster.create(root, 3, 0, serverArgs());
+		var members = List.of("1", "2", "3");
+		startAll(members);
+		client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
+		client.createColumn("data", SCHEMA, CONTEXT).valueOrThrow();
+		assertOk(cluster.admin(members, "snapshot", "2"));
+		assertTrue(cluster.output("2").contains("snapshot taken at"), () -> cluster.logTail("2"));
+		assertFalse(cluster.output("3").contains("snapshot taken at"), () -> cluster.logTail("3"));
+	}
+
+	/** Such a node printed READY and listens, with no election timer: only its log can tell. */
+	@Test
+	void aRemovedNodeThatRestartsWarnsThatItIsOutside() throws Exception {
+		cluster = ProcessCluster.create(root, 3, 0, serverArgs());
+		var members = List.of("1", "2", "3");
+		startAll(members);
+		client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
+		client.createColumn("data", SCHEMA, CONTEXT).valueOrThrow();
+		var removed = members.stream().filter(id -> {
+			try {
+				return !id.equals(leaderOf(members));
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+		}).findFirst().orElseThrow();
+		assertOk(cluster.admin(members, "remove-peer", removed));
+		assertEquals(3, cluster.awaitExit(removed, TIMEOUT), () -> cluster.logTail(removed));
+
+		cluster.start(removed);
+		cluster.waitReady(removed, READY_TIMEOUT);
+		InProcessCluster.await(TIMEOUT, () -> cluster.output(removed).contains(OUTSIDE));
+		assertTrue(cluster.output(removed).contains("it was removed from the cluster"), () -> cluster.logTail(removed));
+		assertTrue(cluster.isRunning(removed), "a removed node that restarts waits, it does not exit");
+	}
+
+	/** Nothing starts an election in such a cluster. */
+	@Test
+	void aNewClusterOfNodesWithJoinWarns() throws Exception {
+		cluster = ProcessCluster.create(root, 3, 0, serverArgs());
+		for (var id : List.of("1", "2", "3")) {
+			cluster.start(id, JOIN);
+		}
+		cluster.waitReady(READY_TIMEOUT);
+		InProcessCluster.await(TIMEOUT, () -> cluster.output("1").contains(OUTSIDE));
+		assertTrue(cluster.output("1").contains("nothing elects a leader"), () -> cluster.logTail("1"));
+	}
+
 	// ---- cluster helpers ----
+
+	/** Three nodes that start from a copy of a database: returns once every replica has a snapshot of it. */
+	private Seed startSeededCluster() throws IOException {
+		cluster = ProcessCluster.create(root, 3, 1, serverArgs());
+		var seed = createSeed();
+		var originals = List.of("1", "2", "3");
+		for (var id : originals) {
+			copyRecursively(seed.dir, cluster.dataDir(id).resolve("db"));
+		}
+		startAll(originals);
+		client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
+		assertSeedServed(seed, originals);
+		InProcessCluster.await(TIMEOUT, () -> originals.stream().allMatch(id -> cluster.output(id).contains("snapshot taken at")));
+		return seed;
+	}
 
 	private List<String> serverArgs() throws IOException {
 		var config = root.resolve("rockserver.conf");

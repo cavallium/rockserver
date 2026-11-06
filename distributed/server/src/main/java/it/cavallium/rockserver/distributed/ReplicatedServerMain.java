@@ -1,11 +1,16 @@
 package it.cavallium.rockserver.distributed;
 
+import com.sun.management.HotSpotDiagnosticMXBean;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftClientReply;
@@ -13,6 +18,11 @@ import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.retry.RetryPolicy;
+import org.apache.ratis.thirdparty.io.grpc.Status;
+import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
+import org.apache.ratis.util.TimeDuration;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Command line entry point.
@@ -23,7 +33,8 @@ import org.apache.ratis.protocol.RaftPeerId;
  *       [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
  *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
  *       [--jvm-pause-limit-ms N]
- * admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
+ * admin --peer ... [--group-id UUID] [--timeout-ms N]
+ *       status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
  * </pre>
  *
@@ -33,6 +44,13 @@ import org.apache.ratis.protocol.RaftPeerId;
  * closed, so that a supervisor notices. {@code repair-log} runs on a stopped node, after a power loss left it unable to read its Raft log: see
  * {@link RaftLogRepair}. It exits with 0 if the log is valid or was repaired (with {@code --dry-run}: could be) and
  * with 1 if it refuses.</p>
+ *
+ * <p>Run a node with {@code -XX:+ExitOnOutOfMemoryError}: it warns without it. See "Heap" in the design document.</p>
+ *
+ * <p>{@code admin} changes end with {@code OK}, or with {@code FAILED: ...} and exit code 1, within {@code --timeout-ms}
+ * (10 minutes by default), which must cover the catch-up of a new member. A leader that started a change goes on with it
+ * after that: see {@code status}, and run the command again. {@code add-peer} first asks the new node what it holds, and
+ * refuses a node that does not run or that has a log of its own. {@code snapshot} makes a member take a snapshot now.</p>
  *
  * <p>{@code --pipelined-updates}, off by default, lets a leader pass a key to its next {@code getForUpdate} update as
  * soon as the previous update's commit is admitted to the log: see "Transactions" in the design document, which also
@@ -47,6 +65,12 @@ import org.apache.ratis.protocol.RaftPeerId;
  * pauses" in the design document.</p>
  */
 public final class ReplicatedServerMain {
+
+	private static final Duration DEFAULT_ADMIN_TIMEOUT = Duration.ofMinutes(10);
+	private static final TimeDuration ADMIN_RETRY_SLEEP = TimeDuration.valueOf(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+	/** How long {@code add-peer} waits for an answer of the new node and of each member, per round. */
+	private static final Duration PEER_ANSWER_TIMEOUT = Duration.ofSeconds(3);
+	private static final long SEED_SNAPSHOT_POLL_MS = 200;
 
 	private ReplicatedServerMain() {}
 
@@ -88,6 +112,7 @@ public final class ReplicatedServerMain {
 				Duration.ofMillis(Long.parseLong(options.value("--jvm-pause-limit-ms",
 						String.valueOf(NodeConfig.DEFAULT_JVM_PAUSE_LIMIT.toMillis())))));
 		options.requireConsumed();
+		warnWithoutExitOnOutOfMemory();
 		ReplicatedNode node;
 		try {
 			node = ReplicatedNode.start(config);
@@ -115,19 +140,36 @@ public final class ReplicatedServerMain {
 		}
 	}
 
-	private static void admin(Options options) throws IOException {
+	/**
+	 * An {@link OutOfMemoryError} on a thread of Ratis does not stop the JVM, and Ratis goes on without what it was doing.
+	 * In the appender that sends a snapshot, that ends the catch-up of a new member as if it had finished. See "Heap" in
+	 * the design document.
+	 */
+	private static void warnWithoutExitOnOutOfMemory() {
+		var diagnostics = ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
+		if (diagnostics != null && !Boolean.parseBoolean(diagnostics.getVMOption("ExitOnOutOfMemoryError").getValue())) {
+			System.err.println("WARNING: this JVM runs without -XX:+ExitOnOutOfMemoryError: an out of memory error on a"
+					+ " thread of Ratis can leave a cluster without a leader. See \"Heap\" in the design document");
+		}
+	}
+
+	private static void admin(Options options) throws IOException, InterruptedException {
 		var peers = options.peers();
 		var groupId = RaftGroupId.valueOf(UUID.fromString(options.value("--group-id", NodeConfig.DEFAULT_GROUP_ID)));
+		var timeout = Duration.ofMillis(Long.parseLong(options.value("--timeout-ms",
+				String.valueOf(DEFAULT_ADMIN_TIMEOUT.toMillis()))));
 		var command = options.positional();
 		if (command.isEmpty()) {
 			usage("missing admin command");
 		}
+		long deadline = System.nanoTime() + timeout.toNanos();
 		var group = RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList());
 		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
 		try (var client = RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
 				.setRaftGroup(group)
 				.setProperties(RaftSettings.client(anyConfig))
+				.setRetryPolicy(retryUntil(deadline))
 				.build()) {
 			RaftClientReply reply = switch (command.getFirst()) {
 				case "status" -> {
@@ -136,26 +178,32 @@ public final class ReplicatedServerMain {
 							var info = client.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId);
 							System.out.println(peer.id() + ": " + info.getRoleInfoProto().getRole()
 									+ ", commit infos " + info.getCommitInfos());
-						} catch (IOException ex) {
+						} catch (IOException | RuntimeException ex) {
 							System.out.println(peer.id() + ": unreachable (" + ex.getMessage() + ")");
 						}
 					}
 					yield null;
 				}
-				case "transfer-leader" -> client.admin().transferLeadership(RaftPeerId.valueOf(arg(command)), 10_000);
+				case "transfer-leader" -> attempt(timeout, () -> client.admin().transferLeadership(
+						RaftPeerId.valueOf(arg(command)), 10_000));
 				case "add-peer" -> {
 					var added = PeerConfig.parse(arg(command));
+					requireFitToJoin(added, peers, groupId, deadline);
 					var members = new ArrayList<>(peers.stream().map(ReplicatedServerMain::raftPeer).toList());
 					members.removeIf(p -> p.getId().toString().equals(added.id()));
 					members.add(raftPeer(added));
-					yield client.admin().setConfiguration(members);
+					yield attempt(timeout, () -> client.admin().setConfiguration(members));
 				}
 				case "remove-peer" -> {
 					var removed = arg(command);
-					yield client.admin().setConfiguration(peers.stream()
+					yield attempt(timeout, () -> client.admin().setConfiguration(peers.stream()
 							.filter(p -> !p.id().equals(removed))
 							.map(ReplicatedServerMain::raftPeer)
-							.toList());
+							.toList()));
+				}
+				case "snapshot" -> {
+					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(arg(command)));
+					yield attempt(timeout, () -> api.create(timeout.toMillis()));
 				}
 				default -> {
 					usage("unknown admin command " + command.getFirst());
@@ -168,6 +216,107 @@ public final class ReplicatedServerMain {
 					System.exit(1);
 				}
 			}
+		}
+	}
+
+	/** Ratis' default retries at once and for ever: a change that cannot happen would flood the leader, with no end. */
+	private static RetryPolicy retryUntil(long deadlineNanos) {
+		return _ -> System.nanoTime() - deadlineNanos < 0 ? () -> ADMIN_RETRY_SLEEP : RetryPolicy.NO_RETRY_ACTION;
+	}
+
+	@FunctionalInterface
+	private interface AdminCall {
+		RaftClientReply run() throws IOException;
+	}
+
+	private static RaftClientReply attempt(Duration timeout, AdminCall call) {
+		try {
+			return call.run();
+		} catch (IOException ex) {
+			fail("no result within the time limit of " + timeout.toMillis() + " ms (--timeout-ms), or the leader refused: "
+					+ ex.getMessage() + ". A leader that started a change goes on with it: see the status, and run the command"
+					+ " again");
+			throw new AssertionError(ex);
+		}
+	}
+
+	private static void fail(String message) {
+		System.out.println("FAILED: " + message);
+		System.exit(1);
+	}
+
+	/**
+	 * Fails the command if {@code added} does not run or holds a log of its own. It then waits until every member that
+	 * answers has applied the genesis entry and, on a seeded cluster, holds a snapshot, which it takes right after: a new
+	 * member cannot catch up from a leader without one.
+	 */
+	private static void requireFitToJoin(PeerConfig added, List<PeerConfig> peers, RaftGroupId groupId, long deadlineNanos)
+			throws InterruptedException {
+		var members = peers.stream().filter(peer -> !peer.id().equals(added.id())).toList();
+		while (true) {
+			var answers = members.stream().map(member -> nodeState(member, groupId)).toList();
+			var target = nodeState(added, groupId);
+			var known = answers.stream().map(ReplicatedServerMain::answerOrNull).filter(Objects::nonNull).toList();
+			var clusterId = known.stream().map(NodeState::clusterId).filter(Objects::nonNull).findFirst().orElse(null);
+			String waitingFor = null;
+			try {
+				var state = target.join();
+				if (state == null) {
+					fail("node " + added.id() + " at " + added.raftAddress() + " has no group " + groupId.getUuid()
+							+ ": start it with the same --group-id as the cluster");
+					return;
+				}
+				var refusal = state.refusalToJoin(added.id(), clusterId);
+				if (refusal != null) {
+					fail(refusal);
+					return;
+				}
+			} catch (CompletionException ex) {
+				if (Status.fromThrowable(ex.getCause()).getCode() != Status.Code.ABORTED) {
+					fail("node " + added.id() + " does not answer at " + added.raftAddress() + ": start it first, with --join and"
+							+ " the same --group-id (" + ex.getCause().getMessage() + ")");
+					return;
+				}
+				waitingFor = "node " + added.id() + ", which is installing a snapshot";
+			}
+			if (waitingFor == null) {
+				waitingFor = memberNotReady(known);
+			}
+			if (waitingFor == null) {
+				return;
+			}
+			if (System.nanoTime() - deadlineNanos > 0) {
+				fail("no result within the time limit (--timeout-ms): still waiting for " + waitingFor);
+				return;
+			}
+			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
+		}
+	}
+
+	/**
+	 * What keeps a new member from getting a state from any member that may lead, null if nothing does. Until a member has
+	 * applied the genesis entry nobody can tell whether it needs a snapshot.
+	 */
+	private static @Nullable String memberNotReady(List<NodeState> members) {
+		if (members.stream().anyMatch(member -> member.clusterId() == null)) {
+			return "a member that has not applied the first entry of the cluster yet";
+		}
+		if (members.stream().anyMatch(member -> member.seeded() && !member.hasSnapshot())) {
+			return "a member of this seeded cluster that has no snapshot yet, which a new member needs";
+		}
+		return null;
+	}
+
+	private static CompletableFuture<@Nullable NodeState> nodeState(PeerConfig peer, RaftGroupId groupId) {
+		var channel = NettyChannelBuilder.forTarget(peer.raftAddress()).usePlaintext().build();
+		return TermService.nodeState(channel, groupId, "", PEER_ANSWER_TIMEOUT).whenComplete((_, _) -> channel.shutdown());
+	}
+
+	private static @Nullable NodeState answerOrNull(CompletableFuture<@Nullable NodeState> answer) {
+		try {
+			return answer.join();
+		} catch (CompletionException ex) {
+			return null;
 		}
 	}
 
@@ -203,7 +352,8 @@ public final class ReplicatedServerMain {
 				        [--snapshot-every N] [--election-timeout-ms MIN:MAX] [--request-timeout-ms N]
 				        [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
 				        [--jvm-pause-limit-ms N]
-				  admin --peer ... [--group-id UUID] status | transfer-leader ID | add-peer ID=... | remove-peer ID
+				  admin --peer ... [--group-id UUID] [--timeout-ms N]
+				        status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]""");
 		System.exit(2);
 	}

@@ -140,7 +140,7 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 | Dies, its host stays up (crash, SIGKILL) | At once: the connection is reset | In milliseconds: the port refuses connections |
 | Stops answering with its host down, cut off from the client or frozen (power loss, SIGSTOP) | By keepalive, in at most 15 s | After that, plus one connect timeout for each such node listed before the one that works |
 | Is cut off from the Raft majority, and the client still reaches it | The node stops serving: it loses its leader within one election timeout, and after 3 maximum election timeouts without one, at least 6 s (about 8 s in all by default), it stops listening and sends GOAWAY. A node that restarts while cut off does the same, counted from its start. Calls running on it end as they do | In milliseconds. Until then calls fail with the errors of a node without a leader |
-| Has a hung disk | **Not detected**: the process still answers the connection handshake and keepalive. Calls wait for their deadline, and calls without one wait for the node | Never: the client stays on this node |
+| Has a hung disk | **Not detected**: the process still answers the connection handshake and keepalive. Calls wait for their deadline, and calls without one wait for the node. A leader with such a disk hands over its leadership after 3 maximum election timeouts, at least 5 s, and the client still stays on this node | Never: the client stays on this node |
 
 | System property | Default | Effect |
 |---|---|---|
@@ -172,9 +172,11 @@ starts with its server still connects and a plain client of a server that is dow
 address fails after 10 s. `ClientBuilder.setDeferred` skips the handshake until the first use, and closing that
 connection ends a handshake in progress.
 
-To replace a node of a replicated cluster, start the new node first with `--join`, and run `admin add-peer` when you
-like: the node waits for it, also across restarts. See "Replacing a node" in the [design
-document](docs/distributed/design.md).
+To replace a node of a replicated cluster, start the new node first with `--join`, and run
+`admin --peer <the other members> add-peer <new node>` when you like: the node waits for it, also across restarts, and
+leaving the old node out of `--peer` replaces it in one step. See "Replacing a node" in the [design
+document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError`, and see "Heap"
+there for the heap that a snapshot send needs.
 
 Shorter keepalive times find a dead node sooner, but a pause of the server or of the client that outlasts the
 timeout ends a working connection, with its calls in flight. Pings cost next to nothing, and a server accepts them

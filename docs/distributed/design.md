@@ -79,7 +79,9 @@ forwards to a non-embedded connection:
 | `Applier` | Applies the requests of log entries to the local database, a group of entries in one transaction without the WAL, with their result records and the applied position. |
 | `LeaderSession`, `ConflictTracker` | Transactions bound to the leader's term, per-key queues of single-key updates, and conflict validation. |
 | `NodeMetrics` | Timers and gauges of the replication path, logged every 10 s. |
-| `ReadBarrier`, `TermService` | Linearizable reads. |
+| `ReadBarrier`, `TermService` | Linearizable reads. `TermService` also answers what a node holds (`NodeState`). |
+| `ClusterCheck` | A leader tells its followers which cluster it leads, and a node of another cluster stops. |
+| `LeaderStall` | Tells a leader that cannot commit to step down. |
 | `NodeStore`, `CheckpointStorage` | Local database, internal metadata, checkpoint snapshots, restore. |
 | `LeaderForwarder` | Finds the leader's API and forwards to it. |
 | `LogEntry`, `Request`, `LogEntryCodec`, `ResultCodec` | Log entry model and its binary encoding. |
@@ -518,33 +520,134 @@ against an incomplete history.
 
 **Membership.**
 
-- **Initial cluster.** All nodes start with the same peer list. The first leader proposes `Genesis`, which
-  binds every replica's database to the cluster and records whether the cluster was seeded from an existing
-  database.
-- **Migrating from a single node.** Stop it and copy its database directory to every node. A seeded cluster
-  takes a snapshot right away, and a member added later through `add-peer` receives the leader's latest snapshot
-  before any log entry, so it gets the seed. A node that replays the seeded `Genesis` with an empty database (an
-  initial member without the copy, before the log is purged, or a new member while the leader has no snapshot
-  because that one attempt failed) stops instead of diverging.
-- **Replacing a node.** Start the new member first, under a new id, with an empty data directory, a peer list
-  that includes itself and `--join`. Then run `ReplicatedServerMain admin --peer ... add-peer` and `remove-peer`
-  (Ratis `setConfiguration`), whenever you like: the new node waits, also across restarts. `admin` does not read the
-  current configuration: it sets it to exactly its own `--peer` list plus or minus one peer, so `--peer` must list
-  every current member, or the ones left out are removed. New members catch up from a snapshot. A node that lost its
-  Raft state but kept its id refuses to start, because it could vote twice in one term. Replace it under a new id.
+- **Initial cluster.** All nodes start with the same peer list and without `--join`. The first leader proposes
+  `Genesis`, with a random cluster id, which binds every replica's database to the cluster and records whether the
+  cluster was seeded from an existing database. A node started with `--join` has no election timer, so a cluster of
+  such nodes never elects a leader, though each prints `READY`; a node that stays outside says so in its log after 15
+  maximum election timeouts, and every as many after that.
+- **One cluster id per genesis.** The group id is shared by name: by default it is the same in every cluster. Raft
+  compares log entries by term and index only, so a node that elected itself writes entries that look like the
+  entries of a real cluster, and they are never replaced: 41 of 700 acknowledged keys read null after such a node
+  was added, with no error. Every genesis therefore gets its own id, and two things keep the histories apart:
+  `add-peer` asks the new node what it holds and refuses it (see below), and a leader tells each of its followers
+  once per term which cluster it leads, also a follower still catching up to join (`ClusterCheck`). A follower of
+  another cluster exits with 3, so a node that the Ratis tools add, or that gets a log right after `add-peer` asked,
+  stops before the configuration changes, and so does a member named in the peer list of the others that started a
+  cluster of its own. A second `Genesis` in a log, from a resent batch of a former leader,
+  changes nothing: the first one wins on every replica. Other ways for two histories to meet are closed: a database
+  that holds a cluster id with no Raft state is refused at start, whichever cluster it comes from, so a copy of a
+  replica cannot seed a new cluster or rejoin; and a new member takes a seeded cluster's data from a snapshot, which
+  replaces its database. Copies of a seed that differ from each other are not detected: the seed must be one database.
+- **Migrating from a single node.** Stop it and copy its database directory to every node. Every replica takes a
+  snapshot as soon as it has applied the seeded `Genesis`, and on each start until it has one, because a member added
+  later needs the seed from whichever node leads by then: a leader sends a new member its latest snapshot before any
+  log entry, and without a snapshot it would send a log that does not hold the seed. `add-peer` waits until every
+  member that answers has its snapshot. A node that replays the seeded `Genesis` with an empty database stops with
+  exit code 3 instead of diverging: an initial member without the copy, before the log is purged, or a new member
+  whose leader still has no snapshot. For the last one to happen, that leader must be a member that `add-peer` could
+  not reach, in the moments after it starts. Such a node is a member by then: take it out with `remove-peer`, then wipe
+  it and add it again. Do not wipe it first, because a member with an empty log gets no vote from Ratis
+  (`LeaderElection.waitForResults`), and with a node lost as well the cluster then has no leader; if the cluster has
+  already lost its majority, restart the node as it is until `remove-peer` gets through. `admin snapshot ID` makes a
+  member take a snapshot at any time.
+- **Replacing a node.** Start the new member first, under a new id, with an empty data directory, a peer list that
+  includes itself and `--join`. It waits, also across restarts, for as long as you like. Then replace the node in one
+  step, leaving it out of `--peer`:
+
+  ```bash
+  ReplicatedServerMain admin --peer <the other members> add-peer <new node>
+  ```
+
+  `admin` does not read the current configuration: it sets it to exactly its own `--peer` list plus or minus one
+  peer. So this command adds the new node and removes the old one together (Ratis `setConfiguration`, a joint
+  configuration), and the members that stay form a majority of the old configuration and of the new one all along.
+  With one node of three lost that is 2 of 3 before, during and after the change, and a failure of the new node stops
+  nothing. It works the same when the lost node was the leader or a follower, seeded or not (`MembershipTest`), and
+  for a node that still runs, the leader too: that node exits with 3 once it is out.
+
+  The other way, `add-peer` with every member in `--peer` and `remove-peer` afterwards, is for growing a cluster. With
+  a lost node in `--peer` it passes through 4 members with 1 lost, where all 3 others are needed: any failure of the
+  new node stops writes until it returns, and an appender that dies during the catch-up leaves the cluster without a
+  leader, with no way back (see "Heap"). Every member must be in `--peer`, or the ones left out are removed.
+
+  New members catch up from a snapshot. A node that lost its Raft state but kept its id refuses to start, because it
+  could vote twice in one term. Replace it under a new id.
+
+  `add-peer` asks the new node first, and exits with 1 and says why if it does not answer, if it runs another group
+  id, if it was started without `--join`, or if it has a log of its own (see "One cluster id per genesis"). It accepts
+  a node of this cluster, so it can run again. `add-peer` and `remove-peer` retry for `--timeout-ms`, 10 minutes by
+  default, sleeping between tries, and then exit with 1. The limit must cover the catch-up of the new node, at about
+  100 MB/s. A leader that started a change goes on with it after the command ended: see `admin status`, and run the
+  command again, which ends with `OK` once the change is done. The catch-up ends by itself if the new node stops
+  answering for 3 maximum election timeouts.
 
   `--join` gives Ratis an empty group, so the node starts in Ratis' initializing state: no election timer, until a
   leader sends it a request that is not part of bringing it up to date. Without the option the node would start
   elections. A leader that is not of the first term answers a pre-vote from a node outside its configuration with a
   request to shut down (its configuration entry has an index, which it compares with the candidate's log), Ratis
-  closes that node's division, and `add-peer` then hangs with no end. So a node that replaces a lost leader had 1 to 2 s
-  to get its `add-peer`. Now such a node exits (see "Long pauses"), and `--join` keeps it from getting there. The
-  option does not change a node that has a configuration of its own, from its log or from a snapshot, so it can stay in
-  the node's command line; a node of a running cluster also restarts without it. It leaves nothing on disk: a node
-  restarted without it before its `add-peer` is an ordinary new member, with the election timer above.
+  closes that node's division, and `add-peer` then hangs. So a node that replaces a lost leader had 1 to 2 s to get its
+  `add-peer`. Now such a node exits (see "Long pauses"), and `--join` keeps it from getting there. The option does not
+  change a node that has a configuration of its own, from its log or from a snapshot, so it can stay in the node's
+  command line; a node of a running cluster also restarts without it.
+
+  `--join` must be there from the first start until `add-peer`. A start without it writes `raft-meta.bootstrap` in the Raft directory,
+  and Ratis uses that peer list whatever a later start says, so adding the option afterwards would change nothing: the
+  node would keep exiting. A start with `--join` is refused when that file exists and no log gave the node a
+  configuration: wipe the data directory and start again with the option. Do that before an `add-peer` reaches the
+  node. `add-peer` itself refuses such a node, but an `add-peer` of the Ratis tools that lands while it runs, in the
+  seconds between its exits, makes it a member, and a wipe then loses that member: with another node lost, that
+  leaves no majority, and neither `add-peer` nor `remove-peer` can end. Such a node must get its data back as a member
+  would: keep its data directory, and restart it until a `remove-peer` gets through.
+
+  The peer list of a node is read at the start, and the API addresses in it are the ones forwarded calls use (a member
+  that is not in the list is asked for its own). So a `--join` node given wrong API ports for its peers joins, and
+  then fails the calls that it forwards: restart it with the right list.
 
   A node still running when `remove-peer` removes it closes Raft by itself and exits with 3. Take it out of its
-  supervisor first, or the supervisor keeps restarting a node that has no group to join.
+  supervisor first. A removed node that a supervisor starts again does not exit: its configuration does not contain it,
+  so it stays up in the initializing state, printing `READY` and with an API that has no leader to serve from, and it
+  says so in its log as above.
+- **Heap.** Run every node with `-XX:+ExitOnOutOfMemoryError`: a node without it warns at its start. A leader that
+  sends a snapshot keeps each chunk on the heap for 4 s, whether or not its reply came: Ratis' `StreamObserverWithTimeout`
+  holds it in the timer of the chunk's timeout, which is 8 times `raft.grpc.server.install_snapshot.request.timeout`, and
+  we set that to 500 ms. So add to the heap of a leader what it sends in 4 s. Measured live `byte[]` after a full GC on a
+  leader sending a 1 GB snapshot, on this machine's disk at about 200 MB/s:
+
+  | Setting | Live heap | Send |
+  |---|---|---|
+  | Ratis' 3 s (24 s per chunk) | 1038 MB: all of it, and it would keep growing | 8.5 s |
+  | 500 ms (4 s per chunk), the setting | 792 MB | 7.6 s |
+  | 250 ms (2 s per chunk) | 540 MB | 6.0 s |
+  | 500 ms, chunks of 1 MB | 413 MB | 16.4 s |
+
+  What stays is what goes out in that time, so a smaller chunk saves nothing per byte sent: it only slowed the send, and
+  chunks stay at 8 MB. A shorter timeout costs more than it saves: a follower that answers no chunk for that long
+  makes the leader start the whole snapshot over. The rule is about 1 GB of heap per 250 MB/s of sending, on top of what
+  the node needs anyway. With Ratis' 3 s a send at 200 MB/s holds up to 4.8 GB, derived, not measured. With 500 ms the
+  same send also passed with `-Xmx1g` and `-Xmx700m`, where it is slower, and `-Xmx1g` at 3 s ran out of memory in 5
+  of 5 runs. Only an error that the JVM itself throws makes it exit: Netty's limit on direct memory is not one.
+
+  An out of memory error on a thread of Ratis does not stop the JVM. In the appender of a new member it ends the
+  catch-up as if it had finished: `LeaderStateImpl.restart` starts a new appender only for a peer in the configuration,
+  and `checkStaging` then finds nobody lagging and appends the joint configuration, with a member that has nothing.
+  - With `-XX:+ExitOnOutOfMemoryError` the leader exits at once (code 3, like a failed replica), before any of this. Start
+    it again with more heap, and run `add-peer` again. The new node keeps waiting. Run once with the literal `add-peer`
+    below: replicas identical at the end.
+  - Without the option, after a one step replacement, nothing is lost: `add-peer` says `OK` too early, but the two old
+    members are a majority of both configurations, the leader stays, writes go on, and a new appender starts the
+    snapshot again. Run once.
+  - Without the option, with `add-peer` that leaves a lost node in the configuration, the cluster ends with no leader,
+    in all 5 runs of the review and 1 of ours. The joint configuration needs the vote of the new node, which is
+    only in the new half, so Ratis starts it in the initializing state, where it refuses votes (a member with an empty
+    log would not count anyway). Restarting nodes does not help, with or without `--join`, and neither does a copy of a
+    survivor's data under the new node's id, which starts in the initializing state too (run once). What worked (run
+    once, replicas identical at 16,100 keys): stop every node, find the survivor with the highest last log entry, copy
+    its data directory to the lost node's place, and start it under the lost node's id. This is outside what Raft
+    proves. With one node of three lost, that copy holds everything committed, since every majority holds a survivor,
+    and a leader that the lost node helped elect is a survivor that wrote an entry of that term, so the highest
+    last entry covers that term too. Start the survivors
+    and the new node (wiped, with `--join`), which gets a snapshot, then run `remove-peer` for the lost id. Do this only
+    with the lost node's disk really gone. With two nodes lost see "No quorum".
 - **No quorum.** Replacing a node takes a leader (`setConfiguration`), so it does not help when too few nodes
   can start: two of three after a shared power cut, for example, each with a hole in a group commit followed by
   later data, which `repair-log` refuses. Writes through a volatile device cache can complete out of order within
@@ -565,8 +668,15 @@ against an incomplete history.
      it, so its keys would have to be exported into a new database that seeds one ("Migrating from a single node").
      What the replica had not flushed, and all that only a Raft log holds, is lost: no tool reads it out. No tool or
      test covers this way, which is a last resort.
-- **Graceful stop.** On SIGTERM a leader hands leadership to the most up-to-date live follower before
-  stopping. A deploy restart costs a few hundred milliseconds without writes (see the tests).
+- **Graceful stop.** On SIGTERM a leader hands leadership to the most up-to-date live follower. It then waits until
+  it knows of a commit of the new leader, for at most 3 s, and stops. A deploy restart with all nodes up costs a few
+  hundred milliseconds without writes (see the tests). With one node of three down the stopping node is the only
+  partner of the new leader, so writes wait for it to come back. The new leader loses its majority while the old one
+  restarts, steps down after one maximum election timeout, and a new election follows once the node is back. Measured
+  with real processes on a real disk, 6 rounds each: 4.6 to 6.1 s without writes at the default election timeouts, and
+  2.3 s at 3000:6000. Before this wait, and before a leader that lost its majority could stand for election again
+  after one maximum election timeout instead of Ratis' default of 10 s (`leaderStepDownWaitTime`), the same rounds took
+  3.0 to 15.6 s, and once 35 s at 3000:6000.
 - **Long pauses.** Ratis closes its server after a JVM pause longer than a limit, and a division also closes when a
   leader tells a node outside its configuration to shut down. Both leave the process up: the API listens, the Raft
   port refuses connections, and a closed division still reports its last leader, which it can no longer follow. So
@@ -595,9 +705,30 @@ against an incomplete history.
   that had no end. The log says `stepping down to restart replication`, and the metric `leader.stall.stepdowns` counts.
   After its first commit a leader cannot stall like this: the next write it accepts has entries, and its reply moves
   the match index past the entry whose reply was lost. An uncommitted entry waits for that write, and only the client
-  that wrote it waits with it, until its deadline. If a partner's disk hangs and heartbeats still pass, the leader
-  steps down once per bound and the other side does the same: elections, and no writes, which is what that fault
-  gives anyway.
+  that wrote it waits with it, until its deadline.
+
+  A disk that is slow looks the same: the reply exists, and takes longer than the bound on every leader, and a step
+  down only starts the wait over. So the bound doubles after each step down of a node, up to 8 times its first value,
+  and goes back when the commit index moves, under any leader. Before the doubling, with both remaining disks slowed
+  to 12 s per write round, leaders stepped down every 11.5 s and committed nothing in 90 s, against 7 commits without
+  the rule; the doubling has not been measured on such disks yet. If a partner's disk hangs and heartbeats
+  still pass, the leader steps down at growing intervals and the other side does the same: elections and no writes,
+  which is what a hung disk gives anyway, when the majority needs it.
+- **A leader whose log stops.** Ratis commits on a leader only up to what the leader itself flushed
+  (`RaftLogBase.updateCommitIndex`), whatever its followers hold, and no setting changes that. The heartbeats come from
+  other threads, so a leader whose log worker hangs stops all writes, and its followers have no reason for an election,
+  with two healthy followers that are a majority. Without more, the wait ended only when the queue of the log worker
+  filled up: Ratis then blocks with the log lock held, and the appenders that need that lock send no more heartbeats.
+  That took 38 to 45 s with 8 writers of 1 MiB values, and with a few small writes it would never happen. So a
+  `LeaderStall` rule in the maintenance loop looks at the leader's log: entries to flush, and a flush index that does
+  not move for 3 maximum election timeouts and at least 5 s, makes it hand over to its most up-to-date follower, or
+  step down if it has none: a leader that only stepped down often won the next election with the same log. The bound
+  doubles here too, and goes back when a flush takes less than its first value, so that disks that are all this slow
+  do not end every leader in turn. `LeaderStallTest` stops the log worker of a leader and checks that writes resume
+  on another node; how long that takes on a real disk under load has not been measured yet. The log says
+  `stepping down`, and the metric `leader.log.stepdowns` counts. It does nothing on a leader with nothing to flush, and
+  it cannot help once the queue is full under a heavy load, which blocks the server lock: then the heartbeats stop
+  anyway, within seconds at that load. The node stays up with its hung disk, as a follower that does not answer.
 
 ## Behavior differences from a single node
 
@@ -662,9 +793,10 @@ failover" below).
 | `IsolatedNodeTest` | A client listing every node, connected to a node that gets isolated (the leader, or a follower), moves to the majority and keeps working, and the isolated node listens and serves again after the heal. With every node isolated all pause, and after the heal all resume and the client recovers by itself. An election shorter than the bound pauses no node. A follower restarted while cut off pauses too, and the client that lists it first moves. A cluster killed or stopped as a whole and restarted at once serves again, a paused node takes part in the election, and a node of a new cluster does not pause. A node that lost its database and kept its log pauses, and a client that starts during a cold start waits for the cluster, also past a frozen node. |
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history, hot counters included, is linearizable. |
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. A freeze longer than `--jvm-pause-limit-ms` ends the node with exit code 3, and it starts again. |
-| `LeaderStallTest` | The rule of `LeaderStall`. With one node down, the reply to a new leader's first entry is lost on a link, after the entry reached the follower's disk: nothing commits and the leader stays, until it steps down and a write gets through. The same loss after the first commit heals with the next write. A leader behind in applying does not step down. |
+| `ClusterIdentityTest` | Each genesis gets its own id, and a second `Genesis` in a log changes nothing. A node that elected itself under the same group id, added with Ratis' own client, stops before the configuration changes, and writes go on. What `add-peer` refuses. |
+| `LeaderStallTest` | The rule of `LeaderStall`, the bound that grows and comes back, and the rule of a log that stops, which a real leader with a stopped log worker follows within seconds. A graceful stop of the leader with one node down, followed by a restart at once, loses no reply and costs no step down. With one node down, the reply to a new leader's first entry is lost on a link, after the entry reached the follower's disk: nothing commits and the leader stays, until it steps down and a write gets through. The same loss after the first commit heals with the next write. A leader behind in applying does not step down. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
-| `MembershipTest` | A node started with `--join` replaces a lost leader, however long before its `add-peer` it started and after a restart in between, catches up from a snapshot, and restarts with or without the option. A node removed while it runs exits. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. |
+| `MembershipTest` | A node started with `--join` replaces a lost leader, however long before its `add-peer` it started and after a restart in between, catches up from a snapshot, and restarts with or without the option. A node removed while it runs exits. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. A node of a seeded cluster is replaced whichever node leads. One step replacement of a lost leader, a lost follower, seeded or not, and of a leader that runs. `add-peer` refuses a node with a log of its own and a node started without `--join`, and fails at once without its node; a change without a majority ends at its limit; `--join` after a start without it is refused; `admin snapshot`; the warnings of a node that stays outside. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories, with read-modify-write updates and hot counters in them, are linearizable, and the transactional bank-transfer invariant holds. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
