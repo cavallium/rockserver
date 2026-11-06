@@ -2160,8 +2160,9 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
    and in item 3), and the round-6 commits `9b69ebb15` and `6358380bc` (an embedded test that the update
    cleanup leaves no transaction open and closes each update once, the in-flight limit warning from one tested helper,
    also in the settings comments), the round-7 commits `b0f42c8bd` and `414f3109f` (that test checks double closes
-   per update id and drives the cancel and overload close paths), and the round-8 commit `b8b713488` (a body's own
-   error after an unconfirmed chained read runs the update again, below). Left on the Yotsuba side:
+   per update id and drives the cancel and overload close paths), and the round-8 commits `b8b713488` (a body's own
+   error after an unconfirmed chained read runs the update again, below) and `520170f65` (its review: resent
+   closes, the exhausted retry's message). Left on the Yotsuba side:
    - Merge the branch, build it against a released `rockserver-core` of this version (the branch was compiled and
      tested against local builds of it; Yotsuba's pom still pins 2.0.3), and deploy it.
    - Set `database.rockserver.nodes` in the deployed settings once the cluster exists.
@@ -2202,7 +2203,21 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `UnconfirmedReadRetryException` instead: an `UPDATE_RETRY` with the body's error suppressed in it, which the
      callers' optimistic retries (`optimisticUpdateRetry`, the messages' own) run again from a new read. If the new
      read is real and the body fails again, its close succeeds and the caller gets the body's error; if the
-     retries run out, the retry exhausted error carries it. Any other failure keeps the old behaviour (the close's
+     retries run out, the retry exhausted error carries it. That last case is left as it is, on purpose: when the
+     base commit does not settle for all 17 attempts, no read was confirmed, so the body's error (say
+     `CommunitiesImpl`'s `IllegalArgumentException`, "Community patch changed source or identity") may be about a
+     value that never existed, and the caller gets an `UPDATE_RETRY` exhaustion (Reactor's retry exhausted error,
+     its cause the `UnconfirmedReadRetryException`) with the body's error in the cause's suppressed list and,
+     since the review commit `520170f65`, in its message, so a log line that prints the cause still shows it. It is
+     bounded, and no caller branches on the body's error type: the importers' `patchCommunity` calls (bot API,
+     TDLib) pass the error on, and the web API's mapping of `IllegalArgumentException` to HTTP 400 never reaches an
+     update body (the web API makes no update calls). A resent close is the other place where the cluster's answer
+     is not quiet: `retryCloseFailedUpdateOnOverload` sends a close again after `SERVER_OVERLOADED`, which a
+     forwarding follower also answers when its stream to the leader broke after the close ran. For a chained
+     update the resend finds nothing held and answers `UPDATE_RETRY`; after a body's own error that is one extra
+     run (the body fails again on a real read, that close succeeds and the caller gets its error;
+     `RockserverUpdateTransactionsTest.aLostCloseAnswerAfterABodyErrorRunsTheUpdateOnceMore`), and nothing was
+     written. Any other failure keeps the old behaviour (the close's
      answer is logged, the caller gets the body's failure). That covers the first case: there the body's failure is
      the ending write's own Rockserver error, and an unknown outcome or a deadline must never become a rerun, since
      the write may have applied. The rule relies on one contract of Yotsuba's bodies: the call with the update id
@@ -2217,7 +2232,9 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      Yotsuba with fakes (`RockserverUpdateTransactionsTest`) and against an embedded single node whose close is made
      to answer `UPDATE_RETRY` (`RockserverUpdateCleanupEmbeddedTest`), not against a running replicated server. The
      same commit fixes the javadoc of `RockserverUpdateTransactions.updateAlreadyEnded`, which said the cluster
-     answers a close of a dropped update quietly: it now says so only without `--pipelined-updates`.
+     answers a close of a dropped update quietly: it now says so only without `--pipelined-updates`, and
+     `520170f65` does the same for `retryCloseFailedUpdateOnOverload` and the workload mapping's paragraph on
+     resent closes.
 
    On the Rockserver side, the core client's automatic gRPC retry of reads waits for its backoff before it sends a
    read to the next node: 50 ms, then growing, on a connection with several addresses (the next node is another one,
