@@ -256,6 +256,65 @@ class ProposerCopiesTest {
 		}
 	}
 
+	/**
+	 * R6-6b: the cap of the wait above. A caller completes its future exceptionally while the batch is paused before
+	 * encoding its write, and the encoding does not end: the future is still completed, with the caller's error, once
+	 * {@link Proposer#MAX_ENCODE_WAIT_NANOS} passed (the control-plane timer), not left waiting for the encoding.
+	 */
+	@Test
+	void aCallerGivingUpWhileTheEncodingDoesNotEndIsAnsweredAfterTheCap() throws Exception {
+		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
+		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(Duration.ofSeconds(3));
+		var metrics = new NodeMetrics("n0");
+		var threads = new NodeThreads("n0");
+		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
+				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
+		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics, threads.control());
+		var release = new CountDownLatch(1);
+		try {
+			var entered = new CountDownLatch(1);
+			proposer.beforeEncodeForTesting = () -> {
+				entered.countDown();
+				try {
+					release.await(20, TimeUnit.SECONDS);
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+				}
+			};
+			var entry = new LogEntry.Put(1, key(3), text("v"), RequestTypeId.NOTHING);
+			Thread.ofVirtual().start(() -> proposer.propose(entry));
+			assertTrue(entered.await(10, TimeUnit.SECONDS), "the batch took the write");
+			var pending = livePending(proposer);
+			var write = Objects.requireNonNull(pending.callerCopy);
+			proposer.beforeEncodeForTesting = null;
+			assertTrue(pending.isEncoding());
+
+			var givenUp = new IllegalStateException("the caller gave up");
+			long start = System.nanoTime();
+			assertTrue(write.completeExceptionally(givenUp), "taken: answered later");
+			assertFalse(write.isDone(), "not answered while the batch has not read the buffers");
+			var error = assertThrows(ExecutionException.class, () -> write.get(5, TimeUnit.SECONDS));
+			long waited = System.nanoTime() - start;
+			assertTrue(error.getCause() == givenUp, String.valueOf(error.getCause()));
+			assertTrue(pending.isEncoding(), "answered by the cap, while the encoding still had not ended");
+			assertTrue(waited >= Proposer.MAX_ENCODE_WAIT_NANOS - TimeUnit.MILLISECONDS.toNanos(50),
+					"not before the cap: " + TimeUnit.NANOSECONDS.toMillis(waited) + " ms");
+			assertTrue(waited < Proposer.MAX_ENCODE_WAIT_NANOS + TimeUnit.SECONDS.toNanos(2),
+					"at the cap: " + TimeUnit.NANOSECONDS.toMillis(waited) + " ms");
+			release.countDown();
+			try {
+				pending.result.get(15, TimeUnit.SECONDS);
+			} catch (ExecutionException expected) {
+				// abandoned, or no leader
+			}
+		} finally {
+			release.countDown();
+			proposer.close();
+			threads.close();
+			metrics.close();
+		}
+	}
+
 	private static Keys key(long value) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(value).array()));
 	}

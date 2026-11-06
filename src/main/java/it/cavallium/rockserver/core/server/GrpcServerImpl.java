@@ -1043,41 +1043,61 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		return Mono.defer(() -> {
 			var buffer = new LatencyMultiBuffer<T>(NUMBERED_MULTI_MAX_ITEMS, NUMBERED_MULTI_MAX_BYTES,
 					"numbered " + requestName);
-			// held[0]: bytes taken from the budget; held[1] != 0 once given back (a cancel may race a late item).
-			var held = new long[2];
+			var hold = new CollectHold(numberedCollectBytes, numberedCollectLimit);
 			return dataFlux
 					.doOnNext(value -> {
 						long bytes = numberedItemBytes(value, encodedInputBytes.applyAsLong(value));
 						buffer.add(value, bytes);
-						synchronized (held) {
-							if (held[1] != 0 || !takeCollectBytes(bytes)) {
-								throw RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
-										"numbered " + requestName + ": the server is collecting too many multi writes ("
-												+ numberedCollectLimit + " bytes), retry later");
-							}
-							held[0] += bytes;
+						if (!hold.take(bytes)) {
+							throw RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
+									"numbered " + requestName + ": the server is collecting too many multi writes ("
+											+ numberedCollectLimit + " bytes), retry later");
 						}
 					})
 					.then(Mono.fromSupplier(buffer::values))
-					.doFinally(signal -> {
-						synchronized (held) {
-							numberedCollectBytes.addAndGet(-held[0]);
-							held[0] = 0;
-							held[1] = 1;
-						}
-					});
+					.doFinally(_ -> hold.end());
 		});
 	}
 
-	private boolean takeCollectBytes(long bytes) {
-		while (true) {
-			long current = numberedCollectBytes.get();
-			if (current + bytes > numberedCollectLimit) {
+	/**
+	 * The bytes one numbered multi write being collected took from the server's collect budget: each item takes its
+	 * own, and {@link #end} gives them all back once, when the collection ends. A late item that races a cancel and
+	 * arrives after the end takes nothing (it fails as if the budget were full), so nothing stays taken.
+	 */
+	static final class CollectHold {
+
+		private final AtomicLong budget;
+		private final long limit;
+		private long held;
+		private boolean ended;
+
+		CollectHold(AtomicLong budget, long limit) {
+			this.budget = budget;
+			this.limit = limit;
+		}
+
+		/** Takes {@code bytes} from the budget: false, taking nothing, if it is full or the collection ended. */
+		synchronized boolean take(long bytes) {
+			if (ended) {
 				return false;
 			}
-			if (numberedCollectBytes.compareAndSet(current, current + bytes)) {
-				return true;
+			while (true) {
+				long current = budget.get();
+				if (current + bytes > limit) {
+					return false;
+				}
+				if (budget.compareAndSet(current, current + bytes)) {
+					held += bytes;
+					return true;
+				}
 			}
+		}
+
+		/** Gives back what the items took; later items take nothing. */
+		synchronized void end() {
+			budget.addAndGet(-held);
+			held = 0;
+			ended = true;
 		}
 	}
 
