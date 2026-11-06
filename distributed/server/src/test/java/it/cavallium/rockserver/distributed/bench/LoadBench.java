@@ -51,9 +51,10 @@ import java.util.concurrent.locks.LockSupport;
  * {@link YotsubaWorkload#MERGES_PER_SLOT} merges only, so values stay under 600 bytes and later steps of a run measure
  * the same read and merge as earlier ones.</p>
  *
- * <p>{@code --delete-range-rate R} adds {@code DELETE_RANGE} (WA-1, see {@link Kind#DELETE_RANGE}: a putMulti of 16
- * keys, then the deleteRange that removes them, alternating per chat) to the mix at R calls per second at scale 1;
- * {@code --only DELETE_RANGE} runs it alone.</p>
+ * <p>{@code --delete-range-rate R} adds {@code DELETE_RANGE} (WA-1, see {@link Kind#DELETE_RANGE}: one call is a
+ * putMulti of 16 keys into a window of its own, then the deleteRange that removes them) to the mix at R calls per
+ * second at scale 1; {@code --only DELETE_RANGE} runs it alone. Its {@code range-deletes} column is created only then.
+ * </p>
  *
  * <p>{@code --hot-keys N:SHARE} sends that share of the updates to N single keys, for what one key sustains; compare
  * with and without {@code --server-arg --pipelined-updates}. {@code --only UPDATE --hot-keys 1:1} isolates it.</p>
@@ -131,7 +132,7 @@ public final class LoadBench {
 			var connections = connect(nodes, replicated);
 			try {
 				var setup = connections.getFirst().getAsyncApi(RequestContext.batch(YotsubaWorkload.TIMEOUT));
-				workload.createColumns(setup);
+				workload.createColumns(setup, mix.getOrDefault(Kind.DELETE_RANGE, 0.0) > 0);
 				long preloadStart = System.nanoTime();
 				workload.preload(setup, 512, 16);
 				double preloadSeconds = (System.nanoTime() - preloadStart) / 1e9;

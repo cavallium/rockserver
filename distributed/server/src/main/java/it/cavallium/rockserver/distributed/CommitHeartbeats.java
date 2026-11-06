@@ -6,9 +6,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.grpc.GrpcFactory;
@@ -50,7 +53,7 @@ import org.jetbrains.annotations.Nullable;
  * ({@code ServerImplUtils.effectiveCommitIndex}) and tells the follower nothing; the follower then waited a full
  * heartbeat interval. This appender instead waits for that append's reply, which wakes it again, and sends the
  * heartbeat then. Its wake signal ({@link WakeSignal}) keeps a wake given while it is not waiting, which Ratis' own
- * signal loses.</p>
+ * signal loses, when that wake would make it send a commit heartbeat.</p>
  *
  * <p>{@link #send} wakes only the appenders whose follower lags below the index and that have no append in flight: a
  * woken appender with appends in flight would send Ratis' heartbeat with commit index 0, extra load on a follower that
@@ -86,6 +89,12 @@ final class CommitHeartbeats {
 	volatile boolean enabled = true;
 	/** Tests only: false does not send a heartbeat again after its stream broke. */
 	volatile boolean resendOnNewStream = true;
+	/**
+	 * Tests only: called by an appender that built nothing to send, just before it returns to its loop and waits; the
+	 * first call that returns true removes it. Lets a test call {@link #send} exactly in the moment a lost wake would
+	 * be lost (R7-1).
+	 */
+	final AtomicReference<@Nullable Predicate<Appender>> whenNothingToSend = new AtomicReference<>();
 
 	CommitHeartbeats(Supplier<@Nullable RaftServer> server, RaftGroupId groupId) {
 		this.commitIndex = () -> {
@@ -221,7 +230,7 @@ final class CommitHeartbeats {
 		Appender(RaftServer.Division server, LeaderState state, FollowerInfo follower,
 				@Nullable CommitHeartbeats heartbeats) {
 			super(server, state, follower);
-			this.wake = new WakeSignal(follower.getName());
+			this.wake = new WakeSignal(follower.getName(), this::wantsCommitHeartbeat);
 			this.heartbeats = heartbeats;
 			if (heartbeats != null) {
 				heartbeats.appenders.add(this);
@@ -262,8 +271,26 @@ final class CommitHeartbeats {
 			}
 			if (request != null) {
 				window.sent(request.getLeaderCommit(), System.nanoTime());
+			} else if (!heartbeat && heartbeats != null) {
+				var hook = heartbeats.whenNothingToSend.get();
+				if (hook != null && hook.test(this)) {
+					heartbeats.whenNothingToSend.compareAndSet(hook, null);
+				}
 			}
 			return request;
+		}
+
+		/**
+		 * Whether this appender, woken now, would send a commit heartbeat: its follower lags below the wanted commit
+		 * index, no request carrying it went out on the current stream, and no append is in flight. The condition under
+		 * which {@link WakeSignal} keeps a wake given while the appender is not waiting. Called from any thread.
+		 */
+		boolean wantsCommitHeartbeat() {
+			if (heartbeats == null || !heartbeats.enabled) {
+				return false;
+			}
+			long target = Math.min(getRaftLog().getLastCommittedIndex(), heartbeats.wanted());
+			return target > getFollower().getCommitIndex() && target > window.sentCommit() && !hasPendingDataRequests();
 		}
 
 		/** Half the minimum election timeout: by then Ratis' own heartbeat, which carries the commit index, is due. */
@@ -339,8 +366,11 @@ final class CommitHeartbeats {
 		/** The most heartbeats sent again for one commit index. */
 		static final int MAX_RESENDS = 3;
 
-		/** The highest commit index that a request on the current stream carried, -1 after the stream broke. */
-		private long sentCommit = -1;
+		/**
+		 * The highest commit index that a request on the current stream carried, -1 after the stream broke. Written by
+		 * the appender's thread only, read by others too ({@link Appender#wantsCommitHeartbeat}).
+		 */
+		private volatile long sentCommit = -1;
 		/** The highest commit index ever sent; its first send opened the window. */
 		private long windowCommit = -1;
 		private long windowStartNanos;
@@ -387,24 +417,55 @@ final class CommitHeartbeats {
 	 * {@code await} reads the new one, so a wake given while the appender is not waiting (between building its requests
 	 * and {@code GrpcLogAppender.mayWait}) is lost: the appender then waits its full wait, a heartbeat interval, and the
 	 * commit heartbeat that {@link CommitHeartbeats#send} asked for in that moment goes out only with Ratis' heartbeat.
-	 * Here a wake is kept until the next wait takes it, which then returns at once; the appender then looks at everything
-	 * again, so a wake given before the wait is never lost and two wakes cost at most one extra pass of its loop.
+	 *
+	 * <p>Here a wake given while the appender is not waiting is kept, so that the next wait takes it and returns at once,
+	 * but only if {@code keepEarlyWake} says the appender would then send a commit heartbeat
+	 * ({@link Appender#wantsCommitHeartbeat}). Every other early wake is dropped, as Ratis drops it: Ratis wakes every
+	 * appender on every commit and an appender on every reply, and under write load, with the appender at its limit of
+	 * appends in flight, each kept wake would buy one more pass of its loop, and that pass an empty heartbeat with commit
+	 * index 0 ({@code GrpcLogAppender.run} calls {@code appendLog(haveTooManyPendingRequests())}). Ratis recovers from the
+	 * wakes it drops by itself: its wait is 0 while it has entries to send ({@code GrpcLogAppender.getWaitTimeMs}). A
+	 * wake given while the appender waits always wakes it.</p>
+	 *
+	 * <p>{@code keepEarlyWake} is called outside the lock: it reads Ratis state, and the thread that signals may hold a
+	 * Ratis lock.</p>
 	 */
 	static final class WakeSignal extends AwaitForSignal {
 
 		private final ReentrantLock lock = new ReentrantLock();
 		private final Condition woken = lock.newCondition();
+		private final BooleanSupplier keepEarlyWake;
 		private boolean signaled;
+		/** Threads in {@link #await}: one, the appender's, or none. */
+		private int waiting;
+		private final AtomicLong awaits = new AtomicLong();
+		private final AtomicLong kept = new AtomicLong();
 
-		WakeSignal(Object name) {
+		WakeSignal(Object name, BooleanSupplier keepEarlyWake) {
 			super(name);
+			this.keepEarlyWake = keepEarlyWake;
 		}
 
 		@Override
 		public void signal() {
 			lock.lock();
 			try {
+				if (waiting > 0) {
+					signaled = true;
+					woken.signalAll();
+					return;
+				}
+			} finally {
+				lock.unlock();
+			}
+			if (!keepEarlyWake.getAsBoolean()) {
+				return;
+			}
+			lock.lock();
+			try {
+				// The appender may be waiting by now; then this wakes it, which it would want anyway.
 				signaled = true;
+				kept.incrementAndGet();
 				woken.signalAll();
 			} finally {
 				lock.unlock();
@@ -413,20 +474,25 @@ final class CommitHeartbeats {
 
 		@Override
 		public void await() throws InterruptedException {
+			awaits.incrementAndGet();
 			lock.lock();
+			waiting++;
 			try {
 				while (!signaled) {
 					woken.await();
 				}
 				signaled = false;
 			} finally {
+				waiting--;
 				lock.unlock();
 			}
 		}
 
 		@Override
 		public boolean await(long time, TimeUnit unit) throws InterruptedException {
+			awaits.incrementAndGet();
 			lock.lock();
+			waiting++;
 			try {
 				long nanos = unit.toNanos(time);
 				while (!signaled) {
@@ -438,8 +504,19 @@ final class CommitHeartbeats {
 				signaled = false;
 				return true;
 			} finally {
+				waiting--;
 				lock.unlock();
 			}
+		}
+
+		/** Tests only: calls of {@code await}, to show that Ratis waits on this signal. */
+		long awaits() {
+			return awaits.get();
+		}
+
+		/** Tests only: wakes given while nobody waited that were kept for the next wait. */
+		long kept() {
+			return kept.get();
 		}
 	}
 }

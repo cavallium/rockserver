@@ -642,6 +642,63 @@ class RatisContractTest {
 		assertTrue(trigger.resent() >= 5, "every lost heartbeat was sent again");
 	}
 
+	/**
+	 * R7-1: a {@link CommitHeartbeats#send} that lands after the leader's appender built nothing to send and before it
+	 * waits still gets its heartbeat out at once. {@link CommitHeartbeats#whenNothingToSend} calls {@code send} in exactly
+	 * that moment: inside {@code newAppendEntriesRequest}, on the appender's own thread, once the leader has committed a
+	 * new write that the follower does not know about yet. The other follower is stopped first, so that no reply of
+	 * its own changes a commit index and wakes the parked appender by accident (Ratis wakes every appender on every
+	 * follower commit change). Heartbeats come every 3 s here; the follower must learn the commit index within 600 ms
+	 * of the {@code send}, five rounds in a row. The test also checks that Ratis waited on the appender's
+	 * {@link CommitHeartbeats.WakeSignal}: a Ratis that waited on its own field instead would fail here. With Ratis'
+	 * {@code AwaitForSignal} (drop the {@code getEventAwaitForSignal} override) the wake is lost and the commit index
+	 * comes with the next heartbeat, seconds later.
+	 */
+	@Test
+	void aCommitHeartbeatAskedForJustBeforeTheAppenderWaitsIsNotLost() throws Exception {
+		var cluster = startHeartbeatCluster(true, true, false);
+		var trigger = cluster.trigger();
+		var follower = cluster.followers().getFirst();
+		var stopped = cluster.followers().getLast();
+		stopped.close();
+		var followerName = follower.getId().toString();
+		var appender = trigger.appenderSet().stream()
+				.filter(candidate -> candidate.getFollower().getId().toString().equals(followerName))
+				.findFirst().orElseThrow();
+		var wake = (CommitHeartbeats.WakeSignal) appender.getEventAwaitForSignal();
+		var followerLog = follower.getDivision(groupId).getRaftLog();
+		var leaderLog = cluster.leader().getDivision(groupId).getRaftLog();
+		var lags = new ArrayList<Long>();
+		for (int i = 0; i < 5; i++) {
+			// Let Ratis' heartbeat after the previous round pass, so that it cannot carry this round's commit index.
+			Thread.sleep(200);
+			long before = leaderLog.getLastCommittedIndex();
+			var sentAt = new AtomicLong();
+			trigger.whenNothingToSend.set(nothing -> {
+				if (nothing != appender || leaderLog.getLastCommittedIndex() <= before
+						|| nothing.getFollower().getCommitIndex() > before) {
+					return false;
+				}
+				trigger.send();
+				sentAt.set(System.nanoTime());
+				return true;
+			});
+			long target = write(cluster.leader(), "j" + i);
+			waitUntil(() -> sentAt.get() != 0, "the appender built nothing after the commit, and send() ran then");
+			long start = sentAt.get();
+			while (followerLog.getLastCommittedIndex() < target) {
+				assertTrue(System.nanoTime() - start < WAIT.toNanos(), "the follower learns the commit index");
+				Thread.sleep(0, 200_000);
+			}
+			lags.add(TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start));
+		}
+		System.out.println("Commit index on the follower after a send() just before the appender's wait, us: " + lags
+				+ "; early wakes kept: " + wake.kept() + ", waits: " + wake.awaits());
+		assertTrue(wake.awaits() > 0, "Ratis waits on the appender's WakeSignal");
+		assertTrue(wake.kept() >= 5, "each round's wake came before the wait and was kept");
+		assertTrue(lags.stream().allMatch(lag -> lag < 600_000), lags::toString);
+	}
+
 	/** CPU time of the leader's threads that append to {@code followerId} (named {@code ...->followerId-...}). */
 	private static long appenderCpuNanos(ThreadMXBean threads, String followerId) {
 		long total = 0;

@@ -64,7 +64,7 @@ class CommitHeartbeatsTest {
 	 */
 	@Test
 	void aWakeGivenBeforeTheWaitIsNotLost() throws Exception {
-		var signal = new CommitHeartbeats.WakeSignal("test");
+		var signal = new CommitHeartbeats.WakeSignal("test", () -> true);
 		signal.signal();
 		long start = System.nanoTime();
 		assertTrue(signal.await(5, TimeUnit.SECONDS), "the wait takes the earlier wake");
@@ -92,6 +92,46 @@ class CommitHeartbeatsTest {
 		waiter.join(TimeUnit.SECONDS.toMillis(5));
 		assertFalse(waiter.isAlive());
 		assertTrue(result[0]);
+	}
+
+	/**
+	 * R7-1 follow-up: a wake given while the appender is not waiting is kept only when it would make the appender send a
+	 * commit heartbeat. Any other early wake is dropped as Ratis drops it, so that the wakes of every commit and reply do
+	 * not each buy the appender another pass, and at its limit of appends in flight another empty heartbeat. A wake
+	 * given while it waits still wakes it. Before this, every early wake was kept, and the first wait below returned.
+	 */
+	@Test
+	void anEarlyWakeIsKeptOnlyWhenACommitHeartbeatIsWanted() throws Exception {
+		var wanted = new java.util.concurrent.atomic.AtomicBoolean(false);
+		var signal = new CommitHeartbeats.WakeSignal("test", wanted::get);
+		signal.signal();
+		signal.signal();
+		assertFalse(signal.await(20, TimeUnit.MILLISECONDS), "an early wake that wants no commit heartbeat is dropped");
+		assertEquals(0, signal.kept());
+		wanted.set(true);
+		signal.signal();
+		assertTrue(signal.await(0, TimeUnit.MILLISECONDS), "an early wake that wants a commit heartbeat is kept");
+		assertEquals(1, signal.kept());
+		wanted.set(false);
+
+		var waiting = new CountDownLatch(1);
+		var result = new boolean[1];
+		var waiter = Thread.ofPlatform().start(() -> {
+			waiting.countDown();
+			try {
+				result[0] = signal.await(10, TimeUnit.SECONDS);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		});
+		waiting.await();
+		Thread.sleep(50);
+		signal.signal();
+		waiter.join(TimeUnit.SECONDS.toMillis(5));
+		assertFalse(waiter.isAlive());
+		assertTrue(result[0], "a wake given while waiting wakes, whatever the condition says");
+		assertEquals(1, signal.kept(), "that wake was not an early one");
+		assertEquals(3, signal.awaits());
 	}
 
 	/**

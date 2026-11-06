@@ -57,9 +57,11 @@ calls for bandwidth, or `MERGE`, single merges of an 8-byte operand that each co
 merges only, so values stay under 600 bytes and the cost per merge does not drift during a run), `--merge-rate R`
 (adds `MERGE` to the mix at R per second at scale 1; whenever it runs, every column gets the string-append merge
 operator through `<root>/merge.conf`, unless a `--server-arg --rockserver-config` is given), `--delete-range-rate R`
-(WA-1: adds `DELETE_RANGE` to the mix at R calls per second at scale 1, or `--only DELETE_RANGE` alone; per chat the
-calls alternate between a `putMulti` that fills a window of 16 keys in the `range-deletes` column and the `deleteRange`
-that empties that window, so every delete removes live keys and the column does not grow; the row counts both calls.
+(WA-1: adds `DELETE_RANGE` to the mix at R calls per second at scale 1, or `--only DELETE_RANGE` alone; each call
+takes the next window of 16 keys of a skewed chat in the `range-deletes` column, fills it with a `putMulti`, waits,
+and then empties it with a `deleteRange`, so a window belongs to one call, every delete removes live keys and the
+column does not grow even when calls of a hot chat overlap; a call's latency is that of both writes in a row, and the
+`range-deletes` column is created only in runs that have `DELETE_RANGE`, so other runs keep the earlier column set.
 Not run yet: compare it with `--only HISTORY_PUT_MULTI` at the same rate for the cost of the deletes through the log
 and at apply), `--max-in-flight N`, `--route all` (clients spread over every node, so most requests are
 forwarded), `--route failover` (spread over every node too, each connection listing every node, starting from a
