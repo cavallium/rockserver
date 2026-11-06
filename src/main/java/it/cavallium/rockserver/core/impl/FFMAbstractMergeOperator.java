@@ -216,7 +216,9 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
     }
 
     private static void recordFailureOnThisThread(Throwable failure) {
-        if (!(failure instanceof VirtualMachineError)) {
+        // A failure of the JVM anywhere in the chain (an operator may wrap it) is not the operator's: RocksDB then
+        // reports the failed merge as a corruption, a local failure.
+        if (!it.cavallium.rockserver.core.common.Failures.isJvmFailure(failure)) {
             FAILURE_ON_THREAD.set(failure);
         }
     }

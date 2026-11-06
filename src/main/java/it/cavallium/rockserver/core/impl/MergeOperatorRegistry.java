@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl;
 
+import it.cavallium.rockserver.core.common.Failures;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.impl.rocksdb.LeakSafeWriteBatch;
@@ -320,9 +321,31 @@ public class MergeOperatorRegistry implements Closeable {
             } catch (NoSuchMethodException e) {
                  return (FFMAbstractMergeOperator) clazz.getConstructor().newInstance();
             }
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to instantiate " + className, e);
+        } catch (Throwable e) {
+            if (Failures.isJvmFailure(e)) {
+                // Out of memory, stack overflow...: a failure of this JVM, not of the operator.
+                throw Failures.rethrow(e);
+            }
+            throw cannotInstantiate(className, e);
         }
+    }
+
+    /**
+     * An operator that cannot be loaded or instantiated: missing class, wrong type, a constructor or static
+     * initializer that throws, a dependency missing from the JAR. The same code fails the same way on every machine,
+     * so this is a rejection of the request, never a local failure: the failure is kept as suppressed, not as the
+     * cause (an {@link Error} cause would read as a failure of this JVM), and described without process details.
+     */
+    private static RocksDBException cannotInstantiate(String className, Throwable failure) {
+        Throwable reason = failure;
+        while ((reason instanceof java.lang.reflect.InvocationTargetException
+                || reason instanceof ExceptionInInitializerError) && reason.getCause() != null) {
+            reason = reason.getCause();
+        }
+        var rejected = RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
+                "Merge operator class " + className + " cannot be instantiated: " + Failures.describe(reason));
+        rejected.addSuppressed(failure);
+        return rejected;
     }
     
     private void validateJar(byte[] jarData) {

@@ -381,9 +381,17 @@ Raft log on disk instead of decoded on the heap. Any error on the apply or compl
     failed merge as a `Corruption` status, which alone would look like a broken disk. The operator records its
     failure on the thread that ran it (a read of a merged key runs the operator on the reading thread), and the
     apply names it. Bucketed columns run the operator from Java, and report it directly. A failure of the JVM
-    itself inside the operator (out of memory, stack overflow) stays local;
-  - any other exception of the apply code (a bug: a `NullPointerException`, a bad cast), as `INTERNAL_ERROR`
-    with the exception's text. Every replica runs the same binary, so it fails the same way everywhere.
+    itself inside the operator (out of memory, stack overflow, an `IOError`, or a class whose initialization one
+    of these ended) stays local, even when the operator wraps it: the whole cause chain is checked first;
+  - an uploaded merge operator that cannot be loaded or instantiated (a missing class, a constructor or static
+    initializer that throws, an `Error` included, but not a failure of the JVM), as `INVALID_REQUEST`. Nothing is
+    stored for it, so a replay after a restart rejects it the same way;
+  - any other exception of the apply code (a bug: a `NullPointerException`, a bad cast), as `INTERNAL_ERROR`.
+    Every replica runs the same binary, so it fails the same way everywhere.
+
+  The recorded text of these failures is the same on every replica: the exception's class and message, without
+  native addresses, identity hashes (as in class loader names) or thread names, which differ between processes.
+  The full failure is only logged.
 - **Local failures** report this machine, not the entry: an `IOException`, an `Error` (out of memory...), a
   native status of the storage or the process (`IOError`, `Corruption`, `NoSpace`, `Busy`, `TimedOut`,
   `Aborted`, `ShutdownInProgress`, or no status at all), a lost local transaction, a failed commit of the group,

@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.RequestType.RequestDelete;
 import it.cavallium.rockserver.core.common.RequestType.RequestMerge;
 import it.cavallium.rockserver.core.common.RequestType.RequestPut;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
+import it.cavallium.rockserver.core.common.Failures;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
@@ -27,6 +28,8 @@ import java.util.ArrayList;
 import java.util.List;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Applies log entries to the local database. Called only by the state machine's apply thread, apart from the static
@@ -45,6 +48,8 @@ import org.jetbrains.annotations.Nullable;
  * as {@link ReplicaFailedException}, and the replica stops instead of skipping the entry.</p>
  */
 final class Applier {
+
+	private static final Logger LOG = LoggerFactory.getLogger(Applier.class);
 
 	/** This replica cannot apply the log any more and must be repaired. */
 	static final class ReplicaFailedException extends RuntimeException {
@@ -1022,12 +1027,16 @@ final class Applier {
 					yield db.uploadMergeOperator(upload.name(), upload.className(), upload.jarData());
 				} catch (LinkageError badJar) {
 					// Malformed or incompatible classes fail the same way on every replica: a rejection, not a local
-					// failure that would stop them all.
-					throw new IllegalArgumentException("Merge operator " + upload.name() + " cannot be loaded: " + badJar,
-							null);
+					// failure that would stop them all. Unless the JVM ended a class initialization (out of memory).
+					if (Failures.isJvmFailure(badJar)) {
+						throw badJar;
+					}
+					throw new IllegalArgumentException("Merge operator " + upload.name() + " cannot be loaded: "
+							+ Failures.describe(badJar), null);
 				} catch (RocksDBException failed) {
-					// An operator that cannot be instantiated (missing class, wrong type, failing constructor) is
-					// reported as PUT_UNKNOWN_ERROR; only a storage error below it is a local failure.
+					// An operator that cannot be instantiated (missing class, wrong type, a constructor that throws, an
+					// Error included) is a PUT_INVALID_REQUEST whose failure is only suppressed; only a storage error or a
+					// failure of the JVM below it is a local failure.
 					if (isLocalFailure(failed)) {
 						throw failed;
 					}
@@ -1226,13 +1235,23 @@ final class Applier {
 			if (isLocalFailure(failure)) {
 				throw new ReplicaFailedException("Storage failure while applying", failure);
 			}
-			return switch (failure) {
-				case RocksDBException rocksDBException ->
-						new ApplyResult.Failed(rocksDBException.getErrorUniqueId(), String.valueOf(failure.getMessage()));
-				case IllegalArgumentException _, UnsupportedOperationException _ ->
-						new ApplyResult.Failed(RocksDBErrorType.INVALID_REQUEST, String.valueOf(failure.getMessage()));
-				default -> new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR, failure.toString());
+			// The recorded text must be the same on every replica: without addresses, identity hashes or thread names
+			// (see Failures). The full failure is only logged here.
+			var result = switch (failure) {
+				case RocksDBException rocksDBException -> new ApplyResult.Failed(rocksDBException.getErrorUniqueId(),
+						Failures.sanitize(String.valueOf(failure.getMessage())));
+				case IllegalArgumentException _, UnsupportedOperationException _ -> new ApplyResult.Failed(
+						RocksDBErrorType.INVALID_REQUEST, Failures.sanitize(String.valueOf(failure.getMessage())));
+				default -> new ApplyResult.Failed(RocksDBErrorType.INTERNAL_ERROR, Failures.describe(failure));
 			};
+			if (result.type() == RocksDBErrorType.INTERNAL_ERROR) {
+				// A bug of the apply code: worth its stack trace.
+				LOG.warn("Entry failed the same way on every replica, recorded as {}", result.type(), failure);
+			} else if (result.type() == RocksDBErrorType.MERGE_OPERATOR_FAILED) {
+				LOG.warn("Merge operator failed, recorded as {}: {}", result.type(),
+						String.valueOf(failure.getCause() != null ? failure.getCause() : failure));
+			}
+			return result;
 		}
 	}
 
@@ -1260,6 +1279,11 @@ final class Applier {
 	 * Everything else (a rejection, an exception of the apply code) is deterministic.
 	 */
 	static boolean isLocalFailure(Throwable error) {
+		// First the whole chain, past a merge operator failure too: an operator may wrap a failure of this JVM (out of
+		// memory, stack overflow), which other replicas did not have.
+		if (Failures.isJvmFailure(error)) {
+			return true;
+		}
 		for (Throwable t = error; t != null; t = t.getCause()) {
 			if (t instanceof RocksDBException rocksDBException) {
 				if (rocksDBException.getErrorUniqueId() == RocksDBErrorType.MERGE_OPERATOR_FAILED) {
