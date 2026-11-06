@@ -200,27 +200,41 @@ class PoisonEntryTest {
 	}
 
 	@Test
-	void anOperandThatCannotBeMergedFailsTheWritesThatReadIt() throws Exception {
+	void aMergeThatReturnsNothingIsCheckedAtApplySoNoFlushCanFail() throws Exception {
+		long column;
 		try (var store = open()) {
 			var applier = new Applier(store);
-			long column = store.db().createColumn("c", SCHEMA);
+			column = store.db().createColumn("c", SCHEMA);
 			applier.apply(new Request(1, 0, 0, new LogEntry.Put(column, key(1), text("a"), RequestTypeId.NOTHING)),
 					TermIndex.valueOf(1, 1));
-			// Nothing reads the merged value: the operand is stored, unmerged.
-			assertInstanceOf(ApplyResult.Ok.class, applier.apply(new Request(1, 1, 0, new LogEntry.Merge(column, key(1),
-					text("boom"), RequestTypeId.NOTHING)), TermIndex.valueOf(1, 2)));
-			// Writes that read the key run the operator.
-			assertMergeFailure(applier.apply(new Request(1, 2, 0, new LogEntry.Put(column, key(1), text("p"),
-					RequestTypeId.PREVIOUS)), TermIndex.valueOf(1, 3)));
-			var guarded = new LogEntry.Guarded(1, 0, new long[0], new long[0],
-					List.of(new LogEntry.Put(column, key(1), text("g"), RequestTypeId.NOTHING)), true, 99,
-					LogEntry.Guard.of(column, key(1), text("a")));
-			assertMergeFailure(applier.apply(new Request(1, 3, 0, guarded), TermIndex.valueOf(1, 4)));
-			// A write that does not read it replaces it.
-			assertInstanceOf(ApplyResult.Ok.class, applier.apply(new Request(1, 4, 0, new LogEntry.Put(column, key(1),
-					text("q"), RequestTypeId.NOTHING)), TermIndex.valueOf(1, 5)));
-			assertEquals("q", text(store.db().get(0, column, key(1), RequestType.current())));
-			assertEquals(TermIndex.valueOf(1, 5), store.applied());
+			// Its result is not the merged value, but the operand is merged at once: it is refused, not stored.
+			assertMergeFailure(applier.apply(new Request(1, 1, 0, new LogEntry.Merge(column, key(1), text("boom"),
+					RequestTypeId.NOTHING)), TermIndex.valueOf(1, 2)));
+			assertMergeFailure(applier.apply(new Request(1, 2, 0, new LogEntry.Merge(column, key(9), text("void"),
+					RequestTypeId.NOTHING)), TermIndex.valueOf(1, 3)));
+			// In a group, a multi-merge with one bad operand fails whole, and the entries around it apply.
+			applier.beginGroup();
+			var batch = applier.applyBatch(List.of(
+					new Request(1, 3, 0, new LogEntry.Merge(column, key(1), text("b"), RequestTypeId.NOTHING)),
+					new Request(1, 4, 0, new LogEntry.MergeMulti(column, List.of(key(2), key(1)),
+							List.of(text("x"), text("boom")), RequestTypeId.NOTHING)),
+					new Request(1, 5, 0, new LogEntry.Merge(column, key(3), text("c"), RequestTypeId.NOTHING))),
+					TermIndex.valueOf(1, 4));
+			applier.endGroup();
+			assertInstanceOf(ApplyResult.Ok.class, batch.get(0));
+			assertMergeFailure(batch.get(1));
+			assertInstanceOf(ApplyResult.Ok.class, batch.get(2));
+			assertEquals("a,b", text(store.db().get(0, column, key(1), RequestType.current())));
+			assertNull(store.db().get(0, column, key(2), RequestType.current()));
+			assertNull(store.db().get(0, column, key(9), RequestType.current()));
+			// No unmergeable operand reached the memtable: the flush, which merges the key, succeeds.
+			store.db().flush();
+			assertEquals(TermIndex.valueOf(1, 4), store.applied());
+		}
+		try (var store = open()) {
+			assertEquals(TermIndex.valueOf(1, 4), store.applied());
+			assertEquals("a,b", text(store.db().get(0, column, key(1), RequestType.current())));
+			assertEquals("c", text(store.db().get(0, column, key(3), RequestType.current())));
 		}
 	}
 
@@ -298,5 +312,34 @@ class PoisonEntryTest {
 		assertFalse(node.isFailed());
 		assertEquals("c", text(node.stateMachine().store().db().get(0, column, key(2), RequestType.current())));
 		assertNull(node.stopped().getNow(null));
+	}
+
+	@Test
+	void aFailingMergeThatReturnsNothingLeavesEveryReplicaServingAndFlushable() throws Exception {
+		var poison = config();
+		cluster = new InProcessCluster(temp, 3, c -> c.withRockserverConfig(poison)).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = leader.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
+		long column = api.createColumn("c", SCHEMA);
+		api.put(0, column, key(1), text("a"), RequestType.none());
+		var failure = assertThrows(RocksDBException.class,
+				() -> api.merge(0, column, key(1), text("boom"), RequestType.none()));
+		assertEquals(RocksDBErrorType.MERGE_OPERATOR_FAILED, failure.getErrorUniqueId(), failure.getMessage());
+		api.merge(0, column, key(1), text("b"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		for (var node : cluster.runningNodes()) {
+			assertFalse(node.isFailed(), node.config().nodeId());
+			// The flush merges the key: it would fail had the bad operand been stored.
+			node.stateMachine().store().db().flush();
+			assertEquals("a,b", text(node.stateMachine().store().db().get(0, column, key(1), RequestType.current())));
+		}
+		var restarted = cluster.anyFollower().config().nodeId();
+		cluster.stop(restarted);
+		api.put(0, column, key(2), text("c"), RequestType.none());
+		var node = cluster.start(restarted);
+		cluster.awaitConverged(TIMEOUT);
+		assertFalse(node.isFailed());
+		assertEquals("a,b", text(node.stateMachine().store().db().get(0, column, key(1), RequestType.current())));
+		assertEquals("c", text(node.stateMachine().store().db().get(0, column, key(2), RequestType.current())));
 	}
 }
