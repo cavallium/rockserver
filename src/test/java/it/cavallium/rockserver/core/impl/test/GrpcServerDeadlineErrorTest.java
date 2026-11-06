@@ -313,7 +313,10 @@ class GrpcServerDeadlineErrorTest {
 		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
 			Field grpcField = GrpcServer.class.getDeclaredField("grpc");
 			grpcField.setAccessible(true);
-			Object grpc = grpcField.get(server);
+			Object service = grpcField.get(server);
+			Field contextsField = service.getClass().getDeclaredField("contexts");
+			contextsField.setAccessible(true);
+			Object grpc = contextsField.get(service);
 			Method mapper = grpc.getClass().getDeclaredMethod("mapRequestContext",
 					it.cavallium.rockserver.core.common.api.proto.RequestContext.class);
 			mapper.setAccessible(true);
@@ -896,8 +899,10 @@ class GrpcServerDeadlineErrorTest {
 
 	/** Swap the private static logger without changing production code just for this assertion. */
 	private static Logger swapGrpcServerLogger(Logger replacement) throws ReflectiveOperationException {
-		Class.forName(GrpcServer.class.getName(), true, GrpcServer.class.getClassLoader());
-		Field loggerField = GrpcServer.class.getDeclaredField("LOG");
+		// The late request failures are logged by GrpcRequestErrors, under the GrpcServer logger name.
+		Class<?> loggingClass = Class.forName("it.cavallium.rockserver.core.server.GrpcRequestErrors",
+				true, GrpcServer.class.getClassLoader());
+		Field loggerField = loggingClass.getDeclaredField("LOG");
 		Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
 		Field theUnsafeField = unsafeClass.getDeclaredField("theUnsafe");
 		theUnsafeField.setAccessible(true);

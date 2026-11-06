@@ -199,13 +199,13 @@ class GrpcCommandPreAdmissionTest {
 		var estimatedWork = it.cavallium.rockserver.core.impl.RWScheduler.EstimatedWork.class;
 		var rejectionAware = it.cavallium.rockserver.core.impl.RWScheduler.RejectionAwareTask.class;
 		assertTrue(estimatedWork.isAssignableFrom(Class.forName(
-				"it.cavallium.rockserver.core.server.GrpcServer$FastGetCallHandler$FastGetListener")));
+				"it.cavallium.rockserver.core.server.FastGetCallHandler$FastGetListener")));
 		assertTrue(estimatedWork.isAssignableFrom(Class.forName(
-				"it.cavallium.rockserver.core.server.GrpcServer$GrpcServerImpl$ScheduledCall")));
+				"it.cavallium.rockserver.core.server.GrpcScheduledCalls$ScheduledCall")));
 		assertTrue(rejectionAware.isAssignableFrom(Class.forName(
-				"it.cavallium.rockserver.core.server.GrpcServer$FastGetCallHandler$FastGetListener")));
+				"it.cavallium.rockserver.core.server.FastGetCallHandler$FastGetListener")));
 		assertTrue(rejectionAware.isAssignableFrom(Class.forName(
-				"it.cavallium.rockserver.core.server.GrpcServer$GrpcServerImpl$ScheduledCall")));
+				"it.cavallium.rockserver.core.server.GrpcScheduledCalls$ScheduledCall")));
 	}
 
 	@Test
@@ -214,7 +214,8 @@ class GrpcCommandPreAdmissionTest {
 		try (var embedded = new EmbeddedConnection(root, "grpc-scheduled-terminal", null);
 				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 			server.start();
-			Object grpc = field(GrpcServer.class, "grpc").get(server);
+			Object service = field(GrpcServer.class, "grpc").get(server);
+			Object grpc = field(service.getClass(), "scheduledCalls").get(service);
 			Method execute = grpc.getClass().getDeclaredMethod(
 					"executeScheduled", Callable.class, Scheduler.class, long.class);
 			execute.setAccessible(true);
@@ -264,7 +265,8 @@ class GrpcCommandPreAdmissionTest {
 		try (var embedded = new EmbeddedConnection(root, "grpc-scheduled-race", null);
 				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 			server.start();
-			Object grpc = field(GrpcServer.class, "grpc").get(server);
+			Object service = field(GrpcServer.class, "grpc").get(server);
+			Object grpc = field(service.getClass(), "scheduledCalls").get(service);
 			Method execute = grpc.getClass().getDeclaredMethod(
 					"executeScheduled",
 					Callable.class,
@@ -339,11 +341,12 @@ class GrpcCommandPreAdmissionTest {
 		try (var embedded = new EmbeddedConnection(root, "grpc-result-ownership", null);
 				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 			server.start();
-			Object grpc = field(GrpcServer.class, "grpc").get(server);
+			Object service = field(GrpcServer.class, "grpc").get(server);
+			Object grpc = field(service.getClass(), "scheduledCalls").get(service);
 			Method execute = grpc.getClass().getDeclaredMethod(
 					"executeScheduled", Callable.class, Scheduler.class, Consumer.class, Scheduler.class, long.class);
 			execute.setAccessible(true);
-			String lateErrorKey = (String) field(GrpcServer.class,
+			String lateErrorKey = (String) field(Class.forName("it.cavallium.rockserver.core.server.GrpcRequestErrors"),
 					"GRPC_LATE_ERROR_HANDLER_CONTEXT_KEY").get(null);
 			assertTrue(java.util.Arrays.stream(ReactorResultOwnership.class.getDeclaredFields())
 					.allMatch(candidate -> Modifier.isStatic(candidate.getModifiers())));
@@ -439,7 +442,7 @@ class GrpcCommandPreAdmissionTest {
 				var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 			var scheduler = embedded.getScheduler();
 			Class<?> handlerType = Class.forName(
-					"it.cavallium.rockserver.core.server.GrpcServer$FastGetCallHandler");
+					"it.cavallium.rockserver.core.server.FastGetCallHandler");
 			var constructor = handlerType.getDeclaredConstructor(GrpcServer.class);
 			constructor.setAccessible(true);
 			Object handler = constructor.newInstance(server);
