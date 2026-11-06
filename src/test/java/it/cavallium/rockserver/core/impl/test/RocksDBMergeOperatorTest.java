@@ -672,6 +672,49 @@ public class RocksDBMergeOperatorTest {
         assertTrue(ex.getCause().getMessage().contains("Could not inject native handle"));
     }
 
+    private static final java.util.List<MemorySegment> DESTROYED = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private static MethodHandle originalDestroy;
+
+    private static void recordingDestroy(MemorySegment raw) throws Throwable {
+        DESTROYED.add(raw);
+        originalDestroy.invokeExact(raw);
+    }
+
+    @Test
+    void testConstructorDestroysNativeOperatorWhenHandleInjectionFails() throws Exception {
+        MethodHandle recording = MethodHandles.lookup().findStatic(RocksDBMergeOperatorTest.class, "recordingDestroy",
+                java.lang.invoke.MethodType.methodType(void.class, MemorySegment.class));
+        DESTROYED.clear();
+        originalDestroy = swapHandle("DESTROY_OP", recording);
+        try {
+            org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, HandleInjectionFailOp::new);
+            assertEquals(1, DESTROYED.size(), "the native operator created before the failure must be destroyed once");
+            org.junit.jupiter.api.Assertions.assertNotEquals(MemorySegment.NULL, DESTROYED.getFirst());
+        } finally {
+            swapHandle("DESTROY_OP", originalDestroy);
+        }
+    }
+
+    @Test
+    void testConstructorDoesNotDestroyWhenCreateFails() throws Exception {
+        MethodHandle recording = MethodHandles.lookup().findStatic(RocksDBMergeOperatorTest.class, "recordingDestroy",
+                java.lang.invoke.MethodType.methodType(void.class, MemorySegment.class));
+        MethodHandle nullCreate = MethodHandles.dropArguments(
+                MethodHandles.constant(MemorySegment.class, MemorySegment.NULL), 0,
+                MemorySegment.class, MemorySegment.class, MemorySegment.class,
+                MemorySegment.class, MemorySegment.class, MemorySegment.class);
+        DESTROYED.clear();
+        originalDestroy = swapHandle("DESTROY_OP", recording);
+        MethodHandle originalCreate = swapHandle("CREATE_OP", nullCreate);
+        try {
+            org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, () -> new NoopOp("NullCreateNoDestroy"));
+            assertTrue(DESTROYED.isEmpty());
+        } finally {
+            swapHandle("CREATE_OP", originalCreate);
+            swapHandle("DESTROY_OP", originalDestroy);
+        }
+    }
+
     @Test
     void testDisposeInternalSuppressesDestroyErrors() throws Exception {
         NoopOp op = new NoopOp("DestroyErrorOp");
