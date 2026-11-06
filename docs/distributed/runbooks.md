@@ -38,13 +38,17 @@ PEERS="--peer n1=10.0.0.1:9001/10.0.0.1:5333 --peer n2=10.0.0.2:9001/10.0.0.2:53
 ## Seeding a cluster from a single-node database
 
 The data of a single Rockserver becomes the first state of the cluster. Every node must start from a copy of the
-same database: copies that differ are not detected.
+same database. Each node records a digest of its copy at its first start, and a replica whose digest differs from the
+leader's stops at genesis with exit code 3 (see "One seed" in the design document): that catches a missing, extra or
+truncated file and a copy taken at another moment, but not a table file damaged without a change of size, which only
+the check of step 3 finds.
 
 1. Stop the single node (a clean stop: its database must be closed).
 2. Copy its database directory to every node, as `<data-dir>/db` (for example `rsync -a --delete old-db/
    n1:/srv/rockserver/data/db/`). The data directories must hold nothing else: no `raft/`.
 3. Check that the copies are equal, for example `find db -type f -exec sha256sum {} + | sort -k2 | sha256sum` on
-   each node, the same result everywhere.
+   each node, the same result everywhere. Do not skip it: the digest of the first start compares table files by size
+   only.
 4. Start every node as for an empty cluster. The first leader proposes a seeded genesis; every replica then takes a
    snapshot of the seed (the log says `snapshot taken`).
 5. Check: `rs admin $PEERS checksum` prints `OK` and the same digest for every node.

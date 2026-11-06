@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftPeer;
@@ -30,6 +31,8 @@ final class StubRaft {
 	volatile long term = 1;
 	volatile List<RaftPeer> currentPeers = List.of();
 	volatile List<RaftPeer> previousPeers = List.of();
+	/** The followers a leader replicates to besides the configuration, such as a peer being added (staging). */
+	volatile List<RaftPeer> stagingFollowers = List.of();
 	volatile long lastCommittedIndex;
 	/** Answers {@code submitClientRequestAsync}. */
 	volatile Function<RaftClientRequest, CompletableFuture<RaftClientReply>> submit =
@@ -49,6 +52,11 @@ final class StubRaft {
 	private final RaftConfiguration conf = proxy(RaftConfiguration.class, (method, _) -> switch (method) {
 		case "getCurrentPeers" -> currentPeers;
 		case "getPreviousPeers" -> previousPeers;
+		case "getAllPeers" -> {
+			var all = new java.util.LinkedHashSet<>(currentPeers);
+			all.addAll(previousPeers);
+			yield List.copyOf(all);
+		}
 		default -> unsupported(method);
 	});
 
@@ -61,6 +69,13 @@ final class StubRaft {
 		case "isLeader" -> leader;
 		case "isLeaderReady" -> leaderReady;
 		case "getCurrentTerm" -> term;
+		case "getRoleInfoProto" -> {
+			var leaderInfo = RaftProtos.LeaderInfoProto.newBuilder();
+			for (var follower : stagingFollowers) {
+				leaderInfo.addFollowerInfo(RaftProtos.ServerRpcProto.newBuilder().setId(follower.getRaftPeerProto()));
+			}
+			yield RaftProtos.RoleInfoProto.newBuilder().setLeaderInfo(leaderInfo).build();
+		}
 		default -> unsupported(method);
 	});
 

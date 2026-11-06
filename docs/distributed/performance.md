@@ -59,7 +59,8 @@ different one), `--route same-list` (every connection lists every node in one or
 starting from `--first follower|leader|ID`, a follower by default; with `--leader-hint listed|any|off` for the
 client's hint mode, so that a run with `listed` and one with `off` show what the leader hint gains over forwarding
 through a follower), `--kill-leader-after S` (SIGKILL of the leader during the step, with a per-second timeline), `--jfr
-profile` (or a `.jfc` file) to record every node. Each node logs its own timers every 10 s (`NodeMetrics`:
+profile` (or a `.jfc` file) to record every node. Each node logs its own timers every 10 s, and exports them as
+`rockserver.replication.*` (`NodeMetrics`:
 proposer queue and batch round trip, append-to-apply, apply phases, read barrier, update lock wait, log lags,
 tracked keys, heap).
 
@@ -245,7 +246,10 @@ Other results:
   6 connections, a small dataset, not a throughput measurement) the second of the kill had 289 errors and the
   11 s after the 4 s gap had 1 error in 58k requests, against a third of the requests with `--route all`.
 - **Bandwidth.** Sixteen clients writing 1 MiB `putMulti` calls: 183 MiB/s on one node, 103 MiB/s
-  replicated, where each device writes 280–390 MiB/s (Raft log, flushes and compactions).
+  replicated, where each device writes 280–390 MiB/s (Raft log, flushes and compactions). Not profiled, and whether
+  Yotsuba's bulk writers (file-location migration, history and photo-recovery archive chunks, chat imports) come near
+  this rate is not measured: their call rates are known, their bytes per call are not (see "Known limits, decided"
+  in the design document).
 
 ## Deployment notes
 
@@ -309,7 +313,7 @@ Other results:
   4096 pending Raft requests (Ratis' default; proposer batches of up to 4096 writes each) or 160 MiB of them
   (the attempts in flight of 4 nodes, 32 MiB each, plus the leader's own commits); the Raft log write queue holds
   up to 64 MiB (65536 entries); each node holds the writes it proposed up to an eighth of its heap (Proposer's
-  byte admission, `-Dit.cavallium.rockserver.replicated.write-admission-bytes`); every replica keeps every reply
+  byte admission, `-Dit.cavallium.rockserver.distributed.write-admission-bytes`); every replica keeps every reply
   (up to 17 MiB each) in Ratis' retry cache for 4 election timeouts, at least 6 s (8 s by default); and each node
   admits 16384 requests at once, with messages up to 512 MiB. Size the heap for bursts of large `putMulti` calls and large results: an
   `OutOfMemoryError` on the apply thread stops the replica.
@@ -327,4 +331,5 @@ Other results:
   and position puts and one `closeTransaction` per applied group, and never with the client's latency. Reads,
   staged transactional writes, transaction opens, rollbacks and range calls are counted only on the leader,
   with their local database time only (no read barrier, forwarding or replication). The replication timers
-  (`NodeMetrics`) are only in the log, every 10 s.
+  (`NodeMetrics`) are logged every 10 s and exported with the core metrics (JMX, InfluxDB) as
+  `rockserver.replication.*`, tagged `node` and `kind` (see design.md, "Metrics and alerts").

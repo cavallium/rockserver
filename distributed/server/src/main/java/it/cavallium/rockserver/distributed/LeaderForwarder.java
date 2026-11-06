@@ -20,7 +20,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.apache.ratis.protocol.RaftPeer;
-import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -93,10 +92,25 @@ final class LeaderForwarder implements Closeable {
 	private final ConcurrentHashMap<String, HostAndPort> answeredAddresses = new ConcurrentHashMap<>();
 	/** The event loop threads and callback executor of every forwarding connection; closed after them. */
 	private final GrpcClientTransport transport;
+	/** The channels to the Raft ports of the other members, for the address lookups. */
+	private final PeerChannels peerChannels;
+	/** Whether {@link #peerChannels} is this instance's own, closed with it, rather than the node's shared one. */
+	private final boolean ownPeerChannels;
 	private volatile boolean closed;
 
 	LeaderForwarder(NodeConfig config) {
+		this(config, new PeerChannels(), true);
+	}
+
+	/** @param peerChannels the node's shared channels to the other members' Raft ports; the caller closes them */
+	LeaderForwarder(NodeConfig config, PeerChannels peerChannels) {
+		this(config, peerChannels, false);
+	}
+
+	private LeaderForwarder(NodeConfig config, PeerChannels peerChannels, boolean ownPeerChannels) {
 		this.config = config;
+		this.peerChannels = peerChannels;
+		this.ownPeerChannels = ownPeerChannels;
 		this.transport = GrpcClientTransport.create(config.nodeId() + "-forward", CONNECTIONS_PER_PEER);
 	}
 
@@ -274,9 +288,8 @@ final class LeaderForwarder implements Closeable {
 		if (answered != null) {
 			return CompletableFuture.completedFuture(answered);
 		}
-		var channel = NettyChannelBuilder.forTarget(peer.raftAddress()).usePlaintext().build();
+		var channel = peerChannels.get(peer.raftAddress());
 		return TermService.apiAddress(channel, Duration.ofMillis(PROBE_TIMEOUT_MS)).handle((address, error) -> {
-			channel.shutdown();
 			if (error != null) {
 				LOG.debug("{}: member {} did not tell its API address", config.nodeId(), peer.id(), error);
 				return listed;
@@ -296,9 +309,8 @@ final class LeaderForwarder implements Closeable {
 		if (raftAddress == null) {
 			return CompletableFuture.failedFuture(new IOException("Peer " + peerId + " is not a member"));
 		}
-		var channel = NettyChannelBuilder.forTarget(raftAddress).usePlaintext().build();
+		var channel = peerChannels.get(raftAddress);
 		return TermService.apiAddress(channel, config.requestTimeout()).whenComplete((address, error) -> {
-			channel.shutdown();
 			if (address != null) {
 				learnedAddresses.put(peerId, address);
 				LOG.info("{}: member {} at {} serves its API at {}:{}", config.nodeId(), peerId, raftAddress,
@@ -333,6 +345,9 @@ final class LeaderForwarder implements Closeable {
 		}
 		connector.shutdown();
 		closer.shutdown();
+		if (ownPeerChannels) {
+			peerChannels.close();
+		}
 		IOException failure = null;
 		for (var pending : connections.values()) {
 			if (!pending.isDone()) {

@@ -12,7 +12,9 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
@@ -98,6 +100,12 @@ public final class ReplicatedNode implements AutoCloseable {
 	private volatile boolean takingSeedSnapshot;
 	/** Only used on the initialization thread. */
 	private final ClusterCheck clusterCheck;
+	/**
+	 * The channels to the other members' Raft ports for {@link ReplicaOps} (checksum results, capabilities) and the
+	 * address lookups of {@link LeaderForwarder}: one cache per node, pruned to the members by {@link #watchRaft}.
+	 * {@link ReadBarrier} and {@link FollowerReads} keep their own, see {@link PeerChannels}.
+	 */
+	private final PeerChannels peerChannels = new PeerChannels();
 	/** Finds a hung disk, which pauses the API like a missing leader does; see {@link #gateApi}. */
 	private final DiskProbe diskProbe;
 	/** Whether {@link #gateApi} last found the disk hung. Maintenance thread only. */
@@ -133,6 +141,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		this.leaderStallStepDowns = metrics.amount("leader.stall.stepdowns");
 		this.leaderLogStepDowns = metrics.amount("leader.log.stepdowns");
 		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure, metrics);
+		stateMachine.ops().channels(peerChannels);
 		this.threads = new NodeThreads(config.nodeId());
 
 		var parameters = new Parameters();
@@ -193,7 +202,7 @@ public final class ReplicatedNode implements AutoCloseable {
 					threads.control());
 			started.add(proposer);
 			stateMachine.ops().proposer(proposer);
-			this.forwarder = new LeaderForwarder(config);
+			this.forwarder = new LeaderForwarder(config, peerChannels);
 			started.add(forwarder);
 			stateMachine.onLeaderChange(forwarder::leaderChanged);
 			this.connection = new ReplicatedConnection(config, stateMachine, proposer, barrier, followerReads, forwarder,
@@ -248,6 +257,7 @@ public final class ReplicatedNode implements AutoCloseable {
 				}
 			}
 			threads.close();
+			peerChannels.close();
 			throw ex;
 		}
 		LOG.info("{}: started, Raft {}, API {}:{}", config.nodeId(), config.self().raftAddress(),
@@ -491,6 +501,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			}
 			warnWhileInitializing(division);
 			warnAbovePendingLimit(division);
+			dropChannelsOfFormerMembers(division);
 			var log = division.getRaftLog();
 			long commitIndex = log.getLastCommittedIndex();
 			long term = division.getInfo().getCurrentTerm();
@@ -524,6 +535,33 @@ public final class ReplicatedNode implements AutoCloseable {
 			LOG.warn("{}: failed to record its membership in {}, retrying", config.nodeId(),
 					config.raftDir().resolve(MEMBER_FILE), ex);
 		}
+	}
+
+	/**
+	 * Shuts down the shared channels to addresses that are no longer a member's (members that left, or changed address):
+	 * the members of the configuration, the peers the leader is bringing in, and this node's peer list stay.
+	 */
+	private void dropChannelsOfFormerMembers(RaftServer.Division division) {
+		dropChannelsOfFormerMembers(peerChannels, division, config);
+	}
+
+	/**
+	 * Shuts down the channels of {@code channels} to addresses that are no longer a member's ({@link #memberAddresses}):
+	 * the address of a removed member, or the old address of a member that moved.
+	 */
+	static void dropChannelsOfFormerMembers(PeerChannels channels, RaftServer.Division division, NodeConfig config) {
+		if (channels.size() == 0) {
+			return;
+		}
+		channels.retainOnly(memberAddresses(division, config));
+	}
+
+	/** The Raft addresses that {@link #peerChannels} keeps channels to. */
+	static Set<@Nullable String> memberAddresses(RaftServer.Division division, NodeConfig config) {
+		var addresses = new HashSet<@Nullable String>();
+		ReplicaOps.pollPeers(division).values().forEach(peer -> addresses.add(peer.getAddress()));
+		config.peers().forEach(peer -> addresses.add(peer.raftAddress()));
+		return addresses;
 	}
 
 	/**
@@ -1031,8 +1069,10 @@ public final class ReplicatedNode implements AutoCloseable {
 		IOException failure = null;
 		// A replica can fail while the constructor is still starting the rest: skip what does not exist yet.
 		var order = (consensusFirst
-				? java.util.stream.Stream.<Closeable>of(server, apiServer, proposer, barrier, followerReads, forwarder)
-				: java.util.stream.Stream.<Closeable>of(apiServer, proposer, barrier, followerReads, forwarder, server))
+				? java.util.stream.Stream.<Closeable>of(server, apiServer, proposer, barrier, followerReads, forwarder,
+						peerChannels)
+				: java.util.stream.Stream.<Closeable>of(apiServer, proposer, barrier, followerReads, forwarder, server,
+						peerChannels))
 				.filter(java.util.Objects::nonNull)
 				.toList();
 		try {

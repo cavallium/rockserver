@@ -37,7 +37,6 @@ import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.thirdparty.io.grpc.Status;
-import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -126,6 +125,12 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	private final Map<Long, BackupResult> backups = new ConcurrentHashMap<>();
 	private volatile long clusterVersion;
 	private volatile @Nullable Proposer proposer;
+	/**
+	 * The channels to the other members: the node's shared cache once {@link #channels(PeerChannels)} set it, until then
+	 * one of this instance's own, closed with it.
+	 */
+	private volatile PeerChannels channels = new PeerChannels();
+	private volatile boolean ownChannels = true;
 	/** Leader only, initialization thread only. */
 	private long versionCheckTerm = -1;
 	private long nextVersionCheckNanos;
@@ -191,6 +196,16 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	@Override
 	public long supported() {
 		return SUPPORTED_FOR_TESTING.getOrDefault(config.nodeId(), Capabilities.SUPPORTED);
+	}
+
+	/** The node's shared channels to the other members, used from now on; the caller closes them. */
+	void channels(PeerChannels shared) {
+		var own = ownChannels ? channels : null;
+		this.channels = shared;
+		this.ownChannels = false;
+		if (own != null) {
+			own.close();
+		}
 	}
 
 	/** The cluster version of the database just opened. */
@@ -727,9 +742,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 
 	private CompletableFuture<byte[]> ask(RaftPeer peer, byte op, byte[] payload) {
 		var groupId = stateMachine.groupId();
-		var channel = NettyChannelBuilder.forTarget(peer.getAddress()).usePlaintext().build();
-		return TermService.ops(channel, groupId, request(op, payload), PEER_TIMEOUT)
-				.whenComplete((_, _) -> channel.shutdown());
+		return TermService.ops(channels.get(peer.getAddress()), groupId, request(op, payload), PEER_TIMEOUT);
 	}
 
 	static byte[] request(byte op, byte[] payload) {
@@ -813,15 +826,21 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		return new Result(state, index, keys, StandardCharsets.UTF_8.decode(buffer).toString());
 	}
 
-	/** Asks the node behind {@code address} (its Raft address) to run {@code op}: for {@code admin}. */
+	/**
+	 * Asks the node behind {@code address} (its Raft address) to run {@code op}: for {@code admin}, a process that makes
+	 * one call per node, so on a channel of its own.
+	 */
 	static CompletableFuture<byte[]> call(String address, RaftGroupId groupId, byte op, byte[] payload, Duration timeout) {
-		var channel = NettyChannelBuilder.forTarget(address).usePlaintext().build();
+		var channel = PeerChannels.open(address);
 		return TermService.ops(channel, groupId, request(op, payload), timeout).whenComplete((_, _) -> channel.shutdown());
 	}
 
 	@Override
 	public void close() {
 		worker.shutdownNow();
+		if (ownChannels) {
+			channels.close();
+		}
 	}
 
 	/** The log index of the last check that found a divergence, or -1: the gauge {@code checksum.last_mismatch_index}. */
