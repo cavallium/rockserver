@@ -116,12 +116,12 @@ forwards to a non-embedded connection:
 | `Applier` | Applies the requests of log entries to the local database, a group of entries in one transaction without the WAL, with their result records and the applied position. |
 | `ApplyResult`, `AppliedIndex`, `ApplyLanes` | The outcome of one entry, identical on every replica; the highest applied index and the reads waiting for it; the platform threads of the partitioned apply (see "Partitioned apply"). |
 | `LeaderSession`, `ConflictTracker` | Transactions bound to the leader's term, per-key queues of single-key updates, and conflict validation. |
-| `NodeMetrics` | Timers and gauges of the replication path, logged every 10 s. |
+| `NodeMetrics` | Timers and gauges of the replication path, logged every 10 s and exported to the node's metrics registry (see "Metrics and alerts"). |
 | `ByteAdmission` | The byte-weighted semaphore that never waits, behind `Proposer`'s bound on the bytes of writes a node holds and has in flight. |
 | `ReadBarrier`, `TermService` | Linearizable reads. `TermService` also answers what a node holds (`NodeState`), a follower's read index, and a node's latest configuration (for `RemovalCheck`). |
 | `FollowerReads` | A follower's read indexes from the leader, for the point reads it serves itself (off by default). |
 | `ClusterCheck` | A leader tells its followers which cluster it leads, and a node of another cluster stops. |
-| `PeerChannels` | The gRPC channels to other members' Raft ports used by `ReadBarrier`, `FollowerReads` (one cached channel per address, a fresh connection attempt when it failed) and `ClusterCheck` (a one-off channel per call). |
+| `PeerChannels` | The gRPC channels to other members' Raft ports: one cached channel per address, with a fresh connection attempt when it failed. Each node has one shared cache for `ReplicaOps` (checksum results, capabilities) and `LeaderForwarder`'s address lookups, pruned by the maintenance thread to the members, the peers being brought in and the peer list, and closed last when the node stops. `ReadBarrier` and `FollowerReads` keep one each: they close theirs to fail their requests in flight when they close, and the barrier prunes its own to the voters of each round. `ClusterCheck` (once per follower and term), `RemovalCheck` (at start) and the `admin` commands use a one-off channel per call. |
 | `ApiGate`, `CommitHeartbeats` | Whether a node serves its API, from whether it knows a leader; the leader sending its commit index to every follower at once instead of with its next heartbeat. |
 | `LeaderStall` | Tells a leader that cannot commit to step down. |
 | `NodeThreads` | The node's control-plane platform threads and the virtual threads of the leader's short local commands (see "Threads"). |
@@ -140,7 +140,11 @@ and value is a slice of the log entry's buffer that goes to RocksDB without a co
 request once, straight into the batch buffer, at an offset it computed before (see "Encoded once"). Protobuf-java
 parses into objects of its own and copies each `bytes` field into a `ByteString`, and its encoder writes a message
 of its own: one copy and one allocation per key and value on every replica, which is the cost the leaner apply
-removed. The price of hand-written codecs is that every format change needs a version and a test for old bytes:
+removed. The decode is in place only when the entry's `ByteString` is backed by one heap array
+(`RockserverStateMachine.decodeBatch`), as Ratis 3.3.1 hands it over from its log and from a request: it parses its
+messages with protobuf's copying parser and does not use the zero-copy marshaller of its gRPC transport. An entry
+made of several pieces, or of `ByteBuffer`-backed ones (what that marshaller would produce, if a later Ratis turned it
+on), is decoded from a read-only view instead, with a copy of each key and value: correct, only slower. The price of hand-written codecs is that every format change needs a version and a test for old bytes:
 `CodecEquivalenceTest` (against the previous codecs, kept as test classes) and the codec tests, fuzzing included,
 pin them, and a format change must keep reading the old bytes. The client API and Ratis' own messages stay protobuf.
 
@@ -1750,41 +1754,55 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
 
 ## Left before a first deployment
 
-0. **Pipelined updates** stay off until the benchmark on hot keys (see [performance.md](performance.md)) and a full
-   review of the Yotsuba call sites: a chained value must not be acted on before the update ended well, and
-   `UPDATE_RETRY` from a no-change close must be retried. Watch `update.guardRejected`, `update.chainConflict`,
+0. **Pipelined updates** stay off until the benchmark on hot keys (see [performance.md](performance.md)). The review
+   of the Yotsuba call sites is done, on Yotsuba's `replicated-rockserver` branch (commit `53d400ef4`, see
+   [consumer-contracts.md](consumer-contracts.md)): every update path acts on a chained value only after the update
+   ended well, and retries `UPDATE_RETRY` from a no-change close. Watch `update.guardRejected`, `update.chainConflict`,
    `transaction.conflict` and `transaction.chainConflict`. A leader chains only once the cluster version has pipelined
    updates (see "Cluster version"): an older node would fail on the entries of a pipelined leader. With the
    option off, entries keep the bytes they always had, and logs written before these flags stay readable.
-1. **Client side.**
-   - Yotsuba does not compile against this version as is: CDC was removed from the client API, and
-     `server/source/api/src/main/java/org/yotsuba/database/RockserverAsyncApiViews.java:133` still overrides
-     `cdcPollBatchAsync` (and imports `it.cavallium.rockserver.core.common.cdc.CdcBatch`). It is a pass-through
-     that nothing calls: delete it, and the few Yotsuba tests that mention it. telegramdb has no CDC references.
-   - Yotsuba must create its connection with every node's address (`GrpcConnection.forHostsAndPorts`, see
-     "Routing"): the core client fails over between them, but Yotsuba passes a single address today.
-   - The core client's automatic gRPC retry of reads waits for its backoff before it sends a read to the next node:
-     50 ms, then growing, on a connection with several addresses (the next node is another one, so there is nothing
-     to wait for), 0.5 s with one address (`it.cavallium.rockserver.grpc.client.initial-retry-backoff` overrides
-     both).
-2. **Exactly-once for client retries** (client sessions, see "Writes, exactly once"). What Yotsuba must change:
-   - `ReactiveGuard` retries `SERVER_OVERLOADED`. It must not retry `OUTCOME_UNKNOWN` as a new write: the core client
-     already resent the write until its deadline, and a new copy could apply it twice. Treat it as a failed call
-     whose effect is unknown (for a counter or an update, re-read before deciding), or give the call a longer
-     deadline. `SESSION_EXPIRED` reaches it only when sessions kept expiring until the deadline, never after a copy
-     that may have applied, and then with the not-applied flag (`isNotApplied()`): safe to retry. `SERVER_OVERLOADED` and
-     `READ_DEADLINE_EXCEEDED` from replicated writes now mean "not applied" and stay safe to retry.
-   - The dead `cdcPollBatchAsync` override (item 1) must go before it compiles at all.
-   - It must build its connection with every node (item 1): a single address has nowhere to resend to while its
-     node is down, so its writes end with `OUTCOME_UNKNOWN` at their deadline.
+1. **Client side.** Yotsuba's changes for this version are on its local branch `replicated-rockserver`, not merged
+   and not deployed: `0427455d1` removes the dead `cdcPollBatchAsync` override and its test stubs (Yotsuba did not
+   compile without it, CDC being gone from the client API), `9cb3a9d6f` builds the connection with every node
+   (`database.rockserver.nodes`, the host names of the cluster's `--peer`, expected leader first; empty keeps the
+   single address), and the commits of item 2. Left on the Yotsuba side:
+   - Merge the branch, build it against a released `rockserver-core` of this version (the branch was compiled and
+     tested against local builds of it; Yotsuba's pom still pins 2.0.3), and deploy it.
+   - Set `database.rockserver.nodes` in the deployed settings once the cluster exists.
+   - Optional, not needed for correctness: the `createColumn` sites that retry only `UNAVAILABLE` could also retry an
+     unknown outcome (`createColumn` is idempotent); a failed no-change close is closed a second time by the cleanup,
+     which logs a rate-limited warning with `UPDATE_RETRY` and does nothing else.
+
+   On the Rockserver side, the core client's automatic gRPC retry of reads waits for its backoff before it sends a
+   read to the next node: 50 ms, then growing, on a connection with several addresses (the next node is another one,
+   so there is nothing to wait for), 0.5 s with one address (`it.cavallium.rockserver.grpc.client.initial-retry-backoff`
+   overrides both).
+2. **Exactly-once for client retries** (client sessions, see "Writes, exactly once"). The contract for a caller, and
+   where Yotsuba's branch meets it:
+   - A caller must not retry `OUTCOME_UNKNOWN` as a new write: the core client already resent the write until its
+     deadline, and a new copy could apply it twice. It treats it as a failed call whose effect is unknown (for a
+     counter or an update, re-read before deciding), or gives the call a longer deadline. `SESSION_EXPIRED` reaches
+     it only when sessions kept expiring until the deadline, never after a copy that may have applied, and then with
+     the not-applied flag (`isNotApplied()`, the `rockserver-applied: no` trailer; also set when the refused copy was
+     the only one sent, R4-1): safe to retry. `SERVER_OVERLOADED` and `READ_DEADLINE_EXCEEDED` from replicated writes
+     mean "not applied" and stay safe to retry. Yotsuba: `2cb001186` (its `ReactiveGuard` vetoes every retry of an
+     unknown outcome or a `MERGE_OPERATOR_FAILED`), `5e648b895` (reads the structured flag instead of the message).
+   - A local timeout around a write must not be shorter than the write's client deadline: the client keeps resending
+     a write its caller cancelled, so an outer retry after a shorter local timeout could apply the write twice.
+     Yotsuba: `53d400ef4` sizes its local timeouts from the client's deadline.
+   - Writes staged in a transaction are not numbered, by design (see "Writes staged in a transaction"): a caller
+     whose staged write or commit has an unknown outcome rolls the transaction back and runs it again, never resends
+     the write. Yotsuba: `5e648b895` reruns its two transactions (invite evidence, monitors) that way, and `c73697eae`
+     sends the search update of an invite commit whose outcome was unknown when the rerun finds the change already
+     stored (R4-2). The rust client has the proto fields, `open_client_session` and
+     `RequestContext::with_request_id`, but numbers and resends nothing by itself.
+   - A client needs every node's address (item 1): a single address has nowhere to resend to while its node is
+     down, so its writes end with `OUTCOME_UNKNOWN` at their deadline.
    - Every node must run this version before clients use sessions: an older node cannot read a version 3 batch,
      a stamp or a `RegisterClient` entry. The cluster version enforces it from this version on (see "Cluster
      version"): restart the clients once the upgrade is done, since they read it when they connect, or start them
-     with `-Dit.cavallium.rockserver.grpc.client.session-writes=false` until it is done.
-   - Writes staged in a transaction are not numbered, by design (see "Writes staged in a transaction"): a caller
-     whose staged write has an unknown outcome rolls the transaction back and runs it again, never resends the
-     write. The rust client has the proto fields, `open_client_session` and `RequestContext::with_request_id`, but
-     numbers and resends nothing by itself.
+     with `-Dit.cavallium.rockserver.grpc.client.session-writes=false` until it is done. Sessions need no Yotsuba
+     change otherwise: the client turns them on by itself.
 3. **Capacity.** See [performance.md](performance.md) for the measurements on one PC and the load benchmark.
    Still to measure on the production machines and data: their fsync latency, snapshot creation and install
    time at 171 GB and at the multi-TB datasets, and log retention in bytes. Raise Yotsuba's in-flight request
@@ -1852,6 +1870,13 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
      100-300 ms pause of the apply. A failing snapshot is no longer tried at every applied entry: after a failure,
      `takeSnapshot` answers "no snapshot" (which Ratis passes over without an error or a purge) for 1 s, doubling with
      each failure in a row up to a minute; the snapshots by bytes wait for the same delay.
+   - Bulk bandwidth is not profiled: 1 MiB `putMulti` calls reach 103 MiB/s replicated against 183 MiB/s on one
+     node (performance.md, "Bandwidth"). Kept for now: Yotsuba does not bulk-ingest. Its writes are small requests,
+     bound by requests per second and their latency, not bytes (see "Client concurrency" in performance.md); its one
+     bulk path, the `MessagesV2Migration` copy, writes through logical `putMulti` at the pace of its source scan, and
+     103 MiB/s is about 380 GB an hour, the 171 GB dataset in under half an hour. Before a bulk import or migration of the
+     multi-TB datasets, profile the path (`load-bench.sh --only BULK_PUT --jfr profile`): a replicated byte is
+     written to the Raft log of every node and sent to two followers, on top of the work of a single node.
    - Iterator calls after a leader change get `UPDATE_RETRY` (see "Leader changes").
    - The snapshot taken right after a seeded genesis is attempted once, on the leader only.
    - A SIGTERM that races a replica failure exits with 3: the shutdown hook closes the node, then waits until it
@@ -1870,3 +1895,10 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
      heartbeat after a stream reset (found in a review of the code). Not seen in practice: with a follower down,
      the leader's appender threads for it used 0.0% of a core over 3 s (`RatisContractTest`), since the retry policy
      sleeps between failed tries. A reset with the follower alive lasts until its next request.
+   - Decided not to report: in `GrpcLogAppender`, the response handler of a stream that was already replaced still
+     resets the current one when its `onError` or `onCompleted` arrives (`resetClient` stops whatever stream is
+     current, with no check that the event belongs to it; checked in the 3.3.1 bytecode). The cost is one extra
+     reset: the pending requests are dropped, and the leader sends again from the follower's next index on a new
+     stream. Neither safety nor the log is affected, and nothing in the tests showed it. If filed anyway, one line:
+     "AppendLogResponseHandler.onError/onCompleted of a stale stream reset the current appendLogRequestObserver;
+     compare the handler's stream with the current one first."

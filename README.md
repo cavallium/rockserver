@@ -244,7 +244,7 @@ owned heap output.
 The measured default uses pinned streaming through 128 bytes, from 512 bytes
 through 4 KiB, and at or above 32 KiB. The remaining bands use independently
 owned heap output. Operators can replace that table with one cutoff by setting
-`-Drockserver.grpc.fast-get.pinned-min-bytes=<bytes>`. The
+`-Drockserver.fast-get.pinned-min-bytes=<bytes>` (read by the database, not the gRPC layer). The
 `rockserver.grpc.fast-get.strategy` property accepts `legacy`, `exact-heap`,
 `pinned`, and `automatic`; the non-automatic values exist for the
 performance matrix and operational comparison.
