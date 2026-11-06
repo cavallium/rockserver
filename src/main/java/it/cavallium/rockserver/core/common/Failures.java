@@ -16,6 +16,14 @@ public final class Failures {
 	private static final Pattern IDENTITY_HASH = Pattern.compile("@[0-9a-fA-F]+\\b");
 	/** The thread named by the JDK in some messages: replicas run their apply on threads of different names. */
 	private static final Pattern THREAD = Pattern.compile("\\[in thread \"[^\"]*\"]");
+	/**
+	 * Absolute file paths, which name each node's own data directory (as in a RocksDB status such as {@code IO error:
+	 * /var/lib/node1/db/000012.sst: No such file}): a Unix path of at least two segments not glued to a word before it
+	 * (so {@code a/b} and {@code 1/2} stay), or a Windows path. A path ends at white space, a quote, a bracket, a comma,
+	 * a semicolon or a colon followed by white space.
+	 */
+	private static final Pattern PATH = Pattern.compile(
+			"(?<![\\w.~])(?:[A-Za-z]:\\\\|/)[^\\s\"'()\\[\\]<>,;:/\\\\]+(?:[/\\\\][^\\s\"'()\\[\\]<>,;:/\\\\]+)+[/\\\\]?");
 	private static final String[] JVM_ERRORS = {"java.lang.OutOfMemoryError", "java.lang.StackOverflowError",
 			"java.lang.InternalError", "java.lang.UnknownError"};
 
@@ -75,9 +83,13 @@ public final class Failures {
 				: failure.getClass().getName() + ": " + sanitize(message);
 	}
 
-	/** {@code text} without native addresses, identity hashes and thread names, which differ between processes. */
+	/**
+	 * {@code text} without native addresses, identity hashes, thread names and absolute file paths, which differ
+	 * between processes and nodes.
+	 */
 	public static String sanitize(String text) {
-		var result = ADDRESS.matcher(text).replaceAll("0x?");
+		var result = PATH.matcher(text).replaceAll("<path>");
+		result = ADDRESS.matcher(result).replaceAll("0x?");
 		result = IDENTITY_HASH.matcher(result).replaceAll("@?");
 		return THREAD.matcher(result).replaceAll("[in thread ?]");
 	}
