@@ -223,6 +223,30 @@ and the `LogEntry`.
   written before sessions read as they did. One entry costs one Ratis
   append, one place in a group fsync and one apply transaction, whatever it holds. Transaction commits have a
   queue of their own, and commits of different leader terms never share an entry.
+- **Encoded once.** `Proposer.submit` computes a request's exact encoded size (`LogEntryCodec.entrySize`, which
+  also rejects what would not encode: strings that are not valid Unicode, request types with no log code) and keeps
+  the entry itself; the batch is sized from those sizes, and each entry is written straight into it when the batch
+  goes out, with no body of its own. The bytes are those of the bodies encoded one by one and joined (versions 2
+  and 3 alike; `CodecEquivalenceTest`). A caller's buffers are read only until its write is first encoded into a
+  batch, which happens while the caller still waits for its answer (except in the short time between a batch
+  taking the write and encoding it, if the caller gives up right then). A caller must therefore not change a
+  write's buffers while it waits; if it does, the batch fails to encode, nothing of it is sent, the writes that no
+  longer encode to their size fail as invalid (or with an unknown outcome if an earlier batch may have appended
+  them) and the others go back to the queue, as never taken unless an earlier batch may have appended them, so that
+  their callers' deadlines and cancellations apply again. The encoder also returns the batch's requests as decoding
+  the bytes in place would read them: each key and value a slice of the batch, each array of a commit a copy,
+  nothing parsed. Each request then keeps that copy instead of its caller's entry, so a write that goes back to the
+  queue still sent (a commit after another commit's conflict, a copy resent alone), which its caller may already
+  have given up on and whose buffers it may reuse, is encoded again from the batch's immutable bytes, never from the
+  caller's memory. A batch with a schema change returns no requests; its members never go back to the queue still
+  sent. On the leader (and for every batch of commits, which only go to the local Raft server) the proposer offers
+  the requests to its own state machine under the
+  batch's Ratis invocation (client id, call id) before submitting it locally, and withdraws the offer when Ratis
+  answers. `startTransaction` takes the offer instead of decoding the batch, only if the request carries the very
+  `ByteString` the requests were encoded into; anything else is decoded as before: batches from other nodes, a
+  resend whose offer was already taken, an offer withdrawn, a batch with a schema change (`CreateColumn`,
+  `UploadMergeOperator`, whose fields could change under it), and every entry after a restart. The stamp, the bytes
+  in the log and what followers decode do not change.
 - **Retries.** A batch is resent with the same bytes across leader changes until the latest deadline of its
   requests (at most one attempt past the oldest one's, and never past a member's caller deadline). A resend
   goes out only if it can start before that deadline: 50 ms after a "not ready", "not leader" or busy answer,
@@ -248,8 +272,9 @@ and the `LogEntry`.
   them a second time while the first copy may still be pending.
 - **Byte admission.** A node holds at most a fixed number of bytes of writes, queued or in flight, from
   `Proposer.submit` to their answer: an eighth of the maximum heap by default (each body is held about twice while
-  in flight), at least room for two entries of the largest size, or the system property
-  `it.cavallium.rockserver.replicated.write-admission-bytes`. Each request counts its encoded body plus 256 bytes. A
+  in flight: as its entry, and in its batch), at least room for two entries of the largest size, or the system
+  property `it.cavallium.rockserver.replicated.write-admission-bytes`. Each request counts its encoded size plus 256
+  bytes. A
   write that does not fit fails at once with `SERVER_OVERLOADED` and a message that says it was not applied
   (metric `writes.admissionRejects`), instead of filling the heap: an out of memory error ends the node (see "Heap").
   A queued write whose caller gives up (deadline or cancellation) drops its body at once and gives it back; its
@@ -362,7 +387,9 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
 client API's writes with a transaction (key encoding, schemas, merges, previous values and deltas are the same
 byte for byte), without what a client call adds around it (the lookup and lock of the transaction id, column use
 counting, action logging, operation counters and timers). Its writes are untracked: the apply thread is the only
-writer, so the commit validates nothing. `applyTransaction` decodes the entry on the Ratis thread, queues it and returns a future; the apply
+writer, so the commit validates nothing. `applyTransaction` decodes the entry on the Ratis thread (on the leader it
+reuses the requests `startTransaction` admitted, which for its own batches are those its proposer encoded, see
+"Encoded once"), queues it and returns a future; the apply
 thread takes everything queued (up to 256 entries or about 16 MiB) and applies it as one group; a third
 thread then completes the group's futures, in log order. Ratis replies to a client, or counts an entry applied,
 only when its future completes, after the group commits,

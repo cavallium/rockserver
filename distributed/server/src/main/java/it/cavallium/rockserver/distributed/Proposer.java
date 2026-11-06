@@ -201,6 +201,17 @@ final class Proposer implements Closeable {
 		return admission.used();
 	}
 
+	/** Batches in flight in both lanes now, for tests. */
+	int batchesInFlight() {
+		int count = 0;
+		for (var lane : List.of(anyLeader, localCommits)) {
+			synchronized (lane) {
+				count += lane.batchesInFlight;
+			}
+		}
+		return count;
+	}
+
 	/**
 	 * Bytes of writes this node holds at most, queued or in flight: {@link #WRITE_ADMISSION_BYTES_PROPERTY} if set,
 	 * otherwise an eighth of the maximum heap (a body is held about twice while in flight: in its request and in its
@@ -267,8 +278,15 @@ final class Proposer implements Closeable {
 		final long sequence;
 		/** Its id in a client session, which identifies it at apply instead of {@link #sequence}; null if none. */
 		final @Nullable ClientRequestId client;
-		/** Null once abandoned: the queue may hold it a while longer, its body need not (see {@link #abandon}). */
-		volatile byte @Nullable [] body;
+		/**
+		 * Its entry, encoded only when its batch goes out, straight into the batch (see {@link Lane#send}). Until then
+		 * it is the caller's; once encoded, it is its copy in that batch (slices of the batch's immutable bytes), so
+		 * that a request sent again never reads its caller's buffers after the caller may have been answered. Null
+		 * once abandoned: the queue may hold it a while longer, its entry need not (see {@link #abandon}).
+		 */
+		volatile @Nullable LogEntry entry;
+		/** Encoded size of {@link #entry} ({@link LogEntryCodec#entrySize}), its weight in batches and admission. */
+		final int bodySize;
 		final boolean batchable;
 		/** When resends stop: the node's request timeout, or the caller's deadline if earlier. */
 		final long deadlineNanos;
@@ -306,11 +324,12 @@ final class Proposer implements Closeable {
 		/** QUEUED until it is taken into a batch (SENT), or until its caller gives up on it first (ABANDONED). */
 		private final AtomicInteger state = new AtomicInteger(QUEUED);
 
-		Pending(long sequence, @Nullable ClientRequestId client, byte[] body, boolean batchable, long deadlineNanos,
-				boolean callerDeadline, long minTimeLeftNanos, long epoch) {
+		Pending(long sequence, @Nullable ClientRequestId client, LogEntry entry, int bodySize, boolean batchable,
+				long deadlineNanos, boolean callerDeadline, long minTimeLeftNanos, long epoch) {
 			this.sequence = sequence;
 			this.client = client;
-			this.body = body;
+			this.entry = entry;
+			this.bodySize = bodySize;
 			this.batchable = batchable;
 			this.deadlineNanos = deadlineNanos;
 			this.callerDeadline = callerDeadline;
@@ -336,6 +355,11 @@ final class Proposer implements Closeable {
 			state.set(QUEUED);
 		}
 
+		/** Back in the queue after it was taken into a batch that was never sent: as if it was never taken. */
+		void untake() {
+			state.set(QUEUED);
+		}
+
 		/** Set by {@link #unsend}: it was sent once, and refused before the append. */
 		volatile boolean refusedOnce;
 
@@ -351,7 +375,7 @@ final class Proposer implements Closeable {
 		void abandon(Throwable error) {
 			if (state.compareAndSet(QUEUED, ABANDONED)) {
 				// Its body is given back to the admission now; the rest of its weight once it leaves its queue.
-				body = null;
+				entry = null;
 				result.completeExceptionally(error);
 			}
 		}
@@ -399,15 +423,17 @@ final class Proposer implements Closeable {
 
 	private CompletableFuture<Object> submit(LogEntry entry, Lane lane, long callerTimeLeftNanos,
 			@Nullable ClientRequestId client) {
-		byte[] body;
+		// Its exact encoded size, checked as encoding would check it; it is encoded only when its batch goes out,
+		// straight into the batch (see Lane.send).
+		long bodySize;
 		try {
-			body = LogEntryCodec.encodeEntryBody(entry);
+			bodySize = LogEntryCodec.entrySize(entry);
 		} catch (IllegalArgumentException ex) {
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST, ex.getMessage()));
 		}
-		if (body.length > MAX_ENTRY_BODY_BYTES) {
+		if (bodySize > MAX_ENTRY_BODY_BYTES) {
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
-					"Write too large for one replicated entry: " + body.length + " bytes"));
+					"Write too large for one replicated entry: " + bodySize + " bytes"));
 		}
 		if (closed) {
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
@@ -416,7 +442,7 @@ final class Proposer implements Closeable {
 		if (callerTimeLeftNanos <= 0) {
 			return CompletableFuture.failedFuture(callerDeadlinePassed());
 		}
-		long weight = body.length + REQUEST_OVERHEAD_BYTES;
+		long weight = bodySize + REQUEST_OVERHEAD_BYTES;
 		if (!admission.tryAcquire(weight)) {
 			admissionRejects.record(1);
 			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
@@ -433,7 +459,8 @@ final class Proposer implements Closeable {
 			sequence = nextSequence++;
 			inFlight.add(sequence);
 		}
-		var pending = new Pending(sequence, client, body, Applier.isBatchable(entry), deadlineNanos, callerDeadline,
+		var pending = new Pending(sequence, client, entry, (int) bodySize, Applier.isBatchable(entry), deadlineNanos,
+				callerDeadline,
 				callerDeadline ? Math.min(MIN_TIME_LEFT_NANOS, callerTimeLeftNanos / 4) : MIN_TIME_LEFT_NANOS,
 				entry instanceof LogEntry.Guarded guarded ? guarded.leaderEpoch() : -1);
 		live.add(pending);
@@ -597,8 +624,7 @@ final class Proposer implements Closeable {
 			boolean anyCaller = false;
 			while (!queue.isEmpty()) {
 				var next = queue.peekFirst();
-				var body = next.body;
-				if (next.result.isDone() || body == null) {
+				if (next.result.isDone() || next.entry == null) {
 					queue.pollFirst();
 					leftQueue(next);
 					continue;
@@ -614,7 +640,7 @@ final class Proposer implements Closeable {
 				if (!batch.isEmpty() && (next.alone() || batch.getFirst().alone()
 						|| next.resentAlone != batch.getFirst().resentAlone || next.epoch != batch.getFirst().epoch
 						|| (next.resentAlone && batch.size() >= Math.min(copyLimit, next.copyBatchLimit))
-						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + body.length > MAX_BATCH_BYTES
+						|| batch.size() >= MAX_BATCH_REQUESTS || bytes + next.bodySize > MAX_BATCH_BYTES
 						|| ((anyCaller || next.callerDeadline) && Math.max(latest, next.deadlineNanos)
 								- Math.min(earliest, next.deadlineNanos) > attemptTimeoutNanos))) {
 					break;
@@ -626,7 +652,7 @@ final class Proposer implements Closeable {
 					continue;
 				}
 				batch.add(next);
-				bytes += body.length + Long.BYTES;
+				bytes += next.bodySize + Long.BYTES;
 				earliest = Math.min(earliest, next.deadlineNanos);
 				latest = Math.max(latest, next.deadlineNanos);
 				anyCaller |= next.callerDeadline;
@@ -657,7 +683,8 @@ final class Proposer implements Closeable {
 		private void send(List<Pending> batch) {
 			var sequences = new long[batch.size()];
 			ClientRequestId[] clients = null;
-			var bodies = new ArrayList<byte[]>(batch.size());
+			var entries = new ArrayList<LogEntry>(batch.size());
+			long entriesSize = 0;
 			long earliest = batch.getFirst().deadlineNanos;
 			long latest = earliest;
 			long callers = Long.MAX_VALUE;
@@ -670,7 +697,9 @@ final class Proposer implements Closeable {
 					}
 					clients[i] = pending.client;
 				}
-				bodies.add(pending.body);
+				// Not null: a request taken into a batch is never abandoned (see Pending.markSent).
+				entries.add(java.util.Objects.requireNonNull(pending.entry, "entry"));
+				entriesSize += pending.bodySize;
 				earliest = Math.min(earliest, pending.deadlineNanos);
 				latest = Math.max(latest, pending.deadlineNanos);
 				if (pending.callerDeadline) {
@@ -682,8 +711,28 @@ final class Proposer implements Closeable {
 			// a member's caller deadline: that caller was told its write timed out, and may write it again. The
 			// members with time left then go back to the queue (see endUnanswered).
 			long deadline = Math.min(Math.min(latest, earliest + attemptTimeoutNanos), callers);
-			var message = Message.valueOf(UnsafeByteOperations.unsafeWrap(
-					LogEntryCodec.encodeBatch(proposerId, completedBelow(), sequences, clients, bodies)));
+			// Each entry is encoded once, straight into the batch, which also returns the batch's requests as decoding
+			// it in place would read them. If this node leads, its state machine takes them instead of decoding the
+			// batch (see submitLocal).
+			LogEntryCodec.EncodedBatch encoded;
+			try {
+				encoded = LogEntryCodec.encodeBatch(proposerId, completedBelow(), sequences, clients, entries,
+						entriesSize, true);
+			} catch (RuntimeException ex) {
+				refuseUnencodable(batch, ex);
+				return;
+			}
+			var message = Message.valueOf(UnsafeByteOperations.unsafeWrap(encoded.bytes()));
+			var local = encoded.requests();
+			if (local != null) {
+				// From now on each request is the copy in this batch, never again its caller's buffers: a request that
+				// goes back to the queue still sent (a commit after another's conflict, a copy resent alone) cannot be
+				// abandoned, so its caller may be answered (cancelled, timed out) and reuse its buffers while it waits.
+				// A batch with a schema change has no requests; its members only go back to the queue unsent.
+				for (int i = 0; i < sequences.length; i++) {
+					batch.get(i).entry = local.get(i).entry();
+				}
+			}
 			long now = System.nanoTime();
 			for (var pending : batch) {
 				queueTime.record(now - pending.queuedNanos);
@@ -692,10 +741,51 @@ final class Proposer implements Closeable {
 			// One Ratis invocation for every attempt of this batch; a batch formed later is another invocation.
 			long callId = callIds.incrementAndGet();
 			if (commits) {
-				sendCommits(batch, message, callId, deadline, now);
+				sendCommits(batch, message, local, callId, deadline, now);
 			} else {
-				attempt(batch, message, callId, deadline, now, false);
+				attempt(batch, message, local, callId, deadline, now, false);
 			}
+		}
+
+		/**
+		 * The batch did not encode, although {@link LogEntryCodec#entrySize} accepted each of its entries at submit:
+		 * a caller changed the buffers of its write while it was queued. Nothing of this batch was sent. The requests
+		 * that no longer encode to their size fail, as invalid if no earlier batch may have appended them; the others
+		 * go back to the queue. If every request still encodes alone, the cause is elsewhere, and {@code error} fails
+		 * the batch (see {@link #dispatch}).
+		 */
+		private void refuseUnencodable(List<Pending> batch, RuntimeException error) {
+			var rest = new ArrayList<Pending>(batch.size());
+			for (var pending : batch) {
+				try {
+					var entry = java.util.Objects.requireNonNull(pending.entry, "entry");
+					if (LogEntryCodec.encodeEntryBody(entry).length != pending.bodySize) {
+						throw new IllegalStateException("The write changed size after it was submitted");
+					}
+					rest.add(pending);
+				} catch (RuntimeException invalid) {
+					pending.fail(pending.maybeAppended || pending.resentAlone ? noAnswer(invalid)
+							: RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
+									"The write could not be encoded, it was not applied: " + invalid.getMessage()));
+				}
+			}
+			if (rest.size() == batch.size()) {
+				throw error;
+			}
+			// Nothing was sent: those that no earlier batch may have appended go back as never taken, so that their
+			// caller's deadline or cancellation can again take them out of the queue (and their buffers be reused).
+			for (var pending : rest) {
+				if (!pending.maybeAppended && !pending.resentAlone) {
+					pending.untake();
+				}
+			}
+			requeue(rest);
+			for (var pending : rest) {
+				if (pending.callerDeadline && pending.isQueued()) {
+					expireWhenQueued(pending);
+				}
+			}
+			finished();
 		}
 
 		/**
@@ -703,9 +793,9 @@ final class Proposer implements Closeable {
 		 * ended without telling whether the entry was appended ({@code ambiguous}), a later refusal no longer means
 		 * "not applied": the batch can only end with its results or an unknown outcome.
 		 */
-		private void attempt(List<Pending> batch, Message message, long callId, long deadlineNanos, long sentNanos,
-				boolean ambiguous) {
-			var reply = isLocalLeader() ? submitLocal(message, callId, deadlineNanos, permits)
+		private void attempt(List<Pending> batch, Message message, @Nullable List<Request> local, long callId,
+				long deadlineNanos, long sentNanos, boolean ambiguous) {
+			var reply = isLocalLeader() ? submitLocal(message, local, callId, deadlineNanos, permits)
 					: CompletableFuture.supplyAsync(() -> sendToLeader(message, callId, permits), sender);
 			reply.handleAsync((answer, error) -> {
 				var refusal = error != null ? stateMachineException(error)
@@ -749,7 +839,7 @@ final class Proposer implements Closeable {
 									return;
 								}
 								try {
-									attempt(batch, message, callId, deadlineNanos, sentNanos, nowAmbiguous);
+									attempt(batch, message, local, callId, deadlineNanos, sentNanos, nowAmbiguous);
 								} catch (Throwable unexpected) {
 									// The scheduler would keep it to itself. Earlier copies may have been appended.
 									fail(batch, unavailable(unexpected));
@@ -838,9 +928,9 @@ final class Proposer implements Closeable {
 		 * The single attempt at a batch of transaction commits. A conflict rejects the whole log entry before it is
 		 * appended: the commits that conflict fail, the others go again with the next batch.
 		 */
-		private void sendCommits(List<Pending> batch, Message message, long callId, long deadlineNanos,
-				long sentNanos) {
-			submitLocal(message, callId, deadlineNanos, permits).handleAsync((answer, error) -> {
+		private void sendCommits(List<Pending> batch, Message message, @Nullable List<Request> local, long callId,
+				long deadlineNanos, long sentNanos) {
+			submitLocal(message, local, callId, deadlineNanos, permits).handleAsync((answer, error) -> {
 				roundTrip.since(sentNanos);
 				try {
 					var refusal = error != null ? stateMachineException(error)
@@ -1001,23 +1091,44 @@ final class Proposer implements Closeable {
 				.build();
 	}
 
-	/** Submits straight to the local Raft server, with no client in between that could redirect it elsewhere. */
-	private CompletableFuture<RaftClientReply> submitLocal(Message message, long callId, long deadlineNanos,
-			ByteAdmission permits) {
+	/**
+	 * Submits straight to the local Raft server, with no client in between that could redirect it elsewhere.
+	 * {@code local}, if not null, is the batch's requests as {@link LogEntryCodec#encodeBatch} returned them with its
+	 * bytes: they are offered to this node's state machine, which takes them instead of decoding the batch (see
+	 * {@link RockserverStateMachine#offerLocal}), and withdrawn once Ratis answers, in case it answered without
+	 * starting a transaction (a refusal, or the retry cache).
+	 */
+	private CompletableFuture<RaftClientReply> submitLocal(Message message, @Nullable List<Request> local, long callId,
+			long deadlineNanos, ByteAdmission permits) {
 		long weight = message.size();
 		if (!permits.tryAcquire(weight)) {
 			return CompletableFuture.failedFuture(new NoPermitException(weight));
 		}
 		CompletableFuture<RaftClientReply> reply;
+		RockserverStateMachine.LocalProposal offered = null;
 		try {
-			reply = localServer.get().submitClientRequestAsync(invocation(message, callId, self));
+			var server = localServer.get();
+			if (local != null
+					&& server.getDivision(groupId).getStateMachine() instanceof RockserverStateMachine stateMachine) {
+				offered = stateMachine.offerLocal(invocationClientId, callId, message.getContent(), local);
+			}
+			reply = server.submitClientRequestAsync(invocation(message, callId, self));
 		} catch (IOException | RuntimeException ex) {
 			permits.release(weight);
+			if (offered != null) {
+				offered.withdraw();
+			}
 			return CompletableFuture.failedFuture(ex);
 		}
+		var withdrawn = offered;
 		// Given back when Ratis answers, which it does once the entry is no longer pending (applied, or failed by a
 		// step down), not when this node stops waiting below: until then the entry holds room in Ratis' limits.
-		reply.whenComplete((_, _) -> permits.release(weight));
+		reply.whenComplete((_, _) -> {
+			permits.release(weight);
+			if (withdrawn != null) {
+				withdrawn.withdraw();
+			}
+		});
 		// The deadline only stops new copies (see attempt): a copy already submitted here runs to its end, so
 		// wait for its answer at least as long as a remote attempt would, or a healthy commit of a batch holding
 		// one short caller deadline would end as "outcome unknown" for every member. A copy, so that the timeout

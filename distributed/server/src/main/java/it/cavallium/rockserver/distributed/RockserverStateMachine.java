@@ -7,6 +7,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.function.Consumer;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroupId;
@@ -92,6 +93,36 @@ final class RockserverStateMachine extends BaseStateMachine {
 			return requests.stream().map(Request::entry).toList();
 		}
 	}
+
+	/**
+	 * A batch that this node's proposer encoded and submitted to its own Raft server, with its requests as
+	 * {@link LogEntryCodec#encodeBatch} returned them: {@link #startTransaction} takes them instead of decoding the
+	 * batch. Keyed by the Ratis invocation, which is unique to one batch of one proposer; the proposer withdraws it
+	 * once Ratis answers, so that one Ratis answers without starting a transaction for (a refusal, a retry-cache hit)
+	 * does not stay behind.
+	 */
+	final class LocalProposal {
+		private final LocalKey key;
+		private final ByteString content;
+		private final List<Request> requests;
+
+		private LocalProposal(LocalKey key, ByteString content, List<Request> requests) {
+			this.key = key;
+			this.content = content;
+			this.requests = requests;
+		}
+
+		void withdraw() {
+			localProposals.remove(key, this);
+		}
+	}
+
+	private record LocalKey(ClientId clientId, long callId) {}
+
+	private final java.util.concurrent.ConcurrentHashMap<LocalKey, LocalProposal> localProposals =
+			new java.util.concurrent.ConcurrentHashMap<>();
+	/** Transactions started from a {@link LocalProposal}, without decoding; for tests. */
+	private final java.util.concurrent.atomic.LongAdder localProposalsTaken = new java.util.concurrent.atomic.LongAdder();
 
 	private final NodeConfig config;
 	private final CheckpointStorage storage = new CheckpointStorage();
@@ -307,6 +338,44 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 	}
 
+	/**
+	 * Offers the requests of a batch this node is about to submit to its own Raft server as invocation
+	 * {@code callId} of {@code clientId}, with {@code content} as its message: {@link #startTransaction} takes them
+	 * instead of decoding the batch, if the request it gets carries that very content. {@code requests} must be what
+	 * decoding {@code content} in place gives (see {@link LogEntryCodec#encodeBatch}). The caller withdraws the offer
+	 * once Ratis answers.
+	 */
+	LocalProposal offerLocal(ClientId clientId, long callId, ByteString content, List<Request> requests) {
+		var offered = new LocalProposal(new LocalKey(clientId, callId), content, requests);
+		localProposals.put(offered.key, offered);
+		return offered;
+	}
+
+	/** The requests offered for {@code request} ({@link #offerLocal}), taken; null if none, or not for its content. */
+	private @Nullable List<Request> takeLocal(RaftClientRequest request, ByteString content) {
+		if (localProposals.isEmpty()) {
+			return null;
+		}
+		var offered = localProposals.remove(new LocalKey(request.getClientId(), request.getCallId()));
+		// The very bytes the requests were encoded into: another request with the same invocation, if one could
+		// ever come, is decoded.
+		if (offered == null || offered.content != content) {
+			return null;
+		}
+		localProposalsTaken.increment();
+		return offered.requests;
+	}
+
+	/** Offers not taken nor withdrawn yet, for tests. */
+	int localProposalsOffered() {
+		return localProposals.size();
+	}
+
+	/** Transactions started from an offer, without decoding, for tests. */
+	long localProposalsTaken() {
+		return localProposalsTaken.sum();
+	}
+
 	@Override
 	public TransactionContext startTransaction(RaftClientRequest request) throws IOException {
 		var builder = TransactionContext.newBuilder()
@@ -318,7 +387,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 				// Only the leader stamps, below: a stamped proposal would make an entry that followers cannot decode.
 				throw new IllegalArgumentException("A proposal must not carry a leader stamp");
 			}
-			var decoded = decodeBatch(content);
+			// The proposer of this node offers the requests it encoded (see offerLocal); any other batch is decoded:
+			// from other nodes, resends after the offer was taken, offers withdrawn.
+			var offered = takeLocal(request, content);
+			var decoded = offered != null ? offered : decodeBatch(content);
 			if (decoded.size() > 1 && !decoded.stream().allMatch(r -> Applier.isBatchable(r.entry()))) {
 				throw new IllegalArgumentException("Only data writes can share a log entry");
 			}
@@ -980,6 +1052,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	@Override
 	public void close() throws IOException {
+		// Offers whose answers never come, if any: nothing will take them now.
+		localProposals.clear();
 		// Ratis waited for every reply it handed over; stop the apply thread before closing the database.
 		applyQueue.add(new Stop());
 		try {
