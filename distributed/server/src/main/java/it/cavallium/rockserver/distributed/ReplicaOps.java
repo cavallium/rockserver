@@ -135,6 +135,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	private volatile Duration checksumEvery;
 	/** Wall-clock time this replica last applied a checksum entry (from the results file at start); 0: none known. */
 	private volatile long lastChecksumMillis;
+	/**
+	 * Per checksum index in the results file, when this replica first applied it: a replay of that entry (a lost WAL
+	 * tail, entries after the snapshot) keeps that time instead of moving the schedule to the replay.
+	 */
+	private final Map<Long, Long> recordedChecksumMillis = new ConcurrentHashMap<>();
 	/** The start of this node: what the interval counts from while it knows of no check. */
 	private final long startMillis = System.currentTimeMillis();
 	/** Leader only, initialization thread only: when this node last proposed a periodic check itself. */
@@ -162,6 +167,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		this.checksumEvery = every;
 	}
 
+	/** Tests only: see {@link #lastChecksumMillis}. */
+	long lastChecksumMillisForTesting() {
+		return lastChecksumMillis;
+	}
+
 	static boolean validBackupName(@Nullable String name) {
 		return name != null && BACKUP_NAME.matcher(name).matches();
 	}
@@ -178,7 +188,8 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	static final Map<String, Long> SUPPORTED_FOR_TESTING = new ConcurrentHashMap<>();
 
 	/** What this node supports: {@link Capabilities#SUPPORTED}, unless a test says otherwise. */
-	long supported() {
+	@Override
+	public long supported() {
 		return SUPPORTED_FOR_TESTING.getOrDefault(config.nodeId(), Capabilities.SUPPORTED);
 	}
 
@@ -209,7 +220,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	@Override
 	public void checksum(TermIndex position, NodeStore store) {
 		long index = position.getIndex();
-		lastChecksumMillis = System.currentTimeMillis();
+		// When this replica first applied it, if it did: a replay must not restart the interval (CR2-2).
+		var recorded = recordedChecksumMillis.get(index);
+		lastChecksumMillis = Math.max(lastChecksumMillis, recorded != null ? recorded : System.currentTimeMillis());
 		var db = store.db();
 		var columns = new TreeMap<String, Long>();
 		// The cluster version at this position, the same on every replica: digests with schemas only once all have it.
@@ -559,7 +572,10 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 							checksums.put(index, new Result(state, index, Long.parseLong(parts[4]), parts[5]));
 							trim(checksums);
 							try {
-								lastChecksumMillis = Math.max(lastChecksumMillis, Instant.parse(parts[0]).toEpochMilli());
+								// The earliest line of an index is its first apply: later ones come from replays.
+								long millis = Instant.parse(parts[0]).toEpochMilli();
+								long first = recordedChecksumMillis.merge(index, millis, Math::min);
+								lastChecksumMillis = Math.max(lastChecksumMillis, first);
 							} catch (java.time.format.DateTimeParseException malformed) {
 								// The interval then counts from the start.
 							}

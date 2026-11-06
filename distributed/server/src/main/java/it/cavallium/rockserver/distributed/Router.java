@@ -431,13 +431,22 @@ final class Router {
 							followerReadTime.since(start);
 							return CompletableFuture.<Object>completedFuture(value);
 						}
-						long now = stateMachine.storeGeneration();
-						return (generation & 1) != 0 || now != generation
+						return replacedDuringRead(generation, stateMachine.storeGeneration())
 								? forwardFollowerRead(context, start, command)
 								: CompletableFuture.<Object>failedFuture(localError);
 					}).thenCompose(f -> f);
 				}, inline)
 				.thenCompose(f -> f);
+	}
+
+	/**
+	 * Whether a follower read that failed locally met a snapshot install, and is forwarded instead of failing: the
+	 * install was under way when it started ({@code before} odd: it did not even try), or began, and closed the database
+	 * it read, after it read {@code before} ({@code after} differs). The database waits for the reads it admitted before
+	 * it closes, so such a read fails as closed, never on freed memory.
+	 */
+	static boolean replacedDuringRead(long before, long after) {
+		return (before & 1) != 0 || after != before;
 	}
 
 	/** Forwards a point read this node tried to serve as a follower. */

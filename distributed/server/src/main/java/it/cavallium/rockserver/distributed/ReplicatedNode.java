@@ -757,6 +757,23 @@ public final class ReplicatedNode implements AutoCloseable {
 		NewerVersionException(String message) {
 			super(message);
 		}
+
+		/** For a cluster version {@code version} of which this node lacks the capabilities {@code unknown}. */
+		static NewerVersionException of(long version, long unknown) {
+			return new NewerVersionException("Cluster version " + Capabilities.describe(version)
+					+ " has capabilities this version lacks (" + Capabilities.describe(unknown) + "): it was written by a newer"
+					+ " version. Run the newer version, see \"Upgrades\" in docs/distributed/runbooks.md");
+		}
+
+		/** Whether {@code failure}, or one of its causes, is a {@link NewerVersionException}. */
+		public static boolean in(@Nullable Throwable failure) {
+			for (var cause = failure; cause != null; cause = cause.getCause()) {
+				if (cause instanceof NewerVersionException) {
+					return true;
+				}
+			}
+			return false;
+		}
 	}
 
 	/** Thrown by {@link #start} for a node that was removed from the cluster: see {@link #requireNotRemoved}. */

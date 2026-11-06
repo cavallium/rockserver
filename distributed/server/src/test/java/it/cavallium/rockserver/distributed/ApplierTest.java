@@ -51,6 +51,37 @@ class ApplierTest {
 		return value == null ? null : value.toString(StandardCharsets.UTF_8);
 	}
 
+	/**
+	 * CR2-6: a raise of the cluster version to capabilities this node lacks, reached through the log (a replay after a
+	 * lost WAL tail, or catching up after a rollback), stops the replica instead of being written; the version and the
+	 * applied position stay as they were, and the failure carries a NewerVersionException (exit 5).
+	 */
+	@Test
+	void aLoggedRaiseToAnUnknownCapabilityStopsTheReplica() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			applier.apply(new Request(5, 0, 0, new LogEntry.ClusterVersion(Capabilities.SUPPORTED)), TermIndex.valueOf(1, 10));
+			assertEquals(Capabilities.SUPPORTED, store.clusterVersion());
+			var failure = assertThrows(Applier.ReplicaFailedException.class, () -> applier.apply(
+					new Request(5, 1, 1, new LogEntry.ClusterVersion(Capabilities.SUPPORTED | (1L << 40))),
+					TermIndex.valueOf(1, 11)));
+			org.junit.jupiter.api.Assertions.assertTrue(ReplicatedNode.NewerVersionException.in(failure), failure.toString());
+			assertEquals(Capabilities.SUPPORTED, store.clusterVersion());
+			assertEquals(TermIndex.valueOf(1, 10), store.applied());
+
+			// A node of an older version (what it supports, as ReplicaOps says): a known bit it lacks stops it too.
+			long older = Capabilities.SUPPORTED & ~Capabilities.CHECKSUM_SCHEMAS;
+			applier.maintenance(new Applier.Maintenance() {
+				@Override
+				public long supported() {
+					return older;
+				}
+			});
+			assertThrows(Applier.ReplicaFailedException.class, () -> applier.apply(
+					new Request(5, 2, 2, new LogEntry.ClusterVersion(Capabilities.SUPPORTED)), TermIndex.valueOf(1, 12)));
+		}
+	}
+
 	@Test
 	void aRetriedRequestTakesEffectOnceAndGetsTheFirstResult() throws Exception {
 		long column;

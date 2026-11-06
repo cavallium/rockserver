@@ -115,6 +115,11 @@ final class Applier {
 		/** The cluster version is now {@code version}. */
 		default void clusterVersion(long version) {}
 
+		/** The capabilities this node can read: a cluster version with any other bit stops the replica. */
+		default long supported() {
+			return Capabilities.SUPPORTED;
+		}
+
 		/** A {@link LogEntry.Checksum} at {@code position}. */
 		default void checksum(TermIndex position, NodeStore store) {}
 
@@ -1266,6 +1271,16 @@ final class Applier {
 			case LogEntry.ClusterVersion version -> {
 				requireNoTransaction(tx, entry);
 				long raised = store.clusterVersion() | version.capabilities();
+				// A raise this node cannot read reaches it through the log too, not only in the database it starts with:
+				// a member of a newer version answered the leader's poll, then was rolled back to this version before its
+				// database kept the raise (a lost WAL tail, replayed), or before it applied it (catching up). The entries
+				// after it may use the capability: stop here, and leave the version as it was. Not an entry failure: a
+				// newer replica applies it.
+				long unknown = raised & ~maintenance.supported();
+				if (unknown != 0) {
+					throw new ReplicaFailedException("The log raises the cluster version to " + Capabilities.describe(raised)
+							+ ", with capabilities this version lacks", ReplicatedNode.NewerVersionException.of(raised, unknown));
+				}
 				writeClusterVersion(raised);
 				maintenance.clusterVersion(raised);
 				yield null;

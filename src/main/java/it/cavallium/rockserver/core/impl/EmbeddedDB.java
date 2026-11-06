@@ -1765,6 +1765,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 		}
 
+		/** Tests only: the serialized native batch of this writer's writes so far, what {@link #commitWith} joins. */
+		@VisibleForTesting
+		public byte[] batchDataForTesting() {
+			try {
+				return tx.val().getWriteBatch().getWriteBatch().data();
+			} catch (org.rocksdb.RocksDBException e) {
+				throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, e);
+			}
+		}
+
 		/** Undoes the writes made since the latest {@link #setSavePoint}, and forgets it. */
 		public void rollbackToSavePoint() {
 			try {
@@ -1788,14 +1798,6 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			closeTransactionInternal(tx, false);
 		}
 
-		/**
-		 * Commits the writes of {@code others} and of this writer in <b>one</b> atomic database write, in that order,
-		 * then closes them all: a crash keeps all of them or none. For the partitioned apply of replication, whose
-		 * writers were filled by different threads and hold writes to different keys. Every writer must have been
-		 * opened with the same {@code disableWal} as this one, and none may be in use meanwhile. Their native batches
-		 * are joined as RocksDB's own {@code WriteBatchInternal::Append} does: one header (sequence, count) followed by
-		 * the records of each batch. If any of them fails, all are closed and the exception is thrown.
-		 */
 		/**
 		 * The serialized write batches {@code parts}, in order, as one batch: what RocksDB's {@code WriteBatchInternal::Append}
 		 * makes (RocksJava has no call for it). A batch is a 12-byte header (8-byte sequence, which the database assigns
@@ -1830,6 +1832,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return joined;
 		}
 
+		/**
+		 * Commits the writes of {@code others} and of this writer in <b>one</b> atomic database write, in that order,
+		 * then closes them all: a crash keeps all of them or none. For the partitioned apply of replication, whose
+		 * writers were filled by different threads and hold writes to different keys. Every writer must have been
+		 * opened with the same {@code disableWal} as this one, and none may be in use meanwhile. Their native batches
+		 * are joined as RocksDB's own {@code WriteBatchInternal::Append} does: one header (sequence, count) followed by
+		 * the records of each batch. If any of them fails, all are closed and the exception is thrown.
+		 */
 		public void commitWith(List<ApplyWriter> others) {
 			try {
 				var parts = new ArrayList<byte[]>(others.size() + 1);

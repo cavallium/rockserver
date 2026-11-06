@@ -289,20 +289,30 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/**
 	 * Refuses a database whose cluster version has a capability this version of the node lacks: a downgrade below the
 	 * cluster version, or a backup of a newer cluster restored here. The log may hold entries of that capability, which
-	 * this node cannot read, and a capability check would never ask it again (the version never goes down). Only at
-	 * the start: an install brings the database of a leader of this cluster, which raised nothing a member lacks.
+	 * this node cannot read, and a capability check would never ask it again (the version never goes down). At the
+	 * start, where the refused database is closed again; the same check runs on an installed snapshot (a member rolled
+	 * back after it answered the leader's poll, then installing the leader's database) and on the apply of a raise
+	 * ({@link Applier}).
 	 */
 	private void requireKnownClusterVersion() throws IOException {
 		var opened = store;
-		long version = opened.clusterVersion();
-		long unknown = version & ~Capabilities.SUPPORTED;
-		if (unknown != 0) {
+		var newer = newerVersion(opened);
+		if (newer != null) {
 			store = null;
 			opened.close();
-			throw new ReplicatedNode.NewerVersionException("Node " + config.nodeId() + " has a database of cluster version "
-					+ Capabilities.describe(version) + ", with capabilities this version lacks (" + Capabilities.describe(unknown)
-					+ "): it was written by a newer version. Run the newer version, see \"Upgrades\" in docs/distributed/runbooks.md");
+			throw newer;
 		}
+	}
+
+	private ReplicatedNode.@Nullable NewerVersionException newerVersion(NodeStore opened) {
+		long version = opened.clusterVersion();
+		long unknown = version & ~ops.supported();
+		if (unknown == 0) {
+			return null;
+		}
+		return new ReplicatedNode.NewerVersionException("Node " + config.nodeId() + " has a database of cluster version "
+				+ Capabilities.describe(version) + ", with capabilities this version lacks (" + Capabilities.describe(unknown)
+				+ "): it was written by a newer version. Run the newer version, see \"Upgrades\" in docs/distributed/runbooks.md");
 	}
 
 	/**
@@ -360,6 +370,11 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/** See {@link #visibleTerm}. Any thread. */
 	long visibleTerm() {
 		return visibleTerm;
+	}
+
+	/** Tests only: the applier of the database open now. */
+	Applier applierForTesting() {
+		return applier;
 	}
 
 	/** See {@link #storeGeneration}. Any thread. */
@@ -1217,6 +1232,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 		CrashPoints.reach(CrashPoints.Point.INSTALL_RESTORING);
 		NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
 		openStore();
+		// The leader's database may carry a raise this node cannot read (it was rolled back after answering the poll).
+		// The store stays open, the generation odd: the failure stops the replica, whose close closes it.
+		var newer = newerVersion(store);
+		if (newer != null) {
+			throw newer;
+		}
 		var gate = installGateForTesting;
 		if (gate != null) {
 			var reached = installReachedForTesting;

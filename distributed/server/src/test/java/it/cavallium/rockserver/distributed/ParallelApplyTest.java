@@ -105,6 +105,57 @@ class ParallelApplyTest {
 		}
 	}
 
+	/**
+	 * R2-PA-5 with the batches commitWith really joins: those of apply writers (transactions over a write batch with
+	 * index) on two user columns, one lane with a write rolled back to a save point. The joined bytes equal the batch
+	 * of one writer that made the kept operations in the same order, and the database after commitWith holds exactly
+	 * them.
+	 */
+	@Test
+	void joinedApplyWriterBatchesAreTheBatchOfOneWriterWithAllTheirOperations() throws Exception {
+		try (var store = open("join")) {
+			var db = store.db();
+			long a = db.createColumn("a", FIXED);
+			long b = db.createColumn("b", FIXED);
+			db.put(0, a, key(5), text("old"), RequestType.none());
+			var first = db.openApplyWriter(true);
+			var second = db.openApplyWriter(true);
+			var reference = db.openApplyWriter(true);
+			try {
+				first.put(a, key(1), text("a1"), RequestType.none());
+				first.setSavePoint();
+				first.put(b, key(2), text("rolled back"), RequestType.none());
+				first.delete(a, key(1), RequestType.none());
+				first.rollbackToSavePoint();
+				first.put(b, key(3), text("b3"), RequestType.none());
+				second.put(b, key(4), text("b4"), RequestType.none());
+				second.delete(a, key(5), RequestType.none());
+
+				reference.put(a, key(1), text("a1"), RequestType.none());
+				reference.put(b, key(3), text("b3"), RequestType.none());
+				reference.put(b, key(4), text("b4"), RequestType.none());
+				reference.delete(a, key(5), RequestType.none());
+				byte[] joined = it.cavallium.rockserver.core.impl.EmbeddedDB.ApplyWriter.joinWriteBatches(
+						List.of(first.batchDataForTesting(), second.batchDataForTesting()));
+				org.junit.jupiter.api.Assertions.assertArrayEquals(reference.batchDataForTesting(), joined,
+						HexFormat.of().formatHex(joined));
+			} finally {
+				reference.close();
+			}
+			// commitWith writes the others first, then itself.
+			second.commitWith(List.of(first));
+			assertEquals("a1", string(db.get(0, a, key(1), RequestType.current())));
+			org.junit.jupiter.api.Assertions.assertNull(db.get(0, b, key(2), RequestType.current()));
+			assertEquals("b3", string(db.get(0, b, key(3), RequestType.current())));
+			assertEquals("b4", string(db.get(0, b, key(4), RequestType.current())));
+			org.junit.jupiter.api.Assertions.assertNull(db.get(0, a, key(5), RequestType.current()));
+		}
+	}
+
+	private static @Nullable String string(@Nullable Buf buf) {
+		return buf == null ? null : buf.toString(StandardCharsets.UTF_8);
+	}
+
 	@Test
 	void aClusterWithPartitionedApplyConverges() throws Exception {
 		Files.createDirectories(temp.resolve("cluster"));

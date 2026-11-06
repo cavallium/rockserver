@@ -50,8 +50,13 @@ final class DirectMemoryWatch implements AutoCloseable {
 		this.stream = stream;
 	}
 
-	/** Prefixes of the threads of Ratis' own executors and of its shaded gRPC transport. */
-	private static final List<String> REPLICATION_PREFIXES = List.of("grpc-default-");
+	/**
+	 * Prefixes of the threads of Ratis' shaded gRPC transport. Ratis leaves its worker group sizes at 0, so its gRPC uses
+	 * grpc-java's shared event loop groups: {@code grpc-default-boss/worker-ELG} where epoll loads, and
+	 * {@code grpc-nio-boss/worker-ELG} where it does not (musl, a noexec temporary directory, the native transport
+	 * turned off, macOS). {@code grpc-default-executor} is grpc-java's shared executor.
+	 */
+	private static final List<String> REPLICATION_PREFIXES = List.of("grpc-default-", "grpc-nio-");
 	/** Suffixes of the executors of a Ratis server ({@code <peer>-server-thread3}, ...), digits removed. */
 	private static final List<String> REPLICATION_SUFFIXES = List.of("-server-thread", "-client-thread", "-impl-thread",
 			"-groupManagement");
@@ -110,7 +115,7 @@ final class DirectMemoryWatch implements AutoCloseable {
 	 * whose code catches the error and goes on without what it was doing. Recognized by name: Ratis' division threads
 	 * ({@code <peer>@group-<id>-...}: appenders, log worker, state machine updater, leader and follower state), the
 	 * executors of its server ({@code <peer>-server-thread<n>}, ...) and the threads of its shaded gRPC
-	 * ({@code grpc-default-...}; the API's gRPC transport names its own threads {@code rockserver-grpc-...}). An event
+	 * ({@code grpc-default-...}, or {@code grpc-nio-...} where Netty runs without epoll; the API's gRPC transport names its own threads {@code rockserver-grpc-...}). An event
 	 * without a thread is fatal. Pinned on a running cluster by {@code DirectMemoryWatchTest}.
 	 */
 	static boolean fatalOn(@Nullable String threadName) {

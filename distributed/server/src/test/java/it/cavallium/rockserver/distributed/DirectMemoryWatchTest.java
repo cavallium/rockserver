@@ -38,7 +38,9 @@ class DirectMemoryWatchTest {
 		for (var name : List.of(APPENDER, "n0@group-0A1B2C3D4E5F-SegmentedRaftLogWorker",
 				"n0@group-0A1B2C3D4E5F-StateMachineUpdater", "n0@group-0A1B2C3D4E5F-LeaderStateImpl",
 				"n0-server-thread3", "n0-client-thread1", "n0-impl-thread12", "n0-groupManagement",
-				"grpc-default-worker-ELG-3-2", "grpc-default-boss-ELG-1-1", "grpc-default-executor-4", "")) {
+				"grpc-default-worker-ELG-3-2", "grpc-default-boss-ELG-1-1", "grpc-default-executor-4",
+				// Ratis' shaded gRPC where epoll does not load (musl, noexec tmpdir, noNative, macOS)
+				"grpc-nio-worker-ELG-3-1", "grpc-nio-boss-ELG-1-1", "")) {
 			assertTrue(DirectMemoryWatch.fatalOn(name), name);
 		}
 		assertTrue(DirectMemoryWatch.fatalOn(null));

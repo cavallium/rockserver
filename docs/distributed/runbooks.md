@@ -187,7 +187,8 @@ The cluster version keeps the new kinds of log entries off until every member ru
 - Never downgrade a node below the cluster version: it would stop on the first entry it cannot read. A node whose
   database has a cluster version with a capability its binary lacks (a downgrade, or a backup of a newer cluster restored
   here) refuses to start, with exit code 5 and a message naming the unknown capabilities: start the newer version
-  again. `add-peer` refuses
+  again. A node rolled back after it took part in a raise can also meet it after the start, in the log it replays or
+  catches up on, or in a snapshot it installs: it stops then, with exit code 5 as well. `add-peer` refuses
   a new node that lacks a capability of the cluster, or one that every member supports already (the leader may turn it
   on at any moment): upgrade the new node first.
 - A cluster created before the cluster version has none until every member was upgraded to a version that has it and the
@@ -217,7 +218,7 @@ only: restart it on 1 and 3, never on 2, 4 or 5, which need an operator.
 | 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError` | Wrong usage | Wrong usage | Wrong usage |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM | - | - | - |
 | 4 | Removed from the cluster: refused at the start, or found out while waiting outside the cluster. Do not start it again | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`): run it again | - | - |
-| 5 | Its database has a cluster version with capabilities this version lacks: run the newer version | - | - | - |
+| 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | - |
 
 Code 4 is kept for both meanings: renumbering either would change what deployed supervisors and scripts, and the
 process tests, already expect, and a supervisor never runs `admin`, nor a script `run`.

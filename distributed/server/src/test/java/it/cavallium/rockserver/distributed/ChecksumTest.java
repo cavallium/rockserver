@@ -138,6 +138,41 @@ class ChecksumTest {
 		assertTrue(after > every.toNanos() - TimeUnit.MILLISECONDS.toNanos(1_000), "early: " + Duration.ofNanos(after));
 	}
 
+	/**
+	 * CR2-2: applying a checksum entry again (a restart that replays it after a lost WAL tail, or entries after the
+	 * snapshot) keeps the time this replica first applied it, from its results file: the schedule is not restarted at
+	 * the replay. Here the recorded time is moved three hours back while the node is down, and the replay is the apply
+	 * of the same position.
+	 */
+	@Test
+	void replayingAChecksumEntryKeepsItsFirstApplyTime() throws Exception {
+		var leader = start();
+		long index = checksum(leader);
+		var follower = cluster.anyFollower();
+		var id = follower.config().nodeId();
+		cluster.stop(id);
+		var results = cluster.config(id).dataDir().resolve("replica-ops.log");
+		long old = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(3);
+		var lines = java.nio.file.Files.readAllLines(results).stream()
+				.map(line -> line.contains(" checksum " + index + " ")
+						? java.time.Instant.ofEpochMilli(old) + line.substring(line.indexOf(' ')) : line)
+				.toList();
+		java.nio.file.Files.write(results, lines);
+
+		var restarted = cluster.start(id);
+		var ops = restarted.stateMachine().ops();
+		assertEquals(old, ops.lastChecksumMillisForTesting(), "loaded from the results file");
+		cluster.awaitConverged(TIMEOUT);
+		var term = restarted.stateMachine().division().getInfo().getCurrentTerm();
+		ops.checksum(org.apache.ratis.server.protocol.TermIndex.valueOf(term, index), restarted.stateMachine().store());
+		InProcessCluster.await(TIMEOUT, () -> ops.checksumResult(index).state() == ReplicaOps.State.DONE);
+		assertEquals(old, ops.lastChecksumMillisForTesting(), "a replay does not move the schedule");
+
+		// Its new lines (written at the replay) do not move it at the next start either.
+		cluster.stop(id);
+		assertEquals(old, cluster.start(id).stateMachine().ops().lastChecksumMillisForTesting());
+	}
+
 	private static Keys key(long value) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(value).array()));
 	}
