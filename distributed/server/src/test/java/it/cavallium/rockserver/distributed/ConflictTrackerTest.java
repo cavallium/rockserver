@@ -247,6 +247,34 @@ class ConflictTrackerTest {
 	}
 
 	@Test
+	void registersAndChecksGoOnWhileALargePruneRuns() throws Exception {
+		// 200,000 resolved keys: forgetting them takes several prunes, each of several lock-holding chunks.
+		for (int entry = 0; entry < 5; entry++) {
+			var keys = new ArrayList<Keys>();
+			var values = new ArrayList<Buf>();
+			for (int i = 0; i < 40_000; i++) {
+				keys.add(key(entry + ":" + i));
+				values.add(VALUE);
+			}
+			tracker.resolve(tracker.register(new LogEntry.PutMulti(COLUMN, keys, values, RequestTypeId.NOTHING)),
+					10 + entry);
+		}
+		var pruner = Thread.ofPlatform().start(() -> {
+			while (tracker.resolvedKeys() > 0) {
+				tracker.prune(14);
+			}
+		});
+		for (int i = 0; i < 2_000; i++) {
+			tracker.register(put(COLUMN, key("live" + i)));
+			assertTrue(tracker.conflicts(transaction(14, COLUMN, key("live" + i))), "a pending write always conflicts");
+			assertFalse(tracker.conflicts(transaction(14, OTHER_COLUMN, key("live" + i))));
+		}
+		pruner.join();
+		assertEquals(0, tracker.resolvedKeys());
+		assertEquals(2_000, tracker.size(), "pending writes are never forgotten");
+	}
+
+	@Test
 	void entryThatFailedToAppendStopsConflictingOnceALaterEntryApplies() {
 		// Ratis rejects both appends after preAppendTransaction registered them: they are never resolved.
 		tracker.register(put(COLUMN, key("k")));

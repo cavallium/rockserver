@@ -1,19 +1,26 @@
 package it.cavallium.rockserver.distributed;
 
+import com.typesafe.config.Config;
 import com.typesafe.config.ConfigException;
 import com.typesafe.config.ConfigFactory;
+import com.typesafe.config.ConfigObject;
 import com.typesafe.config.ConfigParseOptions;
 import com.typesafe.config.ConfigRenderOptions;
+import com.typesafe.config.ConfigValue;
+import com.typesafe.config.ConfigValueFactory;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.config.DataSize;
+import it.cavallium.rockserver.core.resources.DefaultConfig;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -23,6 +30,7 @@ import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -69,7 +77,7 @@ import org.slf4j.LoggerFactory;
  * file system; a live file outside it makes {@link #checkpoint} fail.</p>
  *
  * <p>The database is opened with the node's Rockserver config plus {@link #REPLICA_OVERRIDES}, settings that every
- * replica needs whatever that config says.</p>
+ * replica needs whatever that config says, and the memtable sizing of {@link #withReplicaWriteBuffers}.</p>
  */
 final class NodeStore implements Closeable {
 
@@ -172,8 +180,8 @@ final class NodeStore implements Closeable {
 				config = config.withFallback(ConfigFactory.parseFile(rockserverConfig.toFile(),
 						ConfigParseOptions.defaults().setAllowMissing(false)));
 			}
-			config = config.resolve();
-		} catch (ConfigException e) {
+			config = withReplicaWriteBuffers(config.resolve());
+		} catch (ConfigException | IllegalArgumentException e) {
 			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
 		}
 		Path file = Files.createTempFile("rockserver-replica-", ".conf");
@@ -184,6 +192,66 @@ final class NodeStore implements Closeable {
 			throw e;
 		}
 		return file;
+	}
+
+	/**
+	 * Lets the shared write buffer budget, not a per-column limit, decide when memtables are flushed.
+	 *
+	 * <p>Replicas use atomic flush (see {@link #REPLICA_OVERRIDES}): whatever triggers a flush, every column family
+	 * with unflushed data is flushed with it. With the default per-column {@code write-buffer-size} (64 MiB), one hot
+	 * column filling its memtable would flush every cold column too, each into a tiny SST file, as often as the hot
+	 * column fills up. So every column's {@code write-buffer-size} is raised to the database's write buffer budget,
+	 * {@code database.global.write-buffer-manager} (default 128 MiB; when it is 0 or null, half of {@code block-cache},
+	 * as the database computes it): no single column reaches its own limit before the {@code WriteBufferManager},
+	 * which counts every column's memtables, asks for a flush. Flushes then come once per budget of writes to all
+	 * columns together, and the prefix guarantee of atomic flush is unchanged.</p>
+	 *
+	 * <p>Applied to {@code fallback-column-options} and to every entry of {@code column-options} that the config
+	 * itself lists; a per-column {@code write-buffer-size} in the config is replaced. To flush less often, raise
+	 * {@code write-buffer-manager} (it is charged to the block cache).</p>
+	 */
+	static Config withReplicaWriteBuffers(Config config) {
+		long budget = writeBufferBudget(config);
+		if (budget <= 0) {
+			return config;
+		}
+		ConfigValue size = ConfigValueFactory.fromAnyRef(budget + "B");
+		Config result = config.withValue("database.global.fallback-column-options.write-buffer-size", size);
+		String columnsPath = "database.global.column-options";
+		if (config.hasPath(columnsPath)) {
+			var columns = new ArrayList<ConfigValue>();
+			for (ConfigObject column : config.getObjectList(columnsPath)) {
+				columns.add(column.withValue("write-buffer-size", size));
+			}
+			result = result.withValue(columnsPath, ConfigValueFactory.fromIterable(columns));
+		}
+		return result;
+	}
+
+	/** The size of the database's {@code WriteBufferManager} for {@code config}, computed as the database does. */
+	static long writeBufferBudget(Config config) {
+		Config defaults;
+		try (var reader = new InputStreamReader(DefaultConfig.getDefaultConfig(), StandardCharsets.UTF_8)) {
+			defaults = ConfigFactory.parseReader(reader);
+		} catch (IOException e) {
+			throw new IllegalArgumentException("Failed to read the default Rockserver config", e);
+		}
+		Config effective = config.withFallback(defaults).resolve();
+		long manager = dataSize(effective, "database.global.write-buffer-manager");
+		if (manager > 0) {
+			return manager;
+		}
+		// A null block-cache means the database's 512 MiB default.
+		long blockCache = effective.hasPath("database.global.block-cache")
+				? dataSize(effective, "database.global.block-cache") : 512L << 20;
+		return blockCache / 2;
+	}
+
+	private static long dataSize(Config config, String path) {
+		if (!config.hasPath(path)) {
+			return 0;
+		}
+		return new DataSize(config.getString(path)).longValue();
 	}
 
 	private static Path walDir(Path dbDir, EmbeddedDB db) throws IOException {

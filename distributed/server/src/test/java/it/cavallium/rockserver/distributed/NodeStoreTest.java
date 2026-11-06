@@ -83,6 +83,46 @@ class NodeStoreTest {
 		}
 	}
 
+	/**
+	 * With atomic flush, a column reaching its own write-buffer-size flushes every column: every column's limit is
+	 * raised to the shared write buffer budget, so that the budget decides when to flush.
+	 */
+	@Test
+	void everyColumnBufferIsSizedToTheSharedWriteBufferBudget() throws Exception {
+		Path config = tempDir.resolve("buffers.conf");
+		Files.writeString(config, """
+				database.global.write-buffer-manager = 32MiB
+				database.global.fallback-column-options.write-buffer-size = 4MiB
+				database.global.column-options = [{ name: "data", write-buffer-size: 2MiB }]
+				""");
+		try (var store = NodeStore.open(tempDir.resolve("db"), config, "buffers")) {
+			var global = store.db().getConfig().global();
+			assertEquals(32L << 20, global.writeBufferManager().longValue());
+			assertEquals(32L << 20, global.fallbackColumnOptions().writeBufferSize().longValue());
+			boolean listed = false;
+			for (var column : global.columnOptions()) {
+				if (column.name().equals("data")) {
+					listed = true;
+					assertEquals(32L << 20, column.writeBufferSize().longValue());
+				}
+			}
+			assertTrue(listed, "the column the config lists");
+			assertTrue(global.atomicFlush());
+		}
+	}
+
+	@Test
+	void theWriteBufferBudgetDefaultsLikeTheDatabase() {
+		assertEquals(128L << 20, NodeStore.writeBufferBudget(com.typesafe.config.ConfigFactory.empty()));
+		assertEquals(256L << 20, NodeStore.writeBufferBudget(com.typesafe.config.ConfigFactory.parseString("""
+				database.global.write-buffer-manager = 0
+				database.global.block-cache = 512MiB
+				""")));
+		var resized = NodeStore.withReplicaWriteBuffers(com.typesafe.config.ConfigFactory.empty());
+		assertEquals("134217728B", resized.getString("database.global.fallback-column-options.write-buffer-size"));
+		assertFalse(resized.hasPath("database.global.column-options"), "only the columns the config lists");
+	}
+
 	/** A crash can tear the tail of the un-synced WAL: the replica opens the prefix and Raft replays the rest. */
 	@Test
 	void openRecoversThePrefixOfAWalWithATornTail() throws Exception {

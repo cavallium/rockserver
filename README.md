@@ -199,7 +199,10 @@ To replace a node of a replicated cluster, start the new node first with `--join
 `admin --peer <the other members> add-peer <new node>` when you like: the node waits for it, also across restarts, and
 leaving the old node out of `--peer` replaces it in one step. See "Replacing a node" in the [design
 document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError`, and see "Heap"
-there for the heap that a snapshot send needs.
+there for the heap that a snapshot send needs. A replicated node flushes its memtables when all columns together
+reach `database.global.write-buffer-manager` (128 MiB by default): it replaces every column's `write-buffer-size`
+with that budget, because with atomic flush any flush writes every column (see "Memtables" in
+[performance.md](docs/distributed/performance.md)).
 
 Shorter keepalive times find a dead node sooner, but a pause of the server or of the client that outlasts the
 timeout ends a working connection, with its calls in flight. Pings cost next to nothing, and a server accepts them
