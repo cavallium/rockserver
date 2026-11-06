@@ -107,6 +107,18 @@ public final class ReplicatedServerMain {
 
 	private ReplicatedServerMain() {}
 
+	/**
+	 * How the commands end the process: {@link System#exit} unless a test replaced it (with one that throws, to run a
+	 * command in its own JVM and read the exit code). The code after a call never runs: if the replacement returns,
+	 * {@link #exit} throws.
+	 */
+	static volatile java.util.function.IntConsumer exiter = System::exit;
+
+	private static void exit(int code) {
+		exiter.accept(code);
+		throw new IllegalStateException("exit(" + code + ") returned");
+	}
+
 	public static void main(String[] args) throws Exception {
 		// Netty's leak detector records a stack trace for sampled buffers: about 3% of the leader's event loop under
 		// load. Off unless the operator chose a level (-Dio.netty.leakDetection.level=...).
@@ -165,13 +177,13 @@ public final class ReplicatedServerMain {
 			node = ReplicatedNode.start(config);
 		} catch (ReplicatedNode.RemovedException e) {
 			System.err.println("Node " + config.nodeId() + " does not start: " + e.getMessage());
-			System.exit(4);
+			exit(4);
 			return;
 		} catch (IOException | RuntimeException e) {
 			// Ratis and gRPC leave non-daemon threads behind, which would keep the JVM running without a node.
 			System.err.println("Failed to start node " + config.nodeId() + ":");
 			e.printStackTrace();
-			System.exit(1);
+			exit(1);
 			return;
 		}
 		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -196,7 +208,7 @@ public final class ReplicatedServerMain {
 					+ (failure != null ? failure : "replica failed"));
 			// When a signal already started the shutdown, this blocks; the hook then halts with 3 once the node stopped.
 			// A node that found out, while it waited outside the cluster, that it was removed exits as at start.
-			System.exit(failure instanceof ReplicatedNode.RemovedException ? 4 : 3);
+			exit(failure instanceof ReplicatedNode.RemovedException ? 4 : 3);
 		}
 	}
 
@@ -255,7 +267,7 @@ public final class ReplicatedServerMain {
 			return;
 		}
 		System.err.println("Error: " + problem + ". Add the option, or --allow-without-exit-on-oom (development only)");
-		System.exit(2);
+		exit(2);
 	}
 
 	/**
@@ -405,7 +417,7 @@ public final class ReplicatedServerMain {
 			if (reply != null) {
 				System.out.println(reply.isSuccess() ? "OK" : "FAILED: " + reply.getException());
 				if (!reply.isSuccess()) {
-					System.exit(1);
+					exit(1);
 				}
 			}
 		}
@@ -499,7 +511,7 @@ public final class ReplicatedServerMain {
 	private static void exitOn(@Nullable Verdict verdict) {
 		if (verdict != null) {
 			System.out.println("FAILED: " + verdict.problem());
-			System.exit(verdict.exitCode());
+			exit(verdict.exitCode());
 		}
 	}
 
@@ -627,7 +639,7 @@ public final class ReplicatedServerMain {
 
 	private static void fail(String message) {
 		System.out.println("FAILED: " + message);
-		System.exit(1);
+		exit(1);
 	}
 
 	/**
@@ -720,7 +732,7 @@ public final class ReplicatedServerMain {
 		var report = RaftLogRepair.run(dataDir, groupId, dryRun);
 		report.lines().forEach(System.out::println);
 		if (!report.success()) {
-			System.exit(1);
+			exit(1);
 		}
 	}
 
@@ -767,7 +779,7 @@ public final class ReplicatedServerMain {
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]
 				  export-seed --data-dir DIR --target DIR [--rockserver-config FILE]
 				  restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]""");
-		System.exit(2);
+		exit(2);
 	}
 
 	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
