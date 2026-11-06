@@ -319,39 +319,17 @@ final class Applier {
 		long completedBelow = requests.getFirst().completedBelow();
 		var records = records(proposerId);
 		long floor = records.floor;
-		var results = new ApplyResult[requests.size()];
-		var toRun = new ArrayList<Request>(requests.size());
-		var runIndexes = new IntArrayList(requests.size());
-		var seen = new LongOpenHashSet();
-		for (int i = 0; i < requests.size(); i++) {
-			var request = requests.get(i);
-			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
-				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
-			}
-			if (request.sequence() < floor) {
-				results[i] = STALE_COPY;
-			} else if (records.recorded.contains(request.sequence())) {
-				results[i] = requireRecorded(request);
-			} else if (!seen.add(request.sequence())) {
-				// A second copy in the same entry: it gets the first copy's result below.
-				results[i] = null;
-			} else {
-				toRun.add(request);
-				runIndexes.add(i);
-			}
-		}
+		var batch = classify(requests, records);
+		var toRun = batch.toRun();
+		var outcomes = new ApplyResult[toRun.size()];
 		long openStart = System.nanoTime();
 		var tx = beginApply();
 		record(openTime, openStart);
 		boolean open = true;
 		try {
-			var outcomes = new ApplyResult[toRun.size()];
 			long executeStart = System.nanoTime();
 			for (int j = 0; j < toRun.size(); j++) {
 				var request = toRun.get(j);
-				if (!isBatchable(request.entry())) {
-					throw new IllegalArgumentException("A batch cannot contain " + request.entry().getClass().getSimpleName());
-				}
 				outcomes[j] = applyLogical(() -> execute(tx, request.entry()));
 				if (outcomes[j] instanceof ApplyResult.Failed failed && toRun.size() > 1) {
 					// Its partial writes are in the transaction with the others' writes: start over one at a time.
@@ -383,9 +361,6 @@ final class Applier {
 					throw new ReplicaFailedException("Local apply transaction conflicted at " + position);
 				}
 			}
-			for (int j = 0; j < toRun.size(); j++) {
-				results[runIndexes.getInt(j)] = outcomes[j];
-			}
 		} finally {
 			if (open) {
 				tx.close();
@@ -393,12 +368,66 @@ final class Applier {
 		}
 		committed(proposerId, records, toRun, completedBelow);
 		purge(proposerId, records);
-		for (int i = 0; i < results.length; i++) {
-			if (results[i] == null) {
-				results[i] = requireRecorded(requests.get(i));
+		return batch.complete(outcomes);
+	}
+
+	/**
+	 * The requests of one entry, sorted out before anything runs: those already answered (a late copy below the
+	 * floor, or a recorded one) have their {@link #results}; {@link #toRun} are to apply, at {@link #runIndexes} in
+	 * the entry; {@link #duplicates} are second copies of one of them in the same entry, which get its result.
+	 */
+	private record Classified(ApplyResult[] results, List<Request> toRun, IntArrayList runIndexes,
+			IntArrayList duplicates, List<Request> requests) {
+
+		/** The results of the entry, given those of {@link #toRun}, in its order. */
+		List<ApplyResult> complete(ApplyResult[] outcomes) {
+			for (int j = 0; j < toRun.size(); j++) {
+				results[runIndexes.getInt(j)] = outcomes[j];
+			}
+			for (int d = 0; d < duplicates.size(); d++) {
+				int i = duplicates.getInt(d);
+				long sequence = requests.get(i).sequence();
+				for (int j = 0; j < toRun.size(); j++) {
+					if (toRun.get(j).sequence() == sequence) {
+						results[i] = outcomes[j];
+						break;
+					}
+				}
+			}
+			return List.of(results);
+		}
+	}
+
+	/** Sorts out the requests of one entry, see {@link Classified}. */
+	private Classified classify(List<Request> requests, ProposerRecords records) {
+		long proposerId = requests.getFirst().proposerId();
+		long completedBelow = requests.getFirst().completedBelow();
+		long floor = records.floor;
+		var results = new ApplyResult[requests.size()];
+		var toRun = new ArrayList<Request>(requests.size());
+		var runIndexes = new IntArrayList(requests.size());
+		var duplicates = new IntArrayList(0);
+		var seen = new LongOpenHashSet();
+		for (int i = 0; i < requests.size(); i++) {
+			var request = requests.get(i);
+			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
+				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
+			}
+			if (request.sequence() < floor) {
+				results[i] = STALE_COPY;
+			} else if (records.recorded.contains(request.sequence())) {
+				results[i] = requireRecorded(request);
+			} else if (!seen.add(request.sequence())) {
+				duplicates.add(i);
+			} else {
+				if (!isBatchable(request.entry())) {
+					throw new IllegalArgumentException("A batch cannot contain " + request.entry().getClass().getSimpleName());
+				}
+				toRun.add(request);
+				runIndexes.add(i);
 			}
 		}
-		return List.of(results);
+		return new Classified(results, toRun, runIndexes, duplicates, requests);
 	}
 
 	/**
@@ -484,30 +513,8 @@ final class Applier {
 		long completedBelow = requests.getFirst().completedBelow();
 		var records = records(proposerId);
 		long floor = records.floor;
-		var results = new ApplyResult[requests.size()];
-		var toRun = new ArrayList<Request>(requests.size());
-		var runIndexes = new IntArrayList(requests.size());
-		var seen = new LongOpenHashSet();
-		var duplicates = new IntArrayList(0);
-		for (int i = 0; i < requests.size(); i++) {
-			var request = requests.get(i);
-			if (request.proposerId() != proposerId || request.completedBelow() != completedBelow) {
-				throw new IllegalArgumentException("A batch holds requests of one proposer, with one completedBelow");
-			}
-			if (request.sequence() < floor) {
-				results[i] = STALE_COPY;
-			} else if (records.recorded.contains(request.sequence())) {
-				results[i] = requireRecorded(request);
-			} else if (!seen.add(request.sequence())) {
-				duplicates.add(i);
-			} else {
-				if (!isBatchable(request.entry())) {
-					throw new IllegalArgumentException("A batch cannot contain " + request.entry().getClass().getSimpleName());
-				}
-				toRun.add(request);
-				runIndexes.add(i);
-			}
-		}
+		var batch = classify(requests, records);
+		var toRun = batch.toRun();
 		var tx = openGroupTx(position);
 		long executeStart = System.nanoTime();
 		tx.setSavePoint();
@@ -523,24 +530,12 @@ final class Applier {
 		}
 		for (int j = 0; j < toRun.size(); j++) {
 			outcomes[j] = record(tx, records, toRun.get(j), outcomes[j]);
-			results[runIndexes.getInt(j)] = outcomes[j];
 		}
 		finishBatch(tx, proposerId, completedBelow, floor, position, true);
 		record(executeTime, executeStart);
 		committed(proposerId, records, toRun, completedBelow);
 		groupPurges.add(proposerId);
-		for (int d = 0; d < duplicates.size(); d++) {
-			// A second copy in the same entry gets the first copy's result.
-			int i = duplicates.getInt(d);
-			long sequence = requests.get(i).sequence();
-			for (int j = 0; j < toRun.size(); j++) {
-				if (toRun.get(j).sequence() == sequence) {
-					results[i] = outcomes[j];
-					break;
-				}
-			}
-		}
-		return List.of(results);
+		return batch.complete(outcomes);
 	}
 
 	/**

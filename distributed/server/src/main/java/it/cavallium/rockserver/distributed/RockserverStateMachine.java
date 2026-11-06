@@ -603,19 +603,32 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 	}
 
-	/**
-	 * Applies {@code group} in one local transaction, then has {@link #completer} make each entry count as applied
-	 * and complete its reply, in log order. A failure stops the replica: no entry of the group, nor any queued after it, is answered.
-	 */
-	/** Tests only: while set, the apply thread waits for it before each group. */
-	volatile java.util.concurrent.@Nullable CountDownLatch applyGateForTesting;
 	private final java.util.concurrent.CountDownLatch closed = new java.util.concurrent.CountDownLatch(1);
-	/** Tests only: while set, applying a group throws it, as a failing apply would. */
-	volatile @Nullable RuntimeException applyFailureForTesting;
 
-	/** Tests only: lowers the limit of {@link #queuedKiB} to {@code kib}; it waits until that much is free. */
-	void limitApplyQueueForTesting(int kib) {
-		queuedKiB.acquireUninterruptibly(MAX_QUEUED_KIB - kib);
+	/** Hooks for tests, see {@link #testHooks()}. */
+	final class TestHooks {
+		/** While set, the apply thread waits for it before each group. */
+		volatile java.util.concurrent.@Nullable CountDownLatch applyGate;
+		/** While set, applying a group throws it, as a failing apply would. */
+		volatile @Nullable RuntimeException applyFailure;
+
+		/** Lowers the limit of {@link #queuedKiB} to {@code kib}; it waits until that much is free. */
+		void limitApplyQueue(int kib) {
+			queuedKiB.acquireUninterruptibly(MAX_QUEUED_KIB - kib);
+		}
+	}
+
+	/** Null unless a test asked for them: the apply thread then reads one field per group, and nothing else. */
+	private volatile @Nullable TestHooks testHooks;
+
+	/** Tests only: the test hooks of this state machine, created on first use. */
+	synchronized TestHooks testHooks() {
+		var hooks = testHooks;
+		if (hooks == null) {
+			hooks = new TestHooks();
+			testHooks = hooks;
+		}
+		return hooks;
 	}
 
 	/** Tests only: the KiB of {@link #queuedKiB} that no queued entry holds. */
@@ -628,8 +641,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return handedOver;
 	}
 
+	/**
+	 * Applies {@code group} in one local transaction, then has {@link #completer} make each entry count as applied
+	 * and complete its reply, in log order. A failure stops the replica: no entry of the group, nor any queued after
+	 * it, is answered.
+	 */
 	private void applyGroup(List<Applying> group) {
-		var gate = applyGateForTesting;
+		var hooks = testHooks;
+		var gate = hooks != null ? hooks.applyGate : null;
 		if (gate != null) {
 			try {
 				gate.await();
@@ -646,7 +665,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var applier = this.applier;
 		applier.beginGroup();
 		try {
-			var injected = applyFailureForTesting;
+			var injected = hooks != null ? hooks.applyFailure : null;
 			if (injected != null) {
 				throw injected;
 			}
