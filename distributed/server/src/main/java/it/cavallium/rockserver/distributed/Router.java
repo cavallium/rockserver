@@ -56,7 +56,11 @@ final class Router {
 	static final Duration FOLLOWER_READ_WAIT = Duration.ofMillis(20);
 	/**
 	 * {@code true} turns follower reads on for this node; off by default, a follower forwards every read to the leader.
-	 * Nodes may differ. See "Reads" in the design document for what they cost on a quiet cluster.
+	 * On a leader it also turns {@link ReadBarrier#followerReads} on from the start; a leader turns it on anyway when it
+	 * answers its first read index. Nodes may differ, as during a rolling restart that turns the option on: a follower
+	 * serves a read only while its database holds no entry of a term later than that of the leader that gave it the read
+	 * index (see {@link #followerRead}), so never an entry that a leader with the shortcut may not have applied yet. See
+	 * "Follower reads" in the design document.
 	 */
 	static final String FOLLOWER_READS_PROPERTY = "it.cavallium.rockserver.distributed.follower-reads";
 
@@ -292,6 +296,13 @@ final class Router {
 	 * it has every write acknowledged before the read arrived, and serves it from its own database. Unlike the leader's
 	 * {@link ReadBarrier#awaitLeadership()}, it waits for the whole index: this node did not acknowledge those writes
 	 * itself. If no read index comes, or this node is too far behind, it forwards the read to the leader instead.
+	 *
+	 * <p>The read is discarded and forwarded too if, once it ran, this node's database may hold an entry of a term later
+	 * than the read index's ({@link RockserverStateMachine#visibleTerm()}): the leader of that term may not have
+	 * answered a read index yet, so may still answer its own reads before applying its latest entries
+	 * ({@link ReadBarrier#followerReads}), and a client could then read an older value there after reading the newer
+	 * one here. Checked after the read, because the apply goes on meanwhile; the term is raised before an entry's writes
+	 * become visible. Such reads are only those that straddle a change of leader.</p>
 	 */
 	private CompletableFuture<?> followerRead(RequestContext context, RocksDBAPICommandSingle<?> command) {
 		if (stateMachine.isFailed()) {
@@ -305,32 +316,57 @@ final class Router {
 			readIndex = readIndex.copy().orTimeout(Math.max(0, remainingNanos(context, start)), TimeUnit.NANOSECONDS);
 		}
 		return readIndex.thenCompose(index -> {
-					if (index - applied.get() > FOLLOWER_READ_MAX_LAG) {
-						return CompletableFuture.failedFuture(new ReadBarrier.ApplyLagException(index, applied.get()));
+					if (index.index() - applied.get() > FOLLOWER_READ_MAX_LAG) {
+						return CompletableFuture.failedFuture(new ReadBarrier.ApplyLagException(index.index(), applied.get()));
 					}
 					long wait = Math.min(followerReadWaitNanos, remainingNanos(context, start));
-					return applied.await(index).orTimeout(Math.max(0, wait), TimeUnit.NANOSECONDS);
+					return applied.await(index.index()).orTimeout(Math.max(0, wait), TimeUnit.NANOSECONDS)
+							.thenApply(_ -> index);
 				})
 				// Off gRPC and apply threads: the read runs here.
-				.handleAsync((_, error) -> {
-					var remaining = remainingContext(context, start);
+				.handleAsync((index, error) -> {
 					if (error != null) {
-						followerReadsForwarded.incrementAndGet();
-						followerReadFallbacks.record(1);
-						return forwarding.forward(remaining, command);
+						return forwardFollowerRead(context, start, command);
 					}
-					followerReadsServed.incrementAndGet();
-					followerReadTime.since(start);
-					var store = stateMachine.store();
-					@SuppressWarnings("unchecked")
-					var local = (CompletableFuture<Object>) local(remaining, command);
-					// A snapshot install replaces the database under a follower: a read that fails on the old one is
+					// A snapshot install closes the database, restores another and opens it: a read that fails meanwhile is
 					// forwarded instead. Its answer could not be stale (the new database is further ahead), only lost.
-					return local.exceptionallyCompose(localError -> stateMachine.store() != store
-							? forwarding.forward(remainingContext(context, start), command).thenApply(r -> (Object) r)
-							: CompletableFuture.failedFuture(localError));
+					long generation = stateMachine.storeGeneration();
+					CompletableFuture<Object> local;
+					if ((generation & 1) != 0) {
+						local = CompletableFuture.failedFuture(new IllegalStateException("The database is being replaced"));
+					} else {
+						try {
+							@SuppressWarnings("unchecked")
+							var started = (CompletableFuture<Object>) local(remainingContext(context, start), command);
+							local = started;
+						} catch (Throwable e) {
+							local = CompletableFuture.failedFuture(e);
+						}
+					}
+					return local.handle((value, localError) -> {
+						if (localError == null) {
+							if (stateMachine.visibleTerm() > index.term()) {
+								return forwardFollowerRead(context, start, command);
+							}
+							followerReadsServed.incrementAndGet();
+							followerReadTime.since(start);
+							return CompletableFuture.<Object>completedFuture(value);
+						}
+						long now = stateMachine.storeGeneration();
+						return (generation & 1) != 0 || now != generation
+								? forwardFollowerRead(context, start, command)
+								: CompletableFuture.<Object>failedFuture(localError);
+					}).thenCompose(f -> f);
 				}, inline)
 				.thenCompose(f -> f);
+	}
+
+	/** Forwards a point read this node tried to serve as a follower. */
+	private CompletableFuture<Object> forwardFollowerRead(RequestContext context, long start,
+			RocksDBAPICommandSingle<?> command) {
+		followerReadsForwarded.incrementAndGet();
+		followerReadFallbacks.record(1);
+		return forwarding.forward(remainingContext(context, start), command).thenApply(r -> (Object) r);
 	}
 
 	/** Tests only: point reads this node served as a follower. */

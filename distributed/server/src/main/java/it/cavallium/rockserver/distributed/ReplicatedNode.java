@@ -312,7 +312,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	}
 
 	/** Answers a follower's {@link TermService#READ_INDEX}: see {@link ReadBarrier#readIndex()}. */
-	private CompletableFuture<Long> readIndex(RaftGroupId requested) {
+	private CompletableFuture<ReadBarrier.ReadIndex> readIndex(RaftGroupId requested) {
 		// Null until the constructor created it: term calls can arrive as soon as the Raft server started.
 		var readBarrier = this.barrier;
 		if (readBarrier == null || !requested.equals(group.getGroupId())) {

@@ -44,7 +44,7 @@ final class FollowerReads implements Closeable {
 	private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
 	private final Object lock = new Object();
 	/** Reads waiting for the next request. Guarded by {@link #lock}. */
-	private List<CompletableFuture<Long>> next = new ArrayList<>();
+	private List<CompletableFuture<ReadBarrier.ReadIndex>> next = new ArrayList<>();
 	/** Guarded by {@link #lock}. */
 	private boolean inFlight;
 	private volatile boolean closed;
@@ -60,9 +60,9 @@ final class FollowerReads implements Closeable {
 	}
 
 	/** A read index from the current leader, asked after this call. */
-	CompletableFuture<Long> readIndex() {
-		var future = new CompletableFuture<Long>();
-		List<CompletableFuture<Long>> batch = null;
+	CompletableFuture<ReadBarrier.ReadIndex> readIndex() {
+		var future = new CompletableFuture<ReadBarrier.ReadIndex>();
+		List<CompletableFuture<ReadBarrier.ReadIndex>> batch = null;
 		synchronized (lock) {
 			if (closed) {
 				return CompletableFuture.failedFuture(new IOException("Closed"));
@@ -86,9 +86,9 @@ final class FollowerReads implements Closeable {
 	 * request that is still in flight continues on the thread that completes it. Whatever happens, the reads of a
 	 * batch are completed and {@link #inFlight} is cleared once nothing is left to send.
 	 */
-	private void send(@Nullable List<CompletableFuture<Long>> batch) {
+	private void send(@Nullable List<CompletableFuture<ReadBarrier.ReadIndex>> batch) {
 		while (batch != null) {
-			CompletableFuture<Long> reply;
+			CompletableFuture<ReadBarrier.ReadIndex> reply;
 			try {
 				reply = TermService.readIndex(channel(leaderRaftAddress()), groupId, timeout);
 			} catch (Throwable e) {
@@ -99,7 +99,7 @@ final class FollowerReads implements Closeable {
 				reply.whenComplete((index, error) -> send(finish(sent, index, error)));
 				return;
 			}
-			Long index = null;
+			ReadBarrier.ReadIndex index = null;
 			Throwable error = null;
 			try {
 				index = reply.join();
@@ -114,7 +114,8 @@ final class FollowerReads implements Closeable {
 	 * Completes the reads of {@code batch}; returns the reads that arrived meanwhile, which the caller must send, or
 	 * null after clearing {@link #inFlight}.
 	 */
-	private @Nullable List<CompletableFuture<Long>> finish(List<CompletableFuture<Long>> batch, @Nullable Long index,
+	private @Nullable List<CompletableFuture<ReadBarrier.ReadIndex>> finish(
+			List<CompletableFuture<ReadBarrier.ReadIndex>> batch, ReadBarrier.@Nullable ReadIndex index,
 			@Nullable Throwable error) {
 		for (var future : batch) {
 			if (error == null) {
@@ -208,7 +209,7 @@ final class FollowerReads implements Closeable {
 
 	@Override
 	public void close() {
-		List<CompletableFuture<Long>> waiting;
+		List<CompletableFuture<ReadBarrier.ReadIndex>> waiting;
 		synchronized (lock) {
 			closed = true;
 			waiting = next;

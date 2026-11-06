@@ -49,8 +49,8 @@ import org.slf4j.LoggerFactory;
  * succeeding without it. A reply counts only for the rounds that sent the query, so only if the query was sent after
  * the read arrived: rounds that find every query slot to a peer taken send one query together once a slot frees, if
  * they still need that peer and have time left; meanwhile the peer simply does not contribute to them.</p>
- * <p>{@link #readIndex()} serves a follower's read: the commit index recorded when it was called, once leadership
- * was confirmed after the call. The follower then waits for its own apply to reach it.</p>
+ * <p>{@link #readIndex()} serves a follower's read: the commit index recorded when it was called, and the term, once
+ * leadership was confirmed after the call. The follower then waits for its own apply to reach it.</p>
  * <p>The returned futures complete on threads of this barrier, never on gRPC, Ratis apply or JDK timer threads,
  * so callers may run blocking work, such as a database read, in their continuations.</p>
  */
@@ -73,6 +73,13 @@ final class ReadBarrier implements Closeable {
 			super("The leader is still applying earlier entries: applied " + applied + " of " + index);
 		}
 	}
+
+	/**
+	 * A read index ({@link #readIndex()}): the commit index when the request arrived, and the term in which this node
+	 * confirmed its leadership. A follower serves a read with it only while its database holds no entry of a later term
+	 * ({@link Router}): the leader of a later term may not have turned {@link #followerReads} on yet.
+	 */
+	record ReadIndex(long index, long term) {}
 
 	/** Rounds that may run at once. */
 	static final int ROUNDS_IN_FLIGHT = 2;
@@ -176,7 +183,8 @@ final class ReadBarrier implements Closeable {
 	 * <p>Not with follower reads ({@link #followerReads}): a follower applies an entry once it learns that it is
 	 * committed, possibly before this leader applied it and acknowledged its write, and a client may read it there.
 	 * A read that starts after that one ended must see the entry too, here as well, so it waits for the commit index,
-	 * as {@link #await()} does.</p>
+	 * as {@link #await()} does. A follower serves only entries of terms whose leader answered it a read index, so had
+	 * this flag on: a leader that never answered one keeps the shortcut, whatever the other nodes' configuration.</p>
 	 */
 	CompletableFuture<Void> awaitLeadership() {
 		return enqueue(Wait.LEADERSHIP).thenApply(_ -> null);
@@ -188,13 +196,19 @@ final class ReadBarrier implements Closeable {
 	 * then has every entry committed before the read arrived, including every acknowledged write. Not
 	 * {@link #awaitLeadership()}'s shortcut: the follower did not apply this leader's entries in its own apply.
 	 */
-	CompletableFuture<Long> readIndex() {
+	CompletableFuture<ReadIndex> readIndex() {
 		// Before the answer: once a follower has it, it may expose entries this leader did not apply yet.
 		followerReads = true;
-		return enqueue(Wait.NOTHING);
+		var term = new long[1];
+		return enqueue(Wait.NOTHING, term).thenApply(index -> new ReadIndex(index, term[0]));
 	}
 
 	private CompletableFuture<Long> enqueue(Wait wait) {
+		return enqueue(wait, null);
+	}
+
+	/** @param termOut if not null, receives the term the caller's round confirms, before the future is returned */
+	private CompletableFuture<Long> enqueue(Wait wait, long @Nullable [] termOut) {
 		long term;
 		long commitIndex;
 		try {
@@ -212,6 +226,9 @@ final class ReadBarrier implements Closeable {
 			return CompletableFuture.failedFuture(new NotLeaderException("No division for " + groupId + ": " + e));
 		}
 
+		if (termOut != null) {
+			termOut[0] = term;
+		}
 		var future = new CompletableFuture<Long>();
 		long applyIndex = switch (wait) {
 			case COMMITTED -> commitIndex;

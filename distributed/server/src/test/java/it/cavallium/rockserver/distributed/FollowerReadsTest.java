@@ -32,9 +32,9 @@ class FollowerReadsTest {
 				RaftGroupId.valueOf(UUID.randomUUID()), "n0", Duration.ofSeconds(1))) {
 			// No Raft division: every request fails at once, while more reads keep arriving. This used to recurse once
 			// per batch, deep enough to overflow the stack and leave a request in flight forever.
-			var futures = new ArrayList<CompletableFuture<Long>>();
+			var futures = new ArrayList<CompletableFuture<ReadBarrier.ReadIndex>>();
 			try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-				var submitted = new ArrayList<java.util.concurrent.Future<CompletableFuture<Long>>>();
+				var submitted = new ArrayList<java.util.concurrent.Future<CompletableFuture<ReadBarrier.ReadIndex>>>();
 				for (int i = 0; i < 20_000; i++) {
 					submitted.add(executor.submit(reads::readIndex));
 				}
