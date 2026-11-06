@@ -149,6 +149,43 @@ class GrpcRetryPolicyTest {
 		}
 	}
 
+	/**
+	 * DD-1c: a connection with several addresses starts its gRPC retries after 50 ms (the next address is likely up),
+	 * one with a single address after 500 ms; both grow by 2 up to 30 s, and the properties override each. gRPC draws
+	 * each pause at random below the current backoff, so the configured policy is what can be checked.
+	 */
+	@Test
+	void initialBackoffDependsOnTheNumberOfAddresses() throws Exception {
+		for (var property : RETRY_PROPERTIES) {
+			System.clearProperty(property);
+		}
+		var several = retryPolicy(5, true);
+		var one = retryPolicy(5, false);
+		assertEquals("0.05s", several.get("initialBackoff"));
+		assertEquals("0.5s", one.get("initialBackoff"));
+		for (var policy : java.util.List.of(several, one)) {
+			assertEquals("30s", policy.get("maxBackoff"));
+			assertEquals(2.0d, policy.get("backoffMultiplier"));
+			assertEquals(5.0d, policy.get("maxAttempts"));
+			assertEquals(java.util.List.of("UNAVAILABLE"), policy.get("retryableStatusCodes"));
+		}
+		System.setProperty(INITIAL_BACKOFF_PROPERTY, "0.2s");
+		System.setProperty(MAX_BACKOFF_PROPERTY, "3s");
+		System.setProperty(BACKOFF_MULTIPLIER_PROPERTY, "1.5");
+		var configured = retryPolicy(3, true);
+		assertEquals("0.2s", configured.get("initialBackoff"));
+		assertEquals("0.2s", retryPolicy(3, false).get("initialBackoff"));
+		assertEquals("3s", configured.get("maxBackoff"));
+		assertEquals(1.5d, configured.get("backoffMultiplier"));
+	}
+
+	private static Map<?, ?> retryPolicy(int maxAttempts, boolean severalAddresses) throws Exception {
+		Class<?> delegate = Class.forName("it.cavallium.rockserver.core.client.GrpcConnectionDelegate");
+		Method policy = delegate.getDeclaredMethod("retryPolicy", int.class, boolean.class);
+		policy.setAccessible(true);
+		return (Map<?, ?>) policy.invoke(null, maxAttempts, severalAddresses);
+	}
+
 	@Test
 	void retryAllowlistUsesGeneratedUnaryMethodDescriptors() throws Exception {
 		var expected = Set.of(

@@ -499,9 +499,9 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 			Flux<DeleteRequest> dataFlux,
 			String requestName) {
 		var context = contexts.mapRequestContext(initialRequest.getContext());
-		if (context.profile() == WorkloadProfile.LATENCY) {
+		if (collectsWhole(context)) {
 			var contextualApi = contexts.asyncApi(context);
-			return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+			return collectMulti(context, dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
 					.flatMap(data -> Mono.fromFuture(() -> {
 						var keys = new ArrayList<Keys>(data.size());
 						for (var value : data) {
@@ -549,9 +549,9 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 							}
 							return deleteRequest.getData();
 						});
-				if (context.profile() == WorkloadProfile.LATENCY) {
+				if (collectsWhole(context)) {
 					var contextualApi = contexts.asyncApi(context);
-					return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+					return collectMulti(context, dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
 							.flatMapMany(data -> {
 								var keys = new ArrayList<Keys>(data.size());
 								for (var value : data) {
@@ -562,8 +562,8 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 										initialRequest.getColumnId(),
 										keys,
 										requestType))
-									.flatMapMany(Flux::fromIterable)
-									.map(mapper);
+									// Mapped first: a result may be null (no previous value), which a Flux cannot carry.
+									.flatMapMany(results -> Flux.fromIterable(mapEach(results, mapper)));
 							})
 							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 				}
@@ -670,9 +670,9 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 							}
 							return mergeRequest.getData();
 						});
-				if (context.profile() == WorkloadProfile.LATENCY) {
+				if (collectsWhole(context)) {
 					var contextualApi = contexts.asyncApi(context);
-					return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes,
+					return collectMulti(context, dataFlux, GrpcServerImpl::encodedInputBytes,
 							"mergeMultiGetMerged")
 							.flatMapMany(data -> {
 								var batch = mapKVBatch(data);
@@ -682,10 +682,9 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 										batch.keys(),
 										batch.values(),
 										RequestType.merged()))
-									.flatMapMany(Flux::fromIterable)
-									.map(merged -> Merged.newBuilder()
+									.flatMapMany(results -> Flux.fromIterable(mapEach(results, merged -> Merged.newBuilder()
 											.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
-											.build());
+											.build())));
 							})
 							.onErrorMap(ex -> GrpcRequestErrors.handleError(ex).asRuntimeException());
 				}
@@ -713,9 +712,9 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 	private Mono<Empty> mergeMultiDataFlux(MergeMultiInitialRequest initialRequest,
 			Flux<KV> dataFlux, String requestName) {
 		var context = contexts.mapRequestContext(initialRequest.getContext());
-		if (context.profile() == WorkloadProfile.LATENCY) {
+		if (collectsWhole(context)) {
 			var contextualApi = contexts.asyncApi(context);
-			return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+			return collectMulti(context, dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
 					.flatMap(data -> {
 						var batch = mapKVBatch(data);
 						return Mono.fromFuture(() -> contextualApi.mergeMultiAsync(
@@ -863,9 +862,9 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 							}
 							return putRequest.getData();
 						});
-				if (context.profile() == WorkloadProfile.LATENCY) {
+				if (collectsWhole(context)) {
 					var contextualApi = contexts.asyncApi(context);
-					return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+					return collectMulti(context, dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
 							.flatMapMany(data -> {
 								var batch = mapKVBatch(data);
 								return Mono.fromFuture(() -> contextualApi.putMultiAsync(
@@ -874,8 +873,8 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 										batch.keys(),
 										batch.values(),
 										requestType))
-									.flatMapMany(Flux::fromIterable)
-									.map(mapper);
+									// Mapped first: a result may be null (no previous value), which a Flux cannot carry.
+									.flatMapMany(results -> Flux.fromIterable(mapEach(results, mapper)));
 							})
 							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 				}
@@ -898,9 +897,9 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 	private Mono<Empty> putMultiDataFlux(PutMultiInitialRequest initialRequest,
 			Flux<KV> dataFlux, String requestName) {
 		var context = contexts.mapRequestContext(initialRequest.getContext());
-		if (context.profile() == WorkloadProfile.LATENCY) {
+		if (collectsWhole(context)) {
 			var contextualApi = contexts.asyncApi(context);
-			return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+			return collectMulti(context, dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
 					.flatMap(data -> {
 						var batch = mapKVBatch(data);
 						return Mono.fromFuture(() -> contextualApi.putMultiAsync(
@@ -931,9 +930,9 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 			Flux<KV> dataFlux,
 			String requestName) {
 		var context = contexts.mapRequestContext(initialRequest.getContext());
-		if (context.profile() == WorkloadProfile.LATENCY) {
+		if (collectsWhole(context)) {
 			var contextualApi = contexts.asyncApi(context);
-			return collectLatencyMulti(dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
+			return collectMulti(context, dataFlux, GrpcServerImpl::encodedInputBytes, requestName)
 					.flatMap(data -> {
 						var batch = mapKVBatch(data);
 						return Mono.fromFuture(() -> contextualApi.putMultiAsync(
@@ -960,6 +959,42 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 				})
 				.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 				.then(Mono.just(Empty.getDefaultInstance()));
+	}
+
+	/** {@code mapper} applied to each of {@code results}, nulls included. */
+	private static <T, R> List<R> mapEach(List<T> results, Function<? super T, ? extends R> mapper) {
+		var mapped = new ArrayList<R>(results.size());
+		for (T result : results) {
+			mapped.add(mapper.apply(result));
+		}
+		return mapped;
+	}
+
+	/** Most items of a numbered multi write outside LATENCY ({@link #collectsWhole}). */
+	static final int NUMBERED_MULTI_MAX_ITEMS = 1 << 20;
+	/** Most encoded key and value bytes of a numbered multi write outside LATENCY: one replicated entry's worth. */
+	static final long NUMBERED_MULTI_MAX_BYTES = 16L * 1024 * 1024;
+
+	/**
+	 * True if a streamed multi write is collected whole and applied as one multi call: under LATENCY (its fan-out
+	 * limits), and when it carries a client session's request id. Item by item, every item would carry the same number,
+	 * and a replicated server would apply the first and answer every later item from the first's record without applying
+	 * it. Collected, the call is one numbered write, applied at most once, whose copies answer with its result.
+	 */
+	private static boolean collectsWhole(ResolvedRequestContext context) {
+		return context.profile() == WorkloadProfile.LATENCY || context.value().requestId() != null;
+	}
+
+	private <T> Mono<List<T>> collectMulti(ResolvedRequestContext context, Flux<T> dataFlux,
+			ToLongFunction<T> encodedInputBytes, String requestName) {
+		if (context.profile() == WorkloadProfile.LATENCY) {
+			return collectLatencyMulti(dataFlux, encodedInputBytes, requestName);
+		}
+		return dataFlux.collect(
+				() -> new LatencyMultiBuffer<T>(NUMBERED_MULTI_MAX_ITEMS, NUMBERED_MULTI_MAX_BYTES,
+						"numbered " + requestName),
+				(buffer, value) -> buffer.add(value, encodedInputBytes.applyAsLong(value)))
+				.map(LatencyMultiBuffer::values);
 	}
 
 	private <T> Mono<List<T>> collectLatencyMulti(Flux<T> dataFlux,
@@ -1005,7 +1040,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 			this.maximumItems = maximumItems;
 			this.maximumBytes = maximumBytes;
 			this.requestName = requestName;
-			this.values = new ArrayList<>(maximumItems);
+			this.values = new ArrayList<>(Math.min(maximumItems, 256));
 		}
 
 		private void add(T value, long valueBytes) {

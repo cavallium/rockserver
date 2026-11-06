@@ -767,20 +767,25 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 						"loadBalancingConfig", PICK_FIRST_IN_ORDER,
 						"methodConfig", List.of(Map.of(
 								"name", AUTOMATIC_RETRY_METHOD_CONFIG_NAMES,
-								"retryPolicy", Map.of(
-										"maxAttempts", (double) maxAttempts,
-										"initialBackoff", System.getProperty(INITIAL_RETRY_BACKOFF_PROPERTY, severalAddresses
-												? DEFAULT_INITIAL_RETRY_BACKOFF_SEVERAL_ADDRESSES : DEFAULT_INITIAL_RETRY_BACKOFF_ONE_ADDRESS),
-										"maxBackoff", System.getProperty(MAX_RETRY_BACKOFF_PROPERTY, "30s"),
-										"backoffMultiplier", doubleProperty(RETRY_BACKOFF_MULTIPLIER_PROPERTY, 2.0d, 1.0d),
-										// Retry only transport loss here. SERVER_OVERLOADED and
-										// UPDATE_RETRY are application backpressure/conflict signals;
-										// callers must observe them immediately and apply domain-level
-										// retry, cooldown, or transaction reconstruction.
-										"retryableStatusCodes", AUTOMATIC_RETRYABLE_STATUS_CODE_NAMES
-								)
+								"retryPolicy", retryPolicy(maxAttempts, severalAddresses)
 						))
 				));
+	}
+
+	/** The gRPC retry policy of the automatically retried methods (read by {@code GrpcRetryPolicyTest}). */
+	static Map<String, Object> retryPolicy(int maxAttempts, boolean severalAddresses) {
+		return Map.of(
+				"maxAttempts", (double) maxAttempts,
+				"initialBackoff", System.getProperty(INITIAL_RETRY_BACKOFF_PROPERTY, severalAddresses
+						? DEFAULT_INITIAL_RETRY_BACKOFF_SEVERAL_ADDRESSES : DEFAULT_INITIAL_RETRY_BACKOFF_ONE_ADDRESS),
+				"maxBackoff", System.getProperty(MAX_RETRY_BACKOFF_PROPERTY, "30s"),
+				"backoffMultiplier", doubleProperty(RETRY_BACKOFF_MULTIPLIER_PROPERTY, 2.0d, 1.0d),
+				// Retry only transport loss here. SERVER_OVERLOADED and
+				// UPDATE_RETRY are application backpressure/conflict signals;
+				// callers must observe them immediately and apply domain-level
+				// retry, cooldown, or transaction reconstruction.
+				"retryableStatusCodes", AUTOMATIC_RETRYABLE_STATUS_CODE_NAMES
+		);
 	}
 
 	private static Map<String, String> serviceConfigName(MethodDescriptor<?, ?> method) {

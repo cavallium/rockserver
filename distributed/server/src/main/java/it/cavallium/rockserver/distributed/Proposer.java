@@ -86,6 +86,8 @@ final class Proposer implements Closeable {
 	static final class ConflictException extends RocksDBRetryException {}
 
 	private static final long NOT_READY_RETRY_MS = 50;
+	/** Longest wait of a caller that gives up on a write while its batch is being encoded (see Pending#awaitEncoded). */
+	static final long MAX_ENCODE_WAIT_NANOS = TimeUnit.SECONDS.toNanos(1);
 	private static final Duration MIN_ATTEMPT_TIMEOUT = Duration.ofSeconds(3);
 	private static final long ATTEMPT_SLEEP_MS = 100;
 	/** Batches of one queue in flight at once: later requests wait for one of them to finish, and then go together. */
@@ -201,6 +203,11 @@ final class Proposer implements Closeable {
 	/** Bytes the byte admission holds now, for tests. */
 	long admittedBytes() {
 		return admission.used();
+	}
+
+	/** The byte admission itself, for tests that fill it to make this node refuse writes. */
+	ByteAdmission admissionForTesting() {
+		return admission;
 	}
 
 	/** Batches in flight in both lanes now, for tests. */
@@ -366,6 +373,63 @@ final class Proposer implements Closeable {
 		/** Set by {@link #unsend}: it was sent once, and refused before the append. */
 		volatile boolean refusedOnce;
 
+		/**
+		 * Set from just before it is taken into a batch until that batch's encoding no longer reads its entry: its
+		 * caller's buffers may be read while it is set. See {@link #awaitEncoded}.
+		 */
+		private volatile boolean encoding;
+
+		/** Its batch is about to read its entry: set before {@link #markSent}, so a caller that sees it sent sees it. */
+		void encodingStarted() {
+			encoding = true;
+		}
+
+		/** Its batch read its entry (or will not): a caller waiting in {@link #awaitEncoded} goes on. */
+		void encodingEnded() {
+			if (encoding) {
+				synchronized (this) {
+					encoding = false;
+					notifyAll();
+				}
+			}
+		}
+
+		/** True while a batch may read its entry, for tests. */
+		boolean isEncoding() {
+			return encoding;
+		}
+
+		/**
+		 * Waits, at most {@code maxNanos}, until no batch reads its entry any more. Called when its caller gives up on it
+		 * (cancels, or times out) before its answer: a write already taken into a batch cannot be abandoned, and its
+		 * caller, answered, may reuse its buffers at once, so it must not be answered while the batch still reads them.
+		 * The wait is the encoding of one batch at most, and only in the short time between the batch taking the write
+		 * and encoding it; afterwards the entry is the batch's own copy ({@link Lane#send}).
+		 */
+		void awaitEncoded(long maxNanos) {
+			if (!encoding) {
+				return;
+			}
+			long deadline = System.nanoTime() + maxNanos;
+			boolean interrupted = false;
+			synchronized (this) {
+				while (encoding) {
+					long left = deadline - System.nanoTime();
+					if (left <= 0) {
+						break;
+					}
+					try {
+						TimeUnit.NANOSECONDS.timedWait(this, left);
+					} catch (InterruptedException ex) {
+						interrupted = true;
+					}
+				}
+			}
+			if (interrupted) {
+				Thread.currentThread().interrupt();
+			}
+		}
+
 		/** Its failure when its caller's deadline comes while it is queued: it was not applied. */
 		RocksDBException callerDeadlineFailure() {
 			return refusedOnce ? callerDeadlinePassedUnaccepted() : callerDeadlinePassed();
@@ -496,6 +560,11 @@ final class Proposer implements Closeable {
 			if (copy.isCancelled()) {
 				pending.abandon(new CancellationException("The caller cancelled the write before it was sent"));
 			}
+			if (!pending.result.isDone()) {
+				// The caller gave up on it (cancelled, or timed out its copy) before its answer: if a batch is reading its
+				// buffers right now, the caller is answered only once that is done, so that it can reuse them at once.
+				pending.awaitEncoded(MAX_ENCODE_WAIT_NANOS);
+			}
 		});
 		return copy;
 	}
@@ -607,6 +676,7 @@ final class Proposer implements Closeable {
 				try {
 					send(batch);
 				} catch (RuntimeException ex) {
+					encodingEnded(batch);
 					fail(batch, ex instanceof RocksDBException rocks ? rocks : Proposer.unavailable(ex));
 					finished();
 				}
@@ -654,8 +724,10 @@ final class Proposer implements Closeable {
 					break;
 				}
 				queue.pollFirst();
+				next.encodingStarted();
 				if (!next.markSent()) {
 					// Abandoned just now.
+					next.encodingEnded();
 					leftQueue(next);
 					continue;
 				}
@@ -672,6 +744,12 @@ final class Proposer implements Closeable {
 				}
 			}
 			return batch;
+		}
+
+		private static void encodingEnded(List<Pending> batch) {
+			for (var pending : batch) {
+				pending.encodingEnded();
+			}
 		}
 
 		/** {@code pending} left the queue without being sent: an abandoned one gives back the rest of its weight. */
@@ -741,6 +819,8 @@ final class Proposer implements Closeable {
 					batch.get(i).entry = local.get(i).entry();
 				}
 			}
+			// The callers' buffers are not read any more: a caller that gave up meanwhile is answered now.
+			encodingEnded(batch);
 			long now = System.nanoTime();
 			for (var pending : batch) {
 				queueTime.record(now - pending.queuedNanos);
@@ -777,6 +857,8 @@ final class Proposer implements Closeable {
 									"The write could not be encoded, it was not applied: " + invalid.getMessage()));
 				}
 			}
+			// Read for the last time: the rest goes back to the queue, as never taken (or failed, if every one encodes).
+			encodingEnded(batch);
 			if (rest.size() == batch.size()) {
 				throw error;
 			}

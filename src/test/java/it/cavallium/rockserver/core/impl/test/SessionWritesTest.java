@@ -588,6 +588,50 @@ class SessionWritesTest {
 		executor.shutdownNow();
 	}
 
+	/**
+	 * A reactive caller ({@code Mono.fromFuture}, as Yotsuba wraps the async API) that disposes its subscription, or
+	 * whose {@code timeout} fires, cancels the future: the resends stop and the copy in flight is cancelled.
+	 */
+	@Test
+	void disposingAMonoOverAWriteStopsItsResends() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var copies = Collections.synchronizedList(new ArrayList<CompletableFuture<Object>>());
+		var writes = new Writes(_ -> CompletableFuture.completedFuture(3L), (_, _) -> {
+			if (copies.size() < 2) {
+				copies.add(CompletableFuture.failedFuture(Status.UNAVAILABLE.asRuntimeException()));
+			} else {
+				copies.add(new CompletableFuture<>());
+			}
+			return copies.getLast();
+		}, executor);
+		var result = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		var subscription = reactor.core.publisher.Mono.fromFuture(result).subscribe(_ -> {}, _ -> {});
+		while (copies.size() < 3) {
+			Thread.sleep(5);
+		}
+		subscription.dispose();
+		var error = assertThrows(ExecutionException.class, () -> result.get(1, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId());
+		assertTrue(copies.getLast().isCancelled(), "the copy in flight is cancelled");
+		Thread.sleep(1_200);
+		assertEquals(3, copies.size(), "no copy sent after the dispose");
+
+		// The same through an operator timeout: the caller's Mono ends, the write stops.
+		var lost = Collections.synchronizedList(new ArrayList<CompletableFuture<Object>>());
+		var timedOut = new Writes(_ -> CompletableFuture.completedFuture(4L), (_, _) -> {
+			lost.add(CompletableFuture.failedFuture(Status.UNAVAILABLE.asRuntimeException()));
+			return lost.getLast();
+		}, executor);
+		var write = timedOut.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		assertThrows(RuntimeException.class, () -> reactor.core.publisher.Mono.fromFuture(write)
+				.timeout(Duration.ofMillis(300)).block());
+		assertTrue(write.isDone());
+		int sent = lost.size();
+		Thread.sleep(1_200);
+		assertEquals(sent, lost.size(), "no copy sent after the timeout");
+		executor.shutdownNow();
+	}
+
 	/** A write cancelled before any copy was sent (its session is still opening) is cancelled, and never sent. */
 	@Test
 	void cancellingAWriteBeforeItWasSentCancelsIt() throws Exception {

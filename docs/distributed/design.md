@@ -328,8 +328,11 @@ and the `LogEntry`.
   the entry itself; the batch is sized from those sizes, and each entry is written straight into it when the batch
   goes out, with no body of its own. The bytes are those of the bodies encoded one by one and joined (versions 2
   and 3 alike; `CodecEquivalenceTest`). A caller's buffers are read only until its write is first encoded into a
-  batch, which happens while the caller still waits for its answer (except in the short time between a batch
-  taking the write and encoding it, if the caller gives up right then). A caller must therefore not change a
+  batch, which happens while the caller still waits for its answer. A caller that gives up on a write (cancels its
+  future, or times it out) in the short time between a batch taking the write and encoding it is answered only once
+  that encoding is done (`Pending.awaitEncoded`: a flag set before the write is marked sent and cleared when the
+  batch no longer reads it, at most 1 s of waiting, in practice the encoding of one batch), so a caller may reuse
+  its buffers as soon as it is answered. A caller must therefore not change a
   write's buffers while it waits; if it does, the batch fails to encode, nothing of it is sent, the writes that no
   longer encode to their size fail as invalid (or with an unknown outcome if an earlier batch may have appended
   them) and the others go back to the queue, as never taken unless an earlier batch may have appended them, so that
@@ -339,7 +342,10 @@ and the `LogEntry`.
   queue still sent (a commit after another commit's conflict, a copy resent alone), which its caller may already
   have given up on and whose buffers it may reuse, is encoded again from the batch's immutable bytes, never from the
   caller's memory. A batch with a schema change returns no requests; its members never go back to the queue still
-  sent. On the leader (and for every batch of commits, which only go to the local Raft server) the proposer offers
+  sent (`ProposerCopiesTest.aWriteTakenIntoABatchKeepsTheBatchCopyNotItsCallersBuffer` fails if the copy is not
+  taken). A follower's resend of a batch whose reply is late (past an attempt timeout) goes under the same Ratis
+  invocation and is answered by the leader's retry cache: one log entry, applied once
+  (`aResendOfALateBatchIsAnsweredByTheRetryCacheAndAppliesOnce`). On the leader (and for every batch of commits, which only go to the local Raft server) the proposer offers
   the requests to its own state machine under the
   batch's Ratis invocation (client id, call id) before submitting it locally, and withdraws the offer when Ratis
   answers. `startTransaction` takes the offer instead of decoding the batch, only if the request carries the very
@@ -461,8 +467,22 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   admission only counts proposals, so a large numbered stream would otherwise sit in the heap). Batches are numbered
   only by a server that advertises `numberedBatches` in its capabilities (besides `clientSessions`); a client talking
   to a server without it (an older one, which ignores the id of a batch and would apply a resent chunk twice) sends
-  batches unnumbered, streamed once and never resent. A chunk that fails for good after an earlier one took effect ends the call with `INVALID_REQUEST`
-  ("partly applied"), as on the server.
+  batches unnumbered, streamed once and never resent (`NumberedWritesTest.aServerThatDoesNotNumberBatchesGetsThemUnnumbered`
+  checks both ends through a server that offers sessions without numbered batches). A chunk that fails for good after
+  an earlier one took effect ends the call with `INVALID_REQUEST` ("partly applied"), as on the server. A long
+  numbered batch stream is refused after its second chunk without being read further
+  (`aLongNumberedBatchStreamIsRefusedWithoutReadingIt`: an endless stream, a handful of batches produced).
+- **Streamed multi writes under a number.** The gRPC server applies a streamed `putMulti`, `deleteMulti` or
+  `mergeMulti` (and their variants with results) of a non-LATENCY caller item by item, as it reads the stream. Each
+  item then carried the call's one request id, so a replicated server applied the first item and answered every
+  later one from the first's record, without applying it: the Java client numbers these calls, and a BATCH or
+  INGEST caller lost all but the first item of a list too large for `putMultiList` (and of every `deleteMulti` and
+  `mergeMulti`, which always stream). A numbered streamed multi write is now collected and applied as one multi call,
+  like a LATENCY one (`GrpcServerImpl.collectsWhole`): one numbered write, applied at most once, whose copies answer
+  with its results. Outside LATENCY it is bounded by 2^20 items and 16 MiB of keys and values (one replicated entry;
+  more is refused as invalid, nothing applied), instead of the LATENCY fan-out limits. The collected path also maps
+  each result before streaming it, so a missing previous value (null) no longer fails the call
+  (`NumberedWritesTest.numberedStreamedMultiWritesOfABatchCallerApplyEveryItem`, which fails without the change).
 - **Leader time.** The leader prepends its clock (`LogEntryCodec.stamp`: a marker byte and 8 bytes, without copying
   the batch) to every entry that holds a session write or registration. A proposal that already starts with the
   stamp marker is refused as malformed: only the leader stamps. Apply keeps the highest stamp seen as the
@@ -487,7 +507,14 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   in the `RegisterClient` entry (`-Dit.cavallium.rockserver.distributed.client-session-timeout-ms` of the node that
   opened it, the old name `rockserver.client-session-timeout-ms` still read, 1 hour by
   default, and also when the value is not an integer, with a warning, as `Long.getLong` read it before, at least 10 minutes and 30 request timeouts: well above the time a copy of a write may still be resent),
-  so replicas agree whatever their own settings. A proposer that gets `SESSION_EXPIRED` for a copy of a write whose
+  so replicas agree whatever their own settings. It stays a system property and not a `NodeConfig` option (or
+  `--client-session-timeout-ms` flag), by choice: it is not a setting the members must share, since each session
+  carries the value of the node that opened it and no replica ever reads its own; the part that matters for safety,
+  the floor of 10 minutes and 30 request timeouts, already follows `NodeConfig.requestTimeout`; and it is a rarely
+  touched tuning knob, read through `DistributedProperties` like the other two of its kind (write admission bytes,
+  follower reads), with the documented prefix, the old name as an alias and a warning on a bad value. A `NodeConfig`
+  component would change the record's canonical constructor and its every caller for a value that does not need
+  to be in the node's configuration. A proposer that gets `SESSION_EXPIRED` for a copy of a write whose
   earlier copy may have been appended answers `OUTCOME_UNKNOWN` (or, for a write resent alone after it applied,
   "applied, result lost"), never the "not applied" that would make the client write it again. A session idle longer than its timeout at an entry's
   clock is gone for good: its requests are rejected with `SESSION_EXPIRED` and not recorded, copies of writes it
@@ -588,6 +615,30 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   of round 3 sent `maybe` on `SESSION_EXPIRED`; the client does not read the flag on it, so that changes nothing. A
   follower that forwards keeps the flag: the leader's trailer sets it on the exception the follower's server fails
   with (a forwarded write is sent again only when the earlier forward was not sent, so the flag stays true of it).
+  `NumberedWritesTest.aWriteRefusedByTheLeaderBehindAForwardIsFlaggedNotApplied` checks it on a three-node cluster:
+  a commit sent to a follower, forwarded, refused by the leader's full byte admission, reaches the client as
+  `SERVER_OVERLOADED` with the flag.
+- **The Rust client.** `rust-client` numbers its writes the same way (`sessions.rs`, the counterpart of
+  `SessionWrites`), when the server advertised `clientSessions` at connection: the same writes are numbered (outside
+  transactions, commits, the write ending an update opened through the client, schema changes, `delete_range`, batch
+  chunks when the server also advertises `numberedBatches`, split by `sessions::split_batch` with the server's rule),
+  with the same resend rule (an unknown outcome is a lost call, `OUTCOME_UNKNOWN`, or a deadline error without the
+  `rockserver-applied: no` trailer; after one, a "not applied" answer resends; pauses from 50 ms doubling to 1 s; the
+  caller's deadline, or a 30 s window for a context without one), the same `SESSION_EXPIRED` handling (a first copy
+  goes again under a new session, a copy after an unknown outcome ends `OUTCOME_UNKNOWN`) and the same opening rule
+  (writes wait for the one opening the session; each opens again in its own time if that fails). Its own failures
+  carry the server's message format, `RocksDBError: [uid:TYPE] ...`, and the trailer when not applied, so a caller
+  reads them like the server's (`sessions::is_outcome_unknown`, `is_not_applied`, `rocksdb_error_type`). Where Rust
+  differs: dropping a write's future is its cancel (its number is final, and nothing more is sent, but whether a sent
+  copy applied stays unknown, since there is no future left to answer); a streamed multi write that is numbered reads
+  its whole input stream first, and one with results reads every result before returning them, since a copy may
+  have to be sent again; a view whose context already carries a request id (`RequestContext::with_request_id`) is
+  numbered by its caller and sends once; `without_client_sessions()` sends everything once, as before. The unit tests
+  (`sessions::tests`) drive the resend loop with scripted answers, as `SessionWritesTest` does; the live test
+  `tests/live_server.rs` runs every numbered call against a follower of a three-node in-process cluster
+  (`RustClientLiveTest`, on when `-Drockserver.rust-client.dir` names a buildable copy of the crate) and the Java side
+  then checks every node. Not tested in Rust: a resend across a real leader loss (the Java client's
+  `ClientSessionTest` covers the server side of it).
 
 **Apply.** Every replica applies entries in log order, on an apply thread of its own, through
 `EmbeddedDB.ApplyWriter`: a native transaction held by the apply thread itself, which runs the same code as the
@@ -1603,8 +1654,11 @@ failover" below).
 | `ParallelApplyTest` | Randomized logs over five columns (fixed keys, buckets whose tails all collide, a column without fixed key parts), with rejections, copies, sessions, `deleteRange` and positions without data, applied serially and in lanes: the results of every entry and every row of every column, the internal one included, are the same after every group. A 3-node cluster, two nodes in lanes and one serial, holds the same data, also after a restart. Crashes of a replica in lanes: a flush right after one of its commits (the serial prefix before a segment, a segment's joined batch, a group's end, an entry applied alone), more entries applied, then the database closed without a flush; reopened, it holds exactly what was committed at the flush, its position included, and replaying the rest of the log (serially or in lanes) gives the results and user rows of a replica that never crashed, and every row of a serial replica restarted at the same position. |
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups. |
 | `SessionApplierTest` | Client sessions at apply: a write resent through other proposers, alone or in an entry with other sessions' writes, takes effect once, also after a restart; the session's floor refuses late copies; unknown and expired sessions are rejected and not recorded, a leader clock behind does not revive them, and expired sessions are deleted; a leader whose wall clock is a year ahead, or jumps within its term, expires nothing (`LeaderClock`); two replicas, one restarting midway, give the same results. |
-| `SessionWritesTest` (core) | The client's numbering: which writes are numbered (staged writes not, schema changes, `deleteRange` and batches yes), update ids forgotten once the update ended; a first copy refused by an expired session re-issued under a new one, a later copy so refused ending unknown (also when that copy is flagged not applied), sessions that keep expiring ending at the deadline, flagged not applied; opening retried after an unknown outcome, and again by a write that waited on another write's opening, also when that opening ended "not applied" at the opener's deadline or overloaded; batches unnumbered when the server does not advertise `numberedBatches`; batches sent as numbered chunks in order, a chunk resent with its number, a later chunk's failure reported as partly applied; closing ends waiting writes; each answer of a copy (value, recorded failure, overload, flagged deadline: ends; unknown, then "not applied": same number again; a sender that throws: lost copy); a deadline without the "not applied" flag, gRPC's own included, on a first or a resent copy, ends unknown, whatever its message; a cancel after a copy was sent ends unknown and stops the resends and the copy in flight, before one was sent cancels it unsent, also for a batch (a batch whose chunk only waits for its session counts as unsent); a synchronous wait is bounded, unbounded without a deadline, and never overflows; the client's own expired-deadline check on a first copy ends "not applied"; past 65,536 open updates the oldest is forgotten and counted. |
+| `SessionWritesTest` (core) | The client's numbering: which writes are numbered (staged writes not, schema changes, `deleteRange` and batches yes), update ids forgotten once the update ended; a first copy refused by an expired session re-issued under a new one, a later copy so refused ending unknown (also when that copy is flagged not applied), sessions that keep expiring ending at the deadline, flagged not applied; opening retried after an unknown outcome, and again by a write that waited on another write's opening, also when that opening ended "not applied" at the opener's deadline or overloaded; batches unnumbered when the server does not advertise `numberedBatches`; batches sent as numbered chunks in order, a chunk resent with its number, a later chunk's failure reported as partly applied; closing ends waiting writes; each answer of a copy (value, recorded failure, overload, flagged deadline: ends; unknown, then "not applied": same number again; a sender that throws: lost copy); a deadline without the "not applied" flag, gRPC's own included, on a first or a resent copy, ends unknown, whatever its message; a cancel after a copy was sent ends unknown and stops the resends and the copy in flight, before one was sent cancels it unsent, also for a batch (a batch whose chunk only waits for its session counts as unsent); a synchronous wait is bounded, unbounded without a deadline, and never overflows; the client's own expired-deadline check on a first copy ends "not applied"; past 65,536 open updates the oldest is forgotten and counted; a Reactor caller (`Mono.fromFuture`) that disposes its subscription or times out stops the resends and cancels the copy in flight. |
 | `ClientSessionTest` (in-process) | A merge and a transaction commit whose leader dies after its followers applied them and before it answered: the client sends them again with their request ids through the next node, the merge applies once and the commit answers `true` from its record. Copies of a commit and of the write that ends an update answer "unknown" while the first is in flight, then from the record. Copies of a numbered `mergeBatch` chunk, `deleteColumnIfExists`, `deleteColumn` and `deleteRange` take effect once; a numbered batch of two chunks is refused with nothing applied; the client library sends batches as numbered chunks over gRPC, a three-chunk batch of items that fill a chunk to the byte taking exactly one number per chunk (the client's and the server's split agree after encoding); a client batch whose leader dies after committing its first chunk, unanswered, resends that chunk with its number and every key is merged exactly once. |
+| `NumberedWritesTest` (in-process) | Streamed multi writes of a BATCH caller with sessions apply every item, results included; copies of a numbered `createColumn` and `uploadMergeOperator` answer from the record (no column re-created after a deletion, no version added); a server offering sessions without `numberedBatches` gets a three-chunk batch unnumbered, taking no number; an endless numbered batch stream is refused after a few batches; a commit refused by the leader behind a follower's forward is flagged not applied at the client. |
+| `ProposerCopiesTest` | A write's entry becomes its batch's copy once encoded, so a later re-encode never reads the caller's changed buffer; a follower's resend of a late batch is answered from the leader's retry cache, one log entry, applied once; a caller giving up during its batch's encoding waits for it, bounded. |
+| `RustClientLiveTest` (in-process, off by default) | The Rust client's live test against a follower of a three-node cluster: every numbered call, merge operator upload/check/ensure, batches as chunks, then every node checked. |
 | `CommitOutcomesTest` | The answer to a copy of a numbered commit whose transaction is gone: unknown while a mark of this term exists, also for a mark of a term that started while the copy's leadership barrier ran (the term is read before the barrier), "run it again" with no mark or a mark of an earlier term, the record when there is one; the first mark of a newer term drops the older ones. `NodeStoreTest` checks that a session expired at the replicated clock is not live while its row is still there. |
 | `AppliedFlagWireTest`, `AppliedTrailerInterceptorTest`, `GrpcServerDeadlineErrorTest` (core) | The "not applied" flag on the wire: the server's trailer follows the exception's flag (a real server round trip included), the client reads it, and the legacy messages only without it; gRPC's own deadline is never "not applied". |
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); chains (handoff at admission, the caps on links and on the readers of one, breaks and their end, a pause for a conflicting transaction, duplicates, expiry, close, no session monitor under the log lock); history kept for open transactions and in-flight commits, up to the key cap; an update whose commit is in flight does not expire; the commit size limit of staged writes. |
@@ -1783,8 +1837,7 @@ memory for the nightly job. Nothing was pushed: the runner and the schedule are 
      with `-Dit.cavallium.rockserver.grpc.client.session-writes=false` until it is done.
    - Writes staged in a transaction are not numbered, by design (see "Writes staged in a transaction"): a caller
      whose staged write has an unknown outcome rolls the transaction back and runs it again, never resends the
-     write. The rust client has the proto fields, `open_client_session` and `RequestContext::with_request_id`, but
-     numbers and resends nothing by itself.
+     write. The rust client numbers its writes too (see "The Rust client").
 3. **Capacity.** See [performance.md](performance.md) for the measurements on one PC and the load benchmark.
    Still to measure on the production machines and data: their fsync latency, snapshot creation and install
    time at 171 GB and at the multi-TB datasets, and log retention in bytes. Raise Yotsuba's in-flight request
