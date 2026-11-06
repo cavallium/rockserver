@@ -12,9 +12,11 @@ import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Plaintext gRPC channels to other members' Raft ports, for the {@link TermService} calls of {@link ReadBarrier},
- * {@link FollowerReads} and {@link ClusterCheck}. A cache keeps one channel per address, so a peer whose address
- * changes gets a new one; {@link #open} makes a one-off channel for a caller that calls a peer rarely.
+ * Plaintext gRPC channels to other members' Raft ports, for the {@link TermService} calls. A cache keeps one channel
+ * per address, so a peer whose address changes gets a new one. A node has one shared cache, for {@link ReplicaOps} and
+ * the address lookups of {@link LeaderForwarder}, and {@link ReadBarrier} and {@link FollowerReads} one each, which
+ * they prune and close by themselves. {@link #open} makes a one-off channel for a caller that calls a peer rarely:
+ * {@link ClusterCheck} (once per follower and term), {@link RemovalCheck} (at start) and the {@code admin} commands.
  *
  * <p>While a peer is down, gRPC waits longer and longer (up to two minutes) between attempts to reach it, and fails
  * calls at once in between. These calls must reach a peer as soon as it is back, so {@link #get} makes a fresh attempt
