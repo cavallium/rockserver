@@ -38,6 +38,8 @@ jobs:
           path: ~/.m2/repository
           key: m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: m2-
+      - name: gcc for the fault-injecting storage shim (FaultFsTest, DiskFaultTest)
+        run: apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev
       - name: Core tests
         run: mvn $MAVEN_ARGS test
       - name: Distributed fast tests
@@ -47,7 +49,8 @@ jobs:
           mvn $MAVEN_ARGS -f distributed/pom.xml -pl server -am test \
             -Dsurefire.failIfNoSpecifiedTests=false \
             -Dtest="it.cavallium.rockserver.distributed.**,$excluded" \
-            -Drockserver.test.tmpdir="$TEST_TMPDIR"
+            -Drockserver.test.tmpdir="$TEST_TMPDIR" \
+            -Drockserver.test.requireFaultFs=true
       - name: Test reports
         if: failure()
         uses: actions/upload-artifact@v3
@@ -72,6 +75,8 @@ jobs:
           path: ~/.m2/repository
           key: m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: m2-
+      - name: gcc for the fault-injecting storage shim (FaultFsTest, DiskFaultTest)
+        run: apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev
       - name: Whole distributed suite, multi-process scenarios included
         run: |
           mkdir -p "$TEST_TMPDIR"
@@ -80,7 +85,8 @@ jobs:
             -Dtest='it.cavallium.rockserver.distributed.**' \
             -Drockserver.test.tmpdir="$TEST_TMPDIR" \
             -Djunit.jupiter.tempdir.cleanup.mode.default=ON_SUCCESS \
-            -Drockserver.test.pipelinedUpdates=${{ matrix.pipelined }}
+            -Drockserver.test.pipelinedUpdates=${{ matrix.pipelined }} \
+            -Drockserver.test.requireFaultFs=true
       # JUnit deletes a test's @TempDir (where the process suites keep each node's stdout.log and stderr.log) only
       # when the test passed (ON_SUCCESS above), so the logs of a failed scenario are still there to upload.
       - name: Test reports and node logs

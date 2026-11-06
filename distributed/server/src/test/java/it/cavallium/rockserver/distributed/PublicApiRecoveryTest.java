@@ -8,6 +8,7 @@ import static it.cavallium.rockserver.distributed.ScenarioSupport.SCHEMA;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.key;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.text;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -51,7 +52,9 @@ import org.junit.jupiter.params.provider.ValueSource;
  *   sends the request again with the same id, and the answer comes from the record of the first one ({@code true}),
  *   while the new column stays. In the {@code kill} variant the leader is SIGKILLed instead of the link being reset,
  *   so the copy reaches a new leader, which answers from the replicated record. The same for {@code
- *   uploadMergeOperator}: the copy gets the version the first one created.</li>
+ *   uploadMergeOperator}: the copy gets the version the first one created. The registry deduplicates by content, so
+ *   that answer would be the same after a second apply: the test also checks that no replica logged the upload as
+ *   applied again ("already exists"), with the registry's log at info on every node.</li>
  *   <li>RT-72: a transaction opened through a follower is bound to the leader of that moment. The leader is
  *   SIGKILLed; the commit through the follower is refused as retryable (never rebased onto the new leader), and its
  *   writes are absent, also a while later.</li>
@@ -64,6 +67,9 @@ class PublicApiRecoveryTest {
 
 	private static final Duration CALL_TIMEOUT = Duration.ofSeconds(40);
 	private static final String OPERATOR_CLASS = "it.cavallium.rockserver.core.impl.MyStringAppendOperator";
+
+	private static final String REGISTRY_LOG_LEVEL =
+			"org.slf4j.simpleLogger.log.it.cavallium.rockserver.core.impl.MergeOperatorRegistry";
 
 	@TempDir
 	Path root;
@@ -88,10 +94,16 @@ class PublicApiRecoveryTest {
 	private void start() throws Exception {
 		var rockserverConfig = root.resolve("rockserver.conf");
 		Files.writeString(rockserverConfig, InProcessCluster.MERGE_CONFIG);
-		cluster = ProcessCluster.start(root.resolve("cluster"), 3, List.of(
+		cluster = ProcessCluster.create(root.resolve("cluster"), 3, 0, List.of(
 				"--rockserver-config", rockserverConfig.toString(),
 				"--election-timeout-ms", "400:800",
 				"--request-timeout-ms", "5000"));
+		for (var id : cluster.members()) {
+			// The registry logs every upload it applies, also one it answers with an existing version: that line is
+			// how the upload test sees a second apply (see aMergeOperatorUploadWhoseReplyIsLostAnswersFromItsRecord).
+			cluster.setJvmOptions(id, List.of("-D" + REGISTRY_LOG_LEVEL + "=info"));
+			cluster.start(id);
+		}
 		cluster.waitReady(READY_TIMEOUT);
 		client = new ClusterClient(cluster.apiAddresses(), CLIENT_RETRY_TIMEOUT, false);
 		support = new ScenarioSupport(cluster);
@@ -164,6 +176,16 @@ class PublicApiRecoveryTest {
 		recover(recovery, leader);
 
 		assertEquals(stored[0], upload.get(CALL_TIMEOUT.toSeconds(), TimeUnit.SECONDS));
+		// The registry deduplicates by content, so a copy applied again would also answer stored[0]: the answer alone
+		// does not tell. Every replica that applies an upload logs it, a repeated content as "already exists".
+		support.awaitQuiescent();
+		var applied = "Uploaded merge operator 'op' version " + stored[0] + " ";
+		var reapplied = "Merge operator 'op' with same content already exists as version " + stored[0] + ".";
+		assertTrue(cluster.members().stream().anyMatch(id -> cluster.output(id).contains(applied)),
+				"no node logged the first apply: the check below would see nothing");
+		for (var id : cluster.members()) {
+			assertFalse(cluster.output(id).contains(reapplied), () -> "node " + id + " applied the upload again");
+		}
 		assertEquals(later, client.write(BATCH_CONTEXT, other -> other.uploadMergeOperator("op", OPERATOR_CLASS,
 				second)).valueOrThrow(), "the same content keeps its version");
 	}

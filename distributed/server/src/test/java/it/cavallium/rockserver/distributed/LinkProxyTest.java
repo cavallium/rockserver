@@ -159,6 +159,33 @@ class LinkProxyTest {
 		}
 	}
 
+	/**
+	 * A refusal and a new watch right after a watcher bound the port again (a kill right after a restart), possibly
+	 * while that watcher is still marked running: the proxy must still listen again. Repeated, since the window is small.
+	 */
+	@Test
+	void aWatchRequestedWhileTheLastWatcherEndsIsNotLost() throws Exception {
+		try (var echo = new EchoServer(new InetSocketAddress(LOOPBACK, 0));
+				var proxy = new LinkProxy(new InetSocketAddress(LOOPBACK, 0), echo.address())) {
+			for (int i = 0; i < 100; i++) {
+				proxy.refuseConnections();
+				proxy.acceptWhenTargetUp();
+				long deadline = System.nanoTime() + PROMPT.toNanos();
+				while (!proxy.isAccepting()) {
+					assertTrue(System.nanoTime() - deadline < 0, "round " + i + ": the proxy does not listen");
+					Thread.onSpinWait();
+				}
+				// The watcher may not have cleared its flag yet.
+				proxy.refuseConnections();
+				proxy.acceptWhenTargetUp();
+				awaitTrue(proxy::isAccepting, "round " + i + ": the proxy does not listen again");
+			}
+			try (var socket = connect(proxy.listenAddress())) {
+				assertEchoes(socket, "after the rounds");
+			}
+		}
+	}
+
 	@Test
 	void delayAndJitterHoldBytesInOrder() throws Exception {
 		try (var echo = new EchoServer(new InetSocketAddress(LOOPBACK, 0));

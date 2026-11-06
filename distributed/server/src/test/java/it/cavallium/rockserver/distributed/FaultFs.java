@@ -16,7 +16,8 @@ import org.junit.jupiter.api.Assumptions;
  * one directory (the node's data directory) fails with EIO or ENOSPC, as a failing or full disk would; nothing else
  * changes, and no root is needed. See the comment at the top of {@code faultfs.c} for what it covers.
  *
- * <p>{@link #build} compiles it with {@code gcc}; a test without {@code gcc} on the path is skipped, not failed.</p>
+ * <p>{@link #build} compiles it with {@code gcc}; a test without {@code gcc} on the path is skipped, not failed, unless
+ * {@code -Drockserver.test.requireFaultFs=true} (set in CI's nightly process job), which makes it a failure.</p>
  */
 final class FaultFs {
 
@@ -54,11 +55,16 @@ final class FaultFs {
 		}
 		Process gcc;
 		try {
-			gcc = new ProcessBuilder("gcc", "-shared", "-fPIC", "-O2", "-o", library.toString(), source.toString(), "-ldl")
+			gcc = new ProcessBuilder("gcc", "-shared", "-fPIC", "-O2", "-o", library.toString(), source.toString(), "-ldl",
+					"-lpthread")
 					.redirectErrorStream(true)
 					.start();
 		} catch (IOException e) {
-			Assumptions.abort("gcc is not available to build the fault-injecting shim: " + e.getMessage());
+			var message = "gcc is not available to build the fault-injecting shim: " + e.getMessage();
+			if (Boolean.getBoolean("rockserver.test.requireFaultFs")) {
+				throw new IOException(message + " (-Drockserver.test.requireFaultFs=true)", e);
+			}
+			Assumptions.abort(message);
 			throw e;
 		}
 		var output = new String(gcc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
@@ -72,11 +78,29 @@ final class FaultFs {
 		return library;
 	}
 
-	/** Environment variables that load the shim, with faults under {@code faultyDir} while {@code trigger} exists. */
-	static Map<String, String> environment(Path library, Path faultyDir, Path trigger) {
-		return Map.of("LD_PRELOAD", library.toAbsolutePath().toString(),
-				"FAULTFS_DIR", faultyDir.toAbsolutePath().toString(),
-				"FAULTFS_TRIGGER", trigger.toAbsolutePath().toString());
+	/**
+	 * Environment variables that load the shim, with faults under {@code faultyDir} while {@code trigger} exists. The
+	 * shim compares with canonical paths ({@code /proc/self/fd}), so {@code faultyDir} goes as a canonical path even if
+	 * it does not exist yet (a node's data directory before its first start): its deepest existing ancestor resolved
+	 * with {@link Path#toRealPath}, the rest normalized. A temp directory reached through {@code ..} or a symbolic link
+	 * would otherwise never match.
+	 */
+	static Map<String, String> environment(Path library, Path faultyDir, Path trigger) throws IOException {
+		return Map.of("LD_PRELOAD", canonical(library).toString(),
+				"FAULTFS_DIR", canonical(faultyDir).toString(),
+				"FAULTFS_TRIGGER", canonical(trigger).toString());
+	}
+
+	static Path canonical(Path path) throws IOException {
+		var absolute = path.toAbsolutePath();
+		var existing = absolute;
+		while (existing != null && !Files.exists(existing)) {
+			existing = existing.getParent();
+		}
+		if (existing == null) {
+			return absolute.normalize();
+		}
+		return existing.toRealPath().resolve(existing.relativize(absolute)).normalize();
 	}
 
 	/** Starts the faults: the shim reads the trigger at most 2 ms later. Written atomically. */

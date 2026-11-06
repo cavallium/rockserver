@@ -33,23 +33,42 @@ class FaultFsTest {
 		var faulty = Files.createDirectories(temp.resolve("faulty"));
 		var other = Files.createDirectories(temp.resolve("other"));
 		var trigger = temp.resolve("trigger");
-		var lines = runProbe(library, faulty, other, trigger);
-		var expected = List.of(
+		assertEquals(EXPECTED, runProbe(faulty, other, trigger, FaultFs.environment(library, faulty, trigger)));
+	}
+
+	/**
+	 * The faulty directory is created only after the JVM started (as a node's data directory on its first start) and
+	 * named through {@code ..}: as {@link FaultFs#environment} passes it (made canonical in Java), and as given (the
+	 * shim resolves it once it exists).
+	 */
+	@Test
+	void failsUnderADirectoryCreatedLaterAndNamedThroughDotDot() throws Exception {
+		var library = FaultFs.build(temp.resolve("lib"));
+		var trigger = temp.resolve("trigger");
+		var viaJava = temp.resolve("lib").resolve("..").resolve("late-java").resolve("faulty");
+		var other = Files.createDirectories(temp.resolve("other"));
+		assertEquals(EXPECTED, runProbe(viaJava, other, trigger, FaultFs.environment(library, viaJava, trigger)));
+		var asGiven = temp.resolve("lib").resolve("..").resolve("late-raw").resolve("faulty").toAbsolutePath();
+		var raw = java.util.Map.of("LD_PRELOAD", library.toAbsolutePath().toString(), "FAULTFS_DIR", asGiven.toString(),
+				"FAULTFS_TRIGGER", trigger.toAbsolutePath().toString());
+		assertEquals(EXPECTED, runProbe(asGiven, other, trigger, raw));
+	}
+
+	private static final List<String> EXPECTED = List.of(
 				"none faulty write OK", "none faulty force OK", "none other write OK",
 				"EIO faulty write Input/output error", "EIO faulty force Input/output error",
 				"EIO faulty pwrite Input/output error", "EIO other write OK", "EIO other force OK",
 				"ENOSPC-write faulty write No space left on device", "ENOSPC-write faulty force OK",
 				"EIO-sync faulty write OK", "EIO-sync faulty force Input/output error",
 				"cleared faulty write OK", "cleared faulty force OK");
-		assertEquals(expected, lines);
-	}
 
-	private List<String> runProbe(Path library, Path faulty, Path other, Path trigger) throws Exception {
+	private List<String> runProbe(Path faulty, Path other, Path trigger, java.util.Map<String, String> environment)
+			throws Exception {
 		var command = List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 				"-Xmx32m", "-XX:TieredStopAtLevel=1", "-cp", System.getProperty("java.class.path"),
 				Probe.class.getName(), faulty.toString(), other.toString(), trigger.toString());
 		var builder = new ProcessBuilder(command).redirectErrorStream(true);
-		builder.environment().putAll(FaultFs.environment(library, faulty, trigger));
+		builder.environment().putAll(environment);
 		var process = builder.start();
 		var output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
 		assertTrue(process.waitFor(60, TimeUnit.SECONDS), output);
@@ -64,6 +83,8 @@ class FaultFsTest {
 			var faulty = Path.of(args[0]);
 			var other = Path.of(args[1]);
 			var trigger = Path.of(args[2]);
+			// A directory that does not exist yet when the JVM loads the shim is created here.
+			Files.createDirectories(faulty);
 			var results = new ArrayList<String>();
 			step(results, "none", faulty, other);
 			step(results, "EIO", faulty, other, trigger, FaultFs.Errno.EIO, FaultFs.Ops.ALL);

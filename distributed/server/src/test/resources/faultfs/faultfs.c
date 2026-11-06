@@ -8,7 +8,10 @@
  * calls libc through the PLT) and Ratis' log all reach these functions.
  *
  * Environment:
- *   FAULTFS_DIR      the faulty directory (resolved with realpath at load time); without it the shim does nothing
+ *   FAULTFS_DIR      the faulty directory; without it the shim does nothing. It is compared with the canonical path of
+ *                    each file descriptor (/proc/self/fd), so it is resolved with realpath: at load time, or, if it did
+ *                    not exist yet (a node's first start creates its data directory), at the first faulted call after
+ *                    it appeared. Until then the path is compared as given.
  *   FAULTFS_TRIGGER  the trigger file; it should lie outside FAULTFS_DIR
  *
  * Trigger file contents: "<ERRNO> [<OPS>]", for example "EIO", "ENOSPC write" or "EIO sync".
@@ -21,13 +24,14 @@
  * write to a new file before they rename it, so the write fails first), writes through mmap (neither RocksDB's
  * write path nor Ratis' log use it), io_uring, and direct syscall() calls.
  *
- * Build: gcc -shared -fPIC -O2 -o libfaultfs.so faultfs.c -ldl
+ * Build: gcc -shared -fPIC -O2 -o libfaultfs.so faultfs.c -ldl -lpthread
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,8 +43,13 @@
 #define OP_WRITE 1
 #define OP_SYNC 2
 
-static char fault_dir[PATH_MAX];
-static size_t fault_dir_len;
+/* The path as given, and its realpath once it resolved (resolved_dir is written once, before resolved is set). */
+static char given_dir[PATH_MAX];
+static size_t given_dir_len;
+static char resolved_dir[PATH_MAX];
+static size_t resolved_dir_len;
+static int resolved;
+static pthread_mutex_t resolve_lock = PTHREAD_MUTEX_INITIALIZER;
 static char trigger_path[PATH_MAX];
 static int enabled;
 
@@ -49,25 +58,44 @@ static volatile int current_errno;
 static volatile int current_ops;
 static volatile long long next_check_ns;
 
+static size_t trim_slashes(char *path) {
+	size_t len = strlen(path);
+	while (len > 1 && path[len - 1] == '/') {
+		path[--len] = '\0';
+	}
+	return len;
+}
+
+/* Tries realpath on the given directory; after a success the resolved path is used from then on. */
+static void try_resolve(void) {
+	if (__atomic_load_n(&resolved, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	int saved = errno;
+	pthread_mutex_lock(&resolve_lock);
+	if (!resolved) {
+		char buffer[PATH_MAX];
+		if (realpath(given_dir, buffer) != NULL) {
+			strcpy(resolved_dir, buffer);
+			resolved_dir_len = trim_slashes(resolved_dir);
+			__atomic_store_n(&resolved, 1, __ATOMIC_RELEASE);
+		}
+	}
+	pthread_mutex_unlock(&resolve_lock);
+	errno = saved;
+}
+
 __attribute__((constructor)) static void faultfs_init(void) {
 	const char *dir = getenv("FAULTFS_DIR");
 	const char *trigger = getenv("FAULTFS_TRIGGER");
-	if (dir == NULL || trigger == NULL || strlen(trigger) >= sizeof(trigger_path)) {
+	if (dir == NULL || trigger == NULL || strlen(trigger) >= sizeof(trigger_path) || strlen(dir) >= sizeof(given_dir)) {
 		return;
 	}
-	if (realpath(dir, fault_dir) == NULL) {
-		/* Not created yet: compare with the path as given. */
-		if (strlen(dir) >= sizeof(fault_dir)) {
-			return;
-		}
-		strcpy(fault_dir, dir);
-	}
-	fault_dir_len = strlen(fault_dir);
-	while (fault_dir_len > 1 && fault_dir[fault_dir_len - 1] == '/') {
-		fault_dir[--fault_dir_len] = '\0';
-	}
+	strcpy(given_dir, dir);
+	given_dir_len = trim_slashes(given_dir);
 	strcpy(trigger_path, trigger);
 	enabled = 1;
+	try_resolve();
 }
 
 static long long now_ns(void) {
@@ -118,6 +146,13 @@ static int must_fail(int fd, int op) {
 	int error = current_errno;
 	if (error == 0 || (current_ops & op) == 0) {
 		return 0;
+	}
+	try_resolve();
+	const char *fault_dir = given_dir;
+	size_t fault_dir_len = given_dir_len;
+	if (__atomic_load_n(&resolved, __ATOMIC_ACQUIRE)) {
+		fault_dir = resolved_dir;
+		fault_dir_len = resolved_dir_len;
 	}
 	int saved = errno;
 	char link[64];

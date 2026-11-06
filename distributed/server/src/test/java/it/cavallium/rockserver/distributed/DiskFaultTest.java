@@ -43,9 +43,12 @@ import org.junit.jupiter.params.provider.CsvSource;
 class DiskFaultTest {
 
 	private static final Duration EXIT_TIMEOUT = Duration.ofSeconds(60);
-	/** Lines a node's log shows once a disk failure reached it: Ratis' log worker, the replica, the Raft close. */
-	private static final List<String> FAILURE_MARKERS = List.of("replica failed to", "Raft closed",
-			"hit exception", "Input/output error", "No space left on device");
+	/**
+	 * Lines a node's log shows once a disk failure made it a failed node: Ratis' log worker closing the division, the
+	 * replica, the Raft close. Not the bare errno text: a graceful stop that flushes onto the failed disk prints it too,
+	 * and that stop exits 0 (see DD-7h in the design document).
+	 */
+	private static final List<String> FAILURE_MARKERS = List.of("replica failed to", "Raft closed", "hit exception");
 	private static final int SIGNAL_ROUNDS = Integer.getInteger("rockserver.test.diskFaultSignalRounds", 6);
 
 	@TempDir
@@ -131,8 +134,9 @@ class DiskFaultTest {
 	/**
 	 * DD-7h: a SIGTERM that races a replica failure exits with 3. A follower's disk starts failing (EIO on every write and
 	 * sync) while it is frozen with SIGSTOP, so that the failure starts right after SIGCONT; the SIGTERM follows either
-	 * as soon as the node's log shows the failure, or after a random 0-30 ms. Whenever the failure reached the node, the
-	 * exit code must be 3; at least one round must have signalled a node that was failing and still alive.
+	 * as soon as the node's log shows the failure, or after a random 0-30 ms. The
+	 * exit code must be 3 whenever the failure showed in the node's log before the signal; at least one round must have
+	 * signalled a node that was failing and still alive.
 	 */
 	@Test
 	void aSigtermRacingAReplicaFailureExitsWithThree() throws Exception {
@@ -174,7 +178,9 @@ class DiskFaultTest {
 						+ failingAtSignal + ", failure in its log " + failed + ", exit code " + code;
 				System.out.println(line);
 				rounds.add(line);
-				if (failed) {
+				// Only a failure that showed before the signal makes it the failure's stop. One that first shows during the
+				// graceful stop (the stop's own flush hits the disk) may exit 0: see DD-7h in the design document.
+				if (failingAtSignal) {
 					assertEquals(3, code, () -> line + "\n" + cluster.logTail(victim));
 				}
 				if (aliveAtSignal && failingAtSignal && code == 3) {

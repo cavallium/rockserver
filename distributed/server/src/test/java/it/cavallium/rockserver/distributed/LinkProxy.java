@@ -102,6 +102,8 @@ public final class LinkProxy implements AutoCloseable {
 	private volatile boolean refuseWhileTargetDown;
 	/** Set while a thread waits for the target to accept connections again ({@link #acceptWhenTargetUp()}). */
 	private final AtomicBoolean watchingTarget = new AtomicBoolean();
+	/** Calls of {@link #acceptWhenTargetUp()}: one that a running watcher may have missed starts a new watcher. */
+	private final java.util.concurrent.atomic.AtomicLong watchRequests = new java.util.concurrent.atomic.AtomicLong();
 	private final InetSocketAddress target;
 	private final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 	private final Thread acceptor;
@@ -191,17 +193,23 @@ public final class LinkProxy implements AutoCloseable {
 
 	/**
 	 * Binds the listening port again, after {@link #refuseConnections()}, as soon as the target accepts a connection
-	 * (probed every {@value #TARGET_PROBE_MILLIS} ms by a thread of its own).
+	 * (probed every {@value #TARGET_PROBE_MILLIS} ms by a thread of its own). A call that comes while a watcher is
+	 * still running, after that watcher bound the port (a kill right after a restart: the port was closed again), is
+	 * not lost: the watcher starts another one as it ends.
 	 */
 	public void acceptWhenTargetUp() {
+		watchRequests.incrementAndGet();
 		if (!watchingTarget.compareAndSet(false, true)) {
 			return;
 		}
 		Thread.ofVirtual().name("link-proxy-target-watch-" + target).start(() -> {
+			long served = -1;
 			try {
 				while (!closed) {
+					long requests = watchRequests.get();
 					if (targetAccepts()) {
 						acceptConnections();
+						served = requests;
 						return;
 					}
 					Thread.sleep(TARGET_PROBE_MILLIS);
@@ -212,6 +220,10 @@ public final class LinkProxy implements AutoCloseable {
 				Thread.currentThread().interrupt();
 			} finally {
 				watchingTarget.set(false);
+				// Requests after the bind found this watcher still marked running, and returned.
+				if (served >= 0 && watchRequests.get() != served && !closed) {
+					acceptWhenTargetUp();
+				}
 			}
 		});
 	}
