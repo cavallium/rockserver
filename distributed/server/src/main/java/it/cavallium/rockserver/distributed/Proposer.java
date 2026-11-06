@@ -113,7 +113,9 @@ final class Proposer implements Closeable {
 	static final long MAX_ENTRY_BODY_BYTES = RaftSettings.MAX_ENTRY_BYTES - LogEntryCodec.STAMP_BYTES
 			- LogEntryCodec.BATCH_HEADER_BYTES - LogEntryCodec.MAX_REQUEST_OVERHEAD_BYTES;
 	/** System property: bytes of writes one node holds at most (see {@link #writeAdmissionBytes}). */
-	static final String WRITE_ADMISSION_BYTES_PROPERTY = "it.cavallium.rockserver.replicated.write-admission-bytes";
+	static final String WRITE_ADMISSION_BYTES_PROPERTY = DistributedProperties.PREFIX + "write-admission-bytes";
+	/** The name {@link #WRITE_ADMISSION_BYTES_PROPERTY} had before, still read. */
+	static final String OLD_WRITE_ADMISSION_BYTES_PROPERTY = "it.cavallium.rockserver.replicated.write-admission-bytes";
 	/** What a request costs on the heap besides its body: the request, its future, its queue node. */
 	static final long REQUEST_OVERHEAD_BYTES = 256;
 	/**
@@ -218,7 +220,8 @@ final class Proposer implements Closeable {
 	 * batch). Never less than room for two entries of the largest size.
 	 */
 	static long writeAdmissionBytes() {
-		return writeAdmissionBytes(System.getProperty(WRITE_ADMISSION_BYTES_PROPERTY), Runtime.getRuntime().maxMemory());
+		return writeAdmissionBytes(DistributedProperties.get(WRITE_ADMISSION_BYTES_PROPERTY,
+				OLD_WRITE_ADMISSION_BYTES_PROPERTY), Runtime.getRuntime().maxMemory());
 	}
 
 	static long writeAdmissionBytes(@Nullable String configured, long maxHeapBytes) {
@@ -445,7 +448,7 @@ final class Proposer implements Closeable {
 		long weight = bodySize + REQUEST_OVERHEAD_BYTES;
 		if (!admission.tryAcquire(weight)) {
 			admissionRejects.record(1);
-			return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+			return CompletableFuture.failedFuture(RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
 					"Too many bytes of writes are waiting on this node (" + admission.used() + " of " + admission.limit()
 							+ "); the write was not applied"));
 		}
@@ -503,18 +506,18 @@ final class Proposer implements Closeable {
 	}
 
 	private static RocksDBException callerDeadlinePassed() {
-		return RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+		return RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 				"The request deadline came before the write was sent; it was not applied");
 	}
 
 	/** For a request that was sent, and refused before the append by every leader until its caller's deadline. */
 	private static RocksDBException callerDeadlinePassedUnaccepted() {
-		return RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+		return RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 				"The request deadline came before a leader accepted the write; it was not applied");
 	}
 
 	private static RocksDBException notAccepted() {
-		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+		return RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
 				"No leader accepted the write in time; it was not applied");
 	}
 
@@ -765,7 +768,7 @@ final class Proposer implements Closeable {
 					rest.add(pending);
 				} catch (RuntimeException invalid) {
 					pending.fail(pending.maybeAppended || pending.resentAlone ? noAnswer(invalid)
-							: RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
+							: RocksDBException.notApplied(RocksDBErrorType.INVALID_REQUEST,
 									"The write could not be encoded, it was not applied: " + invalid.getMessage()));
 				}
 			}

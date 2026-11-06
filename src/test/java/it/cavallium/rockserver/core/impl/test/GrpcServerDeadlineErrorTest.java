@@ -152,6 +152,48 @@ class GrpcServerDeadlineErrorTest {
 		}
 	}
 
+	/**
+	 * A failure that says the write was not applied carries the "rockserver-applied: no" trailer over a real server, and
+	 * keeps its message for older clients; any other RocksDB failure carries "maybe" (CR-2).
+	 */
+	@Test
+	void notAppliedFailuresCarryTheAppliedTrailer() throws Exception {
+		var backend = new ProtectedOperationBackendConnection();
+		var key = io.grpc.Metadata.Key.of(RocksDBException.APPLIED_METADATA_KEY, io.grpc.Metadata.ASCII_STRING_MARSHALLER);
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			var channel = io.grpc.ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort())
+					.usePlaintext()
+					.build();
+			try {
+				var stub = it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.newBlockingStub(channel);
+				java.util.function.BiFunction<it.cavallium.rockserver.core.common.api.proto.WorkloadProfile, Long,
+						it.cavallium.rockserver.core.common.api.proto.PutRequest> put = (profile, timeout) ->
+						it.cavallium.rockserver.core.common.api.proto.PutRequest.newBuilder()
+								.setColumnId(1L)
+								.setData(it.cavallium.rockserver.core.common.api.proto.KV.newBuilder()
+										.addKeys(com.google.protobuf.ByteString.copyFrom(new byte[] {1}))
+										.setValue(com.google.protobuf.ByteString.copyFrom(new byte[] {2})))
+								.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+										.setProfile(profile)
+										.setWorkloadContractVersion(3)
+										.setTimeoutNanos(timeout))
+								.build();
+				var expired = assertThrows(io.grpc.StatusRuntimeException.class,
+						() -> stub.put(put.apply(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY, 1L)));
+				assertEquals(io.grpc.Status.Code.DEADLINE_EXCEEDED, expired.getStatus().getCode(), expired.toString());
+				assertTrue(expired.getStatus().getDescription().contains("expired"), expired.toString());
+				assertEquals(RocksDBException.NOT_APPLIED, expired.getTrailers().get(key));
+
+				var refused = assertThrows(io.grpc.StatusRuntimeException.class, () -> stub.put(put.apply(
+						it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.CONTROL, Long.MAX_VALUE)));
+				assertEquals(RocksDBException.MAYBE_APPLIED, refused.getTrailers().get(key));
+			} finally {
+				channel.shutdownNow();
+			}
+		}
+	}
+
 	@Test
 	void readDeadlineExceededSurvivesARealGrpcServerRoundTrip() throws Exception {
 		var backend = new DeadlineBackendConnection();

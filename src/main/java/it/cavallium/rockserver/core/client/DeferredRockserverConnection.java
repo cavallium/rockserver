@@ -55,6 +55,15 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 		return initialized().getSyncApi(context);
 	}
 
+	/** Delegates once connected, as every call does: the default would answer NOT_IMPLEMENTED for a server with sessions. */
+	@Override
+	public CompletableFuture<Long> openClientSessionAsync(RequestContext context) {
+		Objects.requireNonNull(context);
+		var budget = new Budget(context);
+		return acquire(budget).flatMap(client -> Mono.fromFuture(() ->
+				client.openClientSessionAsync(budget.remainingContext()))).toFuture();
+	}
+
 	private RocksDBConnection initialized() {
 		if (Schedulers.isInNonBlockingThread()) {
 			throw new IllegalStateException("Synchronous Rockserver access requires a blocking thread");

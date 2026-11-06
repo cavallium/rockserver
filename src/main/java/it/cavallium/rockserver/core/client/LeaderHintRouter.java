@@ -34,7 +34,9 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Calls go to the leader's channel only while it is connected; until then, and once it fails, they take the
  * ordinary channel, which every node serves. A call that ends with {@code UNAVAILABLE} on the leader's channel drops
- * it, and the same address is not taken again for {@link #FAILED_HINT_BACKOFF_NANOS}. A call in flight when its
+ * it, and the same address is not taken again for {@link #FAILED_HINT_BACKOFF_NANOS}. Each failed address is
+ * remembered on its own, so two addresses that keep failing (two nodes that each name the other) do not alternate
+ * without a pause. A call in flight when its
  * channel fails fails as on any lost connection: whether a call may run again is the caller's decision.</p>
  *
  * <p>By default ({@link Mode#LISTED}) a hinted address is used only if it is one of the addresses the client was given
@@ -60,8 +62,13 @@ final class LeaderHintRouter implements AutoCloseable {
 		ANY
 	}
 
-	/** gRPC methods, by bare name, that the leader serves: they go to the leader's channel when there is one. */
+	/**
+	 * gRPC methods, by bare name, that the leader serves: they go to the leader's channel when there is one. With
+	 * {@link #ORDINARY_METHODS}, every method of the service, which a test checks.
+	 */
 	static final Set<String> LEADER_METHODS = Set.of(
+			// The session is registered through the log: a follower would forward it.
+			"openClientSession",
 			"openTransaction", "closeTransaction", "closeFailedUpdate", "getForUpdate",
 			"put", "putEnsure", "putBatch", "putMulti", "putMultiEnsure", "putMultiList", "putMultiListEnsure",
 			"putGetPrevious", "putMultiGetPrevious", "putGetDelta", "putMultiGetDelta", "putGetChanged",
@@ -73,6 +80,15 @@ final class LeaderHintRouter implements AutoCloseable {
 			"openIterator", "closeIterator", "seekTo", "subsequent", "subsequentExists", "subsequentMultiGet",
 			"reduceRangeFirstAndLast", "reduceRangeEntriesCount", "getAllInRange", "getAllInRangeNoCache", "getRangePage",
 			"scanRaw", "getColumnId", "getAllColumnDefinitions", "checkMergeOperator", "estimateNumKeys");
+
+	/**
+	 * gRPC methods, by bare name, that stay on the ordinary channel: the handshake (the capabilities of the node the
+	 * connection reaches), point reads (followers serve them), and maintenance and node statistics, which concern the
+	 * node they reach.
+	 */
+	static final Set<String> ORDINARY_METHODS = Set.of(
+			"getCapabilities", "get", "exists", "existsMulti", "getMulti",
+			"flush", "compact", "getSstMetadata", "compactFiles", "getTableProperties");
 
 	/** The leader's channel. */
 	record Hint(String address, ManagedChannel channel) {}
@@ -86,10 +102,8 @@ final class LeaderHintRouter implements AutoCloseable {
 	private final LongSupplier nanoTime;
 	private final Object lock = new Object();
 	private volatile @Nullable Hint current;
-	/** Guarded by {@link #lock}. */
-	private @Nullable String failedAddress;
-	/** Guarded by {@link #lock}. */
-	private long failedAt;
+	/** Addresses whose channel failed, with when: not taken again for {@link #FAILED_HINT_BACKOFF_NANOS}. Guarded by {@link #lock}. */
+	private final java.util.Map<String, Long> failedAt = new java.util.HashMap<>();
 	/** Guarded by {@link #lock}. */
 	private boolean closed;
 
@@ -437,8 +451,7 @@ final class LeaderHintRouter implements AutoCloseable {
 		ManagedChannel created;
 		synchronized (lock) {
 			hint = current;
-			if (closed || (hint != null && hint.address().equals(value))
-					|| (value.equals(failedAddress) && nanoTime.getAsLong() - failedAt < FAILED_HINT_BACKOFF_NANOS)) {
+			if (closed || (hint != null && hint.address().equals(value)) || backingOff(value)) {
 				return;
 			}
 			created = channels.apply(address);
@@ -454,6 +467,12 @@ final class LeaderHintRouter implements AutoCloseable {
 		LOG.debug("Leader-bound calls go to {}", value);
 	}
 
+	/** True if {@code address}'s channel failed less than {@link #FAILED_HINT_BACKOFF_NANOS} ago. Holds {@link #lock}. */
+	private boolean backingOff(String address) {
+		var at = failedAt.get(address);
+		return at != null && nanoTime.getAsLong() - at < FAILED_HINT_BACKOFF_NANOS;
+	}
+
 	/** Stops using {@code hint}'s channel, if it is still the current one. */
 	private void drop(Hint hint) {
 		synchronized (lock) {
@@ -461,8 +480,10 @@ final class LeaderHintRouter implements AutoCloseable {
 				return;
 			}
 			current = null;
-			failedAddress = hint.address();
-			failedAt = nanoTime.getAsLong();
+			long now = nanoTime.getAsLong();
+			// Small: only addresses that failed within the backoff stay.
+			failedAt.values().removeIf(at -> now - at >= FAILED_HINT_BACKOFF_NANOS);
+			failedAt.put(hint.address(), now);
 		}
 		hint.channel().shutdown();
 		LOG.debug("Leader-bound calls go to the ordinary channel: {} failed", hint.address());

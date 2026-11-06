@@ -624,6 +624,19 @@ final class NodeStore implements Closeable {
 		return new long[] {buffer.getLong(), buffer.getLong(), buffer.getLong()};
 	}
 
+	/**
+	 * True if a session whose row says {@code timeoutMillis} and {@code lastActiveMillis} is expired at the replicated
+	 * clock {@code clockMillis}: the one rule the applier and the leader's answers use.
+	 */
+	static boolean sessionExpired(long timeoutMillis, long lastActiveMillis, long clockMillis) {
+		return clockMillis - lastActiveMillis > timeoutMillis;
+	}
+
+	/** The replicated clock stored by {@link #CLOCK}: 0 if none was written yet. */
+	static long decodeClock(@org.jetbrains.annotations.Nullable Buf value) {
+		return value == null ? 0 : ByteBuffer.wrap(value.toByteArray()).getLong();
+	}
+
 	private static Keys metaKey(byte kind, long first, long second) {
 		var key = java.nio.ByteBuffer.allocate(META_KEY_BYTES).put(kind).putLong(first).putLong(second).array();
 		return new Keys(Buf.wrap(key));

@@ -145,6 +145,9 @@ final class LeaderSession {
 		/** Its own commit, once admitted to the log and passed its key on. */
 		private volatile @Nullable ChainLink link;
 		private final AtomicBoolean commitStarted = new AtomicBoolean();
+		/** Commits of it in flight ({@link #commitProposed}): it does not expire meanwhile. */
+		private final java.util.concurrent.atomic.AtomicInteger commitsInFlight =
+				new java.util.concurrent.atomic.AtomicInteger();
 		private final long deadlineNanos;
 		private final List<LogEntry.Write> writes = new ArrayList<>();
 		private final LongArrayList conflictColumns = new LongArrayList();
@@ -250,6 +253,23 @@ final class LeaderSession {
 
 		boolean isExpired(long nowNanos) {
 			return nowNanos - deadlineNanos > 0;
+		}
+
+		/**
+		 * Its commit was proposed, until {@link #commitEnded}: {@link #expire} leaves it alone meanwhile. Its key lock
+		 * belongs to that commit, and the commit's handler removes it from the session once the outcome is known; dropping
+		 * it earlier would hand the key to the next update while the commit may still apply.
+		 */
+		void commitProposed() {
+			commitsInFlight.incrementAndGet();
+		}
+
+		void commitEnded() {
+			commitsInFlight.decrementAndGet();
+		}
+
+		boolean commitInFlight() {
+			return commitsInFlight.get() > 0;
 		}
 	}
 
@@ -741,12 +761,15 @@ final class LeaderSession {
 		}
 	}
 
-	/** Drops expired transactions (their native transaction expires on its own) and prunes the tracker. */
+	/**
+	 * Drops expired transactions (their native transaction expires on its own) and prunes the tracker. A transaction
+	 * whose commit is in flight stays: the commit's handler removes it.
+	 */
 	synchronized void expire() {
 		long now = System.nanoTime();
 		lastExpireNanos = now;
 		transactions.values().removeIf(transaction -> {
-			if (transaction.isExpired(now)) {
+			if (transaction.isExpired(now) && !transaction.commitInFlight()) {
 				release(transaction.snapshotIndex);
 				if (transaction.keyLock != null) {
 					unlockKey(transaction.keyLock);

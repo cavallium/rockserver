@@ -173,6 +173,65 @@ class LeaderHintRouterTest {
 		assertEquals(2, opened.size());
 	}
 
+	/**
+	 * Two nodes that each name the other while their channels keep failing: each address waits its own backoff, so the
+	 * client does not open a channel at every hint, alternating between them.
+	 */
+	@Test
+	void twoFailingHintsDoNotAlternateWithoutBackoff() {
+		var router = router(LeaderHintRouter.Mode.LISTED);
+		var routed = router.route(main);
+		router.offer("node-b:5333");
+		var b = opened.getLast();
+		b.state = ConnectivityState.READY;
+		call(routed, "put");
+		b.lastListener.onClose(Status.UNAVAILABLE, new Metadata());
+
+		router.offer("node-c:5333");
+		var c = opened.getLast();
+		assertEquals(2, opened.size());
+		c.state = ConnectivityState.READY;
+		call(routed, "put");
+		c.lastListener.onClose(Status.UNAVAILABLE, new Metadata());
+
+		// Both failed within the backoff: neither is taken again, in any order.
+		router.offer("node-b:5333");
+		router.offer("node-c:5333");
+		router.offer("node-b:5333");
+		assertEquals(2, opened.size(), "no channel opened while both addresses back off");
+		assertNull(router.currentAddress());
+
+		now.addAndGet(LeaderHintRouter.FAILED_HINT_BACKOFF_NANOS + 1);
+		router.offer("node-b:5333");
+		assertEquals(3, opened.size());
+		assertEquals("node-b:5333", router.currentAddress());
+	}
+
+	/**
+	 * Every method of the service is classified: sent to the leader, or explicitly kept on the ordinary channel. A new
+	 * RPC must be added to one of the two sets.
+	 */
+	@Test
+	void everyServiceMethodIsClassified() {
+		var methods = new java.util.TreeSet<String>();
+		for (var method : it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.getServiceDescriptor()
+				.getMethods()) {
+			methods.add(method.getBareMethodName());
+		}
+		var both = new java.util.TreeSet<>(LeaderHintRouter.LEADER_METHODS);
+		both.retainAll(LeaderHintRouter.ORDINARY_METHODS);
+		assertEquals(Set.of(), both, "in both sets");
+		var unclassified = new java.util.TreeSet<>(methods);
+		unclassified.removeAll(LeaderHintRouter.LEADER_METHODS);
+		unclassified.removeAll(LeaderHintRouter.ORDINARY_METHODS);
+		assertEquals(Set.of(), unclassified, "methods in neither set");
+		var unknown = new java.util.TreeSet<>(LeaderHintRouter.LEADER_METHODS);
+		unknown.addAll(LeaderHintRouter.ORDINARY_METHODS);
+		unknown.removeAll(methods);
+		assertEquals(Set.of(), unknown, "names that are not methods of the service");
+		assertTrue(LeaderHintRouter.LEADER_METHODS.contains("openClientSession"), "registered through the log");
+	}
+
 	private static Metadata naming(@Nullable String leader) {
 		var metadata = new Metadata();
 		if (leader != null) {

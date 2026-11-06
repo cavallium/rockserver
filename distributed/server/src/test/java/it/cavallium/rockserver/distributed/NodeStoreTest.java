@@ -54,6 +54,27 @@ class NodeStoreTest {
 		}
 	}
 
+	/**
+	 * A leader answers a copy of a commit whose session is expired at the replicated clock as a gone session, even
+	 * before the sweep deletes its row (F13).
+	 */
+	@Test
+	void aSessionExpiredAtTheReplicatedClockIsNotLive() throws IOException {
+		try (var store = NodeStore.open(tempDir.resolve("db"), null, "sessions")) {
+			var db = store.db();
+			long meta = store.metaColumnId();
+			assertFalse(CommitOutcomes.sessionLive(store, 5), "no row");
+			db.put(0L, meta, NodeStore.sessionKey(5), NodeStore.encodeSession(1_000, 10_000, 0), RequestType.none());
+			assertTrue(CommitOutcomes.sessionLive(store, 5), "no clock yet");
+			db.put(0L, meta, NodeStore.key(NodeStore.CLOCK),
+					Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(11_000).array()), RequestType.none());
+			assertTrue(CommitOutcomes.sessionLive(store, 5), "exactly at its timeout");
+			db.put(0L, meta, NodeStore.key(NodeStore.CLOCK),
+					Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(11_001).array()), RequestType.none());
+			assertFalse(CommitOutcomes.sessionLive(store, 5), "expired at the clock, row still there");
+		}
+	}
+
 	@Test
 	void reopeningKeepsMetaColumnAndMetadata() throws IOException {
 		Path dbDir = tempDir.resolve("db");

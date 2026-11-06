@@ -120,6 +120,7 @@ public final class GrpcConnection extends BaseConnection {
 	 */
 	public static final String SESSION_WRITES_PROPERTY = "it.cavallium.rockserver.grpc.client.session-writes";
 
+	private static final Logger SESSION_LOG = LoggerFactory.getLogger(GrpcConnection.class);
 	private final GrpcConnectionDelegate delegate;
 	/** Numbered writes, on a replicated server that has client sessions and a connection that retries. */
 	private final @Nullable SessionWrites sessionWrites;
@@ -144,12 +145,20 @@ public final class GrpcConnection extends BaseConnection {
 	private GrpcConnection(String name, GrpcConnectionDelegate delegate) {
 		super(name);
 		this.delegate = delegate;
-		this.sessionWrites = delegate.automaticRetry && delegate.getCapabilities().clientSessions()
-				&& !"false".equalsIgnoreCase(System.getProperty(SESSION_WRITES_PROPERTY))
+		var capabilities = delegate.getCapabilities();
+		boolean sessionsOff = "false".equalsIgnoreCase(System.getProperty(SESSION_WRITES_PROPERTY));
+		this.sessionWrites = delegate.automaticRetry && capabilities.clientSessions() && !sessionsOff
 				? new SessionWrites(delegate::openClientSessionAsync,
 						(context, command) -> (CompletableFuture<?>) delegate.requestAsync(context, command),
-						delegate.callbackExecutor, delegate.getCapabilities().numberedBatches())
+						delegate.callbackExecutor, capabilities.numberedBatches())
 				: null;
+		if (delegate.automaticRetry) {
+			// Read once, from the node that answered the handshake: a connection made before the cluster offered sessions
+			// does not start using them, and must be made again after the upgrade.
+			SESSION_LOG.info("Connection {}: client sessions {} (server offers sessions: {}, numbered batches: {}, {}: {})",
+					name, sessionWrites != null ? "on" : "off", capabilities.clientSessions(),
+					capabilities.numberedBatches(), SESSION_WRITES_PROPERTY, sessionsOff ? "false" : "default");
+		}
 		this.channel = delegate.channel;
 		this.callbackExecutor = delegate.callbackExecutor;
 		this.eventLoopGroup = delegate.eventLoopGroup;
@@ -265,14 +274,10 @@ public final class GrpcConnection extends BaseConnection {
 	<R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		var writes = sessionWrites;
 		if (writes != null && (writes.numbers(request) || SessionWrites.observes(request))) {
-			try {
-				return (RS) ((CompletableFuture<Object>) requestAsync(context, request)).join();
-			} catch (CompletionException ex) {
-				if (ex.getCause() instanceof RuntimeException cause) {
-					throw cause;
-				}
-				throw ex;
-			}
+			// Bounded by the deadline plus a margin: a lost callback must not block the caller forever. Past it the write
+			// is cancelled, and ends unknown if a copy was sent.
+			return (RS) SessionWrites.await((CompletableFuture<Object>) requestAsync(context, request),
+					writes.syncWaitNanos(context));
 		}
 		return delegate.requestSync(context, request);
 	}
@@ -479,7 +484,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 						TimeUnit.MILLISECONDS)
 				.keepAliveWithoutCalls(true);
 		if (automaticRetry) {
-			configureRetry(channelBuilder);
+			configureRetry(channelBuilder, severalAddresses);
 		} else {
 			channelBuilder
 					.disableRetry()
@@ -734,7 +739,19 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		return (int) parsed;
 	}
 
+	/**
+	 * Default first pause of gRPC's automatic read retry with several addresses: the retry goes to the next node of the
+	 * list (the failed one's connection is gone), so it need not wait for that node to come back.
+	 */
+	static final String DEFAULT_INITIAL_RETRY_BACKOFF_SEVERAL_ADDRESSES = "0.05s";
+	static final String DEFAULT_INITIAL_RETRY_BACKOFF_ONE_ADDRESS = "0.5s";
+
+	/** With one address. */
 	private static void configureRetry(NettyChannelBuilder channelBuilder) {
+		configureRetry(channelBuilder, false);
+	}
+
+	private static void configureRetry(NettyChannelBuilder channelBuilder, boolean severalAddresses) {
 		int maxAttempts = intProperty(MAX_RETRY_ATTEMPTS_PROPERTY, 5, 1);
 		if (maxAttempts <= 1) {
 			channelBuilder
@@ -752,7 +769,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 								"name", AUTOMATIC_RETRY_METHOD_CONFIG_NAMES,
 								"retryPolicy", Map.of(
 										"maxAttempts", (double) maxAttempts,
-										"initialBackoff", System.getProperty(INITIAL_RETRY_BACKOFF_PROPERTY, "0.5s"),
+										"initialBackoff", System.getProperty(INITIAL_RETRY_BACKOFF_PROPERTY, severalAddresses
+												? DEFAULT_INITIAL_RETRY_BACKOFF_SEVERAL_ADDRESSES : DEFAULT_INITIAL_RETRY_BACKOFF_ONE_ADDRESS),
 										"maxBackoff", System.getProperty(MAX_RETRY_BACKOFF_PROPERTY, "30s"),
 										"backoffMultiplier", doubleProperty(RETRY_BACKOFF_MULTIPLIER_PROPERTY, 2.0d, 1.0d),
 										// Retry only transport loss here. SERVER_OVERLOADED and
@@ -2076,7 +2094,35 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	private static final String grpcRocksDbErrorPrefixString = "RocksDBError: [uid:";
 
-	private static Throwable mapGrpcStatusError(@NotNull Throwable t) {
+	private static final Metadata.Key<String> APPLIED_KEY = Metadata.Key.of(RocksDBException.APPLIED_METADATA_KEY,
+			Metadata.ASCII_STRING_MARSHALLER);
+
+	/**
+	 * Messages by which a server older than {@link RocksDBException#APPLIED_METADATA_KEY} said that a write was not
+	 * applied. Read only when a failure has no such trailer; a server that sends it keeps these messages for older
+	 * clients.
+	 */
+	static final List<String> LEGACY_NOT_APPLIED_MESSAGES = List.of("not applied", "already expired",
+			"before downstream dispatch");
+
+	/**
+	 * True if a failure of a server says that the write was not applied: from its {@link RocksDBException#APPLIED_METADATA_KEY}
+	 * trailer, or, from a server without it, from the message.
+	 */
+	static boolean saysNotApplied(@Nullable Metadata trailers, String message) {
+		var applied = trailers == null ? null : trailers.get(APPLIED_KEY);
+		if (applied != null) {
+			return RocksDBException.NOT_APPLIED.equals(applied);
+		}
+		for (var legacy : LEGACY_NOT_APPLIED_MESSAGES) {
+			if (message.contains(legacy)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static Throwable mapGrpcStatusError(@NotNull Throwable t) {
 		if (t instanceof StatusRuntimeException statusRuntimeException
 				&& statusRuntimeException.getStatus().getDescription() != null
 				&& statusRuntimeException.getStatus().getDescription().startsWith(grpcRocksDbErrorPrefixString)) {
@@ -2099,6 +2145,8 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			}
 			if (errorType == RocksDBErrorType.UPDATE_RETRY) {
 				return new RocksDBRetryException();
+			} else if (saysNotApplied(statusRuntimeException.getTrailers(), errorDescription)) {
+				return RocksDBException.notApplied(errorType, errorDescription);
 			} else {
 				return RocksDBException.of(errorType, errorDescription);
 			}

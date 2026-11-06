@@ -479,11 +479,20 @@ final class UpdateProtocol {
 			LogEntry.Guarded entry) {
 		var pin = session.pin(transaction.snapshotIndex);
 		long start = System.nanoTime();
-		return proposer.proposeOnce(entry, remainingNanos(context, start), context.requestId())
-				.whenComplete((_, error) -> {
-					commitTime.since(start);
-					session.unpin(pin);
-				});
+		transaction.commitProposed();
+		CompletableFuture<Object> proposed;
+		try {
+			proposed = proposer.proposeOnce(entry, remainingNanos(context, start), context.requestId());
+		} catch (RuntimeException ex) {
+			transaction.commitEnded();
+			session.unpin(pin);
+			throw ex;
+		}
+		return proposed.whenComplete((_, error) -> {
+			commitTime.since(start);
+			session.unpin(pin);
+			transaction.commitEnded();
+		});
 	}
 
 	CompletableFuture<?> closeFailedUpdate(RequestContext context, CloseFailedUpdate command) {

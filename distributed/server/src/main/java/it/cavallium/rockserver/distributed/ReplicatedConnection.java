@@ -50,8 +50,11 @@ final class ReplicatedConnection implements RocksDBConnection, it.cavallium.rock
 	 * System property: how long a client session lives without a write applied, in milliseconds. Read by the node that
 	 * opens a session, and written in its log entry, so nodes may differ.
 	 */
-	static final String SESSION_TIMEOUT_PROPERTY = "rockserver.client-session-timeout-ms";
-	static final long SESSION_TIMEOUT_MILLIS = Long.getLong(SESSION_TIMEOUT_PROPERTY, TimeUnit.HOURS.toMillis(1));
+	static final String SESSION_TIMEOUT_PROPERTY = DistributedProperties.PREFIX + "client-session-timeout-ms";
+	/** The name {@link #SESSION_TIMEOUT_PROPERTY} had before, still read. */
+	static final String OLD_SESSION_TIMEOUT_PROPERTY = "rockserver.client-session-timeout-ms";
+	static final long SESSION_TIMEOUT_MILLIS = DistributedProperties.getLong(TimeUnit.HOURS.toMillis(1),
+			SESSION_TIMEOUT_PROPERTY, OLD_SESSION_TIMEOUT_PROPERTY);
 	/**
 	 * Shortest client session: a session that expires while a copy of one of its writes is still being resent (a
 	 * request timeout, plus the client's own retries) could have that copy refused as expired after an earlier copy

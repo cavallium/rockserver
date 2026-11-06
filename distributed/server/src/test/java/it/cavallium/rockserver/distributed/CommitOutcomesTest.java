@@ -97,4 +97,21 @@ class CommitOutcomesTest {
 		assertEquals(true, outcomes.settledCommit(new ClientRequestId(7, 4, 0)).get(5, TimeUnit.SECONDS));
 		assertEquals(0, outcomes.unsettledCommitsForTesting());
 	}
+
+	/**
+	 * A mark left by an unknown outcome stays until its term ends: the first mark of a newer term drops the older ones,
+	 * without waiting for the map to grow (F15).
+	 */
+	@Test
+	void theFirstMarkOfANewTermDropsTheMarksOfEarlierTerms() {
+		var unknown = outcomes.markUnsettled(numbered(10), new LeaderSession(5, applied));
+		outcomes.settle(unknown, RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN, "lost"));
+		var other = outcomes.markUnsettled(numbered(11), new LeaderSession(5, applied));
+		outcomes.settle(other, RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN, "lost"));
+		assertEquals(2, outcomes.unsettledCommitsForTesting(), "kept in their term");
+		term.set(6);
+		outcomes.markUnsettled(numbered(12), new LeaderSession(6, applied));
+		assertEquals(1, outcomes.unsettledCommitsForTesting(), "only the new term's mark");
+		assertInstanceOf(RocksDBRetryException.class, failure(outcomes.settledCommit(new ClientRequestId(7, 10, 0))));
+	}
 }

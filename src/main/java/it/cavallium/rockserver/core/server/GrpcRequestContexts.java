@@ -105,7 +105,7 @@ final class GrpcRequestContexts {
 			timeoutNanos = Math.min(timeoutNanos, transportRemainingNanos);
 		}
 		if (timeoutNanos == 0L) {
-			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+			throw RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"Request deadline already expired");
 		}
 		if (!profile.isClientSelectable()) {
@@ -183,7 +183,7 @@ final class GrpcRequestContexts {
 		}
 		long remainingNanos = scheduler.remainingMonotonicDeadlineNanos(deadlineNanos);
 		if (remainingNanos == 0L) {
-			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+			throw RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"Request deadline expired before downstream dispatch");
 		}
 		return context.value().withTimeoutNanos(remainingNanos);

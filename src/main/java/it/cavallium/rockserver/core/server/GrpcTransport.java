@@ -154,6 +154,7 @@ final class GrpcTransport {
 				.permitKeepAliveWithoutCalls(true)
 				.permitKeepAliveTime(5, TimeUnit.SECONDS)
 				.intercept(new AdaptiveCompressionInterceptor())
+				.intercept(new AppliedTrailerInterceptor())
 				.build();
 	}
 

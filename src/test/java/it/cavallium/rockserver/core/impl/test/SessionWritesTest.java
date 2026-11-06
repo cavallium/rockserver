@@ -94,6 +94,15 @@ class SessionWritesTest {
 			call(target, "close", new Class<?>[0]);
 		}
 
+		long forgottenUpdates() {
+			return (Long) call(target, "forgottenUpdates", new Class<?>[0]);
+		}
+
+		/** {@code SessionWrites.await}: a synchronous caller's bounded wait. */
+		static Object await(CompletableFuture<Object> answer, long waitNanos) {
+			return call(null, "await", new Class<?>[] {CompletableFuture.class, long.class}, answer, waitNanos);
+		}
+
 		private static Object call(Object target, String name, Class<?>[] types, Object... args) {
 			return callOn(TYPE, target, name, types, args);
 		}
@@ -104,6 +113,9 @@ class SessionWritesTest {
 				method.setAccessible(true);
 				return method.invoke(target, args);
 			} catch (InvocationTargetException ex) {
+				if (ex.getCause() instanceof RuntimeException runtime) {
+					throw runtime;
+				}
 				throw new RuntimeException(ex.getCause());
 			} catch (ReflectiveOperationException ex) {
 				throw new IllegalStateException(ex);
@@ -440,5 +452,211 @@ class SessionWritesTest {
 				.get(10, TimeUnit.SECONDS));
 		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(first).getErrorUniqueId());
 		executor.shutdownNow();
+	}
+
+	/** An answer that the fake sender throws instead of returning a failed future. */
+	private record Thrown(RuntimeException error) {}
+
+	private static RocksDBException notApplied(RocksDBErrorType type) {
+		return RocksDBException.notApplied(type, "The request deadline came before the write was sent");
+	}
+
+	/** Runs one write against a sender that answers each copy in turn from {@code answers}; returns the copies sent. */
+	private static List<ClientRequestId> sendAgainst(Duration deadline, CompletableFuture<Object>[] result,
+			Object... answers) throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var ids = Collections.synchronizedList(new ArrayList<ClientRequestId>());
+		var writes = new Writes(_ -> CompletableFuture.completedFuture(3L), (bound, _) -> {
+			ids.add(idOf(bound));
+			var answer = answers[Math.min(ids.size() - 1, answers.length - 1)];
+			if (answer instanceof Thrown thrown) {
+				throw thrown.error;
+			}
+			return answer instanceof Throwable error ? CompletableFuture.failedFuture(error)
+					: CompletableFuture.completedFuture(answer);
+		}, executor);
+		result[0] = writes.send(RequestContext.latency(deadline), put(0));
+		try {
+			result[0].get(10, TimeUnit.SECONDS);
+		} catch (ExecutionException ignored) {
+			// Checked by the caller.
+		} finally {
+			executor.shutdownNow();
+		}
+		return ids;
+	}
+
+	@SuppressWarnings("unchecked")
+	private static CompletableFuture<Object>[] holder() {
+		return new CompletableFuture[1];
+	}
+
+	/**
+	 * Each branch of a copy's answer (CR-4): a value or a failure that is the write's answer ends it at once; an unknown
+	 * outcome sends the same number again, and after it a "not applied" answer does too; a sender that throws counts
+	 * as a lost copy.
+	 */
+	@Test
+	void eachAnswerOfACopyEndsOrResendsTheWrite() throws Exception {
+		var result = holder();
+		assertEquals(1, sendAgainst(Duration.ofSeconds(5), result, "ok").size());
+		assertEquals("ok", result[0].get());
+
+		// The write's own answer: a recorded failure, overload or a flagged "not applied" deadline on the first copy.
+		for (var answer : List.of(RocksDBException.of(RocksDBErrorType.INVALID_REQUEST, "bad"),
+				RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "busy"),
+				notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED))) {
+			assertEquals(1, sendAgainst(Duration.ofSeconds(5), result, answer).size(), answer.getMessage());
+			var error = assertThrows(ExecutionException.class, () -> result[0].get());
+			assertEquals(answer.getErrorUniqueId(), rocks(error).getErrorUniqueId());
+		}
+
+		// Unknown, then "not applied" (says nothing about the first copy), then the answer: same number each time.
+		var ids = sendAgainst(Duration.ofSeconds(5), result, Status.UNAVAILABLE.asRuntimeException(),
+				RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "busy"),
+				notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED),
+				RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN, "lost"), "ok");
+		assertEquals("ok", result[0].get());
+		assertEquals(5, ids.size());
+		assertEquals(1, ids.stream().distinct().count(), "one number: " + ids);
+
+		// A sender that throws instead of failing its future: the copy is lost, its outcome unknown.
+		ids = sendAgainst(Duration.ofSeconds(5), result, new Thrown(Status.UNAVAILABLE.asRuntimeException()), "ok");
+		assertEquals("ok", result[0].get());
+		assertEquals(2, ids.size());
+	}
+
+	/**
+	 * Y-3: a resent copy that ends with gRPC's DEADLINE_EXCEEDED (mapped by the client to READ_DEADLINE_EXCEEDED without
+	 * the server's "not applied" flag, or raw) ends the write OUTCOME_UNKNOWN, never as a plain deadline error, which a
+	 * caller would take for "not applied". On a first copy an unflagged deadline is unknown too: it is sent again.
+	 */
+	@Test
+	void aDeadlineWithoutTheNotAppliedFlagIsAnUnknownOutcome() throws Exception {
+		var result = holder();
+		for (Object deadline : List.of(RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded"),
+				Status.DEADLINE_EXCEEDED.asRuntimeException())) {
+			var ids = sendAgainst(Duration.ofMillis(400), result, Status.UNAVAILABLE.asRuntimeException(), deadline);
+			var error = assertThrows(ExecutionException.class, () -> result[0].get());
+			assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId(), String.valueOf(deadline));
+			assertTrue(ids.size() >= 2, "resent: " + ids);
+
+			ids = sendAgainst(Duration.ofMillis(400), result, deadline);
+			error = assertThrows(ExecutionException.class, () -> result[0].get());
+			assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId(), String.valueOf(deadline));
+			assertTrue(ids.size() >= 2, "a first copy's unflagged deadline is unknown, so it is sent again: " + ids);
+		}
+		// The message alone does not make it "not applied": only the flag does.
+		var ids = sendAgainst(Duration.ofMillis(400), result,
+				RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "it was not applied"));
+		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN,
+				rocks(assertThrows(ExecutionException.class, () -> result[0].get())).getErrorUniqueId());
+		assertTrue(ids.size() >= 2);
+	}
+
+	/**
+	 * WS-12: a caller that cancels a write stops its resends and cancels the copy in flight. A copy was sent, so the
+	 * future ends OUTCOME_UNKNOWN instead of cancelled.
+	 */
+	@Test
+	void cancellingAWriteAfterACopyWasSentStopsItUnknown() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var copies = Collections.synchronizedList(new ArrayList<CompletableFuture<Object>>());
+		var writes = new Writes(_ -> CompletableFuture.completedFuture(3L), (_, _) -> {
+			if (copies.isEmpty()) {
+				copies.add(CompletableFuture.failedFuture(Status.UNAVAILABLE.asRuntimeException()));
+			} else {
+				copies.add(new CompletableFuture<>());
+			}
+			return copies.getLast();
+		}, executor);
+		var result = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		while (copies.size() < 2) {
+			Thread.sleep(5);
+		}
+		assertFalse(result.cancel(true), "not cancelled: it ended unknown");
+		assertFalse(result.isCancelled());
+		var error = assertThrows(ExecutionException.class, () -> result.get(1, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId());
+		assertTrue(copies.getLast().isCancelled(), "the copy in flight is cancelled");
+		Thread.sleep(1_200);
+		assertEquals(2, copies.size(), "no copy sent after the cancel");
+		executor.shutdownNow();
+	}
+
+	/** A write cancelled before any copy was sent (its session is still opening) is cancelled, and never sent. */
+	@Test
+	void cancellingAWriteBeforeItWasSentCancelsIt() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opening = new CompletableFuture<Long>();
+		var sent = new AtomicInteger();
+		var writes = new Writes(_ -> opening, (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		var result = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		assertTrue(result.cancel(true));
+		assertTrue(result.isCancelled());
+		opening.complete(3L);
+		Thread.sleep(100);
+		assertEquals(0, sent.get(), "never sent");
+		assertEquals("ok", writes.send(RequestContext.latency(Duration.ofSeconds(5)), put(0)).get(5, TimeUnit.SECONDS));
+		executor.shutdownNow();
+	}
+
+	/** Cancelling a batch after a chunk was sent ends it unknown and cancels the chunk in flight. */
+	@Test
+	void cancellingABatchAfterAChunkWasSentEndsItUnknown() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var copies = Collections.synchronizedList(new ArrayList<CompletableFuture<Object>>());
+		var writes = new Writes(_ -> CompletableFuture.completedFuture(3L), (_, _) -> {
+			copies.add(new CompletableFuture<>());
+			return copies.getLast();
+		}, executor);
+		var result = writes.send(RequestContext.batch(Duration.ofSeconds(30)),
+				new RocksDBAPICommandSingle.PutBatch(1, Flux.just(batch(2, 1)), PutBatchMode.WRITE_BATCH));
+		while (copies.isEmpty()) {
+			Thread.sleep(5);
+		}
+		assertFalse(result.cancel(true));
+		var error = assertThrows(ExecutionException.class, () -> result.get(1, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId());
+		assertTrue(copies.getFirst().isCancelled(), "the chunk in flight is cancelled");
+		executor.shutdownNow();
+	}
+
+	/**
+	 * F19: a synchronous caller waits at most the time given: then the write is cancelled, and ends unknown because a
+	 * copy was sent.
+	 */
+	@Test
+	void aSynchronousWaitIsBoundedAndEndsUnknown() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var writes = new Writes(_ -> CompletableFuture.completedFuture(3L), (_, _) -> new CompletableFuture<>(), executor);
+		var result = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		Thread.sleep(50);
+		long start = System.nanoTime();
+		var error = assertThrows(RocksDBException.class, () -> Writes.await(result, TimeUnit.MILLISECONDS.toNanos(200)));
+		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, error.getErrorUniqueId());
+		assertTrue(System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5));
+		executor.shutdownNow();
+	}
+
+	/**
+	 * CR-3: past the limit of remembered updates the oldest is forgotten, counted, and the write that ends it is not
+	 * numbered; the newest still are.
+	 */
+	@Test
+	void pastTheLimitTheOldestUpdateIsForgottenAndCounted() throws Exception {
+		var writes = new Writes(_ -> new CompletableFuture<>(), (_, _) -> new CompletableFuture<>(), Runnable::run);
+		var opening = new Get<>(0, 1, KEY, RequestType.forUpdate());
+		int limit = 1 << 16;
+		for (int i = 1; i <= limit + 1; i++) {
+			writes.observe(opening, new UpdateContext<>(null, -i));
+		}
+		assertEquals(1, writes.forgottenUpdates());
+		assertFalse(writes.numbers(put(-1)), "the oldest is forgotten");
+		assertTrue(writes.numbers(put(-2)));
+		assertTrue(writes.numbers(put(-(limit + 1))), "the newest is remembered");
 	}
 }

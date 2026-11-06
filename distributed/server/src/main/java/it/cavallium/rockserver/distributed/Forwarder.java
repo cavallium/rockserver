@@ -127,7 +127,7 @@ final class Forwarder {
 			return forwarder.target(leader, stateMachine).thenCompose(target -> {
 				long attempt = Math.min(forwardTimeoutNanos(command), callerDeadlineNanos - System.nanoTime());
 				if (attempt <= 0) {
-					return CompletableFuture.failedFuture(RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+					return CompletableFuture.failedFuture(RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 							"The request deadline passed before the request was forwarded to the leader"));
 				}
 				var bounded = context.withTimeoutNanos(attempt);
