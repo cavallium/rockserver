@@ -38,7 +38,8 @@ import java.util.concurrent.locks.LockSupport;
  *     [--step-seconds 30] [--warmup-seconds 10] [--route leader|all|failover|same-list] [--connections 4]
  *     [--first follower|leader|ID] [--leader-hint listed|any|off]
  *     [--chats 20000] [--messages-per-chat 50] [--value-bytes 600] [--skew 0.5] [--max-in-flight 512]
- *     [--hot-keys 4:0.5] [--only UPDATE,GET] [--merge-rate 2000] [--jvm "-Xmx4g -XX:+UseZGC"]
+ *     [--hot-keys 4:0.5] [--only UPDATE,GET] [--merge-rate 2000] [--delete-range-rate 200]
+ *     [--jvm "-Xmx4g -XX:+UseZGC"]
  *     [--server-arg "--snapshot-every 100000"] [--label text]
  * </pre>
  *
@@ -49,6 +50,10 @@ import java.util.concurrent.locks.LockSupport;
  * {@code --only MERGE} against {@code --only HISTORY_PUT_MULTI} or a put-only mix of the same rate. Each key takes
  * {@link YotsubaWorkload#MERGES_PER_SLOT} merges only, so values stay under 600 bytes and later steps of a run measure
  * the same read and merge as earlier ones.</p>
+ *
+ * <p>{@code --delete-range-rate R} adds {@code DELETE_RANGE} (WA-1, see {@link Kind#DELETE_RANGE}: a putMulti of 16
+ * keys, then the deleteRange that removes them, alternating per chat) to the mix at R calls per second at scale 1;
+ * {@code --only DELETE_RANGE} runs it alone.</p>
  *
  * <p>{@code --hot-keys N:SHARE} sends that share of the updates to N single keys, for what one key sustains; compare
  * with and without {@code --server-arg --pipelined-updates}. {@code --only UPDATE --hot-keys 1:1} isolates it.</p>
@@ -425,7 +430,7 @@ public final class LoadBench {
 			var map = new LinkedHashMap<Kind, RocksDBAsyncAPI>();
 			for (var kind : Kind.values()) {
 				map.put(kind, switch (kind) {
-					case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, BULK_PUT, MERGE -> ingest;
+					case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, BULK_PUT, MERGE, DELETE_RANGE -> ingest;
 					case GET, EXISTS_MULTI -> latency;
 					case FIRST_LAST, RANGE_PAGE -> analytical;
 					case MONITOR_TX -> batch;
@@ -438,7 +443,7 @@ public final class LoadBench {
 
 	private static boolean isWrite(Kind kind) {
 		return switch (kind) {
-			case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, MONITOR_TX, BULK_PUT, MERGE -> true;
+			case UPDATE, ENSURE, HISTORY_PUT_MULTI, FILE_PUT_MULTI, MONITOR_TX, BULK_PUT, MERGE, DELETE_RANGE -> true;
 			case GET, EXISTS_MULTI, FIRST_LAST, RANGE_PAGE -> false;
 		};
 	}
@@ -446,6 +451,7 @@ public final class LoadBench {
 	private Map<Kind, Double> mix() {
 		var mix = YotsubaWorkload.productionMix();
 		mix.put(Kind.MERGE, Double.parseDouble(option("--merge-rate", "0")));
+		mix.put(Kind.DELETE_RANGE, Double.parseDouble(option("--delete-range-rate", "0")));
 		var only = option("--only", "");
 		if (!only.isBlank()) {
 			var keep = List.of(only.split(","));

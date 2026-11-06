@@ -56,7 +56,12 @@ Other options: `--target single`, `--closed 64,512`, `--only UPDATE,GET` (or `BU
 calls for bandwidth, or `MERGE`, single merges of an 8-byte operand that each cost a read at apply; each key takes 64
 merges only, so values stay under 600 bytes and the cost per merge does not drift during a run), `--merge-rate R`
 (adds `MERGE` to the mix at R per second at scale 1; whenever it runs, every column gets the string-append merge
-operator through `<root>/merge.conf`, unless a `--server-arg --rockserver-config` is given), `--max-in-flight N`, `--route all` (clients spread over every node, so most requests are
+operator through `<root>/merge.conf`, unless a `--server-arg --rockserver-config` is given), `--delete-range-rate R`
+(WA-1: adds `DELETE_RANGE` to the mix at R calls per second at scale 1, or `--only DELETE_RANGE` alone; per chat the
+calls alternate between a `putMulti` that fills a window of 16 keys in the `range-deletes` column and the `deleteRange`
+that empties that window, so every delete removes live keys and the column does not grow; the row counts both calls.
+Not run yet: compare it with `--only HISTORY_PUT_MULTI` at the same rate for the cost of the deletes through the log
+and at apply), `--max-in-flight N`, `--route all` (clients spread over every node, so most requests are
 forwarded), `--route failover` (spread over every node too, each connection listing every node, starting from a
 different one), `--route same-list` (every connection lists every node in one order, as production clients do,
 starting from `--first follower|leader|ID`, a follower by default; with `--leader-hint listed|any|off` for the

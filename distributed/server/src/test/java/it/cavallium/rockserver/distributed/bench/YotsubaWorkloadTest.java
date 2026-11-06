@@ -15,7 +15,10 @@ import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/** WA-15: the bench's MERGE operation works against a database with {@link LoadBench#MERGE_CONFIG}. */
+/**
+ * WA-15: the bench's MERGE operation works against a database with {@link LoadBench#MERGE_CONFIG}; WA-1: its
+ * DELETE_RANGE operation fills a window and then deletes exactly that window.
+ */
 class YotsubaWorkloadTest {
 
 	@TempDir
@@ -60,5 +63,36 @@ class YotsubaWorkloadTest {
 			}
 			assertEquals(merges, operands, "each merge appended its operand");
 		}
+	}
+
+	@Test
+	void deleteRangeEmptiesTheWindowThatTheCallBeforeFilled() throws Exception {
+		try (var connection = new EmbeddedConnection(temp.resolve("db"), "delete-range-bench-test", null)) {
+			var api = connection.getAsyncApi(RequestContext.batch(Duration.ofSeconds(20)));
+			var workload = new YotsubaWorkload(1, 1, 16, 0);
+			workload.createColumns(api);
+			var stats = new BenchStats().op("DELETE_RANGE");
+			int keys = YotsubaWorkload.RANGE_DELETE_KEYS;
+			for (int window = 0; window < 3; window++) {
+				assertEquals(2 * window, workload.rangeDeleteStep(0));
+				workload.run(YotsubaWorkload.Kind.DELETE_RANGE, api, stats);
+				assertEquals(keys, liveSlots(api, workload, window * keys - 1, (window + 1) * keys + 1),
+						"the fill wrote its window " + window + " and nothing around it");
+				workload.run(YotsubaWorkload.Kind.DELETE_RANGE, api, stats);
+				assertEquals(0, liveSlots(api, workload, 0, 4 * keys), "the deleteRange emptied window " + window);
+			}
+		}
+	}
+
+	private static int liveSlots(it.cavallium.rockserver.core.common.RocksDBAsyncAPI api, YotsubaWorkload workload,
+			int from, int to) {
+		int live = 0;
+		for (int slot = Math.max(0, from); slot < to; slot++) {
+			if (api.getAsync(0, workload.rangeDeletes, new Keys(YotsubaWorkload.fixed(8, 0), YotsubaWorkload.fixed(4, slot)),
+					RequestType.current()).join() != null) {
+				live++;
+			}
+		}
+		return live;
 	}
 }

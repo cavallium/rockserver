@@ -41,6 +41,9 @@ import java.util.concurrent.atomic.AtomicReference;
  *   <li>{@code monitor-log}: key [8, 8], small transactions of two {@code putMulti}.</li>
  *   <li>{@code merge-appends}: key [8 chat, 4 slot], single {@code merge} calls of a short operand, at most
  *   {@link #MERGES_PER_SLOT} per key (not in the production mix, see {@link Kind#MERGE}).</li>
+ *   <li>{@code range-deletes}: key [8 chat, 4 slot], windows of {@link #RANGE_DELETE_KEYS} keys that a
+ *   {@code putMulti} fills and a {@code deleteRange} empties (not in the production mix, see
+ *   {@link Kind#DELETE_RANGE}).</li>
  * </ul>
  * Chats are picked with a Zipf-like skew so that hot chats produce real update conflicts. {@link #hotKeys} sends a
  * share of the updates to a few single keys instead, to measure what one key sustains.
@@ -69,7 +72,18 @@ final class YotsubaWorkload {
 		 * only (at most 575 bytes), and a chat's merges go round-robin over 16 slots at a time, then on to the next 16
 		 * ({@link #mergeSlot}). The cost per merge stays the same from the first step of a run to the last.
 		 */
-		MERGE(0);
+		MERGE(0),
+		/**
+		 * Not in the production mix: {@code deleteRange} (WA-1), for its cost through the log and at apply. Each chat
+		 * of the skew has windows of {@link #RANGE_DELETE_KEYS} consecutive slots in {@code range-deletes}; a chat's
+		 * calls alternate between a {@code putMulti} that fills its next window with 16-byte values and the
+		 * {@code deleteRange} that empties that window ({@link #rangeDeleteStep}). So every {@code deleteRange} removes
+		 * live keys (unless calls of one chat overlap, which only makes one remove nothing), the column does not grow,
+		 * and the range tombstones pile up at the pace of the calls, as they would in a store that drops ranges. The row
+		 * counts both calls; half of them are {@code deleteRange}. Compare with {@code --only HISTORY_PUT_MULTI} or
+		 * with a run of putMulti calls of the same size for the share of the deletes.
+		 */
+		DELETE_RANGE(0);
 
 		final double ratePerSecond;
 
@@ -83,6 +97,8 @@ final class YotsubaWorkload {
 	static final int MERGES_PER_SLOT = 64;
 	/** How many slots of a chat take {@link Kind#MERGE} merges at a time. */
 	static final int MERGE_SLOTS = 16;
+	/** How many keys one {@link Kind#DELETE_RANGE} window holds. */
+	static final int RANGE_DELETE_KEYS = 16;
 	private static final int UPDATE_RETRY_ATTEMPTS = 16;
 
 	final int chats;
@@ -98,8 +114,11 @@ final class YotsubaWorkload {
 	long files;
 	long monitorLog;
 	long mergeAppends;
+	long rangeDeletes;
 	/** Per chat: how many {@link Kind#MERGE} merges this workload sent to it, see {@link #mergeSlot}. */
 	private final AtomicIntegerArray mergesPerChat;
+	/** Per chat: how many {@link Kind#DELETE_RANGE} calls this workload sent to it, see {@link #rangeDeleteStep}. */
+	private final AtomicIntegerArray rangeDeletesPerChat;
 
 	YotsubaWorkload(int chats, int messagesPerChat, int valueBytes, double skew) {
 		this(chats, messagesPerChat, valueBytes, skew, 0, 0);
@@ -116,6 +135,7 @@ final class YotsubaWorkload {
 		this.hotKeys = hotKeys;
 		this.hotShare = hotShare;
 		this.mergesPerChat = new AtomicIntegerArray(chats);
+		this.rangeDeletesPerChat = new AtomicIntegerArray(chats);
 	}
 
 	/** Creates (or finds) the columns. */
@@ -130,6 +150,8 @@ final class YotsubaWorkload {
 		monitorLog = api.createColumnAsync("monitor-log-v1", ColumnSchema.of(IntList.of(8, 8), ObjectList.of(), true))
 				.join();
 		mergeAppends = api.createColumnAsync("merge-appends", ColumnSchema.of(IntList.of(8, 4), ObjectList.of(), true))
+				.join();
+		rangeDeletes = api.createColumnAsync("range-deletes", ColumnSchema.of(IntList.of(8, 4), ObjectList.of(), true))
 				.join();
 	}
 
@@ -254,7 +276,43 @@ final class YotsubaWorkload {
 						RequestType.none()).join();
 				yield 12 + operand.length;
 			}
+			case DELETE_RANGE -> {
+				int chat = chat(random);
+				int step = rangeDeletesPerChat.getAndIncrement(chat);
+				int first = rangeDeleteWindow(step) * RANGE_DELETE_KEYS;
+				if (isRangeFill(step)) {
+					var keys = new ArrayList<Keys>(RANGE_DELETE_KEYS);
+					var values = new ArrayList<Buf>(RANGE_DELETE_KEYS);
+					for (int i = 0; i < RANGE_DELETE_KEYS; i++) {
+						keys.add(new Keys(fixed(8, chat), fixed(4, first + i)));
+						values.add(value(16));
+					}
+					api.putMultiAsync(0, rangeDeletes, keys, values, RequestType.none()).join();
+					yield RANGE_DELETE_KEYS * 28L;
+				}
+				api.deleteRangeAsync(rangeDeletes, new Keys(fixed(8, chat), fixed(4, first)),
+						new Keys(fixed(8, chat), fixed(4, first + RANGE_DELETE_KEYS))).join();
+				yield 24;
+			}
 		};
+	}
+
+	/**
+	 * A chat's {@code n}-th {@link Kind#DELETE_RANGE} call: an even one fills window {@code n / 2}, the odd one after it
+	 * deletes that window. Windows move on (and wrap after 2^31 slots), so that no range is deleted twice in a run.
+	 */
+	static int rangeDeleteWindow(int step) {
+		return (step >>> 1) & (Integer.MAX_VALUE / RANGE_DELETE_KEYS);
+	}
+
+	/** Whether a chat's {@code step}-th {@link Kind#DELETE_RANGE} call fills its window (else it deletes it). */
+	static boolean isRangeFill(int step) {
+		return (step & 1) == 0;
+	}
+
+	/** Tests only: what {@link #run} with {@link Kind#DELETE_RANGE} does next for {@code chat}. */
+	int rangeDeleteStep(int chat) {
+		return rangeDeletesPerChat.get(chat);
 	}
 
 	/**
