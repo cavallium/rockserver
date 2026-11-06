@@ -34,6 +34,14 @@ class DistributedPropertiesTest {
 	}
 
 	@Test
+	void aValueThatIsNotAnIntegerFallsBackToTheDefault() {
+		System.setProperty(OLD, "1h");
+		assertEquals(7, DistributedProperties.getLong(7, NEW, OLD));
+		System.setProperty(NEW, "abc");
+		assertEquals(7, DistributedProperties.getLong(7, NEW, OLD));
+	}
+
+	@Test
 	void everyReplicatedPropertyHasThePrefix() {
 		for (var name : new String[] {Proposer.WRITE_ADMISSION_BYTES_PROPERTY, ReplicatedConnection.SESSION_TIMEOUT_PROPERTY,
 				Router.FOLLOWER_READS_PROPERTY}) {

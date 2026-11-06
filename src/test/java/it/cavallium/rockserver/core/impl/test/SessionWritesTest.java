@@ -642,6 +642,70 @@ class SessionWritesTest {
 		executor.shutdownNow();
 	}
 
+	/** {@code SessionWrites.syncWaitNanos} of a write sent with {@code context}. */
+	private static long syncWaitNanos(RequestContext context) {
+		Object bound = Writes.callOn(Writes.BOUND, null, "bind", new Class<?>[] {RequestContext.class}, context);
+		return (Long) Writes.call(null, "syncWaitNanos", new Class<?>[] {Writes.BOUND}, bound);
+	}
+
+	/**
+	 * A caller without a deadline is not bounded (a long ingest batch through the sync API must not be cut and end
+	 * unknown); a huge finite timeout ("forever", clamped by RequestContext) saturates instead of overflowing to a
+	 * negative wait; a finite one waits its deadline plus the margin.
+	 */
+	@Test
+	void theSynchronousWaitIsUnboundedWithoutADeadlineAndNeverOverflows() throws Exception {
+		assertEquals(Long.MAX_VALUE, syncWaitNanos(RequestContext.ingest()));
+		assertEquals(Long.MAX_VALUE, syncWaitNanos(RequestContext.batch()));
+		assertEquals(Long.MAX_VALUE, syncWaitNanos(RequestContext.latency(java.time.temporal.ChronoUnit.FOREVER.getDuration())));
+		assertEquals(Long.MAX_VALUE, syncWaitNanos(RequestContext.latency(Duration.ofSeconds(Long.MAX_VALUE))));
+		long wait = syncWaitNanos(RequestContext.latency(Duration.ofSeconds(1)));
+		assertTrue(wait > TimeUnit.SECONDS.toNanos(5) && wait <= TimeUnit.SECONDS.toNanos(6), String.valueOf(wait));
+
+		// The unbounded wait still returns the answer.
+		var answer = new CompletableFuture<Object>();
+		CompletableFuture.delayedExecutor(100, TimeUnit.MILLISECONDS).execute(() -> answer.complete("ok"));
+		assertEquals("ok", Writes.await(answer, Long.MAX_VALUE));
+	}
+
+	/**
+	 * The client's own "Request deadline already expired" check (thrown before anything is sent) is flagged not
+	 * applied: a first copy that meets it ends the write with the deadline error, not OUTCOME_UNKNOWN.
+	 */
+	@Test
+	void theClientsOwnExpiredDeadlineOnAFirstCopyIsNotApplied() throws Exception {
+		var result = holder();
+		var expired = RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+				"Request deadline already expired");
+		assertEquals(1, sendAgainst(Duration.ofSeconds(5), result, new Thrown(expired)).size());
+		var error = assertThrows(ExecutionException.class, () -> result[0].get());
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks(error).getErrorUniqueId());
+	}
+
+	/**
+	 * A batch cancelled while its session is still opening sent no chunk: it is cancelled (not applied), and no chunk
+	 * is sent afterwards. Before, the batch counted a chunk as sent as soon as it was handed to the session, sent or not.
+	 */
+	@Test
+	void cancellingABatchBeforeAChunkWasSentCancelsIt() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opening = new CompletableFuture<Long>();
+		var sent = new AtomicInteger();
+		var writes = new Writes(_ -> opening, (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture(null);
+		}, executor);
+		var result = writes.send(RequestContext.batch(Duration.ofSeconds(30)),
+				new RocksDBAPICommandSingle.PutBatch(1, Flux.just(batch(2, 1)), PutBatchMode.WRITE_BATCH));
+		Thread.sleep(50);
+		assertTrue(result.cancel(true));
+		assertTrue(result.isCancelled());
+		opening.complete(3L);
+		Thread.sleep(100);
+		assertEquals(0, sent.get(), "never sent");
+		executor.shutdownNow();
+	}
+
 	/**
 	 * CR-3: past the limit of remembered updates the oldest is forgotten, counted, and the write that ends it is not
 	 * numbered; the newest still are.

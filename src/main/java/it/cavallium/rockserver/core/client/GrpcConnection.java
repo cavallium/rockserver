@@ -277,7 +277,7 @@ public final class GrpcConnection extends BaseConnection {
 			// Bounded by the deadline plus a margin: a lost callback must not block the caller forever. Past it the write
 			// is cancelled, and ends unknown if a copy was sent.
 			return (RS) SessionWrites.await((CompletableFuture<Object>) requestAsync(context, request),
-					writes.syncWaitNanos(context));
+					SessionWrites.syncWaitNanos(context));
 		}
 		return delegate.requestSync(context, request);
 	}
@@ -1571,7 +1571,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	private long remainingRequestDeadlineNanos() {
 		long remainingNanos = currentBoundRequestContext().remainingNanos();
 		if (remainingNanos == 0L) {
-			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+			throw RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"Request deadline already expired");
 		}
 		return remainingNanos;
@@ -1807,7 +1807,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				? boundContext.remainingNanos()
 				: RequestContext.NO_TIMEOUT;
 		if (remainingNanos == 0L) {
-			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+			throw RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"Request deadline already expired");
 		}
 		var requestId = context.requestId();

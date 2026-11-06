@@ -32,7 +32,11 @@ final class DistributedProperties {
 		return null;
 	}
 
-	/** {@link #get} as a long, {@code defaultValue} if no name is set. */
+	/**
+	 * {@link #get} as a long, {@code defaultValue} if no name is set or the value is not an integer (with a warning):
+	 * lenient like the {@link Long#getLong} these properties were read with before, so a node that started with a bad
+	 * value still starts.
+	 */
 	static long getLong(long defaultValue, String name, String... oldNames) {
 		var value = get(name, oldNames);
 		if (value == null) {
@@ -41,7 +45,9 @@ final class DistributedProperties {
 		try {
 			return Long.parseLong(value.trim());
 		} catch (NumberFormatException ex) {
-			throw new IllegalArgumentException("System property " + name + " must be an integer, but was: " + value, ex);
+			LOG.warn("System property {} must be an integer, but was \"{}\": using the default {}", name, value,
+					defaultValue);
+			return defaultValue;
 		}
 	}
 }

@@ -24,7 +24,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
@@ -74,6 +73,8 @@ final class SessionWrites {
 	static final int MAX_REMEMBERED_UPDATES = 1 << 16;
 	/** Extra wait of a synchronous caller beyond the deadline, for the answer that ends its write ({@link #syncWaitNanos}). */
 	static final long SYNC_WAIT_MARGIN_NANOS = TimeUnit.SECONDS.toNanos(5);
+	/** {@link #syncWaitNanos} of a caller without a deadline: it waits until the write ends (still interruptible). */
+	static final long NO_SYNC_WAIT_BOUND = Long.MAX_VALUE;
 
 	/** The numbering of one session. */
 	private static final class Session {
@@ -108,6 +109,12 @@ final class SessionWrites {
 	static final class CallResult extends CompletableFuture<Object> {
 		private final BooleanSupplier sent;
 		private final Runnable stop;
+		/**
+		 * Set by {@link #cancel} before it reads {@code sent}; a sender sets its {@code sent} flag before it reads this one
+		 * ({@link SessionWrites#attempt}). With both volatile, either the caller sees the copy as sent (and the write ends
+		 * unknown), or the sender sees the cancel and sends nothing.
+		 */
+		volatile boolean stopping;
 
 		CallResult(BooleanSupplier sent, Runnable stop) {
 			this.sent = sent;
@@ -119,6 +126,7 @@ final class SessionWrites {
 			if (isDone()) {
 				return isCancelled();
 			}
+			stopping = true;
 			boolean cancelled;
 			if (sent.getAsBoolean()) {
 				completeExceptionally(RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN,
@@ -138,6 +146,8 @@ final class SessionWrites {
 		final RocksDBAPICommandSingle<?> command;
 		final long deadlineNanos;
 		final CallResult result;
+		/** The batch this write is a chunk of ({@link #sendBatch}), or null. */
+		final @Nullable CallResult batch;
 		/** The copy in flight, cancelled if the caller cancels the write. */
 		volatile @Nullable CompletableFuture<?> inFlight;
 		@Nullable Session session;
@@ -148,10 +158,12 @@ final class SessionWrites {
 		int reissues;
 		long pauseNanos = FIRST_PAUSE_NANOS;
 
-		Call(BoundRequestContext context, RocksDBAPICommandSingle<?> command, long deadlineNanos) {
+		Call(BoundRequestContext context, RocksDBAPICommandSingle<?> command, long deadlineNanos,
+				@Nullable CallResult batch) {
 			this.context = context;
 			this.command = command;
 			this.deadlineNanos = deadlineNanos;
+			this.batch = batch;
 			this.result = new CallResult(() -> this.sent, this::stopped);
 		}
 
@@ -377,7 +389,7 @@ final class SessionWrites {
 		if (command instanceof RocksDBAPICommandSingle.PutBatch || command instanceof RocksDBAPICommandSingle.MergeBatch) {
 			return sendBatch(context, command);
 		}
-		return sendOne(context, command);
+		return sendOne(context, command, null, null);
 	}
 
 	/**
@@ -406,10 +418,18 @@ final class SessionWrites {
 		}
 		var appliedChunks = new AtomicLong();
 		var appliedKeys = new AtomicLong();
-		// A chunk was sent: cancelling the batch then ends it unknown (see CallResult).
-		var anySent = new AtomicBoolean();
+		// A chunk was sent: cancelling the batch then ends it unknown (see CallResult). A chunk that was applied was sent;
+		// the chunk in progress tells by its own flag, which it sets before it checks whether the batch is stopping.
+		var current = new java.util.concurrent.atomic.AtomicReference<Call>();
+		BooleanSupplier anySent = () -> {
+			if (appliedChunks.get() > 0) {
+				return true;
+			}
+			var chunk = current.get();
+			return chunk != null && chunk.sent;
+		};
 		var subscription = new java.util.concurrent.atomic.AtomicReference<Disposable>();
-		var result = new CallResult(anySent::get, () -> {
+		var result = new CallResult(anySent, () -> {
 			var running = subscription.get();
 			if (running != null) {
 				running.dispose();
@@ -418,11 +438,7 @@ final class SessionWrites {
 		var running = Flux.from(batches)
 				.concatMapIterable(KVBatchChunks::split)
 				// One chunk at a time: a later chunk must not overtake an earlier one writing the same key.
-				.concatMap(chunk -> Mono.fromFuture(() -> {
-							var sent = sendOne(context, chunkCommand.apply(chunk));
-							anySent.set(true);
-							return sent;
-						})
+				.concatMap(chunk -> Mono.fromFuture(() -> sendOne(context, chunkCommand.apply(chunk), result, current::set))
 						.then(Mono.fromRunnable(() -> {
 							appliedChunks.incrementAndGet();
 							appliedKeys.addAndGet(chunk.keys().size());
@@ -442,14 +458,18 @@ final class SessionWrites {
 		return result;
 	}
 
-	private CompletableFuture<Object> sendOne(BoundRequestContext context, RocksDBAPICommandSingle<?> command) {
+	private CompletableFuture<Object> sendOne(BoundRequestContext context, RocksDBAPICommandSingle<?> command,
+			@Nullable CallResult batch, java.util.function.@Nullable Consumer<Call> created) {
 		long now = System.nanoTime();
 		long remaining = context.remainingNanosAt(now);
 		long deadline = remaining == RequestContext.NO_TIMEOUT ? now + retryWindowNanos : now + remaining;
 		if (closed) {
 			return CompletableFuture.failedFuture(closedBeforeSent());
 		}
-		var call = new Call(context, command, deadline);
+		var call = new Call(context, command, deadline, batch);
+		if (created != null) {
+			created.accept(call);
+		}
 		live.add(call);
 		call.result.whenComplete((_, _) -> {
 			live.remove(call);
@@ -573,7 +593,20 @@ final class SessionWrites {
 			return;
 		}
 		CompletableFuture<?> answer;
+		// Published before the cancel check below (see CallResult#stopping): a caller that cancels from now on sees the
+		// copy as sent.
 		call.sent = true;
+		if (call.result.stopping || call.result.isDone()) {
+			// The caller cancelled before this copy left: nothing is sent, and its cancel ends the write.
+			call.ended();
+			return;
+		}
+		if (call.batch != null && call.batch.stopping) {
+			// The batch was cancelled before this chunk left: nothing is sent. The batch decided its own outcome; this
+			// chunk only has to end (unknown, since its flag is set), which is never seen.
+			call.result.cancel(true);
+			return;
+		}
 		try {
 			answer = sender.apply(context, call.command);
 		} catch (RuntimeException ex) {
@@ -669,14 +702,21 @@ final class SessionWrites {
 	}
 
 	/**
-	 * How long a synchronous caller waits for the answer to {@code context}'s write: its deadline (or the retry window,
-	 * for a caller without one) plus {@link #SYNC_WAIT_MARGIN_NANOS}. The write ends by then on its own; the bound only
-	 * keeps a lost callback from blocking the caller forever.
+	 * How long a synchronous caller waits for the answer to {@code context}'s write: its deadline plus
+	 * {@link #SYNC_WAIT_MARGIN_NANOS}, saturated. The write ends by then on its own; the bound only keeps a lost callback
+	 * from blocking the caller forever. A caller without a deadline is not bounded ({@link #NO_SYNC_WAIT_BOUND}): its
+	 * copies have no gRPC deadline, and a batch sends its chunks one after the other with no bound on the whole, so
+	 * any fixed bound would cut a long but healthy write and end it unknown.
 	 */
-	long syncWaitNanos(BoundRequestContext context) {
+	static long syncWaitNanos(BoundRequestContext context) {
 		long remaining = context.remainingNanosAt(System.nanoTime());
-		return (remaining == RequestContext.NO_TIMEOUT ? retryWindowNanos : Math.max(0, remaining))
-				+ SYNC_WAIT_MARGIN_NANOS;
+		if (remaining == RequestContext.NO_TIMEOUT) {
+			return NO_SYNC_WAIT_BOUND;
+		}
+		remaining = Math.max(0, remaining);
+		// Saturated: a huge finite timeout (RequestContext clamps "forever" to Long.MAX_VALUE - 1) must not overflow.
+		return remaining > NO_SYNC_WAIT_BOUND - SYNC_WAIT_MARGIN_NANOS ? NO_SYNC_WAIT_BOUND
+				: remaining + SYNC_WAIT_MARGIN_NANOS;
 	}
 
 	/**
@@ -685,7 +725,7 @@ final class SessionWrites {
 	 */
 	static Object await(CompletableFuture<Object> answer, long waitNanos) {
 		try {
-			return answer.get(waitNanos, TimeUnit.NANOSECONDS);
+			return waitNanos == NO_SYNC_WAIT_BOUND ? answer.get() : answer.get(waitNanos, TimeUnit.NANOSECONDS);
 		} catch (ExecutionException ex) {
 			throw rethrow(ex.getCause());
 		} catch (TimeoutException ex) {

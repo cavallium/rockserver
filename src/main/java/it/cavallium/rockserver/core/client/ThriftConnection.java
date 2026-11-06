@@ -1227,7 +1227,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	private static void validateRequestDeadline(BoundRequestContext context) {
 		if (context.remainingNanos() == 0L) {
-			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+			throw RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"Request deadline already expired");
 		}
 	}

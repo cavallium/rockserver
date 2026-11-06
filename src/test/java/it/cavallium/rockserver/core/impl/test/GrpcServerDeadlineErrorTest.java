@@ -64,6 +64,8 @@ class GrpcServerDeadlineErrorTest {
 						() -> client.getAsyncApi(expired).getColumnIdAsync("never-sent"));
 				assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, error.getErrorUniqueId());
 				assertEquals("Request deadline already expired", error.getMessage());
+				// Never sent: flagged "not applied", so a numbered write that meets it is not left unknown.
+				assertTrue(error.isNotApplied());
 				assertEquals(0, backend.operations.get(),
 						"an expired contextual call must fail before transport reaches the backend");
 			}
