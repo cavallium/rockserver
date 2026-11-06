@@ -5655,9 +5655,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 		try {
 			return operator.merge(key, existing, List.of(value));
-		} catch (VirtualMachineError error) {
-			throw error;
 		} catch (Throwable operatorFailure) {
+			if (Failures.isJvmFailure(operatorFailure)) {
+				// Anywhere in the chain: an operator may wrap it.
+				throw Failures.rethrow(operatorFailure);
+			}
 			throw mergeOperatorFailed(operatorFailure);
 		}
 	}
@@ -5667,8 +5669,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * {@link FFMAbstractMergeOperator#takeFailureOnThisThread}.
 	 */
 	public static RocksDBException mergeOperatorFailed(Throwable operatorFailure) {
-		return RocksDBException.of(RocksDBErrorType.MERGE_OPERATOR_FAILED, "Merge operator failed: " + operatorFailure,
-				operatorFailure);
+		// Described without what differs between processes (addresses, identity hashes): the text becomes a result.
+		return RocksDBException.of(RocksDBErrorType.MERGE_OPERATOR_FAILED,
+				"Merge operator failed: " + Failures.describe(operatorFailure), operatorFailure);
 	}
 
 	private Buf transformResultValue(ColumnInstance col, Buf realPreviousValue) {

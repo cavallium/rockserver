@@ -68,6 +68,17 @@ class PoisonEntryTest {
 				if (text.equals("void")) {
 					return null;
 				}
+				if (text.equals("oom")) {
+					// A failure of the JVM, wrapped by the operator: local, whatever wraps it.
+					throw new IllegalStateException(new OutOfMemoryError("simulated"));
+				}
+				if (text.equals("addr")) {
+					// Text that differs between processes, as an FFM operator's out-of-bounds access gives.
+					throw new IndexOutOfBoundsException("Out of bound access on segment MemorySegment{ address: 0x"
+							+ Long.toHexString(System.nanoTime()) + ", byteSize: 3 } of loader @"
+							+ Integer.toHexString(System.identityHashCode(new Object())) + " [in thread \""
+							+ Thread.currentThread().getName() + "\"]");
+				}
 				if (out.size() > 0) {
 					out.write(',');
 				}
@@ -80,6 +91,28 @@ class PoisonEntryTest {
 		protected void onMergeError(Throwable t, boolean partial) {
 			// Expected here: not worth a stack trace in the test log.
 		}
+	}
+
+	/** An operator whose constructor throws an Error, as one whose JAR lacks a class it needs. */
+	public static final class UnloadableOperator extends FFMByteArrayMergeOperator {
+		public UnloadableOperator() {
+			super("UnloadableOperator");
+			throw new NoClassDefFoundError("com/example/MissingDependency");
+		}
+
+		@Override
+		public byte[] merge(byte[] key, byte[] existingValue, List<byte[]> operands) {
+			return null;
+		}
+	}
+
+	/** A JAR with no classes: the operator classes come from the test class path, the JAR's parent loader. */
+	private static byte[] emptyJar() throws IOException {
+		var out = new ByteArrayOutputStream();
+		try (var jar = new java.util.jar.JarOutputStream(out, new java.util.jar.Manifest())) {
+			// Nothing.
+		}
+		return out.toByteArray();
 	}
 
 	static final String POISON_CONFIG = """
@@ -341,5 +374,88 @@ class PoisonEntryTest {
 		assertFalse(node.isFailed());
 		assertEquals("a,b", text(node.stateMachine().store().db().get(0, column, key(1), RequestType.current())));
 		assertEquals("c", text(node.stateMachine().store().db().get(0, column, key(2), RequestType.current())));
+	}
+
+	@Test
+	void anOperatorWhoseConstructorThrowsAnErrorIsARejection() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			var upload = new LogEntry.UploadMergeOperator("unloadable", UnloadableOperator.class.getName(), emptyJar());
+			var result = assertInstanceOf(ApplyResult.Failed.class,
+					applier.apply(new Request(1, 0, 0, upload), TermIndex.valueOf(1, 1)));
+			assertEquals(RocksDBErrorType.INVALID_REQUEST, result.type(), result.message());
+			assertTrue(result.message().contains("java.lang.NoClassDefFoundError: com/example/MissingDependency"),
+					result.message());
+			assertEquals(TermIndex.valueOf(1, 1), store.applied());
+		}
+		// Replayed after a restart: the same rejection, no crash.
+		try (var store = open()) {
+			var applier = new Applier(store);
+			var upload = new LogEntry.UploadMergeOperator("unloadable", UnloadableOperator.class.getName(), emptyJar());
+			assertInstanceOf(ApplyResult.Failed.class, applier.apply(new Request(2, 0, 0, upload), TermIndex.valueOf(1, 2)));
+		}
+	}
+
+	@Test
+	void aFailureOfTheJvmInsideTheOperatorStopsTheReplicaEvenWhenWrapped() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			long bucketed = store.db().createColumn("b", BUCKETED);
+			applier.apply(new Request(1, 0, 0, new LogEntry.Put(column, key(1), text("a"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 1));
+			assertThrows(Applier.ReplicaFailedException.class, () -> merged(applier, 1, column, key(1), "oom"));
+			var element = new Keys(key(1).keys()[0], Buf.wrap(new byte[] {1}));
+			applier.apply(new Request(1, 2, 0, new LogEntry.Put(bucketed, element, text("a"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 3));
+			assertThrows(Applier.ReplicaFailedException.class, () -> applier.apply(new Request(1, 3, 0,
+					new LogEntry.Merge(bucketed, element, text("oom"), RequestTypeId.NOTHING)), TermIndex.valueOf(1, 4)));
+		}
+		var wrapped = it.cavallium.rockserver.core.impl.EmbeddedDB.mergeOperatorFailed(
+				new RuntimeException(new StackOverflowError()));
+		assertTrue(Applier.isLocalFailure(wrapped));
+		assertTrue(Applier.isLocalFailure(new NoClassDefFoundError("Could not initialize class X")
+				.initCause(new ExceptionInInitializerError("Exception java.lang.OutOfMemoryError: Java heap space"))));
+	}
+
+	@Test
+	void aRecordedFailureHoldsNoProcessDetails() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long column = store.db().createColumn("c", SCHEMA);
+			applier.apply(new Request(1, 0, 0, new LogEntry.Put(column, key(1), text("a"), RequestTypeId.NOTHING)),
+					TermIndex.valueOf(1, 1));
+			var failed = (ApplyResult.Failed) merged(applier, 1, column, key(1), "addr");
+			assertEquals(RocksDBErrorType.MERGE_OPERATOR_FAILED, failed.type(), failed.message());
+			assertEquals("Merge operator failed: java.lang.IndexOutOfBoundsException: Out of bound access on segment"
+					+ " MemorySegment{ address: 0x?, byteSize: 3 } of loader @? [in thread ?]", failed.message());
+			// What is recorded is that same text.
+			assertEquals(failed, applier.recordedResult(new Request(1, 1, 0, new LogEntry.Genesis("x", false))));
+		}
+	}
+
+	@Test
+	void anOperatorThatCannotBeInstantiatedLeavesEveryReplicaServing() throws Exception {
+		var poison = config();
+		cluster = new InProcessCluster(temp, 3, c -> c.withRockserverConfig(poison)).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = leader.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
+		var failure = assertThrows(RocksDBException.class,
+				() -> api.uploadMergeOperator("unloadable", UnloadableOperator.class.getName(), emptyJar()));
+		assertEquals(RocksDBErrorType.INVALID_REQUEST, failure.getErrorUniqueId(), failure.getMessage());
+		long column = api.createColumn("c", SCHEMA);
+		api.put(0, column, key(1), text("a"), RequestType.none());
+		cluster.awaitConverged(TIMEOUT);
+		for (var node : cluster.runningNodes()) {
+			assertFalse(node.isFailed(), node.config().nodeId());
+		}
+		// A replica that restarts replays the upload (unflushed) or starts past it: either way it serves.
+		var restarted = cluster.anyFollower().config().nodeId();
+		cluster.halt(restarted);
+		api.put(0, column, key(2), text("b"), RequestType.none());
+		var node = cluster.start(restarted);
+		cluster.awaitConverged(TIMEOUT);
+		assertFalse(node.isFailed());
+		assertEquals("b", text(node.stateMachine().store().db().get(0, column, key(2), RequestType.current())));
 	}
 }
