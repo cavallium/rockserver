@@ -2075,7 +2075,9 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
    (`database.rockserver.nodes`, the host names of the cluster's `--peer`, expected leader first; empty keeps the
    single address), the commits of item 2, and the round-5 commits `456b8f8b7` and `df8acf015` (column
    registrations retry an unknown outcome, the update cleanup closes once, in-flight limits for a cluster; below
-   and in item 3). Left on the Yotsuba side:
+   and in item 3), and the round-6 commits `9b69ebb15` and `6358380bc` (an embedded test that the update
+   cleanup leaves no transaction open and closes each update once, the in-flight limit warning from one tested helper,
+   also in the settings comments). Left on the Yotsuba side:
    - Merge the branch, build it against a released `rockserver-core` of this version (the branch was compiled and
      tested against local builds of it; Yotsuba's pom still pins 2.0.3), and deploy it.
    - Set `database.rockserver.nodes` in the deployed settings once the cluster exists.
@@ -2135,8 +2137,8 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
    are raised for a cluster on its branch (since `456b8f8b7` and `df8acf015`); the value for production is still to measure
    with the Yotsuba mix (see performance.md).
 
-   *Upgrade note, Yotsuba's in-flight limits* (behaviour as of `df8acf015`; later commits on that branch may
-   reword the warning and the settings comments). `database.rockserver.maxConcurrentReadRequests` and
+   *Upgrade note, Yotsuba's in-flight limits* (behaviour as of `6358380bc`; the warning and the settings comments
+   come from `SettingsImpl.rockserverInFlightLimitMigration` since `9b69ebb15`). `database.rockserver.maxConcurrentReadRequests` and
    `maxConcurrentWriteRequests` now default to 0, automatic: 256 each with one node, 1024 each when
    `database.rockserver.nodes` lists several. A positive value is used as is, with one exception: with several
    nodes an explicit 256 also means automatic, so it becomes 1024. Earlier versions wrote 256, their default, into
