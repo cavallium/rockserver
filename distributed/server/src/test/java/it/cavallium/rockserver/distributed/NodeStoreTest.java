@@ -132,6 +132,61 @@ class NodeStoreTest {
 		}
 	}
 
+	/**
+	 * R2-TS-1 and R2-TS-2: the options RocksDB really runs with, read back from the OPTIONS file it writes, not the parsed
+	 * config. Every column's write buffer is the budget, and the cap on range tombstones per memtable, derived from the
+	 * write buffer size (one per 64 KiB), grows with it until the database's clamp of 65,536.
+	 */
+	@Test
+	void theOpenColumnsRunWithTheBudgetAsWriteBufferAndAScaledRangeDeletionCap() throws Exception {
+		var small = columnOptions("32MiB", "small");
+		assertEquals(String.valueOf(32L << 20), small.get("meta").get("write_buffer_size"));
+		assertEquals(String.valueOf(32L << 20), small.get("data").get("write_buffer_size"));
+		assertEquals(String.valueOf(32L << 20), small.get("user").get("write_buffer_size"));
+		assertEquals("512", small.get("user").get("memtable_max_range_deletions"));
+		assertEquals("512", small.get("data").get("memtable_max_range_deletions"));
+
+		// 8 GiB / 64 KiB would be 131,072 tombstones: clamped.
+		var large = columnOptions("8GiB", "large");
+		assertEquals(String.valueOf(8L << 30), large.get("user").get("write_buffer_size"));
+		assertEquals("65536", large.get("user").get("memtable_max_range_deletions"));
+	}
+
+	/** The options of each column of a database opened with {@code budget}, from RocksDB's latest OPTIONS file. */
+	private Map<String, Map<String, String>> columnOptions(String budget, String name) throws Exception {
+		Path config = tempDir.resolve(name + ".conf");
+		Files.writeString(config, """
+				database.global.write-buffer-manager = %s
+				database.global.column-options = [{ name: "data", write-buffer-size: 2MiB }]
+				""".formatted(budget));
+		Path dbDir = tempDir.resolve(name);
+		try (var store = NodeStore.open(dbDir, config, name)) {
+			store.db().createColumn("data", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+			store.db().createColumn("user", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+		}
+		Path latest;
+		try (var files = Files.list(dbDir)) {
+			latest = files.filter(file -> file.getFileName().toString().startsWith("OPTIONS-"))
+					.max(java.util.Comparator.comparingLong(file -> Long.parseLong(file.getFileName().toString().substring(8))))
+					.orElseThrow();
+		}
+		var columns = new java.util.HashMap<String, Map<String, String>>();
+		Map<String, String> current = null;
+		for (String line : Files.readAllLines(latest)) {
+			var trimmed = line.strip();
+			if (trimmed.startsWith("[CFOptions \"")) {
+				var column = trimmed.substring("[CFOptions \"".length(), trimmed.length() - 2);
+				current = new java.util.HashMap<>();
+				columns.put(column.equals(NodeStore.META_COLUMN) ? "meta" : column, current);
+			} else if (trimmed.startsWith("[")) {
+				current = null;
+			} else if (current != null && trimmed.contains("=")) {
+				current.put(trimmed.substring(0, trimmed.indexOf('=')), trimmed.substring(trimmed.indexOf('=') + 1));
+			}
+		}
+		return columns;
+	}
+
 	@Test
 	void theWriteBufferBudgetDefaultsLikeTheDatabase() {
 		assertEquals(128L << 20, NodeStore.writeBufferBudget(com.typesafe.config.ConfigFactory.empty()));

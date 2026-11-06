@@ -311,7 +311,12 @@ Other results:
 - **Memtables.** Replicas flush when the memtables of all columns together reach the write buffer budget,
   `database.global.write-buffer-manager` in the Rockserver config (128 MiB by default, charged to the block
   cache); a per-column `write-buffer-size` is replaced by that budget. A larger budget means fewer and larger L0
-  files, and more memory and replay after a crash (the Raft log, not the RocksDB WAL, replays it).
+  files, and more memory and replay after a crash (the Raft log, not the RocksDB WAL, replays it). The cap on range
+  tombstones per memtable (`memtable-max-range-deletions`, unless set) follows the write buffer size, one per 64 KiB,
+  and is clamped between 64 and 65,536: 2,048 with the default 128 MiB, 65,536 from 4 GiB up. A memtable with that many
+  range deletions is flushed early; `deleteRange` is rare here, so the clamp does not bind in practice, and a deployment
+  with many range deletions sets the option itself. `NodeStoreTest` reads both values back from the OPTIONS file
+  RocksDB writes (32 MiB gives 512; 8 GiB gives the clamp).
 - **Metrics.** On a cluster, `rocksdb_operation_timer` counts the calls made on each node's own database.
   Replicated writes are counted once per node when they are applied, together with the internal result, floor
   and position puts and one `closeTransaction` per applied group, and never with the client's latency. Reads,
