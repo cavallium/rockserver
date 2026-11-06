@@ -15,6 +15,12 @@ pub type Result<T> = std::result::Result<T, Status>;
 
 pub const REQUIRED_WORKLOAD_CONTRACT_VERSION: i32 = 3;
 
+/// The content hash `check_merge_operator` takes: SHA-256 of the jar, as the server computes it.
+pub fn merge_operator_hash(jar_payload: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha256::digest(jar_payload).to_vec()
+}
+
 fn duration_nanos(value: Duration) -> Result<i64> {
     if value.is_zero() {
         return Err(Status::invalid_argument("lease TTL must be positive"));
@@ -377,6 +383,65 @@ impl RockserverClient {
             })
             .await?;
         Ok(resp.into_inner().deleted)
+    }
+
+    /// Uploads a merge operator: a jar with the class `class_name`, referenced by columns as `operator_name`.
+    ///
+    /// Returns the operator's version. The server deduplicates an upload whose content equals that of an existing
+    /// version of the same name, and answers with that version.
+    pub async fn upload_merge_operator(
+        &self,
+        operator_name: String,
+        class_name: String,
+        jar_payload: Vec<u8>,
+    ) -> Result<i64> {
+        let req = UploadMergeOperatorRequest {
+            operator_name,
+            class_name,
+            jar_payload,
+            context: Some(self.context.clone()),
+        };
+        let resp = self
+            .call_contextual(req, |mut client, request| async move {
+                client.upload_merge_operator(request).await
+            })
+            .await?;
+        Ok(resp.into_inner().version)
+    }
+
+    /// Returns the version of merge operator `operator_name` whose jar has the SHA-256 digest `hash`, or `None` if
+    /// no version has that content.
+    pub async fn check_merge_operator(&self, operator_name: String, hash: Vec<u8>) -> Result<Option<i64>> {
+        let req = CheckMergeOperatorRequest {
+            operator_name,
+            hash,
+            context: Some(self.context.clone()),
+        };
+        let resp = self
+            .call_contextual(req, |mut client, request| async move {
+                client.check_merge_operator(request).await
+            })
+            .await?;
+        Ok(resp.into_inner().version)
+    }
+
+    /// Returns the version of merge operator `operator_name` with this jar, uploading it first if no version has
+    /// the same content (compared by SHA-256, as the Java client's `ensureMergeOperator` does).
+    pub async fn ensure_merge_operator(
+        &self,
+        operator_name: String,
+        class_name: String,
+        jar_payload: Vec<u8>,
+    ) -> Result<i64> {
+        let hash = merge_operator_hash(&jar_payload);
+        if let Some(version) = self
+            .check_merge_operator(operator_name.clone(), hash)
+            .await?
+        {
+            return Ok(version);
+        }
+        self.upload_merge_operator(operator_name, class_name, jar_payload)
+            .await
     }
 
     /// Retrieves the ID of a column by its name.
