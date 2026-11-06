@@ -562,6 +562,11 @@ public final class ReplicatedNode implements AutoCloseable {
 		channels.retainOnly(memberAddresses(division, config));
 	}
 
+	/** Tests only: the node's shared channels to the other members' Raft ports. */
+	PeerChannels peerChannels() {
+		return peerChannels;
+	}
+
 	/** The Raft addresses that {@link #peerChannels} keeps channels to. */
 	static Set<@Nullable String> memberAddresses(RaftServer.Division division, NodeConfig config) {
 		var addresses = new HashSet<@Nullable String>();

@@ -32,9 +32,11 @@ final class InProcessCluster implements AutoCloseable {
 	private final Path root;
 	private final Map<String, NodeConfig> configs = new LinkedHashMap<>();
 	private final Map<String, ReplicatedNode> running = new LinkedHashMap<>();
+	private final UnaryOperator<NodeConfig> customize;
 
 	InProcessCluster(Path root, int size, UnaryOperator<NodeConfig> customize) throws IOException {
 		this.root = root;
+		this.customize = customize;
 		var rockserverConfig = root.resolve("rockserver.conf");
 		Files.writeString(rockserverConfig, MERGE_CONFIG);
 		var peers = new ArrayList<PeerConfig>();
@@ -45,14 +47,41 @@ final class InProcessCluster implements AutoCloseable {
 			peers.add(new PeerConfig("n" + i, "127.0.0.1", ports.get(2 * i), "127.0.0.1", ports.get(2 * i + 1)));
 		}
 		for (PeerConfig peer : peers) {
-			var config = NodeConfig.defaults(peer.id(), peers, root.resolve(peer.id()))
-					.withRockserverConfig(rockserverConfig)
-					.withBindHosts("127.0.0.1", "127.0.0.1")
-					.withElectionTimeouts(Duration.ofMillis(400), Duration.ofMillis(800))
-					.withRequestTimeout(Duration.ofSeconds(10))
-					.withPipelinedUpdates(ProcessCluster.PIPELINED_UPDATES);
-			configs.put(peer.id(), customize.apply(config));
+			configs.put(peer.id(), customize.apply(baseConfig(peer.id(), peers)));
 		}
+	}
+
+	private NodeConfig baseConfig(String id, List<PeerConfig> peers) {
+		return NodeConfig.defaults(id, peers, root.resolve(id))
+				.withRockserverConfig(root.resolve("rockserver.conf"))
+				.withBindHosts("127.0.0.1", "127.0.0.1")
+				.withElectionTimeouts(Duration.ofMillis(400), Duration.ofMillis(800))
+				.withRequestTimeout(Duration.ofSeconds(10))
+				.withPipelinedUpdates(ProcessCluster.PIPELINED_UPDATES);
+	}
+
+	/**
+	 * Starts a new node {@code id} with {@code --join}, on ports of its own, with the peer list of the existing nodes
+	 * plus itself; the existing nodes' configurations do not change. It waits for an add-peer: see {@link #raftPeers}.
+	 */
+	ReplicatedNode join(String id) throws IOException {
+		if (configs.containsKey(id)) {
+			throw new IllegalStateException(id + " exists");
+		}
+		// The running nodes hold their ports, so these are others.
+		var ports = ProcessCluster.freePorts(2, List.of());
+		var peers = new ArrayList<>(configs.values().iterator().next().peers());
+		peers.add(new PeerConfig(id, "127.0.0.1", ports.get(0), "127.0.0.1", ports.get(1)));
+		configs.put(id, customize.apply(baseConfig(id, peers)).withJoin(true));
+		return start(id);
+	}
+
+	/** The Raft peers of {@code ids}, at the addresses of their configurations, for {@code admin().setConfiguration}. */
+	List<org.apache.ratis.protocol.RaftPeer> raftPeers(List<String> ids) {
+		return ids.stream().map(id -> configs.get(id).self())
+				.map(peer -> org.apache.ratis.protocol.RaftPeer.newBuilder().setId(peer.id()).setAddress(peer.raftAddress())
+						.build())
+				.toList();
 	}
 
 	/** Starts every node; if one fails to start, stops the others, so that a failed test leaks no running node. */

@@ -5,6 +5,7 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.ratis.thirdparty.io.grpc.ConnectivityState;
 import org.apache.ratis.thirdparty.io.grpc.ManagedChannel;
@@ -48,6 +49,11 @@ final class PeerChannels implements Closeable {
 	/** The number of cached channels. */
 	int size() {
 		return channels.size();
+	}
+
+	/** The addresses that this cache has channels to now. */
+	Set<String> addresses() {
+		return Set.copyOf(channels.keySet());
 	}
 
 	/**
