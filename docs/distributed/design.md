@@ -1296,8 +1296,9 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   Ratis purge. At a start the count begins from the bytes of the Raft log segments that the database applied past
   the latest snapshot (a segment only partly in that range counts in proportion to its entries), not from 0:
   otherwise restarts more frequent than `snapshotEveryBytes` of writes, a few deploys a day, would leave only the
-  entry-count trigger. Entries past the database's applied position count again when Ratis applies them after the
-  start, which can bring the snapshot forward by that much, never delay it. The byte trigger asks through Ratis' snapshot management API, like `admin
+  entry-count trigger. Ratis replays the entries up to the database's applied position after the start; they count
+  0, since the seed holds them (counting them again doubled the count and took a snapshot at half the threshold,
+  `SnapshotByBytesTest.theCountSurvivesARestart`). The byte trigger asks through Ratis' snapshot management API, like `admin
   snapshot`, from the thread that completes applied groups, so Ratis still takes the snapshot on its own thread.
   Not at stops (a graceful stop flushes the database instead). Taking one flushes the memtables and copies the live files, 100–300 ms, during which
   Ratis hands over no entry: about every 100 s at 2×, writes wait that long. (Taking it on a thread of its own,

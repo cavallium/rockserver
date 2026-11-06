@@ -84,6 +84,16 @@ class SnapshotByBytesTest {
 			long seeded = node.stateMachine().bytesSinceSnapshotForTesting();
 			assertTrue(seeded >= 3 * 256 * 1024, node.config().nodeId() + " counts " + seeded + " bytes");
 		}
+		// Once Ratis replayed the log up to the database's position, those entries are not counted twice: the count
+		// stays below the threshold, and no snapshot is taken.
+		cluster.awaitLeader(TIMEOUT);
+		cluster.awaitConverged(TIMEOUT);
+		Thread.sleep(500);
+		for (var node : cluster.runningNodes()) {
+			long counted = node.stateMachine().bytesSinceSnapshotForTesting();
+			assertTrue(counted < (1 << 20), node.config().nodeId() + " counts " + counted + " bytes after the replay");
+			assertNull(node.stateMachine().getLatestSnapshot(), node.config().nodeId() + " took a snapshot");
+		}
 		leader = cluster.awaitLeader(TIMEOUT);
 		api = leader.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
 		// 512 KiB more: 1.25 MiB since the latest snapshot (none), only 512 KiB since the restart.

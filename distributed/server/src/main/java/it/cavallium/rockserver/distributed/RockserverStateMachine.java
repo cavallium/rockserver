@@ -317,7 +317,9 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private void seedBytesSinceSnapshot(Path raftLogDir) {
 		var snapshot = storage.getLatestSnapshot();
 		long from = snapshot != null ? snapshot.getIndex() : -1;
-		long seed = logBytesBetween(raftLogDir, from, store.applied().getIndex());
+		long through = store.applied().getIndex();
+		long seed = logBytesBetween(raftLogDir, from, through);
+		seededThrough = through;
 		bytesSinceSnapshot.set(seed);
 		if (seed > 0) {
 			LOG.info("{}: {} bytes of Raft log applied past the snapshot at {}", config.nodeId(), seed, from);
@@ -1031,7 +1033,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 		prepareSnapshot(positionOf(group.getLast()));
 		long groupBytes = 0;
 		for (var item : group) {
-			if (item instanceof ApplyEntry entry) {
+			// Entries that Ratis replays after a start, up to the database's applied position, are in the seed already.
+			if (item instanceof ApplyEntry entry && entry.position().getIndex() > seededThrough) {
 				groupBytes += entry.bytes();
 			}
 		}
@@ -1058,6 +1061,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	/** Bytes of log entries applied since the latest snapshot, or since the start: see {@link #snapshotByBytes}. */
 	private final AtomicLong bytesSinceSnapshot = new AtomicLong();
+	/** The last log index counted by the seed of {@link #bytesSinceSnapshot} at start: replayed entries up to it count 0. */
+	private volatile long seededThrough = -1;
 	/** True while a snapshot asked by {@link #snapshotByBytes} is pending. */
 	private final AtomicBoolean snapshotByBytesPending =
 			new AtomicBoolean();
