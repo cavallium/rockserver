@@ -5,7 +5,10 @@ use crate::types::{Column, ColumnSchema};
 use futures::{Stream, StreamExt};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
-use crate::sessions::{partly_applied, split_batch, SessionWrites, DEFAULT_RETRY_WINDOW};
+use crate::sessions::{
+    multi_keys_bytes, multi_kv_bytes, partly_applied, read_multi_items, split_batch, MultiItems, SessionWrites,
+    DEFAULT_RETRY_WINDOW, NUMBERED_MULTI_MAX_BYTES,
+};
 use futures::stream::BoxStream;
 use futures::TryStreamExt;
 use std::sync::Arc;
@@ -1673,6 +1676,21 @@ where
     stream.await?.try_collect().await
 }
 
+/// The deadline of one chunk of a numbered batch sent now: the call's, for a caller with a deadline; otherwise the
+/// retry window from now (the window of a call without a deadline is per chunk, not per call).
+fn chunk_deadline(
+    call_deadline: tokio::time::Instant,
+    finite: bool,
+    window: Duration,
+) -> tokio::time::Instant {
+    if finite {
+        return call_deadline;
+    }
+    let now = tokio::time::Instant::now();
+    now.checked_add(window)
+        .unwrap_or_else(|| now + Duration::from_secs(10 * 365 * 86_400))
+}
+
 fn replayed<T: Send + 'static>(values: Vec<T>) -> BoxStream<'static, Result<T>> {
     futures::stream::iter(values.into_iter().map(Ok)).boxed()
 }
@@ -1791,8 +1809,10 @@ impl RockserverClient {
         result
     }
 
-    /// A batch write as numbered chunks, one at a time, in order, within one deadline. Once a chunk was applied, a
-    /// failure leaves the call partly applied: `INVALID_ARGUMENT` (`INVALID_REQUEST`), not to be resent as a whole.
+    /// A batch write as numbered chunks, one at a time, in order. A caller with a deadline sends every chunk within
+    /// it; a caller without one gives each chunk its own retry window from the moment it is sent, as the Java client
+    /// does, so that a long batch can still resend a late chunk. Once a chunk was applied, a failure leaves the call
+    /// partly applied: `INVALID_ARGUMENT` (`INVALID_REQUEST`), not to be resent as a whole.
     async fn numbered_batch<S, SF>(
         &self,
         writes: &SessionWrites,
@@ -1805,13 +1825,14 @@ impl RockserverClient {
         S: FnMut(RockserverClient, KvBatch) -> SF,
         SF: Future<Output = Result<()>>,
     {
-        let (deadline, finite) = self.numbered_deadline()?;
+        let (call_deadline, finite) = self.numbered_deadline()?;
         let mut applied_chunks = 0u64;
         let mut applied_keys = 0u64;
         futures::pin_mut!(batches);
         while let Some(batch) = batches.next().await {
             for chunk in split_batch(batch) {
                 let keys = chunk.entries.len() as u64;
+                let deadline = chunk_deadline(call_deadline, finite, self.session_retry_window);
                 let result = self
                     .numbered_until(writes, deadline, finite, |view| send(view, chunk.clone()))
                     .await;
@@ -2052,14 +2073,19 @@ impl RockserverClient {
         }
     }
 
-    /// Streams multiple KV pairs to put. Numbered, the stream is read whole first.
+    /// Streams multiple KV pairs to put. Numbered when the stream counts at most `sessions::NUMBERED_MULTI_MAX_BYTES`, read whole first; a larger
+    /// stream is sent unnumbered, streamed.
     pub async fn put_multi(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<()> {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
-            Some(writes) => {
-                let items: Vec<Kv> = items.collect().await;
-                self.numbered(&writes, tx, copy!(view => view.put_multi_once(tx, column_id, futures::stream::iter(items)); items)).await
-            }
+            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(items) => self.numbered(&writes, tx, copy!(view => view.put_multi_once(tx, column_id, futures::stream::iter(items)); items)).await,
+                MultiItems::Streamed(items) => {
+                    let result = self.put_multi_once(tx, column_id, items).await;
+                    writes.update_ended(tx);
+                    result
+                }
+            },
             None => self.put_multi_once(tx, column_id, items).await,
         }
     }
@@ -2069,118 +2095,167 @@ impl RockserverClient {
     pub async fn put_multi_ensure(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<()> {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
-            Some(writes) => {
-                let items: Vec<Kv> = items.collect().await;
-                self.numbered(&writes, tx, copy!(view => view.put_multi_ensure_once(tx, column_id, futures::stream::iter(items)); items)).await
-            }
+            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(items) => self.numbered(&writes, tx, copy!(view => view.put_multi_ensure_once(tx, column_id, futures::stream::iter(items)); items)).await,
+                MultiItems::Streamed(items) => {
+                    let result = self.put_multi_ensure_once(tx, column_id, items).await;
+                    writes.update_ended(tx);
+                    result
+                }
+            },
             None => self.put_multi_ensure_once(tx, column_id, items).await,
         }
     }
 
-    /// Streams multiple KV pairs and retrieves previous values. Numbered, both streams are read whole.
+    /// Streams multiple KV pairs and retrieves previous values. Numbered when the stream counts at most `sessions::NUMBERED_MULTI_MAX_BYTES` (both streams are then read
+    /// whole); a larger stream is sent unnumbered, streamed.
     pub async fn put_multi_get_previous(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<impl Stream<Item = Result<Previous>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => {
-                let items: Vec<Kv> = items.collect().await;
-                replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_previous_once(tx, column_id, futures::stream::iter(items))); items)).await?)
-            }
+            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(items) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_previous_once(tx, column_id, futures::stream::iter(items))); items)).await?),
+                MultiItems::Streamed(items) => {
+                    let results = self.put_multi_get_previous_once(tx, column_id, items).await;
+                    writes.update_ended(tx);
+                    results?.boxed()
+                }
+            },
             None => self.put_multi_get_previous_once(tx, column_id, items).await?.boxed(),
         })
     }
 
-    /// Streams multiple KV pairs and retrieves deltas. Numbered, both streams are read whole.
+    /// Streams multiple KV pairs and retrieves deltas. Numbered when the stream counts at most `sessions::NUMBERED_MULTI_MAX_BYTES` (both streams are then read
+    /// whole); a larger stream is sent unnumbered, streamed.
     pub async fn put_multi_get_delta(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<impl Stream<Item = Result<Delta>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => {
-                let items: Vec<Kv> = items.collect().await;
-                replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_delta_once(tx, column_id, futures::stream::iter(items))); items)).await?)
-            }
+            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(items) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_delta_once(tx, column_id, futures::stream::iter(items))); items)).await?),
+                MultiItems::Streamed(items) => {
+                    let results = self.put_multi_get_delta_once(tx, column_id, items).await;
+                    writes.update_ended(tx);
+                    results?.boxed()
+                }
+            },
             None => self.put_multi_get_delta_once(tx, column_id, items).await?.boxed(),
         })
     }
 
-    /// Streams multiple KV pairs and retrieves change status. Numbered, both streams are read whole.
+    /// Streams multiple KV pairs and retrieves change status. Numbered when the stream counts at most `sessions::NUMBERED_MULTI_MAX_BYTES` (both streams are then read
+    /// whole); a larger stream is sent unnumbered, streamed.
     pub async fn put_multi_get_changed(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<impl Stream<Item = Result<Changed>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => {
-                let items: Vec<Kv> = items.collect().await;
-                replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_changed_once(tx, column_id, futures::stream::iter(items))); items)).await?)
-            }
+            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(items) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_changed_once(tx, column_id, futures::stream::iter(items))); items)).await?),
+                MultiItems::Streamed(items) => {
+                    let results = self.put_multi_get_changed_once(tx, column_id, items).await;
+                    writes.update_ended(tx);
+                    results?.boxed()
+                }
+            },
             None => self.put_multi_get_changed_once(tx, column_id, items).await?.boxed(),
         })
     }
 
-    /// Streams multiple KV pairs and retrieves previous presence status. Numbered, both streams are read whole.
+    /// Streams multiple KV pairs and retrieves previous presence status. Numbered when the stream counts at most `sessions::NUMBERED_MULTI_MAX_BYTES` (both streams are then read
+    /// whole); a larger stream is sent unnumbered, streamed.
     pub async fn put_multi_get_previous_presence(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<impl Stream<Item = Result<PreviousPresence>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => {
-                let items: Vec<Kv> = items.collect().await;
-                replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_previous_presence_once(tx, column_id, futures::stream::iter(items))); items)).await?)
-            }
+            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(items) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.put_multi_get_previous_presence_once(tx, column_id, futures::stream::iter(items))); items)).await?),
+                MultiItems::Streamed(items) => {
+                    let results = self.put_multi_get_previous_presence_once(tx, column_id, items).await;
+                    writes.update_ended(tx);
+                    results?.boxed()
+                }
+            },
             None => self.put_multi_get_previous_presence_once(tx, column_id, items).await?.boxed(),
         })
     }
 
-    /// Streams keys to delete. Numbered, the stream is read whole first.
+    /// Streams keys to delete. Numbered when the stream counts at most `sessions::NUMBERED_MULTI_MAX_BYTES`, read whole first; a larger
+    /// stream is sent unnumbered, streamed.
     pub async fn delete_multi(&self, transaction_or_update_id: i64, column_id: i64, keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static) -> Result<()> {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
-            Some(writes) => {
-                let keys: Vec<Vec<Vec<u8>>> = keys.collect().await;
-                self.numbered(&writes, tx, copy!(view => view.delete_multi_once(tx, column_id, futures::stream::iter(keys)); keys)).await
-            }
+            Some(writes) => match read_multi_items(keys, multi_keys_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(keys) => self.numbered(&writes, tx, copy!(view => view.delete_multi_once(tx, column_id, futures::stream::iter(keys)); keys)).await,
+                MultiItems::Streamed(keys) => {
+                    let result = self.delete_multi_once(tx, column_id, keys).await;
+                    writes.update_ended(tx);
+                    result
+                }
+            },
             None => self.delete_multi_once(tx, column_id, keys).await,
         }
     }
 
-    /// Streams keys to delete and returns their previous values. Numbered, both streams are read whole.
+    /// Streams keys to delete and returns their previous values. Numbered when the stream counts at most `sessions::NUMBERED_MULTI_MAX_BYTES` (both streams are then read
+    /// whole); a larger stream is sent unnumbered, streamed.
     pub async fn delete_multi_get_previous(&self, transaction_or_update_id: i64, column_id: i64, keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static) -> Result<impl Stream<Item = Result<Previous>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => {
-                let keys: Vec<Vec<Vec<u8>>> = keys.collect().await;
-                replayed(self.numbered(&writes, tx, copy!(view => collected(view.delete_multi_get_previous_once(tx, column_id, futures::stream::iter(keys))); keys)).await?)
-            }
+            Some(writes) => match read_multi_items(keys, multi_keys_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(keys) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.delete_multi_get_previous_once(tx, column_id, futures::stream::iter(keys))); keys)).await?),
+                MultiItems::Streamed(keys) => {
+                    let results = self.delete_multi_get_previous_once(tx, column_id, keys).await;
+                    writes.update_ended(tx);
+                    results?.boxed()
+                }
+            },
             None => self.delete_multi_get_previous_once(tx, column_id, keys).await?.boxed(),
         })
     }
 
-    /// Streams keys to delete and reports whether each value existed. Numbered, both streams are read whole.
+    /// Streams keys to delete and reports whether each value existed. Numbered when the stream counts at most `sessions::NUMBERED_MULTI_MAX_BYTES` (both streams are then read
+    /// whole); a larger stream is sent unnumbered, streamed.
     pub async fn delete_multi_get_previous_presence(&self, transaction_or_update_id: i64, column_id: i64, keys: impl Stream<Item = Vec<Vec<u8>>> + Send + 'static) -> Result<impl Stream<Item = Result<PreviousPresence>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => {
-                let keys: Vec<Vec<Vec<u8>>> = keys.collect().await;
-                replayed(self.numbered(&writes, tx, copy!(view => collected(view.delete_multi_get_previous_presence_once(tx, column_id, futures::stream::iter(keys))); keys)).await?)
-            }
+            Some(writes) => match read_multi_items(keys, multi_keys_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(keys) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.delete_multi_get_previous_presence_once(tx, column_id, futures::stream::iter(keys))); keys)).await?),
+                MultiItems::Streamed(keys) => {
+                    let results = self.delete_multi_get_previous_presence_once(tx, column_id, keys).await;
+                    writes.update_ended(tx);
+                    results?.boxed()
+                }
+            },
             None => self.delete_multi_get_previous_presence_once(tx, column_id, keys).await?.boxed(),
         })
     }
 
-    /// Merges multiple KV pairs. Numbered, the stream is read whole first.
+    /// Merges multiple KV pairs. Numbered when the stream counts at most `sessions::NUMBERED_MULTI_MAX_BYTES`, read whole first; a larger
+    /// stream is sent unnumbered, streamed.
     pub async fn merge_multi(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<()> {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
-            Some(writes) => {
-                let items: Vec<Kv> = items.collect().await;
-                self.numbered(&writes, tx, copy!(view => view.merge_multi_once(tx, column_id, futures::stream::iter(items)); items)).await
-            }
+            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(items) => self.numbered(&writes, tx, copy!(view => view.merge_multi_once(tx, column_id, futures::stream::iter(items)); items)).await,
+                MultiItems::Streamed(items) => {
+                    let result = self.merge_multi_once(tx, column_id, items).await;
+                    writes.update_ended(tx);
+                    result
+                }
+            },
             None => self.merge_multi_once(tx, column_id, items).await,
         }
     }
 
-    /// Merges multiple KV pairs and returns the merged results. Numbered, both streams are read whole.
+    /// Merges multiple KV pairs and returns the merged results. Numbered when the stream counts at most `sessions::NUMBERED_MULTI_MAX_BYTES` (both streams are then read
+    /// whole); a larger stream is sent unnumbered, streamed.
     pub async fn merge_multi_get_merged(&self, transaction_or_update_id: i64, column_id: i64, items: impl Stream<Item = Kv> + Send + 'static) -> Result<impl Stream<Item = Result<Merged>>> {
         let tx = transaction_or_update_id;
         Ok(match self.numbering(tx) {
-            Some(writes) => {
-                let items: Vec<Kv> = items.collect().await;
-                replayed(self.numbered(&writes, tx, copy!(view => collected(view.merge_multi_get_merged_once(tx, column_id, futures::stream::iter(items))); items)).await?)
-            }
+            Some(writes) => match read_multi_items(items, multi_kv_bytes, NUMBERED_MULTI_MAX_BYTES).await {
+                MultiItems::Whole(items) => replayed(self.numbered(&writes, tx, copy!(view => collected(view.merge_multi_get_merged_once(tx, column_id, futures::stream::iter(items))); items)).await?),
+                MultiItems::Streamed(items) => {
+                    let results = self.merge_multi_get_merged_once(tx, column_id, items).await;
+                    writes.update_ended(tx);
+                    results?.boxed()
+                }
+            },
             None => self.merge_multi_get_merged_once(tx, column_id, items).await?.boxed(),
         })
     }
@@ -2422,6 +2497,53 @@ mod workload_context_tests {
             .to_str()
             .unwrap();
         assert_ne!(remaining, original);
+    }
+
+    /// A numbered batch of a caller without a deadline gives each chunk its own retry window: a chunk sent after the
+    /// window of the call as a whole would have run out is still resent after an unknown outcome.
+    #[tokio::test]
+    async fn each_chunk_of_a_batch_without_a_deadline_gets_its_own_retry_window() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut client = RockserverClient::new_unchecked(channel, RequestContext::batch())
+            .with_session_retry_window(Duration::from_millis(400));
+        client.sessions = Some(Arc::new(SessionWrites::with_open_session(true, 9)));
+        let writes = client.sessions.clone().unwrap();
+        let batch = |k: u8| KvBatch {
+            entries: vec![Kv { keys: vec![vec![k]], value: vec![k] }],
+        };
+        let copies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent = copies.clone();
+        let result = client
+            .numbered_batch(
+                &writes,
+                false,
+                1,
+                futures::stream::iter([batch(1), batch(2), batch(3)]),
+                move |view, chunk| {
+                    let sent = sent.clone();
+                    async move {
+                        let id = view.context.request_id.clone().expect("numbered");
+                        let key = chunk.entries[0].keys[0][0];
+                        let first_copy = {
+                            let mut sent = sent.lock().unwrap();
+                            let first = !sent.iter().any(|(k, _)| *k == key);
+                            sent.push((key, id.sequence));
+                            first
+                        };
+                        if key == 3 && first_copy {
+                            return Err(Status::unavailable("leader lost"));
+                        }
+                        if key < 3 {
+                            // Two chunks take 500 ms: past the 400 ms window of the call as a whole.
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(*copies.lock().unwrap(), vec![(1, 0), (2, 1), (3, 2), (3, 2)]);
     }
 
     #[test]

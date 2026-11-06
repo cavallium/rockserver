@@ -328,11 +328,18 @@ and the `LogEntry`.
   the entry itself; the batch is sized from those sizes, and each entry is written straight into it when the batch
   goes out, with no body of its own. The bytes are those of the bodies encoded one by one and joined (versions 2
   and 3 alike; `CodecEquivalenceTest`). A caller's buffers are read only until its write is first encoded into a
-  batch, which happens while the caller still waits for its answer. A caller that gives up on a write (cancels its
-  future, or times it out) in the short time between a batch taking the write and encoding it is answered only once
-  that encoding is done (`Pending.awaitEncoded`: a flag set before the write is marked sent and cleared when the
-  batch no longer reads it, at most 1 s of waiting, in practice the encoding of one batch), so a caller may reuse
-  its buffers as soon as it is answered. A caller must therefore not change a
+  batch, which happens while the caller still waits for its answer. A caller that gives up on a write in the short
+  time between a batch taking the write and encoding it is answered only once that encoding is done, so a caller
+  may reuse its buffers as soon as it is answered. The caller's future is a `Proposer.CallerCopy`, which overrides
+  the two ways of giving up: `cancel()` returns only once the encoding is done (`Pending.awaitEncoded`: a flag set
+  before the write is marked sent and cleared when the batch no longer reads it, at most 1 s of waiting, in practice
+  the encoding of one batch); `completeExceptionally()`, which `orTimeout` calls on the JDK's single delayer thread,
+  does not wait there but completes the future later, on a caller thread, once the encoding ended
+  (`Pending.whenEncoded`, also at most 1 s), so that no continuation of the caller runs earlier. Both also take a
+  write that was not sent yet out of its queue. `complete` with a value, `completeOnTimeout` and `obtrude*` are not
+  covered (nothing uses them on a write). Checked through the proposer
+  (`ProposerCopiesTest.aCallerGivingUpWhileItsBatchIsPausedBeforeEncodingIsAnsweredAfterIt`: a batch paused by a test
+  hook just before it encodes; fails if the overrides are removed). A caller must therefore not change a
   write's buffers while it waits; if it does, the batch fails to encode, nothing of it is sent, the writes that no
   longer encode to their size fail as invalid (or with an unknown outcome if an earlier batch may have appended
   them) and the others go back to the queue, as never taken unless an earlier batch may have appended them, so that
@@ -479,8 +486,18 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   INGEST caller lost all but the first item of a list too large for `putMultiList` (and of every `deleteMulti` and
   `mergeMulti`, which always stream). A numbered streamed multi write is now collected and applied as one multi call,
   like a LATENCY one (`GrpcServerImpl.collectsWhole`): one numbered write, applied at most once, whose copies answer
-  with its results. Outside LATENCY it is bounded by 2^20 items and 16 MiB of keys and values (one replicated entry;
-  more is refused as invalid, nothing applied), instead of the LATENCY fan-out limits. The collected path also maps
+  with its results. Outside LATENCY, instead of the LATENCY fan-out limits, it is bounded by 16 MiB counted
+  (`GrpcServerImpl.numberedItemBytes`: keys and values, 16 bytes per key segment and value as the log encoding counts
+  them, and 96 bytes per item for its proto objects on the heap; so also at most 16 MiB / 112, about 150 000, items;
+  more is refused as invalid, nothing applied). The collected items sit on the heap before the node's write
+  admission sees the write, so while it is collected each item also takes its counted bytes from the server's
+  collect budget (`rockserver.grpc.numbered-multi-collect-bytes`, 64 MiB by default, for every such stream at once),
+  given back when the collection ends, when the write's bytes pass to the proposer's admission. A write that does
+  not fit is refused as `SERVER_OVERLOADED` with the not-applied flag, at once, without reading the rest of its
+  stream; the caller knows it can send it again, as after a full admission (a client resends it under the same
+  number only when an earlier copy may have applied) (`NumberedWritesTest.numberedStreamedMultiWritesTakeTheServersCollectBudget`, with a 64 KiB budget). Before
+  this, collecting counted only key and value bytes, up to 2^20 items, with no bound on how many streams were
+  collected at once: a few million-item `deleteMulti` calls could hold gigabytes before admission refused them. The collected path also maps
   each result before streaming it, so a missing previous value (null) no longer fails the call
   (`NumberedWritesTest.numberedStreamedMultiWritesOfABatchCallerApplyEveryItem`, which fails without the change).
 - **Leader time.** The leader prepends its clock (`LogEntryCodec.stamp`: a marker byte and 8 bytes, without copying
@@ -625,19 +642,35 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   with the same resend rule (an unknown outcome is a lost call, `OUTCOME_UNKNOWN`, or a deadline error without the
   `rockserver-applied: no` trailer; after one, a "not applied" answer resends; pauses from 50 ms doubling to 1 s; the
   caller's deadline, or a 30 s window for a context without one), the same `SESSION_EXPIRED` handling (a first copy
-  goes again under a new session, a copy after an unknown outcome ends `OUTCOME_UNKNOWN`) and the same opening rule
+  goes again under a new session, a copy after an unknown outcome ends `OUTCOME_UNKNOWN`), the same window per batch
+  chunk (a context without a deadline gives each chunk the 30 s window from when it is sent, as `SessionWrites` does,
+  not one window for the whole call, which a long batch would use up before a late chunk needs a resend:
+  `each_chunk_of_a_batch_without_a_deadline_gets_its_own_retry_window`) and the same opening rule
   (writes wait for the one opening the session; each opens again in its own time if that fails). Its own failures
   carry the server's message format, `RocksDBError: [uid:TYPE] ...`, and the trailer when not applied, so a caller
   reads them like the server's (`sessions::is_outcome_unknown`, `is_not_applied`, `rocksdb_error_type`). Where Rust
   differs: dropping a write's future is its cancel (its number is final, and nothing more is sent, but whether a sent
   copy applied stays unknown, since there is no future left to answer); a streamed multi write that is numbered reads
   its whole input stream first, and one with results reads every result before returning them, since a copy may
-  have to be sent again; a view whose context already carries a request id (`RequestContext::with_request_id`) is
+  have to be sent again. It does so only up to `sessions::NUMBERED_MULTI_MAX_BYTES` (4 MiB, counted as the server
+  counts it, a quarter of the server's limit): a larger stream is sent unnumbered, streamed item by item as before
+  numbering existed, so a large `put_multi` of an INGEST caller still has no size limit and is not held in the
+  client's memory, but is sent once (a lost call leaves its outcome unknown, as before). Splitting it into numbered
+  chunks, as batches are, was not done: a multi write is one call with one result list and no "partly applied"
+  answer, and the Java client does not split these either; a caller that wants every item numbered uses
+  `put_batch`/`merge_batch` or smaller calls; a view whose context already carries a request id (`RequestContext::with_request_id`) is
   numbered by its caller and sends once; `without_client_sessions()` sends everything once, as before. The unit tests
   (`sessions::tests`) drive the resend loop with scripted answers, as `SessionWritesTest` does; the live test
   `tests/live_server.rs` runs every numbered call against a follower of a three-node in-process cluster
-  (`RustClientLiveTest`, on when `-Drockserver.rust-client.dir` names a buildable copy of the crate) and the Java side
-  then checks every node. Not tested in Rust: a resend across a real leader loss (the Java client's
+  (`RustClientLiveTest`, on when `-Drockserver.rust-client.dir` names a buildable copy of the crate), sends two copies
+  of one numbered merge under the same request id (applied once), and a multi write over the numbering limit
+  (streamed unnumbered); the Java side then checks every node. The live test is `#[ignore]`: a plain `cargo test`
+  reports it as ignored, not as passed, and `cargo test -- --include-ignored` (what `RustClientLiveTest` runs) fails
+  if `ROCKSERVER_TEST_ADDR` is unset. Neither runs in CI: the crate's workspace lists `rust-data-generator`, a git
+  submodule (`.gitmodules`) that a checkout without `git submodule update --init` lacks, and `examples-runner`, the
+  other member, depends on it by path, so the member cannot be dropped or made optional (Cargo has no optional
+  members); with the submodule checked out the crate builds in place. Wiring cargo into the Maven build is left to
+  whoever sets up CI with a Rust toolchain. Not tested in Rust: a resend across a real leader loss (the Java client's
   `ClientSessionTest` covers the server side of it).
 
 **Apply.** Every replica applies entries in log order, on an apply thread of its own, through
@@ -1656,9 +1689,9 @@ failover" below).
 | `SessionApplierTest` | Client sessions at apply: a write resent through other proposers, alone or in an entry with other sessions' writes, takes effect once, also after a restart; the session's floor refuses late copies; unknown and expired sessions are rejected and not recorded, a leader clock behind does not revive them, and expired sessions are deleted; a leader whose wall clock is a year ahead, or jumps within its term, expires nothing (`LeaderClock`); two replicas, one restarting midway, give the same results. |
 | `SessionWritesTest` (core) | The client's numbering: which writes are numbered (staged writes not, schema changes, `deleteRange` and batches yes), update ids forgotten once the update ended; a first copy refused by an expired session re-issued under a new one, a later copy so refused ending unknown (also when that copy is flagged not applied), sessions that keep expiring ending at the deadline, flagged not applied; opening retried after an unknown outcome, and again by a write that waited on another write's opening, also when that opening ended "not applied" at the opener's deadline or overloaded; batches unnumbered when the server does not advertise `numberedBatches`; batches sent as numbered chunks in order, a chunk resent with its number, a later chunk's failure reported as partly applied; closing ends waiting writes; each answer of a copy (value, recorded failure, overload, flagged deadline: ends; unknown, then "not applied": same number again; a sender that throws: lost copy); a deadline without the "not applied" flag, gRPC's own included, on a first or a resent copy, ends unknown, whatever its message; a cancel after a copy was sent ends unknown and stops the resends and the copy in flight, before one was sent cancels it unsent, also for a batch (a batch whose chunk only waits for its session counts as unsent); a synchronous wait is bounded, unbounded without a deadline, and never overflows; the client's own expired-deadline check on a first copy ends "not applied"; past 65,536 open updates the oldest is forgotten and counted; a Reactor caller (`Mono.fromFuture`) that disposes its subscription or times out stops the resends and cancels the copy in flight. |
 | `ClientSessionTest` (in-process) | A merge and a transaction commit whose leader dies after its followers applied them and before it answered: the client sends them again with their request ids through the next node, the merge applies once and the commit answers `true` from its record. Copies of a commit and of the write that ends an update answer "unknown" while the first is in flight, then from the record. Copies of a numbered `mergeBatch` chunk, `deleteColumnIfExists`, `deleteColumn` and `deleteRange` take effect once; a numbered batch of two chunks is refused with nothing applied; the client library sends batches as numbered chunks over gRPC, a three-chunk batch of items that fill a chunk to the byte taking exactly one number per chunk (the client's and the server's split agree after encoding); a client batch whose leader dies after committing its first chunk, unanswered, resends that chunk with its number and every key is merged exactly once. |
-| `NumberedWritesTest` (in-process) | Streamed multi writes of a BATCH caller with sessions apply every item, results included; copies of a numbered `createColumn` and `uploadMergeOperator` answer from the record (no column re-created after a deletion, no version added); a server offering sessions without `numberedBatches` gets a three-chunk batch unnumbered, taking no number; an endless numbered batch stream is refused after a few batches; a commit refused by the leader behind a follower's forward is flagged not applied at the client. |
-| `ProposerCopiesTest` | A write's entry becomes its batch's copy once encoded, so a later re-encode never reads the caller's changed buffer; a follower's resend of a late batch is answered from the leader's retry cache, one log entry, applied once; a caller giving up during its batch's encoding waits for it, bounded. |
-| `RustClientLiveTest` (in-process, off by default) | The Rust client's live test against a follower of a three-node cluster: every numbered call, merge operator upload/check/ensure, batches as chunks, then every node checked. |
+| `NumberedWritesTest` (in-process) | Streamed multi writes of a BATCH caller with sessions apply every item, results included; copies of a numbered `createColumn` and `uploadMergeOperator` answer from the record (no column re-created after a deletion, no version added); a server offering sessions without `numberedBatches` gets a three-chunk batch unnumbered, taking no number; an endless numbered batch stream is refused after a few batches; a commit refused by the leader behind a follower's forward is flagged not applied at the client; a numbered streamed multi write over the server's collect budget is refused as `SERVER_OVERLOADED`, applies nothing, and the budget is given back after each collection. |
+| `ProposerCopiesTest` | A write's entry becomes its batch's copy once encoded, so a later re-encode never reads the caller's changed buffer; a follower's resend of a late batch is answered from the leader's retry cache, one log entry, applied once; a caller giving up during its batch's encoding waits for it, bounded; through the proposer, with a batch paused before its encoding, `cancel()` returns and an `orTimeout` answers only after the encoding, without holding the JDK's delayer thread. |
+| `RustClientLiveTest` (in-process, off by default) | The Rust client's live test against a follower of a three-node cluster: every numbered call, merge operator upload/check/ensure, batches as chunks, two copies of one numbered merge applied once, a multi write over the numbering limit streamed unnumbered, then every node checked. |
 | `CommitOutcomesTest` | The answer to a copy of a numbered commit whose transaction is gone: unknown while a mark of this term exists, also for a mark of a term that started while the copy's leadership barrier ran (the term is read before the barrier), "run it again" with no mark or a mark of an earlier term, the record when there is one; the first mark of a newer term drops the older ones. `NodeStoreTest` checks that a session expired at the replicated clock is not live while its row is still there. |
 | `AppliedFlagWireTest`, `AppliedTrailerInterceptorTest`, `GrpcServerDeadlineErrorTest` (core) | The "not applied" flag on the wire: the server's trailer follows the exception's flag (a real server round trip included), the client reads it, and the legacy messages only without it; gRPC's own deadline is never "not applied". |
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); chains (handoff at admission, the caps on links and on the readers of one, breaks and their end, a pause for a conflicting transaction, duplicates, expiry, close, no session monitor under the log lock); history kept for open transactions and in-flight commits, up to the key cap; an update whose commit is in flight does not expire; the commit size limit of staged writes. |

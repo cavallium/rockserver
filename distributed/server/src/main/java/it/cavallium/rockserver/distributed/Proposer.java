@@ -205,6 +205,9 @@ final class Proposer implements Closeable {
 		return admission.used();
 	}
 
+	/** Run by a batch just before it encodes its requests, for tests that pause there. */
+	volatile @Nullable Runnable beforeEncodeForTesting;
+
 	/** The byte admission itself, for tests that fill it to make this node refuse writes. */
 	ByteAdmission admissionForTesting() {
 		return admission;
@@ -329,6 +332,8 @@ final class Proposer implements Closeable {
 		 * {@link Lane#endUnanswered}): if it then fails without an answer, its outcome is unknown, never "not applied".
 		 */
 		volatile boolean maybeAppended;
+		/** The future its caller got ({@link CallerCopy}), for tests. */
+		volatile @Nullable CompletableFuture<Object> callerCopy;
 		/** Completed only by the proposer; callers get a copy, so that cancelling theirs cannot complete this one. */
 		final CompletableFuture<Object> result = new CompletableFuture<>();
 		/** QUEUED until it is taken into a batch (SENT), or until its caller gives up on it first (ABANDONED). */
@@ -384,14 +389,40 @@ final class Proposer implements Closeable {
 			encoding = true;
 		}
 
+		/** Run once the encoding ends ({@link #whenEncoded}); guarded by this. */
+		private @Nullable List<Runnable> afterEncoding;
+
 		/** Its batch read its entry (or will not): a caller waiting in {@link #awaitEncoded} goes on. */
 		void encodingEnded() {
 			if (encoding) {
+				List<Runnable> waiting;
 				synchronized (this) {
 					encoding = false;
 					notifyAll();
+					waiting = afterEncoding;
+					afterEncoding = null;
+				}
+				if (waiting != null) {
+					waiting.forEach(Runnable::run);
 				}
 			}
+		}
+
+		/**
+		 * Runs {@code action} once no batch reads its entry: now if none does, otherwise on the thread that ends the
+		 * encoding (the action should only hand work off). The non-blocking form of {@link #awaitEncoded}.
+		 */
+		void whenEncoded(Runnable action) {
+			synchronized (this) {
+				if (encoding) {
+					if (afterEncoding == null) {
+						afterEncoding = new ArrayList<>(1);
+					}
+					afterEncoding.add(action);
+					return;
+				}
+			}
+			action.run();
 		}
 
 		/** True while a batch may read its entry, for tests. */
@@ -544,6 +575,11 @@ final class Proposer implements Closeable {
 			// An abandoned request is still in its queue: its overhead is given back when it leaves it (see take()).
 			admission.release(pending.isAbandoned() ? weight - REQUEST_OVERHEAD_BYTES : weight);
 		});
+		// The answer comes on the control plane: the caller's continuations run on a virtual thread instead. Made
+		// before the request is queued: the thread that queues it may also send its batch.
+		var copy = new CallerCopy(pending);
+		pending.callerCopy = copy;
+		pending.result.whenCompleteAsync(copy::answer, CALLERS);
 		lane.enqueue(pending);
 		if (closed) {
 			// close() may have swept the queues before this request was added. If a batch took it meanwhile, close()
@@ -554,19 +590,69 @@ final class Proposer implements Closeable {
 			// It waits for a batch slot: fail it at its deadline even if no slot frees up by then.
 			expireWhenQueued(pending);
 		}
-		// The answer comes on the control plane: the caller's continuations run on a virtual thread instead.
-		var copy = pending.result.whenCompleteAsync((_, _) -> {}, CALLERS);
-		copy.whenComplete((_, _) -> {
-			if (copy.isCancelled()) {
-				pending.abandon(new CancellationException("The caller cancelled the write before it was sent"));
+		return copy;
+	}
+
+	/**
+	 * The future a caller of {@link #submit} gets: completed with its request's answer, on a virtual thread, and
+	 * never completing the request itself. A caller that gives up on it before the answer, while a batch is reading
+	 * the request's buffers ({@link Pending#encoding}), is answered only once the batch has read them, so that it can
+	 * reuse them at once: {@link #cancel} waits for that (at most {@link #MAX_ENCODE_WAIT_NANOS}) before it returns;
+	 * {@link #completeExceptionally} (which {@code orTimeout} uses, on the JDK's one delayer thread) does not wait but
+	 * completes the future later, once the encoding ended. Both take a request that was not sent yet out of its queue. Only the dependents of this future see that order:
+	 * {@code complete}, {@code obtrude*} and {@code completeOnTimeout} with a value are not covered.
+	 */
+	private final class CallerCopy extends CompletableFuture<Object> {
+
+		private final Pending pending;
+
+		CallerCopy(Pending pending) {
+			this.pending = pending;
+		}
+
+		/** The request's answer. */
+		void answer(@Nullable Object value, @Nullable Throwable error) {
+			if (error != null) {
+				super.completeExceptionally(error);
+			} else {
+				super.complete(value);
+			}
+		}
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			if (isDone()) {
+				return false;
 			}
 			if (!pending.result.isDone()) {
-				// The caller gave up on it (cancelled, or timed out its copy) before its answer: if a batch is reading its
-				// buffers right now, the caller is answered only once that is done, so that it can reuse them at once.
+				// Never sent: it never will be. Taken into a batch: answered once the batch no longer reads its buffers.
+				pending.abandon(new CancellationException("The caller cancelled the write before it was sent"));
 				pending.awaitEncoded(MAX_ENCODE_WAIT_NANOS);
 			}
-		});
-		return copy;
+			return super.cancel(mayInterruptIfRunning);
+		}
+
+		@Override
+		public boolean completeExceptionally(Throwable ex) {
+			if (isDone()) {
+				return false;
+			}
+			if (!pending.result.isDone()) {
+				// Never sent: it never will be (its caller was told it failed, and may write it again).
+				pending.abandon(ex);
+			}
+			if (!pending.result.isDone() && pending.isEncoding()) {
+				Runnable fail = () -> CALLERS.execute(() -> CallerCopy.super.completeExceptionally(ex));
+				pending.whenEncoded(fail);
+				try {
+					control.schedule(fail, MAX_ENCODE_WAIT_NANOS, TimeUnit.NANOSECONDS);
+				} catch (RejectedExecutionException stopping) {
+					// close() answers every request, and ends every encoding.
+				}
+				return true;
+			}
+			return super.completeExceptionally(ex);
+		}
 	}
 
 	private void expireWhenQueued(Pending pending) {
@@ -800,6 +886,10 @@ final class Proposer implements Closeable {
 			// Each entry is encoded once, straight into the batch, which also returns the batch's requests as decoding
 			// it in place would read them. If this node leads, its state machine takes them instead of decoding the
 			// batch (see submitLocal).
+			var beforeEncode = beforeEncodeForTesting;
+			if (beforeEncode != null) {
+				beforeEncode.run();
+			}
 			LogEntryCodec.EncodedBatch encoded;
 			try {
 				encoded = LogEntryCodec.encodeBatch(proposerId, completedBelow(), sequences, clients, entries,

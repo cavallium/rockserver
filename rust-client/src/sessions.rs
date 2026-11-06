@@ -291,6 +291,17 @@ impl SessionWrites {
         }
     }
 
+    /// Writes sharing session `id`, already open (tests that send without a server).
+    #[cfg(test)]
+    pub(crate) fn with_open_session(numbered_batches: bool, id: i64) -> Self {
+        let writes = Self::new(numbered_batches);
+        *writes.session.try_lock().unwrap() = Some(Arc::new(Session {
+            id,
+            numbers: Mutex::new(Numbers::default()),
+        }));
+        writes
+    }
+
     #[cfg(test)]
     fn forgotten_updates(&self) -> u64 {
         self.updates.lock().unwrap().forgotten
@@ -428,6 +439,58 @@ impl SessionWrites {
             }
         }
     }
+}
+
+/// Bytes a numbered streamed multi write is read whole up to (`put_multi`, `delete_multi`, `merge_multi` and their
+/// variants with results), counted as [`multi_kv_bytes`] / [`multi_keys_bytes`] do. A larger stream is sent
+/// unnumbered, streamed as before numbering, so that its size has no limit and the client does not hold it: such a
+/// write is sent once, and a lost call leaves its outcome unknown. The server's own limit for a numbered multi write
+/// (16 MiB, `GrpcServerImpl.NUMBERED_MULTI_MAX_BYTES`, counted the same way) is four times this.
+pub const NUMBERED_MULTI_MAX_BYTES: u64 = CHUNK_BYTES;
+/// Heap cost the server counts per item of a numbered multi write besides its bytes
+/// (`GrpcServerImpl.NUMBERED_MULTI_ITEM_HEAP_BYTES`).
+pub const MULTI_ITEM_HEAP_BYTES: u64 = 96;
+
+/// Counted bytes of one item of a numbered `put_multi` / `merge_multi`, as the server counts them.
+pub fn multi_kv_bytes(item: &crate::proto::Kv) -> u64 {
+    item_size(item) + MULTI_ITEM_HEAP_BYTES
+}
+
+/// Counted bytes of one key of a numbered `delete_multi`, as the server counts them.
+pub fn multi_keys_bytes(keys: &Vec<Vec<u8>>) -> u64 {
+    keys.iter()
+        .map(|key| key.len() as u64 + ITEM_OVERHEAD_BYTES)
+        .sum::<u64>()
+        .max(ITEM_OVERHEAD_BYTES)
+        + MULTI_ITEM_HEAP_BYTES
+}
+
+/// A streamed multi write's items, read for numbering.
+pub(crate) enum MultiItems<T> {
+    /// The whole stream, within [`NUMBERED_MULTI_MAX_BYTES`]: sent as one numbered write.
+    Whole(Vec<T>),
+    /// Larger: the items read so far followed by the rest of the stream, to send unnumbered.
+    Streamed(futures::stream::BoxStream<'static, T>),
+}
+
+/// Reads `items` up to `limit` counted bytes: all of them, or the stream again once it is larger.
+pub(crate) async fn read_multi_items<T: Send + 'static>(
+    items: impl futures::Stream<Item = T> + Send + 'static,
+    size: fn(&T) -> u64,
+    limit: u64,
+) -> MultiItems<T> {
+    use futures::StreamExt;
+    let mut items = items.boxed();
+    let mut read = Vec::new();
+    let mut bytes = 0u64;
+    while let Some(item) = items.next().await {
+        bytes = bytes.saturating_add(size(&item));
+        read.push(item);
+        if bytes > limit {
+            return MultiItems::Streamed(futures::stream::iter(read).chain(items).boxed());
+        }
+    }
+    MultiItems::Whole(read)
 }
 
 fn item_size(item: &crate::proto::Kv) -> u64 {
@@ -823,4 +886,33 @@ mod tests {
             assert_eq!(split_batch(chunk.clone()), vec![chunk]);
         }
     }
+
+    #[tokio::test]
+    async fn a_multi_write_over_the_limit_is_streamed_again_whole_and_in_order() {
+        use futures::StreamExt;
+        let kv = |k: u8| Kv { keys: vec![vec![k; 8]], value: vec![k] };
+        // 8-byte key + 1-byte value + 2 x 16 + 96 = 137 counted bytes per item.
+        assert_eq!(multi_kv_bytes(&kv(0)), 137);
+        assert_eq!(multi_keys_bytes(&vec![vec![0u8; 8]]), 8 + 16 + 96);
+        assert_eq!(multi_keys_bytes(&vec![]), 16 + 96);
+        match read_multi_items(futures::stream::iter((0..3).map(kv)), multi_kv_bytes, 3 * 137).await {
+            MultiItems::Whole(items) => assert_eq!(items.len(), 3),
+            MultiItems::Streamed(_) => panic!("within the limit"),
+        }
+        let read = Arc::new(AtomicUsize::new(0));
+        let counter = read.clone();
+        let items = futures::stream::iter(0..10u8).map(move |k| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            kv(k)
+        });
+        match read_multi_items(items, multi_kv_bytes, 3 * 137).await {
+            MultiItems::Whole(_) => panic!("over the limit"),
+            MultiItems::Streamed(rest) => {
+                assert_eq!(read.load(Ordering::SeqCst), 4, "stops reading past the limit");
+                let keys: Vec<u8> = rest.map(|item| item.keys[0][0]).collect().await;
+                assert_eq!(keys, (0..10).collect::<Vec<u8>>());
+            }
+        }
+    }
+
 }

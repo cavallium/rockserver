@@ -970,10 +970,51 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		return mapped;
 	}
 
-	/** Most items of a numbered multi write outside LATENCY ({@link #collectsWhole}). */
-	static final int NUMBERED_MULTI_MAX_ITEMS = 1 << 20;
-	/** Most encoded key and value bytes of a numbered multi write outside LATENCY: one replicated entry's worth. */
+	/**
+	 * Heap cost counted per collected item of a numbered multi write besides its bytes: the proto message, its key
+	 * list, and the {@code ByteString} and backing array of the value. Each key segment and the value also count
+	 * {@link KVBatchChunks#ITEM_OVERHEAD_BYTES}, as the log entry encoding does.
+	 */
+	static final long NUMBERED_MULTI_ITEM_HEAP_BYTES = 96;
+	/**
+	 * Most counted bytes of a numbered multi write outside LATENCY ({@link #collectsWhole}): keys, values and the
+	 * per-item costs above. About one replicated entry, the unit such a write is applied as.
+	 */
 	static final long NUMBERED_MULTI_MAX_BYTES = 16L * 1024 * 1024;
+	/** Most items: what {@link #NUMBERED_MULTI_MAX_BYTES} holds of the smallest item (one empty key segment). */
+	static final int NUMBERED_MULTI_MAX_ITEMS = (int) (NUMBERED_MULTI_MAX_BYTES
+			/ (NUMBERED_MULTI_ITEM_HEAP_BYTES + KVBatchChunks.ITEM_OVERHEAD_BYTES));
+	/** System property: counted bytes all numbered multi writes being collected on this server hold at once. */
+	static final String NUMBERED_MULTI_COLLECT_BYTES_PROPERTY = "rockserver.grpc.numbered-multi-collect-bytes";
+	private static final long DEFAULT_NUMBERED_MULTI_COLLECT_BYTES = 4 * NUMBERED_MULTI_MAX_BYTES;
+
+	/**
+	 * Counted bytes the numbered multi writes being collected hold now, against {@link #numberedCollectLimit}. They
+	 * are held on the heap before the write reaches the node's write admission, so they need a budget of their own.
+	 */
+	private final java.util.concurrent.atomic.AtomicLong numberedCollectBytes = new java.util.concurrent.atomic.AtomicLong();
+	private final long numberedCollectLimit = numberedCollectLimit();
+
+	private static long numberedCollectLimit() {
+		var value = System.getProperty(NUMBERED_MULTI_COLLECT_BYTES_PROPERTY);
+		if (value != null && !value.isBlank()) {
+			try {
+				long parsed = Long.parseLong(value.trim());
+				if (parsed > 0) {
+					return parsed;
+				}
+			} catch (NumberFormatException ignored) {
+				// default below
+			}
+			LOG.warn("Invalid byte count for system property {}: {}", NUMBERED_MULTI_COLLECT_BYTES_PROPERTY, value);
+		}
+		return DEFAULT_NUMBERED_MULTI_COLLECT_BYTES;
+	}
+
+	/** Counted bytes the numbered multi writes being collected hold now (tests). */
+	long numberedCollectBytesForTesting() {
+		return numberedCollectBytes.get();
+	}
 
 	/**
 	 * True if a streamed multi write is collected whole and applied as one multi call: under LATENCY (its fan-out
@@ -985,16 +1026,66 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		return context.profile() == WorkloadProfile.LATENCY || context.value().requestId() != null;
 	}
 
+	/**
+	 * The items of a streamed multi write, collected whole ({@link #collectsWhole}). Outside LATENCY each item takes its
+	 * counted bytes ({@link #numberedItemBytes}) from the server's collect budget as it arrives, and gives them back when
+	 * the collection ends; past {@link #NUMBERED_MULTI_MAX_BYTES} the write is refused as invalid, and when the budget is
+	 * full as {@code SERVER_OVERLOADED} flagged not applied, so that its caller knows it can send it again.
+	 */
 	private <T> Mono<List<T>> collectMulti(ResolvedRequestContext context, Flux<T> dataFlux,
 			ToLongFunction<T> encodedInputBytes, String requestName) {
 		if (context.profile() == WorkloadProfile.LATENCY) {
 			return collectLatencyMulti(dataFlux, encodedInputBytes, requestName);
 		}
-		return dataFlux.collect(
-				() -> new LatencyMultiBuffer<T>(NUMBERED_MULTI_MAX_ITEMS, NUMBERED_MULTI_MAX_BYTES,
-						"numbered " + requestName),
-				(buffer, value) -> buffer.add(value, encodedInputBytes.applyAsLong(value)))
-				.map(LatencyMultiBuffer::values);
+		return Mono.defer(() -> {
+			var buffer = new LatencyMultiBuffer<T>(NUMBERED_MULTI_MAX_ITEMS, NUMBERED_MULTI_MAX_BYTES,
+					"numbered " + requestName);
+			// held[0]: bytes taken from the budget; held[1] != 0 once given back (a cancel may race a late item).
+			var held = new long[2];
+			return dataFlux
+					.doOnNext(value -> {
+						long bytes = numberedItemBytes(value, encodedInputBytes.applyAsLong(value));
+						buffer.add(value, bytes);
+						synchronized (held) {
+							if (held[1] != 0 || !takeCollectBytes(bytes)) {
+								throw RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
+										"numbered " + requestName + ": the server is collecting too many multi writes ("
+												+ numberedCollectLimit + " bytes), retry later");
+							}
+							held[0] += bytes;
+						}
+					})
+					.then(Mono.fromSupplier(buffer::values))
+					.doFinally(signal -> {
+						synchronized (held) {
+							numberedCollectBytes.addAndGet(-held[0]);
+							held[0] = 0;
+							held[1] = 1;
+						}
+					});
+		});
+	}
+
+	private boolean takeCollectBytes(long bytes) {
+		while (true) {
+			long current = numberedCollectBytes.get();
+			if (current + bytes > numberedCollectLimit) {
+				return false;
+			}
+			if (numberedCollectBytes.compareAndSet(current, current + bytes)) {
+				return true;
+			}
+		}
+	}
+
+	/** Counted bytes of one item of a numbered multi write: its encoded bytes plus the per-item costs. */
+	static long numberedItemBytes(Object value, long encodedBytes) {
+		int segments = switch (value) {
+			case KV kv -> kv.getKeysCount() + 1;
+			case DeleteRequest delete -> delete.getKeysCount();
+			default -> 1;
+		};
+		return encodedBytes + NUMBERED_MULTI_ITEM_HEAP_BYTES + (long) Math.max(1, segments) * KVBatchChunks.ITEM_OVERHEAD_BYTES;
 	}
 
 	private <T> Mono<List<T>> collectLatencyMulti(Flux<T> dataFlux,
@@ -1057,7 +1148,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		}
 
 		private List<T> values() {
-			return List.copyOf(values);
+			return java.util.Collections.unmodifiableList(values);
 		}
 	}
 

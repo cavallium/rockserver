@@ -52,7 +52,7 @@ class RustClientLiveTest {
 		var self = follower.config().self();
 		var log = temp.resolve("cargo.log");
 		var process = new ProcessBuilder(List.of("cargo", "test", "--offline", "--test", "live_server", "--",
-				"--nocapture"))
+				"--include-ignored", "--nocapture"))
 				.directory(Path.of(System.getProperty(RUST_CLIENT_DIR)).toFile())
 				.redirectErrorStream(true)
 				.redirectOutput(log.toFile());
@@ -73,6 +73,7 @@ class RustClientLiveTest {
 			assertEquals("p13", value(node, column, 13), "on " + node.config().nodeId());
 			assertEquals("u", value(node, column, 30), "on " + node.config().nodeId());
 			assertEquals("t", value(node, column, 40), "on " + node.config().nodeId());
+			assertEquals("once", value(node, column, 70), "a resent copy merged once, on " + node.config().nodeId());
 		}
 	}
 

@@ -162,6 +162,59 @@ class NumberedWritesTest {
 	}
 
 	/**
+	 * A numbered streamed multi write of a BATCH caller is held on the heap while the server collects it, before the
+	 * node's write admission sees it: it takes its counted bytes (keys, values and per-item costs) from the server's
+	 * collect budget. A write that does not fit is refused as SERVER_OVERLOADED flagged not applied, and applies
+	 * nothing; the bytes go back when a collection ends, so later writes that fit one at a time all succeed.
+	 */
+	@Test
+	void numberedStreamedMultiWritesTakeTheServersCollectBudget() throws Exception {
+		System.setProperty("rockserver.grpc.numbered-multi-collect-bytes", Long.toString(64 * 1024));
+		try {
+			cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		} finally {
+			System.clearProperty("rockserver.grpc.numbered-multi-collect-bytes");
+		}
+		cluster.awaitLeader(TIMEOUT);
+		var addresses = cluster.runningNodes().stream().map(NumberedWritesTest::apiAddress).toList();
+		try (var client = GrpcConnection.forHostsAndPorts("collect-budget", addresses)) {
+			assertTrue(client.getCapabilities().clientSessions());
+			long column = client.getAsyncApi(RequestContext.batch(TIMEOUT)).createColumnAsync("m", SCHEMA)
+					.get(30, TimeUnit.SECONDS);
+			// 1000 items of an 8-byte key and a 1-byte value count about 130 KiB: over the 64 KiB budget.
+			var tooLarge = new ArrayList<Keys>();
+			var tooLargeValues = new ArrayList<Buf>();
+			for (int i = 0; i < 1000; i++) {
+				tooLarge.add(key(i));
+				tooLargeValues.add(text("x"));
+			}
+			var refused = assertThrows(Exception.class, () -> client.getAsyncApi(RequestContext.batch(Duration.ofSeconds(3)))
+					.mergeMultiAsync(0, column, tooLarge, tooLargeValues, RequestType.none())
+					.get(30, TimeUnit.SECONDS));
+			var cause = refused instanceof java.util.concurrent.ExecutionException ? refused.getCause() : refused;
+			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(cause).getErrorUniqueId(), String.valueOf(cause));
+			// 20 writes of 100 items (about 13 KiB each, 260 KiB in all): fit only if each one's bytes went back.
+			var api = client.getAsyncApi(RequestContext.batch(TIMEOUT));
+			for (int round = 0; round < 20; round++) {
+				var keys = new ArrayList<Keys>();
+				var values = new ArrayList<Buf>();
+				for (int i = 0; i < 100; i++) {
+					keys.add(key(10_000 + round * 100L + i));
+					values.add(text("v"));
+				}
+				api.mergeMultiAsync(0, column, keys, values, RequestType.none()).get(30, TimeUnit.SECONDS);
+			}
+			cluster.awaitConverged(TIMEOUT);
+			for (var node : cluster.runningNodes()) {
+				assertNull(localValue(node, column, 0), "refused write applied nothing, on " + node.config().nodeId());
+				assertNull(localValue(node, column, 999), "on " + node.config().nodeId());
+				assertEquals("v", localValue(node, column, 10_000), "on " + node.config().nodeId());
+				assertEquals("v", localValue(node, column, 11_999), "on " + node.config().nodeId());
+			}
+		}
+	}
+
+	/**
 	 * R2-SC-3: numbered column creation and merge operator upload. A copy answers from the record with the first
 	 * result: a copy of a creation sent after the column was deleted does not create it again, and a copy of an upload
 	 * sent after another version was uploaded does not add a version.

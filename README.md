@@ -195,7 +195,12 @@ writes are numbered and resent with the same pauses, until the context's deadlin
 (`with_session_retry_window`) with a context without one. Its own failures use the server's message format
 (`RocksDBError: [uid:OUTCOME_UNKNOWN] ...`); `sessions::is_outcome_unknown`, `sessions::is_not_applied` and
 `sessions::rocksdb_error_type` read any failure. Dropping a write's future stops its resends. A numbered streamed multi
-write reads its input stream whole before sending it (and its results whole before returning them).
+write reads its input stream whole before sending it (and its results whole before returning them), up to
+`sessions::NUMBERED_MULTI_MAX_BYTES` (4 MiB, counting 16 bytes per key segment and value and 96 per item): a larger
+stream is sent unnumbered and streamed, as before, once and without resends. Each chunk of a `put_batch` or
+`merge_batch` without a deadline gets its own 30 s window. On the server, numbered streamed multi writes being
+collected share a heap budget (`-Drockserver.grpc.numbered-multi-collect-bytes`, 64 MiB by default); one that does
+not fit is refused as `SERVER_OVERLOADED` with the not-applied flag: safe to send again.
 `client_sessions()` tells whether a view numbers; `without_client_sessions()` gives one that sends every write once.
 
 A replicated node without a leader for that long serves again by itself: once it has known a leader for one maximum

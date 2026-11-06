@@ -1,5 +1,6 @@
-//! Against a running server, named by `ROCKSERVER_TEST_ADDR` (for example `http://127.0.0.1:5333`); skipped when it
-//! is unset. The Java test `RustClientLiveTest` (distributed module) starts a three-node in-process cluster and runs
+//! Against a running server, named by `ROCKSERVER_TEST_ADDR` (for example `http://127.0.0.1:5333`). Ignored by a plain
+//! `cargo test`, so that it shows as ignored rather than passing; run it with `-- --include-ignored`, which fails when
+//! the variable is unset. The Java test `RustClientLiveTest` (distributed module) starts a three-node in-process cluster and runs
 //! this test against a follower, so that numbered writes also cross a forward. The server must load
 //! `it.cavallium.rockserver.core.impl.MyStringAppendOperator` (the cluster's merge configuration), which joins merged
 //! values with commas.
@@ -40,11 +41,10 @@ fn text(value: &Option<Vec<u8>>) -> Option<String> {
 }
 
 #[tokio::test]
+#[ignore = "needs a server at ROCKSERVER_TEST_ADDR (RustClientLiveTest runs it)"]
 async fn numbered_writes_against_a_live_server() {
-    let Ok(address) = std::env::var("ROCKSERVER_TEST_ADDR") else {
-        eprintln!("ROCKSERVER_TEST_ADDR is not set: skipped");
-        return;
-    };
+    let address = std::env::var("ROCKSERVER_TEST_ADDR")
+        .expect("ROCKSERVER_TEST_ADDR names the server to test against");
     let client = RockserverClient::connect(address, RequestContext::batch_with_timeout(Duration::from_secs(30)))
         .await
         .expect("connect");
@@ -196,6 +196,33 @@ async fn numbered_writes_against_a_live_server() {
     // A range deletion.
     client.delete_range(column, key(50), key(55)).await.unwrap();
     assert_eq!(client.get(0, column, key(50)).await.unwrap(), None);
+
+    // A resend: two copies of one numbered merge (same session and sequence), as after an unknown outcome. The
+    // second is answered from the server's record: merged once.
+    let session = client.open_client_session().await.unwrap();
+    let copy = client.with_context(
+        RequestContext::batch_with_timeout(Duration::from_secs(30)).with_request_id(session, 0, 0),
+    );
+    copy.merge(0, column, key(70), b"once".to_vec()).await.unwrap();
+    copy.merge(0, column, key(70), b"once".to_vec()).await.unwrap();
+    assert_eq!(text(&client.get(0, column, key(70)).await.unwrap()).as_deref(), Some("once"));
+
+    // A multi write over NUMBERED_MULTI_MAX_BYTES is streamed unnumbered, as before numbering: every item applied.
+    let large = 1024 * 1024;
+    client
+        .put_multi(
+            0,
+            column,
+            futures::stream::iter((80..86u64).map(move |k| Kv {
+                keys: key(k),
+                value: vec![b'L'; large],
+            })),
+        )
+        .await
+        .unwrap();
+    for k in 80..86u64 {
+        assert_eq!(client.get(0, column, key(k)).await.unwrap().map(|v| v.len()), Some(large), "key {k}");
+    }
 
     // Unnumbered writes still work.
     let plain = client.without_client_sessions();

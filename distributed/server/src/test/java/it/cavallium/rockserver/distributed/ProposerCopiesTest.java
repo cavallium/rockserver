@@ -174,6 +174,85 @@ class ProposerCopiesTest {
 		assertTrue(System.nanoTime() - start >= TimeUnit.MILLISECONDS.toNanos(200), "bounded wait");
 	}
 
+	/**
+	 * R2-LC-2 through the proposer: a batch pauses just before it encodes its one write. The caller cancels its future
+	 * meanwhile: cancel() returns only once the encoding is done. Another caller times its future out (orTimeout, on
+	 * the JDK's delayer thread): its continuations run only once the encoding is done, and the delayer thread is not
+	 * held meanwhile (another orTimeout fires on time).
+	 */
+	@Test
+	void aCallerGivingUpWhileItsBatchIsPausedBeforeEncodingIsAnsweredAfterIt() throws Exception {
+		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
+		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(Duration.ofSeconds(3));
+		var metrics = new NodeMetrics("n0");
+		var threads = new NodeThreads("n0");
+		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
+				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
+		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics, threads.control());
+		try {
+			for (boolean cancel : new boolean[] {true, false}) {
+				var entered = new CountDownLatch(1);
+				var release = new CountDownLatch(1);
+				proposer.beforeEncodeForTesting = () -> {
+					entered.countDown();
+					try {
+						release.await(10, TimeUnit.SECONDS);
+					} catch (InterruptedException ex) {
+						Thread.currentThread().interrupt();
+					}
+				};
+				// The submitting thread may send the batch itself: submit from another one.
+				var submitted = new CompletableFuture<CompletableFuture<Object>>();
+				var entry = new LogEntry.Put(1, key(cancel ? 1 : 2), text("v"), RequestTypeId.NOTHING);
+				Thread.ofVirtual().start(() -> submitted.complete(proposer.propose(entry)));
+				assertTrue(entered.await(10, TimeUnit.SECONDS), "the batch took the write");
+				var pending = livePending(proposer);
+				var write = java.util.Objects.requireNonNull(pending.callerCopy);
+				proposer.beforeEncodeForTesting = null;
+				assertTrue(pending.isEncoding());
+				var encodingAtAnswer = new CompletableFuture<Boolean>();
+				Thread giver;
+				if (cancel) {
+					giver = Thread.ofVirtual().start(() -> {
+						write.cancel(true);
+						encodingAtAnswer.complete(pending.isEncoding());
+					});
+				} else {
+					write.orTimeout(50, TimeUnit.MILLISECONDS)
+							.whenComplete((_, _) -> encodingAtAnswer.complete(pending.isEncoding()));
+					giver = null;
+					var other = new CompletableFuture<Void>().orTimeout(50, TimeUnit.MILLISECONDS);
+					var otherError = assertThrows(ExecutionException.class, () -> other.get(2, TimeUnit.SECONDS),
+							"the delayer thread is free");
+					assertInstanceOf(java.util.concurrent.TimeoutException.class, otherError.getCause());
+				}
+				Thread.sleep(300);
+				assertFalse(encodingAtAnswer.isDone(), "not answered while the batch has not read the buffers");
+				release.countDown();
+				assertFalse(encodingAtAnswer.get(5, TimeUnit.SECONDS), "answered once the encoding ended");
+				if (giver != null) {
+					assertTrue(giver.join(Duration.ofSeconds(5)));
+				}
+				assertTrue(write.isDone());
+				assertTrue(submitted.get(5, TimeUnit.SECONDS) == write, "the caller's future");
+				// Let the write end (unreachable peer) before the next round, so that one request is live at a time.
+				try {
+					pending.result.get(15, TimeUnit.SECONDS);
+				} catch (ExecutionException expected) {
+					// no leader
+				}
+				long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+				while (proposer.admittedBytes() > 0 && System.nanoTime() < until) {
+					Thread.sleep(10);
+				}
+			}
+		} finally {
+			proposer.close();
+			threads.close();
+			metrics.close();
+		}
+	}
+
 	private static Keys key(long value) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(value).array()));
 	}
