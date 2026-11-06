@@ -2159,7 +2159,9 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
    registrations retry an unknown outcome, the update cleanup closes once, in-flight limits for a cluster; below
    and in item 3), and the round-6 commits `9b69ebb15` and `6358380bc` (an embedded test that the update
    cleanup leaves no transaction open and closes each update once, the in-flight limit warning from one tested helper,
-   also in the settings comments). Left on the Yotsuba side:
+   also in the settings comments), the round-7 commits `b0f42c8bd` and `414f3109f` (that test checks double closes
+   per update id and drives the cancel and overload close paths), and the round-8 commit `b8b713488` (a body's own
+   error after an unconfirmed chained read runs the update again, below). Left on the Yotsuba side:
    - Merge the branch, build it against a released `rockserver-core` of this version (the branch was compiled and
      tested against local builds of it; Yotsuba's pom still pins 2.0.3), and deploy it.
    - Set `database.rockserver.nodes` in the deployed settings once the cluster exists.
@@ -2178,8 +2180,8 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      (`UpdateProtocol.closeFailedUpdate` rolls back a native id and answers at once, whether or not it still holds
      it), but not for a chained one. With `--pipelined-updates`, `UpdateProtocol.closeChained` answers `UPDATE_RETRY`
      whenever it cannot confirm the chained read (see "Chained close"), and `RockserverUpdateTransactions` turns
-     that into a `NoChangeCloseRetryException` that `closeFailedUpdateQuietly` logs ("Failed to close RocksDB update
-     transaction", at most once a minute) and drops. The cleanup close of a chained update therefore warns:
+     that into a `NoChangeCloseRetryException`. The cleanup close of a chained update therefore answers
+     `UPDATE_RETRY`:
      - when the leader no longer holds the update: the commit of any chained ending write removes it, whatever its
        error (`UpdateProtocol.stagedWrite`: `UPDATE_RETRY` from a chain conflict or a failed guard, a deadline or
        `OUTCOME_UNKNOWN`, `NOT_LEADER`, a cancel), and so does the refusal of an ending write whose base commit
@@ -2189,19 +2191,33 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
        the close's wait: a body that throws its own error, or is cancelled, after reading a chained value whose
        predecessor failed.
 
-     So under `--pipelined-updates` the warning follows leader changes, timeouts and body failures as well as refused
-     chained writes: it counts failed chained updates, and a pipelined cluster under contention makes some on purpose.
-     Nothing is written or left open in any of these cases, since a chained update has no native transaction and the
-     leader removes it before it answers. In the first case the caller already has the ending write's own error, and
-     runs the update again on an `UPDATE_RETRY`, as it would anyway. In the second the caller gets the body's error,
-     while the close's `UPDATE_RETRY`, which says the read was not real, is only logged: a body that fails because of
-     what it read has acted on a provisional value, which "Behavior differences from a single node" forbids, and the
-     warning is the only trace of it. Answering these closes quietly would be wrong (a clean close of an unconfirmed
-     chained read would confirm it), and the cleanup cannot skip them without knowing that the update already ended,
-     so the warning stays. Left on the Yotsuba side: the javadoc of `RockserverUpdateTransactions.updateAlreadyEnded`
-     still says the cluster answers a close of a dropped update quietly, which holds only without
-     `--pipelined-updates`; that repository is outside this branch's work. Not checked against a running replicated
-     server.
+     The client cannot tell the two cases apart from the answer. Before round 8 the cleanup logged every such
+     answer ("Failed to close RocksDB update transaction", at most once a minute) and dropped it, so in the second
+     case the caller got the body's own error while the close said the read was not real: a body that fails because
+     of what it read (a validation error on a value that was never written) has acted on a provisional value, which
+     "Behavior differences from a single node" forbids. Done on the branch (round 8, `b8b713488`): the
+     cleanup after a body failure (`closeAfterBodyFailure`) looks at what failed. If the body failed with its own
+     error, with no Rockserver error, timeout, cancel, gRPC status, rejected or circuit-broken call in its causes
+     (`isBodyOwnFailure`), and the close answers `UPDATE_RETRY`, the update fails with an
+     `UnconfirmedReadRetryException` instead: an `UPDATE_RETRY` with the body's error suppressed in it, which the
+     callers' optimistic retries (`optimisticUpdateRetry`, the messages' own) run again from a new read. If the new
+     read is real and the body fails again, its close succeeds and the caller gets the body's error; if the
+     retries run out, the retry exhausted error carries it. Any other failure keeps the old behaviour (the close's
+     answer is logged, the caller gets the body's failure). That covers the first case: there the body's failure is
+     the ending write's own Rockserver error, and an unknown outcome or a deadline must never become a rerun, since
+     the write may have applied. The rule relies on one contract of Yotsuba's bodies: the call with the update id
+     (one put or delete, or the no-change close) is their last step that can fail, so a body's own error always
+     comes before its ending write and the update wrote nothing. A cancel, by the caller or a caller's timeout,
+     goes to the cancel close, which only closes and never reruns. Rockserver needs no change for this: the close
+     already answers `UPDATE_RETRY` whenever the read is not confirmed, and answering these closes quietly would be
+     wrong (a clean close of an unconfirmed chained read would confirm it). Nothing is written or left open in any
+     of these cases, since a chained update has no native transaction and the leader removes it before it answers.
+     Under `--pipelined-updates` the remaining warning follows leader changes, timeouts and refused chained writes:
+     it counts failed chained updates, and a pipelined cluster under contention makes some on purpose. Tested in
+     Yotsuba with fakes (`RockserverUpdateTransactionsTest`) and against an embedded single node whose close is made
+     to answer `UPDATE_RETRY` (`RockserverUpdateCleanupEmbeddedTest`), not against a running replicated server. The
+     same commit fixes the javadoc of `RockserverUpdateTransactions.updateAlreadyEnded`, which said the cluster
+     answers a close of a dropped update quietly: it now says so only without `--pipelined-updates`.
 
    On the Rockserver side, the core client's automatic gRPC retry of reads waits for its backoff before it sends a
    read to the next node: 50 ms, then growing, on a connection with several addresses (the next node is another one,
