@@ -195,7 +195,8 @@ public final class ReplicatedServerMain {
 			System.err.println("Node " + config.nodeId() + " stopped after a failure: "
 					+ (failure != null ? failure : "replica failed"));
 			// When a signal already started the shutdown, this blocks; the hook then halts with 3 once the node stopped.
-			System.exit(3);
+			// A node that found out, while it waited outside the cluster, that it was removed exits as at start.
+			System.exit(failure instanceof ReplicatedNode.RemovedException ? 4 : 3);
 		}
 	}
 

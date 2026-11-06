@@ -49,6 +49,10 @@ import org.slf4j.LoggerFactory;
  *   <li>"which Rockserver config do you run?", for {@link ClusterCheck}. Request: the UTF-8 digest of the caller's
  *   config ({@link NodeStore#configDigest}), possibly empty. Response: the UTF-8 digest of this node's config. Each side
  *   logs a difference: every node must run the same config. {@code UNIMPLEMENTED} on a node that predates the method.</li>
+ *   <li>"which configuration do you hold?", for {@link RemovalCheck}. Request: the 16-byte group UUID. Response: the
+ *   8-byte big-endian log index of this node's latest configuration, one byte 1 if that index is committed here (else
+ *   0), then the UTF-8 ids of its (new) members, one per line; nothing if this server has no such group or is not
+ *   started yet. {@code UNIMPLEMENTED} on a node that predates the method.</li>
  *   <li>the cluster operations of {@link ReplicaOps} (capabilities, checksums, backups). Request: the 16-byte group
  *   UUID, then an operation byte and its payload. Response: see {@link ReplicaOps#answer}; {@code UNIMPLEMENTED} on a
  *   node that predates the method.</li>
@@ -105,6 +109,13 @@ final class TermService {
 			.build();
 
 	private static final Logger LOG = LoggerFactory.getLogger(TermService.class);
+
+	static final MethodDescriptor<byte[], byte[]> CONFIGURATION = MethodDescriptor.<byte[], byte[]>newBuilder()
+			.setType(MethodDescriptor.MethodType.UNARY)
+			.setFullMethodName(MethodDescriptor.generateFullMethodName(SERVICE_NAME, "Configuration"))
+			.setRequestMarshaller(BytesMarshaller.INSTANCE)
+			.setResponseMarshaller(BytesMarshaller.INSTANCE)
+			.build();
 
 	static final MethodDescriptor<byte[], byte[]> OPS = MethodDescriptor.<byte[], byte[]>newBuilder()
 			.setType(MethodDescriptor.MethodType.UNARY)
@@ -199,7 +210,9 @@ final class TermService {
 				.addMethod(API_ADDRESS, ServerCalls.asyncUnaryCall(addressHandler))
 				.addMethod(NODE_STATE, ServerCalls.asyncUnaryCall(stateHandler))
 				.addMethod(READ_INDEX, ServerCalls.asyncUnaryCall(readIndexHandler))
-				.addMethod(OPS, ServerCalls.asyncUnaryCall((request, response) -> answerOps(ops, request, response)));
+				.addMethod(OPS, ServerCalls.asyncUnaryCall((request, response) -> answerOps(ops, request, response)))
+				.addMethod(CONFIGURATION, ServerCalls.asyncUnaryCall((request, response) ->
+						answerConfiguration(server, request, response)));
 		if (configDigest != null) {
 			ServerCalls.UnaryMethod<byte[], byte[]> digestHandler = (request, response) ->
 					answerConfigDigest(configDigest, request, response);
@@ -298,13 +311,72 @@ final class TermService {
 				(flags & STARTED_OUTSIDE_JOIN) != 0, cluster.length == 0 ? null : new String(cluster, StandardCharsets.UTF_8));
 	}
 
+	/**
+	 * Asks the server behind {@code channel} for its latest configuration of {@code groupId}: null if it has no such
+	 * group, or is not started yet. Fails at once, without waiting for {@code timeout}, if the server cannot be reached.
+	 */
+	static CompletableFuture<RemovalCheck.@Nullable PeerConfiguration> configuration(Channel channel, RaftGroupId groupId,
+			Duration timeout) {
+		return call(channel, CONFIGURATION, encodeGroupId(groupId), timeout, false).thenApply(value -> {
+			if (value.length == 0) {
+				return null;
+			}
+			if (value.length < Long.BYTES + 1) {
+				throw new CompletionException(new IOException("Bad configuration reply size " + value.length));
+			}
+			var buffer = ByteBuffer.wrap(value);
+			long index = buffer.getLong();
+			boolean committed = buffer.get() != 0;
+			var text = new String(value, buffer.position(), buffer.remaining(), StandardCharsets.UTF_8);
+			return new RemovalCheck.PeerConfiguration(index, committed,
+					text.isEmpty() ? java.util.List.of() : java.util.List.of(text.split("\n")));
+		});
+	}
+
+	private static void answerConfiguration(Supplier<RaftServer> server, byte[] request,
+			StreamObserver<byte[]> response) {
+		if (request.length != GROUP_ID_BYTES) {
+			response.onError(Status.INVALID_ARGUMENT
+					.withDescription("Expected a 16-byte group id, got " + request.length + " bytes")
+					.asRuntimeException());
+			return;
+		}
+		var uuid = ByteBuffer.wrap(request);
+		var groupId = RaftGroupId.valueOf(new UUID(uuid.getLong(), uuid.getLong()));
+		byte[] reply;
+		try {
+			var raftServer = server.get();
+			var division = raftServer == null ? null : raftServer.getDivision(groupId);
+			if (division == null) {
+				reply = new byte[0];
+			} else {
+				var conf = division.getRaftConf();
+				boolean committed = conf.getLogEntryIndex() <= division.getRaftLog().getLastCommittedIndex();
+				var members = String.join("\n", conf.getCurrentPeers().stream().map(peer -> peer.getId().toString())
+						.toList()).getBytes(StandardCharsets.UTF_8);
+				reply = ByteBuffer.allocate(Long.BYTES + 1 + members.length).putLong(conf.getLogEntryIndex())
+						.put((byte) (committed ? 1 : 0)).put(members).array();
+			}
+		} catch (IOException | RuntimeException e) {
+			reply = new byte[0];
+		}
+		response.onNext(reply);
+		response.onCompleted();
+	}
+
 	private static CompletableFuture<byte[]> call(Channel channel, MethodDescriptor<byte[], byte[]> method,
 			byte[] request, Duration timeout) {
+		return call(channel, method, request, timeout, true);
+	}
+
+	/** {@code waitForReady}: wait for a connection being (re)established, within the deadline, rather than fail at once. */
+	private static CompletableFuture<byte[]> call(Channel channel, MethodDescriptor<byte[], byte[]> method,
+			byte[] request, Duration timeout, boolean waitForReady) {
 		var result = new CompletableFuture<byte[]>();
-		// Wait for a connection being (re)established, within the deadline, rather than failing at once.
-		var options = CallOptions.DEFAULT
-				.withDeadlineAfter(timeout.toNanos(), TimeUnit.NANOSECONDS)
-				.withWaitForReady();
+		var options = CallOptions.DEFAULT.withDeadlineAfter(timeout.toNanos(), TimeUnit.NANOSECONDS);
+		if (waitForReady) {
+			options = options.withWaitForReady();
+		}
 		ClientCalls.asyncUnaryCall(channel.newCall(method, options), request, new StreamObserver<>() {
 			@Override
 			public void onNext(byte[] value) {
