@@ -44,6 +44,14 @@ final class RaftSettings {
 	 */
 	private static final Duration INSTALL_SNAPSHOT_REQUEST_TIMEOUT = Duration.ofMillis(500);
 
+	/** Nodes whose attempts in flight together fit in {@link #PENDING_BYTES_LIMIT}. */
+	static final int NODES_UNDER_PENDING_LIMIT = 4;
+	/** Ratis' pending-request count limit on the leader: its default. */
+	static final int PENDING_REQUESTS_LIMIT = 4096;
+	/** Ratis' pending-request byte limit on the leader (default 64 MB), see {@link #server}. */
+	static final SizeInBytes PENDING_BYTES_LIMIT =
+			SizeInBytes.valueOf(NODES_UNDER_PENDING_LIMIT * Proposer.ATTEMPT_BYTES_IN_FLIGHT);
+
 	private RaftSettings() {}
 
 	static RaftProperties server(NodeConfig config) {
@@ -76,15 +84,20 @@ final class RaftSettings {
 		// the fsync ran, which it did not cover.
 		RaftServerConfigKeys.Log.setForceSyncNum(properties, 4096);
 		RaftServerConfigKeys.Log.setQueueElementLimit(properties, 65536);
-		// Pending client requests on the leader (defaults 4096 and 64MB): with thousands of writers in flight, a full
-		// queue fails writes with ResourceUnavailable instead of letting them join the next group commit.
-		RaftServerConfigKeys.Write.setElementLimit(properties, 65536);
-		RaftServerConfigKeys.Write.setByteLimit(properties, SizeInBytes.valueOf(64L * MAX_ENTRY_BYTES));
+		// Pending client requests on the leader. Ratis refuses more with a ResourceUnavailableException, which it also
+		// raises after an append, so Proposer takes it as an unknown outcome: these limits must not be reached. Each
+		// node's proposer keeps at most 2 × Proposer.MAX_BATCHES_IN_FLIGHT batches and Proposer.ATTEMPT_BYTES_IN_FLIGHT
+		// bytes of attempts in flight (its own permit, a refusal before the append by its own decision), and its
+		// writers are batched: the element limit stays Ratis' default, and the byte limit covers every node of a
+		// cluster of up to NODES_UNDER_PENDING_LIMIT nodes, at 128 MiB instead of the 1 GiB this used to be. The heap
+		// of writes is bounded on each node by Proposer's byte admission instead.
+		RaftServerConfigKeys.Write.setElementLimit(properties, PENDING_REQUESTS_LIMIT);
+		RaftServerConfigKeys.Write.setByteLimit(properties, PENDING_BYTES_LIMIT);
 		// Every attempt at one proposer batch is the same Ratis invocation (see Proposer), so the retry cache answers a
 		// resend while the first copy is still pending instead of appending it again. Every replica caches every
 		// reply, with no size bound, so keep them only about two attempt timeouts, which covers the usual resend of a
 		// copy still pending: Rockserver deduplicates requests itself (see Request), so a resend the cache misses is
-		// only appended again.
+		// only appended again. Ratis 3.3.1 offers no size bound for this cache, only the expiry.
 		RaftServerConfigKeys.RetryCache.setExpiryTime(properties, TimeDuration.valueOf(
 				Math.max(6_000, 4 * config.electionTimeoutMax().toMillis()), TimeUnit.MILLISECONDS));
 		GrpcConfigKeys.setMessageSizeMax(properties, SizeInBytes.valueOf(MAX_ENTRY_BYTES + (2 << 20)));

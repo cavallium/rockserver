@@ -39,35 +39,17 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	/**
 	 * Transaction commits of a log entry were rejected because one of their keys changed after their snapshot. The
-	 * message lists their positions in the entry, after {@link #POSITIONS}; the entry was not appended.
+	 * message lists their positions in the entry ({@link ConflictPositions}); the entry was not appended. Ratis rebuilds
+	 * it on the proposer from its class name and this constructor.
 	 */
 	public static final class ConflictException extends IOException {
-		static final String POSITIONS = "conflicting positions: ";
 
 		public ConflictException(String message) {
 			super(message);
 		}
 
 		static ConflictException of(IntList positions) {
-			var text = new StringBuilder("Transaction conflict, ").append(POSITIONS);
-			for (int i = 0; i < positions.size(); i++) {
-				text.append(i == 0 ? "" : ",").append(positions.getInt(i));
-			}
-			return new ConflictException(text.toString());
-		}
-
-		/** The positions listed in {@code message}, or null if it lists none. */
-		static int @Nullable [] positions(@Nullable String message) {
-			int at = message == null ? -1 : message.indexOf(POSITIONS);
-			if (at < 0) {
-				return null;
-			}
-			try {
-				return java.util.Arrays.stream(message.substring(at + POSITIONS.length()).strip().split(","))
-						.mapToInt(Integer::parseInt).toArray();
-			} catch (NumberFormatException ex) {
-				return null;
-			}
+			return new ConflictException(ConflictPositions.format(positions));
 		}
 	}
 

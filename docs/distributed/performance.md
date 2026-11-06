@@ -118,6 +118,20 @@ with 11–18 s write latency. In order of discovery:
     pin a virtual thread's carrier) off the carriers, gave mixed results in back-to-back pairs: better tails
     with the leader on an NVMe disk, but with the leader on the SATA disk its local commands stalled for 2–3.6 s
     at times (against at most 0.9 s on virtual threads), once slow reads blocked all its threads.
+    What starved carriers could hold up besides data reads was the Raft control plane: the proposer's replies
+    and resends and the read barrier's rounds ran on virtual threads too. They now run on a few platform threads
+    of their own (see "Threads" in [design.md](design.md)), so slow reads can at worst slow other data reads, not
+    leadership confirmation or write replies. The local commands stay on virtual threads, one executor per node
+    instead of one shared by every node of a JVM: a bounded platform pool is the configuration that stalled, and
+    the control plane no longer depends on the carriers. **Not measured yet** (the control-plane move costs one
+    hand-off per write reply, a few microseconds). To check it, and whether more carriers help, run back to
+    back, more than once, on a quiet machine, with the leader on the SATA disk and then on an NVMe disk:
+    `load-bench.sh --target replicated --root <dir> --node-dirs <three disks> --scales 1,2,4 --step-seconds 30`
+    on the commit before this change and on this one, then on this one with `--jvm "-Xms4g -Xmx4g -XX:+UseZGC
+    -XX:+AlwaysPreTouch -XX:+ExitOnOutOfMemoryError -Djdk.virtualThreadScheduler.parallelism=<2 × cores>
+    -Djdk.virtualThreadScheduler.maxPoolSize=<4 × cores>"`. Compare throughput, `GET` and `UPDATE` p99/max, the
+    `read.barrier` and `writes.batch` timers, and the longest local command (`local` max). Keep the default
+    parallelism unless the larger one cuts the stalls without costing throughput.
 12. **One commit per entry.** Each entry paid its own local transaction: open, commit (0.12 ms) and the floor
     and position writes. Entries are now handed to an apply thread of the state machine's own, which applies
     whatever queued up meanwhile, up to 256 entries, in one transaction, with a savepoint per entry for

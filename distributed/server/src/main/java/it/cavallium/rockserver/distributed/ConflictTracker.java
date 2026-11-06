@@ -167,12 +167,15 @@ final class ConflictTracker {
 	 * Records every key written by {@code entry} (for {@link LogEntry.Guarded}, by its writes) as pending.
 	 * Entries that write no data (e.g. {@link LogEntry.Genesis}) return a token that resolves nothing.
 	 */
-	synchronized Token register(LogEntry entry) {
+	Token register(LogEntry entry) {
 		return register(List.of(entry));
 	}
 
-	/** Records every key written by {@code entries}, the requests of one log entry, as one pending token. */
-	synchronized Token register(List<LogEntry> entries) {
+	/**
+	 * Records every key written by {@code entries}, the requests of one log entry, as one pending token. The keys are
+	 * hashed before the lock is taken: only the map updates hold it.
+	 */
+	Token register(List<LogEntry> entries) {
 		var keys = new ArrayList<KeyId>();
 		var columns = new ArrayList<Long>();
 		boolean global = false;
@@ -186,16 +189,18 @@ final class ConflictTracker {
 			}
 		}
 		var token = new Token(keys, columns, global);
-		for (KeyId key : keys) {
-			keyWriters.put(key, token);
+		synchronized (this) {
+			for (KeyId key : keys) {
+				keyWriters.put(key, token);
+			}
+			for (Long column : columns) {
+				columnWriters.put(column, token);
+			}
+			if (global) {
+				globalWriter = token;
+			}
+			pending.add(token);
 		}
-		for (Long column : columns) {
-			columnWriters.put(column, token);
-		}
-		if (global) {
-			globalWriter = token;
-		}
-		pending.add(token);
 		return token;
 	}
 
@@ -274,7 +279,7 @@ final class ConflictTracker {
 	 * does not conflict itself, since that one is applied first. Without such a position, every entry can be
 	 * appended and registered as one; with one, nothing is registered.
 	 */
-	synchronized IntList conflicts(List<LogEntry> entries) {
+	IntList conflicts(List<LogEntry> entries) {
 		return conflicts(entries, _ -> null);
 	}
 
@@ -282,10 +287,40 @@ final class ConflictTracker {
 	 * {@link #conflicts(List)}, with {@code chains} telling what is known of each chained commit, one with a guard.
 	 * {@code chains} runs inside this tracker's lock: it must take no other lock.
 	 */
-	synchronized IntList conflicts(List<LogEntry> entries, Function<LogEntry.Guarded, @Nullable ChainCheck> chains) {
+	IntList conflicts(List<LogEntry> entries, Function<LogEntry.Guarded, @Nullable ChainCheck> chains) {
+		// Only commits can conflict: an entry of plain writes needs no lock here. The keys that a commit may conflict
+		// with inside the entry are hashed before the lock is taken.
+		int lastGuarded = -1;
+		for (int i = 0; i < entries.size(); i++) {
+			if (entries.get(i) instanceof LogEntry.Guarded) {
+				lastGuarded = i;
+			}
+		}
+		if (lastGuarded < 0) {
+			return new IntArrayList();
+		}
+		var writes = new ArrayList<List<KeyId>>(lastGuarded);
+		for (int i = 0; i < lastGuarded; i++) {
+			// Only data writes share a log entry (see Applier.isBatchable), so keys cover everything they write.
+			var keys = new ArrayList<KeyId>();
+			switch (entries.get(i)) {
+				case LogEntry.Write write -> collectWrite(write, keys, new ArrayList<>());
+				case LogEntry.Guarded guarded -> guarded.writes().forEach(w -> collectWrite(w, keys, new ArrayList<>()));
+				default -> {}
+			}
+			writes.add(keys);
+		}
+		synchronized (this) {
+			return conflicts(entries, lastGuarded, writes, chains);
+		}
+	}
+
+	private IntList conflicts(List<LogEntry> entries, int lastGuarded, List<List<KeyId>> writes,
+			Function<LogEntry.Guarded, @Nullable ChainCheck> chains) {
+		assert Thread.holdsLock(this);
 		var conflicting = new IntArrayList();
 		Set<KeyId> written = null;
-		for (int i = 0; i < entries.size(); i++) {
+		for (int i = 0; i <= lastGuarded; i++) {
 			var entry = entries.get(i);
 			if (entry instanceof LogEntry.Guarded guarded) {
 				boolean conflict = conflicts(guarded, guarded.guard() != null ? chains.apply(guarded) : null);
@@ -301,14 +336,8 @@ final class ConflictTracker {
 					continue;
 				}
 			}
-			if (i + 1 < entries.size()) {
-				// Only data writes share a log entry (see Applier.isBatchable), so keys cover everything they write.
-				var keys = new ArrayList<KeyId>();
-				switch (entry) {
-					case LogEntry.Write write -> collectWrite(write, keys, new ArrayList<>());
-					case LogEntry.Guarded guarded -> guarded.writes().forEach(w -> collectWrite(w, keys, new ArrayList<>()));
-					default -> {}
-				}
+			if (i < lastGuarded) {
+				var keys = writes.get(i);
 				if (!keys.isEmpty()) {
 					if (written == null) {
 						written = new HashSet<>();

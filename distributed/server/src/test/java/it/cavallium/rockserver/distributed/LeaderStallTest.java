@@ -95,6 +95,31 @@ class LeaderStallTest {
 		return answer;
 	}
 
+	private static RaftProtos.ServerRpcProto follower(String id, long lastReplyMillisAgo) {
+		return RaftProtos.ServerRpcProto.newBuilder()
+				.setId(RaftPeer.newBuilder().setId(id).setAddress("127.0.0.1:1").build().getRaftPeerProto())
+				.setLastRpcElapsedTimeMs(lastReplyMillisAgo)
+				.build();
+	}
+
+	/** Ratis gives the next indices without ids: they pair only with follower lists that agree around them. */
+	@Test
+	void nextIndicesArePairedWithFollowerIdsOnlyWhenTheListDidNotChange() {
+		var before = List.of(follower("b", 5), follower("c", 7));
+		var after = List.of(follower("b", 1), follower("c", 2));
+		var paired = LeaderStall.pairById(before, new long[] {10, 20}, after);
+		assertEquals(List.of(new LeaderStall.Follower("b", 10, 1), new LeaderStall.Follower("c", 20, 2)), paired);
+
+		var reordered = List.of(follower("c", 2), follower("b", 1));
+		assertEquals(null, LeaderStall.pairById(before, new long[] {10, 20}, reordered));
+		var replaced = List.of(follower("b", 1), follower("d", 2));
+		assertEquals(null, LeaderStall.pairById(before, new long[] {10, 20}, replaced));
+		assertEquals(null, LeaderStall.pairById(before, new long[] {10}, after));
+		assertEquals(null, LeaderStall.pairById(before, null, after));
+		assertEquals(null, LeaderStall.pairById(before, new long[] {10, 20, 30},
+				List.of(follower("b", 1), follower("c", 2), follower("d", 3))));
+	}
+
 	@Test
 	void aLeaderWaitingForTheWholeBoundStepsDownAndNotBefore() {
 		assertFalse(run(true, COMMIT, STALL - TICK));
