@@ -131,6 +131,13 @@ final class Applier {
 		this.maintenance = maintenance;
 	}
 
+	private volatile ColumnStreams columnStreams = new ColumnStreams();
+
+	/** The streams that a column deletion ends before it waits for the column's uses (DD-7a). */
+	void columnStreams(ColumnStreams columnStreams) {
+		this.columnStreams = columnStreams;
+	}
+
 	private final NodeMetrics.@Nullable Series openTime;
 	private final NodeMetrics.@Nullable Series executeTime;
 	private final NodeMetrics.@Nullable Series commitTime;
@@ -1162,10 +1169,16 @@ final class Applier {
 			case LogEntry.DeleteColumn delete -> {
 				requireNoTransaction(tx, entry);
 				requireUserColumn(delete.columnId());
-				// The deletion waits for the column's iterators, which only the leader has: close them, instead of
-				// stopping this replica's apply until their clients close them or their leases end.
-				db.closeIteratorsOfColumn(delete.columnId());
-				db.deleteColumn(delete.columnId());
+				// The deletion waits for the column's iterators and streams, which only the leader has: end them, instead
+				// of stopping this replica's apply until their clients close them or their leases end.
+				var streams = columnStreams;
+				streams.deleting(delete.columnId());
+				try {
+					db.closeIteratorsOfColumn(delete.columnId());
+					db.deleteColumn(delete.columnId());
+				} finally {
+					streams.deleted(delete.columnId());
+				}
 				yield null;
 			}
 			case LogEntry.DeleteColumnIfExists delete -> {
@@ -1173,8 +1186,24 @@ final class Applier {
 				if (NodeStore.META_COLUMN.equals(delete.name())) {
 					throw new IllegalArgumentException("Reserved column name: " + delete.name());
 				}
-				db.closeIteratorsOfColumn(delete.name());
-				yield db.deleteColumnIfExists(delete.name());
+				Long columnId;
+				try {
+					columnId = db.getColumnId(delete.name());
+				} catch (RocksDBException missing) {
+					columnId = null;
+				}
+				var streams = columnStreams;
+				if (columnId != null) {
+					streams.deleting(columnId);
+				}
+				try {
+					db.closeIteratorsOfColumn(delete.name());
+					yield db.deleteColumnIfExists(delete.name());
+				} finally {
+					if (columnId != null) {
+						streams.deleted(columnId);
+					}
+				}
 			}
 			case LogEntry.UploadMergeOperator upload -> {
 				requireNoTransaction(tx, entry);

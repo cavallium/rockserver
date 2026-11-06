@@ -143,6 +143,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 */
 	private volatile long storeGeneration;
 	private volatile Applier applier;
+	/** This node's streams by column, which a column deletion ends: one for the node, through every database it opens. */
+	private final ColumnStreams columnStreams = new ColumnStreams();
 	/** The clock this node stamps on session entries while it leads, see {@link LeaderClock}. */
 	private final LeaderClock leaderClock = new LeaderClock();
 	private volatile @Nullable LeaderSession leaderSession;
@@ -231,6 +233,11 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	/** Cluster version, checksums and backups: see {@link ReplicaOps}. */
 	private final ReplicaOps ops;
+
+	/** This node's streams by column: see {@link ColumnStreams}. */
+	ColumnStreams columnStreams() {
+		return columnStreams;
+	}
 
 	ReplicaOps ops() {
 		return ops;
@@ -329,6 +336,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		this.store = opened;
 		this.applier = new Applier(opened, metrics, applyLanes);
 		applier.maintenance(ops);
+		applier.columnStreams(columnStreams);
 		ops.opened(opened);
 		metrics.bind(opened.db().getMetricsRegistry(), opened.metricsNodeName(config.nodeId()));
 		setLastAppliedTermIndex(position);
