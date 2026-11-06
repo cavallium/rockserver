@@ -221,12 +221,20 @@ and the `LogEntry`.
   also rejects what would not encode: strings that are not valid Unicode, request types with no log code) and keeps
   the entry itself; the batch is sized from those sizes, and each entry is written straight into it when the batch
   goes out, with no body of its own. The bytes are those of the bodies encoded one by one and joined (versions 2
-  and 3 alike; `CodecEquivalenceTest`). A caller must therefore not change a write's buffers until it is answered;
-  if it does, the batch fails to encode, nothing of it is sent, the writes that no longer encode to their size fail
-  as invalid (or with an unknown outcome if an earlier batch may have appended them) and the others go back to the
-  queue. On the leader (and for every batch of commits, which only go to the local Raft server) the encoder also
-  returns the batch's requests as decoding the bytes in place would read them: each key and value a slice of the
-  batch, each array of a commit a copy, nothing parsed. The proposer offers them to its own state machine under the
+  and 3 alike; `CodecEquivalenceTest`). A caller's buffers are read only until its write is first encoded into a
+  batch, which happens while the caller still waits for its answer (except in the short time between a batch
+  taking the write and encoding it, if the caller gives up right then). A caller must therefore not change a
+  write's buffers while it waits; if it does, the batch fails to encode, nothing of it is sent, the writes that no
+  longer encode to their size fail as invalid (or with an unknown outcome if an earlier batch may have appended
+  them) and the others go back to the queue, as never taken unless an earlier batch may have appended them, so that
+  their callers' deadlines and cancellations apply again. The encoder also returns the batch's requests as decoding
+  the bytes in place would read them: each key and value a slice of the batch, each array of a commit a copy,
+  nothing parsed. Each request then keeps that copy instead of its caller's entry, so a write that goes back to the
+  queue still sent (a commit after another commit's conflict, a copy resent alone), which its caller may already
+  have given up on and whose buffers it may reuse, is encoded again from the batch's immutable bytes, never from the
+  caller's memory. A batch with a schema change returns no requests; its members never go back to the queue still
+  sent. On the leader (and for every batch of commits, which only go to the local Raft server) the proposer offers
+  the requests to its own state machine under the
   batch's Ratis invocation (client id, call id) before submitting it locally, and withdraws the offer when Ratis
   answers. `startTransaction` takes the offer instead of decoding the batch, only if the request carries the very
   `ByteString` the requests were encoded into; anything else is decoded as before: batches from other nodes, a

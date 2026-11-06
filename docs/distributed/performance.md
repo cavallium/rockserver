@@ -165,7 +165,9 @@ with 11–18 s write latency. In order of discovery:
     the batch, and the leader then decoded the batch it had just encoded, on Ratis' request thread. Each entry is
     now written once, straight into the batch, from its size computed at submit; on the leader the encoder returns
     the requests as slices of the batch, and `startTransaction` takes them instead of decoding (see "Encoded once" in
-    [design.md](design.md)). Batches from followers are still decoded on the leader, as before. Compare the
+    [design.md](design.md)). Batches from followers are still decoded on the leader, as before. Every node, leader
+    or not, builds those requests (objects and slices, no byte copies), so that a request sent again is encoded from
+    its first batch and not from its caller's buffers. Compare the
     `writes.batch` and `commits.batch` timers, the leader's CPU per operation and its allocation rate at 4×.
 
 ## Results

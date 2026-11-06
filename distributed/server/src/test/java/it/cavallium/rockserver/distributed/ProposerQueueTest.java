@@ -6,6 +6,9 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import java.nio.file.Path;
@@ -65,6 +68,61 @@ class ProposerQueueTest {
 			while (proposer.admittedBytes() != 0 && System.nanoTime() < deadline) {
 				Thread.sleep(10);
 			}
+			assertEquals(0, proposer.admittedBytes());
+		} finally {
+			proposer.close();
+			threads.close();
+			metrics.close();
+		}
+	}
+
+	/**
+	 * A caller that changes a queued write's buffers makes its batch fail to encode: nothing of it is sent, that write
+	 * fails as invalid, and the others of the batch go back to the queue, are sent, and end as usual. Every batch slot
+	 * and every admitted byte is given back.
+	 */
+	@Test
+	void aWriteWhoseBuffersChangeWhileQueuedFailsAloneAsInvalid() throws Exception {
+		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
+		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(Duration.ofSeconds(3));
+		var metrics = new NodeMetrics("n0");
+		var threads = new NodeThreads("n0");
+		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
+				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
+		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics, threads.control());
+		try {
+			// Every batch slot is taken, for about a second.
+			var stuck = new ArrayList<CompletableFuture<Object>>();
+			for (int i = 0; i < Proposer.MAX_BATCHES_IN_FLIGHT; i++) {
+				stuck.add(proposer.propose(new LogEntry.VerifyColumn("x", 1), TimeUnit.SECONDS.toNanos(1)));
+			}
+			var changing = Buf.create(8);
+			for (int i = 0; i < 4; i++) {
+				changing.add((byte) i);
+			}
+			var changed = proposer.propose(new LogEntry.Put(1, new Keys(Buf.wrap(new byte[] {1})), changing,
+					RequestTypeId.NOTHING));
+			var unchanged = proposer.propose(new LogEntry.Put(1, new Keys(Buf.wrap(new byte[] {2})),
+					Buf.wrap(new byte[] {1, 2, 3, 4}), RequestTypeId.NOTHING));
+			// Changed while both wait in the queue, before the batch that takes them is encoded.
+			changing.add((byte) 4);
+
+			var error = assertThrows(ExecutionException.class, () -> changed.get(10, TimeUnit.SECONDS));
+			assertEquals(RocksDBErrorType.INVALID_REQUEST,
+					assertInstanceOf(RocksDBException.class, error.getCause()).getErrorUniqueId());
+			// The other one was sent: with no Raft server here, its attempts end without an answer, not as invalid.
+			error = assertThrows(ExecutionException.class, () -> unchanged.get(10, TimeUnit.SECONDS));
+			var type = assertInstanceOf(RocksDBException.class, error.getCause()).getErrorUniqueId();
+			assertTrue(type == RocksDBErrorType.OUTCOME_UNKNOWN || type == RocksDBErrorType.SERVER_OVERLOADED,
+					type::toString);
+			for (var write : stuck) {
+				assertThrows(ExecutionException.class, () -> write.get(10, TimeUnit.SECONDS));
+			}
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+			while ((proposer.batchesInFlight() != 0 || proposer.admittedBytes() != 0) && System.nanoTime() < deadline) {
+				Thread.sleep(10);
+			}
+			assertEquals(0, proposer.batchesInFlight());
 			assertEquals(0, proposer.admittedBytes());
 		} finally {
 			proposer.close();

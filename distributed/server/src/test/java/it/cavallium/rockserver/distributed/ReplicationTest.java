@@ -887,6 +887,72 @@ class ReplicationTest {
 		}
 	}
 
+	/**
+	 * Commits always go to the local Raft server, which on a follower refuses them before starting a transaction: the
+	 * offer made for that attempt is withdrawn when the refusal comes back, never left in the map.
+	 */
+	@Test
+	void anOfferRefusedBeforeItsTransactionStartsIsWithdrawn() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		long column = api(leader).createColumn("c", SCHEMA);
+		var follower = cluster.anyFollower();
+		long taken = follower.stateMachine().localProposalsTaken();
+		var commit = new LogEntry.Guarded(1, 0, new long[0], new long[0],
+				List.of(new LogEntry.Put(column, key(1), text("refused"), RequestType.RequestTypeId.NOTHING)), false);
+		var reply = follower.proposer().proposeOnce(commit, TimeUnit.SECONDS.toNanos(10), null);
+		assertThrows(ExecutionException.class, () -> reply.get(20, TimeUnit.SECONDS));
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		while (follower.stateMachine().localProposalsOffered() != 0 && System.nanoTime() < deadline) {
+			Thread.sleep(10);
+		}
+		assertEquals(0, follower.stateMachine().localProposalsOffered());
+		assertEquals(taken, follower.stateMachine().localProposalsTaken());
+		assertNull(api(leader).get(0, column, key(1), RequestType.current()));
+	}
+
+	/**
+	 * A copy of an invocation Ratis already answered gets the cached reply without a new transaction: an offer for it
+	 * is not taken, which is why the proposer withdraws every offer when Ratis answers.
+	 */
+	@Test
+	void aRetryCacheAnswerLeavesTheOfferToBeWithdrawn() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		long column = api(leader).createColumn("c", SCHEMA);
+		var stateMachine = leader.stateMachine();
+		var entry = new LogEntry.Put(column, key(1), text("once"), RequestType.RequestTypeId.NOTHING);
+		var encoded = LogEntryCodec.encodeBatch(Long.MAX_VALUE / 3, 0, new long[] {1}, null, List.of(entry),
+				LogEntryCodec.entrySize(entry), true);
+		var content = org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations.unsafeWrap(encoded.bytes());
+		var clientId = org.apache.ratis.protocol.ClientId.randomId();
+		var division = stateMachine.division();
+		var request = org.apache.ratis.protocol.RaftClientRequest.newBuilder()
+				.setClientId(clientId)
+				.setServerId(division.getId())
+				.setGroupId(division.getGroup().getGroupId())
+				.setCallId(1)
+				.setMessage(org.apache.ratis.protocol.Message.valueOf(content))
+				.setType(org.apache.ratis.protocol.RaftClientRequest.writeRequestType())
+				.build();
+		long taken = stateMachine.localProposalsTaken();
+		stateMachine.offerLocal(clientId, 1, content, encoded.requests());
+		var first = leader.raftServerForTests().submitClientRequestAsync(request).get(20, TimeUnit.SECONDS);
+		assertTrue(first.isSuccess(), () -> String.valueOf(first.getException()));
+		assertEquals(taken + 1, stateMachine.localProposalsTaken());
+		assertEquals(0, stateMachine.localProposalsOffered());
+
+		var offered = stateMachine.offerLocal(clientId, 1, content, encoded.requests());
+		var again = leader.raftServerForTests().submitClientRequestAsync(request).get(20, TimeUnit.SECONDS);
+		assertTrue(again.isSuccess(), () -> String.valueOf(again.getException()));
+		assertEquals(first.getLogIndex(), again.getLogIndex(), "answered from the retry cache");
+		assertEquals(taken + 1, stateMachine.localProposalsTaken());
+		assertEquals(1, stateMachine.localProposalsOffered());
+		offered.withdraw();
+		assertEquals(0, stateMachine.localProposalsOffered());
+		assertEquals("once", text(api(leader).get(0, column, key(1), RequestType.current())));
+	}
+
 	@Test
 	void transactionsCommitAtomicallyAndDetectConflicts() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c).startAll();

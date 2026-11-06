@@ -201,6 +201,17 @@ final class Proposer implements Closeable {
 		return admission.used();
 	}
 
+	/** Batches in flight in both lanes now, for tests. */
+	int batchesInFlight() {
+		int count = 0;
+		for (var lane : List.of(anyLeader, localCommits)) {
+			synchronized (lane) {
+				count += lane.batchesInFlight;
+			}
+		}
+		return count;
+	}
+
 	/**
 	 * Bytes of writes this node holds at most, queued or in flight: {@link #WRITE_ADMISSION_BYTES_PROPERTY} if set,
 	 * otherwise an eighth of the maximum heap (a body is held about twice while in flight: in its request and in its
@@ -268,8 +279,10 @@ final class Proposer implements Closeable {
 		/** Its id in a client session, which identifies it at apply instead of {@link #sequence}; null if none. */
 		final @Nullable ClientRequestId client;
 		/**
-		 * Its entry, encoded only when its batch goes out, straight into the batch (see {@link Lane#send}). Null once
-		 * abandoned: the queue may hold it a while longer, its entry need not (see {@link #abandon}).
+		 * Its entry, encoded only when its batch goes out, straight into the batch (see {@link Lane#send}). Until then
+		 * it is the caller's; once encoded, it is its copy in that batch (slices of the batch's immutable bytes), so
+		 * that a request sent again never reads its caller's buffers after the caller may have been answered. Null
+		 * once abandoned: the queue may hold it a while longer, its entry need not (see {@link #abandon}).
 		 */
 		volatile @Nullable LogEntry entry;
 		/** Encoded size of {@link #entry} ({@link LogEntryCodec#entrySize}), its weight in batches and admission. */
@@ -339,6 +352,11 @@ final class Proposer implements Closeable {
 		 */
 		void unsend() {
 			refusedOnce = true;
+			state.set(QUEUED);
+		}
+
+		/** Back in the queue after it was taken into a batch that was never sent: as if it was never taken. */
+		void untake() {
 			state.set(QUEUED);
 		}
 
@@ -693,18 +711,28 @@ final class Proposer implements Closeable {
 			// a member's caller deadline: that caller was told its write timed out, and may write it again. The
 			// members with time left then go back to the queue (see endUnanswered).
 			long deadline = Math.min(Math.min(latest, earliest + attemptTimeoutNanos), callers);
-			// Each entry is encoded once, straight into the batch. If this node leads, the batch's requests come back
-			// as its own state machine would decode them, which it then does not (see submitLocal).
+			// Each entry is encoded once, straight into the batch, which also returns the batch's requests as decoding
+			// it in place would read them. If this node leads, its state machine takes them instead of decoding the
+			// batch (see submitLocal).
 			LogEntryCodec.EncodedBatch encoded;
 			try {
 				encoded = LogEntryCodec.encodeBatch(proposerId, completedBelow(), sequences, clients, entries,
-						entriesSize, commits || isLocalLeader());
+						entriesSize, true);
 			} catch (RuntimeException ex) {
 				refuseUnencodable(batch, ex);
 				return;
 			}
 			var message = Message.valueOf(UnsafeByteOperations.unsafeWrap(encoded.bytes()));
 			var local = encoded.requests();
+			if (local != null) {
+				// From now on each request is the copy in this batch, never again its caller's buffers: a request that
+				// goes back to the queue still sent (a commit after another's conflict, a copy resent alone) cannot be
+				// abandoned, so its caller may be answered (cancelled, timed out) and reuse its buffers while it waits.
+				// A batch with a schema change has no requests; its members only go back to the queue unsent.
+				for (int i = 0; i < sequences.length; i++) {
+					batch.get(i).entry = local.get(i).entry();
+				}
+			}
 			long now = System.nanoTime();
 			for (var pending : batch) {
 				queueTime.record(now - pending.queuedNanos);
@@ -744,7 +772,19 @@ final class Proposer implements Closeable {
 			if (rest.size() == batch.size()) {
 				throw error;
 			}
+			// Nothing was sent: those that no earlier batch may have appended go back as never taken, so that their
+			// caller's deadline or cancellation can again take them out of the queue (and their buffers be reused).
+			for (var pending : rest) {
+				if (!pending.maybeAppended && !pending.resentAlone) {
+					pending.untake();
+				}
+			}
 			requeue(rest);
+			for (var pending : rest) {
+				if (pending.callerDeadline && pending.isQueued()) {
+					expireWhenQueued(pending);
+				}
+			}
 			finished();
 		}
 
