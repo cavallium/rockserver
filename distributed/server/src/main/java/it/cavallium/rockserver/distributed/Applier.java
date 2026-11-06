@@ -109,6 +109,19 @@ final class Applier {
 	private final NodeMetrics.@Nullable Series guardRejected;
 	private final NodeMetrics.@Nullable Series parallelCuts;
 
+	/**
+	 * Tests only: runs on the apply thread right after each database write of the apply, with what it committed
+	 * ("entry", "group", "prefix" before a segment, "segment"). A crash test flushes there, to keep exactly that point.
+	 */
+	@Nullable java.util.function.Consumer<String> afterCommit;
+
+	private void committed(String what) {
+		var hook = afterCommit;
+		if (hook != null) {
+			hook.accept(what);
+		}
+	}
+
 	private static void record(NodeMetrics.@Nullable Series series, long startNanos) {
 		if (series != null) {
 			series.since(startNanos);
@@ -506,6 +519,7 @@ final class Applier {
 					// Only the apply thread writes the database, so an optimistic conflict means local corruption.
 					throw new ReplicaFailedException("Local apply transaction conflicted at " + position);
 				}
+				committed("entry");
 			}
 		} finally {
 			if (open) {
@@ -645,7 +659,7 @@ final class Applier {
 	/** Commits the writes of the group so far, if any, then deletes the records their floors passed. */
 	private void commitGroup() {
 		finishSegment();
-		commitGroupTx();
+		commitGroupTx("group");
 		for (var records : groupPurges) {
 			purge(records);
 		}
@@ -657,7 +671,7 @@ final class Applier {
 	 * Commits {@link #groupTx}, if open, without the deletions that follow a group's commit: for the partitioned
 	 * apply, which commits a prefix of the group when it changes between lanes and the serial path.
 	 */
-	private void commitGroupTx() {
+	private void commitGroupTx(String what) {
 		var tx = groupTx;
 		if (tx != null) {
 			groupTx = null;
@@ -676,6 +690,7 @@ final class Applier {
 				// Only the apply thread writes the database, so an optimistic conflict means local corruption.
 				throw new ReplicaFailedException("Local apply transaction conflicted at " + groupPosition);
 			}
+			committed(what);
 		}
 	}
 
@@ -1029,6 +1044,7 @@ final class Applier {
 				throw new ReplicaFailedException("Local apply transaction conflicted at " + position);
 			}
 		}
+		committed("entry");
 	}
 
 	/** Flushes the memtables, so that the writes applied without the WAL become durable before a logged one. */
@@ -1540,7 +1556,7 @@ final class Applier {
 		var open = segment;
 		if (open == null) {
 			// The lanes read the database: the writes of serial entries before them must be there.
-			commitGroupTx();
+			commitGroupTx("prefix");
 			open = new Segment(lanes.count());
 			segment = open;
 		}
@@ -1696,6 +1712,7 @@ final class Applier {
 					throw new ReplicaFailedException("Failed to commit the entries applied up to " + groupPosition, ex);
 				}
 				record(commitTime, commitStart);
+				committed("segment");
 			} else {
 				for (var writer : writers) {
 					writer.close();

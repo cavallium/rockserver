@@ -153,25 +153,262 @@ class ParallelApplyTest {
 			// Small purge limits, so that purges (whose timing depends on the commits) run too.
 			var serial = new Applier(a, null, 8, 2048);
 			var parallel = new Applier(b, null, 8, 2048, lanes);
-			long[] columns = new long[5];
-			var schemas = List.of(FIXED, FIXED, FIXED, BUCKETED, TAIL_ONLY);
-			for (int i = 0; i < columns.length; i++) {
-				columns[i] = a.db().createColumn("c" + i, schemas.get(i));
-				assertEquals(columns[i], b.db().createColumn("c" + i, schemas.get(i)));
+			long[] columns = createColumns(a, b);
+			var log = new Workload(new Random(seed), columns, a.metaColumnId()).log(40);
+			for (int group = 0; group < log.size(); group++) {
+				serial.beginGroup();
+				parallel.beginGroup();
+				var expected = new ArrayList<List<ApplyResult>>();
+				var actual = new ArrayList<List<ApplyResult>>();
+				for (var step : log.get(group)) {
+					var result = step.apply(serial);
+					if (result != null) {
+						expected.add(result);
+					}
+					result = step.apply(parallel);
+					if (result != null) {
+						actual.add(result);
+					}
+				}
+				serial.endGroup();
+				parallel.endGroup();
+				for (int i = 0; i < expected.size(); i++) {
+					assertEquals(expected.get(i), List.copyOf(actual.get(i)), "results of entry " + i + " of group " + group);
+				}
+				assertEquals(dump(a, columns), dump(b, columns), "databases after group " + group);
 			}
-			new Workload(new Random(seed), columns, serial, parallel, a, b).run();
+			var results = dump(a, columns);
+			assertTrue(results.size() > 100, "the workload wrote something: " + results.size());
+			assertTrue(parallel.segmentedEntries > 100, "entries applied in lanes: " + parallel.segmentedEntries);
+			assertTrue(parallel.segmentCuts > 5, "segments cut by a rejection: " + parallel.segmentCuts);
+			System.out.println("Partitioned apply: " + parallel.segmentedEntries + " entries in lanes, "
+					+ parallel.segmentCuts + " cuts");
 		} finally {
 			lanes.close();
 		}
 	}
 
+	/** Creates the workload's columns in every store, with the same ids. */
+	private static long[] createColumns(NodeStore... stores) {
+		long[] columns = new long[5];
+		var schemas = List.of(FIXED, FIXED, FIXED, BUCKETED, TAIL_ONLY);
+		for (int i = 0; i < columns.length; i++) {
+			columns[i] = stores[0].db().createColumn("c" + i, schemas.get(i));
+			for (int s = 1; s < stores.length; s++) {
+				assertEquals(columns[i], stores[s].db().createColumn("c" + i, schemas.get(i)));
+			}
+		}
+		return columns;
+	}
+
+	/**
+	 * A replica applying in lanes that crashes keeps a consistent prefix of the log, whichever of its commits was the
+	 * last to reach the disk: the serial prefix of a group committed before a segment, a segment (the lanes' batches
+	 * joined with the records and the position), the end of a group, an entry applied alone. The apply writes no WAL,
+	 * so what survives is what the last flush kept: the test flushes right after one such commit, goes on applying
+	 * (into the same group or past it) and then closes the database without a flush. Reopened, the replica holds
+	 * exactly what was committed at the flush, the position included; replaying the rest of the log (serially, or in
+	 * lanes) gives the results and every row, the internal column included, of a replica that never crashed.
+	 */
+	@Test
+	void aCrashDuringPartitionedApplyKeepsAConsistentPrefix() throws Exception {
+		var lanes = new ApplyLanes("crash-test", 4);
+		try {
+			for (int seed = 1; seed <= 2; seed++) {
+				long[] columns;
+				List<List<Step>> log;
+				var expected = new HashMap<Long, List<ApplyResult>>();
+				List<String> expectedRows;
+				var commits = new HashMap<String, Integer>();
+				try (var reference = open("reference-" + seed); var lanesOnly = open("lanes-" + seed)) {
+					columns = createColumns(reference, lanesOnly);
+					log = new Workload(new Random(seed), columns, reference.metaColumnId()).log(25);
+					var serial = new Applier(reference, null, 8, 2048);
+					var parallel = new Applier(lanesOnly, null, 8, 2048, lanes);
+					parallel.afterCommit = what -> commits.merge(what, 1, Integer::sum);
+					for (var group : log) {
+						serial.beginGroup();
+						parallel.beginGroup();
+						for (var step : group) {
+							var result = step.apply(serial);
+							if (result != null) {
+								expected.put(step.position().getIndex(), result);
+							}
+							step.apply(parallel);
+						}
+						serial.endGroup();
+						parallel.endGroup();
+					}
+					expectedRows = dump(reference, columns);
+					assertEquals(expectedRows, dump(lanesOnly, columns));
+				}
+				for (var what : List.of("prefix", "segment", "group")) {
+					assertTrue(commits.getOrDefault(what, 0) > 3, "commits of the lanes replica: " + commits);
+				}
+				var random = new Random(seed * 31);
+				var points = List.of("prefix", "segment", "group", "entry", "prefix", "segment", "prefix", "segment");
+				for (int p = 0; p < points.size(); p++) {
+					var what = points.get(p);
+					int count = commits.getOrDefault(what, 0);
+					if (count == 0) {
+						continue;
+					}
+					crashAndReplay("crash-" + seed + "-" + p, columns, log, expected, expectedRows, lanes, what,
+							1 + random.nextInt(count), random.nextInt(25), p % 2 == 1 ? lanes : null);
+				}
+			}
+		} finally {
+			lanes.close();
+		}
+	}
+
+	/**
+	 * Applies {@code log} in lanes, flushes right after the {@code at}-th commit of kind {@code what}, applies
+	 * {@code after} more entries and crashes; then reopens, checks what survived and replays the rest of the log.
+	 */
+	private void crashAndReplay(String name, long[] columns, List<List<Step>> log,
+			Map<Long, List<ApplyResult>> expected, List<String> expectedRows, ApplyLanes lanes, String what, int at,
+			int after, @Nullable ApplyLanes replayLanes) throws Exception {
+		var point = name + " (flush after " + what + " commit " + at + ", " + after + " entries more)";
+		List<String> durable;
+		TermIndex durablePosition;
+		var crashed = open(name);
+		try {
+			assertEquals(java.util.Arrays.toString(columns), java.util.Arrays.toString(createColumns(crashed)));
+			crashed.db().flush();
+			var flushed = new Object[] {null, null};
+			int[] seen = {0};
+			var applier = new Applier(crashed, null, 8, 2048, lanes);
+			applier.afterCommit = kind -> {
+				if (kind.equals(what) && ++seen[0] == at) {
+					crashed.db().flush();
+					flushed[0] = dump(crashed, columns);
+					flushed[1] = crashed.applied();
+				}
+			};
+			int left = after;
+			boolean inGroup = false;
+			outer:
+			for (var group : log) {
+				applier.beginGroup();
+				inGroup = true;
+				for (var step : group) {
+					step.apply(applier);
+					if (flushed[0] != null && left-- <= 0) {
+						break outer;
+					}
+				}
+				applier.endGroup();
+				inGroup = false;
+			}
+			if (inGroup) {
+				applier.abortGroup();
+			}
+			assertTrue(flushed[0] != null, point + ": the flush point was reached");
+			@SuppressWarnings("unchecked") var rows = (List<String>) flushed[0];
+			durable = rows;
+			durablePosition = (TermIndex) flushed[1];
+		} finally {
+			// Kill: no flush, no WAL; only what the flush above kept is on disk.
+			crashed.connection().close();
+		}
+		long applied;
+		List<String> replayed;
+		String metaPrefix;
+		try (var store = open(name)) {
+			assertEquals(durablePosition, store.applied(), point);
+			assertEquals(durable, dump(store, columns), point + ": the rows committed at the flush, no more, no less");
+			applied = store.applied().getIndex();
+			var results = applyLog(new Applier(store, null, 8, 2048, replayLanes), log, applied, Long.MAX_VALUE);
+			results.forEach((index, result) -> assertEquals(expected.get(index), result,
+					point + ": result of the replayed entry " + index));
+			replayed = dump(store, columns);
+			metaPrefix = store.metaColumnId() + ":";
+		}
+		assertEquals(expectedRows.stream().filter(row -> !row.startsWith(metaPrefix)).toList(),
+				replayed.stream().filter(row -> !row.startsWith(metaPrefix)).toList(), point + ": user rows after the replay");
+		// A restarted applier deletes the records below every floor at its start: the internal column matches a serial
+		// replica restarted at the same position.
+		try (var restarted = open(name + "-serial")) {
+			assertEquals(java.util.Arrays.toString(columns), java.util.Arrays.toString(createColumns(restarted)));
+			applyLog(new Applier(restarted, null, 8, 2048), log, 0, applied);
+			applyLog(new Applier(restarted, null, 8, 2048), log, applied, Long.MAX_VALUE);
+			assertEquals(dump(restarted, columns), replayed, point + ": every row after the replay");
+		}
+	}
+
+	/**
+	 * Applies the entries of {@code log} after {@code fromIndex} up to {@code toIndex}, in the log's groups (a group
+	 * partly in the range is cut there), and returns their results by index.
+	 */
+	private static Map<Long, List<ApplyResult>> applyLog(Applier applier, List<List<Step>> log, long fromIndex,
+			long toIndex) {
+		var results = new HashMap<Long, List<ApplyResult>>();
+		for (var group : log) {
+			var pending = new HashMap<Long, List<ApplyResult>>();
+			boolean open = false;
+			for (var step : group) {
+				long index = step.position().getIndex();
+				if (index > fromIndex && index <= toIndex) {
+					if (!open) {
+						applier.beginGroup();
+						open = true;
+					}
+					var result = step.apply(applier);
+					if (result != null) {
+						pending.put(index, result);
+					}
+				}
+			}
+			if (open) {
+				applier.endGroup();
+			}
+			pending.forEach((index, result) -> results.put(index, List.copyOf(result)));
+		}
+		return results;
+	}
+
+	/** One log entry of the workload: a mark (no requests) or a batch, with the leader's time. */
+	private record Step(TermIndex position, @Nullable List<Request> requests, long leaderTime) {
+
+		@Nullable List<ApplyResult> apply(Applier applier) {
+			if (requests == null) {
+				applier.markApplied(position);
+				return null;
+			}
+			return applier.applyBatch(requests, position, leaderTime);
+		}
+	}
+
+	/** Every row of every column, the internal one included. */
+	private static List<String> dump(NodeStore store, long[] columns) {
+		var rows = new ArrayList<String>();
+		var ids = new ArrayList<Long>();
+		ids.add(store.metaColumnId());
+		for (long column : columns) {
+			ids.add(column);
+		}
+		var hex = HexFormat.of();
+		for (long column : ids) {
+			try (var range = store.db().getRange(0L, column, null, null, false, RequestType.<KV>allInRange())) {
+				range.forEach(kv -> {
+					var row = new StringBuilder().append(column).append(':');
+					for (var part : kv.keys().keys()) {
+						row.append(hex.formatHex(part.toByteArray())).append('/');
+					}
+					row.append('=').append(kv.value() == null ? "null" : hex.formatHex(kv.value().toByteArray()));
+					rows.add(row.toString());
+				});
+			}
+		}
+		return rows;
+	}
+
+	/** A randomized log: entries of several proposers and sessions, in groups. */
 	private static final class Workload {
 		final Random random;
 		final long[] columns;
-		final Applier serial;
-		final Applier parallel;
-		final NodeStore a;
-		final NodeStore b;
+		final long metaColumn;
 		long index = 1;
 		long leaderTime = 10_000;
 		final long[] nextSequence = new long[4];
@@ -180,28 +417,22 @@ class ParallelApplyTest {
 		final List<Long> sessions = new ArrayList<>();
 		final Map<Long, long[]> sessionSequences = new HashMap<>();
 
-		Workload(Random random, long[] columns, Applier serial, Applier parallel, NodeStore a, NodeStore b) {
+		Workload(Random random, long[] columns, long metaColumn) {
 			this.random = random;
 			this.columns = columns;
-			this.serial = serial;
-			this.parallel = parallel;
-			this.a = a;
-			this.b = b;
+			this.metaColumn = metaColumn;
 		}
 
-		void run() {
-			for (int group = 0; group < 40; group++) {
-				serial.beginGroup();
-				parallel.beginGroup();
-				var expected = new ArrayList<List<ApplyResult>>();
-				var actual = new ArrayList<List<ApplyResult>>();
+		List<List<Step>> log(int groups) {
+			var log = new ArrayList<List<Step>>();
+			for (int group = 0; group < groups; group++) {
+				var steps = new ArrayList<Step>();
 				int entries = 1 + random.nextInt(24);
 				for (int e = 0; e < entries; e++) {
 					var position = TermIndex.valueOf(1, index++);
 					int kind = random.nextInt(100);
 					if (kind < 4) {
-						serial.markApplied(position);
-						parallel.markApplied(position);
+						steps.add(new Step(position, null, 0));
 						continue;
 					}
 					if (kind < 6) {
@@ -220,26 +451,15 @@ class ParallelApplyTest {
 						requests = batch();
 					}
 					leaderTime += random.nextInt(50);
-					expected.add(serial.applyBatch(requests, position, leaderTime));
-					actual.add(parallel.applyBatch(requests, position, leaderTime));
+					steps.add(new Step(position, requests, leaderTime));
 					if (requests.getFirst().entry() instanceof LogEntry.RegisterClient) {
 						sessions.add(position.getIndex());
 						sessionSequences.put(position.getIndex(), new long[2]);
 					}
 				}
-				serial.endGroup();
-				parallel.endGroup();
-				for (int i = 0; i < expected.size(); i++) {
-					assertEquals(expected.get(i), List.copyOf(actual.get(i)), "results of entry " + i + " of group " + group);
-				}
-				assertEquals(dump(a), dump(b), "databases after group " + group);
+				log.add(List.copyOf(steps));
 			}
-			var results = dump(a);
-			assertTrue(results.size() > 100, "the workload wrote something: " + results.size());
-			assertTrue(parallel.segmentedEntries > 100, "entries applied in lanes: " + parallel.segmentedEntries);
-			assertTrue(parallel.segmentCuts > 5, "segments cut by a rejection: " + parallel.segmentCuts);
-			System.out.println("Partitioned apply: " + parallel.segmentedEntries + " entries in lanes, "
-					+ parallel.segmentCuts + " cuts");
+			return log;
 		}
 
 		/** One entry of a proposer: a mix of single-lane and cross-lane requests, rejections and copies. */
@@ -333,7 +553,7 @@ class ParallelApplyTest {
 						false, 0, null);
 			} else if (kind < 96) {
 				// Rejected the same way everywhere: the internal column, a key of the wrong size.
-				return new LogEntry.Put(random.nextBoolean() ? a.metaColumnId() : c0,
+				return new LogEntry.Put(random.nextBoolean() ? metaColumn : c0,
 						new Keys(text("bad")), text("x"), RequestTypeId.NOTHING);
 			} else {
 				return new LogEntry.Merge(c0, key(k), text("q"), RequestTypeId.NOTHING);
@@ -344,30 +564,6 @@ class ParallelApplyTest {
 			return new LogEntry.Guarded(1, 0, new long[0], new long[0],
 					List.of(new LogEntry.Put(column, key(key), text(value), RequestTypeId.NOTHING)), true, 99,
 					LogEntry.Guard.of(column, key(key), read == null ? null : text(read)));
-		}
-
-		/** Every row of every column, the internal one included. */
-		List<String> dump(NodeStore store) {
-			var rows = new ArrayList<String>();
-			var ids = new ArrayList<Long>();
-			ids.add(store.metaColumnId());
-			for (long column : columns) {
-				ids.add(column);
-			}
-			var hex = HexFormat.of();
-			for (long column : ids) {
-				try (var range = store.db().getRange(0L, column, null, null, false, RequestType.<KV>allInRange())) {
-					range.forEach(kv -> {
-						var row = new StringBuilder().append(column).append(':');
-						for (var part : kv.keys().keys()) {
-							row.append(hex.formatHex(part.toByteArray())).append('/');
-						}
-						row.append('=').append(kv.value() == null ? "null" : hex.formatHex(kv.value().toByteArray()));
-						rows.add(row.toString());
-					});
-				}
-			}
-			return rows;
 		}
 	}
 }
