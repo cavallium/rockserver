@@ -495,7 +495,12 @@ opened, before any entry is applied, and no other column is ever created locally
   such a node stays down and the cluster stalls instead. So keep the Raft log on storage that keeps fsynced data,
   and repair only after a power loss.
 - **RocksDB.** Replicas open it with `atomic-flush` (every column flushed together) and point-in-time WAL
-  recovery (`absolute-consistency` forced off). After a crash or power loss the database is the last flushed
+  recovery (`absolute-consistency` forced off). With atomic flush, whatever triggers a flush flushes every column
+  that has data, so a replica raises every column's `write-buffer-size` to the write buffer budget
+  (`database.global.write-buffer-manager`, default 128 MiB, or half the block cache when it is 0 or null): the
+  `WriteBufferManager`, which counts the memtables of all columns, decides when to flush, instead of the hottest
+  column filling its own 64 MiB and flushing every cold column into a tiny file each time. A per-column
+  `write-buffer-size` in the Rockserver config is replaced on replicas; raise the budget to flush less often. After a crash or power loss the database is the last flushed
   state, a consistent point where the applied position matches the data, and Raft replays the rest: the log
   is purged only up to a snapshot, and a snapshot flushes. So after a kill, a replica's files are behind until
   it starts again; a graceful stop flushes.
@@ -703,14 +708,19 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
 - **Otherwise** the entry is appended and later applied atomically on every replica (unless a chained commit's
   guard rejects it: see above). The leader's native transaction is then rolled back, because its effects arrive
   through the log.
-- **Hash collisions** can only cause false conflicts.
+- **Hash collisions** can only cause false conflicts. Keys are tracked by their 64-bit hash alone, which folds in
+  the column id, in a primitive open-addressing map (`Long2ObjectOpenHashMap`): registering a written key under the
+  append lock allocates no object per key. Two keys with the same hash, of the same column or not, share a slot.
 - **History is kept** as long as any open transaction, reservation or in-flight commit pins a snapshot. A commit
   whose snapshot is older than history that was already forgotten always conflicts, whatever released it, so a
   timing mistake can only cause a false conflict, never a missed one.
-- **History is bounded.** Once the applied entries in the tracker hold more than 4M keys (about 300 MB), the
+- **History is bounded.** Once the applied entries in the tracker hold more than 4M keys (about 130 MB), the
   oldest are forgotten even if a snapshot still needs them, and the transactions with that snapshot conflict at
-  commit. Pruning forgets about 64k keys per call, and runs after every applied entry, so it never holds the
-  tracker lock (which appends need) for long.
+  commit. Pruning forgets about 64k keys per call and runs after every applied entry, on the thread that completes
+  applied entries. It takes the tracker lock (which appends need) once per 4096 keys, not for the whole call, so an
+  append waits for one such chunk at most. It stays on that thread, synchronous: `LeaderSession` computes the
+  pruned index under its own monitor (a reservation reads the applied index under the same monitor), and an
+  incremental prune with a bounded lock hold gives what a background pruner would, without a hand-off per entry.
 
 **Leader changes.** Transactions, update ids and iterators do not survive a leader change. Clients get
 `UPDATE_RETRY` and run the transaction again, which Yotsuba already does. A commit whose answer was lost with the
@@ -1087,7 +1097,7 @@ failover" below).
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories, with read-modify-write updates and hot counters in them, are linearizable, and the transactional bank-transfer invariant holds. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
-| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
+| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
 
 Run them all (about 20 minutes on a real disk):
 

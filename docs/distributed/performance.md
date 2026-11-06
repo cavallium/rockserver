@@ -161,6 +161,18 @@ with 11–18 s write latency. In order of discovery:
     counters or timers per write. `deleteRange` no longer flushes every memtable and syncs the WAL (hundreds of
     milliseconds on the apply thread, and small L0 files in every column). Keys and values are decoded as slices
     of the log entry instead of one array each, and merges pass their slice to RocksDB without a copy.
+16. **The conflict tracker under the append lock.** Not measured yet. `preAppendTransaction` registers every
+    written key in `ConflictTracker`, under Ratis' append lock and the tracker's monitor. Each key used to allocate
+    a record and a `HashMap` node there; keys are now `long` hashes in an open-addressing map and in one `long`
+    array per entry. Pruning, on the completer thread after every applied entry, holds the monitor for at most
+    4096 keys at a time instead of up to 64k. To check: JFR `jdk.JavaMonitorEnter` on `ConflictTracker` and
+    allocation samples under `LoadBench` with transactions, before and after.
+17. **Every column flushed with the hottest one.** Not measured yet. Replicas use atomic flush, so the hottest
+    column reaching its 64 MiB `write-buffer-size` flushed every column with data, each into a small L0 file.
+    Every column's limit is now the shared write buffer budget, so flushes come once per budget of writes to all
+    columns together (see "RocksDB" under "Durability" in [design.md](design.md)). To check: L0 file count and size
+    per column (`rocksdb.num-files-at-level0`, the SST table properties call) after a `LoadBench` run, before and
+    after.
 
 ## Results
 
@@ -263,6 +275,10 @@ Other results:
   (up to 17 MiB each) in Ratis' retry cache for 8 s by default, and each node admits 16384 requests at once,
   with messages up to 512 MiB. Size the heap for bursts of large `putMulti` calls and large results: an
   `OutOfMemoryError` on the apply thread stops the replica.
+- **Memtables.** Replicas flush when the memtables of all columns together reach the write buffer budget,
+  `database.global.write-buffer-manager` in the Rockserver config (128 MiB by default, charged to the block
+  cache); a per-column `write-buffer-size` is replaced by that budget. A larger budget means fewer and larger L0
+  files, and more memory and replay after a crash (the Raft log, not the RocksDB WAL, replays it).
 - **Metrics.** On a cluster, `rocksdb_operation_timer` counts the calls made on each node's own database.
   Replicated writes are counted once per node when they are applied, together with the internal result, floor
   and position puts and one `closeTransaction` per applied group, and never with the client's latency. Reads,

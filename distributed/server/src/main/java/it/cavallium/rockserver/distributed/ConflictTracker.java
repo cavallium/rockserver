@@ -5,16 +5,15 @@ import it.cavallium.rockserver.core.common.Keys;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntList;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Set;
-import java.util.HashSet;
-import it.unimi.dsi.fastutil.ints.IntList;
-import it.unimi.dsi.fastutil.ints.IntArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.function.Function;
 import org.jetbrains.annotations.Nullable;
@@ -37,6 +36,10 @@ import org.jetbrains.annotations.Nullable;
  * forgets the oldest ones even if an open transaction's snapshot still needs them, and that transaction then
  * conflicts at commit. A long or abandoned transaction costs a false conflict instead of unbounded heap.</p>
  *
+ * <p>Keys are tracked by their {@link #keyHash} alone, in a primitive long-keyed open-addressing map: the hash
+ * already folds in the column id, and two keys (of any columns) with the same hash only share a slot, which can
+ * cause a false conflict, never a missed one. Registering a key allocates no object per key.</p>
+ *
  * <p>False conflicts are allowed (hash collisions, coarse column markers, entries that failed to append, history
  * forgotten past the cap); missed conflicts are not. Thread-safe.</p>
  */
@@ -45,7 +48,7 @@ final class ConflictTracker {
 	/** Index of an entry that has not been applied yet: newer than any snapshot. */
 	private static final long PENDING = Long.MAX_VALUE;
 	/**
-	 * Default {@code maxKeys}: about 300 MB of heap, and minutes of history at tens of thousands of written keys per
+	 * Default {@code maxKeys}: about 130 MB of heap, and minutes of history at tens of thousands of written keys per
 	 * second, well over the longest transaction lease.
 	 */
 	static final long DEFAULT_MAX_KEYS = 4_000_000;
@@ -55,6 +58,11 @@ final class ConflictTracker {
 	 * applied entry, forget the rest.
 	 */
 	private static final int PRUNE_BATCH_KEYS = 65_536;
+	/**
+	 * Keys and columns that {@link #prune} forgets while holding the lock once (at least one entry): it releases the
+	 * lock between such chunks, so {@code preAppendTransaction} waits for one chunk at most, not for a whole call.
+	 */
+	private static final int PRUNE_CHUNK_KEYS = 4_096;
 
 	private static final ValueLayout.OfLong LONG_LE
 			= ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
@@ -64,8 +72,8 @@ final class ConflictTracker {
 	 * Every map value is the last entry that wrote that key or column. The key's write index is the index of that
 	 * entry, so resolving an entry updates every key it still owns, and a later pending writer stays pending.
 	 */
-	private final Map<KeyId, Token> keyWriters = new HashMap<>();
-	private final Map<Long, Token> columnWriters = new HashMap<>();
+	private final Long2ObjectOpenHashMap<Token> keyWriters = new Long2ObjectOpenHashMap<>();
+	private final Long2ObjectOpenHashMap<Token> columnWriters = new Long2ObjectOpenHashMap<>();
 	/** Last column creation or name-based column deletion: its column id is unknown, so it covers every column. */
 	private @Nullable Token globalWriter;
 	/** Highest index whose older writes may have been forgotten. */
@@ -93,13 +101,14 @@ final class ConflictTracker {
 	/** Opaque handle for one registered entry. */
 	static final class Token {
 
-		private final List<KeyId> keys;
-		private final List<Long> columns;
+		/** {@link #keyHash} of every key written, duplicates included. */
+		private final LongArrayList keys;
+		private final LongArrayList columns;
 		private final boolean global;
 		/** Log index once applied, guarded by the tracker's lock. */
 		private long index = PENDING;
 
-		private Token(List<KeyId> keys, List<Long> columns, boolean global) {
+		private Token(LongArrayList keys, LongArrayList columns, boolean global) {
 			this.keys = keys;
 			this.columns = columns;
 			this.global = global;
@@ -113,8 +122,6 @@ final class ConflictTracker {
 			return keys.size() + columns.size() + (global ? 1 : 0);
 		}
 	}
-
-	private record KeyId(long columnId, long hash) {}
 
 	/**
 	 * What the leader knows about a chained commit, see {@link #conflicts(List, Function)}.
@@ -176,8 +183,8 @@ final class ConflictTracker {
 	 * hashed before the lock is taken: only the map updates hold it.
 	 */
 	Token register(List<LogEntry> entries) {
-		var keys = new ArrayList<KeyId>();
-		var columns = new ArrayList<Long>();
+		var keys = new LongArrayList();
+		var columns = new LongArrayList();
 		boolean global = false;
 		for (var entry : entries) {
 			switch (entry) {
@@ -191,11 +198,13 @@ final class ConflictTracker {
 		}
 		var token = new Token(keys, columns, global);
 		synchronized (this) {
-			for (KeyId key : keys) {
-				keyWriters.put(key, token);
+			long[] keyArray = keys.elements();
+			for (int i = 0, n = keys.size(); i < n; i++) {
+				keyWriters.put(keyArray[i], token);
 			}
-			for (Long column : columns) {
-				columnWriters.put(column, token);
+			long[] columnArray = columns.elements();
+			for (int i = 0, n = columns.size(); i < n; i++) {
+				columnWriters.put(columnArray[i], token);
 			}
 			if (global) {
 				globalWriter = token;
@@ -205,21 +214,24 @@ final class ConflictTracker {
 		return token;
 	}
 
-	private static void collectWrite(LogEntry.Write write, List<KeyId> keys, List<Long> columns) {
+	private static void collectWrite(LogEntry.Write write, LongArrayList keys, LongArrayList columns) {
 		long columnId = write.columnId();
 		switch (write) {
-			case LogEntry.Put put -> keys.add(keyId(columnId, put.keys()));
-			case LogEntry.Delete delete -> keys.add(keyId(columnId, delete.keys()));
-			case LogEntry.Merge merge -> keys.add(keyId(columnId, merge.keys()));
-			case LogEntry.PutMulti putMulti -> putMulti.keys().forEach(k -> keys.add(keyId(columnId, k)));
-			case LogEntry.DeleteMulti deleteMulti -> deleteMulti.keys().forEach(k -> keys.add(keyId(columnId, k)));
-			case LogEntry.MergeMulti mergeMulti -> mergeMulti.keys().forEach(k -> keys.add(keyId(columnId, k)));
+			case LogEntry.Put put -> keys.add(keyHash(columnId, put.keys()));
+			case LogEntry.Delete delete -> keys.add(keyHash(columnId, delete.keys()));
+			case LogEntry.Merge merge -> keys.add(keyHash(columnId, merge.keys()));
+			case LogEntry.PutMulti putMulti -> collectKeys(columnId, putMulti.keys(), keys);
+			case LogEntry.DeleteMulti deleteMulti -> collectKeys(columnId, deleteMulti.keys(), keys);
+			case LogEntry.MergeMulti mergeMulti -> collectKeys(columnId, mergeMulti.keys(), keys);
 			case LogEntry.DeleteRange _ -> columns.add(columnId);
 		}
 	}
 
-	private static KeyId keyId(long columnId, Keys keys) {
-		return new KeyId(columnId, keyHash(columnId, keys));
+	private static void collectKeys(long columnId, List<Keys> keyList, LongArrayList keys) {
+		keys.ensureCapacity(keys.size() + keyList.size());
+		for (Keys k : keyList) {
+			keys.add(keyHash(columnId, k));
+		}
 	}
 
 	/**
@@ -230,7 +242,7 @@ final class ConflictTracker {
 	synchronized boolean chainIntact(long columnId, long hash, Token link, long appliedIndex) {
 		return !isNewer(globalWriter, appliedIndex)
 				&& !isNewer(columnWriters.get(columnId), appliedIndex)
-				&& keyWriters.get(new KeyId(columnId, hash)) == link;
+				&& keyWriters.get(hash) == link;
 	}
 
 	/** True if any conflict key of {@code guarded} (or its column) was written by an entry newer than its snapshot. */
@@ -262,7 +274,7 @@ final class ConflictTracker {
 			if (isNewer(columnWriters.get(columns[i]), snapshotIndex)) {
 				return true;
 			}
-			var writer = keyWriters.get(new KeyId(columns[i], hashes[i]));
+			var writer = keyWriters.get(hashes[i]);
 			if (check != null && columns[i] == check.columnId() && hashes[i] == check.hash()) {
 				if (writer != null && writer != check.base()) {
 					return true;
@@ -300,13 +312,14 @@ final class ConflictTracker {
 		if (lastGuarded < 0) {
 			return new IntArrayList();
 		}
-		var writes = new ArrayList<List<KeyId>>(lastGuarded);
+		var writes = new ArrayList<LongArrayList>(lastGuarded);
+		var ignoredColumns = new LongArrayList();
 		for (int i = 0; i < lastGuarded; i++) {
 			// Only data writes share a log entry (see Applier.isBatchable), so keys cover everything they write.
-			var keys = new ArrayList<KeyId>();
+			var keys = new LongArrayList();
 			switch (entries.get(i)) {
-				case LogEntry.Write write -> collectWrite(write, keys, new ArrayList<>());
-				case LogEntry.Guarded guarded -> guarded.writes().forEach(w -> collectWrite(w, keys, new ArrayList<>()));
+				case LogEntry.Write write -> collectWrite(write, keys, ignoredColumns);
+				case LogEntry.Guarded guarded -> guarded.writes().forEach(w -> collectWrite(w, keys, ignoredColumns));
 				default -> {}
 			}
 			writes.add(keys);
@@ -316,20 +329,19 @@ final class ConflictTracker {
 		}
 	}
 
-	private IntList conflicts(List<LogEntry> entries, int lastGuarded, List<List<KeyId>> writes,
+	private IntList conflicts(List<LogEntry> entries, int lastGuarded, List<LongArrayList> writes,
 			Function<LogEntry.Guarded, @Nullable ChainCheck> chains) {
 		assert Thread.holdsLock(this);
 		var conflicting = new IntArrayList();
-		Set<KeyId> written = null;
+		LongOpenHashSet written = null;
 		for (int i = 0; i <= lastGuarded; i++) {
 			var entry = entries.get(i);
 			if (entry instanceof LogEntry.Guarded guarded) {
 				boolean conflict = conflicts(guarded, guarded.guard() != null ? chains.apply(guarded) : null);
 				if (!conflict && written != null) {
-					long[] columns = guarded.conflictColumns();
 					long[] hashes = guarded.conflictHashes();
-					for (int k = 0; k < columns.length && !conflict; k++) {
-						conflict = written.contains(new KeyId(columns[k], hashes[k]));
+					for (int k = 0; k < hashes.length && !conflict; k++) {
+						conflict = written.contains(hashes[k]);
 					}
 				}
 				if (conflict) {
@@ -341,7 +353,7 @@ final class ConflictTracker {
 				var keys = writes.get(i);
 				if (!keys.isEmpty()) {
 					if (written == null) {
-						written = new HashSet<>();
+						written = new LongOpenHashSet();
 					}
 					written.addAll(keys);
 				}
@@ -390,11 +402,41 @@ final class ConflictTracker {
 	 * above {@code index}, and raises the pruned index to theirs. One call forgets about {@link #PRUNE_BATCH_KEYS}
 	 * keys. Entries at or below the pruned index that are left for a later call make nothing conflict: every
 	 * snapshot that is still validated is at or above that index.</p>
+	 *
+	 * <p>It takes the lock once per {@link #PRUNE_CHUNK_KEYS} keys, not once for the whole call: the leader's
+	 * {@code preAppendTransaction} (under Ratis' append lock) and the completer thread calling this after every
+	 * applied entry then never wait on each other for more than one chunk. The same rule as between two calls makes
+	 * this safe.</p>
 	 */
-	synchronized void prune(long index) {
-		prunedThrough = Math.max(prunedThrough, index);
+	void prune(long index) {
 		long forgotten = 0;
-		while (!resolved.isEmpty() && forgotten < PRUNE_BATCH_KEYS) {
+		boolean first = true;
+		while (forgotten < PRUNE_BATCH_KEYS) {
+			long chunk;
+			synchronized (this) {
+				if (first) {
+					prunedThrough = Math.max(prunedThrough, index);
+					first = false;
+				}
+				chunk = pruneChunk(Math.min(PRUNE_CHUNK_KEYS, PRUNE_BATCH_KEYS - forgotten));
+			}
+			if (chunk == 0) {
+				break;
+			}
+			forgotten += chunk;
+		}
+	}
+
+	/**
+	 * Forgets resolved entries that {@link #prune} may drop, about {@code budget} keys and columns (at least one
+	 * entry, if one can be dropped), and returns how many it forgot: zero once nothing more can be dropped now.
+	 * Between two chunks every structure is consistent: an entry is forgotten whole, and only after {@link
+	 * #prunedThrough} covers it.
+	 */
+	private long pruneChunk(long budget) {
+		assert Thread.holdsLock(this);
+		long forgotten = 0;
+		while (!resolved.isEmpty() && forgotten < budget) {
 			Token token = resolved.peek();
 			if (token.index > prunedThrough) {
 				if (resolvedKeys <= maxKeys) {
@@ -405,18 +447,22 @@ final class ConflictTracker {
 			}
 			resolved.poll();
 			resolvedKeys -= token.weight();
-			forgotten += token.weight();
+			// Count an empty-weight token too, so that the loop always makes progress.
+			forgotten += Math.max(1, token.weight());
 			// Only the keys this token still owns: a later writer of the same key keeps its own state.
-			for (KeyId key : token.keys) {
-				keyWriters.remove(key, token);
+			long[] keyArray = token.keys.elements();
+			for (int i = 0, n = token.keys.size(); i < n; i++) {
+				keyWriters.remove(keyArray[i], token);
 			}
-			for (Long column : token.columns) {
-				columnWriters.remove(column, token);
+			long[] columnArray = token.columns.elements();
+			for (int i = 0, n = token.columns.size(); i < n; i++) {
+				columnWriters.remove(columnArray[i], token);
 			}
 			if (globalWriter == token) {
 				globalWriter = null;
 			}
 		}
+		return forgotten;
 	}
 
 	/** Highest index whose older writes may have been forgotten, for tests. */
