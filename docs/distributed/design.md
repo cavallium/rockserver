@@ -237,8 +237,12 @@ and the `LogEntry`.
   at or above it, loaded from the internal column the first time the proposer is seen: checking a request for
   an earlier copy costs no read.
 
-**Apply.** Every replica applies entries in log order, through the `EmbeddedDB` API, on an apply thread of
-its own. `applyTransaction` decodes the entry on the Ratis thread, queues it and returns a future; the apply
+**Apply.** Every replica applies entries in log order, on an apply thread of its own, through
+`EmbeddedDB.ApplyWriter`: a native transaction held by the apply thread itself, which runs the same code as the
+client API's writes with a transaction (key encoding, schemas, merges, previous values and deltas are the same
+byte for byte), without what a client call adds around it (the lookup and lock of the transaction id, column use
+counting, action logging, operation counters and timers). Its writes are untracked: the apply thread is the only
+writer, so the commit validates nothing. `applyTransaction` decodes the entry on the Ratis thread, queues it and returns a future; the apply
 thread takes everything queued (up to 256 entries or about 16 MiB) and applies it as one group; a third
 thread then completes the group's futures, in log order. Ratis replies to a client, or counts an entry applied,
 only when its future completes, after the group commits,
