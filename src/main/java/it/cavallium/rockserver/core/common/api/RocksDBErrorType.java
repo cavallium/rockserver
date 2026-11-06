@@ -50,7 +50,9 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
   SERVER_OVERLOADED(43),
   RANGE_ITEM_TOO_LARGE(44),
   GET_MULTI_ITEM_TOO_LARGE(45),
-  INVALID_REQUEST(46);
+  INVALID_REQUEST(46),
+  OUTCOME_UNKNOWN(47),
+  SESSION_EXPIRED(48);
 
   private final int value;
 
@@ -159,6 +161,10 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
         return GET_MULTI_ITEM_TOO_LARGE;
       case 46:
         return INVALID_REQUEST;
+      case 47:
+        return OUTCOME_UNKNOWN;
+      case 48:
+        return SESSION_EXPIRED;
       default:
         return null;
     }

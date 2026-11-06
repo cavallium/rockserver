@@ -806,7 +806,7 @@ final class ReplicatedConnection implements RocksDBConnection {
 		if (!context.hasTimeout()) {
 			return context;
 		}
-		return new RequestContext(context.profile(), Math.max(1, remainingNanos(context, startNanos)));
+		return context.withTimeoutNanos(Math.max(1, remainingNanos(context, startNanos)));
 	}
 
 	/**

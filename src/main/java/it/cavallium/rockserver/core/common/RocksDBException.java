@@ -44,7 +44,20 @@ public class RocksDBException extends RuntimeException {
 		COMPACTION_CONFLICT,
 		COMPACTION_FAILED,
 		GET_MULTI_ITEM_TOO_LARGE,
-		INVALID_REQUEST
+		INVALID_REQUEST,
+		/**
+		 * A write may or may not have been applied: the server lost track of it (leader change, lost connection,
+		 * deadline) after it may have been appended. Resending it as a new write can apply it twice. A replicated
+		 * server's client library resends it with its own request id until its deadline, and reports this only when
+		 * that did not settle the outcome.
+		 */
+		OUTCOME_UNKNOWN,
+		/**
+		 * The client session of a write is unknown to the replicated server, or expired: this copy of the write was
+		 * not applied. A write sent for the first time can be sent again under a new session; for a resent write,
+		 * whose earlier copy may have been applied, the outcome is unknown.
+		 */
+		SESSION_EXPIRED
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {
