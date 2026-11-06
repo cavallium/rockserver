@@ -306,7 +306,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		this.applier = new Applier(opened, metrics, applyLanes);
 		applier.maintenance(ops);
 		ops.opened(opened);
-		metrics.bind(opened.db().getMetricsRegistry());
+		metrics.bind(opened.db().getMetricsRegistry(), opened.metricsNodeName(config.nodeId()));
 		setLastAppliedTermIndex(position);
 		applied.advance(Math.max(applied.get(), position.getIndex()));
 		LOG.info("{}: database open, applied position {}", config.nodeId(), position);

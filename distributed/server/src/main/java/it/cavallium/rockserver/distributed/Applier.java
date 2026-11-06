@@ -119,7 +119,7 @@ final class Applier {
 		default void checksum(TermIndex position, NodeStore store) {}
 
 		/** A {@link LogEntry.Backup} at {@code position}. */
-		default void backup(String name, TermIndex position, NodeStore store) {}
+		default void backup(String name, long requestId, TermIndex position, NodeStore store) {}
 	}
 
 	private volatile Maintenance maintenance = Maintenance.NONE;
@@ -1221,7 +1221,7 @@ final class Applier {
 			case LogEntry.Backup backup -> {
 				requireNoTransaction(tx, entry);
 				var position = java.util.Objects.requireNonNull(alonePosition, "position");
-				maintenance.backup(backup.name(), position, store);
+				maintenance.backup(backup.name(), backup.requestId(), position, store);
 				yield position.getIndex();
 			}
 		};

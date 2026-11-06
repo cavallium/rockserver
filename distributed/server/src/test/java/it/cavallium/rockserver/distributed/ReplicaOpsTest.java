@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -19,6 +20,8 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
+import org.apache.ratis.thirdparty.io.grpc.Status;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -32,7 +35,7 @@ class ReplicaOpsTest {
 	@Test
 	void maintenanceEntriesRoundTrip() {
 		for (LogEntry entry : List.of(new LogEntry.ClusterVersion(Capabilities.SUPPORTED), new LogEntry.Checksum(),
-				new LogEntry.Backup("nightly-2026.11.06_a"))) {
+				new LogEntry.Backup("nightly-2026.11.06_a", 0x1234_5678_9abcL))) {
 			byte[] encoded = LogEntryCodec.encode(entry);
 			var decoded = LogEntryCodec.decode(encoded);
 			assertEquals(entry, decoded);
@@ -49,7 +52,7 @@ class ReplicaOpsTest {
 		for (String bad : new String[] {"", ".hidden", "../x", "a/b", "a b", "x".repeat(65), null}) {
 			assertFalse(ReplicaOps.validBackupName(bad), String.valueOf(bad));
 		}
-		assertThrows(IllegalArgumentException.class, () -> new LogEntry.Backup("../etc"));
+		assertThrows(IllegalArgumentException.class, () -> new LogEntry.Backup("../etc", 1));
 	}
 
 	@Test
@@ -59,6 +62,68 @@ class ReplicaOpsTest {
 				new ReplicaOps.Result(ReplicaOps.State.FAILED, 3, 0, "java.io.IOException: disk full é"))) {
 			assertEquals(result, ReplicaOps.decodeResult(ReplicaOps.encodeResult(result)));
 		}
+	}
+
+	private static ReplicaOps.Result done(String digest) {
+		return new ReplicaOps.Result(ReplicaOps.State.DONE, 9, 3, digest);
+	}
+
+	/** {@code admin checksum} says OK only with a digest from every member, all equal. */
+	@Test
+	void checksumVerdict() {
+		var members = List.of("n0", "n1", "n2");
+		var none = new ReplicaOps.Result(ReplicaOps.State.NONE, 9, 0, "");
+		var failed = new ReplicaOps.Result(ReplicaOps.State.FAILED, 9, 0, "closed");
+		assertNull(ReplicatedServerMain.checksumVerdict(9, members, Map.of("n0", done("a"), "n1", done("a"), "n2", done("a")),
+				false));
+		assertEquals(1, ReplicatedServerMain.checksumVerdict(9, members,
+				Map.of("n0", done("a"), "n1", done("b"), "n2", done("a")), false).exitCode());
+		// Missing, failed, skipped, or no digest at all: incomplete, never OK.
+		assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, ReplicatedServerMain.checksumVerdict(9, members,
+				Map.of("n0", done("a"), "n1", done("a")), false).exitCode());
+		assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, ReplicatedServerMain.checksumVerdict(9, members,
+				Map.of("n0", done("a"), "n1", failed, "n2", done("a")), false).exitCode());
+		assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, ReplicatedServerMain.checksumVerdict(9, members, Map.of(), false)
+				.exitCode());
+		var skipped = Map.of("n0", done("a"), "n1", none, "n2", done("a"));
+		assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE,
+				ReplicatedServerMain.checksumVerdict(9, members, skipped, false).exitCode());
+		assertNull(ReplicatedServerMain.checksumVerdict(9, members, skipped, true));
+		assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, ReplicatedServerMain.checksumVerdict(9, members,
+				Map.of("n0", none, "n1", none, "n2", none), true).exitCode(), "no digest at all");
+	}
+
+	/** {@code admin backup} says OK only if every member wrote it. */
+	@Test
+	void backupVerdict() {
+		var members = List.of("n0", "n1", "n2");
+		var failed = new ReplicaOps.Result(ReplicaOps.State.FAILED, 9, 0, "disk full");
+		assertNull(ReplicatedServerMain.backupVerdict(members, Map.of("n0", done("d"), "n1", done("d"), "n2", done("d"))));
+		assertEquals(1, ReplicatedServerMain.backupVerdict(members,
+				Map.of("n0", done("d"), "n1", failed, "n2", done("d"))).exitCode());
+		assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, ReplicatedServerMain.backupVerdict(members,
+				Map.of("n0", done("d"), "n2", done("d"))).exitCode());
+	}
+
+	/** Only an answer that proves nothing was proposed lets admin propose a checksum again. */
+	@Test
+	void retriedOnlyWhenNothingWasProposed() {
+		assertTrue(ReplicatedServerMain.notProposed(Status.Code.UNAVAILABLE));
+		assertTrue(ReplicatedServerMain.notProposed(Status.Code.NOT_FOUND));
+		assertFalse(ReplicatedServerMain.notProposed(Status.Code.ABORTED));
+		assertFalse(ReplicatedServerMain.notProposed(Status.Code.DEADLINE_EXCEEDED));
+	}
+
+	/** add-peer refuses a node lacking a bit that the cluster uses, or that every member supports (about to be used). */
+	@Test
+	void addedNodeNeedsCurrentAndPendingCapabilities() {
+		long old = Capabilities.PIPELINED_UPDATES | Capabilities.CLIENT_SESSIONS;
+		assertEquals(0, ReplicatedServerMain.missingCapabilities(0, 0, 0));
+		assertEquals(Capabilities.CHECKSUM | Capabilities.BACKUP,
+				ReplicatedServerMain.missingCapabilities(0, Capabilities.SUPPORTED, old), "a raise is pending");
+		assertEquals(Capabilities.CLIENT_SESSIONS,
+				ReplicatedServerMain.missingCapabilities(Capabilities.CLIENT_SESSIONS, 0, 0));
+		assertEquals(0, ReplicatedServerMain.missingCapabilities(old, old, Capabilities.SUPPORTED));
 	}
 
 	@Test
@@ -128,8 +193,30 @@ class ReplicaOpsTest {
 			metrics.bind(reopened);
 			assertEquals(2, reopened.find("rockserver.replication.duration").tag("name", "apply").functionTimer().count());
 			assertEquals(9, reopened.find("rockserver.replication.raft.term").gauge().value());
+
+			// A database whose meters are tagged with a configured node name: the replication meters follow it.
+			var named = new SimpleMeterRegistry();
+			metrics.bind(named, "host-7");
+			assertEquals("host-7", named.find("rockserver.replication.duration").tag("name", "apply").functionTimer()
+					.getId().getTag("node"));
+			assertEquals(9, named.find("rockserver.replication.raft.term").tag("node", "host-7").gauge().value());
 		} finally {
 			metrics.close();
+		}
+	}
+
+	/** A blank {@code node-name} (the default config's) means unset: the node id tags the core meters. */
+	@Test
+	void blankNodeNameMeansTheNodeId() throws Exception {
+		Path blank = temp.resolve("blank.conf");
+		Files.writeString(blank, "database.metrics.node-name = \"\"\n");
+		try (var store = NodeStore.open(temp.resolve("db1"), blank, "n-blank")) {
+			assertEquals("n-blank", store.metricsNodeName("fallback"));
+		}
+		Path named = temp.resolve("named.conf");
+		Files.writeString(named, "database.metrics.node-name = host-1\n");
+		try (var store = NodeStore.open(temp.resolve("db2"), named, "n-named")) {
+			assertEquals("host-1", store.metricsNodeName("fallback"));
 		}
 	}
 

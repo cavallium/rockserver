@@ -91,12 +91,26 @@ class ClusterOpsTest {
 
 		// Backup through the Raft port, as admin does it.
 		var reply = ReplicaOps.call(leader.config().self().raftAddress(), leader.stateMachine().groupId(),
-				ReplicaOps.OP_PROPOSE_BACKUP, "b1".getBytes(StandardCharsets.UTF_8), Duration.ofSeconds(20)).join();
+				ReplicaOps.OP_PROPOSE_BACKUP, ReplicaOps.backupPayload(77, "b1"), Duration.ofSeconds(20)).join();
 		long backupIndex = ByteBuffer.wrap(reply).getLong();
-		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node -> {
-			var result = node.stateMachine().ops().backupResult("b1");
-			return result != null && result.state() == ReplicaOps.State.DONE;
-		}));
+		awaitBackup("b1", backupIndex, ReplicaOps.State.DONE);
+		// What the Raft port answers about it, by name and log index.
+		var backupAnswer = ReplicaOps.decodeResult(ReplicaOps.call(leader.config().self().raftAddress(),
+				leader.stateMachine().groupId(), ReplicaOps.OP_BACKUP_RESULT, ReplicaOps.backupPayload(backupIndex, "b1"),
+				Duration.ofSeconds(5)).join());
+		assertEquals(ReplicaOps.State.DONE, backupAnswer.state());
+		assertEquals(backupIndex, backupAnswer.index());
+		// The same request proposed again (admin retrying after a lost answer): the same backup, done again.
+		long again = (Long) follower.proposer().propose(new LogEntry.Backup("b1", 77)).get(20, TimeUnit.SECONDS);
+		awaitBackup("b1", again, ReplicaOps.State.DONE);
+		// Another request with the name: fails, and the first result stays DONE.
+		long reused = (Long) follower.proposer().propose(new LogEntry.Backup("b1", 78)).get(20, TimeUnit.SECONDS);
+		awaitBackup("b1", reused, ReplicaOps.State.FAILED);
+		awaitBackup("b1", backupIndex, ReplicaOps.State.DONE);
+		// Asked about another name at that index, or a position that holds no backup: never an older result.
+		assertEquals(ReplicaOps.State.FAILED, leader.stateMachine().ops().backupResult("b2", backupIndex).state());
+		assertEquals(ReplicaOps.State.NONE, leader.stateMachine().ops().backupResult("b1", checksumIndex).state());
+		assertEquals(ReplicaOps.State.PENDING, leader.stateMachine().ops().backupResult("b1", reused + 1_000_000).state());
 		for (var node : cluster.runningNodes()) {
 			var dir = ReplicaOps.backupsDir(node.config().dataDir()).resolve("b1");
 			var properties = ReplicaOps.readBackupProperties(dir);
@@ -124,9 +138,18 @@ class ClusterOpsTest {
 		cluster.close();
 		cluster = null;
 
-		// A new cluster, seeded from copies of the backup.
+		// A new cluster, seeded from copies of the backup, into a data directory that held the results and backups of
+		// another cluster: they are moved aside, so that they do not answer for the new one.
 		var newRoot = temp.resolve("new");
-		ReplicaOps.restore(backup, newRoot.resolve("n0"), null);
+		Path target = newRoot.resolve("n0");
+		Files.createDirectories(target.resolve(ReplicaOps.BACKUPS_DIR).resolve("old"));
+		Files.writeString(target.resolve("replica-ops.log"), "2026-01-01T00:00:00Z backup 5 DONE b1 /old\n");
+		ReplicaOps.restore(backup, target, null);
+		assertTrue(Files.notExists(target.resolve("replica-ops.log")));
+		assertTrue(Files.notExists(target.resolve(ReplicaOps.BACKUPS_DIR)));
+		try (var listed = Files.list(target)) {
+			assertEquals(2, listed.filter(p -> p.getFileName().toString().contains(".before-restore-")).count());
+		}
 		restored = new InProcessCluster(newRoot, 1, c -> c).startAll();
 		var newLeader = restored.awaitLeader(TIMEOUT);
 		var newApi = newLeader.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
@@ -137,6 +160,11 @@ class ClusterOpsTest {
 			assertEquals("v" + i, text(newApi.get(0, newColumn, key(i), RequestType.current())));
 		}
 		assertNull(newApi.get(0, newColumn, key(1000), RequestType.current()));
+	}
+
+	private void awaitBackup(String name, long index, ReplicaOps.State state) throws Exception {
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node ->
+				node.stateMachine().ops().backupResult(name, index).state() == state));
 	}
 
 	private static Keys key(long i) {

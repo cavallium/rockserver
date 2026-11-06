@@ -447,9 +447,10 @@ final class LogEntryCodec {
 				out.writeLong(capabilities);
 			}
 			case LogEntry.Checksum() -> out.writeByte(CHECKSUM);
-			case LogEntry.Backup(String name) -> {
+			case LogEntry.Backup(String name, long requestId) -> {
 				out.writeByte(BACKUP);
 				writeString(out, name);
+				out.writeLong(requestId);
 			}
 		}
 		return entry;
@@ -625,7 +626,7 @@ final class LogEntryCodec {
 			case LogEntry.RegisterClient _ -> 1 + Long.BYTES;
 			case LogEntry.ClusterVersion _ -> 1 + Long.BYTES;
 			case LogEntry.Checksum _ -> 1;
-			case LogEntry.Backup(String name) -> 1 + stringSize(name);
+			case LogEntry.Backup(String name, long _) -> 1 + stringSize(name) + Long.BYTES;
 		};
 	}
 
@@ -795,7 +796,7 @@ final class LogEntryCodec {
 			case REGISTER_CLIENT -> new LogEntry.RegisterClient(in.readLong());
 			case CLUSTER_VERSION -> new LogEntry.ClusterVersion(in.readLong());
 			case CHECKSUM -> new LogEntry.Checksum();
-			case BACKUP -> new LogEntry.Backup(in.readString());
+			case BACKUP -> new LogEntry.Backup(in.readString(), in.readLong());
 			default -> readWrite(in, tag);
 		};
 	}

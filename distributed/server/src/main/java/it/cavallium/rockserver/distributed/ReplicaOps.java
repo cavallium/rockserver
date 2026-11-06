@@ -63,9 +63,12 @@ import org.slf4j.LoggerFactory;
  * database ({@link NodeStore#checkpoint}: a memtable flush and hard links, 100–300 ms during which the apply waits) to
  * {@code <data-dir>/backups/<name>/db}, with {@code backup.properties} beside it. All of them hold the same data, that of
  * every entry before the backup entry: a copy of the whole cluster at one moment, on every node. A backup that a replica
- * could not write (disk full, a name used before) is logged and reported by {@code admin backup-status}, and does not
- * stop the replica: the entry's result is its log index on every replica. Restoring one starts a new cluster seeded from
- * it, see {@link #restore}. The runbook is {@code docs/distributed/runbooks.md}.</p>
+ * could not write (disk full, a name used before) is logged, recorded in {@code replica-ops.log} and reported by
+ * {@code admin backup} and {@code admin backup-status}, and does not stop the replica: the entry's result is its log
+ * index on every replica. Results are kept by log index, so a name used again later is never answered with an older
+ * result. The same request proposed twice ({@link LogEntry.Backup#requestId}, after a lost answer) finds its own backup
+ * and reports it done. Restoring one starts a new cluster seeded from it, see {@link #restore}. The runbook is
+ * {@code docs/distributed/runbooks.md}.</p>
  */
 final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 
@@ -105,6 +108,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	/** A replica's result. {@code detail}: the hex digest of a checksum, the directory of a backup, or why it failed. */
 	record Result(State state, long index, long keys, String detail) {}
 
+	/** A replica's result of the backup {@code name}. */
+	private record BackupResult(String name, Result result) {}
+
 	private final NodeConfig config;
 	private final RockserverStateMachine stateMachine;
 	private final NodeMetrics.Series mismatches;
@@ -112,13 +118,15 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	private final ScheduledExecutorService worker;
 	private final Path resultsFile;
 	private final Map<Long, Result> checksums = new ConcurrentHashMap<>();
-	private final Map<String, Result> backups = new ConcurrentHashMap<>();
+	/** By log index of the backup entry. */
+	private final Map<Long, BackupResult> backups = new ConcurrentHashMap<>();
 	private volatile long clusterVersion;
 	private volatile @Nullable Proposer proposer;
 	/** Leader only, initialization thread only. */
 	private long versionCheckTerm = -1;
 	private long nextVersionCheckNanos;
-	private boolean versionCheckRunning;
+	/** Set on the initialization thread, cleared by the thread that ends the check. */
+	private volatile boolean versionCheckRunning;
 	private long nextChecksumNanos;
 	private volatile long lastMismatchIndex = -1;
 	private volatile long lastMatchIndex = -1;
@@ -342,7 +350,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	// Backups
 
 	@Override
-	public void backup(String name, TermIndex position, NodeStore store) {
+	public void backup(String name, long requestId, TermIndex position, NodeStore store) {
 		long index = position.getIndex();
 		Path dir = config.dataDir().resolve(BACKUPS_DIR).resolve(name);
 		Result result;
@@ -355,6 +363,13 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 					record(name, result);
 					return;
 				}
+				if (requestId != 0 && String.valueOf(requestId).equals(existing.getProperty("request"))) {
+					// The same request proposed again, after its first answer was lost: that backup is this one.
+					LOG.info("{}: backup {} at log index {} is the one written at index {} for the same request",
+							config.nodeId(), name, index, existing.getProperty("index"));
+					record(name, new Result(State.DONE, index, 0, dir.toString()));
+					return;
+				}
 				throw new IOException("A backup named " + name + " exists already, at index " + existing.getProperty("index"));
 			}
 			long start = System.nanoTime();
@@ -365,6 +380,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			var properties = new Properties();
 			properties.setProperty("name", name);
 			properties.setProperty("index", String.valueOf(index));
+			properties.setProperty("request", String.valueOf(requestId));
 			properties.setProperty("term", String.valueOf(position.getTerm()));
 			properties.setProperty("applied", contained.getTerm() + ":" + contained.getIndex());
 			properties.setProperty("cluster", String.valueOf(store.clusterId()));
@@ -400,6 +416,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 * the database belongs to no cluster. Every node of the new cluster is prepared from a copy of the same backup and
 	 * started without {@code --join}: the cluster starts seeded, see "Migrating from a single node" in the design
 	 * document. Client sessions and the results kept for them are gone with the metadata: clients open new sessions.
+	 * The results file and the backups of the old cluster in {@code dataDir}, if any, are renamed with the suffix
+	 * {@code .before-restore-<time>}: their results, by log index and by name, would otherwise answer for the new cluster,
+	 * whose log starts again from 1.
 	 */
 	static TermIndex restore(Path backupDir, Path dataDir, @Nullable Path rockserverConfig) throws IOException {
 		var properties = readBackupProperties(backupDir);
@@ -414,6 +433,14 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		try (var store = NodeStore.open(db, rockserverConfig, "restore")) {
 			applied = store.applied();
 			store.db().deleteColumn(store.metaColumnId());
+		}
+		String suffix = ".before-restore-" + System.currentTimeMillis();
+		for (Path old : List.of(dataDir.resolve(RESULTS_FILE), dataDir.resolve(BACKUPS_DIR))) {
+			if (Files.exists(old)) {
+				Path aside = old.resolveSibling(old.getFileName() + suffix);
+				Files.move(old, aside);
+				LOG.info("Moved {} of the old cluster to {}", old, aside);
+			}
 		}
 		LOG.info("Restored backup {} (log index {} of cluster {}) into {}, holding the entries up to {}",
 				properties.getProperty("name"), properties.getProperty("index"), properties.getProperty("cluster"), db, applied);
@@ -437,7 +464,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	}
 
 	private void record(String name, Result result) {
-		backups.put(name, result);
+		backups.put(result.index(), new BackupResult(name, result));
 		trim(backups);
 		persist("backup " + result.index() + " " + result.state() + " " + name + " " + oneLine(result.detail()));
 	}
@@ -446,10 +473,10 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		return text.isEmpty() ? "-" : text.replace('\n', ' ').replace('\r', ' ');
 	}
 
-	private static <K extends Comparable<K>> void trim(Map<K, Result> results) {
+	/** Forgets the oldest result, by log index, beyond {@link #KEPT_RESULTS}. */
+	private static void trim(Map<Long, ?> results) {
 		if (results.size() > KEPT_RESULTS) {
-			results.entrySet().stream().min(Map.Entry.comparingByValue((a, b) -> Long.compare(a.index(), b.index())))
-					.ifPresent(oldest -> results.remove(oldest.getKey()));
+			results.keySet().stream().min(Long::compare).ifPresent(results::remove);
 		}
 	}
 
@@ -483,7 +510,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 							trim(checksums);
 						}
 						case "backup" -> {
-							backups.put(parts[4], new Result(state, index, 0, parts[5]));
+							backups.put(index, new BackupResult(parts[4], new Result(state, index, 0, parts[5])));
 							trim(backups);
 						}
 						default -> {}
@@ -506,9 +533,20 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		return new Result(stateMachine.appliedIndex().get() >= index ? State.NONE : State.PENDING, index, 0, "");
 	}
 
-	/** This replica's result of the backup {@code name}, null if it has none. */
-	@Nullable Result backupResult(String name) {
-		return backups.get(name);
+	/**
+	 * This replica's result of the backup {@code name} proposed at log index {@code index}: never the result of an
+	 * earlier backup of the same name.
+	 */
+	Result backupResult(String name, long index) {
+		var result = backups.get(index);
+		if (result == null) {
+			return new Result(stateMachine.appliedIndex().get() >= index ? State.NONE : State.PENDING, index, 0, "");
+		}
+		if (!result.name().equals(name)) {
+			return new Result(State.FAILED, index, 0, "The entry at log index " + index + " is the backup " + result.name()
+					+ ", not " + name);
+		}
+		return result.result();
 	}
 
 	// The cluster version, on the leader
@@ -534,42 +572,56 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		nextVersionCheckNanos = now + VERSION_CHECK_EVERY.toNanos();
 		versionCheckRunning = true;
 		var answers = new ArrayList<CompletableFuture<Long>>();
-		for (RaftPeer peer : division.getRaftConf().getAllPeers()) {
+		for (RaftPeer peer : pollPeers(division).values()) {
 			if (peer.getId().toString().equals(config.nodeId())) {
 				answers.add(CompletableFuture.completedFuture(Capabilities.SUPPORTED));
 			} else {
 				answers.add(ask(peer, OP_CAPABILITIES, new byte[0]).thenApply(reply -> ByteBuffer.wrap(reply).getLong()));
 			}
 		}
-		CompletableFuture.allOf(answers.toArray(CompletableFuture[]::new)).whenComplete((_, error) -> {
-			try {
-				if (error != null) {
-					LOG.debug("{}: not every member told its capabilities, the cluster version stays {}", config.nodeId(),
-							Capabilities.describe(clusterVersion), error);
-					return;
-				}
-				long common = Capabilities.SUPPORTED;
-				for (var answer : answers) {
-					common &= answer.join();
-				}
-				long current = clusterVersion;
-				if ((common & ~current) == 0) {
-					return;
-				}
-				var proposer = this.proposer;
-				if (proposer == null) {
-					return;
-				}
-				LOG.info("{}: every member supports {}: raising the cluster version", config.nodeId(),
-						Capabilities.describe(common | current));
-				proposer.propose(new LogEntry.ClusterVersion(common | current)).get(config.requestTimeout().toMillis(),
-						TimeUnit.MILLISECONDS);
-			} catch (Exception ex) {
-				LOG.warn("{}: failed to raise the cluster version, retrying", config.nodeId(), ex);
-			} finally {
-				versionCheckRunning = false;
+		// Ends on whichever thread answers last, without blocking it: versionCheckRunning is volatile for that.
+		CompletableFuture.allOf(answers.toArray(CompletableFuture[]::new)).thenCompose(_ -> {
+			long common = Capabilities.SUPPORTED;
+			for (var answer : answers) {
+				common &= answer.join();
 			}
+			long current = clusterVersion;
+			var proposer = this.proposer;
+			if ((common & ~current) == 0 || proposer == null) {
+				return CompletableFuture.<Object>completedFuture(null);
+			}
+			LOG.info("{}: every member supports {}: raising the cluster version", config.nodeId(),
+					Capabilities.describe(common | current));
+			return proposer.propose(new LogEntry.ClusterVersion(common | current))
+					.orTimeout(config.requestTimeout().toMillis(), TimeUnit.MILLISECONDS);
+		}).whenComplete((_, error) -> {
+			if (error != null) {
+				LOG.debug("{}: the cluster version stays {} for now: {}", config.nodeId(),
+						Capabilities.describe(clusterVersion), error.toString());
+			}
+			versionCheckRunning = false;
 		});
+	}
+
+	/**
+	 * The peers the leader asks for their capabilities: the members of its configuration, old and new while it changes,
+	 * and every peer it sends the log to, which includes a peer that {@code add-peer} is bringing in and that is still
+	 * catching up (Ratis' staging peers, not yet in the configuration). Such a peer receives every entry of the log, a
+	 * {@link LogEntry.ClusterVersion} among them, so it must support what that entry turns on.
+	 */
+	static Map<String, RaftPeer> pollPeers(RaftServer.Division division) {
+		var peers = new TreeMap<String, RaftPeer>();
+		for (RaftPeer peer : division.getRaftConf().getAllPeers()) {
+			peers.put(peer.getId().toString(), peer);
+		}
+		for (var follower : division.getInfo().getRoleInfoProto().getLeaderInfo().getFollowerInfoList()) {
+			var id = follower.getId();
+			var name = org.apache.ratis.protocol.RaftPeerId.valueOf(id.getId()).toString();
+			if (!peers.containsKey(name) && !id.getAddress().isEmpty()) {
+				peers.put(name, RaftPeer.newBuilder().setId(name).setAddress(id.getAddress()).build());
+			}
+		}
+		return peers;
 	}
 
 	private void proposePeriodicChecksum(long now) {
@@ -610,12 +662,22 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		return ByteBuffer.allocate(1 + payload.length).put(op).put(payload).array();
 	}
 
+	/** The payload of {@link #OP_PROPOSE_BACKUP} (a request id) or {@link #OP_BACKUP_RESULT} (a log index). */
+	static byte[] backupPayload(long number, String name) {
+		var bytes = name.getBytes(StandardCharsets.UTF_8);
+		return ByteBuffer.allocate(Long.BYTES + bytes.length).putLong(number).put(bytes).array();
+	}
+
 	/** Answers a {@link TermService#OPS} call: {@code request} is the operation byte, then its payload. */
 	CompletableFuture<byte[]> answer(byte[] request) {
 		if (request.length == 0) {
 			return failed(Status.INVALID_ARGUMENT, "Empty request");
 		}
 		var payload = ByteBuffer.wrap(request, 1, request.length - 1).slice();
+		if ((request[0] == OP_CHECKSUM_RESULT || request[0] == OP_BACKUP_RESULT || request[0] == OP_PROPOSE_BACKUP)
+				&& payload.remaining() < Long.BYTES) {
+			return failed(Status.INVALID_ARGUMENT, "Operation " + request[0] + " needs a number first");
+		}
 		switch (request[0]) {
 			case OP_CAPABILITIES -> {
 				return CompletableFuture.completedFuture(ByteBuffer.allocate(2 * Long.BYTES)
@@ -625,21 +687,21 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 				return CompletableFuture.completedFuture(encodeResult(checksumResult(payload.getLong())));
 			}
 			case OP_BACKUP_RESULT -> {
+				long index = payload.getLong();
 				var name = StandardCharsets.UTF_8.decode(payload).toString();
-				var result = backupResult(name);
-				return CompletableFuture.completedFuture(encodeResult(result != null ? result
-						: new Result(State.PENDING, -1, 0, "")));
+				return CompletableFuture.completedFuture(encodeResult(backupResult(name, index)));
 			}
 			case OP_PROPOSE_CHECKSUM -> {
 				return propose(Capabilities.CHECKSUM, new LogEntry.Checksum());
 			}
 			case OP_PROPOSE_BACKUP -> {
+				long requestId = payload.getLong();
 				var name = StandardCharsets.UTF_8.decode(payload).toString();
 				if (!validBackupName(name)) {
 					return failed(Status.INVALID_ARGUMENT, "Invalid backup name " + name + ": 1 to 64 letters, digits, '.', '_'"
 							+ " or '-', starting with a letter or a digit");
 				}
-				return propose(Capabilities.BACKUP, new LogEntry.Backup(name));
+				return propose(Capabilities.BACKUP, new LogEntry.Backup(name, requestId));
 			}
 			default -> {
 				return failed(Status.UNIMPLEMENTED, "Unknown operation " + request[0]);

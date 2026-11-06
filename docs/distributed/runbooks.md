@@ -93,7 +93,9 @@ rs admin $PEERS backup 2026-11-06
 ```
 
 It prints the log index of the backup and, for each node, `DONE` and the directory, `<data-dir>/backups/<name>`, or
-why it failed (disk full, a backup of that name exists). It exits with 1 if a node failed. Each node's apply stops for
+why it failed (disk full, a backup of that name exists), and `OK` only if every node of `$PEERS` wrote it. It exits
+with 1 if a node failed, and with 4 if a node gave no result within `--timeout-ms` (down, or slow): then ask again
+later with `rs admin $PEERS backup-status 2026-11-06 <index it printed>`, which proposes nothing. Each node's apply stops for
 the flush (100–300 ms); the files are hard links, so a backup costs space only as compactions replace the files it
 holds.
 
@@ -113,7 +115,8 @@ over (clients open new ones by themselves).
 1. Stop every node of the old cluster, and copy their data directories aside before anything else.
 2. On every node of the new cluster, into an empty data directory, from a copy of the same backup:
    `rs restore-backup --backup /path/to/<name> --data-dir /srv/rockserver/data [--rockserver-config ...]`.
-   It prints `OK` and the log index the data reaches.
+   It prints `OK` and the log index the data reaches. It refuses a data directory with a `db/` or a Raft log, and
+   renames a `replica-ops.log` and a `backups/` of the old cluster found there (suffix `.before-restore-<time>`).
 3. Start every node as for a new cluster, without `--join`; the nodes of the old cluster stay stopped. The first leader proposes
    a seeded genesis, as in "Seeding a cluster".
 4. Check: `status`, then `checksum` prints `OK`, then a few known keys read back.
@@ -121,7 +124,10 @@ over (clients open new ones by themselves).
 ## Checksums
 
 `rs admin $PEERS checksum` makes every replica digest its user data at one log position and compare it with the others.
-It prints each node's digest and number of keys, and exits with 1 if they differ. The digest reads every key of the
+It prints each node's digest and number of keys, and `OK` only if every node of `$PEERS` gave a digest and all are
+equal. It exits with 1 if they differ, and with 4 if a node gave none (down, failed, not done within `--timeout-ms`,
+or it skipped the position because a snapshot install jumped over it): run it again. `--allow-skipped` accepts nodes
+that skipped the position. The digest reads every key of the
 database on every node at once, holding a snapshot meanwhile: run it at a quiet time on large databases. With
 `-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` on the nodes, the leader also runs one every N hours.
 
@@ -174,7 +180,8 @@ The cluster version keeps the new kinds of log entries off until every member ru
   `-Dit.cavallium.rockserver.grpc.client.session-writes=false` until then).
 - `admin checksum` and `admin backup` are refused until every member supports them.
 - Never downgrade a node below the cluster version: it would stop on the first entry it cannot read. `add-peer` refuses
-  a new node that lacks a capability of the cluster.
+  a new node that lacks a capability of the cluster, or one that every member supports already (the leader may turn it
+  on at any moment): upgrade the new node first.
 - A cluster created before the cluster version has none until every member was upgraded to a version that has it and the
   leader raised it.
 

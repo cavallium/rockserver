@@ -1161,7 +1161,14 @@ What waits for it:
   version has them, or before genesis. A client reads that when it connects, so one connected before stays without
   sessions until it reconnects.
 - Checksums and backups (next section): refused until the version has them.
-- `admin add-peer` refuses a node that lacks a capability of the cluster. A member must not be downgraded below it.
+- `admin add-peer` refuses a node that lacks a capability of the cluster, or one that every member that answered
+  supports: the leader may raise the version to it at any moment, also while the new node catches up and before the
+  CLI's check could see it. The leader closes the same race from its side: it also asks every peer it sends the log to,
+  which includes a peer that `add-peer` is bringing in and that is still catching up (Ratis' staging peers, which are
+  not in the configuration yet), and does not raise the version past what that peer supports. A member must not be
+  downgraded below it.
+- The leader's question and proposal run on the threads of the answers, without blocking them; the flag that tells
+  the next round whether one is running is volatile.
 
 Rejected: a check of the members' versions at each use instead of a version in the log. A node restarted during an
 upgrade would not know whether it may serve sessions until a leader asked everyone again, and pipelining would turn on
@@ -1185,15 +1192,28 @@ reported, and stops nothing.
   `REPLICAS DIVERGED` and counted in `checksum.mismatches`, with an alert. This is what finds a merge operator that is
   not deterministic, which nothing else detects. A check reads the whole database on every node at once and holds a
   snapshot meanwhile, which keeps the files that compactions replace: it runs when asked (`admin checksum`) or every N
-  hours with `-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` (off by default).
+  hours with `-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` (off by default). `admin checksum` prints
+  `OK` only when every member it was given returned a digest and all are equal: a member down, failed, not done in
+  time, or that skipped the position makes it exit with 4 ("incomplete"; `--allow-skipped` accepts a skipped one), a
+  difference with 1. It proposes the check again through another member only after an answer that proves nothing was
+  proposed (UNAVAILABLE, NOT_FOUND): a second check of the same data would cost a second full read of the database.
 - **`Backup`** (RA-7.2, DD-6f). Each replica writes a checkpoint of its database (`NodeStore.checkpoint`, as for a
   snapshot: a memtable flush and hard links, 100–300 ms during which its apply waits) to `<data-dir>/backups/<name>/db`,
-  with `backup.properties` (log index, cluster, node, time). All of them hold the data of every entry before the backup
-  entry: a consistent copy of the whole cluster, on every node. The same entry applied again after a crash finds its
-  backup and changes nothing. `restore-backup` prepares an empty data directory from a copy: it restores the
-  checkpoint and deletes the meta column, so the database belongs to no cluster, and every node of a new cluster is
-  prepared from the same backup and started as a seeded cluster (see "Migrating from a single node"). Client sessions
-  go with the meta column: clients open new ones. Restoring under the old cluster's ids and Raft state was rejected:
+  with `backup.properties` (log index, request id, cluster, node, time). All of them hold the data of every entry before
+  the backup entry: a consistent copy of the whole cluster, on every node. The same entry applied again after a crash
+  finds its backup and changes nothing. The entry carries a request id that `admin backup` draws at random: after an
+  answer that was lost (a timeout, a leader change) it proposes the backup again through another member, and the second
+  entry finds the backup of the same request and reports it done instead of "exists already". Results are kept and
+  asked for by log index (the name is checked too), so a name used again after its backup was deleted is never
+  answered with the older result, and a later failure with a name never replaces the earlier backup's result.
+  `admin backup` prints `OK` only when every member it was given wrote the backup: it exits with 1 if one failed, and
+  with 4 if one gave no result in time; `admin backup-status NAME INDEX` asks again later, without proposing anything.
+  `restore-backup` prepares an empty data directory from a copy: it restores the checkpoint and deletes the meta
+  column, so the database belongs to no cluster, and every node of a new cluster is prepared from the same backup and
+  started as a seeded cluster (see "Migrating from a single node"). It renames a `replica-ops.log` and a `backups/`
+  left in the data directory by an old cluster (suffix `.before-restore-<time>`): their results, by log index and by
+  name, would otherwise answer for the new cluster, whose log starts again from 1. Client sessions go with the meta
+  column: clients open new ones. Restoring under the old cluster's ids and Raft state was rejected:
   each node's Raft log and vote are local and not taken at the backup's position, and an older log with a newer vote,
   or the reverse, is the fault that "No quorum" describes. A new cluster has neither problem.
 
@@ -1205,7 +1225,9 @@ function timer) or `rockserver.replication.count` and `.amount` (function counte
 every gauge as `rockserver.replication.<name>`. The values are cumulative; the log line keeps its own interval sums. A
 snapshot install opens a new database, with a new registry, and the meters move to it. Every meter of a replica's
 database, the core ones included, also gets the tag `node`: a replica sets `database.metrics.node-name` to its node id
-unless the config sets it, since the nodes of a cluster share one config and would otherwise write the same series.
+unless the config sets a name that is not blank (the default config's `""` means unset), since the nodes of a cluster
+share one config and would otherwise write the same series. The replication meters take the tag the database resolved,
+so a configured name (a host name, say) tags both families the same way.
 
 `NodeMonitor` reads, once per second on the maintenance thread, what the alerts watch: `raft.role` (2 leader, 1
 candidate, 0 follower, -1 unknown), `raft.term`, `raft.last_index`, `raft.commit_index`, `raft.applied_index`,
@@ -1340,8 +1362,8 @@ failover" below).
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, partitions, pauses and restarts. Register histories, with read-modify-write updates and hot counters in them, are linearizable, and the transactional bank-transfer invariant holds. |
 | `RaftLogRepairTest` | Segments written by Ratis' own output stream, torn at sector boundaries: torn entries are dropped, and Ratis then opens and appends to the log; anything else is refused and left unchanged: a damaged complete entry, a size that hides a valid entry, a gap or overlap between segments, a problem in a closed segment; a dry run changes nothing. A leader, and a follower that never acknowledged its last entry, refuse to start with a torn entry and rejoin after `repair-log`. So does a leader that loses a whole open segment after closed segments, a snapshot and a purge. Two or three nodes torn by one power cut, in entries no quorum confirmed, repair and elect a leader among themselves with every acknowledged write. No test interrupts a real device: the torn bytes are written by the test. |
-| `ClusterOpsTest` (in-process) | A cluster created by this version has the full cluster version, and advertises sessions. A checksum proposed through a follower gives the same digest and key count on every replica, and every replica finds the others equal; the Raft port answers it. A backup asked through the Raft port is written by every replica at the same log index; restored with `restore-backup` into a new seeded cluster, it holds every key written before it and none written after. The monitor's gauges (one leader, a Raft log with bytes) and the replication timers reach each node's database registry, and the core meters carry the node tag. |
-| `ReplicaOpsTest` | The new entries round-trip and are applied alone; backup names; the wire form of results; capability names; digests that tell key parts and values apart; series and gauges exported cumulative, with their kind, and moved to a new registry; the lag sampling period; Raft log bytes counted from segment files only; the alarm's start, repeat and end. |
+| `ClusterOpsTest` (in-process) | A cluster created by this version has the full cluster version, and advertises sessions. A checksum proposed through a follower gives the same digest and key count on every replica, and every replica finds the others equal; the Raft port answers it. A backup asked through the Raft port is written by every replica at the same log index, and the port answers it by name and index; the same request proposed again is done again, another request with the name fails without changing the first result, and a query by another name or index never returns an older result. Restored with `restore-backup` into a new seeded cluster, through a data directory holding an old `replica-ops.log` and `backups/` (moved aside), it holds every key written before it and none written after. The monitor's gauges (one leader, a Raft log with bytes) and the replication timers reach each node's database registry, and the core meters carry the node tag. |
+| `ReplicaOpsTest` | The new entries round-trip and are applied alone; backup names; the wire form of results; capability names; digests that tell key parts and values apart; series and gauges exported cumulative, with their kind, and moved to a new registry; the lag sampling period; Raft log bytes counted from segment files only; the alarm's start, repeat and end; the verdicts of `admin checksum` and `admin backup` (OK only with a final result from every member), which failed proposals are retried, the capabilities `add-peer` requires (current and pending), the replication meters following a configured node name, and a blank `node-name` meaning the node id. |
 | Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage`, `LeaderForwarder` (leader lookups still waiting fail on close), fault proxy, linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
 
 Run them all (about 20 minutes on a real disk):

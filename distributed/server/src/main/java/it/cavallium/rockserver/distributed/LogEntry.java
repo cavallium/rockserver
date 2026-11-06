@@ -212,9 +212,10 @@ public sealed interface LogEntry {
 	/**
 	 * Every replica writes a checkpoint of its database at this log position under {@code backups/<name>} of its data
 	 * directory: a copy of the cluster at one moment, on every node (see {@link ReplicaOps}). Needs
-	 * {@link Capabilities#BACKUP}.
+	 * {@link Capabilities#BACKUP}. {@code requestId}, chosen by the caller ({@code admin backup}), names the request: the
+	 * same request proposed again, after an answer that was lost, finds its own backup there and does not fail.
 	 */
-	record Backup(String name) implements LogEntry {
+	record Backup(String name, long requestId) implements LogEntry {
 		public Backup {
 			if (!ReplicaOps.validBackupName(name)) {
 				throw new IllegalArgumentException("Invalid backup name: " + name);

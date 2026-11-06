@@ -79,6 +79,8 @@ final class NodeMetrics {
 	private static final long DEFAULT_LAG_SAMPLE_MS = 10;
 
 	private final String nodeId;
+	/** The {@code node} tag of the exported meters: that of the database bound last. Guarded by {@link #exportLock}. */
+	private String nodeTag;
 	private final Map<String, Series> durations = new ConcurrentHashMap<>();
 	private final Map<String, Series> amounts = new ConcurrentHashMap<>();
 	private final ScheduledExecutorService logger;
@@ -94,6 +96,7 @@ final class NodeMetrics {
 
 	NodeMetrics(String nodeId) {
 		this.nodeId = nodeId;
+		this.nodeTag = nodeId;
 		this.logger = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon()
 				.name("rockserver-metrics-" + nodeId).factory());
 		logger.scheduleAtFixedRate(this::log, INTERVAL_SECONDS, INTERVAL_SECONDS, TimeUnit.SECONDS);
@@ -186,11 +189,20 @@ final class NodeMetrics {
 	 * in the registries bound before, which their database closed.
 	 */
 	void bind(MeterRegistry registry) {
+		bind(registry, nodeId);
+	}
+
+	/**
+	 * As {@link #bind(MeterRegistry)}, tagging the meters with {@code node} = {@code nodeTag}: the tag the database gives
+	 * its own meters ({@code database.metrics.node-name}), so that both families name the node the same way.
+	 */
+	void bind(MeterRegistry registry, String nodeTag) {
 		synchronized (exportLock) {
-			if (this.registry == registry) {
+			if (this.registry == registry && this.nodeTag.equals(nodeTag)) {
 				return;
 			}
 			this.registry = registry;
+			this.nodeTag = nodeTag;
 			registered.clear();
 			durations.forEach((name, series) -> registerDuration(registry, name, series));
 			amounts.forEach((name, series) -> registerAmount(registry, name, series));
@@ -217,7 +229,7 @@ final class NodeMetrics {
 	private void registerDuration(MeterRegistry registry, String name, Series series) {
 		registered.add(FunctionTimer.builder("rockserver.replication.duration", series, Series::count, Series::sum,
 						TimeUnit.NANOSECONDS)
-				.tag("node", nodeId)
+				.tag("node", nodeTag)
 				.tag("name", name)
 				.tag("kind", kindOf(name))
 				.description("Replication timings of this node, see NodeMetrics")
@@ -226,12 +238,12 @@ final class NodeMetrics {
 
 	private void registerAmount(MeterRegistry registry, String name, Series series) {
 		registered.add(FunctionCounter.builder("rockserver.replication.count", series, s -> s.count())
-				.tag("node", nodeId)
+				.tag("node", nodeTag)
 				.tag("name", name)
 				.tag("kind", kindOf(name))
 				.register(registry));
 		registered.add(FunctionCounter.builder("rockserver.replication.amount", series, s -> s.sum())
-				.tag("node", nodeId)
+				.tag("node", nodeTag)
 				.tag("name", name)
 				.tag("kind", kindOf(name))
 				.register(registry));
@@ -250,7 +262,7 @@ final class NodeMetrics {
 						return Double.NaN;
 					}
 				})
-				.tag("node", nodeId);
+				.tag("node", nodeTag);
 		if (!tag.isEmpty()) {
 			builder.tag(tag.get(0), tag.get(1));
 		}

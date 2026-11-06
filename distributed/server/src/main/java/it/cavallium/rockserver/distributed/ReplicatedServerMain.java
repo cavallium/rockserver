@@ -34,15 +34,21 @@ import org.jetbrains.annotations.Nullable;
  *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
  *       [--jvm-pause-limit-ms N] [--snapshot-every-bytes N] [--parallel-apply-threads N]
  * admin --peer ... [--group-id UUID] [--timeout-ms N]
- *       status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID | checksum | backup NAME
+ *       status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
+ *       | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
  * restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]
  * </pre>
  *
  * <p>{@code checksum} has every replica digest its data at one log position and compares the digests; it prints each
- * member's and exits with 1 if they differ. {@code backup NAME} has every replica write a checkpoint of its database at
- * one log position to {@code <data-dir>/backups/NAME}; it prints where each member wrote it, and exits with 1 if a
- * member failed. {@code restore-backup} prepares an empty data directory to seed a new cluster from such a backup. See
+ * member's, and prints {@code OK} only if every member of {@code --peer} gave a digest and all of them are equal. It
+ * exits with 1 if they differ, and with 4 if a member gave none (down, failed, or not done within {@code --timeout-ms});
+ * with {@code --allow-skipped} a member that skipped the position (a snapshot install jumped over it) does not count
+ * as missing. {@code backup NAME} has every replica write a checkpoint of its database at one log position to
+ * {@code <data-dir>/backups/NAME}; it prints where each member wrote it, and prints {@code OK} only if every member of
+ * {@code --peer} wrote it; it exits with 1 if a member failed and with 4 if a member gave no result in time.
+ * {@code backup-status NAME INDEX} asks the members again about that backup ({@code INDEX} is the log index that
+ * {@code backup} printed), without proposing anything, with the same output and exit codes. {@code restore-backup} prepares an empty data directory to seed a new cluster from such a backup. See
  * {@link ReplicaOps} and {@code docs/distributed/runbooks.md}.</p>
  *
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
@@ -224,19 +230,16 @@ public final class ReplicatedServerMain {
 					yield attempt(timeout, () -> api.create(timeout.toMillis()));
 				}
 				case "checksum" -> {
+					boolean allowSkipped = options.flag("--allow-skipped");
 					if (command.size() != 1) {
 						usage("checksum takes no argument");
 					}
-					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0], deadline);
+					// Not idempotent: proposed again only after an answer that says nothing was proposed.
+					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0], false, deadline);
 					System.out.println("checksum at log index " + index);
 					var results = awaitResults(peers, groupId, ReplicaOps.OP_CHECKSUM_RESULT,
 							java.nio.ByteBuffer.allocate(Long.BYTES).putLong(index).array(), deadline);
-					var digests = results.values().stream().filter(r -> r.state() == ReplicaOps.State.DONE)
-							.map(r -> r.detail() + "/" + r.keys()).distinct().count();
-					if (digests > 1) {
-						fail("the replicas hold different data at log index " + index + ": see the lines above, and"
-								+ " \"Checksums\" in docs/distributed/runbooks.md");
-					}
+					exitOn(checksumVerdict(index, peers.stream().map(PeerConfig::id).toList(), results, allowSkipped));
 					System.out.println("OK");
 					yield null;
 				}
@@ -245,15 +248,18 @@ public final class ReplicatedServerMain {
 					if (!ReplicaOps.validBackupName(name)) {
 						usage("invalid backup name " + name);
 					}
-					var payload = name.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_BACKUP, payload, deadline);
+					// A request id makes it safe to propose again after an answer that was lost.
+					long requestId = new java.security.SecureRandom().nextLong() | 1;
+					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_BACKUP,
+							ReplicaOps.backupPayload(requestId, name), true, deadline);
 					System.out.println("backup " + name + " at log index " + index);
-					var results = awaitResults(peers, groupId, ReplicaOps.OP_BACKUP_RESULT, payload, deadline);
-					if (results.values().stream().anyMatch(r -> r.state() != ReplicaOps.State.DONE)) {
-						fail("not every member wrote the backup: see the lines above");
+					yield awaitBackup(peers, groupId, name, index, deadline);
+				}
+				case "backup-status" -> {
+					if (command.size() != 3 || !ReplicaOps.validBackupName(command.get(1))) {
+						usage("backup-status takes a backup name and the log index that backup printed");
 					}
-					System.out.println("OK");
-					yield null;
+					yield awaitBackup(peers, groupId, command.get(1), Long.parseLong(command.get(2)), deadline);
 				}
 				default -> {
 					usage("unknown admin command " + command.getFirst());
@@ -269,9 +275,13 @@ public final class ReplicatedServerMain {
 		}
 	}
 
-	/** Proposes a cluster operation through the first member that takes it; returns the log index of its entry. */
+	/**
+	 * Proposes a cluster operation through the first member that takes it; returns the log index of its entry. After an
+	 * answer that leaves open whether the entry was proposed (a timeout, a leader change), it tries again only if the
+	 * operation is {@code idempotent}: otherwise it fails and says so.
+	 */
 	private static long proposeOp(List<PeerConfig> peers, RaftGroupId groupId, byte op, byte[] payload,
-			long deadlineNanos) throws InterruptedException {
+			boolean idempotent, long deadlineNanos) throws InterruptedException {
 		while (true) {
 			String last = null;
 			for (PeerConfig peer : peers) {
@@ -284,6 +294,10 @@ public final class ReplicatedServerMain {
 							|| status.getCode() == Status.Code.UNIMPLEMENTED) {
 						fail(peer.id() + " refused: " + status.getDescription());
 					}
+					if (!idempotent && !notProposed(status.getCode())) {
+						fail("the answer of " + peer.id() + " (" + status + ") does not tell whether the operation was"
+								+ " proposed: look for it in the logs of the members, or run the command again");
+					}
 					last = peer.id() + ": " + status;
 				}
 			}
@@ -292,6 +306,74 @@ public final class ReplicatedServerMain {
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
 		}
+	}
+
+	/**
+	 * Whether a failed call to propose an operation certainly proposed nothing: the node was not there (UNAVAILABLE: no
+	 * connection, or the node is starting) or serves no such group (NOT_FOUND).
+	 */
+	static boolean notProposed(Status.Code code) {
+		return code == Status.Code.UNAVAILABLE || code == Status.Code.NOT_FOUND;
+	}
+
+	/** Exit code of {@code checksum} and {@code backup} when a member gave no final result, or no usable one. */
+	static final int EXIT_INCOMPLETE = 4;
+
+	/** Why a cluster operation is not OK, and the exit code to end with. */
+	record Verdict(int exitCode, String problem) {}
+
+	/**
+	 * The verdict on a checksum at {@code index}: null (OK) only if every member gave a digest and all are equal. With
+	 * {@code allowSkipped}, a member that skipped the position ({@link ReplicaOps.State#NONE}) is not counted.
+	 */
+	static @Nullable Verdict checksumVerdict(long index, List<String> members, java.util.Map<String, ReplicaOps.Result> results,
+			boolean allowSkipped) {
+		var digests = results.values().stream().filter(r -> r.state() == ReplicaOps.State.DONE)
+				.map(r -> r.detail() + "/" + r.keys()).distinct().count();
+		if (digests > 1) {
+			return new Verdict(1, "the replicas hold different data at log index " + index + ": see the lines above, and"
+					+ " \"Checksums\" in docs/distributed/runbooks.md");
+		}
+		var missing = members.stream().filter(id -> {
+			var result = results.get(id);
+			return result == null || result.state() == ReplicaOps.State.FAILED || result.state() == ReplicaOps.State.PENDING
+					|| (result.state() == ReplicaOps.State.NONE && !allowSkipped);
+		}).toList();
+		if (!missing.isEmpty() || digests == 0) {
+			return new Verdict(EXIT_INCOMPLETE, "no digest from " + (missing.isEmpty() ? "any member" : missing)
+					+ ": the check is incomplete, run it again (see the lines above)");
+		}
+		return null;
+	}
+
+	/** The verdict on a backup: null (OK) only if every member wrote it. */
+	static @Nullable Verdict backupVerdict(List<String> members, java.util.Map<String, ReplicaOps.Result> results) {
+		var failed = members.stream().filter(id -> results.containsKey(id)
+				&& results.get(id).state() != ReplicaOps.State.DONE).toList();
+		if (!failed.isEmpty()) {
+			return new Verdict(1, "the backup is not on " + failed + ": see the lines above");
+		}
+		var missing = members.stream().filter(id -> !results.containsKey(id)).toList();
+		if (!missing.isEmpty()) {
+			return new Verdict(EXIT_INCOMPLETE, "no result from " + missing + " yet: run backup-status later");
+		}
+		return null;
+	}
+
+	private static void exitOn(@Nullable Verdict verdict) {
+		if (verdict != null) {
+			System.out.println("FAILED: " + verdict.problem());
+			System.exit(verdict.exitCode());
+		}
+	}
+
+	private static @Nullable RaftClientReply awaitBackup(List<PeerConfig> peers, RaftGroupId groupId, String name,
+			long index, long deadlineNanos) throws InterruptedException {
+		var results = awaitResults(peers, groupId, ReplicaOps.OP_BACKUP_RESULT, ReplicaOps.backupPayload(index, name),
+				deadlineNanos);
+		exitOn(backupVerdict(peers.stream().map(PeerConfig::id).toList(), results));
+		System.out.println("OK");
+		return null;
 	}
 
 	/**
@@ -333,11 +415,15 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
-	 * Fails the command if {@code added} lacks a capability that the cluster uses already: it would stop on the first
-	 * entry that it cannot read. See {@link Capabilities}.
+	 * Fails the command if {@code added} lacks a capability that the cluster uses already, or that every member that
+	 * answered supports, which the leader may turn on at any moment (before the new node is in the configuration): it
+	 * would stop on the first entry that it cannot read. The leader also asks a node that is catching up before it turns
+	 * a capability on (see {@link ReplicaOps#pollPeers}). See {@link Capabilities}.
 	 */
 	private static void requireCapabilities(PeerConfig added, List<PeerConfig> peers, RaftGroupId groupId) {
 		long clusterVersion = 0;
+		long commonSupported = -1;
+		boolean anyAnswered = false;
 		for (PeerConfig member : peers) {
 			if (member.id().equals(added.id())) {
 				continue;
@@ -345,10 +431,16 @@ public final class ReplicatedServerMain {
 			try {
 				var reply = java.nio.ByteBuffer.wrap(ReplicaOps.call(member.raftAddress(), groupId,
 						ReplicaOps.OP_CAPABILITIES, new byte[0], PEER_ANSWER_TIMEOUT).join());
-				reply.getLong();
+				commonSupported &= reply.getLong();
 				clusterVersion |= reply.getLong();
+				anyAnswered = true;
 			} catch (CompletionException unanswered) {
-				// A member down, or of a version before the cluster versions: it holds the version where it is.
+				if (Status.fromThrowable(unanswered.getCause()).getCode() == Status.Code.UNIMPLEMENTED) {
+					// A member of a version before the cluster versions: the leader cannot raise the version past it.
+					commonSupported = 0;
+					anyAnswered = true;
+				}
+				// A member down holds the version where it is.
 			}
 		}
 		long supported;
@@ -361,11 +453,19 @@ public final class ReplicatedServerMain {
 			}
 			supported = 0;
 		}
-		long missing = clusterVersion & ~supported;
+		long missing = missingCapabilities(clusterVersion, anyAnswered ? commonSupported : 0, supported);
 		if (missing != 0) {
 			fail("node " + added.id() + " runs a version without " + Capabilities.describe(missing) + ", which this cluster"
-					+ " uses: it would stop on the first such entry. Upgrade it first");
+					+ " uses or is about to use: it would stop on the first such entry. Upgrade it first");
 		}
+	}
+
+	/**
+	 * What a node supporting {@code supported} lacks to join a cluster at {@code clusterVersion} whose members all
+	 * support {@code membersSupport}.
+	 */
+	static long missingCapabilities(long clusterVersion, long membersSupport, long supported) {
+		return (clusterVersion | membersSupport) & ~supported;
 	}
 
 	/** Ratis' default retries at once and for ever: a change that cannot happen would flood the leader, with no end. */
@@ -518,7 +618,8 @@ public final class ReplicatedServerMain {
 				        [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
 				        [--jvm-pause-limit-ms N]
 				  admin --peer ... [--group-id UUID] [--timeout-ms N]
-				        status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID | checksum | backup NAME
+				        status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
+				        | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]
 				  restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]""");
 		System.exit(2);
@@ -526,7 +627,7 @@ public final class ReplicatedServerMain {
 
 	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
 	private static final class Options {
-		private static final List<String> FLAGS = List.of("--pipelined-updates", "--join", "--dry-run");
+		private static final List<String> FLAGS = List.of("--pipelined-updates", "--join", "--dry-run", "--allow-skipped");
 
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();

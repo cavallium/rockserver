@@ -120,7 +120,10 @@ final class NodeStore implements Closeable {
 	 *   leader stops.</li>
 	 * </ul>
 	 */
-	/** Tags every meter of the database with the node id, unless the config sets it: see {@code MetricsConfig}. */
+	/**
+	 * Tags every meter of the database with the node id, unless the config sets a name that is not blank: see
+	 * {@code MetricsConfig}. The replication meters take the same tag, see {@link #metricsNodeName}.
+	 */
 	private static final String METRICS_NODE_NAME = "database.metrics.node-name";
 
 	private static final String REPLICA_OVERRIDES = """
@@ -186,8 +189,9 @@ final class NodeStore implements Closeable {
 				config = config.withFallback(ConfigFactory.parseFile(rockserverConfig.toFile(),
 						ConfigParseOptions.defaults().setAllowMissing(false)));
 			}
-			if (!config.hasPath(METRICS_NODE_NAME)) {
-				// The nodes of a cluster share one config: their meters must still tell them apart.
+			if (!config.hasPath(METRICS_NODE_NAME) || config.getString(METRICS_NODE_NAME).isBlank()) {
+				// The nodes of a cluster share one config: their meters must still tell them apart. The default config
+				// has node-name "", which means unset.
 				config = config.withValue(METRICS_NODE_NAME, ConfigValueFactory.fromAnyRef(nodeId));
 			}
 			config = withReplicaWriteBuffers(config.resolve());
@@ -300,6 +304,19 @@ final class NodeStore implements Closeable {
 
 	EmbeddedConnection connection() {
 		return connection;
+	}
+
+	/**
+	 * The {@code node} tag of the database's meters ({@code database.metrics.node-name}, the node id unless configured),
+	 * or {@code fallback} if it has none: the replication meters must carry the same one.
+	 */
+	String metricsNodeName(String fallback) {
+		try {
+			var name = db().getConfig().metrics().nodeName();
+			return name == null || name.isBlank() ? fallback : name;
+		} catch (Exception unreadable) {
+			return fallback;
+		}
 	}
 
 	EmbeddedDB db() {
