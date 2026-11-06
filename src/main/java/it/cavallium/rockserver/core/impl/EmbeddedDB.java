@@ -2484,24 +2484,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	/**
-	 * Opens a transaction for a caller that is the only writer of the keys it writes and does its own recovery: its
-	 * writes are not tracked for conflicts (nothing else writes them, so commit has nothing to validate), no
-	 * snapshot is taken and, if {@code disableWal}, its commit skips the WAL, so it survives a crash only once
-	 * flushed. Only for replication, which replays the writes lost by a crash from its own log.
-	 */
-	public long openUnloggedTransaction(long timeoutMs, WorkloadProfile workloadProfile, boolean disableWal) {
-		ops.beginOp();
-		try {
-			return allocateTransactionInternal(openTransactionInternal(timeoutMs, false, workloadProfile, false,
-					disableWal, true));
-		} finally {
-			ops.endOp();
-		}
-	}
-
-	/**
-	 * Opens a write transaction for the apply thread of replication, which is the only writer of the database: like
-	 * {@link #openUnloggedTransaction}, but held by the caller instead of being registered under an id. Its
+	 * Opens a write transaction for the apply thread of replication, which is the only writer of the database. Its
+	 * writes are not tracked for conflicts (nothing else writes them, so commit has nothing to validate), no snapshot
+	 * is taken and, if {@code disableWal}, its commit skips the WAL, so it survives a crash only once flushed: the
+	 * replication log replays the writes a crash loses. It is held by the caller instead of being registered under
+	 * an id. Its
 	 * operations run the same code as the public ones with a transaction, so keys, schemas, merges and results are
 	 * the same byte for byte, without the per-call bookkeeping of a client operation: the transaction lookup and
 	 * lock, column use counting, action logging, operation counters and timers. The caller must not use it from

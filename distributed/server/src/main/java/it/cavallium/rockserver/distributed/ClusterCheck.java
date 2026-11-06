@@ -6,7 +6,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.ratis.protocol.RaftGroupId;
-import org.apache.ratis.thirdparty.io.grpc.netty.NettyChannelBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,7 +60,8 @@ final class ClusterCheck {
 	}
 
 	private void tell(String id, String address, String clusterId) {
-		var channel = NettyChannelBuilder.forTarget(address).usePlaintext().build();
+		// A channel of its own, shut down after the one call: a follower is told once per term.
+		var channel = PeerChannels.open(address);
 		TermService.nodeState(channel, groupId, clusterId, timeout).whenComplete((state, error) -> {
 			channel.shutdown();
 			if (error != null) {

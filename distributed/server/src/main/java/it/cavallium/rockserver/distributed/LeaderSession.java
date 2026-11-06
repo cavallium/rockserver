@@ -223,10 +223,6 @@ final class LeaderSession {
 			conflictHashes.add(ConflictTracker.keyHash(columnId, keys));
 		}
 
-		synchronized boolean hasWrites() {
-			return !writes.isEmpty();
-		}
-
 		/** The commit entry of a transaction: all staged writes, returning true. */
 		synchronized LogEntry.Guarded commitEntry(long term) {
 			return new LogEntry.Guarded(term, snapshotIndex, conflictColumns.toLongArray(), conflictHashes.toLongArray(),
