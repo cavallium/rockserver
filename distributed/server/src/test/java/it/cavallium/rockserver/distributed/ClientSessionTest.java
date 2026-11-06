@@ -12,7 +12,12 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.KVBatch;
+import it.cavallium.rockserver.core.common.KVBatchChunks;
 import it.cavallium.rockserver.core.common.Keys;
+import it.cavallium.rockserver.core.common.MergeBatchMode;
+import it.cavallium.rockserver.core.common.PutBatchMode;
+import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
@@ -33,6 +38,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import reactor.core.publisher.Flux;
 
 /**
  * Exactly-once client writes: a write whose outcome the client cannot know, because the leader it went to died after
@@ -203,5 +209,106 @@ class ClientSessionTest {
 				.closeTransactionAsync(123_456, true);
 		var retry = assertThrows(java.util.concurrent.CompletionException.class, never::join);
 		assertInstanceOf(RocksDBRetryException.class, retry.getCause());
+	}
+	private static KVBatch kv(long firstKey, String... values) {
+		var keys = new ArrayList<Keys>();
+		var bufs = new ArrayList<Buf>();
+		for (int i = 0; i < values.length; i++) {
+			keys.add(key(firstKey + i));
+			bufs.add(text(values[i]));
+		}
+		return new KVBatch.KVBatchRef(keys, bufs);
+	}
+
+	private static RocksDBErrorType errorOf(java.util.concurrent.CompletableFuture<?> future) {
+		var error = assertThrows(java.util.concurrent.CompletionException.class, future::join);
+		return ((RocksDBException) error.getCause()).getErrorUniqueId();
+	}
+
+	/**
+	 * The write kinds numbered since round 2, sent straight to the leader with request ids: a numbered batch chunk, a
+	 * column deletion, a range deletion and the write that ends an update each take effect once, and a copy answers with the first
+	 * result; a numbered batch of more than one chunk is refused before anything is applied. Then the client library
+	 * sends a batch of several batches as numbered chunks.
+	 */
+	@Test
+	void batchesSchemaChangesAndUpdateEndsAreNumbered() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var connection = (ReplicatedConnection) leader.connection();
+		var context = RequestContext.batch(TIMEOUT);
+		var api = connection.getAsyncApi(context);
+		long session = connection.openClientSessionAsync(context).join();
+		long column = api.createColumnAsync("c", SCHEMA).join();
+		java.util.function.LongFunction<it.cavallium.rockserver.core.common.RocksDBAsyncAPI> numbered = sequence ->
+				connection.getAsyncApi(context.withRequestId(new ClientRequestId(session, sequence, 0)));
+
+		// A merge batch chunk sent twice is merged once.
+		numbered.apply(0).mergeBatchAsync(column, Flux.just(kv(1, "a", "b")), MergeBatchMode.MERGE_WRITE_BATCH).join();
+		numbered.apply(0).mergeBatchAsync(column, Flux.just(kv(1, "a", "b")), MergeBatchMode.MERGE_WRITE_BATCH).join();
+		assertEquals("a", localValue(leader, column, 1));
+		assertEquals("b", localValue(leader, column, 2));
+
+		// More than one chunk under one number: refused, nothing applied.
+		var bigValue = "v".repeat((int) (KVBatchChunks.CHUNK_BYTES / 2));
+		var tooBig = numbered.apply(1).putBatchAsync(column, Flux.just(kv(10, bigValue, bigValue, bigValue)),
+				PutBatchMode.WRITE_BATCH);
+		assertEquals(RocksDBErrorType.INVALID_REQUEST, errorOf(tooBig));
+		assertEquals(null, localValue(leader, column, 10));
+
+		// A column deletion sent twice answers as the first time, not "not found".
+		long doomed = api.createColumnAsync("d", SCHEMA).join();
+		assertTrue(numbered.apply(2).deleteColumnIfExistsAsync("d").join());
+		assertTrue(numbered.apply(2).deleteColumnIfExistsAsync("d").join(), "the copy answers from the record");
+		long doomed2 = api.createColumnAsync("e", SCHEMA).join();
+		numbered.apply(3).deleteColumnAsync(doomed2).join();
+		numbered.apply(3).deleteColumnAsync(doomed2).join();
+		assertTrue(doomed != doomed2);
+
+		// The write that ends an update: a copy while the first is in flight answers "unknown", then from the record.
+		cluster.awaitConverged(TIMEOUT);
+		var update = (UpdateContext<?>) api.getAsync(0, column, key(20), RequestType.forUpdate()).join();
+		var gate = new CountDownLatch(1);
+		leader.stateMachine().testHooks().applyGate = gate;
+		CompletableFuture<?> first;
+		try {
+			first = numbered.apply(4).mergeAsync(update.updateId(), column, key(20), text("u"), RequestType.none());
+			var followers = cluster.runningNodes().stream().filter(node -> node != leader).toList();
+			InProcessCluster.await(TIMEOUT, () -> followers.stream().allMatch(node ->
+					"u".equals(localValue(node, column, 20))));
+			assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, errorOf(numbered.apply(4)
+					.mergeAsync(update.updateId(), column, key(20), text("u"), RequestType.none())));
+		} finally {
+			gate.countDown();
+			leader.stateMachine().testHooks().applyGate = null;
+		}
+		first.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		numbered.apply(4).mergeAsync(update.updateId(), column, key(20), text("u"), RequestType.none())
+				.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		assertEquals("u", localValue(leader, column, 20), "merged once");
+		assertEquals(0, connection.outcomes.unsettledCommitsForTesting());
+
+		// A copy of a range deletion does not delete what was written into the range after the first.
+		numbered.apply(5).deleteRangeAsync(column, key(40), key(50)).join();
+		api.putAsync(0, column, key(41), text("w"), RequestType.none()).join();
+		numbered.apply(5).deleteRangeAsync(column, key(40), key(50)).join();
+		assertEquals("w", localValue(leader, column, 41));
+
+		// Through the client library: every batch goes as numbered chunks.
+		var addresses = cluster.runningNodes().stream().map(ClientSessionTest::apiAddress).toList();
+		try (var client = GrpcConnection.forHostsAndPorts("batch-client", addresses)) {
+			var clientApi = client.getAsyncApi(RequestContext.batch(TIMEOUT));
+			clientApi.mergeBatchAsync(column, Flux.just(kv(30, "p", "q"), kv(32, "r")), MergeBatchMode.MERGE_WRITE_BATCH)
+					.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		}
+		cluster.awaitConverged(TIMEOUT);
+		for (var node : cluster.runningNodes()) {
+			assertEquals("p", localValue(node, column, 30));
+			assertEquals("q", localValue(node, column, 31));
+			assertEquals("r", localValue(node, column, 32));
+			assertEquals("a", localValue(node, column, 1));
+			assertEquals("u", localValue(node, column, 20));
+			assertEquals("w", localValue(node, column, 41));
+		}
 	}
 }

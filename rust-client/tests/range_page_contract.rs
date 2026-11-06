@@ -9,6 +9,7 @@ use rockserver_client::REQUIRED_WORKLOAD_CONTRACT_VERSION;
 fn workload_v3_capability_is_exact() {
     let capability = CapabilitiesResponse {
         workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+        client_sessions: false,
     };
     let decoded = CapabilitiesResponse::decode(capability.encode_to_vec().as_slice()).unwrap();
     assert_eq!(decoded.workload_contract_version, 3);
@@ -41,6 +42,7 @@ fn page_request_repeats_original_bounds_and_carries_an_exclusive_cursor() {
             profile: 2,
             workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
             timeout_nanos: 123_456,
+            request_id: None,
         }),
     };
     let decoded = GetRangePageRequest::decode(request.encode_to_vec().as_slice()).unwrap();

@@ -254,6 +254,11 @@ Other results:
   after 3 maximum election timeouts without a leader, at least 6 s (about 8 s in all by default), so its clients move,
   and listens again once it knows a leader. A hung disk is not detected. See the
   [README](../../README.md#client-connections).
+- **Batch writes with client sessions.** The core client sends a `putBatch` or `mergeBatch` as one call per chunk
+  of at most 4 MiB, one after the other, so each chunk costs a client round trip on top of its commit, which the
+  server already waited for chunk by chunk. Each batch the caller publishes is split on its own and chunks are not
+  merged across batches: publish batches of a few MiB, not many tiny ones. Not measured; Yotsuba does not use these
+  calls today.
 - **Snapshots.** One every 500k entries (`--snapshot-every`), about every 100 s at 2×, or every 4 GiB of
   applied log entries (`--snapshot-every-bytes`), whichever comes first. A snapshot flushes the
   memtables and stops the apply for about 150–200 ms; the Raft log keeps up to twice the interval.

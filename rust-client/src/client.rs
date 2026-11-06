@@ -264,6 +264,23 @@ impl RockserverClient {
     ///
     /// # Returns
     /// The transaction ID.
+    /// Opens a client session on a replicated server whose capabilities advertise `client_sessions`: the
+    /// session id to number writes with (see `RequestContext::with_request_id`). Opening twice only leaves an
+    /// unused session, which expires, so this call can be retried after any failure.
+    pub async fn open_client_session(&self) -> Result<i64> {
+        let mut context = self.context.clone();
+        context.request_id = None;
+        let req = OpenClientSessionRequest {
+            context: Some(context),
+        };
+        let resp = self
+            .call_contextual(req, |mut client, request| async move {
+                client.open_client_session(request).await
+            })
+            .await?;
+        Ok(resp.into_inner().session_id)
+    }
+
     pub async fn open_transaction(&self, transaction_lease_ttl: Duration) -> Result<i64> {
         let req = OpenTransactionRequest {
             transaction_lease_ttl_nanos: duration_nanos(transaction_lease_ttl)?,
@@ -1691,6 +1708,7 @@ mod workload_context_tests {
             profile: 2,
             workload_contract_version: 2,
             timeout_nanos: 1,
+            request_id: None,
         };
         let error = RockserverClient::new_unchecked(channel, context)
             .get_column_id("never-sent".to_owned())
@@ -1706,6 +1724,7 @@ mod workload_context_tests {
             profile: 2,
             workload_contract_version: 2,
             timeout_nanos: 1,
+            request_id: None,
         };
         let error = RockserverClient::new_unchecked(channel, context)
             .close_transaction(1, false)

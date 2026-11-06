@@ -3,6 +3,8 @@ package it.cavallium.rockserver.core.client;
 import io.grpc.Status;
 import io.grpc.Status.Code;
 import it.cavallium.rockserver.core.common.ClientRequestId;
+import it.cavallium.rockserver.core.common.KVBatch;
+import it.cavallium.rockserver.core.common.KVBatchChunks;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
@@ -21,9 +23,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import org.jetbrains.annotations.Nullable;
+import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * Writes that take effect at most once on a replicated server, across lost connections and leader changes, through
@@ -37,11 +43,12 @@ import org.jetbrains.annotations.Nullable;
  * answers every copy with the first result. The caller gets {@code OUTCOME_UNKNOWN} only when the deadline came
  * before an answer settled it.</p>
  *
- * <p>Numbered: writes outside transactions, transaction commits, and the write that ends an update opened through
- * this connection (whose id this class remembers from the {@code getForUpdate} answer). A write staged in a
- * transaction is not: sending it again could stage it twice. A write whose first copy is refused because its session
- * expired was not applied, and goes again under a new session; a copy sent again after an unknown outcome that meets
- * an expired session ends with {@code OUTCOME_UNKNOWN}.</p>
+ * <p>Numbered: writes outside transactions, transaction commits, the write that ends an update opened through
+ * this connection (whose id this class remembers from the {@code getForUpdate} answer), schema changes (column
+ * creation and deletion, merge operator upload), range deletions, and batch writes, chunk by chunk
+ * ({@link #sendBatch}). A write staged in a transaction is not: sending it again could stage it twice. A write whose first copy is refused because its
+ * session expired was not applied, and goes again under a new session; a copy sent again after an unknown outcome that
+ * meets an expired session ends with {@code OUTCOME_UNKNOWN}.</p>
  */
 final class SessionWrites {
 
@@ -89,6 +96,8 @@ final class SessionWrites {
 		long sequence;
 		/** A copy was sent and its outcome is unknown: no "not applied" answer can end the call any more. */
 		boolean maybeApplied;
+		/** Times it was numbered again in a new session, after its first copy met an expired session. */
+		int reissues;
 		long pauseNanos = FIRST_PAUSE_NANOS;
 
 		Call(BoundRequestContext context, RocksDBAPICommandSingle<?> command, long deadlineNanos) {
@@ -204,6 +213,14 @@ final class SessionWrites {
 			case RocksDBAPICommandSingle.Merge<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId());
 			case RocksDBAPICommandSingle.MergeMulti<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId());
 			case RocksDBAPICommandSingle.CloseTransaction c -> c.commit();
+			// Schema changes: a copy of a deletion would answer "not found" (or false) for a deletion that took effect, and
+			// creation and upload, which the server already makes idempotent by name and schema or content, get resent
+			// after an unknown outcome instead of failing with it.
+			case RocksDBAPICommandSingle.CreateColumn _, RocksDBAPICommandSingle.DeleteColumn _,
+					RocksDBAPICommandSingle.DeleteColumnIfExists _, RocksDBAPICommandSingle.UploadMergeOperator _ -> true;
+			case RocksDBAPICommandSingle.PutBatch _, RocksDBAPICommandSingle.MergeBatch _ -> true;
+			// A copy of a range deletion sent after later writes into the range would delete them too.
+			case RocksDBAPICommandSingle.DeleteRange _ -> true;
 			default -> false;
 		};
 	}
@@ -244,6 +261,57 @@ final class SessionWrites {
 
 	/** Sends the numbered write {@code command}, again after unknown outcomes; see the class description. */
 	CompletableFuture<Object> send(BoundRequestContext context, RocksDBAPICommandSingle<?> command) {
+		if (command instanceof RocksDBAPICommandSingle.PutBatch || command instanceof RocksDBAPICommandSingle.MergeBatch) {
+			return sendBatch(context, command);
+		}
+		return sendOne(context, command);
+	}
+
+	/**
+	 * A batch write: its batches are split into the chunks a replicated server writes as one log entry each
+	 * ({@link KVBatchChunks}), and each chunk is sent as a numbered write of its own, one at a time, in order, all
+	 * within the call's deadline. A chunk, kept until its answer, can be sent again after an unknown outcome, which the
+	 * stream of the whole call could not. Once a chunk took effect, a failure of a later one leaves the call partly
+	 * applied: it ends with {@code INVALID_REQUEST}, as on the server, which callers do not resend as a whole.
+	 */
+	private CompletableFuture<Object> sendBatch(BoundRequestContext context, RocksDBAPICommandSingle<?> command) {
+		boolean merge = command instanceof RocksDBAPICommandSingle.MergeBatch;
+		long columnId;
+		Publisher<KVBatch> batches;
+		Function<KVBatch, RocksDBAPICommandSingle<?>> chunkCommand;
+		if (command instanceof RocksDBAPICommandSingle.MergeBatch c) {
+			columnId = c.columnId();
+			batches = c.batchPublisher();
+			chunkCommand = chunk -> new RocksDBAPICommandSingle.MergeBatch(c.columnId(), Flux.<KVBatch>just(chunk),
+					c.mode());
+		} else {
+			var c = (RocksDBAPICommandSingle.PutBatch) command;
+			columnId = c.columnId();
+			batches = c.batchPublisher();
+			chunkCommand = chunk -> new RocksDBAPICommandSingle.PutBatch(c.columnId(), Flux.<KVBatch>just(chunk),
+					c.mode());
+		}
+		var appliedChunks = new AtomicLong();
+		var appliedKeys = new AtomicLong();
+		return Flux.from(batches)
+				.concatMapIterable(KVBatchChunks::split)
+				// One chunk at a time: a later chunk must not overtake an earlier one writing the same key.
+				.concatMap(chunk -> Mono.fromFuture(() -> sendOne(context, chunkCommand.apply(chunk)))
+						.then(Mono.fromRunnable(() -> {
+							appliedChunks.incrementAndGet();
+							appliedKeys.addAndGet(chunk.keys().size());
+						})), 1)
+				.then()
+				.onErrorMap(error -> appliedChunks.get() == 0 ? unwrap(error) : RocksDBException.of(
+						RocksDBErrorType.INVALID_REQUEST,
+						(merge ? "mergeBatch" : "putBatch") + " on column " + columnId + " was partly applied: "
+								+ appliedChunks.get() + " chunks (" + appliedKeys.get() + " keys) were applied before it"
+								+ " failed, so it is not safe to resend as a whole: " + describe(unwrap(error))))
+				.<Object>then(Mono.empty())
+				.toFuture();
+	}
+
+	private CompletableFuture<Object> sendOne(BoundRequestContext context, RocksDBAPICommandSingle<?> command) {
 		long now = System.nanoTime();
 		long remaining = context.remainingNanosAt(now);
 		long deadline = remaining == RequestContext.NO_TIMEOUT ? now + retryWindowNanos : now + remaining;
@@ -286,6 +354,12 @@ final class SessionWrites {
 			if (error != null) {
 				// Not sent: whatever the opening's own outcome, this write was not applied.
 				var cause = unwrap(error);
+				if (isUnknownOutcome(cause) && !closed && canPause(call, FIRST_PAUSE_NANOS)) {
+					// The opening shared with other writes ended at another write's deadline: this one opens again, in its
+					// own time.
+					later(FIRST_PAUSE_NANOS, () -> start(call), call::failClosed);
+					return;
+				}
 				call.fail(cause instanceof RocksDBException rocks
 						&& rocks.getErrorUniqueId() != RocksDBErrorType.OUTCOME_UNKNOWN
 						? rocks : RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
@@ -372,9 +446,17 @@ final class SessionWrites {
 				sessionExpired(session);
 				if (call.maybeApplied) {
 					call.failUnknown(cause);
-				} else {
+				} else if (call.reissues++ == 0) {
 					// This copy was the first, and it was not applied: send it as a new write.
 					start(call);
+				} else if (!closed && canPause(call, call.pauseNanos)) {
+					// The new session expired too (a server whose sessions outlive no write): not in a tight loop.
+					long pause = call.pauseNanos;
+					call.pauseNanos = Math.min(MAX_PAUSE_NANOS, pause * 2);
+					later(pause, () -> start(call), call::failClosed);
+				} else {
+					// Not applied, and no time left to send it again.
+					call.fail(cause);
 				}
 				return;
 			}

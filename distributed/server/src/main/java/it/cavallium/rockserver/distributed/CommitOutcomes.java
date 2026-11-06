@@ -167,7 +167,9 @@ final class CommitOutcomes {
 							RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Invalid record"));
 				};
 			}
-			if (unsettledTerm != null && unsettledTerm == term) {
+			// A mark of this term, or of a later one (this node lost and won leadership again while the barrier ran, and
+			// a copy was marked in the new term): its entry may still be applied. Earlier terms' entries are all applied.
+			if (unsettledTerm != null && unsettledTerm >= term) {
 				throw new CompletionException(earlierCopyInFlight());
 			}
 			var store = stateMachine.store();

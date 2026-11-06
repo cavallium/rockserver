@@ -13,6 +13,7 @@ fn unary_request_retains_mandatory_workload_context() {
         profile: 4,
         workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         timeout_nanos: RequestContext::NO_TIMEOUT,
+        request_id: None,
     };
     let request = PutRequest {
         transaction_or_update_id: 0,
@@ -33,6 +34,7 @@ fn streaming_initial_request_retains_workload_context() {
         profile: 6,
         workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         timeout_nanos: RequestContext::NO_TIMEOUT,
+        request_id: None,
     };
     let request = PutBatchRequest {
         put_batch_request_type: Some(put_batch_request::PutBatchRequestType::InitialRequest(
