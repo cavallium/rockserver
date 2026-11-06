@@ -36,7 +36,10 @@ import org.slf4j.LoggerFactory;
 final class LeaderForwarder implements Closeable {
 
 	private static final Logger LOG = LoggerFactory.getLogger(LeaderForwarder.class);
-	/** Checks again this often while waiting for a leader, in case a notification was missed. */
+	/**
+	 * Checks again this often while waiting for a leader. Every change is notified, and a request registers before its
+	 * last check, so no wake-up is lost; the poll only enforces the deadline and covers a notification Ratis might skip.
+	 */
 	private static final long POLL_MS = 250;
 
 	/** Connections to each peer, used in turn: one connection has a single event loop thread. */
@@ -96,6 +99,12 @@ final class LeaderForwarder implements Closeable {
 		// Woken by leaderChanged(), or by the next poll, which waits in the timer whose queue close() drops.
 		pendingLeaders.put(result, () -> check(stateMachine, result, deadline));
 		result.whenComplete((_, _) -> pendingLeaders.remove(result));
+		// Checked again once registered: a change that Ratis reported between the first check and the registration
+		// found nothing to wake, but it is visible now. Ratis updates the leader before it notifies, so no change can
+		// fall between this check and the registration.
+		if (check(stateMachine, result, deadline)) {
+			return result;
+		}
 		schedule(stateMachine, result, deadline);
 		if (closed) {
 			result.completeExceptionally(closing());

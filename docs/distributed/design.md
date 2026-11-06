@@ -107,7 +107,8 @@ forwards to a non-embedded connection:
 Forwarding uses the leader's ordinary Rockserver API through the core `GrpcConnection` (4 connections per
 peer, without gRPC's own retries; a port probe first, so a dead peer fails in milliseconds). A request that finds no
 leader waits for one: the state machine tells `LeaderForwarder` of every leader change, and of this node becoming a
-ready leader, so it goes on at once (a 250 ms poll stays as a safety net). Each forwarded call takes at most the
+ready leader, so it goes on at once. A request registers for that wake-up before its last check, so a change between
+the two is not missed; a 250 ms poll only enforces the deadline. Each forwarded call takes at most the
 caller's deadline or the request timeout, whichever comes first (for a `getForUpdate`, the request timeout plus its
 12 s key wait), and the leader gets that deadline as the call's own: a leader that is alive but stuck, such as one
 whose apply waits, or one in a long pause, holds neither the call nor the follower's proxy permit longer. A call that
@@ -178,7 +179,13 @@ serves: writes, transactions, updates, iterators, ranges and column calls. Point
 serves them itself with follower reads on, and so do maintenance calls, which concern that node, and the handshake. The
 second channel takes calls only while it is connected; before that, and after a call on it ends with `UNAVAILABLE`
 (the channel is then dropped, and the same address is not taken again for 2 s), calls go through the ordinary channel
-and a follower forwards them. A hint moves with the leader, since every response carries the current one. By default
+and a follower forwards them. It is also dropped when the hinted node answers without naming itself as the leader: a
+deposed leader, or one cut off from the majority, names another node or none, and fails its calls with errors other
+than `UNAVAILABLE`. The second channel has no gRPC retries of its own, which would go to the same, perhaps dead,
+node: a read that the ordinary channel's retry policy would send again (`getRangePage`, `reduceRange*`,
+`getColumnId`, `estimateNumKeys`, `getAllColumnDefinitions`, `checkMergeOperator`) and that fails with `UNAVAILABLE`
+before any answer runs again on the ordinary channel, which fails over to a live node. Other calls fail as on any lost
+connection. A hint moves with the leader, since every response carries the current one. By default
 the client takes only an address of its own list, compared by host name and port: otherwise a server could send it to
 an address its user never listed, and the address the members use among themselves (an internal name, a NAT address)
 may not be reachable from the client (`it.cavallium.rockserver.grpc.client.leader-hint`: `listed`, `any` or `off`). A
