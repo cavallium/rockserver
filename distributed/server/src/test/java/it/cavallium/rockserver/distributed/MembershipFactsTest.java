@@ -141,6 +141,30 @@ class MembershipFactsTest {
 		assertEquals(Probe.COMMITTED, MembershipFacts.probe(division, history, 3, 15), "C_old, E's configuration");
 	}
 
+	/**
+	 * Round-13 review: the same stale J once F purged its log up to 25 (a snapshot at 25). The entry at 20 is gone, so
+	 * nothing in the log tells J from E's ordinary entry; the history, complete from 0, recorded C_old at 15 and nothing at
+	 * 20, so J was never committed. Below the first index the history covers, the snapshot still decides (a database of
+	 * an older version).
+	 */
+	@Test
+	void aStaleConfigurationOverAPurgedEntryIsNotCommitted() {
+		var division = division(20, WITHOUT_X, ALL, new TreeMap<>(), 25, 25);
+		var cOld = new Conf(3, 15, ALL, List.of());
+		var history = new CommittedConfigurations(List.of(new Conf(1, 5, ALL, List.of()), cOld), 0);
+		var committed = assertNotNullAndGet(MembershipFacts.committed(division, history));
+		assertEquals(cOld, committed, "J taken as committed from the snapshot: " + committed);
+		assertFalse(MembershipFacts.latest(division, history).termKnown());
+		assertEquals(cOld, MembershipFacts.report(division, history, List.of()).committed());
+		// A history that does not cover 20 cannot tell: the snapshot covers J's index, as before.
+		var older = new CommittedConfigurations(List.of(new Conf(1, 5, ALL, List.of())), 22);
+		assertEquals(20, assertNotNullAndGet(MembershipFacts.committed(division, older)).index());
+		// The same configuration recorded at 20: committed, with the recorded term.
+		var j = new Conf(4, 20, WITHOUT_X, ALL);
+		var recorded = new CommittedConfigurations(List.of(new Conf(1, 5, ALL, List.of()), cOld, j), 0);
+		assertEquals(j, MembershipFacts.committed(division, recorded));
+	}
+
 	/** The asker X of the scenario: before the fix, F's answers and the members' probes removed it. */
 	@Test
 	void xIsNotRemovedOnTheStaleConfiguration() {
