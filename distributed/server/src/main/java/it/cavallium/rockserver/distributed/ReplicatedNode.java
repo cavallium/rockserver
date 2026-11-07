@@ -239,14 +239,7 @@ public final class ReplicatedNode implements AutoCloseable {
 					MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 			this.monitor = new NodeMonitor(config, stateMachine::division, stateMachine,
 					config.raftDir().resolve(groupId.getUuid().toString()).resolve("current"), metrics);
-			monitor.membershipState(() -> {
-				var verdict = membership;
-				return verdict == null ? 0 : switch (verdict.outcome()) {
-					case MEMBER, REMOVED -> 0;
-					case NOT_ADDED -> 1;
-					case UNDECIDED -> 2;
-				};
-			});
+			monitor.membershipState(() -> membershipGauge(membership));
 			maintenance.scheduleWithFixedDelay(this::refreshMonitor, 0, NodeMonitor.REFRESH_MILLIS, TimeUnit.MILLISECONDS);
 			var appendLag = metrics.amount("lag.uncommitted");
 			var applyLag = metrics.amount("lag.unapplied");
@@ -727,6 +720,15 @@ public final class ReplicatedNode implements AutoCloseable {
 		} catch (RejectedExecutionException closing) {
 			askingMembers.set(false);
 		}
+	}
+
+	/** The {@code membership.state} gauge for the verdict {@code verdict} (null: not checked yet). */
+	static int membershipGauge(RemovalRule.@Nullable Verdict verdict) {
+		return verdict == null ? 0 : switch (verdict.outcome()) {
+			case MEMBER, REMOVED -> 0;
+			case NOT_ADDED -> 1;
+			case UNDECIDED -> 2;
+		};
 	}
 
 	/** Whether {@link #checkWhileDetached} has a check queued or running. */
