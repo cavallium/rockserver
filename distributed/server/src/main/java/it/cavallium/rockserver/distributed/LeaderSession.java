@@ -829,24 +829,7 @@ final class LeaderSession {
 	 * a read or write in that transaction holds for a whole native call, as long as a stalled disk makes it last.
 	 */
 	void drain(LongConsumer rollBackUpdate, LongConsumer rollBackTransaction) {
-		if (!closed) {
-			throw new IllegalStateException("drain() before seal()");
-		}
-		List<CompletableFuture<KeyLock>> waiters = new ArrayList<>();
-		List<ChainLink> links;
-		synchronized (chainLock) {
-			keys.values().forEach(state -> waiters.addAll(state.waiters));
-			keys.clear();
-			heldKeys = 0;
-			links = List.copyOf(unsettled);
-			unsettled.clear();
-			links.forEach(link -> link.finished = true);
-		}
-		for (var waiter : waiters) {
-			waiter.completeExceptionally(new RocksDBRetryException());
-		}
-		// A commit may still apply, but nobody here will hear of it.
-		links.forEach(link -> link.settled.complete(false));
+		answerWaiters();
 		for (OpenTransaction transaction : transactions.values()) {
 			if (transaction.chained()) {
 				continue;
@@ -865,5 +848,30 @@ final class LeaderSession {
 		synchronized (this) {
 			snapshots.clear();
 		}
+	}
+	/**
+	 * The first part of {@link #drain(LongConsumer, LongConsumer)}: answers the updates waiting for a key with
+	 * {@link RocksDBRetryException} and the unsettled links with false. No native work, so it may run where the
+	 * rollbacks must not (see {@code RockserverStateMachine.retire}); a second call finds nothing to answer.
+	 */
+	void answerWaiters() {
+		if (!closed) {
+			throw new IllegalStateException("drain() before seal()");
+		}
+		List<CompletableFuture<KeyLock>> waiters = new ArrayList<>();
+		List<ChainLink> links;
+		synchronized (chainLock) {
+			keys.values().forEach(state -> waiters.addAll(state.waiters));
+			keys.clear();
+			heldKeys = 0;
+			links = List.copyOf(unsettled);
+			unsettled.clear();
+			links.forEach(link -> link.finished = true);
+		}
+		for (var waiter : waiters) {
+			waiter.completeExceptionally(new RocksDBRetryException());
+		}
+		// A commit may still apply, but nobody here will hear of it.
+		links.forEach(link -> link.settled.complete(false));
 	}
 }

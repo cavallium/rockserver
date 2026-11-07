@@ -1462,7 +1462,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * ({@link LeaderSession#drain}) run on a platform thread of this session: one per session, so that a stuck rollback
 	 * of term t does not delay the waiters of a later term. The database is the one open now: a database installed
 	 * later never knew these transactions. {@link #close()} and {@link #installSnapshot()} wait for these threads before
-	 * closing the database.
+	 * closing the database. Nothing is thrown into Ratis if that thread cannot be created (an {@link OutOfMemoryError}
+	 * "unable to create native thread"): the waiters and links are answered here, which takes no native call, and the
+	 * drain runs on a virtual thread; failing that too, the transactions stay open until they expire or the database
+	 * closes, and the session counts as drained so that nothing waits for it forever.
 	 */
 	private void retire(LeaderSession session) {
 		session.seal();
@@ -1470,7 +1473,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var db = store != null ? store.db() : null;
 		var done = new CompletableFuture<Void>();
 		sessionCloses.put(done, session.term());
-		sessionCloseStarter.accept(config.nodeId() + "-session-close-" + session.term(), () -> {
+		Runnable drain = () -> {
 			try {
 				if (db != null) {
 					session.drain(db);
@@ -1483,7 +1486,33 @@ final class RockserverStateMachine extends BaseStateMachine {
 				sessionCloses.remove(done);
 				done.complete(null);
 			}
-		});
+		};
+		String name = config.nodeId() + "-session-close-" + session.term();
+		try {
+			sessionCloseStarter.accept(name, drain);
+			return;
+		} catch (Throwable ex) {
+			// Typically OutOfMemoryError "unable to create native thread". Nothing may be thrown into Ratis from here.
+			LOG.error("{}: could not start a thread to close the leader session of term {}", config.nodeId(),
+					session.term(), ex);
+		}
+		try {
+			// No native work, so fine on Ratis' thread; the waiters must not wait for the rollbacks to get a thread.
+			session.answerWaiters();
+		} catch (Throwable ex) {
+			LOG.warn("{}: failed to answer the waiters of the leader session of term {}", config.nodeId(),
+					session.term(), ex);
+		}
+		try {
+			// A virtual thread needs no new native thread, only a carrier of the shared pool. A rollback stuck in a native
+			// call pins its carrier: acceptable once a platform thread could not even be created.
+			Thread.ofVirtual().name(name).start(drain);
+		} catch (Throwable ex) {
+			LOG.error("{}: could not start a thread to roll back the transactions of term {}; they stay open until they"
+					+ " expire or the database closes", config.nodeId(), session.term(), ex);
+			sessionCloses.remove(done);
+			done.complete(null);
+		}
 	}
 
 	/**
