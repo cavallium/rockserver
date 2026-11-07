@@ -1370,7 +1370,11 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
 - **Open** also checks that the leader session belongs to the term the read barrier confirmed. A node that lost
   and regained leadership meanwhile might not have applied, or tracked, what the other leader committed.
 
-**Validation.** Ratis calls `preAppendTransaction` under its log write lock, in log order.
+**Validation.** Ratis calls `preAppendTransaction` under its log write lock, in log order. Nothing it runs there,
+nor under the state machine monitor it may wait for (`leaderSession`), reads the disk: the cluster version and the
+cluster id are in memory (`NodeStore` reads the id when it opens and `Genesis` sets it, R24-2; before, choosing
+whether a term pipelines its updates read it from the meta column under the monitor, and `startTransaction` read it
+natively for every proposal).
 
 - **Check.** It checks the conflict keys against `ConflictTracker`, a map from key hash (or whole column) to
   the index of the last entry that wrote it, filled as entries are appended. A key written after the snapshot
@@ -1496,8 +1500,15 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   the server restarts, a newer install starts, or its files did not change for 10 minutes (the leader's own read
   lease of a snapshot being sent): a cleanup thread of its own then deletes it. It is not the maintenance thread,
   which pauses the API on a hung disk and steps down a leader whose log stopped: that thread does no disk I/O and
-  takes no install lock, so a hung disk cannot hold it back. An install that is only that slow fails at
-  its next chunk and Ratis starts it over.
+  takes no install lock, so a hung disk cannot hold it back. Nor is it a Ratis thread (R24-1): Ratis reads the
+  latest snapshot holding its server's monitor on every append that carries entries (a follower checks the append
+  against its snapshot index: `appendEntriesAsync`, `checkInconsistentAppendEntries`, `getSnapshotIndex`) and on the
+  leader's appender threads, so `CheckpointStorage.getLatestSnapshot()` only reads a field. Before R24 it ran the
+  scan itself, at most once a second (a listing of `tmp/`, and every 10 s a walk of each current installation), so
+  the appends did most scans under that monitor; with a hung disk, the cleanup thread held the install lock in its
+  walk, the next append waited for that lock holding the monitor, and the follower stopped answering every Raft
+  RPC, votes included. Only the cleanup thread (`discardFailedInstalls`, every 200 ms, at most one scan a second)
+  looks now. An install that is only that slow fails at its next chunk and Ratis starts it over.
 - **Damaged installs.** A snapshot that a crash damaged during install makes the replica fail loudly; it is not
   silently ignored.
 
@@ -2458,7 +2469,12 @@ threads, and what to measure, is in [performance.md](performance.md), item 11. T
 adds its lanes: platform threads (`<node>-apply-lane-N`) that run RocksDB calls only for the apply thread. A leader
 session of a term that ended is drained on a platform thread of its own (`<node>-session-close-<term>`, once per
 term): its rollbacks are native calls that can wait for a stalled disk, and must not run on the Ratis thread that
-reported the change while it holds the server's monitor (see "Transactions", "End of a term").
+reported the change while it holds the server's monitor (see "Transactions", "End of a term"). For the same
+reason the state machine answers Ratis' frequent calls under its locks from memory: the latest snapshot
+(`getLatestSnapshot`, under the server's monitor on every append with entries) and the cluster id (under the append
+lock). The partial copies of failed snapshot installs are looked for on a platform thread of their own
+(`rockserver-<node>-install-cleanup`), the only thread that lists, walks or renames them (see "Disk cost of
+snapshots").
 
 ## Behavior differences from a single node
 
@@ -2584,7 +2600,7 @@ failover" below).
 | `CapabilityUpgradeTest` (in-process) | A version-0 cluster with one member of an older version is raised only to what that member has (no sessions advertised, no pipelining, also after another check); once that member is upgraded, the version reaches everything, sessions are advertised, the current term still runs without pipelining and the next leader pipelines. |
 | `ChecksumTest` (in-process) | A row written past the log on one replica makes its digest and key count differ, and every replica reports the divergence (`checksum.mismatches`, the index gauge). A column with the same name and no data but another merge operator on one replica digests differently (schemas are in the digest). With checks every 6 s and the leader stopped 3 s after one, the next check comes about 6 s after the last one, not 6 s after the change. A check applied again (its recorded time moved 3 hours back while the node was down) keeps that time, also across the next start. |
 | `ReplicaOpsTest` | The new entries round-trip and are applied alone; backup names; the wire form of results; capability names; digests that tell key parts and values apart; series and gauges exported cumulative, with their kind, and moved to a new registry; the lag sampling period; Raft log bytes counted from segment files only; the alarm's start, repeat and end; the verdicts of `admin checksum` and `admin backup` (OK only with a final result from every member), which failed proposals are retried, the capabilities `add-peer` requires (current and pending), the replication meters following a configured node name, and a blank `node-name` meaning the node id. |
-| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped; every service method classified; two failing addresses each back off), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage` (partial installs deleted once replaced, at the start, and after 10 minutes without a change), `LeaderForwarder` (leader lookups still waiting fail on close; see also "Targeted faults and component tests" below), fault proxy (cuts, delay and jitter keeping byte order, bandwidth caps, blackholes that release held bytes, dropped answers resetting their connections when healed), linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. `GrpcProxyWritesUnorderedTest`: a later put to a key, sent without awaiting an earlier one, reaches the connection and completes while the earlier one still runs (writes not awaited have no relative order, R23-A). |
+| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped; every service method classified; two failing addresses each back off), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage` (partial installs deleted once replaced, at the start, and after 10 minutes without a change; R24-1: `getLatestSnapshot` deletes none of them and does not wait for the install lock while another thread holds it, `latestSnapshotNeverScansTheInstallations` and `latestSnapshotDoesNotWaitForTheInstallLock`, both red before the fix; R24-2: the cluster id is answered from memory, also after the store closed, `clusterIdIsAnsweredFromMemory`, red before the fix with "Closed"), `LeaderForwarder` (leader lookups still waiting fail on close; see also "Targeted faults and component tests" below), fault proxy (cuts, delay and jitter keeping byte order, bandwidth caps, blackholes that release held bytes, dropped answers resetting their connections when healed), linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. `GrpcProxyWritesUnorderedTest`: a later put to a key, sent without awaiting an earlier one, reaches the connection and completes while the earlier one still runs (writes not awaited have no relative order, R23-A). |
 
 Run them all (about 20 minutes on a real disk):
 
