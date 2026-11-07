@@ -18,10 +18,8 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
-import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.net.URI;
 import java.time.Duration;
-import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -110,8 +108,8 @@ final class ReplicatedConnection implements RocksDBConnection, LeaderHint {
 		return url;
 	}
 
-	/** The leader, its API address as the forwarder knew it, and that address as text, as last looked up. */
-	private record CachedHint(RaftPeerId leader, @Nullable HostAndPort api, @Nullable String address) {}
+	/** The leader, the forwarder's {@link LeaderForwarder#addressVersion()} then, and the leader's API address as text. */
+	private record CachedHint(RaftPeerId leader, long version, @Nullable String address) {}
 
 	private volatile @Nullable CachedHint cachedHint;
 
@@ -129,15 +127,16 @@ final class ReplicatedConnection implements RocksDBConnection, LeaderHint {
 		if (leaderId == null) {
 			return null;
 		}
-		// Asked every time: the forwarder learns a new address when a member moves its API port (R18-2). Only the text
-		// is cached.
-		var api = forwarder.apiAddress(leaderId.toString());
+		// The forwarder learns a new address when a member moves its API port (R18-2): looked up again only when its
+		// address version changed, read before the lookup so that a change during it is seen by the next call.
+		long version = forwarder.addressVersion();
 		var cached = cachedHint;
-		if (cached != null && cached.leader().equals(leaderId) && Objects.equals(cached.api(), api)) {
+		if (cached != null && cached.version() == version && cached.leader().equals(leaderId)) {
 			return cached.address();
 		}
+		var api = forwarder.apiAddress(leaderId.toString());
 		var address = api == null ? null : api.host() + ":" + api.port();
-		cachedHint = new CachedHint(leaderId, api, address);
+		cachedHint = new CachedHint(leaderId, version, address);
 		return address;
 	}
 

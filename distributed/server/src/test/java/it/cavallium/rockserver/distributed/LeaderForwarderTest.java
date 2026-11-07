@@ -237,6 +237,7 @@ class LeaderForwarderTest {
 			targets.add(s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
 		}
 		assertEquals(new HostAndPort("127.0.0.1", first.getPort()), s.forwarder().apiAddress("n1"));
+		long version = s.forwarder().addressVersion();
 
 		// The member moves its API port: the old one closes, the member answers the new one.
 		first.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
@@ -253,6 +254,7 @@ class LeaderForwarderTest {
 		assertEquals("n1", moved.peerId());
 		assertEquals(new HostAndPort("127.0.0.1", second.getPort()), s.forwarder().apiAddress("n1"),
 				"leader hints still name the old port");
+		assertTrue(s.forwarder().addressVersion() != version, "cached leader hints are not looked up again");
 	}
 
 	/**
@@ -278,6 +280,7 @@ class LeaderForwarderTest {
 			targets.add(s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
 		}
 		assertEquals(answered, s.forwarder().apiAddress("n1"));
+		long version = s.forwarder().addressVersion();
 
 		first.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
 		targets.forEach(s.forwarder()::invalidate);
@@ -293,6 +296,8 @@ class LeaderForwarderTest {
 		var back = s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS);
 		assertEquals("n1", back.peerId());
 		assertEquals(answered, s.forwarder().apiAddress("n1"));
+		// Leader hints cache their text by this version: the same answer again leaves it, and the cached hint, alone.
+		assertEquals(version, s.forwarder().addressVersion());
 	}
 
 	/** A port nothing listens on. */

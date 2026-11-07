@@ -215,7 +215,9 @@ over (clients open new ones by themselves).
    It prints `OK` and the log index the data reaches. It refuses a data directory with a `db/` or a Raft log, and
    renames a `replica-ops.log` and a `backups/` of the old cluster found there (suffix `.before-restore-<time>`).
    It refuses a backup of a newer cluster version than this binary supports with exit code 5, and leaves no `db/`:
-   restore it with the newer version.
+   restore it with the newer version. Run that newer version on every node of the new cluster as well: the restored
+   `db/` carries no cluster version, so an older binary started on it is not refused, and would hold data written by a
+   newer version under the oldest cluster version.
 3. Start every node as for a new cluster, without `--join`; the nodes of the old cluster stay stopped. The first leader proposes
    a seeded genesis, as in "Seeding a cluster".
 4. Check: `status`, then `checksum` prints `OK`, then a few known keys read back.
@@ -314,7 +316,9 @@ The cluster version keeps the new kinds of log entries off until every member ru
   catches up on, or in a snapshot it installs: it stops then, with exit code 5 as well. `add-peer` refuses
   a new node that lacks a capability of the cluster, or one that every member supports already (the leader may turn it
   on at any moment): upgrade the new node first. `restore-backup` and `export-seed` refuse a newer cluster's backup or
-  database the same way, with exit code 5 and no `db/` or seed written: run them with the newer version.
+  database the same way, with exit code 5 and no `db/` or seed written: run them with the newer version, and run it on
+  every node that starts on their output too, since that output carries no cluster version and an older binary is not
+  refused there.
 - A cluster created before the cluster version has none until every member was upgraded to a version that has it and the
   leader raised it.
 

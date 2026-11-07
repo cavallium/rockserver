@@ -1555,11 +1555,19 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   list; a member that does not answer within 500 ms is likely down, and the listed address is used until it answers. A
   member that is not in the list is asked the same way. So a node given wrong API ports for its peers still forwards
   to the right ones: fix its list anyway, since the address it gives clients as a leader hint comes from the same
-  place until the member answered. The answer is kept until a connection to the member fails; the next connection,
-  after the 200 ms backoff, asks again, and leader hints follow. So a member restarted with another API port while the
-  others keep running is found at the new port at once; before R18-2 the first answer was kept until this node
-  restarted (`LeaderForwarderTest.aListedMemberThatMovesItsApiPortIsAskedAgainOnceAConnectionFails` fails without the
-  fix).
+  place until the member answered. The answer is used without asking again until a connection to the member fails;
+  then the member is asked again at once, and again before the next connection after the 200 ms backoff, and leader
+  hints follow the new answer. So a member restarted with another API port while the others keep running is found at
+  the new port at once; before R18-2 the first answer was kept until this node restarted
+  (`LeaderForwarderTest.aListedMemberThatMovesItsApiPortIsAskedAgainOnceAConnectionFails` fails without the fix).
+  The old answer stays until a new one replaces it, for connections and hints alike: after a one-off failure at the
+  same port (a pause, a restart on the same port) it is still right, while the listed port may be the wrong one that
+  made the answer necessary. The first R18-2 fix removed the answer on any failure, so hints named the listed port
+  until this node next forwarded to the member, which clients that follow hints may make rare
+  (`aListedMemberThatFailsOnceAtTheSamePortKeepsItsAnsweredAddress` fails with that fix). A member that is down and
+  does not answer keeps its last answer. The leader hint of every response is cached by
+  `LeaderForwarder.addressVersion()`, which changes only when an answer or a learned address changes, so the hot path
+  reads one counter instead of looking the address up.
 
   A node still running when `remove-peer` removes it closes Raft by itself and exits with 3, or, if its Raft server
   stays up outside the cluster, is stopped by the check below with exit 4. With systemd,
@@ -2138,9 +2146,11 @@ before the gate (`c756b00`) wrote no version; gate builds from `c756b00` to `729
 SUPPORTED` without `CHECKSUM_SCHEMAS`). A current node that applies that genesis from the log writes 0x1F, so it holds
 `CHECKSUM_SCHEMAS` while the other replicas do not: its checksums digest the schemas and theirs do not, so every check
 reports a false divergence, and as leader it may use any capability of 0x1F the others lack. It lasts until every
-older member was upgraded to a build with `CHECKSUM_SCHEMAS` and the leader's poll then raised the others to 0x1F:
-before that, a 0xF-build leader supports nothing beyond 0xF and never polls past it, and the current node does not poll
-either, since its `supported()` equals its version. Such a cluster exists only if a development build
+older member was upgraded to a build with `CHECKSUM_SCHEMAS` and one of those upgraded members leads, whose poll then
+raises the others to 0x1F: a 0xF-build leader supports nothing beyond 0xF and never polls past it, and a current node
+that leads never polls at all (`ReplicaOps.onLeader` returns while `supported() & ~clusterVersion` is 0, and its version
+is already 0x1F). If a current node keeps the leadership, the residual never ends: transfer the leadership to an
+upgraded former 0xF member, or better, recreate the cluster. Such a cluster exists only if a development build
 of this branch created it and its log still starts at genesis (nothing was deployed). Wipe and recreate it rather than
 add a current node to it by log replay.
 
@@ -2253,7 +2263,12 @@ reported, and stops nothing.
   (exit 5, and no `db/` left behind) a backup whose version has a capability this binary lacks: the new cluster would
   start at `Capabilities.GENESIS` holding data a newer version wrote, and no later check would see it (R18-1;
   `export-seed` refuses such a replica the same way; `NodeStoreTest` and `CommandLineTest` check both; before the fix
-  both commands dropped the version unread, while the docs promised the refusal). Restoring under the old cluster's ids and Raft state was rejected:
+  both commands dropped the version unread, while the docs promised the refusal). Residual: the `db/` that either
+  command writes, whichever binary writes it, has no meta column and so no cluster version, so an older binary started
+  on it is not refused and starts at `Capabilities.GENESIS` (for example a new cluster seeded from a newer backup with
+  some nodes still on the older version). Every node of the new cluster must run a version at least as new as the
+  backup's (runbooks.md says so). Keeping the version in the restored database, for the start-up check to read, would
+  close it; that changes what a seeded genesis starts from and was not done in R18. Restoring under the old cluster's ids and Raft state was rejected:
   each node's Raft log and vote are local and not taken at the backup's position, and an older log with a newer vote,
   or the reverse, is the fault that "No quorum" describes. A new cluster has neither problem.
 
@@ -2591,7 +2606,7 @@ hook: the test cuts the leader's links, lets clients write to it directly, and k
 | `LogWorkerGateContractTest` | The Ratis-private members that `LogWorkerGate` uses still exist, and on a real single node a blocked worker holds a write back and a pause delays one: a Ratis upgrade that breaks the gate fails here by name. |
 | `LongStreamSemanticsTest` (in-process) | A range stream outside a transaction is one point-in-time view of the leader's database, taken when its cursor opens: writes acknowledged while it runs (updates, deletes, inserts ahead of the cursor) are not in it, also when a follower forwards the stream. |
 | `ProposerCommitRetryTest` | Commits refused before the append for lack of room (Ratis' pending-request limit, or the commit lane's attempt permits held by commits Ratis has not answered) go back to the queue: they succeed once there is room, are not sent while there is none, and fail at their caller's deadline as not applied (`READ_DEADLINE_EXCEEDED`), never as unknown. |
-| `LeaderForwarderTest` | Leader lookups: another node is answered at once, this node only as a ready leader; a change wakes waiting lookups well before the poll; a leader that appears between the first check and the registration (its notification finding nobody) is seen by the check after the registration; no leader within the request timeout is a retryable overload. Connections: four per peer, used in turn; an invalidated connection is replaced while the other slots stay, and a stale invalidation does not drop a newer one; a refused port fails at once (the probe) and the peer is not tried again for 200 ms; a listed member that moved its API port is asked again after a failed connection, and reached at the new port (R18-2). |
+| `LeaderForwarderTest` | Leader lookups: another node is answered at once, this node only as a ready leader; a change wakes waiting lookups well before the poll; a leader that appears between the first check and the registration (its notification finding nobody) is seen by the check after the registration; no leader within the request timeout is a retryable overload. Connections: four per peer, used in turn; an invalidated connection is replaced while the other slots stay, and a stale invalidation does not drop a newer one; a refused port fails at once (the probe) and the peer is not tried again for 200 ms; a listed member that moved its API port is asked again after a failed connection, and reached at the new port (R18-2); a listed member that fails once at the same port keeps its answered address, for hints and the next connection, and the address version stays (R18 review finding 1). |
 | `ClusterCheckTest`, `CommitOutcomesPathsTest`, `LocalCommandsTest`, `ReplicatedWritesTest`, `UpdateProtocolPathsTest` | The classes split out of `ReplicatedConnection`: the cluster check tells each follower once per term, retries a silent one only after its pause and asks again in a new term; commit outcomes (a second copy marked in the same term, settling by outcome, pruning of marks, every kind of record, a gone session, flagged not applied, barrier failures); who leads and gets the session of its term; column creation and its check, and batches split, refused when numbered and too large, reported when partly applied; the update protocol's answers for transactions and updates that are gone (also for copies of numbered commits), staged writes carrying a request id, empty commits, the end of an update and a failed update. |
 | `MergeErrorKindsTest`, `CrashPointsTest`, `ConflictTrackerPropertyTest` | A merge operator's `AssertionError` or `LinkageError` is a recorded `MERGE_OPERATOR_FAILED` result and the replica goes on, a `StackOverflowError` stops it. The arming rules of the crash points. `ConflictTracker` against a model of the log, with jqwik (failures shrink to the shortest sequence of steps): a write after a transaction's snapshot always conflicts, also with dropped entries, pruning and tiny history caps, and without those it conflicts exactly then. |
 
