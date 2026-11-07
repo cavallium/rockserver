@@ -72,7 +72,7 @@ majority and healthy (`status`).
    10 minutes by default: raise it for a large database, about 100 MB/s).
 3. Check: `status` shows `n4` with the others' commit index; `checksum` prints `OK`; the `rockserver-node-missing`
    alert threshold and the clients' address lists include `n4` and not the old node.
-4. If the old node still runs, it exits with code 3 once removed: take it out of its supervisor first.
+4. If the old node still runs, it exits with code 3 or 4 once removed: take it out of its supervisor first.
 
 Failure branches:
 
@@ -84,6 +84,34 @@ Failure branches:
 - The lost node was the leader: the same steps, after the election (`status` shows a new leader).
 - Two nodes of three lost: there is no majority, `add-peer` cannot work. See "No quorum" in the design document, and
   "Restoring a backup" below.
+
+## Removed node
+
+A node that was removed (`remove-peer`, or the replace above) and is started again exits with 4, and its log says
+which committed configuration left it out and which members confirmed it. It does so only once a majority of the new
+half of the newest committed configuration answer; until then it prints `READY` and waits outside the cluster: it
+serves nothing (its clients' calls are forwarded to a leader, or time out), and checks again every three election
+timeouts while no leader sends to it. Whether it votes depends on its own log: one whose latest configuration leaves
+it out keeps it in Ratis' initializing state, where it votes for nobody; one that missed its removal (it still holds
+the node in both halves) makes it a follower that answers vote requests and starts elections of its own until the
+check stops it. Neither can elect a leader that lacks the removal, nor win an election itself (see "Removal and
+waiting outside" in the design document); the elections it starts show in the members' logs as rejected pre-votes. Every 15 election timeouts it logs `hears no leader` or, at its
+start, `starting, not known to be a member`, with `Membership <reason> (K* ..., confirmed by ..., blocked by ..., pending
+..., unreachable ...)` and what to do. The `membership.state` gauge is 2 meanwhile (1 for a `--join` node before its
+`add-peer`, 0 for a member). By reason:
+
+| Reason | What to do |
+|---|---|
+| `NO_MAJORITY`, `NO_COMMITTED_CONFIGURATION` | Start or repair the pending and unreachable members (a member of a version without `Configuration` counts as unreachable). The node decides by itself once a majority of them answer. If they are gone for good (wiped, replaced), check with `status` on a member: if this node is not in its configuration, stop it, take it out of its supervisor, wipe its data directory, and add it again with `--join` and `add-peer` if you want it back. |
+| `NEEDS_TERM` | The members that answered run a version without `Configuration2`: upgrade them. Until then judge with `status`, as above. |
+| `MEMBER_LATER_CONFIGURATION` | Clears by itself within seconds. If it lasts, the blocking members are stuck or were removed themselves: look at their logs and `status`. |
+| `OWN_LATER_CONFIGURATION` | An `add-peer` of this node is in flight: let it finish. |
+| `NOT_ADDED` | A `--join` node that never was a voter: run `add-peer`. If the add was abandoned, or the node was added and removed long ago, stop it and wipe its data directory (`add-peer` refuses a node that has a log). |
+| `INCONSISTENT` | A bug, or a data directory restored from elsewhere: wipe nothing, collect the logs of every node. |
+| `HEARD_LEADER` | A leader sent the node something during the check: it is a member again, or will be checked again. |
+| `MEMBER` (with `hears no leader`) | It is a member waiting for a leader; in Ratis' initializing state if it was started with `--join` and no node started without it. |
+
+`RestartPreventExitStatus=4` stays: a node that exited with 4 is removed, and a restart only repeats the check.
 
 ## Backups
 
@@ -256,7 +284,7 @@ disk problem to look at.
 | 1 | Did not start: a bad option value, a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`) | `FAILED: ...`: refused, a change failed, the replicas differ (`checksum`), a member failed (`backup`) | Refused: see its output | Failed: see the exception |
 | 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError` | Wrong usage | Wrong usage | Wrong usage |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
-| 4 | Removed from the cluster: refused at the start, or found out while waiting outside the cluster. Do not start it again | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`): run it again | - | - |
+| 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`): run it again | - | - |
 | 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | - |
 
 A stop of `run` by SIGTERM, after its hand-off, ends with 143 and one by SIGINT with 130: the JVM's

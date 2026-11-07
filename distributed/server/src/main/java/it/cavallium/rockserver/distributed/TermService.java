@@ -2,6 +2,9 @@ package it.cavallium.rockserver.distributed;
 
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -18,6 +21,7 @@ import java.util.function.Supplier;
 import org.apache.ratis.grpc.server.GrpcServices;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.thirdparty.io.grpc.CallOptions;
 import org.apache.ratis.thirdparty.io.grpc.Channel;
 import org.apache.ratis.thirdparty.io.grpc.MethodDescriptor;
@@ -51,10 +55,16 @@ import org.slf4j.LoggerFactory;
  *   <li>"which Rockserver config do you run?", for {@link ClusterCheck}. Request: the UTF-8 digest of the caller's
  *   config ({@link NodeStore#configDigest}), possibly empty. Response: the UTF-8 digest of this node's config. Each side
  *   logs a difference: every node must run the same config. {@code UNIMPLEMENTED} on a node that predates the method.</li>
- *   <li>"which configuration do you hold?", for {@link RemovalCheck}. Request: the 16-byte group UUID. Response: the
- *   8-byte big-endian log index of this node's latest configuration, one byte 1 if that index is committed here (else
- *   0), then the UTF-8 ids of its (new) members, one per line; nothing if this server has no such group or is not
- *   started yet. {@code UNIMPLEMENTED} on a node that predates the method.</li>
+ *   <li>"which configuration do you hold?" ({@code Configuration}, version 1), for {@link RemovalCheck} of older
+ *   versions, and asked by this one of a member that predates version 2. Request: the 16-byte group UUID. Response:
+ *   the 8-byte big-endian log index of this node's latest configuration, one byte 1 if that index is committed here
+ *   (else 0), then the UTF-8 ids of its (new) members, one per line; nothing if this server has no such group or is
+ *   not started yet. {@code UNIMPLEMENTED} on a node that predates the method.</li>
+ *   <li>"which configurations do you hold, and do you hold these entries?" ({@link #CONFIGURATION2}), for
+ *   {@link RemovalCheck}. Request: the 16-byte group UUID, a count byte (at most 2), then that many probes, each an
+ *   8-byte term and an 8-byte index: the asker's latest configuration entry, then the committed configuration K* it
+ *   decides on. Response: see {@link #encodeReport}; nothing if this server has no such group or is not started yet.
+ *   {@code UNIMPLEMENTED} on a node that predates the method.</li>
  *   <li>the cluster operations of {@link ReplicaOps} (capabilities, checksums, backups). Request: the 16-byte group
  *   UUID, then an operation byte and its payload. Response: see {@link ReplicaOps#answer}; {@code UNIMPLEMENTED} on a
  *   node that predates the method.</li>
@@ -118,6 +128,29 @@ final class TermService {
 			.setRequestMarshaller(BytesMarshaller.INSTANCE)
 			.setResponseMarshaller(BytesMarshaller.INSTANCE)
 			.build();
+
+	static final MethodDescriptor<byte[], byte[]> CONFIGURATION2 = MethodDescriptor.<byte[], byte[]>newBuilder()
+			.setType(MethodDescriptor.MethodType.UNARY)
+			.setFullMethodName(MethodDescriptor.generateFullMethodName(SERVICE_NAME, "Configuration2"))
+			.setRequestMarshaller(BytesMarshaller.INSTANCE)
+			.setResponseMarshaller(BytesMarshaller.INSTANCE)
+			.setIdempotent(true)
+			.setSafe(true)
+			.build();
+
+	/** The version byte that starts an answer to {@link #CONFIGURATION2}. */
+	static final int CONFIGURATION_VERSION = 2;
+	private static final int MAX_PROBES = 2;
+	private static final byte HAS_GROUP = 1;
+	private static final byte RUNNING = 2;
+	private static final byte LEADER_KNOWN = 4;
+
+	/** Answers {@link #CONFIGURATION2} on a node. */
+	@FunctionalInterface
+	interface ConfigurationSource {
+		/** The answer about {@code groupId} for {@code probes}; null if this node has no such group or is not started. */
+		RemovalRule.@Nullable Report report(RaftGroupId groupId, List<TermIndex> probes);
+	}
 
 	static final MethodDescriptor<byte[], byte[]> OPS = MethodDescriptor.<byte[], byte[]>newBuilder()
 			.setType(MethodDescriptor.MethodType.UNARY)
@@ -198,6 +231,26 @@ final class TermService {
 	 */
 	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
 			NodeStateSource nodeState, ReadIndexSource readIndex, @Nullable String configDigest, OpsSource ops) {
+		return customizer(server, apiAddress, nodeState, readIndex, configDigest, ops, null);
+	}
+
+	/**
+	 * {@link #customizer(Supplier, HostAndPort, NodeStateSource, ReadIndexSource, String, OpsSource)}, also installing
+	 * {@code traffic}, unless null, on the Raft server.
+	 */
+	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
+			NodeStateSource nodeState, ReadIndexSource readIndex, @Nullable String configDigest, OpsSource ops,
+			@Nullable RaftTraffic traffic) {
+		return customizer(server, apiAddress, nodeState, readIndex, configDigest, ops, traffic, null);
+	}
+
+	/**
+	 * {@link #customizer(Supplier, HostAndPort, NodeStateSource, ReadIndexSource, String, OpsSource, RaftTraffic)},
+	 * answering {@link #CONFIGURATION2} too, unless {@code configurations} is null.
+	 */
+	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
+			NodeStateSource nodeState, ReadIndexSource readIndex, @Nullable String configDigest, OpsSource ops,
+			@Nullable RaftTraffic traffic, @Nullable ConfigurationSource configurations) {
 		ServerCalls.UnaryMethod<byte[], byte[]> handler = (request, response) -> answer(server, request, response);
 		var address = (apiAddress.host() + ":" + apiAddress.port()).getBytes(StandardCharsets.UTF_8);
 		ServerCalls.UnaryMethod<byte[], byte[]> addressHandler = (_, response) -> {
@@ -215,6 +268,10 @@ final class TermService {
 				.addMethod(OPS, ServerCalls.asyncUnaryCall((request, response) -> answerOps(ops, request, response)))
 				.addMethod(CONFIGURATION, ServerCalls.asyncUnaryCall((request, response) ->
 						answerConfiguration(server, request, response)));
+		if (configurations != null) {
+			definition.addMethod(CONFIGURATION2, ServerCalls.asyncUnaryCall((request, response) ->
+					answerConfiguration2(configurations, request, response)));
+		}
 		if (configDigest != null) {
 			ServerCalls.UnaryMethod<byte[], byte[]> digestHandler = (request, response) ->
 					answerConfigDigest(configDigest, request, response);
@@ -222,7 +279,15 @@ final class TermService {
 		}
 		var service = definition.build();
 		// Ratis may run admin and client services on separate ports; the peers' Raft address is the SERVER one.
-		return (builder, types) -> types.contains(GrpcServices.Type.SERVER) ? builder.addService(service) : builder;
+		return (builder, types) -> {
+			if (!types.contains(GrpcServices.Type.SERVER)) {
+				return builder;
+			}
+			if (traffic != null) {
+				builder.intercept(traffic);
+			}
+			return builder.addService(service);
+		};
 	}
 
 	/** Asks the server behind {@code channel} for its current term in {@code groupId}. */
@@ -333,6 +398,141 @@ final class TermService {
 			return new RemovalCheck.PeerConfiguration(index, committed,
 					text.isEmpty() ? List.of() : List.of(text.split("\n")));
 		});
+	}
+
+	/**
+	 * Asks the server behind {@code channel} for {@link #CONFIGURATION2} about {@code groupId}, with {@code probes} (at
+	 * most two): null if it has no such group or is not started yet. Fails with {@code UNIMPLEMENTED} on a node that
+	 * predates the method, and at once, without waiting for {@code timeout}, if the server cannot be reached.
+	 */
+	static CompletableFuture<RemovalRule.@Nullable Report> configuration2(Channel channel, RaftGroupId groupId,
+			List<TermIndex> probes, Duration timeout) {
+		return call(channel, CONFIGURATION2, encodeConfigurationRequest(groupId, probes), timeout, false)
+				.thenApply(value -> {
+					try {
+						return decodeReport(value, probes);
+					} catch (IOException | RuntimeException e) {
+						throw new CompletionException(new IOException("Bad Configuration2 reply", e));
+					}
+				});
+	}
+
+	static byte[] encodeConfigurationRequest(RaftGroupId groupId, List<TermIndex> probes) {
+		if (probes.size() > MAX_PROBES) {
+			throw new IllegalArgumentException("At most " + MAX_PROBES + " probes");
+		}
+		var buffer = ByteBuffer.allocate(GROUP_ID_BYTES + 1 + probes.size() * 2 * Long.BYTES).put(encodeGroupId(groupId))
+				.put((byte) probes.size());
+		for (var probe : probes) {
+			buffer.putLong(probe.getTerm()).putLong(probe.getIndex());
+		}
+		return buffer.array();
+	}
+
+	/**
+	 * Encodes {@code report}: the version byte ({@link #CONFIGURATION_VERSION}), a flags byte (has the group, running,
+	 * leader known), the current term, the commit index, its committed configuration and its latest one (each: term,
+	 * index, -1 for none, then the halves of {@link CommittedConfigurations#writeHalves}), one byte per probe
+	 * ({@link RemovalRule.Probe} ordinal), then the members' addresses.
+	 */
+	static byte[] encodeReport(RemovalRule.Report report, int probes) {
+		var bytes = new ByteArrayOutputStream();
+		try (var out = new DataOutputStream(bytes)) {
+			out.writeByte(CONFIGURATION_VERSION);
+			out.writeByte(HAS_GROUP | (report.running() ? RUNNING : 0) | (report.leaderKnown() ? LEADER_KNOWN : 0));
+			out.writeLong(report.currentTerm());
+			out.writeLong(report.commitIndex());
+			writeConf(out, report.committed());
+			writeConf(out, report.latest());
+			if (probes > 0) {
+				out.writeByte(report.ownProbe().ordinal());
+			}
+			if (probes > 1) {
+				out.writeByte(report.kStarProbe().ordinal());
+			}
+			CommittedConfigurations.writeAddresses(out, report.addresses());
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+		return bytes.toByteArray();
+	}
+
+	private static void writeConf(DataOutputStream out, RemovalRule.@Nullable Conf conf) throws IOException {
+		if (conf == null) {
+			out.writeLong(RemovalRule.UNKNOWN_TERM);
+			out.writeLong(-1);
+			return;
+		}
+		out.writeLong(conf.term());
+		out.writeLong(conf.index());
+		CommittedConfigurations.writeHalves(out, conf);
+	}
+
+	private static RemovalRule.@Nullable Conf readConf(DataInputStream in) throws IOException {
+		long term = in.readLong();
+		long index = in.readLong();
+		return index < 0 ? null : CommittedConfigurations.readHalves(in, term, index);
+	}
+
+	/** Decodes {@link #encodeReport}; null for an empty answer (no group, or not started). */
+	static RemovalRule.@Nullable Report decodeReport(byte[] value, List<TermIndex> probes) throws IOException {
+		if (value.length == 0) {
+			return null;
+		}
+		var in = new DataInputStream(new ByteArrayInputStream(value));
+		int version = in.readUnsignedByte();
+		if (version != CONFIGURATION_VERSION) {
+			throw new IOException("Unknown Configuration2 reply version " + version);
+		}
+		int flags = in.readUnsignedByte();
+		if ((flags & HAS_GROUP) == 0) {
+			return null;
+		}
+		long currentTerm = in.readLong();
+		long commitIndex = in.readLong();
+		var committed = readConf(in);
+		var latest = readConf(in);
+		var probeValues = RemovalRule.Probe.values();
+		var own = probes.isEmpty() ? RemovalRule.Probe.UNKNOWN : probeValues[in.readUnsignedByte() % probeValues.length];
+		var kStar = probes.size() < 2 ? RemovalRule.Probe.UNKNOWN
+				: probeValues[in.readUnsignedByte() % probeValues.length];
+		var addresses = CommittedConfigurations.readAddresses(in);
+		long probedTerm = probes.size() < 2 ? RemovalRule.UNKNOWN_TERM : probes.get(1).getTerm();
+		long probedIndex = probes.size() < 2 ? -1 : probes.get(1).getIndex();
+		return new RemovalRule.Report(version, (flags & RUNNING) != 0, (flags & LEADER_KNOWN) != 0, currentTerm,
+				commitIndex, committed, latest, own, probedTerm, probedIndex, kStar, addresses);
+	}
+
+	private static void answerConfiguration2(ConfigurationSource source, byte[] request,
+			StreamObserver<byte[]> response) {
+		if (request.length < GROUP_ID_BYTES + 1) {
+			response.onError(Status.INVALID_ARGUMENT
+					.withDescription("Expected a 16-byte group id and a probe count, got " + request.length + " bytes")
+					.asRuntimeException());
+			return;
+		}
+		var buffer = ByteBuffer.wrap(request);
+		var groupId = RaftGroupId.valueOf(new UUID(buffer.getLong(), buffer.getLong()));
+		int count = buffer.get();
+		if (count < 0 || count > MAX_PROBES || buffer.remaining() != count * 2 * Long.BYTES) {
+			response.onError(Status.INVALID_ARGUMENT.withDescription("Bad probe count " + count).asRuntimeException());
+			return;
+		}
+		var probes = new java.util.ArrayList<TermIndex>(count);
+		for (int i = 0; i < count; i++) {
+			probes.add(TermIndex.valueOf(buffer.getLong(), buffer.getLong()));
+		}
+		byte[] reply;
+		try {
+			var report = source.report(groupId, probes);
+			reply = report == null ? new byte[0] : encodeReport(report, count);
+		} catch (RuntimeException e) {
+			// Its database closes while it installs a snapshot: the caller asks again.
+			response.onError(Status.ABORTED.withDescription(e.toString()).asRuntimeException());
+			return;
+		}
+		response.onNext(reply);
+		response.onCompleted();
 	}
 
 	private static void answerConfiguration(Supplier<RaftServer> server, byte[] request,

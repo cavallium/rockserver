@@ -164,6 +164,15 @@ final class NodeMonitor {
 		metrics.exportedGauge("disk.raft.total_bytes", () -> raftDisk.totalBytes);
 		metrics.exportedGauge("disk.raft.usable_percent", raftDisk::usablePercent);
 		metrics.exportedGauge("replica.failed", () -> stateMachine.isFailed() ? 1 : 0);
+		// R11: 0 a member (or not checked yet), 1 never added (a --join node before add-peer), 2 outside and undecided.
+		metrics.exportedGauge("membership.state", () -> membershipState.getAsDouble());
+	}
+
+	/** See the {@code membership.state} gauge; set by the node. */
+	private volatile java.util.function.DoubleSupplier membershipState = () -> 0;
+
+	void membershipState(java.util.function.DoubleSupplier state) {
+		this.membershipState = state;
 	}
 
 	/** Reads the state and raises or clears the alarms. Maintenance thread only. */

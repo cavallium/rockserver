@@ -123,8 +123,9 @@ class StartupClusterTest {
 		}
 
 		var error = assertThrows(ReplicatedNode.RemovedException.class, () -> cluster.start(removedId));
-		assertTrue(error.getMessage().contains("removed from the cluster while its log did not follow"),
-				error.getMessage());
+		// R11: its own log ends before the removal, which a majority of the new half confirm.
+		assertEquals(RemovalRule.Reason.REMOVED, java.util.Objects.requireNonNull(error.verdict()).reason());
+		assertTrue(error.verdict().ownLog().contains("ends before index"), error.getMessage());
 		// Refused again, also the second time (nothing of the refused start makes it look like a member). A --join
 		// restart is not tried here: the raft-meta.bootstrap check may refuse it first, with another error.
 		assertThrows(ReplicatedNode.RemovedException.class, () -> cluster.start(removedId));

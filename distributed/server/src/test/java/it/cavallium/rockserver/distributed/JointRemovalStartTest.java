@@ -20,8 +20,9 @@ import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * R3-G2b-4: a node whose log ends with a joint configuration of its own removal decides by asking the members of the new
- * half whether that configuration was committed. R10-1: only a majority of them that say so refuses it.
+ * R3-G2b-4, R10-1, R11: a node whose log ends with a joint configuration of its own removal. That configuration counts
+ * only once it is committed: the node is refused (exit 4) only when a majority of the new half of the newest committed
+ * configuration confirm it (see {@link RemovalRule}); otherwise it starts, outside the cluster if its log leaves it out.
  */
 @Timeout(300)
 class JointRemovalStartTest {
@@ -134,6 +135,7 @@ class JointRemovalStartTest {
 
 		// Before R3-G2b-4: RemovedException, "is not in the new configuration of its log".
 		var restarted = cluster.start(nodes.removed());
+		assertEquals(RemovalRule.Reason.MEMBER, Objects.requireNonNull(restarted.membership()).reason());
 		awaitMemberAgain(restarted, nodes.removed());
 		cluster.awaitConverged(TIMEOUT);
 	}
@@ -152,6 +154,8 @@ class JointRemovalStartTest {
 		var division = Objects.requireNonNull(restarted.stateMachine().division());
 		assertTrue(jointWithoutIn(restarted, nodes.removed()), "the start took the joint-configuration path");
 		assertEquals(LifeCycle.State.STARTING, division.getInfo().getLifeCycleState(), "it waits outside the cluster");
+		// Its own committed configuration, the one before the joint one, holds it: no member had to answer.
+		assertEquals(RemovalRule.Reason.MEMBER, Objects.requireNonNull(restarted.membership()).reason());
 
 		for (var id : nodes.others()) {
 			cluster.start(id);
@@ -177,8 +181,9 @@ class JointRemovalStartTest {
 		var pending = division.getRaftServer().setConfigurationAsync(new SetConfigurationRequest(ClientId.randomId(),
 				RaftPeerId.valueOf(leader.config().nodeId()), division.getGroup().getGroupId(), 1,
 				cluster.raftPeers(newHalf)));
-		// The removal commits without the removed follower: it must hold the joint configuration before it stops, or
-		// its start takes the path of a log that still holds it (askMembers) instead of the one under test (the new half's answer).
+		// The removal commits without the removed follower: it must hold the joint configuration before it stops, so that
+		// its start decides on a log that ends with the joint configuration of its removal (the case under test), not on a
+		// log that still holds it in both halves.
 		InProcessCluster.await(TIMEOUT, () -> jointWithoutIn(removedNode, removed));
 		awaitConfigurationOnDisk(removedNode);
 		var reply = pending.get();
@@ -187,7 +192,11 @@ class JointRemovalStartTest {
 		cluster.halt(removed);
 		var failure = assertThrows(ReplicatedNode.RemovedException.class, () -> cluster.start(removed));
 		assertTrue(failure.getMessage().contains(removed), failure.getMessage());
-		// The message of the joint-configuration path, not of askMembers ("is in the configuration of its log").
-		assertTrue(failure.getMessage().contains("is not in the new configuration of its log"), failure.getMessage());
+		// R11-8: the verdict, not a message shared by two paths, says why.
+		var verdict = Objects.requireNonNull(failure.verdict());
+		assertEquals(RemovalRule.Reason.REMOVED, verdict.reason());
+		var kStar = Objects.requireNonNull(verdict.kStar());
+		assertFalse(kStar.inNew(removed), String.valueOf(kStar));
+		assertTrue(verdict.confirmers().size() >= RemovalRule.majority(kStar.newHalf().size()), String.valueOf(verdict));
 	}
 }

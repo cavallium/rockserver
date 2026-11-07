@@ -233,7 +233,13 @@ To replace a node of a replicated cluster, start the new node first with `--join
 leaving the old node out of `--peer` replaces it in one step. See "Replacing a node" in the [design
 document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
 without it), and see "Heap" there for the heap that a snapshot send needs. A removed node that is started again exits
-with 4, and one that meets a database or log of a newer cluster version with 5: set `RestartPreventExitStatus=2 4 5` (2: wrong
+with 4 once a majority of the current configuration's members can confirm its removal; until they answer (they are
+down, unreachable, or of an older version) it prints `READY` and waits outside the cluster, serving nothing; it
+votes only when its own log missed its removal (then it runs as a follower, whose vote cannot elect a leader without
+that removal), and logs every 15 election timeouts why and what to do (start the named members, or, if they are gone for good, check
+with `admin status` and stop and wipe the node yourself): see "Removal and waiting outside" in the design document and
+"Removed node" in [runbooks.md](docs/distributed/runbooks.md). One that meets a database or log of a newer cluster
+version exits with 5: set `RestartPreventExitStatus=2 4 5` (2: wrong
 usage, or no `-XX:+ExitOnOutOfMemoryError`), `SuccessExitStatus=143` (the JVM's status after SIGTERM) and
 `TimeoutStopSec=150` (a stop can outlast systemd's default of 90 s) in its systemd unit (see "Exit codes" in
 [runbooks.md](docs/distributed/runbooks.md)). A replicated node flushes its memtables when all columns together

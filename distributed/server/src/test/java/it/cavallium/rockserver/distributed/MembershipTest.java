@@ -267,7 +267,9 @@ class MembershipTest {
 				.findFirst()
 				.orElseThrow();
 		assertOk(cluster.admin(List.of("1", "2", "3"), "remove-peer", removed));
-		assertEquals(3, cluster.awaitExit(removed, TIMEOUT), () -> cluster.logTail(removed));
+		// 3 when Ratis closes its Raft server (NOT_IN_CONF), 4 when its check while it hears no leader comes first (R11).
+		int code = cluster.awaitExit(removed, TIMEOUT);
+		assertTrue(code == 3 || code == 4, () -> code + "\n" + cluster.logTail(removed));
 	}
 
 	/**
@@ -491,9 +493,8 @@ class MembershipTest {
 	}
 
 	/**
-	 * DD-30 / R4-6: a removed node that a supervisor starts again exits with 4 before it serves anything (it no longer
-	 * prints READY and waits outside the cluster, as it did before), whether its log holds the configuration that
-	 * removed it or the members tell it.
+	 * DD-30 / R4-6 / R11: a removed node that a supervisor starts again, while the members are up, exits with 4 before
+	 * it serves anything, whether its log holds the configuration that removed it or the members tell it.
 	 */
 	@Test
 	void aRemovedNodeThatRestartsExitsWithFour() throws Exception {
@@ -510,7 +511,8 @@ class MembershipTest {
 			}
 		}).findFirst().orElseThrow();
 		assertOk(cluster.admin(members, "remove-peer", removed));
-		assertEquals(3, cluster.awaitExit(removed, TIMEOUT), () -> cluster.logTail(removed));
+		int code = cluster.awaitExit(removed, TIMEOUT);
+		assertTrue(code == 3 || code == 4, () -> code + "\n" + cluster.logTail(removed));
 
 		cluster.start(removed);
 		assertEquals(4, cluster.awaitExit(removed, TIMEOUT), () -> cluster.logTail(removed));
