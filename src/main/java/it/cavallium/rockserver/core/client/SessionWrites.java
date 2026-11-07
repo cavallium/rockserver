@@ -56,7 +56,8 @@ import reactor.core.publisher.Mono;
  * write whose session opens later ends {@code READ_DEADLINE_EXCEEDED} flagged
  * {@linkplain RocksDBException#isNotApplied() not applied}. A write that gets no session at all was never sent, and
  * ends flagged not applied too: with the opening's own error, or {@code SERVER_OVERLOADED} if the opening's outcome
- * was unknown.</p>
+ * was unknown, if the deadline passed before an opening was sent, if a caller without a deadline got no answer to its
+ * opening within the window, or if the connection closed first.</p>
  *
  * <p>Numbered: writes outside transactions, transaction commits, the write that ends an update opened through
  * this connection (whose id this class remembers from the {@code getForUpdate} answer), schema changes (column
@@ -242,8 +243,9 @@ final class SessionWrites {
 		}
 	}
 
+	/** Flagged not applied (R26-3 review, as the Rust client's {@code not_sent}): the write was never sent. */
 	private static RocksDBException closedBeforeSent() {
-		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+		return RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
 				"The connection is closed; the write was not sent");
 	}
 
@@ -624,13 +626,30 @@ final class SessionWrites {
 	}
 
 	private void open(Call call, CompletableFuture<Session> opening, long pauseNanos) {
+		if (opening.isDone()) {
+			// Ended by the window (below) while this attempt waited for its pause.
+			return;
+		}
+		long remaining = call.deadlineNanos - System.nanoTime();
+		if (remaining <= 0) {
+			// As the Rust client's `remaining` before every opening: nothing is opened once the deadline or the window
+			// has passed. The write was not sent.
+			opening.completeExceptionally(notSent("the deadline came before a session was opened"));
+			return;
+		}
 		CompletableFuture<Long> id;
+		var context = call.context.value().withRequestId(null);
 		try {
-			long remaining = call.deadlineNanos - System.nanoTime();
-			var context = call.context.value().withRequestId(null);
-			id = opener.apply(context.hasTimeout() ? context.withTimeoutNanos(Math.max(1, remaining)) : context);
+			id = opener.apply(context.hasTimeout() ? context.withTimeoutNanos(remaining) : context);
 		} catch (RuntimeException ex) {
 			id = CompletableFuture.failedFuture(ex);
+		}
+		if (!context.hasTimeout() && !id.isDone()) {
+			// A caller without a deadline sends the opening with no gRPC deadline: the window ends it here, as the Rust
+			// client's `within_window`, so that neither this write nor one waiting for this opening is bounded only by
+			// keepalive. The opening may still succeed on the server: that leaves an unused session, which expires.
+			CompletableFuture.delayedExecutor(remaining, TimeUnit.NANOSECONDS).execute(() -> opening
+					.completeExceptionally(notSent("no answer to the opening of a session before the retry window ended")));
 		}
 		id.whenComplete((sessionId, error) -> {
 			if (error == null) {
@@ -646,6 +665,12 @@ final class SessionWrites {
 			}
 			opening.completeExceptionally(cause);
 		});
+	}
+
+	/** The opening of a session ended without one: the write was not sent, so it was not applied. */
+	private static RocksDBException notSent(String cause) {
+		return RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
+				"Could not open a client session; the write was not sent: " + cause);
 	}
 
 	private void sessionExpired(Session expired) {
