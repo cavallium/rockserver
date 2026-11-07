@@ -32,7 +32,10 @@ import org.slf4j.LoggerFactory;
  * <p>Installed on the Raft gRPC server as an interceptor (through {@link TermService#customizer}); it reads the
  * method name, and forwards every message unchanged, but for snapshot chunks. A chunk whose leader's term is below the
  * node's current term (a deposed leader's) it answers NOT_LEADER itself, as Ratis would, since Ratis would still take
- * that chunk's configuration (round 15 review, N-R15-1). Before it forwards any other chunk, it records the chunk's
+ * that chunk's configuration (round 15 review, N-R15-1). A chunk whose configuration is older than the node's newest
+ * committed one comes from an install stream its leader gave up on (R16-2): it fails that stream with
+ * FAILED_PRECONDITION, since Ratis would answer it ALREADY_INSTALLED, or install it, and take its configuration either
+ * way. Before it forwards any other chunk, it records the chunk's
  * configuration with the leader's term ({@link InstalledConfiguration}, round-13 review, finding 1), whatever its term:
  * Ratis takes the configuration of a chunk it rejects too (round 15), and the node's term may rise between this check
  * and Ratis'. If the record cannot be written, it fails the install stream with UNAVAILABLE instead of forwarding the
@@ -172,6 +175,24 @@ final class RaftTraffic implements ServerInterceptor {
 						return;
 					}
 				}
+				if (serialized != null && message instanceof RaftProtos.InstallSnapshotRequestProto request
+						&& request.hasLastRaftConfigurationLogEntryProto()) {
+					long index = request.getLastRaftConfigurationLogEntryProto().getIndex();
+					long committed = committedOf(request);
+					if (committed != NO_INDEX && index < committed) {
+						// R16-2: a leader sends its latest configuration, whose index is at least that of every
+						// committed one, so this chunk comes from a stream its leader gave up on (delayed behind a
+						// later stream and the appends that committed the newer configuration). Ratis would answer
+						// it ALREADY_INSTALLED, or install it, and take its configuration either way, dropping the
+						// committed ones after it. Its leader no longer waits on this stream.
+						LOG.warn("{}: a snapshot chunk of term {} carries the configuration at index {}, older than the"
+								+ " committed one at {}: failing its install stream, which its leader gave up on", nodeId,
+								request.getLeaderTerm(), index, committed);
+						fail(Status.FAILED_PRECONDITION.withDescription("the configuration of the chunk, at index " + index
+								+ ", is older than the committed one at " + committed));
+						return;
+					}
+				}
 				if (fromLeader) {
 					lastLeaderRequestNanos.set(Math.max(1, System.nanoTime()));
 				}
@@ -249,6 +270,19 @@ final class RaftTraffic implements ServerInterceptor {
 			return currentTerm.applyAsLong(RaftGroupId.valueOf(request.getServerRequest().getRaftGroupId().getId()));
 		} catch (RuntimeException e) {
 			return NO_TERM;
+		}
+	}
+
+	/** The index of the newest committed configuration of the division the chunk is for, {@link #NO_INDEX} if unknown. */
+	private long committedOf(RaftProtos.InstallSnapshotRequestProto request) {
+		if (!request.hasServerRequest() || !request.getServerRequest().hasRaftGroupId()) {
+			return NO_INDEX;
+		}
+		try {
+			return committedConfiguration.applyAsLong(RaftGroupId.valueOf(
+					request.getServerRequest().getRaftGroupId().getId()));
+		} catch (RuntimeException e) {
+			return NO_INDEX;
 		}
 	}
 

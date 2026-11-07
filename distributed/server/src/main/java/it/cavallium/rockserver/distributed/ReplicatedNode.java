@@ -140,7 +140,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		this.config = config;
 		this.metrics = new NodeMetrics(config.nodeId());
 		this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir(), this::currentTerm,
-				metrics.amount("install.recordFailures"));
+				this::committedConfigurationIndex, metrics.amount("install.recordFailures"));
 		Files.createDirectories(config.dbDir().getParent());
 		Files.createDirectories(config.raftDir());
 		requireSameFileSystem(config.raftDir(), config.dbDir().getParent());
@@ -311,6 +311,24 @@ public final class ReplicatedNode implements AutoCloseable {
 			return raftServer.getDivision(requested).getInfo().getCurrentTerm();
 		} catch (IOException | RuntimeException e) {
 			return RaftTraffic.NO_TERM;
+		}
+	}
+
+	/**
+	 * The index of the newest committed configuration of this node's division of {@code requested}
+	 * ({@link MembershipFacts#committed}), {@link RaftTraffic#NO_INDEX} if none is known, the server is not built yet,
+	 * or the group is another one or not started: for {@link RaftTraffic} (R16-2).
+	 */
+	private long committedConfigurationIndex(RaftGroupId requested) {
+		var raftServer = this.server;
+		if (raftServer == null || group == null || !requested.equals(group.getGroupId())) {
+			return RaftTraffic.NO_INDEX;
+		}
+		try {
+			var committed = MembershipFacts.committed(raftServer.getDivision(requested), stateMachine.configurations());
+			return committed == null ? RaftTraffic.NO_INDEX : committed.index();
+		} catch (IOException | RuntimeException e) {
+			return RaftTraffic.NO_INDEX;
 		}
 	}
 

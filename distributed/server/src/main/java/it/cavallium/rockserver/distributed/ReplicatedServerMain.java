@@ -672,10 +672,12 @@ public final class ReplicatedServerMain {
 			String refusalMessage = null;
 			while (true) {
 				var current = leaderConfiguration(infoClient, peers, groupId, deadlineNanos);
-				if (refusedOn != null && sameMembers(refusedOn, current)) {
-					// Not a lost race: Ratis refused for a reason that a re-read does not change (for one, "changes a
-					// majority set": the new members are at least as many as the kept ones).
-					fail("the leader refused, and its configuration did not change since: " + refusalMessage);
+				if (refusedOn != null && refusedOn.leader().equals(current.leader()) && refusedOn.term() == current.term()
+						&& sameMembers(refusedOn, current)) {
+					// Not a lost race: the same leader, in the same term, refused for a reason that a re-read does not
+					// change (for one, "changes a majority set": the new members are at least as many as the kept ones).
+					fail("the leader " + current.leader() + " (term " + current.term() + ") refused, and its configuration"
+							+ " did not change since: " + refusalMessage + ". If the leader changes, run the command again");
 				}
 				refusedOn = null;
 				var change = VoterChange.between(current.servers(), target);
@@ -848,25 +850,49 @@ public final class ReplicatedServerMain {
 	/** What the answers of one round settle on: the leader's configuration, or (null) what is still waited for. */
 	record Settled(@Nullable Membership membership, String waitingFor) {}
 
-	/** The leader's configuration that {@code answers} (in {@code --peer} order) settle on. */
+	/**
+	 * The leader's configuration that {@code answers} (one round, every member that answered) settle on (R16-1): the
+	 * answer of the LEADER of the highest term, and only if no member shows a higher term, as the term of its last
+	 * entry (a leader's term is in its answer, a follower's is not). A deposed leader keeps answering LEADER until it
+	 * checks its leadership (about an election timeout), with the configuration of its term: taken because it came
+	 * first in {@code --peer}, it made a valid change fail at once and printed stale voters. Waits if that leader is in
+	 * a change (a joint configuration), rather than settling on another leader's answer.
+	 */
 	static Settled settle(List<MemberAnswer> answers) {
-		String waitingFor = "an answer of a member";
+		MemberAnswer leader = null;
+		MemberAnswer highest = null;
+		String roles = "";
 		for (var answer : answers) {
-			var conf = answer.conf();
-			if (answer.role() != RaftPeerRole.LEADER || conf == null) {
-				waitingFor = "a leader (" + answer.id() + " is " + answer.role() + ")";
-				continue;
+			if (answer.role() == RaftPeerRole.LEADER && answer.conf() != null
+					&& (leader == null || answer.leaderTerm() > leader.leaderTerm())) {
+				leader = answer;
 			}
-			if (conf.getOldPeersCount() > 0 || conf.getOldListenersCount() > 0) {
-				waitingFor = "the change under way on leader " + answer.id() + " (voters "
-						+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getOldPeersList())) + " to "
-						+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getPeersList())) + ")";
-				continue;
+			if (highest == null || seenTerm(answer) > seenTerm(highest)) {
+				highest = answer;
 			}
-			return new Settled(new Membership(answer.id(), answer.leaderTerm(),
-					ProtoUtils.toRaftPeers(conf.getPeersList()), ProtoUtils.toRaftPeers(conf.getListenersList())), "");
+			roles += (roles.isEmpty() ? "" : ", ") + answer.id() + " is " + answer.role();
 		}
-		return new Settled(null, waitingFor);
+		if (leader == null) {
+			return new Settled(null, "a leader (" + roles + ")");
+		}
+		if (highest != null && seenTerm(highest) > leader.leaderTerm()) {
+			return new Settled(null, "a leader of term " + seenTerm(highest) + " or later (" + leader.id()
+					+ " answers as the leader of term " + leader.leaderTerm() + ", but " + highest.id() + " shows term "
+					+ seenTerm(highest) + ")");
+		}
+		var conf = Objects.requireNonNull(leader.conf());
+		if (conf.getOldPeersCount() > 0 || conf.getOldListenersCount() > 0) {
+			return new Settled(null, "the change under way on leader " + leader.id() + " (voters "
+					+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getOldPeersList())) + " to "
+					+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getPeersList())) + ")");
+		}
+		return new Settled(new Membership(leader.id(), leader.leaderTerm(), ProtoUtils.toRaftPeers(conf.getPeersList()),
+				ProtoUtils.toRaftPeers(conf.getListenersList())), "");
+	}
+
+	/** The highest term {@code answer} shows: its leader term, or the term of its last entry. */
+	private static long seenTerm(MemberAnswer answer) {
+		return Math.max(answer.leaderTerm(), answer.lastEntryTerm());
 	}
 
 	/**
