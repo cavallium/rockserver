@@ -13,6 +13,7 @@ import org.apache.ratis.proto.RaftProtos.SetConfigurationRequestProto;
 import org.apache.ratis.proto.grpc.AdminProtocolServiceGrpc;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.protocol.exceptions.NotLeaderException;
 import org.apache.ratis.protocol.exceptions.ReconfigurationInProgressException;
 import org.apache.ratis.protocol.exceptions.SetConfigurationException;
 import org.apache.ratis.server.RaftServer;
@@ -191,6 +192,15 @@ final class MembershipGuard implements ServerInterceptor {
 				.clearCurrentPeers().addAllCurrentPeers(protos(servers))
 				.clearCurrentListeners().addAllCurrentListeners(protos(listeners))
 				.build());
+	}
+
+	/** Stub: keeps the old behaviour on a non-leader (the request passes unchanged). */
+	static Decision decide(SetConfigurationRequestProto request, Collection<RaftPeer> servers,
+			Collection<RaftPeer> listeners, boolean unsafe, @Nullable Supplier<NotLeaderException> notLeader) {
+		if (notLeader != null) {
+			return Decision.pass(request);
+		}
+		return decide(request, servers, listeners, unsafe);
 	}
 
 	/** {@code current} with the peers of {@code added}, which replace a current one of the same id, as Ratis' ADD does. */

@@ -220,12 +220,13 @@ class CommandLineTest {
 		var add = run(admin(survivors, "add-peer", newPeer));
 		assertEquals(0, add.code(), add.toString());
 		assertVoters(plus(survivors, "n3"));
-		// add-peer asks the new node what it holds first: right after the change it may not have applied the genesis
-		// yet, which looks like a log of its own (an older behaviour of add-peer, not of the guard).
-		InProcessCluster.await(TIMEOUT, () -> cluster.node("n3").stateMachine().store().clusterId() != null);
+		// Right away, as a re-run after a timeout would be: n3 may not have applied the genesis yet, which looks like a
+		// log of its own. add-peer reads the leader's configuration first and answers OK for a voter at that address,
+		// without asking n3 (it must never tell to wipe a voter).
 		var again = run(admin(survivors, "add-peer", newPeer));
 		assertEquals(0, again.code(), again.toString());
 		assertTrue(again.out().strip().endsWith("OK"), again.out());
+		assertTrue(again.out().contains("already a voter"), again.out());
 
 		// A stale --peer: it lists the lost node again, and removes a survivor.
 		var stale = run(admin(List.of("n0", "n1", "n2"), "remove-peer", survivors.getFirst()));
@@ -238,9 +239,35 @@ class CommandLineTest {
 		long column = api.createColumn("c", SCHEMA);
 		api.put(0, column, key(1), value("v1"), RequestType.none());
 		cluster.stop("n3");
+		// A re-run with the voter n3 down: still OK, from the leader's configuration alone.
+		var whileDown = run(admin(survivors, "add-peer", newPeer));
+		assertEquals(0, whileDown.code(), whileDown.toString());
+		assertTrue(whileDown.out().contains("already a voter"), whileDown.out());
 		var leader = leader();
 		leader.connection().getSyncApi(RequestContext.batch(TIMEOUT)).put(0, column, key(2), value("v2"),
 				RequestType.none());
+	}
+
+	/**
+	 * Review of round 14: a refusal by Ratis itself that no re-read can change ({@code changes a majority set}: two of
+	 * three voters replaced, which Ratis refuses whatever the flag) fails at once with Ratis' message, instead of
+	 * reading the configuration again until the time limit.
+	 */
+	@Test
+	void aRefusalThatNoReReadChangesFailsAtOnce() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("majority")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		cluster.join("n3");
+		cluster.join("n4");
+		long start = System.nanoTime();
+		var replace = run(with(List.of(admin(List.of("n0", "n1", "n3", "n4"), "remove-peer", "n1")),
+				ReplicatedServerMain.UNSAFE_MULTI_VOTER_CHANGE));
+		var elapsed = Duration.ofNanos(System.nanoTime() - start);
+		assertEquals(1, replace.code(), replace.toString());
+		assertTrue(replace.out().contains("changes a majority set"), replace.out());
+		assertTrue(!replace.out().contains("kept changing"), replace.out());
+		assertTrue(elapsed.compareTo(Duration.ofSeconds(15)) < 0, () -> "took " + elapsed + ": " + replace.out());
+		assertVoters(List.of("n0", "n1", "n2"));
 	}
 
 	private String[] admin(List<String> peerIds, String... command) {

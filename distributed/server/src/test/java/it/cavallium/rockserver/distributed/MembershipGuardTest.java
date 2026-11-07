@@ -22,11 +22,13 @@ import org.apache.ratis.client.impl.ClientProtoUtils;
 import org.apache.ratis.proto.RaftProtos.RaftPeerProto;
 import org.apache.ratis.proto.RaftProtos.SetConfigurationRequestProto;
 import org.apache.ratis.protocol.ClientId;
+import org.apache.ratis.protocol.RaftGroupMemberId;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.SetConfigurationRequest;
+import org.apache.ratis.protocol.exceptions.NotLeaderException;
 import org.apache.ratis.protocol.exceptions.SetConfigurationException;
 import org.apache.ratis.retry.RetryPolicies;
 import org.apache.ratis.util.ProtoUtils;
@@ -266,5 +268,40 @@ class MembershipGuardTest {
 		assertNull(stale.forward());
 		assertInstanceOf(SetConfigurationException.class, stale.refusal());
 		assertFalse(stale.refusal().getMessage().contains(VoterChange.MULTI_VOTER_REFUSAL), stale.refusal().getMessage());
+	}
+
+	/**
+	 * Review of round 14: on a node that is not the leader the guard checks too, against that node's own configuration.
+	 * Ratis handles the request only later (at half-close, through the division's executor), and the node may have won
+	 * an election meanwhile. What it lets through is a compare-and-set against the configuration it checked, so a
+	 * leader with another configuration refuses it; what it refuses goes back as {@link NotLeaderException}, and the
+	 * client asks the leader, which checks again.
+	 */
+	@Test
+	void onANonLeaderTheGuardChecksAgainstThatNodesConfiguration() {
+		var current = peers("n0", "n1", "n2");
+		var notLeader = new NotLeaderException(RaftGroupMemberId.valueOf(RaftPeerId.valueOf("n1"), RaftGroupId.randomId()),
+				current.getFirst(), current);
+
+		var two = request(SetConfigurationRequest.Mode.SET_UNCONDITIONALLY, peers("n0", "n1", "n2", "n3", "n4"),
+				List.of());
+		var refused = MembershipGuard.decide(two, current, List.of(), false, () -> notLeader);
+		assertNull(refused.forward());
+		assertInstanceOf(NotLeaderException.class, refused.refusal());
+
+		var one = MembershipGuard.decide(request(SetConfigurationRequest.Mode.SET_UNCONDITIONALLY,
+				peers("n0", "n1", "n2", "n3"), List.of()), current, List.of(), false, () -> notLeader);
+		assertNull(one.refusal());
+		assertEquals(SetConfigurationRequestProto.Mode.COMPARE_AND_SET, one.forward().getMode());
+		assertEquals(List.of("n0", "n1", "n2"), protoIds(one.forward().getCurrentPeersList()));
+
+		// A compare-and-set against another configuration than this node's: the leader decides.
+		var stale = MembershipGuard.decide(request(SetConfigurationRequest.Mode.COMPARE_AND_SET, peers("n0", "n1"),
+				peers("n0", "n1", "n3")), current, List.of(), false, () -> notLeader);
+		assertInstanceOf(NotLeaderException.class, stale.refusal());
+
+		var unsafe = MembershipGuard.decide(two, current, List.of(), true, () -> notLeader);
+		assertNull(unsafe.refusal());
+		assertEquals(SetConfigurationRequestProto.Mode.COMPARE_AND_SET, unsafe.forward().getMode());
 	}
 }
