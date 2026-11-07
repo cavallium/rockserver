@@ -217,7 +217,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			this.followerReads = new FollowerReads(stateMachine, groupId, config.nodeId(), config.electionTimeoutMax());
 			started.add(followerReads);
 			this.proposer = new Proposer(group, RaftSettings.client(config), config, this::raftServer, metrics,
-					threads.control());
+					threads.control(), threads.submit());
 			started.add(proposer);
 			stateMachine.ops().proposer(proposer);
 			this.forwarder = new LeaderForwarder(config, peerChannels);

@@ -70,7 +70,7 @@ class ProposerCommitRetryTest {
 		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
 		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(requestTimeout);
 		return new Proposer(group, RaftSettings.client(config), config, raft.serverSupplier(), metrics,
-				threads.control());
+				threads.control(), threads.submit());
 	}
 
 	@AfterEach
@@ -356,6 +356,53 @@ class ProposerCommitRetryTest {
 			assertTrue(tookNanos < TimeUnit.MILLISECONDS.toNanos(2500),
 					"failed after " + TimeUnit.NANOSECONDS.toMillis(tookNanos) + " ms");
 			assertEquals(Proposer.MAX_BATCHES_IN_FLIGHT + 1, submissions.get(), "the refused commit was sent again");
+			for (var other : others) {
+				assertFalse(other.isDone(), "a held commit ended: " + other);
+			}
+		} finally {
+			answerAll(held, heldRequests);
+		}
+	}
+
+	/**
+	 * R22 F2: a queued commit's expiry timer fires when {@code take()} would fail it, at its deadline minus the least
+	 * time left to be sent ({@code minTimeLeftNanos}: 100 ms, or a quarter of the caller's time), not at the deadline
+	 * itself: in between nothing else fails it while no slot frees up, and its caller would get the clean "not
+	 * applied" answer only {@code CALLER_MARGIN_NANOS} before its own deadline. With a 1 s caller deadline the timer
+	 * waits 1000 - 20 - 100 = 880 ms, checked on the control plane's queue, without depending on timing.
+	 */
+	@Test
+	void aQueuedCommitsExpiryTimerFiresWhenTakeWouldFailIt() throws Exception {
+		var held = new ConcurrentLinkedQueue<CompletableFuture<RaftClientReply>>();
+		var heldRequests = new ConcurrentLinkedQueue<RaftClientRequest>();
+		raft.submit = request -> {
+			var reply = new CompletableFuture<RaftClientReply>();
+			held.add(reply);
+			heldRequests.add(request);
+			return reply;
+		};
+		var timers = ((ScheduledThreadPoolExecutor) threads.control()).getQueue();
+		try {
+			var others = new ArrayList<CompletableFuture<Object>>();
+			for (int i = 0; i < Proposer.MAX_BATCHES_IN_FLIGHT; i++) {
+				others.add(proposer.proposeOnce(commit(10 + i, 16), TimeUnit.SECONDS.toNanos(30), null));
+			}
+			InProcessCluster.await(Duration.ofSeconds(10), () -> held.size() == Proposer.MAX_BATCHES_IN_FLIGHT);
+			long start = System.nanoTime();
+			var queued = proposer.proposeOnce(commit(1, 16), TimeUnit.MILLISECONDS.toNanos(1000), null);
+			long longest = 0;
+			for (var timer : timers) {
+				longest = Math.max(longest, ((java.util.concurrent.Delayed) timer).getDelay(TimeUnit.MILLISECONDS));
+			}
+			assertTrue(longest > 0 && longest <= 885, "the expiry timer waits " + longest + " ms");
+
+			var error = assertThrows(ExecutionException.class, () -> queued.get(5, TimeUnit.SECONDS));
+			long tookMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+			var cause = assertInstanceOf(RocksDBException.class, error.getCause());
+			assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, cause.getErrorUniqueId(), cause.getMessage());
+			assertTrue(cause.getMessage().contains("not applied"), cause.getMessage());
+			assertTrue(tookMillis < 1000, "failed after " + tookMillis + " ms");
+			assertEquals(Proposer.MAX_BATCHES_IN_FLIGHT, held.size(), "the queued commit was sent");
 			for (var other : others) {
 				assertFalse(other.isDone(), "a held commit ended: " + other);
 			}

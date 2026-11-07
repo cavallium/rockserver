@@ -64,7 +64,8 @@ class ProposerCopiesTest {
 		var threads = new NodeThreads("n0");
 		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
 				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
-		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics, threads.control());
+		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics,
+				threads.control(), threads.submit());
 		try {
 			var changing = Buf.create(8);
 			for (int i = 0; i < 4; i++) {
@@ -191,7 +192,8 @@ class ProposerCopiesTest {
 		var threads = new NodeThreads("n0");
 		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
 				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
-		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics, threads.control());
+		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics,
+				threads.control(), threads.submit());
 		try {
 			for (boolean cancel : new boolean[] {true, false}) {
 				var entered = new CountDownLatch(1);
@@ -269,7 +271,8 @@ class ProposerCopiesTest {
 		var threads = new NodeThreads("n0");
 		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
 				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
-		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics, threads.control());
+		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics,
+				threads.control(), threads.submit());
 		var release = new CountDownLatch(1);
 		try {
 			var entered = new CountDownLatch(1);
