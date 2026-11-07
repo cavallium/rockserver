@@ -1626,7 +1626,11 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   missed. The warning is chosen by the verdict (never by `--join`, R11-5) and repeated every 15 election timeouts. A
   removal found while a leader sent the node anything during the check is not trusted (HEARD_LEADER): the answers may
   be older than that leader's configuration. `ReplicatedNode#membership` keeps the last verdict, and the
-  `membership.state` gauge says 0 (member, or not checked), 1 (never added) or 2 (outside, undecided). While undecided
+  `membership.state` gauge says 0 (member, or not checked), 1 (never added; also while `add-peer` catches the node
+  up, since it is not detached then and keeps its last verdict until its configuration holds it), 2 (outside,
+  undecided) or 3 (removed, the last sample just before exit 4). The alerts `rockserver-node-outside` (2 or more for
+  10 minutes) and `rockserver-node-not-added` (1 for 6 hours: a catch-up of a large snapshot can take an hour or more)
+  watch it. While undecided
   the node runs in whatever Ratis state its own log gives: a log whose latest configuration leaves it out of a half
   keeps it initializing (no election timer, no vote: `RaftServerImpl.requestVote` needs a running server); one that
   holds it in both halves (a log that missed its removal) makes it a follower, whose votes cannot elect a leader that
@@ -2005,7 +2009,8 @@ candidate, 0 follower, -1 unknown), `raft.term`, `raft.last_index`, `raft.commit
 `raft.flush_index`, `raft.start_index`, the lags between them (`raft.commit_lag`, `raft.apply_lag`, `raft.flush_lag`),
 on the leader `raft.follower_lag` per follower (tag `follower`, from the commit index the leader knows of it) and
 `raft.follower_lag_max`, `raft.log.bytes` and `raft.log.entries` (DD-22), `snapshot.index` and `snapshot.age_seconds`,
-`disk.data.*` and `disk.raft.*` (usable and total bytes, usable percent) and `replica.failed`; and from `ReplicaOps`,
+`disk.data.*` and `disk.raft.*` (usable and total bytes, usable percent), `replica.failed` and `membership.state` (0 a
+member, 1 never added, 2 outside and undecided, 3 removed: see "Removal and waiting outside"); and from `ReplicaOps`,
 `cluster.version` and the last checksum matched or mismatched. The metrics thread only reads fields. The node also logs
 the alarms it can tell by itself, once when they start, every minute while they last and once when they end: less than
 10% free on either disk, a Raft log above 4 snapshots' worth of `--snapshot-every-bytes` (a member gone for good holds

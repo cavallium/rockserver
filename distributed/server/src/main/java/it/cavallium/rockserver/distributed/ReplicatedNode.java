@@ -722,12 +722,16 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 	}
 
-	/** The {@code membership.state} gauge for the verdict {@code verdict} (null: not checked yet). */
+	/**
+	 * The {@code membership.state} gauge for the verdict {@code verdict} (null: not checked yet): 0 a member, 1 never
+	 * added, 2 outside and undecided, 3 removed (the last sample before exit 4).
+	 */
 	static int membershipGauge(RemovalRule.@Nullable Verdict verdict) {
 		return verdict == null ? 0 : switch (verdict.outcome()) {
-			case MEMBER, REMOVED -> 0;
+			case MEMBER -> 0;
 			case NOT_ADDED -> 1;
 			case UNDECIDED -> 2;
+			case REMOVED -> 3;
 		};
 	}
 

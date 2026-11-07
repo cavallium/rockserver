@@ -98,7 +98,8 @@ check stops it. Neither can elect a leader that lacks the removal, nor win an el
 waiting outside" in the design document); the elections it starts show in the members' logs as rejected pre-votes. Every 15 election timeouts it logs `hears no leader` or, at its
 start, `starting, not known to be a member`, with `Membership <reason> (K* ..., confirmed by ..., blocked by ..., pending
 ..., unreachable ...)` and what to do. The `membership.state` gauge is 2 meanwhile (1 for a `--join` node before its
-`add-peer`, 0 for a member). By reason:
+`add-peer` and while `add-peer` catches it up, 0 for a member, 3 in the last sample before exit 4); the alert
+`rockserver-node-outside` fires after 10 minutes at 2, and `rockserver-node-not-added` after 6 hours at 1. By reason:
 
 | Reason | What to do |
 |---|---|
@@ -323,3 +324,5 @@ says. The rules and what to do:
 | `rockserver-write-delayed` | warning | RocksDB slows writes | "Disk space and write stalls" |
 | `rockserver-checksum-mismatch` | critical | The replicas diverged | "Checksums" |
 | `rockserver-leader-stall` | warning | A leader stepped down to restart replication | "A leader whose log stops" in design.md |
+| `rockserver-node-outside` | warning | A node is outside the cluster and undecided for 10 minutes (`membership.state` 2) | "Removed node" (the reason is in its log) |
+| `rockserver-node-not-added` | warning | A `--join` node is not a voter after 6 hours (`membership.state` 1): a forgotten or abandoned `add-peer`. It is 1 during a normal catch-up too, hence the long wait | "Removed node", `NOT_ADDED` |

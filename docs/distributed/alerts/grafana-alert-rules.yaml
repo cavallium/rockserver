@@ -376,3 +376,53 @@ groups:
           - refId: C
             datasourceUid: __expr__
             model: {refId: C, type: math, expression: "$B > 86400 && $E > 8589934592"}
+      - uid: rockserver-node-outside
+        title: A node waits outside the cluster
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "The node is not a member and cannot decide whether it was removed (membership.state 2; 3 is the last sample before exit 4, and the node then stops reporting). Its log says why every 15 election timeouts: see \"Removed node\" in runbooks.md."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_membership_state" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [1.5]}}]}
+      - uid: rockserver-node-not-added
+        title: A --join node is not added
+        condition: C
+        for: 6h
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "A --join node never became a voter for 6 hours (membership.state 1): an add-peer was forgotten or abandoned. It is 1 also while add-peer catches the node up, hence the long wait. See \"Removed node\" in runbooks.md (NOT_ADDED)."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_membership_state" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: within_range, params: [0.5, 1.5]}}]}
