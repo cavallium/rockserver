@@ -52,7 +52,11 @@ import reactor.core.publisher.Mono;
  * write is sent again, after a short pause, to whichever node the channel then reaches, until the caller's deadline
  * ({@link #RETRY_WINDOW_PROPERTY} for a caller without one). The server applies a numbered write at most once and
  * answers every copy with the first result. The caller gets {@code OUTCOME_UNKNOWN} only when the deadline came
- * before an answer settled it.</p>
+ * before an answer settled it. No copy is sent once the deadline or the window has passed, the first one included: a
+ * write whose session opens later ends {@code READ_DEADLINE_EXCEEDED} flagged
+ * {@linkplain RocksDBException#isNotApplied() not applied}. A write that gets no session at all was never sent, and
+ * ends flagged not applied too: with the opening's own error, or {@code SERVER_OVERLOADED} if the opening's outcome
+ * was unknown.</p>
  *
  * <p>Numbered: writes outside transactions, transaction commits, the write that ends an update opened through
  * this connection (whose id this class remembers from the {@code getForUpdate} answer), schema changes (column
@@ -591,9 +595,11 @@ final class SessionWrites {
 					later(pause, () -> start(call), call::failClosed);
 					return;
 				}
+				// Flagged (R26-3, as the Rust client): the opening's own error may not say it, as gRPC's deadline on the
+				// opening, mapped to READ_DEADLINE_EXCEEDED, which would otherwise read as an unknown outcome.
 				call.fail(cause instanceof RocksDBException rocks
 						&& rocks.getErrorUniqueId() != RocksDBErrorType.OUTCOME_UNKNOWN
-						? rocks : RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+						? flaggedNotApplied(rocks) : RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
 								"Could not open a client session; the write was not sent: " + describe(cause)));
 				return;
 			}
@@ -659,6 +665,19 @@ final class SessionWrites {
 		var context = new BoundRequestContext(call.context.value().withRequestId(id), call.context.startedNanos());
 		if (closed) {
 			call.failClosed();
+			return;
+		}
+		if (System.nanoTime() - call.deadlineNanos >= 0) {
+			// Nothing is sent once the deadline or the window has passed, for either kind of caller (R26-4, as the Rust
+			// client's `remaining`): a session that opened late, or a resend after a long pause. A caller without a
+			// deadline sends its copies with no gRPC deadline, so nothing else would stop a copy sent now, which, lost,
+			// would end OUTCOME_UNKNOWN where not sending it is known not applied.
+			if (call.maybeApplied) {
+				call.failUnknown(RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "the deadline came"));
+			} else {
+				call.fail(RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						"The request deadline expired before the write was sent"));
+			}
 			return;
 		}
 		CompletableFuture<?> answer;
@@ -740,6 +759,16 @@ final class SessionWrites {
 			call.pauseNanos = Math.min(MAX_PAUSE_NANOS, pause * 2);
 			later(pause, () -> attempt(call, session), call::failClosed);
 		});
+	}
+
+	/** {@code error}, flagged not applied if it is not already (an {@code UPDATE_RETRY} cannot be, and stays as it is). */
+	private static RocksDBException flaggedNotApplied(RocksDBException error) {
+		if (error.isNotApplied() || error instanceof RocksDBRetryException) {
+			return error;
+		}
+		var flagged = RocksDBException.notApplied(error.getErrorUniqueId(), error.getMessage());
+		flagged.initCause(error);
+		return flagged;
 	}
 
 	private static boolean canPause(Call call, long pauseNanos) {

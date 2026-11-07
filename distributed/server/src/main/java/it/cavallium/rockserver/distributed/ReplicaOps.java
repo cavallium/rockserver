@@ -230,7 +230,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			Files.createDirectories(scheduleFile.getParent());
 			var temporary = scheduleFile.resolveSibling(SCHEDULE_FILE + ".tmp");
 			Files.writeString(temporary, nowMillis + "\n", StandardCharsets.UTF_8);
+			NodeStore.syncFile(temporary);
 			Files.move(temporary, scheduleFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+			NodeStore.syncDirectory(scheduleFile.getParent());
 		} catch (IOException ex) {
 			LOG.warn("{}: failed to write {}: {}", config.nodeId(), scheduleFile, ex.toString());
 		}
@@ -494,8 +496,15 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		Path dir = config.dataDir().resolve(BACKUPS_DIR).resolve(name);
 		Result result;
 		try {
-			if (Files.exists(dir.resolve(BACKUP_PROPERTIES))) {
-				var existing = readBackupProperties(dir);
+			Properties existing = Files.exists(dir.resolve(BACKUP_PROPERTIES)) ? readBackupProperties(dir) : null;
+			if (existing != null && existing.getProperty("index") == null) {
+				// No index: the file a power loss left empty after the rename, before it was synced (R26-2). The attempt
+				// was interrupted: it is taken again below, as one without the file.
+				LOG.warn("{}: backup {} at log index {}: {} holds no index, the trace of an interrupted attempt: taking it"
+						+ " again", config.nodeId(), name, index, dir.resolve(BACKUP_PROPERTIES));
+				existing = null;
+			}
+			if (existing != null) {
 				if (Long.parseLong(existing.getProperty("index", "-1")) == index) {
 					// The same entry applied again after a restart: the backup is there already.
 					result = new Result(State.DONE, index, 0, dir.toString());
@@ -529,6 +538,8 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			try (Writer out = Files.newBufferedWriter(temporary, StandardCharsets.UTF_8)) {
 				properties.store(out, "Rockserver cluster backup: every node took it at the same log index");
 			}
+			// Synced before the rename, which does not replace a file: otherwise a power loss can leave it empty (R26-2).
+			NodeStore.syncFile(temporary);
 			Files.move(temporary, dir.resolve(BACKUP_PROPERTIES));
 			NodeStore.syncDirectory(dir);
 			result = new Result(State.DONE, index, 0, dir.toString());
@@ -574,7 +585,12 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		Files.createDirectories(dataDir);
 		TermIndex applied;
 		try {
+			// The seed digest of the backup's own files, before anything opens them: each restore opens its database and
+			// leaves files of its own (OPTIONS, with this node's paths), so a digest of the restored db/ would differ on
+			// every node restored from a copy of the same backup, and the followers would stop at genesis (R26-1).
+			String seedDigest = NodeStore.databaseFilesDigest(backupDir.resolve(BACKUP_DB_DIR));
 			applied = restoreDatabase(backupDir, db, rockserverConfig);
+			NodeStore.recordRestoredSeedDigest(db, seedDigest);
 			String suffix = ".before-restore-" + System.currentTimeMillis();
 			for (Path old : List.of(dataDir.resolve(RESULTS_FILE), dataDir.resolve(BACKUPS_DIR))) {
 				if (Files.exists(old)) {
@@ -591,6 +607,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			// backups/ aside itself.
 			try {
 				NodeStore.deleteRecursively(db);
+				NodeStore.deleteSeedDigest(db);
 			} catch (IOException | RuntimeException cleanup) {
 				failure.addSuppressed(cleanup);
 			}
