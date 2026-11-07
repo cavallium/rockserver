@@ -22,6 +22,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
@@ -281,6 +282,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			var applyLag = metrics.amount("lag.unapplied");
 			var flushLag = metrics.amount("lag.unflushed");
 			metrics.sampleEveryMillisecond(() -> {
+				errorForTesting("sampler");
 				RaftLog log;
 				try {
 					log = server.getDivision(group.getGroupId()).getRaftLog();
@@ -294,6 +296,7 @@ public final class ReplicatedNode implements AutoCloseable {
 				flushLag.record(last - log.getFlushIndex());
 				applyLag.record(committed - stateMachine.appliedIndex().get());
 			});
+			failForTesting(config.nodeId(), "start", () -> new IllegalStateException("test: " + config.nodeId() + "/start"));
 		} catch (IOException | RuntimeException ex) {
 			for (int i = started.size() - 1; i >= 0; i--) {
 				try {
@@ -464,6 +467,7 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	private void refreshMonitor() {
 		try {
+			errorForTesting("monitor");
 			if (!closed.get()) {
 				monitor.refresh();
 			}
@@ -559,6 +563,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	/** Stops serving clients while the node is cut off from a leader (see {@link ApiGate}). */
 	private void gateApi() {
 		try {
+			errorForTesting("api-gate");
 			long now = System.nanoTime();
 			boolean serve = apiGate.shouldServe(knowsLeader(), now);
 			// A write waits at most the request timeout: a disk that has not ended an fsync for that long fails them all.
@@ -599,6 +604,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	/** Stops the node if Raft closed, and starts a new election if this leader is stalled (see {@link LeaderStall}). */
 	private void watchRaft() {
 		try {
+			errorForTesting("raft-watch");
 			if (closed.get()) {
 				return;
 			}
@@ -671,6 +677,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	 */
 	private void recordMembershipOnce() {
 		try {
+			errorForTesting("member");
 			var division = stateMachine.division();
 			if (!closed.get() && division != null && division.getInfo().isAlive()) {
 				recordMembership(division);
@@ -724,6 +731,38 @@ public final class ReplicatedNode implements AutoCloseable {
 				stateMachine.discardFailedInstalls();
 			}
 		});
+	}
+
+	/**
+	 * Tests only: how many {@link OutOfMemoryError}s the periodic task {@code <node id>/<task>} still throws, one per run
+	 * ({@code api-gate}, {@code raft-watch}, {@code monitor}, {@code member}, {@code sampler}); and {@code <node id>/start}
+	 * makes the constructor fail once the background tasks run. Empty in production: one lookup of an empty map per run.
+	 */
+	static final Map<String, Integer> FAILURES_FOR_TESTING = new ConcurrentHashMap<>();
+
+	/** Tests only: throws {@code failure} if {@link #FAILURES_FOR_TESTING} asks for one more for {@code task}. */
+	static void failForTesting(String nodeId, String task, java.util.function.Supplier<? extends Throwable> failure) {
+		if (FAILURES_FOR_TESTING.isEmpty()) {
+			return;
+		}
+		var fail = new boolean[1];
+		FAILURES_FOR_TESTING.computeIfPresent(nodeId + "/" + task, (key, left) -> {
+			fail[0] = true;
+			return left > 1 ? left - 1 : null;
+		});
+		if (fail[0]) {
+			sneakyThrow(failure.get());
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private static <T extends Throwable> void sneakyThrow(Throwable failure) throws T {
+		throw (T) failure;
+	}
+
+	/** {@link #failForTesting} with an {@link OutOfMemoryError}, for a periodic task of this node. */
+	private void errorForTesting(String task) {
+		failForTesting(config.nodeId(), task, () -> new OutOfMemoryError("test: " + config.nodeId() + "/" + task));
 	}
 
 	/**

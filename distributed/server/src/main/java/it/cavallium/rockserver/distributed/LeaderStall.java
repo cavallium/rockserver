@@ -95,6 +95,14 @@ final class LeaderStall {
 	}
 
 	/**
+	 * {@link #shouldStepDown(boolean, long, long, long)}, for a caller that can start a step-down now only if
+	 * {@code canStepDown}.
+	 */
+	boolean shouldStepDown(boolean waiting, long term, long commitIndex, long nowNanos, boolean canStepDown) {
+		return shouldStepDown(waiting, term, commitIndex, nowNanos);
+	}
+
+	/**
 	 * Takes the current observation and tells whether the leader should step down now. After a true answer the
 	 * doubled bound starts, for a step down that did not happen or that did not help. Call it on every node, leader or
 	 * not: the commit index it sees is what brings the bounds back.
@@ -119,6 +127,11 @@ final class LeaderStall {
 		stepDowns++;
 		commitIndexAtStepDown = commitIndex;
 		return true;
+	}
+
+	/** {@link #logStopped(boolean, long, long, long)}, for a caller that can start a step-down now only if {@code canStepDown}. */
+	boolean logStopped(boolean leader, long flushIndex, long lastIndex, long nowNanos, boolean canStepDown) {
+		return logStopped(leader, flushIndex, lastIndex, nowNanos);
 	}
 
 	/**

@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -17,6 +18,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import org.apache.ratis.server.raftlog.segmented.LogWorkerGate;
 import org.junit.jupiter.api.AfterEach;
@@ -44,6 +46,7 @@ class WatchdogThreadsTest {
 
 	@AfterEach
 	void tearDown() throws Exception {
+		ReplicatedNode.FAILURES_FOR_TESTING.clear();
 		if (cluster != null) {
 			cluster.close();
 		}
@@ -144,6 +147,73 @@ class WatchdogThreadsTest {
 			release.countDown();
 			holder.join();
 		}
+	}
+
+	/**
+	 * R25 review: {@code scheduleWithFixedDelay} cancels every later run of a task that throws, silently. A periodic task
+	 * of the node that throws an Error once (an {@code OutOfDirectMemoryError} when the API gate resumes the API server
+	 * builds a new Netty server) runs again; and the API gate still pauses the API on a hung disk afterwards.
+	 */
+	@Test
+	@Timeout(180)
+	void anErrorInAPeriodicTaskDoesNotStopItsNextRuns() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectory(temp.resolve("cluster")), 3,
+				c -> c.withRequestTimeout(Duration.ofSeconds(2))).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var victim = cluster.anyFollower();
+		var tasks = List.of("api-gate", "raft-watch", "monitor", "member", "sampler");
+		for (var node : cluster.runningNodes()) {
+			for (var task : tasks) {
+				// Two Errors: the second is thrown only by a run after the first.
+				ReplicatedNode.FAILURES_FOR_TESTING.put(node.config().nodeId() + "/" + task, 2);
+			}
+		}
+		try {
+			InProcessCluster.await(TIMEOUT, ReplicatedNode.FAILURES_FOR_TESTING::isEmpty);
+		} catch (AssertionError | Exception stopped) {
+			throw new AssertionError("tasks that stopped after one Error: " + ReplicatedNode.FAILURES_FOR_TESTING.keySet(),
+					stopped);
+		}
+		var hang = new CountDownLatch(1);
+		var key = victim.config().dataDir().toAbsolutePath().normalize();
+		try {
+			DiskProbe.HANGS_FOR_TESTING.put(key, hang);
+			InProcessCluster.await(TIMEOUT, () -> !listens(victim));
+		} finally {
+			hang.countDown();
+			DiskProbe.HANGS_FOR_TESTING.remove(key);
+		}
+		InProcessCluster.await(TIMEOUT, () -> listens(victim));
+	}
+
+	/**
+	 * R25 review: a start that fails once the background tasks run stops them all, and the disk probe and the metrics
+	 * threads: before, only the resources already started, the node's threads and its channels were closed, and the API
+	 * gate and the Raft watch went on against a half-built node. Only the Raft watch could stop them, when it found the
+	 * Raft server closed, and as a replica failure: here it cannot (as when it waits for the Raft log's lock).
+	 */
+	@Test
+	@Timeout(120)
+	void aFailedStartStopsTheBackgroundThreads() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectory(temp.resolve("cluster")), 1, c -> c);
+		ReplicatedNode.FAILURES_FOR_TESTING.put("n0/start", 1);
+		ReplicatedNode.FAILURES_FOR_TESTING.put("n0/raft-watch", Integer.MAX_VALUE);
+		assertThrows(IllegalStateException.class, () -> cluster.start("n0"));
+		var names = List.of("rockserver-n0-api-gate", "rockserver-n0-raft-watch", "rockserver-n0-monitor",
+				"rockserver-n0-initialization", "rockserver-n0-install-cleanup", "rockserver-n0-disk-probe",
+				"rockserver-metrics-n0", "rockserver-metrics-sampler-n0");
+		try {
+			InProcessCluster.await(Duration.ofSeconds(10), () -> Thread.getAllStackTraces().keySet().stream()
+					.noneMatch(thread -> thread.isAlive() && names.contains(thread.getName())));
+		} catch (AssertionError | Exception notStopped) {
+			throw new AssertionError("still running after the failed start: " + Thread.getAllStackTraces().keySet().stream()
+					.filter(thread -> thread.isAlive() && names.contains(thread.getName())).map(Thread::getName).toList(),
+					notStopped);
+		}
+		// Nothing of the failed start stays in the way of the next one.
+		ReplicatedNode.FAILURES_FOR_TESTING.clear();
+		cluster.start("n0");
+		cluster.awaitLeader(TIMEOUT);
 	}
 
 	/** Holds the monitor of {@code lock} on a thread of its own until {@code release} opens; returns once held. */
