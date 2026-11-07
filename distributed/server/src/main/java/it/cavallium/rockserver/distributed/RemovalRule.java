@@ -330,12 +330,23 @@ final class RemovalRule {
 			return new Verdict(Reason.REMOVED, kStar, confirmers, List.of(), pending, unreachable,
 					ownLog(kStar, termAtKStar, ownLatest));
 		}
+		// Version-1 answers report K* committed, but do not confirm it alone: NEEDS_TERM, unless members of this version
+		// of K*'s new half that answered without confirming yet (lagging) can still make a majority with the confirmers
+		// (round-13 review, finding 3): asked again, they may confirm, so NO_MAJORITY, which the check asks again.
 		boolean onlyOldConfirm = false;
+		int lagging = 0;
 		for (var entry : reports.entrySet()) {
-			onlyOldConfirm |= !kStarSound && kStar.inNew(entry.getKey()) && entry.getValue().version() < SOUND_VERSION
-					&& committedAt(entry.getValue(), iStar);
+			var report = entry.getValue();
+			if (!kStar.inNew(entry.getKey()) || confirmers.contains(entry.getKey())) {
+				continue;
+			}
+			if (report.version() < SOUND_VERSION) {
+				onlyOldConfirm |= !kStarSound && committedAt(report, iStar);
+			} else {
+				lagging++;
+			}
 		}
-		if (onlyOldConfirm) {
+		if (onlyOldConfirm && confirmers.size() + lagging < majority(kStar.newHalf().size())) {
 			return new Verdict(Reason.NEEDS_TERM, kStar, confirmers, List.of(), pending, unreachable,
 					"only members that predate Configuration2 report K* committed");
 		}

@@ -778,8 +778,11 @@ public final class ReplicatedNode implements AutoCloseable {
 					+ " itself once a majority of the new half of the newest committed configuration answer. If they are gone"
 					+ " for good, check with status on a member: if this node is not in its configuration, stop it, wipe its"
 					+ " data directory, start it with --join and run add-peer";
-			case NEEDS_TERM -> "Members answered with a version that predates Configuration2, which does not tell terms:"
-					+ " upgrade them. Until then, judge with status on a member";
+			case NEEDS_TERM -> "Members answered with a version that predates Configuration2, which does not tell terms"
+					+ " (its committed flag does not confirm a removal by itself), and the members of this version that"
+					+ " answered cannot make a majority of the new half of the newest committed configuration without"
+					+ " them: upgrade the named members of the older version, or start more members of this version."
+					+ " Until then, judge with status on a member";
 			case MEMBER_LATER_CONFIGURATION -> "Normally clears within seconds. If it persists, the blocking members are"
 					+ " stuck or were removed themselves: look at their logs and status";
 			case OWN_LATER_CONFIGURATION -> "Its own log holds a later configuration that includes it and may still"

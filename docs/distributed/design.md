@@ -1656,8 +1656,11 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   members of K*'s new half (members of a version without the method count as unreachable); the node decides by itself
   once a majority of them answer; if they are gone for good, check with `status` on a member, and if this node is not
   in its configuration, stop it, wipe it, start it with `--join` and run `add-peer`. NEEDS_TERM, upgrade the named
-  members (their version tells no terms, and their committed flag does not confirm a removal by itself); until then
-  judge with `status`. MEMBER_LATER_CONFIGURATION, normally clears within seconds; if it persists,
+  members (their version tells no terms, and their committed flag does not confirm a removal by itself), or start more
+  members of this version; until then judge with `status`. It is given only when the members of this version that
+  answered cannot make a majority of K*'s new half without the older ones: members of this version that answered
+  without confirming yet (lagging) make it NO_MAJORITY, which the check asks again within its budget (round-13
+  review, finding 3). MEMBER_LATER_CONFIGURATION, normally clears within seconds; if it persists,
   the named member is stuck or was removed itself. OWN_LATER_CONFIGURATION, its own log holds a later configuration
   that includes it and may still commit: normally an add of this node in flight (let `add-peer` finish), or a
   configuration a leader appended just before it lost leadership, which clears once the next leader's configuration
