@@ -130,10 +130,16 @@ final class RemovalRule {
 	 * The node's own facts: its id, its committed configuration (the newest it applied), its latest configuration,
 	 * the term at an index of its own log ({@link #PURGED}, {@link #BEYOND}), and whether it was ever a voter: it was
 	 * started without {@code --join} ({@code seeded}: its own peer list holds it), or it recorded that a leader made it
-	 * a voter ({@code memberFile}).
+	 * a voter ({@code memberFile}). {@code latestStale}: its log holds another entry at the index of its latest
+	 * configuration, a stale configuration of Ratis ({@link MembershipFacts.Entry#OTHER}).
 	 */
 	record Own(String self, @Nullable Conf committed, @Nullable Conf latest, LongUnaryOperator termAt, boolean seeded,
-			boolean memberFile) {}
+			boolean memberFile, boolean latestStale) {
+		Own(String self, @Nullable Conf committed, @Nullable Conf latest, LongUnaryOperator termAt, boolean seeded,
+				boolean memberFile) {
+			this(self, committed, latest, termAt, seeded, memberFile, false);
+		}
+	}
 
 	/** What a verdict means for the node. */
 	enum Outcome {
