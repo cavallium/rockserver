@@ -156,7 +156,15 @@ older `admin` gets its one-step replacement through. Until every node that can b
 voter per call with every `admin` (see "Upgrades"). Several dead nodes are removed one per call; a re-run of a call
 that succeeded prints `OK` again (for `add-peer`, `already a voter`). If the leader refuses for another reason that a
 new read of its configuration does not change (Ratis' own `changes a majority set`, say), `admin` fails at once with
-its message.
+its message (`the leader n2 (term 7) refused, and its configuration did not change since: ...`).
+
+`admin` asks every `--peer` and takes the configuration of the leader of the highest term; it waits while a member
+shows a later term than the leader that answered. A leader that has just been deposed answers as the leader for about
+an election timeout, with its old configuration: if neither the new leader nor any member that knows its term
+answers, `admin` can still read that one. A change then fails at once with `did not change since` and the advice to
+run it again, and the voters printed by `add-peer` can be stale: run the command again before acting on them, and
+never wipe a node on one such answer (wipe only if `add-peer` fails the same way again with the node not among the
+voters printed).
 
 `--unsafe-multi-voter-change` skips both checks: `admin` prints a warning and sends the change straight to the leader
 with a header that its guard lets through (it logs a WARN with the old and new voters). It is **never needed for
