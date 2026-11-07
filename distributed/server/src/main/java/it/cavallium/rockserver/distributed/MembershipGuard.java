@@ -16,6 +16,7 @@ import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.exceptions.NotLeaderException;
 import org.apache.ratis.protocol.exceptions.ReconfigurationInProgressException;
 import org.apache.ratis.protocol.exceptions.SetConfigurationException;
+import org.apache.ratis.server.RaftConfiguration;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.thirdparty.io.grpc.ForwardingServerCallListener;
 import org.apache.ratis.thirdparty.io.grpc.Metadata;
@@ -35,8 +36,12 @@ import org.slf4j.LoggerFactory;
  * not go through gRPC and skip it.
  *
  * <ul>
- *   <li>On a node that is not the leader, or that serves no such group, the request passes unchanged: Ratis answers
- *   that it is not the leader, and the client asks the leader.</li>
+ *   <li>On a node that serves no such group, the request passes unchanged.</li>
+ *   <li>On a node that is not the leader, it checks the same against that node's configuration (its current half,
+ *   if joint): a refusal goes back as {@link NotLeaderException} (the client asks the leader, which checks again), and
+ *   what passes is rewritten as below. Ratis handles the request only at half-close, through the division's executor,
+ *   and the node may have won an election by then: the compare-and-set makes it apply the change only if its
+ *   configuration is still the one checked. Otherwise Ratis answers that it is not the leader.</li>
  *   <li>On a leader whose configuration is a joint one, it answers {@link ReconfigurationInProgressException} itself
  *   (what Ratis would answer), which the client retries.</li>
  *   <li>Otherwise it computes the configuration the request asks for ({@code SET_UNCONDITIONALLY} and
@@ -126,16 +131,18 @@ final class MembershipGuard implements ServerInterceptor {
 		} catch (IOException | RuntimeException noSuchGroup) {
 			return Decision.pass(request);
 		}
-		if (!division.getInfo().isLeader()) {
-			return Decision.pass(request);
-		}
+		boolean leader = division.getInfo().isLeader();
 		var conf = division.getRaftConf();
-		if (!conf.getPreviousPeers().isEmpty() || !conf.getPreviousPeers(RaftPeerRole.LISTENER).isEmpty()) {
+		if (leader && (!conf.getPreviousPeers().isEmpty() || !conf.getPreviousPeers(RaftPeerRole.LISTENER).isEmpty())) {
 			return Decision.refuse(new ReconfigurationInProgressException("Reconfiguration is already in progress: "
 					+ conf));
 		}
 		var servers = conf.getCurrentPeers();
 		var listeners = conf.getCurrentPeers(RaftPeerRole.LISTENER);
+		if (!leader) {
+			// Ratis handles the request only at half-close, through the division's executor: the node may lead by then.
+			return decide(request, servers, listeners, unsafe, () -> notLeader(division, conf));
+		}
 		var decision = decide(request, servers, listeners, unsafe);
 		if (decision.forward() != null && unsafe) {
 			var change = VoterChange.between(servers, ProtoUtils.toRaftPeers(decision.forward().getPeersList()));
@@ -194,13 +201,29 @@ final class MembershipGuard implements ServerInterceptor {
 				.build());
 	}
 
-	/** Stub: keeps the old behaviour on a non-leader (the request passes unchanged). */
+	/**
+	 * What the guard does with {@code request} on a node whose configuration has {@code servers} and {@code listeners}
+	 * (its current half, if joint): on the leader ({@code notLeader} null) as {@link #decide(SetConfigurationRequestProto,
+	 * Collection, Collection, boolean)}; on another node the same, except that a refusal becomes {@code notLeader}'s
+	 * exception, so that the client asks the leader, which checks again. What passes is a compare-and-set against this
+	 * node's configuration: if the node leads by the time Ratis handles it, Ratis applies it only if its configuration is
+	 * still the one checked here.
+	 */
 	static Decision decide(SetConfigurationRequestProto request, Collection<RaftPeer> servers,
 			Collection<RaftPeer> listeners, boolean unsafe, @Nullable Supplier<NotLeaderException> notLeader) {
-		if (notLeader != null) {
-			return Decision.pass(request);
+		var decision = decide(request, servers, listeners, unsafe);
+		if (notLeader != null && decision.refusal() != null) {
+			return Decision.refuse(notLeader.get());
 		}
-		return decide(request, servers, listeners, unsafe);
+		return decision;
+	}
+
+	/** What Ratis answers on a node that is not the leader: the leader it knows, if any, and the peers it knows. */
+	private static NotLeaderException notLeader(RaftServer.Division division, RaftConfiguration conf) {
+		var leaderId = division.getInfo().getLeaderId();
+		var peers = new ArrayList<RaftPeer>(conf.getAllPeers());
+		RaftPeer suggested = leaderId == null ? null : conf.getPeer(leaderId);
+		return new NotLeaderException(division.getMemberId(), suggested, peers);
 	}
 
 	/** {@code current} with the peers of {@code added}, which replace a current one of the same id, as Ratis' ADD does. */

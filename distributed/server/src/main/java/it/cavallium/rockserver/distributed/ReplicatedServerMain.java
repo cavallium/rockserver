@@ -444,7 +444,12 @@ public final class ReplicatedServerMain {
 						RaftPeerId.valueOf(arg(command)), 10_000));
 				case "add-peer" -> {
 					var added = PeerConfig.parse(arg(command));
-					requireFitToJoin(added, peers, groupId, deadline);
+					// A voter already (a re-run after a timeout, or of a call that succeeded): OK without asking the node,
+					// whose answer can look like a log of its own until it applies the genesis or its snapshot.
+					if (isVoter(added, peers, groupId, deadline) || !requireFitToJoin(added, peers, groupId, deadline)) {
+						System.out.println("OK");
+						yield null;
+					}
 					requireCapabilities(added, peers, groupId);
 					var members = new ArrayList<>(peers.stream().map(ReplicatedServerMain::raftPeer).toList());
 					members.removeIf(p -> p.getId().toString().equals(added.id()));
@@ -655,15 +660,17 @@ public final class ReplicatedServerMain {
 	 */
 	private static RaftClientReply changeVoters(RaftClient client, List<PeerConfig> peers, RaftGroupId groupId,
 			List<RaftPeer> target, boolean unsafe, Duration timeout, long deadlineNanos) throws InterruptedException {
-		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
-		try (var infoClient = RaftClient.newBuilder()
-				.setClientId(ClientId.randomId())
-				.setRaftGroup(RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList()))
-				.setProperties(RaftSettings.client(anyConfig))
-				.setRetryPolicy(RetryPolicies.noRetry())
-				.build()) {
+		try (var infoClient = infoClient(peers, groupId)) {
+			Membership refusedOn = null;
+			String refusalMessage = null;
 			while (true) {
 				var current = leaderConfiguration(infoClient, peers, groupId, deadlineNanos);
+				if (refusedOn != null && sameMembers(refusedOn, current)) {
+					// Not a lost race: Ratis refused for a reason that a re-read does not change (for one, "changes a
+					// majority set": the new members are at least as many as the kept ones).
+					fail("the leader refused, and its configuration did not change since: " + refusalMessage);
+				}
+				refusedOn = null;
 				var change = VoterChange.between(current.servers(), target);
 				System.out.println("leader " + current.leader() + ": voters " + VoterChange.ids(current.servers())
 						+ (current.listeners().isEmpty() ? "" : ", listeners " + VoterChange.ids(current.listeners()))
@@ -709,6 +716,10 @@ public final class ReplicatedServerMain {
 							throw ex;
 						});
 					}
+					if (refusal != null) {
+						refusedOn = current;
+						refusalMessage = refusal.getMessage();
+					}
 					// Another change committed between the read and the request (or, unsafe, no answer yet).
 					System.out.println("not done (" + ex.getMessage() + "): reading the configuration again");
 				}
@@ -722,6 +733,53 @@ public final class ReplicatedServerMain {
 			fail("cannot close the client: " + closing);
 			throw new AssertionError(closing);
 		}
+	}
+
+	/** Whether {@code a} and {@code b} have the same voters and listeners, by id (as Ratis' compare-and-set compares). */
+	private static boolean sameMembers(Membership a, Membership b) {
+		return VoterChange.ids(a.servers()).equals(VoterChange.ids(b.servers()))
+				&& VoterChange.ids(a.listeners()).equals(VoterChange.ids(b.listeners()));
+	}
+
+	/** A client that asks one member once, for {@link #leaderConfiguration}. */
+	private static RaftClient infoClient(List<PeerConfig> peers, RaftGroupId groupId) {
+		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
+		return RaftClient.newBuilder()
+				.setClientId(ClientId.randomId())
+				.setRaftGroup(RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList()))
+				.setProperties(RaftSettings.client(anyConfig))
+				.setRetryPolicy(RetryPolicies.noRetry())
+				.build();
+	}
+
+	/**
+	 * Whether the leader's settled configuration holds {@code added} as a voter at its address; prints the leader's
+	 * voters. Fails if it holds it at another address: Ratis compares peers by id only, so no change of {@code add-peer}
+	 * moves it, and the node must not be wiped.
+	 */
+	private static boolean isVoter(PeerConfig added, List<PeerConfig> peers, RaftGroupId groupId, long deadlineNanos)
+			throws InterruptedException {
+		Membership current;
+		try (var infoClient = infoClient(peers, groupId)) {
+			current = leaderConfiguration(infoClient, peers, groupId, deadlineNanos);
+		} catch (IOException closing) {
+			fail("cannot close the client: " + closing);
+			throw new AssertionError(closing);
+		}
+		System.out.println("leader " + current.leader() + ": voters " + VoterChange.ids(current.servers())
+				+ (current.listeners().isEmpty() ? "" : ", listeners " + VoterChange.ids(current.listeners())));
+		var voter = current.servers().stream().filter(peer -> peer.getId().toString().equals(added.id())).findFirst()
+				.orElse(null);
+		if (voter == null) {
+			return false;
+		}
+		if (!String.valueOf(voter.getAddress()).equals(raftPeer(added).getAddress())) {
+			fail("node " + added.id() + " is a voter already, at " + voter.getAddress() + ", not at "
+					+ raftPeer(added).getAddress() + ": add-peer does not move a voter (Ratis compares peers by id). Never"
+					+ " wipe a voter's data directory: to move it, remove-peer " + added.id() + " and add it again");
+		}
+		System.out.println("node " + added.id() + " is already a voter at " + voter.getAddress() + ": nothing to do");
+		return true;
 	}
 
 	private static @Nullable SetConfigurationException setConfigurationRefusal(Throwable error) {
@@ -884,10 +942,12 @@ public final class ReplicatedServerMain {
 	/**
 	 * Fails the command if {@code added} does not run or holds a log of its own. It then waits until every member that
 	 * answers has applied the genesis entry and, on a seeded cluster, holds a snapshot, which it takes right after: a new
-	 * member cannot catch up from a leader without one.
+	 * member cannot catch up from a leader without one. Before it fails on the node's log it reads the leader's
+	 * configuration again: if the node became a voter meanwhile (an earlier add-peer of it ended), it returns false, and
+	 * nothing is left to do.
 	 */
-	private static void requireFitToJoin(PeerConfig added, List<PeerConfig> peers, RaftGroupId groupId, long deadlineNanos)
-			throws InterruptedException {
+	private static boolean requireFitToJoin(PeerConfig added, List<PeerConfig> peers, RaftGroupId groupId,
+			long deadlineNanos) throws InterruptedException {
 		var members = peers.stream().filter(peer -> !peer.id().equals(added.id())).toList();
 		while (true) {
 			var answers = members.stream().map(member -> nodeState(member, groupId)).toList();
@@ -900,18 +960,23 @@ public final class ReplicatedServerMain {
 				if (state == null) {
 					fail("node " + added.id() + " at " + added.raftAddress() + " has no group " + groupId.getUuid()
 							+ ": start it with the same --group-id as the cluster");
-					return;
+					return false;
 				}
 				var refusal = state.refusalToJoin(added.id(), clusterId);
 				if (refusal != null) {
-					fail(refusal);
-					return;
+					if (isVoter(added, peers, groupId, deadlineNanos)) {
+						return false;
+					}
+					fail(refusal + ". First, if an earlier add-peer of " + added.id() + " ended without OK, the leader may"
+							+ " still be catching it up: run add-peer again, and wipe only if it fails like this again with "
+							+ added.id() + " not among the leader's voters (printed above). Never wipe a voter");
+					return false;
 				}
 			} catch (CompletionException ex) {
 				if (Status.fromThrowable(ex.getCause()).getCode() != Status.Code.ABORTED) {
 					fail("node " + added.id() + " does not answer at " + added.raftAddress() + ": start it first, with --join and"
 							+ " the same --group-id (" + ex.getCause().getMessage() + ")");
-					return;
+					return false;
 				}
 				waitingFor = "node " + added.id() + ", which is installing a snapshot";
 			}
@@ -919,11 +984,11 @@ public final class ReplicatedServerMain {
 				waitingFor = memberNotReady(known, members.size());
 			}
 			if (waitingFor == null) {
-				return;
+				return true;
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
 				fail("no result within the time limit (--timeout-ms): still waiting for " + waitingFor);
-				return;
+				return false;
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
 		}
