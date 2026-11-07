@@ -140,7 +140,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		this.config = config;
 		this.metrics = new NodeMetrics(config.nodeId());
 		this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir(), this::currentTerm,
-				this::installFloor, metrics.amount("install.recordFailures"));
+				this::installFloor, metrics.amount("install.recordFailures"), metrics.amount("install.staleChunks"));
 		Files.createDirectories(config.dbDir().getParent());
 		Files.createDirectories(config.raftDir());
 		requireSameFileSystem(config.raftDir(), config.dbDir().getParent());

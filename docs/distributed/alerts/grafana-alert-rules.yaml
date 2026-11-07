@@ -339,6 +339,31 @@ groups:
           - refId: C
             datasourceUid: __expr__
             model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [0]}}]}
+      - uid: rockserver-install-refused
+        title: Snapshot install chunks refused
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "A follower failed snapshot install streams: it could not record a chunk's configuration (install.recordFailures: its Raft disk) or refused a chunk older than its install floor (install.staleChunks: a stream its leader gave up on; repeated refusals with a follower that never catches up would show a live stream refused). runbooks.md, \"Snapshot installs refused\"."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT sum("value") FROM "rockserver_replication_count" WHERE "database-name" = 'CLUSTER' AND "name" =~ /^install\.(recordFailures|staleChunks)$/ AND time > now() - 30m GROUP BY "node", "name"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [0]}}]}
       - uid: rockserver-snapshot-old
         title: No snapshot for a day with a large log
         condition: C

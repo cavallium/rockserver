@@ -216,6 +216,9 @@ final class RaftTraffic implements ServerInterceptor {
 						LOG.warn("{}: a snapshot chunk of term {} carries the configuration at index {}, older than the"
 								+ " one at {} that its leader already holds: failing its install stream, which its leader"
 								+ " gave up on", nodeId, request.getLeaderTerm(), index, floor);
+						if (staleChunks != null) {
+							staleChunks.record(1);
+						}
 						fail(Status.FAILED_PRECONDITION.withDescription("the configuration of the chunk, at index " + index
 								+ ", is older than the one at " + floor + " that its leader already holds"));
 						return;
