@@ -1130,6 +1130,8 @@ final class Proposer implements Closeable {
 								rest.set(position, null);
 							}
 							rest.removeIf(Objects::isNull);
+							// Still SENT, so no expiry is armed: they are at the head of the queue, and the finished()
+							// below gives this batch's slot to them at once (take() fails any past its deadline).
 							requeue(rest);
 						}
 					} else if (refusal != null) {
@@ -1161,8 +1163,8 @@ final class Proposer implements Closeable {
 
 		/**
 		 * Puts the commits of a batch that was not appended back in the queue after {@link #NOT_READY_RETRY_MS}, as if
-		 * never sent: their deadlines and cancellations apply again, and {@link #take} fails them as not applied once
-		 * their deadline comes.
+		 * never sent: their deadlines and cancellations apply again, and they fail as not applied at their caller's
+		 * deadline, from {@link #take} or, while no slot frees up, from {@link #expireWhenQueued}.
 		 */
 		private void retryLater(List<Pending> batch) {
 			for (var pending : batch) {
@@ -1170,7 +1172,16 @@ final class Proposer implements Closeable {
 				pending.unsend();
 			}
 			try {
-				control.schedule(() -> requeue(batch), NOT_READY_RETRY_MS, TimeUnit.MILLISECONDS);
+				control.schedule(() -> {
+					requeue(batch);
+					// A commit sent at once when submitted has no expiry timer, and every slot may be taken again by
+					// now: fail it at its caller's deadline even if no slot frees up by then (R21-1).
+					for (var pending : batch) {
+						if (pending.callerDeadline && pending.isQueued()) {
+							expireWhenQueued(pending);
+						}
+					}
+				}, NOT_READY_RETRY_MS, TimeUnit.MILLISECONDS);
 			} catch (RejectedExecutionException stopping) {
 				fail(batch, RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping"));
 			}
