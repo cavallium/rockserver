@@ -211,12 +211,13 @@ final class MembershipFacts {
 			// Past the end of the log (a log is a contiguous run after the snapshot).
 			return Probe.ABSENT;
 		}
-		// In the snapshot: committed here, so the history decides, where it is complete. Probes are of configurations.
+		// In the snapshot: committed here, so the history decides where it recorded a configuration. Probes are of
+		// configurations believed committed (K*, or the asker's latest, of which only COMMITTED counts). No record is
+		// UNKNOWN, never ABSENT (R12-2): during a snapshot install Ratis moves the snapshot index before the state
+		// machine swaps in the snapshot's history, and for a K* that really is committed "complete history, no record"
+		// cannot happen otherwise, so ABSENT there would only ever drop a blocker wrongly.
 		var recorded = history.at(index);
-		if (recorded != null) {
-			return recorded.term() == term ? Probe.COMMITTED : Probe.ABSENT;
-		}
-		return index >= history.completeFrom() ? Probe.ABSENT : Probe.UNKNOWN;
+		return recorded == null ? Probe.UNKNOWN : recorded.term() == term ? Probe.COMMITTED : Probe.ABSENT;
 	}
 
 	/** Whether the entry at {@code index} of {@code log} is a configuration entry; null if it cannot tell. */

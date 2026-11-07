@@ -1566,7 +1566,10 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   took from the leader, past the snapshot and not in the log, does not count; one in the snapshot counts only if the
   history recorded it at its index, or does not cover that index). A probe of an entry in the log answers
   from the log and the commit index (or the history, for a restarted node whose commit index has not caught up), and
-  of an entry in the snapshot from the history where it is complete. Seeding from `raft-meta.conf` was not needed: the
+  of an entry in the snapshot from the history: committed if it recorded that configuration, absent if it recorded
+  another one there, unknown otherwise (also during a snapshot install, while Ratis' snapshot index is ahead of the
+  history, R12-2: Ratis moves it before `reinitialize` swaps in the snapshot's history, and "absent" there would drop a
+  blocker; for a K* that really is committed, a complete history with no record cannot happen otherwise). Seeding from `raft-meta.conf` was not needed: the
   derived committed configuration covers a database of an older version.
 
   Ratis' configuration of a node is not always the entry at its index (round-11 review, finding 1). A snapshot install
@@ -1597,7 +1600,9 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   correctly, and Ratis is left as it is.
 
   The history must not say that it is complete where it misses a committed configuration (round-11 review, finding 2),
-  or a probe of a purged entry answers "absent" for it and stops a member from blocking. Two ways led there, both
+  or a probe of a purged entry answers "absent" for it and stops a member from blocking (since R12-2 a missing record
+  answers "unknown", so completeness no longer feeds any probe answer; it still decides whether a configuration of
+  Ratis in the snapshot counts as committed). Two ways led there, both
   closed. Ratis calls `notifyConfigurationChanged` from the install path on a gRPC thread with term 0; that call cleared
   the pending configuration of the updater thread, so one landing between the updater's notification of a
   configuration entry and its `notifyTermIndexUpdated` lost the entry while the applied position moved past it. A call

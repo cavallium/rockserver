@@ -81,9 +81,9 @@ final class RemovalRule {
 		COMMITTED,
 		/** The entry is in its log, past its commit index. */
 		PRESENT,
-		/** Its log has another term at that index, or ends before it, or its history says no such configuration. */
+		/** Its log has another term at that index, or ends before it, or its history recorded another configuration there. */
 		ABSENT,
-		/** Cannot tell: in its snapshot, past what its history covers, or a member that predates the probe. */
+		/** Cannot tell: in its snapshot with no record in its history, or a member that predates the probe. */
 		UNKNOWN
 	}
 
