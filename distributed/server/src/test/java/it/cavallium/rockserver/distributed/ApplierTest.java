@@ -89,7 +89,7 @@ class ApplierTest {
 	}
 
 	/**
-	 * R16-1: a replicated server offers client sessions when the version it was told of has them, or when its database
+	 * R16b-1: a replicated server offers client sessions when the version it was told of has them, or when its database
 	 * has no cluster id yet (see ReplicatedConnection.getCapabilities). Genesis used to write the cluster id before it
 	 * told the node of its version, so a client whose handshake came in between was told there were no sessions, and its
 	 * connection never used them. Here, at every point where the node learns the version, what it would answer just
@@ -118,6 +118,45 @@ class ApplierTest {
 			assertEquals(1, answers.size(), answers.toString());
 			Assertions.assertTrue(answers.getFirst().endsWith("sessions true"), answers.toString());
 		}
+	}
+
+	/**
+	 * R17-1: genesis writes the version of the cluster it creates, frozen at the capabilities this branch's builds had
+	 * when the value was frozen (0x1F), not the capabilities of the node that applies it. A node of a newer version that replays genesis
+	 * from the log (it joined a young cluster whose log still starts at genesis, or was upgraded before it applied genesis)
+	 * would otherwise hold a version above the other replicas', which applying {@code ClusterVersion} as a union never
+	 * lowers: as leader it would write entries older members cannot read, and its checksums would digest differently.
+	 * <p>This pins the literal; it does not reproduce a newer node (R17 review, finding 3). The old bug read the
+	 * constant {@code GENESIS = SUPPORTED} and never asked {@link Applier.Maintenance#supported()}, so the extra bit
+	 * given here does not bring it back: the test passes at {@code b3df680}, before the fix. It checks that genesis
+	 * writes 0x1F, and that {@code applyGenesis} does not start writing what the applying node supports. It fails only
+	 * if {@code GENESIS} changes, or once a bit is added to {@code SUPPORTED} with {@code GENESIS = SUPPORTED} restored
+	 * (checked by hand with {@code 1 << 5}: 31 expected, 63 written).</p>
+	 */
+	@Test
+	void genesisWritesTheFrozenVersionNotTheApplyingNodesCapabilities() throws Exception {
+		long frozen = 0x1FL;
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long newer = Capabilities.SUPPORTED | (1L << 40);
+			var told = new ArrayList<Long>();
+			applier.maintenance(new Applier.Maintenance() {
+				@Override
+				public long supported() {
+					return newer;
+				}
+
+				@Override
+				public void clusterVersion(long version) {
+					told.add(version);
+				}
+			});
+			applier.apply(new Request(5, 0, 0, new LogEntry.Genesis("c", false)), TermIndex.valueOf(1, 1));
+			assertEquals(frozen, store.clusterVersion(), Capabilities.describe(store.clusterVersion()));
+			assertEquals(List.of(frozen), told);
+		}
+		// Every later version supports at least what a cluster starts with.
+		Assertions.assertTrue(Capabilities.has(Capabilities.SUPPORTED, Capabilities.GENESIS));
 	}
 
 	@Test

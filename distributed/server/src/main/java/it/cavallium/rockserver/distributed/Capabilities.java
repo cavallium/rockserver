@@ -15,9 +15,9 @@ import java.util.List;
  * the question, holds the version where it is. The version never goes down: {@code admin add-peer} refuses a node that
  * lacks a capability of the cluster, and a member must not be downgraded below it.</p>
  *
- * <p>A cluster created by a version with this gate starts at {@link #GENESIS} ({@link LogEntry.Genesis} writes it):
- * every node of a new cluster must run the same version. A cluster created before has no version until the leader
- * proposes one, once every member was upgraded.</p>
+ * <p>A cluster created by a version with this gate starts at {@link #GENESIS} ({@link LogEntry.Genesis} writes it), a
+ * frozen value that every later version supports; the leader's poll raises anything newer. A cluster created before has
+ * no version until the leader proposes one, once every member was upgraded.</p>
  */
 final class Capabilities {
 
@@ -38,8 +38,17 @@ final class Capabilities {
 
 	/** Everything this version supports. */
 	static final long SUPPORTED = PIPELINED_UPDATES | CLIENT_SESSIONS | CHECKSUM | BACKUP | CHECKSUM_SCHEMAS;
-	/** The version of a cluster created by this version (see the class documentation). */
-	static final long GENESIS = SUPPORTED;
+	/**
+	 * The version {@link LogEntry.Genesis} writes: the capabilities this branch's builds had when the value was frozen
+	 * (R17-1), not those of the first build with this gate, which wrote 0xF ({@link #CHECKSUM_SCHEMAS} came later, at
+	 * {@code 729fa06}; design.md, "Cluster version", has the residual). Never change it, not even when a later version
+	 * adds a bit. The entry carries no version, so a node applies it
+	 * with its own code: a node of a later version that replays genesis from the log (it joined a cluster whose log still
+	 * starts at genesis, or was upgraded before it applied genesis) must write what the other replicas wrote, or it would
+	 * hold a version above theirs, which {@link LogEntry.ClusterVersion} never lowers. A cluster created by a later
+	 * version gets its new bits from the leader's poll, as an upgraded cluster does.
+	 */
+	static final long GENESIS = 0x1F;
 
 	private Capabilities() {}
 

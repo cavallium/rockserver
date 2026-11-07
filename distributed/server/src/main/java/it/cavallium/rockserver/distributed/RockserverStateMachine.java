@@ -440,7 +440,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		raiseVisibleTerm(position.getTerm());
 		this.configurations = new CommittedConfigurations(opened.configurations(), opened.configurationHistoryFrom());
 		// The version first: a database with a cluster id next to the version of the one it replaces (a node that had
-		// not applied genesis, installing a snapshot) would advertise no client sessions (R16-1).
+		// not applied genesis, installing a snapshot) would advertise no client sessions (R16b-1).
 		ops.opened(opened);
 		this.store = opened;
 		this.applier = new Applier(opened, metrics, applyLanes);
@@ -525,7 +525,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			replaced = current;
 			// Only once every member can read the entries of a pipelined leader (see Capabilities). A cluster version
 			// raised during the term takes effect at the next term. Before genesis this leader creates the cluster, whose
-			// genesis gives it the version of this node.
+			// genesis gives it Capabilities.GENESIS.
 			boolean pipelined = config.pipelinedUpdates() && (ops.clusterHas(Capabilities.PIPELINED_UPDATES)
 					|| (store.clusterId() == null && Capabilities.has(Capabilities.GENESIS, Capabilities.PIPELINED_UPDATES)));
 			if (config.pipelinedUpdates() && !pipelined) {

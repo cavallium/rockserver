@@ -101,6 +101,7 @@ final class RaftTraffic implements ServerInterceptor {
 	/** See the constructor. */
 	private final ConfigurationFloor configurationFloor;
 	private final NodeMetrics.@Nullable Series recordFailures;
+	private final NodeMetrics.@Nullable Series staleChunks;
 	/** {@link System#nanoTime} of the last leader request, 0 if none yet. */
 	private final AtomicLong lastLeaderRequestNanos = new AtomicLong();
 
@@ -130,11 +131,25 @@ final class RaftTraffic implements ServerInterceptor {
 	 */
 	RaftTraffic(String nodeId, @Nullable Path raftDir, ToLongFunction<RaftGroupId> currentTerm,
 			ConfigurationFloor configurationFloor, NodeMetrics.@Nullable Series recordFailures) {
+		this(nodeId, raftDir, currentTerm, configurationFloor, recordFailures, null);
+	}
+
+	/**
+	 * @param currentTerm the current term of this node's division of a group, {@link #NO_TERM} if unknown (no such
+	 *     division, or the server is not built yet)
+	 * @param configurationFloor the index below which a chunk's configuration shows an abandoned stream (R16-2)
+	 * @param recordFailures counts the chunks whose configuration could not be recorded (null: not counted)
+	 * @param staleChunks counts the chunks refused below {@code configurationFloor} (null: not counted)
+	 */
+	RaftTraffic(String nodeId, @Nullable Path raftDir, ToLongFunction<RaftGroupId> currentTerm,
+			ConfigurationFloor configurationFloor, NodeMetrics.@Nullable Series recordFailures,
+			NodeMetrics.@Nullable Series staleChunks) {
 		this.nodeId = nodeId;
 		this.raftDir = raftDir;
 		this.currentTerm = currentTerm;
 		this.configurationFloor = configurationFloor;
 		this.recordFailures = recordFailures;
+		this.staleChunks = staleChunks;
 	}
 
 	/** {@link System#nanoTime} of the last append or snapshot chunk a leader sent to this node, 0 if none yet. */
@@ -201,6 +216,9 @@ final class RaftTraffic implements ServerInterceptor {
 						LOG.warn("{}: a snapshot chunk of term {} carries the configuration at index {}, older than the"
 								+ " one at {} that its leader already holds: failing its install stream, which its leader"
 								+ " gave up on", nodeId, request.getLeaderTerm(), index, floor);
+						if (staleChunks != null) {
+							staleChunks.record(1);
+						}
 						fail(Status.FAILED_PRECONDITION.withDescription("the configuration of the chunk, at index " + index
 								+ ", is older than the one at " + floor + " that its leader already holds"));
 						return;
