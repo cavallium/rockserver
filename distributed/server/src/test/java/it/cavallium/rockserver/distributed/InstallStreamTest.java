@@ -173,7 +173,8 @@ class InstallStreamTest {
 	 * term-start entry or later), and for a later term its committed configuration; neither is unknown. A chunk the
 	 * follower got from that install, replayed through its own {@link RaftTraffic} with a configuration one index older,
 	 * fails its stream with FAILED_PRECONDITION and never reaches Ratis (a fake handler stands in for it here). Were the
-	 * node's floor always unknown, the replayed chunk would pass.
+	 * node's floor always unknown, the replayed chunk would pass. R17 review, finding 4: the refusal is counted in the
+	 * node's own {@code install.staleChunks} series, the one {@code rockserver-install-stale-chunks} reads.
 	 */
 	@Test
 	void theRunningNodesFloorFailsAReplayedChunkOfAnOlderConfiguration() throws Exception {
@@ -211,11 +212,15 @@ class InstallStreamTest {
 				RaftProtos.InstallSnapshotReplyProto>(RaftServerProtocolServiceGrpc.getInstallSnapshotMethod());
 		var handler = new RaftTrafficTest.FakeHandler<RaftProtos.InstallSnapshotRequestProto,
 				RaftProtos.InstallSnapshotReplyProto>();
+		// R17 review, finding 4: the node wires the series the alert reads, under its exported name.
+		var staleChunks = fNode.metrics().amount("install.staleChunks");
+		long staleBefore = staleChunks.count();
 		var listener = fNode.raftTraffic().interceptCall(call, new Metadata(), handler);
 		listener.onMessage(older);
 		assertNotNull(call.closed, () -> "the replayed chunk's stream is not failed: " + call.events);
 		assertEquals(Status.Code.FAILED_PRECONDITION, call.closed.getCode());
 		assertTrue(handler.messages.isEmpty(), "the replayed chunk reached Ratis");
+		assertEquals(staleBefore + 1, staleChunks.count(), "the node's install.staleChunks");
 	}
 
 	/**
