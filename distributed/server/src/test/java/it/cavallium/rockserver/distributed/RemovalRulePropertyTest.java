@@ -135,7 +135,8 @@ class RemovalRulePropertyTest {
 	/**
 	 * A snapshot chunk of node {@code n}, sent while it led its current term, reaches {@code f}: a deposed leader's
 	 * chunk, or one of a leader that is down here (cut off from the others, it still runs as the leader of its term,
-	 * so it neither votes nor answers). Whatever {@code f} answers, Ratis takes the chunk's configuration (round 15).
+	 * so it neither votes nor answers). Whatever {@code f} answers, Ratis takes the chunk's configuration (round 15),
+	 * except that RaftTraffic answers NOT_LEADER itself to a chunk below {@code f}'s term (round 15 review, N-R15-1).
 	 */
 	record StaleInstall(int n, int f) implements Step {}
 
@@ -664,6 +665,14 @@ class RemovalRulePropertyTest {
 			}
 			long p = commonPrefix(n, f);
 			boolean notLeader = f.term > n.term;
+			if (notLeader && !raced) {
+				// RaftTraffic answers NOT_LEADER itself: nothing recorded, Ratis never sees the chunk.
+				if (n.up) {
+					n.leader = false;
+					n.term = f.term;
+				}
+				return true;
+			}
 			boolean alreadyInstalled = !notLeader && f.commit >= n.snapshot;
 			if (!notLeader && !alreadyInstalled && p >= n.snapshot) {
 				return false;

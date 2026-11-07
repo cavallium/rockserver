@@ -138,13 +138,14 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
 		this.config = config;
-		this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir());
+		this.metrics = new NodeMetrics(config.nodeId());
+		this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir(), this::currentTerm,
+				metrics.amount("install.recordFailures"));
 		Files.createDirectories(config.dbDir().getParent());
 		Files.createDirectories(config.raftDir());
 		requireSameFileSystem(config.raftDir(), config.dbDir().getParent());
 		var groupId = RaftGroupId.valueOf(UUID.fromString(config.groupId()));
 		this.group = RaftGroup.valueOf(groupId, raftPeers(config));
-		this.metrics = new NodeMetrics(config.nodeId());
 		this.commitHeartbeats = new CommitHeartbeats(this::raftServer, groupId);
 		this.leaderStall = LeaderStall.forElectionTimeout(config.electionTimeoutMax());
 		var configDigest = NodeStore.configDigest(config.rockserverConfig());
@@ -295,6 +296,22 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	private RaftServer raftServer() {
 		return server;
+	}
+
+	/**
+	 * The current term of this node's division of {@code requested}, {@link RaftTraffic#NO_TERM} if the server is not
+	 * built yet, or the group is another one or not started: for {@link RaftTraffic}.
+	 */
+	private long currentTerm(RaftGroupId requested) {
+		var raftServer = this.server;
+		if (raftServer == null || group == null || !requested.equals(group.getGroupId())) {
+			return RaftTraffic.NO_TERM;
+		}
+		try {
+			return raftServer.getDivision(requested).getInfo().getCurrentTerm();
+		} catch (IOException | RuntimeException e) {
+			return RaftTraffic.NO_TERM;
+		}
 	}
 
 	/**
@@ -451,8 +468,9 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	/**
 	 * The term in Ratis' {@code raft-meta} ({@code RaftStorageMetadataFileImpl}: properties {@code term} and
-	 * {@code votedFor}), 0 if there is none; {@link Long#MAX_VALUE} if it cannot be read: then every configuration a
-	 * chunk installs is bounded by no term, and blocks the removal check ({@link InstalledConfiguration}).
+	 * {@code votedFor}), 0 if there is none; {@link Long#MAX_VALUE} if it cannot be read: then, until a start that reads
+	 * it, every configuration a chunk installs is bounded by no term, and blocks the removal check
+	 * ({@link InstalledConfiguration#initialize}).
 	 */
 	private long persistedTerm() {
 		var file = raftMetaFile(RAFT_META_FILE);
@@ -464,7 +482,8 @@ public final class ReplicatedNode implements AutoCloseable {
 			properties.load(reader);
 			return Long.parseLong(Objects.requireNonNull(properties.getProperty("term"), "no term").trim());
 		} catch (IOException | RuntimeException e) {
-			LOG.warn("{}: cannot read the term in {}; configurations from snapshot installs get no term bound",
+			LOG.warn("{}: cannot read the term in {}; configurations from snapshot installs get no term bound until a"
+					+ " start that reads it",
 					config.nodeId(), file, e);
 			return Long.MAX_VALUE;
 		}

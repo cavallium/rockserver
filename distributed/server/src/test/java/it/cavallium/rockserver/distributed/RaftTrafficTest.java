@@ -12,6 +12,7 @@ import java.util.Collections;
 import java.util.List;
 import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc;
+import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.ratis.thirdparty.io.grpc.Metadata;
 import org.apache.ratis.thirdparty.io.grpc.MethodDescriptor;
@@ -29,6 +30,9 @@ import org.junit.jupiter.api.io.TempDir;
 class RaftTrafficTest {
 
 	private static final List<String> ABX = List.of("a", "b", "x");
+	private static final RaftGroupId GROUP = RaftGroupId.randomId();
+	private static final RaftProtos.RaftGroupIdProto GROUP_PROTO = RaftProtos.RaftGroupIdProto.newBuilder()
+			.setId(GROUP.toByteString()).build();
 
 	/** A server call that records what is done on it, and fails as gRPC does on a second close. */
 	static final class FakeCall<Q, R> extends ServerCall<Q, R> {
@@ -119,6 +123,7 @@ class RaftTrafficTest {
 			conf.addPeers(RaftProtos.RaftPeerProto.newBuilder().setId(ByteString.copyFromUtf8(id)));
 		}
 		return RaftProtos.InstallSnapshotRequestProto.newBuilder().setLeaderTerm(leaderTerm)
+				.setServerRequest(RaftProtos.RaftRpcRequestProto.newBuilder().setRaftGroupId(GROUP_PROTO))
 				.setLastRaftConfigurationLogEntryProto(RaftProtos.LogEntryProto.newBuilder().setIndex(index)
 						.setConfigurationEntry(conf))
 				.build();
@@ -178,13 +183,13 @@ class RaftTrafficTest {
 	 */
 	@Test
 	void aChunkBelowTheCurrentTermIsAnsweredNotLeaderWithoutRatis(@TempDir Path raftDir) throws Exception {
-		var traffic = new RaftTraffic("n1", raftDir, _ -> 5, null);
+		var traffic = new RaftTraffic("n1", raftDir, group -> group.equals(GROUP) ? 5 : RaftTraffic.NO_TERM, null);
 		var call = installCall();
 		var handler = new FakeHandler<RaftProtos.InstallSnapshotRequestProto, RaftProtos.InstallSnapshotReplyProto>();
 		var listener = traffic.interceptCall(call, new Metadata(), handler);
 		var request = chunk(3, 40, ABX).toBuilder()
 				.setServerRequest(RaftProtos.RaftRpcRequestProto.newBuilder().setRequestorId(ByteString.copyFromUtf8("a"))
-						.setReplyId(ByteString.copyFromUtf8("n1")))
+						.setReplyId(ByteString.copyFromUtf8("n1")).setRaftGroupId(GROUP_PROTO))
 				.setSnapshotChunk(RaftProtos.InstallSnapshotRequestProto.SnapshotChunkProto.newBuilder().setRequestIndex(2))
 				.build();
 		listener.onMessage(request);
@@ -197,6 +202,7 @@ class RaftTrafficTest {
 		assertEquals(2, reply.getRequestIndex());
 		assertEquals(ByteString.copyFromUtf8("a"), reply.getServerReply().getRequestorId());
 		assertEquals(ByteString.copyFromUtf8("n1"), reply.getServerReply().getReplyId());
+		assertEquals(GROUP_PROTO, reply.getServerReply().getRaftGroupId());
 		assertEquals(RemovalRule.UNKNOWN_TERM, InstalledConfiguration.boundOf(InstalledConfiguration.read(raftDir),
 				new Conf(RemovalRule.UNKNOWN_TERM, 40, ABX, List.of())));
 		// Ratis' handler answers on the same call afterwards: its headers are not sent twice.

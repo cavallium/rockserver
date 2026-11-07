@@ -19,6 +19,8 @@ import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.ratis.proto.RaftProtos;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Upper bounds of the terms of the configurations snapshot chunks gave Ratis (round-13 review, finding 1; round 15,
@@ -27,7 +29,8 @@ import org.jetbrains.annotations.Nullable;
  * it to {@code raft-meta.conf} and into memory, often past the end of the node's log: {@link MembershipFacts} cannot
  * tell its term. The sender's term bounds it (a leader, deposed or not, holds no entry of a later term than its own),
  * so {@link RaftTraffic} records, before Ratis sees a chunk, the index and halves of its configuration (the key) with
- * the leader's term: the highest term seen for that key. {@link RemovalRule} uses a bound only to tell that such a
+ * the leader's term: the highest term seen for that key (but not a chunk below the node's term, which RaftTraffic
+ * answers itself and Ratis never sees). {@link RemovalRule} uses a bound only to tell that such a
  * configuration is older than K*.
  *
  * <p>Ratis 3.3.1 takes the configuration of a chunk it rejects. {@code SnapshotInstallationHandler.installSnapshotImpl}
@@ -49,13 +52,16 @@ import org.jetbrains.annotations.Nullable;
  * ({@link #initialize}) a missing file, an unreadable one or one of the single record of round 13 (whose bound R14-1
  * may have left too low) is replaced by an empty record whose floor is the term in Ratis' {@code raft-meta}: Ratis
  * persists a term before it acts on a chunk of that term ({@code changeToFollowerAndPersistMetadata}), and a chunk it
- * rejects has a lower one. A key that is not held bounds nothing ({@link RemovalRule#UNKNOWN_TERM}): the node waits.</p>
+ * rejects has a lower one; a file of this format is kept, with its floor and bounds lowered to that term. A file lost
+ * or damaged while the node runs is written again with Ratis' current term as its floor ({@link #update}). A key that
+ * is not held bounds nothing ({@link RemovalRule#UNKNOWN_TERM}): the node waits.</p>
  *
  * <p>The file: a first line {@code records-v2 <floor>}, which a version of round 13 fails to read as an index (it then
  * bounds nothing), then four lines per key: index, bound, new half, old half (ids separated by commas).</p>
  */
 record InstalledConfiguration(long floor, Map<Key, Long> bounds) {
 
+	private static final Logger LOG = LoggerFactory.getLogger(InstalledConfiguration.class);
 	static final String FILE = "installed-configuration";
 	/** At most this many keys; then the lowest index goes, and its bound raises the floor. */
 	static final int CAP = 32;
@@ -181,36 +187,61 @@ record InstalledConfiguration(long floor, Map<Key, Long> bounds) {
 		return CACHES.computeIfAbsent(raftDir.toAbsolutePath().normalize(), _ -> new Cache());
 	}
 
+	/** This record with its floor and every bound lowered to {@code term} where they are above it. */
+	InstalledConfiguration loweredTo(long term) {
+		var lowered = new LinkedHashMap<Key, Long>();
+		bounds.forEach((key, bound) -> lowered.put(key, Math.min(bound, term)));
+		return new InstalledConfiguration(Math.min(floor, term), lowered);
+	}
+
 	/**
-	 * At a start, before the Raft server: keeps a file of this format, else writes an empty record with the floor
-	 * {@code floor} (the term in Ratis' {@code raft-meta}, 0 for a new group).
+	 * At a start, before the Raft server, with {@code persistedTerm} the term in Ratis' {@code raft-meta} (0 for a new
+	 * group, {@link Long#MAX_VALUE} if it cannot be read): keeps a file of this format, with its floor and bounds lowered
+	 * to that term where they are above it (no chunk Ratis handled exceeds it: a floor of {@link Long#MAX_VALUE} written
+	 * by a start that could not read the term comes down at the next start that can, R15 review, finding 3); else
+	 * writes an empty record with that term as its floor.
 	 */
-	static void initialize(Path raftDir, long floor) throws IOException {
+	static void initialize(Path raftDir, long persistedTerm) throws IOException {
 		var cache = cache(raftDir);
 		synchronized (cache) {
+			InstalledConfiguration old = null;
 			try {
-				if (cache.current(raftDir) != null) {
-					return;
-				}
+				old = cache.current(raftDir);
 			} catch (IOException | RuntimeException e) {
 				// Unreadable, or the single record of round 13: replaced.
 			}
-			write(raftDir, cache, new InstalledConfiguration(floor, Map.of()));
+			var next = old == null ? new InstalledConfiguration(persistedTerm, Map.of()) : old.loweredTo(persistedTerm);
+			if (!next.equals(old)) {
+				write(raftDir, cache, next);
+			}
 		}
 	}
 
 	/**
 	 * Records a chunk of a leader of term {@code leaderTerm} with the configuration ({@code index}, {@code newHalf},
-	 * {@code oldHalf}) in {@code raftDir}: replaces the file (synced) only if the record changes. Throws if the file
-	 * cannot be read: merging into an empty record would lose its floor.
+	 * {@code oldHalf}) in {@code raftDir}: replaces the file (synced) only if the record changes. A file that is missing
+	 * or cannot be read (deleted or damaged while the node runs; {@link #initialize} wrote one) is replaced by a record
+	 * with the floor {@code lostFloor}, which must be at least the term of every chunk Ratis handled: Ratis' current
+	 * term ({@link Long#MAX_VALUE} if unknown). An empty record of floor 0 would lose the floor (R15 review, findings 2
+	 * and 4), and failing would fail every install stream until the next start. Throws if the file cannot be written.
 	 */
 	static void update(Path raftDir, long lostFloor, long leaderTerm, long index, List<String> newHalf,
 			List<String> oldHalf) throws IOException {
 		var cache = cache(raftDir);
 		synchronized (cache) {
-			var old = cache.current(raftDir);
-			var next = with(old, leaderTerm, index, newHalf, oldHalf);
-			if (!next.equals(old)) {
+			InstalledConfiguration old;
+			try {
+				old = cache.current(raftDir);
+				if (old == null) {
+					LOG.warn("{} is missing; writing it again with the floor {}", raftDir.resolve(FILE), lostFloor);
+				}
+			} catch (IOException | RuntimeException e) {
+				LOG.warn("{} cannot be read; writing it again with the floor {}", raftDir.resolve(FILE), lostFloor, e);
+				old = null;
+			}
+			var base = old != null ? old : new InstalledConfiguration(lostFloor, Map.of());
+			var next = with(base, leaderTerm, index, newHalf, oldHalf);
+			if (old == null || !next.equals(old)) {
 				write(raftDir, cache, next);
 			}
 		}

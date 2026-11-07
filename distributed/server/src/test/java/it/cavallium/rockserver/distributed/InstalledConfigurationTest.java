@@ -163,9 +163,9 @@ class InstalledConfigurationTest {
 		assertEquals(RemovalRule.UNKNOWN_TERM, bound(raftDir, 40, ABX, AB));
 		InstalledConfiguration.update(raftDir, 0, 2, 40, ABX, AB);
 		assertEquals(5, bound(raftDir, 40, ABX, AB));
-		// A start keeps a file of this format.
+		// A start keeps a file of this format (Ratis' term is then at least every recorded one).
 		InstalledConfiguration.update(raftDir, 0, 7, 41, ABX, AB);
-		InstalledConfiguration.initialize(raftDir, 3);
+		InstalledConfiguration.initialize(raftDir, 9);
 		assertEquals(7, bound(raftDir, 41, ABX, AB));
 		assertEquals(5, bound(raftDir, 40, ABX, AB));
 	}
