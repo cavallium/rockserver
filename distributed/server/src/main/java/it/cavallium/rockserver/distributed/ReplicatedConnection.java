@@ -27,7 +27,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import org.apache.ratis.protocol.RaftPeerId;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
@@ -108,10 +107,7 @@ final class ReplicatedConnection implements RocksDBConnection, LeaderHint {
 		return url;
 	}
 
-	/** The leader, the forwarder's {@link LeaderForwarder#addressVersion()} then, and the leader's API address as text. */
-	private record CachedHint(RaftPeerId leader, long version, @Nullable String address) {}
-
-	private volatile @Nullable CachedHint cachedHint;
+	private final LeaderHintCache leaderHint = new LeaderHintCache();
 
 	/**
 	 * The leader's API address, which {@code GrpcServer} sends to clients with every response, so that a client of
@@ -128,16 +124,8 @@ final class ReplicatedConnection implements RocksDBConnection, LeaderHint {
 			return null;
 		}
 		// The forwarder learns a new address when a member moves its API port (R18-2): looked up again only when its
-		// address version changed, read before the lookup so that a change during it is seen by the next call.
-		long version = forwarder.addressVersion();
-		var cached = cachedHint;
-		if (cached != null && cached.version() == version && cached.leader().equals(leaderId)) {
-			return cached.address();
-		}
-		var api = forwarder.apiAddress(leaderId.toString());
-		var address = api == null ? null : api.host() + ":" + api.port();
-		cachedHint = new CachedHint(leaderId, version, address);
-		return address;
+		// address version changed.
+		return leaderHint.hint(leaderId, forwarder::addressVersion, forwarder::apiAddress);
 	}
 
 	@Override
