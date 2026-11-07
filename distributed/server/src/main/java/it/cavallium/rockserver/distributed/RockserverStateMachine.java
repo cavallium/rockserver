@@ -534,7 +534,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 			replaced = current;
 			// Only once every member can read the entries of a pipelined leader (see Capabilities). A cluster version
 			// raised during the term takes effect at the next term. Before genesis this leader creates the cluster, whose
-			// genesis gives it Capabilities.GENESIS.
+			// genesis gives it Capabilities.GENESIS. Both the version and the cluster id are in memory: no disk read under
+			// this monitor.
 			boolean pipelined = config.pipelinedUpdates() && (ops.clusterHas(Capabilities.PIPELINED_UPDATES)
 					|| (store.clusterId() == null && Capabilities.has(Capabilities.GENESIS, Capabilities.PIPELINED_UPDATES)));
 			if (config.pipelinedUpdates() && !pipelined) {

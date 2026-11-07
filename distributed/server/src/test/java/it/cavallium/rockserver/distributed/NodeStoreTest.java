@@ -630,8 +630,7 @@ class NodeStoreTest {
 	}
 
 	static void setClusterId(NodeStore store, String clusterId) {
-		store.db().put(0, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_ID),
-				Buf.wrap(clusterId.getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		store.writeClusterId(clusterId);
 	}
 
 	static void put(NodeStore store, long column, int key, String value) {
