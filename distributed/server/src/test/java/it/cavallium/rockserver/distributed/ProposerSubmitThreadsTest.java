@@ -303,6 +303,47 @@ class ProposerSubmitThreadsTest {
 	}
 
 	/**
+	 * R23-A: two writes proposed by one thread without awaiting the first have no submission order. Batch A, taken
+	 * first, is held while it encodes; batch B, taken after it, reaches Ratis and is answered first. A is still applied,
+	 * not refused as a late copy: B carries a {@code completedBelow} computed when B encoded, which never passes A's
+	 * sequence while A is in flight.
+	 */
+	@Test
+	void aBatchOvertakenByALaterOneIsStillApplied() throws Exception {
+		var submitted = new LinkedBlockingQueue<Request>();
+		raft.submit = request -> {
+			submitted.addAll(RockserverStateMachine.decodeBatch(request.getMessage().getContent()));
+			return CompletableFuture.completedFuture(applied(request));
+		};
+		var encoding = new CountDownLatch(1);
+		var releaseA = new CountDownLatch(1);
+		var first = new AtomicBoolean(true);
+		proposer.beforeEncodeForTesting = () -> {
+			if (first.compareAndSet(true, false)) {
+				encoding.countDown();
+				try {
+					releaseA.await(10, TimeUnit.SECONDS);
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+				}
+			}
+		};
+		var a = proposer.propose(put(1));
+		assertTrue(encoding.await(5, TimeUnit.SECONDS), "batch A did not start encoding");
+		var b = proposer.propose(put(1));
+		assertEquals(true, b.get(5, TimeUnit.SECONDS));
+		assertFalse(a.isDone(), "A was answered while it was held");
+		var requestB = submitted.poll(5, TimeUnit.SECONDS);
+		releaseA.countDown();
+		assertEquals(true, a.get(5, TimeUnit.SECONDS));
+		var requestA = submitted.poll(5, TimeUnit.SECONDS);
+		assertTrue(requestA != null && requestB != null);
+		assertTrue(requestA.sequence() < requestB.sequence(), "A was not taken first");
+		assertTrue(requestB.completedBelow() <= requestA.sequence(),
+				"B told the replicas that A completed: " + requestB + ", " + requestA);
+	}
+
+	/**
 	 * R22-4: a batch taken just before the proposer starts to close, but not yet sent, is not submitted to the Raft
 	 * server once it is closing. {@code close()} marks the proposer closed, then closes its client (which can wait
 	 * seconds for a connection's calls to end), and only then answers the writes in flight: the test stops it between

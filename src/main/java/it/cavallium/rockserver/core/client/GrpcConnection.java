@@ -105,7 +105,12 @@ import reactor.core.publisher.Mono;
 
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 
-/** Public gRPC connection. Database operations are exposed only by context-bound API views. */
+/**
+ * Public gRPC connection. Database operations are exposed only by context-bound API views.
+ *
+ * <p>Writes that are not awaited have no relative order, on one node or replicated: see
+ * {@link it.cavallium.rockserver.core.common.RocksDBAsyncAPI}.</p>
+ */
 public final class GrpcConnection extends BaseConnection {
 
 	public static final String MAX_INBOUND_MESSAGE_SIZE_PROPERTY =

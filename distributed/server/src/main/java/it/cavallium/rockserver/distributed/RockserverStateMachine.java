@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -507,8 +508,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 
 	/**
 	 * The leader session of the current term, if this node leads it; created on first use. The session of an earlier
-	 * term is closed outside the monitor, as in {@link #notifyLeaderChanged}: closing rolls back its native
-	 * transactions and updates, and {@link #preAppendTransaction} waits for this monitor under Ratis' append lock.
+	 * term is retired outside the monitor, as in {@link #notifyLeaderChanged}: {@link #preAppendTransaction} waits for
+	 * this monitor under Ratis' append lock, and the rollbacks of its native transactions run on a thread of their own.
 	 */
 	@Nullable LeaderSession leaderSession(long term) {
 		LeaderSession replaced;
@@ -540,7 +541,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			leaderSession = created;
 		}
 		if (replaced != null) {
-			replaced.close(store.db());
+			retire(replaced);
 		}
 		LOG.info("{}: leading term {}", config.nodeId(), term);
 		return created;
@@ -1346,6 +1347,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 		// Odd from here until the restored database replaced the old one: reads that fail meanwhile are retried elsewhere.
 		storeGeneration++;
+		awaitSessionCloses();
 		old.close();
 		CrashPoints.reach(CrashPoints.Point.INSTALL_RESTORING);
 		NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
@@ -1392,7 +1394,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			}
 			if (session != null) {
 				LOG.info("{}: no longer leading term {}", config.nodeId(), session.term());
-				session.close(store.db());
+				retire(session);
 			}
 		}
 		leaderListener.run();
@@ -1446,7 +1448,103 @@ final class RockserverStateMachine extends BaseStateMachine {
 			leaderSession = null;
 		}
 		if (session != null) {
-			session.close(store.db());
+			retire(session);
+		}
+	}
+
+	/**
+	 * Ends the leader session of a term that ended. Ratis calls {@link #notifyLeaderChanged} holding its server's
+	 * monitor (from {@code changeToFollower} and inside {@code appendEntriesAsync} and {@code requestVote}), and
+	 * {@link #leaderSession} under its append lock; the session's rollbacks take each native transaction's monitor,
+	 * which a read or a write in that transaction holds for a whole native call, for as long as a stalled disk makes it
+	 * last, and are thousands of native calls on a busy term. So only {@link LeaderSession#seal()} runs here, after
+	 * which nothing registers in the session or queues for one of its keys; the waiters, the links and the rollbacks
+	 * ({@link LeaderSession#drain}) run on a platform thread of this session: one per session, so that a stuck rollback
+	 * of term t does not delay the waiters of a later term. The database is the one open now: a database installed
+	 * later never knew these transactions. {@link #close()} and {@link #installSnapshot()} wait for these threads before
+	 * closing the database. Nothing is thrown into Ratis if that thread cannot be created (an {@link OutOfMemoryError}
+	 * "unable to create native thread"): the waiters and links are answered here, which takes no native call, and the
+	 * drain runs on a virtual thread; failing that too, the transactions stay open until they expire or the database
+	 * closes, and the session counts as drained so that nothing waits for it forever.
+	 */
+	private void retire(LeaderSession session) {
+		session.seal();
+		var store = this.store;
+		var db = store != null ? store.db() : null;
+		var done = new CompletableFuture<Void>();
+		sessionCloses.put(done, session.term());
+		Runnable drain = () -> {
+			try {
+				if (db != null) {
+					session.drain(db);
+				} else {
+					session.drain(_ -> {}, _ -> {});
+				}
+			} catch (Throwable ex) {
+				LOG.warn("{}: failed to close the leader session of term {}", config.nodeId(), session.term(), ex);
+			} finally {
+				sessionCloses.remove(done);
+				done.complete(null);
+			}
+		};
+		String name = config.nodeId() + "-session-close-" + session.term();
+		try {
+			sessionCloseStarter.accept(name, drain);
+			return;
+		} catch (Throwable ex) {
+			// Typically OutOfMemoryError "unable to create native thread". Nothing may be thrown into Ratis from here.
+			LOG.error("{}: could not start a thread to close the leader session of term {}", config.nodeId(),
+					session.term(), ex);
+		}
+		try {
+			// No native work, so fine on Ratis' thread; the waiters must not wait for the rollbacks to get a thread.
+			session.answerWaiters();
+		} catch (Throwable ex) {
+			LOG.warn("{}: failed to answer the waiters of the leader session of term {}", config.nodeId(),
+					session.term(), ex);
+		}
+		try {
+			// A virtual thread needs no new native thread, only a carrier of the shared pool. A rollback stuck in a native
+			// call pins its carrier: acceptable once a platform thread could not even be created.
+			Thread.ofVirtual().name(name).start(drain);
+		} catch (Throwable ex) {
+			LOG.error("{}: could not start a thread to roll back the transactions of term {}; they stay open until they"
+					+ " expire or the database closes", config.nodeId(), session.term(), ex);
+			sessionCloses.remove(done);
+			done.complete(null);
+		}
+	}
+
+	/**
+	 * Starts the thread named by the first argument that runs the second: what {@link #retire} drains a session on.
+	 * Tests replace it to make the thread fail to start.
+	 */
+	volatile BiConsumer<String, Runnable> sessionCloseStarter =
+			(name, task) -> Thread.ofPlatform().daemon().name(name).start(task);
+
+	/** Sessions {@link #retire}d whose rollbacks still run, with their terms. */
+	private final ConcurrentHashMap<CompletableFuture<Void>, Long> sessionCloses = new ConcurrentHashMap<>();
+
+	/**
+	 * Waits for the rollbacks of every {@link #retire}d session, however long: the database must not close under one.
+	 * (Its own close would wait anyway, for the same monitors.)
+	 */
+	private void awaitSessionCloses() {
+		for (var entry : List.copyOf(sessionCloses.entrySet())) {
+			while (true) {
+				try {
+					entry.getKey().get(10, TimeUnit.SECONDS);
+					break;
+				} catch (java.util.concurrent.TimeoutException ex) {
+					LOG.warn("{}: still rolling back the transactions of term {} before closing the database",
+							config.nodeId(), entry.getValue());
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+					return;
+				} catch (ExecutionException ex) {
+					break;
+				}
+			}
 		}
 	}
 
@@ -1479,6 +1577,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 		leaderSession = null;
 		var store = this.store;
 		try {
+			// A session retired off Ratis' threads may still be rolling back: not under a closing database.
+			awaitSessionCloses();
 			if (store != null) {
 				if (session != null) {
 					session.close(store.db());

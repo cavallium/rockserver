@@ -49,6 +49,16 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.reactivestreams.Publisher;
 
+/**
+ * The asynchronous API.
+ *
+ * <p><b>Write order.</b> Writes that are not awaited have no relative order, on one node or replicated: a put sent
+ * before an earlier put to the same key completed may be applied first, by a single-node server (whose write pool
+ * runs requests in parallel), by a replicated node (which runs each call on a thread of its own), or by a client
+ * session that resends a write whose outcome was unknown. Order comes from awaiting each write before sending the
+ * next, from an update of the key ({@code getForUpdate}, whose updates of one key run one at a time), a transaction,
+ * or a batch ({@code putBatch} applies its chunks in order).</p>
+ */
 public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 
 	/** See: {@link OpenTransaction}. */

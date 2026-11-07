@@ -798,14 +798,38 @@ final class LeaderSession {
 
 	/** Leadership ended: roll back every open transaction. Their ids become unknown, so clients retry them. */
 	void close(EmbeddedDB db) {
-		close(id -> db.closeFailedUpdate(id), id -> db.closeTransaction(id, false));
+		seal();
+		drain(db);
 	}
 
 	/** {@link #close(EmbeddedDB)}, with what rolls back a native update and a native transaction. */
 	void close(LongConsumer rollBackUpdate, LongConsumer rollBackTransaction) {
+		seal();
+		drain(rollBackUpdate, rollBackTransaction);
+	}
+
+	/**
+	 * The first half of {@link #close}: from here on no transaction registers and no update queues for a key. Cheap,
+	 * no native work: Ratis calls it holding its server's monitor (see {@code RockserverStateMachine.retire}).
+	 */
+	void seal() {
 		synchronized (this) {
 			closed = true;
 		}
+	}
+
+	/** The second half of {@link #close}, after {@link #seal()}, on any thread: see {@link #drain(LongConsumer, LongConsumer)}. */
+	void drain(EmbeddedDB db) {
+		drain(id -> db.closeFailedUpdate(id), id -> db.closeTransaction(id, false));
+	}
+
+	/**
+	 * Answers the updates waiting for a key with {@link RocksDBRetryException} and the unsettled links with false, then
+	 * rolls back every open transaction. The waiters go first: a rollback takes the native transaction's monitor, which
+	 * a read or write in that transaction holds for a whole native call, as long as a stalled disk makes it last.
+	 */
+	void drain(LongConsumer rollBackUpdate, LongConsumer rollBackTransaction) {
+		answerWaiters();
 		for (OpenTransaction transaction : transactions.values()) {
 			if (transaction.chained()) {
 				continue;
@@ -823,6 +847,16 @@ final class LeaderSession {
 		transactions.clear();
 		synchronized (this) {
 			snapshots.clear();
+		}
+	}
+	/**
+	 * The first part of {@link #drain(LongConsumer, LongConsumer)}: answers the updates waiting for a key with
+	 * {@link RocksDBRetryException} and the unsettled links with false. No native work, so it may run where the
+	 * rollbacks must not (see {@code RockserverStateMachine.retire}); a second call finds nothing to answer.
+	 */
+	void answerWaiters() {
+		if (!closed) {
+			throw new IllegalStateException("drain() before seal()");
 		}
 		List<CompletableFuture<KeyLock>> waiters = new ArrayList<>();
 		List<ChainLink> links;

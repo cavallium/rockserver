@@ -13,6 +13,13 @@
 //! - Iterators and Range Scans
 //! - Bounded Range Pages with Exclusive Continuations
 //!
+//! ## Write order
+//!
+//! Writes that are not awaited have no relative order, on one node or replicated: two
+//! futures of writes to the same key, polled together, may apply in either order. Order
+//! comes from awaiting each write before sending the next, from an update of the key, a
+//! transaction, or a batch (`put_batch` sends its chunks one after another).
+//!
 //! ## Example
 //!
 //! ```rust,no_run
