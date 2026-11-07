@@ -815,7 +815,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	/** This node's own facts for {@link RemovalRule#decide}. */
 	private RemovalRule.Own ownFacts(RaftServer.Division division) {
 		return MembershipFacts.own(division, stateMachine.configurations(), config.nodeId(), !config.join(),
-				Files.exists(config.raftDir().resolve(MEMBER_FILE)));
+				Files.exists(config.raftDir().resolve(MEMBER_FILE)), InstalledConfiguration.read(config.raftDir()));
 	}
 
 	/** The answer of this node to {@link TermService#CONFIGURATION2}. */

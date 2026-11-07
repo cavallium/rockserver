@@ -131,13 +131,15 @@ final class RemovalRule {
 	 * the term at an index of its own log ({@link #PURGED}, {@link #BEYOND}), and whether it was ever a voter: it was
 	 * started without {@code --join} ({@code seeded}: its own peer list holds it), or it recorded that a leader made it
 	 * a voter ({@code memberFile}). {@code latestStale}: its log holds another entry at the index of its latest
-	 * configuration, a stale configuration of Ratis ({@link MembershipFacts.Entry#OTHER}).
+	 * configuration, a stale configuration of Ratis ({@link MembershipFacts.Entry#OTHER}). {@code latestTermBound}: a
+	 * term that its latest configuration's term cannot exceed, when that configuration came from a snapshot install
+	 * ({@link InstalledConfiguration}), else {@link #UNKNOWN_TERM}.
 	 */
 	record Own(String self, @Nullable Conf committed, @Nullable Conf latest, LongUnaryOperator termAt, boolean seeded,
-			boolean memberFile, boolean latestStale) {
+			boolean memberFile, boolean latestStale, long latestTermBound) {
 		Own(String self, @Nullable Conf committed, @Nullable Conf latest, LongUnaryOperator termAt, boolean seeded,
 				boolean memberFile) {
-			this(self, committed, latest, termAt, seeded, memberFile, false);
+			this(self, committed, latest, termAt, seeded, memberFile, false, UNKNOWN_TERM);
 		}
 	}
 

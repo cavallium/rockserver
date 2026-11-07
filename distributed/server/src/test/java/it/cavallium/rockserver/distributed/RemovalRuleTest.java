@@ -232,30 +232,41 @@ class RemovalRuleTest {
 	}
 
 	/**
-	 * R12-3: a latest configuration D that Ratis took from a snapshot install's {@code raft-meta.conf} (the leader's,
-	 * not committed), past the end of the node's own log and with no known term, does not block by itself: it can
-	 * commit only through a majority of K*'s new half, which step 5 sees. Nor does a stale one over another entry of its
-	 * log (round-13 review). One that is in its log, unreadable, still blocks.
+	 * R12-3, narrowed by the round-13 review (finding 1): a latest configuration D that Ratis took from a snapshot
+	 * install's {@code raft-meta.conf} (the leader's, not committed), past the end of the node's own log and with no
+	 * known term, does not block by itself only when its term bound (the installing leader's term,
+	 * {@link InstalledConfiguration}) is below K*'s term: D is then on another branch than K*, and never commits. With
+	 * no bound, or a bound not below K*'s term, D may be K*'s successor (a re-add of this incarnation) and blocks. The
+	 * same for a stale one over another entry of its log. One that is in its log, unreadable, still blocks.
 	 */
 	@Test
-	void aLatestConfigurationOutsideTheNodesOwnLogDoesNotBlockByItself() {
+	void aLatestConfigurationOutsideTheNodesOwnLogBlocksUnlessOlderThanKStar() {
 		var cOld = stable(1, 5, X, "a", "b");
 		var d = new Conf(UNKNOWN_TERM, 40, List.of(X, "a", "b"), List.of());
 		var removal = stable(3, 35, "a", "b");
-		var beyond = decide(seeded(cOld, d, log(2, 30, 30)), "a", report(removal, removal), "b",
-				report(removal, removal));
-		assertEquals(Reason.REMOVED, beyond.reason(), beyond.toString());
+		var older = decide(new Own(X, cOld, d, log(2, 30, 30), true, false, false, 2), "a", report(removal, removal),
+				"b", report(removal, removal));
+		assertEquals(Reason.REMOVED, older.reason(), older.toString());
+		var noBound = decide(new Own(X, cOld, d, log(2, 30, 30), true, true, false, UNKNOWN_TERM), "a",
+				report(removal, removal), "b", report(removal, removal));
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, noBound.reason(), noBound.toString());
+		var sameTerm = decide(new Own(X, cOld, d, log(2, 30, 30), false, true, false, 3), "a", report(removal, removal),
+				"b", report(removal, removal));
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, sameTerm.reason(), sameTerm.toString());
 		// In its log (a contiguous run after the snapshot, term 3 from 31), not readable: it may still commit.
 		LongUnaryOperator inLog = index -> index <= 30 ? PURGED : index <= 40 ? 3 : BEYOND;
 		var unreadable = decide(seeded(cOld, d, inLog), "a", report(removal, removal), "b", report(removal, removal));
 		assertEquals(Reason.OWN_LATER_CONFIGURATION, unreadable.reason(), unreadable.toString());
 		// Its log holds another entry at 40: D is a stale configuration of Ratis, not in its log.
-		var stale = decide(new Own(X, cOld, d, inLog, true, false, true), "a", report(removal, removal), "b",
+		var stale = decide(new Own(X, cOld, d, inLog, true, false, true, 2), "a", report(removal, removal), "b",
 				report(removal, removal));
 		assertEquals(Reason.REMOVED, stale.reason(), stale.toString());
+		var staleNoBound = decide(new Own(X, cOld, d, inLog, true, false, true, UNKNOWN_TERM), "a",
+				report(removal, removal), "b", report(removal, removal));
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, staleNoBound.reason(), staleNoBound.toString());
 		// A member that holds D, with a term at least K*'s, blocks.
 		var held = stable(3, 40, X, "a", "b");
-		var blocked = decide(seeded(cOld, d, log(2, 30, 30)), "a", report(removal, held), "b",
+		var blocked = decide(new Own(X, cOld, d, log(2, 30, 30), true, false, false, 2), "a", report(removal, held), "b",
 				report(removal, removal));
 		assertEquals(Reason.MEMBER_LATER_CONFIGURATION, blocked.reason(), blocked.toString());
 	}

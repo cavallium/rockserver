@@ -99,8 +99,11 @@ class RemovalRulePropertyTest {
 	 * half of an uncommitted joint configuration and then commits by the new half alone, which, when a majority of the
 	 * new half and a majority of the old one can be disjoint, lets a majority of the old half elect a leader without
 	 * the committed entries (round-13 finding, outside the removal rule; the model's sanity check finds it at once).
+	 * {@code lag}: an added node that the staging brings up to date by a snapshot install gets only the snapshot, as
+	 * Ratis' staging ends once the node is within its catch-up gap of the leader's commit index, so that the leader
+	 * may install a later snapshot after the joint configuration (round-13 review, finding 1).
 	 */
-	record Change(int n, int node) implements Step {}
+	record Change(int n, int node, boolean lag) implements Step {}
 
 	/** Leader {@code n} appends the stable configuration after its committed joint one. */
 	record FinishConf(int n) implements Step {}
@@ -156,6 +159,8 @@ class RemovalRulePropertyTest {
 		int incarnation;
 		boolean join;
 		boolean memberFile;
+		/** {@link InstalledConfiguration}, written as RaftTraffic writes it: before the follower acts on a chunk. */
+		InstalledConfiguration installed;
 		/** The index of the joint configuration that added this incarnation (-1: seeded). */
 		long addIndex = -1;
 		boolean up;
@@ -305,7 +310,7 @@ class RemovalRulePropertyTest {
 			boolean done = switch (step) {
 				case Elect s -> elect(pick(s.n(), n -> n.up && !n.inWindow() && n.current().holds(n.id)));
 				case Append s -> append(leaderNode(s.n()));
-				case SetConf s -> setConf(leaderNode(s.n()), s.target());
+				case SetConf s -> setConf(leaderNode(s.n()), s.target(), false);
 				case Change s -> {
 					var leader = leaderNode(s.n());
 					if (leader == null) {
@@ -316,7 +321,7 @@ class RemovalRulePropertyTest {
 					if (!target.remove(id)) {
 						target.add(id);
 					}
-					yield setConf(leader, target.stream().map(UNIVERSE::indexOf).collect(Collectors.toSet()));
+					yield setConf(leader, target.stream().map(UNIVERSE::indexOf).collect(Collectors.toSet()), s.lag());
 				}
 				case FinishConf s -> finishConf(leaderNode(s.n()));
 				case Replicate s -> {
@@ -404,7 +409,7 @@ class RemovalRulePropertyTest {
 			return true;
 		}
 
-		boolean setConf(Node n, Set<Integer> targetIndexes) {
+		boolean setConf(Node n, Set<Integer> targetIndexes, boolean lag) {
 			if (n == null) {
 				return false;
 			}
@@ -431,7 +436,9 @@ class RemovalRulePropertyTest {
 				// add-peer brings it up to date first (staging): no member file from this.
 				if (!replicate(n, a, 0, true)) {
 					install(n, a, false, true);
-					replicate(n, a, 0, true);
+					if (!lag) {
+						replicate(n, a, 0, true);
+					}
 				}
 				if (!n.leader) {
 					return true;
@@ -449,6 +456,7 @@ class RemovalRulePropertyTest {
 			a.incarnation++;
 			a.join = true;
 			a.memberFile = false;
+			a.installed = null;
 			a.addIndex = Long.MAX_VALUE;
 			a.leader = false;
 			a.term = 0;
@@ -611,17 +619,22 @@ class RemovalRulePropertyTest {
 			if (n == null || f == n || !f.up || f.inWindow() || n.snapshot == 0 || (!staging && !sendsTo(n, f))) {
 				return false;
 			}
+			long p = commonPrefix(n, f);
+			var latest = n.current();
+			if (p < n.snapshot) {
+				// RaftTraffic, before Ratis sees the chunk (and may reject it for its term).
+				f.installed = InstalledConfiguration.next(f.installed, n.term, latest.index(), latest.newHalf(),
+						latest.oldHalf());
+			}
 			if (f.term > n.term) {
 				n.leader = false;
 				n.term = f.term;
 				return true;
 			}
-			long p = commonPrefix(n, f);
 			if (p >= n.snapshot) {
 				return false;
 			}
 			long s = n.snapshot;
-			var latest = n.current();
 			f.term = n.term;
 			f.leader = false;
 			f.log = new ArrayList<>(n.log.subList(0, (int) s));
@@ -671,6 +684,12 @@ class RemovalRulePropertyTest {
 			n.leader = false;
 			n.commit = n.applied;
 			n.mem = n.rebuiltMem();
+			// Ratis runs it as a follower when its configuration holds it: recordMembership writes the member file
+			// (round-13 review, finding 1).
+			var conf = n.current();
+			if (conf.index() >= 0 && conf.inNew(n.id)) {
+				n.memberFile = true;
+			}
 			return true;
 		}
 
@@ -722,7 +741,7 @@ class RemovalRulePropertyTest {
 		}
 
 		Own own(Node n) {
-			return MembershipFacts.own(division(n), history(n), n.id, !n.join, n.memberFile);
+			return MembershipFacts.own(division(n), history(n), n.id, !n.join, n.memberFile, n.installed);
 		}
 
 		@Override
@@ -1045,7 +1064,7 @@ class RemovalRulePropertyTest {
 		var node = Arbitraries.integers().between(0, UNIVERSE.size() - 1);
 		Arbitrary<Step> elect = node.map(Elect::new);
 		Arbitrary<Step> append = node.map(Append::new);
-		Arbitrary<Step> setConf = Combinators.combine(node, node).as(Change::new);
+		Arbitrary<Step> setConf = Combinators.combine(node, node, Arbitraries.of(false, false, true)).as(Change::new);
 		Arbitrary<Step> finish = node.map(FinishConf::new);
 		Arbitrary<Step> replicate = Combinators.combine(node, node, Arbitraries.of(0, 0, 0, 1, 2)).as(Replicate::new);
 		Arbitrary<Step> broadcast = node.map(Broadcast::new);
@@ -1173,6 +1192,31 @@ class RemovalRulePropertyTest {
 		assertTrue(x.current().index() > x.last() && x.current().holds("x"), () -> "past x's log\n" + model);
 		assertEquals(Reason.REMOVED, check(model, x, Map.of()).reason(), model::toString);
 		checkLiveness(model);
+	}
+
+	/**
+	 * Round-13 review, finding 1: x, removed and then wiped and added again, is brought up to date only to a's snapshot
+	 * (Ratis' staging gap); a appends the joint add D and installs a later snapshot on x, with D past its end; x
+	 * restarts, Ratis runs it with D and it writes the member file. b, c and d have not got D yet, and a does not
+	 * answer: D may still commit through a, so x must wait (OWN_LATER_CONFIGURATION). D's term bound (a's term) is not
+	 * below K*'s. With the R12-3 rule (no bound), the verdict is REMOVED and S1 (b) fails.
+	 */
+	@Example
+	void aReAddFromAnInstallPastTheEndOfTheLogKeepsTheNodeWaiting() {
+		var model = run(FIVE, steps(new Elect(A), toAll(A, B, C, D, X), new AdvanceCommit(A), toAll(A, B, C, D, X),
+				new Change(A, X, false), toAll(A, B, C, D), new AdvanceCommit(A), new FinishConf(A), toAll(A, B, C, D),
+				new AdvanceCommit(A), toAll(A, B, C, D), repeat(2, new Append(A)), toAll(A, B, C, D), new AdvanceCommit(A),
+				new Apply(A, 0), new Snapshot(A, 0), repeat(2, new Append(A)), toAll(A, B, C, D), new AdvanceCommit(A),
+				new Apply(A, 0), new Change(A, X, true), new Install(A, X, false), new Crash(X), new Restart(X)), 7, true);
+		var x = model.nodes.get("x");
+		assertTrue(x.incarnation == 1 && x.memberFile && x.current().index() > x.last() && x.current().inNew("x")
+				&& !x.current().oldHalf().isEmpty(), () -> "D past x's log\n" + model);
+		var modes = Map.of("a", Mode.NONE);
+		var verdict = check(model, x, modes);
+		if (verdict.outcome() == Outcome.REMOVED) {
+			checkRemovedIsSafe(model, x, verdict, modes);
+		}
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, verdict.reason(), () -> verdict + "\n" + model);
 	}
 
 	/**
