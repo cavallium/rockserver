@@ -5,88 +5,259 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.ratis.proto.RaftProtos;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
- * An upper bound of the term of the configuration a snapshot install gave Ratis (round-13 review, finding 1), kept in
- * the Raft directory as {@link #FILE}. A leader sends its latest configuration with each snapshot chunk without its
- * term ({@code LeaderProtoUtils.toInstallSnapshotRequestProtoBuilder} passes none), and Ratis writes it to
- * {@code raft-meta.conf} and into memory, often past the end of the node's log: {@link MembershipFacts} cannot tell
- * its term. The leader's term bounds it (a leader holds no entry of a later term), so {@link RaftTraffic} records,
- * before Ratis sees a chunk, the index and halves of its configuration with the leader's term: the highest term seen
- * for that index and those halves, or the new one in place of a record of another configuration.
+ * Upper bounds of the terms of the configurations snapshot chunks gave Ratis (round-13 review, finding 1; round 15,
+ * R14-1), kept in the Raft directory as {@link #FILE}. A leader sends its latest configuration with each snapshot
+ * chunk without its term ({@code LeaderProtoUtils.toInstallSnapshotRequestProtoBuilder} passes none), and Ratis writes
+ * it to {@code raft-meta.conf} and into memory, often past the end of the node's log: {@link MembershipFacts} cannot
+ * tell its term. The sender's term bounds it (a leader, deposed or not, holds no entry of a later term than its own),
+ * so {@link RaftTraffic} records, before Ratis sees a chunk, the index and halves of its configuration (the key) with
+ * the leader's term: the highest term seen for that key (but not a chunk below the node's term, which RaftTraffic
+ * answers itself and Ratis never sees). {@link RemovalRule} uses a bound only to tell that such a
+ * configuration is older than K*.
  *
- * <p>A record never bounds the configuration Ratis holds too low. It is written before Ratis acts on the chunk; a
- * chunk Ratis rejects leaves a record of another configuration (which then matches none, and bounds nothing) or a
- * higher bound for the same one. Ratis replaces its configuration only with one that differs (index or peers), so a
- * later configuration with the same index and halves keeps the one in memory, whose record then holds the higher
- * term. {@link RemovalRule} uses the bound only to tell that such a configuration is older than K*.</p>
+ * <p>Ratis 3.3.1 takes the configuration of a chunk it rejects. {@code SnapshotInstallationHandler.installSnapshotImpl}
+ * applies it for every reply that {@code checkAndInstallSnapshot} returns (offsets 120-241): NOT_LEADER (the leader's
+ * term is below the current one), SNAPSHOT_EXPIRED and ALREADY_INSTALLED as well as SUCCESS. It drops its
+ * configurations from the chunk's index on ({@code ServerState.truncate}, {@code ConfigurationManager
+ * .removeConfigurations}) and takes the chunk's when it differs from the one left. Only a chunk it fails with an
+ * exception (wrong chunk index, group, life cycle, write error) leaves its configuration alone. So every chunk is
+ * recorded, whatever its term, and a chunk of another configuration never replaces the record of one (it did until
+ * round 15: a deposed leader's chunk with D', then an older one's with D, left D bounded by the older term).</p>
+ *
+ * <p>The record holds a bound per key, at most {@link #CAP} of them, and a {@code floor}. Invariant: for every chunk
+ * forwarded to Ratis since the file was written at this node's start, the record holds its key with a bound not below
+ * its leader's term, or does not hold its key and the floor is not below it; and the floor is not below the term of
+ * any chunk Ratis handled before that start. A key is added with the greater of its term and the floor, a full record
+ * drops the lowest index (then the lowest bound) other than the key just recorded and raises the floor to that bound,
+ * updates are serialized per Raft directory, and the file (synced, with its directory) is replaced before the chunk is
+ * forwarded. At a start
+ * ({@link #initialize}) a missing file, an unreadable one or one of the single record of round 13 (whose bound R14-1
+ * may have left too low) is replaced by an empty record whose floor is the term in Ratis' {@code raft-meta}: Ratis
+ * persists a term before it acts on a chunk of that term ({@code changeToFollowerAndPersistMetadata}), and a chunk it
+ * rejects has a lower one; a file of this format is kept, with its floor and bounds lowered to that term. A file lost
+ * or damaged while the node runs is written again with Ratis' current term as its floor ({@link #update}). A key that
+ * is not held bounds nothing ({@link RemovalRule#UNKNOWN_TERM}): the node waits.</p>
+ *
+ * <p>The file: a first line {@code records-v2 <floor>}, which a version of round 13 fails to read as an index (it then
+ * bounds nothing), then four lines per key: index, bound, new half, old half (ids separated by commas).</p>
  */
-record InstalledConfiguration(long index, long termBound, List<String> newHalf, List<String> oldHalf) {
+record InstalledConfiguration(long floor, Map<Key, Long> bounds) {
 
+	private static final Logger LOG = LoggerFactory.getLogger(InstalledConfiguration.class);
 	static final String FILE = "installed-configuration";
+	/** At most this many keys; then the lowest index goes, and its bound raises the floor. */
+	static final int CAP = 32;
+	static final InstalledConfiguration EMPTY = new InstalledConfiguration(0, Map.of());
+	private static final String TAG = "records-v2";
+	/**
+	 * Per Raft directory: serializes its updates (install streams of several leaders may run at once), and keeps the
+	 * record last read or written with the attributes of its file.
+	 */
+	private static final ConcurrentHashMap<Path, Cache> CACHES = new ConcurrentHashMap<>();
+	private static final Comparator<Map.Entry<Key, Long>> EVICTION = Comparator
+			.comparingLong((Map.Entry<Key, Long> entry) -> entry.getKey().index()).thenComparingLong(Map.Entry::getValue);
+
+	/** A configuration: its index and the ids of its halves. Coarser than Ratis' equality (no addresses). */
+	record Key(long index, Set<String> newHalf, Set<String> oldHalf) {
+		Key {
+			newHalf = Set.copyOf(newHalf);
+			oldHalf = Set.copyOf(oldHalf);
+		}
+
+		static Key of(long index, List<String> newHalf, List<String> oldHalf) {
+			return new Key(index, Set.copyOf(newHalf), Set.copyOf(oldHalf));
+		}
+	}
 
 	InstalledConfiguration {
-		newHalf = List.copyOf(newHalf);
-		oldHalf = List.copyOf(oldHalf);
+		bounds = Map.copyOf(bounds);
 	}
 
-	/** Whether this record is of the configuration ({@code index}, {@code newHalf}, {@code oldHalf}). */
-	private boolean of(long index, List<String> newHalf, @Nullable List<String> oldHalf) {
-		return this.index == index && oldHalf != null && Set.copyOf(this.newHalf).equals(Set.copyOf(newHalf))
-				&& Set.copyOf(this.oldHalf).equals(Set.copyOf(oldHalf));
-	}
-
-	/** The bound of the term of {@code conf}, {@link RemovalRule#UNKNOWN_TERM} if {@code record} is not of it. */
+	/** The bound of the term of {@code conf}, {@link RemovalRule#UNKNOWN_TERM} if {@code record} does not hold it. */
 	static long boundOf(@Nullable InstalledConfiguration record, @Nullable Conf conf) {
-		return record != null && conf != null && record.of(conf.index(), conf.newHalf(), conf.oldHalf())
-				? record.termBound : RemovalRule.UNKNOWN_TERM;
-	}
-
-	/** {@code record} after a chunk of a leader of term {@code leaderTerm} with the given configuration. */
-	static InstalledConfiguration next(@Nullable InstalledConfiguration record, long leaderTerm, long index,
-			List<String> newHalf, List<String> oldHalf) {
-		if (record != null && record.of(index, newHalf, oldHalf) && record.termBound >= leaderTerm) {
-			return record;
+		if (record == null || conf == null || conf.oldHalf() == null) {
+			return RemovalRule.UNKNOWN_TERM;
 		}
-		return new InstalledConfiguration(index, leaderTerm, newHalf, oldHalf);
+		var bound = record.bounds.get(Key.of(conf.index(), conf.newHalf(), conf.oldHalf()));
+		return bound == null ? RemovalRule.UNKNOWN_TERM : bound;
 	}
 
-	/** The record in {@code raftDir}, null if none or unreadable (then it bounds nothing). */
+	/** {@code record} (null: none) after a chunk of a leader of term {@code leaderTerm} with the given configuration. */
+	static InstalledConfiguration with(@Nullable InstalledConfiguration record, long leaderTerm, long index,
+			List<String> newHalf, List<String> oldHalf) {
+		var current = record == null ? EMPTY : record;
+		var key = Key.of(index, newHalf, oldHalf);
+		var bound = current.bounds.get(key);
+		if (bound != null && bound >= leaderTerm) {
+			return current;
+		}
+		var bounds = new LinkedHashMap<>(current.bounds);
+		bounds.put(key, bound != null ? leaderTerm : Math.max(leaderTerm, current.floor));
+		long floor = current.floor;
+		while (bounds.size() > CAP) {
+			// Not the key just recorded: Ratis may hold it now.
+			var evicted = bounds.entrySet().stream().filter(entry -> !entry.getKey().equals(key)).min(EVICTION)
+					.orElseThrow();
+			bounds.remove(evicted.getKey());
+			floor = Math.max(floor, evicted.getValue());
+		}
+		return new InstalledConfiguration(floor, bounds);
+	}
+
+	/**
+	 * The record in {@code raftDir}: {@link #EMPTY} if there is no file, null if it cannot be read or is of the old
+	 * format (then it bounds nothing).
+	 */
 	static @Nullable InstalledConfiguration read(Path raftDir) {
 		try {
-			var lines = Files.readAllLines(raftDir.resolve(FILE), StandardCharsets.UTF_8);
-			if (lines.size() < 4) {
-				return null;
-			}
-			return new InstalledConfiguration(Long.parseLong(lines.get(0).trim()), Long.parseLong(lines.get(1).trim()),
-					ids(lines.get(2)), ids(lines.get(3)));
+			var record = parse(raftDir);
+			return record == null ? EMPTY : record;
 		} catch (IOException | RuntimeException e) {
 			return null;
 		}
 	}
 
+	/** The record in {@code raftDir}, null if there is no file; throws if it cannot be read or is of the old format. */
+	private static @Nullable InstalledConfiguration parse(Path raftDir) throws IOException {
+		List<String> lines;
+		try {
+			lines = Files.readAllLines(raftDir.resolve(FILE), StandardCharsets.UTF_8);
+		} catch (NoSuchFileException e) {
+			return null;
+		}
+		if (lines.isEmpty() || !lines.getFirst().startsWith(TAG + " ") || (lines.size() - 1) % 4 != 0) {
+			throw new IOException("not a record of this format: " + raftDir.resolve(FILE));
+		}
+		long floor = Long.parseLong(lines.getFirst().substring(TAG.length() + 1).trim());
+		var bounds = new LinkedHashMap<Key, Long>();
+		for (int i = 1; i < lines.size(); i += 4) {
+			bounds.put(new Key(Long.parseLong(lines.get(i).trim()), ids(lines.get(i + 2)), ids(lines.get(i + 3))),
+					Long.parseLong(lines.get(i + 1).trim()));
+		}
+		return new InstalledConfiguration(floor, bounds);
+	}
+
+	/** The lock of a Raft directory, and its record as of the file with {@code version}'s attributes. */
+	private static final class Cache {
+		@Nullable Object version;
+		@Nullable InstalledConfiguration record;
+
+		/**
+		 * The record of the file (null if none), read again only if its attributes changed: a chunk that changes
+		 * nothing costs no read. The file is replaced by a move, so a new file has a new key.
+		 */
+		@Nullable InstalledConfiguration current(Path raftDir) throws IOException {
+			var version = version(raftDir);
+			if (version == null || !version.equals(this.version)) {
+				record = parse(raftDir);
+				this.version = version;
+			}
+			return record;
+		}
+
+		static @Nullable Object version(Path raftDir) throws IOException {
+			try {
+				var attributes = Files.readAttributes(raftDir.resolve(FILE), BasicFileAttributes.class);
+				return List.of(String.valueOf(attributes.fileKey()), attributes.lastModifiedTime(), attributes.size());
+			} catch (NoSuchFileException e) {
+				return null;
+			}
+		}
+	}
+
+	private static Cache cache(Path raftDir) {
+		return CACHES.computeIfAbsent(raftDir.toAbsolutePath().normalize(), _ -> new Cache());
+	}
+
+	/** This record with its floor and every bound lowered to {@code term} where they are above it. */
+	InstalledConfiguration loweredTo(long term) {
+		var lowered = new LinkedHashMap<Key, Long>();
+		bounds.forEach((key, bound) -> lowered.put(key, Math.min(bound, term)));
+		return new InstalledConfiguration(Math.min(floor, term), lowered);
+	}
+
+	/**
+	 * At a start, before the Raft server, with {@code persistedTerm} the term in Ratis' {@code raft-meta} (0 for a new
+	 * group, {@link Long#MAX_VALUE} if it cannot be read): keeps a file of this format, with its floor and bounds lowered
+	 * to that term where they are above it (no chunk Ratis handled exceeds it: a floor of {@link Long#MAX_VALUE} written
+	 * by a start that could not read the term comes down at the next start that can, R15 review, finding 3); else
+	 * writes an empty record with that term as its floor.
+	 */
+	static void initialize(Path raftDir, long persistedTerm) throws IOException {
+		var cache = cache(raftDir);
+		synchronized (cache) {
+			InstalledConfiguration old = null;
+			try {
+				old = cache.current(raftDir);
+			} catch (IOException | RuntimeException e) {
+				// Unreadable, or the single record of round 13: replaced.
+			}
+			var next = old == null ? new InstalledConfiguration(persistedTerm, Map.of()) : old.loweredTo(persistedTerm);
+			if (!next.equals(old)) {
+				write(raftDir, cache, next);
+			}
+		}
+	}
+
 	/**
 	 * Records a chunk of a leader of term {@code leaderTerm} with the configuration ({@code index}, {@code newHalf},
-	 * {@code oldHalf}) in {@code raftDir}: replaces the file (synced) only if the record changes.
+	 * {@code oldHalf}) in {@code raftDir}: replaces the file (synced) only if the record changes. A file that is missing
+	 * or cannot be read (deleted or damaged while the node runs; {@link #initialize} wrote one) is replaced by a record
+	 * with the floor {@code lostFloor}, which must be at least the term of every chunk Ratis handled: Ratis' current
+	 * term ({@link Long#MAX_VALUE} if unknown). An empty record of floor 0 would lose the floor (R15 review, findings 2
+	 * and 4), and failing would fail every install stream until the next start. Throws if the file cannot be written.
 	 */
-	static void update(Path raftDir, long leaderTerm, long index, List<String> newHalf, List<String> oldHalf)
-			throws IOException {
-		var old = read(raftDir);
-		var next = next(old, leaderTerm, index, newHalf, oldHalf);
-		if (next.equals(old)) {
-			return;
+	static void update(Path raftDir, long lostFloor, long leaderTerm, long index, List<String> newHalf,
+			List<String> oldHalf) throws IOException {
+		var cache = cache(raftDir);
+		synchronized (cache) {
+			InstalledConfiguration old;
+			try {
+				old = cache.current(raftDir);
+				if (old == null) {
+					LOG.warn("{} is missing; writing it again with the floor {}", raftDir.resolve(FILE), lostFloor);
+				}
+			} catch (IOException | RuntimeException e) {
+				LOG.warn("{} cannot be read; writing it again with the floor {}", raftDir.resolve(FILE), lostFloor, e);
+				old = null;
+			}
+			var base = old != null ? old : new InstalledConfiguration(lostFloor, Map.of());
+			var next = with(base, leaderTerm, index, newHalf, oldHalf);
+			if (old == null || !next.equals(old)) {
+				write(raftDir, cache, next);
+			}
 		}
+	}
+
+	/** Under the lock of {@code raftDir}, {@code cache}. */
+	private static void write(Path raftDir, Cache cache, InstalledConfiguration record) throws IOException {
+		cache.version = null;
+		var text = new StringBuilder(TAG).append(' ').append(record.floor).append('\n');
+		record.bounds.entrySet().stream().sorted(EVICTION).forEach(entry -> text.append(entry.getKey().index())
+				.append('\n').append(entry.getValue()).append('\n').append(String.join(",",
+						new TreeSet<>(entry.getKey().newHalf()))).append('\n').append(String.join(",",
+						new TreeSet<>(entry.getKey().oldHalf()))).append('\n'));
 		var file = raftDir.resolve(FILE);
 		var temporary = raftDir.resolve(FILE + ".tmp");
-		Files.writeString(temporary, next.index + "\n" + next.termBound + "\n" + String.join(",", next.newHalf) + "\n"
-				+ String.join(",", next.oldHalf) + "\n", StandardCharsets.UTF_8);
+		Files.writeString(temporary, text, StandardCharsets.UTF_8);
 		NodeStore.syncFile(temporary);
 		try {
 			Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
@@ -94,19 +265,21 @@ record InstalledConfiguration(long index, long termBound, List<String> newHalf, 
 			Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
 		}
 		NodeStore.syncDirectory(raftDir);
+		cache.record = record;
+		cache.version = Cache.version(raftDir);
 	}
 
 	/**
 	 * Records the configuration of the snapshot chunk {@code request} with its leader's term, if it carries one:
 	 * {@link RaftTraffic}, before Ratis sees it.
 	 */
-	static void record(Path raftDir, RaftProtos.InstallSnapshotRequestProto request) throws IOException {
+	static void record(Path raftDir, long lostFloor, RaftProtos.InstallSnapshotRequestProto request) throws IOException {
 		if (!request.hasLastRaftConfigurationLogEntryProto()) {
 			return;
 		}
 		var entry = request.getLastRaftConfigurationLogEntryProto();
 		var conf = entry.getConfigurationEntry();
-		update(raftDir, request.getLeaderTerm(), entry.getIndex(), peerIds(conf.getPeersList()),
+		update(raftDir, lostFloor, request.getLeaderTerm(), entry.getIndex(), peerIds(conf.getPeersList()),
 				peerIds(conf.getOldPeersList()));
 	}
 
@@ -114,8 +287,8 @@ record InstalledConfiguration(long index, long termBound, List<String> newHalf, 
 		return peers.stream().map(peer -> peer.getId().toStringUtf8()).toList();
 	}
 
-	private static List<String> ids(String line) {
+	private static Set<String> ids(String line) {
 		var trimmed = line.trim();
-		return trimmed.isEmpty() ? List.of() : Arrays.stream(trimmed.split(",")).map(String::trim).toList();
+		return trimmed.isEmpty() ? Set.of() : Set.copyOf(Arrays.stream(trimmed.split(",")).map(String::trim).toList());
 	}
 }

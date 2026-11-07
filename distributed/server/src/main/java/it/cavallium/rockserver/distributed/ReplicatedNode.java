@@ -6,6 +6,7 @@ import it.cavallium.rockserver.core.server.GrpcServer;
 import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -16,6 +17,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -64,6 +66,8 @@ public final class ReplicatedNode implements AutoCloseable {
 	private static final int ELECTION_TIMEOUTS_TO_WARN = 15;
 	/** Ratis keeps here the peer list of a start with one, until the node has a configuration from a log. */
 	private static final String BOOTSTRAP_FILE = "raft-meta.bootstrap";
+	/** Ratis keeps here its current term and vote. */
+	private static final String RAFT_META_FILE = "raft-meta";
 	/** Ratis keeps here the configuration from the log. */
 	private static final String CONFIGURATION_FILE = "raft-meta.conf";
 	/** In the Raft directory, once a leader made this node a voter: see {@link #recordMembership}. */
@@ -134,13 +138,14 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
 		this.config = config;
-		this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir());
+		this.metrics = new NodeMetrics(config.nodeId());
+		this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir(), this::currentTerm,
+				metrics.amount("install.recordFailures"));
 		Files.createDirectories(config.dbDir().getParent());
 		Files.createDirectories(config.raftDir());
 		requireSameFileSystem(config.raftDir(), config.dbDir().getParent());
 		var groupId = RaftGroupId.valueOf(UUID.fromString(config.groupId()));
 		this.group = RaftGroup.valueOf(groupId, raftPeers(config));
-		this.metrics = new NodeMetrics(config.nodeId());
 		this.commitHeartbeats = new CommitHeartbeats(this::raftServer, groupId);
 		this.leaderStall = LeaderStall.forElectionTimeout(config.electionTimeoutMax());
 		var configDigest = NodeStore.configDigest(config.rockserverConfig());
@@ -171,6 +176,9 @@ public final class ReplicatedNode implements AutoCloseable {
 					+ " and start the node again with --join. Do not do it if an add-peer already reached this node: it is then"
 					+ " a member, see \"Replacing a node\" in the design document");
 		}
+		// Before the Raft server can take a snapshot chunk: the floor of the term bounds of installed configurations is
+		// the term Ratis persisted, which no chunk it handled before this start exceeds (round 15, R14-1).
+		InstalledConfiguration.initialize(config.raftDir(), existing ? persistedTerm() : 0);
 		this.server = RaftServer.newBuilder()
 				.setServerId(RaftPeerId.valueOf(config.nodeId()))
 				// With no peers at all Ratis starts the node without an election timer, until a leader's first request
@@ -288,6 +296,22 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	private RaftServer raftServer() {
 		return server;
+	}
+
+	/**
+	 * The current term of this node's division of {@code requested}, {@link RaftTraffic#NO_TERM} if the server is not
+	 * built yet, or the group is another one or not started: for {@link RaftTraffic}.
+	 */
+	private long currentTerm(RaftGroupId requested) {
+		var raftServer = this.server;
+		if (raftServer == null || group == null || !requested.equals(group.getGroupId())) {
+			return RaftTraffic.NO_TERM;
+		}
+		try {
+			return raftServer.getDivision(requested).getInfo().getCurrentTerm();
+		} catch (IOException | RuntimeException e) {
+			return RaftTraffic.NO_TERM;
+		}
 	}
 
 	/**
@@ -440,6 +464,29 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	private Path raftMetaFile(String name) {
 		return config.raftDir().resolve(group.getGroupId().getUuid().toString()).resolve("current").resolve(name);
+	}
+
+	/**
+	 * The term in Ratis' {@code raft-meta} ({@code RaftStorageMetadataFileImpl}: properties {@code term} and
+	 * {@code votedFor}), 0 if there is none; {@link Long#MAX_VALUE} if it cannot be read: then, until a start that reads
+	 * it, every configuration a chunk installs is bounded by no term, and blocks the removal check
+	 * ({@link InstalledConfiguration#initialize}).
+	 */
+	private long persistedTerm() {
+		var file = raftMetaFile(RAFT_META_FILE);
+		if (!Files.exists(file)) {
+			return 0;
+		}
+		try (var reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+			var properties = new Properties();
+			properties.load(reader);
+			return Long.parseLong(Objects.requireNonNull(properties.getProperty("term"), "no term").trim());
+		} catch (IOException | RuntimeException e) {
+			LOG.warn("{}: cannot read the term in {}; configurations from snapshot installs get no term bound until a"
+					+ " start that reads it",
+					config.nodeId(), file, e);
+			return Long.MAX_VALUE;
+		}
 	}
 
 	/** The first start of this node had a peer list, and no log gave it a configuration since. */

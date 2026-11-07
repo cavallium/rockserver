@@ -281,8 +281,9 @@ final class RemovalRule {
 		}
 		// 4. Its own log: a later configuration that includes it, and may still commit. A latest configuration with no
 		// known term that is not in its own log at all (past its end: Ratis took it from a snapshot install's
-		// raft-meta.conf; or another entry at its index: stale, finding 1) does not block when the term of the leader
-		// that installed it, which bounds its own (InstalledConfiguration), is below K*'s (R12-3, narrowed by the
+		// raft-meta.conf; or another entry at its index: stale, finding 1) does not block when the highest term of a
+		// leader whose chunk carried it, which bounds its own (InstalledConfiguration: every chunk is recorded, since
+		// Ratis takes the configuration of a chunk it rejects too, round 15), is below K*'s (R12-3, narrowed by the
 		// round-13 review, finding 1): it then has an entry other than K* at iStar before it, and Leader Completeness
 		// keeps it from committing. Without that bound it may be K*'s successor, a re-add of this incarnation, which a
 		// leader that cannot reach the members may still commit after they answered.

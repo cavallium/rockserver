@@ -1378,7 +1378,7 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   A restored database with many level-0 files starts a compaction as soon as it opens, which unlinks the
   compaction's inputs while the open checks the disk layout. Until round 12 that check (`Files.walk`) failed on such a
   file (`NoSuchFileException` on an `.sst` of the follower's own `db/volume`) and the install stopped the replica for
-  good; it now skips entries deleted under it (R12-1, seen as a flake of `CommittedConfigurationsTest`; the bug was
+  good; it now skips entries deleted under it (R12-0, seen as a flake of `CommittedConfigurationsTest`; the bug was
   there since the check first ran on an open database).
 - **Leader-side retention.** The leader keeps the previous snapshot, and any snapshot whose file list was read
   in the last 10 minutes, so a long install is not cut short by newer snapshots.
@@ -1721,26 +1721,63 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   its log, blocks too, unless D is older than K* (R12-3, narrowed in round 13, review finding 1). A leader sends its
   configuration with each snapshot chunk without a term (`LeaderProtoUtils` passes none, checked in the 3.3.1
   bytecode), so `RaftTraffic` records, before Ratis sees a chunk, the chunk's configuration (index and halves) with the
-  leader's term in `raft/installed-configuration` (`InstalledConfiguration`): the highest term seen for that
-  configuration, or the new one in place of a record of another. A leader holds no entry of a later term than its
-  own, so that term bounds D's; written before Ratis acts, a record never bounds the configuration Ratis holds too
-  low (a rejected chunk leaves a record of another configuration, which matches nothing, or a higher bound; Ratis
-  replaces its configuration only with one that differs, and the record then keeps the highest term for the one it
-  keeps). When the bound is below K*'s term, D has an entry of a lower term than K* at iStar before it, which is not
+  leader's term in `raft/installed-configuration` (`InstalledConfiguration`): a bound per configuration, the highest
+  term of a chunk that carried it. A leader, deposed or not, holds no entry of a later term than its own, so that term
+  bounds the term of whichever entry D came from. Every chunk is recorded, whatever its term: Ratis 3.3.1 takes the
+  configuration of a chunk it rejects too (`SnapshotInstallationHandler.installSnapshotImpl` applies it for every
+  reply that is not an exception: NOT_LEADER for a leader's term below its own, SNAPSHOT_EXPIRED, ALREADY_INSTALLED,
+  and the install itself), dropping its configurations from the chunk's index on and taking the chunk's
+  (`RatisStaleInstallConfigurationTest` pins it). Until round 15 the file held one record, which a chunk of another
+  configuration replaced whatever its term: after the leader of term 6 installed D, a chunk of a leader deposed in term
+  4 with D', then one of a leader deposed in term 2 whose log holds an uncommitted entry with D's index and halves,
+  left Ratis with D and a bound of 2, so step 4 could skip a D that may still commit (R14-1; the model example
+  `aStaleChunkOfAnotherConfigurationDoesNotLowerTheBoundOfTheOneRatisHolds`). Now a chunk raises only its own
+  configuration's bound; at most 32 configurations are kept, the lowest index going first, and its bound raises a
+  floor that a configuration recorded later starts from. Updates are serialized per Raft directory (install streams of
+  several leaders may run at once), and the file, synced with its directory, is replaced before the chunk is
+  forwarded. Invariant: for every chunk forwarded to Ratis since the file was written at this node's start, the file
+  holds the chunk's configuration with a bound not below the chunk's term, or does not hold it and the floor is not
+  below it. At each start, before the Raft server runs, a missing or unreadable file, or one of the round-13 single
+  record (whose bound R14-1 may have left too low; a version of round 13 cannot read the new format either, so it
+  bounds nothing after a downgrade), is replaced by an empty one whose floor is the term in Ratis' `raft-meta`: Ratis
+  persists a term before it acts on a chunk of that term, and a chunk it rejects has a lower one, so no chunk handled
+  before exceeds it. A file of the new format is kept, with its floor and every bound above that term lowered to it,
+  for the same reason. If `raft-meta` cannot be read, the floor of a new file is the highest term and nothing kept is
+  lowered: until a start that reads `raft-meta` again, which lowers that floor, nothing a chunk adds is skipped
+  (review of round 15, finding 3: before, a floor of the highest term stayed for good). While the node runs, a file
+  that is missing or cannot be read when a chunk comes (deleted or damaged since the start) is written again with
+  Ratis' current term as its floor (the highest term if the division is not known yet), which no chunk Ratis handled
+  exceeds; before, a missing file was read as an empty record of floor 0, so a later stale chunk of a configuration
+  Ratis took before got its own lower term (findings 2 and 4). If the record cannot be written even so (a read-only
+  Raft directory, a non-empty directory in the file's place), `RaftTraffic` fails the install stream with UNAVAILABLE
+  instead of forwarding the chunk, counts it in the `install.recordFailures` series, and the leader starts the install
+  again after its retry wait (R14-3; Ratis' leader never sends a single chunk again, so a dropped chunk would show only
+  at the next one, or after the leader's request timeout; `GrpcLogAppender.InstallSnapshotResponseHandler.onError`
+  resets the client and closes, checked in the bytecode). Such a node never catches up by a snapshot, and its log
+  and snapshot writes, in the same directory, fail as well: the series and Ratis' own errors show it. gRPC ends a call
+  that the interceptor closed with `onComplete`, which the listener of Ratis' stream handler does not pass on
+  (`ServerCalls.StreamingServerCallListener.onComplete` runs only an on-close handler); the interceptor passes it on as
+  `onCancel`, which tells Ratis' request observer of the end as for a leader's cancel (finding 7, checked in the
+  bytecode of the gRPC that Ratis shades; with a fake call only). A chunk of a leader whose term is below the node's
+  current term, a deposed leader's, does not reach Ratis at all: `RaftTraffic` answers it NOT_LEADER with the current
+  term, as Ratis would, and does not record it (N-R15-1 below). When the bound is below K*'s term, D has an entry of a lower term than K* at iStar before it, which is not
   K*, and Leader Completeness keeps it from committing: step 4 skips it. Otherwise D may be K*'s successor: a re-add of
   this incarnation, whose staging ended within Ratis' catch-up gap, so that the leader then installed a snapshot with
   the joint add D past it; restarted, Ratis runs the node with D and it writes `raft/member`. If the members of K*'s
   new half answer before that leader replicated D to them, step 5 sees nothing, and a leader that cannot reach the
   node can still commit D: the round-12 rule (skip with no bound) said REMOVED there, which
-  `RemovalRulePropertyTest.aReAddFromAnInstallPastTheEndOfTheLogKeepsTheNodeWaiting` reproduces. Without a record
-  (an install by an older version, or a crash between the record and Ratis' write) the node waits with
-  OWN_LATER_CONFIGURATION, as before R12-3, until a leader's configuration reaches it. The majority of K*'s new half matters because
+  `RemovalRulePropertyTest.aReAddFromAnInstallPastTheEndOfTheLogKeepsTheNodeWaiting` reproduces. A crash between the
+  record and Ratis' write leaves a record of a configuration Ratis may not hold, which bounds nothing it holds. Without
+  a record of D (an install before this node started with this version, or a configuration that was dropped from the
+  file to make room) the node waits with OWN_LATER_CONFIGURATION, as before R12-3, until a leader's configuration
+  reaches it. The majority of K*'s new half matters because
   every configuration after K* needs a majority of K*'s new half to commit (the joint one after a stable K* has K*'s new
   half as its old half; the one after a joint K* is its new half), and that majority meets the confirmers. Answers come
   at different times over a round, so the guarantee is: no configuration that includes the node commits during the
   round unless its current data directory is brought up to date, and a leader sending to it during the round makes
   the verdict HEARD_LEADER. S1 and S2 are checked against a model of Raft logs and Ratis' configurations by
-  `RemovalRulePropertyTest` (R12-6), with answers taken atomically per round. The term-start case (R11-1) and the joint case (R3-G2b-4, R10-1) need nothing special: an
+  `RemovalRulePropertyTest` (R12-6), with answers taken atomically per round. The term-start case (R11-1) and the
+  joint case (R3-G2b-4, R10-1) need nothing special: an
   uncommitted configuration never enters the committed set. Liveness (S2): with membership quiescent and a majority of
   the newest committed configuration's new half up, of this version and applied, the next check finds that
   configuration as K*, those members confirm it, other removed nodes do not block (lower term, or "absent" for K*), and
@@ -1786,7 +1823,23 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   refuses it as different, and `admin` reads again); if it is still a follower, Ratis answers `NotLeaderException`
   itself. So no unchecked request goes through on a node of this version. What remains: in-process calls, and leaders
   of an older version during a rolling upgrade (above). The upstream report about the term-start entry is for the
-  user.
+  user. A second one is for the user too (N-R15-1, round 15): a snapshot chunk of a deposed leader, which Ratis
+  rejects with NOT_LEADER, still drops Ratis' configurations from the chunk's index on, those of its own log and
+  committed ones included, and makes the stale configuration current (`raft-meta.conf` too). A node can so lose the
+  evidence of a later configuration that includes it: after the leader installed D on it, a deposed leader's chunk
+  with a configuration at a lower index leaves the node with that one, and if the leader that holds D does not answer
+  the check, the node may be told REMOVED while D may still commit; on a leader the same chunk replaces the
+  configuration it commits with. `RaftTraffic` sees every chunk before Ratis does, so it answers a chunk whose
+  leader's term is below the division's current term itself: NOT_LEADER with the current term, the reply Ratis builds
+  (`ServerProtoUtils.toInstallSnapshotReplyProto`), on which the sender's appender steps down; the chunk is neither
+  recorded nor forwarded, and the stream goes on (its half-close reaches Ratis). Terms only grow, so a chunk stale at
+  that check would be rejected by Ratis too: nothing Ratis would accept is refused. What is left is a term that rises
+  between that check and Ratis' own (the node votes or times out in between): Ratis then rejects the chunk and takes
+  its configuration as before. The chunk was recorded with its term, so R14-1 holds there, but the configurations
+  dropped are lost as before; the model example `aStaleChunkOfAnotherConfigurationDoesNotLowerTheBoundOfTheOneRatisHolds`
+  steps through that window (`RacedStaleInstall`), and random histories never do. Closing it would take Ratis' own
+  lock; the upstream report stays for the user. `aChunkOfADeposedLeaderDoesNotReplaceTheConfigurationRatisHolds`
+  shows the wrong REMOVED without the check (it fails at `009b698`).
 
   Tests (in-process; each of the first three fails at `0d8bc71`, which has the round-10 rule and the test filter):
   `FlattenedConfigurationStartTest` (R11-1: five nodes; with `RaftTraffic.dropForTesting`, L's appends reach X only,
@@ -1813,9 +1866,15 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   quorum arithmetic for odd, even and joint halves, version-1 answers that do not confirm alone (R12-1), a latest
   configuration outside the node's own log, skipped only with a term bound below K*'s (R12-3, round 13), the
   "voter once" cases and INCONSISTENT), `RemovalRulePropertyTest` (R12-6, the model above, with the R11-1, R11-2,
-  finding-1, R12-1, R12-2 and R12-3 scenarios and the round-13 re-add from an install as examples),
-  `InstalledConfigurationTest` and `SnapshotInstallTest` (the term bound of an installed configuration, and that a
-  real install records it), `MembershipGaugeTest` (the gauge values, R12-4) and
+  finding-1, R12-1, R12-2 and R12-3 scenarios, the round-13 re-add from an install and the R14-1 chunks of deposed
+  leaders as examples, and N-R15-1), `InstalledConfigurationTest` (a bound per configuration that a chunk of another
+  one does not lower, concurrent updates, the floor of evicted configurations, the start that discards a round-13
+  record, the format tag, a file lost or damaged while running written again with the floor given, a start that
+  lowers a floor of the highest term, a file replaced behind the cached record), `RaftTrafficTest` (a chunk whose
+  configuration cannot be recorded fails the install stream, what Ratis sends on it after that is dropped, and Ratis
+  is told of the end as a cancel; a chunk below the current term is answered NOT_LEADER without Ratis), `RatisStaleInstallConfigurationTest` (Ratis takes the configuration of a
+  chunk it rejects for its term) and `SnapshotInstallTest` (a real install records the configuration),
+  `MembershipGaugeTest` (the gauge values, R12-4) and
   `RemovalCheckTest` (rounds, unreachable members, the `Configuration2` wire through the real handler and client, a
   member with only version 1, and one with neither). Not run here: the process suites (`MembershipTest`,
   `MembershipFaultTest`, the random-fault suites), which would check the exit codes and a supervisor's restarts; a
@@ -2228,7 +2287,7 @@ failover" below).
 | `ProposerCopiesTest` | A write's entry becomes its batch's copy once encoded, so a later re-encode never reads the caller's changed buffer; a follower's resend of a late batch is answered from the leader's retry cache, one log entry, applied once; a caller giving up during its batch's encoding waits for it, bounded; through the proposer, with a batch paused before its encoding, `cancel()` returns and an `orTimeout` answers only after the encoding, without holding the JDK's delayer thread; a caller that gives up while the encoding does not end is answered after the 1 s cap. |
 | `RustClientLiveTest` (in-process, off by default) | The Rust client's live test against a follower of a three-node cluster: every numbered call, merge operator upload/check/ensure, batches as chunks, two copies of one numbered merge applied once, two copies of numbered multi writes with results answered alike, the multi writes and their result variants over the numbering limit streamed unnumbered, then every node checked. A second run: numbered writes (with results) lost with a halted leader behind a proxy, resent by the client to a follower, answered with their first results and applied once. |
 | `CommitOutcomesTest` | The answer to a copy of a numbered commit whose transaction is gone: unknown while a mark of this term exists, also for a mark of a term that started while the copy's leadership barrier ran (the term is read before the barrier), "run it again" with no mark or a mark of an earlier term, the record when there is one; the first mark of a newer term drops the older ones. `NodeStoreTest` checks that a session expired at the replicated clock is not live while its row is still there. |
-| `NodeStoreTest` (disk layout) | Opening a database is not failed by files, or directories, created and deleted in its volume directory while the open checks the disk layout (R12-1); both tests fail without the fix. |
+| `NodeStoreTest` (disk layout) | Opening a database is not failed by files, or directories, created and deleted in its volume directory while the open checks the disk layout (R12-0); both tests fail without the fix. |
 | `AppliedFlagWireTest`, `AppliedTrailerInterceptorTest`, `GrpcServerDeadlineErrorTest` (core) | The "not applied" flag on the wire: the server's trailer follows the exception's flag (a real server round trip included), the client reads it, and the legacy messages only without it; gRPC's own deadline is never "not applied". |
 | `LeaderSessionTest` | Per-key update queue (order, release on commit, expiry also without other traffic, and end of leadership); chains (handoff at admission, the caps on links and on the readers of one, breaks and their end, a pause for a conflicting transaction, duplicates, expiry, close, no session monitor under the log lock); history kept for open transactions and in-flight commits, up to the key cap; an update whose commit is in flight does not expire; the commit size limit of staged writes. |
 | `PipelinedUpdatesTest` (in-process, flag on) | With the leader's apply stopped: chained updates see each other's values and nothing is acknowledged; wrong guards; plain writes, transactions and `deleteRange` against a chain; closes in mid-chain, and more of them waiting than a server's CONTROL workers and queue hold; refused operations on chained ids; second writes; merges and multi-key commits; caller gone, abandon; a snapshot and a restart inside a chain, around a rejected entry; a leader change with a chain in flight; a commit that ends without an outcome; the flag on and off at restarts, and a chained id handed to a leader without it; concurrent counters. With the flag off: the commit of an update, read back from the Raft log, has the old bytes, and a second write goes to the log. |
@@ -2249,7 +2308,9 @@ failover" below).
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. A freeze longer than `--jvm-pause-limit-ms` ends the node with exit code 3, and it starts again. |
 | `StartupChecksTest`, `StartupClusterTest` (in-process) | The config digest ignores layout and key order; a column volume outside `db/` is refused before it is created; copies of one seed share a digest that a truncated copy and an opened database do not, and a digest recorded by a failed first start is kept after the start-up check opened the database but taken again after `db/` is replaced, and a replica with another seed than the leader stops at genesis while copies of one seed start a cluster; `export-seed`'s copy holds the data with no cluster and no position, also with an absolute volume path inside `db/`, and a refused target config leaves no target; a direct-memory error made in Java code reaches the JFR watch; `run` refuses a JVM without `-XX:+ExitOnOutOfMemoryError`; a removed node refuses to start again, also with `--join`, and so does one stopped before its removal, whose log never received it (the members tell it); a node with a wrong API port for the leader forwards to the port the leader names. |
 | `RemovalRuleTest`, `RemovalCheckTest` | The removal rule, one case per scenario of "Removal and waiting outside" (the R11-1 and R11-2 inputs, Figure-8 tails that block until shown off K*'s branch, quorum arithmetic for odd, even and joint halves, version-1 answers that confirm only a K* a member of this version reports committed (R12-1), a latest configuration past the end of the node's own log or stale over another entry, which does not block only with a term bound below K*'s (R12-3, round 13), the "voter once" cases, INCONSISTENT and an empty committed set); one check's rounds (pending members and new members of K* asked again, a blocker asked until the budget ends, unreachable members leave it undecided at once), the `Configuration2` wire through the real handler and client, and a member with only `Configuration` (asked that) or neither (no answer). |
-| `RemovalRulePropertyTest` (jqwik, pure) | R12-6: the removal rule and the real membership facts (on stub divisions, `ModelDivision`) against a model of Raft logs, Ratis' in-memory configurations and `raft-meta.conf` (kept apart), histories, snapshots and installs, with elections, one-node changes, replication, commits, crashes and restarts. After every step: committed prefixes agree, committed facts and probe answers are true, no false INCONSISTENT, and S1 for REMOVED verdicts under answers of version 2, version 1, pending or none; S2 after quiescing. Examples for R11-1, R11-2, finding 1 after a purge, R12-1, R12-2 and R12-3 (the last four fail with the round-13 fixes reverted), and the round-13 review's re-add whose joint configuration arrives by an install past the log's end (it fails with the R12-3 skip that ignores the term bound). The model writes `raft/installed-configuration` before the follower acts on a chunk, the member file also when a restart runs the node with a configuration that holds it, and lets a staging end after a snapshot install (Ratis' catch-up gap). It found that a change of several nodes at once is unsafe in Ratis (see the residuals of "Removal and waiting outside"), so it generates one-node changes. Answers are atomic per round: the asynchrony of `RemovalCheck`'s rounds and HEARD_LEADER are not modelled. |
+| `RemovalRulePropertyTest` (jqwik, pure) | R12-6: the removal rule and the real membership facts (on stub divisions, `ModelDivision`) against a model of Raft logs, Ratis' in-memory configurations and `raft-meta.conf` (kept apart), histories, snapshots and installs, with elections, one-node changes, replication, commits, crashes and restarts. After every step: committed prefixes agree, committed facts and probe answers are true, no false INCONSISTENT, and S1 for REMOVED verdicts under answers of version 2, version 1, pending or none; S2 after quiescing. Examples for R11-1, R11-2, finding 1 after a purge, R12-1, R12-2 and R12-3 (the last four fail with the round-13 fixes reverted), the round-13 review's re-add whose joint configuration arrives by an install past the log's end (it fails with the R12-3 skip that ignores the term bound), and R14-1: chunks of two deposed leaders, the second with the configuration Ratis held (it fails with the single record of round 13). The model records every chunk in `raft/installed-configuration` before the follower acts on it, whatever Ratis answers, and applies the chunk's configuration as Ratis 3.3.1 does for NOT_LEADER and ALREADY_INSTALLED as well as for an install (round 15); chunks of deposed leaders, or of leaders cut off from the others, are generated (`StaleInstall`). Since the review of round 15 a chunk below the follower's term is answered by `RaftTraffic` and reaches neither the record nor Ratis; a chunk that passed that check before the term rose (`RacedStaleInstall`) is in examples only, and the example of N-R15-1 fails without the check. Not generated (finding 6): a chunk Ratis would install over a log that already holds the snapshot's prefix, SNAPSHOT_EXPIRED, and chunks that Ratis fails with an exception. The first comes only from the current leader of the follower's term (an older one is answered NOT_LEADER, a later one raises the term first), whose configuration is the one its next appends would bring; the follower's entries past the snapshot that conflict with it are of earlier terms, uncommitted, and the leader drops them anyway. SNAPSHOT_EXPIRED (notifications only) takes the configuration as ALREADY_INSTALLED does, which is modelled. A chunk Ratis fails is recorded but not applied, which only adds a key with a bound at least its sender's term, an upper bound of any entry with that configuration the sender holds. So those orderings fall under cases the model has; the argument, not the model, covers them. It writes the member file also when a restart runs the node with a configuration that holds it, and lets a staging end after a snapshot install (Ratis' catch-up gap). It found that a change of several nodes at once is unsafe in Ratis (see the residuals of "Removal and waiting outside"), so it generates one-node changes. Answers are atomic per round: the asynchrony of `RemovalCheck`'s rounds and HEARD_LEADER are not modelled. |
+| `InstalledConfigurationTest`, `RaftTrafficTest` | R14-1, R14-3: a bound per configuration, the highest term of a chunk that carried it, never lowered by a chunk of another configuration; eight threads recording at once lose no update; an evicted configuration comes back with a bound not below its old one; a start replaces a round-13 record by an empty one with Ratis' term as floor, and the file's first line is a tag an older version cannot read; a chunk whose configuration cannot be recorded fails the install stream with UNAVAILABLE and reaches neither Ratis nor does a later message, and what Ratis' handler sends on the call after that is dropped. All but one fail with the round-13 record. Review of round 15: a chunk below the node's term is answered NOT_LEADER (with the term, the request index and the ids of the request) and reaches neither Ratis nor the record (N-R15-1); a failed stream reaches Ratis as a cancel; a record file deleted or damaged while running is written again with the floor given; a start that reads Ratis' term lowers a floor of the highest term; a file replaced behind the cached record is read again. Each fails at `94a5795` but the last, which fails, as the concurrent test does (on the shared temporary file), with the cache's check and the lock taken out. |
+| `RatisStaleInstallConfigurationTest` (one in-process Ratis server) | Pins Ratis 3.3.1: a snapshot chunk with a leader's term below the current one is answered NOT_LEADER and still replaces Ratis' configuration with its own. Why every chunk is recorded; if it fails after an upgrade, revisit that and N-R15-1. |
 | `MembershipGaugeTest` | R12-4: `membership.state` is 0 for a member or not checked, 1 never added, 2 undecided, 3 removed. Fails with the round-11 mapping (REMOVED was 0). |
 | `MembershipFactsTest`, `ConfigurationHistoryGapTest` | Round-11 review, findings 1 and 2: a stale configuration of Ratis (loaded from `raft-meta.conf`) over another leader's ordinary entry at its index is not committed, has no term, and its probe answers absent, and a node asking about it is not removed; the same once the entry is purged (round-13 review); a probe in the snapshot with no record in the history is unknown, never absent (R12-2); a snapshot install's notification between the updater's configuration and its position does not drop it; a history whose applied position moved without it (an older version) is complete only after that position. Each fails without its fix. |
 | `ClusterIdentityTest` | Each genesis gets its own id, and a second `Genesis` in a log changes nothing. A node that elected itself under the same group id, added with Ratis' own client, stops before the configuration changes, and writes go on. What `add-peer` refuses. |
