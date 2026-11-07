@@ -226,8 +226,11 @@ over (clients open new ones by themselves).
    digest of the backup's own files (`DATA-DIR/db.seed-digest`), before it opens the database, because the restored
    `db/` differs on each node (each restore opens it once and writes its own `OPTIONS` and info log, R26-1): the
    followers compare that digest with the leader's at genesis and stop with exit 3 if it differs. Running
-   `restore-backup` once and copying the stopped `db/` (with or without `db.seed-digest`) to every node with `cp -a`
-   or `rsync` works as well, as in "Seeding a cluster".
+   `restore-backup` once and copying the stopped `DATA-DIR/db` to every node with `cp -a` or `rsync` works as well,
+   as in "Seeding a cluster", but only together with `DATA-DIR/db.seed-digest`: that file holds the backup's digest,
+   and the restored `db/` (opened once by the restore) digests to another value, so a node that gets `db/` alone
+   records that other value at its first start and the nodes stop at genesis with exit 3. Either copy both to every
+   node, or delete `db.seed-digest` on every node, the one that ran the restore included, before the first start.
 3. Start every node as for a new cluster, without `--join`; the nodes of the old cluster stay stopped. The first leader proposes
    a seeded genesis, as in "Seeding a cluster".
 4. Check: `status`, then `checksum` prints `OK`, then a few known keys read back.
