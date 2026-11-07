@@ -264,11 +264,6 @@ class ProposerQueueTest {
 		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, failure(afterAmbiguousAttempt));
 		assertFalse(exception(afterAmbiguousAttempt).isNotApplied());
 
-		var afterAppendedBatch = pending();
-		afterAppendedBatch.maybeAppended = true;
-		afterAppendedBatch.complete(Applier.SESSION_GONE, false);
-		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, failure(afterAppendedBatch));
-
 		// It took effect: its result is lost, not its write.
 		var resentAlone = pending();
 		resentAlone.resentAlone = true;

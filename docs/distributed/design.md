@@ -352,9 +352,11 @@ and the `LogEntry`.
   the encoding does not end (`aCallerGivingUpWhileTheEncodingDoesNotEndIsAnsweredAfterTheCap`: the future completes
   with the caller's error after the cap, the encoding still paused). A caller must therefore not change a
   write's buffers while it waits; if it does, the batch fails to encode, nothing of it is sent, the writes that no
-  longer encode to their size fail as invalid (or with an unknown outcome if an earlier batch may have appended
-  them) and the others go back to the queue, as never taken unless an earlier batch may have appended them, so that
-  their callers' deadlines and cancellations apply again. The encoder also returns the batch's requests as decoding
+  longer encode to their size fail as invalid (or, resent alone after an earlier batch applied them, with an unknown
+  outcome) and the others go back to the queue, as never taken unless resent alone, so that their callers' deadlines
+  and cancellations apply again. No request in the queue may have been appended by an earlier batch without knowing
+  it: such a request fails with an unknown outcome when its batch's resends stop (below), never goes back (R17-3: a
+  `maybeAppended` flag for requeued ones was never set and is removed). The encoder also returns the batch's requests as decoding
   the bytes in place would read them: each key and value a slice of the batch, each array of a commit a copy,
   nothing parsed. Each request then keeps that copy instead of its caller's entry, so a write that goes back to the
   queue still sent (a commit after another commit's conflict, a copy resent alone), which its caller may already

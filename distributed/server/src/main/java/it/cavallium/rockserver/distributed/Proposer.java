@@ -336,11 +336,6 @@ final class Proposer implements Closeable {
 		 * carries only what fits (possibly nothing), one round trip after another.
 		 */
 		volatile int copyBatchLimit = 1;
-		/**
-		 * Set when it went back to the queue after a batch whose copy may have been appended (see
-		 * {@link Lane#endUnanswered}): if it then fails without an answer, its outcome is unknown, never "not applied".
-		 */
-		volatile boolean maybeAppended;
 		/** The future its caller got ({@link CallerCopy}), for tests. */
 		volatile @Nullable CompletableFuture<Object> callerCopy;
 		/** Completed only by the proposer; callers get a copy, so that cancelling theirs cannot complete this one. */
@@ -507,7 +502,7 @@ final class Proposer implements Closeable {
 		void complete(ApplyResult result, boolean earlierCopy) {
 			switch (result) {
 				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.SESSION_EXPIRED
-						&& (earlierCopy || maybeAppended || resentAlone) -> fail(unavailable(failed.toException()));
+						&& (earlierCopy || resentAlone) -> fail(unavailable(failed.toException()));
 				// The only copy of this request, refused unexecuted: flagged, so that the client's trailer says so.
 				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.SESSION_EXPIRED ->
 						this.result.completeExceptionally(RocksDBException.notApplied(failed.type(), failed.message()));
@@ -781,8 +776,9 @@ final class Proposer implements Closeable {
 		/**
 		 * The next batch: the first queued request and, if it is a data write, the data writes behind it, up to the
 		 * batch limits. Requests past their deadline, or with less than {@link #MIN_TIME_LEFT_NANOS} left before the
-		 * node's own deadline, fail as not applied, except those resent alone (see {@link Pending#fail}) and those
-		 * that an earlier batch may have appended ({@link Pending#maybeAppended}). Abandoned requests are dropped.
+		 * node's own deadline, fail as not applied, except those resent alone (see {@link Pending#fail}). A request that
+		 * an earlier batch may have appended never comes back to the queue: it fails with an unknown outcome instead
+		 * (see {@link Lane#endUnanswered}). Abandoned requests are dropped.
 		 */
 		private List<Pending> take() {
 			var batch = new ArrayList<Pending>();
@@ -805,7 +801,6 @@ final class Proposer implements Closeable {
 				if (closed || next.deadlineNanos - now < next.minTimeLeftNanos) {
 					queue.pollFirst();
 					next.fail(closed ? RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping")
-							: next.maybeAppended ? noAnswer(null)
 							: next.callerDeadline ? next.callerDeadlineFailure()
 							: notAccepted());
 					continue;
@@ -937,7 +932,7 @@ final class Proposer implements Closeable {
 		/**
 		 * The batch did not encode, although {@link LogEntryCodec#entrySize} accepted each of its entries at submit:
 		 * a caller changed the buffers of its write while it was queued. Nothing of this batch was sent. The requests
-		 * that no longer encode to their size fail, as invalid if no earlier batch may have appended them; the others
+		 * that no longer encode to their size fail, as invalid unless an earlier batch applied them (resent alone); the others
 		 * go back to the queue. If every request still encodes alone, the cause is elsewhere, and {@code error} fails
 		 * the batch (see {@link #dispatch}).
 		 */
@@ -951,7 +946,7 @@ final class Proposer implements Closeable {
 					}
 					rest.add(pending);
 				} catch (RuntimeException invalid) {
-					pending.fail(pending.maybeAppended || pending.resentAlone ? noAnswer(invalid)
+					pending.fail(pending.resentAlone ? noAnswer(invalid)
 							: RocksDBException.notApplied(RocksDBErrorType.INVALID_REQUEST,
 									"The write could not be encoded, it was not applied: " + invalid.getMessage()));
 				}
@@ -961,10 +956,10 @@ final class Proposer implements Closeable {
 			if (rest.size() == batch.size()) {
 				throw error;
 			}
-			// Nothing was sent: those that no earlier batch may have appended go back as never taken, so that their
+			// Nothing was sent: those that no earlier batch applied (resent alone) go back as never taken, so that their
 			// caller's deadline or cancellation can again take them out of the queue (and their buffers be reused).
 			for (var pending : rest) {
-				if (!pending.maybeAppended && !pending.resentAlone) {
+				if (!pending.resentAlone) {
 					pending.untake();
 				}
 			}
@@ -1050,7 +1045,7 @@ final class Proposer implements Closeable {
 					if (refusal != null) {
 						for (var pending : batch) {
 							// An earlier copy may have been appended, although this one was refused.
-							pending.fail(ambiguous || pending.maybeAppended ? unavailable(refusal) : refusal(refusal));
+							pending.fail(ambiguous ? unavailable(refusal) : refusal(refusal));
 						}
 					} else if (isReplyTooLarge(error)) {
 						fail(batch, replyTooLarge(error));
@@ -1083,16 +1078,16 @@ final class Proposer implements Closeable {
 			long now = System.nanoTime();
 			var again = new ArrayList<Pending>(0);
 			for (var pending : batch) {
-				boolean appended = ambiguous || pending.maybeAppended;
-				if (!closed && !appended && pending.deadlineNanos - deadlineNanos > 0
+				// Only requests that no copy of this batch may have appended go back: one that may have been appended
+				// fails here with an unknown outcome, so no request in the queue was ever possibly appended (R17-3).
+				if (!closed && !ambiguous && pending.deadlineNanos - deadlineNanos > 0
 						&& pending.deadlineNanos - now >= pending.minTimeLeftNanos) {
-					pending.maybeAppended = appended;
 					pending.queuedNanos = now;
-					if (!appended && !pending.resentAlone) {
+					if (!pending.resentAlone) {
 						pending.unsend();
 					}
 					again.add(pending);
-				} else if (appended) {
+				} else if (ambiguous) {
 					pending.fail(noAnswer(cause));
 				} else if (closed) {
 					pending.fail(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping"));
