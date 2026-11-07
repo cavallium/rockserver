@@ -284,10 +284,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 
 	@Override
 	public void clusterVersion(long version) {
-		if (version != clusterVersion) {
+		long previous = clusterVersion;
+		clusterVersion = version;
+		if (version != previous) {
 			LOG.info("{}: cluster version is now {}", config.nodeId(), Capabilities.describe(version));
 		}
-		clusterVersion = version;
 	}
 
 	// Checksums

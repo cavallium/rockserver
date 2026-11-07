@@ -439,11 +439,13 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var position = opened.applied();
 		raiseVisibleTerm(position.getTerm());
 		this.configurations = new CommittedConfigurations(opened.configurations(), opened.configurationHistoryFrom());
+		// The version first: a database with a cluster id next to the version of the one it replaces (a node that had
+		// not applied genesis, installing a snapshot) would advertise no client sessions (R16-1).
+		ops.opened(opened);
 		this.store = opened;
 		this.applier = new Applier(opened, metrics, applyLanes);
 		applier.maintenance(ops);
 		applier.columnStreams(columnStreams);
-		ops.opened(opened);
 		metrics.bind(opened.db().getMetricsRegistry(), opened.metricsNodeName(config.nodeId()));
 		setLastAppliedTermIndex(position);
 		applied.advance(Math.max(applied.get(), position.getIndex()));
