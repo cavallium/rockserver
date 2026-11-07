@@ -710,11 +710,12 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   copy that outlasts the window ends `OUTCOME_UNKNOWN`, an opening that does ends not sent (`SERVER_OVERLOADED`,
   flagged not applied): `a_copy_that_never_answers_ends_a_caller_without_deadline_at_the_window` and
   `an_opening_that_never_answers_ends_a_caller_without_deadline_unsent_at_the_window` (both hung before). Unlike the
-  Java client, `RockserverClient::connect` uses one address and sets no HTTP/2 keepalive or connect timeout (tonic's
-  defaults are all off): resends go back to the same node, through the server's forwarding, and a dead peer is seen
-  only by a call's deadline or the window. A caller that wants failover or dead-peer detection builds its own tonic
-  `Channel` (`Endpoint::http2_keep_alive_interval`, `keep_alive_timeout`, `connect_timeout`, `Channel::balance_list`
-  over several nodes) and passes it to `RockserverClient::new`. The unit tests
+  Java client, `RockserverClient::connect` uses one address and adds no settings of its own: given a string or URI it
+  has tonic's defaults, with no HTTP/2 keepalive or connect timeout, so resends go back to the same node, through the
+  server's forwarding, and a dead peer is seen only by a call's deadline or the window. `connect` takes any
+  `TryInto<Endpoint>` and uses an `Endpoint` as given, so a caller that wants dead-peer detection passes one set up
+  with `http2_keep_alive_interval`, `keep_alive_timeout` or `connect_timeout`. Only failover over several nodes needs
+  a tonic `Channel` built by the caller (`Channel::balance_list`) and passed to `RockserverClient::new`. The unit tests
   (`sessions::tests`) drive the resend loop with scripted answers, as `SessionWritesTest` does; the live test
   `tests/live_server.rs` runs every numbered call against a follower of a three-node in-process cluster
   (`RustClientLiveTest`, on when `-Drockserver.rust-client.dir` names a buildable copy of the crate), sends two copies
@@ -1582,7 +1583,9 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   together after the backoff each asked again. Now only the request that marks the answer stale asks, and asks to a
   member share the one in flight (R19-2;
   `requestsSharingAFailedConnectionAskTheMemberForItsApiAddressOnce`: 17 asks instead of 2 without the fix, and 4
-  instead of 1 without the sharing). The leader hint of every response is cached by
+  instead of 1 without the sharing; the test accepts up to one ask per failed connection, 5 in all, since an answer
+  that returns before a later connection fails lets that failure mark the member stale and ask again, which is
+  correct). The leader hint of every response is cached by
   `LeaderForwarder.addressVersion()`, which changes only when an answer or a learned address changes, so the hot path
   reads one counter instead of looking the address up (`LeaderHintCache`, keyed by leader and version, the version
   read before the lookup; `LeaderHintCacheTest`).
@@ -2284,7 +2287,9 @@ reported, and stops nothing.
   both commands dropped the version unread, while the docs promised the refusal). Any other failure of `restore-backup`
   after the copy (a configuration that does not parse, a column that does not open, the renames) also deletes the
   `db/` it made, so the same command can run again (R19-3; before, only the version refusal did, and a rerun refused
-  the directory as holding a database). A run killed midway still leaves its `db/`; runbooks.md says to delete it.
+  the directory as holding a database). Only `db/` is undone: if `replica-ops.log` was already renamed when the
+  rename of `backups/` fails, it stays renamed, which the rerun does not mind. A run killed midway still leaves its
+  `db/`; runbooks.md says to delete it.
   Residual: the `db/` that either
   command writes, whichever binary writes it, has no meta column and so no cluster version, so an older binary started
   on it is not refused and starts at `Capabilities.GENESIS` (for example a new cluster seeded from a newer backup with
