@@ -74,7 +74,8 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #CLUSTER_VERSION}: the 8-byte {@link Capabilities} of the cluster, see {@link #clusterVersion}</li>
  *   <li>{@link #CONFIGURATION} + index + term: the halves of a committed configuration entry applied here, see
  *   {@link CommittedConfigurations}</li>
- *   <li>{@link #CONFIGURATION_HISTORY}: the 8-byte first index from which those are complete</li>
+ *   <li>{@link #CONFIGURATION_HISTORY}: the first index from which those are complete and the applied index written
+ *   with it (two longs), see {@link #configurationHistoryFrom}</li>
  * </ul>
  *
  * <p>The meta column is created locally when a database is first opened, before any log entry is applied, so it
@@ -502,13 +503,30 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * The first log index from which every configuration entry this database applied is recorded
-	 * ({@link #CONFIGURATION}): as written with the first record, or else the index after the applied position, since
-	 * every later entry is applied by a version that records them.
+	 * ({@link #CONFIGURATION}). {@link #CONFIGURATION_HISTORY} holds that index and the applied position it was written
+	 * with, in the same write as {@link #APPLIED}: if the applied position is still that one, the history is complete
+	 * from that index. Otherwise a version that does not keep the history applied entries after it (a rolling upgrade
+	 * or downgrade, or a snapshot that such a version took), and configurations it applied may be missing: the history
+	 * is complete only from the index after the applied position, as for a database without the key, since every later
+	 * entry is applied by a version that records them (R11 review, finding 2).
 	 */
 	long configurationHistoryFrom() {
+		long applied = applied().getIndex();
 		Buf value = readMeta(CONFIGURATION_HISTORY);
-		return value != null && value.size() == Long.BYTES ? ByteBuffer.wrap(value.toByteArray()).getLong()
-				: applied().getIndex() + 1;
+		if (value != null && value.size() == 2 * Long.BYTES) {
+			var bytes = ByteBuffer.wrap(value.toByteArray());
+			long from = bytes.getLong();
+			long through = bytes.getLong();
+			if (through == applied) {
+				return from;
+			}
+		}
+		return applied + 1;
+	}
+
+	/** The value of {@link #CONFIGURATION_HISTORY}: complete from {@code from}, written with the position {@code through}. */
+	static Buf encodeHistory(long from, long through) {
+		return Buf.wrap(ByteBuffer.allocate(2 * Long.BYTES).putLong(from).putLong(through).array());
 	}
 
 	/** Whether {@link #CONFIGURATION_HISTORY} is written. */

@@ -700,7 +700,7 @@ final class Applier {
 	 */
 	private final java.util.HashMap<Long, RemovalRule.Conf> configurations = new java.util.HashMap<>();
 
-	/** {@link NodeStore#configurationHistoryFrom} of this database when it was opened. */
+	/** {@link NodeStore#configurationHistoryFrom} of this database when it was opened; read at the first mark. */
 	private long configurationHistoryFrom = -1;
 
 	/**
@@ -708,9 +708,6 @@ final class Applier {
 	 * {@link #markApplied(TermIndex)} of that position, in the same group.
 	 */
 	void recordConfiguration(RemovalRule.Conf conf) {
-		if (configurationHistoryFrom < 0) {
-			configurationHistoryFrom = store.configurationHistoryFrom();
-		}
 		configurations.put(conf.index(), conf);
 	}
 
@@ -1505,13 +1502,18 @@ final class Applier {
 	}
 
 	private void markApplied(MetaSink tx, TermIndex position) {
+		if (configurationHistoryFrom < 0) {
+			configurationHistoryFrom = store.configurationHistoryFrom();
+		}
 		var conf = configurations.get(position.getIndex());
 		if (conf != null && conf.term() == position.getTerm()) {
 			tx.put(NodeStore.configurationKey(conf.index(), conf.term()), Buf.wrap(CommittedConfigurations.encodeHalves(conf)));
-			// The same value every time: the first record fixes it (see NodeStore.configurationHistoryFrom).
-			tx.put(NodeStore.key(NodeStore.CONFIGURATION_HISTORY),
-					Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(configurationHistoryFrom).array()));
 		}
+		// With every applied position: the history is complete from configurationHistoryFrom up to this position. A
+		// version that does not keep the history moves APPLIED without it, and the next open sees the gap
+		// (NodeStore.configurationHistoryFrom).
+		tx.put(NodeStore.key(NodeStore.CONFIGURATION_HISTORY), NodeStore.encodeHistory(configurationHistoryFrom,
+				position.getIndex()));
 		tx.put(NodeStore.key(NodeStore.APPLIED), NodeStore.encodeTermIndex(position));
 		if (clockMoved) {
 			tx.put(NodeStore.key(NodeStore.CLOCK),

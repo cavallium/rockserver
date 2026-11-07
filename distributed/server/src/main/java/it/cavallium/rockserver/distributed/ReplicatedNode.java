@@ -881,6 +881,11 @@ public final class ReplicatedNode implements AutoCloseable {
 		return budget.compareTo(Duration.ofSeconds(1)) < 0 ? Duration.ofSeconds(1) : budget;
 	}
 
+	/** Whether {@link #MEMBER_FILE} exists: tests. */
+	boolean memberFileExists() {
+		return Files.exists(config.raftDir().resolve(MEMBER_FILE));
+	}
+
 	/**
 	 * Records, once, that a leader made this node a voter (R11): Ratis runs it (it left its initializing state, which only
 	 * an append that is not part of bringing it up to date does), and its latest configuration holds it in its new half.

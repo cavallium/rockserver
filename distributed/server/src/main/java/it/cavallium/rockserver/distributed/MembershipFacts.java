@@ -5,10 +5,15 @@ import it.cavallium.rockserver.distributed.RemovalRule.Probe;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.server.RaftConfiguration;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
+import org.apache.ratis.server.raftlog.RaftLog;
+import org.apache.ratis.server.raftlog.RaftLogIOException;
 import org.apache.ratis.util.LifeCycle;
 import org.jetbrains.annotations.Nullable;
 
@@ -37,14 +42,75 @@ final class MembershipFacts {
 		return index >= 0 && index <= log.getSnapshotIndex() ? RemovalRule.PURGED : RemovalRule.BEYOND;
 	}
 
-	/** The term of the configuration entry at {@code index}: from the log, else from the history, else unknown. */
-	private static long confTerm(RaftServer.Division division, CommittedConfigurations history, long index) {
-		long term = termAt(division, index);
-		if (term > 0) {
-			return term;
+	/** What a node's log holds at the index of a configuration it reports: see {@link #entry}. */
+	enum Entry {
+		/** That configuration's entry. */
+		SAME,
+		/** Another entry: another configuration, or an ordinary entry. */
+		OTHER,
+		/** Nothing: the index is in the snapshot, past the end of the log, or the log could not be read. */
+		NONE
+	}
+
+	/**
+	 * What {@code division}'s log holds at the index of {@code conf}. Ratis' configuration ({@code getRaftConf}) is not
+	 * always the entry at its index (R11 review, finding 1): a snapshot install writes the leader's latest
+	 * configuration to {@code raft-meta.conf}, committed or not, and a restart loads that file first and then keeps it
+	 * against every configuration of the log at a lower index, also when a later leader replaced the entry at its index
+	 * with an ordinary one, until the node applies that leader's first configuration and rewrites the file
+	 * ({@code ServerState.initialize}, {@code ConfigurationManager.addConfiguration}).
+	 */
+	static Entry entry(RaftServer.Division division, RaftConfiguration conf) {
+		long index = conf.getLogEntryIndex();
+		var log = division.getRaftLog();
+		if (index < 0 || log.getTermIndex(index) == null) {
+			return Entry.NONE;
+		}
+		RaftProtos.LogEntryProto proto;
+		try {
+			proto = log.get(index);
+		} catch (RaftLogIOException | RuntimeException ex) {
+			return Entry.NONE;
+		}
+		if (proto == null) {
+			return Entry.NONE;
+		}
+		if (!proto.hasConfigurationEntry()) {
+			return Entry.OTHER;
+		}
+		var entry = proto.getConfigurationEntry();
+		return sameIds(entry.getPeersList(), conf.getCurrentPeers())
+				&& sameIds(entry.getOldPeersList(), conf.getPreviousPeers()) ? Entry.SAME : Entry.OTHER;
+	}
+
+	private static boolean sameIds(List<RaftProtos.RaftPeerProto> entry, Collection<RaftPeer> peers) {
+		return entry.stream().map(peer -> peer.getId().toStringUtf8()).collect(Collectors.toSet())
+				.equals(Set.copyOf(ids(peers)));
+	}
+
+	/**
+	 * The term of the configuration {@code conf}: from the log if its entry is there, else from the history if that
+	 * recorded the same configuration at its index, else unknown. Unknown too when the log holds another entry at its
+	 * index: then {@code conf} is a stale configuration of Ratis (see {@link #entry}), and the term of that entry is
+	 * not its term.
+	 */
+	private static long confTerm(RaftServer.Division division, CommittedConfigurations history, RaftConfiguration conf,
+			Entry entry) {
+		long index = conf.getLogEntryIndex();
+		if (entry == Entry.SAME) {
+			long term = termAt(division, index);
+			if (term > 0) {
+				return term;
+			}
+		}
+		if (entry == Entry.OTHER) {
+			return RemovalRule.UNKNOWN_TERM;
 		}
 		var recorded = history.at(index);
-		return recorded != null ? recorded.term() : RemovalRule.UNKNOWN_TERM;
+		return recorded != null && recorded.oldHalf() != null
+				&& Set.copyOf(recorded.newHalf()).equals(Set.copyOf(ids(conf.getCurrentPeers())))
+				&& Set.copyOf(recorded.oldHalf()).equals(Set.copyOf(ids(conf.getPreviousPeers())))
+				? recorded.term() : RemovalRule.UNKNOWN_TERM;
 	}
 
 	/** {@code conf} with the term {@code term}. */
@@ -56,14 +122,16 @@ final class MembershipFacts {
 	static Conf latest(RaftServer.Division division, CommittedConfigurations history) {
 		var conf = division.getRaftConf();
 		return conf(conf, conf.getLogEntryIndex() < 0 ? RemovalRule.UNKNOWN_TERM
-				: confTerm(division, history, conf.getLogEntryIndex()));
+				: confTerm(division, history, conf, entry(division, conf)));
 	}
 
 	/**
 	 * The newest committed configuration of this node: the newest it applied ({@code history}), or its latest
 	 * configuration if that is at or below its commit index and in its log or snapshot (Ratis' commit index covers only
 	 * entries that match the leader's log). A configuration that a snapshot install took from the leader, past the
-	 * snapshot and not in the log yet, may not be committed: it does not count. Null if none.
+	 * snapshot and not in the log yet, may not be committed: it does not count. Nor does a configuration whose index
+	 * holds another entry in the log (a stale one, see {@link #entry}): the commit index covers that entry, not it.
+	 * Null if none.
 	 */
 	static @Nullable Conf committed(RaftServer.Division division, CommittedConfigurations history) {
 		var applied = history.last();
@@ -71,9 +139,12 @@ final class MembershipFacts {
 		long index = conf.getLogEntryIndex();
 		var log = division.getRaftLog();
 		Conf derived = null;
-		if (index >= 0 && index <= log.getLastCommittedIndex()
-				&& (log.getTermIndex(index) != null || index <= log.getSnapshotIndex())) {
-			derived = conf(conf, confTerm(division, history, index));
+		if (index >= 0 && index <= log.getLastCommittedIndex()) {
+			var entry = entry(division, conf);
+			if (entry == Entry.SAME || (entry == Entry.NONE && log.getTermIndex(index) == null
+					&& index <= log.getSnapshotIndex())) {
+				derived = conf(conf, confTerm(division, history, conf, entry));
+			}
 		}
 		if (derived == null) {
 			return applied;
@@ -99,6 +170,15 @@ final class MembershipFacts {
 			if (found.getTerm() != term) {
 				return Probe.ABSENT;
 			}
+			// Probes are of configurations: an ordinary entry at (term, index) is the only entry there in any log
+			// (Log Matching), so no configuration has that term and index (a stale one of Ratis, see entry()).
+			var body = configurationBody(log, index);
+			if (body == null) {
+				return Probe.UNKNOWN;
+			}
+			if (!body) {
+				return Probe.ABSENT;
+			}
 			// Applied here, so committed, also while the commit index of a restarted node has not caught up yet.
 			var applied = history.at(index);
 			return index <= log.getLastCommittedIndex() || (applied != null && applied.term() == term) ? Probe.COMMITTED
@@ -114,6 +194,19 @@ final class MembershipFacts {
 			return recorded.term() == term ? Probe.COMMITTED : Probe.ABSENT;
 		}
 		return index >= history.completeFrom() ? Probe.ABSENT : Probe.UNKNOWN;
+	}
+
+	/** Whether the entry at {@code index} of {@code log} is a configuration entry; null if it cannot tell. */
+	private static @Nullable Boolean configurationBody(RaftLog log, long index) {
+		try {
+			var headers = log.getEntries(index, index + 1);
+			if (headers != null && headers.length == 1 && headers[0] != null && headers[0].getIndex() == index) {
+				return headers[0].getLogEntryBodyCase() == RaftProtos.LogEntryProto.LogEntryBodyCase.CONFIGURATIONENTRY;
+			}
+		} catch (RuntimeException ex) {
+			return null;
+		}
+		return null;
 	}
 
 	/** The answer to {@link TermService#CONFIGURATION2}, for the probes {@code probes} (at most two). */

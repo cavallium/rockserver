@@ -1407,7 +1407,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * the same position on the same thread; the pair goes to the apply thread, which records the configuration with
 	 * the position ({@link CommittedConfigurations}). Ratis also calls it on every chunk of a snapshot install, with
 	 * the leader's latest configuration, which may not be committed, and with no term (0): that call has no position
-	 * after it, and is not recorded.
+	 * after it, is not recorded, and leaves a pending configuration of the updater thread alone.
 	 */
 	@Override
 	public void notifyConfigurationChanged(long term, long index,
@@ -1415,9 +1415,13 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (newRaftConfiguration.getOldPeersCount() > 0) {
 			CrashPoints.reach(CrashPoints.Point.JOINT_CONFIGURATION_APPLIED);
 		}
-		pendingConfiguration = term > RemovalRule.UNKNOWN_TERM ? new PendingConfiguration(Thread.currentThread(),
-				new RemovalRule.Conf(term, index, ids(newRaftConfiguration.getPeersList()),
-						ids(newRaftConfiguration.getOldPeersList()))) : null;
+		if (term <= RemovalRule.UNKNOWN_TERM) {
+			// The install path, on another thread: it must not drop a configuration the updater thread passed on and
+			// is about to record with its position (R11 review, finding 2).
+			return;
+		}
+		pendingConfiguration = new PendingConfiguration(Thread.currentThread(), new RemovalRule.Conf(term, index,
+				ids(newRaftConfiguration.getPeersList()), ids(newRaftConfiguration.getOldPeersList())));
 	}
 
 	private static List<String> ids(List<RaftProtos.RaftPeerProto> peers) {

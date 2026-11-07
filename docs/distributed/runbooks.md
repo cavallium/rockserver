@@ -90,8 +90,12 @@ Failure branches:
 A node that was removed (`remove-peer`, or the replace above) and is started again exits with 4, and its log says
 which committed configuration left it out and which members confirmed it. It does so only once a majority of the new
 half of the newest committed configuration answer; until then it prints `READY` and waits outside the cluster: it
-votes for nobody, serves nothing (its clients' calls are forwarded to a leader, or time out), and checks again every
-three election timeouts while no leader sends to it. Every 15 election timeouts it logs `hears no leader` or, at its
+serves nothing (its clients' calls are forwarded to a leader, or time out), and checks again every three election
+timeouts while no leader sends to it. Whether it votes depends on its own log: one whose latest configuration leaves
+it out keeps it in Ratis' initializing state, where it votes for nobody; one that missed its removal (it still holds
+the node in both halves) makes it a follower that answers vote requests and starts elections of its own until the
+check stops it. Neither can elect a leader that lacks the removal, nor win an election itself (see "Removal and
+waiting outside" in the design document); the elections it starts show in the members' logs as rejected pre-votes. Every 15 election timeouts it logs `hears no leader` or, at its
 start, `starting, not known to be a member`, with `Membership <reason> (K* ..., confirmed by ..., blocked by ..., pending
 ..., unreachable ...)` and what to do. The `membership.state` gauge is 2 meanwhile (1 for a `--join` node before its
 `add-peer`, 0 for a member). By reason:

@@ -60,8 +60,8 @@ class JoinRemovedWhileDownTest {
 		// A voter of the joint configuration: the leader sends it appends that are not part of its catch-up.
 		InProcessCluster.await(TIMEOUT, () -> division.getInfo().getLifeCycleState() == LifeCycle.State.RUNNING);
 		awaitConfigurationOnDisk(yNode);
-		// A few maintenance rounds, which record that the node was a voter.
-		Thread.sleep(1_000);
+		// The maintenance round that records that the node was a voter (R11 review, finding 3: not a fixed sleep).
+		InProcessCluster.await(TIMEOUT, yNode::memberFileExists);
 		cluster.halt(y);
 		RaftTraffic.dropForTesting = null;
 
