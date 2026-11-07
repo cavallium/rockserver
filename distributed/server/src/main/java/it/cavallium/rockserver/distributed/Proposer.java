@@ -24,6 +24,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -383,6 +384,12 @@ final class Proposer implements Closeable {
 		volatile boolean refusedOnce;
 
 		/**
+		 * Its expiry timer ({@link #expireWhenQueued}), the latest one armed; guarded by this. At most one is waiting at
+		 * a time: its deadline never changes, so a requeue finds the one still waiting and arms none (R21-2).
+		 */
+		private @Nullable ScheduledFuture<?> expiry;
+
+		/**
 		 * Set from just before it is taken into a batch until that batch's encoding no longer reads its entry: its
 		 * caller's buffers may be read while it is set. See {@link #awaitEncoded}.
 		 */
@@ -468,6 +475,14 @@ final class Proposer implements Closeable {
 		/** Its failure when its caller's deadline comes while it is queued: it was not applied. */
 		RocksDBException callerDeadlineFailure() {
 			return refusedOnce ? callerDeadlinePassedUnaccepted() : callerDeadlinePassed();
+		}
+
+		/**
+		 * Its failure when its deadline comes while it is queued, as {@link Lane#take} fails it: it was not applied. With
+		 * no caller deadline, its deadline is the node's request timeout.
+		 */
+		RocksDBException deadlineFailure() {
+			return callerDeadline ? callerDeadlineFailure() : notAccepted();
 		}
 
 		/**
@@ -590,10 +605,8 @@ final class Proposer implements Closeable {
 			// answers it as unknown.
 			pending.abandon(RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping"));
 		}
-		if (callerDeadline && pending.isQueued()) {
-			// It waits for a batch slot: fail it at its deadline even if no slot frees up by then.
-			expireWhenQueued(pending);
-		}
+		// It waits for a batch slot: fail it at its deadline even if no slot frees up by then.
+		expireWhenQueued(pending);
 		return copy;
 	}
 
@@ -659,13 +672,45 @@ final class Proposer implements Closeable {
 		}
 	}
 
+	/**
+	 * If {@code pending} is queued (never sent, or sent and refused before the append), fails it as not applied at its
+	 * deadline, its caller's or else the node's request timeout, even if no batch slot frees up by then to look at the
+	 * queue (R21-1, R21-4). Called after every enqueue and requeue of requests that are queued again; arms a timer
+	 * only if none is still waiting, so that a request requeued again and again holds one timer, not one per requeue
+	 * (R21-2). The timer only abandons a request that is queued when it fires ({@link Pending#abandon} needs QUEUED),
+	 * so one that fires while the request is in a batch does nothing; once it fired, the next requeue arms another.
+	 */
 	private void expireWhenQueued(Pending pending) {
-		try {
-			var expiry = control.schedule(() -> pending.abandon(pending.callerDeadlineFailure()),
-					pending.deadlineNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
-			pending.result.whenComplete((_, _) -> expiry.cancel(false));
-		} catch (RejectedExecutionException stopping) {
-			// close() answers every request.
+		if (!pending.isQueued()) {
+			return;
+		}
+		boolean first;
+		synchronized (pending) {
+			var current = pending.expiry;
+			if (pending.result.isDone() || current != null && current.getDelay(TimeUnit.NANOSECONDS) > 0) {
+				// Answered, or a timer still waits for the same deadline.
+				return;
+			}
+			first = current == null;
+			try {
+				pending.expiry = control.schedule(() -> pending.abandon(pending.deadlineFailure()),
+						pending.deadlineNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
+			} catch (RejectedExecutionException stopping) {
+				// close() answers every request.
+				return;
+			}
+		}
+		if (first) {
+			// One callback per request, which cancels whichever timer is the latest then.
+			pending.result.whenComplete((_, _) -> {
+				ScheduledFuture<?> latest;
+				synchronized (pending) {
+					latest = pending.expiry;
+				}
+				if (latest != null) {
+					latest.cancel(false);
+				}
+			});
 		}
 	}
 
@@ -965,9 +1010,7 @@ final class Proposer implements Closeable {
 			}
 			requeue(rest);
 			for (var pending : rest) {
-				if (pending.callerDeadline && pending.isQueued()) {
-					expireWhenQueued(pending);
-				}
+				expireWhenQueued(pending);
 			}
 			finished();
 		}
@@ -1101,9 +1144,7 @@ final class Proposer implements Closeable {
 				// Before finished(), so that the dispatch after it, which has this batch's slot, finds them queued.
 				requeue(again);
 				for (var pending : again) {
-					if (pending.callerDeadline && pending.isQueued()) {
-						expireWhenQueued(pending);
-					}
+					expireWhenQueued(pending);
 				}
 			}
 		}
@@ -1130,9 +1171,21 @@ final class Proposer implements Closeable {
 								rest.set(position, null);
 							}
 							rest.removeIf(Objects::isNull);
-							// Still SENT, so no expiry is armed: they are at the head of the queue, and the finished()
-							// below gives this batch's slot to them at once (take() fails any past its deadline).
+							// Rejected with the whole entry before its append: back as never sent, as after a busy
+							// refusal, so that their deadlines and cancellations apply again. The finished() below
+							// usually gives this batch's slot to them, but another requeue on another control thread
+							// may get ahead of them, so they also get their expiry (R21-3).
+							long now = System.nanoTime();
+							for (var pending : rest) {
+								pending.queuedNanos = now;
+								if (!pending.resentAlone) {
+									pending.unsend();
+								}
+							}
 							requeue(rest);
+							for (var pending : rest) {
+								expireWhenQueued(pending);
+							}
 						}
 					} else if (refusal != null) {
 						fail(batch, refusal(refusal));
@@ -1163,8 +1216,9 @@ final class Proposer implements Closeable {
 
 		/**
 		 * Puts the commits of a batch that was not appended back in the queue after {@link #NOT_READY_RETRY_MS}, as if
-		 * never sent: their deadlines and cancellations apply again, and they fail as not applied at their caller's
-		 * deadline, from {@link #take} or, while no slot frees up, from {@link #expireWhenQueued}.
+		 * never sent: their deadlines and cancellations apply again, and they fail as not applied at their deadline
+		 * (their caller's, or else the request timeout), from {@link #take} or, while no slot frees up, from
+		 * {@link #expireWhenQueued}.
 		 */
 		private void retryLater(List<Pending> batch) {
 			for (var pending : batch) {
@@ -1175,11 +1229,9 @@ final class Proposer implements Closeable {
 				control.schedule(() -> {
 					requeue(batch);
 					// A commit sent at once when submitted has no expiry timer, and every slot may be taken again by
-					// now: fail it at its caller's deadline even if no slot frees up by then (R21-1).
+					// now: fail it at its deadline even if no slot frees up by then (R21-1).
 					for (var pending : batch) {
-						if (pending.callerDeadline && pending.isQueued()) {
-							expireWhenQueued(pending);
-						}
+						expireWhenQueued(pending);
 					}
 				}, NOT_READY_RETRY_MS, TimeUnit.MILLISECONDS);
 			} catch (RejectedExecutionException stopping) {
