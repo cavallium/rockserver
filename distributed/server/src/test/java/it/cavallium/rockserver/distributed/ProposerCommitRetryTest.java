@@ -20,6 +20,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.ratis.protocol.Message;
@@ -52,16 +53,23 @@ class ProposerCommitRetryTest {
 
 	@BeforeEach
 	void setUp() {
-		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
-		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(Duration.ofSeconds(10));
 		metrics = new NodeMetrics("n0");
 		threads = new NodeThreads("n0");
-		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
-				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
 		raft.leaderId = "n0";
 		raft.leader = true;
 		raft.leaderReady = true;
-		proposer = new Proposer(group, RaftSettings.client(config), config, raft.serverSupplier(), metrics,
+		proposer = newProposer(group(), Duration.ofSeconds(10));
+	}
+
+	private static RaftGroup group() {
+		return RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
+				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
+	}
+
+	private Proposer newProposer(RaftGroup group, Duration requestTimeout) {
+		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
+		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(requestTimeout);
+		return new Proposer(group, RaftSettings.client(config), config, raft.serverSupplier(), metrics,
 				threads.control());
 	}
 
@@ -172,5 +180,187 @@ class ProposerCommitRetryTest {
 		}
 		assertEquals(true, waiting.get(10, TimeUnit.SECONDS));
 		assertEquals(fitting + 1, submissions.get());
+	}
+
+	/**
+	 * R21-1: a commit sent at once has no expiry timer of its own. Refused before its append for lack of room, it goes
+	 * back to the queue 50 ms later, when every commit slot ({@link Proposer#MAX_BATCHES_IN_FLIGHT}) is again taken by
+	 * commits that Ratis does not answer. No slot frees up to look at the queue, yet it still fails at its caller's
+	 * deadline, as not applied, instead of waiting past it for an answer the caller no longer hears.
+	 */
+	@Test
+	void aRequeuedCommitFailsAtItsDeadlineAsNotAppliedWhileNoSlotFreesUp() throws Exception {
+		var refusal = new CompletableFuture<RaftClientReply>();
+		var held = new ConcurrentLinkedQueue<CompletableFuture<RaftClientReply>>();
+		var heldRequests = new ConcurrentLinkedQueue<RaftClientRequest>();
+		var submissions = new AtomicInteger();
+		raft.submit = request -> {
+			if (submissions.incrementAndGet() == 1) {
+				return refusal;
+			}
+			var reply = new CompletableFuture<RaftClientReply>();
+			held.add(reply);
+			heldRequests.add(request);
+			return reply;
+		};
+		try {
+			long start = System.nanoTime();
+			long timeLeftNanos = TimeUnit.MILLISECONDS.toNanos(1000);
+			var refused = proposer.proposeOnce(commit(1, 16), timeLeftNanos, null);
+			InProcessCluster.await(Duration.ofSeconds(10), () -> submissions.get() == 1);
+			var others = new ArrayList<CompletableFuture<Object>>();
+			for (int i = 0; i < Proposer.MAX_BATCHES_IN_FLIGHT; i++) {
+				others.add(proposer.proposeOnce(commit(10 + i, 16), TimeUnit.SECONDS.toNanos(30), null));
+			}
+			// Every slot but the refused commit's is taken; one more commit waits in the queue.
+			InProcessCluster.await(Duration.ofSeconds(10), () -> held.size() == Proposer.MAX_BATCHES_IN_FLIGHT - 1);
+			refusal.completeExceptionally(new ResourceUnavailableException(
+					"Failed to " + Proposer.RATIS_PENDING_LIMIT_MESSAGE + " (test)"));
+			// Its slot goes to the waiting commit: all slots are taken again when it comes back to the queue.
+			InProcessCluster.await(Duration.ofSeconds(10), () -> held.size() == Proposer.MAX_BATCHES_IN_FLIGHT);
+
+			var error = assertThrows(ExecutionException.class, () -> refused.get(5, TimeUnit.SECONDS));
+			long tookNanos = System.nanoTime() - start;
+			var cause = assertInstanceOf(RocksDBException.class, error.getCause());
+			assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, cause.getErrorUniqueId(), cause.getMessage());
+			assertTrue(cause.getMessage().contains("not applied"), cause.getMessage());
+			assertTrue(tookNanos < timeLeftNanos + TimeUnit.MILLISECONDS.toNanos(500),
+					"failed after " + TimeUnit.NANOSECONDS.toMillis(tookNanos) + " ms");
+			assertEquals(Proposer.MAX_BATCHES_IN_FLIGHT + 1, submissions.get(), "the refused commit was sent again");
+			for (var other : others) {
+				assertFalse(other.isDone(), "a held commit ended: " + other);
+			}
+		} finally {
+			var requests = new ArrayList<>(heldRequests);
+			var replies = new ArrayList<>(held);
+			for (int i = 0; i < replies.size(); i++) {
+				replies.get(i).complete(applied(requests.get(i)));
+			}
+		}
+	}
+
+	private static void answerAll(ConcurrentLinkedQueue<CompletableFuture<RaftClientReply>> held,
+			ConcurrentLinkedQueue<RaftClientRequest> heldRequests) {
+		var requests = new ArrayList<>(heldRequests);
+		var replies = new ArrayList<>(held);
+		for (int i = 0; i < replies.size(); i++) {
+			replies.get(i).complete(applied(requests.get(i)));
+		}
+	}
+
+	/**
+	 * R21-2: two commits take turns in the one commit slot that held commits leave free, each refused before its
+	 * append for lack of room (100 ms after it is sent), so each comes back to the queue again and again while the
+	 * other has the slot. Each requeue finds the commit's expiry timer still waiting and arms no other: the control
+	 * plane holds one timer per commit, not one per requeue, and both still fail at their deadline as not applied.
+	 */
+	@Test
+	void aCommitRequeuedAgainAndAgainHoldsOneExpiryTimer() throws Exception {
+		var held = new ConcurrentLinkedQueue<CompletableFuture<RaftClientReply>>();
+		var heldRequests = new ConcurrentLinkedQueue<RaftClientRequest>();
+		var refusals = new AtomicInteger();
+		int holding = Proposer.MAX_BATCHES_IN_FLIGHT - 1;
+		raft.submit = request -> {
+			var reply = new CompletableFuture<RaftClientReply>();
+			if (held.size() < holding) {
+				held.add(reply);
+				heldRequests.add(request);
+			} else {
+				refusals.incrementAndGet();
+				CompletableFuture.delayedExecutor(100, TimeUnit.MILLISECONDS).execute(() -> reply.completeExceptionally(
+						new ResourceUnavailableException("Failed to " + Proposer.RATIS_PENDING_LIMIT_MESSAGE + " (test)")));
+			}
+			return reply;
+		};
+		var timers = ((ScheduledThreadPoolExecutor) threads.control()).getQueue();
+		try {
+			var others = new ArrayList<CompletableFuture<Object>>();
+			for (int i = 0; i < holding; i++) {
+				others.add(proposer.proposeOnce(commit(10 + i, 16), TimeUnit.SECONDS.toNanos(30), null));
+			}
+			InProcessCluster.await(Duration.ofSeconds(10), () -> held.size() == holding);
+			int before = timers.size();
+			long timeLeftNanos = TimeUnit.MILLISECONDS.toNanos(3000);
+			var first = proposer.proposeOnce(commit(1, 16), timeLeftNanos, null);
+			var second = proposer.proposeOnce(commit(2, 16), timeLeftNanos, null);
+			long sampleUntil = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(2200);
+			Thread.sleep(1200);
+			int most = 0;
+			while (System.nanoTime() - sampleUntil < 0) {
+				most = Math.max(most, timers.size() - before);
+				Thread.sleep(20);
+			}
+			assertTrue(refusals.get() >= 10, "refused only " + refusals.get() + " times: not taking turns");
+			assertFalse(first.isDone(), "ended before its deadline: " + first);
+			assertFalse(second.isDone(), "ended before its deadline: " + second);
+			// One expiry each, and at most one pending requeue each.
+			assertTrue(most <= 4, most + " control-plane timers for two requeued commits");
+
+			for (var commit : List.of(first, second)) {
+				var error = assertThrows(ExecutionException.class, () -> commit.get(5, TimeUnit.SECONDS));
+				var cause = assertInstanceOf(RocksDBException.class, error.getCause());
+				assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, cause.getErrorUniqueId(), cause.getMessage());
+				assertTrue(cause.getMessage().contains("not applied"), cause.getMessage());
+			}
+			for (var other : others) {
+				assertFalse(other.isDone(), "a held commit ended: " + other);
+			}
+		} finally {
+			answerAll(held, heldRequests);
+		}
+	}
+
+	/**
+	 * R21-4: as R21-1, for a commit whose caller has no deadline of its own: its deadline is the node's request
+	 * timeout. Requeued while every slot is held by commits submitted later (whose deadlines come later), it still
+	 * fails at that deadline as not applied, instead of waiting until a slot frees up.
+	 */
+	@Test
+	void aRequeuedCommitWithoutACallerDeadlineFailsAtTheRequestTimeoutWhileNoSlotFreesUp() throws Exception {
+		proposer.close();
+		proposer = newProposer(group(), Duration.ofSeconds(2));
+		var refusal = new CompletableFuture<RaftClientReply>();
+		var held = new ConcurrentLinkedQueue<CompletableFuture<RaftClientReply>>();
+		var heldRequests = new ConcurrentLinkedQueue<RaftClientRequest>();
+		var submissions = new AtomicInteger();
+		raft.submit = request -> {
+			if (submissions.incrementAndGet() == 1) {
+				return refusal;
+			}
+			var reply = new CompletableFuture<RaftClientReply>();
+			held.add(reply);
+			heldRequests.add(request);
+			return reply;
+		};
+		try {
+			long start = System.nanoTime();
+			long noDeadline = TimeUnit.SECONDS.toNanos(60);
+			var refused = proposer.proposeOnce(commit(1, 16), noDeadline, null);
+			InProcessCluster.await(Duration.ofSeconds(10), () -> submissions.get() == 1);
+			// Later deadlines than the refused commit's: they cannot end before it.
+			Thread.sleep(1000);
+			var others = new ArrayList<CompletableFuture<Object>>();
+			for (int i = 0; i < Proposer.MAX_BATCHES_IN_FLIGHT; i++) {
+				others.add(proposer.proposeOnce(commit(10 + i, 16), noDeadline, null));
+			}
+			InProcessCluster.await(Duration.ofSeconds(10), () -> held.size() == Proposer.MAX_BATCHES_IN_FLIGHT - 1);
+			refusal.completeExceptionally(new ResourceUnavailableException(
+					"Failed to " + Proposer.RATIS_PENDING_LIMIT_MESSAGE + " (test)"));
+			InProcessCluster.await(Duration.ofSeconds(10), () -> held.size() == Proposer.MAX_BATCHES_IN_FLIGHT);
+
+			var error = assertThrows(ExecutionException.class, () -> refused.get(5, TimeUnit.SECONDS));
+			long tookNanos = System.nanoTime() - start;
+			var cause = assertInstanceOf(RocksDBException.class, error.getCause());
+			assertTrue(cause.isNotApplied(), cause.getMessage());
+			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, cause.getErrorUniqueId(), cause.getMessage());
+			assertTrue(tookNanos < TimeUnit.MILLISECONDS.toNanos(2500),
+					"failed after " + TimeUnit.NANOSECONDS.toMillis(tookNanos) + " ms");
+			assertEquals(Proposer.MAX_BATCHES_IN_FLIGHT + 1, submissions.get(), "the refused commit was sent again");
+			for (var other : others) {
+				assertFalse(other.isDone(), "a held commit ended: " + other);
+			}
+		} finally {
+			answerAll(held, heldRequests);
+		}
 	}
 }
