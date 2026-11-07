@@ -297,8 +297,10 @@ class LeaderForwarderTest {
 	 */
 	@Test
 	void aListedMemberThatFailsOnceAtTheSamePortKeepsItsAnsweredAddress() throws Exception {
-		var first = startHandshakeServer();
-		int apiPort = first.getPort();
+		// Bound twice, so taken below the ephemeral range: a kernel-assigned port can go to an outgoing connection (the
+		// forwarder's own probes) between the shutdown and the second bind (R19-4).
+		int apiPort = ProcessCluster.freePorts(1, List.of()).getFirst();
+		var first = startHandshakeServer(apiPort);
 		var answered = new HostAndPort("127.0.0.1", apiPort);
 		var answer = new AtomicReference<>("127.0.0.1:" + apiPort);
 		int raftPort = apiAddressServer(answer);
