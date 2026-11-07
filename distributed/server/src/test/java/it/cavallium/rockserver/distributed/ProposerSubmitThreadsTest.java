@@ -22,6 +22,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -65,12 +67,16 @@ class ProposerSubmitThreadsTest {
 	}
 
 	private Proposer newProposer(Duration requestTimeout) {
+		return newProposer(requestTimeout, threads.submit());
+	}
+
+	private Proposer newProposer(Duration requestTimeout, Executor submitter) {
 		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
 				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
 		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
 		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(requestTimeout);
 		return new Proposer(group, RaftSettings.client(config), config, raft.serverSupplier(), metrics,
-				threads.control(), threads.submit());
+				threads.control(), submitter);
 	}
 
 	@AfterEach
@@ -203,5 +209,93 @@ class ProposerSubmitThreadsTest {
 		}
 		assertEquals(0, proposer.admittedBytes(), "bytes left counted in the write admission");
 		assertEquals(0, submissions.get(), "a write past its deadline was sent");
+	}
+
+	/**
+	 * R22-2: on a node that does not lead, an attempt only hands the batch to the sender of remote attempts, which
+	 * cannot block in Ratis' submit: once the node has seen that it does not lead, its batches and their resends no
+	 * longer pass through the submit threads on their way to the sender. Here no leader is known, so each attempt is
+	 * refused before the append and resent every 50 ms until the write's 1 s deadline: about 18 attempts.
+	 */
+	@Test
+	void aFollowerSendsWithoutPassingThroughTheSubmitThreads() throws Exception {
+		proposer.close();
+		var submitted = new AtomicInteger();
+		var submit = threads.submit();
+		proposer = newProposer(Duration.ofSeconds(10), task -> {
+			submitted.incrementAndGet();
+			submit.execute(task);
+		});
+		raft.leader = false;
+		raft.leaderReady = false;
+		raft.leaderId = null;
+		var localSubmissions = new AtomicInteger();
+		raft.submit = request -> {
+			localSubmissions.incrementAndGet();
+			return CompletableFuture.completedFuture(applied(request));
+		};
+		var write = proposer.propose(put(1), TimeUnit.SECONDS.toNanos(1));
+		var error = assertThrows(ExecutionException.class, () -> write.get(5, TimeUnit.SECONDS));
+		assertInstanceOf(RocksDBException.class, error.getCause());
+		var second = proposer.propose(put(2), TimeUnit.MILLISECONDS.toNanos(500));
+		assertThrows(ExecutionException.class, () -> second.get(5, TimeUnit.SECONDS));
+		assertEquals(0, localSubmissions.get(), "a follower submitted to its own Raft server");
+		assertTrue(submitted.get() <= 1, "batches and resends went through the submit threads: " + submitted.get());
+	}
+
+	/**
+	 * R22-3: an {@link Error} while a batch is encoded (an out-of-memory error on a large batch) ends the batch, as a
+	 * runtime failure does: its writes are answered and its slot given back, not left waiting until the node stops.
+	 */
+	@Test
+	void anErrorWhileEncodingFailsTheBatch() throws Exception {
+		raft.submit = request -> CompletableFuture.completedFuture(applied(request));
+		var thrown = new AtomicBoolean();
+		proposer.beforeEncodeForTesting = () -> {
+			if (thrown.compareAndSet(false, true)) {
+				throw new OutOfMemoryError("thrown by the test while encoding");
+			}
+		};
+		var write = proposer.propose(put(1));
+		var error = assertThrows(ExecutionException.class, () -> write.get(2, TimeUnit.SECONDS),
+				"the write was not answered after an error while encoding");
+		assertInstanceOf(RocksDBException.class, error.getCause());
+		assertEquals(true, proposer.propose(put(2)).get(2, TimeUnit.SECONDS));
+		long until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(500);
+		while (proposer.admittedBytes() != 0 && System.nanoTime() - until < 0) {
+			Thread.sleep(10);
+		}
+		assertEquals(0, proposer.admittedBytes(), "bytes left counted in the write admission");
+	}
+
+	/**
+	 * R22-4: a batch taken just before the proposer starts to close, but not yet sent, is not submitted to the Raft
+	 * server once it is closing. {@code close()} marks the proposer closed, then closes its client (which can wait
+	 * seconds for a connection's calls to end), and only then answers the writes in flight: the test stops it between
+	 * the two, as a submit thread reaching the batch meanwhile would see it. Its write is answered as stopping, since
+	 * nothing of it was sent. (Once {@code close()} has answered a write, its batch no longer encodes: its sequence is
+	 * below {@code completedBelow}.)
+	 */
+	@Test
+	void aBatchTakenBeforeCloseIsNotSubmittedWhileItCloses() throws Exception {
+		proposer.close();
+		var held = new LinkedBlockingQueue<Runnable>();
+		proposer = newProposer(Duration.ofSeconds(10), held::add);
+		var submissions = new AtomicInteger();
+		raft.submit = request -> {
+			submissions.incrementAndGet();
+			return CompletableFuture.completedFuture(applied(request));
+		};
+		var write = proposer.propose(put(1));
+		var batch = held.poll(5, TimeUnit.SECONDS);
+		assertTrue(batch != null, "no batch was handed to the submit threads");
+		var closed = Proposer.class.getDeclaredField("closed");
+		closed.setAccessible(true);
+		closed.setBoolean(proposer, true);
+		batch.run();
+		assertEquals(0, submissions.get(), "a batch was submitted while the proposer was closing");
+		var error = assertThrows(ExecutionException.class, () -> write.get(2, TimeUnit.SECONDS));
+		var cause = assertInstanceOf(RocksDBException.class, error.getCause());
+		assertTrue(cause.getMessage().contains("The node is stopping"), cause.getMessage());
 	}
 }
