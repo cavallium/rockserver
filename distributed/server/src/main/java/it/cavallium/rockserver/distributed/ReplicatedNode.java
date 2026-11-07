@@ -156,7 +156,8 @@ public final class ReplicatedNode implements AutoCloseable {
 		parameters.put(CommitHeartbeats.PARAMETER, commitHeartbeats, CommitHeartbeats.class);
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
 		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress,
-				this::nodeState, this::readIndex, configDigest, this::answerOps, raftTraffic, this::configurationReport));
+				this::nodeState, this::readIndex, configDigest, this::answerOps, raftTraffic, this::configurationReport,
+				new MembershipGuard(this::raftServer)));
 		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
 		if (!existing) {
 			// Before anything opens the database: copies of a seed are the same only until then.

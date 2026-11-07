@@ -251,6 +251,18 @@ final class TermService {
 	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
 			NodeStateSource nodeState, ReadIndexSource readIndex, @Nullable String configDigest, OpsSource ops,
 			@Nullable RaftTraffic traffic, @Nullable ConfigurationSource configurations) {
+		return customizer(server, apiAddress, nodeState, readIndex, configDigest, ops, traffic, configurations, null);
+	}
+
+	/**
+	 * {@link #customizer(Supplier, HostAndPort, NodeStateSource, ReadIndexSource, String, OpsSource, RaftTraffic,
+	 * ConfigurationSource)}, also installing {@code guard}, unless null, on the gRPC server that runs Ratis' admin
+	 * service (the Raft one, unless an admin port is configured).
+	 */
+	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
+			NodeStateSource nodeState, ReadIndexSource readIndex, @Nullable String configDigest, OpsSource ops,
+			@Nullable RaftTraffic traffic, @Nullable ConfigurationSource configurations,
+			@Nullable MembershipGuard guard) {
 		ServerCalls.UnaryMethod<byte[], byte[]> handler = (request, response) -> answer(server, request, response);
 		var address = (apiAddress.host() + ":" + apiAddress.port()).getBytes(StandardCharsets.UTF_8);
 		ServerCalls.UnaryMethod<byte[], byte[]> addressHandler = (_, response) -> {
@@ -280,6 +292,9 @@ final class TermService {
 		var service = definition.build();
 		// Ratis may run admin and client services on separate ports; the peers' Raft address is the SERVER one.
 		return (builder, types) -> {
+			if (guard != null && types.contains(GrpcServices.Type.ADMIN)) {
+				builder.intercept(guard);
+			}
 			if (!types.contains(GrpcServices.Type.SERVER)) {
 				return builder;
 			}

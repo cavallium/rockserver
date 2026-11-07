@@ -22,6 +22,19 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
+import org.apache.ratis.protocol.exceptions.ReconfigurationInProgressException;
+import org.apache.ratis.protocol.exceptions.SetConfigurationException;
+import org.apache.ratis.retry.RetryPolicies;
+import org.apache.ratis.util.ProtoUtils;
+import org.apache.ratis.client.impl.ClientProtoUtils;
+import org.apache.ratis.grpc.GrpcUtil;
+import org.apache.ratis.proto.grpc.AdminProtocolServiceGrpc;
+import org.apache.ratis.protocol.SetConfigurationRequest;
+import org.apache.ratis.rpc.CallId;
+import org.apache.ratis.thirdparty.io.grpc.Metadata;
+import org.apache.ratis.thirdparty.io.grpc.StatusRuntimeException;
+import org.apache.ratis.thirdparty.io.grpc.stub.MetadataUtils;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftGroup;
@@ -45,7 +58,7 @@ import org.rocksdb.NativeLibraryLoader;
  *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
  *       [--jvm-pause-limit-ms N] [--snapshot-every-bytes N] [--parallel-apply-threads N]
  *       [--allow-without-exit-on-oom]
- * admin --peer ... [--group-id UUID] [--timeout-ms N]
+ * admin --peer ... [--group-id UUID] [--timeout-ms N] [--unsafe-multi-voter-change]
  *       status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
  *       | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
@@ -92,8 +105,24 @@ import org.rocksdb.NativeLibraryLoader;
  *
  * <p>{@code admin} changes end with {@code OK}, or with {@code FAILED: ...} and exit code 1, within {@code --timeout-ms}
  * (10 minutes by default), which must cover the catch-up of a new member. A leader that started a change goes on with it
- * after that: see {@code status}, and run the command again. {@code add-peer} first asks the new node what it holds, and
- * refuses a node that does not run or that has a log of its own. {@code snapshot} makes a member take a snapshot now.</p>
+ * after that: see {@code status}, and run the command again. {@code add-peer} first reads the leader's configuration:
+ * for a node that is a voter there at the same address it prints {@code OK} (a re-run) without asking the node. Else
+ * it asks the new node what it holds, and refuses a node that does not run or that has a log of its own (after reading
+ * the configuration again: a node that became a voter meanwhile is {@code OK}). {@code snapshot} makes a member take a snapshot now.</p>
+ *
+ * <p>{@code add-peer} and {@code remove-peer} build the new voters from {@code --peer} (plus or minus the one node), read
+ * the leader's configuration (waiting while a change is under way), and refuse with exit code 1, before proposing
+ * anything, a change of more than one voter ({@link VoterChange}): with Ratis 3.3.1 a leader elected during such a
+ * change commits with the new voters alone, which can lose committed entries. They send the change as a compare-and-set
+ * against the configuration they read, and read it again if another change came first. The leader checks the same
+ * ({@link MembershipGuard}), also for older {@code admin} versions and other Ratis clients, once every node that can
+ * lead runs this version (a leader of an older version, during a rolling upgrade, does not). A refusal of Ratis' own
+ * without the guard's marker (for one {@code changes a majority set}) fails at once if the configuration read again did
+ * not change. A lost node is replaced by
+ * {@code remove-peer} then {@code add-peer}, a running one by {@code add-peer} then {@code remove-peer}.
+ * {@code --unsafe-multi-voter-change} skips both checks (the leader logs a warning): it is never needed for recovery,
+ * since any change that can commit can be made one voter at a time; it is safe only if every majority of the old voters
+ * that can still vote meets every majority of the new ones. See "Replacing a node" in the design document.</p>
  *
  * <p>{@code --pipelined-updates}, off by default, lets a leader pass a key to its next {@code getForUpdate} update as
  * soon as the previous update's commit is admitted to the log: see "Transactions" in the design document, which also
@@ -120,6 +149,8 @@ public final class ReplicatedServerMain {
 	/** How long {@code add-peer} waits for an answer of the new node and of each member, per round. */
 	private static final Duration PEER_ANSWER_TIMEOUT = Duration.ofSeconds(3);
 	private static final long SEED_SNAPSHOT_POLL_MS = 200;
+	/** The {@code admin} flag that skips the check of one voter per change, here and on the leader. */
+	static final String UNSAFE_MULTI_VOTER_CHANGE = "--unsafe-multi-voter-change";
 
 	private ReplicatedServerMain() {}
 
@@ -387,6 +418,7 @@ public final class ReplicatedServerMain {
 		var groupId = RaftGroupId.valueOf(UUID.fromString(options.value("--group-id", NodeConfig.DEFAULT_GROUP_ID)));
 		var timeout = Duration.ofMillis(Long.parseLong(options.value("--timeout-ms",
 				String.valueOf(DEFAULT_ADMIN_TIMEOUT.toMillis()))));
+		boolean unsafe = options.flag(UNSAFE_MULTI_VOTER_CHANGE);
 		var command = options.positional();
 		if (command.isEmpty()) {
 			usage("missing admin command");
@@ -417,19 +449,24 @@ public final class ReplicatedServerMain {
 						RaftPeerId.valueOf(arg(command)), 10_000));
 				case "add-peer" -> {
 					var added = PeerConfig.parse(arg(command));
-					requireFitToJoin(added, peers, groupId, deadline);
+					// A voter already (a re-run after a timeout, or of a call that succeeded): OK without asking the node,
+					// whose answer can look like a log of its own until it applies the genesis or its snapshot.
+					if (isVoter(added, peers, groupId, deadline) || !requireFitToJoin(added, peers, groupId, deadline)) {
+						System.out.println("OK");
+						yield null;
+					}
 					requireCapabilities(added, peers, groupId);
 					var members = new ArrayList<>(peers.stream().map(ReplicatedServerMain::raftPeer).toList());
 					members.removeIf(p -> p.getId().toString().equals(added.id()));
 					members.add(raftPeer(added));
-					yield attempt(timeout, () -> client.admin().setConfiguration(members));
+					yield changeVoters(client, peers, groupId, members, unsafe, timeout, deadline);
 				}
 				case "remove-peer" -> {
 					var removed = arg(command);
-					yield attempt(timeout, () -> client.admin().setConfiguration(peers.stream()
+					yield changeVoters(client, peers, groupId, peers.stream()
 							.filter(p -> !p.id().equals(removed))
 							.map(ReplicatedServerMain::raftPeer)
-							.toList()));
+							.toList(), unsafe, timeout, deadline);
 				}
 				case "snapshot" -> {
 					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(arg(command)));
@@ -616,6 +653,213 @@ public final class ReplicatedServerMain {
 		return results;
 	}
 
+	/** The leader's settled configuration, as {@code admin} read it. */
+	record Membership(String leader, List<RaftPeer> servers, List<RaftPeer> listeners) {}
+
+	/**
+	 * Proposes the configuration with voters {@code target} (and the listeners of the leader's configuration) as a
+	 * compare-and-set against the leader's configuration, which it reads first. Without {@code unsafe} it fails, before
+	 * anything is proposed, if more than one voter would change ({@link VoterChange}); the leader's
+	 * {@link MembershipGuard} checks it again. If another change commits meanwhile (the compare-and-set fails), it reads
+	 * the configuration again and checks again, until the deadline.
+	 */
+	private static RaftClientReply changeVoters(RaftClient client, List<PeerConfig> peers, RaftGroupId groupId,
+			List<RaftPeer> target, boolean unsafe, Duration timeout, long deadlineNanos) throws InterruptedException {
+		try (var infoClient = infoClient(peers, groupId)) {
+			Membership refusedOn = null;
+			String refusalMessage = null;
+			while (true) {
+				var current = leaderConfiguration(infoClient, peers, groupId, deadlineNanos);
+				if (refusedOn != null && sameMembers(refusedOn, current)) {
+					// Not a lost race: Ratis refused for a reason that a re-read does not change (for one, "changes a
+					// majority set": the new members are at least as many as the kept ones).
+					fail("the leader refused, and its configuration did not change since: " + refusalMessage);
+				}
+				refusedOn = null;
+				var change = VoterChange.between(current.servers(), target);
+				System.out.println("leader " + current.leader() + ": voters " + VoterChange.ids(current.servers())
+						+ (current.listeners().isEmpty() ? "" : ", listeners " + VoterChange.ids(current.listeners()))
+						+ "; this change adds " + change.added() + " and removes " + change.removed());
+				if (!change.safe()) {
+					if (!unsafe) {
+						fail(VoterChange.refusal(change, current.servers()));
+					}
+					System.out.println("WARNING: " + UNSAFE_MULTI_VOTER_CHANGE + ": " + change.size() + " voters change at"
+							+ " once. Committed entries can be lost if the leader changes before it commits, unless every"
+							+ " majority of the old voters that can still vote meets every majority of the new ones");
+				}
+				var arguments = SetConfigurationRequest.Arguments.newBuilder()
+						.setServersInNewConf(target)
+						.setListenersInNewConf(current.listeners())
+						.setServersInCurrentConf(current.servers())
+						.setListenersInCurrentConf(current.listeners())
+						.setMode(SetConfigurationRequest.Mode.COMPARE_AND_SET)
+						.build();
+				try {
+					if (!unsafe) {
+						return client.admin().setConfiguration(arguments);
+					}
+					var leaderAddress = peers.stream().filter(peer -> peer.id().equals(current.leader()))
+							.map(PeerConfig::raftAddress).findFirst()
+							.orElseGet(() -> current.servers().stream()
+									.filter(peer -> peer.getId().toString().equals(current.leader()))
+									.map(RaftPeer::getAddress).findFirst().orElseThrow());
+					var reply = setConfigurationUnsafe(leaderAddress, RaftPeerId.valueOf(current.leader()), groupId,
+							arguments, remaining(deadlineNanos));
+					if (reply.isSuccess() || (reply.getNotLeaderException() == null
+							&& !(reply.getException() instanceof ReconfigurationInProgressException))) {
+						return reply;
+					}
+					System.out.println("not done (" + reply.getException() + "): asking again");
+				} catch (IOException ex) {
+					var refusal = setConfigurationRefusal(ex);
+					if (refusal != null && String.valueOf(refusal.getMessage()).contains(VoterChange.MULTI_VOTER_REFUSAL)) {
+						fail("the leader " + refusal.getMessage());
+					}
+					if (refusal == null && !unsafe) {
+						attempt(timeout, () -> {
+							throw ex;
+						});
+					}
+					if (refusal != null) {
+						refusedOn = current;
+						refusalMessage = refusal.getMessage();
+					}
+					// Another change committed between the read and the request (or, unsafe, no answer yet).
+					System.out.println("not done (" + ex.getMessage() + "): reading the configuration again");
+				}
+				if (System.nanoTime() - deadlineNanos > 0) {
+					fail("no result within the time limit of " + timeout.toMillis() + " ms (--timeout-ms): the configuration"
+							+ " kept changing, or the leader did not answer. See the status, and run the command again");
+				}
+				Thread.sleep(SEED_SNAPSHOT_POLL_MS);
+			}
+		} catch (IOException closing) {
+			fail("cannot close the client: " + closing);
+			throw new AssertionError(closing);
+		}
+	}
+
+	/** Whether {@code a} and {@code b} have the same voters and listeners, by id (as Ratis' compare-and-set compares). */
+	private static boolean sameMembers(Membership a, Membership b) {
+		return VoterChange.ids(a.servers()).equals(VoterChange.ids(b.servers()))
+				&& VoterChange.ids(a.listeners()).equals(VoterChange.ids(b.listeners()));
+	}
+
+	/** A client that asks one member once, for {@link #leaderConfiguration}. */
+	private static RaftClient infoClient(List<PeerConfig> peers, RaftGroupId groupId) {
+		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
+		return RaftClient.newBuilder()
+				.setClientId(ClientId.randomId())
+				.setRaftGroup(RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList()))
+				.setProperties(RaftSettings.client(anyConfig))
+				.setRetryPolicy(RetryPolicies.noRetry())
+				.build();
+	}
+
+	/**
+	 * Whether the leader's settled configuration holds {@code added} as a voter at its address; prints the leader's
+	 * voters. Fails if it holds it at another address: Ratis compares peers by id only, so no change of {@code add-peer}
+	 * moves it, and the node must not be wiped.
+	 */
+	private static boolean isVoter(PeerConfig added, List<PeerConfig> peers, RaftGroupId groupId, long deadlineNanos)
+			throws InterruptedException {
+		Membership current;
+		try (var infoClient = infoClient(peers, groupId)) {
+			current = leaderConfiguration(infoClient, peers, groupId, deadlineNanos);
+		} catch (IOException closing) {
+			fail("cannot close the client: " + closing);
+			throw new AssertionError(closing);
+		}
+		System.out.println("leader " + current.leader() + ": voters " + VoterChange.ids(current.servers())
+				+ (current.listeners().isEmpty() ? "" : ", listeners " + VoterChange.ids(current.listeners())));
+		var voter = current.servers().stream().filter(peer -> peer.getId().toString().equals(added.id())).findFirst()
+				.orElse(null);
+		if (voter == null) {
+			return false;
+		}
+		if (!String.valueOf(voter.getAddress()).equals(raftPeer(added).getAddress())) {
+			fail("node " + added.id() + " is a voter already, at " + voter.getAddress() + ", not at "
+					+ raftPeer(added).getAddress() + ": add-peer does not move a voter (Ratis compares peers by id). Never"
+					+ " wipe a voter's data directory: to move it, remove-peer " + added.id() + " and add it again");
+		}
+		System.out.println("node " + added.id() + " is already a voter at " + voter.getAddress() + ": nothing to do");
+		return true;
+	}
+
+	private static @Nullable SetConfigurationException setConfigurationRefusal(Throwable error) {
+		for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+			if (cause instanceof SetConfigurationException refusal) {
+				return refusal;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Asks the members of {@code --peer} until one answers as the leader with a settled (not joint) configuration: a
+	 * joint one means a change is under way, which it waits for. Fails at the deadline.
+	 */
+	private static Membership leaderConfiguration(RaftClient infoClient, List<PeerConfig> peers, RaftGroupId groupId,
+			long deadlineNanos) throws InterruptedException {
+		String waitingFor = "an answer of a member";
+		while (true) {
+			for (PeerConfig peer : peers) {
+				try {
+					var info = infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId);
+					var conf = info.getConf().orElse(null);
+					if (info.getRoleInfoProto().getRole() != RaftPeerRole.LEADER || conf == null) {
+						waitingFor = "a leader (" + peer.id() + " is " + info.getRoleInfoProto().getRole() + ")";
+						continue;
+					}
+					if (conf.getOldPeersCount() > 0 || conf.getOldListenersCount() > 0) {
+						waitingFor = "the change under way on leader " + peer.id() + " (voters "
+								+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getOldPeersList())) + " to "
+								+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getPeersList())) + ")";
+						continue;
+					}
+					return new Membership(peer.id(), ProtoUtils.toRaftPeers(conf.getPeersList()),
+							ProtoUtils.toRaftPeers(conf.getListenersList()));
+				} catch (IOException | RuntimeException unanswered) {
+					// Down, or not in the group: the others are asked.
+				}
+			}
+			if (System.nanoTime() - deadlineNanos > 0) {
+				fail("no result within the time limit (--timeout-ms): still waiting for " + waitingFor
+						+ ". Nothing was proposed");
+			}
+			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
+		}
+	}
+
+	/**
+	 * Sends a configuration change straight to the leader at {@code leaderAddress} through Ratis' admin service, with the
+	 * header that lets it past the leader's {@link MembershipGuard} ({@code --unsafe-multi-voter-change}). One attempt:
+	 * a reply that is not a success (not the leader, for one) is returned as it is, and an error comes back as the
+	 * exception Ratis sent.
+	 */
+	static RaftClientReply setConfigurationUnsafe(String leaderAddress, RaftPeerId leader, RaftGroupId groupId,
+			SetConfigurationRequest.Arguments arguments, Duration timeout) throws IOException {
+		var channel = NettyChannelBuilder.forTarget(leaderAddress).usePlaintext().build();
+		try {
+			var request = new SetConfigurationRequest(ClientId.randomId(), leader, groupId, CallId.getAndIncrement(),
+					arguments);
+			var headers = new Metadata();
+			headers.put(MembershipGuard.UNSAFE, "1");
+			var stub = AdminProtocolServiceGrpc.newBlockingStub(channel)
+					.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
+					.withDeadlineAfter(Math.max(1, timeout.toMillis()), TimeUnit.MILLISECONDS);
+			try {
+				return ClientProtoUtils.toRaftClientReply(stub.setConfiguration(
+						ClientProtoUtils.toSetConfigurationRequestProto(request)));
+			} catch (StatusRuntimeException ex) {
+				throw GrpcUtil.unwrapException(ex);
+			}
+		} finally {
+			channel.shutdownNow();
+		}
+	}
+
 	private static Duration remaining(long deadlineNanos) {
 		return Duration.ofNanos(Math.max(1_000_000, deadlineNanos - System.nanoTime()));
 	}
@@ -703,10 +947,12 @@ public final class ReplicatedServerMain {
 	/**
 	 * Fails the command if {@code added} does not run or holds a log of its own. It then waits until every member that
 	 * answers has applied the genesis entry and, on a seeded cluster, holds a snapshot, which it takes right after: a new
-	 * member cannot catch up from a leader without one.
+	 * member cannot catch up from a leader without one. Before it fails on the node's log it reads the leader's
+	 * configuration again: if the node became a voter meanwhile (an earlier add-peer of it ended), it returns false, and
+	 * nothing is left to do.
 	 */
-	private static void requireFitToJoin(PeerConfig added, List<PeerConfig> peers, RaftGroupId groupId, long deadlineNanos)
-			throws InterruptedException {
+	private static boolean requireFitToJoin(PeerConfig added, List<PeerConfig> peers, RaftGroupId groupId,
+			long deadlineNanos) throws InterruptedException {
 		var members = peers.stream().filter(peer -> !peer.id().equals(added.id())).toList();
 		while (true) {
 			var answers = members.stream().map(member -> nodeState(member, groupId)).toList();
@@ -719,18 +965,23 @@ public final class ReplicatedServerMain {
 				if (state == null) {
 					fail("node " + added.id() + " at " + added.raftAddress() + " has no group " + groupId.getUuid()
 							+ ": start it with the same --group-id as the cluster");
-					return;
+					return false;
 				}
 				var refusal = state.refusalToJoin(added.id(), clusterId);
 				if (refusal != null) {
-					fail(refusal);
-					return;
+					if (isVoter(added, peers, groupId, deadlineNanos)) {
+						return false;
+					}
+					fail(refusal + ". First, if an earlier add-peer of " + added.id() + " ended without OK, the leader may"
+							+ " still be catching it up: run add-peer again, and wipe only if it fails like this again with "
+							+ added.id() + " not among the leader's voters (printed above). Never wipe a voter");
+					return false;
 				}
 			} catch (CompletionException ex) {
 				if (Status.fromThrowable(ex.getCause()).getCode() != Status.Code.ABORTED) {
 					fail("node " + added.id() + " does not answer at " + added.raftAddress() + ": start it first, with --join and"
 							+ " the same --group-id (" + ex.getCause().getMessage() + ")");
-					return;
+					return false;
 				}
 				waitingFor = "node " + added.id() + ", which is installing a snapshot";
 			}
@@ -738,11 +989,11 @@ public final class ReplicatedServerMain {
 				waitingFor = memberNotReady(known, members.size());
 			}
 			if (waitingFor == null) {
-				return;
+				return true;
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
 				fail("no result within the time limit (--timeout-ms): still waiting for " + waitingFor);
-				return;
+				return false;
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
 		}
@@ -831,7 +1082,7 @@ public final class ReplicatedServerMain {
 				        [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
 				        [--jvm-pause-limit-ms N] [--snapshot-every-bytes N] [--parallel-apply-threads N]
 				        [--allow-without-exit-on-oom]
-				  admin --peer ... [--group-id UUID] [--timeout-ms N]
+				  admin --peer ... [--group-id UUID] [--timeout-ms N] [--unsafe-multi-voter-change]
 				        status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
 				        | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]
@@ -843,7 +1094,7 @@ public final class ReplicatedServerMain {
 	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
 	private static final class Options {
 		private static final List<String> FLAGS = List.of("--pipelined-updates", "--join", "--dry-run",
-				"--allow-without-exit-on-oom", "--allow-skipped");
+				"--allow-without-exit-on-oom", "--allow-skipped", UNSAFE_MULTI_VOTER_CHANGE);
 
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();

@@ -308,12 +308,14 @@ class MembershipTest {
 	}
 
 	/**
-	 * Leaving the lost node out of {@code --peer} replaces it in one step: two of the three members answer before, during
-	 * and after the change, so a failure of the new node cannot stop the cluster.
+	 * A lost node is replaced by remove-peer of the lost node, then add-peer of the new one: two of the three members
+	 * answer before, during and after both changes, so a failure of the new node cannot stop the cluster. The one-step
+	 * replacement (the lost node left out of {@code --peer}, the new one in) changes two voters: {@code admin} refuses
+	 * it, with exit code 1, before it proposes anything (round 14).
 	 */
 	@ParameterizedTest(name = "seeded: {0}, the leader is lost: {1}")
 	@CsvSource({"false,true", "false,false", "true,true", "true,false"})
-	void aLostNodeIsReplacedInOneStep(boolean seeded, boolean leaderLost) throws Exception {
+	void aLostNodeIsReplacedRemoveThenAdd(boolean seeded, boolean leaderLost) throws Exception {
 		var originals = List.of("1", "2", "3");
 		long column;
 		if (seeded) {
@@ -337,6 +339,14 @@ class MembershipTest {
 		cluster.start("4", JOIN);
 		cluster.waitReady("4", READY_TIMEOUT);
 
+		var oneStep = cluster.adminResult(survivors, "add-peer", cluster.peer("4").format());
+		assertEquals(1, oneStep.exitCode(), oneStep.output());
+		assertTrue(oneStep.output().contains(VoterChange.MULTI_VOTER_REFUSAL), oneStep.output());
+		for (var survivor : survivors) {
+			assertFalse(cluster.output(survivor).contains("receive setConfiguration"), survivor);
+		}
+
+		assertOk(cluster.admin(originals, "remove-peer", lost));
 		assertOk(cluster.admin(survivors, "add-peer", cluster.peer("4").format()));
 		assertFalse(cluster.output("4").contains(REPLICA_FAILED), () -> "node 4 failed:\n" + cluster.logTail("4"));
 		var status = cluster.admin(members, "status");
@@ -358,9 +368,8 @@ class MembershipTest {
 
 	/**
 	 * A planned replacement: the node to replace is the leader and it runs. It closes Raft and exits when it is out. In
-	 * two steps, add-peer then remove-peer, one node each: the one-step replacement changes two nodes, which is unsafe
-	 * while the old one still votes (round 13, design: residuals of "Removal and waiting outside"), so a running node
-	 * is replaced this way or stopped first.
+	 * two steps, add-peer then remove-peer, one voter each: {@code admin} refuses a change of two voters at once
+	 * (round 14), which is unsafe while the old one still votes (design: "Replacing a node").
 	 */
 	@Test
 	void aRunningLeaderIsReplacedInTwoSteps() throws Exception {
