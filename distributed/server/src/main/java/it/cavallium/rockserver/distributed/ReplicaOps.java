@@ -584,9 +584,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 				}
 			}
 		} catch (Throwable failure) {
-			// Leaves the data directory as it was given, without a database, so that the same command can run again
-			// (with the newer binary after a version refusal, R18-1; after any other failure too, R19-3: the half-made
-			// db/ used to stay, and the rerun refused the directory as holding a database).
+			// Leaves the data directory without a database, so that the same command can run again (with the newer
+			// binary after a version refusal, R18-1; after any other failure too, R19-3: the half-made db/ used to stay,
+			// and the rerun refused the directory as holding a database). A replica-ops.log already moved aside to
+			// .before-restore-<ts> when the move of backups/ fails stays moved: the rerun needs neither, and moves
+			// backups/ aside itself.
 			try {
 				NodeStore.deleteRecursively(db);
 			} catch (IOException | RuntimeException cleanup) {
