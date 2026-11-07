@@ -702,7 +702,19 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   chunks, as batches are, was not done: a multi write is one call with one result list and no "partly applied"
   answer, and the Java client does not split these either (it has the same 4 MiB fallback); a caller that wants every item numbered uses
   `put_batch`/`merge_batch` or smaller calls; a view whose context already carries a request id (`RequestContext::with_request_id`) is
-  numbered by its caller and sends once; `without_client_sessions()` sends everything once, as before. The unit tests
+  numbered by its caller and sends once; `without_client_sessions()` sends everything once, as before. A caller
+  without a deadline sends each copy and each session opening with no gRPC timeout, so that the server still sees a
+  caller without one, and awaits it under a local `tokio::time::timeout_at` of its window (R19-1). Before, nothing
+  else ended such a copy: a silent node (power loss, SIGSTOP, a partition with the host still up) held the write, and
+  the opening, forever instead of for the window, since the window only decides whether to resend after an answer. A
+  copy that outlasts the window ends `OUTCOME_UNKNOWN`, an opening that does ends not sent (`SERVER_OVERLOADED`,
+  flagged not applied): `a_copy_that_never_answers_ends_a_caller_without_deadline_at_the_window` and
+  `an_opening_that_never_answers_ends_a_caller_without_deadline_unsent_at_the_window` (both hung before). Unlike the
+  Java client, `RockserverClient::connect` uses one address and sets no HTTP/2 keepalive or connect timeout (tonic's
+  defaults are all off): resends go back to the same node, through the server's forwarding, and a dead peer is seen
+  only by a call's deadline or the window. A caller that wants failover or dead-peer detection builds its own tonic
+  `Channel` (`Endpoint::http2_keep_alive_interval`, `keep_alive_timeout`, `connect_timeout`, `Channel::balance_list`
+  over several nodes) and passes it to `RockserverClient::new`. The unit tests
   (`sessions::tests`) drive the resend loop with scripted answers, as `SessionWritesTest` does; the live test
   `tests/live_server.rs` runs every numbered call against a follower of a three-node in-process cluster
   (`RustClientLiveTest`, on when `-Drockserver.rust-client.dir` names a buildable copy of the crate), sends two copies

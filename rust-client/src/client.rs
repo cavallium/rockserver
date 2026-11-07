@@ -127,6 +127,12 @@ where
 impl RockserverClient {
     /// Connect to the RockServer at the specified destination.
     ///
+    /// The channel has one address and tonic's defaults: no HTTP/2 keepalive and no connect timeout. Calls are
+    /// resent to the same node, and a node that stops answering without closing the connection is noticed only by
+    /// a call's deadline (or, for a numbered write without one, its retry window). For failover or dead-peer
+    /// detection, build a `Channel` yourself (`Endpoint::http2_keep_alive_interval`, `keep_alive_timeout`,
+    /// `connect_timeout`, `Channel::balance_list` over several nodes) and pass it to [`RockserverClient::new`].
+    ///
     /// # Arguments
     /// * `dst` - The destination to connect to. Can be a string like `http://[::1]:50051`.
     ///
