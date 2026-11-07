@@ -119,6 +119,22 @@ class AppenderMetricsRaceTest {
 		assertEquals(1, calls.get());
 	}
 
+	/** R9 review: HotSpot's fast-throw NPE (or -XX:-StackTraceInThrowable) has no stack trace, so it is retried. */
+	@Test
+	void aNullPointerExceptionWithoutAStackTraceIsMadeAgain() {
+		var calls = new AtomicInteger();
+		var made = CommitHeartbeats.retryingMissingRegistry("n1", () -> {
+			if (calls.incrementAndGet() < 2) {
+				var npe = new NullPointerException();
+				npe.setStackTrace(new StackTraceElement[0]);
+				throw npe;
+			}
+			return "appender";
+		});
+		assertEquals("appender", made);
+		assertEquals(2, calls.get());
+	}
+
 	@Test
 	void aRaceThatGoesOnFailsAfterTheLastAttempt() {
 		var calls = new AtomicInteger();

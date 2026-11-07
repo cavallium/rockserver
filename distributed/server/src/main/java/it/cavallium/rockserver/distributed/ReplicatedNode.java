@@ -731,8 +731,11 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * <p>A joint configuration that leaves the node out may never have been committed: its leader lost its leadership
 	 * first, and the next leader dropped it, so the node is still a member (R3-G2b-4). So a node whose log ends with
 	 * a joint configuration that holds it in the old half only asks the members of the new half
-	 * ({@link RemovalCheck#keptBy}), and starts if a majority of them hold a committed configuration with it; a leader
-	 * then cuts its log back. Otherwise (removed, undecided, or members out of reach) it is refused as before.</p>
+	 * ({@link RemovalCheck#keptBy}), and starts if a majority of them hold a committed configuration with it. A leader
+	 * usually cuts its log back, but the joint configuration can still be committed: by this node, which may stand for
+	 * election as a member of the old half and win while its log is the most up to date, or by the old leader when it
+	 * restarts. The node then leaves the cluster, and the check that runs while it waits outside stops it. Otherwise
+	 * (removed, undecided, or members out of reach) it is refused as before.</p>
 	 *
 	 * <p>The configuration that removes a node commits with the other members alone, so the removed node's log may
 	 * never receive it: a node that was stopped, slow or cut off during its removal still holds itself in its log. So a

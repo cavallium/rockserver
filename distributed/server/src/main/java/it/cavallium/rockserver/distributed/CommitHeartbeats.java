@@ -227,7 +227,8 @@ final class CommitHeartbeats {
 	 * {@link NullPointerException} at its first counter. Ratis has then already taken the old appender of that follower
 	 * out ({@code LeaderStateImpl.restart} is stop, then add), so the follower would get no appends or heartbeats until
 	 * the leadership changes. The constructor has no other effect before that point, and the next attempt makes a new
-	 * registry. A {@link NullPointerException} from elsewhere is not retried.
+	 * registry. A {@link NullPointerException} from elsewhere is not retried, except one without a stack trace (see
+	 * {@link #fromMetrics}).
 	 */
 	static <T> T retryingMissingRegistry(String follower, Supplier<T> make) {
 		for (int attempt = 1; ; attempt++) {
@@ -242,9 +243,18 @@ final class CommitHeartbeats {
 		}
 	}
 
-	/** Whether {@code ex} was thrown in Ratis' metrics: a metrics class, or a frame of one, on top of its stack. */
+	/**
+	 * Whether {@code ex} was thrown in Ratis' metrics: a metrics class, or a frame of one, on top of its stack. One
+	 * without a stack trace counts too: HotSpot throws a preallocated one with none for an implicit exception at a hot
+	 * compiled site ({@code OmitStackTraceInFastThrow}), and {@code -XX:-StackTraceInThrowable} drops every trace. It
+	 * cannot be told apart, and a retry is bounded: an NPE from elsewhere fails each attempt and is thrown after the last.
+	 */
 	static boolean fromMetrics(NullPointerException ex) {
-		for (var frame : ex.getStackTrace()) {
+		var stack = ex.getStackTrace();
+		if (stack.length == 0) {
+			return true;
+		}
+		for (var frame : stack) {
 			var name = frame.getClassName();
 			if (name.startsWith("org.apache.ratis.") && name.contains(".metrics.")) {
 				return true;
