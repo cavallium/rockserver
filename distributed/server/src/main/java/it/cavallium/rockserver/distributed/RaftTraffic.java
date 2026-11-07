@@ -5,6 +5,7 @@ import java.nio.file.Path;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiPredicate;
+import java.util.function.ToLongBiFunction;
 import java.util.function.ToLongFunction;
 import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc;
@@ -59,15 +60,29 @@ final class RaftTraffic implements ServerInterceptor {
 	 * index it learns, a snapshot install from its first chunk). Static, for in-process clusters.
 	 */
 	static volatile @Nullable BiPredicate<String, Object> dropForTesting;
+	/**
+	 * Tests only: the current term that node {@code receiver} sees for a snapshot chunk, instead of its division's;
+	 * {@link #NO_TERM}: its division's. Static, for in-process clusters.
+	 */
+	static volatile @Nullable ToLongBiFunction<String, RaftProtos.InstallSnapshotRequestProto> termForTesting;
+	/**
+	 * Tests only: the record of a snapshot chunk's configuration at node {@code receiver} fails when it returns true, as
+	 * a write error would. Static, for in-process clusters.
+	 */
+	static volatile @Nullable BiPredicate<String, RaftProtos.InstallSnapshotRequestProto> recordFailureForTesting;
 
 	/** What the current-term function answers when it does not know the term. */
 	static final long NO_TERM = -1;
+	/** What the committed-configuration function answers when it knows no committed configuration. */
+	static final long NO_INDEX = -1;
 
 	private final String nodeId;
 	/** Where {@link InstalledConfiguration} is kept: the Raft directory; null: not recorded (tests). */
 	private final @Nullable Path raftDir;
 	/** See the constructor. */
 	private final ToLongFunction<RaftGroupId> currentTerm;
+	/** See the constructor. */
+	private final ToLongFunction<RaftGroupId> committedConfiguration;
 	private final NodeMetrics.@Nullable Series recordFailures;
 	/** {@link System#nanoTime} of the last leader request, 0 if none yet. */
 	private final AtomicLong lastLeaderRequestNanos = new AtomicLong();
@@ -87,9 +102,22 @@ final class RaftTraffic implements ServerInterceptor {
 	 */
 	RaftTraffic(String nodeId, @Nullable Path raftDir, ToLongFunction<RaftGroupId> currentTerm,
 			NodeMetrics.@Nullable Series recordFailures) {
+		this(nodeId, raftDir, currentTerm, _ -> NO_INDEX, recordFailures);
+	}
+
+	/**
+	 * @param currentTerm the current term of this node's division of a group, {@link #NO_TERM} if unknown (no such
+	 *     division, or the server is not built yet)
+	 * @param committedConfiguration the index of the newest committed configuration of this node's division of a group,
+	 *     {@link #NO_INDEX} if unknown
+	 * @param recordFailures counts the chunks whose configuration could not be recorded (null: not counted)
+	 */
+	RaftTraffic(String nodeId, @Nullable Path raftDir, ToLongFunction<RaftGroupId> currentTerm,
+			ToLongFunction<RaftGroupId> committedConfiguration, NodeMetrics.@Nullable Series recordFailures) {
 		this.nodeId = nodeId;
 		this.raftDir = raftDir;
 		this.currentTerm = currentTerm;
+		this.committedConfiguration = committedConfiguration;
 		this.recordFailures = recordFailures;
 	}
 
@@ -129,6 +157,11 @@ final class RaftTraffic implements ServerInterceptor {
 				long term = NO_TERM;
 				if (serialized != null && message instanceof RaftProtos.InstallSnapshotRequestProto request) {
 					term = termOf(request);
+					var termHook = termForTesting;
+					if (termHook != null) {
+						long tested = termHook.applyAsLong(nodeId, request);
+						term = tested != NO_TERM ? tested : term;
+					}
 					if (term != NO_TERM && request.getLeaderTerm() < term) {
 						// A deposed leader's chunk (R15 review, N-R15-1): Ratis would answer NOT_LEADER too, but still
 						// drop its configurations from the chunk's index on and take the chunk's. Terms only grow, so
@@ -154,6 +187,10 @@ final class RaftTraffic implements ServerInterceptor {
 			private boolean recordOrFail(RaftProtos.InstallSnapshotRequestProto request, long term) {
 				{
 					try {
+						var failHook = recordFailureForTesting;
+						if (failHook != null && failHook.test(nodeId, request)) {
+							throw new IOException("recordFailureForTesting");
+						}
 						InstalledConfiguration.record(Objects.requireNonNull(raftDir),
 								term == NO_TERM ? Long.MAX_VALUE : term, request);
 					} catch (IOException | RuntimeException ex) {
@@ -166,14 +203,18 @@ final class RaftTraffic implements ServerInterceptor {
 						if (recordFailures != null) {
 							recordFailures.record(1);
 						}
-						failed = true;
-						Objects.requireNonNull(serialized).close(Status.UNAVAILABLE.withDescription(
-								"cannot record the configuration of a snapshot chunk in " + file).withCause(ex),
-								new Metadata());
+						fail(Status.UNAVAILABLE.withDescription("cannot record the configuration of a snapshot chunk in "
+								+ file).withCause(ex));
 						return false;
 					}
 				}
 				return true;
+			}
+
+			/** Fails the install stream: no later message of it reaches Ratis, and its end reaches Ratis as a cancel. */
+			private void fail(Status status) {
+				failed = true;
+				Objects.requireNonNull(serialized).close(status, new Metadata());
 			}
 
 			@Override

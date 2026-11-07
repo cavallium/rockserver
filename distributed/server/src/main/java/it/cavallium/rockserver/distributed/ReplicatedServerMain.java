@@ -22,7 +22,9 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
+import org.apache.ratis.protocol.GroupInfoReply;
 import org.apache.ratis.protocol.exceptions.ReconfigurationInProgressException;
 import org.apache.ratis.protocol.exceptions.SetConfigurationException;
 import org.apache.ratis.retry.RetryPolicies;
@@ -653,8 +655,8 @@ public final class ReplicatedServerMain {
 		return results;
 	}
 
-	/** The leader's settled configuration, as {@code admin} read it. */
-	record Membership(String leader, List<RaftPeer> servers, List<RaftPeer> listeners) {}
+	/** The leader's settled configuration, as {@code admin} read it, with the term the leader reported. */
+	record Membership(String leader, long term, List<RaftPeer> servers, List<RaftPeer> listeners) {}
 
 	/**
 	 * Proposes the configuration with voters {@code target} (and the listeners of the leader's configuration) as a
@@ -797,32 +799,28 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
-	 * Asks the members of {@code --peer} until one answers as the leader with a settled (not joint) configuration: a
-	 * joint one means a change is under way, which it waits for. Fails at the deadline.
+	 * Asks the members of {@code --peer} until their answers settle on a leader with a settled (not joint)
+	 * configuration ({@link #settle}): a joint one means a change is under way, which it waits for. Fails at the deadline.
 	 */
 	private static Membership leaderConfiguration(RaftClient infoClient, List<PeerConfig> peers, RaftGroupId groupId,
 			long deadlineNanos) throws InterruptedException {
 		String waitingFor = "an answer of a member";
 		while (true) {
+			var answers = new ArrayList<MemberAnswer>();
 			for (PeerConfig peer : peers) {
 				try {
-					var info = infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId);
-					var conf = info.getConf().orElse(null);
-					if (info.getRoleInfoProto().getRole() != RaftPeerRole.LEADER || conf == null) {
-						waitingFor = "a leader (" + peer.id() + " is " + info.getRoleInfoProto().getRole() + ")";
-						continue;
-					}
-					if (conf.getOldPeersCount() > 0 || conf.getOldListenersCount() > 0) {
-						waitingFor = "the change under way on leader " + peer.id() + " (voters "
-								+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getOldPeersList())) + " to "
-								+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getPeersList())) + ")";
-						continue;
-					}
-					return new Membership(peer.id(), ProtoUtils.toRaftPeers(conf.getPeersList()),
-							ProtoUtils.toRaftPeers(conf.getListenersList()));
+					answers.add(MemberAnswer.of(peer.id(),
+							infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId)));
 				} catch (IOException | RuntimeException unanswered) {
 					// Down, or not in the group: the others are asked.
 				}
+			}
+			if (!answers.isEmpty()) {
+				var settled = settle(answers);
+				if (settled.membership() != null) {
+					return settled.membership();
+				}
+				waitingFor = settled.waitingFor();
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
 				fail("no result within the time limit (--timeout-ms): still waiting for " + waitingFor
@@ -830,6 +828,45 @@ public final class ReplicatedServerMain {
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
 		}
+	}
+
+	/**
+	 * One member's answer to {@link #leaderConfiguration}: its role, its term if it leads ({@code leaderTerm}, else 0),
+	 * the term of the last entry of its log (0 if none), and its configuration (null if it sent none).
+	 */
+	record MemberAnswer(String id, RaftPeerRole role, long leaderTerm, long lastEntryTerm,
+			RaftProtos.@Nullable RaftConfigurationProto conf) {
+		static MemberAnswer of(String id, GroupInfoReply info) {
+			var role = info.getRoleInfoProto();
+			var log = info.getLogInfoProto();
+			return new MemberAnswer(id, role.getRole(),
+					role.getRole() == RaftPeerRole.LEADER && role.hasLeaderInfo() ? role.getLeaderInfo().getTerm() : 0,
+					log != null && log.hasLastEntry() ? log.getLastEntry().getTerm() : 0, info.getConf().orElse(null));
+		}
+	}
+
+	/** What the answers of one round settle on: the leader's configuration, or (null) what is still waited for. */
+	record Settled(@Nullable Membership membership, String waitingFor) {}
+
+	/** The leader's configuration that {@code answers} (in {@code --peer} order) settle on. */
+	static Settled settle(List<MemberAnswer> answers) {
+		String waitingFor = "an answer of a member";
+		for (var answer : answers) {
+			var conf = answer.conf();
+			if (answer.role() != RaftPeerRole.LEADER || conf == null) {
+				waitingFor = "a leader (" + answer.id() + " is " + answer.role() + ")";
+				continue;
+			}
+			if (conf.getOldPeersCount() > 0 || conf.getOldListenersCount() > 0) {
+				waitingFor = "the change under way on leader " + answer.id() + " (voters "
+						+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getOldPeersList())) + " to "
+						+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getPeersList())) + ")";
+				continue;
+			}
+			return new Settled(new Membership(answer.id(), answer.leaderTerm(),
+					ProtoUtils.toRaftPeers(conf.getPeersList()), ProtoUtils.toRaftPeers(conf.getListenersList())), "");
+		}
+		return new Settled(null, waitingFor);
 	}
 
 	/**
