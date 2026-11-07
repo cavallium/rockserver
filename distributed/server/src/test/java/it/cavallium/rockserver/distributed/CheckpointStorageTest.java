@@ -383,9 +383,7 @@ class CheckpointStorageTest {
 		var clock = new AtomicLong();
 		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT, clock);
 		writePartialInstall(follower.getTmpDir().toPath(), "snapshot-installing");
-		var lockField = CheckpointStorage.class.getDeclaredField("installsLock");
-		lockField.setAccessible(true);
-		Object installsLock = lockField.get(follower);
+		Object installsLock = follower.installsLock();
 		var held = new java.util.concurrent.CountDownLatch(1);
 		var release = new java.util.concurrent.CountDownLatch(1);
 		Thread holder = Thread.ofPlatform().start(() -> {

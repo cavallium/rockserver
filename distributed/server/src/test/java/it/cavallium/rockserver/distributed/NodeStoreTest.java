@@ -98,7 +98,8 @@ class NodeStoreTest {
 	/**
 	 * R24-2: the state machine asks for the cluster id under its monitor, which {@code preAppendTransaction} waits for
 	 * under Ratis' append lock, and on every proposal: the id is kept in memory (read when the database opens, set by
-	 * genesis), never read from the database. Answering after close shows that no read reaches the database.
+	 * genesis), never read from the database. A value put in the database behind the store's back is not seen until
+	 * the store opens again.
 	 */
 	@Test
 	void clusterIdIsAnsweredFromMemory() throws IOException {
@@ -106,12 +107,35 @@ class NodeStoreTest {
 		try (var store = NodeStore.open(dbDir, null, "first")) {
 			setClusterId(store, "cluster-a");
 		}
+		try (var store = NodeStore.open(dbDir, null, "second")) {
+			assertEquals("cluster-a", store.clusterId());
+			store.db().put(0, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_ID),
+					Buf.wrap("cluster-b".getBytes(StandardCharsets.UTF_8)), RequestType.none());
+			assertEquals("cluster-a", store.clusterId());
+		}
+		try (var store = NodeStore.open(dbDir, null, "third")) {
+			assertEquals("cluster-b", store.clusterId());
+		}
+	}
+
+	/**
+	 * R24-2 review: a closed store still refuses to answer, as it did when the id was read from the database. A node
+	 * installing a snapshot has closed its old store; {@code ReplicatedConnection.getCapabilities} counts on the
+	 * refusal to advertise no client sessions then, and {@code initializeCluster} to wait instead of reading null.
+	 */
+	@Test
+	void clusterIdRefusesAClosedStore() throws IOException {
+		Path dbDir = tempDir.resolve("db");
+		try (var store = NodeStore.open(dbDir, null, "first")) {
+			setClusterId(store, "cluster-a");
+		}
 		var store = NodeStore.open(dbDir, null, "second");
 		store.close();
-		assertEquals("cluster-a", store.clusterId());
+		var refused = assertThrows(IllegalStateException.class, store::clusterId);
+		assertEquals("Closed", refused.getMessage());
 		var fresh = NodeStore.open(tempDir.resolve("fresh"), null, "fresh");
 		fresh.close();
-		assertNull(fresh.clusterId());
+		assertThrows(IllegalStateException.class, fresh::clusterId);
 	}
 
 	/**

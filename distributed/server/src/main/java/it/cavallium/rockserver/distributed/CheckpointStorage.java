@@ -295,6 +295,11 @@ final class CheckpointStorage implements StateMachineStorage {
 		}
 	}
 
+	/** Tests only: the lock that {@link #discardFailedInstalls} holds while it lists, walks and renames. */
+	Object installsLock() {
+		return installsLock;
+	}
+
 	/**
 	 * Deletes the directories of the installations a newer one replaced: every installation directory except the
 	 * ones that appeared since the previous check that found a new one. A directory that comes back after being

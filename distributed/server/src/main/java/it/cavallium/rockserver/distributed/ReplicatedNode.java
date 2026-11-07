@@ -656,12 +656,19 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * snapshot under the server monitor.
 	 */
 	private void discardFailedInstalls() {
-		try {
+		runInstallCleanup(config.nodeId(), () -> {
 			if (!closed.get()) {
 				stateMachine.discardFailedInstalls();
 			}
+		});
+	}
+
+	/** One run of the install cleanup task: {@code discard} logged when it fails, so that the next runs still happen. */
+	static void runInstallCleanup(String nodeId, Runnable discard) {
+		try {
+			discard.run();
 		} catch (RuntimeException ex) {
-			LOG.warn("{}: failed to discard abandoned snapshot installations, retrying", config.nodeId(), ex);
+			LOG.warn("{}: failed to discard abandoned snapshot installations, retrying", nodeId, ex);
 		}
 	}
 
