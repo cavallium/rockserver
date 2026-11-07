@@ -24,7 +24,7 @@ import org.slf4j.LoggerFactory;
  * every node must run the same config file. A difference is logged on both nodes, once per term, and stops nothing: a
  * rolling change of the config passes through it, and some settings (such as cache sizes) may differ on purpose.</p>
  *
- * <p>Runs on the maintenance thread of the node.</p>
+ * <p>Runs on the initialization thread of the node.</p>
  */
 final class ClusterCheck {
 

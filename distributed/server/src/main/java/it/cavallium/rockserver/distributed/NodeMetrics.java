@@ -86,6 +86,11 @@ final class NodeMetrics {
 	private final Map<String, Series> durations = new ConcurrentHashMap<>();
 	private final Map<String, Series> amounts = new ConcurrentHashMap<>();
 	private final ScheduledExecutorService logger;
+	/**
+	 * Runs the samplers of {@link #sampleEveryMillisecond}: the node's reads Ratis' log under its read lock, which a hung
+	 * disk can keep away for good, and the log line must go on (R25-W). Created by the first sampler.
+	 */
+	private volatile @Nullable ScheduledExecutorService samplerThread;
 	/** Guards {@link #registry}. */
 	private final Object exportLock = new Object();
 	private @Nullable MeterRegistry registry;
@@ -100,25 +105,42 @@ final class NodeMetrics {
 		this.nodeTag = nodeId;
 		this.logger = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon()
 				.name("rockserver-metrics-" + nodeId).factory());
-		logger.scheduleAtFixedRate(this::log, INTERVAL_SECONDS, INTERVAL_SECONDS, TimeUnit.SECONDS);
+		logger.scheduleAtFixedRate(() -> {
+			try {
+				log();
+			} catch (Throwable error) {
+				// scheduleAtFixedRate cancels every later run of a task that throws, silently.
+				ReplicatedNode.taskError(nodeId, "the metrics log line", error);
+			}
+		}, INTERVAL_SECONDS, INTERVAL_SECONDS, TimeUnit.SECONDS);
 	}
 
 	/**
 	 * Runs {@code sampler} periodically until {@link #close()}, to record gauges into series: every
 	 * {@value #DEFAULT_LAG_SAMPLE_MS} ms, or every {@link #LAG_SAMPLE_PROPERTY} ms; 0 turns it off. It used to run every
 	 * millisecond on every node, always: the alerts read the gauges of {@link NodeMonitor} instead, so the samples only
-	 * add the average and maximum lags to the log line.
+	 * add the average and maximum lags to the log line. Samplers run on a thread of their own, not the logger's: a
+	 * sampler that waits for good (for Ratis' log lock on a hung disk) stops the samples, not the log line.
 	 */
-	void sampleEveryMillisecond(Runnable sampler) {
+	synchronized void sampleEveryMillisecond(Runnable sampler) {
 		long periodMs = lagSamplePeriodMs();
-		if (periodMs <= 0) {
+		if (periodMs <= 0 || logger.isShutdown()) {
 			return;
 		}
-		logger.scheduleAtFixedRate(() -> {
+		var thread = samplerThread;
+		if (thread == null) {
+			thread = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon()
+					.name("rockserver-metrics-sampler-" + nodeId).factory());
+			samplerThread = thread;
+		}
+		thread.scheduleAtFixedRate(() -> {
 			try {
 				sampler.run();
 			} catch (RuntimeException ignored) {
 				// Not ready yet, or stopping.
+			} catch (Throwable error) {
+				// scheduleAtFixedRate cancels every later run of a task that throws, silently.
+				ReplicatedNode.taskError(nodeId, "the lag sampler", error);
 			}
 		}, periodMs, periodMs, TimeUnit.MILLISECONDS);
 	}
@@ -303,7 +325,11 @@ final class NodeMetrics {
 		}
 	}
 
-	void close() {
+	synchronized void close() {
 		logger.shutdownNow();
+		var thread = samplerThread;
+		if (thread != null) {
+			thread.shutdownNow();
+		}
 	}
 }

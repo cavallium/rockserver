@@ -55,6 +55,7 @@ class CommitOutcomesTest {
 	private static void assertUnknown(CompletableFuture<?> answer) {
 		var cause = assertInstanceOf(RocksDBException.class, failure(answer));
 		assertFalse(cause instanceof RocksDBRetryException, "must not answer \"not applied\"");
+		assertFalse(cause.isNotApplied(), "must not be flagged \"not applied\"");
 		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, cause.getErrorUniqueId(), cause.getMessage());
 	}
 
@@ -113,5 +114,21 @@ class CommitOutcomesTest {
 		outcomes.markUnsettled(numbered(12), new LeaderSession(6, applied));
 		assertEquals(1, outcomes.unsettledCommitsForTesting(), "only the new term's mark");
 		assertInstanceOf(RocksDBRetryException.class, failure(outcomes.settledCommit(new ClientRequestId(7, 10, 0))));
+	}
+
+	/**
+	 * R25-O: an earlier copy's outcome was lost in term 5 (its mark stays), and the barrier of the copy asking now fails
+	 * because this node lost leadership: the earlier copy may be in the next leader's log and commit there. "Not
+	 * applied" ({@code UPDATE_RETRY}) would make the client run the transaction a second time.
+	 */
+	@Test
+	void aCopyWhoseBarrierLosesLeadershipIsNeverToldNotApplied() {
+		var lost = outcomes.markUnsettled(numbered(20), new LeaderSession(5, applied));
+		outcomes.settle(lost, RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN, "no answer"));
+		barrier.set(CompletableFuture.failedFuture(new ReadBarrier.NotLeaderException("deposed")));
+		term.set(6);
+		assertUnknown(outcomes.settledCommit(new ClientRequestId(7, 20, 0)));
+		// Without any mark too: a copy of an earlier term may still be in the log of the node that leads next.
+		assertUnknown(outcomes.settledCommit(new ClientRequestId(7, 21, 0)));
 	}
 }

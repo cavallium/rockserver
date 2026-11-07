@@ -476,3 +476,28 @@ groups:
           - refId: C
             datasourceUid: __expr__
             model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: within_range, params: [0.5, 1.5]}}]}
+      - uid: rockserver-monitor-stale
+        title: A node's gauges are stale
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: rockserver}
+        annotations:
+          summary: "The node monitor has not refreshed for more than a minute (monitor.refresh_age_seconds): its thread waits for a hung disk, and every other gauge of the node keeps its last value, however healthy. Check its disk; its API is likely paused too. See \"Routing\" in design.md (a hung disk pauses the API)."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: A
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_monitor_refresh_age_seconds" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [60]}}]}

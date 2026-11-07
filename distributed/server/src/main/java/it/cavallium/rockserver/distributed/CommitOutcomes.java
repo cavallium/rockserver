@@ -20,7 +20,6 @@ import java.util.function.Supplier;
 import org.jetbrains.annotations.Nullable;
 
 import static it.cavallium.rockserver.distributed.ReplicatedConnection.unwrap;
-import static it.cavallium.rockserver.distributed.LocalCommands.barrierFailure;
 
 /**
  * The outcome of the commits of client session writes on this leader: which are unsettled in the current term
@@ -53,6 +52,8 @@ final class CommitOutcomes {
 	private final AtomicLong markedTerm = new AtomicLong();
 
 	private final Supplier<CompletableFuture<Void>> leadership;
+	/** Tests only: replaces {@link #leadership} when set, see {@link #leadershipForTesting}. */
+	private volatile @Nullable Supplier<CompletableFuture<Void>> leadershipForTesting;
 	private final LongSupplier currentTerm;
 	private final Function<ClientRequestId, ApplyResult> recorded;
 	private final LongPredicate sessionExists;
@@ -98,7 +99,13 @@ final class CommitOutcomes {
 	}
 
 	private CompletableFuture<Void> leadership() {
-		return leadership.get();
+		var replaced = leadershipForTesting;
+		return replaced != null ? replaced.get() : leadership.get();
+	}
+
+	/** Tests only: the leadership barrier that {@link #settledCommit} waits for from now on; null for the real one. */
+	void leadershipForTesting(@Nullable Supplier<CompletableFuture<Void>> barrier) {
+		this.leadershipForTesting = barrier;
 	}
 
 	private long currentTerm() {
@@ -190,43 +197,68 @@ final class CommitOutcomes {
 	 * answer. Without a record, and with no copy unsettled in this term, the commit was never applied: the client
 	 * runs the transaction again ({@code UPDATE_RETRY}), as without sessions. A session that is gone, or expired at the
 	 * replicated clock, which the applier treats as gone, has no records any more: {@code SESSION_EXPIRED}.
+	 *
+	 * <p>Anything that keeps this node from proving that (round 25, R25-O) answers {@code OUTCOME_UNKNOWN}, never a
+	 * "not applied" answer: a barrier that fails (this node lost leadership, is stopping, could not confirm it in time
+	 * or lags in applying), and a store that fails while it is read. An earlier copy may be in this node's log,
+	 * replicated, and commit under the next leader: {@code UPDATE_RETRY} would make the client run the transaction a
+	 * second time. Told "unknown", the client sends the write again until its deadline; a deposed node forwards the
+	 * copy to the next leader, whose barrier settles it.</p>
 	 */
 	CompletableFuture<?> settledCommit(ClientRequestId id) {
 		long term = currentTerm();
 		var write = new SessionWrite(id.sessionId(), id.sequence());
 		return leadership().handle((_, error) -> {
 			if (error != null) {
-				throw new CompletionException(barrierFailure(error));
+				throw new CompletionException(unsettled("leadership not confirmed", error));
 			}
-			// The mark first: a commit removes it only after its record is in the database, so no mark and then no record
-			// proves that no copy applied in this term.
-			Long unsettledTerm = unsettledCommits.get(write);
-			var recorded = this.recorded.apply(id);
-			if (recorded != null && unsettledTerm != null) {
-				unsettledCommits.remove(write, unsettledTerm);
+			try {
+				return settledAfterBarrier(id, term, write);
+			} catch (CompletionException answer) {
+				throw answer;
+			} catch (RuntimeException storeFailed) {
+				throw new CompletionException(unsettled("its records could not be read", storeFailed));
 			}
-			if (recorded != null) {
-				return switch (recorded) {
-					case ApplyResult.Ok ok -> ok.value();
-					case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.UPDATE_RETRY ->
-							throw new CompletionException(new RocksDBRetryException());
-					case ApplyResult.Failed failed -> throw new CompletionException(failed.toException());
-					case ApplyResult.ResendAlone _ -> throw new CompletionException(
-							RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Invalid record"));
-				};
-			}
-			// A mark of this term, or of a later one (this node lost and won leadership again while the barrier ran, and
-			// a copy was marked in the new term): its entry may still be applied. Earlier terms' entries are all applied.
-			if (unsettledTerm != null && unsettledTerm >= term) {
-				throw new CompletionException(earlierCopyInFlight());
-			}
-			if (!sessionExists.test(id.sessionId())) {
-				// This copy is refused before it runs: flagged not applied. An earlier copy may have applied, which only
-				// the client knows (it sent it): it ends the write unknown then.
-				var gone = (ApplyResult.Failed) Applier.SESSION_GONE;
-				throw new CompletionException(RocksDBException.notApplied(gone.type(), gone.message()));
-			}
-			throw new CompletionException(new RocksDBRetryException());
 		});
+	}
+
+	/** The "unknown" answer of a copy that this node could not settle, see {@link #settledCommit}. */
+	private static RocksDBException unsettled(String reason, Throwable error) {
+		var cause = unwrap(error);
+		return RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN, "Could not settle this copy of the commit: "
+				+ reason + " (" + cause + "); an earlier copy may still apply");
+	}
+
+	/** {@link #settledCommit} once the barrier passed. */
+	private @Nullable Object settledAfterBarrier(ClientRequestId id, long term, SessionWrite write) {
+		// The mark first: a commit removes it only after its record is in the database, so no mark and then no record
+		// proves that no copy applied in this term.
+		Long unsettledTerm = unsettledCommits.get(write);
+		var recorded = this.recorded.apply(id);
+		if (recorded != null && unsettledTerm != null) {
+			unsettledCommits.remove(write, unsettledTerm);
+		}
+		if (recorded != null) {
+			return switch (recorded) {
+				case ApplyResult.Ok ok -> ok.value();
+				case ApplyResult.Failed failed when failed.type() == RocksDBErrorType.UPDATE_RETRY ->
+						throw new CompletionException(new RocksDBRetryException());
+				case ApplyResult.Failed failed -> throw new CompletionException(failed.toException());
+				case ApplyResult.ResendAlone _ -> throw new CompletionException(
+						RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Invalid record"));
+			};
+		}
+		// A mark of this term, or of a later one (this node lost and won leadership again while the barrier ran, and
+		// a copy was marked in the new term): its entry may still be applied. Earlier terms' entries are all applied.
+		if (unsettledTerm != null && unsettledTerm >= term) {
+			throw new CompletionException(earlierCopyInFlight());
+		}
+		if (!sessionExists.test(id.sessionId())) {
+			// This copy is refused before it runs: flagged not applied. An earlier copy may have applied, which only
+			// the client knows (it sent it): it ends the write unknown then.
+			var gone = (ApplyResult.Failed) Applier.SESSION_GONE;
+			throw new CompletionException(RocksDBException.notApplied(gone.type(), gone.message()));
+		}
+		throw new CompletionException(new RocksDBRetryException());
 	}
 }

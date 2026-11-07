@@ -61,6 +61,37 @@ class DiskProbeTest {
 		}
 	}
 
+	/**
+	 * R25 review: a probe that throws an Error once (out of memory) does not end the probe thread; before, the thread
+	 * died, the probe looked idle for good and a disk that hung later never paused the API.
+	 */
+	@Test
+	void anErrorInOneProbeDoesNotStopTheNextOnes() throws Exception {
+		var disk = new CountDownLatch(1);
+		var probes = new AtomicInteger();
+		try (var probe = new DiskProbe("test", () -> {
+			int n = probes.incrementAndGet();
+			if (n == 1) {
+				throw new OutOfMemoryError("test: direct buffer memory");
+			}
+			if (n == 3) {
+				try {
+					disk.await();
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+			}
+		}, Duration.ofMillis(10), System::nanoTime).start()) {
+			long limit = Duration.ofMillis(200).toNanos();
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+			while (!probe.hung(System.nanoTime(), limit) && System.nanoTime() - deadline < 0) {
+				Thread.sleep(20);
+			}
+			assertTrue(probe.hung(System.nanoTime(), limit), "the probe stopped after an Error (probes: " + probes.get() + ")");
+			disk.countDown();
+		}
+	}
+
 	@Test
 	void theProbeOfADirectoryWritesAndSyncsAFileThere() throws Exception {
 		try (var probe = DiskProbe.forDirectory("test", temp).start()) {

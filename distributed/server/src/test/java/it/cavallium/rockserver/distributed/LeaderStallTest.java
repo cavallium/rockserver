@@ -171,6 +171,39 @@ class LeaderStallTest {
 		assertTrue(stall.shouldStepDown(true, TERM + 1, COMMIT, now));
 	}
 
+	/**
+	 * R25 review: a decision that the caller cannot act on (the previous step-down is still being started on its own
+	 * thread) is not taken: it neither doubles the next bound nor starts the bound again, and the next check that can act
+	 * steps down at once.
+	 */
+	@Test
+	void aStepDownThatCannotStartIsNotTaken() {
+		assertFalse(run(true, COMMIT, STALL - TICK));
+		for (int i = 0; i < 10; i++) {
+			now += TICK;
+			assertFalse(stall.shouldStepDown(true, TERM, COMMIT, now, false), "decided while a step-down is starting");
+		}
+		now += TICK;
+		assertTrue(stall.shouldStepDown(true, TERM, COMMIT, now, true), "the bound started again");
+		// One step-down taken: the next bound is twice the first, not four times.
+		assertFalse(run(true, COMMIT, 2 * STALL - TICK));
+		assertTrue(run(true, COMMIT, TICK), "the dropped decision doubled the bound");
+	}
+
+	/** The same for the rule of the log. */
+	@Test
+	void aLogStepDownThatCannotStartIsNotTaken() {
+		assertFalse(runLog(true, COMMIT, COMMIT + 1, LOG_STALL - TICK));
+		for (int i = 0; i < 10; i++) {
+			now += TICK;
+			assertFalse(stall.logStopped(true, COMMIT, COMMIT + 1, now, false), "decided while a step-down is starting");
+		}
+		now += TICK;
+		assertTrue(stall.logStopped(true, COMMIT, COMMIT + 1, now, true), "the bound started again");
+		assertFalse(runLog(true, COMMIT, COMMIT + 1, 2 * LOG_STALL - TICK));
+		assertTrue(runLog(true, COMMIT, COMMIT + 1, TICK), "the dropped decision doubled the bound");
+	}
+
 	private static final long LOG_STALL = ELECTION_TIMEOUT_MAX.multipliedBy(LeaderStall.ELECTION_TIMEOUTS_TO_LOG_STALL).toNanos();
 
 	/** Observes this every tick for this long, and returns the last answer. */
