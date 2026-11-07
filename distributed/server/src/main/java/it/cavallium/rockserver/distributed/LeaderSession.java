@@ -798,14 +798,55 @@ final class LeaderSession {
 
 	/** Leadership ended: roll back every open transaction. Their ids become unknown, so clients retry them. */
 	void close(EmbeddedDB db) {
-		close(id -> db.closeFailedUpdate(id), id -> db.closeTransaction(id, false));
+		seal();
+		drain(db);
 	}
 
 	/** {@link #close(EmbeddedDB)}, with what rolls back a native update and a native transaction. */
 	void close(LongConsumer rollBackUpdate, LongConsumer rollBackTransaction) {
+		seal();
+		drain(rollBackUpdate, rollBackTransaction);
+	}
+
+	/**
+	 * The first half of {@link #close}: from here on no transaction registers and no update queues for a key. Cheap,
+	 * no native work: Ratis calls it holding its server's monitor (see {@code RockserverStateMachine.retire}).
+	 */
+	void seal() {
 		synchronized (this) {
 			closed = true;
 		}
+	}
+
+	/** The second half of {@link #close}, after {@link #seal()}, on any thread: see {@link #drain(LongConsumer, LongConsumer)}. */
+	void drain(EmbeddedDB db) {
+		drain(id -> db.closeFailedUpdate(id), id -> db.closeTransaction(id, false));
+	}
+
+	/**
+	 * Answers the updates waiting for a key with {@link RocksDBRetryException} and the unsettled links with false, then
+	 * rolls back every open transaction. The waiters go first: a rollback takes the native transaction's monitor, which
+	 * a read or write in that transaction holds for a whole native call, as long as a stalled disk makes it last.
+	 */
+	void drain(LongConsumer rollBackUpdate, LongConsumer rollBackTransaction) {
+		if (!closed) {
+			throw new IllegalStateException("drain() before seal()");
+		}
+		List<CompletableFuture<KeyLock>> waiters = new ArrayList<>();
+		List<ChainLink> links;
+		synchronized (chainLock) {
+			keys.values().forEach(state -> waiters.addAll(state.waiters));
+			keys.clear();
+			heldKeys = 0;
+			links = List.copyOf(unsettled);
+			unsettled.clear();
+			links.forEach(link -> link.finished = true);
+		}
+		for (var waiter : waiters) {
+			waiter.completeExceptionally(new RocksDBRetryException());
+		}
+		// A commit may still apply, but nobody here will hear of it.
+		links.forEach(link -> link.settled.complete(false));
 		for (OpenTransaction transaction : transactions.values()) {
 			if (transaction.chained()) {
 				continue;
@@ -824,20 +865,5 @@ final class LeaderSession {
 		synchronized (this) {
 			snapshots.clear();
 		}
-		List<CompletableFuture<KeyLock>> waiters = new ArrayList<>();
-		List<ChainLink> links;
-		synchronized (chainLock) {
-			keys.values().forEach(state -> waiters.addAll(state.waiters));
-			keys.clear();
-			heldKeys = 0;
-			links = List.copyOf(unsettled);
-			unsettled.clear();
-			links.forEach(link -> link.finished = true);
-		}
-		for (var waiter : waiters) {
-			waiter.completeExceptionally(new RocksDBRetryException());
-		}
-		// A commit may still apply, but nobody here will hear of it.
-		links.forEach(link -> link.settled.complete(false));
 	}
 }
