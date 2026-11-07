@@ -305,6 +305,24 @@ class RemovalRuleTest {
 	}
 
 	/**
+	 * Round-13 review, finding 3: version-1 answers alone report K* committed, but members of this version of K*'s new
+	 * half answered without it yet (lagging): asking them again may confirm K*, so the verdict is NO_MAJORITY (asked
+	 * again within the check), not NEEDS_TERM (final, with the advice to upgrade).
+	 */
+	@Test
+	void laggingMembersOfThisVersionThatCanMakeAMajorityAreAskedAgain() {
+		var own = stable(1, 5, X, "a", "b", "c");
+		var removal = RemovalCheck.fromVersion1(new RemovalCheck.PeerConfiguration(9, true, List.of("a", "b", "c")));
+		var lagging = decide(seeded(own, own, log(1, -1, 5)), "a", report(own, own), "b", report(own, own), "c",
+				Answer.of(removal));
+		assertEquals(Reason.NO_MAJORITY, lagging.reason(), lagging.toString());
+		// One lagging member of this version cannot make a majority of three without the version-1 answers.
+		var one = decide(seeded(own, own, log(1, -1, 5)), "a", report(own, own), "b", Answer.of(removal), "c",
+				Answer.of(removal));
+		assertEquals(Reason.NEEDS_TERM, one.reason(), one.toString());
+	}
+
+	/**
 	 * R12-1: two old members in the finding-1 state report a stale configuration without X as committed, at an index
 	 * above the real K*. It hides K* (NEEDS_TERM), and never removes X.
 	 */
