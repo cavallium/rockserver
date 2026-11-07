@@ -5,6 +5,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -65,15 +66,34 @@ final class InProcessCluster implements AutoCloseable {
 	 * plus itself; the existing nodes' configurations do not change. It waits for an add-peer: see {@link #raftPeers}.
 	 */
 	ReplicatedNode join(String id) throws IOException {
+		addJoining(id);
+		return start(id);
+	}
+
+	/**
+	 * The configuration of {@link #join}, without the start. R9-9: the peers are every configured node (each one's own
+	 * entry, so a node that joined before is in it too), and the ports are none of theirs: a stopped node does not hold
+	 * its ports, but takes them again when it restarts.
+	 */
+	NodeConfig addJoining(String id) throws IOException {
 		if (configs.containsKey(id)) {
 			throw new IllegalStateException(id + " exists");
 		}
-		// The running nodes hold their ports, so these are others.
-		var ports = ProcessCluster.freePorts(2, List.of());
-		var peers = new ArrayList<>(configs.values().iterator().next().peers());
+		var taken = new HashSet<Integer>();
+		var peers = new ArrayList<PeerConfig>();
+		for (var config : configs.values()) {
+			var self = config.self();
+			peers.add(self);
+			taken.add(self.raftPort());
+			taken.add(self.apiPort());
+		}
+		// Free now, but possibly a stopped node's: asked for enough that two are left without those.
+		var ports = ProcessCluster.freePorts(2 + taken.size(), List.of()).stream().filter(port -> !taken.contains(port))
+				.limit(2).toList();
 		peers.add(new PeerConfig(id, "127.0.0.1", ports.get(0), "127.0.0.1", ports.get(1)));
-		configs.put(id, customize.apply(baseConfig(id, peers)).withJoin(true));
-		return start(id);
+		var config = customize.apply(baseConfig(id, peers)).withJoin(true);
+		configs.put(id, config);
+		return config;
 	}
 
 	/** The Raft peers of {@code ids}, at the addresses of their configurations, for {@code admin().setConfiguration}. */
