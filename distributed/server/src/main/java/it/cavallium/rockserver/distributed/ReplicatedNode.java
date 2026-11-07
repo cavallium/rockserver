@@ -134,7 +134,7 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
 		this.config = config;
-		this.raftTraffic = new RaftTraffic(config.nodeId());
+		this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir());
 		Files.createDirectories(config.dbDir().getParent());
 		Files.createDirectories(config.raftDir());
 		requireSameFileSystem(config.raftDir(), config.dbDir().getParent());

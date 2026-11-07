@@ -281,12 +281,17 @@ final class RemovalRule {
 		}
 		// 4. Its own log: a later configuration that includes it, and may still commit. A latest configuration with no
 		// known term that is not in its own log at all (past its end: Ratis took it from a snapshot install's
-		// raft-meta.conf; or another entry at its index: stale, finding 1) does not block by itself (R12-3): it can
-		// commit only through a majority of K*'s new half, which step 5 sees.
+		// raft-meta.conf; or another entry at its index: stale, finding 1) does not block when the term of the leader
+		// that installed it, which bounds its own (InstalledConfiguration), is below K*'s (R12-3, narrowed by the
+		// round-13 review, finding 1): it then has an entry other than K* at iStar before it, and Leader Completeness
+		// keeps it from committing. Without that bound it may be K*'s successor, a re-add of this incarnation, which a
+		// leader that cannot reach the members may still commit after they answered.
 		long termAtKStar = own.termAt().applyAsLong(iStar);
 		boolean outsideOwnLog = ownLatest != null && !ownLatest.termKnown()
 				&& (own.latestStale() || own.termAt().applyAsLong(ownLatest.index()) == BEYOND);
-		if (ownLatest != null && ownLatest.index() > iStar && ownLatest.holds(self) && !outsideOwnLog) {
+		boolean installedBeforeKStar = outsideOwnLog && kStar.termKnown() && own.latestTermBound() > UNKNOWN_TERM
+				&& own.latestTermBound() < kStar.term();
+		if (ownLatest != null && ownLatest.index() > iStar && ownLatest.holds(self) && !installedBeforeKStar) {
 			boolean otherBranch = kStar.termKnown() && termAtKStar > 0 && termAtKStar != kStar.term();
 			boolean olderTerm = kStar.termKnown() && ownLatest.termKnown() && ownLatest.term() < kStar.term();
 			if (!otherBranch && !olderTerm) {

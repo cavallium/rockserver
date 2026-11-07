@@ -1,7 +1,10 @@
 package it.cavallium.rockserver.distributed;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiPredicate;
+import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc;
 import org.apache.ratis.thirdparty.io.grpc.ForwardingServerCallListener;
 import org.apache.ratis.thirdparty.io.grpc.Metadata;
@@ -10,6 +13,8 @@ import org.apache.ratis.thirdparty.io.grpc.ServerCall;
 import org.apache.ratis.thirdparty.io.grpc.ServerCallHandler;
 import org.apache.ratis.thirdparty.io.grpc.ServerInterceptor;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Watches the Raft requests that reach this node's Raft server: when a leader last sent it anything (an append, a
@@ -18,10 +23,13 @@ import org.jetbrains.annotations.Nullable;
  * initializing state, so the membership check that runs while a node hears no leader
  * ({@link ReplicatedNode}'s {@code checkWhileDetached}) reads it here.
  *
- * <p>Installed on the Raft gRPC server as an interceptor (through {@link TermService#customizer}); it only reads the
- * method name, and forwards every message unchanged.</p>
+ * <p>Installed on the Raft gRPC server as an interceptor (through {@link TermService#customizer}); it reads the
+ * method name, and forwards every message unchanged. Before it forwards a snapshot chunk, it records the chunk's
+ * configuration with the leader's term ({@link InstalledConfiguration}, round-13 review, finding 1).</p>
  */
 final class RaftTraffic implements ServerInterceptor {
+
+	private static final Logger LOG = LoggerFactory.getLogger(RaftTraffic.class);
 
 	private static final String APPEND_ENTRIES = RaftServerProtocolServiceGrpc.getAppendEntriesMethod()
 			.getFullMethodName();
@@ -36,11 +44,18 @@ final class RaftTraffic implements ServerInterceptor {
 	static volatile @Nullable BiPredicate<String, Object> dropForTesting;
 
 	private final String nodeId;
+	/** Where {@link InstalledConfiguration} is kept: the Raft directory; null: not recorded (tests). */
+	private final @Nullable Path raftDir;
 	/** {@link System#nanoTime} of the last leader request, 0 if none yet. */
 	private final AtomicLong lastLeaderRequestNanos = new AtomicLong();
 
 	RaftTraffic(String nodeId) {
+		this(nodeId, null);
+	}
+
+	RaftTraffic(String nodeId, @Nullable Path raftDir) {
 		this.nodeId = nodeId;
+		this.raftDir = raftDir;
 	}
 
 	/** {@link System#nanoTime} of the last append or snapshot chunk a leader sent to this node, 0 if none yet. */
@@ -70,6 +85,20 @@ final class RaftTraffic implements ServerInterceptor {
 				}
 				if (fromLeader) {
 					lastLeaderRequestNanos.set(Math.max(1, System.nanoTime()));
+				}
+				if (raftDir != null && message instanceof RaftProtos.InstallSnapshotRequestProto request) {
+					try {
+						InstalledConfiguration.record(raftDir, request);
+					} catch (IOException | RuntimeException ex) {
+						// Ratis must not take a configuration whose term bound may be lower than recorded: the
+						// chunk is dropped, as on a lossy link, and the leader sends it again.
+						LOG.warn("{}: failed to record the configuration of a snapshot chunk in {}, dropping it", nodeId,
+								raftDir.resolve(InstalledConfiguration.FILE), ex);
+						if (call.getMethodDescriptor().getType() != MethodDescriptor.MethodType.UNARY) {
+							call.request(1);
+						}
+						return;
+					}
 				}
 				super.onMessage(message);
 			}

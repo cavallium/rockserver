@@ -116,6 +116,11 @@ class SnapshotInstallTest {
 		cluster.awaitConverged(TIMEOUT);
 		assertEquals(0, lagging.stateMachine().storeGeneration() & 1);
 		assertTrue(lagging.stateMachine().storeGeneration() >= 2, "it installed a snapshot");
+		// RaftTraffic recorded the configuration of the chunks with the leader's term (round-13 review, finding 1).
+		var installed = InstalledConfiguration.read(lagging.config().raftDir());
+		assertNotNull(installed, "the configuration of the install is recorded");
+		assertEquals(division.getRaftConf().getLogEntryIndex(), installed.index());
+		assertEquals(division.getInfo().getCurrentTerm(), installed.termBound());
 		for (int i = 0; i < written; i += 97) {
 			assertEquals("v" + i, localValue(lagging, column, i));
 		}
