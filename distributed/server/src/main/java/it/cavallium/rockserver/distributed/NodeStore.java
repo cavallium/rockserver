@@ -744,6 +744,8 @@ final class NodeStore implements Closeable {
 	 * run. Table files are hard-linked when {@code target} is on the same file system.
 	 *
 	 * @return what the copy held: the applied position and cluster of the replica
+	 * @throws ReplicatedNode.NewerVersionException if the replica's cluster version has capabilities this version lacks:
+	 *                                              nothing is written
 	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path rockserverConfig, Path target) throws IOException {
 		target = target.toAbsolutePath().normalize();
@@ -758,6 +760,13 @@ final class NodeStore implements Closeable {
 		TermIndex applied;
 		String clusterId;
 		try (var store = open(dbDir, rockserverConfig, "export-source")) {
+			// The copy leaves out the cluster version with the rest of the metadata: refuse a newer cluster's database
+			// here, or the new cluster would start at GENESIS with data that a newer version wrote (R18-1).
+			long version = store.clusterVersion();
+			long unknown = version & ~Capabilities.SUPPORTED;
+			if (unknown != 0) {
+				throw ReplicatedNode.NewerVersionException.of(version, unknown);
+			}
 			clusterId = store.clusterId();
 			applied = store.checkpoint(target);
 		} catch (IOException | RuntimeException e) {

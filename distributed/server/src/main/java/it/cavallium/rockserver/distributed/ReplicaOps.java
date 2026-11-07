@@ -558,6 +558,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 * The results file and the backups of the old cluster in {@code dataDir}, if any, are renamed with the suffix
 	 * {@code .before-restore-<time>}: their results, by log index and by name, would otherwise answer for the new cluster,
 	 * whose log starts again from 1.
+	 *
+	 * @throws ReplicatedNode.NewerVersionException if the backup's cluster version has capabilities this version lacks
+	 *                                              (a newer cluster's backup): {@code dataDir} is left without a database
 	 */
 	static TermIndex restore(Path backupDir, Path dataDir, @Nullable Path rockserverConfig) throws IOException {
 		var properties = readBackupProperties(backupDir);
@@ -569,9 +572,21 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		Files.createDirectories(dataDir);
 		NodeStore.restore(backupDir.resolve(BACKUP_DB_DIR), db);
 		TermIndex applied;
+		long version;
 		try (var store = NodeStore.open(db, rockserverConfig, "restore")) {
 			applied = store.applied();
-			store.db().deleteColumn(store.metaColumnId());
+			// Read before the metadata, which holds it, is dropped: the new cluster starts at GENESIS and no start would
+			// refuse data that a newer version wrote (R18-1).
+			version = store.clusterVersion();
+			if ((version & ~Capabilities.SUPPORTED) == 0) {
+				store.db().deleteColumn(store.metaColumnId());
+			}
+		}
+		long unknown = version & ~Capabilities.SUPPORTED;
+		if (unknown != 0) {
+			// Leaves the data directory as it was given: empty, ready for the newer binary to run the same command.
+			NodeStore.deleteRecursively(db);
+			throw ReplicatedNode.NewerVersionException.of(version, unknown);
 		}
 		String suffix = ".before-restore-" + System.currentTimeMillis();
 		for (Path old : List.of(dataDir.resolve(RESULTS_FILE), dataDir.resolve(BACKUPS_DIR))) {

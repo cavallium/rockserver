@@ -34,7 +34,7 @@ import org.junit.jupiter.api.io.TempDir;
  * checksum} and {@code admin backup} against a running in-process cluster, then {@code export-seed} of a stopped
  * replica and {@code restore-backup} of the backup into an empty data directory, which then starts as a seeded node and
  * serves the data. Also the refusals: wrong arguments (exit 2), a target that exists, a restore into a used directory
- * (exit 1).
+ * (exit 1), and a newer cluster's database or backup (exit 5).
  */
 class CommandLineTest {
 
@@ -306,6 +306,32 @@ class CommandLineTest {
 		var unknown = run("serve");
 		assertEquals(2, unknown.code());
 		assertTrue(unknown.err().contains("unknown command serve"), unknown.err());
+	}
+
+	/**
+	 * {@code export-seed} and {@code restore-backup} refuse a newer cluster's database or backup with exit code 5, like
+	 * {@code run} refuses one copied in place, and leave no seed and no database behind (R18-1).
+	 */
+	@Test
+	void exportSeedAndRestoreBackupOfANewerClusterExitWithFive() throws IOException {
+		Path dataDir = temp.resolve("newer");
+		NodeStoreTest.writeDatabaseOfVersion(dataDir.resolve("db"), NodeStoreTest.NEWER_VERSION);
+		Path seed = temp.resolve("seed");
+		var export = run("export-seed", "--data-dir", dataDir.toString(), "--target", seed.toString());
+		assertEquals(5, export.code(), export.toString());
+		assertTrue(export.err().contains("0x10000000000"), export.err());
+		assertTrue(Files.notExists(seed));
+
+		Path backup = temp.resolve("backup");
+		try (var store = NodeStore.open(dataDir.resolve("db"), null, "newer")) {
+			store.checkpoint(backup.resolve(ReplicaOps.BACKUP_DB_DIR));
+		}
+		Files.writeString(backup.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=7\ncluster=c\n");
+		Path target = temp.resolve("target");
+		var restore = run("restore-backup", "--backup", backup.toString(), "--data-dir", target.toString());
+		assertEquals(5, restore.code(), restore.toString());
+		assertTrue(restore.out().startsWith("FAILED: ") && restore.out().contains("0x10000000000"), restore.out());
+		assertTrue(Files.notExists(target.resolve("db")));
 	}
 
 	private static String[] with(List<String> base, String... more) {

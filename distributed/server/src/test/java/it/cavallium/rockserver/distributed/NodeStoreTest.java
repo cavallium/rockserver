@@ -330,9 +330,9 @@ class NodeStoreTest {
 	}
 
 	/** This version's capabilities plus one it lacks. */
-	private static final long NEWER_VERSION = Capabilities.SUPPORTED | 1L << 40;
+	static final long NEWER_VERSION = Capabilities.SUPPORTED | 1L << 40;
 
-	private static void writeDatabaseOfVersion(Path dbDir, long version) throws IOException {
+	static void writeDatabaseOfVersion(Path dbDir, long version) throws IOException {
 		try (var store = NodeStore.open(dbDir, null, "versioned")) {
 			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
 			put(store, column, 1, "v1");

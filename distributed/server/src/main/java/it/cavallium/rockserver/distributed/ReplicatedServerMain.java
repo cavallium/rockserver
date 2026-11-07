@@ -98,7 +98,9 @@ import org.rocksdb.NativeLibraryLoader;
  * cluster and warns): a supervisor must not start it again. See "Removal and waiting outside" in the design
  * document.
  * It exits with 5, and does not start, if its database has a cluster version with capabilities this version lacks (a
- * downgrade, or a newer cluster's backup). Every command's exit codes: "Exit codes" in
+ * downgrade, or a newer cluster's database copied in place); {@code restore-backup} and {@code export-seed} refuse a
+ * newer cluster's backup or database with 5 too, before they drop the metadata that holds the version. Every command's
+ * exit codes: "Exit codes" in
  * {@code docs/distributed/runbooks.md}; 4 means "removed" for {@code run} and "incomplete" for {@code admin}.</p>
  *
  * <p>Unless {@code -Djava.io.tmpdir} is given, {@code run} extracts the RocksDB library into {@code DATA-DIR/tmp}, and
@@ -411,7 +413,14 @@ public final class ReplicatedServerMain {
 		var rockserverConfig = options.value("--rockserver-config") != null
 				? Path.of(options.value("--rockserver-config")) : null;
 		options.requireConsumed();
-		var exported = NodeStore.exportSeed(dataDir.resolve("db"), rockserverConfig, target);
+		NodeStore.ExportedSeed exported;
+		try {
+			exported = NodeStore.exportSeed(dataDir.resolve("db"), rockserverConfig, target);
+		} catch (ReplicatedNode.NewerVersionException e) {
+			System.err.println("Not exported: " + e.getMessage());
+			exit(5);
+			return;
+		}
 		System.out.println("Exported the database of cluster " + exported.clusterId() + ", applied up to index "
 				+ exported.applied().getIndex() + " of term " + exported.applied().getTerm() + ", to " + target
 				+ ". Compare the applied index with the other replicas' before seeding a new cluster with it");
@@ -1160,6 +1169,9 @@ public final class ReplicatedServerMain {
 			System.out.println("OK: " + dataDir + " holds the data up to log index " + applied.getIndex()
 					+ " of the old cluster, and belongs to no cluster. Start every node of the new cluster from a copy of the same"
 					+ " backup, without --join");
+		} catch (ReplicatedNode.NewerVersionException ex) {
+			System.out.println("FAILED: " + ex.getMessage());
+			exit(5);
 		} catch (IOException | RuntimeException ex) {
 			fail(String.valueOf(ex));
 		}
