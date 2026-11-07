@@ -230,6 +230,18 @@ fn remaining(deadline: Instant, finite: bool) -> Option<Option<Duration>> {
     }
 }
 
+/// Awaits a copy or an opening. A caller with a deadline sends it with what is left as its gRPC timeout, so the
+/// transport ends it. A caller without one sends it with no timeout, so that the server still sees a caller without
+/// a deadline. Nothing else ends it then: `connect` sets no keepalive, so a silent node (power loss, SIGSTOP, a
+/// partition with the host up) would hold it forever. The window ends it here instead, with `None`.
+async fn within_window<F: Future>(deadline: Instant, finite: bool, call: F) -> Option<F::Output> {
+    if finite {
+        Some(call.await)
+    } else {
+        tokio::time::timeout_at(deadline, call).await.ok()
+    }
+}
+
 impl SessionWrites {
     pub(crate) fn new(numbered_batches: bool) -> Self {
         Self {
@@ -333,7 +345,10 @@ impl SessionWrites {
             let Some(timeout) = remaining(deadline, finite) else {
                 return Err(not_sent("the deadline came before a session was opened"));
             };
-            match open(timeout).await {
+            let Some(opened) = within_window(deadline, finite, open(timeout)).await else {
+                return Err(not_sent("no answer to the opening of a session before the retry window ended"));
+            };
+            match opened {
                 Ok(id) => {
                     let session = Arc::new(Session {
                         id,
@@ -409,9 +424,15 @@ impl SessionWrites {
                 if maybe_applied {
                     self.resends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                let status = match send(id, timeout).await {
-                    Ok(value) => return Ok(value),
-                    Err(status) => status,
+                let status = match within_window(deadline, finite, send(id, timeout)).await {
+                    Some(Ok(value)) => return Ok(value),
+                    Some(Err(status)) => status,
+                    // The copy may have been applied; the window has no room for another.
+                    None => {
+                        return Err(unknown_outcome(&Status::deadline_exceeded(
+                            "no answer to the copy before the retry window ended",
+                        )))
+                    }
                 };
                 if rocksdb_error_type(&status) == Some("SESSION_EXPIRED") {
                     // This copy was refused before it ran. Copies sent earlier are this client's to judge.
