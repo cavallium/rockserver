@@ -120,6 +120,40 @@ class ApplierTest {
 		}
 	}
 
+	/**
+	 * R17-1: genesis writes the version of the cluster it creates, frozen at the capabilities of the first version with
+	 * the gate (0x1F), not the capabilities of the node that applies it. A node of a newer version that replays genesis
+	 * from the log (it joined a young cluster whose log still starts at genesis, or was upgraded before it applied genesis)
+	 * would otherwise hold a version above the other replicas', which applying {@code ClusterVersion} as a union never
+	 * lowers: as leader it would write entries older members cannot read, and its checksums would digest differently.
+	 * Here the node supports a bit no version has yet, as a newer node would.
+	 */
+	@Test
+	void genesisWritesTheFrozenVersionNotTheApplyingNodesCapabilities() throws Exception {
+		long frozen = 0x1FL;
+		try (var store = open()) {
+			var applier = new Applier(store);
+			long newer = Capabilities.SUPPORTED | (1L << 40);
+			var told = new ArrayList<Long>();
+			applier.maintenance(new Applier.Maintenance() {
+				@Override
+				public long supported() {
+					return newer;
+				}
+
+				@Override
+				public void clusterVersion(long version) {
+					told.add(version);
+				}
+			});
+			applier.apply(new Request(5, 0, 0, new LogEntry.Genesis("c", false)), TermIndex.valueOf(1, 1));
+			assertEquals(frozen, store.clusterVersion(), Capabilities.describe(store.clusterVersion()));
+			assertEquals(List.of(frozen), told);
+		}
+		// Every later version supports at least what a cluster starts with.
+		Assertions.assertTrue(Capabilities.has(Capabilities.SUPPORTED, Capabilities.GENESIS));
+	}
+
 	@Test
 	void aRetriedRequestTakesEffectOnceAndGetsTheFirstResult() throws Exception {
 		long column;
