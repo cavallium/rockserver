@@ -2223,7 +2223,7 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
    per update id and drives the cancel and overload close paths), and the round-8 commits `b8b713488` (a body's own
    error after an unconfirmed chained read runs the update again, below), `520170f65` (its review: resent
    closes, the exhausted retry's message) and `ffb742b77` (R8-5: documents the one side write before an ending put,
-   see item 0; no code change), and the round-9 commits `2cb7df603`, `f4ded3df4`, `f0b80643b` and `f1a857d1b`
+   see item 0; no code change), and the round-9 commits `2cb7df603`, `f4ded3df4`, `f0b80643b` `f1a857d1b`, and the round-10 commit `8cf79428e` (javadoc only)
    (a Rockserver or gRPC error kept only as a suppressed exception also stops a rerun; a timing-free cleanup test;
    javadocs and the workload mapping match the pipelined close answers). Left on the Yotsuba side:
    - Merge the branch, build it against a released `rockserver-core` of this version (the branch was compiled and
