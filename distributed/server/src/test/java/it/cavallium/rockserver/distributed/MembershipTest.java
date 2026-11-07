@@ -356,9 +356,14 @@ class MembershipTest {
 		assertReplicasEqual(members, dumps);
 	}
 
-	/** A planned replacement: the node to replace is the leader and it runs. It closes Raft and exits when it is out. */
+	/**
+	 * A planned replacement: the node to replace is the leader and it runs. It closes Raft and exits when it is out. In
+	 * two steps, add-peer then remove-peer, one node each: the one-step replacement changes two nodes, which is unsafe
+	 * while the old one still votes (round 13, design: residuals of "Removal and waiting outside"), so a running node
+	 * is replaced this way or stopped first.
+	 */
 	@Test
-	void aRunningLeaderIsReplacedInOneStep() throws Exception {
+	void aRunningLeaderIsReplacedInTwoSteps() throws Exception {
 		cluster = ProcessCluster.create(root, 3, 1, serverArgs());
 		var originals = List.of("1", "2", "3");
 		startAll(originals);
@@ -373,8 +378,13 @@ class MembershipTest {
 		cluster.start("4", JOIN);
 		cluster.waitReady("4", READY_TIMEOUT);
 
-		assertOk(cluster.admin(others, "add-peer", cluster.peer("4").format()));
-		assertEquals(3, cluster.awaitExit(leader, TIMEOUT), () -> cluster.logTail(leader));
+		assertOk(cluster.admin(originals, "add-peer", cluster.peer("4").format()));
+		var all = new ArrayList<>(originals);
+		all.add("4");
+		assertOk(cluster.admin(all, "remove-peer", leader));
+		// 3 when Ratis closes its Raft server (NOT_IN_CONF), 4 when its check while it hears no leader comes first (R11).
+		int code = cluster.awaitExit(leader, TIMEOUT);
+		assertTrue(code == 3 || code == 4, () -> code + "\n" + cluster.logTail(leader));
 		client.put(column, key(2), text("after"), CONTEXT).valueOrThrow();
 		awaitAppliedEverywhere(members, column, key(2), text("after"));
 		stopAll(members);

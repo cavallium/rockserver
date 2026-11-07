@@ -67,14 +67,16 @@ majority and healthy (`status`).
    `rs run --node-id n4 --peer n2=... --peer n3=... --peer n4=... --data-dir /srv/rockserver/data --join`.
    It prints `READY` and waits for as long as it takes.
 2. If the old node still runs (a move), stop it first and take it out of its supervisor: the step below changes two
-   nodes at once, which is safe only while the node that leaves cannot vote (see "Removed node" below).
+   nodes at once, which is safe only while the node that leaves cannot vote (see "Removed node" below). To keep it
+   serving until it is out, use two steps instead: `add-peer n4` with every member, the old one included, in
+   `--peer`, then `remove-peer <old id>` with all of them in `--peer`.
    From any host, in one step, add `n4` and remove the old node, by leaving it out of `--peer`:
    `rs admin --peer n2=... --peer n3=... --peer n4=... add-peer n4=10.0.0.4:9001/10.0.0.4:5333`.
    It ends with `OK` once `n4` caught up from a snapshot and the configuration changed (the limit, `--timeout-ms`, is
    10 minutes by default: raise it for a large database, about 100 MB/s).
 3. Check: `status` shows `n4` with the others' commit index; `checksum` prints `OK`; the `rockserver-node-missing`
    alert threshold and the clients' address lists include `n4` and not the old node.
-4. If the old node still runs, it exits with code 3 or 4 once removed: take it out of its supervisor first.
+4. With the two steps, the old node exits with code 3 or 4 once removed: take it out of its supervisor first.
 
 Failure branches:
 

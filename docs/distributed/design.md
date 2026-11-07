@@ -1452,11 +1452,14 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   peer. So this command adds the new node and removes the old one together (Ratis `setConfiguration`, a joint
   configuration), and the members that stay form a majority of the old configuration and of the new one all along.
   With one node of three lost that is 2 of 3 before, during and after the change, and a failure of the new node stops
-  nothing. It works the same when the lost node was the leader or a follower, seeded or not (`MembershipTest`), and
-  for a node that still runs, the leader too: that node exits with 3 once it is out. Stop a node that still runs
-  first, though (round 13): with both the old and the new node voting, a majority of the old half and one of the new
-  half can be disjoint, and a leader elected during the joint configuration commits by the new half alone (see the
-  residuals of "Removal and waiting outside"); with the old node stopped they always meet in the members that stay.
+  nothing. It works the same when the lost node was the leader or a follower, seeded or not (`MembershipTest`). It is
+  only for a node that cannot vote: stop a node that still runs first (round 13). With both the old and the new node
+  voting, a majority of the old half and one of the new half can be disjoint, and a leader elected during the joint
+  configuration commits by the new half alone (see the residuals of "Removal and waiting outside"); with the old node
+  stopped they always meet in the members that stay. To keep a running node, the leader too, in service until it is
+  out, replace it in two steps instead, one node each: `add-peer` with every member in `--peer`, then `remove-peer`;
+  it exits with 3 (or 4) once it is out (`MembershipTest.aRunningLeaderIsReplacedInTwoSteps`). `admin` does not
+  refuse a one-step change while the old node runs: whether it should is left to the operator's decision.
 
   The other way, `add-peer` with every member in `--peer` and `remove-peer` afterwards, is for growing a cluster. With
   a lost node in `--peer` it passes through 4 members with 1 lost, where all 3 others are needed: any failure of the
