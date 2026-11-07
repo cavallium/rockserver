@@ -53,19 +53,36 @@ final class RemovalCheck {
 
 	/** What {@code answer} (null: the member has no group yet) says about node {@code self}, whose own is at {@code ownIndex}. */
 	static Answer judge(@Nullable PeerConfiguration answer, String self, long ownIndex) {
-		if (answer == null || !answer.committed()) {
-			return Answer.PENDING;
-		}
-		if (answer.members().contains(self) || answer.index() <= ownIndex) {
-			return Answer.MEMBER;
-		}
-		return Answer.REMOVED;
+		return judge(answer, self, ownIndex, false);
 	}
 
 	/**
-	 * The decision for a configuration of {@code knownMembers} members (the node included): true if {@code removed}
-	 * members, a majority, say it was removed; false if they can no longer become one, with {@code pending} members
-	 * still to answer; null while undecided.
+	 * What {@code answer} says about node {@code self}, whose own configuration is at {@code ownIndex}.
+	 * {@code ownLeavesOut}: that configuration is a joint one whose new half already leaves the node out (R3-G2b-4).
+	 * Then the question is whether that configuration, or a later one without the node, is committed: a committed answer
+	 * without the node at {@code ownIndex} or later says removed (the same one, or one after it); a committed answer
+	 * that holds the node says member (the joint configuration was dropped, or the node was added again); a committed
+	 * answer without the node from before {@code ownIndex} comes from a member behind this node's log, and tells
+	 * nothing.
+	 */
+	static Answer judge(@Nullable PeerConfiguration answer, String self, long ownIndex, boolean ownLeavesOut) {
+		if (answer == null || !answer.committed()) {
+			return Answer.PENDING;
+		}
+		if (answer.members().contains(self)) {
+			return Answer.MEMBER;
+		}
+		if (ownLeavesOut) {
+			return answer.index() >= ownIndex ? Answer.REMOVED : Answer.NONE;
+		}
+		return answer.index() <= ownIndex ? Answer.MEMBER : Answer.REMOVED;
+	}
+
+	/**
+	 * The decision for a configuration of {@code knownMembers} members (the node included; for {@link #keptBy}, the
+	 * members of the new half): true if {@code removed} members (for {@link #keptBy}, those that hold the node), a
+	 * majority, say so; false if they can no longer become one, with {@code pending} members still to answer; null while
+	 * undecided.
 	 */
 	static @Nullable Boolean decide(int knownMembers, int removed, int pending) {
 		int majority = knownMembers / 2 + 1;
@@ -86,8 +103,38 @@ final class RemovalCheck {
 	 */
 	static @Nullable List<String> removedBy(String self, RaftGroupId groupId, long ownIndex, int knownMembers,
 			Map<String, String> addresses, Duration budget) {
+		return removedBy(self, groupId, ownIndex, false, knownMembers, addresses, budget);
+	}
+
+	/**
+	 * As {@link #removedBy(String, RaftGroupId, long, int, Map, Duration)}, for a node whose own configuration may be a
+	 * joint one that leaves it out ({@code ownLeavesOut}, see {@link #judge(PeerConfiguration, String, long, boolean)}):
+	 * then {@code knownMembers} and {@code addresses} are the members of its new half.
+	 */
+	static @Nullable List<String> removedBy(String self, RaftGroupId groupId, long ownIndex, boolean ownLeavesOut,
+			int knownMembers, Map<String, String> addresses, Duration budget) {
+		return ask(self, groupId, ownIndex, ownLeavesOut, Answer.REMOVED, knownMembers, addresses, budget);
+	}
+
+	/**
+	 * R3-G2b-4: for a node whose log ends with a joint configuration that leaves it out of its new half, asks the
+	 * members of that new half ({@code addresses}, {@code knownMembers} of them) whether they still hold the node. The
+	 * leader that wrote the configuration may have lost its leadership before committing it, and the next leader drop it:
+	 * the node is then still a member, and its log is cut back to the configuration before when a leader reaches it.
+	 *
+	 * @return the members that hold a committed configuration with the node, if they are a majority of the new half;
+	 * null otherwise (removed, undecided or unreachable: the node is refused as before)
+	 */
+	static @Nullable List<String> keptBy(String self, RaftGroupId groupId, long ownIndex, int knownMembers,
+			Map<String, String> addresses, Duration budget) {
+		return ask(self, groupId, ownIndex, true, Answer.MEMBER, knownMembers, addresses, budget);
+	}
+
+	/** The members that give the answer {@code counted}, if a majority of {@code knownMembers} does; null otherwise. */
+	private static @Nullable List<String> ask(String self, RaftGroupId groupId, long ownIndex, boolean ownLeavesOut,
+			Answer counted, int knownMembers, Map<String, String> addresses, Duration budget) {
 		long deadline = System.nanoTime() + budget.toNanos();
-		var removed = new ArrayList<String>();
+		var agreeing = new ArrayList<String>();
 		var pending = new LinkedHashMap<>(addresses);
 		var channels = new HashMap<String, ManagedChannel>();
 		try {
@@ -101,7 +148,7 @@ final class RemovalCheck {
 					Answer answer;
 					try {
 						answer = judge(call.get(timeout.toNanos() + TimeUnit.SECONDS.toNanos(1), TimeUnit.NANOSECONDS), self,
-								ownIndex);
+								ownIndex, ownLeavesOut);
 					} catch (InterruptedException ex) {
 						Thread.currentThread().interrupt();
 						answer = Answer.NONE;
@@ -109,23 +156,22 @@ final class RemovalCheck {
 						LOG.debug("{}: member {} did not tell its configuration", self, id, ex);
 						answer = Answer.NONE;
 					}
-					switch (answer) {
-						case REMOVED -> {
-							removed.add(id);
-							pending.remove(id);
-						}
-						case MEMBER, NONE -> pending.remove(id);
-						case PENDING -> {}
+					if (answer == counted) {
+						agreeing.add(id);
+						pending.remove(id);
+					} else if (answer != Answer.PENDING) {
+						pending.remove(id);
 					}
 				});
-				var decision = decide(knownMembers, removed.size(), pending.size());
+				var decision = decide(knownMembers, agreeing.size(), pending.size());
 				if (decision != null) {
-					return decision ? removed : null;
+					return decision ? agreeing : null;
 				}
 				if (System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RETRY_MS) - deadline >= 0
 						|| Thread.currentThread().isInterrupted()) {
-					LOG.warn("{}: could not tell whether it is still a member: {} of {} members say it was removed, {} did not"
-							+ " decide in {}; starting", self, removed.size(), knownMembers, pending.keySet(), budget);
+					LOG.warn("{}: could not tell whether it is still a member: {} of {} members say {}, {} did not decide in {}",
+							self, agreeing.size(), knownMembers, counted == Answer.REMOVED ? "it was removed" : "it is a member",
+							pending.keySet(), budget);
 					return null;
 				}
 				Thread.sleep(RETRY_MS);

@@ -30,6 +30,36 @@ class RemovalCheckTest {
 		assertEquals(Answer.PENDING, RemovalCheck.judge(null, "n1", 5));
 	}
 
+	/**
+	 * R3-G2b-4: for a node whose own configuration is a joint one that leaves it out, a committed answer without it at
+	 * that index or later says removed, one that holds it says member, and one from before says nothing.
+	 */
+	@Test
+	void aJointConfigurationThatLeavesTheNodeOutIsJudgedByWhetherItWasCommitted() {
+		// The same joint configuration, committed: its removal goes on.
+		assertEquals(Answer.REMOVED, RemovalCheck.judge(new PeerConfiguration(7, true, List.of("n0", "n2")), "n1", 7, true));
+		assertEquals(Answer.REMOVED, RemovalCheck.judge(new PeerConfiguration(9, true, List.of("n0", "n2")), "n1", 7, true));
+		// The joint configuration was dropped: the member's committed one, older, still holds the node.
+		assertEquals(Answer.MEMBER, RemovalCheck.judge(new PeerConfiguration(3, true, List.of("n0", "n1", "n2")), "n1", 7,
+				true));
+		// A member behind this node's log, from before it was added.
+		assertEquals(Answer.NONE, RemovalCheck.judge(new PeerConfiguration(3, true, List.of("n0", "n2")), "n1", 7, true));
+		assertEquals(Answer.PENDING, RemovalCheck.judge(new PeerConfiguration(7, false, List.of("n0", "n2")), "n1", 7, true));
+		// Without the joint case, the same committed answer at the node's own index says member.
+		assertEquals(Answer.MEMBER, RemovalCheck.judge(new PeerConfiguration(7, true, List.of("n0", "n2")), "n1", 7));
+	}
+
+	/** Without answers, a node whose own joint configuration leaves it out is not kept: it is refused as before. */
+	@Test
+	void unreachableMembersDoNotKeepANodeOutOfItsNewHalf() throws Exception {
+		int port;
+		try (var socket = new ServerSocket(0)) {
+			port = socket.getLocalPort();
+		}
+		assertNull(RemovalCheck.keptBy("n1", RaftGroupId.valueOf(UUID.randomUUID()), 7, 2,
+				Map.of("n0", "127.0.0.1:" + port, "n2", "127.0.0.1:" + port), Duration.ofSeconds(5)));
+	}
+
 	@Test
 	void aMajorityOfTheKnownConfigurationDecides() {
 		assertTrue(RemovalCheck.decide(3, 2, 0));

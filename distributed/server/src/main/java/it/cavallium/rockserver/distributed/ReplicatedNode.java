@@ -14,6 +14,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
@@ -727,9 +728,11 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * half only: the leader sends the final one to the members that stay. A node started with {@code --join} that never was
 	 * a member is not removed: it may hold the configuration of a snapshot from before its {@code add-peer}.
 	 *
-	 * <p>One case is refused wrongly: a joint configuration that leaves the node out, which the node wrote but the leader
-	 * never committed before it lost its leadership, so that the next leader drops it. Only a node that was being removed
-	 * gets there, and it can be removed again with {@code remove-peer}.</p>
+	 * <p>A joint configuration that leaves the node out may never have been committed: its leader lost its leadership
+	 * first, and the next leader dropped it, so the node is still a member (R3-G2b-4). So a node whose log ends with
+	 * a joint configuration that holds it in the old half only asks the members of the new half
+	 * ({@link RemovalCheck#keptBy}), and starts if a majority of them hold a committed configuration with it; a leader
+	 * then cuts its log back. Otherwise (removed, undecided, or members out of reach) it is refused as before.</p>
 	 *
 	 * <p>The configuration that removes a node commits with the other members alone, so the removed node's log may
 	 * never receive it: a node that was stopped, slow or cut off during its removal still holds itself in its log. So a
@@ -743,6 +746,13 @@ public final class ReplicatedNode implements AutoCloseable {
 				&& conf.getCurrentPeers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()));
 		boolean memberOnce = !config.join() || Files.exists(config.raftDir().resolve(MEMBER_FILE));
 		if (leftOut && memberOnce) {
+			var keptBy = jointWithSelfInOldHalf(conf) ? askNewHalf(conf) : null;
+			if (keptBy != null) {
+				LOG.warn("{}: its log ends with a joint configuration that leaves it out, {}, but members {}, a majority of its"
+						+ " new half, hold a committed configuration with this node: that one was dropped, starting", config.nodeId(),
+						conf, keptBy);
+				return;
+			}
 			throw new RemovedException("Node " + config.nodeId() + " is not in the new configuration of its log, " + conf
 					+ ": it was removed from the cluster. " + REMOVED_ADVICE);
 		}
@@ -765,6 +775,31 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * removed, if they are a majority, else null. Takes at most two election timeouts (at least a second).
 	 */
 	private @Nullable List<String> askMembers(RaftConfiguration conf) {
+		var members = conf.getCurrentPeers().stream().map(peer -> peer.getId().toString()).toList();
+		// A joint configuration that leaves this node out of its new half: the members of that half decide (R3-G2b-4).
+		boolean ownLeavesOut = jointWithSelfInOldHalf(conf);
+		return RemovalCheck.removedBy(config.nodeId(), group.getGroupId(), conf.getLogEntryIndex(), ownLeavesOut,
+				members.size(), RemovalCheck.addressesOf(config.nodeId(), members, memberAddresses(conf)), removalCheckBudget());
+	}
+
+	/**
+	 * R3-G2b-4: asks the members of the new half of {@code conf}, a joint configuration that leaves this node out,
+	 * whether they still hold it: see {@link RemovalCheck#keptBy}.
+	 */
+	private @Nullable List<String> askNewHalf(RaftConfiguration conf) {
+		var members = conf.getCurrentPeers().stream().map(peer -> peer.getId().toString()).toList();
+		return RemovalCheck.keptBy(config.nodeId(), group.getGroupId(), conf.getLogEntryIndex(), members.size(),
+				RemovalCheck.addressesOf(config.nodeId(), members, memberAddresses(conf)), removalCheckBudget());
+	}
+
+	/** Whether {@code conf} is a joint configuration that holds this node in its old half only. */
+	private boolean jointWithSelfInOldHalf(RaftConfiguration conf) {
+		return conf.getPreviousPeers().stream().anyMatch(peer -> peer.getId().toString().equals(config.nodeId()))
+				&& conf.getCurrentPeers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()));
+	}
+
+	/** Id to Raft address of every peer this node knows of: its startup list, then the peers of {@code conf}. */
+	private Map<String, String> memberAddresses(RaftConfiguration conf) {
 		var addresses = new HashMap<String, String>();
 		for (var peer : config.peers()) {
 			addresses.put(peer.id(), peer.raftAddress());
@@ -774,13 +809,13 @@ public final class ReplicatedNode implements AutoCloseable {
 				addresses.put(peer.getId().toString(), peer.getAddress());
 			}
 		}
-		var members = conf.getCurrentPeers().stream().map(peer -> peer.getId().toString()).toList();
+		return addresses;
+	}
+
+	/** Two election timeouts, at least a second. */
+	private Duration removalCheckBudget() {
 		var budget = config.electionTimeoutMax().multipliedBy(2);
-		if (budget.compareTo(Duration.ofSeconds(1)) < 0) {
-			budget = Duration.ofSeconds(1);
-		}
-		return RemovalCheck.removedBy(config.nodeId(), group.getGroupId(), conf.getLogEntryIndex(), members.size(),
-				RemovalCheck.addressesOf(config.nodeId(), members, addresses), budget);
+		return budget.compareTo(Duration.ofSeconds(1)) < 0 ? Duration.ofSeconds(1) : budget;
 	}
 
 	/** Records, once, that a configuration from the log made this node a member: see {@link #requireNotRemoved}. */
