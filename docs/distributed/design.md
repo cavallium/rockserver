@@ -1498,9 +1498,24 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   unit, with `SuccessExitStatus=143` for a stop by SIGTERM and `TimeoutStopSec=150` for a stop longer than systemd's
   default of 90 s). A node of a version before
   this, started with `--join`, has no `raft/member` and still stays up in the initializing state, printing `READY`; it
-  says so in its log as above. One start is refused wrongly: a node that holds a joint configuration of its own
-  removal that its leader never committed before losing its leadership. Only a node that was being removed gets there;
-  run `remove-peer` again.
+  says so in its log as above.
+
+  A joint configuration of its own removal in the node's log need not have been committed: its leader may have lost
+  its leadership first, and the next leader, elected by members that never received it, dropped it, so the node is
+  still a member (R3-G2b-4; before, such a node was refused and had to be removed again with `remove-peer`). So a node
+  whose log ends with a joint configuration that holds it in the old half only asks the members of the new half for
+  their configuration (`RemovalCheck.keptBy`, the same `TermService` question as below), and starts if a majority of
+  that half hold a committed configuration with it; a leader then cuts its log back to the configuration before. A
+  committed answer without it, at the index of its joint configuration or later, says it was removed; one from
+  before that index comes from a member behind its log and does not count. Removed, undecided within two election
+  timeouts, or members out of reach: it is refused as before, with exit code 4. A node that started this way and then
+  waits outside the cluster asks the same members each time it warns, and stops once a majority hold its removal
+  committed. One case still starts a removed node: a restart during a removal still in flight, when a majority of the
+  new half answer before the leader's joint configuration reached them, and the leader then commits it. The node is
+  then outside the cluster, and the next restart refuses it. `JointRemovalStartTest` builds the dropped case with five
+  in-process nodes (the leader writes the joint configuration while three followers are down, so only the removed
+  follower receives it; the other three then elect a leader without it), and checks that a committed removal is still
+  refused; without the change the first test fails with `RemovedException`.
 
   The configuration that removes a node commits with the other members alone (a majority of the old members need not
   include it), and then the leader stops sending to it: a node that was stopped, slow or cut off during its removal
@@ -1893,7 +1908,8 @@ adds its lanes: platform threads (`<node>-apply-lane-N`) that run RocksDB calls 
   of the same keys by one client block (up to 12 s) instead of conflicting at once, as long as the first has not
   committed.
 - **With `--pipelined-updates`, a `getForUpdate` value is provisional** until the update ends well, so nothing
-  may act on it first. `closeFailedUpdate` of such an update can wait (up to 2 s) and can fail with `UPDATE_RETRY`,
+  may act on it first. (The one exception is a write that is right whatever the value turns out to be, such as Yotsuba's
+  idempotent sender-index entry, see item 0 of "Left before a first deployment".) `closeFailedUpdate` of such an update can wait (up to 2 s) and can fail with `UPDATE_RETRY`,
   which on a single node it never does: code that uses a no-change close to confirm what it read must retry on
   it. Its update id is positive, and a call that needs a native snapshot on it fails with `UPDATE_RETRY`. A hot key
   almost always has a pending write, so transactions that touch one conflict more often.
@@ -1927,8 +1943,10 @@ failover" below).
 | `PipelinedLeaderKillTest`, `PipelinedPartitionTest`, `PipelinedRandomFaultTest` | The suites of the same name, with the nodes on `--pipelined-updates`. With `PipelinedUpdatesTest`, the only tests that chain in a default run: the suites below run the plain per-key queue unless the property below is set, and fail if an update chains there. After each fault these three wait for an update that chains. |
 | `LeaderKillTest` | Repeated SIGKILL of the leader under concurrent writes. No acknowledged merge is lost or doubled, no acknowledged increment of a hot counter is lost, and replicas are byte-identical. Writes resume in about 1 s (the test only requires under 10 s). |
 | `FollowerReadTest` (in-process, follower reads on) | A follower serves reads of writes acknowledged on the leader, with writes flowing meanwhile and on a quiet cluster (thanks to `CommitHeartbeats`), some by itself (the share is printed, not asserted beyond a loose bound: it depends on the disk and load); once it knows the commit index it serves by itself. The option is set on every node through the property. A follower whose database may hold an entry of a term later than its read index forwards, also after a real leader change: a read index of term T whose apply (held by the test) is reached in one group with the entries of the next leader's term is forwarded, not served (a mutation without the check serves it); reads stay linearizable on the follower and the new leader across a leader change. A read on the leader whose apply is held does not answer the old value after a follower served the new one. A follower whose apply is held forwards instead of answering with the old value, and one cut off from the rest fails instead of answering. A follower names the leader in its responses, and a client of several nodes listing the follower first reads its writes and its transaction through it. |
-| `PeerChannelsMembershipTest` (in-process, 3 nodes and a fourth that joins) | R2-RT-2: after a real membership change the shared `PeerChannels` of every node drop the channel to a member removed after it joined (no startup peer list holds its address) and keep the other members' channels (with the pruning call removed, the channel stays and the test fails). `InProcessCluster.join` starts a node with `--join` on ports of its own. |
+| `PeerChannelsMembershipTest` (in-process, 3 nodes and a fourth that joins) | R2-RT-2: after a real membership change the shared `PeerChannels` of every node drop the channel to a member removed after it joined (no startup peer list holds its address) and keep the other members' channels (with the pruning call removed, the channel stays and the test fails). `InProcessCluster.join` starts a node with `--join` on ports of its own, with every configured node as a peer and none of their ports, also a stopped node's (R9-9, `InProcessClusterTest`: two joins and more, no node started; with the old peer list the second join leaves out the first). |
 | `CommitHeartbeatsTest` | Each commit index is asked for once and a higher one again, nothing before a commit index or when disabled; Ratis finds the transport by class name and builds it with and without the node's instance. A wake given before the appender waits is kept for that wait (R7-1; Ratis' `AwaitForSignal` loses it), but only when it would make the appender send a commit heartbeat; any other early wake is dropped, a wake while waiting always wakes. Resends after broken streams do not reopen the window of the first send and stop at 3 per commit index (R7-2). |
+| `AppenderMetricsRaceTest` | R9-1: Ratis' `GrpcServerMetrics`, made while another of the same division unregisters, gets no registry and its constructor throws a `NullPointerException` (a few thousand generations, under a second); that failure is recognized and the appender made again, up to 5 times; a `NullPointerException` from elsewhere is not retried. Without the retry the tests of it fail. |
+| `JointRemovalStartTest` (in-process, 5 nodes, then 3) | R3-G2b-4: a node whose log ends with a joint configuration of its own removal that the next leader dropped starts and rejoins; one whose removal was committed is still refused. |
 | `FollowerReadLatencyTest` (in-process, prints numbers) | Read-after-write latency on a follower, with and without `CommitHeartbeats`, against forwarded reads with and without the leader's apply wait, quiet and with a writer in the background; with the heartbeats the follower serves more than half of the quiet reads and some of the busy ones itself (loose bounds; the printed shares are the measurement). The numbers in "Follower reads" come from it. |
 | `ForwardingFailoverTest` | A client of a follower sees only retryable errors (point reads, range streams, writes) while the leader is killed, and every kind of request succeeds again after the election. |
 | `ClientFailoverTest` | One client connection listing all three nodes, while the node it uses is killed (the leader, or a follower): only retryable errors, new calls succeed on another node of the same connection (about 1 s with an election, under 200 ms without), a new connection skips the dead node, and a transaction opened through a dead follower still commits. |
@@ -1941,7 +1959,7 @@ failover" below).
 | `RatisContractTest` | The Ratis 3.3.1 behaviors that the design relies on beyond its API, against real servers in the JVM: the bootstrap and configuration meta files that `--join` safety reads, and the initializing state of a server started with an empty group (no election, no bootstrap file); the open segment format that `RaftLogRepair` rewrites; the type of the full-pending-queue refusal; a state machine refusal that reaches a remote client by class name and message, without a step down; `NotLeaderException` for an entry appended by a leader that then steps down (three servers); a transfer without a new leader that steps down; the 3 s wait of `GrpcUtil.shutdownManagedChannel` with a call in flight; a snapshot chunk held on the heap until its timeout by `StreamObserverWithTimeout`; a leader whose log worker is stopped (`LogWorkerGate`) commits nothing until it flushes; the CPU of the appender to a dead follower (printed, bounded at half a core); with the node's Raft settings, a follower learns a new commit index only with the next append or heartbeat (3 s), and within 600 ms of `CommitHeartbeats.send` on the leader, for both followers, 20 writes in a row, also when the link to a follower drops that heartbeat and breaks its stream (sent again on the new stream), and when `send` lands between the appender building nothing and its wait (R7-1, through a test hook in the real appender; the appender waits on its own `WakeSignal`); a client proxy made while the one before it to the same peer closes can get a metric interceptor without a registry (R8-4: every call of it and its close then throw a `NullPointerException`), and `PeerProxyMap.close` lets such a close failure out as a `CompletionException` after closing the other proxies. The match index moving only on replies with entries, and the follower order of `LeaderStall`, are pinned by `LeaderStallTest`. |
 | `RaftSettingsTest`, `ByteAdmissionTest`, `ConflictPositionsTest` | Snapshot chunks stay at most 4 s on the heap; Ratis' pending-request limits hold every node's attempts and stay near the defaults, and the byte limit grows with a peer list of more than 4 nodes; one entry of the largest size fits every limit on its way. The byte admission never exceeds its limit and is sized from the heap. Conflict positions survive the exception that Ratis rebuilds, and a text that does not parse is a conflict of the whole entry. |
 | `SstMaintenanceTest` (in-process) | `scanRawResumable`, `getSstMetadata` and `getTableProperties` through a follower describe the leader's database; raw-scan tokens carry the leader and its term and skip their tables through any node, while tokens of another node or term, or untagged ones, scan them again; over gRPC a client that does not set `acceptsTaggedSstTokens` gets plain filenames; `compactFiles` of the internal column is refused. |
-| `ColumnIteratorsTest`, `SnapshotBackoffTest`, `DiskProbeTest`, `AddPeerCheckTest`, `ProposerResetTest`, `ProposerBrokenProxyTest`, `ShutdownSignalTest` | Applying a column deletion closes the column's iterators and ends its range streams with `COLUMN_NOT_FOUND` instead of waiting for them (a stream of another column goes on; one started during the deletion fails), and so does a replicated deletion for `scanRaw` and `scanRawResumable` served through a node's API (R3-G2a-5), and an unknown iterator answers `UPDATE_RETRY` (the database's error for it is pinned); a failing snapshot is tried again only after its delay (1 s doubling to a minute), on a cluster too; a disk probe that does not end within the limit means a hung disk, until it ends; `add-peer` waits for a majority of the members to answer; a proposer's connection reset returns once the failed proxy left Ratis' map, before its slow close, so a resend gets a new one; a follower's proposer replaces a client proxy to the leader whose calls throw (a metric interceptor without a registry, R8-4) instead of failing every write with an unknown outcome, and a node stops without an error although its proposer holds such a proxy to another peer; the shutdown hook's stop waits for a node whose replica failure was already stopping it, and gives 3; a node stopped by a removal or a newer cluster version exits with 4 or 5 from both the main thread and the shutdown hook's halt (R6-2). |
+| `ColumnIteratorsTest`, `SnapshotBackoffTest`, `DiskProbeTest`, `AddPeerCheckTest`, `ProposerResetTest`, `ProposerBrokenProxyTest`, `ShutdownSignalTest` | Applying a column deletion closes the column's iterators and ends its range streams with `COLUMN_NOT_FOUND` instead of waiting for them (a stream of another column goes on; one started during the deletion fails), and so does a replicated deletion for `scanRaw` and `scanRawResumable` served through a node's API (R3-G2a-5), and an unknown iterator answers `UPDATE_RETRY` (the database's error for it is pinned); a failing snapshot is tried again only after its delay (1 s doubling to a minute), on a cluster too; a disk probe that does not end within the limit means a hung disk, until it ends; `add-peer` waits for a majority of the members to answer; a proposer's connection reset returns once the failed proxy left Ratis' map, before its slow close, so a resend gets a new one; later attempts that failed on a proxy already replaced keep its replacement (R9-2); a follower's proposer replaces a client proxy to the leader whose calls throw (a metric interceptor without a registry, R8-4) instead of failing every write with an unknown outcome, and a node stops without an error although its proposer holds such a proxy to another peer; the shutdown hook's stop waits for a node whose replica failure was already stopping it, and gives 3; a node stopped by a removal or a newer cluster version exits with 4 or 5 from both the main thread and the shutdown hook's halt (R6-2). |
 | `CommandLineTest`, `FaultFsTest`, `LogTermsTest` | The operator commands through `main`, in this JVM with the exit replaced (`ReplicatedServerMain.exiter`): `admin checksum` and `admin backup` against a running cluster print `OK`, wrong arguments exit with 2, `export-seed` of a stopped replica writes the seed and refuses a target that exists, `restore-backup` restores into an empty directory (which then starts and serves the data) and refuses a used one with 1. The storage shim fails writes and syncs under its directory only while triggered, and only the kinds the trigger names. `LogTerms` reads the terms of a stopped cluster's logs, and they match. |
 | `LeaderStallTest` | The rule of `LeaderStall`; follower next indices, which Ratis gives without ids, pair with ids only when the follower list read before and after them is the same; the bound that grows and comes back, and the rule of a log that stops, which a real leader with a stopped log worker follows within seconds. A graceful stop of the leader with one node down, followed by a restart at once, loses no reply and costs no step down. With one node down, the reply to a new leader's first entry is lost on a link, after the entry reached the follower's disk: nothing commits and the leader stays, until it steps down and a write gets through. The same loss after the first commit heals with the next write. A leader behind in applying does not step down. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
@@ -2153,7 +2171,13 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
 0. **Pipelined updates** stay off until the benchmark on hot keys (see [performance.md](performance.md)). The review
    of the Yotsuba call sites is done, on Yotsuba's `replicated-rockserver` branch (commit `53d400ef4`, see
    [consumer-contracts.md](consumer-contracts.md)): every update path acts on a chained value only after the update
-   ended well, and retries `UPDATE_RETRY` from a no-change close. Watch `update.guardRejected`, `update.chainConflict`,
+   ended well, and retries `UPDATE_RETRY` from a no-change close. One exception, argued harmless (Yotsuba
+   `ffb742b77`, its workload mapping's "Side writes before the ending write"): `MessagesImpl.patchCanonicalMessage`
+   writes the sender-index presence entry (an idempotent `ensure` put, never deleted) before its ending put, from a
+   read that may be provisional, and the entry stays after a failed update or a rerun. The order keeps the lossy
+   index a superset of the committed rows; the sender of a provisional value is one whose writer already wrote the
+   same entry, and an extra entry would only cost a filtered block scan. Every other update body ends with its only
+   write. Watch `update.guardRejected`, `update.chainConflict`,
    `transaction.conflict` and `transaction.chainConflict`. A leader chains only once the cluster version has pipelined
    updates (see "Cluster version"): an older node would fail on the entries of a pipelined leader. With the
    option off, entries keep the bytes they always had, and logs written before these flags stay readable.
@@ -2167,8 +2191,9 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
    cleanup leaves no transaction open and closes each update once, the in-flight limit warning from one tested helper,
    also in the settings comments), the round-7 commits `b0f42c8bd` and `414f3109f` (that test checks double closes
    per update id and drives the cancel and overload close paths), and the round-8 commits `b8b713488` (a body's own
-   error after an unconfirmed chained read runs the update again, below) and `520170f65` (its review: resent
-   closes, the exhausted retry's message). Left on the Yotsuba side:
+   error after an unconfirmed chained read runs the update again, below), `520170f65` (its review: resent
+   closes, the exhausted retry's message) and `ffb742b77` (R8-5: documents the one side write before an ending put,
+   see item 0; no code change). Left on the Yotsuba side:
    - Merge the branch, build it against a released `rockserver-core` of this version (the branch was compiled and
      tested against local builds of it; Yotsuba's pom still pins 2.0.3), and deploy it.
    - Set `database.rockserver.nodes` in the deployed settings once the cluster exists.
@@ -2231,8 +2256,10 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      comes before its ending write and the update wrote nothing. A cancel, by the caller or a caller's timeout,
      goes to the cancel close, which only closes and never reruns. Rockserver needs no change for this: the close
      already answers `UPDATE_RETRY` whenever the read is not confirmed, and answering these closes quietly would be
-     wrong (a clean close of an unconfirmed chained read would confirm it). Nothing is written or left open in any
-     of these cases, since a chained update has no native transaction and the leader removes it before it answers.
+     wrong (a clean close of an unconfirmed chained read would confirm it). Nothing is left open in any of these
+     cases, since a chained update has no native transaction and the leader removes it before it answers, and
+     nothing is written through the update; the one side write of a body before its ending write (the sender-index
+     presence entry, item 0) is an idempotent `ensure` put outside the update, which stays, harmlessly.
      Under `--pipelined-updates` the remaining warning follows leader changes, timeouts and refused chained writes:
      it counts failed chained updates, and a pipelined cluster under contention makes some on purpose. Tested in
      Yotsuba with fakes (`RockserverUpdateTransactionsTest`) and against an embedded single node whose close is made
@@ -2418,6 +2445,13 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `MembershipTest.aRemovedNodeThatRestartsExitsWithFour` only for the start path, and that suite has not run.
 8. **Upstream.** Report the Ratis ReadIndex reuse bug, and switch back to Ratis ReadIndex once it is fixed
    upstream. Also to report (drafts in the round-3 notes), none of them blocking:
+   - `AwaitForSignal.signal()` loses a wake given while nobody waits (R7-1, see "Commit heartbeats" above): it sets
+     the flag that it replaces (`signaled.getAndSet(new AtomicBoolean()).set(true)`), and `await` reads the new one.
+     So a `LogAppender` woken between building its requests and its wait in `GrpcLogAppender.mayWait` waits its
+     whole wait, up to a heartbeat interval, and the follower learns a commit index late. Worked around by
+     `CommitHeartbeats.WakeSignal` (returned by `Appender.getEventAwaitForSignal`), which keeps such a wake for the
+     next wait when it would send a commit heartbeat; `RatisContractTest` drives the lost-wake moment through a test
+     hook. On a Ratis that fixes it, `WakeSignal` can go.
    - `GrpcUtil.shutdownManagedChannel` waits 3 s, then 2 s more, on the thread that resets a peer's proxy; worked
      around by `Proposer.resetConnection`, which resets on a thread of its own and waits only until Ratis took the
      failed proxy out of its map (so a resend to the same peer gets a new channel, not the one being closed).
@@ -2430,7 +2464,28 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      node met it after a leader loss (`RustClientLiveTest`: the stop failed with "Failed to stop node"). Worked around
      in `Proposer`: an attempt whose call throws a runtime exception replaces the proxy (`resetBrokenProxy`), and a
      runtime failure of the client's close is logged (`closeClient`); Ratis has closed the other proxies and its
-     threads by then. `RatisContractTest` pins the race.
+     threads by then. `RatisContractTest` pins the race. A reset replaces only the proxy its attempt was sent on
+     (read before the call): attempts in flight on one broken proxy fail together, and each would otherwise reset the
+     replacement made by the one before, closing a healthy channel under its resends, which then fail `UNAVAILABLE`
+     and may end with an unknown outcome (R9-2). Ratis' `PeerProxyMap` has no compare-and-remove, so the check and the
+     reset are two steps, checked again just before the reset: a reset by another attempt between them can still
+     replace one healthy proxy, once. `ProposerResetTest` fails without the check.
+   - The same race on the server side (R9-1): every `GrpcLogAppender` of a division makes a `GrpcServerMetrics` with
+     one shared registry name (member id, `ratis_grpc`, `log_appender`), and its stop unregisters it. An appender made
+     while another one stops (`LeaderStateImpl.restart` is stop then add, and is not synchronized; a removed follower;
+     the appenders of an earlier term) can get `null`, and its constructor throws a `NullPointerException` at its
+     first counter; the old appender of that follower is already gone, so the follower would get no appends or
+     heartbeats until the leadership changes. Worked around in `CommitHeartbeats.Factory.newLogAppender`: an appender
+     whose constructor throws a `NullPointerException` from a Ratis metrics class is made again, up to 5 times (the
+     constructor has no effect before its metrics, and the next try makes a new registry; any other
+     `NullPointerException` is thrown at once). `AppenderMetricsRaceTest` pins the race against Ratis' own
+     `GrpcServerMetrics` (a few thousand generations) and checks the retry. Other Ratis objects with shared metric
+     names were checked in the 3.3.1 bytecode: the server's `MetricServerInterceptor` (one per server), and a
+     division's `LogAppenderMetrics` (per leader term), `RaftServerMetricsImpl`, `LeaderElectionMetrics`,
+     `SegmentedRaftLogMetrics` and `StateMachineMetrics` are made and unregistered once per server, division or term,
+     one after the other on the division's own transitions, never two of one name at once; `GrpcServerProtocolClient`
+     (the leader's channel to a follower) has no metric interceptor. The `admin` command's `RaftClient` builds its
+     proxies once, in a process of its own: a broken proxy there fails the command, which is run again.
    - The two `ResourceUnavailableException`s of the pending-request limit (before and after the append) differ only
      by their message: a typed refusal before the append would let `Proposer` stop matching text.
    - The retry cache has an expiry but no size bound (`RaftServerConfigKeys.RetryCache`): a bound in entries or
