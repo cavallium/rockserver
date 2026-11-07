@@ -139,8 +139,10 @@ with 11–18 s write latency. In order of discovery:
     instead of one shared by every node of a JVM: a bounded platform pool is the configuration that stalled, and
     the control plane no longer depends on the carriers. Batches are also encoded (up to 8 MiB each) and
     submitted to Ratis on the proposer's submit threads, not on the 2–4 control threads, since a local submission
-    can block in Ratis' append during a disk stall (R22): one more hand-off per batch, never per request, and none
-    at all while every batch slot is taken. **Not measured yet** (the control-plane move costs one
+    can block in Ratis' append during a disk stall (R22): one more hand-off per batch on the leader, never per
+    request, and none at all while every batch slot is taken. On a node that does not lead, a data batch goes
+    straight to the sender's virtual threads, as its attempts did before, and is encoded there: no extra hand-off,
+    but the encoding now waits for a carrier too, behind pinned database reads (R22-2). **Not measured yet** (the control-plane move costs one
     hand-off per write reply, a few microseconds). To check it, and whether more carriers help, run back to
     back, more than once, on a quiet machine, with the leader on the SATA disk and then on an NVMe disk:
     `load-bench.sh --target replicated --root <dir> --node-dirs <three disks> --scales 1,2,4 --step-seconds 30`
