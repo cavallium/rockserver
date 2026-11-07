@@ -1116,6 +1116,8 @@ class RemovalRulePropertyTest {
 				.collect(SUBJECTS.stream().anyMatch(id -> !model.newestCommitted().inNew(id)
 						&& model.nodes.get(id).incarnation == 0 && model.seeded.inNew(id)));
 		Statistics.label("snapshot installs").collect(model.trace.stream().anyMatch(t -> t.startsWith("Install")));
+		Statistics.label("chunks of deposed leaders").collect(model.trace.stream()
+				.anyMatch(t -> t.startsWith("StaleInstall")));
 		Statistics.label("REMOVED verdicts seen").collect(model.removedVerdicts > 0);
 	}
 

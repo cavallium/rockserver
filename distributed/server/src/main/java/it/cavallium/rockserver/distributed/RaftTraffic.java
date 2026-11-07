@@ -2,16 +2,19 @@ package it.cavallium.rockserver.distributed;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiPredicate;
 import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc;
+import org.apache.ratis.thirdparty.io.grpc.ForwardingServerCall;
 import org.apache.ratis.thirdparty.io.grpc.ForwardingServerCallListener;
 import org.apache.ratis.thirdparty.io.grpc.Metadata;
 import org.apache.ratis.thirdparty.io.grpc.MethodDescriptor;
 import org.apache.ratis.thirdparty.io.grpc.ServerCall;
 import org.apache.ratis.thirdparty.io.grpc.ServerCallHandler;
 import org.apache.ratis.thirdparty.io.grpc.ServerInterceptor;
+import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,7 +28,14 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Installed on the Raft gRPC server as an interceptor (through {@link TermService#customizer}); it reads the
  * method name, and forwards every message unchanged. Before it forwards a snapshot chunk, it records the chunk's
- * configuration with the leader's term ({@link InstalledConfiguration}, round-13 review, finding 1).</p>
+ * configuration with the leader's term ({@link InstalledConfiguration}, round-13 review, finding 1): every chunk,
+ * whatever its term, since Ratis takes the configuration of a chunk it rejects too (round 15). If the record cannot
+ * be written, it fails the install stream with UNAVAILABLE instead of forwarding the chunk (R14-3): Ratis never takes
+ * that configuration, and the leader, told at once, starts the install again after its retry wait (Ratis' leader
+ * never sends a single chunk again). The record is synced on the gRPC listener thread of that stream only (Raft's
+ * gRPC server has no executor of its own: the listeners of a call run one at a time on gRPC's shared pool), outside
+ * Ratis' server lock, and only when it changes: about two syncs per install; Ratis' own handler writes each chunk
+ * on that same thread.</p>
  */
 final class RaftTraffic implements ServerInterceptor {
 
@@ -38,8 +48,10 @@ final class RaftTraffic implements ServerInterceptor {
 
 	/**
 	 * Tests only: drops a Raft request (append, vote, snapshot chunk, ...) that reaches node {@code receiver} when it
-	 * returns true, as a lossy link would: Ratis never sees it, and its sender times out and sends again. Static, for
-	 * in-process clusters.
+	 * returns true: Ratis never sees it. A unary request (a vote) times out at its sender, which sends it again; on a
+	 * stream (appends, snapshot chunks) the follower sees the gap at the next message (a snapshot chunk of an unexpected
+	 * index fails the stream) or the leader's request times out, and the leader starts over (appends from the next
+	 * index it learns, a snapshot install from its first chunk). Static, for in-process clusters.
 	 */
 	static volatile @Nullable BiPredicate<String, Object> dropForTesting;
 
@@ -72,9 +84,17 @@ final class RaftTraffic implements ServerInterceptor {
 		if (!raft) {
 			return next.startCall(call, headers);
 		}
-		return new ForwardingServerCallListener.SimpleForwardingServerCallListener<>(next.startCall(call, headers)) {
+		var serialized = method.equals(INSTALL_SNAPSHOT) ? new SerializedCall<>(call) : null;
+		return new ForwardingServerCallListener.SimpleForwardingServerCallListener<>(next.startCall(
+				serialized != null ? serialized : call, headers)) {
+			/** The install stream was failed: no message of it reaches Ratis any more. Listener calls are serial. */
+			private boolean failed;
+
 			@Override
 			public void onMessage(Q message) {
+				if (failed) {
+					return;
+				}
 				var drop = dropForTesting;
 				if (drop != null && drop.test(nodeId, message)) {
 					// The stream handler asks for the next message only after it saw one.
@@ -90,18 +110,64 @@ final class RaftTraffic implements ServerInterceptor {
 					try {
 						InstalledConfiguration.record(raftDir, request);
 					} catch (IOException | RuntimeException ex) {
-						// Ratis must not take a configuration whose term bound may be lower than recorded: the
-						// chunk is dropped, as on a lossy link, and the leader sends it again.
-						LOG.warn("{}: failed to record the configuration of a snapshot chunk in {}, dropping it", nodeId,
-								raftDir.resolve(InstalledConfiguration.FILE), ex);
-						if (call.getMethodDescriptor().getType() != MethodDescriptor.MethodType.UNARY) {
-							call.request(1);
-						}
+						// Ratis must not take a configuration that is not recorded: the stream fails, so the leader
+						// starts the install again (a dropped chunk would show only at the next chunk, or, for the
+						// last one, after the leader's request timeout).
+						var file = raftDir.resolve(InstalledConfiguration.FILE);
+						LOG.warn("{}: cannot record the configuration of a snapshot chunk in {}; failing the install"
+								+ " stream", nodeId, file, ex);
+						failed = true;
+						Objects.requireNonNullElse(serialized, call).close(Status.UNAVAILABLE.withDescription(
+								"cannot record the configuration of a snapshot chunk in " + file).withCause(ex),
+								new Metadata());
 						return;
 					}
 				}
 				super.onMessage(message);
 			}
+
+			@Override
+			public void onHalfClose() {
+				if (!failed) {
+					super.onHalfClose();
+				}
+			}
 		};
+	}
+
+	/**
+	 * The call of an install stream, as Ratis' handler and this interceptor share it: a {@link ServerCall} is not
+	 * thread-safe, and Ratis answers chunks from the callbacks of its futures, on other threads than the listener's.
+	 * Once closed (by this interceptor, after a failed record), what Ratis still sends or closes on it is dropped
+	 * instead of failing on a closed call.
+	 */
+	static final class SerializedCall<Q, R> extends ForwardingServerCall.SimpleForwardingServerCall<Q, R> {
+		private boolean closed;
+
+		SerializedCall(ServerCall<Q, R> delegate) {
+			super(delegate);
+		}
+
+		@Override
+		public synchronized void sendHeaders(Metadata headers) {
+			if (!closed) {
+				super.sendHeaders(headers);
+			}
+		}
+
+		@Override
+		public synchronized void sendMessage(R message) {
+			if (!closed) {
+				super.sendMessage(message);
+			}
+		}
+
+		@Override
+		public synchronized void close(Status status, Metadata trailers) {
+			if (!closed) {
+				closed = true;
+				super.close(status, trailers);
+			}
+		}
 	}
 }
