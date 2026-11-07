@@ -88,6 +88,38 @@ class ApplierTest {
 		}
 	}
 
+	/**
+	 * R16-1: a replicated server offers client sessions when the version it was told of has them, or when its database
+	 * has no cluster id yet (see ReplicatedConnection.getCapabilities). Genesis used to write the cluster id before it
+	 * told the node of its version, so a client whose handshake came in between was told there were no sessions, and its
+	 * connection never used them. Here, at every point where the node learns the version, what it would answer just
+	 * before must offer sessions: the cluster id must not be visible before the version is known.
+	 */
+	@Test
+	void genesisMakesTheVersionKnownBeforeTheClusterId() throws Exception {
+		try (var store = open()) {
+			var applier = new Applier(store);
+			var answers = new ArrayList<String>();
+			applier.maintenance(new Applier.Maintenance() {
+				private long known;
+
+				@Override
+				public void clusterVersion(long version) {
+					String clusterId = store.clusterId();
+					boolean sessions = Capabilities.has(known, Capabilities.CLIENT_SESSIONS) || clusterId == null;
+					answers.add("version " + Capabilities.describe(known) + ", cluster id " + clusterId + ": sessions "
+							+ sessions);
+					known = version;
+				}
+			});
+			applier.apply(new Request(5, 0, 0, new LogEntry.Genesis("c", false)), TermIndex.valueOf(1, 1));
+			assertEquals("c", store.clusterId());
+			assertEquals(Capabilities.GENESIS, store.clusterVersion());
+			assertEquals(1, answers.size(), answers.toString());
+			Assertions.assertTrue(answers.getFirst().endsWith("sessions true"), answers.toString());
+		}
+	}
+
 	@Test
 	void aRetriedRequestTakesEffectOnceAndGetsTheFirstResult() throws Exception {
 		long column;

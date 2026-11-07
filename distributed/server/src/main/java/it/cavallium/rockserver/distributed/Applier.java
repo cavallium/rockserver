@@ -1359,15 +1359,18 @@ final class Applier {
 		if (genesis.seedDigest() != null) {
 			checkSeedDigest(genesis.seedDigest());
 		}
-		store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_ID),
-				Buf.wrap(genesis.clusterId().getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		// A cluster created by this version: every member runs it (see Capabilities). The node learns the version before
+		// the cluster id becomes visible: until then it answers as before genesis, which assumes this same version. The
+		// other order left a moment, id written and version not yet known, in which the node told a connecting client
+		// that there were no sessions, and that connection never used them (R16-1).
+		maintenance.clusterVersion(Capabilities.GENESIS);
+		writeClusterVersion(Capabilities.GENESIS);
 		if (genesis.seeded()) {
 			store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.SEEDED), Buf.wrap(new byte[] {1}),
 					RequestType.none());
 		}
-		// A cluster created by this version: every member runs it (see Capabilities).
-		writeClusterVersion(Capabilities.GENESIS);
-		maintenance.clusterVersion(Capabilities.GENESIS);
+		store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_ID),
+				Buf.wrap(genesis.clusterId().getBytes(StandardCharsets.UTF_8)), RequestType.none());
 	}
 
 	private void writeClusterVersion(long version) {

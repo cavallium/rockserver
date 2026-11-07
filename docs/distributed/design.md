@@ -2056,7 +2056,12 @@ What waits for it:
   takes effect at the next term; a node with the option logs a warning at each term without it.
 - Client sessions: a node advertises them to its clients (`RockserverCapabilities.clientSessions`) only when the cluster
   version has them, or before genesis. A client reads that when it connects, so one connected before stays without
-  sessions until it reconnects.
+  sessions until it reconnects. So no moment of a node's life may answer "no sessions" on a cluster that has them
+  (R16-1): `Genesis` makes the version known to the node before it writes the cluster id (it wrote the id first, and
+  a client whose handshake fell in between, typically on the leader of a cluster being created, ran without sessions
+  for good; `ApplierTest.genesisMakesTheVersionKnownBeforeTheClusterId`), and a database opened at a snapshot install
+  gives its version before it replaces the old one. A crash between the two writes of genesis leaves the version
+  without the id: genesis is applied again, and a version without an id answers as before genesis.
 - Checksums and backups (next section): refused until the version has them.
 - `admin add-peer` refuses a node that lacks a capability of the cluster, or one that every member that answered
   supports: the leader may raise the version to it at any moment, also while the new node catches up and before the
