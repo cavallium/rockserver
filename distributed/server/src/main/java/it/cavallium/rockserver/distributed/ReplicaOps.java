@@ -560,7 +560,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 * whose log starts again from 1.
 	 *
 	 * @throws ReplicatedNode.NewerVersionException if the backup's cluster version has capabilities this version lacks
-	 *                                              (a newer cluster's backup): {@code dataDir} is left without a database
+	 *                                              (a newer cluster's backup). On this or any other failure,
+	 *                                              {@code dataDir} is left without a database, so the command can run
+	 *                                              again
 	 */
 	static TermIndex restore(Path backupDir, Path dataDir, @Nullable Path rockserverConfig) throws IOException {
 		var properties = readBackupProperties(backupDir);
@@ -570,6 +572,36 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			throw new IOException(dataDir + " holds a database or a Raft log: restore into an empty data directory");
 		}
 		Files.createDirectories(dataDir);
+		TermIndex applied;
+		try {
+			applied = restoreDatabase(backupDir, db, rockserverConfig);
+			String suffix = ".before-restore-" + System.currentTimeMillis();
+			for (Path old : List.of(dataDir.resolve(RESULTS_FILE), dataDir.resolve(BACKUPS_DIR))) {
+				if (Files.exists(old)) {
+					Path aside = old.resolveSibling(old.getFileName() + suffix);
+					Files.move(old, aside);
+					LOG.info("Moved {} of the old cluster to {}", old, aside);
+				}
+			}
+		} catch (Throwable failure) {
+			// Leaves the data directory as it was given, without a database, so that the same command can run again
+			// (with the newer binary after a version refusal, R18-1; after any other failure too, R19-3: the half-made
+			// db/ used to stay, and the rerun refused the directory as holding a database).
+			try {
+				NodeStore.deleteRecursively(db);
+			} catch (IOException | RuntimeException cleanup) {
+				failure.addSuppressed(cleanup);
+			}
+			throw failure;
+		}
+		LOG.info("Restored backup {} (log index {} of cluster {}) into {}, holding the entries up to {}",
+				properties.getProperty("name"), properties.getProperty("index"), properties.getProperty("cluster"), db, applied);
+		return applied;
+	}
+
+	/** Copies the backup's database to {@code db} and drops its replication metadata; returns its applied entry. */
+	private static TermIndex restoreDatabase(Path backupDir, Path db, @Nullable Path rockserverConfig)
+			throws IOException {
 		NodeStore.restore(backupDir.resolve(BACKUP_DB_DIR), db);
 		TermIndex applied;
 		long version;
@@ -584,20 +616,8 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		}
 		long unknown = version & ~Capabilities.SUPPORTED;
 		if (unknown != 0) {
-			// Leaves the data directory as it was given: empty, ready for the newer binary to run the same command.
-			NodeStore.deleteRecursively(db);
 			throw ReplicatedNode.NewerVersionException.of(version, unknown);
 		}
-		String suffix = ".before-restore-" + System.currentTimeMillis();
-		for (Path old : List.of(dataDir.resolve(RESULTS_FILE), dataDir.resolve(BACKUPS_DIR))) {
-			if (Files.exists(old)) {
-				Path aside = old.resolveSibling(old.getFileName() + suffix);
-				Files.move(old, aside);
-				LOG.info("Moved {} of the old cluster to {}", old, aside);
-			}
-		}
-		LOG.info("Restored backup {} (log index {} of cluster {}) into {}, holding the entries up to {}",
-				properties.getProperty("name"), properties.getProperty("index"), properties.getProperty("cluster"), db, applied);
 		return applied;
 	}
 
