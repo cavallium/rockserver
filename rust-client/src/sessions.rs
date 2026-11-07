@@ -851,6 +851,52 @@ mod tests {
         assert_eq!(rocksdb_error_type(&error), Some("OUTCOME_UNKNOWN"));
     }
 
+    #[tokio::test]
+    async fn a_copy_that_never_answers_ends_a_caller_without_deadline_at_the_window() {
+        // A silent node (power loss, SIGSTOP, a partition with the host up): the copy has no gRPC timeout, and
+        // nothing on the channel ends it, so only the window can.
+        let writes = SessionWrites::new(true);
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            writes.run(soon(1_000), false, fixed_opener(1), |_, timeout| {
+                assert_eq!(timeout, None, "the server still sees a caller without a deadline");
+                std::future::pending::<Result<(), Status>>()
+            }),
+        )
+        .await
+        .expect("the write ended with the window, not hung");
+        let error = result.unwrap_err();
+        assert_eq!(rocksdb_error_type(&error), Some("OUTCOME_UNKNOWN"));
+        assert!(!is_not_applied(&error));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(900) && took < Duration::from_millis(2_000), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn an_opening_that_never_answers_ends_a_caller_without_deadline_unsent_at_the_window() {
+        let writes = SessionWrites::new(true);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            writes.run(
+                soon(1_000),
+                false,
+                |timeout| {
+                    assert_eq!(timeout, None);
+                    std::future::pending::<Result<i64, Status>>()
+                },
+                script(vec![Ok("never")], sent.clone()),
+            ),
+        )
+        .await
+        .expect("the opening ended with the window, not hung");
+        let error = result.unwrap_err();
+        assert_eq!(rocksdb_error_type(&error), Some("SERVER_OVERLOADED"));
+        assert!(is_not_applied(&error));
+        assert!(sent.lock().unwrap().is_empty(), "nothing sent");
+    }
+
     #[test]
     fn updates_are_remembered_until_they_end() {
         let writes = SessionWrites::new(true);
