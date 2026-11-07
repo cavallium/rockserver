@@ -22,6 +22,14 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.client.impl.ClientProtoUtils;
+import org.apache.ratis.grpc.GrpcUtil;
+import org.apache.ratis.proto.grpc.AdminProtocolServiceGrpc;
+import org.apache.ratis.protocol.SetConfigurationRequest;
+import org.apache.ratis.rpc.CallId;
+import org.apache.ratis.thirdparty.io.grpc.Metadata;
+import org.apache.ratis.thirdparty.io.grpc.StatusRuntimeException;
+import org.apache.ratis.thirdparty.io.grpc.stub.MetadataUtils;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftGroup;
@@ -614,6 +622,34 @@ public final class ReplicatedServerMain {
 					: result.state() + (result.keys() > 0 ? " " + result.keys() + " keys" : "") + " " + result.detail()));
 		}
 		return results;
+	}
+
+	/**
+	 * Sends a configuration change straight to the leader at {@code leaderAddress} through Ratis' admin service, with the
+	 * header that lets it past the leader's {@link MembershipGuard} ({@code --unsafe-multi-voter-change}). One attempt:
+	 * a reply that is not a success (not the leader, for one) is returned as it is, and an error comes back as the
+	 * exception Ratis sent.
+	 */
+	static RaftClientReply setConfigurationUnsafe(String leaderAddress, RaftPeerId leader, RaftGroupId groupId,
+			SetConfigurationRequest.Arguments arguments, Duration timeout) throws IOException {
+		var channel = NettyChannelBuilder.forTarget(leaderAddress).usePlaintext().build();
+		try {
+			var request = new SetConfigurationRequest(ClientId.randomId(), leader, groupId, CallId.getAndIncrement(),
+					arguments);
+			var headers = new Metadata();
+			headers.put(MembershipGuard.UNSAFE, "1");
+			var stub = AdminProtocolServiceGrpc.newBlockingStub(channel)
+					.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
+					.withDeadlineAfter(Math.max(1, timeout.toMillis()), TimeUnit.MILLISECONDS);
+			try {
+				return ClientProtoUtils.toRaftClientReply(stub.setConfiguration(
+						ClientProtoUtils.toSetConfigurationRequestProto(request)));
+			} catch (StatusRuntimeException ex) {
+				throw GrpcUtil.unwrapException(ex);
+			}
+		} finally {
+			channel.shutdownNow();
+		}
 	}
 
 	private static Duration remaining(long deadlineNanos) {

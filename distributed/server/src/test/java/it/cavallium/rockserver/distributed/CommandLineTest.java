@@ -189,6 +189,87 @@ class CommandLineTest {
 		}
 	}
 
+	/**
+	 * Round 14: {@code admin} reads the leader's configuration and refuses a change of more than one voter before it
+	 * proposes anything. The one-step replacement of a lost node ({@code --peer} lists the survivors and the new node) is
+	 * refused with the two-step advice; remove-peer of the lost node, then add-peer of the new one, go through, and the
+	 * new node counts. A re-run of a change that succeeded prints OK; a stale {@code --peer} with remove-peer is refused.
+	 */
+	@Test
+	void adminRefusesAChangeOfMoreThanOneVoter() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("guard")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var lost = cluster.anyFollower().config().nodeId();
+		var survivors = new ArrayList<>(List.of("n0", "n1", "n2"));
+		survivors.remove(lost);
+		cluster.stop(lost);
+		cluster.join("n3");
+		var newPeer = cluster.config("n3").self().format();
+
+		var oneStep = run(admin(plus(survivors, "n3"), "add-peer", newPeer));
+		assertEquals(1, oneStep.code(), oneStep.toString());
+		assertTrue(oneStep.out().contains(VoterChange.MULTI_VOTER_REFUSAL), oneStep.out());
+		assertTrue(oneStep.out().contains("remove-peer " + lost) && oneStep.out().contains("add-peer n3"),
+				oneStep.out());
+		assertVoters(List.of("n0", "n1", "n2"));
+
+		var remove = run(admin(List.of("n0", "n1", "n2"), "remove-peer", lost));
+		assertEquals(0, remove.code(), remove.toString());
+		assertTrue(remove.out().strip().endsWith("OK"), remove.out());
+		assertVoters(survivors);
+		var add = run(admin(survivors, "add-peer", newPeer));
+		assertEquals(0, add.code(), add.toString());
+		assertVoters(plus(survivors, "n3"));
+		var again = run(admin(survivors, "add-peer", newPeer));
+		assertEquals(0, again.code(), again.toString());
+		assertTrue(again.out().strip().endsWith("OK"), again.out());
+
+		// A stale --peer: it lists the lost node again, and removes a survivor.
+		var stale = run(admin(List.of("n0", "n1", "n2"), "remove-peer", survivors.getFirst()));
+		assertEquals(1, stale.code(), stale.toString());
+		assertTrue(stale.out().contains(VoterChange.MULTI_VOTER_REFUSAL), stale.out());
+		assertVoters(plus(survivors, "n3"));
+
+		// n3 counts: with it stopped the two survivors still commit.
+		var api = leader().connection().getSyncApi(RequestContext.batch(TIMEOUT));
+		long column = api.createColumn("c", SCHEMA);
+		api.put(0, column, key(1), value("v1"), RequestType.none());
+		cluster.stop("n3");
+		var leader = leader();
+		leader.connection().getSyncApi(RequestContext.batch(TIMEOUT)).put(0, column, key(2), value("v2"),
+				RequestType.none());
+	}
+
+	private String[] admin(List<String> peerIds, String... command) {
+		var args = new ArrayList<String>(List.of("admin"));
+		for (var id : peerIds) {
+			args.add("--peer");
+			args.add(cluster.config(id).self().format());
+		}
+		args.addAll(List.of("--timeout-ms", "30000"));
+		args.addAll(List.of(command));
+		return args.toArray(String[]::new);
+	}
+
+	/** The leader ({@link InProcessCluster#awaitLeader} also waits for a --join node to know it, which it does not). */
+	private ReplicatedNode leader() {
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().anyMatch(ReplicatedNode::isLeader));
+		return cluster.runningNodes().stream().filter(ReplicatedNode::isLeader).findFirst().orElseThrow();
+	}
+
+	private void assertVoters(List<String> expected) {
+		var conf = leader().stateMachine().division().getRaftConf();
+		assertEquals(expected.stream().sorted().toList(),
+				conf.getCurrentPeers().stream().map(peer -> peer.getId().toString()).sorted().toList());
+		assertTrue(conf.getPreviousPeers().isEmpty(), () -> "a change is under way: " + conf);
+	}
+
+	private static List<String> plus(List<String> ids, String... more) {
+		var all = new ArrayList<>(ids);
+		all.addAll(List.of(more));
+		return all;
+	}
+
 	@Test
 	void noCommandAndAnUnknownCommandExitWithTwo() {
 		assertEquals(2, run().code());
