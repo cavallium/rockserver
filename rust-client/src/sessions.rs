@@ -918,6 +918,29 @@ mod tests {
         assert!(sent.lock().unwrap().is_empty(), "nothing sent");
     }
 
+    #[tokio::test]
+    async fn a_session_opened_after_the_window_ends_a_caller_without_deadline_unsent() {
+        // The opening answers, but only once the window has ended (a late lock or a late answer): the copy must
+        // not go out, so the write is known not applied, as for a caller with a deadline.
+        let writes = SessionWrites::new(true);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let error = writes
+            .run(
+                soon(50),
+                false,
+                |_| {
+                    std::thread::sleep(Duration::from_millis(150));
+                    std::future::ready(Ok(1))
+                },
+                script(vec![Ok("sent after the window")], sent.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(sent.lock().unwrap().is_empty(), "no copy sent after the window");
+        assert_eq!(rocksdb_error_type(&error), Some("READ_DEADLINE_EXCEEDED"));
+        assert!(is_not_applied(&error));
+    }
+
     #[test]
     fn updates_are_remembered_until_they_end() {
         let writes = SessionWrites::new(true);
