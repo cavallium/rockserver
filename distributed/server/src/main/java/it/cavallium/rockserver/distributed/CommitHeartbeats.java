@@ -72,6 +72,8 @@ import org.jetbrains.annotations.Nullable;
  */
 final class CommitHeartbeats {
 
+	private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(CommitHeartbeats.class);
+
 	/** The {@link Parameters} key under which a node's Raft server finds its instance of this class. */
 	static final String PARAMETER = CommitHeartbeats.class.getName();
 
@@ -208,8 +210,51 @@ final class CommitHeartbeats {
 
 		@Override
 		public LogAppender newLogAppender(RaftServer.Division server, LeaderState state, FollowerInfo follower) {
-			return new Appender(server, state, follower, heartbeats);
+			return retryingMissingRegistry(follower.getName(), () -> new Appender(server, state, follower, heartbeats));
 		}
+	}
+
+	/** How many times {@link #retryingMissingRegistry} makes an appender whose metrics got no registry. */
+	static final int APPENDER_ATTEMPTS = 5;
+
+	/**
+	 * R9-1: {@code make()}, made again (up to {@link #APPENDER_ATTEMPTS} times) when it fails because its metrics got no
+	 * registry. Ratis 3.3.1 has the race of R8-4 ({@link Proposer#resetBrokenProxy}) on the server side too: every
+	 * {@code GrpcLogAppender} of a division makes a {@code GrpcServerMetrics} with one shared registry name (the member
+	 * id, {@code ratis_grpc}, {@code log_appender}), and the stop of another appender (a restart of an appender of
+	 * another follower, a removed follower, the appenders of an earlier term) can unregister that registry between
+	 * {@code RefCountingMap.put} and its count, so the new one gets {@code null} and its constructor throws a
+	 * {@link NullPointerException} at its first counter. Ratis has then already taken the old appender of that follower
+	 * out ({@code LeaderStateImpl.restart} is stop, then add), so the follower would get no appends or heartbeats until
+	 * the leadership changes. The constructor has no other effect before that point, and the next attempt makes a new
+	 * registry. A {@link NullPointerException} from elsewhere is not retried.
+	 */
+	static <T> T retryingMissingRegistry(String follower, Supplier<T> make) {
+		for (int attempt = 1; ; attempt++) {
+			try {
+				return make.get();
+			} catch (NullPointerException ex) {
+				if (attempt >= APPENDER_ATTEMPTS || !fromMetrics(ex)) {
+					throw ex;
+				}
+				LOG.warn("{}: the appender's metrics got no registry (a Ratis race), making it again", follower, ex);
+			}
+		}
+	}
+
+	/** Whether {@code ex} was thrown in Ratis' metrics: a metrics class, or a frame of one, on top of its stack. */
+	static boolean fromMetrics(NullPointerException ex) {
+		for (var frame : ex.getStackTrace()) {
+			var name = frame.getClassName();
+			if (name.startsWith("org.apache.ratis.") && name.contains(".metrics.")) {
+				return true;
+			}
+			if (name.equals(GrpcLogAppender.class.getName()) || name.equals(Appender.class.getName())) {
+				// Reached the appender's own constructor without a metrics frame: another failure.
+				return false;
+			}
+		}
+		return false;
 	}
 
 	/** Ratis' gRPC appender that also sends a heartbeat when its follower lags below a wanted commit index. */
