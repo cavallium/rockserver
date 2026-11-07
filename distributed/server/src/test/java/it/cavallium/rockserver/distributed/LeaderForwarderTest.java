@@ -175,7 +175,11 @@ class LeaderForwarderTest {
 	}
 
 	private Server startHandshakeServer() throws Exception {
-		Server server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0))
+		return startHandshakeServer(0);
+	}
+
+	private Server startHandshakeServer(int port) throws Exception {
+		Server server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", port))
 				.addService(new RocksDBServiceGrpc.RocksDBServiceImplBase() {
 					@Override
 					public void getCapabilities(CapabilitiesRequest request,
@@ -249,6 +253,46 @@ class LeaderForwarderTest {
 		assertEquals("n1", moved.peerId());
 		assertEquals(new HostAndPort("127.0.0.1", second.getPort()), s.forwarder().apiAddress("n1"),
 				"leader hints still name the old port");
+	}
+
+	/**
+	 * A listed member whose API stops answering for a moment at the same port (a pause, a restart on the same port):
+	 * the failed connection keeps the member's answered address, so leader hints keep naming it instead of the wrong
+	 * port of this node's peer list, and the connection after the backoff reaches the member there again. Before the
+	 * fix the failure removed the answer and hints named the listed port until this node forwarded to the member again
+	 * (R18 review finding 1).
+	 */
+	@Test
+	void aListedMemberThatFailsOnceAtTheSamePortKeepsItsAnsweredAddress() throws Exception {
+		var first = startHandshakeServer();
+		int apiPort = first.getPort();
+		var answered = new HostAndPort("127.0.0.1", apiPort);
+		var answer = new AtomicReference<>("127.0.0.1:" + apiPort);
+		int raftPort = apiAddressServer(answer);
+		// The peer list names a wrong API port: only the member's answer leads to it.
+		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2),
+				new PeerConfig("n1", "127.0.0.1", raftPort, "127.0.0.1", closedPort()));
+		var s = setup(peers, Duration.ofSeconds(5));
+		var targets = new ArrayList<LeaderForwarder.Target>();
+		for (int i = 0; i < 4; i++) {
+			targets.add(s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		}
+		assertEquals(answered, s.forwarder().apiAddress("n1"));
+
+		first.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+		targets.forEach(s.forwarder()::invalidate);
+		var failed = assertThrows(ExecutionException.class,
+				() -> s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		assertInstanceOf(LeaderForwarder.NotConnectedException.class, failed.getCause());
+		assertEquals(answered, s.forwarder().apiAddress("n1"), "a hint names the listed port after one failure");
+
+		// Back at the same port.
+		startHandshakeServer(apiPort);
+		Thread.sleep(250);
+		assertEquals(answered, s.forwarder().apiAddress("n1"));
+		var back = s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS);
+		assertEquals("n1", back.peerId());
+		assertEquals(answered, s.forwarder().apiAddress("n1"));
 	}
 
 	/** A port nothing listens on. */
