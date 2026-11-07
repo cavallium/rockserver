@@ -24,6 +24,6 @@ class MembershipGaugeTest {
 				Reason.HEARD_LEADER)) {
 			assertEquals(2, ReplicatedNode.membershipGauge(verdict(undecided)), undecided.toString());
 		}
-		assertEquals(3, ReplicatedNode.membershipGauge(verdict(Reason.REMOVED)), "removed, just before exit 4");
+		assertEquals(3, ReplicatedNode.membershipGauge(verdict(Reason.REMOVED)), "removed (reported only if a push happens before exit 4)");
 	}
 }

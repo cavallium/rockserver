@@ -100,7 +100,7 @@ check stops it. Neither can elect a leader that lacks the removal, nor win an el
 waiting outside" in the design document); the elections it starts show in the members' logs as rejected pre-votes. Every 15 election timeouts it logs `hears no leader` or, at its
 start, `starting, not known to be a member`, with `Membership <reason> (K* ..., confirmed by ..., blocked by ..., pending
 ..., unreachable ...)` and what to do. The `membership.state` gauge is 2 meanwhile (1 for a `--join` node before its
-`add-peer` and while `add-peer` catches it up, 0 for a member, 3 in the last sample before exit 4); the alert
+`add-peer` and while `add-peer` catches it up, 0 for a member, 3 if a sample happens to be pushed between the verdict and exit 4, which is not guaranteed); the alert
 `rockserver-node-outside` fires after 10 minutes at 2, and `rockserver-node-not-added` after 6 hours at 1. By reason:
 
 | Reason | What to do |

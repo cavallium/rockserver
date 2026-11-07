@@ -1641,7 +1641,9 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   be older than that leader's configuration. `ReplicatedNode#membership` keeps the last verdict, and the
   `membership.state` gauge says 0 (member, or not checked), 1 (never added; also while `add-peer` catches the node
   up, since it is not detached then and keeps its last verdict until its configuration holds it), 2 (outside,
-  undecided) or 3 (removed, the last sample just before exit 4). The alerts `rockserver-node-outside` (2 or more for
+  undecided) or 3 (removed: reported only if a push of the gauges happens between the verdict and exit 4, which the
+  shutdown does not wait for, and never for a removal found at the start, which exits before the gauges report; no
+  alert relies on it). The alerts `rockserver-node-outside` (2 or more for
   10 minutes) and `rockserver-node-not-added` (1 for 6 hours: a catch-up of a large snapshot can take an hour or more)
   watch it. While undecided
   the node runs in whatever Ratis state its own log gives: a log whose latest configuration leaves it out of a half

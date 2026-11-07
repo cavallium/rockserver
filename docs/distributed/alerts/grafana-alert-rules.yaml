@@ -384,7 +384,7 @@ groups:
         execErrState: Error
         labels: {severity: warning, team: rockserver}
         annotations:
-          summary: "The node is not a member and cannot decide whether it was removed (membership.state 2; 3 is the last sample before exit 4, and the node then stops reporting). Its log says why every 15 election timeouts: see \"Removed node\" in runbooks.md."
+          summary: "The node is not a member and cannot decide whether it was removed (membership.state 2; 3, removed, may show briefly before exit 4, and the node then stops reporting). Its log says why every 15 election timeouts: see \"Removed node\" in runbooks.md."
         data:
           - refId: A
             relativeTimeRange: {from: 3600, to: 0}

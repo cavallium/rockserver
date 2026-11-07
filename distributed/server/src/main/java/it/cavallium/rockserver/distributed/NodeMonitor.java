@@ -165,8 +165,8 @@ final class NodeMonitor {
 		metrics.exportedGauge("disk.raft.usable_percent", raftDisk::usablePercent);
 		metrics.exportedGauge("replica.failed", () -> stateMachine.isFailed() ? 1 : 0);
 		// R11: 0 a member (or not checked yet), 1 never added (a --join node before add-peer, or while add-peer catches it
-		// up), 2 outside and undecided, 3 removed (the last sample before exit 4). Alerts: rockserver-node-outside (2 or
-		// more for 10 min) and rockserver-node-not-added (1 for 6 h).
+		// up), 2 outside and undecided, 3 removed (only if a push happens between the verdict and exit 4, which nothing
+		// waits for). Alerts: rockserver-node-outside (2 or more for 10 min) and rockserver-node-not-added (1 for 6 h).
 		metrics.exportedGauge("membership.state", () -> membershipState.getAsDouble());
 	}
 
