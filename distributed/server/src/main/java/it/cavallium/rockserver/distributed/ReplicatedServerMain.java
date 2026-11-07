@@ -105,15 +105,20 @@ import org.rocksdb.NativeLibraryLoader;
  *
  * <p>{@code admin} changes end with {@code OK}, or with {@code FAILED: ...} and exit code 1, within {@code --timeout-ms}
  * (10 minutes by default), which must cover the catch-up of a new member. A leader that started a change goes on with it
- * after that: see {@code status}, and run the command again. {@code add-peer} first asks the new node what it holds, and
- * refuses a node that does not run or that has a log of its own. {@code snapshot} makes a member take a snapshot now.</p>
+ * after that: see {@code status}, and run the command again. {@code add-peer} first reads the leader's configuration:
+ * for a node that is a voter there at the same address it prints {@code OK} (a re-run) without asking the node. Else
+ * it asks the new node what it holds, and refuses a node that does not run or that has a log of its own (after reading
+ * the configuration again: a node that became a voter meanwhile is {@code OK}). {@code snapshot} makes a member take a snapshot now.</p>
  *
  * <p>{@code add-peer} and {@code remove-peer} build the new voters from {@code --peer} (plus or minus the one node), read
  * the leader's configuration (waiting while a change is under way), and refuse with exit code 1, before proposing
  * anything, a change of more than one voter ({@link VoterChange}): with Ratis 3.3.1 a leader elected during such a
  * change commits with the new voters alone, which can lose committed entries. They send the change as a compare-and-set
  * against the configuration they read, and read it again if another change came first. The leader checks the same
- * ({@link MembershipGuard}), also for older {@code admin} versions and other Ratis clients. A lost node is replaced by
+ * ({@link MembershipGuard}), also for older {@code admin} versions and other Ratis clients, once every node that can
+ * lead runs this version (a leader of an older version, during a rolling upgrade, does not). A refusal of Ratis' own
+ * without the guard's marker (for one {@code changes a majority set}) fails at once if the configuration read again did
+ * not change. A lost node is replaced by
  * {@code remove-peer} then {@code add-peer}, a running one by {@code add-peer} then {@code remove-peer}.
  * {@code --unsafe-multi-voter-change} skips both checks (the leader logs a warning): it is never needed for recovery,
  * since any change that can commit can be made one voter at a time; it is safe only if every majority of the old voters

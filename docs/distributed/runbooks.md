@@ -90,15 +90,22 @@ majority and healthy (`status`).
 Failure branches:
 
 - `add-peer` says `FAILED: ... has a log of its own` or `was started without --join`: wipe the new node's data
-  directory and start it again with `--join`, then run `add-peer` again.
+  directory and start it again with `--join`, then run `add-peer` again. **Never wipe a node that is a voter**: the
+  line `leader ...: voters [...]` that `add-peer` prints first lists them (a voter at the given address gets `already
+  a voter ... nothing to do` and `OK`, without its own state being asked). If an earlier `add-peer` of the same node
+  ended without `OK`, the leader may still be catching it up: run `add-peer` again first, and wipe only if it fails
+  the same way with the node still not among the voters printed. Wiping a voter's log and vote can lose committed
+  entries (with voters n2, n3, n4, an entry on n3 and n4 alone is gone once n4 is wiped and n2 is elected).
 - `add-peer` says the new node `runs a version without ...`: upgrade it to the cluster's version first.
 - `add-peer` or `remove-peer` says `FAILED: refused: changes more than one voter: 2 voters would change at once (adds
   [n4], removes [n1]; the voters now are [...])`: `--peer` does not match the leader's configuration (the line before
   prints it), or the call is the old one-step replacement. Nothing was proposed. Fix `--peer` to the voters printed,
-  and change one voter per call as in step 2. If the leader itself refused it (`the leader refused: ...`), the same
-  applies: it checks every call, also of an older `admin`.
+  and change one voter per call as in step 2. If the leader itself refused it (`FAILED: the leader refused: changes
+  more than one voter ...`; an `admin` of an older version prints `FAILED: ... or the leader refused: refused: changes
+  more than one voter ...`), the same applies.
 - `add-peer` ends with no result within the limit: the leader goes on with the change. Run the same command again until
-  it says `OK`; `status` shows the progress.
+  it says `OK` (once the node is a voter it says `already a voter` and `OK`); `status` shows the progress. Do not wipe
+  the new node meanwhile, whatever a re-run says about its log (see the first branch).
 - The lost node was the leader: the same steps, after the election (`status` shows a new leader).
 - Two nodes of three lost: there is no majority, `add-peer` cannot work. See "No quorum" in the design document, and
   "Restoring a backup" below.
@@ -142,17 +149,25 @@ lose committed entries if the leader changes in the middle (see "Replacing a nod
 waiting outside" in the design document). A voter that becomes a listener, or the reverse, counts as one change;
 listeners, addresses and priorities count nothing. The change is sent as a compare-and-set against the configuration
 read: if another change commits first, `admin` reads it again and checks again. The leader refuses the same on its
-own, also for an `admin` of an older version or the Ratis tools, at once (`FAILED: ... the leader refused: refused:
-changes more than one voter ...`). Several dead nodes are removed one per call; a re-run of a call that succeeded
-prints `OK` again.
+own, at once (`FAILED: the leader refused: changes more than one voter ...`), also for an `admin` of an older version
+(which prints `FAILED: ... or the leader refused: refused: changes more than one voter ...`) or the Ratis tools, but
+only a leader of this version does: during a rolling upgrade a leader of an older version has no such check, and an
+older `admin` gets its one-step replacement through. Until every node that can become leader is upgraded, change one
+voter per call with every `admin` (see "Upgrades"). Several dead nodes are removed one per call; a re-run of a call
+that succeeded prints `OK` again (for `add-peer`, `already a voter`). If the leader refuses for another reason that a
+new read of its configuration does not change (Ratis' own `changes a majority set`, say), `admin` fails at once with
+its message.
 
 `--unsafe-multi-voter-change` skips both checks: `admin` prints a warning and sends the change straight to the leader
 with a header that its guard lets through (it logs a WARN with the old and new voters). It is **never needed for
 recovery**: any change that can commit needs a live majority of the old voters, and with one, the same result can be
 reached one voter at a time; with no live majority nothing commits, flag or not: see "No quorum" in the design
 document, `export-seed` and "Restoring a backup". The change is safe only if every majority of the old voters that can
-still vote meets every majority of the new voters; that the leaving nodes are dead is not enough (three voters with
-one dead, adding four new ones at once: the new majority of the four new ones misses both live old voters). It is for
+still vote meets every majority of the new voters, and that the leaving nodes look dead is not enough: going from five
+voters n1..n5 to n3, n4, n5, n6 in one change while n1 and n2 are partitioned rather than dead, the old majority n1, n2,
+n3 and the new majority n4, n5, n6 do not meet. Ratis itself refuses, flag or not, a change whose new voters are at
+least as many as the kept ones (`changes a majority set of the current configuration`, for example two of three voters
+replaced at once, or three voters with four new ones added), and `admin` then fails at once with that message. It is for
 tests and experts.
 
 ## Backups
@@ -249,6 +264,11 @@ The alerts `rockserver-disk-low`, `rockserver-write-stopped`, `rockserver-write-
 Upgrade one node at a time (a rolling restart): stop it (SIGTERM: a leader hands over first), replace the binary, start
 it, wait until `status` shows it with the others' commit index, then the next. Clients see a few hundred milliseconds
 without writes per leader restart.
+
+Do not change the membership in the middle of an upgrade if you can avoid it. If you must, change one voter per call
+(`remove-peer` then `add-peer` for a lost node, as in "Replacing a node"), whatever the version of `admin`: until every
+node that can become leader runs round 14 or later, a leader of an older version does not refuse a change of several
+voters, so an older `admin`'s one-step replacement goes through.
 
 The cluster version keeps the new kinds of log entries off until every member runs a version that reads them (see
 "Cluster version" in the design document):
