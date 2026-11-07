@@ -230,6 +230,18 @@ fn remaining(deadline: Instant, finite: bool) -> Option<Option<Duration>> {
     }
 }
 
+/// Awaits a copy or an opening. A caller with a deadline sends it with what is left as its gRPC timeout, so the
+/// transport ends it. A caller without one sends it with no timeout, so that the server still sees a caller without
+/// a deadline. Nothing else ends it then: `connect` sets no keepalive, so a silent node (power loss, SIGSTOP, a
+/// partition with the host up) would hold it forever. The window ends it here instead, with `None`.
+async fn within_window<F: Future>(deadline: Instant, finite: bool, call: F) -> Option<F::Output> {
+    if finite {
+        Some(call.await)
+    } else {
+        tokio::time::timeout_at(deadline, call).await.ok()
+    }
+}
+
 impl SessionWrites {
     pub(crate) fn new(numbered_batches: bool) -> Self {
         Self {
@@ -333,7 +345,10 @@ impl SessionWrites {
             let Some(timeout) = remaining(deadline, finite) else {
                 return Err(not_sent("the deadline came before a session was opened"));
             };
-            match open(timeout).await {
+            let Some(opened) = within_window(deadline, finite, open(timeout)).await else {
+                return Err(not_sent("no answer to the opening of a session before the retry window ended"));
+            };
+            match opened {
                 Ok(id) => {
                     let session = Arc::new(Session {
                         id,
@@ -409,9 +424,15 @@ impl SessionWrites {
                 if maybe_applied {
                     self.resends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                let status = match send(id, timeout).await {
-                    Ok(value) => return Ok(value),
-                    Err(status) => status,
+                let status = match within_window(deadline, finite, send(id, timeout)).await {
+                    Some(Ok(value)) => return Ok(value),
+                    Some(Err(status)) => status,
+                    // The copy may have been applied; the window has no room for another.
+                    None => {
+                        return Err(unknown_outcome(&Status::deadline_exceeded(
+                            "no answer to the copy before the retry window ended",
+                        )))
+                    }
                 };
                 if rocksdb_error_type(&status) == Some("SESSION_EXPIRED") {
                     // This copy was refused before it ran. Copies sent earlier are this client's to judge.
@@ -849,6 +870,52 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(rocksdb_error_type(&error), Some("OUTCOME_UNKNOWN"));
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_never_answers_ends_a_caller_without_deadline_at_the_window() {
+        // A silent node (power loss, SIGSTOP, a partition with the host up): the copy has no gRPC timeout, and
+        // nothing on the channel ends it, so only the window can.
+        let writes = SessionWrites::new(true);
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            writes.run(soon(1_000), false, fixed_opener(1), |_, timeout| {
+                assert_eq!(timeout, None, "the server still sees a caller without a deadline");
+                std::future::pending::<Result<(), Status>>()
+            }),
+        )
+        .await
+        .expect("the write ended with the window, not hung");
+        let error = result.unwrap_err();
+        assert_eq!(rocksdb_error_type(&error), Some("OUTCOME_UNKNOWN"));
+        assert!(!is_not_applied(&error));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(900) && took < Duration::from_millis(2_000), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn an_opening_that_never_answers_ends_a_caller_without_deadline_unsent_at_the_window() {
+        let writes = SessionWrites::new(true);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            writes.run(
+                soon(1_000),
+                false,
+                |timeout| {
+                    assert_eq!(timeout, None);
+                    std::future::pending::<Result<i64, Status>>()
+                },
+                script(vec![Ok("never")], sent.clone()),
+            ),
+        )
+        .await
+        .expect("the opening ended with the window, not hung");
+        let error = result.unwrap_err();
+        assert_eq!(rocksdb_error_type(&error), Some("SERVER_OVERLOADED"));
+        assert!(is_not_applied(&error));
+        assert!(sent.lock().unwrap().is_empty(), "nothing sent");
     }
 
     #[test]

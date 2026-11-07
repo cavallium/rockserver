@@ -217,7 +217,10 @@ over (clients open new ones by themselves).
    It refuses a backup of a newer cluster version than this binary supports with exit code 5, and leaves no `db/`:
    restore it with the newer version. Run that newer version on every node of the new cluster as well: the restored
    `db/` carries no cluster version, so an older binary started on it is not refused, and would hold data written by a
-   newer version under the oldest cluster version.
+   newer version under the oldest cluster version. On any other failure (a `--rockserver-config` that does not parse,
+   a column that does not open, a full disk) it also removes the `db/` it made, so fix the cause and run the same
+   command again. A `db/` left there by an interrupted run (power loss, `kill -9`) is not removed: delete
+   `DATA-DIR/db` and run it again.
 3. Start every node as for a new cluster, without `--join`; the nodes of the old cluster stay stopped. The first leader proposes
    a seeded genesis, as in "Seeding a cluster".
 4. Check: `status`, then `checksum` prints `OK`, then a few known keys read back.

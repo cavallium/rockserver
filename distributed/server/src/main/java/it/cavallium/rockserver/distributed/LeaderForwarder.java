@@ -105,6 +105,8 @@ final class LeaderForwarder implements Closeable {
 	 * replaces it (R18-2, R18 review finding 1).
 	 */
 	private final Set<String> staleAnswers = ConcurrentHashMap.newKeySet();
+	/** The ask in flight to each member of the peer list, shared by the connections made meanwhile (R19-2). */
+	private final ConcurrentHashMap<String, CompletableFuture<HostAndPort>> askingListed = new ConcurrentHashMap<>();
 	/** The API addresses of this node's peer list, by peer id, built once. */
 	private final Map<String, HostAndPort> listedAddresses;
 	/** Raised whenever {@link #apiAddress} may return something else for some peer; see {@link #addressVersion()}. */
@@ -272,10 +274,11 @@ final class LeaderForwarder implements Closeable {
 				// The member may serve its API elsewhere now (restarted with another port while this node kept running):
 				// it is asked again at once, and before the next connection, instead of the old port being tried until
 				// this node restarts (R18-2). Its old answer stays until a new one replaces it: after a one-off failure at
-				// the same port it is still right, and the peer list may not be (R18 review finding 1).
+				// the same port it is still right, and the peer list may not be (R18 review finding 1). Only the caller
+				// that marks it stale asks: every request waiting on this handle runs this stage, and each used to send its
+				// own ask, each resetting the lookup channel's backoff (R19-2).
 				var listedPeer = listedPeer(peerId);
-				if (listedPeer != null && answeredAddresses.containsKey(peerId)) {
-					staleAnswers.add(peerId);
+				if (listedPeer != null && answeredAddresses.containsKey(peerId) && staleAnswers.add(peerId)) {
 					listedApiAddress(listedPeer);
 				}
 				downUntil.put(peerId, System.nanoTime() + DOWN_BACKOFF_NANOS);
@@ -350,6 +353,28 @@ final class LeaderForwarder implements Closeable {
 		if (answered != null && !staleAnswers.contains(peer.id())) {
 			return CompletableFuture.completedFuture(answered);
 		}
+		// Connections made together while the member is stale share one ask (R19-2).
+		var asking = askingListed.get(peer.id());
+		if (asking != null) {
+			return asking;
+		}
+		var ask = new CompletableFuture<HostAndPort>();
+		asking = askingListed.putIfAbsent(peer.id(), ask);
+		if (asking != null) {
+			return asking;
+		}
+		askListed(peer, listed).whenComplete((address, error) -> {
+			askingListed.remove(peer.id(), ask);
+			if (error != null) {
+				ask.completeExceptionally(error);
+			} else {
+				ask.complete(address);
+			}
+		});
+		return ask;
+	}
+
+	private CompletableFuture<HostAndPort> askListed(PeerConfig peer, HostAndPort listed) {
 		var channel = peerChannels.get(peer.raftAddress());
 		return TermService.apiAddress(channel, Duration.ofMillis(PROBE_TIMEOUT_MS)).handle((address, error) -> {
 			if (error != null) {

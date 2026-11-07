@@ -199,7 +199,13 @@ the cluster. With a single server, which has no sessions, nothing changes.
 
 The Rust client (`rust-client`) does the same when the server advertises client sessions at `connect`: the same
 writes are numbered and resent with the same pauses, until the context's deadline, or for 30 s
-(`with_session_retry_window`) with a context without one. Its own failures use the server's message format
+(`with_session_retry_window`) with a context without one; a copy or session opening that gets no answer at all ends
+with the window too (`OUTCOME_UNKNOWN`, or not sent for an opening). `RockserverClient::connect` uses one address and
+adds no settings of its own: given a string, it has tonic's defaults, with no HTTP/2 keepalive or connect timeout, so
+resends go back to the same node and a silent node is noticed only by the deadline or the window. For dead-peer
+detection, pass `connect` a tonic `Endpoint` already set up (`http2_keep_alive_interval`, `keep_alive_timeout`,
+`connect_timeout`); it uses it as given. Only failover over several nodes needs your own `Channel`
+(`Channel::balance_list`) passed to `RockserverClient::new`. Its own failures use the server's message format
 (`RocksDBError: [uid:OUTCOME_UNKNOWN] ...`); `sessions::is_outcome_unknown`, `sessions::is_not_applied` and
 `sessions::rocksdb_error_type` read any failure. Dropping a write's future stops its resends. A numbered streamed multi
 write reads its input stream whole before sending it (and its results whole before returning them), up to

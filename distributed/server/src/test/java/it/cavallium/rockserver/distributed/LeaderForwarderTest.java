@@ -179,11 +179,26 @@ class LeaderForwarderTest {
 	}
 
 	private Server startHandshakeServer(int port) throws Exception {
+		return startHandshakeServer(port, new java.util.concurrent.atomic.AtomicBoolean());
+	}
+
+	/** While {@code failing} is set, the handshake fails after 300 ms instead of answering. */
+	private Server startHandshakeServer(int port, java.util.concurrent.atomic.AtomicBoolean failing)
+			throws Exception {
 		Server server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", port))
 				.addService(new RocksDBServiceGrpc.RocksDBServiceImplBase() {
 					@Override
 					public void getCapabilities(CapabilitiesRequest request,
 							StreamObserver<CapabilitiesResponse> response) {
+						if (failing.get()) {
+							try {
+								Thread.sleep(300);
+							} catch (InterruptedException e) {
+								Thread.currentThread().interrupt();
+							}
+							response.onError(io.grpc.Status.UNAVAILABLE.withDescription("failing").asRuntimeException());
+							return;
+						}
 						var current = RockserverCapabilities.CURRENT;
 						response.onNext(CapabilitiesResponse.newBuilder()
 								.setWorkloadContractVersion(current.workloadContractVersion())
@@ -201,9 +216,25 @@ class LeaderForwarderTest {
 
 	/** A Raft port that answers only {@link TermService#API_ADDRESS}, with whatever {@code address} holds then. */
 	private int apiAddressServer(AtomicReference<String> address) throws Exception {
+		return apiAddressServer(address, new AtomicInteger(), new java.util.concurrent.atomic.AtomicBoolean());
+	}
+
+	/** Counts the asks in {@code asks}; while {@code refuse} is set, each fails after 300 ms instead of answering. */
+	private int apiAddressServer(AtomicReference<String> address, AtomicInteger asks,
+			java.util.concurrent.atomic.AtomicBoolean refuse) throws Exception {
 		var definition = org.apache.ratis.thirdparty.io.grpc.ServerServiceDefinition.builder(TermService.SERVICE_NAME)
 				.addMethod(TermService.API_ADDRESS, org.apache.ratis.thirdparty.io.grpc.stub.ServerCalls.asyncUnaryCall(
 						(byte[] request, org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver<byte[]> response) -> {
+							asks.incrementAndGet();
+							if (refuse.get()) {
+								try {
+									Thread.sleep(300);
+								} catch (InterruptedException e) {
+									Thread.currentThread().interrupt();
+								}
+								response.onError(org.apache.ratis.thirdparty.io.grpc.Status.UNAVAILABLE.asRuntimeException());
+								return;
+							}
 							response.onNext(address.get().getBytes(StandardCharsets.UTF_8));
 							response.onCompleted();
 						}))
@@ -266,8 +297,10 @@ class LeaderForwarderTest {
 	 */
 	@Test
 	void aListedMemberThatFailsOnceAtTheSamePortKeepsItsAnsweredAddress() throws Exception {
-		var first = startHandshakeServer();
-		int apiPort = first.getPort();
+		// Bound twice, so taken below the ephemeral range: a kernel-assigned port can go to an outgoing connection (the
+		// forwarder's own probes) between the shutdown and the second bind (R19-4).
+		int apiPort = ProcessCluster.freePorts(1, List.of()).getFirst();
+		var first = startHandshakeServer(apiPort);
 		var answered = new HostAndPort("127.0.0.1", apiPort);
 		var answer = new AtomicReference<>("127.0.0.1:" + apiPort);
 		int raftPort = apiAddressServer(answer);
@@ -298,6 +331,69 @@ class LeaderForwarderTest {
 		assertEquals(answered, s.forwarder().apiAddress("n1"));
 		// Leader hints cache their text by this version: the same answer again leaves it, and the cached hint, alone.
 		assertEquals(version, s.forwarder().addressVersion());
+	}
+
+	/**
+	 * Many requests waiting on the same failed connections to a listed member ask the member for its API address once,
+	 * not once each: every waiter used to start its own {@code TermService.apiAddress} call, and each call reset the
+	 * lookup channel's backoff (R19-2). While the member stays stale, the connections made at once after the backoff
+	 * share one ask too.
+	 */
+	@Test
+	void requestsSharingAFailedConnectionAskTheMemberForItsApiAddressOnce() throws Exception {
+		var failing = new java.util.concurrent.atomic.AtomicBoolean();
+		var api = startHandshakeServer(0, failing);
+		var answer = new AtomicReference<>("127.0.0.1:" + api.getPort());
+		var asks = new AtomicInteger();
+		var refuse = new java.util.concurrent.atomic.AtomicBoolean();
+		int raftPort = apiAddressServer(answer, asks, refuse);
+		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2),
+				new PeerConfig("n1", "127.0.0.1", raftPort, "127.0.0.1", closedPort()));
+		var s = setup(peers, Duration.ofSeconds(5));
+		var targets = new ArrayList<LeaderForwarder.Target>();
+		for (int i = 0; i < 4; i++) {
+			targets.add(s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		}
+		assertEquals(1, asks.get(), "asked once while connecting");
+
+		// The member's API fails its handshakes, slowly: every request below waits on one of four failing connections.
+		failing.set(true);
+		targets.forEach(s.forwarder()::invalidate);
+		var waiting = new ArrayList<java.util.concurrent.CompletableFuture<LeaderForwarder.Target>>();
+		for (int i = 0; i < 16; i++) {
+			waiting.add(s.forwarder().target("n1", s.stateMachine()));
+		}
+		for (var request : waiting) {
+			var error = assertThrows(ExecutionException.class, () -> request.get(10, TimeUnit.SECONDS));
+			assertInstanceOf(LeaderForwarder.NotConnectedException.class, error.getCause());
+		}
+		Thread.sleep(600);
+		// One ask is the usual count: the first failure marks n1 stale and asks. The answer can come back from loopback
+		// before another of the four connections has failed, and that later failure marks n1 stale again and asks once
+		// more, so up to one ask per connection is correct. One ask per waiting request (16) is the bug.
+		int afterFailures = asks.get();
+		assertTrue(afterFailures >= 2 && afterFailures <= 1 + 4,
+				"asked once per failed connection at most, not once per waiting request: " + afterFailures);
+
+		// The member does not answer the ask any more, so its answer stays stale; after the backoff, the connections
+		// made at once share one ask.
+		refuse.set(true);
+		var answered = s.forwarder().apiAddress("n1");
+		// The ask above found the member: one more failed connection marks it stale again, and its ask fails.
+		var once = s.forwarder().target("n1", s.stateMachine());
+		assertThrows(ExecutionException.class, () -> once.get(10, TimeUnit.SECONDS));
+		Thread.sleep(600);
+		int before = asks.get();
+		var again = new ArrayList<java.util.concurrent.CompletableFuture<LeaderForwarder.Target>>();
+		for (int i = 0; i < 8; i++) {
+			again.add(s.forwarder().target("n1", s.stateMachine()));
+		}
+		for (var request : again) {
+			assertThrows(ExecutionException.class, () -> request.get(10, TimeUnit.SECONDS));
+		}
+		Thread.sleep(600);
+		assertEquals(before + 1, asks.get(), "each connection made while the member is stale asked on its own");
+		assertEquals(answered, s.forwarder().apiAddress("n1"), "the last answer is kept while the member is stale");
 	}
 
 	/** A port nothing listens on. */
