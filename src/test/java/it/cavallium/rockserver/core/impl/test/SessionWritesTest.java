@@ -191,6 +191,97 @@ class SessionWritesTest {
 		var refused = assertThrows(ExecutionException.class, () -> later.get(5, TimeUnit.SECONDS));
 		assertEquals(RocksDBErrorType.SERVER_OVERLOADED,
 				((RocksDBException) refused.getCause()).getErrorUniqueId());
+		assertTrue(((RocksDBException) refused.getCause()).isNotApplied(), "not sent: flagged not applied");
+	}
+
+	/**
+	 * R26-3 review: a write that never got a session and ends because the connection closed was not sent, so it ends
+	 * flagged not applied (as the Rust client's {@code not_sent}), both while it waits between openings and when the
+	 * connection is already closed. Before, both ended {@code SERVER_OVERLOADED} without the flag.
+	 */
+	@Test
+	void aWriteEndedByCloseBeforeItWasSentIsNotApplied() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opens = new AtomicInteger();
+		var sent = new AtomicInteger();
+		var writes = new Writes(_ -> {
+			opens.incrementAndGet();
+			return CompletableFuture.failedFuture(Status.UNAVAILABLE.asRuntimeException());
+		}, (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		var context = RequestContext.latency(Duration.ofSeconds(60));
+		var waiting = writes.send(context, put(0));
+		while (opens.get() < 2) {
+			Thread.sleep(10);
+		}
+		writes.close();
+		var error = assertThrows(ExecutionException.class, () -> waiting.get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId(), rocks(error).getMessage());
+		assertTrue(rocks(error).isNotApplied(), "closed between openings, nothing sent: not applied");
+		var later = writes.send(context, put(0));
+		error = assertThrows(ExecutionException.class, () -> later.get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId());
+		assertTrue(rocks(error).isNotApplied(), "sent on a closed connection, nothing sent: not applied");
+		assertEquals(0, sent.get());
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R26-4 review: nothing is opened once the deadline has passed, as the Rust client's {@code remaining} before every
+	 * opening. A write whose deadline passed before its session was opened ends {@code SERVER_OVERLOADED} flagged not
+	 * applied, without an opening. Before, the opening was sent with a 1 ns gRPC deadline.
+	 */
+	@Test
+	void noSessionIsOpenedOnceTheDeadlineHasPassed() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opens = new AtomicInteger();
+		var writes = new Writes(_ -> {
+			opens.incrementAndGet();
+			return CompletableFuture.completedFuture(3L);
+		}, (_, _) -> CompletableFuture.completedFuture("ok"), executor);
+		var context = RequestContext.latency(Duration.ofNanos(1));
+		Thread.sleep(1);
+		var error = assertThrows(ExecutionException.class,
+				() -> writes.send(context, put(0)).get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId(), rocks(error).getMessage());
+		assertTrue(rocks(error).isNotApplied());
+		assertEquals(0, opens.get(), "no opening after the deadline");
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R26-4 review: an opening of a caller without a deadline, sent with no gRPC deadline, is ended at the window by a
+	 * local timer, as the Rust client's {@code within_window}: the write ends {@code SERVER_OVERLOADED} flagged not
+	 * applied, and so does a caller without a deadline that waits for that opening. Before, only keepalive bounded it
+	 * (here: never, the opening does not answer).
+	 */
+	@Test
+	void anOpeningThatNeverAnswersEndsACallerWithoutDeadlineUnsentAtTheWindow() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var property = "it.cavallium.rockserver.grpc.client.write-retry-window-ms";
+		var previous = System.getProperty(property);
+		System.setProperty(property, "200");
+		Writes writes;
+		try {
+			writes = new Writes(_ -> new CompletableFuture<>(), (_, _) -> CompletableFuture.completedFuture("ok"),
+					executor);
+		} finally {
+			if (previous == null) {
+				System.clearProperty(property);
+			} else {
+				System.setProperty(property, previous);
+			}
+		}
+		var opener = writes.send(RequestContext.batch(), put(0));
+		var joined = writes.send(RequestContext.batch(), put(0));
+		for (var write : List.of(opener, joined)) {
+			var error = assertThrows(ExecutionException.class, () -> write.get(5, TimeUnit.SECONDS));
+			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId(), rocks(error).getMessage());
+			assertTrue(rocks(error).isNotApplied(), "not sent: not applied");
+		}
+		executor.shutdownNow();
 	}
 	/** The request id a copy was sent with. */
 	private static ClientRequestId idOf(Object bound) {
@@ -553,11 +644,16 @@ class SessionWritesTest {
 				System.setProperty(property, previous);
 			}
 		}
+		// The opening is started by a caller with a deadline, so the window's timer on an opening (which a caller
+		// without one would start) does not end it: the caller without a deadline waits for it and gets the session
+		// after its window.
+		var timed = writes.send(RequestContext.latency(Duration.ofSeconds(10)), put(0));
 		var error = assertThrows(ExecutionException.class,
 				() -> writes.send(RequestContext.batch(), put(0)).get(5, TimeUnit.SECONDS));
 		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks(error).getErrorUniqueId());
 		assertTrue(rocks(error).isNotApplied(), "not sent: not applied");
-		assertEquals(0, sent.get(), "no copy after the window");
+		assertEquals("ok", timed.get(5, TimeUnit.SECONDS));
+		assertEquals(1, sent.get(), "no copy after the window, only the timed caller's");
 		executor.shutdownNow();
 	}
 
