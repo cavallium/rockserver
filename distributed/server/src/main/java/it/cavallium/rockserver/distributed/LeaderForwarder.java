@@ -92,7 +92,7 @@ final class LeaderForwarder implements Closeable {
 	private final ConcurrentHashMap<String, HostAndPort> learnedAddresses = new ConcurrentHashMap<>();
 	/**
 	 * API addresses that members of this node's peer list told about themselves: they win over the list, which may
-	 * be wrong on this node (see {@link #listedApiAddress}).
+	 * be wrong on this node (see {@link #listedApiAddress}). A failed connection to a member removes its entry.
 	 */
 	private final ConcurrentHashMap<String, HostAndPort> answeredAddresses = new ConcurrentHashMap<>();
 	/** The event loop threads and callback executor of every forwarding connection; closed after them. */
@@ -233,6 +233,10 @@ final class LeaderForwarder implements Closeable {
 		return handle.handle((connection, error) -> {
 			if (error != null) {
 				connections.remove(key, handle);
+				// The member may serve its API elsewhere now (restarted with another port while this node kept running):
+				// the next connection, after the backoff, asks it again instead of trying the old port until this node
+				// restarts (R18-2).
+				answeredAddresses.remove(peerId);
 				downUntil.put(peerId, System.nanoTime() + DOWN_BACKOFF_NANOS);
 				LOG.debug("{}: cannot reach the API of {}", config.nodeId(), peerId, error);
 				throw new CompletionException(new NotConnectedException());
@@ -285,7 +289,9 @@ final class LeaderForwarder implements Closeable {
 	 * The API address of a member of this node's peer list, checked once against what the member answers at its Raft
 	 * address: a node started with wrong API ports for its peers would otherwise fail every call that it forwards. The
 	 * answer wins, and a difference is logged. A member that does not answer within {@link #PROBE_TIMEOUT_MS} is likely
-	 * down: the listed address is used, and it is asked again at the next connection.
+	 * down: the listed address is used, and it is asked again at the next connection. The answer is kept until a
+	 * connection to the member fails ({@link #target}), then asked again: a member that moved its API port is found at
+	 * the new one (R18-2).
 	 */
 	private CompletableFuture<HostAndPort> listedApiAddress(PeerConfig peer) {
 		var listed = new HostAndPort(peer.apiHost(), peer.apiPort());

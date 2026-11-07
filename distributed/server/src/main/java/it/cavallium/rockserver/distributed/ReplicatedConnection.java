@@ -18,8 +18,10 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.net.URI;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -108,8 +110,8 @@ final class ReplicatedConnection implements RocksDBConnection, LeaderHint {
 		return url;
 	}
 
-	/** The leader and its API address, as last looked up. */
-	private record CachedHint(RaftPeerId leader, @Nullable String address) {}
+	/** The leader, its API address as the forwarder knew it, and that address as text, as last looked up. */
+	private record CachedHint(RaftPeerId leader, @Nullable HostAndPort api, @Nullable String address) {}
 
 	private volatile @Nullable CachedHint cachedHint;
 
@@ -127,13 +129,15 @@ final class ReplicatedConnection implements RocksDBConnection, LeaderHint {
 		if (leaderId == null) {
 			return null;
 		}
+		// Asked every time: the forwarder learns a new address when a member moves its API port (R18-2). Only the text
+		// is cached.
+		var api = forwarder.apiAddress(leaderId.toString());
 		var cached = cachedHint;
-		if (cached != null && cached.leader().equals(leaderId) && cached.address() != null) {
+		if (cached != null && cached.leader().equals(leaderId) && Objects.equals(cached.api(), api)) {
 			return cached.address();
 		}
-		var api = forwarder.apiAddress(leaderId.toString());
 		var address = api == null ? null : api.host() + ":" + api.port();
-		cachedHint = new CachedHint(leaderId, address);
+		cachedHint = new CachedHint(leaderId, api, address);
 		return address;
 	}
 
