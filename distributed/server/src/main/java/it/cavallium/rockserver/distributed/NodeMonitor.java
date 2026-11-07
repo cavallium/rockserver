@@ -23,7 +23,8 @@ import org.slf4j.LoggerFactory;
  * follower's lag on the leader, the size of the Raft log, the age of the latest snapshot and the free space of the
  * disks of the database and of the Raft log. The metrics pipeline's thread only reads fields, never Ratis or the disk.
  * A refresh reads the disk and Ratis' log (under its read lock), so a hung disk can stop it for good: the monitor
- * thread is the node's own for that reason, shared with nothing that must notice the hung disk (R25-W).
+ * thread is the node's own for that reason, shared with nothing that must notice the hung disk (R25-W). Then every
+ * gauge keeps its last value, and only {@code monitor.refresh_age_seconds}, which the metrics thread computes, grows.
  *
  * <p>It also raises the alarms that a node can tell by itself, as log lines: a disk that runs out of space, a Raft log
  * that keeps growing (a member that is gone for good holds it back) and RocksDB stopping or slowing writes (a write
@@ -66,6 +67,12 @@ final class NodeMonitor {
 	private volatile double snapshotIndex = Double.NaN;
 	private volatile double snapshotAgeSeconds = Double.NaN;
 	private volatile double followerLagMax = Double.NaN;
+	/**
+	 * When the last refresh ended ({@link System#nanoTime}), or this monitor was made. A refresh that waits for good (a
+	 * hung disk) leaves every other gauge at its last value, which looks healthy: {@code monitor.refresh_age_seconds},
+	 * computed from this by the metrics pipeline's thread, is what tells a frozen node from a healthy one.
+	 */
+	private volatile long refreshedNanos = System.nanoTime();
 	private final Disk dataDisk;
 	private final Disk raftDisk;
 	private final Map<String, double[]> followerLags = new ConcurrentHashMap<>();
@@ -170,6 +177,14 @@ final class NodeMonitor {
 		// up), 2 outside and undecided, 3 removed (only if a push happens between the verdict and exit 4, which nothing
 		// waits for). Alerts: rockserver-node-outside (2 or more for 10 min) and rockserver-node-not-added (1 for 6 h).
 		metrics.exportedGauge("membership.state", () -> membershipState.getAsDouble());
+		// R25 review: seconds since the last refresh ended; above a few seconds every gauge above is stale (the monitor
+		// thread waits for a hung disk). Alert: rockserver-monitor-stale.
+		metrics.exportedGauge("monitor.refresh_age_seconds", this::refreshAgeSeconds);
+	}
+
+	/** Seconds since the last refresh ended (or since this monitor was made): see {@link #refreshedNanos}. */
+	double refreshAgeSeconds() {
+		return (System.nanoTime() - refreshedNanos) / 1e9;
 	}
 
 	/** See the {@code membership.state} gauge; set by the node. */
@@ -190,6 +205,7 @@ final class NodeMonitor {
 		checkDisks(now);
 		checkLogSize(now);
 		checkWriteStall(now);
+		refreshedNanos = System.nanoTime();
 	}
 
 	private void refreshRaft() {

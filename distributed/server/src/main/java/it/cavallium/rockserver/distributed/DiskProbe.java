@@ -93,6 +93,9 @@ final class DiskProbe implements Closeable {
 			} catch (IOException | RuntimeException ex) {
 				// A disk that fails at once is not a hung one: the database and the log report their own errors.
 				LOG.warn("{}: the disk probe failed", name, ex);
+			} catch (Throwable error) {
+				// Out of memory, say: the thread must go on, or the probe looks idle for good and no hung disk pauses the API.
+				ReplicatedNode.taskError(name, "the disk probe", error);
 			} finally {
 				startedNanos = IDLE;
 			}

@@ -297,7 +297,15 @@ public final class ReplicatedNode implements AutoCloseable {
 				applyLag.record(committed - stateMachine.appliedIndex().get());
 			});
 			failForTesting(config.nodeId(), "start", () -> new IllegalStateException("test: " + config.nodeId() + "/start"));
-		} catch (IOException | RuntimeException ex) {
+		} catch (Throwable ex) {
+			// The background tasks first: the API gate and the Raft watch must not go on against a half-built node, and
+			// only the Raft watch would stop them otherwise (when it finds the Raft server closed, as a replica failure).
+			closed.set(true);
+			try {
+				stopBackgroundTasks();
+			} catch (Throwable stopError) {
+				ex.addSuppressed(stopError);
+			}
 			for (int i = started.size() - 1; i >= 0; i--) {
 				try {
 					started.get(i).close();
@@ -390,6 +398,8 @@ public final class ReplicatedNode implements AutoCloseable {
 			}
 		} catch (Exception ex) {
 			LOG.warn("{}: cluster initialization attempt failed, retrying", config.nodeId(), ex);
+		} catch (Throwable error) {
+			taskError(config.nodeId(), "cluster initialization", error);
 		}
 	}
 
@@ -473,6 +483,8 @@ public final class ReplicatedNode implements AutoCloseable {
 			}
 		} catch (RuntimeException ex) {
 			LOG.debug("{}: failed to refresh the monitor", config.nodeId(), ex);
+		} catch (Throwable error) {
+			taskError(config.nodeId(), "the node monitor's refresh", error);
 		}
 	}
 
@@ -584,6 +596,9 @@ public final class ReplicatedNode implements AutoCloseable {
 			}
 		} catch (IOException | RuntimeException ex) {
 			LOG.warn("{}: failed to pause or resume the API, retrying", config.nodeId(), ex);
+		} catch (Throwable error) {
+			// An OutOfDirectMemoryError when resume() builds and binds a new Netty server, say.
+			taskError(config.nodeId(), "the API gate", error);
 		}
 	}
 
@@ -622,13 +637,16 @@ public final class ReplicatedNode implements AutoCloseable {
 			long now = System.nanoTime();
 			boolean waiting = LeaderStall.waitsForReplyOfSentEntry(division, config.nodeId(),
 					config.electionTimeoutMax().toMillis());
-			if (leaderStall.shouldStepDown(waiting, term, commitIndex, now)) {
+			// A decision taken while the previous step-down is still being started could not be acted on, yet would double
+			// the next bound and start it again: LeaderStall does not take it.
+			boolean canStepDown = !stepDownStarting.get();
+			if (leaderStall.shouldStepDown(waiting, term, commitIndex, now, canStepDown)) {
 				LOG.warn("{}: leader of term {}: no entry of this term committed, commit index {} did not move and the log"
 						+ " up to {} went to a majority, stepping down to restart replication", config.nodeId(), term,
 						commitIndex, log.getNextIndex() - 1);
 				startStepDown(false, leaderStallStepDowns);
 			} else if (leaderStall.logStopped(division.getInfo().isLeader(), log.getFlushIndex(), log.getNextIndex() - 1,
-					now)) {
+					now, canStepDown)) {
 				LOG.warn("{}: leader of term {}: its Raft log flushed nothing past {} with entries up to {} waiting, and a"
 						+ " leader commits only what it flushed: stepping down", config.nodeId(), term, log.getFlushIndex(),
 						log.getNextIndex() - 1);
@@ -636,17 +654,21 @@ public final class ReplicatedNode implements AutoCloseable {
 			}
 		} catch (RuntimeException ex) {
 			LOG.warn("{}: failed to check Raft, retrying", config.nodeId(), ex);
+		} catch (Throwable error) {
+			taskError(config.nodeId(), "the Raft watch", error);
 		}
 	}
 
 	/**
 	 * Steps down ({@link #stepDown}) or hands over ({@link #handOverOrStepDown}) on a virtual thread: a hand-over takes
 	 * the Raft server's monitor, which Ratis holds while it waits for its log or fsyncs its metadata, and the Raft watch
-	 * thread must still notice that Raft closed meanwhile. At most one is being started at a time; a check that decides
-	 * again meanwhile does nothing, and is not counted in {@code counter}.
+	 * thread must still notice that Raft closed meanwhile. At most one is being started at a time: {@link #watchRaft}
+	 * asks {@link LeaderStall} for a decision only while none is (only this thread sets {@code stepDownStarting}), so
+	 * that a decision nothing can act on neither doubles the next bound nor starts it again.
 	 */
 	private void startStepDown(boolean handOver, NodeMetrics.Series counter) {
 		if (!stepDownStarting.compareAndSet(false, true)) {
+			// Not reached: only this thread sets it, after watchRaft found it clear.
 			LOG.info("{}: the previous step-down is still being started", config.nodeId());
 			return;
 		}
@@ -685,6 +707,8 @@ public final class ReplicatedNode implements AutoCloseable {
 		} catch (IOException | RuntimeException ex) {
 			LOG.warn("{}: failed to record its membership in {}, retrying", config.nodeId(),
 					config.raftDir().resolve(MEMBER_FILE), ex);
+		} catch (Throwable error) {
+			taskError(config.nodeId(), "the write of raft/" + MEMBER_FILE, error);
 		}
 	}
 
@@ -731,6 +755,20 @@ public final class ReplicatedNode implements AutoCloseable {
 				stateMachine.discardFailedInstalls();
 			}
 		});
+	}
+
+	/**
+	 * Logs an Error that a periodic task threw, and returns, so that its next run still happens:
+	 * {@code scheduleWithFixedDelay} cancels every later run of a task that throws, silently (R24-1, R25 review). Every
+	 * periodic task of the node catches {@link Throwable} for that reason. Guarded: out of memory even for the message,
+	 * the next run retries anyway.
+	 */
+	static void taskError(String nodeId, String task, Throwable error) {
+		try {
+			LOG.error("{}: {} failed, retrying at its next run", nodeId, task, error);
+		} catch (Throwable logFailed) {
+			// Nothing left to do: the next run retries.
+		}
 	}
 
 	/**
@@ -1410,21 +1448,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		if (!closed.compareAndSet(false, true)) {
 			return;
 		}
-		for (var executor : Arrays.asList(apiGateThread, raftWatchThread, monitorThread)) {
-			if (executor != null) {
-				executor.shutdownNow();
-			}
-		}
-		if (diskProbe != null) {
-			diskProbe.close();
-		}
-		if (initialization != null) {
-			initialization.shutdownNow();
-		}
-		if (installCleanup != null) {
-			installCleanup.shutdownNow();
-		}
-		metrics.close();
+		stopBackgroundTasks();
 		IOException failure = null;
 		// A replica can fail while the constructor is still starting the rest: skip what does not exist yet.
 		var order = (consensusFirst
@@ -1448,6 +1472,22 @@ public final class ReplicatedNode implements AutoCloseable {
 		if (failure != null) {
 			throw failure;
 		}
+	}
+
+	/**
+	 * Stops the periodic tasks and their threads, the disk probe and the metrics threads. Also called by a constructor
+	 * that fails, so a field can still be null.
+	 */
+	private void stopBackgroundTasks() {
+		for (var executor : Arrays.asList(apiGateThread, raftWatchThread, monitorThread, initialization, installCleanup)) {
+			if (executor != null) {
+				executor.shutdownNow();
+			}
+		}
+		if (diskProbe != null) {
+			diskProbe.close();
+		}
+		metrics.close();
 	}
 
 	/**

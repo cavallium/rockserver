@@ -97,9 +97,20 @@ class WatchdogThreadsTest {
 		InProcessCluster.await(TIMEOUT, () -> listens(victim));
 	}
 
+	/** The exported {@code monitor.refresh_age_seconds} of {@code node}, as the metrics pipeline reads it. */
+	private static double refreshAgeSeconds(ReplicatedNode node) {
+		var gauge = node.stateMachine().store().db().getMetricsRegistry()
+				.find("rockserver.replication.monitor.refresh_age_seconds").tag("node", node.config().nodeId()).gauge();
+		if (gauge == null) {
+			throw new AssertionError("monitor.refresh_age_seconds is not exported");
+		}
+		return gauge.value();
+	}
+
 	/**
 	 * A follower whose Raft log write lock is held (Ratis' append waiting for a stopped log worker) still pauses its API
-	 * once its disk probe hangs.
+	 * once its disk probe hangs. Meanwhile its node monitor waits for the log's read lock, and the exported age of its
+	 * last refresh grows (R25 review): every other gauge keeps its last value.
 	 */
 	@Test
 	@Timeout(180)
@@ -116,6 +127,7 @@ class WatchdogThreadsTest {
 			DiskProbe.HANGS_FOR_TESTING.put(key, hang);
 			InProcessCluster.await(TIMEOUT, () -> !listens(victim));
 			assertApiGateNotBlocked(victim);
+			InProcessCluster.await(TIMEOUT, () -> refreshAgeSeconds(victim) > 3);
 		} finally {
 			hang.countDown();
 			DiskProbe.HANGS_FOR_TESTING.remove(key);
@@ -123,6 +135,7 @@ class WatchdogThreadsTest {
 			holder.join();
 		}
 		InProcessCluster.await(TIMEOUT, () -> listens(victim));
+		InProcessCluster.await(TIMEOUT, () -> refreshAgeSeconds(victim) < 3);
 	}
 
 	/** A leader whose log stopped steps down while its snapshot storage monitor is held. */

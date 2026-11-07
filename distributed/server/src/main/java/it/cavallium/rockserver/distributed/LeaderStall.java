@@ -94,12 +94,9 @@ final class LeaderStall {
 				logStallAfter.compareTo(MIN_LOG_STALL) < 0 ? MIN_LOG_STALL : logStallAfter);
 	}
 
-	/**
-	 * {@link #shouldStepDown(boolean, long, long, long)}, for a caller that can start a step-down now only if
-	 * {@code canStepDown}.
-	 */
-	boolean shouldStepDown(boolean waiting, long term, long commitIndex, long nowNanos, boolean canStepDown) {
-		return shouldStepDown(waiting, term, commitIndex, nowNanos);
+	/** {@link #shouldStepDown(boolean, long, long, long, boolean)} for a caller that can always step down. */
+	boolean shouldStepDown(boolean waiting, long term, long commitIndex, long nowNanos) {
+		return shouldStepDown(waiting, term, commitIndex, nowNanos, true);
 	}
 
 	/**
@@ -108,8 +105,11 @@ final class LeaderStall {
 	 * not: the commit index it sees is what brings the bounds back.
 	 *
 	 * @param waiting whether this node leads, with no entry of its term committed, and {@link #sentToMajority}
+	 * @param canStepDown whether the caller can start a step-down now: when not (the previous one is still being started),
+	 *     the bound that passed gives no answer, and is neither doubled nor started again, so the next check that can
+	 *     act steps down at once (R25 review)
 	 */
-	boolean shouldStepDown(boolean waiting, long term, long commitIndex, long nowNanos) {
+	boolean shouldStepDown(boolean waiting, long term, long commitIndex, long nowNanos, boolean canStepDown) {
 		if (stepDowns > 0 && commitIndex != commitIndexAtStepDown) {
 			stepDowns = 0;
 		}
@@ -120,7 +120,7 @@ final class LeaderStall {
 			sinceNanos = nowNanos;
 			return false;
 		}
-		if (nowNanos - sinceNanos < stallAfterNanos << doublings(stepDowns)) {
+		if (nowNanos - sinceNanos < stallAfterNanos << doublings(stepDowns) || !canStepDown) {
 			return false;
 		}
 		sinceNanos = nowNanos;
@@ -129,9 +129,9 @@ final class LeaderStall {
 		return true;
 	}
 
-	/** {@link #logStopped(boolean, long, long, long)}, for a caller that can start a step-down now only if {@code canStepDown}. */
-	boolean logStopped(boolean leader, long flushIndex, long lastIndex, long nowNanos, boolean canStepDown) {
-		return logStopped(leader, flushIndex, lastIndex, nowNanos);
+	/** {@link #logStopped(boolean, long, long, long, boolean)} for a caller that can always step down. */
+	boolean logStopped(boolean leader, long flushIndex, long lastIndex, long nowNanos) {
+		return logStopped(leader, flushIndex, lastIndex, nowNanos, true);
 	}
 
 	/**
@@ -141,8 +141,11 @@ final class LeaderStall {
 	 * @param leader whether this node leads
 	 * @param flushIndex the last entry of the log that reached the disk
 	 * @param lastIndex the last entry of the log
+	 * @param canStepDown whether the caller can start a step-down now: when not (the previous one is still being started),
+	 *     the bound that passed gives no answer, and is neither doubled nor started again, so the next check that can
+	 *     act steps down at once (R25 review)
 	 */
-	boolean logStopped(boolean leader, long flushIndex, long lastIndex, long nowNanos) {
+	boolean logStopped(boolean leader, long flushIndex, long lastIndex, long nowNanos, boolean canStepDown) {
 		boolean waiting = leader && flushIndex < lastIndex;
 		if (!waiting || !logWaiting || flushIndex != this.flushIndex) {
 			// Only a leader's flush says something about the disk: a step down ends the wait too, right after the bound.
@@ -154,7 +157,7 @@ final class LeaderStall {
 			logSinceNanos = nowNanos;
 			return false;
 		}
-		if (nowNanos - logSinceNanos < logStallAfterNanos << doublings(logStepDowns)) {
+		if (nowNanos - logSinceNanos < logStallAfterNanos << doublings(logStepDowns) || !canStepDown) {
 			return false;
 		}
 		logSinceNanos = nowNanos;

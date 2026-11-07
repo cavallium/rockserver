@@ -105,7 +105,14 @@ final class NodeMetrics {
 		this.nodeTag = nodeId;
 		this.logger = Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon()
 				.name("rockserver-metrics-" + nodeId).factory());
-		logger.scheduleAtFixedRate(this::log, INTERVAL_SECONDS, INTERVAL_SECONDS, TimeUnit.SECONDS);
+		logger.scheduleAtFixedRate(() -> {
+			try {
+				log();
+			} catch (Throwable error) {
+				// scheduleAtFixedRate cancels every later run of a task that throws, silently.
+				ReplicatedNode.taskError(nodeId, "the metrics log line", error);
+			}
+		}, INTERVAL_SECONDS, INTERVAL_SECONDS, TimeUnit.SECONDS);
 	}
 
 	/**
@@ -131,6 +138,9 @@ final class NodeMetrics {
 				sampler.run();
 			} catch (RuntimeException ignored) {
 				// Not ready yet, or stopping.
+			} catch (Throwable error) {
+				// scheduleAtFixedRate cancels every later run of a task that throws, silently.
+				ReplicatedNode.taskError(nodeId, "the lag sampler", error);
 			}
 		}, periodMs, periodMs, TimeUnit.MILLISECONDS);
 	}
