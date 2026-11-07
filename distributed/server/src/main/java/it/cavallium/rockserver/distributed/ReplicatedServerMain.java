@@ -17,9 +17,11 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.IntConsumer;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.proto.RaftProtos;
@@ -672,12 +674,9 @@ public final class ReplicatedServerMain {
 			String refusalMessage = null;
 			while (true) {
 				var current = leaderConfiguration(infoClient, peers, groupId, deadlineNanos);
-				if (refusedOn != null && refusedOn.leader().equals(current.leader()) && refusedOn.term() == current.term()
-						&& sameMembers(refusedOn, current)) {
-					// Not a lost race: the same leader, in the same term, refused for a reason that a re-read does not
-					// change (for one, "changes a majority set": the new members are at least as many as the kept ones).
-					fail("the leader " + current.leader() + " (term " + current.term() + ") refused, and its configuration"
-							+ " did not change since: " + refusalMessage + ". If the leader changes, run the command again");
+				var standing = standingRefusal(refusedOn, refusalMessage, current);
+				if (standing != null) {
+					fail(standing);
 				}
 				refusedOn = null;
 				var change = VoterChange.between(current.servers(), target);
@@ -744,6 +743,24 @@ public final class ReplicatedServerMain {
 		}
 	}
 
+	/**
+	 * The failure of {@link #changeVoters} after the leader refused a change on {@code refusedOn} with
+	 * {@code refusalMessage} and the configuration was read again as {@code current}; null (null {@code refusedOn}: no
+	 * refusal) if it goes on. It fails only if the same leader, in the same term, answers with the same members: not a
+	 * lost race, a refusal that a re-read does not change (for one, "changes a majority set": the new members are at
+	 * least as many as the kept ones). Another leader, or the same one in another term, may be the real leader that a
+	 * deposed one's answer hid (R16-1): asked again.
+	 */
+	static @Nullable String standingRefusal(@Nullable Membership refusedOn, @Nullable String refusalMessage,
+			Membership current) {
+		if (refusedOn == null || !refusedOn.leader().equals(current.leader()) || refusedOn.term() != current.term()
+				|| !sameMembers(refusedOn, current)) {
+			return null;
+		}
+		return "the leader " + current.leader() + " (term " + current.term() + ") refused, and its configuration did not"
+				+ " change since: " + refusalMessage + ". If the leader changes, run the command again";
+	}
+
 	/** Whether {@code a} and {@code b} have the same voters and listeners, by id (as Ratis' compare-and-set compares). */
 	private static boolean sameMembers(Membership a, Membership b) {
 		return VoterChange.ids(a.servers()).equals(VoterChange.ids(b.servers()))
@@ -808,15 +825,15 @@ public final class ReplicatedServerMain {
 			long deadlineNanos) throws InterruptedException {
 		String waitingFor = "an answer of a member";
 		while (true) {
-			var answers = new ArrayList<MemberAnswer>();
-			for (PeerConfig peer : peers) {
+			// Down, or not in the group: the others answer.
+			var answers = askAll(peers, peer -> {
 				try {
-					answers.add(MemberAnswer.of(peer.id(),
-							infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId)));
-				} catch (IOException | RuntimeException unanswered) {
-					// Down, or not in the group: the others are asked.
+					return MemberAnswer.of(peer.id(),
+							infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId));
+				} catch (IOException unanswered) {
+					return null;
 				}
-			}
+			});
 			if (!answers.isEmpty()) {
 				var settled = settle(answers);
 				if (settled.membership() != null) {
@@ -830,6 +847,27 @@ public final class ReplicatedServerMain {
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
 		}
+	}
+
+	/**
+	 * Asks every one of {@code peers} at once ({@code ask}, which may block for its request timeout), and returns the
+	 * answers in their order, without the null ones and those that failed: a down or unroutable member costs one request
+	 * timeout per round, not one each (nit of the R16 review).
+	 */
+	static <T> List<T> askAll(List<PeerConfig> peers, Function<PeerConfig, @Nullable T> ask) throws InterruptedException {
+		// One after another (the review's test commit; the fix asks at once).
+		var answers = new ArrayList<T>();
+		for (PeerConfig peer : peers) {
+			try {
+				var value = ask.apply(peer);
+				if (value != null) {
+					answers.add(value);
+				}
+			} catch (RuntimeException unanswered) {
+				// Failed: the others answer.
+			}
+		}
+		return answers;
 	}
 
 	/**

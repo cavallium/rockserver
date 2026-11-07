@@ -171,6 +171,32 @@ final class MembershipFacts {
 	}
 
 	/**
+	 * The index below which the configuration of a snapshot chunk from the leader of {@code leaderTerm} shows an install
+	 * stream that leader gave up on (R16-2), {@link RaftTraffic#NO_INDEX} if none: see
+	 * {@link #installFloor(Conf, Conf, long)}, with this node's committed and latest configurations.
+	 */
+	static long installFloor(RaftServer.Division division, CommittedConfigurations history, long leaderTerm) {
+		return installFloor(committed(division, history), latest(division, history), leaderTerm);
+	}
+
+	/**
+	 * The index below which the configuration of a snapshot chunk from the leader of {@code leaderTerm} shows an install
+	 * stream that leader gave up on (R16-2), {@link RaftTraffic#NO_INDEX} if none. A leader builds each chunk with its
+	 * latest configuration ({@code LeaderProtoUtils} reads {@code getRaftConf()}), whose index is at least that of every
+	 * committed configuration (Leader Completeness) and of every configuration it appended itself, and its appender
+	 * sends no appends while an install runs: so a chunk of a live stream is never below the {@code committed}
+	 * configuration, nor below the {@code latest} one if that is of {@code leaderTerm} (only that leader appends
+	 * entries of its term). The latest of another term, or of a term not known, gives no floor: a later leader may not
+	 * hold it (uncommitted), and an earlier one is answered NOT_LEADER before this. The latest configuration is the
+	 * newest in the log, so the newest of {@code leaderTerm} if the node's term is not above it; Ratis' stale
+	 * {@code raft-meta.conf} (see {@link #entry}), whose term is unknown, only hides that floor.
+	 */
+	static long installFloor(@Nullable Conf committed, Conf latest, long leaderTerm) {
+		long floor = committed == null ? RaftTraffic.NO_INDEX : committed.index();
+		return floor;
+	}
+
+	/**
 	 * The node's own facts for {@link RemovalRule#decide}: {@code self}, its committed and latest configurations, the
 	 * terms of its log, whether its latest configuration is stale ({@link Entry#OTHER}), whether it was a voter once,
 	 * and the bound of its latest configuration's term that {@code installed} gives (round-13 review, finding 1).

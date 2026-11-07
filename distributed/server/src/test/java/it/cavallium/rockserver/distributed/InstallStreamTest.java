@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.TIMEOUT;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitReadyLeader;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -24,6 +25,12 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.ratis.proto.RaftProtos;
+import org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc;
+import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.thirdparty.io.grpc.Metadata;
+import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.SnapshotManagementRequest;
 import org.junit.jupiter.api.AfterEach;
@@ -158,6 +165,57 @@ class InstallStreamTest {
 		var record = InstalledConfiguration.read(fNode.config().raftDir());
 		assertNotNull(record);
 		assertTrue(!record.bounds().isEmpty(), () -> "the install recorded nothing: " + record);
+	}
+
+	/**
+	 * R16 review, finding 2: how a running node wires the R16-2 check. After a real install, the follower's floor
+	 * ({@link ReplicatedNode#installFloor}) for the leader's term is the index of its configuration (the leader's
+	 * term-start entry or later), and for a later term its committed configuration; neither is unknown. A chunk the
+	 * follower got from that install, replayed through its own {@link RaftTraffic} with a configuration one index older,
+	 * fails its stream with FAILED_PRECONDITION and never reaches Ratis (a fake handler stands in for it here). Were the
+	 * node's floor always unknown, the replayed chunk would pass.
+	 */
+	@Test
+	void theRunningNodesFloorFailsAReplayedChunkOfAnOlderConfiguration() throws Exception {
+		var lagging = lagging();
+		var leader = lagging.leader();
+		long leaderTerm = leader.stateMachine().division().getInfo().getCurrentTerm();
+		var captured = new AtomicReference<RaftProtos.InstallSnapshotRequestProto>();
+		RaftTraffic.termForTesting = (receiver, chunk) -> {
+			if (receiver.equals(lagging.follower()) && chunk.hasLastRaftConfigurationLogEntryProto()) {
+				captured.compareAndSet(null, chunk);
+			}
+			return RaftTraffic.NO_TERM;
+		};
+		var fNode = cluster.start(lagging.follower());
+		InProcessCluster.await(TIMEOUT, () -> fNode.appliedIndex() >= lagging.snapshotIndex());
+		RaftTraffic.termForTesting = null;
+		cluster.awaitConverged(TIMEOUT);
+		assertTrue(leader.isLeader(), "the leader changed");
+		var chunk = Objects.requireNonNull(captured.get(), "no chunk reached the follower");
+		var group = RaftGroupId.valueOf(chunk.getServerRequest().getRaftGroupId().getId());
+
+		long confIndex = fNode.stateMachine().division().getRaftConf().getLogEntryIndex();
+		long floor = fNode.installFloor(group, leaderTerm);
+		assertNotEquals(RaftTraffic.NO_INDEX, floor, "the running node knows no floor");
+		assertEquals(confIndex, floor);
+		assertTrue(chunk.getLastRaftConfigurationLogEntryProto().getIndex() <= floor);
+		long committedFloor = fNode.installFloor(group, leaderTerm + 1);
+		assertNotEquals(RaftTraffic.NO_INDEX, committedFloor, "the running node knows no committed configuration");
+		assertTrue(committedFloor <= floor);
+		assertEquals(RaftTraffic.NO_INDEX, fNode.installFloor(RaftGroupId.randomId(), leaderTerm), "another group");
+
+		var older = chunk.toBuilder().setLastRaftConfigurationLogEntryProto(
+				chunk.getLastRaftConfigurationLogEntryProto().toBuilder().setIndex(floor - 1)).build();
+		var call = new RaftTrafficTest.FakeCall<RaftProtos.InstallSnapshotRequestProto,
+				RaftProtos.InstallSnapshotReplyProto>(RaftServerProtocolServiceGrpc.getInstallSnapshotMethod());
+		var handler = new RaftTrafficTest.FakeHandler<RaftProtos.InstallSnapshotRequestProto,
+				RaftProtos.InstallSnapshotReplyProto>();
+		var listener = fNode.raftTraffic().interceptCall(call, new Metadata(), handler);
+		listener.onMessage(older);
+		assertNotNull(call.closed, () -> "the replayed chunk's stream is not failed: " + call.events);
+		assertEquals(Status.Code.FAILED_PRECONDITION, call.closed.getCode());
+		assertTrue(handler.messages.isEmpty(), "the replayed chunk reached Ratis");
 	}
 
 	/**
