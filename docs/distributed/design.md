@@ -437,6 +437,13 @@ and the `LogEntry`.
   caller's deadline for it: once submitted, its single attempt waits for its reply for up to one attempt
   timeout, even past the caller's deadline. The
   chunks of a `putBatch` or `mergeBatch` share one deadline, counted from the start of the call.
+  A queued write is failed at its deadline by a timer, not only by the next batch that looks at the queue, so it
+  fails on time also while every batch slot is taken by batches that get no answer. A write without a caller
+  deadline has the node's request timeout as its deadline, and fails at it the same way, as not applied
+  (`SERVER_OVERLOADED`, "No leader accepted the write in time"). The timer is armed when the write is queued and
+  again whenever it comes back to the queue unsent, but a write holds at most one waiting timer: its deadline never
+  changes, so a requeue that finds a timer still waiting arms none, and a write refused again and again under load
+  does not pile timers onto the control threads (R21-2, R21-4).
 - **Results are recorded.** Applying a request writes its encoded result under
   `(proposerId, sequence)` in the internal column, in the same local transaction as its effects. If a
   later copy of the same request reaches the log (a retry that went to a new leader, or to a restarted node
@@ -1298,12 +1305,16 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
   One whose base failed, or whose update expired, always conflicts.
 - **On conflict** commit returns `false` and the transaction stays open, as on a single node. Commits share
   entries: the leader rejects the entry before appending it and names the commits that conflict (with history,
-  or with an earlier write of the same entry); those fail and the others go again in the next entry.
+  or with an earlier write of the same entry); those fail and the others go again in the next entry. Rejected with
+  the entry before its append, the others go back to the queue as never sent, as after a refusal for lack of room:
+  their deadlines and cancellations apply again and their expiry timer is armed, so they cannot wait past their
+  deadline when another requeue gets ahead of them and takes the freed slot (R21-3).
 - **Outcome of a commit.** It is submitted once, to the local Raft server. Only a refusal that is known to come
   before appending (Ratis' leader not ready, or the state machine's own refusals) means "not committed"; no room
   (no attempt permit, Ratis' full pending queue) sends it again through its queue until its caller's deadline
   (back in the queue, it fails at that deadline as not applied even while every commit slot stays taken by commits
-  Ratis has not answered, as any queued request does: a timer, not only the next free slot, ends it);
+  Ratis has not answered, as any queued request does: a timer, not only the next free slot, ends it; a commit
+  without a caller deadline fails so at the request timeout);
   `NotLeaderException`, which a leader stepping down also returns for appended entries, and any other
   `ResourceUnavailableException` (see "Attempt permits") are an unknown outcome
   (`OUTCOME_UNKNOWN`). A client with a session sends the commit again with the same request id, and the copy
@@ -2639,7 +2650,7 @@ hook: the test cuts the leader's links, lets clients write to it directly, and k
 | `SlowFollowerDiskTest` (in-process) | One follower's log worker sleeps 180 ms of every 200 ms (`LogWorkerGate.pause`) under 20 s of writes: the leader keeps its term, writes are acknowledged in every second, the follower falls behind (hundreds of entries) and catches up once its disk is fast again. Memory: the nodes use 1 MiB log segments, and the leader's Ratis log cache, read directly, must stay within Ratis' cached-segment limit plus three segments (9 MiB) while the load writes far more (about 200 MiB; the test fails below four times the bound, where the check could not fail). The appender's buffers are not measured. |
 | `LogWorkerGateContractTest` | The Ratis-private members that `LogWorkerGate` uses still exist, and on a real single node a blocked worker holds a write back and a pause delays one: a Ratis upgrade that breaks the gate fails here by name. |
 | `LongStreamSemanticsTest` (in-process) | A range stream outside a transaction is one point-in-time view of the leader's database, taken when its cursor opens: writes acknowledged while it runs (updates, deletes, inserts ahead of the cursor) are not in it, also when a follower forwards the stream. |
-| `ProposerCommitRetryTest` | Commits refused before the append for lack of room (Ratis' pending-request limit, or the commit lane's attempt permits held by commits Ratis has not answered) go back to the queue: they succeed once there is room, are not sent while there is none, and fail at their caller's deadline as not applied (`READ_DEADLINE_EXCEEDED`), never as unknown, also when every commit slot is held by unanswered commits by the time a refused commit is back in the queue. |
+| `ProposerCommitRetryTest` | Commits refused before the append for lack of room (Ratis' pending-request limit, or the commit lane's attempt permits held by commits Ratis has not answered) go back to the queue: they succeed once there is room, are not sent while there is none, and fail at their caller's deadline as not applied (`READ_DEADLINE_EXCEEDED`), never as unknown, also when every commit slot is held by unanswered commits by the time a refused commit is back in the queue (R21-1), and a commit without a caller deadline fails so at the request timeout (R21-4); two commits taking turns in the one free slot, each refused again and again, hold one expiry timer each on the control threads, not one per requeue (R21-2). |
 | `LeaderForwarderTest` | Leader lookups: another node is answered at once, this node only as a ready leader; a change wakes waiting lookups well before the poll; a leader that appears between the first check and the registration (its notification finding nobody) is seen by the check after the registration; no leader within the request timeout is a retryable overload. Connections: four per peer, used in turn; an invalidated connection is replaced while the other slots stay, and a stale invalidation does not drop a newer one; a refused port fails at once (the probe) and the peer is not tried again for 200 ms; a listed member that moved its API port is asked again after a failed connection, and reached at the new port (R18-2); a listed member that fails once at the same port keeps its answered address, for hints and the next connection, and the address version stays (R18 review finding 1); sixteen requests waiting on four failing connections ask the member at most once per failed connection, not once per request (2 to 5 asks in all, counting the first connect: an answer that comes back before a later connection fails lets that one ask again), and connections made together to a stale member share one ask (R19-2). |
 | `LeaderHintCacheTest` | The leader hint cache of `ReplicatedConnection.leaderApiAddress`: the same leader and address version are not looked up again; a new version is, and follows a moved port; another leader is looked up at the same version; an unknown address is cached as null until the version changes; an address recorded during a lookup (the version raised meanwhile) is looked up at the next call. |
 | `ClusterCheckTest`, `CommitOutcomesPathsTest`, `LocalCommandsTest`, `ReplicatedWritesTest`, `UpdateProtocolPathsTest` | The classes split out of `ReplicatedConnection`: the cluster check tells each follower once per term, retries a silent one only after its pause and asks again in a new term; commit outcomes (a second copy marked in the same term, settling by outcome, pruning of marks, every kind of record, a gone session, flagged not applied, barrier failures); who leads and gets the session of its term; column creation and its check, and batches split, refused when numbered and too large, reported when partly applied; the update protocol's answers for transactions and updates that are gone (also for copies of numbered commits), staged writes carrying a request id, empty commits, the end of an update and a failed update. |
