@@ -76,8 +76,10 @@ import org.rocksdb.NativeLibraryLoader;
  * replication stops the node too,
  * with exit code 3, see {@link DirectMemoryWatch}. See "Heap" in the design document.</p>
  *
- * <p>{@code run} exits with 4, and does not start, if the configuration in its log no longer contains the node: it was
- * removed from the cluster, and a supervisor must not start it again. See "Replacing a node" in the design document.
+ * <p>{@code run} exits with 4 if the node was removed from the cluster, which a majority of the current configuration
+ * confirmed, at its start or while it heard no leader (until a majority answers, a removed node waits outside the
+ * cluster and warns): a supervisor must not start it again. See "Removal and waiting outside" in the design
+ * document.
  * It exits with 5, and does not start, if its database has a cluster version with capabilities this version lacks (a
  * downgrade, or a newer cluster's backup). Every command's exit codes: "Exit codes" in
  * {@code docs/distributed/runbooks.md}; 4 means "removed" for {@code run} and "incomplete" for {@code admin}.</p>
@@ -288,8 +290,8 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
-	 * The exit status for the failure that stopped a running node, the same as at start: 4 if it found out, while it waited
-	 * outside the cluster, that it was removed; 5 if its replica met a cluster version it cannot read in its log or in an
+	 * The exit status for the failure that stopped a running node, the same as at start: 4 if it found out, while it heard
+	 * no leader, that it was removed; 5 if its replica met a cluster version it cannot read in its log or in an
 	 * installed snapshot; else 3 (its replica failed, or its Raft server closed by itself).
 	 */
 	static int exitStatusOf(Throwable failure) {

@@ -83,21 +83,24 @@ class RemovalCheckTest {
 		var own = stable(1, 5, "x", "a", "b");
 		var removal = stable(3, 9, "a", "b", "c");
 		var asked = new ConcurrentHashMap<String, AtomicInteger>();
+		var cProbes = new ArrayList<TermIndex>();
 		RemovalCheck.Asker asker = (id, _, probes, _) -> {
 			int round = asked.computeIfAbsent(id, _ -> new AtomicInteger()).incrementAndGet();
 			if (id.equals("b") && round < 3) {
 				return CompletableFuture.completedFuture(Answer.PENDING);
 			}
 			if (id.equals("c")) {
-				// Asked with the probe of K*.
-				assertEquals(TermIndex.valueOf(3, 9), probes.get(1));
+				cProbes.add(probes.get(1));
 			}
-			return CompletableFuture.completedFuture(Answer.of(report(removal, removal)));
+			// Its report gives the address of c, which this node does not know.
+			return CompletableFuture.completedFuture(Answer.of(new Report(2, true, true, 3, 9, removal, removal,
+					Probe.UNKNOWN, 0, -1, Probe.UNKNOWN, Map.of("c", "c:1"))));
 		};
-		var verdict = RemovalCheck.check(() -> own(own), Map.of("a", "a:1", "b", "b:1", "c", "c:1"),
-				Duration.ofSeconds(20), asker);
+		var verdict = RemovalCheck.check(() -> own(own), Map.of("a", "a:1", "b", "b:1"), Duration.ofSeconds(20), asker);
 		assertEquals(Reason.REMOVED, verdict.reason());
 		assertTrue(asked.containsKey("c"), "c, a member of K* only, was asked");
+		// Asked with the probe of K*, which it was not part of the round before.
+		assertEquals(TermIndex.valueOf(3, 9), cProbes.getFirst());
 	}
 
 	/** A member that blocks is asked until it stops blocking, within the budget. */
