@@ -139,7 +139,8 @@ final class ReplicatedConnection implements RocksDBConnection, LeaderHint {
 				var store = stateMachine.store();
 				sessions = store != null && store.clusterId() == null;
 			} catch (RuntimeException replaced) {
-				// Its database is being replaced by a snapshot install.
+				// Its database is being replaced by a snapshot install: the old store is closed and refuses to answer
+				// (NodeStore.clusterId), so no sessions until the new store says which cluster this node belongs to.
 			}
 		}
 		return RockserverCapabilities.CURRENT.withClientSessions(sessions).withNumberedBatches(sessions);

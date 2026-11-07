@@ -94,8 +94,8 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final ScheduledExecutorService initialization;
 	/**
 	 * Runs {@link #discardFailedInstalls}, which lists, walks and renames in the data directory: on a thread of its own,
-	 * so that a hung disk or Ratis threads holding the install lock never hold back {@link #gateApi} and
-	 * {@link #watchRaft}, which must notice exactly that disk (see "Hung disk" in the design document).
+	 * so that a hung disk never holds back {@link #gateApi} and {@link #watchRaft}, which must notice exactly that disk
+	 * (see "Hung disk" in the design document). It is the only thread that takes the install lock.
 	 */
 	private final ScheduledExecutorService installCleanup;
 	/** The node's control plane and local command threads, see {@link NodeThreads}. */
@@ -651,16 +651,34 @@ public final class ReplicatedNode implements AutoCloseable {
 	}
 
 	/**
-	 * Deletes the partial copies of failed snapshot installations also while nothing else reads the snapshot. Install
-	 * cleanup thread only: it does disk I/O and takes the install lock, so it must stay off the maintenance thread.
+	 * Deletes the partial copies of failed snapshot installations. Install cleanup thread only: it does disk I/O and
+	 * takes the install lock, so it must stay off the maintenance thread, and off Ratis' threads, which read the latest
+	 * snapshot under the server monitor.
 	 */
 	private void discardFailedInstalls() {
-		try {
+		runInstallCleanup(config.nodeId(), () -> {
 			if (!closed.get()) {
-				stateMachine.getLatestSnapshot();
+				stateMachine.discardFailedInstalls();
 			}
-		} catch (RuntimeException ex) {
-			LOG.warn("{}: failed to discard abandoned snapshot installations, retrying", config.nodeId(), ex);
+		});
+	}
+
+	/**
+	 * One run of the install cleanup task: {@code discard} logged when it fails, so that the next runs still happen.
+	 * Errors too: {@code scheduleWithFixedDelay} cancels every later run of a task that throws, silently, and nothing
+	 * else deletes replaced or abandoned installations before the next restart. An {@link OutOfMemoryError} in a walk
+	 * of a large installation, or when {@code CheckpointStorage.discard} cannot start its virtual thread, is retried
+	 * like any other failure; the scan itself waits {@code INSTALL_SCAN_INTERVAL} after the run that failed.
+	 */
+	static void runInstallCleanup(String nodeId, Runnable discard) {
+		try {
+			discard.run();
+		} catch (Throwable ex) {
+			try {
+				LOG.error("{}: failed to discard abandoned snapshot installations, retrying", nodeId, ex);
+			} catch (Throwable logFailed) {
+				// Out of memory even for the log message: the next run retries anyway.
+			}
 		}
 	}
 

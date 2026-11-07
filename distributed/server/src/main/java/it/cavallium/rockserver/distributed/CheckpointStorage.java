@@ -52,9 +52,10 @@ import org.slf4j.LoggerFactory;
  * {@code tmp/snapshot-<request id>/}, at the same paths relative to {@link #getSnapshotDir()}, and when complete
  * moves {@code snapshots/} aside, renames the new directory into its place and deletes the old one. An
  * installation that fails is restarted under a new request id and leaves its partial copy behind: the copies are
- * deleted when the server starts, when a newer installation starts writing (Ratis reads the latest snapshot
- * for every chunk it receives; installations on one follower never overlap, a new one invalidates the older
- * ones), and once their files did not change for {@link #INSTALL_ABANDONED_AFTER}.</p>
+ * deleted when the server starts, soon after a newer installation starts writing (installations on one follower
+ * never overlap, a new one invalidates the older ones), and once their files did not change for
+ * {@link #INSTALL_ABANDONED_AFTER}. The node's install cleanup thread looks for them ({@link #discardFailedInstalls});
+ * {@link #getLatestSnapshot()}, which Ratis calls under its locks, never does.</p>
  *
  * <p>Ratis saves a {@code <file>.md5} next to every received file but syncs nothing, so an installed snapshot is
  * used only once each file matches its saved digest; it is then fsynced and marked as verified. A snapshot that
@@ -178,12 +179,13 @@ final class CheckpointStorage implements StateMachineStorage {
 	}
 
 	/**
-	 * The latest usable snapshot, listing every file under its directory by absolute path. Also deletes the
-	 * partial copies of installations that a newer installation replaced.
+	 * The latest usable snapshot, listing every file under its directory by absolute path. Reads a field only: Ratis
+	 * calls this under its server monitor on every append that carries entries (a follower checking the append
+	 * against its snapshot index) and on the leader's appender threads, so it must never touch the disk nor wait for
+	 * the install lock, see {@link #discardFailedInstalls}.
 	 */
 	@Override
 	public @Nullable FileListSnapshotInfo getLatestSnapshot() {
-		discardReplacedInstalls();
 		return latest;
 	}
 
@@ -293,12 +295,23 @@ final class CheckpointStorage implements StateMachineStorage {
 		}
 	}
 
+	/** Tests only: the lock that {@link #discardFailedInstalls} holds while it lists, walks and renames. */
+	Object installsLock() {
+		return installsLock;
+	}
+
 	/**
 	 * Deletes the directories of the installations a newer one replaced: every installation directory except the
 	 * ones that appeared since the previous check that found a new one. A directory that comes back after being
-	 * deleted (a stale request writing one more chunk) is never taken for a new installation.
+	 * deleted (a stale request writing one more chunk) is never taken for a new installation. Also deletes the
+	 * installations that stopped writing, see {@link #INSTALL_ABANDONED_AFTER}. Runs at most every
+	 * {@link #INSTALL_SCAN_INTERVAL}.
+	 *
+	 * <p>Lists, walks and renames in the data directory under the install lock, so only the node's install cleanup
+	 * thread calls it (and tests): never a Ratis thread, which could hold the server monitor while a hung disk holds
+	 * this lock. {@link #init} deletes every installation directory left from before the start.</p>
 	 */
-	private void discardReplacedInstalls() {
+	void discardFailedInstalls() {
 		Path tmp = tmpDir;
 		long now = nanoClock.getAsLong();
 		long last = lastInstallScan;

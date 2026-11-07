@@ -25,7 +25,6 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
 import it.unimi.dsi.fastutil.longs.LongSortedSet;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -1370,8 +1369,7 @@ final class Applier {
 			store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.SEEDED), Buf.wrap(new byte[] {1}),
 					RequestType.none());
 		}
-		store.db().put(0L, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_ID),
-				Buf.wrap(genesis.clusterId().getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		store.writeClusterId(genesis.clusterId());
 	}
 
 	private void writeClusterVersion(long version) {

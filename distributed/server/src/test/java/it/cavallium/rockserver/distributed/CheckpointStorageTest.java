@@ -337,22 +337,79 @@ class CheckpointStorageTest {
 		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT, clock);
 		Path tmp = follower.getTmpDir().toPath();
 		Path failed = writePartialInstall(tmp, "snapshot-failed");
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		assertTrue(Files.exists(failed), "the newest installation is kept");
 
 		// Ratis restarts the installation under a new request id and receives its first chunk.
 		writePartialInstall(tmp, "snapshot-retried");
 		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		awaitFileNames(tmp, Set.of("snapshot-retried"));
 
 		// A stale request of the replaced installation writes one more chunk.
 		writePartialInstall(tmp, "snapshot-failed");
 		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		awaitFileNames(tmp, Set.of("snapshot-retried"));
+	}
+
+	/**
+	 * R24-1: Ratis asks for the latest snapshot under its server monitor on every follower append that carries entries
+	 * (RaftServerImpl.appendEntriesAsync, checkInconsistentAppendEntries, ServerState.getSnapshotIndex), and on the
+	 * leader's appender threads. Answering must not touch the disk nor wait for the install lock: the cleanup of failed
+	 * installations runs on the install cleanup thread only, and a hung disk there must not stop the Raft RPCs.
+	 */
+	@Test
+	void latestSnapshotNeverScansTheInstallations() throws IOException {
+		var clock = new AtomicLong();
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT, clock);
+		Path tmp = follower.getTmpDir().toPath();
+		Path replaced = writePartialInstall(tmp, "snapshot-replaced");
+		follower.getLatestSnapshot();
+		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
+		writePartialInstall(tmp, "snapshot-newer");
+		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
+		follower.getLatestSnapshot();
+		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
+		follower.getLatestSnapshot();
+		assertTrue(Files.exists(replaced), "getLatestSnapshot deleted the partial copy of a replaced installation");
+	}
+
+	/** R24-1: the install cleanup holding the install lock (in a walk of a hung disk) does not hold back Ratis. */
+	@Test
+	void latestSnapshotDoesNotWaitForTheInstallLock() throws Exception {
+		var clock = new AtomicLong();
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT, clock);
+		writePartialInstall(follower.getTmpDir().toPath(), "snapshot-installing");
+		Object installsLock = follower.installsLock();
+		var held = new java.util.concurrent.CountDownLatch(1);
+		var release = new java.util.concurrent.CountDownLatch(1);
+		Thread holder = Thread.ofPlatform().start(() -> {
+			synchronized (installsLock) {
+				held.countDown();
+				try {
+					release.await();
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+			}
+		});
+		try {
+			assertTrue(held.await(10, java.util.concurrent.TimeUnit.SECONDS));
+			clock.addAndGet(CheckpointStorage.INSTALL_PROGRESS_INTERVAL.toNanos());
+			var answer = java.util.concurrent.CompletableFuture.supplyAsync(follower::getLatestSnapshot,
+					command -> Thread.ofPlatform().daemon().start(command));
+			try {
+				answer.get(5, java.util.concurrent.TimeUnit.SECONDS);
+			} catch (java.util.concurrent.TimeoutException blocked) {
+				throw new AssertionError("getLatestSnapshot waited for the install lock", blocked);
+			}
+		} finally {
+			release.countDown();
+			holder.join();
+		}
 	}
 
 	/** DD-20: an installation that writes nothing more is deleted, without waiting for a newer one or a restart. */
@@ -363,12 +420,12 @@ class CheckpointStorageTest {
 		Path tmp = follower.getTmpDir().toPath();
 		Path install = writePartialInstall(tmp, "snapshot-stopped");
 		long step = CheckpointStorage.INSTALL_PROGRESS_INTERVAL.toNanos();
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		// It goes on writing for a while: kept.
 		for (int i = 0; i < 5; i++) {
 			clock.addAndGet(step);
 			Files.write(install.resolve("snapshot-1-10").resolve("db").resolve("0000" + (20 + i) + ".sst"), new byte[16]);
-			follower.getLatestSnapshot();
+			follower.discardFailedInstalls();
 		}
 		assertTrue(Files.exists(install));
 		// Then nothing more, for almost the limit: still kept.
@@ -376,16 +433,16 @@ class CheckpointStorageTest {
 		while (idle + step < CheckpointStorage.INSTALL_ABANDONED_AFTER.toNanos()) {
 			clock.addAndGet(step);
 			idle += step;
-			follower.getLatestSnapshot();
+			follower.discardFailedInstalls();
 		}
 		assertTrue(Files.exists(install), "not yet");
 		clock.addAndGet(2 * step);
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		awaitFileNames(tmp, Set.of());
 		// A new installation after that is a current one again.
 		Path next = writePartialInstall(tmp, "snapshot-next");
 		clock.addAndGet(step);
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		assertTrue(Files.exists(next));
 	}
 

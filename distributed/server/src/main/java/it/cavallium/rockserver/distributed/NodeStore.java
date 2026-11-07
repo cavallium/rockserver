@@ -157,12 +157,20 @@ final class NodeStore implements Closeable {
 	private final EmbeddedConnection connection;
 	private final long metaColumnId;
 	private final AtomicBoolean closed = new AtomicBoolean();
+	/**
+	 * {@link #CLUSTER_ID}, kept in memory: read when the database opens and set by {@link #writeClusterId}, the only
+	 * writer while it is open. Snapshot installation and backup restore replace the database files while it is
+	 * closed, and the store opened afterwards reads the id again.
+	 */
+	private volatile @Nullable String clusterId;
 
 	private NodeStore(Path dbDir, Path walDir, EmbeddedConnection connection, long metaColumnId) {
 		this.dbDir = dbDir;
 		this.walDir = walDir;
 		this.connection = connection;
 		this.metaColumnId = metaColumnId;
+		Buf value = readMeta(CLUSTER_ID);
+		this.clusterId = value == null ? null : value.toString(StandardCharsets.UTF_8);
 	}
 
 	/**
@@ -519,10 +527,26 @@ final class NodeStore implements Closeable {
 		return value == null ? TermIndex.INITIAL_VALUE : decodeTermIndex(value);
 	}
 
-	/** The persisted cluster id, or null before genesis. */
+	/**
+	 * The persisted cluster id, or null before genesis. From memory, without reading the database: the state machine
+	 * asks under its monitor, which Ratis' append lock waits for, and for every proposal.
+	 *
+	 * @throws IllegalStateException "Closed" once the store is closing, as when the id was read from the database: a
+	 *     node installing a snapshot has closed its old store, and callers take the refusal for "being replaced", never a
+	 *     stale or null id ({@code ReplicatedConnection.getCapabilities} advertises no client sessions,
+	 *     {@code ReplicatedNode.initializeCluster} retries). Only a flag is read, no lock and no disk.
+	 */
 	@Nullable String clusterId() {
-		Buf value = readMeta(CLUSTER_ID);
-		return value == null ? null : value.toString(StandardCharsets.UTF_8);
+		if (closed.get()) {
+			throw new IllegalStateException("Closed");
+		}
+		return clusterId;
+	}
+
+	/** Persists the cluster id, for {@link LogEntry.Genesis}: visible to {@link #clusterId()} once written. */
+	void writeClusterId(String id) {
+		db().put(0L, metaColumnId, key(CLUSTER_ID), Buf.wrap(id.getBytes(StandardCharsets.UTF_8)), RequestType.none());
+		clusterId = id;
 	}
 
 	/**
