@@ -12,6 +12,7 @@ import io.grpc.Server;
 import io.grpc.netty.NettyServerBuilder;
 import io.grpc.stub.StreamObserver;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest;
@@ -19,6 +20,7 @@ import it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse;
 import it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -27,6 +29,7 @@ import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -168,7 +171,15 @@ class LeaderForwarderTest {
 
 	/** A gRPC server that answers only the capability handshake, as a Rockserver would. */
 	private int handshakeServer() throws Exception {
-		Server server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0))
+		return startHandshakeServer().getPort();
+	}
+
+	private Server startHandshakeServer() throws Exception {
+		return startHandshakeServer(0);
+	}
+
+	private Server startHandshakeServer(int port) throws Exception {
+		Server server = NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", port))
 				.addService(new RocksDBServiceGrpc.RocksDBServiceImplBase() {
 					@Override
 					public void getCapabilities(CapabilitiesRequest request,
@@ -185,7 +196,108 @@ class LeaderForwarderTest {
 				.build()
 				.start();
 		closing.add(() -> server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS));
+		return server;
+	}
+
+	/** A Raft port that answers only {@link TermService#API_ADDRESS}, with whatever {@code address} holds then. */
+	private int apiAddressServer(AtomicReference<String> address) throws Exception {
+		var definition = org.apache.ratis.thirdparty.io.grpc.ServerServiceDefinition.builder(TermService.SERVICE_NAME)
+				.addMethod(TermService.API_ADDRESS, org.apache.ratis.thirdparty.io.grpc.stub.ServerCalls.asyncUnaryCall(
+						(byte[] request, org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver<byte[]> response) -> {
+							response.onNext(address.get().getBytes(StandardCharsets.UTF_8));
+							response.onCompleted();
+						}))
+				.build();
+		var server = org.apache.ratis.thirdparty.io.grpc.netty.NettyServerBuilder
+				.forAddress(new InetSocketAddress("127.0.0.1", 0))
+				.addService(definition)
+				.build()
+				.start();
+		closing.add(() -> server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS));
 		return server.getPort();
+	}
+
+	/**
+	 * A listed member that answered its API address once, then moved its API to another port (restarted with another
+	 * one while this node kept running): once a connection to the old port fails, the next connection after the backoff
+	 * asks the member again and reaches the new port, and leader hints name it. Before the fix the first answer was
+	 * kept until this node restarted (R18-2).
+	 */
+	@Test
+	void aListedMemberThatMovesItsApiPortIsAskedAgainOnceAConnectionFails() throws Exception {
+		var first = startHandshakeServer();
+		var answer = new AtomicReference<>("127.0.0.1:" + first.getPort());
+		int raftPort = apiAddressServer(answer);
+		// The peer list names a wrong API port: only the member's answer leads to it.
+		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2),
+				new PeerConfig("n1", "127.0.0.1", raftPort, "127.0.0.1", closedPort()));
+		var s = setup(peers, Duration.ofSeconds(5));
+		var targets = new ArrayList<LeaderForwarder.Target>();
+		for (int i = 0; i < 4; i++) {
+			targets.add(s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		}
+		assertEquals(new HostAndPort("127.0.0.1", first.getPort()), s.forwarder().apiAddress("n1"));
+		long version = s.forwarder().addressVersion();
+
+		// The member moves its API port: the old one closes, the member answers the new one.
+		first.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+		var second = startHandshakeServer();
+		answer.set("127.0.0.1:" + second.getPort());
+		// Each call on the old connections fails in transport.
+		targets.forEach(s.forwarder()::invalidate);
+		var failed = assertThrows(ExecutionException.class,
+				() -> s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		assertInstanceOf(LeaderForwarder.NotConnectedException.class, failed.getCause());
+
+		Thread.sleep(250);
+		var moved = s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS);
+		assertEquals("n1", moved.peerId());
+		assertEquals(new HostAndPort("127.0.0.1", second.getPort()), s.forwarder().apiAddress("n1"),
+				"leader hints still name the old port");
+		assertTrue(s.forwarder().addressVersion() != version, "cached leader hints are not looked up again");
+	}
+
+	/**
+	 * A listed member whose API stops answering for a moment at the same port (a pause, a restart on the same port):
+	 * the failed connection keeps the member's answered address, so leader hints keep naming it instead of the wrong
+	 * port of this node's peer list, and the connection after the backoff reaches the member there again. Before the
+	 * fix the failure removed the answer and hints named the listed port until this node forwarded to the member again
+	 * (R18 review finding 1).
+	 */
+	@Test
+	void aListedMemberThatFailsOnceAtTheSamePortKeepsItsAnsweredAddress() throws Exception {
+		var first = startHandshakeServer();
+		int apiPort = first.getPort();
+		var answered = new HostAndPort("127.0.0.1", apiPort);
+		var answer = new AtomicReference<>("127.0.0.1:" + apiPort);
+		int raftPort = apiAddressServer(answer);
+		// The peer list names a wrong API port: only the member's answer leads to it.
+		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2),
+				new PeerConfig("n1", "127.0.0.1", raftPort, "127.0.0.1", closedPort()));
+		var s = setup(peers, Duration.ofSeconds(5));
+		var targets = new ArrayList<LeaderForwarder.Target>();
+		for (int i = 0; i < 4; i++) {
+			targets.add(s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		}
+		assertEquals(answered, s.forwarder().apiAddress("n1"));
+		long version = s.forwarder().addressVersion();
+
+		first.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+		targets.forEach(s.forwarder()::invalidate);
+		var failed = assertThrows(ExecutionException.class,
+				() -> s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS));
+		assertInstanceOf(LeaderForwarder.NotConnectedException.class, failed.getCause());
+		assertEquals(answered, s.forwarder().apiAddress("n1"), "a hint names the listed port after one failure");
+
+		// Back at the same port.
+		startHandshakeServer(apiPort);
+		Thread.sleep(250);
+		assertEquals(answered, s.forwarder().apiAddress("n1"));
+		var back = s.forwarder().target("n1", s.stateMachine()).get(10, TimeUnit.SECONDS);
+		assertEquals("n1", back.peerId());
+		assertEquals(answered, s.forwarder().apiAddress("n1"));
+		// Leader hints cache their text by this version: the same answer again leaves it, and the cached hint, alone.
+		assertEquals(version, s.forwarder().addressVersion());
 	}
 
 	/** A port nothing listens on. */

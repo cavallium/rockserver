@@ -14,7 +14,10 @@ import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
@@ -24,6 +27,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.ratis.protocol.RaftPeer;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -92,9 +96,19 @@ final class LeaderForwarder implements Closeable {
 	private final ConcurrentHashMap<String, HostAndPort> learnedAddresses = new ConcurrentHashMap<>();
 	/**
 	 * API addresses that members of this node's peer list told about themselves: they win over the list, which may
-	 * be wrong on this node (see {@link #listedApiAddress}).
+	 * be wrong on this node (see {@link #listedApiAddress}). An entry is only ever replaced by a newer answer.
 	 */
 	private final ConcurrentHashMap<String, HostAndPort> answeredAddresses = new ConcurrentHashMap<>();
+	/**
+	 * Members of {@link #answeredAddresses} that a connection failed to since they answered: they are asked again
+	 * before the next connection, and their old answer is kept, for connections and leader hints, until a new one
+	 * replaces it (R18-2, R18 review finding 1).
+	 */
+	private final Set<String> staleAnswers = ConcurrentHashMap.newKeySet();
+	/** The API addresses of this node's peer list, by peer id, built once. */
+	private final Map<String, HostAndPort> listedAddresses;
+	/** Raised whenever {@link #apiAddress} may return something else for some peer; see {@link #addressVersion()}. */
+	private final AtomicLong addressVersion = new AtomicLong();
 	/** The event loop threads and callback executor of every forwarding connection; closed after them. */
 	private final GrpcClientTransport transport;
 	/** The channels to the Raft ports of the other members, for the address lookups. */
@@ -116,6 +130,11 @@ final class LeaderForwarder implements Closeable {
 		this.config = config;
 		this.peerChannels = peerChannels;
 		this.ownPeerChannels = ownPeerChannels;
+		var listed = new HashMap<String, HostAndPort>();
+		for (var peer : config.peers()) {
+			listed.put(peer.id(), new HostAndPort(peer.apiHost(), peer.apiPort()));
+		}
+		this.listedAddresses = Map.copyOf(listed);
 		this.transport = GrpcClientTransport.create(config.nodeId() + "-forward", CONNECTIONS_PER_PEER);
 	}
 
@@ -169,12 +188,29 @@ final class LeaderForwarder implements Closeable {
 		if (answered != null) {
 			return answered;
 		}
-		for (var peer : config.peers()) {
-			if (peer.id().equals(peerId)) {
-				return new HostAndPort(peer.apiHost(), peer.apiPort());
-			}
+		var listed = listedAddresses.get(peerId);
+		if (listed != null) {
+			return listed;
 		}
 		return learnedAddresses.get(peerId);
+	}
+
+	/**
+	 * A counter that changes whenever {@link #apiAddress} may return another address for some peer, so that a caller
+	 * on a hot path (the leader hint of every response) can cache its result: read it before {@link #apiAddress}.
+	 */
+	long addressVersion() {
+		return addressVersion.get();
+	}
+
+	/** Records {@code address} in {@code addresses}; true, and the version raised, if it changed the entry. */
+	private boolean record(ConcurrentHashMap<String, HostAndPort> addresses, String peerId, HostAndPort address) {
+		var previous = addresses.put(peerId, address);
+		if (address.equals(previous)) {
+			return false;
+		}
+		addressVersion.incrementAndGet();
+		return true;
 	}
 
 	private static RocksDBException closing() {
@@ -233,6 +269,15 @@ final class LeaderForwarder implements Closeable {
 		return handle.handle((connection, error) -> {
 			if (error != null) {
 				connections.remove(key, handle);
+				// The member may serve its API elsewhere now (restarted with another port while this node kept running):
+				// it is asked again at once, and before the next connection, instead of the old port being tried until
+				// this node restarts (R18-2). Its old answer stays until a new one replaces it: after a one-off failure at
+				// the same port it is still right, and the peer list may not be (R18 review finding 1).
+				var listedPeer = listedPeer(peerId);
+				if (listedPeer != null && answeredAddresses.containsKey(peerId)) {
+					staleAnswers.add(peerId);
+					listedApiAddress(listedPeer);
+				}
 				downUntil.put(peerId, System.nanoTime() + DOWN_BACKOFF_NANOS);
 				LOG.debug("{}: cannot reach the API of {}", config.nodeId(), peerId, error);
 				throw new CompletionException(new NotConnectedException());
@@ -261,14 +306,23 @@ final class LeaderForwarder implements Closeable {
 		if (closed) {
 			return CompletableFuture.failedFuture(new IOException("Node is closing"));
 		}
-		var known = config.peers().stream().filter(p -> p.id().equals(peerId)).findFirst();
-		var address = known.isPresent() ? listedApiAddress(known.get()) : askApiAddress(peerId, stateMachine);
+		var known = listedPeer(peerId);
+		var address = known != null ? listedApiAddress(known) : askApiAddress(peerId, stateMachine);
 		return address.thenApplyAsync(api -> {
 			LOG.debug("{}: connecting to {} at {}:{}", config.nodeId(), peerId, api.host(), api.port());
 			probe(api);
 			// Retried here, possibly at another leader, never by gRPC against a peer that may be gone.
 			return GrpcConnection.forHostAndPortWithoutRetry(config.nodeId() + "->" + peerId, api, transport);
 		}, connector);
+	}
+
+	private @Nullable PeerConfig listedPeer(String peerId) {
+		for (var peer : config.peers()) {
+			if (peer.id().equals(peerId)) {
+				return peer;
+			}
+		}
+		return null;
 	}
 
 	/** The handshake retries a refused connection for seconds: fail at once on a peer that is down instead. */
@@ -285,24 +339,35 @@ final class LeaderForwarder implements Closeable {
 	 * The API address of a member of this node's peer list, checked once against what the member answers at its Raft
 	 * address: a node started with wrong API ports for its peers would otherwise fail every call that it forwards. The
 	 * answer wins, and a difference is logged. A member that does not answer within {@link #PROBE_TIMEOUT_MS} is likely
-	 * down: the listed address is used, and it is asked again at the next connection.
+	 * down: its last answer, or else the listed address, is used, and it is asked again at the next connection. An
+	 * answer is used without asking again until a connection to the member fails ({@link #target}): then the member is
+	 * asked again, and a member that moved its API port is found at the new one (R18-2), while the old answer is kept
+	 * until the new one replaces it (R18 review finding 1).
 	 */
 	private CompletableFuture<HostAndPort> listedApiAddress(PeerConfig peer) {
-		var listed = new HostAndPort(peer.apiHost(), peer.apiPort());
+		var listed = listedAddresses.get(peer.id());
 		var answered = answeredAddresses.get(peer.id());
-		if (answered != null) {
+		if (answered != null && !staleAnswers.contains(peer.id())) {
 			return CompletableFuture.completedFuture(answered);
 		}
 		var channel = peerChannels.get(peer.raftAddress());
 		return TermService.apiAddress(channel, Duration.ofMillis(PROBE_TIMEOUT_MS)).handle((address, error) -> {
 			if (error != null) {
 				LOG.debug("{}: member {} did not tell its API address", config.nodeId(), peer.id(), error);
-				return listed;
+				var last = answeredAddresses.get(peer.id());
+				return last != null ? last : listed;
 			}
-			if (answeredAddresses.put(peer.id(), address) == null && !address.equals(listed)) {
-				LOG.error("{}: member {} serves its API at {}:{}, but the peer list of this node says {}:{}: using the"
-						+ " member's. Fix --peer {}", config.nodeId(), peer.id(), address.host(), address.port(), listed.host(),
-						listed.port(), peer.format());
+			staleAnswers.remove(peer.id());
+			var previous = answeredAddresses.get(peer.id());
+			if (record(answeredAddresses, peer.id(), address)) {
+				if (previous != null) {
+					LOG.info("{}: member {} serves its API at {}:{} now, no longer at {}:{}", config.nodeId(), peer.id(),
+							address.host(), address.port(), previous.host(), previous.port());
+				} else if (!address.equals(listed)) {
+					LOG.error("{}: member {} serves its API at {}:{}, but the peer list of this node says {}:{}: using the"
+							+ " member's. Fix --peer {}", config.nodeId(), peer.id(), address.host(), address.port(),
+							listed.host(), listed.port(), peer.format());
+				}
 			}
 			return address;
 		});
@@ -316,8 +381,7 @@ final class LeaderForwarder implements Closeable {
 		}
 		var channel = peerChannels.get(raftAddress);
 		return TermService.apiAddress(channel, config.requestTimeout()).whenComplete((address, error) -> {
-			if (address != null) {
-				learnedAddresses.put(peerId, address);
+			if (address != null && record(learnedAddresses, peerId, address)) {
 				LOG.info("{}: member {} at {} serves its API at {}:{}", config.nodeId(), peerId, raftAddress,
 						address.host(), address.port());
 			}

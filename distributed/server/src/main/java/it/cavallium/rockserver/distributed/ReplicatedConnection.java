@@ -108,8 +108,8 @@ final class ReplicatedConnection implements RocksDBConnection, LeaderHint {
 		return url;
 	}
 
-	/** The leader and its API address, as last looked up. */
-	private record CachedHint(RaftPeerId leader, @Nullable String address) {}
+	/** The leader, the forwarder's {@link LeaderForwarder#addressVersion()} then, and the leader's API address as text. */
+	private record CachedHint(RaftPeerId leader, long version, @Nullable String address) {}
 
 	private volatile @Nullable CachedHint cachedHint;
 
@@ -127,13 +127,16 @@ final class ReplicatedConnection implements RocksDBConnection, LeaderHint {
 		if (leaderId == null) {
 			return null;
 		}
+		// The forwarder learns a new address when a member moves its API port (R18-2): looked up again only when its
+		// address version changed, read before the lookup so that a change during it is seen by the next call.
+		long version = forwarder.addressVersion();
 		var cached = cachedHint;
-		if (cached != null && cached.leader().equals(leaderId) && cached.address() != null) {
+		if (cached != null && cached.version() == version && cached.leader().equals(leaderId)) {
 			return cached.address();
 		}
 		var api = forwarder.apiAddress(leaderId.toString());
 		var address = api == null ? null : api.host() + ":" + api.port();
-		cachedHint = new CachedHint(leaderId, address);
+		cachedHint = new CachedHint(leaderId, version, address);
 		return address;
 	}
 

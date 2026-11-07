@@ -214,6 +214,10 @@ over (clients open new ones by themselves).
    `rs restore-backup --backup /path/to/<name> --data-dir /srv/rockserver/data [--rockserver-config ...]`.
    It prints `OK` and the log index the data reaches. It refuses a data directory with a `db/` or a Raft log, and
    renames a `replica-ops.log` and a `backups/` of the old cluster found there (suffix `.before-restore-<time>`).
+   It refuses a backup of a newer cluster version than this binary supports with exit code 5, and leaves no `db/`:
+   restore it with the newer version. Run that newer version on every node of the new cluster as well: the restored
+   `db/` carries no cluster version, so an older binary started on it is not refused, and would hold data written by a
+   newer version under the oldest cluster version.
 3. Start every node as for a new cluster, without `--join`; the nodes of the old cluster stay stopped. The first leader proposes
    a seeded genesis, as in "Seeding a cluster".
 4. Check: `status`, then `checksum` prints `OK`, then a few known keys read back.
@@ -306,12 +310,15 @@ The cluster version keeps the new kinds of log entries off until every member ru
   `-Dit.cavallium.rockserver.grpc.client.session-writes=false` until then).
 - `admin checksum` and `admin backup` are refused until every member supports them.
 - Never downgrade a node below the cluster version: it would stop on the first entry it cannot read. A node whose
-  database has a cluster version with a capability its binary lacks (a downgrade, or a backup of a newer cluster restored
+  database has a cluster version with a capability its binary lacks (a downgrade, or a newer cluster's database copied
   here) refuses to start, with exit code 5 and a message naming the unknown capabilities: start the newer version
   again. A node rolled back after it took part in a raise can also meet it after the start, in the log it replays or
   catches up on, or in a snapshot it installs: it stops then, with exit code 5 as well. `add-peer` refuses
   a new node that lacks a capability of the cluster, or one that every member supports already (the leader may turn it
-  on at any moment): upgrade the new node first.
+  on at any moment): upgrade the new node first. `restore-backup` and `export-seed` refuse a newer cluster's backup or
+  database the same way, with exit code 5 and no `db/` or seed written: run them with the newer version, and run it on
+  every node that starts on their output too, since that output carries no cluster version and an older binary is not
+  refused there.
 - A cluster created before the cluster version has none until every member was upgraded to a version that has it and the
   leader raised it.
 
@@ -375,7 +382,7 @@ disk problem to look at.
 | 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError` | Wrong usage | Wrong usage | Wrong usage |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
 | 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`): run it again | - | - |
-| 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | - |
+| 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | The replica's database (`export-seed`) or the backup (`restore-backup`) has a cluster version with capabilities this version lacks; nothing is written: run the newer version |
 
 A stop of `run` by SIGTERM, after its hand-off, ends with 143 and one by SIGINT with 130: the JVM's
 status for a signal (128 plus its number), since the shutdown hook halts with a status of its own only after a
