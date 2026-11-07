@@ -270,6 +270,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return groupId;
 	}
 
+	/**
+	 * Deletes the partial copies of failed snapshot installations, see {@link CheckpointStorage#discardFailedInstalls}:
+	 * disk I/O under the install lock, so the install cleanup thread of {@link ReplicatedNode} only.
+	 */
+	void discardFailedInstalls() {
+		storage.discardFailedInstalls();
+	}
+
 	/** When the latest snapshot was taken or installed, from its files; 0 if unknown. */
 	long latestSnapshotTimeMillis() {
 		var dir = storage.latestSnapshotDir();

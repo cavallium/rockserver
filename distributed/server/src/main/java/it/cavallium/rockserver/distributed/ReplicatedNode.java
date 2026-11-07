@@ -651,13 +651,14 @@ public final class ReplicatedNode implements AutoCloseable {
 	}
 
 	/**
-	 * Deletes the partial copies of failed snapshot installations also while nothing else reads the snapshot. Install
-	 * cleanup thread only: it does disk I/O and takes the install lock, so it must stay off the maintenance thread.
+	 * Deletes the partial copies of failed snapshot installations. Install cleanup thread only: it does disk I/O and
+	 * takes the install lock, so it must stay off the maintenance thread, and off Ratis' threads, which read the latest
+	 * snapshot under the server monitor.
 	 */
 	private void discardFailedInstalls() {
 		try {
 			if (!closed.get()) {
-				stateMachine.getLatestSnapshot();
+				stateMachine.discardFailedInstalls();
 			}
 		} catch (RuntimeException ex) {
 			LOG.warn("{}: failed to discard abandoned snapshot installations, retrying", config.nodeId(), ex);

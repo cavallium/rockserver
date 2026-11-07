@@ -337,21 +337,21 @@ class CheckpointStorageTest {
 		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT, clock);
 		Path tmp = follower.getTmpDir().toPath();
 		Path failed = writePartialInstall(tmp, "snapshot-failed");
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		assertTrue(Files.exists(failed), "the newest installation is kept");
 
 		// Ratis restarts the installation under a new request id and receives its first chunk.
 		writePartialInstall(tmp, "snapshot-retried");
 		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		awaitFileNames(tmp, Set.of("snapshot-retried"));
 
 		// A stale request of the replaced installation writes one more chunk.
 		writePartialInstall(tmp, "snapshot-failed");
 		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		awaitFileNames(tmp, Set.of("snapshot-retried"));
 	}
 
@@ -422,12 +422,12 @@ class CheckpointStorageTest {
 		Path tmp = follower.getTmpDir().toPath();
 		Path install = writePartialInstall(tmp, "snapshot-stopped");
 		long step = CheckpointStorage.INSTALL_PROGRESS_INTERVAL.toNanos();
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		// It goes on writing for a while: kept.
 		for (int i = 0; i < 5; i++) {
 			clock.addAndGet(step);
 			Files.write(install.resolve("snapshot-1-10").resolve("db").resolve("0000" + (20 + i) + ".sst"), new byte[16]);
-			follower.getLatestSnapshot();
+			follower.discardFailedInstalls();
 		}
 		assertTrue(Files.exists(install));
 		// Then nothing more, for almost the limit: still kept.
@@ -435,16 +435,16 @@ class CheckpointStorageTest {
 		while (idle + step < CheckpointStorage.INSTALL_ABANDONED_AFTER.toNanos()) {
 			clock.addAndGet(step);
 			idle += step;
-			follower.getLatestSnapshot();
+			follower.discardFailedInstalls();
 		}
 		assertTrue(Files.exists(install), "not yet");
 		clock.addAndGet(2 * step);
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		awaitFileNames(tmp, Set.of());
 		// A new installation after that is a current one again.
 		Path next = writePartialInstall(tmp, "snapshot-next");
 		clock.addAndGet(step);
-		follower.getLatestSnapshot();
+		follower.discardFailedInstalls();
 		assertTrue(Files.exists(next));
 	}
 
