@@ -3,7 +3,6 @@ package it.cavallium.rockserver.distributed;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.TIMEOUT;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitReadyLeader;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.confEntry;
-import static it.cavallium.rockserver.distributed.RemovalScenarios.isAppend;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.sender;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.setConfiguration;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -26,6 +25,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.SnapshotManagementRequest;
 import org.junit.jupiter.api.AfterEach;
@@ -124,8 +124,13 @@ class CommittedConfigurationsTest {
 		assertTrue(snapshot.isSuccess(), () -> String.valueOf(snapshot.getException()));
 		long snapshotIndex = Objects.requireNonNull(leader.stateMachine().getLatestSnapshot()).getIndex();
 
-		RaftTraffic.dropForTesting = (receiver, message) -> isAppend(message) && l.equals(sender(message))
-				&& !receiver.equals(f);
+		// J and every entry after it reach F only. L's heartbeats still reach the others, so that none of them starts an
+		// election and L, hearing from a majority, keeps leading for as long as F takes to start and install.
+		long firstDropped = division.getRaftLog().getNextIndex();
+		RaftTraffic.dropForTesting = (receiver, message) -> l.equals(sender(message)) && !receiver.equals(f)
+				&& (message instanceof RaftProtos.InstallSnapshotRequestProto
+				|| message instanceof RaftProtos.AppendEntriesRequestProto append
+				&& append.getEntriesList().stream().anyMatch(entry -> entry.getIndex() >= firstDropped));
 		var newHalf = cluster.ids().stream().filter(id -> !id.equals(removed)).toList();
 		var reply = setConfiguration(cluster, leader, newHalf);
 		InProcessCluster.await(TIMEOUT, () -> !RemovalScenarios.conf(leader).getPreviousPeers().isEmpty());

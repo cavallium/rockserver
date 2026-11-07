@@ -432,8 +432,9 @@ final class NodeStore implements Closeable {
 		FileStore parentStore = Files.getFileStore(dbDir.getParent());
 		List<Path> directories = new ArrayList<>();
 		// The database may be open: RocksDB deletes files (compaction inputs, obsolete WALs) from its own threads while
-		// this walks, so an entry listed and gone before it is read is skipped. Symbolic links are not followed, as by
-		// Files.walk; Files.isDirectory and getFileStore follow them, so a linked volume is checked too.
+		// this walks, so an entry, file or directory, that is gone before it is read is skipped, here and in the loop
+		// below. Symbolic links are not followed, as by Files.walk; Files.isDirectory and getFileStore follow them, so a
+		// linked volume is checked too.
 		Files.walkFileTree(dbDir, new SimpleFileVisitor<>() {
 			@Override
 			public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
@@ -458,7 +459,13 @@ final class NodeStore implements Closeable {
 			}
 		});
 		for (Path directory : directories) {
-			if (!Files.getFileStore(directory).equals(parentStore)) {
+			FileStore store;
+			try {
+				store = Files.getFileStore(directory);
+			} catch (NoSuchFileException gone) {
+				continue;
+			}
+			if (!store.equals(parentStore)) {
 				throw new IOException(directory + " is on a different file system than " + dbDir.getParent()
 						+ ": the database directory and its volumes must be on the file system of its parent, so that"
 						+ " a snapshot can be restored by renaming");
