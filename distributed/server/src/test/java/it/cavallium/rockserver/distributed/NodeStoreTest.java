@@ -103,6 +103,20 @@ class NodeStoreTest {
 	 */
 	@Test
 	void openToleratesFilesDeletedConcurrentlyInTheDatabaseDirectory() throws Exception {
+		reopenWhileChurning(false);
+	}
+
+	/**
+	 * The same for directories: core does not delete a directory of an open database, but the check walks first and asks
+	 * each directory's file system after, so a directory gone in between is skipped as a file is.
+	 */
+	@Test
+	void openToleratesDirectoriesDeletedConcurrentlyInTheDatabaseDirectory() throws Exception {
+		reopenWhileChurning(true);
+	}
+
+	/** Reopens a database 30 times while a thread creates and deletes files, or directories, in its volume directory. */
+	private void reopenWhileChurning(boolean directories) throws Exception {
 		Path dbDir = tempDir.resolve("db");
 		try (var store = NodeStore.open(dbDir, null, "first")) {
 			setApplied(store, TermIndex.valueOf(1, 1));
@@ -113,10 +127,14 @@ class NodeStoreTest {
 		var churner = new Thread(() -> {
 			int n = 0;
 			while (!stop.get()) {
-				Path file = volume.resolve("churn-" + (n++ % 256) + ".tmp");
+				Path entry = volume.resolve("churn-" + (n++ % 256) + (directories ? ".d" : ".tmp"));
 				try {
-					if (!Files.deleteIfExists(file)) {
-						Files.createFile(file);
+					if (!Files.deleteIfExists(entry)) {
+						if (directories) {
+							Files.createDirectory(entry);
+						} else {
+							Files.createFile(entry);
+						}
 					}
 				} catch (IOException ignored) {
 					// Racing with nothing but this thread: retry on the next name.

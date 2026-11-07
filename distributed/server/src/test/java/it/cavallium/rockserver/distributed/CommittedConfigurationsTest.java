@@ -130,6 +130,8 @@ class CommittedConfigurationsTest {
 		var reply = setConfiguration(cluster, leader, newHalf);
 		InProcessCluster.await(TIMEOUT, () -> !RemovalScenarios.conf(leader).getPreviousPeers().isEmpty());
 		long jointIndex = RemovalScenarios.conf(leader).getLogEntryIndex();
+		// Longer than the largest election timeout: L must still lead however long F then takes to start and install.
+		Thread.sleep(Duration.ofSeconds(15));
 		var fNode = cluster.start(f);
 		InProcessCluster.await(TIMEOUT, () -> fNode.appliedIndex() >= snapshotIndex);
 		// The scenario: L, still leading with J uncommitted, sent the snapshot.
