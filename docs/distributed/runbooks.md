@@ -103,7 +103,7 @@ start, `starting, not known to be a member`, with `Membership <reason> (K* ..., 
 | Reason | What to do |
 |---|---|
 | `NO_MAJORITY`, `NO_COMMITTED_CONFIGURATION` | Start or repair the pending and unreachable members (a member of a version without `Configuration` counts as unreachable). The node decides by itself once a majority of them answer. If they are gone for good (wiped, replaced), check with `status` on a member: if this node is not in its configuration, stop it, take it out of its supervisor, wipe its data directory, and add it again with `--join` and `add-peer` if you want it back. |
-| `NEEDS_TERM` | The members that answered run a version without `Configuration2`: upgrade them. Until then judge with `status`, as above. |
+| `NEEDS_TERM` | The members that answered run a version without `Configuration2`: upgrade them. Their answers tell no terms, and their committed flag does not confirm a removal unless a member of this version (or the node itself) reports the same configuration committed. Until then judge with `status`, as above. |
 | `MEMBER_LATER_CONFIGURATION` | Clears by itself within seconds. If it lasts, the blocking members are stuck or were removed themselves: look at their logs and `status`. |
 | `OWN_LATER_CONFIGURATION` | An `add-peer` of this node is in flight: let it finish. |
 | `NOT_ADDED` | A `--join` node that never was a voter: run `add-peer`. If the add was abandoned, or the node was added and removed long ago, stop it and wipe its data directory (`add-peer` refuses a node that has a log). |
@@ -240,6 +240,10 @@ Upgrades across these versions need more care, because no gate covers them:
   the cluster version covers this from this version on.
 - **Pipelined updates** need every node on the version with the flags of `Guarded` entries; the cluster version covers
   this from this version on.
+- **Removing nodes** (`remove-peer`, or a replacement) during an upgrade from a version without `Configuration2`:
+  upgrade the remaining members first. A removed node started again decides that it was removed only once the node
+  itself or an upgraded member reports its removal committed; with only old members it waits outside with
+  `NEEDS_TERM` (see "Removed node").
 
 ## Exit codes
 

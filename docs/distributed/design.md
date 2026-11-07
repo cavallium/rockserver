@@ -1541,8 +1541,15 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   which tell no terms), MEMBER_LATER_CONFIGURATION, NO_MAJORITY, and HEARD_LEADER (below). A check returns as soon as
   the verdict is decided, or when asking again cannot change it, or after two election timeouts (at least 1 s). A
   member that answers `UNIMPLEMENTED` is asked the version-1 `Configuration` (its committed configuration, with no term
-  and no old half), and one that predates both, or cannot be reached, is no answer: a version-1 answer is still a
-  committed fact, so it leaves more cases undecided and never makes one unsafe.
+  and no old half), and one that predates both, or cannot be reached, is no answer. A version-1 committed flag
+  compares Ratis' configuration with the commit index, which is wrong for the stale configuration of finding 1 below
+  (R12-1). So a version-1 answer raises K* or blocks, but confirms only a K* that the node itself or a member of this
+  version reports committed: that member's log then holds K* committed at that index, and the old member's committed
+  entry there is the same entry. Otherwise the verdict is NEEDS_TERM. A K* that only version-1 answers report has no
+  known term, so neither step 4's branch tests nor step 5's exclusions can drop a blocker on its account. The cost is
+  liveness in a rolling upgrade: a removed node often never applied its own removal, so with every remaining member on
+  a version without `Configuration2` it waits outside (NEEDS_TERM) until one of them is upgraded, where the round-11
+  rule exited with 4. Upgrade the members before removing nodes.
 
   The committed configurations come from the node's own records, not from Ratis' notification: on a snapshot install
   Ratis reports the leader's latest configuration, committed or not, with term 0, on every chunk
@@ -1556,7 +1563,8 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   version applied on that database (`CONFIGURATION_HISTORY`), and kept: one entry per term start and per membership
   change, about a hundred bytes each. A node's committed configuration is the newest it recorded, or its latest
   configuration if that is at or below its commit index and in its log or snapshot (a configuration a snapshot install
-  took from the leader, past the snapshot and not in the log, does not count). A probe of an entry in the log answers
+  took from the leader, past the snapshot and not in the log, does not count; one in the snapshot counts only if the
+  history recorded it at its index, or does not cover that index). A probe of an entry in the log answers
   from the log and the commit index (or the history, for a restarted node whose commit index has not caught up), and
   of an entry in the snapshot from the history where it is complete. Seeding from `raft-meta.conf` was not needed: the
   derived committed configuration covers a database of an older version.
@@ -1576,8 +1584,11 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   configuration (both halves), from the history only if it recorded the same configuration at that index, and is
   unknown otherwise; it is the committed configuration only if that entry is the same configuration, or the index is in
   the snapshot; and a probe whose (term, index) is an ordinary entry answers "absent" (that entry is the only one with
-  that term and index in any log, so no configuration has them). A stale J is then only a latest configuration with an
-  unknown term, which can neither be K* nor confirm one. `MembershipFactsTest` builds F's state (a stub log and
+  that term and index in any log, so no configuration has them). Once the node purges its log past c (purging follows
+  the members' lowest commit index, so it does, while no configuration above c is appended), the entry is gone and J
+  sits in the snapshot: there it counts as committed only if the history recorded J at c, or does not cover c (a
+  database of an older version, which keeps the round-11 behaviour), round-13 review. A stale J is then only a latest
+  configuration with an unknown term, which can neither be K* nor confirm one, for a history complete over c. `MembershipFactsTest` builds F's state (a stub log and
   configuration) and the members' answers, and fails without the change (J committed with term 3, X REMOVED by four
   confirmers). An in-process reproduction needs F's Ratis updater stalled between appending E's entries and applying e,
   which stock Ratis has no hook for; it is not written. At the Ratis level the same stale state can do more: if F is
@@ -1623,7 +1634,8 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   members of K*'s new half (members of a version without the method count as unreachable); the node decides by itself
   once a majority of them answer; if they are gone for good, check with `status` on a member, and if this node is not
   in its configuration, stop it, wipe it, start it with `--join` and run `add-peer`. NEEDS_TERM, upgrade the named
-  members; until then judge with `status`. MEMBER_LATER_CONFIGURATION, normally clears within seconds; if it persists,
+  members (their version tells no terms, and their committed flag does not confirm a removal by itself); until then
+  judge with `status`. MEMBER_LATER_CONFIGURATION, normally clears within seconds; if it persists,
   the named member is stuck or was removed itself. OWN_LATER_CONFIGURATION, an add of this node is in flight: let it
   finish. NOT_ADDED, run `add-peer`; if the add was abandoned, or the node was added and removed long ago, stop it and
   wipe it (`add-peer` refuses a node that has a log). INCONSISTENT, a bug or a data directory restored from elsewhere:
