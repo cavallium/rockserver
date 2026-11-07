@@ -18,10 +18,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * The state of a node that alerts watch, read once per {@link #REFRESH_MILLIS} on the node's maintenance thread and
+ * The state of a node that alerts watch, read once per {@link #REFRESH_MILLIS} on the node's monitor thread and
  * exported as gauges ({@link NodeMetrics#exportedGauge}): Raft role, term and indices, the lags between them, each
  * follower's lag on the leader, the size of the Raft log, the age of the latest snapshot and the free space of the
  * disks of the database and of the Raft log. The metrics pipeline's thread only reads fields, never Ratis or the disk.
+ * A refresh reads the disk and Ratis' log (under its read lock), so a hung disk can stop it for good: the monitor
+ * thread is the node's own for that reason, shared with nothing that must notice the hung disk (R25-W).
  *
  * <p>It also raises the alarms that a node can tell by itself, as log lines: a disk that runs out of space, a Raft log
  * that keeps growing (a member that is gone for good holds it back) and RocksDB stopping or slowing writes (a write
@@ -177,7 +179,7 @@ final class NodeMonitor {
 		this.membershipState = state;
 	}
 
-	/** Reads the state and raises or clears the alarms. Maintenance thread only. */
+	/** Reads the state and raises or clears the alarms. Monitor thread only. */
 	void refresh() {
 		long now = System.currentTimeMillis();
 		refreshRaft();

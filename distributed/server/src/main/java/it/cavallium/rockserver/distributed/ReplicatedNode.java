@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -85,8 +86,28 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final LeaderForwarder forwarder;
 	private final ReplicatedConnection connection;
 	private final GrpcServer apiServer;
-	/** Runs {@link #gateApi} and {@link #watchRaft}, which must keep running while the cluster is initialized. */
-	private final ScheduledExecutorService maintenance;
+	/**
+	 * Runs {@link #gateApi}, and nothing else (round 25, R25-W): every call it makes reads fields or atomics, or pauses
+	 * and resumes the API server, and none waits for a disk or for a lock that a thread waiting for a disk can hold (the
+	 * snapshot storage monitor, the Raft log's lock, the Raft server's monitor). So the API pauses within
+	 * {@link #MAINTENANCE_INTERVAL_MS} of the disk probe finding the disk hung, whatever Ratis and the state machine
+	 * wait for. Never schedule anything else here.
+	 */
+	private final ScheduledExecutorService apiGateThread;
+	/**
+	 * Runs {@link #watchRaft}: it reads the Raft log, under the log's read lock, which a hung disk can keep away for
+	 * good (an append holds the write lock while it waits for room in the queue of a log worker that stopped writing).
+	 * Then Ratis cannot step down either, and the API gate, on its own thread, still pauses the API. The step-downs
+	 * it decides run on a virtual thread ({@link #startStepDown}), since a hand-over takes the Raft server's monitor.
+	 */
+	private final ScheduledExecutorService raftWatchThread;
+	/**
+	 * Runs {@link #refreshMonitor} and {@link #recordMembership}, which touch the disk (file listings, sizes, free
+	 * space, a file write and fsyncs) and read Ratis' log: off the threads of {@link #gateApi} and {@link #watchRaft}.
+	 */
+	private final ScheduledExecutorService monitorThread;
+	/** Whether a step-down decided by {@link #watchRaft} is still being started on its virtual thread. */
+	private final AtomicBoolean stepDownStarting = new AtomicBoolean();
 	/**
 	 * Runs {@link #initializeCluster}, whose genesis proposal blocks for up to the request timeout: on a thread of its
 	 * own, so that it does not hold back {@link #gateApi} and {@link #watchRaft} (and {@link LeaderStall}).
@@ -100,7 +121,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final ScheduledExecutorService installCleanup;
 	/** The node's control plane and local command threads, see {@link NodeThreads}. */
 	private final NodeThreads threads;
-	/** Only used on the maintenance thread. */
+	/** Only used on the API gate thread. */
 	private final ApiGate apiGate;
 	/** The id this node proposes, if it is the one that starts the cluster. Only used on the initialization thread. */
 	private final String newClusterId = UUID.randomUUID().toString();
@@ -119,9 +140,9 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final PeerChannels peerChannels = new PeerChannels();
 	/** Finds a hung disk, which pauses the API like a missing leader does; see {@link #gateApi}. */
 	private final DiskProbe diskProbe;
-	/** Whether {@link #gateApi} last found the disk hung. Maintenance thread only. */
+	/** Whether {@link #gateApi} last found the disk hung. API gate thread only. */
 	private boolean diskHung;
-	/** Only used on the maintenance thread. */
+	/** Only used on the Raft watch thread. */
 	private final LeaderStall leaderStall;
 	private final NodeMetrics.Series leaderStallStepDowns;
 	private final NodeMetrics.Series leaderLogStepDowns;
@@ -129,11 +150,11 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final AtomicLong snapshotCalls = new AtomicLong();
 	private final CompletableFuture<@Nullable Throwable> stopped = new CompletableFuture<>();
 	private final NodeMetrics metrics;
-	/** Whether {@link #MEMBER_FILE} exists. Maintenance thread only. */
+	/** Whether {@link #MEMBER_FILE} exists. Monitor thread only. */
 	private boolean memberRecorded;
 	/** When a leader last sent this node a Raft request: see {@link RaftTraffic}. */
 	private final RaftTraffic raftTraffic;
-	/** The gauges and alarms of this node; only refreshed on the maintenance thread. */
+	/** The gauges and alarms of this node; only refreshed on the monitor thread. */
 	private NodeMonitor monitor;
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
@@ -230,8 +251,12 @@ public final class ReplicatedNode implements AutoCloseable {
 			this.apiServer = new GrpcServer(connection, new InetSocketAddress(apiHost, self.apiPort()));
 			apiServer.start();
 			started.add(apiServer);
-			this.maintenance = Executors.newSingleThreadScheduledExecutor(
-					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-maintenance").factory());
+			this.apiGateThread = Executors.newSingleThreadScheduledExecutor(
+					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-api-gate").factory());
+			this.raftWatchThread = Executors.newSingleThreadScheduledExecutor(
+					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-raft-watch").factory());
+			this.monitorThread = Executors.newSingleThreadScheduledExecutor(
+					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-monitor").factory());
 			this.initialization = Executors.newSingleThreadScheduledExecutor(
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-initialization").factory());
 			this.installCleanup = Executors.newSingleThreadScheduledExecutor(
@@ -240,16 +265,18 @@ public final class ReplicatedNode implements AutoCloseable {
 			diskProbe.start();
 			initialization.scheduleWithFixedDelay(this::initializeCluster, 0, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
-			maintenance.scheduleWithFixedDelay(this::gateApi, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
+			apiGateThread.scheduleWithFixedDelay(this::gateApi, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
-			maintenance.scheduleWithFixedDelay(this::watchRaft, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
+			raftWatchThread.scheduleWithFixedDelay(this::watchRaft, MAINTENANCE_INTERVAL_MS, MAINTENANCE_INTERVAL_MS,
 					TimeUnit.MILLISECONDS);
+			monitorThread.scheduleWithFixedDelay(this::recordMembershipOnce, MAINTENANCE_INTERVAL_MS,
+					MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 			installCleanup.scheduleWithFixedDelay(this::discardFailedInstalls, MAINTENANCE_INTERVAL_MS,
 					MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 			this.monitor = new NodeMonitor(config, stateMachine::division, stateMachine,
 					config.raftDir().resolve(groupId.getUuid().toString()).resolve("current"), metrics);
 			monitor.membershipState(() -> membershipGauge(membership));
-			maintenance.scheduleWithFixedDelay(this::refreshMonitor, 0, NodeMonitor.REFRESH_MILLIS, TimeUnit.MILLISECONDS);
+			monitorThread.scheduleWithFixedDelay(this::refreshMonitor, 0, NodeMonitor.REFRESH_MILLIS, TimeUnit.MILLISECONDS);
 			var appendLag = metrics.amount("lag.uncommitted");
 			var applyLag = metrics.amount("lag.unapplied");
 			var flushLag = metrics.amount("lag.unflushed");
@@ -593,20 +620,56 @@ public final class ReplicatedNode implements AutoCloseable {
 				LOG.warn("{}: leader of term {}: no entry of this term committed, commit index {} did not move and the log"
 						+ " up to {} went to a majority, stepping down to restart replication", config.nodeId(), term,
 						commitIndex, log.getNextIndex() - 1);
-				leaderStallStepDowns.record(1);
-				stepDown();
+				startStepDown(false, leaderStallStepDowns);
 			} else if (leaderStall.logStopped(division.getInfo().isLeader(), log.getFlushIndex(), log.getNextIndex() - 1,
 					now)) {
 				LOG.warn("{}: leader of term {}: its Raft log flushed nothing past {} with entries up to {} waiting, and a"
 						+ " leader commits only what it flushed: stepping down", config.nodeId(), term, log.getFlushIndex(),
 						log.getNextIndex() - 1);
-				leaderLogStepDowns.record(1);
-				handOverOrStepDown();
+				startStepDown(true, leaderLogStepDowns);
 			}
-		} catch (IOException | RuntimeException ex) {
+		} catch (RuntimeException ex) {
 			LOG.warn("{}: failed to check Raft, retrying", config.nodeId(), ex);
 		}
-		// After the checks above, and on its own: a write that fails (a full disk) must not keep a stalled leader in place.
+	}
+
+	/**
+	 * Steps down ({@link #stepDown}) or hands over ({@link #handOverOrStepDown}) on a virtual thread: a hand-over takes
+	 * the Raft server's monitor, which Ratis holds while it waits for its log or fsyncs its metadata, and the Raft watch
+	 * thread must still notice that Raft closed meanwhile. At most one is being started at a time; a check that decides
+	 * again meanwhile does nothing, and is not counted in {@code counter}.
+	 */
+	private void startStepDown(boolean handOver, NodeMetrics.Series counter) {
+		if (!stepDownStarting.compareAndSet(false, true)) {
+			LOG.info("{}: the previous step-down is still being started", config.nodeId());
+			return;
+		}
+		counter.record(1);
+		try {
+			Thread.ofVirtual().name("rockserver-" + config.nodeId() + "-step-down").start(() -> {
+				try {
+					if (handOver) {
+						handOverOrStepDown();
+					} else {
+						stepDown();
+					}
+				} catch (IOException | RuntimeException ex) {
+					LOG.warn("{}: failed to step down", config.nodeId(), ex);
+				} finally {
+					stepDownStarting.set(false);
+				}
+			});
+		} catch (Throwable notStarted) {
+			stepDownStarting.set(false);
+			LOG.warn("{}: failed to start the step-down, retrying at the next check", config.nodeId(), notStarted);
+		}
+	}
+
+	/**
+	 * {@link #recordMembership}, on the monitor thread: it writes and fsyncs a file. A write that fails (a full disk)
+	 * is retried at the next run, and holds nothing else back.
+	 */
+	private void recordMembershipOnce() {
 		try {
 			var division = stateMachine.division();
 			if (!closed.get() && division != null && division.getInfo().isAlive()) {
@@ -652,8 +715,8 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	/**
 	 * Deletes the partial copies of failed snapshot installations. Install cleanup thread only: it does disk I/O and
-	 * takes the install lock, so it must stay off the maintenance thread, and off Ratis' threads, which read the latest
-	 * snapshot under the server monitor.
+	 * takes the install lock, so it must stay off the threads of {@link #gateApi} and {@link #watchRaft}, and off
+	 * Ratis' threads, which read the latest snapshot under the server monitor.
 	 */
 	private void discardFailedInstalls() {
 		runInstallCleanup(config.nodeId(), () -> {
@@ -688,7 +751,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	/**
 	 * Warns, on the leader, when the configuration has more members than its Ratis pending-request byte limit was sized
 	 * for ({@link RaftSettings#nodesUnderPendingLimit}): their attempts in flight can then fill it, and Ratis refuses
-	 * the rest before the append, which costs resends, not correctness. Maintenance thread only.
+	 * the rest before the append, which costs resends, not correctness. Raft watch thread only.
 	 */
 	private void warnAbovePendingLimit(RaftServer.Division division) {
 		int members = division.getGroup().getPeers().size();
@@ -739,7 +802,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		});
 	}
 
-	/** When {@link #checkWhileDetached} last asked the members, and last warned. Maintenance thread only. */
+	/** When {@link #checkWhileDetached} last asked the members, and last warned. Raft watch thread only. */
 	private long lastDetachedCheckNanos;
 	private long lastDetachedWarnNanos;
 	/** When the node started: until a leader sends to it, it counts as detached from then. */
@@ -1308,8 +1371,10 @@ public final class ReplicatedNode implements AutoCloseable {
 		if (!closed.compareAndSet(false, true)) {
 			return;
 		}
-		if (maintenance != null) {
-			maintenance.shutdownNow();
+		for (var executor : Arrays.asList(apiGateThread, raftWatchThread, monitorThread)) {
+			if (executor != null) {
+				executor.shutdownNow();
+			}
 		}
 		if (diskProbe != null) {
 			diskProbe.close();

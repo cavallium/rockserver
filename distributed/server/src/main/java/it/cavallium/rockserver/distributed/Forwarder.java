@@ -108,7 +108,9 @@ final class Forwarder {
 	 * Forwards {@code command} to the leader. When the leader cannot be reached (it died or lost leadership, and this
 	 * node may not know yet), a command that can safely run again ({@link #isReplayable}) is sent again, to whichever
 	 * node leads then, until {@code deadlineNanos}; any other command fails with a retryable error, or with an
-	 * unknown outcome if it may have taken effect. Each attempt takes at most the caller's deadline or
+	 * unknown outcome if it may have taken effect. A write of a client session that could not be sent before the
+	 * deadline fails flagged not applied ({@code SERVER_OVERLOADED}), for this copy only: an earlier copy may have
+	 * reached a leader. Each attempt takes at most the caller's deadline or
 	 * {@link #forwardTimeoutNanos}, whichever comes first, and the leader gets that deadline too: a leader that is alive
 	 * but stuck does not hold the call, nor this node's caller, indefinitely.
 	 */
@@ -151,6 +153,13 @@ final class Forwarder {
 					return CompletableFuture.failedFuture(lost ? unreachableFailure(command, cause) : cause);
 				}
 				if (System.nanoTime() - deadlineNanos > 0) {
+					if (notSent && context.requestId() != null) {
+						// A write of a client session: this copy was never sent, but an earlier one may have been, to a leader
+						// that appended it and then became unreachable, and it may commit under the next leader. Only this
+						// copy is not applied (R25-O): never UPDATE_RETRY, which says that no copy was.
+						return CompletableFuture.failedFuture(RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
+								"Not sent: the leader could not be reached before the deadline"));
+					}
 					// A retry signal from the leader (or a request never sent) is still the right answer.
 					return CompletableFuture.failedFuture(lost ? RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
 							"No leader could serve the request in time: " + cause) : cause);

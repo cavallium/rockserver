@@ -95,7 +95,11 @@ final class CheckpointStorage implements StateMachineStorage {
 	private Path stateMachineDir;
 	private Path snapshotsDir;
 	private volatile Path tmpDir;
-	private @Nullable Path latestDir;
+	/**
+	 * Written under this storage's monitor, read without it by {@link #latestSnapshotDir}: the node monitor reads it
+	 * while {@link #take} or {@link #reload} may hold the monitor for a whole checkpoint or install (R25-W).
+	 */
+	private volatile @Nullable Path latestDir;
 	private volatile @Nullable Snapshot latest;
 	/** The snapshots listed by this instance that are still on disk, by directory. */
 	private final Map<Path, Snapshot> listed = new HashMap<>();
@@ -240,8 +244,12 @@ final class CheckpointStorage implements StateMachineStorage {
 		return termIndex;
 	}
 
-	/** Directory of the latest snapshot, null if none: for its age. */
-	synchronized @Nullable Path latestSnapshotDir() {
+	/**
+	 * Directory of the latest snapshot, null if none: for its age. Reads a field only, without this storage's monitor,
+	 * which {@link #take} holds for a whole checkpoint and {@link #reload} for the digest checks and fsyncs of an
+	 * install: on a hung disk for good (R25-W).
+	 */
+	@Nullable Path latestSnapshotDir() {
 		return latestDir;
 	}
 
