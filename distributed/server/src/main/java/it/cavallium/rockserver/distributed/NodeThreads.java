@@ -63,7 +63,9 @@ final class NodeThreads implements Closeable {
 
 	/**
 	 * The proposer's submit threads: encode its batches and submit them to this node's Raft server (or hand them to
-	 * the sender of remote attempts). A submission may block inside Ratis while a disk stall fills its log queue, so
+	 * the sender of remote attempts, the first batch after this node stops leading). While the node does not lead, its
+	 * data batches skip these threads and go straight to the sender's virtual threads, which waited for the carriers
+	 * anyway to send them to the leader (R22-2). A submission may block inside Ratis while a disk stall fills its log queue, so
 	 * this is never the control plane. Platform threads, not virtual ones: most batches are sent from reply handlers
 	 * as slots free up, and on virtual threads they would wait behind carriers pinned by database reads, as the
 	 * control plane would. A cached pool (direct handoff, idle threads stop after 60 s): a thread blocks only for a

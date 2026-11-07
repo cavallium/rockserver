@@ -244,6 +244,40 @@ class ProposerSubmitThreadsTest {
 	}
 
 	/**
+	 * R22-2: a node that last saw it does not lead, and then leads, hands its batch to the sender first; that attempt
+	 * finds it leading and submits on a submit thread, never on the sender's virtual threads, since a local submission
+	 * can block in Ratis.
+	 */
+	@Test
+	void aBatchSentAfterBecomingLeaderIsSubmittedOnASubmitThread() throws Exception {
+		raft.leader = false;
+		raft.leaderReady = false;
+		raft.leaderId = null;
+		raft.submit = request -> CompletableFuture.completedFuture(applied(request));
+		var first = proposer.propose(put(1), TimeUnit.MILLISECONDS.toNanos(500));
+		assertThrows(ExecutionException.class, () -> first.get(5, TimeUnit.SECONDS));
+		var submitThreads = new ArrayList<Thread>();
+		raft.submit = request -> {
+			synchronized (submitThreads) {
+				submitThreads.add(Thread.currentThread());
+			}
+			return CompletableFuture.completedFuture(applied(request));
+		};
+		raft.leaderId = "n0";
+		raft.leader = true;
+		raft.leaderReady = true;
+		assertEquals(true, proposer.propose(put(2)).get(5, TimeUnit.SECONDS));
+		assertEquals(true, proposer.propose(put(3)).get(5, TimeUnit.SECONDS));
+		synchronized (submitThreads) {
+			assertEquals(2, submitThreads.size(), submitThreads.toString());
+			for (var thread : submitThreads) {
+				assertFalse(thread.isVirtual(), "submitted on " + thread);
+				assertTrue(thread.getName().startsWith("rockserver-n0-submit-"), "submitted on " + thread);
+			}
+		}
+	}
+
+	/**
 	 * R22-3: an {@link Error} while a batch is encoded (an out-of-memory error on a large batch) ends the batch, as a
 	 * runtime failure does: its writes are answered and its slot given back, not left waiting until the node stops.
 	 */

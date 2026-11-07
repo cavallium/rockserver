@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.RaftClientConfigKeys;
@@ -93,7 +94,9 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Batches are taken on whichever thread dispatches, and encoded and submitted on {@link #submitter}: never on the
  * control plane, which handles the replies and the timers, nor on the proposing caller, whose {@code propose} returns
- * at once. A local submission can block inside Ratis during a disk stall (see {@link #submitter}).</p>
+ * at once. A local submission can block inside Ratis during a disk stall (see {@link #submitter}). A data write on a
+ * node that last saw it does not lead goes straight to {@link #sender} instead, which encodes it and sends it to the
+ * leader (see {@link #leaderHint}).</p>
  */
 final class Proposer implements Closeable {
 
@@ -189,6 +192,15 @@ final class Proposer implements Closeable {
 	private final Lane anyLeader;
 	private final Lane localCommits;
 	private volatile boolean closed;
+	/**
+	 * Whether this node led, ready, the last time {@link #isLocalLeader()} looked: chooses, without waiting, where a data
+	 * batch or its resend goes (R22-2). While it led, to {@link #submitter}, which may block in Ratis' submit; while it
+	 * did not, to {@link #sender}, whose attempt only sends to the leader and cannot block in Ratis, so that a follower's
+	 * batch is not handed over twice. {@link #isLocalLeader()} itself can wait while the Raft group starts, so it is
+	 * never called on the dispatching thread. Only a hint: each attempt asks {@link #isLocalLeader()} again, and an
+	 * attempt on {@link #sender} that finds this node leading hands its submission to {@link #submitter}.
+	 */
+	private volatile boolean leaderHint = true;
 
 	/**
 	 * @param control   platform threads for the reply handling and timers; the caller shuts them down after
@@ -829,11 +841,13 @@ final class Proposer implements Closeable {
 
 		/**
 		 * Forms batches while there are queued requests and room in flight, and hands each to {@link #submitter}, which
-		 * encodes and sends it (R22-F1). Taking a batch is short and never waits but for this lane's lock, so it stays on
+		 * encodes and sends it (R22-F1), or, for a data batch while this node last saw it does not lead, to
+		 * {@link #sender} (R22-2, see {@link #leaderHint}). Taking a batch is short and never waits but for this lane's lock, so it stays on
 		 * the calling thread (a caller, a control thread or a submit thread), and batches form exactly as before;
 		 * encoding and the submission to Ratis, which can block during a disk stall, never run on {@link #control} or
 		 * on the proposing caller. No order between batches is relied on (see design.md, "Submitting off the control
-		 * plane"): {@code send()} already ran outside the lane's lock, on whichever thread dispatched.
+		 * plane"): {@code send()} already ran outside the lane's lock, on whichever thread dispatched, and two batches
+		 * taken one after the other by one thread can reach Ratis in either order.
 		 */
 		void dispatch() {
 			while (true) {
@@ -848,8 +862,10 @@ final class Proposer implements Closeable {
 					}
 					batchesInFlight++;
 				}
+				// Commits are only ever submitted to this node's own Raft server.
+				boolean viaSender = !commits && !leaderHint;
 				try {
-					submitter.execute(() -> sendTaken(batch));
+					(viaSender ? sender : submitter).execute(() -> sendTaken(batch, viaSender));
 				} catch (RejectedExecutionException ex) {
 					// The node is stopping: nothing of this batch was encoded or sent.
 					encodingEnded(batch);
@@ -861,11 +877,23 @@ final class Proposer implements Closeable {
 			}
 		}
 
-		/** Sends a batch that {@link #dispatch} took, on a submit thread. */
-		private void sendTaken(List<Pending> batch) {
+		/**
+		 * Sends a batch that {@link #dispatch} took, on a submit thread or, {@code onSender}, on {@link #sender}. A batch
+		 * reached once the proposer is closing is not sent (R22-4): {@code close()} answers the writes in flight only
+		 * after closing the client, which can take seconds, and nothing would wait for this append. Any failure here,
+		 * an {@link Error} too (an out-of-memory error encoding up to 8 MiB), ends the batch and gives back its slot
+		 * (R22-3): the executor would keep it to itself, and the writes would wait unanswered until the node stops.
+		 */
+		private void sendTaken(List<Pending> batch, boolean onSender) {
 			try {
-				send(batch);
-			} catch (RuntimeException ex) {
+				if (closed) {
+					encodingEnded(batch);
+					fail(batch, stopping());
+					finished();
+					return;
+				}
+				send(batch, onSender);
+			} catch (Throwable ex) {
 				encodingEnded(batch);
 				fail(batch, ex instanceof RocksDBException rocks ? rocks : Proposer.unavailable(ex));
 				finished();
@@ -964,7 +992,7 @@ final class Proposer implements Closeable {
 			dispatch();
 		}
 
-		private void send(List<Pending> batch) {
+		private void send(List<Pending> batch, boolean onSender) {
 			var sequences = new long[batch.size()];
 			ClientRequestId[] clients = null;
 			var entries = new ArrayList<LogEntry>(batch.size());
@@ -1033,7 +1061,7 @@ final class Proposer implements Closeable {
 			if (commits) {
 				sendCommits(batch, message, local, callId, deadline, now);
 			} else {
-				attempt(batch, message, local, callId, deadline, now, false);
+				attempt(batch, message, local, callId, deadline, now, false, onSender);
 			}
 		}
 
@@ -1081,12 +1109,40 @@ final class Proposer implements Closeable {
 		/**
 		 * One attempt at a batch of data writes, then resends until answered or {@code deadlineNanos}. Once an attempt
 		 * ended without telling whether the entry was appended ({@code ambiguous}), a later refusal no longer means
-		 * "not applied": the batch can only end with its results or an unknown outcome.
+		 * "not applied": the batch can only end with its results or an unknown outcome. Runs on a submit thread or,
+		 * {@code onSender}, on {@link #sender} (see {@link #leaderHint}): a local submission always runs on a submit
+		 * thread, a remote attempt always on {@link #sender}, with one hand-off at most.
 		 */
 		private void attempt(List<Pending> batch, Message message, @Nullable List<Request> local, long callId,
-				long deadlineNanos, long sentNanos, boolean ambiguous) {
-			var reply = isLocalLeader() ? submitLocal(message, local, callId, deadlineNanos, permits)
-					: CompletableFuture.supplyAsync(() -> sendToLeader(message, callId, permits), sender);
+				long deadlineNanos, long sentNanos, boolean ambiguous, boolean onSender) {
+			CompletableFuture<RaftClientReply> reply;
+			if (isLocalLeader()) {
+				if (onSender) {
+					// This node leads after all: its submission can block in Ratis, so not on the sender's threads.
+					CompletableFuture<RaftClientReply> submitted;
+					try {
+						submitted = CompletableFuture.supplyAsync(
+								() -> submitLocal(message, local, callId, deadlineNanos, permits), submitter)
+								.thenCompose(Function.identity());
+					} catch (RejectedExecutionException stopping) {
+						submitted = CompletableFuture.failedFuture(stopping);
+					}
+					reply = submitted;
+				} else {
+					reply = submitLocal(message, local, callId, deadlineNanos, permits);
+				}
+			} else if (onSender) {
+				// Already on the sender: no second hand-off. Failures as supplyAsync would report them.
+				CompletableFuture<RaftClientReply> sent;
+				try {
+					sent = CompletableFuture.completedFuture(sendToLeader(message, callId, permits));
+				} catch (Throwable ex) {
+					sent = CompletableFuture.failedFuture(ex instanceof CompletionException ? ex : new CompletionException(ex));
+				}
+				reply = sent;
+			} else {
+				reply = CompletableFuture.supplyAsync(() -> sendToLeader(message, callId, permits), sender);
+			}
 			reply.handleAsync((answer, error) -> {
 				var refusal = error != null ? stateMachineException(error)
 						: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
@@ -1121,15 +1177,16 @@ final class Proposer implements Closeable {
 								finished();
 							}
 						};
-						// The timer only hands the resend to a submit thread: a local submission can block inside Ratis.
-						Runnable resend = () -> {
+						// The timer only hands the resend over, to a submit thread or, while this node does not lead, to
+						// the sender (see leaderHint): a local submission can block inside Ratis.
+						Consumer<Boolean> resend = viaSender -> {
 							if (closed || System.nanoTime() - deadlineNanos >= 0) {
 								// Too late after all (the timer ran late): no copy goes out after the deadline.
 								end.run();
 								return;
 							}
 							try {
-								attempt(batch, message, local, callId, deadlineNanos, sentNanos, nowAmbiguous);
+								attempt(batch, message, local, callId, deadlineNanos, sentNanos, nowAmbiguous, viaSender);
 							} catch (Throwable unexpected) {
 								// The executor would keep it to itself. Earlier copies may have been appended.
 								fail(batch, unavailable(unexpected));
@@ -1138,8 +1195,9 @@ final class Proposer implements Closeable {
 						};
 						try {
 							control.schedule(() -> {
+								boolean viaSender = !leaderHint;
 								try {
-									submitter.execute(resend);
+									(viaSender ? sender : submitter).execute(() -> resend.accept(viaSender));
 								} catch (RejectedExecutionException stopping) {
 									end.run();
 								}
@@ -1391,8 +1449,11 @@ final class Proposer implements Closeable {
 	private boolean isLocalLeader() {
 		try {
 			var info = localServer.get().getDivision(groupId).getInfo();
-			return info.isLeader() && info.isLeaderReady();
+			boolean leads = info.isLeader() && info.isLeaderReady();
+			leaderHint = leads;
+			return leads;
 		} catch (IOException | RuntimeException ex) {
+			leaderHint = false;
 			return false;
 		}
 	}
