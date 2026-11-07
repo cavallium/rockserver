@@ -324,4 +324,28 @@ class ReplicaOpsTest {
 			assertEquals(start, ops.scheduleStartMillisForTesting());
 		}
 	}
+
+	/**
+	 * R26-2: a power loss right after a backup's rename can leave {@code backup.properties} empty (it was not synced
+	 * before the rename). When the entry is applied again, that file says no index and no request: it is the trace of an
+	 * interrupted attempt, which is done again, like a backup without properties, not a backup "at index -1" that makes
+	 * this one FAILED.
+	 */
+	@Test
+	void aBackupWhosePropertiesAreEmptyIsTakenAgain() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		Path dir = ReplicaOps.backupsDir(config.dataDir()).resolve("b1");
+		Files.createDirectories(dir.resolve(ReplicaOps.BACKUP_DB_DIR));
+		Files.writeString(dir.resolve(ReplicaOps.BACKUP_PROPERTIES), "");
+		try (var store = NodeStore.open(temp.resolve("store"), null, "n0");
+				var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			ops.backup("b1", 5, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 10), store);
+			var result = ops.backupResult("b1", 10);
+			assertEquals(ReplicaOps.State.DONE, result.state(), result.detail());
+		}
+		var properties = ReplicaOps.readBackupProperties(dir);
+		assertEquals("10", properties.getProperty("index"));
+		assertEquals("5", properties.getProperty("request"));
+		assertTrue(Files.isRegularFile(dir.resolve(ReplicaOps.BACKUP_DB_DIR).resolve("CURRENT")));
+	}
 }

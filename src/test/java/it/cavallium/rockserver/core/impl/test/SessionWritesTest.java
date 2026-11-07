@@ -480,6 +480,87 @@ class SessionWritesTest {
 		executor.shutdownNow();
 	}
 
+	/**
+	 * R26-3: a write that could not get a session was never sent, so it ends flagged not applied, whatever the opening
+	 * answered. Before, the opening's own error came back unflagged: gRPC's deadline on the opening (mapped to
+	 * {@code READ_DEADLINE_EXCEEDED}) then read as an unknown outcome, and a refusal such as {@code NOT_IMPLEMENTED}
+	 * did not say that nothing was applied. As in the Rust client.
+	 */
+	@Test
+	void aWriteThatGotNoSessionEndsNotApplied() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var sent = new AtomicInteger();
+		// gRPC's own deadline on every opening, as GrpcConnection maps it: unflagged.
+		var timingOut = new Writes(_ -> CompletableFuture.failedFuture(RocksDBException.of(
+				RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded")), (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		var error = assertThrows(ExecutionException.class,
+				() -> timingOut.send(RequestContext.latency(Duration.ofMillis(300)), put(0)).get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks(error).getErrorUniqueId());
+		assertTrue(rocks(error).isNotApplied(), "nothing was sent: not applied");
+
+		var refusing = new Writes(_ -> CompletableFuture.failedFuture(
+				RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "no sessions")), (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		error = assertThrows(ExecutionException.class,
+				() -> refusing.send(RequestContext.latency(Duration.ofSeconds(10)), put(0)).get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.NOT_IMPLEMENTED, rocks(error).getErrorUniqueId());
+		assertTrue(rocks(error).isNotApplied(), "refused before anything was sent: not applied");
+
+		var unknown = new Writes(_ -> CompletableFuture.failedFuture(Status.UNAVAILABLE.asRuntimeException()),
+				(_, _) -> {
+					sent.incrementAndGet();
+					return CompletableFuture.completedFuture("ok");
+				}, executor);
+		error = assertThrows(ExecutionException.class,
+				() -> unknown.send(RequestContext.latency(Duration.ofMillis(300)), put(0)).get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId());
+		assertTrue(rocks(error).isNotApplied(), "an opening of unknown outcome sent no write: not applied");
+		assertEquals(0, sent.get(), "no copy was sent");
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R26-4: for a caller without a deadline the retry window bounds the copies too, not only the resends. A session
+	 * that opens after the window sends no copy: the write ends {@code READ_DEADLINE_EXCEEDED} flagged not applied,
+	 * where a copy sent then and lost would end {@code OUTCOME_UNKNOWN}. As in the Rust client (R20-1).
+	 */
+	@Test
+	void aSessionOpenedAfterTheWindowSendsNoCopyForACallerWithoutDeadline() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var property = "it.cavallium.rockserver.grpc.client.write-retry-window-ms";
+		var previous = System.getProperty(property);
+		System.setProperty(property, "200");
+		Writes writes;
+		var sent = new AtomicInteger();
+		try {
+			writes = new Writes(_ -> {
+				var late = new CompletableFuture<Long>();
+				CompletableFuture.delayedExecutor(500, TimeUnit.MILLISECONDS).execute(() -> late.complete(7L));
+				return late;
+			}, (_, _) -> {
+				sent.incrementAndGet();
+				return CompletableFuture.completedFuture("ok");
+			}, executor);
+		} finally {
+			if (previous == null) {
+				System.clearProperty(property);
+			} else {
+				System.setProperty(property, previous);
+			}
+		}
+		var error = assertThrows(ExecutionException.class,
+				() -> writes.send(RequestContext.batch(), put(0)).get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks(error).getErrorUniqueId());
+		assertTrue(rocks(error).isNotApplied(), "not sent: not applied");
+		assertEquals(0, sent.get(), "no copy after the window");
+		executor.shutdownNow();
+	}
+
 	private static KVBatch batch(int items, int valueBytes) {
 		var keys = new ArrayList<Keys>();
 		var values = new ArrayList<Buf>();

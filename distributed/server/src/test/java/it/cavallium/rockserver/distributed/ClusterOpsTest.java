@@ -170,16 +170,47 @@ class ClusterOpsTest {
 		try (var listed = Files.list(target)) {
 			assertEquals(2, listed.filter(p -> p.getFileName().toString().contains(".before-restore-")).count());
 		}
-		restored = new InProcessCluster(newRoot, 1, c -> c).startAll();
+		// The other nodes as the runbook says: restore-backup on each, from its own copy of the same backup. Each restore
+		// opens its database once and leaves files of its own (OPTIONS, the info log): the seed digest must still be the
+		// same on every node, or the followers stop at genesis (R26-1).
+		for (String node : List.of("n1", "n2")) {
+			Path copy = temp.resolve("copy-" + node);
+			copyTree(backup, copy);
+			ReplicaOps.restore(copy, newRoot.resolve(node), null);
+		}
+		restored = new InProcessCluster(newRoot, 3, c -> c).startAll();
 		var newLeader = restored.awaitLeader(TIMEOUT);
 		var newApi = newLeader.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
-		InProcessCluster.await(TIMEOUT, () -> newLeader.stateMachine().store().clusterId() != null);
-		assertTrue(newLeader.stateMachine().store().seeded());
+		// Every node applies the seeded genesis; a follower whose seed digest differs stops there instead (exit 3).
+		InProcessCluster.await(TIMEOUT, () -> restored.runningNodes().stream().allMatch(node ->
+				node.stateMachine().store().clusterId() != null));
+		restored.awaitConverged(TIMEOUT);
+		var seedDigests = new HashSet<String>();
+		for (var node : restored.runningNodes()) {
+			assertNotNull(node.stateMachine().store().clusterId(), node.config().nodeId());
+			assertTrue(node.stateMachine().store().seeded(), node.config().nodeId());
+			seedDigests.add(String.valueOf(node.stateMachine().store().seedDigest()));
+		}
+		assertEquals(3, restored.runningNodes().size());
+		assertEquals(1, seedDigests.size(), "seed digests " + seedDigests);
 		long newColumn = newLeader.stateMachine().store().db().getColumnId("c");
 		for (long i = 0; i < 500; i++) {
 			assertEquals("v" + i, text(newApi.get(0, newColumn, key(i), RequestType.current())));
 		}
 		assertNull(newApi.get(0, newColumn, key(1000), RequestType.current()));
+	}
+
+	private static void copyTree(Path from, Path to) throws java.io.IOException {
+		try (var walk = Files.walk(from)) {
+			for (Path file : walk.toList()) {
+				Path target = to.resolve(from.relativize(file).toString());
+				if (Files.isDirectory(file)) {
+					Files.createDirectories(target);
+				} else {
+					Files.copy(file, target);
+				}
+			}
+		}
 	}
 
 	private void awaitBackup(String name, long index, ReplicaOps.State state) throws Exception {
