@@ -20,7 +20,8 @@ import org.jetbrains.annotations.Nullable;
  *   <li>a committed configuration K* leaves it out of its new half;</li>
  *   <li>K* is the newest committed configuration that anyone reports, the node's own included;</li>
  *   <li>a majority of K*'s new half each report K* committed in their own log, and none of them holds a later
- *   configuration that includes the node and may still commit;</li>
+ *   configuration that includes the node and may still commit; a member that predates {@code Configuration2} counts
+ *   only when the node itself or a member of this version reports K* committed (R12-1);</li>
  *   <li>the node's own log holds no later configuration that includes it and may still commit;</li>
  *   <li>the node was a voter once ({@link Own#seeded} or {@link Own#memberFile}).</li>
  * </ul>
@@ -38,6 +39,8 @@ final class RemovalRule {
 	static final long PURGED = -2;
 	/** {@link Own#termAt}: the index is past the end of the log. */
 	static final long BEYOND = -3;
+	/** The first {@link Report#version} whose committed configuration is a committed fact ({@code Configuration2}). */
+	static final int SOUND_VERSION = 2;
 
 	private RemovalRule() {}
 
@@ -78,9 +81,9 @@ final class RemovalRule {
 		COMMITTED,
 		/** The entry is in its log, past its commit index. */
 		PRESENT,
-		/** Its log has another term at that index, or ends before it, or its history says no such configuration. */
+		/** Its log has another term at that index, or ends before it, or its history recorded another configuration there. */
 		ABSENT,
-		/** Cannot tell: in its snapshot, past what its history covers, or a member that predates the probe. */
+		/** Cannot tell: in its snapshot with no record in its history, or a member that predates the probe. */
 		UNKNOWN
 	}
 
@@ -127,10 +130,18 @@ final class RemovalRule {
 	 * The node's own facts: its id, its committed configuration (the newest it applied), its latest configuration,
 	 * the term at an index of its own log ({@link #PURGED}, {@link #BEYOND}), and whether it was ever a voter: it was
 	 * started without {@code --join} ({@code seeded}: its own peer list holds it), or it recorded that a leader made it
-	 * a voter ({@code memberFile}).
+	 * a voter ({@code memberFile}). {@code latestStale}: its log holds another entry at the index of its latest
+	 * configuration, a stale configuration of Ratis ({@link MembershipFacts.Entry#OTHER}). {@code latestTermBound}: a
+	 * term that its latest configuration's term cannot exceed, when that configuration came from a snapshot install
+	 * ({@link InstalledConfiguration}), else {@link #UNKNOWN_TERM}.
 	 */
 	record Own(String self, @Nullable Conf committed, @Nullable Conf latest, LongUnaryOperator termAt, boolean seeded,
-			boolean memberFile) {}
+			boolean memberFile, boolean latestStale, long latestTermBound) {
+		Own(String self, @Nullable Conf committed, @Nullable Conf latest, LongUnaryOperator termAt, boolean seeded,
+				boolean memberFile) {
+			this(self, committed, latest, termAt, seeded, memberFile, false, UNKNOWN_TERM);
+		}
+	}
 
 	/** What a verdict means for the node. */
 	enum Outcome {
@@ -149,9 +160,16 @@ final class RemovalRule {
 		INCONSISTENT(Outcome.UNDECIDED),
 		/** No committed configuration known: nobody answered, and this node applied none. */
 		NO_COMMITTED_CONFIGURATION(Outcome.UNDECIDED),
-		/** The node's own log has a later configuration that includes it and may still commit: an add in flight. */
+		/**
+		 * The node's own log has a later configuration that includes it and may still commit: normally an add in flight,
+		 * or a configuration a leader appended just before it lost leadership.
+		 */
 		OWN_LATER_CONFIGURATION(Outcome.UNDECIDED),
-		/** The node's own log has a later configuration that includes it, and K*'s term is unknown (older members). */
+		/**
+		 * K* known only from members that predate {@code Configuration2}: they tell no terms, and their committed flag
+		 * cannot confirm K* by itself (R12-1). Either the node's own log has a later configuration that includes it and
+		 * K*'s term is unknown, or only such members report K* committed.
+		 */
 		NEEDS_TERM(Outcome.UNDECIDED),
 		/** A member holds a later configuration that includes the node and may still commit. */
 		MEMBER_LATER_CONFIGURATION(Outcome.UNDECIDED),
@@ -214,20 +232,29 @@ final class RemovalRule {
 			}
 		});
 
-		// 1. The committed configurations that anyone reports.
+		// 1. The committed configurations that anyone reports. "sound": the indexes of those that this version's facts
+		// report (the node's own, a member's of this version, the node's own latest probed committed). A version-1
+		// committed flag compares Ratis' configuration with the commit index, which is wrong for a stale configuration
+		// of Ratis (round-11 review, finding 1): it raises K* or blocks, but does not confirm by itself (R12-1).
 		var byIndex = new TreeMap<Long, List<Conf>>();
+		var sound = new HashSet<Long>();
 		if (own.committed() != null && own.committed().index() >= 0) {
 			byIndex.computeIfAbsent(own.committed().index(), _ -> new ArrayList<>()).add(own.committed());
+			sound.add(own.committed().index());
 		}
 		for (var report : reports.values()) {
 			if (report.committed() != null && report.committed().index() >= 0) {
 				byIndex.computeIfAbsent(report.committed().index(), _ -> new ArrayList<>()).add(report.committed());
+				if (report.version() >= SOUND_VERSION) {
+					sound.add(report.committed().index());
+				}
 			}
 		}
 		var ownLatest = own.latest();
 		if (ownLatest != null && ownLatest.termKnown() && ownLatest.index() >= 0
 				&& reports.values().stream().anyMatch(report -> report.ownProbe() == Probe.COMMITTED)) {
 			byIndex.computeIfAbsent(ownLatest.index(), _ -> new ArrayList<>()).add(ownLatest);
+			sound.add(ownLatest.index());
 		}
 		if (byIndex.isEmpty()) {
 			return new Verdict(Reason.NO_COMMITTED_CONFIGURATION, null, List.of(), List.of(), pending, unreachable, "");
@@ -252,9 +279,19 @@ final class RemovalRule {
 		if (!own.seeded() && !own.memberFile()) {
 			return new Verdict(Reason.NOT_ADDED, kStar, List.of(), List.of(), pending, unreachable, "");
 		}
-		// 4. Its own log: a later configuration that includes it, and may still commit.
+		// 4. Its own log: a later configuration that includes it, and may still commit. A latest configuration with no
+		// known term that is not in its own log at all (past its end: Ratis took it from a snapshot install's
+		// raft-meta.conf; or another entry at its index: stale, finding 1) does not block when the term of the leader
+		// that installed it, which bounds its own (InstalledConfiguration), is below K*'s (R12-3, narrowed by the
+		// round-13 review, finding 1): it then has an entry other than K* at iStar before it, and Leader Completeness
+		// keeps it from committing. Without that bound it may be K*'s successor, a re-add of this incarnation, which a
+		// leader that cannot reach the members may still commit after they answered.
 		long termAtKStar = own.termAt().applyAsLong(iStar);
-		if (ownLatest != null && ownLatest.index() > iStar && ownLatest.holds(self)) {
+		boolean outsideOwnLog = ownLatest != null && !ownLatest.termKnown()
+				&& (own.latestStale() || own.termAt().applyAsLong(ownLatest.index()) == BEYOND);
+		boolean installedBeforeKStar = outsideOwnLog && kStar.termKnown() && own.latestTermBound() > UNKNOWN_TERM
+				&& own.latestTermBound() < kStar.term();
+		if (ownLatest != null && ownLatest.index() > iStar && ownLatest.holds(self) && !installedBeforeKStar) {
 			boolean otherBranch = kStar.termKnown() && termAtKStar > 0 && termAtKStar != kStar.term();
 			boolean olderTerm = kStar.termKnown() && ownLatest.termKnown() && ownLatest.term() < kStar.term();
 			if (!otherBranch && !olderTerm) {
@@ -274,12 +311,14 @@ final class RemovalRule {
 				blockers.add(entry.getKey());
 			}
 		}
-		// 6. Members of K*'s new half that hold K* committed.
+		// 6. Members of K*'s new half that hold K* committed. A version-1 member only once K* is sound: its committed
+		// entry at iStar is then the cluster's committed entry there, K* itself.
 		var confirmers = new ArrayList<String>();
+		boolean kStarSound = sound.contains(iStar);
 		for (var entry : reports.entrySet()) {
 			var report = entry.getValue();
 			if (kStar.inNew(entry.getKey()) && !blockers.contains(entry.getKey())
-					&& ((report.committed() != null && report.committed().index() == iStar)
+					&& ((committedAt(report, iStar) && (report.version() >= SOUND_VERSION || kStarSound))
 					|| report.probeOf(kStar) == Probe.COMMITTED)) {
 				confirmers.add(entry.getKey());
 			}
@@ -291,7 +330,31 @@ final class RemovalRule {
 			return new Verdict(Reason.REMOVED, kStar, confirmers, List.of(), pending, unreachable,
 					ownLog(kStar, termAtKStar, ownLatest));
 		}
+		// Version-1 answers report K* committed, but do not confirm it alone: NEEDS_TERM, unless members of this version
+		// of K*'s new half that answered without confirming yet (lagging) can still make a majority with the confirmers
+		// (round-13 review, finding 3): asked again, they may confirm, so NO_MAJORITY, which the check asks again.
+		boolean onlyOldConfirm = false;
+		int lagging = 0;
+		for (var entry : reports.entrySet()) {
+			var report = entry.getValue();
+			if (!kStar.inNew(entry.getKey()) || confirmers.contains(entry.getKey())) {
+				continue;
+			}
+			if (report.version() < SOUND_VERSION) {
+				onlyOldConfirm |= !kStarSound && committedAt(report, iStar);
+			} else {
+				lagging++;
+			}
+		}
+		if (onlyOldConfirm && confirmers.size() + lagging < majority(kStar.newHalf().size())) {
+			return new Verdict(Reason.NEEDS_TERM, kStar, confirmers, List.of(), pending, unreachable,
+					"only members that predate Configuration2 report K* committed");
+		}
 		return new Verdict(Reason.NO_MAJORITY, kStar, confirmers, List.of(), pending, unreachable, "");
+	}
+
+	private static boolean committedAt(Report report, long index) {
+		return report.committed() != null && report.committed().index() == index;
 	}
 
 	/** What the node's own log holds at K*'s index, for the message of a removal. */

@@ -107,10 +107,14 @@ final class MembershipFacts {
 			return RemovalRule.UNKNOWN_TERM;
 		}
 		var recorded = history.at(index);
+		return sameConfiguration(recorded, conf) ? recorded.term() : RemovalRule.UNKNOWN_TERM;
+	}
+
+	/** Whether the history's record {@code recorded} is the configuration {@code conf} (both halves). */
+	private static boolean sameConfiguration(@Nullable Conf recorded, RaftConfiguration conf) {
 		return recorded != null && recorded.oldHalf() != null
 				&& Set.copyOf(recorded.newHalf()).equals(Set.copyOf(ids(conf.getCurrentPeers())))
-				&& Set.copyOf(recorded.oldHalf()).equals(Set.copyOf(ids(conf.getPreviousPeers())))
-				? recorded.term() : RemovalRule.UNKNOWN_TERM;
+				&& Set.copyOf(recorded.oldHalf()).equals(Set.copyOf(ids(conf.getPreviousPeers())));
 	}
 
 	/** {@code conf} with the term {@code term}. */
@@ -130,7 +134,10 @@ final class MembershipFacts {
 	 * configuration if that is at or below its commit index and in its log or snapshot (Ratis' commit index covers only
 	 * entries that match the leader's log). A configuration that a snapshot install took from the leader, past the
 	 * snapshot and not in the log yet, may not be committed: it does not count. Nor does a configuration whose index
-	 * holds another entry in the log (a stale one, see {@link #entry}): the commit index covers that entry, not it.
+	 * holds another entry in the log (a stale one, see {@link #entry}): the commit index covers that entry, not it. In
+	 * the snapshot, where the log no longer tells, it counts only if the history recorded it at its index, or does not
+	 * cover that index (a database of an older version): a stale configuration stays in Ratis' memory after the entry
+	 * at its index is purged (round-13 review).
 	 * Null if none.
 	 */
 	static @Nullable Conf committed(RaftServer.Division division, CommittedConfigurations history) {
@@ -141,8 +148,12 @@ final class MembershipFacts {
 		Conf derived = null;
 		if (index >= 0 && index <= log.getLastCommittedIndex()) {
 			var entry = entry(division, conf);
-			if (entry == Entry.SAME || (entry == Entry.NONE && log.getTermIndex(index) == null
-					&& index <= log.getSnapshotIndex())) {
+			boolean inSnapshot = entry == Entry.NONE && log.getTermIndex(index) == null && index <= log.getSnapshotIndex();
+			if (inSnapshot) {
+				var recorded = history.at(index);
+				inSnapshot = recorded != null ? sameConfiguration(recorded, conf) : index < history.completeFrom();
+			}
+			if (entry == Entry.SAME || inSnapshot) {
 				derived = conf(conf, confTerm(division, history, conf, entry));
 			}
 		}
@@ -157,6 +168,20 @@ final class MembershipFacts {
 			return merged != null ? merged : applied;
 		}
 		return applied;
+	}
+
+	/**
+	 * The node's own facts for {@link RemovalRule#decide}: {@code self}, its committed and latest configurations, the
+	 * terms of its log, whether its latest configuration is stale ({@link Entry#OTHER}), whether it was a voter once,
+	 * and the bound of its latest configuration's term that {@code installed} gives (round-13 review, finding 1).
+	 */
+	static RemovalRule.Own own(RaftServer.Division division, CommittedConfigurations history, String self,
+			boolean seeded, boolean memberFile, @Nullable InstalledConfiguration installed) {
+		var conf = division.getRaftConf();
+		var latest = latest(division, history);
+		return new RemovalRule.Own(self, committed(division, history), latest, index -> termAt(division, index), seeded,
+				memberFile, conf.getLogEntryIndex() >= 0 && entry(division, conf) == Entry.OTHER,
+				InstalledConfiguration.boundOf(installed, latest));
 	}
 
 	/** What {@code division}'s log says about the entry ({@code term}, {@code index}). */
@@ -188,12 +213,13 @@ final class MembershipFacts {
 			// Past the end of the log (a log is a contiguous run after the snapshot).
 			return Probe.ABSENT;
 		}
-		// In the snapshot: committed here, so the history decides, where it is complete. Probes are of configurations.
+		// In the snapshot: committed here, so the history decides where it recorded a configuration. Probes are of
+		// configurations believed committed (K*, or the asker's latest, of which only COMMITTED counts). No record is
+		// UNKNOWN, never ABSENT (R12-2): during a snapshot install Ratis moves the snapshot index before the state
+		// machine swaps in the snapshot's history, and for a K* that really is committed "complete history, no record"
+		// cannot happen otherwise, so ABSENT there would only ever drop a blocker wrongly.
 		var recorded = history.at(index);
-		if (recorded != null) {
-			return recorded.term() == term ? Probe.COMMITTED : Probe.ABSENT;
-		}
-		return index >= history.completeFrom() ? Probe.ABSENT : Probe.UNKNOWN;
+		return recorded == null ? Probe.UNKNOWN : recorded.term() == term ? Probe.COMMITTED : Probe.ABSENT;
 	}
 
 	/** Whether the entry at {@code index} of {@code log} is a configuration entry; null if it cannot tell. */

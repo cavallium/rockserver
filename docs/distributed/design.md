@@ -1452,8 +1452,14 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   peer. So this command adds the new node and removes the old one together (Ratis `setConfiguration`, a joint
   configuration), and the members that stay form a majority of the old configuration and of the new one all along.
   With one node of three lost that is 2 of 3 before, during and after the change, and a failure of the new node stops
-  nothing. It works the same when the lost node was the leader or a follower, seeded or not (`MembershipTest`), and
-  for a node that still runs, the leader too: that node exits with 3 once it is out.
+  nothing. It works the same when the lost node was the leader or a follower, seeded or not (`MembershipTest`). It is
+  only for a node that cannot vote: stop a node that still runs first (round 13). With both the old and the new node
+  voting, a majority of the old half and one of the new half can be disjoint, and a leader elected during the joint
+  configuration commits by the new half alone (see the residuals of "Removal and waiting outside"); with the old node
+  stopped they always meet in the members that stay. To keep a running node, the leader too, in service until it is
+  out, replace it in two steps instead, one node each: `add-peer` with every member in `--peer`, then `remove-peer`;
+  it exits with 3 (or 4) once it is out (`MembershipTest.aRunningLeaderIsReplacedInTwoSteps`). `admin` does not
+  refuse a one-step change while the old node runs: whether it should is left to the operator's decision.
 
   The other way, `add-peer` with every member in `--peer` and `remove-peer` afterwards, is for growing a cluster. With
   a lost node in `--peer` it passes through 4 members with 1 lost, where all 3 others are needed: any failure of the
@@ -1541,8 +1547,15 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   which tell no terms), MEMBER_LATER_CONFIGURATION, NO_MAJORITY, and HEARD_LEADER (below). A check returns as soon as
   the verdict is decided, or when asking again cannot change it, or after two election timeouts (at least 1 s). A
   member that answers `UNIMPLEMENTED` is asked the version-1 `Configuration` (its committed configuration, with no term
-  and no old half), and one that predates both, or cannot be reached, is no answer: a version-1 answer is still a
-  committed fact, so it leaves more cases undecided and never makes one unsafe.
+  and no old half), and one that predates both, or cannot be reached, is no answer. A version-1 committed flag
+  compares Ratis' configuration with the commit index, which is wrong for the stale configuration of finding 1 below
+  (R12-1). So a version-1 answer raises K* or blocks, but confirms only a K* that the node itself or a member of this
+  version reports committed: that member's log then holds K* committed at that index, and the old member's committed
+  entry there is the same entry. Otherwise the verdict is NEEDS_TERM. A K* that only version-1 answers report has no
+  known term, so neither step 4's branch tests nor step 5's exclusions can drop a blocker on its account. The cost is
+  liveness in a rolling upgrade: a removed node often never applied its own removal, so with every remaining member on
+  a version without `Configuration2` it waits outside (NEEDS_TERM) until one of them is upgraded, where the round-11
+  rule exited with 4. Upgrade the members before removing nodes.
 
   The committed configurations come from the node's own records, not from Ratis' notification: on a snapshot install
   Ratis reports the leader's latest configuration, committed or not, with term 0, on every chunk
@@ -1556,9 +1569,13 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   version applied on that database (`CONFIGURATION_HISTORY`), and kept: one entry per term start and per membership
   change, about a hundred bytes each. A node's committed configuration is the newest it recorded, or its latest
   configuration if that is at or below its commit index and in its log or snapshot (a configuration a snapshot install
-  took from the leader, past the snapshot and not in the log, does not count). A probe of an entry in the log answers
+  took from the leader, past the snapshot and not in the log, does not count; one in the snapshot counts only if the
+  history recorded it at its index, or does not cover that index). A probe of an entry in the log answers
   from the log and the commit index (or the history, for a restarted node whose commit index has not caught up), and
-  of an entry in the snapshot from the history where it is complete. Seeding from `raft-meta.conf` was not needed: the
+  of an entry in the snapshot from the history: committed if it recorded that configuration, absent if it recorded
+  another one there, unknown otherwise (also during a snapshot install, while Ratis' snapshot index is ahead of the
+  history, R12-2: Ratis moves it before `reinitialize` swaps in the snapshot's history, and "absent" there would drop a
+  blocker; for a K* that really is committed, a complete history with no record cannot happen otherwise). Seeding from `raft-meta.conf` was not needed: the
   derived committed configuration covers a database of an older version.
 
   Ratis' configuration of a node is not always the entry at its index (round-11 review, finding 1). A snapshot install
@@ -1576,8 +1593,11 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   configuration (both halves), from the history only if it recorded the same configuration at that index, and is
   unknown otherwise; it is the committed configuration only if that entry is the same configuration, or the index is in
   the snapshot; and a probe whose (term, index) is an ordinary entry answers "absent" (that entry is the only one with
-  that term and index in any log, so no configuration has them). A stale J is then only a latest configuration with an
-  unknown term, which can neither be K* nor confirm one. `MembershipFactsTest` builds F's state (a stub log and
+  that term and index in any log, so no configuration has them). Once the node purges its log past c (purging follows
+  the members' lowest commit index, so it does, while no configuration above c is appended), the entry is gone and J
+  sits in the snapshot: there it counts as committed only if the history recorded J at c, or does not cover c (a
+  database of an older version, which keeps the round-11 behaviour), round-13 review. A stale J is then only a latest
+  configuration with an unknown term, which can neither be K* nor confirm one, for a history complete over c. `MembershipFactsTest` builds F's state (a stub log and
   configuration) and the members' answers, and fails without the change (J committed with term 3, X REMOVED by four
   confirmers). An in-process reproduction needs F's Ratis updater stalled between appending E's entries and applying e,
   which stock Ratis has no hook for; it is not written. At the Ratis level the same stale state can do more: if F is
@@ -1586,7 +1606,9 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   correctly, and Ratis is left as it is.
 
   The history must not say that it is complete where it misses a committed configuration (round-11 review, finding 2),
-  or a probe of a purged entry answers "absent" for it and stops a member from blocking. Two ways led there, both
+  or a probe of a purged entry answers "absent" for it and stops a member from blocking (since R12-2 a missing record
+  answers "unknown", so completeness no longer feeds any probe answer; it still decides whether a configuration of
+  Ratis in the snapshot counts as committed). Two ways led there, both
   closed. Ratis calls `notifyConfigurationChanged` from the install path on a gRPC thread with term 0; that call cleared
   the pending configuration of the updater thread, so one landing between the updater's notification of a
   configuration entry and its `notifyTermIndexUpdated` lost the entry while the applied position moved past it. A call
@@ -1607,10 +1629,26 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   server: Ratis shows that time only for a running follower) and it does not lead. Ratis' initializing state is not
   detachment, so a node being caught up is never checked during its own add; and a node that runs as a follower with
   a configuration its log never saw removed (R11-2) is checked too, which the round-10 gate on the initializing state
-  missed. The warning is chosen by the verdict (never by `--join`, R11-5) and repeated every 15 election timeouts. A
+  missed. `RaftTraffic` counts a request before Ratis checks its term, so an append or snapshot chunk from a deposed
+  leader counts too (R12-7, accepted): Ratis rejects it (`NOT_LEADER`) only when its term is below the receiver's, or
+  equal with another leader known (`ServerState.recognizeLeader`, and `SnapshotInstallationHandler` for chunks), and
+  that leader steps down on the reply (`GrpcLogAppender`, `onFollowerTerm`); when its term is not lower, Ratis does
+  accept it as leader, so a check based on the reply would change nothing there, and it stops within about an election
+  timeout once a majority of its configuration stops answering (`LeaderStateImpl.checkLeadership`). It cannot be
+  elected again: the members that committed the removal have a later last term, and the removed nodes whose logs
+  missed the joint configuration are fewer than a majority of its old half, through which it committed. The cost is
+  one more quiet period (at most about three election timeouts) and at most one REMOVED turned into HEARD_LEADER; the
+  next check decides. The warning is chosen by the verdict (never by `--join`, R11-5) and repeated every 15 election
+  timeouts. A
   removal found while a leader sent the node anything during the check is not trusted (HEARD_LEADER): the answers may
   be older than that leader's configuration. `ReplicatedNode#membership` keeps the last verdict, and the
-  `membership.state` gauge says 0 (member, or not checked), 1 (never added) or 2 (outside, undecided). While undecided
+  `membership.state` gauge says 0 (member, or not checked), 1 (never added; also while `add-peer` catches the node
+  up, since it is not detached then and keeps its last verdict until its configuration holds it), 2 (outside,
+  undecided) or 3 (removed: reported only if a push of the gauges happens between the verdict and exit 4, which the
+  shutdown does not wait for, and never for a removal found at the start, which exits before the gauges report; no
+  alert relies on it). The alerts `rockserver-node-outside` (2 or more for
+  10 minutes) and `rockserver-node-not-added` (1 for 6 hours: a catch-up of a large snapshot can take an hour or more)
+  watch it. While undecided
   the node runs in whatever Ratis state its own log gives: a log whose latest configuration leaves it out of a half
   keeps it initializing (no election timer, no vote: `RaftServerImpl.requestVote` needs a running server); one that
   holds it in both halves (a log that missed its removal) makes it a follower, whose votes cannot elect a leader that
@@ -1623,10 +1661,17 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   members of K*'s new half (members of a version without the method count as unreachable); the node decides by itself
   once a majority of them answer; if they are gone for good, check with `status` on a member, and if this node is not
   in its configuration, stop it, wipe it, start it with `--join` and run `add-peer`. NEEDS_TERM, upgrade the named
-  members; until then judge with `status`. MEMBER_LATER_CONFIGURATION, normally clears within seconds; if it persists,
-  the named member is stuck or was removed itself. OWN_LATER_CONFIGURATION, an add of this node is in flight: let it
-  finish. NOT_ADDED, run `add-peer`; if the add was abandoned, or the node was added and removed long ago, stop it and
-  wipe it (`add-peer` refuses a node that has a log). INCONSISTENT, a bug or a data directory restored from elsewhere:
+  members (their version tells no terms, and their committed flag does not confirm a removal by itself), or start more
+  members of this version; until then judge with `status`. It is given only when the members of this version that
+  answered cannot make a majority of K*'s new half without the older ones: members of this version that answered
+  without confirming yet (lagging) make it NO_MAJORITY, which the check asks again within its budget (round-13
+  review, finding 3). MEMBER_LATER_CONFIGURATION, normally clears within seconds; if it persists,
+  the named member is stuck or was removed itself. OWN_LATER_CONFIGURATION, its own log holds a later configuration
+  that includes it and may still commit: normally an add of this node in flight (let `add-peer` finish), or a
+  configuration a leader appended just before it lost leadership, which clears once the next leader's configuration
+  reaches this node; if it persists while a leader runs, check `status` on a member. NOT_ADDED, run `add-peer`; if
+  the add was abandoned, or the node was added and removed long ago, stop it and wipe it (`add-peer` refuses a node
+  that has a log). INCONSISTENT, a bug or a data directory restored from elsewhere:
   wipe nothing, collect the logs.
 
   Why it is safe (S1: never exit 4 while the node is, or may still become, a member). REMOVED needs a K* that is
@@ -1638,12 +1683,31 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   holds F unapplied, its log holds K* (a leader that holds K* brought it up to date), and step 4 finds a later
   configuration of its own that holds it. If it does not hold F, the data directory was made for this add (`add-peer`
   refuses a node that has a log), so it was never a voter: NOT_ADDED. A configuration that may still commit in a
-  member's log is excluded by step 5, in the node's own log by step 4. The majority of K*'s new half matters because
+  member's log is excluded by step 5, in the node's own log by step 4. A configuration D that Ratis took from a
+  snapshot install, past the end of the node's own log and with no known term, or a stale one over another entry of
+  its log, blocks too, unless D is older than K* (R12-3, narrowed in round 13, review finding 1). A leader sends its
+  configuration with each snapshot chunk without a term (`LeaderProtoUtils` passes none, checked in the 3.3.1
+  bytecode), so `RaftTraffic` records, before Ratis sees a chunk, the chunk's configuration (index and halves) with the
+  leader's term in `raft/installed-configuration` (`InstalledConfiguration`): the highest term seen for that
+  configuration, or the new one in place of a record of another. A leader holds no entry of a later term than its
+  own, so that term bounds D's; written before Ratis acts, a record never bounds the configuration Ratis holds too
+  low (a rejected chunk leaves a record of another configuration, which matches nothing, or a higher bound; Ratis
+  replaces its configuration only with one that differs, and the record then keeps the highest term for the one it
+  keeps). When the bound is below K*'s term, D has an entry of a lower term than K* at iStar before it, which is not
+  K*, and Leader Completeness keeps it from committing: step 4 skips it. Otherwise D may be K*'s successor: a re-add of
+  this incarnation, whose staging ended within Ratis' catch-up gap, so that the leader then installed a snapshot with
+  the joint add D past it; restarted, Ratis runs the node with D and it writes `raft/member`. If the members of K*'s
+  new half answer before that leader replicated D to them, step 5 sees nothing, and a leader that cannot reach the
+  node can still commit D: the round-12 rule (skip with no bound) said REMOVED there, which
+  `RemovalRulePropertyTest.aReAddFromAnInstallPastTheEndOfTheLogKeepsTheNodeWaiting` reproduces. Without a record
+  (an install by an older version, or a crash between the record and Ratis' write) the node waits with
+  OWN_LATER_CONFIGURATION, as before R12-3, until a leader's configuration reaches it. The majority of K*'s new half matters because
   every configuration after K* needs a majority of K*'s new half to commit (the joint one after a stable K* has K*'s new
   half as its old half; the one after a joint K* is its new half), and that majority meets the confirmers. Answers come
   at different times over a round, so the guarantee is: no configuration that includes the node commits during the
   round unless its current data directory is brought up to date, and a leader sending to it during the round makes
-  the verdict HEARD_LEADER. The term-start case (R11-1) and the joint case (R3-G2b-4, R10-1) need nothing special: an
+  the verdict HEARD_LEADER. S1 and S2 are checked against a model of Raft logs and Ratis' configurations by
+  `RemovalRulePropertyTest` (R12-6), with answers taken atomically per round. The term-start case (R11-1) and the joint case (R3-G2b-4, R10-1) need nothing special: an
   uncommitted configuration never enters the committed set. Liveness (S2): with membership quiescent and a majority of
   the newest committed configuration's new half up, of this version and applied, the next check finds that
   configuration as K*, those members confirm it, other removed nodes do not block (lower term, or "absent" for K*), and
@@ -1663,7 +1727,18 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   configuration that was never committed: at worst a node whose add was dropped exits with 4 and the advice to wipe it
   and add it again, which add-peer needs anyway. Stock Ratis keeps a removed node with a stale configuration as a
   follower until the check fires; Ratis' own shutdown signal (`shouldSendShutdown`, which compares only indexes) is
-  left as it is. Ratis' own safety, Leader Completeness included, is assumed.
+  left as it is. Ratis' own safety, Leader Completeness included, is assumed, for changes of one node at a time:
+  the model of `RemovalRulePropertyTest` found that with a change of several nodes at once it does not hold. A leader
+  elected while a joint configuration is uncommitted writes a term-start entry with only the new half
+  (`LeaderStateImpl.StartupLogEntry` takes `getRaftConf().getConf()`, checked in the 3.3.1 bytecode) and then commits
+  by the new half alone; when a majority of the new half and a majority of the old half can be disjoint (two nodes of
+  five removed at once, say), a majority of the old half that never saw the joint configuration can elect another
+  leader, which overwrites those committed entries. `add-peer` and `remove-peer` compute the new configuration from
+  the `--peers` given to `admin`, so that list must be the cluster's current configuration. The one-step replacement
+  ("Replacing a node") changes two nodes, old o for new n: that is safe while o cannot vote (lost, or stopped first),
+  since a majority of the old half without o lies in the members that stay, and two majorities of the same size cannot
+  be disjoint within them; with o running, a leader change during the joint configuration can lose committed
+  entries. Not reproduced on Ratis itself; an upstream report is for the user.
 
   Tests (in-process; each of the first three fails at `0d8bc71`, which has the round-10 rule and the test filter):
   `FlattenedConfigurationStartTest` (R11-1: five nodes; with `RaftTraffic.dropForTesting`, L's appends reach X only,
@@ -1676,16 +1751,23 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   never stops), `JoinRemovedWhileDownTest` (R11-3: a `--join` node gets only the joint configuration of its add, goes
   down and is removed; its start is refused; at `0d8bc71` it waited for `add-peer` forever), `ReAddTest` (a removed id
   wiped and added again, replaying its earlier membership, through checks while it hears no leader and a restart in
-  the middle of its add: NOT_ADDED, never exit 4, then a member; and a fresh `--join` node through six check periods),
+  the middle of its add: NOT_ADDED, never exit 4, then a member; and a fresh `--join` node through six completed checks;
+  both wait for a count of completed checks, not a fixed sleep),
   `ColdRestartOrderTest` (every start order of three members; a removed fourth node started first, in the middle or
   last exits with 4 once two members are up), `CommittedConfigurationsTest` (records with terms, kept across a restart,
   probes; a snapshot install from a leader that holds an uncommitted joint configuration records the leader's
   history and not that configuration, which the next leader drops), `MembershipFactsTest` (a stale configuration of
-  Ratis over another leader's entry: not committed, no term, its probe absent; X not removed), `ConfigurationHistoryGapTest`
+  Ratis over another leader's entry: not committed, no term, its probe absent; X not removed; also once the entry is
+  purged; a probe in the snapshot with no record is unknown, R12-2), `ConfigurationHistoryGapTest`
   (an install notification between a configuration and its position; a history left behind by an older version),
   `JointRemovalStartTest` (now asserts the verdict's
   reason code, R11-8), `RemovalRuleTest` (one case per scenario, with the R11-1 and R11-2 inputs, Figure-8 tails,
-  quorum arithmetic for odd, even and joint halves, version-1 answers, the "voter once" cases and INCONSISTENT) and
+  quorum arithmetic for odd, even and joint halves, version-1 answers that do not confirm alone (R12-1), a latest
+  configuration outside the node's own log, skipped only with a term bound below K*'s (R12-3, round 13), the
+  "voter once" cases and INCONSISTENT), `RemovalRulePropertyTest` (R12-6, the model above, with the R11-1, R11-2,
+  finding-1, R12-1, R12-2 and R12-3 scenarios and the round-13 re-add from an install as examples),
+  `InstalledConfigurationTest` and `SnapshotInstallTest` (the term bound of an installed configuration, and that a
+  real install records it), `MembershipGaugeTest` (the gauge values, R12-4) and
   `RemovalCheckTest` (rounds, unreachable members, the `Configuration2` wire through the real handler and client, a
   member with only version 1, and one with neither). Not run here: the process suites (`MembershipTest`,
   `MembershipFaultTest`, the random-fault suites), which would check the exit codes and a supervisor's restarts; a
@@ -1981,7 +2063,8 @@ candidate, 0 follower, -1 unknown), `raft.term`, `raft.last_index`, `raft.commit
 `raft.flush_index`, `raft.start_index`, the lags between them (`raft.commit_lag`, `raft.apply_lag`, `raft.flush_lag`),
 on the leader `raft.follower_lag` per follower (tag `follower`, from the commit index the leader knows of it) and
 `raft.follower_lag_max`, `raft.log.bytes` and `raft.log.entries` (DD-22), `snapshot.index` and `snapshot.age_seconds`,
-`disk.data.*` and `disk.raft.*` (usable and total bytes, usable percent) and `replica.failed`; and from `ReplicaOps`,
+`disk.data.*` and `disk.raft.*` (usable and total bytes, usable percent), `replica.failed` and `membership.state` (0 a
+member, 1 never added, 2 outside and undecided, 3 removed: see "Removal and waiting outside"); and from `ReplicaOps`,
 `cluster.version` and the last checksum matched or mismatched. The metrics thread only reads fields. The node also logs
 the alarms it can tell by itself, once when they start, every minute while they last and once when they end: less than
 10% free on either disk, a Raft log above 4 snapshots' worth of `--snapshot-every-bytes` (a member gone for good holds
@@ -2117,8 +2200,10 @@ failover" below).
 | `PartitionTest` | An isolated leader acknowledges nothing. The majority takes over. A leader that keeps its majority keeps serving. The history, hot counters included, is linearizable. |
 | `PauseTest` | SIGSTOP of the leader and of a follower. The history stays linearizable. A freeze longer than `--jvm-pause-limit-ms` ends the node with exit code 3, and it starts again. |
 | `StartupChecksTest`, `StartupClusterTest` (in-process) | The config digest ignores layout and key order; a column volume outside `db/` is refused before it is created; copies of one seed share a digest that a truncated copy and an opened database do not, and a digest recorded by a failed first start is kept after the start-up check opened the database but taken again after `db/` is replaced, and a replica with another seed than the leader stops at genesis while copies of one seed start a cluster; `export-seed`'s copy holds the data with no cluster and no position, also with an absolute volume path inside `db/`, and a refused target config leaves no target; a direct-memory error made in Java code reaches the JFR watch; `run` refuses a JVM without `-XX:+ExitOnOutOfMemoryError`; a removed node refuses to start again, also with `--join`, and so does one stopped before its removal, whose log never received it (the members tell it); a node with a wrong API port for the leader forwards to the port the leader names. |
-| `RemovalRuleTest`, `RemovalCheckTest` | The removal rule, one case per scenario of "Removal and waiting outside" (the R11-1 and R11-2 inputs, Figure-8 tails that block until shown off K*'s branch, quorum arithmetic for odd, even and joint halves, version-1 answers, the "voter once" cases, INCONSISTENT and an empty committed set); one check's rounds (pending members and new members of K* asked again, a blocker asked until the budget ends, unreachable members leave it undecided at once), the `Configuration2` wire through the real handler and client, and a member with only `Configuration` (asked that) or neither (no answer). |
-| `MembershipFactsTest`, `ConfigurationHistoryGapTest` | Round-11 review, findings 1 and 2: a stale configuration of Ratis (loaded from `raft-meta.conf`) over another leader's ordinary entry at its index is not committed, has no term, and its probe answers absent, and a node asking about it is not removed; a snapshot install's notification between the updater's configuration and its position does not drop it; a history whose applied position moved without it (an older version) is complete only after that position. Each fails without its fix. |
+| `RemovalRuleTest`, `RemovalCheckTest` | The removal rule, one case per scenario of "Removal and waiting outside" (the R11-1 and R11-2 inputs, Figure-8 tails that block until shown off K*'s branch, quorum arithmetic for odd, even and joint halves, version-1 answers that confirm only a K* a member of this version reports committed (R12-1), a latest configuration past the end of the node's own log or stale over another entry, which does not block only with a term bound below K*'s (R12-3, round 13), the "voter once" cases, INCONSISTENT and an empty committed set); one check's rounds (pending members and new members of K* asked again, a blocker asked until the budget ends, unreachable members leave it undecided at once), the `Configuration2` wire through the real handler and client, and a member with only `Configuration` (asked that) or neither (no answer). |
+| `RemovalRulePropertyTest` (jqwik, pure) | R12-6: the removal rule and the real membership facts (on stub divisions, `ModelDivision`) against a model of Raft logs, Ratis' in-memory configurations and `raft-meta.conf` (kept apart), histories, snapshots and installs, with elections, one-node changes, replication, commits, crashes and restarts. After every step: committed prefixes agree, committed facts and probe answers are true, no false INCONSISTENT, and S1 for REMOVED verdicts under answers of version 2, version 1, pending or none; S2 after quiescing. Examples for R11-1, R11-2, finding 1 after a purge, R12-1, R12-2 and R12-3 (the last four fail with the round-13 fixes reverted), and the round-13 review's re-add whose joint configuration arrives by an install past the log's end (it fails with the R12-3 skip that ignores the term bound). The model writes `raft/installed-configuration` before the follower acts on a chunk, the member file also when a restart runs the node with a configuration that holds it, and lets a staging end after a snapshot install (Ratis' catch-up gap). It found that a change of several nodes at once is unsafe in Ratis (see the residuals of "Removal and waiting outside"), so it generates one-node changes. Answers are atomic per round: the asynchrony of `RemovalCheck`'s rounds and HEARD_LEADER are not modelled. |
+| `MembershipGaugeTest` | R12-4: `membership.state` is 0 for a member or not checked, 1 never added, 2 undecided, 3 removed. Fails with the round-11 mapping (REMOVED was 0). |
+| `MembershipFactsTest`, `ConfigurationHistoryGapTest` | Round-11 review, findings 1 and 2: a stale configuration of Ratis (loaded from `raft-meta.conf`) over another leader's ordinary entry at its index is not committed, has no term, and its probe answers absent, and a node asking about it is not removed; the same once the entry is purged (round-13 review); a probe in the snapshot with no record in the history is unknown, never absent (R12-2); a snapshot install's notification between the updater's configuration and its position does not drop it; a history whose applied position moved without it (an older version) is complete only after that position. Each fails without its fix. |
 | `ClusterIdentityTest` | Each genesis gets its own id, and a second `Genesis` in a log changes nothing. A node that elected itself under the same group id, added with Ratis' own client, stops before the configuration changes, and writes go on. What `add-peer` refuses. |
 | `RatisContractTest` | The Ratis 3.3.1 behaviors that the design relies on beyond its API, against real servers in the JVM: the bootstrap and configuration meta files that `--join` safety reads, and the initializing state of a server started with an empty group (no election, no bootstrap file); the open segment format that `RaftLogRepair` rewrites; the type of the full-pending-queue refusal; a state machine refusal that reaches a remote client by class name and message, without a step down; `NotLeaderException` for an entry appended by a leader that then steps down (three servers); a transfer without a new leader that steps down; the 3 s wait of `GrpcUtil.shutdownManagedChannel` with a call in flight; a snapshot chunk held on the heap until its timeout by `StreamObserverWithTimeout`; a leader whose log worker is stopped (`LogWorkerGate`) commits nothing until it flushes; the CPU of the appender to a dead follower (printed, bounded at half a core); with the node's Raft settings, a follower learns a new commit index only with the next append or heartbeat (3 s), and within 600 ms of `CommitHeartbeats.send` on the leader, for both followers, 20 writes in a row, also when the link to a follower drops that heartbeat and breaks its stream (sent again on the new stream), and when `send` lands between the appender building nothing and its wait (R7-1, through a test hook in the real appender; the appender waits on its own `WakeSignal`); a client proxy made while the one before it to the same peer closes can get a metric interceptor without a registry (R8-4: every call of it and its close then throw a `NullPointerException`), and `PeerProxyMap.close` lets such a close failure out as a `CompletionException` after closing the other proxies. The match index moving only on replies with entries, and the follower order of `LeaderStall`, are pinned by `LeaderStallTest`. |
 | `RaftSettingsTest`, `ByteAdmissionTest`, `ConflictPositionsTest` | Snapshot chunks stay at most 4 s on the heap; Ratis' pending-request limits hold every node's attempts and stay near the defaults, and the byte limit grows with a peer list of more than 4 nodes; one entry of the largest size fits every limit on its way. The byte admission never exceeds its limit and is sized from the heap. Conflict positions survive the exception that Ratis rebuilds, and a text that does not parse is a conflict of the whole entry. |
@@ -2644,7 +2729,12 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      and replaces it. The cost is bounded by one more failed attempt and its resend, and the window is the few
      instructions between the two reads (`GrpcClientRpc.sendRequest` reads the map as its first step, checked in the
      3.3.1 bytecode). No test sends an attempt into that window; `ProposerResetTest` only pins the reset rule the bound
-     relies on.
+     relies on. Accepted (round 13): Ratis 3.3.1 offers no public way to send on a given proxy
+     (`GrpcClientRpc.sendRequest(RaftClientRequest, GrpcClientProtocolClient)` is private,
+     `GrpcClientProtocolClient.unorderedWithTimeout` is package-private, and its only public members are `close()` and
+     `getTarget()`, checked with javap); reflection or a helper in Ratis' package would tie the Proposer to Ratis
+     internals, and a per-peer lock held across the call would hold resets back for an attempt timeout, which
+     `resetConnection` exists to avoid.
    - The same race on the server side (R9-1): every `GrpcLogAppender` of a division makes a `GrpcServerMetrics` with
      one shared registry name (member id, `ratis_grpc`, `log_appender`), and its stop unregisters it. An appender made
      while another one stops (`LeaderStateImpl.restart` is stop then add, and is not synchronized; a removed follower;

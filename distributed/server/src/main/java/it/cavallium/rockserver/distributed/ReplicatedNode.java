@@ -134,7 +134,7 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
 		this.config = config;
-		this.raftTraffic = new RaftTraffic(config.nodeId());
+		this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir());
 		Files.createDirectories(config.dbDir().getParent());
 		Files.createDirectories(config.raftDir());
 		requireSameFileSystem(config.raftDir(), config.dbDir().getParent());
@@ -239,14 +239,7 @@ public final class ReplicatedNode implements AutoCloseable {
 					MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 			this.monitor = new NodeMonitor(config, stateMachine::division, stateMachine,
 					config.raftDir().resolve(groupId.getUuid().toString()).resolve("current"), metrics);
-			monitor.membershipState(() -> {
-				var verdict = membership;
-				return verdict == null ? 0 : switch (verdict.outcome()) {
-					case MEMBER, REMOVED -> 0;
-					case NOT_ADDED -> 1;
-					case UNDECIDED -> 2;
-				};
-			});
+			monitor.membershipState(() -> membershipGauge(membership));
 			maintenance.scheduleWithFixedDelay(this::refreshMonitor, 0, NodeMonitor.REFRESH_MILLIS, TimeUnit.MILLISECONDS);
 			var appendLag = metrics.amount("lag.uncommitted");
 			var applyLag = metrics.amount("lag.unapplied");
@@ -706,6 +699,7 @@ public final class ReplicatedNode implements AutoCloseable {
 						return;
 					}
 					var verdict = checkMembership(division);
+					detachedChecks.incrementAndGet();
 					if (verdict.outcome() == RemovalRule.Outcome.REMOVED) {
 						onReplicaFailure(RemovedException.of(config.nodeId(), verdict, "while it heard no leader"));
 						return;
@@ -729,8 +723,30 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 	}
 
+	/**
+	 * The {@code membership.state} gauge for the verdict {@code verdict} (null: not checked yet): 0 a member, 1 never
+	 * added, 2 outside and undecided, 3 removed (reported only if a push of the gauges happens between the verdict and
+	 * exit 4: the shutdown starts at once and does not wait for one, and a removal found at the start exits before the
+	 * gauges report; do not alert on it).
+	 */
+	static int membershipGauge(RemovalRule.@Nullable Verdict verdict) {
+		return verdict == null ? 0 : switch (verdict.outcome()) {
+			case MEMBER -> 0;
+			case NOT_ADDED -> 1;
+			case UNDECIDED -> 2;
+			case REMOVED -> 3;
+		};
+	}
+
 	/** Whether {@link #checkWhileDetached} has a check queued or running. */
 	private final AtomicBoolean askingMembers = new AtomicBoolean();
+	/** How many checks {@link #checkWhileDetached} completed (its verdict set in {@link #membership}): tests. */
+	private final AtomicLong detachedChecks = new AtomicLong();
+
+	/** See {@link #detachedChecks}: tests. */
+	long detachedChecks() {
+		return detachedChecks.get();
+	}
 
 	/**
 	 * The membership verdict of this node's last check (R11), null if none ran: at the start (existing data
@@ -764,11 +780,17 @@ public final class ReplicatedNode implements AutoCloseable {
 					+ " itself once a majority of the new half of the newest committed configuration answer. If they are gone"
 					+ " for good, check with status on a member: if this node is not in its configuration, stop it, wipe its"
 					+ " data directory, start it with --join and run add-peer";
-			case NEEDS_TERM -> "Members answered with a version that predates Configuration2, which does not tell terms:"
-					+ " upgrade them. Until then, judge with status on a member";
+			case NEEDS_TERM -> "Members answered with a version that predates Configuration2, which does not tell terms"
+					+ " (its committed flag does not confirm a removal by itself), and the members of this version that"
+					+ " answered cannot make a majority of the new half of the newest committed configuration without"
+					+ " them: upgrade the named members of the older version, or start more members of this version."
+					+ " Until then, judge with status on a member";
 			case MEMBER_LATER_CONFIGURATION -> "Normally clears within seconds. If it persists, the blocking members are"
 					+ " stuck or were removed themselves: look at their logs and status";
-			case OWN_LATER_CONFIGURATION -> "An add of this node is in flight: let add-peer finish";
+			case OWN_LATER_CONFIGURATION -> "Its own log holds a later configuration that includes it and may still"
+					+ " commit: normally an add of this node in flight (let add-peer finish), or a configuration a leader"
+					+ " appended just before it lost leadership, which clears once the next leader's configuration reaches"
+					+ " this node. If it persists while a leader runs, check status on a member";
 			case INCONSISTENT -> "A bug, or a data directory restored from elsewhere: do not wipe anything, collect the"
 					+ " logs of every node";
 			case HEARD_LEADER -> "A leader sent this node a request during the check: it is checked again if it hears no"
@@ -797,10 +819,8 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	/** This node's own facts for {@link RemovalRule#decide}. */
 	private RemovalRule.Own ownFacts(RaftServer.Division division) {
-		var history = stateMachine.configurations();
-		return new RemovalRule.Own(config.nodeId(), MembershipFacts.committed(division, history),
-				MembershipFacts.latest(division, history), index -> MembershipFacts.termAt(division, index), !config.join(),
-				Files.exists(config.raftDir().resolve(MEMBER_FILE)));
+		return MembershipFacts.own(division, stateMachine.configurations(), config.nodeId(), !config.join(),
+				Files.exists(config.raftDir().resolve(MEMBER_FILE)), InstalledConfiguration.read(config.raftDir()));
 	}
 
 	/** The answer of this node to {@link TermService#CONFIGURATION2}. */

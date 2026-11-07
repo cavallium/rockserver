@@ -26,8 +26,10 @@ import org.jetbrains.annotations.Nullable;
  *
  * <p>{@code completeFrom}: the first index from which every committed configuration applied here is recorded. A
  * database that a version without this history applied (or a snapshot of one) has none below the first entry this
- * version applied, see {@link NodeStore#configurationHistoryFrom}. Kept forever: one entry per term start and per
- * membership change, about a hundred bytes each.</p>
+ * version applied, see {@link NodeStore#configurationHistoryFrom}. {@link MembershipFacts#committed} reads it: below
+ * it, a configuration of Ratis in the snapshot without a record cannot be told from a stale one. A probe no longer
+ * reads it (R12-2: no record is unknown). Kept forever: one entry per term start and per membership change, about a
+ * hundred bytes each.</p>
  */
 final class CommittedConfigurations {
 

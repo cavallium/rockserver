@@ -231,6 +231,46 @@ class RemovalRuleTest {
 				report(v1, v1)).reason());
 	}
 
+	/**
+	 * R12-3, narrowed by the round-13 review (finding 1): a latest configuration D that Ratis took from a snapshot
+	 * install's {@code raft-meta.conf} (the leader's, not committed), past the end of the node's own log and with no
+	 * known term, does not block by itself only when its term bound (the installing leader's term,
+	 * {@link InstalledConfiguration}) is below K*'s term: D is then on another branch than K*, and never commits. With
+	 * no bound, or a bound not below K*'s term, D may be K*'s successor (a re-add of this incarnation) and blocks. The
+	 * same for a stale one over another entry of its log. One that is in its log, unreadable, still blocks.
+	 */
+	@Test
+	void aLatestConfigurationOutsideTheNodesOwnLogBlocksUnlessOlderThanKStar() {
+		var cOld = stable(1, 5, X, "a", "b");
+		var d = new Conf(UNKNOWN_TERM, 40, List.of(X, "a", "b"), List.of());
+		var removal = stable(3, 35, "a", "b");
+		var older = decide(new Own(X, cOld, d, log(2, 30, 30), true, false, false, 2), "a", report(removal, removal),
+				"b", report(removal, removal));
+		assertEquals(Reason.REMOVED, older.reason(), older.toString());
+		var noBound = decide(new Own(X, cOld, d, log(2, 30, 30), true, true, false, UNKNOWN_TERM), "a",
+				report(removal, removal), "b", report(removal, removal));
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, noBound.reason(), noBound.toString());
+		var sameTerm = decide(new Own(X, cOld, d, log(2, 30, 30), false, true, false, 3), "a", report(removal, removal),
+				"b", report(removal, removal));
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, sameTerm.reason(), sameTerm.toString());
+		// In its log (a contiguous run after the snapshot, term 3 from 31), not readable: it may still commit.
+		LongUnaryOperator inLog = index -> index <= 30 ? PURGED : index <= 40 ? 3 : BEYOND;
+		var unreadable = decide(seeded(cOld, d, inLog), "a", report(removal, removal), "b", report(removal, removal));
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, unreadable.reason(), unreadable.toString());
+		// Its log holds another entry at 40: D is a stale configuration of Ratis, not in its log.
+		var stale = decide(new Own(X, cOld, d, inLog, true, false, true, 2), "a", report(removal, removal), "b",
+				report(removal, removal));
+		assertEquals(Reason.REMOVED, stale.reason(), stale.toString());
+		var staleNoBound = decide(new Own(X, cOld, d, inLog, true, false, true, UNKNOWN_TERM), "a",
+				report(removal, removal), "b", report(removal, removal));
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, staleNoBound.reason(), staleNoBound.toString());
+		// A member that holds D, with a term at least K*'s, blocks.
+		var held = stable(3, 40, X, "a", "b");
+		var blocked = decide(new Own(X, cOld, d, log(2, 30, 30), true, false, false, 2), "a", report(removal, held), "b",
+				report(removal, removal));
+		assertEquals(Reason.MEMBER_LATER_CONFIGURATION, blocked.reason(), blocked.toString());
+	}
+
 	/** A committed answer of the node's own latest configuration (probe 0) makes it a committed fact. */
 	@Test
 	void theNodesOwnLatestConfigurationCountsOnceAMemberHoldsItCommitted() {
@@ -240,26 +280,73 @@ class RemovalRuleTest {
 				report(removal, removal, Probe.COMMITTED, null, Probe.UNKNOWN), "b", Answer.NONE).reason());
 	}
 
+	/**
+	 * R12-1: a version-1 "committed" flag compares Ratis' configuration with the commit index, which is wrong for a
+	 * stale configuration of Ratis (round-11 review, finding 1). Version-1 answers alone raise K* but do not confirm it.
+	 */
 	@Test
-	void versionOneAnswersDecideWhatNeedsNoTerm() {
+	void versionOneAnswersAloneDoNotConfirm() {
 		var own = stable(1, 5, X, "a", "b", "c");
 		var removal = RemovalCheck.fromVersion1(new RemovalCheck.PeerConfiguration(9, true, List.of("a", "b", "c")));
-		assertEquals(Reason.REMOVED, decide(seeded(own, own, log(1, -1, 5)), "a", Answer.of(removal), "b",
-				Answer.of(removal)).reason());
+		var verdict = decide(seeded(own, own, log(1, -1, 5)), "a", Answer.of(removal), "b", Answer.of(removal), "c",
+				Answer.of(removal));
+		assertEquals(Reason.NEEDS_TERM, verdict.reason(), verdict.toString());
+		assertEquals(9, verdict.kStar().index());
+		// A member of this version that reports K* committed makes the version-1 answers confirmers.
+		var k = stable(3, 9, "a", "b", "c");
+		var confirmed = decide(seeded(own, own, log(1, -1, 5)), "a", report(k, k), "b", Answer.of(removal), "c",
+				Answer.NONE);
+		assertEquals(Reason.REMOVED, confirmed.reason(), confirmed.toString());
+		assertEquals(List.of("a", "b"), confirmed.confirmers());
 		// Not committed: no fact.
 		var pending = RemovalCheck.fromVersion1(new RemovalCheck.PeerConfiguration(9, false, List.of("a", "b", "c")));
 		assertEquals(Reason.MEMBER, decide(seeded(own, own, log(1, -1, 5)), "a", Answer.of(pending), "b",
 				Answer.of(pending)).reason());
 	}
 
+	/**
+	 * Round-13 review, finding 3: version-1 answers alone report K* committed, but members of this version of K*'s new
+	 * half answered without it yet (lagging): asking them again may confirm K*, so the verdict is NO_MAJORITY (asked
+	 * again within the check), not NEEDS_TERM (final, with the advice to upgrade).
+	 */
+	@Test
+	void laggingMembersOfThisVersionThatCanMakeAMajorityAreAskedAgain() {
+		var own = stable(1, 5, X, "a", "b", "c");
+		var removal = RemovalCheck.fromVersion1(new RemovalCheck.PeerConfiguration(9, true, List.of("a", "b", "c")));
+		var lagging = decide(seeded(own, own, log(1, -1, 5)), "a", report(own, own), "b", report(own, own), "c",
+				Answer.of(removal));
+		assertEquals(Reason.NO_MAJORITY, lagging.reason(), lagging.toString());
+		// One lagging member of this version cannot make a majority of three without the version-1 answers.
+		var one = decide(seeded(own, own, log(1, -1, 5)), "a", report(own, own), "b", Answer.of(removal), "c",
+				Answer.of(removal));
+		assertEquals(Reason.NEEDS_TERM, one.reason(), one.toString());
+	}
+
+	/**
+	 * R12-1: two old members in the finding-1 state report a stale configuration without X as committed, at an index
+	 * above the real K*. It hides K* (NEEDS_TERM), and never removes X.
+	 */
+	@Test
+	void aStaleVersionOneConfigurationAtTheHighestIndexDoesNotRemove() {
+		var own = stable(1, 5, X, "a", "b", "c");
+		var k = stable(3, 9, X, "a", "b", "c");
+		var stale = RemovalCheck.fromVersion1(new RemovalCheck.PeerConfiguration(12, true, List.of("b", "c")));
+		var verdict = decide(seeded(own, own, log(1, -1, 5)), "a", report(k, k), "b", Answer.of(stale), "c",
+				Answer.of(stale));
+		assertEquals(Reason.NEEDS_TERM, verdict.reason(), verdict.toString());
+		assertEquals(List.of(), verdict.confirmers());
+	}
+
 	@Test
 	void committedConfigurationsAtOneIndexMustAgreeOnWhatBothKnow() {
 		var own = stable(1, 5, X, "a", "b", "c");
 		var v2 = joint(3, 9, List.of("a", "b"), List.of(X, "a", "b"));
-		var v1 = new Conf(UNKNOWN_TERM, 9, List.of("b", "a"), null);
-		// The version-1 answer knows neither the term nor the old half: no conflict.
-		assertEquals(Reason.REMOVED, decide(seeded(own, own, log(1, -1, 5)), "a", report(v2, v2), "b", report(v1, v1))
-				.reason());
+		var v1 = RemovalCheck.fromVersion1(new RemovalCheck.PeerConfiguration(9, true, List.of("b", "a")));
+		// The version-1 answer knows neither the term nor the old half: no conflict. A member of this version reports
+		// the same K* committed, so the version-1 answer confirms it too.
+		var verdict = decide(seeded(own, own, log(1, -1, 5)), "a", report(v2, v2), "b", Answer.of(v1));
+		assertEquals(Reason.REMOVED, verdict.reason(), verdict.toString());
+		assertEquals(List.of("a", "b"), verdict.confirmers());
 		var otherTerm = joint(4, 9, List.of("a", "b"), List.of(X, "a", "b"));
 		assertEquals(Reason.INCONSISTENT, decide(seeded(own, own, log(1, -1, 5)), "a", report(v2, v2), "b",
 				report(otherTerm, otherTerm)).reason());

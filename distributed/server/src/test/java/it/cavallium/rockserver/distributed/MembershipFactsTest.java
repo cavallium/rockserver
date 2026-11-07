@@ -9,20 +9,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import it.cavallium.rockserver.distributed.RemovalRule.Answer;
 import it.cavallium.rockserver.distributed.RemovalRule.Conf;
 import it.cavallium.rockserver.distributed.RemovalRule.Probe;
-import java.lang.reflect.Proxy;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import org.apache.ratis.proto.RaftProtos;
-import org.apache.ratis.protocol.RaftPeer;
-import org.apache.ratis.server.DivisionInfo;
-import org.apache.ratis.server.RaftConfiguration;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
-import org.apache.ratis.server.raftlog.LogEntryHeader;
-import org.apache.ratis.server.raftlog.RaftLog;
-import org.apache.ratis.util.LifeCycle;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -38,72 +31,19 @@ class MembershipFactsTest {
 	private static final List<String> ALL = List.of("n0", "n1", "n2", "n3", "x");
 	private static final List<String> WITHOUT_X = List.of("n0", "n1", "n2", "n3");
 
-	private static RaftPeer peer(String id) {
-		return RaftPeer.newBuilder().setId(id).build();
-	}
-
-	private static List<RaftPeer> peers(List<String> ids) {
-		return ids.stream().map(MembershipFactsTest::peer).toList();
-	}
-
 	private static RaftProtos.LogEntryProto configurationEntry(long term, long index, List<String> current,
 			List<String> previous) {
-		var conf = RaftProtos.RaftConfigurationProto.newBuilder();
-		peers(current).forEach(peer -> conf.addPeers(peer.getRaftPeerProto()));
-		peers(previous).forEach(peer -> conf.addOldPeers(peer.getRaftPeerProto()));
-		return RaftProtos.LogEntryProto.newBuilder().setTerm(term).setIndex(index).setConfigurationEntry(conf).build();
+		return ModelDivision.configurationEntry(term, index, current, previous);
 	}
 
 	private static RaftProtos.LogEntryProto ordinaryEntry(long term, long index) {
-		return RaftProtos.LogEntryProto.newBuilder().setTerm(term).setIndex(index)
-				.setStateMachineLogEntry(RaftProtos.StateMachineLogEntryProto.getDefaultInstance()).build();
-	}
-
-	@SuppressWarnings("unchecked")
-	private static <T> T proxy(Class<T> type, java.util.function.BiFunction<String, Object[], Object> handler) {
-		return (T) Proxy.newProxyInstance(MembershipFactsTest.class.getClassLoader(), new Class<?>[] {type},
-				(_, method, args) -> switch (method.getName()) {
-					case "toString" -> type.getSimpleName();
-					case "hashCode" -> 0;
-					case "equals" -> false;
-					default -> handler.apply(method.getName(), args);
-				});
+		return ModelDivision.ordinaryEntry(term, index);
 	}
 
 	/** A division whose Ratis configuration is {@code current}/{@code previous} at {@code confIndex}. */
 	private static RaftServer.Division division(long confIndex, List<String> current, List<String> previous,
 			TreeMap<Long, RaftProtos.LogEntryProto> log, long snapshotIndex, long commitIndex) {
-		var conf = proxy(RaftConfiguration.class, (method, _) -> switch (method) {
-			case "getLogEntryIndex" -> confIndex;
-			case "getCurrentPeers" -> peers(current);
-			case "getPreviousPeers" -> peers(previous);
-			case "getAllPeers" -> peers(ALL);
-			default -> throw new UnsupportedOperationException(method);
-		});
-		var raftLog = proxy(RaftLog.class, (method, args) -> switch (method) {
-			case "getTermIndex" -> {
-				var entry = log.get((Long) args[0]);
-				yield entry == null ? null : TermIndex.valueOf(entry.getTerm(), entry.getIndex());
-			}
-			case "get" -> log.get((Long) args[0]);
-			case "getEntries" -> log.subMap((Long) args[0], (Long) args[1]).values().stream()
-					.map(LogEntryHeader::valueOf).toArray(LogEntryHeader[]::new);
-			case "getSnapshotIndex" -> snapshotIndex;
-			case "getLastCommittedIndex" -> commitIndex;
-			default -> throw new UnsupportedOperationException(method);
-		});
-		var info = proxy(DivisionInfo.class, (method, _) -> switch (method) {
-			case "getLifeCycleState" -> LifeCycle.State.RUNNING;
-			case "getLeaderId" -> null;
-			case "getCurrentTerm" -> 3L;
-			default -> throw new UnsupportedOperationException(method);
-		});
-		return proxy(RaftServer.Division.class, (method, _) -> switch (method) {
-			case "getInfo" -> info;
-			case "getRaftConf" -> conf;
-			case "getRaftLog" -> raftLog;
-			default -> throw new UnsupportedOperationException(method);
-		});
+		return ModelDivision.of(confIndex, current, previous, ALL, log, snapshotIndex, commitIndex, 3);
 	}
 
 	/**
@@ -139,6 +79,44 @@ class MembershipFactsTest {
 		assertEquals(Probe.ABSENT, MembershipFacts.probe(division, history, 3, 20),
 				"(3, 20) is an ordinary entry: no configuration has that term and index");
 		assertEquals(Probe.COMMITTED, MembershipFacts.probe(division, history, 3, 15), "C_old, E's configuration");
+	}
+
+	/**
+	 * Round-13 review: the same stale J once F purged its log up to 25 (a snapshot at 25). The entry at 20 is gone, so
+	 * nothing in the log tells J from E's ordinary entry; the history, complete from 0, recorded C_old at 15 and nothing at
+	 * 20, so J was never committed. Below the first index the history covers, the snapshot still decides (a database of
+	 * an older version).
+	 */
+	@Test
+	void aStaleConfigurationOverAPurgedEntryIsNotCommitted() {
+		var division = division(20, WITHOUT_X, ALL, new TreeMap<>(), 25, 25);
+		var cOld = new Conf(3, 15, ALL, List.of());
+		var history = new CommittedConfigurations(List.of(new Conf(1, 5, ALL, List.of()), cOld), 0);
+		var committed = assertNotNullAndGet(MembershipFacts.committed(division, history));
+		assertEquals(cOld, committed, "J taken as committed from the snapshot: " + committed);
+		assertFalse(MembershipFacts.latest(division, history).termKnown());
+		assertEquals(cOld, MembershipFacts.report(division, history, List.of()).committed());
+		// A history that does not cover 20 cannot tell: the snapshot covers J's index, as before.
+		var older = new CommittedConfigurations(List.of(new Conf(1, 5, ALL, List.of())), 22);
+		assertEquals(20, assertNotNullAndGet(MembershipFacts.committed(division, older)).index());
+		// The same configuration recorded at 20: committed, with the recorded term.
+		var j = new Conf(4, 20, WITHOUT_X, ALL);
+		var recorded = new CommittedConfigurations(List.of(new Conf(1, 5, ALL, List.of()), cOld, j), 0);
+		assertEquals(j, MembershipFacts.committed(division, recorded));
+	}
+
+	/**
+	 * R12-2: during a snapshot install Ratis moves its snapshot index (to 30 here) before the state machine swaps in the
+	 * snapshot's history; meanwhile the old history (applied up to about 12) has no record for a configuration
+	 * committed in between. A missing record in the snapshot is unknown, never absent: absent would drop a blocker.
+	 */
+	@Test
+	void aConfigurationInTheSnapshotWithNoRecordIsUnknown() {
+		var division = division(5, ALL, List.of(), new TreeMap<>(), 30, 30);
+		var history = new CommittedConfigurations(List.of(new Conf(1, 5, ALL, List.of())), 0);
+		assertEquals(Probe.UNKNOWN, MembershipFacts.probe(division, history, 2, 20), "no record at 20");
+		assertEquals(Probe.COMMITTED, MembershipFacts.probe(division, history, 1, 5));
+		assertEquals(Probe.ABSENT, MembershipFacts.probe(division, history, 2, 5), "another term recorded at 5");
 	}
 
 	/** The asker X of the scenario: before the fix, F's answers and the members' probes removed it. */

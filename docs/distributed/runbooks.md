@@ -66,13 +66,17 @@ majority and healthy (`status`).
    `--join` and a peer list that has the members that stay plus itself:
    `rs run --node-id n4 --peer n2=... --peer n3=... --peer n4=... --data-dir /srv/rockserver/data --join`.
    It prints `READY` and waits for as long as it takes.
-2. From any host, in one step, add `n4` and remove the lost node, by leaving it out of `--peer`:
+2. If the old node still runs (a move), stop it first and take it out of its supervisor: the step below changes two
+   nodes at once, which is safe only while the node that leaves cannot vote (see "Removed node" below). To keep it
+   serving until it is out, use two steps instead: `add-peer n4` with every member, the old one included, in
+   `--peer`, then `remove-peer <old id>` with all of them in `--peer`.
+   From any host, in one step, add `n4` and remove the old node, by leaving it out of `--peer`:
    `rs admin --peer n2=... --peer n3=... --peer n4=... add-peer n4=10.0.0.4:9001/10.0.0.4:5333`.
    It ends with `OK` once `n4` caught up from a snapshot and the configuration changed (the limit, `--timeout-ms`, is
    10 minutes by default: raise it for a large database, about 100 MB/s).
 3. Check: `status` shows `n4` with the others' commit index; `checksum` prints `OK`; the `rockserver-node-missing`
    alert threshold and the clients' address lists include `n4` and not the old node.
-4. If the old node still runs, it exits with code 3 or 4 once removed: take it out of its supervisor first.
+4. With the two steps, the old node exits with code 3 or 4 once removed: take it out of its supervisor first.
 
 Failure branches:
 
@@ -98,20 +102,27 @@ check stops it. Neither can elect a leader that lacks the removal, nor win an el
 waiting outside" in the design document); the elections it starts show in the members' logs as rejected pre-votes. Every 15 election timeouts it logs `hears no leader` or, at its
 start, `starting, not known to be a member`, with `Membership <reason> (K* ..., confirmed by ..., blocked by ..., pending
 ..., unreachable ...)` and what to do. The `membership.state` gauge is 2 meanwhile (1 for a `--join` node before its
-`add-peer`, 0 for a member). By reason:
+`add-peer` and while `add-peer` catches it up, 0 for a member, 3 if a sample happens to be pushed between the verdict and exit 4, which is not guaranteed); the alert
+`rockserver-node-outside` fires after 10 minutes at 2, and `rockserver-node-not-added` after 6 hours at 1. By reason:
 
 | Reason | What to do |
 |---|---|
 | `NO_MAJORITY`, `NO_COMMITTED_CONFIGURATION` | Start or repair the pending and unreachable members (a member of a version without `Configuration` counts as unreachable). The node decides by itself once a majority of them answer. If they are gone for good (wiped, replaced), check with `status` on a member: if this node is not in its configuration, stop it, take it out of its supervisor, wipe its data directory, and add it again with `--join` and `add-peer` if you want it back. |
-| `NEEDS_TERM` | The members that answered run a version without `Configuration2`: upgrade them. Until then judge with `status`, as above. |
+| `NEEDS_TERM` | The members that answered run a version without `Configuration2`: upgrade them. Their answers tell no terms, and their committed flag does not confirm a removal unless a member of this version (or the node itself) reports the same configuration committed. Until then judge with `status`, as above. |
 | `MEMBER_LATER_CONFIGURATION` | Clears by itself within seconds. If it lasts, the blocking members are stuck or were removed themselves: look at their logs and `status`. |
-| `OWN_LATER_CONFIGURATION` | An `add-peer` of this node is in flight: let it finish. |
+| `OWN_LATER_CONFIGURATION` | Its own log holds a later configuration that includes it and may still commit: normally an `add-peer` of this node in flight (let it finish), or a configuration a leader appended just before it lost leadership, which clears once the next leader's configuration reaches this node. If it persists while a leader runs, check `status` on a member. |
 | `NOT_ADDED` | A `--join` node that never was a voter: run `add-peer`. If the add was abandoned, or the node was added and removed long ago, stop it and wipe its data directory (`add-peer` refuses a node that has a log). |
 | `INCONSISTENT` | A bug, or a data directory restored from elsewhere: wipe nothing, collect the logs of every node. |
 | `HEARD_LEADER` | A leader sent the node something during the check: it is a member again, or will be checked again. |
 | `MEMBER` (with `hears no leader`) | It is a member waiting for a leader; in Ratis' initializing state if it was started with `--join` and no node started without it. |
 
 `RestartPreventExitStatus=4` stays: a node that exited with 4 is removed, and a restart only repeats the check.
+
+`add-peer` and `remove-peer` build the new configuration from the `--peers` given to `admin`: give the cluster's
+current members (as `status` shows them). A call should change one running node: Ratis' first entry of a new leader
+keeps only the new half of a joint configuration and commits by it alone, so a change of several running nodes at
+once can lose committed entries if the leader changes in the middle (see the residuals of "Removal and waiting
+outside" in the design document). The replacement above changes two nodes, safely while the old one is stopped.
 
 ## Backups
 
@@ -240,6 +251,10 @@ Upgrades across these versions need more care, because no gate covers them:
   the cluster version covers this from this version on.
 - **Pipelined updates** need every node on the version with the flags of `Guarded` entries; the cluster version covers
   this from this version on.
+- **Removing nodes** (`remove-peer`, or a replacement) during an upgrade from a version without `Configuration2`:
+  upgrade the remaining members first. A removed node started again decides that it was removed only once the node
+  itself or an upgraded member reports its removal committed; with only old members it waits outside with
+  `NEEDS_TERM` (see "Removed node").
 
 ## Exit codes
 
@@ -319,3 +334,5 @@ says. The rules and what to do:
 | `rockserver-write-delayed` | warning | RocksDB slows writes | "Disk space and write stalls" |
 | `rockserver-checksum-mismatch` | critical | The replicas diverged | "Checksums" |
 | `rockserver-leader-stall` | warning | A leader stepped down to restart replication | "A leader whose log stops" in design.md |
+| `rockserver-node-outside` | warning | A node is outside the cluster and undecided for 10 minutes (`membership.state` 2) | "Removed node" (the reason is in its log) |
+| `rockserver-node-not-added` | warning | A `--join` node is not a voter after 6 hours (`membership.state` 1): a forgotten or abandoned `add-peer`. It is 1 during a normal catch-up too, hence the long wait | "Removed node", `NOT_ADDED` |

@@ -17,7 +17,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * R11 review, finding 2: the history of committed configurations must not say that it is complete where it misses
- * one, or a probe of a purged entry answers {@link RemovalRule.Probe#ABSENT} for a committed configuration.
+ * one. In round 11 a probe of a purged entry then answered {@link RemovalRule.Probe#ABSENT} for a committed
+ * configuration; since R12-2 a missing record answers {@link RemovalRule.Probe#UNKNOWN}, so this is defence in depth,
+ * and {@link MembershipFacts#committed} still reads where the history is complete.
  */
 class ConfigurationHistoryGapTest {
 
