@@ -62,7 +62,8 @@ class DirectMemoryWatchTest {
 					Buf.wrap(new byte[] {1}), RequestType.none());
 			cluster.awaitConverged(Duration.ofSeconds(30));
 			var names = Thread.getAllStackTraces().keySet().stream().map(Thread::getName).toList();
-			for (var kind : List.of("GrpcLogAppender", "SegmentedRaftLogWorker", "StateMachineUpdater",
+			// The appender is CommitHeartbeats.Appender (R6-1), whose daemon Ratis names "...->nX-Appender-LogAppenderDaemon".
+			for (var kind : List.of("-Appender-LogAppenderDaemon", "SegmentedRaftLogWorker", "StateMachineUpdater",
 					"grpc-default-worker-ELG", "-server-thread")) {
 				var matching = names.stream().filter(name -> name.contains(kind)).toList();
 				assertFalse(matching.isEmpty(), () -> "no thread named " + kind + " in " + names);
