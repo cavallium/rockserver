@@ -1355,6 +1355,8 @@ final class Proposer implements Closeable {
 		if (!permits.tryAcquire(weight)) {
 			throw new CompletionException(new NoPermitException(weight));
 		}
+		// The proxy this attempt is sent on, read before the call: only that one is replaced if the call fails (R9-2).
+		Object proxy = currentProxy(rpc, leader);
 		try {
 			return rpc.sendRequest(invocation(message, callId, leader));
 		} catch (IOException ex) {
@@ -1362,13 +1364,13 @@ final class Proposer implements Closeable {
 			// of its own: closing the old channel waits up to 3 s (then 2 s more) for its calls to end
 			// (GrpcUtil.shutdownManagedChannel, see RatisContractTest), and a frozen leader ends none, so done here it
 			// would hold this attempt's failure, and the resend to the next leader, that long.
-			resetConnection(rpc, leader, ex);
+			resetConnection(rpc, leader, proxy, ex);
 			throw new CompletionException(ex);
 		} catch (RuntimeException ex) {
 			// The proxy threw instead of failing the call: it is broken, and Ratis would keep it (it resets a proxy only
 			// on connection errors), so every later attempt to this peer would fail the same way. Seen with a proxy
 			// whose metric interceptor has no registry (R8-4, see resetBrokenProxy). Replaced like a failed connection.
-			resetBrokenProxy(rpc, leader, ex);
+			resetBrokenProxy(rpc, leader, proxy, ex);
 			throw new CompletionException(ex);
 		} finally {
 			permits.release(weight);
@@ -1385,10 +1387,15 @@ final class Proposer implements Closeable {
 	 * that failed (bounded by {@link #RESET_REMOVAL_WAIT_NANOS}). So a resend to the same peer right after takes a new
 	 * channel, and is not sent on the old one that the reset then closes under it; attempts to other peers never
 	 * waited for the close (the map's lock is not held meanwhile).
+	 *
+	 * <p>{@code failed} is the proxy the attempt was sent on, read before the call (null if unknown: then the one in the
+	 * map now). If the map no longer holds it, another attempt that failed on it already replaced it, and the proxy now
+	 * in the map is that replacement: it is kept (R9-2). Without this, attempts in flight on one broken proxy, which all
+	 * fail together, would each reset the proxy of the one before, closing healthy channels under their resends.</p>
 	 */
-	static void resetConnection(RaftClientRpc rpc, RaftPeerId peer, IOException error) {
+	static void resetConnection(RaftClientRpc rpc, RaftPeerId peer, @Nullable Object failed, IOException error) {
 		// Ratis' proxy map resets on these errors only (PeerProxyMap.handleException with reconnect false).
-		reset(rpc, peer, error, IOUtils.shouldReconnect(error));
+		reset(rpc, peer, failed, error, IOUtils.shouldReconnect(error));
 	}
 
 	/**
@@ -1401,15 +1408,24 @@ final class Proposer implements Closeable {
 	 * connection error. {@link #resetConnection} closes old proxies while new ones are made, so this node can meet it
 	 * after a leader loss ({@code RatisContractTest.aProxyMadeWhileTheOneBeforeItClosesCanGetNoMetricRegistry}).
 	 */
-	static void resetBrokenProxy(RaftClientRpc rpc, RaftPeerId peer, RuntimeException error) {
-		reset(rpc, peer, error, true);
+	static void resetBrokenProxy(RaftClientRpc rpc, RaftPeerId peer, @Nullable Object failed, RuntimeException error) {
+		reset(rpc, peer, failed, error, true);
 	}
 
-	private static void reset(RaftClientRpc rpc, RaftPeerId peer, Exception error, boolean reconnect) {
-		Object failed = reconnect ? currentProxy(rpc, peer) : null;
+	private static void reset(RaftClientRpc rpc, RaftPeerId peer, @Nullable Object sentOn, Exception error,
+			boolean reconnect) {
+		Object failed = !reconnect ? null : sentOn != null ? sentOn : currentProxy(rpc, peer);
+		if (failed != null && currentProxy(rpc, peer) != failed) {
+			// Already replaced by another attempt that failed on it: the proxy in the map is a new one (R9-2).
+			return;
+		}
 		Thread.ofVirtual().name("rockserver-propose-reset-" + peer).start(() -> {
 			try {
-				rpc.handleException(peer, error, reconnect);
+				// Checked again here, just before the reset: Ratis' map has no compare-and-remove, so a reset by another
+				// attempt between this check and the removal can still replace one healthy proxy (a narrow window).
+				if (failed == null || currentProxy(rpc, peer) == failed) {
+					rpc.handleException(peer, error, reconnect);
+				}
 			} catch (RuntimeException ex) {
 				LoggerFactory.getLogger(Proposer.class).debug("Could not reset the connection to {}", peer, ex);
 			}

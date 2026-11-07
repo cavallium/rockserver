@@ -22,7 +22,7 @@ import org.junit.jupiter.api.Test;
 /**
  * DD-4: {@link Proposer#resetConnection} returns once Ratis took the failed proxy out of its map, before the old channel
  * closed (which waits up to 3 s for a frozen peer), so a resend to the same peer gets a new proxy instead of the one
- * being closed.
+ * being closed. R9-2: it replaces only the proxy the attempt was sent on.
  */
 class ProposerResetTest {
 
@@ -70,7 +70,7 @@ class ProposerResetTest {
 			rpc.addRaftPeers(List.of(RaftPeer.newBuilder().setId(PEER).setAddress("127.0.0.1:1").build()));
 			var failed = proxies.getProxy(PEER);
 			long start = System.nanoTime();
-			Proposer.resetConnection(rpc, PEER, new TimeoutIOException("attempt timed out"));
+			Proposer.resetConnection(rpc, PEER, failed, new TimeoutIOException("attempt timed out"));
 			long millis = (System.nanoTime() - start) / 1_000_000;
 			assertTrue(millis < 1_000, () -> "took " + millis + " ms");
 			var resend = proxies.getProxy(PEER);
@@ -93,8 +93,37 @@ class ProposerResetTest {
 		try {
 			rpc.addRaftPeers(List.of(RaftPeer.newBuilder().setId(PEER).setAddress("127.0.0.1:1").build()));
 			var kept = proxies.getProxy(PEER);
-			Proposer.resetConnection(rpc, PEER, new IOException("not a connection error"));
+			Proposer.resetConnection(rpc, PEER, kept, new IOException("not a connection error"));
 			assertSame(kept, proxies.getProxy(PEER));
+		} finally {
+			release.countDown();
+		}
+	}
+
+	/**
+	 * R9-2: attempts in flight on one broken proxy fail together. The first one's reset replaces it; the later ones,
+	 * sent on the same proxy, must not reset (and close) the replacement, which the resends already use.
+	 */
+	@Test
+	void attemptsThatFailedOnAReplacedProxyKeepItsReplacement() throws Exception {
+		var release = new CountDownLatch(1);
+		var proxies = new PeerProxyMap<SlowProxy>("test", _ -> new SlowProxy(release));
+		var rpc = new Rpc(proxies);
+		try {
+			rpc.addRaftPeers(List.of(RaftPeer.newBuilder().setId(PEER).setAddress("127.0.0.1:1").build()));
+			var broken = proxies.getProxy(PEER);
+			Proposer.resetBrokenProxy(rpc, PEER, broken, new NullPointerException("first attempt"));
+			var replacement = proxies.getProxy(PEER);
+			assertNotSame(broken, replacement);
+			for (int i = 0; i < 3; i++) {
+				Proposer.resetBrokenProxy(rpc, PEER, broken, new NullPointerException("a later attempt on the same proxy"));
+				Proposer.resetConnection(rpc, PEER, broken, new TimeoutIOException("a later attempt on the same proxy"));
+			}
+			release.countDown();
+			// The reset threads that would have closed it have had their time.
+			Thread.sleep(200);
+			assertSame(replacement, proxies.getProxy(PEER), "the replacement was kept");
+			assertFalse(replacement.closing.getCount() == 0, "the replacement was not closed");
 		} finally {
 			release.countDown();
 		}
