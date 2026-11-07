@@ -170,6 +170,18 @@ final class MembershipFacts {
 		return applied;
 	}
 
+	/**
+	 * The node's own facts for {@link RemovalRule#decide}: {@code self}, its committed and latest configurations, the
+	 * terms of its log, whether its latest configuration is stale ({@link Entry#OTHER}), and whether it was a voter once.
+	 */
+	static RemovalRule.Own own(RaftServer.Division division, CommittedConfigurations history, String self,
+			boolean seeded, boolean memberFile) {
+		var conf = division.getRaftConf();
+		return new RemovalRule.Own(self, committed(division, history), latest(division, history),
+				index -> termAt(division, index), seeded, memberFile,
+				conf.getLogEntryIndex() >= 0 && entry(division, conf) == Entry.OTHER);
+	}
+
 	/** What {@code division}'s log says about the entry ({@code term}, {@code index}). */
 	static Probe probe(RaftServer.Division division, CommittedConfigurations history, long term, long index) {
 		if (term <= RemovalRule.UNKNOWN_TERM || index < 0) {

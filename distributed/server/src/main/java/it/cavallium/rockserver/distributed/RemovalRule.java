@@ -158,7 +158,10 @@ final class RemovalRule {
 		INCONSISTENT(Outcome.UNDECIDED),
 		/** No committed configuration known: nobody answered, and this node applied none. */
 		NO_COMMITTED_CONFIGURATION(Outcome.UNDECIDED),
-		/** The node's own log has a later configuration that includes it and may still commit: an add in flight. */
+		/**
+		 * The node's own log has a later configuration that includes it and may still commit: normally an add in flight,
+		 * or a configuration a leader appended just before it lost leadership.
+		 */
 		OWN_LATER_CONFIGURATION(Outcome.UNDECIDED),
 		/**
 		 * K* known only from members that predate {@code Configuration2}: they tell no terms, and their committed flag
@@ -274,9 +277,14 @@ final class RemovalRule {
 		if (!own.seeded() && !own.memberFile()) {
 			return new Verdict(Reason.NOT_ADDED, kStar, List.of(), List.of(), pending, unreachable, "");
 		}
-		// 4. Its own log: a later configuration that includes it, and may still commit.
+		// 4. Its own log: a later configuration that includes it, and may still commit. A latest configuration with no
+		// known term that is not in its own log at all (past its end: Ratis took it from a snapshot install's
+		// raft-meta.conf; or another entry at its index: stale, finding 1) does not block by itself (R12-3): it can
+		// commit only through a majority of K*'s new half, which step 5 sees.
 		long termAtKStar = own.termAt().applyAsLong(iStar);
-		if (ownLatest != null && ownLatest.index() > iStar && ownLatest.holds(self)) {
+		boolean outsideOwnLog = ownLatest != null && !ownLatest.termKnown()
+				&& (own.latestStale() || own.termAt().applyAsLong(ownLatest.index()) == BEYOND);
+		if (ownLatest != null && ownLatest.index() > iStar && ownLatest.holds(self) && !outsideOwnLog) {
 			boolean otherBranch = kStar.termKnown() && termAtKStar > 0 && termAtKStar != kStar.term();
 			boolean olderTerm = kStar.termKnown() && ownLatest.termKnown() && ownLatest.term() < kStar.term();
 			if (!otherBranch && !olderTerm) {

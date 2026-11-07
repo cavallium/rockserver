@@ -768,7 +768,10 @@ public final class ReplicatedNode implements AutoCloseable {
 					+ " upgrade them. Until then, judge with status on a member";
 			case MEMBER_LATER_CONFIGURATION -> "Normally clears within seconds. If it persists, the blocking members are"
 					+ " stuck or were removed themselves: look at their logs and status";
-			case OWN_LATER_CONFIGURATION -> "An add of this node is in flight: let add-peer finish";
+			case OWN_LATER_CONFIGURATION -> "Its own log holds a later configuration that includes it and may still"
+					+ " commit: normally an add of this node in flight (let add-peer finish), or a configuration a leader"
+					+ " appended just before it lost leadership, which clears once the next leader's configuration reaches"
+					+ " this node. If it persists while a leader runs, check status on a member";
 			case INCONSISTENT -> "A bug, or a data directory restored from elsewhere: do not wipe anything, collect the"
 					+ " logs of every node";
 			case HEARD_LEADER -> "A leader sent this node a request during the check: it is checked again if it hears no"
@@ -797,9 +800,7 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	/** This node's own facts for {@link RemovalRule#decide}. */
 	private RemovalRule.Own ownFacts(RaftServer.Division division) {
-		var history = stateMachine.configurations();
-		return new RemovalRule.Own(config.nodeId(), MembershipFacts.committed(division, history),
-				MembershipFacts.latest(division, history), index -> MembershipFacts.termAt(division, index), !config.join(),
+		return MembershipFacts.own(division, stateMachine.configurations(), config.nodeId(), !config.join(),
 				Files.exists(config.raftDir().resolve(MEMBER_FILE)));
 	}
 

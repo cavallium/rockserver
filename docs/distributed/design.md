@@ -1636,8 +1636,10 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   in its configuration, stop it, wipe it, start it with `--join` and run `add-peer`. NEEDS_TERM, upgrade the named
   members (their version tells no terms, and their committed flag does not confirm a removal by itself); until then
   judge with `status`. MEMBER_LATER_CONFIGURATION, normally clears within seconds; if it persists,
-  the named member is stuck or was removed itself. OWN_LATER_CONFIGURATION, an add of this node is in flight: let it
-  finish. NOT_ADDED, run `add-peer`; if the add was abandoned, or the node was added and removed long ago, stop it and
+  the named member is stuck or was removed itself. OWN_LATER_CONFIGURATION, its own log holds a later configuration
+  that includes it and may still commit: normally an add of this node in flight (let `add-peer` finish), or a
+  configuration a leader appended just before it lost leadership, which clears once the next leader's configuration
+  reaches this node; if it persists while a leader runs, check `status` on a member. NOT_ADDED, run `add-peer`; if the add was abandoned, or the node was added and removed long ago, stop it and
   wipe it (`add-peer` refuses a node that has a log). INCONSISTENT, a bug or a data directory restored from elsewhere:
   wipe nothing, collect the logs.
 
@@ -1650,7 +1652,12 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   holds F unapplied, its log holds K* (a leader that holds K* brought it up to date), and step 4 finds a later
   configuration of its own that holds it. If it does not hold F, the data directory was made for this add (`add-peer`
   refuses a node that has a log), so it was never a voter: NOT_ADDED. A configuration that may still commit in a
-  member's log is excluded by step 5, in the node's own log by step 4. The majority of K*'s new half matters because
+  member's log is excluded by step 5, in the node's own log by step 4. A configuration Ratis took from a snapshot
+  install, past the end of the node's own log and with no known term, does not block by itself, nor does a stale one
+  over another entry of its log (R12-3): neither is in the node's log, and it can commit only through a majority of
+  K*'s new half, which step 5 sees (a confirmer that held it would have it, or a successor that holds the node, as
+  its latest configuration, since Ratis starts a new change only after the current one is committed and a term-start
+  entry copies the new half; and neither exclusion of step 5 applies to a member that holds K* before it). The majority of K*'s new half matters because
   every configuration after K* needs a majority of K*'s new half to commit (the joint one after a stable K* has K*'s new
   half as its old half; the one after a joint K* is its new half), and that majority meets the confirmers. Answers come
   at different times over a round, so the guarantee is: no configuration that includes the node commits during the
