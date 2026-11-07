@@ -5,6 +5,7 @@ import java.nio.file.Path;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiPredicate;
+import java.util.function.ToLongBiFunction;
 import java.util.function.ToLongFunction;
 import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.proto.grpc.RaftServerProtocolServiceGrpc;
@@ -31,7 +32,11 @@ import org.slf4j.LoggerFactory;
  * <p>Installed on the Raft gRPC server as an interceptor (through {@link TermService#customizer}); it reads the
  * method name, and forwards every message unchanged, but for snapshot chunks. A chunk whose leader's term is below the
  * node's current term (a deposed leader's) it answers NOT_LEADER itself, as Ratis would, since Ratis would still take
- * that chunk's configuration (round 15 review, N-R15-1). Before it forwards any other chunk, it records the chunk's
+ * that chunk's configuration (round 15 review, N-R15-1). A chunk whose configuration is older than the node's newest
+ * committed one, or than the newest configuration in its log of the chunk's leader term, comes from an install stream
+ * its leader gave up on (R16-2): it fails that stream with
+ * FAILED_PRECONDITION, since Ratis would answer it ALREADY_INSTALLED, or install it, and take its configuration either
+ * way. Before it forwards any other chunk, it records the chunk's
  * configuration with the leader's term ({@link InstalledConfiguration}, round-13 review, finding 1), whatever its term:
  * Ratis takes the configuration of a chunk it rejects too (round 15), and the node's term may rise between this check
  * and Ratis'. If the record cannot be written, it fails the install stream with UNAVAILABLE instead of forwarding the
@@ -59,15 +64,42 @@ final class RaftTraffic implements ServerInterceptor {
 	 * index it learns, a snapshot install from its first chunk). Static, for in-process clusters.
 	 */
 	static volatile @Nullable BiPredicate<String, Object> dropForTesting;
+	/**
+	 * Tests only: the current term that node {@code receiver} sees for a snapshot chunk, instead of its division's;
+	 * {@link #NO_TERM}: its division's. Static, for in-process clusters.
+	 */
+	static volatile @Nullable ToLongBiFunction<String, RaftProtos.InstallSnapshotRequestProto> termForTesting;
+	/**
+	 * Tests only: the record of a snapshot chunk's configuration at node {@code receiver} fails when it returns true, as
+	 * a write error would. Static, for in-process clusters.
+	 */
+	static volatile @Nullable BiPredicate<String, RaftProtos.InstallSnapshotRequestProto> recordFailureForTesting;
 
 	/** What the current-term function answers when it does not know the term. */
 	static final long NO_TERM = -1;
+	/** What the configuration floor answers when it knows no floor. */
+	static final long NO_INDEX = -1;
+
+	/**
+	 * The index below which a snapshot chunk's configuration shows a stream its leader gave up on (R16-2): see
+	 * {@link MembershipFacts#installFloor}.
+	 */
+	@FunctionalInterface
+	interface ConfigurationFloor {
+		/**
+		 * The floor for a chunk of a leader of {@code leaderTerm} to this node's division of {@code group}, {@link #NO_INDEX}
+		 * if none is known (no such division, or the server is not built yet).
+		 */
+		long floor(RaftGroupId group, long leaderTerm);
+	}
 
 	private final String nodeId;
 	/** Where {@link InstalledConfiguration} is kept: the Raft directory; null: not recorded (tests). */
 	private final @Nullable Path raftDir;
 	/** See the constructor. */
 	private final ToLongFunction<RaftGroupId> currentTerm;
+	/** See the constructor. */
+	private final ConfigurationFloor configurationFloor;
 	private final NodeMetrics.@Nullable Series recordFailures;
 	/** {@link System#nanoTime} of the last leader request, 0 if none yet. */
 	private final AtomicLong lastLeaderRequestNanos = new AtomicLong();
@@ -87,9 +119,21 @@ final class RaftTraffic implements ServerInterceptor {
 	 */
 	RaftTraffic(String nodeId, @Nullable Path raftDir, ToLongFunction<RaftGroupId> currentTerm,
 			NodeMetrics.@Nullable Series recordFailures) {
+		this(nodeId, raftDir, currentTerm, (_, _) -> NO_INDEX, recordFailures);
+	}
+
+	/**
+	 * @param currentTerm the current term of this node's division of a group, {@link #NO_TERM} if unknown (no such
+	 *     division, or the server is not built yet)
+	 * @param configurationFloor the index below which a chunk's configuration shows an abandoned stream (R16-2)
+	 * @param recordFailures counts the chunks whose configuration could not be recorded (null: not counted)
+	 */
+	RaftTraffic(String nodeId, @Nullable Path raftDir, ToLongFunction<RaftGroupId> currentTerm,
+			ConfigurationFloor configurationFloor, NodeMetrics.@Nullable Series recordFailures) {
 		this.nodeId = nodeId;
 		this.raftDir = raftDir;
 		this.currentTerm = currentTerm;
+		this.configurationFloor = configurationFloor;
 		this.recordFailures = recordFailures;
 	}
 
@@ -129,6 +173,11 @@ final class RaftTraffic implements ServerInterceptor {
 				long term = NO_TERM;
 				if (serialized != null && message instanceof RaftProtos.InstallSnapshotRequestProto request) {
 					term = termOf(request);
+					var termHook = termForTesting;
+					if (termHook != null) {
+						long tested = termHook.applyAsLong(nodeId, request);
+						term = tested != NO_TERM ? tested : term;
+					}
 					if (term != NO_TERM && request.getLeaderTerm() < term) {
 						// A deposed leader's chunk (R15 review, N-R15-1): Ratis would answer NOT_LEADER too, but still
 						// drop its configurations from the chunk's index on and take the chunk's. Terms only grow, so
@@ -136,6 +185,24 @@ final class RaftTraffic implements ServerInterceptor {
 						// request, and not recorded: Ratis never sees it.
 						serialized.reply(notLeader(request, term));
 						call.request(1);
+						return;
+					}
+				}
+				if (serialized != null && message instanceof RaftProtos.InstallSnapshotRequestProto request
+						&& request.hasLastRaftConfigurationLogEntryProto()) {
+					long index = request.getLastRaftConfigurationLogEntryProto().getIndex();
+					long floor = floorOf(request);
+					if (floor != NO_INDEX && index < floor) {
+						// R16-2: a leader sends its latest configuration, whose index is at least that of every
+						// committed one and of every configuration it appended in its term, so this chunk comes from
+						// a stream its leader gave up on (delayed behind a later stream and the appends that brought
+						// the newer configuration). Ratis would answer it ALREADY_INSTALLED, or install it, and take
+						// its configuration either way, dropping the later ones. Its leader no longer waits on it.
+						LOG.warn("{}: a snapshot chunk of term {} carries the configuration at index {}, older than the"
+								+ " one at {} that its leader already holds: failing its install stream, which its leader"
+								+ " gave up on", nodeId, request.getLeaderTerm(), index, floor);
+						fail(Status.FAILED_PRECONDITION.withDescription("the configuration of the chunk, at index " + index
+								+ ", is older than the one at " + floor + " that its leader already holds"));
 						return;
 					}
 				}
@@ -154,6 +221,10 @@ final class RaftTraffic implements ServerInterceptor {
 			private boolean recordOrFail(RaftProtos.InstallSnapshotRequestProto request, long term) {
 				{
 					try {
+						var failHook = recordFailureForTesting;
+						if (failHook != null && failHook.test(nodeId, request)) {
+							throw new IOException("recordFailureForTesting");
+						}
 						InstalledConfiguration.record(Objects.requireNonNull(raftDir),
 								term == NO_TERM ? Long.MAX_VALUE : term, request);
 					} catch (IOException | RuntimeException ex) {
@@ -166,14 +237,18 @@ final class RaftTraffic implements ServerInterceptor {
 						if (recordFailures != null) {
 							recordFailures.record(1);
 						}
-						failed = true;
-						Objects.requireNonNull(serialized).close(Status.UNAVAILABLE.withDescription(
-								"cannot record the configuration of a snapshot chunk in " + file).withCause(ex),
-								new Metadata());
+						fail(Status.UNAVAILABLE.withDescription("cannot record the configuration of a snapshot chunk in "
+								+ file).withCause(ex));
 						return false;
 					}
 				}
 				return true;
+			}
+
+			/** Fails the install stream: no later message of it reaches Ratis, and its end reaches Ratis as a cancel. */
+			private void fail(Status status) {
+				failed = true;
+				Objects.requireNonNull(serialized).close(status, new Metadata());
 			}
 
 			@Override
@@ -208,6 +283,19 @@ final class RaftTraffic implements ServerInterceptor {
 			return currentTerm.applyAsLong(RaftGroupId.valueOf(request.getServerRequest().getRaftGroupId().getId()));
 		} catch (RuntimeException e) {
 			return NO_TERM;
+		}
+	}
+
+	/** The {@link ConfigurationFloor} of the division the chunk is for, {@link #NO_INDEX} if unknown. */
+	private long floorOf(RaftProtos.InstallSnapshotRequestProto request) {
+		if (!request.hasServerRequest() || !request.getServerRequest().hasRaftGroupId()) {
+			return NO_INDEX;
+		}
+		try {
+			return configurationFloor.floor(RaftGroupId.valueOf(request.getServerRequest().getRaftGroupId().getId()),
+					request.getLeaderTerm());
+		} catch (RuntimeException e) {
+			return NO_INDEX;
 		}
 	}
 

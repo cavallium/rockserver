@@ -140,7 +140,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		this.config = config;
 		this.metrics = new NodeMetrics(config.nodeId());
 		this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir(), this::currentTerm,
-				metrics.amount("install.recordFailures"));
+				this::installFloor, metrics.amount("install.recordFailures"));
 		Files.createDirectories(config.dbDir().getParent());
 		Files.createDirectories(config.raftDir());
 		requireSameFileSystem(config.raftDir(), config.dbDir().getParent());
@@ -312,6 +312,29 @@ public final class ReplicatedNode implements AutoCloseable {
 		} catch (IOException | RuntimeException e) {
 			return RaftTraffic.NO_TERM;
 		}
+	}
+
+	/**
+	 * The {@link MembershipFacts#installFloor} of this node's division of {@code requested} for a chunk of a leader of
+	 * {@code leaderTerm}, {@link RaftTraffic#NO_INDEX} if none is known, the server is not built yet, or the group is
+	 * another one or not started: for {@link RaftTraffic} (R16-2). Package-private for {@code InstallStreamTest}.
+	 */
+	long installFloor(RaftGroupId requested, long leaderTerm) {
+		var raftServer = this.server;
+		if (raftServer == null || group == null || !requested.equals(group.getGroupId())) {
+			return RaftTraffic.NO_INDEX;
+		}
+		try {
+			return MembershipFacts.installFloor(raftServer.getDivision(requested), stateMachine.configurations(),
+					leaderTerm);
+		} catch (IOException | RuntimeException e) {
+			return RaftTraffic.NO_INDEX;
+		}
+	}
+
+	/** The interceptor of this node's Raft traffic: for {@code InstallStreamTest}. */
+	RaftTraffic raftTraffic() {
+		return raftTraffic;
 	}
 
 	/**

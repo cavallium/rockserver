@@ -230,4 +230,71 @@ class RaftTrafficTest {
 				new Conf(RemovalRule.UNKNOWN_TERM, 40, ABX, List.of())));
 		assertEquals(null, call.closed);
 	}
+
+	/**
+	 * R16-2: a chunk of the current term whose configuration is older than the node's newest committed one (a delayed
+	 * chunk of an install stream its leader gave up on, answered ALREADY_INSTALLED by Ratis, which would still drop the
+	 * later configurations and take the chunk's) fails its stream: Ratis never sees it, and its end reaches Ratis as a
+	 * cancel. A chunk of the same configuration, or of a later one, is forwarded.
+	 */
+	@Test
+	void aChunkOfAConfigurationOlderThanTheCommittedOneFailsTheStream(@TempDir Path raftDir) throws Exception {
+		var traffic = new RaftTraffic("n1", raftDir, _ -> 5,
+				(group, _) -> group.equals(GROUP) ? 40 : RaftTraffic.NO_INDEX, null);
+		var call = installCall();
+		var handler = new FakeHandler<RaftProtos.InstallSnapshotRequestProto, RaftProtos.InstallSnapshotReplyProto>();
+		var listener = traffic.interceptCall(call, new Metadata(), handler);
+		listener.onMessage(chunk(5, 30, ABX));
+		assertNotNull(call.closed, () -> "the stream is not failed: " + call.events);
+		assertTrue(handler.messages.isEmpty(), "the chunk reached Ratis");
+		assertEquals(RemovalRule.UNKNOWN_TERM, InstalledConfiguration.boundOf(InstalledConfiguration.read(raftDir),
+				new Conf(RemovalRule.UNKNOWN_TERM, 30, ABX, List.of())));
+		listener.onComplete();
+		assertEquals(List.of("cancel"), List.copyOf(handler.ends));
+
+		var current = installCall();
+		var currentHandler = new FakeHandler<RaftProtos.InstallSnapshotRequestProto,
+				RaftProtos.InstallSnapshotReplyProto>();
+		var currentListener = traffic.interceptCall(current, new Metadata(), currentHandler);
+		currentListener.onMessage(chunk(5, 40, ABX));
+		currentListener.onMessage(chunk(5, 41, ABX));
+		assertEquals(2, currentHandler.messages.size());
+		assertEquals(null, current.closed);
+	}
+
+	/**
+	 * R16 review, finding 1: the floor is also the newest configuration of the chunk's leader term, committed or not
+	 * ({@link MembershipFacts#installFloor}): a delayed chunk of an abandoned stream that arrives after the same leader's
+	 * appends brought a later configuration, before the node learns it is committed, fails its stream. A configuration of
+	 * another term, or of no known term, gives no floor beyond the committed one.
+	 */
+	@Test
+	void theFloorIsTheNewestConfigurationOfTheLeadersTermCommittedOrNot(@TempDir Path raftDir) throws Exception {
+		var committed = new Conf(4, 40, ABX, List.of());
+		var latest = new Conf(5, 50, List.of("a", "b", "x", "y"), List.of());
+		assertEquals(50, MembershipFacts.installFloor(committed, latest, 5));
+		assertEquals(50, MembershipFacts.installFloor(null, latest, 5));
+		assertEquals(40, MembershipFacts.installFloor(committed, latest, 6), "a later leader may not hold it");
+		assertEquals(40, MembershipFacts.installFloor(committed,
+				new Conf(RemovalRule.UNKNOWN_TERM, 50, ABX, List.of()), 5), "a configuration of no known term");
+		assertEquals(RaftTraffic.NO_INDEX, MembershipFacts.installFloor(null,
+				new Conf(4, 40, ABX, List.of()), 5));
+		assertEquals(40, MembershipFacts.installFloor(committed, committed, 4));
+
+		var traffic = new RaftTraffic("n1", raftDir, _ -> 5,
+				(_, leaderTerm) -> MembershipFacts.installFloor(committed, latest, leaderTerm), null);
+		var call = installCall();
+		var handler = new FakeHandler<RaftProtos.InstallSnapshotRequestProto, RaftProtos.InstallSnapshotReplyProto>();
+		var listener = traffic.interceptCall(call, new Metadata(), handler);
+		listener.onMessage(chunk(5, 45, ABX));
+		assertNotNull(call.closed, () -> "the stream is not failed: " + call.events);
+		assertTrue(handler.messages.isEmpty(), "the chunk reached Ratis");
+
+		var live = installCall();
+		var liveHandler = new FakeHandler<RaftProtos.InstallSnapshotRequestProto, RaftProtos.InstallSnapshotReplyProto>();
+		var liveListener = traffic.interceptCall(live, new Metadata(), liveHandler);
+		liveListener.onMessage(chunk(5, 50, latest.newHalf()));
+		assertEquals(1, liveHandler.messages.size());
+		assertEquals(null, live.closed);
+	}
 }

@@ -17,12 +17,16 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.IntConsumer;
 import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
+import org.apache.ratis.protocol.GroupInfoReply;
 import org.apache.ratis.protocol.exceptions.ReconfigurationInProgressException;
 import org.apache.ratis.protocol.exceptions.SetConfigurationException;
 import org.apache.ratis.retry.RetryPolicies;
@@ -653,8 +657,8 @@ public final class ReplicatedServerMain {
 		return results;
 	}
 
-	/** The leader's settled configuration, as {@code admin} read it. */
-	record Membership(String leader, List<RaftPeer> servers, List<RaftPeer> listeners) {}
+	/** The leader's settled configuration, as {@code admin} read it, with the term the leader reported. */
+	record Membership(String leader, long term, List<RaftPeer> servers, List<RaftPeer> listeners) {}
 
 	/**
 	 * Proposes the configuration with voters {@code target} (and the listeners of the leader's configuration) as a
@@ -670,10 +674,9 @@ public final class ReplicatedServerMain {
 			String refusalMessage = null;
 			while (true) {
 				var current = leaderConfiguration(infoClient, peers, groupId, deadlineNanos);
-				if (refusedOn != null && sameMembers(refusedOn, current)) {
-					// Not a lost race: Ratis refused for a reason that a re-read does not change (for one, "changes a
-					// majority set": the new members are at least as many as the kept ones).
-					fail("the leader refused, and its configuration did not change since: " + refusalMessage);
+				var standing = standingRefusal(refusedOn, refusalMessage, current);
+				if (standing != null) {
+					fail(standing);
 				}
 				refusedOn = null;
 				var change = VoterChange.between(current.servers(), target);
@@ -740,6 +743,24 @@ public final class ReplicatedServerMain {
 		}
 	}
 
+	/**
+	 * The failure of {@link #changeVoters} after the leader refused a change on {@code refusedOn} with
+	 * {@code refusalMessage} and the configuration was read again as {@code current}; null (null {@code refusedOn}: no
+	 * refusal) if it goes on. It fails only if the same leader, in the same term, answers with the same members: not a
+	 * lost race, a refusal that a re-read does not change (for one, "changes a majority set": the new members are at
+	 * least as many as the kept ones). Another leader, or the same one in another term, may be the real leader that a
+	 * deposed one's answer hid (R16-1): asked again.
+	 */
+	static @Nullable String standingRefusal(@Nullable Membership refusedOn, @Nullable String refusalMessage,
+			Membership current) {
+		if (refusedOn == null || !refusedOn.leader().equals(current.leader()) || refusedOn.term() != current.term()
+				|| !sameMembers(refusedOn, current)) {
+			return null;
+		}
+		return "the leader " + current.leader() + " (term " + current.term() + ") refused, and its configuration did not"
+				+ " change since: " + refusalMessage + ". If the leader changes, run the command again";
+	}
+
 	/** Whether {@code a} and {@code b} have the same voters and listeners, by id (as Ratis' compare-and-set compares). */
 	private static boolean sameMembers(Membership a, Membership b) {
 		return VoterChange.ids(a.servers()).equals(VoterChange.ids(b.servers()))
@@ -797,32 +818,28 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
-	 * Asks the members of {@code --peer} until one answers as the leader with a settled (not joint) configuration: a
-	 * joint one means a change is under way, which it waits for. Fails at the deadline.
+	 * Asks the members of {@code --peer} until their answers settle on a leader with a settled (not joint)
+	 * configuration ({@link #settle}): a joint one means a change is under way, which it waits for. Fails at the deadline.
 	 */
 	private static Membership leaderConfiguration(RaftClient infoClient, List<PeerConfig> peers, RaftGroupId groupId,
 			long deadlineNanos) throws InterruptedException {
 		String waitingFor = "an answer of a member";
 		while (true) {
-			for (PeerConfig peer : peers) {
+			// Down, or not in the group: the others answer.
+			var answers = askAll(peers, peer -> {
 				try {
-					var info = infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId);
-					var conf = info.getConf().orElse(null);
-					if (info.getRoleInfoProto().getRole() != RaftPeerRole.LEADER || conf == null) {
-						waitingFor = "a leader (" + peer.id() + " is " + info.getRoleInfoProto().getRole() + ")";
-						continue;
-					}
-					if (conf.getOldPeersCount() > 0 || conf.getOldListenersCount() > 0) {
-						waitingFor = "the change under way on leader " + peer.id() + " (voters "
-								+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getOldPeersList())) + " to "
-								+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getPeersList())) + ")";
-						continue;
-					}
-					return new Membership(peer.id(), ProtoUtils.toRaftPeers(conf.getPeersList()),
-							ProtoUtils.toRaftPeers(conf.getListenersList()));
-				} catch (IOException | RuntimeException unanswered) {
-					// Down, or not in the group: the others are asked.
+					return MemberAnswer.of(peer.id(),
+							infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId));
+				} catch (IOException unanswered) {
+					return null;
 				}
+			});
+			if (!answers.isEmpty()) {
+				var settled = settle(answers);
+				if (settled.membership() != null) {
+					return settled.membership();
+				}
+				waitingFor = settled.waitingFor();
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
 				fail("no result within the time limit (--timeout-ms): still waiting for " + waitingFor
@@ -830,6 +847,93 @@ public final class ReplicatedServerMain {
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
 		}
+	}
+
+	/**
+	 * Asks every one of {@code peers} at once ({@code ask}, which may block for its request timeout), and returns the
+	 * answers in their order, without the null ones and those that failed: a down or unroutable member costs one request
+	 * timeout per round, not one each (nit of the R16 review).
+	 */
+	static <T> List<T> askAll(List<PeerConfig> peers, Function<PeerConfig, @Nullable T> ask) throws InterruptedException {
+		try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+			var asked = peers.stream().map(peer -> CompletableFuture.supplyAsync(() -> ask.apply(peer), executor))
+					.toList();
+			var answers = new ArrayList<T>();
+			for (var answer : asked) {
+				try {
+					var value = answer.get();
+					if (value != null) {
+						answers.add(value);
+					}
+				} catch (ExecutionException unanswered) {
+					// Failed: the others answer.
+				}
+			}
+			return answers;
+		}
+	}
+
+	/**
+	 * One member's answer to {@link #leaderConfiguration}: its role, its term if it leads ({@code leaderTerm}, else 0),
+	 * the term of the last entry of its log (0 if none), and its configuration (null if it sent none).
+	 */
+	record MemberAnswer(String id, RaftPeerRole role, long leaderTerm, long lastEntryTerm,
+			RaftProtos.@Nullable RaftConfigurationProto conf) {
+		static MemberAnswer of(String id, GroupInfoReply info) {
+			var role = info.getRoleInfoProto();
+			var log = info.getLogInfoProto();
+			return new MemberAnswer(id, role.getRole(),
+					role.getRole() == RaftPeerRole.LEADER && role.hasLeaderInfo() ? role.getLeaderInfo().getTerm() : 0,
+					log != null && log.hasLastEntry() ? log.getLastEntry().getTerm() : 0, info.getConf().orElse(null));
+		}
+	}
+
+	/** What the answers of one round settle on: the leader's configuration, or (null) what is still waited for. */
+	record Settled(@Nullable Membership membership, String waitingFor) {}
+
+	/**
+	 * The leader's configuration that {@code answers} (one round, every member that answered) settle on (R16-1): the
+	 * answer of the LEADER of the highest term, and only if no member shows a higher term, as the term of its last
+	 * entry (a leader's term is in its answer, a follower's is not). A deposed leader keeps answering LEADER until it
+	 * checks its leadership (about an election timeout), with the configuration of its term: taken because it came
+	 * first in {@code --peer}, it made a valid change fail at once and printed stale voters. Waits if that leader is in
+	 * a change (a joint configuration), rather than settling on another leader's answer.
+	 */
+	static Settled settle(List<MemberAnswer> answers) {
+		MemberAnswer leader = null;
+		MemberAnswer highest = null;
+		String roles = "";
+		for (var answer : answers) {
+			if (answer.role() == RaftPeerRole.LEADER && answer.conf() != null
+					&& (leader == null || answer.leaderTerm() > leader.leaderTerm())) {
+				leader = answer;
+			}
+			if (highest == null || seenTerm(answer) > seenTerm(highest)) {
+				highest = answer;
+			}
+			roles += (roles.isEmpty() ? "" : ", ") + answer.id() + " is " + answer.role();
+		}
+		if (leader == null) {
+			return new Settled(null, "a leader (" + roles + ")");
+		}
+		if (highest != null && seenTerm(highest) > leader.leaderTerm()) {
+			return new Settled(null, "a leader of term " + seenTerm(highest) + " or later (" + leader.id()
+					+ " answers as the leader of term " + leader.leaderTerm() + ", but " + highest.id() + " shows term "
+					+ seenTerm(highest) + ")");
+		}
+		var conf = Objects.requireNonNull(leader.conf());
+		if (conf.getOldPeersCount() > 0 || conf.getOldListenersCount() > 0) {
+			return new Settled(null, "the change under way on leader " + leader.id() + " (voters "
+					+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getOldPeersList())) + " to "
+					+ VoterChange.ids(ProtoUtils.toRaftPeers(conf.getPeersList())) + ")");
+		}
+		return new Settled(new Membership(leader.id(), leader.leaderTerm(), ProtoUtils.toRaftPeers(conf.getPeersList()),
+				ProtoUtils.toRaftPeers(conf.getListenersList())), "");
+	}
+
+	/** The highest term {@code answer} shows: its leader term, or the term of its last entry. */
+	private static long seenTerm(MemberAnswer answer) {
+		return Math.max(answer.leaderTerm(), answer.lastEntryTerm());
 	}
 
 	/**
