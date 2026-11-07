@@ -66,7 +66,9 @@ majority and healthy (`status`).
    `--join` and a peer list that has the members that stay plus itself:
    `rs run --node-id n4 --peer n2=... --peer n3=... --peer n4=... --data-dir /srv/rockserver/data --join`.
    It prints `READY` and waits for as long as it takes.
-2. From any host, in one step, add `n4` and remove the lost node, by leaving it out of `--peer`:
+2. If the old node still runs (a move), stop it first and take it out of its supervisor: the step below changes two
+   nodes at once, which is safe only while the node that leaves cannot vote (see "Removed node" below).
+   From any host, in one step, add `n4` and remove the old node, by leaving it out of `--peer`:
    `rs admin --peer n2=... --peer n3=... --peer n4=... add-peer n4=10.0.0.4:9001/10.0.0.4:5333`.
    It ends with `OK` once `n4` caught up from a snapshot and the configuration changed (the limit, `--timeout-ms`, is
    10 minutes by default: raise it for a large database, about 100 MB/s).
@@ -113,6 +115,12 @@ start, `starting, not known to be a member`, with `Membership <reason> (K* ..., 
 | `MEMBER` (with `hears no leader`) | It is a member waiting for a leader; in Ratis' initializing state if it was started with `--join` and no node started without it. |
 
 `RestartPreventExitStatus=4` stays: a node that exited with 4 is removed, and a restart only repeats the check.
+
+`add-peer` and `remove-peer` build the new configuration from the `--peers` given to `admin`: give the cluster's
+current members (as `status` shows them). A call should change one running node: Ratis' first entry of a new leader
+keeps only the new half of a joint configuration and commits by it alone, so a change of several running nodes at
+once can lose committed entries if the leader changes in the middle (see the residuals of "Removal and waiting
+outside" in the design document). The replacement above changes two nodes, safely while the old one is stopped.
 
 ## Backups
 

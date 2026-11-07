@@ -230,7 +230,8 @@ connection ends a handshake in progress.
 
 To replace a node of a replicated cluster, start the new node first with `--join`, and run
 `admin --peer <the other members> add-peer <new node>` when you like: the node waits for it, also across restarts, and
-leaving the old node out of `--peer` replaces it in one step. See "Replacing a node" in the [design
+leaving the old node out of `--peer` replaces it in one step (stop the old node first if it still runs: that step
+changes two nodes, which is safe only while the one that leaves cannot vote). See "Replacing a node" in the [design
 document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
 without it), and see "Heap" there for the heap that a snapshot send needs. A removed node that is started again exits
 with 4 once a majority of the current configuration's members can confirm its removal; until they answer (they are
