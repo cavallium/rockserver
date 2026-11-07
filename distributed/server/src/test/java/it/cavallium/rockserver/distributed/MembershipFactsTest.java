@@ -9,20 +9,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import it.cavallium.rockserver.distributed.RemovalRule.Answer;
 import it.cavallium.rockserver.distributed.RemovalRule.Conf;
 import it.cavallium.rockserver.distributed.RemovalRule.Probe;
-import java.lang.reflect.Proxy;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import org.apache.ratis.proto.RaftProtos;
-import org.apache.ratis.protocol.RaftPeer;
-import org.apache.ratis.server.DivisionInfo;
-import org.apache.ratis.server.RaftConfiguration;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
-import org.apache.ratis.server.raftlog.LogEntryHeader;
-import org.apache.ratis.server.raftlog.RaftLog;
-import org.apache.ratis.util.LifeCycle;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -38,72 +31,19 @@ class MembershipFactsTest {
 	private static final List<String> ALL = List.of("n0", "n1", "n2", "n3", "x");
 	private static final List<String> WITHOUT_X = List.of("n0", "n1", "n2", "n3");
 
-	private static RaftPeer peer(String id) {
-		return RaftPeer.newBuilder().setId(id).build();
-	}
-
-	private static List<RaftPeer> peers(List<String> ids) {
-		return ids.stream().map(MembershipFactsTest::peer).toList();
-	}
-
 	private static RaftProtos.LogEntryProto configurationEntry(long term, long index, List<String> current,
 			List<String> previous) {
-		var conf = RaftProtos.RaftConfigurationProto.newBuilder();
-		peers(current).forEach(peer -> conf.addPeers(peer.getRaftPeerProto()));
-		peers(previous).forEach(peer -> conf.addOldPeers(peer.getRaftPeerProto()));
-		return RaftProtos.LogEntryProto.newBuilder().setTerm(term).setIndex(index).setConfigurationEntry(conf).build();
+		return ModelDivision.configurationEntry(term, index, current, previous);
 	}
 
 	private static RaftProtos.LogEntryProto ordinaryEntry(long term, long index) {
-		return RaftProtos.LogEntryProto.newBuilder().setTerm(term).setIndex(index)
-				.setStateMachineLogEntry(RaftProtos.StateMachineLogEntryProto.getDefaultInstance()).build();
-	}
-
-	@SuppressWarnings("unchecked")
-	private static <T> T proxy(Class<T> type, java.util.function.BiFunction<String, Object[], Object> handler) {
-		return (T) Proxy.newProxyInstance(MembershipFactsTest.class.getClassLoader(), new Class<?>[] {type},
-				(_, method, args) -> switch (method.getName()) {
-					case "toString" -> type.getSimpleName();
-					case "hashCode" -> 0;
-					case "equals" -> false;
-					default -> handler.apply(method.getName(), args);
-				});
+		return ModelDivision.ordinaryEntry(term, index);
 	}
 
 	/** A division whose Ratis configuration is {@code current}/{@code previous} at {@code confIndex}. */
 	private static RaftServer.Division division(long confIndex, List<String> current, List<String> previous,
 			TreeMap<Long, RaftProtos.LogEntryProto> log, long snapshotIndex, long commitIndex) {
-		var conf = proxy(RaftConfiguration.class, (method, _) -> switch (method) {
-			case "getLogEntryIndex" -> confIndex;
-			case "getCurrentPeers" -> peers(current);
-			case "getPreviousPeers" -> peers(previous);
-			case "getAllPeers" -> peers(ALL);
-			default -> throw new UnsupportedOperationException(method);
-		});
-		var raftLog = proxy(RaftLog.class, (method, args) -> switch (method) {
-			case "getTermIndex" -> {
-				var entry = log.get((Long) args[0]);
-				yield entry == null ? null : TermIndex.valueOf(entry.getTerm(), entry.getIndex());
-			}
-			case "get" -> log.get((Long) args[0]);
-			case "getEntries" -> log.subMap((Long) args[0], (Long) args[1]).values().stream()
-					.map(LogEntryHeader::valueOf).toArray(LogEntryHeader[]::new);
-			case "getSnapshotIndex" -> snapshotIndex;
-			case "getLastCommittedIndex" -> commitIndex;
-			default -> throw new UnsupportedOperationException(method);
-		});
-		var info = proxy(DivisionInfo.class, (method, _) -> switch (method) {
-			case "getLifeCycleState" -> LifeCycle.State.RUNNING;
-			case "getLeaderId" -> null;
-			case "getCurrentTerm" -> 3L;
-			default -> throw new UnsupportedOperationException(method);
-		});
-		return proxy(RaftServer.Division.class, (method, _) -> switch (method) {
-			case "getInfo" -> info;
-			case "getRaftConf" -> conf;
-			case "getRaftLog" -> raftLog;
-			default -> throw new UnsupportedOperationException(method);
-		});
+		return ModelDivision.of(confIndex, current, previous, ALL, log, snapshotIndex, commitIndex, 3);
 	}
 
 	/**

@@ -535,6 +535,18 @@ final class TermService {
 		response.onCompleted();
 	}
 
+	/**
+	 * The version-1 answer ({@link #CONFIGURATION}) of {@code division}: Ratis' configuration, whether its index is at
+	 * or below the commit index, and its new half. The flag is what older versions answer too, and is wrong for a stale
+	 * configuration of Ratis (R11 review, finding 1): {@link RemovalRule#decide} does not confirm on it alone (R12-1).
+	 */
+	static RemovalCheck.PeerConfiguration versionOneAnswer(RaftServer.Division division) {
+		var conf = division.getRaftConf();
+		boolean committed = conf.getLogEntryIndex() <= division.getRaftLog().getLastCommittedIndex();
+		return new RemovalCheck.PeerConfiguration(conf.getLogEntryIndex(), committed,
+				conf.getCurrentPeers().stream().map(peer -> peer.getId().toString()).toList());
+	}
+
 	private static void answerConfiguration(Supplier<RaftServer> server, byte[] request,
 			StreamObserver<byte[]> response) {
 		if (request.length != GROUP_ID_BYTES) {
@@ -552,12 +564,10 @@ final class TermService {
 			if (division == null) {
 				reply = new byte[0];
 			} else {
-				var conf = division.getRaftConf();
-				boolean committed = conf.getLogEntryIndex() <= division.getRaftLog().getLastCommittedIndex();
-				var members = String.join("\n", conf.getCurrentPeers().stream().map(peer -> peer.getId().toString())
-						.toList()).getBytes(StandardCharsets.UTF_8);
-				reply = ByteBuffer.allocate(Long.BYTES + 1 + members.length).putLong(conf.getLogEntryIndex())
-						.put((byte) (committed ? 1 : 0)).put(members).array();
+				var answer = versionOneAnswer(division);
+				var members = String.join("\n", answer.members()).getBytes(StandardCharsets.UTF_8);
+				reply = ByteBuffer.allocate(Long.BYTES + 1 + members.length).putLong(answer.index())
+						.put((byte) (answer.committed() ? 1 : 0)).put(members).array();
 			}
 		} catch (IOException | RuntimeException e) {
 			reply = new byte[0];
