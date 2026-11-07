@@ -141,6 +141,57 @@ class StepDownRollbackOffRaftTest {
 		assertNull(nativeTransaction(db, tx));
 	}
 
+	/**
+	 * A step-down whose drain thread cannot start (an {@link OutOfMemoryError} "unable to create native thread" on a
+	 * host short of memory) throws nothing into Ratis: the old leader follows the new one and applies its entries, the
+	 * update waiting for a key of the ended term is answered, the ended term's transactions are rolled back, and a
+	 * stop that waits for the session's drain returns.
+	 */
+	@Test
+	void aDrainThreadThatCannotStartDoesNotBreakTheStepDown() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var oldLeader = cluster.awaitLeader(TIMEOUT);
+		var api = api(oldLeader);
+		long column = api.createColumn("c", SCHEMA);
+		long tx = api.openTransaction(Duration.ofSeconds(60));
+		api.put(tx, column, key(1), text("tx"), RequestType.none());
+		var holder = api.get(0, column, key(2), RequestType.forUpdate());
+		var waiter = oldLeader.connection().getAsyncApi(CONTEXT)
+				.getAsync(0, column, key(2), RequestType.forUpdate());
+		Thread.sleep(200);
+		assertFalse(waiter.isDone(), "the second update did not wait for the key");
+		var db = oldLeader.stateMachine().store().db();
+		assertNotNull(nativeTransaction(db, tx), "the transaction is not open on the leader");
+		oldLeader.stateMachine().sessionCloseStarter = (name, task) -> {
+			throw new OutOfMemoryError("unable to create native thread: possibly out of memory (test)");
+		};
+
+		var target = cluster.runningNodes().stream().filter(node -> node != oldLeader).findFirst().orElseThrow();
+		String targetId = target.config().nodeId();
+		oldLeader.raftServerForTests().transferLeadershipAsync(transferRequest(oldLeader, targetId));
+
+		within(STEP_DOWN_BOUND, "the old leader did not follow the new one", () -> target.isLeader()
+				&& oldLeader.stateMachine().division().getInfo().isFollower() && targetId.equals(oldLeader.leaderId()));
+		api(target).put(0, column, key(3), text("after"), RequestType.none());
+		within(STEP_DOWN_BOUND, "the old leader did not apply the new leader's entry",
+				() -> "after".equals(localValue(oldLeader, column, 3)));
+		within(STEP_DOWN_BOUND, "the update waiting for the key was not answered", waiter::isDone);
+		within(TIMEOUT, "the transaction of the ended term was not rolled back", () -> nativeTransaction(db, tx) == null);
+		within(TIMEOUT, "the update of the ended term was not rolled back",
+				() -> nativeTransaction(db, holder.updateId()) == null);
+
+		var stateMachine = oldLeader.stateMachine();
+		var halted = CompletableFuture.runAsync(() -> {
+			try {
+				cluster.halt(oldLeader.config().nodeId());
+			} catch (Exception ex) {
+				throw new RuntimeException(ex);
+			}
+		}, command -> Thread.ofPlatform().daemon().name("halt").start(command));
+		halted.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		assertTrue(stateMachine.awaitClosed(TIMEOUT), "the stop did not close the database");
+	}
+
 	private void holdMonitor(Object monitor) throws InterruptedException {
 		var held = new CountDownLatch(1);
 		Thread.ofPlatform().daemon().name("stuck-native-call").start(() -> {

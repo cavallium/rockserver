@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -1469,7 +1470,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		var db = store != null ? store.db() : null;
 		var done = new CompletableFuture<Void>();
 		sessionCloses.put(done, session.term());
-		Thread.ofPlatform().daemon().name(config.nodeId() + "-session-close-" + session.term()).start(() -> {
+		sessionCloseStarter.accept(config.nodeId() + "-session-close-" + session.term(), () -> {
 			try {
 				if (db != null) {
 					session.drain(db);
@@ -1484,6 +1485,13 @@ final class RockserverStateMachine extends BaseStateMachine {
 			}
 		});
 	}
+
+	/**
+	 * Starts the thread named by the first argument that runs the second: what {@link #retire} drains a session on.
+	 * Tests replace it to make the thread fail to start.
+	 */
+	volatile BiConsumer<String, Runnable> sessionCloseStarter =
+			(name, task) -> Thread.ofPlatform().daemon().name(name).start(task);
 
 	/** Sessions {@link #retire}d whose rollbacks still run, with their terms. */
 	private final ConcurrentHashMap<CompletableFuture<Void>, Long> sessionCloses = new ConcurrentHashMap<>();
