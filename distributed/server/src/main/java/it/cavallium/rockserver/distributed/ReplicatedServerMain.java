@@ -855,19 +855,22 @@ public final class ReplicatedServerMain {
 	 * timeout per round, not one each (nit of the R16 review).
 	 */
 	static <T> List<T> askAll(List<PeerConfig> peers, Function<PeerConfig, @Nullable T> ask) throws InterruptedException {
-		// One after another (the review's test commit; the fix asks at once).
-		var answers = new ArrayList<T>();
-		for (PeerConfig peer : peers) {
-			try {
-				var value = ask.apply(peer);
-				if (value != null) {
-					answers.add(value);
+		try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+			var asked = peers.stream().map(peer -> CompletableFuture.supplyAsync(() -> ask.apply(peer), executor))
+					.toList();
+			var answers = new ArrayList<T>();
+			for (var answer : asked) {
+				try {
+					var value = answer.get();
+					if (value != null) {
+						answers.add(value);
+					}
+				} catch (ExecutionException unanswered) {
+					// Failed: the others answer.
 				}
-			} catch (RuntimeException unanswered) {
-				// Failed: the others answer.
 			}
+			return answers;
 		}
-		return answers;
 	}
 
 	/**

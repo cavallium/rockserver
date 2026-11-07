@@ -193,6 +193,9 @@ final class MembershipFacts {
 	 */
 	static long installFloor(@Nullable Conf committed, Conf latest, long leaderTerm) {
 		long floor = committed == null ? RaftTraffic.NO_INDEX : committed.index();
+		if (latest.termKnown() && latest.term() == leaderTerm && latest.index() > floor) {
+			floor = latest.index();
+		}
 		return floor;
 	}
 
