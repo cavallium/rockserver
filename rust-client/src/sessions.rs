@@ -217,16 +217,18 @@ fn can_pause(deadline: Instant, pause: Duration) -> bool {
     deadline.saturating_duration_since(Instant::now()) > pause + FIRST_PAUSE
 }
 
-/// The timeout of a copy sent now: what is left of a finite deadline (`None` once it passed), or no timeout.
+/// The timeout of a copy sent now: what is left of a finite deadline, or no timeout for a caller without one.
+/// `None` once the deadline or the window has passed, for both kinds of caller, so that nothing is sent then: a copy
+/// sent after the window could reach the server and would end `OUTCOME_UNKNOWN`, where not sending it is known not
+/// applied.
 fn remaining(deadline: Instant, finite: bool) -> Option<Option<Duration>> {
-    if !finite {
-        return Some(None);
-    }
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         None
-    } else {
+    } else if finite {
         Some(Some(left))
+    } else {
+        Some(None)
     }
 }
 
@@ -916,6 +918,29 @@ mod tests {
         assert_eq!(rocksdb_error_type(&error), Some("SERVER_OVERLOADED"));
         assert!(is_not_applied(&error));
         assert!(sent.lock().unwrap().is_empty(), "nothing sent");
+    }
+
+    #[tokio::test]
+    async fn a_session_opened_after_the_window_ends_a_caller_without_deadline_unsent() {
+        // The opening answers, but only once the window has ended (a late lock or a late answer): the copy must
+        // not go out, so the write is known not applied, as for a caller with a deadline.
+        let writes = SessionWrites::new(true);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let error = writes
+            .run(
+                soon(50),
+                false,
+                |_| {
+                    std::thread::sleep(Duration::from_millis(150));
+                    std::future::ready(Ok(1))
+                },
+                script(vec![Ok("sent after the window")], sent.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(sent.lock().unwrap().is_empty(), "no copy sent after the window");
+        assert_eq!(rocksdb_error_type(&error), Some("READ_DEADLINE_EXCEEDED"));
+        assert!(is_not_applied(&error));
     }
 
     #[test]

@@ -200,7 +200,8 @@ the cluster. With a single server, which has no sessions, nothing changes.
 The Rust client (`rust-client`) does the same when the server advertises client sessions at `connect`: the same
 writes are numbered and resent with the same pauses, until the context's deadline, or for 30 s
 (`with_session_retry_window`) with a context without one; a copy or session opening that gets no answer at all ends
-with the window too (`OUTCOME_UNKNOWN`, or not sent for an opening). `RockserverClient::connect` uses one address and
+with the window too (`OUTCOME_UNKNOWN`, or not sent for an opening), and nothing is sent after it (a write whose
+session opens too late ends not sent, flagged not applied). `RockserverClient::connect` uses one address and
 adds no settings of its own: given a string, it has tonic's defaults, with no HTTP/2 keepalive or connect timeout, so
 resends go back to the same node and a silent node is noticed only by the deadline or the window. For dead-peer
 detection, pass `connect` a tonic `Endpoint` already set up (`http2_keep_alive_interval`, `keep_alive_timeout`,
