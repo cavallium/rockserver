@@ -31,6 +31,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.RaftClientConfigKeys;
@@ -217,6 +218,12 @@ final class Proposer implements Closeable {
 
 	/** Run by a batch just before it encodes its requests, for tests that pause there. */
 	volatile @Nullable Runnable beforeEncodeForTesting;
+
+	/**
+	 * Run by {@link Lane#take} with a request it drops from the queue unsent (past its deadline, or the node stopping),
+	 * just after it left the queue and before it is failed, for tests that race its expiry timer there.
+	 */
+	volatile @Nullable Consumer<Pending> onTakeDropsForTesting;
 
 	/** The byte admission itself, for tests that fill it to make this node refuse writes. */
 	ByteAdmission admissionForTesting() {
@@ -845,6 +852,10 @@ final class Proposer implements Closeable {
 				}
 				if (closed || next.deadlineNanos - now < next.minTimeLeftNanos) {
 					queue.pollFirst();
+					var onDrop = onTakeDropsForTesting;
+					if (onDrop != null) {
+						onDrop.accept(next);
+					}
 					next.fail(closed ? RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping")
 							: next.callerDeadline ? next.callerDeadlineFailure()
 							: notAccepted());
