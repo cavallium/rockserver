@@ -220,6 +220,9 @@ class CommandLineTest {
 		var add = run(admin(survivors, "add-peer", newPeer));
 		assertEquals(0, add.code(), add.toString());
 		assertVoters(plus(survivors, "n3"));
+		// add-peer asks the new node what it holds first: right after the change it may not have applied the genesis
+		// yet, which looks like a log of its own (an older behaviour of add-peer, not of the guard).
+		InProcessCluster.await(TIMEOUT, () -> cluster.node("n3").stateMachine().store().clusterId() != null);
 		var again = run(admin(survivors, "add-peer", newPeer));
 		assertEquals(0, again.code(), again.toString());
 		assertTrue(again.out().strip().endsWith("OK"), again.out());
