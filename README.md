@@ -163,7 +163,7 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 | `it.cavallium.rockserver.grpc.client.initial-retry-backoff` | `0.05s` with several addresses, `0.5s` with one | First pause of that retry, as a gRPC duration. With several addresses the retry goes to another node, so it need not wait for the failed one. |
 | `it.cavallium.rockserver.grpc.client.max-retry-backoff` | `30s` | Longest pause of that retry. |
 | `it.cavallium.rockserver.grpc.client.retry-backoff-multiplier` | `2` | Growth of that pause. |
-| `it.cavallium.rockserver.grpc.client.write-retry-window-ms` | `30000` | On a replicated cluster, how long a write of a caller without a deadline is sent again after an unknown outcome. A caller's deadline bounds it otherwise. |
+| `it.cavallium.rockserver.grpc.client.write-retry-window-ms` | `30000` | On a replicated cluster, how long a write of a caller without a deadline is sent again after an unknown outcome; no copy is sent after it, the first included (a write whose session opens later ends `READ_DEADLINE_EXCEEDED`, flagged not applied). A caller's deadline bounds it otherwise. |
 | `it.cavallium.rockserver.grpc.client.session-writes` | `true` | `false` turns off client sessions (below) for connections made afterwards: writes are sent once, as to a single server. |
 | `it.cavallium.rockserver.grpc.client.leader-hint` | `listed` | With several addresses, which leader addresses named by the nodes the connection uses for the calls the leader serves: `listed` only those in its list, `any` any, `off` none. A server could otherwise send the client anywhere, and the address the members use among themselves may not be reachable from the client. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-ms` | `0` (off) | On a server in front of another connection, such as a replicated node, the age at which a connection ends, +/-10%. The client then starts again from the top of its list, which is what brings it back to the first address. It has two costs: a silent first address costs every client the connect timeout at every cycle, not once, and calls that outlive the grace below fail with `UNAVAILABLE`, which includes `Compact` and long scans, on a healthy cluster too. Left off, a client stays on the node it failed over to until that node goes away. |
@@ -192,7 +192,8 @@ caller get `OUTCOME_UNKNOWN`: the write may or may not be applied, and sending i
 it twice. A deadline error counts as an unknown outcome unless the server flagged it "not applied" (in the
 `rockserver-applied: no` trailer; the message text is not read when the trailer is there). A caller that cancels a
 write's future stops the resends: the future ends with `OUTCOME_UNKNOWN` if a copy was sent, or is cancelled if
-none was. A synchronous call waits at most its deadline plus 5 s. A write staged in a transaction is sent once, as
+none was. A write that could not get a session was never sent: it ends with the failure flagged "not applied"
+(`SERVER_OVERLOADED` when the opening's own outcome was unknown). A synchronous call waits at most its deadline plus 5 s. A write staged in a transaction is sent once, as
 before: if its outcome is unknown, roll the transaction back and run it again, never send the staged write again.
 The connection decides whether it uses sessions once, at its handshake, and logs it: recreate it after upgrading
 the cluster. With a single server, which has no sessions, nothing changes.

@@ -221,6 +221,13 @@ over (clients open new ones by themselves).
    a column that does not open, a full disk) it also removes the `db/` it made, so fix the cause and run the same
    command again. A `db/` left there by an interrupted run (power loss, `kill -9`) is not removed: delete
    `DATA-DIR/db` and run it again.
+   Use copies of one node's backup on every node (`cp -a`, `rsync`, `scp` of the whole `<name>` directory), not the
+   backup each node took itself: those hold the same data, but not the same files. `restore-backup` records the seed
+   digest of the backup's own files (`DATA-DIR/db.seed-digest`), before it opens the database, because the restored
+   `db/` differs on each node (each restore opens it once and writes its own `OPTIONS` and info log, R26-1): the
+   followers compare that digest with the leader's at genesis and stop with exit 3 if it differs. Running
+   `restore-backup` once and copying the stopped `db/` (with or without `db.seed-digest`) to every node with `cp -a`
+   or `rsync` works as well, as in "Seeding a cluster".
 3. Start every node as for a new cluster, without `--join`; the nodes of the old cluster stay stopped. The first leader proposes
    a seeded genesis, as in "Seeding a cluster".
 4. Check: `status`, then `checksum` prints `OK`, then a few known keys read back.
