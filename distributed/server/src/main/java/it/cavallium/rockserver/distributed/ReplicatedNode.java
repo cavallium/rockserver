@@ -31,6 +31,7 @@ import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.SnapshotManagementRequest;
@@ -65,7 +66,7 @@ public final class ReplicatedNode implements AutoCloseable {
 	private static final String BOOTSTRAP_FILE = "raft-meta.bootstrap";
 	/** Ratis keeps here the configuration from the log. */
 	private static final String CONFIGURATION_FILE = "raft-meta.conf";
-	/** In the Raft directory, once a configuration from the log made this node a member: see {@link #requireNotRemoved}. */
+	/** In the Raft directory, once a leader made this node a voter: see {@link #recordMembership}. */
 	private static final String MEMBER_FILE = "member";
 
 	private final NodeConfig config;
@@ -120,8 +121,6 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final LeaderStall leaderStall;
 	private final NodeMetrics.Series leaderStallStepDowns;
 	private final NodeMetrics.Series leaderLogStepDowns;
-	/** When this node last entered or warned about the initializing state, 0 if out of it. Maintenance thread only. */
-	private long initializingSinceNanos;
 	private final AtomicBoolean closed = new AtomicBoolean();
 	private final AtomicLong snapshotCalls = new AtomicLong();
 	private final CompletableFuture<@Nullable Throwable> stopped = new CompletableFuture<>();
@@ -157,7 +156,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		parameters.put(CommitHeartbeats.PARAMETER, commitHeartbeats, CommitHeartbeats.class);
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
 		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress,
-				this::nodeState, this::readIndex, configDigest, this::answerOps, raftTraffic));
+				this::nodeState, this::readIndex, configDigest, this::answerOps, raftTraffic, this::configurationReport));
 		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
 		if (!existing) {
 			// Before anything opens the database: copies of a seed are the same only until then.
@@ -198,7 +197,7 @@ public final class ReplicatedNode implements AutoCloseable {
 				throw ex;
 			}
 			started.add(server);
-			requireNotRemoved(existing);
+			checkMembershipAtStart(existing);
 			this.barrier = new ReadBarrier(server, groupId, stateMachine.appliedIndex(), config.requestTimeout(),
 					stateMachine::leaderReadyIndex, threads.control());
 			// Every node of a cluster should have follower reads on or off alike: see "Follower reads" in the design.
@@ -240,6 +239,14 @@ public final class ReplicatedNode implements AutoCloseable {
 					MAINTENANCE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 			this.monitor = new NodeMonitor(config, stateMachine::division, stateMachine,
 					config.raftDir().resolve(groupId.getUuid().toString()).resolve("current"), metrics);
+			monitor.membershipState(() -> {
+				var verdict = membership;
+				return verdict == null ? 0 : switch (verdict.outcome()) {
+					case MEMBER, REMOVED -> 0;
+					case NOT_ADDED -> 1;
+					case UNDECIDED -> 2;
+				};
+			});
 			maintenance.scheduleWithFixedDelay(this::refreshMonitor, 0, NodeMonitor.REFRESH_MILLIS, TimeUnit.MILLISECONDS);
 			var appendLag = metrics.amount("lag.uncommitted");
 			var applyLag = metrics.amount("lag.unapplied");
@@ -509,7 +516,7 @@ public final class ReplicatedNode implements AutoCloseable {
 				stopAfterRaftClosed();
 				return;
 			}
-			warnWhileInitializing(division);
+			checkWhileDetached(division);
 			warnAbovePendingLimit(division);
 			dropChannelsOfFormerMembers(division);
 			var log = division.getRaftLog();
@@ -650,56 +657,66 @@ public final class ReplicatedNode implements AutoCloseable {
 		});
 	}
 
+	/** When {@link #checkWhileDetached} last asked the members, and last warned. Maintenance thread only. */
+	private long lastDetachedCheckNanos;
+	private long lastDetachedWarnNanos;
+	/** When the node started: until a leader sends to it, it counts as detached from then. */
+	private final long startedNanos = System.nanoTime();
+
+	/** The last membership verdict of this node (R11): see {@link #membership()}. */
+	private volatile RemovalRule.@Nullable Verdict membership;
+
 	/**
-	 * A node in Ratis' initializing state has no election timer, and nothing shows that but the log: it printed READY and
-	 * it listens. It leaves that state when a leader sends it a request that is not part of bringing it up to date.
+	 * For a node that hears no leader (R11): asks the members whether it was removed ({@link RemovalCheck}), on the
+	 * initialization thread, and stops it with exit 4 if it was, which the start-up check could not tell when they did
+	 * not answer then, or when it was removed while it ran. "Detached" means that no leader sent this node any Raft
+	 * request (append, heartbeat, snapshot chunk, including those that bring it up to date for add-peer) for three
+	 * election timeouts ({@link RaftTraffic}), and it does not lead itself. Ratis' initializing state is not
+	 * detachment: a node being caught up for add-peer hears its leader and is never checked during its own add. The
+	 * check runs every three election timeouts (at least a second) while the node stays detached; the warning, chosen
+	 * by the verdict (never by {@code --join}), every {@value #ELECTION_TIMEOUTS_TO_WARN} election timeouts.
 	 */
-	private void warnWhileInitializing(RaftServer.Division division) {
-		if (division.getInfo().getLifeCycleState() != LifeCycle.State.STARTING) {
-			initializingSinceNanos = 0;
+	private void checkWhileDetached(RaftServer.Division division) {
+		long now = System.nanoTime();
+		long last = raftTraffic.lastLeaderRequestNanos();
+		long quiet = config.electionTimeoutMax().multipliedBy(3).toNanos();
+		boolean detached = !division.getInfo().isLeader() && now - (last == 0 ? startedNanos : last) >= quiet;
+		if (!detached) {
+			var verdict = membership;
+			if (verdict != null && verdict.outcome() != RemovalRule.Outcome.MEMBER && division.getRaftConf()
+					.getCurrentPeers().stream().anyMatch(peer -> peer.getId().toString().equals(config.nodeId()))) {
+				// A leader sends to it, and its configuration holds it: a member again (or at last).
+				membership = new RemovalRule.Verdict(RemovalRule.Reason.MEMBER, null, List.of(), List.of(), List.of(),
+						List.of(), "a leader sends to it");
+			}
 			return;
 		}
-		long now = System.nanoTime();
-		if (initializingSinceNanos == 0) {
-			initializingSinceNanos = now;
-		} else if (now - initializingSinceNanos >= config.electionTimeoutMax().multipliedBy(ELECTION_TIMEOUTS_TO_WARN)
-				.toNanos()) {
-			initializingSinceNanos = now;
-			if (!config.join() || Files.exists(config.raftDir().resolve(MEMBER_FILE))) {
-				askMembersWhileOutside(division);
-			}
-			LOG.warn("{}: this node is outside the cluster, with no election timer, and waits for a leader. {}", config.nodeId(),
-					config.join() ? "It was started with --join, so it waits for add-peer. If no node of the cluster started"
-							+ " without --join, nothing elects a leader: --join is only for a node that joins a running cluster"
-							: jointWithSelfInOldHalf(division.getRaftConf())
-							? "Its log ends with a joint configuration that leaves it out, which may never have been committed: it"
-							+ " waits for a leader that dropped it, and stops once a majority of the new half say it was removed"
-							: "Its configuration does not contain it: it was removed from the cluster, or it never was a member."
-							+ " A removed node has nothing to do: stop it. To bring it back, wipe its data directory and add it again");
+		long interval = Math.max(TimeUnit.SECONDS.toNanos(1), quiet);
+		if (lastDetachedCheckNanos != 0 && now - lastDetachedCheckNanos < interval) {
+			return;
 		}
-	}
-
-	/** Whether {@link #askMembersWhileOutside} has a check queued or running. */
-	private final AtomicBoolean askingMembers = new AtomicBoolean();
-
-	/**
-	 * For a node that was a member and waits outside the cluster: asks the members, on the initialization thread, and
-	 * stops the node if a majority of them removed it ({@link RemovalCheck}), which the start-up check could not tell
-	 * when they were not reachable then. The process then exits as a removed node.
-	 */
-	private void askMembersWhileOutside(RaftServer.Division division) {
+		lastDetachedCheckNanos = now;
 		if (!askingMembers.compareAndSet(false, true)) {
 			return;
 		}
 		try {
 			initialization.execute(() -> {
 				try {
-					var conf = division.getRaftConf();
-					var removedBy = closed.get() ? null : askMembers(conf);
-					if (removedBy != null) {
-						onReplicaFailure(new RemovedException("Node " + config.nodeId() + " waits outside the cluster, and members "
-								+ removedBy + ", a majority of its configuration " + conf + ", hold a newer committed one without"
-								+ " it: it was removed from the cluster. " + REMOVED_ADVICE));
+					if (closed.get()) {
+						return;
+					}
+					var verdict = checkMembership(division);
+					if (verdict.outcome() == RemovalRule.Outcome.REMOVED) {
+						onReplicaFailure(RemovedException.of(config.nodeId(), verdict, "while it heard no leader"));
+						return;
+					}
+					long warnEvery = config.electionTimeoutMax().multipliedBy(ELECTION_TIMEOUTS_TO_WARN).toNanos();
+					long at = System.nanoTime();
+					boolean outside = verdict.outcome() != RemovalRule.Outcome.MEMBER
+							|| division.getInfo().getLifeCycleState() == LifeCycle.State.STARTING;
+					if (outside && (lastDetachedWarnNanos == 0 || at - lastDetachedWarnNanos >= warnEvery)) {
+						lastDetachedWarnNanos = at;
+						LOG.warn("{}: hears no leader; {}", config.nodeId(), describeOutside(verdict, division));
 					}
 				} catch (RuntimeException ex) {
 					LOG.warn("{}: failed to ask the members whether it was removed", config.nodeId(), ex);
@@ -710,6 +727,95 @@ public final class ReplicatedNode implements AutoCloseable {
 		} catch (RejectedExecutionException closing) {
 			askingMembers.set(false);
 		}
+	}
+
+	/** Whether {@link #checkWhileDetached} has a check queued or running. */
+	private final AtomicBoolean askingMembers = new AtomicBoolean();
+
+	/**
+	 * The membership verdict of this node's last check (R11), null if none ran: at the start (existing data
+	 * directory), and while it hears no leader. Its {@link RemovalRule.Reason} says whether it is a member, not added,
+	 * or outside and undecided, and why.
+	 */
+	public RemovalRule.@Nullable Verdict membership() {
+		return membership;
+	}
+
+	/** What a node outside the cluster logs, and what the operator does about it (design: "Removal and waiting outside"). */
+	private String describeOutside(RemovalRule.Verdict verdict, RaftServer.Division division) {
+		var facts = (division.getInfo().getLifeCycleState() == LifeCycle.State.STARTING
+				? "this node is outside the cluster, in Ratis' initializing state (no election timer, no vote). " : "")
+				+ "Membership " + verdict + ".";
+		var action = switch (verdict.reason()) {
+			case MEMBER -> division.getInfo().getLifeCycleState() == LifeCycle.State.STARTING
+					? "It is a member, in Ratis' initializing state (no election timer, no vote) until a leader sends to it."
+							+ " If no node of the cluster started without --join, nothing elects a leader: --join is only for a"
+							+ " node that joins a running cluster"
+					: "It is a member: it waits for the others to elect a leader";
+			case NOT_ADDED -> "It never was a voter (started with --join): run add-peer for it. If its add was abandoned,"
+					+ " or it was added and removed long ago, stop it and wipe its data directory: add-peer refuses a node"
+					+ " that has a log";
+			case NO_COMMITTED_CONFIGURATION -> "No member answered with a committed configuration, and this node applied"
+					+ " none. If every node of a new cluster was started with --join, nothing elects a leader: --join is only"
+					+ " for a node that joins a running cluster. Otherwise start or repair the pending and unreachable"
+					+ " members: this node decides by itself once they answer";
+			case NO_MAJORITY -> "Start or repair the pending and unreachable members (also"
+					+ " members of a version without the Configuration method count as unreachable): this node decides by"
+					+ " itself once a majority of the new half of the newest committed configuration answer. If they are gone"
+					+ " for good, check with status on a member: if this node is not in its configuration, stop it, wipe its"
+					+ " data directory, start it with --join and run add-peer";
+			case NEEDS_TERM -> "Members answered with a version that predates Configuration2, which does not tell terms:"
+					+ " upgrade them. Until then, judge with status on a member";
+			case MEMBER_LATER_CONFIGURATION -> "Normally clears within seconds. If it persists, the blocking members are"
+					+ " stuck or were removed themselves: look at their logs and status";
+			case OWN_LATER_CONFIGURATION -> "An add of this node is in flight: let add-peer finish";
+			case INCONSISTENT -> "A bug, or a data directory restored from elsewhere: do not wipe anything, collect the"
+					+ " logs of every node";
+			case HEARD_LEADER -> "A leader sent this node a request during the check: it is checked again if it hears no"
+					+ " leader";
+			case REMOVED -> REMOVED_ADVICE;
+		};
+		return facts + " " + action + ".";
+	}
+
+	/**
+	 * One membership check of this node ({@link RemovalCheck}, at most {@link #removalCheckBudget}): the verdict, also
+	 * kept in {@link #membership}. A removal found while a leader sent this node a request is not trusted (the answers
+	 * may be older than that leader's configuration): {@link RemovalRule.Reason#HEARD_LEADER}.
+	 */
+	private RemovalRule.Verdict checkMembership(RaftServer.Division division) {
+		long trafficBefore = raftTraffic.lastLeaderRequestNanos();
+		var verdict = RemovalCheck.check(() -> ownFacts(division), memberAddresses(division.getRaftConf()),
+				group.getGroupId(), removalCheckBudget());
+		if (verdict.outcome() == RemovalRule.Outcome.REMOVED && raftTraffic.lastLeaderRequestNanos() != trafficBefore) {
+			verdict = new RemovalRule.Verdict(RemovalRule.Reason.HEARD_LEADER, verdict.kStar(), verdict.confirmers(),
+					verdict.blockers(), verdict.pending(), verdict.unreachable(), verdict.ownLog());
+		}
+		membership = verdict;
+		return verdict;
+	}
+
+	/** This node's own facts for {@link RemovalRule#decide}. */
+	private RemovalRule.Own ownFacts(RaftServer.Division division) {
+		var history = stateMachine.configurations();
+		return new RemovalRule.Own(config.nodeId(), MembershipFacts.committed(division, history),
+				MembershipFacts.latest(division, history), index -> MembershipFacts.termAt(division, index), !config.join(),
+				Files.exists(config.raftDir().resolve(MEMBER_FILE)));
+	}
+
+	/** The answer of this node to {@link TermService#CONFIGURATION2}. */
+	private RemovalRule.@Nullable Report configurationReport(RaftGroupId groupId, List<TermIndex> probes) {
+		var raftServer = this.server;
+		if (raftServer == null || !groupId.equals(group.getGroupId())) {
+			return null;
+		}
+		RaftServer.Division division;
+		try {
+			division = raftServer.getDivision(groupId);
+		} catch (IOException e) {
+			return null;
+		}
+		return division == null ? null : MembershipFacts.report(division, stateMachine.configurations(), probes);
 	}
 
 	/**
@@ -726,95 +832,34 @@ public final class ReplicatedNode implements AutoCloseable {
 	}
 
 	/**
-	 * Fails the start of a node that a configuration from its log left out, which a supervisor started again after its
-	 * removal: it would otherwise print {@code READY} and stay up in Ratis' initializing state, with no leader to serve
-	 * from. A node counts as removed if the new half of that configuration does not hold it, and either it was started
-	 * without {@code --join} (its own peer list holds it, so only a removal can have left it out) or it was a member once
-	 * ({@link #MEMBER_FILE}). A removed node usually holds the joint configuration of its removal, with itself in the old
-	 * half only: the leader sends the final one to the members that stay. A node started with {@code --join} that never was
-	 * a member is not removed: it may hold the configuration of a snapshot from before its {@code add-peer}.
-	 *
-	 * <p>A joint configuration that leaves the node out may never have been committed: its leader lost its leadership
-	 * first, and the next leader dropped it, so the node is still a member (R3-G2b-4). So a node whose log ends with
-	 * a joint configuration that holds it in the old half only asks the members of the new half
-	 * ({@link RemovalCheck#removedBy} with {@code ownLeavesOut}), and is refused only if a majority of them hold a
-	 * committed configuration without it at that configuration's index or later: positive evidence that the joint
-	 * configuration, or a later one without the node, was committed. Otherwise (members that hold the node, members
-	 * still undecided, or members out of reach, as in a cold restart of the whole cluster where this node comes up
-	 * first) it starts (R10-1). Ratis then keeps it in its initializing state, outside the cluster: it neither votes
-	 * nor stands for election ({@code RaftServerImpl.start} starts a follower only from a configuration that holds it
-	 * in both halves). A leader that dropped the joint configuration cuts its log back and makes it a follower; while
-	 * it waits, the check for a node waiting outside ({@link #askMembersWhileOutside}) asks the same members again and
-	 * stops it, with exit 4, once a majority of them say it was removed. The joint configuration can still be committed
-	 * by the old leader when it restarts with it in its log: its appends make this node a follower, the leader then
-	 * stops sending to it, and its election timer finds that the new configuration does not hold it
-	 * ({@code LeaderElection} answers {@code NOT_IN_CONF} and shuts the Raft server down). The node then stops with
-	 * "Raft closed" (exit 3, {@link #stopAfterRaftClosed}); its next start is refused here (exit 4) if the members of
-	 * the new half answer, or else waits outside until they do. Two consequences: a member waiting outside casts no
-	 * vote ({@code RaftServerImpl.requestVote} needs a running server), so the members that are up must make a majority
-	 * without it (as before R10-1, when it was refused); and a removed node whose whole new half never answers (gone,
-	 * or of a version without {@link TermService#configuration}) waits outside indefinitely, warning in its log.</p>
-	 *
-	 * <p>The configuration that removes a node commits with the other members alone, so the removed node's log may
-	 * never receive it: a node that was stopped, slow or cut off during its removal still holds itself in its log. So a
-	 * node that restarts ({@code existing}) and is or was a member also asks the members of its own configuration for
-	 * theirs, see {@link RemovalCheck}: it is refused once a majority of them hold a committed configuration, newer than
-	 * its own, that leaves it out. A first start, or a {@code --join} node that never was a member, skips this.</p>
+	 * The membership check at the start of a node with an existing data directory (R11), after its Raft server started
+	 * (it needs its own log, and its own {@link TermService} must answer the others during a cold start of the
+	 * cluster): see {@link RemovalCheck} and {@link RemovalRule}. A removed node is refused with
+	 * {@link RemovedException} (exit 4). Any other verdict lets it start: a member; a node never added
+	 * ({@link RemovalRule.Reason#NOT_ADDED}); or a node outside and undecided (members down or unreachable, a later
+	 * configuration that may still commit, ...), which logs why and what the operator does, and runs in whatever Ratis
+	 * state its own log gives (Ratis' initializing state for a log whose latest configuration leaves it out of a half:
+	 * no election timer, no vote). {@link #checkWhileDetached} decides again while it hears no leader. A first start
+	 * has nothing to check.
 	 */
-	private void requireNotRemoved(boolean existing) throws IOException {
-		var conf = server.getDivision(group.getGroupId()).getRaftConf();
-		boolean leftOut = conf.getLogEntryIndex() >= 0
-				&& conf.getCurrentPeers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()));
-		boolean memberOnce = !config.join() || Files.exists(config.raftDir().resolve(MEMBER_FILE));
-		if (leftOut && memberOnce) {
-			if (!jointWithSelfInOldHalf(conf)) {
-				// A final configuration without the node, or a joint one that held it in neither half: each follows a
-				// committed configuration that removed it.
-				throw new RemovedException("Node " + config.nodeId() + " is not in the new configuration of its log, " + conf
-						+ ": it was removed from the cluster. " + REMOVED_ADVICE);
-			}
-			var removedBy = askMembers(conf);
-			if (removedBy != null) {
-				throw new RemovedException("Node " + config.nodeId() + " is not in the new configuration of its log, " + conf
-						+ ", and members " + removedBy + ", a majority of its new half, hold that one or a later one without it,"
-						+ " committed: it was removed from the cluster. " + REMOVED_ADVICE);
-			}
-			LOG.warn("{}: its log ends with a joint configuration that leaves it out, {}, which a majority of its new half did"
-					+ " not say was committed: starting outside the cluster, until a leader that dropped it takes this node back"
-					+ " or the members say it was removed", config.nodeId(), conf);
+	private void checkMembershipAtStart(boolean existing) throws IOException {
+		if (!existing) {
 			return;
 		}
-		if (leftOut || !existing || !memberOnce) {
-			return;
-		}
-		var removedBy = askMembers(conf);
-		if (removedBy != null) {
-			throw new RemovedException("Node " + config.nodeId() + " is in the configuration of its log, " + conf
-					+ ", but members " + removedBy + ", a majority of it, hold a newer committed one without this node: it was"
-					+ " removed from the cluster while its log did not follow. " + REMOVED_ADVICE);
+		var division = server.getDivision(group.getGroupId());
+		var verdict = checkMembership(division);
+		switch (verdict.outcome()) {
+			case REMOVED -> throw RemovedException.of(config.nodeId(), verdict, "at its start");
+			case MEMBER -> {
+			}
+			default -> LOG.warn("{}: starting, not known to be a member; {}", config.nodeId(),
+					describeOutside(verdict, division));
 		}
 	}
 
 	private static final String REMOVED_ADVICE = "Take it out of its supervisor. To add it again, wipe its data"
 			+ " directory, start it with --join and run add-peer";
 
-	/**
-	 * Asks the other members of {@code conf} about this node, see {@link RemovalCheck}: the members that say it was
-	 * removed, if they are a majority, else null. Takes at most two election timeouts (at least a second).
-	 */
-	private @Nullable List<String> askMembers(RaftConfiguration conf) {
-		var members = conf.getCurrentPeers().stream().map(peer -> peer.getId().toString()).toList();
-		// A joint configuration that leaves this node out of its new half: the members of that half decide (R3-G2b-4).
-		boolean ownLeavesOut = jointWithSelfInOldHalf(conf);
-		return RemovalCheck.removedBy(config.nodeId(), group.getGroupId(), conf.getLogEntryIndex(), ownLeavesOut,
-				members.size(), RemovalCheck.addressesOf(config.nodeId(), members, memberAddresses(conf)), removalCheckBudget());
-	}
-
-	/** Whether {@code conf} is a joint configuration that holds this node in its old half only. */
-	private boolean jointWithSelfInOldHalf(RaftConfiguration conf) {
-		return conf.getPreviousPeers().stream().anyMatch(peer -> peer.getId().toString().equals(config.nodeId()))
-				&& conf.getCurrentPeers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()));
-	}
 
 	/** Id to Raft address of every peer this node knows of: its startup list, then the peers of {@code conf}. */
 	private Map<String, String> memberAddresses(RaftConfiguration conf) {
@@ -836,13 +881,21 @@ public final class ReplicatedNode implements AutoCloseable {
 		return budget.compareTo(Duration.ofSeconds(1)) < 0 ? Duration.ofSeconds(1) : budget;
 	}
 
-	/** Records, once, that a configuration from the log made this node a member: see {@link #requireNotRemoved}. */
+	/**
+	 * Records, once, that a leader made this node a voter (R11): Ratis runs it (it left its initializing state, which only
+	 * an append that is not part of bringing it up to date does), and its latest configuration holds it in its new half.
+	 * {@link RemovalRule.Own#memberFile}: a node started with {@code --join} counts as removed only after this. The
+	 * appends that bring a node up to date for add-peer may replay configurations of an earlier membership of the same
+	 * id; they arrive while the node is initializing, and do not count. The configuration may not be committed yet: a
+	 * node whose add was then dropped is told to wipe its data directory, which add-peer needs anyway. Files of
+	 * earlier versions, written from a stable configuration that held the node, are kept.
+	 */
 	private void recordMembership(RaftServer.Division division) throws IOException {
 		if (memberRecorded) {
 			return;
 		}
 		var conf = division.getRaftConf();
-		if (conf.getLogEntryIndex() < 0 || !conf.getPreviousPeers().isEmpty()
+		if (conf.getLogEntryIndex() < 0 || division.getInfo().getLifeCycleState() != LifeCycle.State.RUNNING
 				|| conf.getCurrentPeers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()))) {
 			return;
 		}
@@ -882,10 +935,34 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 	}
 
-	/** Thrown by {@link #start} for a node that was removed from the cluster: see {@link #requireNotRemoved}. */
+	/**
+	 * Thrown by {@link #start}, or stopping a running node, for a node that was removed from the cluster (R11): see
+	 * {@link #checkMembershipAtStart} and {@link #checkWhileDetached}. {@code run} exits with 4.
+	 */
 	public static final class RemovedException extends IOException {
+		private final RemovalRule.@Nullable Verdict verdict;
+
 		RemovedException(String message) {
+			this(message, null);
+		}
+
+		RemovedException(String message, RemovalRule.@Nullable Verdict verdict) {
 			super(message);
+			this.verdict = verdict;
+		}
+
+		/** The verdict of the check that found the removal. */
+		public RemovalRule.@Nullable Verdict verdict() {
+			return verdict;
+		}
+
+		/** For node {@code nodeId}, removed by {@code verdict}, found {@code when}. */
+		static RemovedException of(String nodeId, RemovalRule.Verdict verdict, String when) {
+			var kStar = java.util.Objects.requireNonNull(verdict.kStar());
+			return new RemovedException("Node " + nodeId + " was removed from the cluster (found " + when + "): the"
+					+ " committed configuration " + kStar + " leaves it out of its new half, and members "
+					+ verdict.confirmers() + ", a majority of that new half, hold it committed with no later configuration that"
+					+ " includes this node; " + verdict.ownLog() + ". " + REMOVED_ADVICE, verdict);
 		}
 	}
 

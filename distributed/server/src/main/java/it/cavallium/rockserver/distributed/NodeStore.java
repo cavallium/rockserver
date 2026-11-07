@@ -11,6 +11,7 @@ import com.typesafe.config.ConfigValueFactory;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.KV;
 import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.config.DataSize;
@@ -71,6 +72,9 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #SESSION_REQUEST} + session id + sequence: the encoded result of an applied write of that session</li>
  *   <li>{@link #CLOCK}: the latest leader time stamped on an applied entry, see {@link LogEntryCodec#stamp}</li>
  *   <li>{@link #CLUSTER_VERSION}: the 8-byte {@link Capabilities} of the cluster, see {@link #clusterVersion}</li>
+ *   <li>{@link #CONFIGURATION} + index + term: the halves of a committed configuration entry applied here, see
+ *   {@link CommittedConfigurations}</li>
+ *   <li>{@link #CONFIGURATION_HISTORY}: the 8-byte first index from which those are complete</li>
  * </ul>
  *
  * <p>The meta column is created locally when a database is first opened, before any log entry is applied, so it
@@ -103,6 +107,10 @@ final class NodeStore implements Closeable {
 	static final byte CLOCK = 9;
 	/** Far from the kinds above, so that other new kinds can take the next ones. */
 	static final byte CLUSTER_VERSION = 40;
+	/** A committed configuration entry applied here: its index and term, see {@link CommittedConfigurations}. */
+	static final byte CONFIGURATION = 41;
+	/** The first index from which every applied configuration is recorded, see {@link #configurationHistoryFrom}. */
+	static final byte CONFIGURATION_HISTORY = 42;
 
 	private static final int META_KEY_BYTES = 1 + 2 * Long.BYTES;
 	private static final ColumnSchema META_SCHEMA = ColumnSchema.of(IntList.of(META_KEY_BYTES), ObjectList.of(), true);
@@ -490,6 +498,42 @@ final class NodeStore implements Closeable {
 	long clusterVersion() {
 		Buf value = readMeta(CLUSTER_VERSION);
 		return value == null || value.size() != Long.BYTES ? 0 : ByteBuffer.wrap(value.toByteArray()).getLong();
+	}
+
+	/**
+	 * The first log index from which every configuration entry this database applied is recorded
+	 * ({@link #CONFIGURATION}): as written with the first record, or else the index after the applied position, since
+	 * every later entry is applied by a version that records them.
+	 */
+	long configurationHistoryFrom() {
+		Buf value = readMeta(CONFIGURATION_HISTORY);
+		return value != null && value.size() == Long.BYTES ? ByteBuffer.wrap(value.toByteArray()).getLong()
+				: applied().getIndex() + 1;
+	}
+
+	/** Whether {@link #CONFIGURATION_HISTORY} is written. */
+	boolean configurationHistoryRecorded() {
+		return readMeta(CONFIGURATION_HISTORY) != null;
+	}
+
+	/** The committed configurations recorded here ({@link #CONFIGURATION}), in log order. */
+	List<RemovalRule.Conf> configurations() {
+		var result = new java.util.ArrayList<RemovalRule.Conf>();
+		try (var rows = db().getRange(0L, metaColumnId, key(CONFIGURATION), key((byte) (CONFIGURATION + 1)), false,
+				RequestType.<KV>allInRange())) {
+			rows.forEach(kv -> {
+				var key = ByteBuffer.wrap(kv.keys().keys()[0].toByteArray());
+				long index = key.getLong(1);
+				long term = key.getLong(1 + Long.BYTES);
+				result.add(CommittedConfigurations.decodeHalves(term, index, kv.value().toByteArray()));
+			});
+		}
+		return result;
+	}
+
+	/** Key of the configuration entry at {@code index}, of term {@code term}. */
+	static Keys configurationKey(long index, long term) {
+		return metaKey(CONFIGURATION, index, term);
 	}
 
 	/** True if the {@link LogEntry.Genesis} entry applied here said that the cluster started from a seed database. */

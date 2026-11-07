@@ -208,7 +208,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 			@Nullable Proposal proposal, long bytes, int kib, CompletableFuture<Message> reply) implements Applying {}
 
 	/** A position without data (configuration entries, leader no-ops) to record. */
-	private record MarkPosition(TermIndex position) implements Applying {}
+	/** A position without data; {@code configuration}: the committed configuration entry at it, if it is one. */
+	private record MarkPosition(TermIndex position, RemovalRule.@Nullable Conf configuration) implements Applying {}
 
 	/** Completes {@code done} once everything queued before it is applied. */
 	private record Drain(CompletableFuture<Void> done) implements Applying {}
@@ -437,6 +438,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 		var position = opened.applied();
 		raiseVisibleTerm(position.getTerm());
+		this.configurations = new CommittedConfigurations(opened.configurations(), opened.configurationHistoryFrom());
 		this.store = opened;
 		this.applier = new Applier(opened, metrics, applyLanes);
 		applier.maintenance(ops);
@@ -826,8 +828,17 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/** Configuration entries and leader no-ops: record the position so restarts resume after them. */
 	@Override
 	public void notifyTermIndexUpdated(long term, long index) {
+		var pending = pendingConfiguration;
+		pendingConfiguration = null;
+		RemovalRule.Conf configuration = null;
+		// The apply path passes a configuration entry on just before its position, on the same thread
+		// (RaftServerImpl.applyLogToStateMachine); a snapshot install reports one without a position or a term.
+		if (pending != null && pending.thread() == Thread.currentThread() && pending.conf().term() == term
+				&& pending.conf().index() == index) {
+			configuration = pending.conf();
+		}
 		if (!failed) {
-			applyQueue.add(new MarkPosition(TermIndex.valueOf(term, index)));
+			applyQueue.add(new MarkPosition(TermIndex.valueOf(term, index), configuration));
 			handedOver = index;
 		}
 	}
@@ -1008,8 +1019,16 @@ final class RockserverStateMachine extends BaseStateMachine {
 					case MarkPosition mark -> {
 						var position = mark.position();
 						if (position.getIndex() > applied.get()) {
+							var configuration = mark.configuration();
+							if (configuration != null) {
+								applier.recordConfiguration(configuration);
+							}
 							applier.markApplied(position);
+							var history = configurations;
 							completions.add(() -> {
+								if (configuration != null) {
+									history.add(configuration);
+								}
 								updateLastAppliedTermIndex(position);
 								applied.advance(position.getIndex());
 							});
@@ -1377,14 +1396,41 @@ final class RockserverStateMachine extends BaseStateMachine {
 		leaderListener.run();
 	}
 
-	/** Only a test hook: the configuration itself is Ratis' business. */
+	/** A configuration entry that the apply path passed on, waiting for its position: see {@link #notifyTermIndexUpdated}. */
+	private record PendingConfiguration(Thread thread, RemovalRule.Conf conf) {}
+
+	/** Set and read on Ratis' state machine updater thread. */
+	private volatile @Nullable PendingConfiguration pendingConfiguration;
+
+	/**
+	 * Ratis calls this when it applies a committed configuration entry, just before {@link #notifyTermIndexUpdated} of
+	 * the same position on the same thread; the pair goes to the apply thread, which records the configuration with
+	 * the position ({@link CommittedConfigurations}). Ratis also calls it on every chunk of a snapshot install, with
+	 * the leader's latest configuration, which may not be committed, and with no term (0): that call has no position
+	 * after it, and is not recorded.
+	 */
 	@Override
 	public void notifyConfigurationChanged(long term, long index,
 			RaftProtos.RaftConfigurationProto newRaftConfiguration) {
 		if (newRaftConfiguration.getOldPeersCount() > 0) {
 			CrashPoints.reach(CrashPoints.Point.JOINT_CONFIGURATION_APPLIED);
 		}
+		pendingConfiguration = term > RemovalRule.UNKNOWN_TERM ? new PendingConfiguration(Thread.currentThread(),
+				new RemovalRule.Conf(term, index, ids(newRaftConfiguration.getPeersList()),
+						ids(newRaftConfiguration.getOldPeersList()))) : null;
 	}
+
+	private static List<String> ids(List<RaftProtos.RaftPeerProto> peers) {
+		return peers.stream().map(peer -> peer.getId().toStringUtf8()).toList();
+	}
+
+	/** The committed configurations applied here, see {@link CommittedConfigurations}. Any thread. */
+	CommittedConfigurations configurations() {
+		return configurations;
+	}
+
+	/** Replaced when a database opens. */
+	private volatile CommittedConfigurations configurations = CommittedConfigurations.none();
 
 	@Override
 	public void notifyServerShutdown(RaftProtos.RoleInfoProto roleInfo, boolean allServer) {

@@ -691,6 +691,27 @@ final class Applier {
 	 */
 	void beginGroup() {
 		grouping = true;
+		configurations.clear();
+	}
+
+	/**
+	 * The committed configuration entries of this group, by index: {@link #markApplied(MetaSink, TermIndex)} records
+	 * the one at its position, in the same write ({@link CommittedConfigurations}). Apply thread only.
+	 */
+	private final java.util.HashMap<Long, RemovalRule.Conf> configurations = new java.util.HashMap<>();
+
+	/** {@link NodeStore#configurationHistoryFrom} of this database when it was opened. */
+	private long configurationHistoryFrom = -1;
+
+	/**
+	 * Records {@code conf}, a configuration entry Ratis applied, with the mark of its position: call before
+	 * {@link #markApplied(TermIndex)} of that position, in the same group.
+	 */
+	void recordConfiguration(RemovalRule.Conf conf) {
+		if (configurationHistoryFrom < 0) {
+			configurationHistoryFrom = store.configurationHistoryFrom();
+		}
+		configurations.put(conf.index(), conf);
 	}
 
 	/** Commits the current group, see {@link #beginGroup}. */
@@ -1484,6 +1505,13 @@ final class Applier {
 	}
 
 	private void markApplied(MetaSink tx, TermIndex position) {
+		var conf = configurations.get(position.getIndex());
+		if (conf != null && conf.term() == position.getTerm()) {
+			tx.put(NodeStore.configurationKey(conf.index(), conf.term()), Buf.wrap(CommittedConfigurations.encodeHalves(conf)));
+			// The same value every time: the first record fixes it (see NodeStore.configurationHistoryFrom).
+			tx.put(NodeStore.key(NodeStore.CONFIGURATION_HISTORY),
+					Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(configurationHistoryFrom).array()));
+		}
 		tx.put(NodeStore.key(NodeStore.APPLIED), NodeStore.encodeTermIndex(position));
 		if (clockMoved) {
 			tx.put(NodeStore.key(NodeStore.CLOCK),

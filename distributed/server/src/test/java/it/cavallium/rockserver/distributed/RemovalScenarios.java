@@ -27,6 +27,16 @@ final class RemovalScenarios {
 		return leader;
 	}
 
+	/**
+	 * A ready leader among the running nodes, whatever the others think: unlike {@link #awaitReadyLeader}, for a cluster
+	 * with a running node that follows no leader (a joiner before its add, a removed node).
+	 */
+	static ReplicatedNode awaitAnyReadyLeader(InProcessCluster cluster) {
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().anyMatch(node -> node.isLeader()
+				&& Objects.requireNonNull(node.stateMachine().division()).getInfo().isLeaderReady()));
+		return cluster.runningNodes().stream().filter(ReplicatedNode::isLeader).findFirst().orElseThrow();
+	}
+
 	/** Asks {@code leader} to change the configuration to {@code ids} (Ratis' setConfiguration, as add/remove-peer do). */
 	static CompletableFuture<RaftClientReply> setConfiguration(InProcessCluster cluster, ReplicatedNode leader,
 			List<String> ids) throws Exception {
