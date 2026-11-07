@@ -1704,7 +1704,8 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   never stops), `JoinRemovedWhileDownTest` (R11-3: a `--join` node gets only the joint configuration of its add, goes
   down and is removed; its start is refused; at `0d8bc71` it waited for `add-peer` forever), `ReAddTest` (a removed id
   wiped and added again, replaying its earlier membership, through checks while it hears no leader and a restart in
-  the middle of its add: NOT_ADDED, never exit 4, then a member; and a fresh `--join` node through six check periods),
+  the middle of its add: NOT_ADDED, never exit 4, then a member; and a fresh `--join` node through six completed checks;
+  both wait for a count of completed checks, not a fixed sleep),
   `ColdRestartOrderTest` (every start order of three members; a removed fourth node started first, in the middle or
   last exits with 4 once two members are up), `CommittedConfigurationsTest` (records with terms, kept across a restart,
   probes; a snapshot install from a leader that holds an uncommitted joint configuration records the leader's

@@ -699,6 +699,7 @@ public final class ReplicatedNode implements AutoCloseable {
 						return;
 					}
 					var verdict = checkMembership(division);
+					detachedChecks.incrementAndGet();
 					if (verdict.outcome() == RemovalRule.Outcome.REMOVED) {
 						onReplicaFailure(RemovedException.of(config.nodeId(), verdict, "while it heard no leader"));
 						return;
@@ -737,6 +738,13 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	/** Whether {@link #checkWhileDetached} has a check queued or running. */
 	private final AtomicBoolean askingMembers = new AtomicBoolean();
+	/** How many checks {@link #checkWhileDetached} completed (its verdict set in {@link #membership}): tests. */
+	private final AtomicLong detachedChecks = new AtomicLong();
+
+	/** See {@link #detachedChecks}: tests. */
+	long detachedChecks() {
+		return detachedChecks.get();
+	}
 
 	/**
 	 * The membership verdict of this node's last check (R11), null if none ran: at the start (existing data

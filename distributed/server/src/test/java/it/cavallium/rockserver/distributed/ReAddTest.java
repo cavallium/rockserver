@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import org.apache.ratis.proto.RaftProtos;
@@ -77,7 +78,8 @@ class ReAddTest {
 		assertTrue(history.all().stream().anyMatch(conf -> conf.inNew(x)), "it replayed its earlier membership");
 		// Several checks while it hears no leader (now every request to it is dropped): none says removed.
 		RaftTraffic.dropForTesting = (receiver, message) -> receiver.equals(x);
-		Thread.sleep(fresh.config().electionTimeoutMax().multipliedBy(12).toMillis());
+		long before = fresh.detachedChecks();
+		InProcessCluster.await(checks(fresh, 3), () -> fresh.detachedChecks() >= before + 3);
 		assertFalse(fresh.stopped().isDone(), () -> "stopped: " + fresh.stopped().join());
 		assertEquals(RemovalRule.Reason.NOT_ADDED, Objects.requireNonNull(fresh.membership()).reason());
 		assertFalse(Files.exists(cluster.config(x).raftDir().resolve("member")), "not a voter yet");
@@ -98,13 +100,22 @@ class ReAddTest {
 		assertFalse(restarted.stopped().isDone());
 	}
 
+	/**
+	 * Enough time for {@code n} checks while a node hears no leader: three election timeouts of quiet, then one check
+	 * every three election timeouts (at least a second), with room to spare.
+	 */
+	private static Duration checks(ReplicatedNode node, int n) {
+		var periods = node.config().electionTimeoutMax().multipliedBy(3L * (n + 3));
+		return periods.compareTo(TIMEOUT) > 0 ? periods : TIMEOUT;
+	}
+
 	/** A fresh --join node waits for add-peer through several checks, and never exits. */
 	@Test
 	void aFreshJoinerWaitsWithoutExiting() throws Exception {
 		cluster = new InProcessCluster(root, 3, config -> config).startAll();
 		awaitReadyLeader(cluster);
 		var joiner = cluster.join("j0");
-		Thread.sleep(joiner.config().electionTimeoutMax().multipliedBy(3 * 6).toMillis());
+		InProcessCluster.await(checks(joiner, 6), () -> joiner.detachedChecks() >= 6);
 		assertFalse(joiner.stopped().isDone(), () -> "stopped: " + joiner.stopped().join());
 		var membership = Objects.requireNonNull(joiner.membership(), "checked while it heard no leader");
 		assertEquals(RemovalRule.Reason.NOT_ADDED, membership.reason(), String.valueOf(membership));
