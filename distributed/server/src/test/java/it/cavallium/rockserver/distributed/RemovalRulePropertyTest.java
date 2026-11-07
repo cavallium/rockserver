@@ -43,15 +43,17 @@ import org.apache.ratis.server.protocol.TermIndex;
  *
  * <p>The model, per node: its log (term; ordinary or configuration entry), snapshot, commit and applied indexes, the
  * history of applied configurations, {@code raft-meta.conf} and Ratis' configurations in memory, kept apart as Ratis
- * keeps them: an append or truncation removes the configurations in memory from its first index on, a snapshot install
- * writes the leader's latest configuration (committed or not) to the file and into memory, an apply rewrites only the
- * file, and a restart rebuilds the memory from the file and the log (round-11 finding 1). Steps: elections (votes by
+ * keeps them: an append or truncation removes the configurations in memory from its first index on, a snapshot chunk
+ * writes the sender's latest configuration (committed or not) to the file and into memory, after dropping those from
+ * its index on, also when Ratis rejects it for its term or because the snapshot is already installed (round 15), an
+ * apply rewrites only the file, and a restart rebuilds the memory from the file and the log (round-11 finding 1).
+ * {@link InstalledConfiguration} records every chunk that reaches a node, before Ratis sees it. Steps: elections (votes by
  * log up-to-dateness from a majority of each half of the candidate's configuration, voters whose configuration holds
  * the candidate; the term-start entry copies the new half, R11-1), ordinary appends, membership changes (joint, then
  * stable, each only after the one before is committed; an add of a node that has a log is refused, but x and y are
  * wiped and join as a new incarnation), replication with truncation only on conflict, commit, apply, snapshots,
- * installs (also one that stops between Ratis' snapshot index and the history swap, R12-2), crashes and restarts
- * (commit index back to the applied one).</p>
+ * installs (also one that stops between Ratis' snapshot index and the history swap, R12-2), chunks of deposed leaders
+ * or of leaders cut off from the others, to any node, crashes and restarts (commit index back to the applied one).</p>
  *
  * <p>Checked after every step: the committed prefixes of all nodes agree (sanity of the model); every committed
  * configuration a running node reports, and every probe it answers committed, is a configuration entry the model
@@ -67,7 +69,8 @@ import org.apache.ratis.server.protocol.TermIndex;
  * <p>Not modelled: timing (current-term constraints of votes, leader leases), RemovalCheck's budget and the asynchrony
  * of its rounds (answers are taken atomically in each round; the rounds are replayed with the probes of the K* of the
  * round before, and a member that did not answer is not asked again, as {@link RemovalCheck} does), HEARD_LEADER, and
- * the 200 ms window of the member file (written at once here). Version-1 answers are not held to the fact oracle: their
+ * the 200 ms window of the member file (written at once here), and the record's file writes, which are atomic here
+ * (their concurrency is {@code InstalledConfigurationTest}'s). Version-1 answers are not held to the fact oracle: their
  * committed flag is the finding-1 flaw of older versions, which the rule must survive (R12-1). S2 leaves out a
  * subject whose current incarnation became a voter only through an add that never committed: its own log holds that
  * add's configuration after K*, on K*'s branch and of a term not lower, which the rule cannot tell from one that may
@@ -129,6 +132,13 @@ class RemovalRulePropertyTest {
 	/** Leader {@code n} installs its snapshot on {@code f}; {@code window}: f stops before the history swap. */
 	record Install(int n, int f, boolean window) implements Step {}
 
+	/**
+	 * A snapshot chunk of node {@code n}, sent while it led its current term, reaches {@code f}: a deposed leader's
+	 * chunk, or one of a leader that is down here (cut off from the others, it still runs as the leader of its term,
+	 * so it neither votes nor answers). Whatever {@code f} answers, Ratis takes the chunk's configuration (round 15).
+	 */
+	record StaleInstall(int n, int f) implements Step {}
+
 	/** Node {@code n} swaps in the history of the snapshot it installs. */
 	record FinishInstall(int n) implements Step {}
 
@@ -166,6 +176,8 @@ class RemovalRulePropertyTest {
 		boolean up;
 		boolean leader;
 		long term;
+		/** The term it last led, -1 if none: while it equals {@link #term}, it may still send chunks of that term. */
+		long ledTerm = -1;
 		/** The whole log, the purged prefix included (index i at position i - 1): the model's truth. */
 		List<Entry> log = new ArrayList<>();
 		long snapshot;
@@ -350,6 +362,11 @@ class RemovalRulePropertyTest {
 					}
 					yield install(leader, f, s.window(), false);
 				}
+				case StaleInstall s -> {
+					var sender = pick(s.n(), node -> node.ledTerm == node.term && node.snapshot > 0 && !node.inWindow());
+					yield sender.ledTerm == sender.term && sender.snapshot > 0 && !sender.inWindow()
+							&& install(sender, pick(s.f(), node -> node != sender && node.up && !node.inWindow()), false, true);
+				}
 				case FinishInstall s -> finishInstall(pick(s.n(), Node::inWindow));
 				case Crash s -> crash(pick(s.n(), n -> n.up && !n.inWindow()));
 				case Restart s -> restart(pick(s.n(), n -> !n.up));
@@ -390,6 +407,7 @@ class RemovalRulePropertyTest {
 			}
 			n.term = term;
 			n.leader = true;
+			n.ledTerm = term;
 			appendEntry(n, new Entry(term, conf.newHalf(), List.of()));
 			return true;
 		}
@@ -460,6 +478,7 @@ class RemovalRulePropertyTest {
 			a.addIndex = Long.MAX_VALUE;
 			a.leader = false;
 			a.term = 0;
+			a.ledTerm = -1;
 			a.log = new ArrayList<>();
 			a.snapshot = 0;
 			a.commit = 0;
@@ -615,28 +634,42 @@ class RemovalRulePropertyTest {
 			return true;
 		}
 
+		/**
+		 * Leader {@code n} (or a deposed one, {@link StaleInstall}) sends {@code f} a chunk of its snapshot, as Ratis 3.3.1
+		 * handles it ({@code SnapshotInstallationHandler}): NOT_LEADER for a term below {@code f}'s, ALREADY_INSTALLED
+		 * for a snapshot not past {@code f}'s commit index, else the install. For each of them Ratis drops its
+		 * configurations from the index of the chunk's on, and takes the chunk's (round 15). An install over a log that
+		 * already holds the snapshot's prefix is not modelled (the leader sends entries then).
+		 */
 		boolean install(Node n, Node f, boolean window, boolean staging) {
-			if (n == null || f == n || !f.up || f.inWindow() || n.snapshot == 0 || (!staging && !sendsTo(n, f))) {
+			if (n == null || f == null || f == n || !f.up || f.inWindow() || n.snapshot == 0
+					|| (!staging && !sendsTo(n, f))) {
 				return false;
 			}
 			long p = commonPrefix(n, f);
-			var latest = n.current();
-			if (p < n.snapshot) {
-				// RaftTraffic, before Ratis sees the chunk (and may reject it for its term).
-				f.installed = InstalledConfiguration.next(f.installed, n.term, latest.index(), latest.newHalf(),
-						latest.oldHalf());
-			}
-			if (f.term > n.term) {
-				n.leader = false;
-				n.term = f.term;
-				return true;
-			}
-			if (p >= n.snapshot) {
+			boolean notLeader = f.term > n.term;
+			boolean alreadyInstalled = !notLeader && f.commit >= n.snapshot;
+			if (!notLeader && !alreadyInstalled && p >= n.snapshot) {
 				return false;
 			}
-			long s = n.snapshot;
+			var latest = n.current();
+			// RaftTraffic, before Ratis sees the chunk: every chunk, whatever Ratis answers.
+			f.installed = InstalledConfiguration.with(f.installed, n.term, latest.index(), latest.newHalf(),
+					latest.oldHalf());
+			takeConfiguration(f, latest);
+			if (notLeader) {
+				if (n.up) {
+					n.leader = false;
+					n.term = f.term;
+				}
+				return true;
+			}
 			f.term = n.term;
 			f.leader = false;
+			if (alreadyInstalled) {
+				return true;
+			}
+			long s = n.snapshot;
 			f.log = new ArrayList<>(n.log.subList(0, (int) s));
 			f.snapshot = s;
 			f.commit = s;
@@ -654,6 +687,17 @@ class RemovalRulePropertyTest {
 				f.applied = s;
 			}
 			return true;
+		}
+
+		/**
+		 * What Ratis does with the configuration of a chunk it does not fail ({@code installSnapshotImpl}):
+		 * {@code state.truncate(index)} drops its configurations from that index on (not the log), then, the chunk's
+		 * configuration being other than the one left, it takes it and writes {@code raft-meta.conf}.
+		 */
+		static void takeConfiguration(Node f, Conf latest) {
+			f.mem.tailMap(latest.index(), true).clear();
+			f.mem.put(latest.index(), latest);
+			f.file = latest;
 		}
 
 		boolean finishInstall(Node n) {
@@ -1025,6 +1069,30 @@ class RemovalRulePropertyTest {
 		return false;
 	}
 
+	/**
+	 * Applies {@code steps} (each must apply) with the checks of {@link #checkState} under one set of answers only:
+	 * every member answering in this version.
+	 */
+	static Model runAllAnswering(Setup setup, List<Step> steps) {
+		var model = new Model(setup);
+		for (var step : steps) {
+			assertTrue(model.apply(step), () -> "step not applicable: " + step + "\n" + model);
+			checkFacts(model);
+			for (var id : SUBJECTS) {
+				var subject = model.nodes.get(id);
+				if (subject.up) {
+					var verdict = check(model, subject, Map.of());
+					assertTrue(verdict.reason() != Reason.INCONSISTENT, () -> "false alarm for " + id + ": " + verdict
+							+ "\n" + model);
+					if (verdict.outcome() == Outcome.REMOVED) {
+						checkRemovedIsSafe(model, subject, verdict, Map.of());
+					}
+				}
+			}
+		}
+		return model;
+	}
+
 	static Model run(Setup setup, List<Step> steps, long seed, boolean strict) {
 		var model = new Model(setup);
 		var random = new Random(seed);
@@ -1072,13 +1140,14 @@ class RemovalRulePropertyTest {
 		Arbitrary<Step> apply = Combinators.combine(node, Arbitraries.of(0, 0, 1, 3)).as(Apply::new);
 		Arbitrary<Step> snapshot = Combinators.combine(node, Arbitraries.integers().between(0, 3)).as(Snapshot::new);
 		Arbitrary<Step> install = Combinators.combine(node, node, Arbitraries.of(false, false, true)).as(Install::new);
+		Arbitrary<Step> staleInstall = Combinators.combine(node, node).as(StaleInstall::new);
 		Arbitrary<Step> finishInstall = node.map(FinishInstall::new);
 		Arbitrary<Step> crash = node.map(Crash::new);
 		Arbitrary<Step> restart = node.map(Restart::new);
 		return Arbitraries.frequencyOf(Tuple.of(4, elect), Tuple.of(4, append), Tuple.of(3, setConf),
 				Tuple.of(3, finish), Tuple.of(6, replicate), Tuple.of(6, broadcast), Tuple.of(3, commit),
-				Tuple.of(5, apply), Tuple.of(5, snapshot), Tuple.of(5, install), Tuple.of(1, finishInstall),
-				Tuple.of(3, crash), Tuple.of(3, restart)).list().ofMinSize(30).ofMaxSize(120);
+				Tuple.of(5, apply), Tuple.of(5, snapshot), Tuple.of(5, install), Tuple.of(3, staleInstall),
+				Tuple.of(1, finishInstall), Tuple.of(3, crash), Tuple.of(3, restart)).list().ofMinSize(30).ofMaxSize(120);
 	}
 
 	/** Facts, S1 and no false alarm after every step of a random history. */
@@ -1105,7 +1174,9 @@ class RemovalRulePropertyTest {
 	static final int C = 2;
 	static final int D = 3;
 	static final int X = 4;
+	static final int Y = 5;
 	static final Setup FIVE = new Setup(true, false);
+	static final Setup SIX = new Setup(true, true);
 
 	static List<Step> steps(Object... steps) {
 		var list = new ArrayList<Step>();
@@ -1212,6 +1283,42 @@ class RemovalRulePropertyTest {
 		assertTrue(x.incarnation == 1 && x.memberFile && x.current().index() > x.last() && x.current().inNew("x")
 				&& !x.current().oldHalf().isEmpty(), () -> "D past x's log\n" + model);
 		var modes = Map.of("a", Mode.NONE);
+		var verdict = check(model, x, modes);
+		if (verdict.outcome() == Outcome.REMOVED) {
+			checkRemovedIsSafe(model, x, verdict, modes);
+		}
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, verdict.reason(), () -> verdict + "\n" + model);
+	}
+
+	/**
+	 * Round 15, R14-1: x, removed by b in term 2, then re-added by b (D_B, joint, index 7, not committed; b is then cut
+	 * off as the leader of term 2). c commits K* (term 5, index 6) without x, re-adds x (D_L: index 7, same halves as
+	 * D_B) and installs a snapshot on x with D_L past its log end. Then a chunk of a, deposed in term 4, with its
+	 * configuration at index 6 reaches x, and one of b with D_B. Ratis rejects both for their term but takes their
+	 * configurations, so x ends with D_B, which equals D_L. D_L may still commit through c, which does not answer: x
+	 * must wait. With one record replaced by each chunk of another configuration, D's bound was b's term 2, below K*'s,
+	 * the rule skipped D, and x was REMOVED (S1 (b) fails at c4707b0). Checked with every member answering until the
+	 * end: between a's chunk and b's, x holds a's configuration and no evidence of D_L (N-R15-1, an upstream issue).
+	 */
+	@Example
+	void aStaleChunkOfAnotherConfigurationDoesNotLowerTheBoundOfTheOneRatisHolds() {
+		var model = runAllAnswering(SIX, steps(new Elect(A), toAll(A, B, C, D, X, Y), new AdvanceCommit(A),
+				toAll(A, B, C, D, X, Y), new Elect(B), toAll(B, A, C, D, X, Y), new AdvanceCommit(B),
+				toAll(B, A, C, D, X, Y), new Change(B, X, false), toAll(B, A, C, D, Y), new AdvanceCommit(B),
+				new FinishConf(B), toAll(B, A, C, D, Y), new AdvanceCommit(B), toAll(B, A, C, D, Y), new Apply(B, 0),
+				new Snapshot(B, 0), repeat(2, new Append(B)), new Change(B, X, false), new Crash(B), new Elect(C),
+				toAll(C, A, D, Y), new AdvanceCommit(C), toAll(C, A, D, Y), new Apply(C, 1), new Snapshot(C, 0),
+				new Apply(A, 0), new Snapshot(A, 0), new Elect(A), new Crash(A), new Elect(C), toAll(C, D, Y),
+				new AdvanceCommit(C), toAll(C, D, Y), new Apply(C, 1), new Change(C, X, true), new Install(C, X, false),
+				new Crash(X), new Restart(X), new StaleInstall(A, X), new Restart(A), new Replicate(C, A, 1),
+				new Apply(A, 0), new StaleInstall(B, X)));
+		var x = model.nodes.get("x");
+		var c = model.nodes.get("c");
+		var kStar = model.newestCommitted();
+		assertTrue(x.incarnation == 2 && x.memberFile && x.current().index() == 7 && x.current().index() > x.last()
+				&& x.current().inNew("x") && c.current().index() == 7 && c.current().inNew("x") && kStar.index() == 6
+				&& kStar.term() == 5, () -> "D past x's log, K* at 6 in term 5\n" + model);
+		var modes = Map.of("c", Mode.NONE);
 		var verdict = check(model, x, modes);
 		if (verdict.outcome() == Outcome.REMOVED) {
 			checkRemovedIsSafe(model, x, verdict, modes);

@@ -58,6 +58,19 @@ record InstalledConfiguration(long index, long termBound, List<String> newHalf, 
 		return new InstalledConfiguration(index, leaderTerm, newHalf, oldHalf);
 	}
 
+	/** R15 tests: at most this many configurations are kept. Stub: one record is kept. */
+	static final int CAP = 32;
+
+	/** R15 tests: the record after a chunk. Stub: {@link #next}, the old replacement. */
+	static InstalledConfiguration with(@Nullable InstalledConfiguration record, long leaderTerm, long index,
+			List<String> newHalf, List<String> oldHalf) {
+		return next(record, leaderTerm, index, newHalf, oldHalf);
+	}
+
+	/** R15 tests: the file at a start, with the floor {@code floor}. Stub: keeps the file as it is. */
+	static void initialize(Path raftDir, long floor) {
+	}
+
 	/** The record in {@code raftDir}, null if none or unreadable (then it bounds nothing). */
 	static @Nullable InstalledConfiguration read(Path raftDir) {
 		try {
