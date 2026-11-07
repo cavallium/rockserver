@@ -158,7 +158,7 @@ that succeeded prints `OK` again (for `add-peer`, `already a voter`). If the lea
 new read of its configuration does not change (Ratis' own `changes a majority set`, say), `admin` fails at once with
 its message (`the leader n2 (term 7) refused, and its configuration did not change since: ...`).
 
-`admin` asks every `--peer` and takes the configuration of the leader of the highest term; it waits while a member
+`admin` asks every `--peer` at once (a down member delays each round by one request timeout, not one each) and takes the configuration of the leader of the highest term; it waits while a member
 shows a later term than the leader that answered. A leader that has just been deposed answers as the leader for about
 an election timeout, with its old configuration: if neither the new leader nor any member that knows its term
 answers, `admin` can still read that one. A change then fails at once with `did not change since` and the advice to
