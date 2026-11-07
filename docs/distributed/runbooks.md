@@ -248,13 +248,14 @@ A difference (the log says `REPLICAS DIVERGED`, the alert `rockserver-checksum-m
 
 ## Snapshot installs refused
 
-The alert `rockserver-install-refused` counts two ways a follower fails a leader's snapshot install stream (design.md,
-R16-2 and the install record). The leader starts the install again in both cases.
+Two alerts count the ways a follower fails a leader's snapshot install stream (design.md, R16-2 and the install
+record). The leader starts the install again in both cases.
 
-- `install.recordFailures`: the follower could not write the chunk's configuration to `raft/installed-configuration`.
+- `install.recordFailures` (`rockserver-install-record-failed`, on the first one): the follower could not write the chunk's configuration to `raft/installed-configuration`.
   Its log says `cannot record the configuration of a snapshot chunk`, with the I/O error. Check the Raft disk (space,
   permissions, errors in the kernel log) as in "Disk space and write stalls".
-- `install.staleChunks`: the follower refused a chunk whose configuration is older than its install floor. Its log says
+- `install.staleChunks` (`rockserver-install-stale-chunks`, only when more than 3 come in every 30 minutes for 30
+  minutes): the follower refused a chunk whose configuration is older than its install floor. Its log says
   `a snapshot chunk of term ... carries the configuration at index ..., older than the one at ...`. A few right after a
   leader change or a restarted install are expected: they are chunks of a stream its leader gave up on. If they keep
   coming while the same follower's lag never drops (`rockserver-follower-lag`), the follower may be refusing a live
@@ -408,6 +409,7 @@ says. The rules and what to do:
 | `rockserver-write-delayed` | warning | RocksDB slows writes | "Disk space and write stalls" |
 | `rockserver-checksum-mismatch` | critical | The replicas diverged | "Checksums" |
 | `rockserver-leader-stall` | warning | A leader stepped down to restart replication | "A leader whose log stops" in design.md |
-| `rockserver-install-refused` | warning | A follower failed snapshot install streams (`install.recordFailures`, `install.staleChunks`) | "Snapshot installs refused" |
+| `rockserver-install-record-failed` | warning | A follower could not record a snapshot chunk's configuration (`install.recordFailures`) | "Snapshot installs refused", "Disk space and write stalls" |
+| `rockserver-install-stale-chunks` | warning | A follower kept refusing stale snapshot chunks: more than 3 in every 30 minutes for 30 minutes (`install.staleChunks`). A few after a leader change are expected, hence the threshold and the wait | "Snapshot installs refused" |
 | `rockserver-node-outside` | warning | A node is outside the cluster and undecided for 10 minutes (`membership.state` 2) | "Removed node" (the reason is in its log) |
 | `rockserver-node-not-added` | warning | A `--join` node is not a voter after 6 hours (`membership.state` 1): a forgotten or abandoned `add-peer`. It is 1 during a normal catch-up too, hence the long wait | "Removed node", `NOT_ADDED` |

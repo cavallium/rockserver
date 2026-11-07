@@ -39,8 +39,10 @@ final class Capabilities {
 	/** Everything this version supports. */
 	static final long SUPPORTED = PIPELINED_UPDATES | CLIENT_SESSIONS | CHECKSUM | BACKUP | CHECKSUM_SCHEMAS;
 	/**
-	 * The version {@link LogEntry.Genesis} writes: the capabilities of the first version with this gate, frozen. Never
-	 * change it, not even when a later version adds a bit (R17-1). The entry carries no version, so a node applies it
+	 * The version {@link LogEntry.Genesis} writes: the capabilities this branch's builds had when the value was frozen
+	 * (R17-1), not those of the first build with this gate, which wrote 0xF ({@link #CHECKSUM_SCHEMAS} came later, at
+	 * {@code 729fa06}; design.md, "Cluster version", has the residual). Never change it, not even when a later version
+	 * adds a bit. The entry carries no version, so a node applies it
 	 * with its own code: a node of a later version that replays genesis from the log (it joined a cluster whose log still
 	 * starts at genesis, or was upgraded before it applied genesis) must write what the other replicas wrote, or it would
 	 * hold a version above theirs, which {@link LogEntry.ClusterVersion} never lowers. A cluster created by a later

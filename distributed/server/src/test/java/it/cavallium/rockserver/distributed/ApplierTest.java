@@ -121,12 +121,17 @@ class ApplierTest {
 	}
 
 	/**
-	 * R17-1: genesis writes the version of the cluster it creates, frozen at the capabilities of the first version with
-	 * the gate (0x1F), not the capabilities of the node that applies it. A node of a newer version that replays genesis
+	 * R17-1: genesis writes the version of the cluster it creates, frozen at the capabilities this branch's builds had
+	 * when the value was frozen (0x1F), not the capabilities of the node that applies it. A node of a newer version that replays genesis
 	 * from the log (it joined a young cluster whose log still starts at genesis, or was upgraded before it applied genesis)
 	 * would otherwise hold a version above the other replicas', which applying {@code ClusterVersion} as a union never
 	 * lowers: as leader it would write entries older members cannot read, and its checksums would digest differently.
-	 * Here the node supports a bit no version has yet, as a newer node would.
+	 * <p>This pins the literal; it does not reproduce a newer node (R17 review, finding 3). The old bug read the
+	 * constant {@code GENESIS = SUPPORTED} and never asked {@link Applier.Maintenance#supported()}, so the extra bit
+	 * given here does not bring it back: the test passes at {@code b3df680}, before the fix. It checks that genesis
+	 * writes 0x1F, and that {@code applyGenesis} does not start writing what the applying node supports. It fails only
+	 * if {@code GENESIS} changes, or once a bit is added to {@code SUPPORTED} with {@code GENESIS = SUPPORTED} restored
+	 * (checked by hand with {@code 1 << 5}: 31 expected, 63 written).</p>
 	 */
 	@Test
 	void genesisWritesTheFrozenVersionNotTheApplyingNodesCapabilities() throws Exception {
