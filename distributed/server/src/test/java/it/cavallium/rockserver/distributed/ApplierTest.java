@@ -89,7 +89,7 @@ class ApplierTest {
 	}
 
 	/**
-	 * R16-1: a replicated server offers client sessions when the version it was told of has them, or when its database
+	 * R16b-1: a replicated server offers client sessions when the version it was told of has them, or when its database
 	 * has no cluster id yet (see ReplicatedConnection.getCapabilities). Genesis used to write the cluster id before it
 	 * told the node of its version, so a client whose handshake came in between was told there were no sessions, and its
 	 * connection never used them. Here, at every point where the node learns the version, what it would answer just

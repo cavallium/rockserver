@@ -1359,10 +1359,11 @@ final class Applier {
 		if (genesis.seedDigest() != null) {
 			checkSeedDigest(genesis.seedDigest());
 		}
-		// A cluster created by this version: every member runs it (see Capabilities). The node learns the version before
-		// the cluster id becomes visible: until then it answers as before genesis, which assumes this same version. The
-		// other order left a moment, id written and version not yet known, in which the node told a connecting client
-		// that there were no sessions, and that connection never used them (R16-1).
+		// The frozen version of a new cluster, the same on every replica whatever version applies it (R17-1, see
+		// Capabilities.GENESIS); the leader's poll raises anything newer. The node learns the version before the cluster
+		// id becomes visible: until then it answers as before genesis, which offers client sessions too. The other order
+		// left a moment, id written and version not yet known, in which the node told a connecting client that there were
+		// no sessions, and that connection never used them (R16b-1).
 		maintenance.clusterVersion(Capabilities.GENESIS);
 		writeClusterVersion(Capabilities.GENESIS);
 		if (genesis.seeded()) {
