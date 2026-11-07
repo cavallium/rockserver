@@ -165,6 +165,20 @@ class MembershipFactsTest {
 		assertEquals(j, MembershipFacts.committed(division, recorded));
 	}
 
+	/**
+	 * R12-2: during a snapshot install Ratis moves its snapshot index (to 30 here) before the state machine swaps in the
+	 * snapshot's history; meanwhile the old history (applied up to about 12) has no record for a configuration
+	 * committed in between. A missing record in the snapshot is unknown, never absent: absent would drop a blocker.
+	 */
+	@Test
+	void aConfigurationInTheSnapshotWithNoRecordIsUnknown() {
+		var division = division(5, ALL, List.of(), new TreeMap<>(), 30, 30);
+		var history = new CommittedConfigurations(List.of(new Conf(1, 5, ALL, List.of())), 0);
+		assertEquals(Probe.UNKNOWN, MembershipFacts.probe(division, history, 2, 20), "no record at 20");
+		assertEquals(Probe.COMMITTED, MembershipFacts.probe(division, history, 1, 5));
+		assertEquals(Probe.ABSENT, MembershipFacts.probe(division, history, 2, 5), "another term recorded at 5");
+	}
+
 	/** The asker X of the scenario: before the fix, F's answers and the members' probes removed it. */
 	@Test
 	void xIsNotRemovedOnTheStaleConfiguration() {
