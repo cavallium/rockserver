@@ -747,7 +747,10 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * stops sending to it, and its election timer finds that the new configuration does not hold it
 	 * ({@code LeaderElection} answers {@code NOT_IN_CONF} and shuts the Raft server down). The node then stops with
 	 * "Raft closed" (exit 3, {@link #stopAfterRaftClosed}); its next start is refused here (exit 4) if the members of
-	 * the new half answer, or else waits outside until they do.</p>
+	 * the new half answer, or else waits outside until they do. Two consequences: a member waiting outside casts no
+	 * vote ({@code RaftServerImpl.requestVote} needs a running server), so the members that are up must make a majority
+	 * without it (as before R10-1, when it was refused); and a removed node whose whole new half never answers (gone,
+	 * or of a version without {@link TermService#configuration}) waits outside indefinitely, warning in its log.</p>
 	 *
 	 * <p>The configuration that removes a node commits with the other members alone, so the removed node's log may
 	 * never receive it: a node that was stopped, slow or cut off during its removal still holds itself in its log. So a

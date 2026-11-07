@@ -132,7 +132,9 @@ class ProposerResetTest {
 	/**
 	 * R10-5, the bound: an attempt that read the old proxy, and was sent on the replacement that another attempt's reset
 	 * made in between, keeps that replacement when it fails there (it cannot tell which proxy the call used). The next
-	 * attempt to the peer reads the replacement first, and its failure replaces it.
+	 * attempt to the peer reads the replacement first, and its failure replaces it. This pins only the reset rule that
+	 * bound relies on: the test calls {@link Proposer#resetBrokenProxy} itself and sends no attempt, so it does not
+	 * exercise where {@code Proposer.send} reads the proxy, and it passes without that change.
 	 */
 	@Test
 	void aFailureOnAReplacementMadeAfterTheReadIsReplacedByTheNextAttempt() throws Exception {
