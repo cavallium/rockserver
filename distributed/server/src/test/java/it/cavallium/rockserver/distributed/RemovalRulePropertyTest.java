@@ -139,6 +139,13 @@ class RemovalRulePropertyTest {
 	 */
 	record StaleInstall(int n, int f) implements Step {}
 
+	/**
+	 * As {@link StaleInstall}, but the chunk passed {@link RaftTraffic}'s term check before {@code f}'s term rose past the
+	 * sender's (round 15, N-R15-1: the window between that check and Ratis' own): Ratis answers NOT_LEADER and takes its
+	 * configuration. Examples only: random histories never contain it (a residual, see the design document).
+	 */
+	record RacedStaleInstall(int n, int f) implements Step {}
+
 	/** Node {@code n} swaps in the history of the snapshot it installs. */
 	record FinishInstall(int n) implements Step {}
 
@@ -360,12 +367,19 @@ class RemovalRulePropertyTest {
 						leader.snapshot = leader.applied;
 						trace.add(new Snapshot(UNIVERSE.indexOf(leader.id), 0).toString());
 					}
-					yield install(leader, f, s.window(), false);
+					yield install(leader, f, s.window(), false, false);
 				}
 				case StaleInstall s -> {
 					var sender = pick(s.n(), node -> node.ledTerm == node.term && node.snapshot > 0 && !node.inWindow());
 					yield sender.ledTerm == sender.term && sender.snapshot > 0 && !sender.inWindow()
-							&& install(sender, pick(s.f(), node -> node != sender && node.up && !node.inWindow()), false, true);
+							&& install(sender, pick(s.f(), node -> node != sender && node.up && !node.inWindow()), false, true,
+							false);
+				}
+				case RacedStaleInstall s -> {
+					var sender = nodes.get(UNIVERSE.get(s.n()));
+					var f = nodes.get(UNIVERSE.get(s.f()));
+					yield sender.ledTerm == sender.term && sender.snapshot > 0 && !sender.inWindow() && f.term > sender.term
+							&& install(sender, f, false, true, true);
 				}
 				case FinishInstall s -> finishInstall(pick(s.n(), Node::inWindow));
 				case Crash s -> crash(pick(s.n(), n -> n.up && !n.inWindow()));
@@ -453,7 +467,7 @@ class RemovalRulePropertyTest {
 				a.up = true;
 				// add-peer brings it up to date first (staging): no member file from this.
 				if (!replicate(n, a, 0, true)) {
-					install(n, a, false, true);
+					install(n, a, false, true, false);
 					if (!lag) {
 						replicate(n, a, 0, true);
 					}
@@ -638,10 +652,12 @@ class RemovalRulePropertyTest {
 		 * Leader {@code n} (or a deposed one, {@link StaleInstall}) sends {@code f} a chunk of its snapshot, as Ratis 3.3.1
 		 * handles it ({@code SnapshotInstallationHandler}): NOT_LEADER for a term below {@code f}'s, ALREADY_INSTALLED
 		 * for a snapshot not past {@code f}'s commit index, else the install. For each of them Ratis drops its
-		 * configurations from the index of the chunk's on, and takes the chunk's (round 15). An install over a log that
-		 * already holds the snapshot's prefix is not modelled (the leader sends entries then).
+		 * configurations from the index of the chunk's on, and takes the chunk's (round 15). But {@link RaftTraffic}
+		 * answers NOT_LEADER itself to a chunk of a term below {@code f}'s, which Ratis then never sees (N-R15-1), unless
+		 * {@code raced}: the chunk passed that check before {@code f}'s term rose. An install over a log that already
+		 * holds the snapshot's prefix is not modelled (the leader sends entries then; see the design document).
 		 */
-		boolean install(Node n, Node f, boolean window, boolean staging) {
+		boolean install(Node n, Node f, boolean window, boolean staging, boolean raced) {
 			if (n == null || f == null || f == n || !f.up || f.inWindow() || n.snapshot == 0
 					|| (!staging && !sendsTo(n, f))) {
 				return false;
@@ -1012,7 +1028,7 @@ class RemovalRulePropertyTest {
 					continue;
 				}
 				if (!model.replicate(leader, f, 0, false)) {
-					model.install(leader, f, false, false);
+					model.install(leader, f, false, false, false);
 					model.replicate(leader, f, 0, false);
 				}
 				if (!leader.leader) {
@@ -1296,11 +1312,13 @@ class RemovalRulePropertyTest {
 	 * Round 15, R14-1: x, removed by b in term 2, then re-added by b (D_B, joint, index 7, not committed; b is then cut
 	 * off as the leader of term 2). c commits K* (term 5, index 6) without x, re-adds x (D_L: index 7, same halves as
 	 * D_B) and installs a snapshot on x with D_L past its log end. Then a chunk of a, deposed in term 4, with its
-	 * configuration at index 6 reaches x, and one of b with D_B. Ratis rejects both for their term but takes their
-	 * configurations, so x ends with D_B, which equals D_L. D_L may still commit through c, which does not answer: x
-	 * must wait. With one record replaced by each chunk of another configuration, D's bound was b's term 2, below K*'s,
-	 * the rule skipped D, and x was REMOVED (S1 (b) fails at c4707b0). Checked with every member answering until the
-	 * end: between a's chunk and b's, x holds a's configuration and no evidence of D_L (N-R15-1, an upstream issue).
+	 * configuration at index 6 reaches x, and one of b with D_B. Both passed RaftTraffic's term check before x's term
+	 * rose ({@link RacedStaleInstall}): Ratis rejects both for their term but takes their configurations, so x ends with
+	 * D_B, which equals D_L. D_L may still commit through c, which does not answer: x must wait. With one record
+	 * replaced by each chunk of another configuration, D's bound was b's term 2, below K*'s, the rule skipped D, and x
+	 * was REMOVED (S1 (b) fails at c4707b0). Checked with every member answering until the end: between a's chunk and
+	 * b's, x holds a's configuration and no evidence of D_L (N-R15-1, left only in that window; see
+	 * {@link #aChunkOfADeposedLeaderDoesNotReplaceTheConfigurationRatisHolds}).
 	 */
 	@Example
 	void aStaleChunkOfAnotherConfigurationDoesNotLowerTheBoundOfTheOneRatisHolds() {
@@ -1312,8 +1330,8 @@ class RemovalRulePropertyTest {
 				toAll(C, A, D, Y), new AdvanceCommit(C), toAll(C, A, D, Y), new Apply(C, 1), new Snapshot(C, 0),
 				new Apply(A, 0), new Snapshot(A, 0), new Elect(A), new Crash(A), new Elect(C), toAll(C, D, Y),
 				new AdvanceCommit(C), toAll(C, D, Y), new Apply(C, 1), new Change(C, X, true), new Install(C, X, false),
-				new Crash(X), new Restart(X), new StaleInstall(A, X), new Restart(A), new Replicate(C, A, 1),
-				new Apply(A, 0), new StaleInstall(B, X)));
+				new Crash(X), new Restart(X), new RacedStaleInstall(A, X), new Restart(A), new Replicate(C, A, 1),
+				new Apply(A, 0), new RacedStaleInstall(B, X)));
 		var x = model.nodes.get("x");
 		var c = model.nodes.get("c");
 		var kStar = model.newestCommitted();
@@ -1325,6 +1343,45 @@ class RemovalRulePropertyTest {
 		if (verdict.outcome() == Outcome.REMOVED) {
 			checkRemovedIsSafe(model, x, verdict, modes);
 		}
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, verdict.reason(), () -> verdict + "\n" + model);
+	}
+
+	/**
+	 * Round 15 review, N-R15-1: the setup of {@link #aStaleChunkOfAnotherConfigurationDoesNotLowerTheBoundOfTheOneRatisHolds}
+	 * up to a's chunk, which reaches x after x took c's term. Ratis would reject it for its term (NOT_LEADER) and still
+	 * drop D_L (index 7) and take a's configuration at index 6: x, with no evidence of D_L left, was REMOVED (K* term 5,
+	 * index 6, confirmed by a, d and y) while c, which does not answer, holds D_L and can be elected without x (S1 (b)
+	 * fails at 009b698). RaftTraffic now answers NOT_LEADER itself to a chunk below the current term: Ratis never sees
+	 * it, x keeps D_L and waits.
+	 */
+	@Example
+	void aChunkOfADeposedLeaderDoesNotReplaceTheConfigurationRatisHolds() {
+		var model = runAllAnswering(SIX, steps(new Elect(A), toAll(A, B, C, D, X, Y), new AdvanceCommit(A),
+				toAll(A, B, C, D, X, Y), new Elect(B), toAll(B, A, C, D, X, Y), new AdvanceCommit(B),
+				toAll(B, A, C, D, X, Y), new Change(B, X, false), toAll(B, A, C, D, Y), new AdvanceCommit(B),
+				new FinishConf(B), toAll(B, A, C, D, Y), new AdvanceCommit(B), toAll(B, A, C, D, Y), new Apply(B, 0),
+				new Snapshot(B, 0), repeat(2, new Append(B)), new Change(B, X, false), new Crash(B), new Elect(C),
+				toAll(C, A, D, Y), new AdvanceCommit(C), toAll(C, A, D, Y), new Apply(C, 1), new Snapshot(C, 0),
+				new Apply(A, 0), new Snapshot(A, 0), new Elect(A), new Crash(A), new Elect(C), toAll(C, D, Y),
+				new AdvanceCommit(C), toAll(C, D, Y), new Apply(C, 1), new Change(C, X, true), new Install(C, X, false),
+				new Crash(X), new Restart(X)));
+		var a = model.nodes.get("a");
+		var x = model.nodes.get("x");
+		var c = model.nodes.get("c");
+		assertTrue(a.ledTerm == a.term && a.term < x.term && x.current().index() == 7 && x.current().inNew("x"),
+				() -> "a led a lower term than x's, and x holds D_L\n" + model);
+		for (var step : steps(new StaleInstall(A, X), new Restart(A), new Replicate(C, A, 1), new Apply(A, 0))) {
+			assertTrue(model.apply(step), () -> "step not applicable: " + step + "\n" + model);
+		}
+		var kStar = model.newestCommitted();
+		assertTrue(c.current().index() == 7 && c.current().inNew("x") && kStar.index() == 6 && kStar.term() == 5,
+				() -> "c holds D_L, K* at 6 in term 5\n" + model);
+		var modes = Map.of("c", Mode.NONE);
+		var verdict = check(model, x, modes);
+		if (verdict.outcome() == Outcome.REMOVED) {
+			checkRemovedIsSafe(model, x, verdict, modes);
+		}
+		assertTrue(x.current().index() == 7 && x.current().inNew("x"), () -> "x lost D_L\n" + model);
 		assertEquals(Reason.OWN_LATER_CONFIGURATION, verdict.reason(), () -> verdict + "\n" + model);
 	}
 

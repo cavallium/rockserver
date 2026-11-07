@@ -66,6 +66,11 @@ final class RaftTraffic implements ServerInterceptor {
 	}
 
 	RaftTraffic(String nodeId, @Nullable Path raftDir) {
+		this(nodeId, raftDir, _ -> -1, null);
+	}
+
+	RaftTraffic(String nodeId, @Nullable Path raftDir, java.util.function.ToLongFunction<org.apache.ratis.protocol.RaftGroupId> currentTerm,
+			NodeMetrics.@Nullable Series recordFailures) {
 		this.nodeId = nodeId;
 		this.raftDir = raftDir;
 	}
@@ -108,7 +113,7 @@ final class RaftTraffic implements ServerInterceptor {
 				}
 				if (raftDir != null && message instanceof RaftProtos.InstallSnapshotRequestProto request) {
 					try {
-						InstalledConfiguration.record(raftDir, request);
+						InstalledConfiguration.record(raftDir, 0, request);
 					} catch (IOException | RuntimeException ex) {
 						// Ratis must not take a configuration that is not recorded: the stream fails, so the leader
 						// starts the install again (a dropped chunk would show only at the next chunk, or, for the

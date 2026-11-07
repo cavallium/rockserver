@@ -204,8 +204,8 @@ record InstalledConfiguration(long floor, Map<Key, Long> bounds) {
 	 * {@code oldHalf}) in {@code raftDir}: replaces the file (synced) only if the record changes. Throws if the file
 	 * cannot be read: merging into an empty record would lose its floor.
 	 */
-	static void update(Path raftDir, long leaderTerm, long index, List<String> newHalf, List<String> oldHalf)
-			throws IOException {
+	static void update(Path raftDir, long lostFloor, long leaderTerm, long index, List<String> newHalf,
+			List<String> oldHalf) throws IOException {
 		var cache = cache(raftDir);
 		synchronized (cache) {
 			var old = cache.current(raftDir);
@@ -242,13 +242,13 @@ record InstalledConfiguration(long floor, Map<Key, Long> bounds) {
 	 * Records the configuration of the snapshot chunk {@code request} with its leader's term, if it carries one:
 	 * {@link RaftTraffic}, before Ratis sees it.
 	 */
-	static void record(Path raftDir, RaftProtos.InstallSnapshotRequestProto request) throws IOException {
+	static void record(Path raftDir, long lostFloor, RaftProtos.InstallSnapshotRequestProto request) throws IOException {
 		if (!request.hasLastRaftConfigurationLogEntryProto()) {
 			return;
 		}
 		var entry = request.getLastRaftConfigurationLogEntryProto();
 		var conf = entry.getConfigurationEntry();
-		update(raftDir, request.getLeaderTerm(), entry.getIndex(), peerIds(conf.getPeersList()),
+		update(raftDir, lostFloor, request.getLeaderTerm(), entry.getIndex(), peerIds(conf.getPeersList()),
 				peerIds(conf.getOldPeersList()));
 	}
 

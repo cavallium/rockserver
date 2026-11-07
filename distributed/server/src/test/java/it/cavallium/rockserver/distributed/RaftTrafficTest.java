@@ -34,6 +34,7 @@ class RaftTrafficTest {
 	static final class FakeCall<Q, R> extends ServerCall<Q, R> {
 		final MethodDescriptor<Q, R> method;
 		final List<String> events = Collections.synchronizedList(new ArrayList<>());
+		final List<R> sent = Collections.synchronizedList(new ArrayList<>());
 		volatile Status closed;
 
 		FakeCall(MethodDescriptor<Q, R> method) {
@@ -56,6 +57,7 @@ class RaftTrafficTest {
 				throw new IllegalStateException("call is closed");
 			}
 			events.add("message");
+			sent.add(message);
 		}
 
 		@Override
@@ -78,10 +80,11 @@ class RaftTrafficTest {
 		}
 	}
 
-	/** Ratis' handler: keeps the call it was given and the messages that reach it. */
+	/** Ratis' handler: keeps the call it was given, the messages that reach it and how its stream ended. */
 	static final class FakeHandler<Q, R> implements ServerCallHandler<Q, R> {
 		volatile ServerCall<Q, R> call;
 		final List<Q> messages = Collections.synchronizedList(new ArrayList<>());
+		final List<String> ends = Collections.synchronizedList(new ArrayList<>());
 
 		@Override
 		public ServerCall.Listener<Q> startCall(ServerCall<Q, R> call, Metadata headers) {
@@ -90,6 +93,21 @@ class RaftTrafficTest {
 				@Override
 				public void onMessage(Q message) {
 					messages.add(message);
+				}
+
+				@Override
+				public void onHalfClose() {
+					ends.add("half-close");
+				}
+
+				@Override
+				public void onCancel() {
+					ends.add("cancel");
+				}
+
+				@Override
+				public void onComplete() {
+					ends.add("complete");
 				}
 			};
 		}
@@ -136,10 +154,66 @@ class RaftTrafficTest {
 		assertEquals(events, List.copyOf(call.events));
 	}
 
-	/** A chunk of a lower term than one recorded is still recorded (at the highest term) and forwarded. */
+	/**
+	 * R15 review, finding 7: gRPC ends a call this interceptor closed with onComplete, which Ratis' stream listener
+	 * does not pass to its request observer; Ratis must be told the stream ended, as for a cancel by the leader.
+	 */
+	@Test
+	void aFailedStreamEndsRatisStreamAsACancel(@TempDir Path dir) throws Exception {
+		var raftDir = Files.createFile(dir.resolve("not-a-directory"));
+		var traffic = new RaftTraffic("n1", raftDir);
+		var call = installCall();
+		var handler = new FakeHandler<RaftProtos.InstallSnapshotRequestProto, RaftProtos.InstallSnapshotReplyProto>();
+		var listener = traffic.interceptCall(call, new Metadata(), handler);
+		listener.onMessage(chunk(3, 40, ABX));
+		listener.onHalfClose();
+		listener.onComplete();
+		assertEquals(List.of("cancel"), List.copyOf(handler.ends));
+	}
+
+	/**
+	 * R15 review, finding 1 (N-R15-1): a chunk of a term below the node's current term (a deposed leader's) is answered
+	 * NOT_LEADER with the current term by the interceptor itself: Ratis, which would answer the same but still take
+	 * the chunk's configuration, never sees it, and nothing is recorded. The stream goes on; its end reaches Ratis.
+	 */
+	@Test
+	void aChunkBelowTheCurrentTermIsAnsweredNotLeaderWithoutRatis(@TempDir Path raftDir) throws Exception {
+		var traffic = new RaftTraffic("n1", raftDir, _ -> 5, null);
+		var call = installCall();
+		var handler = new FakeHandler<RaftProtos.InstallSnapshotRequestProto, RaftProtos.InstallSnapshotReplyProto>();
+		var listener = traffic.interceptCall(call, new Metadata(), handler);
+		var request = chunk(3, 40, ABX).toBuilder()
+				.setServerRequest(RaftProtos.RaftRpcRequestProto.newBuilder().setRequestorId(ByteString.copyFromUtf8("a"))
+						.setReplyId(ByteString.copyFromUtf8("n1")))
+				.setSnapshotChunk(RaftProtos.InstallSnapshotRequestProto.SnapshotChunkProto.newBuilder().setRequestIndex(2))
+				.build();
+		listener.onMessage(request);
+		assertTrue(handler.messages.isEmpty(), "the chunk reached Ratis");
+		assertEquals(null, call.closed);
+		assertEquals(List.of("headers", "message", "request 1"), List.copyOf(call.events));
+		var reply = call.sent.getFirst();
+		assertEquals(RaftProtos.InstallSnapshotResult.NOT_LEADER, reply.getResult());
+		assertEquals(5, reply.getTerm());
+		assertEquals(2, reply.getRequestIndex());
+		assertEquals(ByteString.copyFromUtf8("a"), reply.getServerReply().getRequestorId());
+		assertEquals(ByteString.copyFromUtf8("n1"), reply.getServerReply().getReplyId());
+		assertEquals(RemovalRule.UNKNOWN_TERM, InstalledConfiguration.boundOf(InstalledConfiguration.read(raftDir),
+				new Conf(RemovalRule.UNKNOWN_TERM, 40, ABX, List.of())));
+		// Ratis' handler answers on the same call afterwards: its headers are not sent twice.
+		handler.call.sendHeaders(new Metadata());
+		handler.call.sendMessage(RaftProtos.InstallSnapshotReplyProto.getDefaultInstance());
+		assertEquals(List.of("headers", "message", "request 1", "message"), List.copyOf(call.events));
+		listener.onHalfClose();
+		assertEquals(List.of("half-close"), List.copyOf(handler.ends));
+	}
+
+	/**
+	 * A chunk of a lower term than one recorded, that passed the term check (the node's term had not risen yet), is
+	 * still recorded (at the highest term) and forwarded.
+	 */
 	@Test
 	void aChunkOfALowerTermIsRecordedAndForwarded(@TempDir Path raftDir) throws Exception {
-		var traffic = new RaftTraffic("n1", raftDir);
+		var traffic = new RaftTraffic("n1", raftDir, _ -> 3, null);
 		var call = installCall();
 		var handler = new FakeHandler<RaftProtos.InstallSnapshotRequestProto, RaftProtos.InstallSnapshotReplyProto>();
 		var listener = traffic.interceptCall(call, new Metadata(), handler);
