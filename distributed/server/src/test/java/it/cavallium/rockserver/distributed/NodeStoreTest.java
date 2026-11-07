@@ -295,6 +295,54 @@ class NodeStoreTest {
 		assertThrows(IllegalArgumentException.class, () -> NodeStore.decodeTermIndex(Buf.wrap(new byte[8])));
 	}
 
+	/**
+	 * {@code restore-backup} refuses a backup of a newer cluster, whose cluster version has a capability this version
+	 * lacks, before it drops the replication metadata that holds the version: the new cluster would otherwise start at
+	 * {@link Capabilities#GENESIS} with data a newer version wrote, and no start would refuse it (R18-1). The data
+	 * directory stays empty, so the same command runs again with the newer binary.
+	 */
+	@Test
+	void restoreBackupRefusesABackupOfANewerCluster() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		Path source = tempDir.resolve("source");
+		writeDatabaseOfVersion(source, NEWER_VERSION);
+		try (var store = NodeStore.open(source, null, "source")) {
+			store.checkpoint(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR));
+		}
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=7\ncluster=c\n");
+		Path dataDir = tempDir.resolve("data");
+		var refused = assertThrows(ReplicatedNode.NewerVersionException.class,
+				() -> ReplicaOps.restore(backupDir, dataDir, null));
+		assertTrue(refused.getMessage().contains("0x10000000000"), refused.getMessage());
+		assertTrue(Files.notExists(dataDir.resolve("db")), "the data directory holds no database after the refusal");
+	}
+
+	/** {@code export-seed} refuses the database of a newer cluster the same way, and writes no target (R18-1). */
+	@Test
+	void exportSeedRefusesADatabaseOfANewerCluster() throws IOException {
+		Path source = tempDir.resolve("source");
+		writeDatabaseOfVersion(source, NEWER_VERSION);
+		Path target = tempDir.resolve("seed");
+		var refused = assertThrows(ReplicatedNode.NewerVersionException.class,
+				() -> NodeStore.exportSeed(source, null, target));
+		assertTrue(refused.getMessage().contains("0x10000000000"), refused.getMessage());
+		assertTrue(Files.notExists(target), "no target after the refusal");
+	}
+
+	/** This version's capabilities plus one it lacks. */
+	private static final long NEWER_VERSION = Capabilities.SUPPORTED | 1L << 40;
+
+	private static void writeDatabaseOfVersion(Path dbDir, long version) throws IOException {
+		try (var store = NodeStore.open(dbDir, null, "versioned")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			put(store, column, 1, "v1");
+			setApplied(store, TermIndex.valueOf(1, 7));
+			setClusterId(store, "newer-cluster");
+			store.db().put(0, store.metaColumnId(), NodeStore.key(NodeStore.CLUSTER_VERSION),
+					Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(version).array()), RequestType.none());
+		}
+	}
+
 	@Test
 	void restoreReplacesDatabaseWithCheckpointContents() throws IOException {
 		Path dbDir = tempDir.resolve("db");
