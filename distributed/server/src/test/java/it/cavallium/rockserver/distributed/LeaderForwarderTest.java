@@ -11,7 +11,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.grpc.Server;
 import io.grpc.netty.NettyServerBuilder;
 import io.grpc.stub.StreamObserver;
+import it.cavallium.rockserver.core.common.ClientRequestId;
+import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
+import it.cavallium.rockserver.core.common.RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction;
+import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
@@ -492,6 +496,39 @@ class LeaderForwarderTest {
 		var after = s.forwarder().target("n1", s.stateMachine());
 		var again = assertThrows(ExecutionException.class, () -> after.get(10, TimeUnit.SECONDS));
 		assertInstanceOf(LeaderForwarder.NotConnectedException.class, again.getCause());
+	}
+
+	/**
+	 * R25-O: a numbered commit that could not be sent to the leader before the deadline was never sent, so it is told
+	 * "not applied" for this copy (flagged, {@code SERVER_OVERLOADED}), which the client answers by sending it again
+	 * if an earlier copy may have applied. Not {@code UPDATE_RETRY}: that tells the client that no copy applied, and an
+	 * earlier copy, appended by the leader that then became unreachable, may still commit under the next leader.
+	 */
+	@Test
+	void aNumberedCommitNeverSentToTheLeaderIsNotAppliedForThisCopyOnly() throws Exception {
+		int port = closedPort();
+		var s = setup(peers(port), Duration.ofSeconds(5));
+		s.raft().leaderId = "n1";
+		var config = NodeConfig.defaults("n0", peers(port), temp).withRequestTimeout(Duration.ofSeconds(5));
+		var metrics = new NodeMetrics("n0");
+		closing.add(metrics::close);
+		var forwarding = new Forwarder(config, s.stateMachine(), s.forwarder(), null, null, metrics);
+		var context = RequestContext.batch(Duration.ofSeconds(10)).withRequestId(new ClientRequestId(7, 3, 0));
+		long now = System.nanoTime();
+		var answer = forwarding.forward(context, new CloseTransaction(-5L, true), now + Duration.ofMillis(500).toNanos(),
+				now + Duration.ofSeconds(10).toNanos());
+		var error = assertThrows(ExecutionException.class, () -> answer.get(10, TimeUnit.SECONDS));
+		var cause = assertInstanceOf(RocksDBException.class, ReplicatedConnection.unwrap(error));
+		assertFalse(cause instanceof RocksDBRetryException, () -> "\"not applied\" for every copy: " + cause);
+		assertTrue(cause.isNotApplied(), () -> "not flagged: " + cause);
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, cause.getErrorUniqueId(), cause.getMessage());
+
+		// Without a request id (no client session) the pre-session answer stays: run it again.
+		long again = System.nanoTime();
+		var plain = forwarding.forward(RequestContext.batch(Duration.ofSeconds(10)), new CloseTransaction(-5L, true),
+				again + Duration.ofMillis(500).toNanos(), again + Duration.ofSeconds(10).toNanos());
+		var plainError = assertThrows(ExecutionException.class, () -> plain.get(10, TimeUnit.SECONDS));
+		assertInstanceOf(RocksDBRetryException.class, ReplicatedConnection.unwrap(plainError));
 	}
 
 	/** A peer that is back after its backoff gets a working connection. */

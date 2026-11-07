@@ -5,6 +5,7 @@ import java.io.InterruptedIOException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import org.apache.ratis.server.raftlog.RaftLog;
+import org.apache.ratis.server.raftlog.RaftLogBase;
 
 /** Stops the log worker of a Raft log, as a hung disk does. In this package for {@link SegmentedRaftLog.Task}. */
 public final class LogWorkerGate {
@@ -53,6 +54,26 @@ public final class LogWorkerGate {
 	}
 
 	/**
+	 * Holds the write lock of {@code log} on a thread of its own until {@code release} opens, as Ratis does while an
+	 * append waits for room in the queue of a log worker that stopped writing (a hung disk): every read of the log that
+	 * takes its read lock ({@code getNextIndex}, {@code getTermIndex}, {@code getLastEntryTermIndex}, ...) waits
+	 * meanwhile. Returns once the lock is held; join the returned thread after opening {@code release}.
+	 */
+	public static Thread holdWriteLock(RaftLog log, CountDownLatch release) throws InterruptedException {
+		var held = new CountDownLatch(1);
+		var holder = Thread.ofPlatform().daemon().name("log-write-lock-holder").start(() -> {
+			try (var _ = ((RaftLogBase) log).writeLock()) {
+				held.countDown();
+				release.await();
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		});
+		held.await();
+		return holder;
+	}
+
+	/**
 	 * Fails unless the Ratis internals this gate uses are still there: a Ratis upgrade that renames them must fail
 	 * here, by name, rather than as an odd timing in the tests that use the gate.
 	 */
@@ -68,6 +89,7 @@ public final class LogWorkerGate {
 		}
 		SegmentedRaftLog.Task.class.getDeclaredMethod("execute");
 		SegmentedRaftLog.Task.class.getDeclaredMethod("getEndIndex");
+		RaftLogBase.class.getDeclaredMethod("writeLock");
 	}
 
 	@FunctionalInterface

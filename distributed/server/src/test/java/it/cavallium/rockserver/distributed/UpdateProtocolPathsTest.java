@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -22,6 +23,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -63,6 +65,10 @@ class UpdateProtocolPathsTest {
 
 	private RocksDBSyncAPI numbered(long session, long sequence) {
 		return node.connection().getSyncApi(CONTEXT.withRequestId(new ClientRequestId(session, sequence, 0)));
+	}
+
+	private ReplicatedConnection connection() {
+		return (ReplicatedConnection) node.connection();
 	}
 
 	private static Keys key(long value) {
@@ -114,6 +120,37 @@ class UpdateProtocolPathsTest {
 		var error = assertThrows(RocksDBException.class,
 				() -> numbered(UNKNOWN_SESSION, 4).put(-77L, column, key(1), text("x"), RequestType.none()));
 		assertEquals(RocksDBErrorType.SESSION_EXPIRED, error.getErrorUniqueId(), error.getMessage());
+	}
+
+	/**
+	 * R25-O, through the router and the update protocol: a copy of a numbered commit whose transaction is gone, on a
+	 * leader whose barrier then fails because it lost leadership. An earlier copy may be in its log and commit under the
+	 * next leader, so the answer is "unknown", never {@code UPDATE_RETRY} (the client would run the transaction again).
+	 */
+	@Test
+	void aCopyOfANumberedCommitWhoseBarrierLosesLeadershipAnswersUnknown() {
+		long session = connection().openClientSessionAsync(CONTEXT).join();
+		connection().outcomes.leadershipForTesting(
+				() -> CompletableFuture.failedFuture(new ReadBarrier.NotLeaderException("deposed")));
+		var error = assertThrows(RocksDBException.class, () -> numbered(session, 1).closeTransaction(-55L, true));
+		assertUnknown(error);
+	}
+
+	/** The same for a copy of the write that ends an update. */
+	@Test
+	void aCopyOfTheWriteEndingAGoneUpdateWhoseBarrierLosesLeadershipAnswersUnknown() {
+		long session = connection().openClientSessionAsync(CONTEXT).join();
+		connection().outcomes.leadershipForTesting(
+				() -> CompletableFuture.failedFuture(new ReadBarrier.NotLeaderException("deposed")));
+		var error = assertThrows(RocksDBException.class,
+				() -> numbered(session, 2).put(-77L, column, key(1), text("x"), RequestType.none()));
+		assertUnknown(error);
+	}
+
+	private static void assertUnknown(RocksDBException error) {
+		assertFalse(error instanceof RocksDBRetryException, () -> "\"not applied\": " + error);
+		assertFalse(error.isNotApplied(), () -> "flagged not applied: " + error);
+		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, error.getErrorUniqueId(), error.getMessage());
 	}
 
 	@Test

@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -12,12 +13,14 @@ import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -28,7 +31,8 @@ import org.junit.jupiter.api.Test;
 
 /**
  * The paths of {@link CommitOutcomes} that {@code CommitOutcomesTest} leaves out: marking a second copy, settling
- * with each kind of outcome, the pruning of marks, every kind of record, a session that is gone, and barrier failures.
+ * with each kind of outcome, the pruning of marks, every kind of record, a session that is gone, and barrier and store
+ * failures.
  */
 class CommitOutcomesPathsTest {
 
@@ -141,15 +145,42 @@ class CommitOutcomesPathsTest {
 		assertTrue(((RocksDBException) error).isNotApplied(), "this copy was refused before it ran");
 	}
 
+	/**
+	 * R25-O: a barrier that fails proves nothing about the earlier copies of the commit. One may be in this node's log,
+	 * replicated, and commit under the next leader (a barrier that fails with NotLeader is exactly that case), so the
+	 * copy asking is told "unknown", never "not applied" ({@code UPDATE_RETRY}, after which the client runs the
+	 * transaction a second time) nor an answer flagged not applied. The client sends it again, and the next leader's
+	 * barrier, which applies every earlier entry, settles it.
+	 */
 	@Test
-	void barrierFailuresBecomeRetryableAnswers() {
-		barrier.set(CompletableFuture.failedFuture(new ReadBarrier.NotLeaderException("deposed")));
-		assertInstanceOf(RocksDBRetryException.class, failure(outcomes.settledCommit(new ClientRequestId(7, 1, 0))));
-		barrier.set(CompletableFuture.failedFuture(new TimeoutException()));
-		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, type(failure(outcomes.settledCommit(new ClientRequestId(7, 1, 0)))));
-		barrier.set(CompletableFuture.failedFuture(new ReadBarrier.ApplyLagException(10, 5)));
-		var lag = failure(outcomes.settledCommit(new ClientRequestId(7, 1, 0)));
-		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, type(lag));
-		assertTrue(lag.getMessage().contains("applied 5 of 10"), lag.getMessage());
+	void barrierFailuresAnswerUnknown() {
+		var failures = List.<Throwable>of(new ReadBarrier.NotLeaderException("deposed"),
+				new ReadBarrier.NotLeaderException("Read barrier closed"), new TimeoutException(),
+				new ReadBarrier.ApplyLagException(10, 5), new RejectedExecutionException("stopping"),
+				new CompletionException(new ReadBarrier.NotLeaderException("Term changed")));
+		for (var failure : failures) {
+			barrier.set(CompletableFuture.failedFuture(failure));
+			assertUnknown(outcomes.settledCommit(new ClientRequestId(7, 1, 0)), failure);
+		}
+	}
+
+	/** The store failing while a copy is settled (the node stops) does not say "not applied" either. */
+	@Test
+	void aRecordThatCannotBeReadAnswersUnknown() {
+		var failing = new CommitOutcomes(() -> CompletableFuture.completedFuture(null), term::get, _ -> {
+			throw new IllegalStateException("Closed");
+		}, _ -> true, inline);
+		assertUnknown(failing.settledCommit(new ClientRequestId(7, 1, 0)), null);
+		var noSession = new CommitOutcomes(() -> CompletableFuture.completedFuture(null), term::get, _ -> null, _ -> {
+			throw new IllegalStateException("Closed");
+		}, inline);
+		assertUnknown(noSession.settledCommit(new ClientRequestId(7, 1, 0)), null);
+	}
+
+	private static void assertUnknown(CompletableFuture<?> answer, Throwable barrierFailure) {
+		var cause = assertInstanceOf(RocksDBException.class, failure(answer), String.valueOf(barrierFailure));
+		assertFalse(cause instanceof RocksDBRetryException, () -> "\"not applied\" after " + barrierFailure);
+		assertFalse(cause.isNotApplied(), () -> "flagged not applied after " + barrierFailure);
+		assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, cause.getErrorUniqueId(), cause.getMessage());
 	}
 }

@@ -53,6 +53,8 @@ final class CommitOutcomes {
 	private final AtomicLong markedTerm = new AtomicLong();
 
 	private final Supplier<CompletableFuture<Void>> leadership;
+	/** Tests only: replaces {@link #leadership} when set, see {@link #leadershipForTesting}. */
+	private volatile @Nullable Supplier<CompletableFuture<Void>> leadershipForTesting;
 	private final LongSupplier currentTerm;
 	private final Function<ClientRequestId, ApplyResult> recorded;
 	private final LongPredicate sessionExists;
@@ -98,7 +100,13 @@ final class CommitOutcomes {
 	}
 
 	private CompletableFuture<Void> leadership() {
-		return leadership.get();
+		var replaced = leadershipForTesting;
+		return replaced != null ? replaced.get() : leadership.get();
+	}
+
+	/** Tests only: the leadership barrier that {@link #settledCommit} waits for from now on; null for the real one. */
+	void leadershipForTesting(@Nullable Supplier<CompletableFuture<Void>> barrier) {
+		this.leadershipForTesting = barrier;
 	}
 
 	private long currentTerm() {
