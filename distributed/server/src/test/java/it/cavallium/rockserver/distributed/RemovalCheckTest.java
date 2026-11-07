@@ -49,15 +49,20 @@ class RemovalCheckTest {
 		assertEquals(Answer.MEMBER, RemovalCheck.judge(new PeerConfiguration(7, true, List.of("n0", "n2")), "n1", 7));
 	}
 
-	/** Without answers, a node whose own joint configuration leaves it out is not kept: it is refused as before. */
+	/**
+	 * R10-1: members of the new half that cannot be reached do not say that a node whose own joint configuration leaves
+	 * it out was removed (a cold restart where it comes up first): it starts, at once, and waits outside the cluster.
+	 */
 	@Test
-	void unreachableMembersDoNotKeepANodeOutOfItsNewHalf() throws Exception {
+	void unreachableMembersOfTheNewHalfDoNotRefuseTheNode() throws Exception {
 		int port;
 		try (var socket = new ServerSocket(0)) {
 			port = socket.getLocalPort();
 		}
-		assertNull(RemovalCheck.keptBy("n1", RaftGroupId.valueOf(UUID.randomUUID()), 7, 2,
-				Map.of("n0", "127.0.0.1:" + port, "n2", "127.0.0.1:" + port), Duration.ofSeconds(5)));
+		long start = System.nanoTime();
+		assertNull(RemovalCheck.removedBy("n1", RaftGroupId.valueOf(UUID.randomUUID()), 7, true, 2,
+				Map.of("n0", "127.0.0.1:" + port, "n2", "127.0.0.1:" + port), Duration.ofSeconds(20)));
+		assertTrue(System.nanoTime() - start < Duration.ofSeconds(10).toNanos());
 	}
 
 	@Test

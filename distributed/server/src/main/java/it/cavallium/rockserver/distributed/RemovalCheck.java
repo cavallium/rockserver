@@ -28,6 +28,15 @@ import org.slf4j.LoggerFactory;
  * leaves it out. A committed configuration never goes away again, so this cannot refuse a member; an answer that is not
  * committed yet is asked again, until the check is decided or its time is up. A member that cannot be reached, or that
  * predates the method, does not count: without a majority of answers the node starts as before.</p>
+ *
+ * <p>A node whose own log ends with a joint configuration that leaves it out of the new half (R3-G2b-4,
+ * {@code ownLeavesOut}) asks the members of that new half instead, and the question is whether that configuration
+ * was committed: it counts as removed once a majority of the new half answer with a committed configuration without
+ * it at the index of its own or later (the same one, or one after it). A committed answer that holds it says it is a
+ * member (the joint configuration was dropped, or the node was added again); a committed answer without it from
+ * before its own index comes from a member behind its log and tells nothing. The rule is the same fail-open one: only
+ * a majority of positive answers refuses the node, and members that hold it, are undecided or cannot be reached let it
+ * start (R10-1), outside the cluster, where the check that runs while it waits outside asks again.</p>
  */
 final class RemovalCheck {
 
@@ -36,13 +45,22 @@ final class RemovalCheck {
 
 	/** What one member's answer says about this node. */
 	enum Answer {
-		/** A committed configuration, newer than this node's, that leaves it out. */
+		/**
+		 * A committed configuration, newer than this node's, that leaves it out; with {@code ownLeavesOut}, one without
+		 * it at the index of this node's own configuration or later.
+		 */
 		REMOVED,
-		/** A committed configuration that holds this node, or one not newer than its own. */
+		/**
+		 * A committed configuration that holds this node, or (without {@code ownLeavesOut}) one without it that is not
+		 * newer than its own.
+		 */
 		MEMBER,
 		/** Not decided yet: the member is starting, or its configuration is not committed yet. Asked again. */
 		PENDING,
-		/** No answer: unreachable, or a node that predates the method. */
+		/**
+		 * No answer: unreachable, or a node that predates the method; with {@code ownLeavesOut}, also a committed
+		 * configuration without this node from before its own (a member behind its log).
+		 */
 		NONE
 	}
 
@@ -79,10 +97,9 @@ final class RemovalCheck {
 	}
 
 	/**
-	 * The decision for a configuration of {@code knownMembers} members (the node included; for {@link #keptBy}, the
-	 * members of the new half): true if {@code removed} members (for {@link #keptBy}, those that hold the node), a
-	 * majority, say so; false if they can no longer become one, with {@code pending} members still to answer; null while
-	 * undecided.
+	 * The decision for a configuration of {@code knownMembers} members (the node included; with {@code ownLeavesOut},
+	 * the members of the new half): true if {@code removed} members, a majority, say so; false if they can no longer
+	 * become one, with {@code pending} members still to answer; null while undecided.
 	 */
 	static @Nullable Boolean decide(int knownMembers, int removed, int pending) {
 		int majority = knownMembers / 2 + 1;
@@ -113,26 +130,6 @@ final class RemovalCheck {
 	 */
 	static @Nullable List<String> removedBy(String self, RaftGroupId groupId, long ownIndex, boolean ownLeavesOut,
 			int knownMembers, Map<String, String> addresses, Duration budget) {
-		return ask(self, groupId, ownIndex, ownLeavesOut, Answer.REMOVED, knownMembers, addresses, budget);
-	}
-
-	/**
-	 * R3-G2b-4: for a node whose log ends with a joint configuration that leaves it out of its new half, asks the
-	 * members of that new half ({@code addresses}, {@code knownMembers} of them) whether they still hold the node. The
-	 * leader that wrote the configuration may have lost its leadership before committing it, and the next leader drop it:
-	 * the node is then still a member, and its log is cut back to the configuration before when a leader reaches it.
-	 *
-	 * @return the members that hold a committed configuration with the node, if they are a majority of the new half;
-	 * null otherwise (removed, undecided or unreachable: the node is refused as before)
-	 */
-	static @Nullable List<String> keptBy(String self, RaftGroupId groupId, long ownIndex, int knownMembers,
-			Map<String, String> addresses, Duration budget) {
-		return ask(self, groupId, ownIndex, true, Answer.MEMBER, knownMembers, addresses, budget);
-	}
-
-	/** The members that give the answer {@code counted}, if a majority of {@code knownMembers} does; null otherwise. */
-	private static @Nullable List<String> ask(String self, RaftGroupId groupId, long ownIndex, boolean ownLeavesOut,
-			Answer counted, int knownMembers, Map<String, String> addresses, Duration budget) {
 		long deadline = System.nanoTime() + budget.toNanos();
 		var agreeing = new ArrayList<String>();
 		var pending = new LinkedHashMap<>(addresses);
@@ -156,7 +153,7 @@ final class RemovalCheck {
 						LOG.debug("{}: member {} did not tell its configuration", self, id, ex);
 						answer = Answer.NONE;
 					}
-					if (answer == counted) {
+					if (answer == Answer.REMOVED) {
 						agreeing.add(id);
 						pending.remove(id);
 					} else if (answer != Answer.PENDING) {
@@ -169,9 +166,8 @@ final class RemovalCheck {
 				}
 				if (System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RETRY_MS) - deadline >= 0
 						|| Thread.currentThread().isInterrupted()) {
-					LOG.warn("{}: could not tell whether it is still a member: {} of {} members say {}, {} did not decide in {}",
-							self, agreeing.size(), knownMembers, counted == Answer.REMOVED ? "it was removed" : "it is a member",
-							pending.keySet(), budget);
+					LOG.warn("{}: could not tell whether it is still a member: {} of {} members say it was removed, {} did not"
+							+ " decide in {}", self, agreeing.size(), knownMembers, pending.keySet(), budget);
 					return null;
 				}
 				Thread.sleep(RETRY_MS);

@@ -1355,10 +1355,17 @@ final class Proposer implements Closeable {
 		if (!permits.tryAcquire(weight)) {
 			throw new CompletionException(new NoPermitException(weight));
 		}
-		// The proxy this attempt is sent on, read before the call: only that one is replaced if the call fails (R9-2).
-		Object proxy = currentProxy(rpc, leader);
+		Object proxy = null;
 		try {
-			return rpc.sendRequest(invocation(message, callId, leader));
+			var request = invocation(message, callId, leader);
+			// The proxy this attempt is sent on, read just before the call: only that one is replaced if the call fails
+			// (R9-2). GrpcClientRpc.sendRequest reads it from the map once more, and Ratis has no way to send on a given
+			// proxy (the sendRequest that takes one is private), so a reset by another attempt between the two reads sends
+			// this attempt on the replacement while this one holds the old proxy (R10-5). If it fails there, the reset
+			// below keeps the replacement, and the resend to that peer can fail on it once more; the attempt after that
+			// reads it first and replaces it. So such a race costs at most one more failed attempt and its resend.
+			proxy = currentProxy(rpc, leader);
+			return rpc.sendRequest(request);
 		} catch (IOException ex) {
 			// Resets the connection to that peer if the error calls for it, as the client's own calls do. On a thread
 			// of its own: closing the old channel waits up to 3 s (then 2 s more) for its calls to end

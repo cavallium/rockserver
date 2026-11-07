@@ -668,6 +668,9 @@ public final class ReplicatedNode implements AutoCloseable {
 			LOG.warn("{}: this node is outside the cluster, with no election timer, and waits for a leader. {}", config.nodeId(),
 					config.join() ? "It was started with --join, so it waits for add-peer. If no node of the cluster started"
 							+ " without --join, nothing elects a leader: --join is only for a node that joins a running cluster"
+							: jointWithSelfInOldHalf(division.getRaftConf())
+							? "Its log ends with a joint configuration that leaves it out, which may never have been committed: it"
+							+ " waits for a leader that dropped it, and stops once a majority of the new half say it was removed"
 							: "Its configuration does not contain it: it was removed from the cluster, or it never was a member."
 							+ " A removed node has nothing to do: stop it. To bring it back, wipe its data directory and add it again");
 		}
@@ -731,11 +734,20 @@ public final class ReplicatedNode implements AutoCloseable {
 	 * <p>A joint configuration that leaves the node out may never have been committed: its leader lost its leadership
 	 * first, and the next leader dropped it, so the node is still a member (R3-G2b-4). So a node whose log ends with
 	 * a joint configuration that holds it in the old half only asks the members of the new half
-	 * ({@link RemovalCheck#keptBy}), and starts if a majority of them hold a committed configuration with it. A leader
-	 * usually cuts its log back, but the joint configuration can still be committed: by this node, which may stand for
-	 * election as a member of the old half and win while its log is the most up to date, or by the old leader when it
-	 * restarts. The node then leaves the cluster, and the check that runs while it waits outside stops it. Otherwise
-	 * (removed, undecided, or members out of reach) it is refused as before.</p>
+	 * ({@link RemovalCheck#removedBy} with {@code ownLeavesOut}), and is refused only if a majority of them hold a
+	 * committed configuration without it at that configuration's index or later: positive evidence that the joint
+	 * configuration, or a later one without the node, was committed. Otherwise (members that hold the node, members
+	 * still undecided, or members out of reach, as in a cold restart of the whole cluster where this node comes up
+	 * first) it starts (R10-1). Ratis then keeps it in its initializing state, outside the cluster: it neither votes
+	 * nor stands for election ({@code RaftServerImpl.start} starts a follower only from a configuration that holds it
+	 * in both halves). A leader that dropped the joint configuration cuts its log back and makes it a follower; while
+	 * it waits, the check for a node waiting outside ({@link #askMembersWhileOutside}) asks the same members again and
+	 * stops it, with exit 4, once a majority of them say it was removed. The joint configuration can still be committed
+	 * by the old leader when it restarts with it in its log: its appends make this node a follower, the leader then
+	 * stops sending to it, and its election timer finds that the new configuration does not hold it
+	 * ({@code LeaderElection} answers {@code NOT_IN_CONF} and shuts the Raft server down). The node then stops with
+	 * "Raft closed" (exit 3, {@link #stopAfterRaftClosed}); its next start is refused here (exit 4) if the members of
+	 * the new half answer, or else waits outside until they do.</p>
 	 *
 	 * <p>The configuration that removes a node commits with the other members alone, so the removed node's log may
 	 * never receive it: a node that was stopped, slow or cut off during its removal still holds itself in its log. So a
@@ -749,15 +761,22 @@ public final class ReplicatedNode implements AutoCloseable {
 				&& conf.getCurrentPeers().stream().noneMatch(peer -> peer.getId().toString().equals(config.nodeId()));
 		boolean memberOnce = !config.join() || Files.exists(config.raftDir().resolve(MEMBER_FILE));
 		if (leftOut && memberOnce) {
-			var keptBy = jointWithSelfInOldHalf(conf) ? askNewHalf(conf) : null;
-			if (keptBy != null) {
-				LOG.warn("{}: its log ends with a joint configuration that leaves it out, {}, but members {}, a majority of its"
-						+ " new half, hold a committed configuration with this node: that one was dropped, starting", config.nodeId(),
-						conf, keptBy);
-				return;
+			if (!jointWithSelfInOldHalf(conf)) {
+				// A final configuration without the node, or a joint one that held it in neither half: each follows a
+				// committed configuration that removed it.
+				throw new RemovedException("Node " + config.nodeId() + " is not in the new configuration of its log, " + conf
+						+ ": it was removed from the cluster. " + REMOVED_ADVICE);
 			}
-			throw new RemovedException("Node " + config.nodeId() + " is not in the new configuration of its log, " + conf
-					+ ": it was removed from the cluster. " + REMOVED_ADVICE);
+			var removedBy = askMembers(conf);
+			if (removedBy != null) {
+				throw new RemovedException("Node " + config.nodeId() + " is not in the new configuration of its log, " + conf
+						+ ", and members " + removedBy + ", a majority of its new half, hold that one or a later one without it,"
+						+ " committed: it was removed from the cluster. " + REMOVED_ADVICE);
+			}
+			LOG.warn("{}: its log ends with a joint configuration that leaves it out, {}, which a majority of its new half did"
+					+ " not say was committed: starting outside the cluster, until a leader that dropped it takes this node back"
+					+ " or the members say it was removed", config.nodeId(), conf);
+			return;
 		}
 		if (leftOut || !existing || !memberOnce) {
 			return;
@@ -783,16 +802,6 @@ public final class ReplicatedNode implements AutoCloseable {
 		boolean ownLeavesOut = jointWithSelfInOldHalf(conf);
 		return RemovalCheck.removedBy(config.nodeId(), group.getGroupId(), conf.getLogEntryIndex(), ownLeavesOut,
 				members.size(), RemovalCheck.addressesOf(config.nodeId(), members, memberAddresses(conf)), removalCheckBudget());
-	}
-
-	/**
-	 * R3-G2b-4: asks the members of the new half of {@code conf}, a joint configuration that leaves this node out,
-	 * whether they still hold it: see {@link RemovalCheck#keptBy}.
-	 */
-	private @Nullable List<String> askNewHalf(RaftConfiguration conf) {
-		var members = conf.getCurrentPeers().stream().map(peer -> peer.getId().toString()).toList();
-		return RemovalCheck.keptBy(config.nodeId(), group.getGroupId(), conf.getLogEntryIndex(), members.size(),
-				RemovalCheck.addressesOf(config.nodeId(), members, memberAddresses(conf)), removalCheckBudget());
 	}
 
 	/** Whether {@code conf} is a joint configuration that holds this node in its old half only. */

@@ -1,15 +1,18 @@
 package it.cavallium.rockserver.distributed;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.SetConfigurationRequest;
+import org.apache.ratis.util.LifeCycle;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -18,7 +21,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * R3-G2b-4: a node whose log ends with a joint configuration of its own removal decides by asking the members of the new
- * half whether that configuration was committed.
+ * half whether that configuration was committed. R10-1: only a majority of them that say so refuses it.
  */
 @Timeout(300)
 class JointRemovalStartTest {
@@ -63,13 +66,25 @@ class JointRemovalStartTest {
 	}
 
 	/**
-	 * Five nodes: the leader writes the joint configuration that removes one follower while the other three are down,
-	 * so it reaches only that follower and cannot commit. The leader and that follower stop; the other three elect a
-	 * leader without the entry, which drops it. The follower then holds itself in the old half only, while the members
-	 * of the new half still hold it in their committed configuration: it is a member, and starts.
+	 * R10-4: waits until {@code node}'s joint configuration is in its log on disk. Ratis takes a configuration from an
+	 * append before it writes the entry, and a halt can drop a write still queued: the restarted log would then end with
+	 * the configuration before, and the start would not take the path under test.
 	 */
-	@Test
-	void aNodeWhoseRemovalWasNeverCommittedStarts() throws Exception {
+	private static void awaitConfigurationOnDisk(ReplicatedNode node) {
+		var division = Objects.requireNonNull(node.stateMachine().division());
+		long index = division.getRaftConf().getLogEntryIndex();
+		InProcessCluster.await(TIMEOUT, () -> division.getRaftLog().getFlushIndex() >= index);
+	}
+
+	/** The nodes of {@link #haltAfterAnUncommittedJointRemoval}. */
+	private record DroppedRemoval(String leader, String removed, List<String> others) {}
+
+	/**
+	 * Five nodes: the leader writes the joint configuration that removes one follower while the other three are down,
+	 * so it reaches only that follower and cannot commit. Then the leader and that follower stop too: every node is
+	 * down, and the follower holds itself in the old half only, on disk, while the other three never received it.
+	 */
+	private DroppedRemoval haltAfterAnUncommittedJointRemoval() throws Exception {
 		cluster = new InProcessCluster(root, 5, config -> config.withElectionTimeouts(ELECTION_MIN, ELECTION_MAX))
 				.startAll();
 		var leader = awaitReadyLeader();
@@ -90,22 +105,60 @@ class JointRemovalStartTest {
 		// It cannot commit: a reply means the leader refused the change or lost its leadership first.
 		assertFalse(reply.isDone(), () -> "setConfiguration replied: " + reply.handle((r, e) -> e != null ? e : r).join());
 		assertTrue(jointWithoutIn(removedNode, removed));
+		awaitConfigurationOnDisk(removedNode);
 		cluster.halt(removed);
 		cluster.halt(leaderId);
+		return new DroppedRemoval(leaderId, removed, others);
+	}
 
-		// The other three elect a leader without the entry.
-		for (var id : others) {
+	/** Waits until {@code node} holds a configuration that is not joint and holds it: a leader cut its log back. */
+	private static void awaitMemberAgain(ReplicatedNode node, String id) {
+		InProcessCluster.await(TIMEOUT, () -> {
+			var conf = Objects.requireNonNull(node.stateMachine().division()).getRaftConf();
+			return conf.getPreviousPeers().isEmpty()
+					&& conf.getCurrentPeers().stream().anyMatch(peer -> peer.getId().toString().equals(id));
+		});
+	}
+
+	/**
+	 * The other three elect a leader without the joint configuration, which drops it. The members of the new half
+	 * still hold the follower in their committed configuration: it is a member, and starts.
+	 */
+	@Test
+	void aNodeWhoseRemovalWasNeverCommittedStarts() throws Exception {
+		var nodes = haltAfterAnUncommittedJointRemoval();
+		for (var id : nodes.others()) {
 			cluster.start(id);
 		}
 		cluster.awaitLeader(TIMEOUT);
 
 		// Before R3-G2b-4: RemovedException, "is not in the new configuration of its log".
-		var restarted = cluster.start(removed);
-		InProcessCluster.await(TIMEOUT, () -> {
-			var conf = Objects.requireNonNull(restarted.stateMachine().division()).getRaftConf();
-			return conf.getPreviousPeers().isEmpty()
-					&& conf.getCurrentPeers().stream().anyMatch(peer -> peer.getId().toString().equals(removed));
-		});
+		var restarted = cluster.start(nodes.removed());
+		awaitMemberAgain(restarted, nodes.removed());
+		cluster.awaitConverged(TIMEOUT);
+	}
+
+	/**
+	 * R10-1: the same, but the follower starts first, in a cold restart of the cluster, while no member of the new half
+	 * answers. Not knowing is no evidence that it was removed: it starts outside the cluster (Ratis' initializing state)
+	 * and becomes a member again when the others elect a leader that dropped the joint configuration.
+	 */
+	@Test
+	void aNodeWhoseRemovalWasNeverCommittedStartsBeforeTheNewHalf() throws Exception {
+		var nodes = haltAfterAnUncommittedJointRemoval();
+
+		// Before R10-1: RemovedException (exit 4, with the advice to wipe it), as no member of the new half answered.
+		var restarted = cluster.start(nodes.removed());
+		var division = Objects.requireNonNull(restarted.stateMachine().division());
+		assertTrue(jointWithoutIn(restarted, nodes.removed()), "the start took the joint-configuration path");
+		assertEquals(LifeCycle.State.STARTING, division.getInfo().getLifeCycleState(), "it waits outside the cluster");
+
+		for (var id : nodes.others()) {
+			cluster.start(id);
+		}
+		cluster.awaitLeader(TIMEOUT);
+		awaitMemberAgain(restarted, nodes.removed());
+		InProcessCluster.await(TIMEOUT, () -> division.getInfo().getLifeCycleState() == LifeCycle.State.RUNNING);
 		cluster.awaitConverged(TIMEOUT);
 	}
 
@@ -125,8 +178,9 @@ class JointRemovalStartTest {
 				RaftPeerId.valueOf(leader.config().nodeId()), division.getGroup().getGroupId(), 1,
 				cluster.raftPeers(newHalf)));
 		// The removal commits without the removed follower: it must hold the joint configuration before it stops, or
-		// its start takes the path of a log that still holds it (askMembers) instead of the one under test (keptBy).
+		// its start takes the path of a log that still holds it (askMembers) instead of the one under test (the new half's answer).
 		InProcessCluster.await(TIMEOUT, () -> jointWithoutIn(removedNode, removed));
+		awaitConfigurationOnDisk(removedNode);
 		var reply = pending.get();
 		assertTrue(reply.isSuccess(), String.valueOf(reply.getException()));
 		assertTrue(jointWithoutIn(removedNode, removed), "the leader sends the final configuration to the members that stay");

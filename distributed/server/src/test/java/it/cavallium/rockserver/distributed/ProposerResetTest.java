@@ -128,4 +128,32 @@ class ProposerResetTest {
 			release.countDown();
 		}
 	}
+
+	/**
+	 * R10-5, the bound: an attempt that read the old proxy, and was sent on the replacement that another attempt's reset
+	 * made in between, keeps that replacement when it fails there (it cannot tell which proxy the call used). The next
+	 * attempt to the peer reads the replacement first, and its failure replaces it.
+	 */
+	@Test
+	void aFailureOnAReplacementMadeAfterTheReadIsReplacedByTheNextAttempt() throws Exception {
+		var release = new CountDownLatch(1);
+		var proxies = new PeerProxyMap<SlowProxy>("test", _ -> new SlowProxy(release));
+		var rpc = new Rpc(proxies);
+		try {
+			rpc.addRaftPeers(List.of(RaftPeer.newBuilder().setId(PEER).setAddress("127.0.0.1:1").build()));
+			var readBeforeTheCall = proxies.getProxy(PEER);
+			// Another attempt fails on it and replaces it before this attempt's call takes the proxy from the map.
+			Proposer.resetBrokenProxy(rpc, PEER, readBeforeTheCall, new NullPointerException("another attempt"));
+			var usedByTheCall = proxies.getProxy(PEER);
+			assertNotSame(readBeforeTheCall, usedByTheCall);
+			// The call fails on the replacement: the reset, given the proxy read before, keeps it.
+			Proposer.resetBrokenProxy(rpc, PEER, readBeforeTheCall, new NullPointerException("this attempt"));
+			assertSame(usedByTheCall, proxies.getProxy(PEER), "one more attempt can fail on it");
+			// The next attempt reads it before its call, fails on it, and replaces it.
+			Proposer.resetBrokenProxy(rpc, PEER, proxies.getProxy(PEER), new NullPointerException("the next attempt"));
+			assertNotSame(usedByTheCall, proxies.getProxy(PEER));
+		} finally {
+			release.countDown();
+		}
+	}
 }
