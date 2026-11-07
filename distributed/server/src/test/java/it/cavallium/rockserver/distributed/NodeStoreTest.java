@@ -95,6 +95,65 @@ class NodeStoreTest {
 		}
 	}
 
+	/**
+	 * RocksDB deletes files in its directories from its own threads as soon as it is open (the inputs of the compaction
+	 * that a database restored with many level-0 files starts at once, obsolete WALs): the checks that {@link
+	 * NodeStore#open} runs on the open database must not fail when a file disappears under them. The thread below stands
+	 * in for those deletions, in the volume directory, with files RocksDB does not know.
+	 */
+	@Test
+	void openToleratesFilesDeletedConcurrentlyInTheDatabaseDirectory() throws Exception {
+		reopenWhileChurning(false);
+	}
+
+	/**
+	 * The same for directories: core does not delete a directory of an open database, but the check walks first and asks
+	 * each directory's file system after, so a directory gone in between is skipped as a file is.
+	 */
+	@Test
+	void openToleratesDirectoriesDeletedConcurrentlyInTheDatabaseDirectory() throws Exception {
+		reopenWhileChurning(true);
+	}
+
+	/** Reopens a database 30 times while a thread creates and deletes files, or directories, in its volume directory. */
+	private void reopenWhileChurning(boolean directories) throws Exception {
+		Path dbDir = tempDir.resolve("db");
+		try (var store = NodeStore.open(dbDir, null, "first")) {
+			setApplied(store, TermIndex.valueOf(1, 1));
+		}
+		Path volume = dbDir.resolve("volume");
+		assertTrue(Files.isDirectory(volume), "default volume directory " + volume);
+		var stop = new java.util.concurrent.atomic.AtomicBoolean();
+		var churner = new Thread(() -> {
+			int n = 0;
+			while (!stop.get()) {
+				Path entry = volume.resolve("churn-" + (n++ % 256) + (directories ? ".d" : ".tmp"));
+				try {
+					if (!Files.deleteIfExists(entry)) {
+						if (directories) {
+							Files.createDirectory(entry);
+						} else {
+							Files.createFile(entry);
+						}
+					}
+				} catch (IOException ignored) {
+					// Racing with nothing but this thread: retry on the next name.
+				}
+			}
+		}, "churner");
+		churner.start();
+		try {
+			for (int i = 0; i < 30; i++) {
+				try (var store = NodeStore.open(dbDir, null, "reopen-" + i)) {
+					assertEquals(TermIndex.valueOf(1, 1), store.applied());
+				}
+			}
+		} finally {
+			stop.set(true);
+			churner.join();
+		}
+	}
+
 	/** The leader's native transactions must not hold locks that the apply waits on, whatever the config says. */
 	@Test
 	void theDatabaseIsOptimisticEvenIfTheConfigSaysOtherwise() throws Exception {

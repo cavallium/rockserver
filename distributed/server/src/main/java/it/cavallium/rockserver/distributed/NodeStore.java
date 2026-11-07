@@ -28,10 +28,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileStore;
 import java.nio.file.FileSystemException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -426,13 +430,42 @@ final class NodeStore implements Closeable {
 			return;
 		}
 		FileStore parentStore = Files.getFileStore(dbDir.getParent());
-		List<Path> directories;
-		try (Stream<Path> walk = Files.walk(dbDir)) {
-			// Files.isDirectory and getFileStore follow symbolic links, so a linked volume is checked too.
-			directories = walk.filter(Files::isDirectory).toList();
-		}
+		List<Path> directories = new ArrayList<>();
+		// The database may be open: RocksDB deletes files (compaction inputs, obsolete WALs) from its own threads while
+		// this walks, so an entry, file or directory, that is gone before it is read is skipped, here and in the loop
+		// below. Symbolic links are not followed, as by Files.walk; Files.isDirectory and getFileStore follow them, so a
+		// linked volume is checked too.
+		Files.walkFileTree(dbDir, new SimpleFileVisitor<>() {
+			@Override
+			public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+				directories.add(dir);
+				return FileVisitResult.CONTINUE;
+			}
+
+			@Override
+			public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+				if (attrs.isSymbolicLink() && Files.isDirectory(file)) {
+					directories.add(file);
+				}
+				return FileVisitResult.CONTINUE;
+			}
+
+			@Override
+			public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException {
+				if (exc instanceof NoSuchFileException) {
+					return FileVisitResult.CONTINUE;
+				}
+				throw exc;
+			}
+		});
 		for (Path directory : directories) {
-			if (!Files.getFileStore(directory).equals(parentStore)) {
+			FileStore store;
+			try {
+				store = Files.getFileStore(directory);
+			} catch (NoSuchFileException gone) {
+				continue;
+			}
+			if (!store.equals(parentStore)) {
 				throw new IOException(directory + " is on a different file system than " + dbDir.getParent()
 						+ ": the database directory and its volumes must be on the file system of its parent, so that"
 						+ " a snapshot can be restored by renaming");
