@@ -198,6 +198,16 @@ final class TermService {
 	 */
 	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
 			NodeStateSource nodeState, ReadIndexSource readIndex, @Nullable String configDigest, OpsSource ops) {
+		return customizer(server, apiAddress, nodeState, readIndex, configDigest, ops, null);
+	}
+
+	/**
+	 * {@link #customizer(Supplier, HostAndPort, NodeStateSource, ReadIndexSource, String, OpsSource)}, also installing
+	 * {@code traffic}, unless null, on the Raft server.
+	 */
+	static GrpcServices.Customizer customizer(Supplier<RaftServer> server, HostAndPort apiAddress,
+			NodeStateSource nodeState, ReadIndexSource readIndex, @Nullable String configDigest, OpsSource ops,
+			@Nullable RaftTraffic traffic) {
 		ServerCalls.UnaryMethod<byte[], byte[]> handler = (request, response) -> answer(server, request, response);
 		var address = (apiAddress.host() + ":" + apiAddress.port()).getBytes(StandardCharsets.UTF_8);
 		ServerCalls.UnaryMethod<byte[], byte[]> addressHandler = (_, response) -> {
@@ -222,7 +232,15 @@ final class TermService {
 		}
 		var service = definition.build();
 		// Ratis may run admin and client services on separate ports; the peers' Raft address is the SERVER one.
-		return (builder, types) -> types.contains(GrpcServices.Type.SERVER) ? builder.addService(service) : builder;
+		return (builder, types) -> {
+			if (!types.contains(GrpcServices.Type.SERVER)) {
+				return builder;
+			}
+			if (traffic != null) {
+				builder.intercept(traffic);
+			}
+			return builder.addService(service);
+		};
 	}
 
 	/** Asks the server behind {@code channel} for its current term in {@code groupId}. */

@@ -128,11 +128,14 @@ public final class ReplicatedNode implements AutoCloseable {
 	private final NodeMetrics metrics;
 	/** Whether {@link #MEMBER_FILE} exists. Maintenance thread only. */
 	private boolean memberRecorded;
+	/** When a leader last sent this node a Raft request: see {@link RaftTraffic}. */
+	private final RaftTraffic raftTraffic;
 	/** The gauges and alarms of this node; only refreshed on the maintenance thread. */
 	private NodeMonitor monitor;
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
 		this.config = config;
+		this.raftTraffic = new RaftTraffic(config.nodeId());
 		Files.createDirectories(config.dbDir().getParent());
 		Files.createDirectories(config.raftDir());
 		requireSameFileSystem(config.raftDir(), config.dbDir().getParent());
@@ -154,7 +157,7 @@ public final class ReplicatedNode implements AutoCloseable {
 		parameters.put(CommitHeartbeats.PARAMETER, commitHeartbeats, CommitHeartbeats.class);
 		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
 		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress,
-				this::nodeState, this::readIndex, configDigest, this::answerOps));
+				this::nodeState, this::readIndex, configDigest, this::answerOps, raftTraffic));
 		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
 		if (!existing) {
 			// Before anything opens the database: copies of a seed are the same only until then.
