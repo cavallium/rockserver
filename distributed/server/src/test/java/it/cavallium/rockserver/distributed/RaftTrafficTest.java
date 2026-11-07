@@ -235,17 +235,21 @@ class RaftTrafficTest {
 	 * R16-2: a chunk of the current term whose configuration is older than the node's newest committed one (a delayed
 	 * chunk of an install stream its leader gave up on, answered ALREADY_INSTALLED by Ratis, which would still drop the
 	 * later configurations and take the chunk's) fails its stream: Ratis never sees it, and its end reaches Ratis as a
-	 * cancel. A chunk of the same configuration, or of a later one, is forwarded.
+	 * cancel, and it is counted ({@code install.staleChunks}, R17-6). A chunk of the same configuration, or of a later
+	 * one, is forwarded.
 	 */
 	@Test
 	void aChunkOfAConfigurationOlderThanTheCommittedOneFailsTheStream(@TempDir Path raftDir) throws Exception {
+		var staleChunks = new NodeMetrics.Series();
 		var traffic = new RaftTraffic("n1", raftDir, _ -> 5,
-				(group, _) -> group.equals(GROUP) ? 40 : RaftTraffic.NO_INDEX, null);
+				(group, _) -> group.equals(GROUP) ? 40 : RaftTraffic.NO_INDEX, null, staleChunks);
 		var call = installCall();
 		var handler = new FakeHandler<RaftProtos.InstallSnapshotRequestProto, RaftProtos.InstallSnapshotReplyProto>();
 		var listener = traffic.interceptCall(call, new Metadata(), handler);
 		listener.onMessage(chunk(5, 30, ABX));
 		assertNotNull(call.closed, () -> "the stream is not failed: " + call.events);
+		// R17-6: counted, so that a live stream refused by mistake shows in a metric and an alert, not only in a WARN.
+		assertEquals(1, staleChunks.count(), "install.staleChunks");
 		assertTrue(handler.messages.isEmpty(), "the chunk reached Ratis");
 		assertEquals(RemovalRule.UNKNOWN_TERM, InstalledConfiguration.boundOf(InstalledConfiguration.read(raftDir),
 				new Conf(RemovalRule.UNKNOWN_TERM, 30, ABX, List.of())));
@@ -260,6 +264,7 @@ class RaftTrafficTest {
 		currentListener.onMessage(chunk(5, 41, ABX));
 		assertEquals(2, currentHandler.messages.size());
 		assertEquals(null, current.closed);
+		assertEquals(1, staleChunks.count(), "a forwarded chunk is not counted");
 	}
 
 	/**
