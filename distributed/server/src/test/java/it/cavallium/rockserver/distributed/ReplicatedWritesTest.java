@@ -75,7 +75,7 @@ class ReplicatedWritesTest {
 		raft.leaderReady = true;
 		raft.submit = request -> CompletableFuture.completedFuture(answer(request));
 		proposer = new Proposer(group, RaftSettings.client(config), config, raft.serverSupplier(), metrics,
-				threads.control());
+				threads.control(), threads.submit());
 		writes = new ReplicatedWrites(proposer);
 	}
 

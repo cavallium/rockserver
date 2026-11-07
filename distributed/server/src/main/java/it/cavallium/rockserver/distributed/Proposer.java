@@ -90,6 +90,10 @@ import org.slf4j.LoggerFactory;
  * applied. A batch is resent only until the earliest caller deadline among its requests. If that deadline ends the
  * batch without an answer, its other requests go back to the queue and are sent again in a new batch, under their
  * own deadlines (see {@link Lane#endUnanswered}).</p>
+ *
+ * <p>Batches are taken on whichever thread dispatches, and encoded and submitted on {@link #submitter}: never on the
+ * control plane, which handles the replies and the timers, nor on the proposing caller, whose {@code propose} returns
+ * at once. A local submission can block inside Ratis during a disk stall (see {@link #submitter}).</p>
  */
 final class Proposer implements Closeable {
 
@@ -156,11 +160,22 @@ final class Proposer implements Closeable {
 	private final ExecutorService sender = Executors.newThreadPerTaskExecutor(
 			Thread.ofVirtual().name("rockserver-propose-", 0).factory());
 	/**
-	 * The node's control plane ({@link NodeThreads#control()}), platform threads: handles the replies, sends the
-	 * resends and fails queued requests at their caller's deadline, also while no batch slot frees up to look at the
-	 * queue. It never waits behind virtual-thread carriers pinned by database calls.
+	 * The node's control plane ({@link NodeThreads#control()}), platform threads: handles the replies, schedules the
+	 * resends and fails queued requests at their deadline, also while no batch slot frees up to look at the queue. It
+	 * never waits behind virtual-thread carriers pinned by database calls, and never encodes nor submits a batch (see
+	 * {@link #submitter}), so that a submission blocked in Ratis during a disk stall does not stop it.
 	 */
 	private final ScheduledExecutorService control;
+	/**
+	 * The node's submit threads ({@link NodeThreads#submit()}), platform threads: encode the batches and hand them to
+	 * Ratis, this node's own Raft server or the sender for a remote leader. Never {@link #control} nor the proposing
+	 * caller: in Ratis 3.3.1 {@code RaftServerImpl.executeSubmitClientRequestAsync} waits with
+	 * {@code supplyAsync(..., clientExecutor).join()} for {@code writeAsyncImpl}, whose {@code appendTransaction} holds
+	 * the server's lock around {@code ServerState.appendLog}, which ends in {@code SegmentedRaftLogWorker.addIOTask}:
+	 * that waits, without giving up, for room in the log queue. A disk stall fills that queue (64 MiB, below the 160
+	 * MiB pending-request limit, see {@link RaftSettings}), and every local submission then blocks for the whole stall.
+	 */
+	private final Executor submitter;
 	/**
 	 * Bytes of the requests this node holds, from {@link #submit} to their answer (see {@link #writeAdmissionBytes}).
 	 * A request that does not fit is refused at once as not applied, instead of filling the heap.
@@ -176,13 +191,16 @@ final class Proposer implements Closeable {
 	private volatile boolean closed;
 
 	/**
-	 * @param control platform threads for the reply handling and timers; the caller shuts them down after
-	 *                {@link #close()}
+	 * @param control   platform threads for the reply handling and timers; the caller shuts them down after
+	 *                  {@link #close()}
+	 * @param submitter threads that encode batches and submit them, which may block inside Ratis (see
+	 *                  {@link NodeThreads#submit()}); the caller shuts them down after {@link #close()}
 	 */
 	Proposer(RaftGroup group, RaftProperties properties, NodeConfig config, Supplier<RaftServer> localServer,
-			NodeMetrics metrics, ScheduledExecutorService control) {
+			NodeMetrics metrics, ScheduledExecutorService control, Executor submitter) {
 		this.metrics = metrics;
 		this.control = control;
+		this.submitter = submitter;
 		this.admissionRejects = metrics.amount("writes.admissionRejects");
 		this.anyLeader = new Lane(false);
 		this.localCommits = new Lane(true);
@@ -494,14 +512,17 @@ final class Proposer implements Closeable {
 
 		/**
 		 * Fails it with {@code error} if it was never sent, so that it never will be; does nothing once it was sent,
-		 * since it may then take effect. It stays in its queue until a batch is formed, which skips it.
+		 * since it may then take effect. It stays in its queue until a batch is formed, which skips it. True if this
+		 * call abandoned it.
 		 */
-		void abandon(Throwable error) {
+		boolean abandon(Throwable error) {
 			if (state.compareAndSet(QUEUED, ABANDONED)) {
 				// Its body is given back to the admission now; the rest of its weight once it leaves its queue.
 				entry = null;
 				result.completeExceptionally(error);
+				return true;
 			}
+			return false;
 		}
 
 		boolean isAbandoned() {
@@ -602,7 +623,7 @@ final class Proposer implements Closeable {
 			admission.release(pending.isAbandoned() ? weight - REQUEST_OVERHEAD_BYTES : weight);
 		});
 		// The answer comes on the control plane: the caller's continuations run on a virtual thread instead. Made
-		// before the request is queued: the thread that queues it may also send its batch.
+		// before the request is queued: the thread that queues it may also take it into a batch, sent at once.
 		var copy = new CallerCopy(pending);
 		pending.callerCopy = copy;
 		pending.result.whenCompleteAsync(copy::answer, CALLERS);
@@ -680,9 +701,10 @@ final class Proposer implements Closeable {
 	}
 
 	/**
-	 * If {@code pending} is queued (never sent, or sent and refused before the append), fails it as not applied at its
-	 * deadline, its caller's or else the node's request timeout, even if no batch slot frees up by then to look at the
-	 * queue (R21-1, R21-4). Called after every enqueue and requeue of requests that are queued again; arms a timer
+	 * If {@code pending} is queued (never sent, or sent and refused before the append), fails it as not applied when
+	 * {@link Lane#take} would: {@link Pending#minTimeLeftNanos} before its deadline, its caller's or else the node's
+	 * request timeout, even if no batch slot frees up by then to look at the queue (R21-1, R21-4, R22-F2: at the
+	 * deadline itself the caller would get that answer only {@link #CALLER_MARGIN_NANOS} before its own deadline). Called after every enqueue and requeue of requests that are queued again; arms a timer
 	 * only if none is still waiting, so that a request requeued again and again holds one timer, not one per requeue
 	 * (R21-2). The timer only abandons a request that is queued when it fires ({@link Pending#abandon} needs QUEUED),
 	 * so one that fires while the request is in a batch does nothing; once it fired, the next requeue arms another.
@@ -701,7 +723,7 @@ final class Proposer implements Closeable {
 			first = current == null;
 			try {
 				pending.expiry = control.schedule(() -> pending.abandon(pending.deadlineFailure()),
-						pending.deadlineNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
+						pending.deadlineNanos - pending.minTimeLeftNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
 			} catch (RejectedExecutionException stopping) {
 				// close() answers every request.
 				return;
@@ -719,6 +741,10 @@ final class Proposer implements Closeable {
 				}
 			});
 		}
+	}
+
+	private static RocksDBException stopping() {
+		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping");
 	}
 
 	private static RocksDBException callerDeadlinePassed() {
@@ -801,7 +827,14 @@ final class Proposer implements Closeable {
 			dispatch();
 		}
 
-		/** Sends batches while there are queued requests and room in flight. */
+		/**
+		 * Forms batches while there are queued requests and room in flight, and hands each to {@link #submitter}, which
+		 * encodes and sends it (R22-F1). Taking a batch is short and never waits but for this lane's lock, so it stays on
+		 * the calling thread (a caller, a control thread or a submit thread), and batches form exactly as before;
+		 * encoding and the submission to Ratis, which can block during a disk stall, never run on {@link #control} or
+		 * on the proposing caller. No order between batches is relied on (see design.md, "Submitting off the control
+		 * plane"): {@code send()} already ran outside the lane's lock, on whichever thread dispatched.
+		 */
 		void dispatch() {
 			while (true) {
 				List<Pending> batch;
@@ -816,12 +849,26 @@ final class Proposer implements Closeable {
 					batchesInFlight++;
 				}
 				try {
-					send(batch);
-				} catch (RuntimeException ex) {
+					submitter.execute(() -> sendTaken(batch));
+				} catch (RejectedExecutionException ex) {
+					// The node is stopping: nothing of this batch was encoded or sent.
 					encodingEnded(batch);
-					fail(batch, ex instanceof RocksDBException rocks ? rocks : Proposer.unavailable(ex));
-					finished();
+					fail(batch, stopping());
+					synchronized (this) {
+						batchesInFlight--;
+					}
 				}
+			}
+		}
+
+		/** Sends a batch that {@link #dispatch} took, on a submit thread. */
+		private void sendTaken(List<Pending> batch) {
+			try {
+				send(batch);
+			} catch (RuntimeException ex) {
+				encodingEnded(batch);
+				fail(batch, ex instanceof RocksDBException rocks ? rocks : Proposer.unavailable(ex));
+				finished();
 			}
 		}
 
@@ -856,9 +903,14 @@ final class Proposer implements Closeable {
 					if (onDrop != null) {
 						onDrop.accept(next);
 					}
-					next.fail(closed ? RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping")
-							: next.callerDeadline ? next.callerDeadlineFailure()
-							: notAccepted());
+					// Out of QUEUED before it is failed (R22-F3): its expiry timer may abandon it at this very moment, and
+					// then the admission keeps its overhead until leftQueue() gives it back, which must happen once.
+					var failure = closed ? stopping() : next.deadlineFailure();
+					if (!next.abandon(failure)) {
+						// Resent alone (still SENT): failed saying it was applied. Already abandoned: nothing to do.
+						next.fail(failure);
+					}
+					leftQueue(next);
 					continue;
 				}
 				if (!batch.isEmpty() && (next.alone() || batch.getFirst().alone()
@@ -1069,19 +1121,27 @@ final class Proposer implements Closeable {
 								finished();
 							}
 						};
+						// The timer only hands the resend to a submit thread: a local submission can block inside Ratis.
+						Runnable resend = () -> {
+							if (closed || System.nanoTime() - deadlineNanos >= 0) {
+								// Too late after all (the timer ran late): no copy goes out after the deadline.
+								end.run();
+								return;
+							}
+							try {
+								attempt(batch, message, local, callId, deadlineNanos, sentNanos, nowAmbiguous);
+							} catch (Throwable unexpected) {
+								// The executor would keep it to itself. Earlier copies may have been appended.
+								fail(batch, unavailable(unexpected));
+								finished();
+							}
+						};
 						try {
 							control.schedule(() -> {
-								if (closed || System.nanoTime() - deadlineNanos >= 0) {
-									// Too late after all (the timer ran late): no copy goes out after the deadline.
-									end.run();
-									return;
-								}
 								try {
-									attempt(batch, message, local, callId, deadlineNanos, sentNanos, nowAmbiguous);
-								} catch (Throwable unexpected) {
-									// The scheduler would keep it to itself. Earlier copies may have been appended.
-									fail(batch, unavailable(unexpected));
-									finished();
+									submitter.execute(resend);
+								} catch (RejectedExecutionException stopping) {
+									end.run();
 								}
 							}, delay, TimeUnit.MILLISECONDS);
 						} catch (RejectedExecutionException stopping) {

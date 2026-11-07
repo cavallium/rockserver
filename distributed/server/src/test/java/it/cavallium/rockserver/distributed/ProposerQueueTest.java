@@ -50,7 +50,8 @@ class ProposerQueueTest {
 		var threads = new NodeThreads("n0");
 		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
 				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
-		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics, threads.control());
+		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics,
+				threads.control(), threads.submit());
 		try {
 			var entry = new LogEntry.VerifyColumn("x".repeat(4096), 1);
 			long weight = LogEntryCodec.encodeEntryBody(entry).length + Proposer.REQUEST_OVERHEAD_BYTES;
@@ -96,7 +97,8 @@ class ProposerQueueTest {
 		var threads = new NodeThreads("n0");
 		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
 				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
-		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics, threads.control());
+		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> null, metrics,
+				threads.control(), threads.submit());
 		try {
 			// Every batch slot is taken, for about a second.
 			var stuck = new ArrayList<CompletableFuture<Object>>();

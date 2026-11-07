@@ -70,7 +70,7 @@ class ProposerCommitRetryTest {
 		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
 		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(requestTimeout);
 		return new Proposer(group, RaftSettings.client(config), config, raft.serverSupplier(), metrics,
-				threads.control());
+				threads.control(), threads.submit());
 	}
 
 	@AfterEach
