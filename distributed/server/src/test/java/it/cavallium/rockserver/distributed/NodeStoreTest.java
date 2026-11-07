@@ -317,6 +317,30 @@ class NodeStoreTest {
 		assertTrue(Files.notExists(dataDir.resolve("db")), "the data directory holds no database after the refusal");
 	}
 
+	/**
+	 * A {@code restore-backup} that fails after the backup was copied (here: a {@code --rockserver-config} that does not
+	 * parse) leaves the data directory as it was given, so that the same command can run again; before, the half-made
+	 * {@code db/} stayed and the rerun refused the directory as holding a database (R19-3).
+	 */
+	@Test
+	void aFailedRestoreBackupLeavesNoDatabaseAndCanRunAgain() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		Path source = tempDir.resolve("source");
+		writeDatabaseOfVersion(source, Capabilities.SUPPORTED);
+		try (var store = NodeStore.open(source, null, "source")) {
+			store.checkpoint(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR));
+		}
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=7\ncluster=c\n");
+		Path badConfig = tempDir.resolve("bad.conf");
+		Files.writeString(badConfig, "database { this does not parse");
+		Path dataDir = tempDir.resolve("data");
+		assertThrows(Exception.class, () -> ReplicaOps.restore(backupDir, dataDir, badConfig));
+		assertTrue(Files.notExists(dataDir.resolve("db")), "a failed restore left a database behind");
+
+		assertEquals(TermIndex.valueOf(1, 7), ReplicaOps.restore(backupDir, dataDir, null), "the rerun was refused");
+		assertTrue(Files.isDirectory(dataDir.resolve("db")));
+	}
+
 	/** {@code export-seed} refuses the database of a newer cluster the same way, and writes no target (R18-1). */
 	@Test
 	void exportSeedRefusesADatabaseOfANewerCluster() throws IOException {
