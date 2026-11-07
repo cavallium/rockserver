@@ -469,21 +469,35 @@ and the `LogEntry`.
   `completedBelow`). Any failure while a batch is sent, an `Error` too (out of memory encoding 8 MiB), answers its
   writes with an unknown outcome and gives back its slot (R22-3). No order between batches is
   relied on. Between dispatching threads there never was any: `send()` already ran outside the lane's lock, so a
-  batch taken first could reach Ratis second. Within one thread there now is none either: before R22, on the
-  leader, a thread that proposed A and then B while slots were free had A appended first, since it submitted A
-  itself and `submitClientRequestAsync` returns only after the append; now each batch is its own task on the
-  submit threads, and B's can reach Ratis before A's. So two writes to the same key that a caller pipelines without
-  awaiting the first (async Router writes, such as `Put`, `Delete` and `Merge` from one gRPC thread through
-  `writes.propose`) are applied in either order on the leader too, as they already were on a follower, whose
-  attempts went through the sender's executor. No guarantee is lost: a caller that needs last-writer order awaits
-  each write before sending the next (or uses a pipelined update chain, ordered as below). Order
+  batch taken first could reach Ratis second. Within one thread there now is none either: each batch is its own
+  task on the submit threads, and a batch B taken after A can reach Ratis first. Before R22 a leader thread that
+  proposed A and then B had A appended first only for A's first attempt, and only if A got its permits: a refusal
+  before the append (`NoPermitException` when the attempt bytes in flight are full, Ratis'
+  `ResourceUnavailableException` when its pending limits are), `NotLeader` and a timeout all resend A 50 ms or more
+  later, after a smaller B that fit. Nor was that order ever a contract anywhere (R23-A):
+  **writes that are not awaited have no relative order, on one node or replicated; order comes from awaiting each
+  write before sending the next, from an update of the key (the per-key FIFO lock), a transaction, or a batch.**
+  A replicated node's gRPC server runs each call on a virtual thread of its own (`GrpcServer.callExecutor`, and in
+  proxy mode one virtual thread per write through `ProxyScheduler`), so each gRPC write is its own
+  `writes.propose`, racing the next; the single-node server runs writes on its write pool (at least 3 threads in
+  production) under DRR and deadline scheduling, and `EmbeddedConnection` on the column's scheduler executors; the
+  core and Rust client sessions resend a copy whose outcome is unknown after later writes succeeded; on a follower
+  attempts always went through the sender's executor. Restoring submission order per lane (a ticket taken in
+  `dispatch()`, encoding in parallel, a drainer submitting in ticket order) would cost little, but would not cover
+  resends, followers (one ordered stream to the leader per lane), leader changes, client resends or the gRPC
+  front: "usually in order", worse than a clear contract. No client relies on it: Yotsuba's non-update puts and
+  deletes are idempotent markers or writes of distinct keys, its value writes go through updates, its one ordered
+  pair (`senderPresence` before the ending put) is awaited, and it uses no merges; the Rust client's calls are
+  awaited, `put_batch` chunks are sent one after another. `GrpcProxyWritesUnorderedTest` (core) shows a later put
+  to a key completing while an earlier, not awaited one still runs, independent of the proposer. Order
   comes from elsewhere, independent of submission order: successive attempts of one batch are sequential (the
   next is scheduled from the previous one's reply, same call id); single-key updates are ordered by the per-key
   FIFO lock and pipelined chains, admitted in `preAppendTransaction` in log order; commits by conflict validation
   in log order; `putBatch` chunks by sending each only after the previous one completes; requests requeued at the
   head are back before the dispatch that follows; and `completedBelow`, computed at encode time and kept as a
   maximum per proposer at apply, never passes a sequence still in flight, so a batch overtaken by a later one is
-  still applied (a copy of requests already answered is refused as a late copy, as intended).
+  still applied (a copy of requests already answered is refused as a late copy, as intended;
+  `ProposerSubmitThreadsTest.aBatchOvertakenByALaterOneIsStillApplied`).
 - **Results are recorded.** Applying a request writes its encoded result under
   `(proposerId, sequence)` in the internal column, in the same local transaction as its effects. If a
   later copy of the same request reaches the log (a retry that went to a new leader, or to a restarted node
@@ -1262,6 +1276,21 @@ would block the apply of their own commits. Yotsuba relies on conflicts spanning
   `--max-transaction-lease-ms`); a longer requested lease is shortened to it, for the native transaction too.
   An open transaction keeps the write history after its snapshot on the leader, so an abandoned one must not
   hold it for hours.
+- **End of a term.** When this node stops leading (`notifyLeaderChanged`, `notifyServerShutdown`, or a newer term's
+  session replacing the old one in `leaderSession(term)`), the session of the ended term is retired (R23-B): Ratis
+  calls the first two holding its server's monitor (from `changeToFollower`, and inside `appendEntriesAsync` and
+  `requestVote`) and the third under its append lock, while a rollback takes the native transaction's monitor,
+  which a point read or a staged write in that transaction holds for a whole native call, as long as a stalled
+  disk makes it last. So on Ratis' thread the session is only sealed (`LeaderSession.seal()`: nothing registers in
+  it or queues for one of its keys afterwards); a platform thread of that session (`<node>-session-close-<term>`,
+  one per session, so that a stuck rollback of one term does not delay the waiters of a later one) then answers
+  its key waiters with `UPDATE_RETRY` and its unsettled links, and only then rolls back its native transactions
+  and updates. Their ids are already unknown to the new term (a new session starts empty, and `EmbeddedDB` ids
+  are random and never reuse a live one); the replicated store is an `OptimisticTransactionDB`, so the old
+  transactions hold no row locks meanwhile, only snapshots. `installSnapshot` and `close()` wait for these threads
+  before closing the database (the database's own close would wait for the same monitors anyway; a session
+  retired while an install swaps the store rolls back on the old database object, whose closed transaction map
+  makes that a no-op).
 - **Single-key updates queue.** A `getForUpdate` without a transaction first waits for the earlier updates of
   the same key (a FIFO lock per key hash, held until the update's commit is applied or the update is closed or
   expires after its 10 s lease; a waiter gives up after 12 s, or at its caller's deadline, with `UPDATE_RETRY`).
@@ -2420,7 +2449,10 @@ before touching the database. The leader forwarder's poll timer has a platform t
 initialization (the genesis proposal, which can wait up to the request timeout) has a thread of its own, so that
 the API gate and the Raft watch (`LeaderStall`) keep running meanwhile. Why the local commands stay on virtual
 threads, and what to measure, is in [performance.md](performance.md), item 11. The partitioned apply, when on,
-adds its lanes: platform threads (`<node>-apply-lane-N`) that run RocksDB calls only for the apply thread.
+adds its lanes: platform threads (`<node>-apply-lane-N`) that run RocksDB calls only for the apply thread. A leader
+session of a term that ended is drained on a platform thread of its own (`<node>-session-close-<term>`, once per
+term): its rollbacks are native calls that can wait for a stalled disk, and must not run on the Ratis thread that
+reported the change while it holds the server's monitor (see "Transactions", "End of a term").
 
 ## Behavior differences from a single node
 
@@ -2494,7 +2526,8 @@ failover" below).
 | `ClientSessionTest` (in-process) | A merge and a transaction commit whose leader dies after its followers applied them and before it answered: the client sends them again with their request ids through the next node, the merge applies once and the commit answers `true` from its record. Copies of a commit and of the write that ends an update answer "unknown" while the first is in flight, then from the record. Copies of a numbered `mergeBatch` chunk, `deleteColumnIfExists`, `deleteColumn` and `deleteRange` take effect once; a numbered batch of two chunks is refused with nothing applied; the client library sends batches as numbered chunks over gRPC, a three-chunk batch of items that fill a chunk to the byte taking exactly one number per chunk (the client's and the server's split agree after encoding); a client batch whose leader dies after committing its first chunk, unanswered, resends that chunk with its number and every key is merged exactly once. |
 | `NumberedWritesTest` (in-process) | Streamed multi writes of a BATCH caller with sessions apply every item, results included; copies of a numbered `createColumn` and `uploadMergeOperator` answer from the record (no column re-created after a deletion, no version added); a server offering sessions without `numberedBatches` gets a three-chunk batch unnumbered, taking no number; an endless numbered batch stream is refused after a few batches; a commit refused by the leader behind a follower's forward is flagged not applied at the client; a numbered streamed multi write over the server's collect budget is refused as `SERVER_OVERLOADED`, applies nothing, and the budget is given back after each collection; a BATCH `putMulti` with results over 16 MiB counted is sent unnumbered and applied, on every node (R6-3); an unnumbered `putMulti` over the numbering limit that ends an update makes the client forget the update. |
 | `ProposerCopiesTest` | A write's entry becomes its batch's copy once encoded, so a later re-encode never reads the caller's changed buffer; a follower's resend of a late batch is answered from the leader's retry cache, one log entry, applied once; a caller giving up during its batch's encoding waits for it, bounded; through the proposer, with a batch paused before its encoding, `cancel()` returns and an `orTimeout` answers only after the encoding, without holding the JDK's delayer thread; a caller that gives up while the encoding does not end is answered after the 1 s cap. |
-| `ProposerSubmitThreadsTest` | R22: against a `StubRaft` leader whose submissions block as Ratis' append does behind a full log queue, a write Ratis answers at once is still answered while as many resends as there are control threads block in Ratis' submit (F1); `propose` returns at once while its submission blocks (F1b); a request that `take()` drops past its deadline while its expiry timer abandons it gives its whole weight back to the write admission (F3); a follower's batches and resends skip the submit threads (at most one hand-off to them while about 18 attempts go to the sender), and once it leads a batch handed to the sender is submitted on a submit thread (R22-2); an `Error` while encoding answers the write and frees the slot (R22-3); a batch taken before the proposer closes is not submitted while it closes (R22-4). |
+| `ProposerSubmitThreadsTest` | R22: against a `StubRaft` leader whose submissions block as Ratis' append does behind a full log queue, a write Ratis answers at once is still answered while as many resends as there are control threads block in Ratis' submit (F1); `propose` returns at once while its submission blocks (F1b); a request that `take()` drops past its deadline while its expiry timer abandons it gives its whole weight back to the write admission (F3); a follower's batches and resends skip the submit threads (at most one hand-off to them while about 18 attempts go to the sender), and once it leads a batch handed to the sender is submitted on a submit thread (R22-2); an `Error` while encoding answers the write and frees the slot (R22-3); a batch taken before the proposer closes is not submitted while it closes (R22-4); a batch held while it encodes is overtaken by one taken after it, and is still applied: the later batch's `completedBelow` does not pass its sequence (R23-A). |
+| `StepDownRollbackOffRaftTest` | R23-B: while a test thread holds the monitor of an open native transaction on the leader (a read stuck on a stalled disk), a leadership transfer makes the old leader a follower that applies the new leader's entries, an update waiting for a key of the ended term is answered, and the transaction's id is unknown to the new leader; the transaction and the update are rolled back once the monitor is free. A node stopped during such a stuck rollback closes its database only after it (a regression check: the database's own close takes the same monitor). |
 | `RustClientLiveTest` (in-process, off by default) | The Rust client's live test against a follower of a three-node cluster: every numbered call, merge operator upload/check/ensure, batches as chunks, two copies of one numbered merge applied once, two copies of numbered multi writes with results answered alike, the multi writes and their result variants over the numbering limit streamed unnumbered, then every node checked. A second run: numbered writes (with results) lost with a halted leader behind a proxy, resent by the client to a follower, answered with their first results and applied once. |
 | `CommitOutcomesTest` | The answer to a copy of a numbered commit whose transaction is gone: unknown while a mark of this term exists, also for a mark of a term that started while the copy's leadership barrier ran (the term is read before the barrier), "run it again" with no mark or a mark of an earlier term, the record when there is one; the first mark of a newer term drops the older ones. `NodeStoreTest` checks that a session expired at the replicated clock is not live while its row is still there. |
 | `NodeStoreTest` (disk layout) | Opening a database is not failed by files, or directories, created and deleted in its volume directory while the open checks the disk layout (R12-0); both tests fail without the fix. R18-1: `restore-backup` (`ReplicaOps.restore`) and `export-seed` refuse a database whose cluster version has a bit this version lacks, and leave no `db/` or seed (both failed at `d385ecd`). R19-3: a `restore-backup` that fails after the copy for another reason (a `--rockserver-config` that does not parse) leaves no `db/` either, and the same command then succeeds (`aFailedRestoreBackupLeavesNoDatabaseAndCanRunAgain`; at `d1b98b0` the half-made `db/` stayed and a rerun refused the directory). |
@@ -2545,7 +2578,7 @@ failover" below).
 | `CapabilityUpgradeTest` (in-process) | A version-0 cluster with one member of an older version is raised only to what that member has (no sessions advertised, no pipelining, also after another check); once that member is upgraded, the version reaches everything, sessions are advertised, the current term still runs without pipelining and the next leader pipelines. |
 | `ChecksumTest` (in-process) | A row written past the log on one replica makes its digest and key count differ, and every replica reports the divergence (`checksum.mismatches`, the index gauge). A column with the same name and no data but another merge operator on one replica digests differently (schemas are in the digest). With checks every 6 s and the leader stopped 3 s after one, the next check comes about 6 s after the last one, not 6 s after the change. A check applied again (its recorded time moved 3 hours back while the node was down) keeps that time, also across the next start. |
 | `ReplicaOpsTest` | The new entries round-trip and are applied alone; backup names; the wire form of results; capability names; digests that tell key parts and values apart; series and gauges exported cumulative, with their kind, and moved to a new registry; the lag sampling period; Raft log bytes counted from segment files only; the alarm's start, repeat and end; the verdicts of `admin checksum` and `admin backup` (OK only with a final result from every member), which failed proposals are retried, the capabilities `add-peer` requires (current and pending), the replication meters following a configured node name, and a blank `node-name` meaning the node id. |
-| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped; every service method classified; two failing addresses each back off), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage` (partial installs deleted once replaced, at the start, and after 10 minutes without a change), `LeaderForwarder` (leader lookups still waiting fail on close; see also "Targeted faults and component tests" below), fault proxy (cuts, delay and jitter keeping byte order, bandwidth caps, blackholes that release held bytes, dropped answers resetting their connections when healed), linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. |
+| Component tests | Codecs (including fuzzing), `ConflictTracker` (checked against a reference model, also with a capped history; pruning in bounded steps, and appends and checks while a long prune runs), `ReadBarrier` (deposed and isolated leaders never pass; a second round starts while the first is in flight; a read index needs no apply), `LeaderHintRouter` (which calls go to the hinted leader, and when the hint is taken or dropped; every service method classified; two failing addresses each back off), the idle timeout of forwarded streams, `NodeStore`/`CheckpointStorage` (partial installs deleted once replaced, at the start, and after 10 minutes without a change), `LeaderForwarder` (leader lookups still waiting fail on close; see also "Targeted faults and component tests" below), fault proxy (cuts, delay and jitter keeping byte order, bandwidth caps, blackholes that release held bytes, dropped answers resetting their connections when healed), linearizability checker. In the core project, `GrpcProxyCloseTest`: closes that answer late, on a proxy `GrpcServer`, take no worker, are not cancelled with their caller, and hold up shutdown after their caller left; the close of an update whose caller left while it opened is asynchronous too; a retry of either close, with no caller left, is no late failure. `GrpcProxyWritesUnorderedTest`: a later put to a key, sent without awaiting an earlier one, reaches the connection and completes while the earlier one still runs (writes not awaited have no relative order, R23-A). |
 
 Run them all (about 20 minutes on a real disk):
 
