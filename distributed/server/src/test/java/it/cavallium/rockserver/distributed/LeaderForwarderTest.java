@@ -368,7 +368,12 @@ class LeaderForwarderTest {
 			assertInstanceOf(LeaderForwarder.NotConnectedException.class, error.getCause());
 		}
 		Thread.sleep(600);
-		assertEquals(2, asks.get(), "each request waiting on a failed connection asked again");
+		// One ask is the usual count: the first failure marks n1 stale and asks. The answer can come back from loopback
+		// before another of the four connections has failed, and that later failure marks n1 stale again and asks once
+		// more, so up to one ask per connection is correct. One ask per waiting request (16) is the bug.
+		int afterFailures = asks.get();
+		assertTrue(afterFailures >= 2 && afterFailures <= 1 + 4,
+				"asked once per failed connection at most, not once per waiting request: " + afterFailures);
 
 		// The member does not answer the ask any more, so its answer stays stale; after the backoff, the connections
 		// made at once share one ask.
