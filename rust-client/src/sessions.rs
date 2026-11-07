@@ -217,16 +217,18 @@ fn can_pause(deadline: Instant, pause: Duration) -> bool {
     deadline.saturating_duration_since(Instant::now()) > pause + FIRST_PAUSE
 }
 
-/// The timeout of a copy sent now: what is left of a finite deadline (`None` once it passed), or no timeout.
+/// The timeout of a copy sent now: what is left of a finite deadline, or no timeout for a caller without one.
+/// `None` once the deadline or the window has passed, for both kinds of caller, so that nothing is sent then: a copy
+/// sent after the window could reach the server and would end `OUTCOME_UNKNOWN`, where not sending it is known not
+/// applied.
 fn remaining(deadline: Instant, finite: bool) -> Option<Option<Duration>> {
-    if !finite {
-        return Some(None);
-    }
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         None
-    } else {
+    } else if finite {
         Some(Some(left))
+    } else {
+        Some(None)
     }
 }
 
