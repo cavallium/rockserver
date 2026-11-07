@@ -66,23 +66,37 @@ majority and healthy (`status`).
    `--join` and a peer list that has the members that stay plus itself:
    `rs run --node-id n4 --peer n2=... --peer n3=... --peer n4=... --data-dir /srv/rockserver/data --join`.
    It prints `READY` and waits for as long as it takes.
-2. If the old node still runs (a move), stop it first and take it out of its supervisor: the step below changes two
-   nodes at once, which is safe only while the node that leaves cannot vote (see "Removed node" below). To keep it
-   serving until it is out, use two steps instead: `add-peer n4` with every member, the old one included, in
-   `--peer`, then `remove-peer <old id>` with all of them in `--peer`.
-   From any host, in one step, add `n4` and remove the old node, by leaving it out of `--peer`:
-   `rs admin --peer n2=... --peer n3=... --peer n4=... add-peer n4=10.0.0.4:9001/10.0.0.4:5333`.
-   It ends with `OK` once `n4` caught up from a snapshot and the configuration changed (the limit, `--timeout-ms`, is
-   10 minutes by default: raise it for a large database, about 100 MB/s).
+2. From any host, change one voter per command. `admin` reads the leader's configuration first (it waits while a change
+   is under way) and refuses, with exit code 1 and before it proposes anything, a call that would add and remove
+   voters together or change two of them: see "One voter per change" below. Old node `n1`:
+   - **The old node is down (lost):** remove it first, with `--peer` listing all current members, then add the new one
+     with `--peer` listing the members that stay:
+     `rs admin --peer n1=... --peer n2=... --peer n3=... remove-peer n1`, then
+     `rs admin --peer n2=... --peer n3=... add-peer n4=10.0.0.4:9001/10.0.0.4:5333`.
+     The two members that stay are needed throughout, as with any replacement of one node of three.
+   - **The old node runs (a move):** add the new one first, with every member, the old one included, in `--peer`, then
+     remove the old one with all of them in `--peer`:
+     `rs admin --peer n1=... --peer n2=... --peer n3=... add-peer n4=10.0.0.4:9001/10.0.0.4:5333`, then
+     `rs admin --peer n1=... --peer n2=... --peer n3=... --peer n4=... remove-peer n1`.
+     The old node exits with code 3 or 4 once removed: take it out of its supervisor before the `remove-peer`.
+
+   Do not add first while the old node is down: with 4 voters and one lost, all 3 others are needed, and a failure of
+   the new node during its catch-up stops the cluster (see "Heap" in the design document). `add-peer` ends with `OK`
+   once `n4` caught up from a snapshot and the configuration changed (the limit, `--timeout-ms`, is 10 minutes by
+   default: raise it for a large database, about 100 MB/s).
 3. Check: `status` shows `n4` with the others' commit index; `checksum` prints `OK`; the `rockserver-node-missing`
    alert threshold and the clients' address lists include `n4` and not the old node.
-4. With the two steps, the old node exits with code 3 or 4 once removed: take it out of its supervisor first.
 
 Failure branches:
 
 - `add-peer` says `FAILED: ... has a log of its own` or `was started without --join`: wipe the new node's data
   directory and start it again with `--join`, then run `add-peer` again.
 - `add-peer` says the new node `runs a version without ...`: upgrade it to the cluster's version first.
+- `add-peer` or `remove-peer` says `FAILED: refused: changes more than one voter: 2 voters would change at once (adds
+  [n4], removes [n1]; the voters now are [...])`: `--peer` does not match the leader's configuration (the line before
+  prints it), or the call is the old one-step replacement. Nothing was proposed. Fix `--peer` to the voters printed,
+  and change one voter per call as in step 2. If the leader itself refused it (`the leader refused: ...`), the same
+  applies: it checks every call, also of an older `admin`.
 - `add-peer` ends with no result within the limit: the leader goes on with the change. Run the same command again until
   it says `OK`; `status` shows the progress.
 - The lost node was the leader: the same steps, after the election (`status` shows a new leader).
@@ -118,11 +132,28 @@ start, `starting, not known to be a member`, with `Membership <reason> (K* ..., 
 
 `RestartPreventExitStatus=4` stays: a node that exited with 4 is removed, and a restart only repeats the check.
 
-`add-peer` and `remove-peer` build the new configuration from the `--peers` given to `admin`: give the cluster's
-current members (as `status` shows them). A call should change one running node: Ratis' first entry of a new leader
-keeps only the new half of a joint configuration and commits by it alone, so a change of several running nodes at
-once can lose committed entries if the leader changes in the middle (see the residuals of "Removal and waiting
-outside" in the design document). The replacement above changes two nodes, safely while the old one is stopped.
+### One voter per change
+
+`add-peer` and `remove-peer` build the new voters from the `--peer` given to `admin`, plus or minus the one node, and
+compare them with the leader's configuration, which they read first and print (`leader n2: voters [...]; this change
+adds [...] and removes [...]`). A call that changes more than one voter is refused: Ratis' first entry of a new leader
+keeps only the new half of a joint configuration and commits with it alone, so a change of several voters at once can
+lose committed entries if the leader changes in the middle (see "Replacing a node" and the residuals of "Removal and
+waiting outside" in the design document). A voter that becomes a listener, or the reverse, counts as one change;
+listeners, addresses and priorities count nothing. The change is sent as a compare-and-set against the configuration
+read: if another change commits first, `admin` reads it again and checks again. The leader refuses the same on its
+own, also for an `admin` of an older version or the Ratis tools, at once (`FAILED: ... the leader refused: refused:
+changes more than one voter ...`). Several dead nodes are removed one per call; a re-run of a call that succeeded
+prints `OK` again.
+
+`--unsafe-multi-voter-change` skips both checks: `admin` prints a warning and sends the change straight to the leader
+with a header that its guard lets through (it logs a WARN with the old and new voters). It is **never needed for
+recovery**: any change that can commit needs a live majority of the old voters, and with one, the same result can be
+reached one voter at a time; with no live majority nothing commits, flag or not: see "No quorum" in the design
+document, `export-seed` and "Restoring a backup". The change is safe only if every majority of the old voters that can
+still vote meets every majority of the new voters; that the leaving nodes are dead is not enough (three voters with
+one dead, adding four new ones at once: the new majority of the four new ones misses both live old voters). It is for
+tests and experts.
 
 ## Backups
 
@@ -296,7 +327,7 @@ disk problem to look at.
 | Code | `run` | `admin` | `repair-log` | `export-seed`, `restore-backup` |
 |---|---|---|---|---|
 | 0 | Not on a stop by signal: see below | `OK` | The log is valid, or was (with `--dry-run`: could be) repaired | Done |
-| 1 | Did not start: a bad option value, a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`) | `FAILED: ...`: refused, a change failed, the replicas differ (`checksum`), a member failed (`backup`) | Refused: see its output | Failed: see the exception |
+| 1 | Did not start: a bad option value, a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`) | `FAILED: ...`: refused (a change of more than one voter included), a change failed, the replicas differ (`checksum`), a member failed (`backup`) | Refused: see its output | Failed: see the exception |
 | 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError` | Wrong usage | Wrong usage | Wrong usage |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
 | 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`): run it again | - | - |

@@ -368,9 +368,8 @@ class MembershipTest {
 
 	/**
 	 * A planned replacement: the node to replace is the leader and it runs. It closes Raft and exits when it is out. In
-	 * two steps, add-peer then remove-peer, one node each: the one-step replacement changes two nodes, which is unsafe
-	 * while the old one still votes (round 13, design: residuals of "Removal and waiting outside"), so a running node
-	 * is replaced this way or stopped first.
+	 * two steps, add-peer then remove-peer, one voter each: {@code admin} refuses a change of two voters at once
+	 * (round 14), which is unsafe while the old one still votes (design: "Replacing a node").
 	 */
 	@Test
 	void aRunningLeaderIsReplacedInTwoSteps() throws Exception {

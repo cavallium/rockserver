@@ -177,6 +177,9 @@ divisions.
     in turn, and print OK only when every group has the target configuration.
   - The state in between, with some groups changed and others not, is safe: every group is an independent Raft
     group with a majority in both halves. The command is idempotent, so running it again completes the rest.
+  - The one-voter guard of round 14 (`VoterChange`, `MembershipGuard`) applies per group: `admin` reads each group's
+    leader configuration, refuses before the first group if any group would change more than one voter (a group that a run
+    interrupted earlier already changed counts zero), and sends each group a compare-and-set. The leader's guard checks each group's request on its own.
   - `requireFitToJoin` asks `nodeState` for every group.
   - `--join` gives every group an empty configuration.
   - A node that lost one group's Raft state but kept the others must still be replaced under a new id, as it is today.
@@ -386,7 +389,7 @@ The session work in progress registers sessions through the log and keys records
    - Every group takes its post-genesis snapshot, as design.md "Migrating from a single node" (in "Snapshots,
      catch-up and membership") requires today.
 7. **Admin:**
-   - `add-peer`/`remove-peer` loop over the groups;
+   - `add-peer`/`remove-peer` loop over the groups, with the one-voter check per group;
    - `status` per group;
    - `snapshot ID [--group k]`;
    - `transfer-leader --group k`;

@@ -229,10 +229,11 @@ address fails after 10 s. `ClientBuilder.setDeferred` skips the handshake until 
 connection ends a handshake in progress.
 
 To replace a node of a replicated cluster, start the new node first with `--join`, and run
-`admin --peer <the other members> add-peer <new node>` when you like: the node waits for it, also across restarts, and
-leaving the old node out of `--peer` replaces it in one step (stop the old node first if it still runs: that step
-changes two nodes, which is safe only while the one that leaves cannot vote). See "Replacing a node" in the [design
-document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
+`admin --peer <the members> add-peer <new node>` when you like: the node waits for it, also across restarts. `admin`
+changes one voter per command and refuses more (a change of several voters at once can lose committed entries if the
+leader changes meanwhile): replace a lost node with `remove-peer <old>` and then `add-peer <new>`, a running one with
+`add-peer <new>` and then `remove-peer <old>`. See "Replacing a node" in the
+[runbooks](docs/distributed/runbooks.md) and the [design document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
 without it), and see "Heap" there for the heap that a snapshot send needs. A removed node that is started again exits
 with 4 once a majority of the current configuration's members can confirm its removal; until they answer (they are
 down, unreachable, or of an older version) it prints `READY` and waits outside the cluster, serving nothing; it

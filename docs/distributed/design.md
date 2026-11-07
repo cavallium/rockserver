@@ -1441,30 +1441,47 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   already lost its majority, restart the node as it is until `remove-peer` gets through. `admin snapshot ID` makes a
   member take a snapshot at any time.
 - **Replacing a node.** Start the new member first, under a new id, with an empty data directory, a peer list that
-  includes itself and `--join`. It waits, also across restarts, for as long as you like. Then replace the node in one
-  step, leaving it out of `--peer`:
+  includes itself and `--join`. It waits, also across restarts, for as long as you like. Then change one voter per
+  command (round 14): `admin` refuses a call that adds and removes a voter together, or changes two, and so does the
+  leader.
 
-  ```bash
-  ReplicatedServerMain admin --peer <the other members> add-peer <new node>
-  ```
+  - **A lost node:** `remove-peer` of the lost node with every current member in `--peer`, then `add-peer` of the new
+    one with the members that stay:
 
-  `admin` does not read the current configuration: it sets it to exactly its own `--peer` list plus or minus one
-  peer. So this command adds the new node and removes the old one together (Ratis `setConfiguration`, a joint
-  configuration), and the members that stay form a majority of the old configuration and of the new one all along.
-  With one node of three lost that is 2 of 3 before, during and after the change, and a failure of the new node stops
-  nothing. It works the same when the lost node was the leader or a follower, seeded or not (`MembershipTest`). It is
-  only for a node that cannot vote: stop a node that still runs first (round 13). With both the old and the new node
-  voting, a majority of the old half and one of the new half can be disjoint, and a leader elected during the joint
-  configuration commits by the new half alone (see the residuals of "Removal and waiting outside"); with the old node
-  stopped they always meet in the members that stay. To keep a running node, the leader too, in service until it is
-  out, replace it in two steps instead, one node each: `add-peer` with every member in `--peer`, then `remove-peer`;
-  it exits with 3 (or 4) once it is out (`MembershipTest.aRunningLeaderIsReplacedInTwoSteps`). `admin` does not
-  refuse a one-step change while the old node runs: whether it should is left to the operator's decision.
+    ```bash
+    ReplicatedServerMain admin --peer <every current member> remove-peer <lost node>
+    ReplicatedServerMain admin --peer <the members that stay> add-peer <new node>
+    ```
 
-  The other way, `add-peer` with every member in `--peer` and `remove-peer` afterwards, is for growing a cluster. With
-  a lost node in `--peer` it passes through 4 members with 1 lost, where all 3 others are needed: any failure of the
-  new node stops writes until it returns, and an appender that dies during the catch-up leaves the cluster without a
-  leader, with no way back (see "Heap"). Every member must be in `--peer`, or the ones left out are removed.
+    This needs the same live members as the joint change that the one-step replacement made before round 14: with one
+    node of three lost, the two others are 2 of 3 during the removal (both of them, as the joint change also needed)
+    and 2 of 2, then 2 of 2 and 2 of 3 during the addition, so they are a majority of both halves all along and a
+    failure of the new node stops nothing. It works the same when the lost node was the leader or a follower, seeded
+    or not (`MembershipTest.aLostNodeIsReplacedRemoveThenAdd`).
+  - **A running node (a move), the leader too:** `add-peer` with every member in `--peer`, then `remove-peer`; it keeps
+    serving until it is out, and exits with 3 (or 4) then (`MembershipTest.aRunningLeaderIsReplacedInTwoSteps`).
+
+  Why one voter at a time: with Ratis 3.3.1 a leader elected while a joint configuration is uncommitted writes only the
+  new half in its term-start entry and commits with it alone (see the residuals of "Removal and waiting outside"). With
+  one voter added or removed every majority of the new half meets every majority of the old half; with two voters
+  changed (old o for new n) a majority of the old half and one of the new half can be disjoint while o still votes.
+  The one-step replacement was safe only while o could not vote, which `admin` cannot tell from a partition, so it is
+  refused rather than left to the operator. `admin` reads the leader's configuration, refuses a change of more than
+  one voter before it proposes anything (exit 1, with the two orders above in the message), and sends the change as a
+  compare-and-set against what it read; the leader's `MembershipGuard` checks every `setConfiguration` that reaches it
+  through gRPC the same way (also an older `admin`, or the Ratis tools), and rewrites what it lets through into a
+  compare-and-set against the configuration it checked, so that a change committed between its check and Ratis'
+  handling makes Ratis refuse instead. `--unsafe-multi-voter-change` skips both (the leader logs a WARN); it is never
+  needed for recovery, since any change that can commit needs a live majority of the old voters, and with one the
+  same result is reached one voter at a time; with none nothing commits, flag or not ("No quorum"). It is safe only if
+  every majority of the old voters that can still vote meets every majority of the new ones, which the leaving nodes
+  being dead does not ensure ({1,2,3} with 1 dead, adding 4, 5, 6 and 7 at once: {4,5,6,7} misses {2,3}).
+
+  Adding first while a lost node is still in the configuration is the risky order: it passes through 4 members with 1
+  lost, where all 3 others are needed: any failure of the new node stops writes until it returns, and an appender that
+  dies during the catch-up leaves the cluster without a leader, with no way back (see "Heap"). Adding first is for
+  growing a cluster and for a node that runs. Every member must be in `--peer`, or the change removes the ones left
+  out, which the one-voter check refuses unless it is just one.
 
   New members catch up from a snapshot. A node that lost its Raft state but kept its id refuses to start, because it
   could vote twice in one term. Replace it under a new id.
@@ -1733,12 +1750,20 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   (`LeaderStateImpl.StartupLogEntry` takes `getRaftConf().getConf()`, checked in the 3.3.1 bytecode) and then commits
   by the new half alone; when a majority of the new half and a majority of the old half can be disjoint (two nodes of
   five removed at once, say), a majority of the old half that never saw the joint configuration can elect another
-  leader, which overwrites those committed entries. `add-peer` and `remove-peer` compute the new configuration from
-  the `--peers` given to `admin`, so that list must be the cluster's current configuration. The one-step replacement
-  ("Replacing a node") changes two nodes, old o for new n: that is safe while o cannot vote (lost, or stopped first),
-  since a majority of the old half without o lies in the members that stay, and two majorities of the same size cannot
-  be disjoint within them; with o running, a leader change during the joint configuration can lose committed
-  entries. Not reproduced on Ratis itself; an upstream report is for the user.
+  leader, which overwrites those committed entries. Round 14 enforces one voter per change ("Replacing a node"):
+  `admin add-peer` and `remove-peer` read the leader's configuration, refuse a change of more than one voter
+  (`VoterChange`) before proposing anything, and send a compare-and-set; the leader's `MembershipGuard`, an
+  interceptor on the gRPC server of Ratis' admin service, refuses the same for any client (with
+  `SetConfigurationException`, which Ratis clients do not retry), answers `ReconfigurationInProgressException` while
+  its configuration is joint, and rewrites what it lets through into a compare-and-set against the configuration it
+  checked, with the same call id. The header `rockserver-unsafe-membership-change` (`admin
+  --unsafe-multi-voter-change`) lets a change through with a WARN. In-process calls
+  (`Division.getRaftServer().setConfigurationAsync`, tests only) skip gRPC and the guard, on purpose, and so do the raw
+  Ratis servers of `ReadBarrierTest`. Residual: on a node that is not the leader when the guard looks, the request
+  passes unchanged to Ratis; if the node became leader and committed its own term-start configuration in the
+  microseconds before Ratis' handler runs (Ratis refuses a change until then), an unchecked request would go
+  through; that needs a commit round trip within that gap. Not reproduced on Ratis itself; an upstream report is for
+  the user.
 
   Tests (in-process; each of the first three fails at `0d8bc71`, which has the round-10 rule and the test filter):
   `FlattenedConfigurationStartTest` (R11-1: five nodes; with `RaftTraffic.dropForTesting`, L's appends reach X only,
@@ -1822,8 +1847,8 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   - With `-XX:+ExitOnOutOfMemoryError` the leader exits at once (code 3, like a failed replica), before any of this. Start
     it again with more heap, and run `add-peer` again. The new node keeps waiting. Run once with the literal `add-peer`
     below: replicas identical at the end.
-  - Without the option, after a one step replacement, nothing is lost: `add-peer` says `OK` too early, but the two old
-    members are a majority of both configurations, the leader stays, writes go on, and a new appender starts the
+  - Without the option, after `remove-peer` of the lost node and `add-peer`, nothing is lost: `add-peer` says `OK` too
+    early, but the two old members are a majority of both configurations, the leader stays, writes go on, and a new appender starts the
     snapshot again. Run once.
   - Without the option, which now takes `--allow-without-exit-on-oom`, with `add-peer` that leaves a lost node in the
     configuration, the cluster ends with no leader,
@@ -2209,10 +2234,11 @@ failover" below).
 | `RaftSettingsTest`, `ByteAdmissionTest`, `ConflictPositionsTest` | Snapshot chunks stay at most 4 s on the heap; Ratis' pending-request limits hold every node's attempts and stay near the defaults, and the byte limit grows with a peer list of more than 4 nodes; one entry of the largest size fits every limit on its way. The byte admission never exceeds its limit and is sized from the heap. Conflict positions survive the exception that Ratis rebuilds, and a text that does not parse is a conflict of the whole entry. |
 | `SstMaintenanceTest` (in-process) | `scanRawResumable`, `getSstMetadata` and `getTableProperties` through a follower describe the leader's database; raw-scan tokens carry the leader and its term and skip their tables through any node, while tokens of another node or term, or untagged ones, scan them again; over gRPC a client that does not set `acceptsTaggedSstTokens` gets plain filenames; `compactFiles` of the internal column is refused. |
 | `ColumnIteratorsTest`, `SnapshotBackoffTest`, `DiskProbeTest`, `AddPeerCheckTest`, `ProposerResetTest`, `ProposerBrokenProxyTest`, `ShutdownSignalTest` | Applying a column deletion closes the column's iterators and ends its range streams with `COLUMN_NOT_FOUND` instead of waiting for them (a stream of another column goes on; one started during the deletion fails), and so does a replicated deletion for `scanRaw` and `scanRawResumable` served through a node's API (R3-G2a-5), and an unknown iterator answers `UPDATE_RETRY` (the database's error for it is pinned); a failing snapshot is tried again only after its delay (1 s doubling to a minute), on a cluster too; a disk probe that does not end within the limit means a hung disk, until it ends; `add-peer` waits for a majority of the members to answer; a proposer's connection reset returns once the failed proxy left Ratis' map, before its slow close, so a resend gets a new one; later attempts that failed on a proxy already replaced keep its replacement (R9-2), and a failure reported with an older proxy than the map's keeps the map's, while one reported with the map's own proxy replaces it, the reset rule that R10-5's bound relies on (the test calls `resetBrokenProxy` itself and sends no attempt, so it does not exercise where `Proposer.send` reads the proxy, and passes without that change); a follower's proposer replaces a client proxy to the leader whose calls throw (a metric interceptor without a registry, R8-4) instead of failing every write with an unknown outcome, and a node stops without an error although its proposer holds such a proxy to another peer; the shutdown hook's stop waits for a node whose replica failure was already stopping it, and gives 3; a node stopped by a removal or a newer cluster version exits with 4 or 5 from both the main thread and the shutdown hook's halt (R6-2). |
-| `CommandLineTest`, `FaultFsTest`, `LogTermsTest` | The operator commands through `main`, in this JVM with the exit replaced (`ReplicatedServerMain.exiter`): `admin checksum` and `admin backup` against a running cluster print `OK`, wrong arguments exit with 2, `export-seed` of a stopped replica writes the seed and refuses a target that exists, `restore-backup` restores into an empty directory (which then starts and serves the data) and refuses a used one with 1. The storage shim fails writes and syncs under its directory only while triggered, and only the kinds the trigger names. `LogTerms` reads the terms of a stopped cluster's logs, and they match. |
+| `VoterChangeTest`, `MembershipGuardTest` (in-process, 3 nodes and joined ones, gRPC client) | Round 14: what counts as a voter change (by id; listeners, addresses and priorities count nothing; voter to listener and back count one) and the refusal message. A two-voter change through gRPC is refused at once (well within the client's retry time) by the leader, also when the client asks a follower first, and the configuration stays; single changes, an address-only and a priority-only change and a re-run go through; the unsafe header lets a two-voter change through; what the guard lets through is a compare-and-set against the configuration it checked, ADD keeps the current members, and a compare-and-set against another configuration is refused without the marker. The two refusal tests and the rewrite check fail without the guard. |
+| `CommandLineTest`, `FaultFsTest`, `LogTermsTest` | The operator commands through `main`, in this JVM with the exit replaced (`ReplicatedServerMain.exiter`): `admin checksum` and `admin backup` against a running cluster print `OK`, wrong arguments exit with 2, `export-seed` of a stopped replica writes the seed and refuses a target that exists, `restore-backup` restores into an empty directory (which then starts and serves the data) and refuses a used one with 1. Round 14: `admin` refuses the one-step replacement of a stopped node with exit 1 and the two-step advice, leaving the configuration as it was; `remove-peer` then `add-peer` pass, a re-run prints `OK`, a stale `--peer` with `remove-peer` is refused. The storage shim fails writes and syncs under its directory only while triggered, and only the kinds the trigger names. `LogTerms` reads the terms of a stopped cluster's logs, and they match. |
 | `LeaderStallTest` | The rule of `LeaderStall`; follower next indices, which Ratis gives without ids, pair with ids only when the follower list read before and after them is the same; the bound that grows and comes back, and the rule of a log that stops, which a real leader with a stopped log worker follows within seconds. A graceful stop of the leader with one node down, followed by a restart at once, loses no reply and costs no step down. With one node down, the reply to a new leader's first entry is lost on a link, after the entry reached the follower's disk: nothing commits and the leader stays, until it steps down and a write gets through. The same loss after the first commit heals with the next write. A leader behind in applying does not step down. |
 | `RollingRestartTest` | Graceful restart of every node, twice, under load. No failed operation. A leader restart stops writes for about 200–300 ms. |
-| `MembershipTest` | A node started with `--join` replaces a lost leader, however long before its `add-peer` it started and after a restart in between, catches up from a snapshot, and restarts with or without the option. A node removed while it runs exits. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. A node of a seeded cluster is replaced whichever node leads. One step replacement of a lost leader, a lost follower, seeded or not, and of a leader that runs. `add-peer` refuses a node with a log of its own and a node started without `--join`, and fails at once without its node; a change without a majority ends at its limit; `--join` after a start without it is refused; `admin snapshot`; a removed node that a supervisor starts again exits with 4 and never prints `READY` again (DD-30, R4-6), while the others serve on; the warning of a new cluster whose nodes all have `--join`. |
+| `MembershipTest` | A node started with `--join` replaces a lost leader, however long before its `add-peer` it started and after a restart in between, catches up from a snapshot, and restarts with or without the option. A node removed while it runs exits. Seeded bootstrap works. An empty node added right after a seeded start receives the seed through the snapshot taken after genesis, and never replays the seeded `Genesis`. A node of a seeded cluster is replaced whichever node leads. A lost leader or follower, seeded or not, replaced by `remove-peer` then `add-peer`, after `admin` refused the one-step replacement (exit 1, no `receive setConfiguration` on any member); a leader that runs replaced by `add-peer` then `remove-peer`. `add-peer` refuses a node with a log of its own and a node started without `--join`, and fails at once without its node; a change without a majority ends at its limit; `--join` after a start without it is refused; `admin snapshot`; a removed node that a supervisor starts again exits with 4 and never prints `READY` again (DD-30, R4-6), while the others serve on; the warning of a new cluster whose nodes all have `--join`. |
 | `ColdRestartTest` | SIGKILL of all three nodes under load, 5 cycles, plus a 2-of-3 restart. Nothing acknowledged is lost, and replicas are identical. |
 | `RandomFaultTest` | A seeded random schedule of kills, restarts, pauses, isolations, partitions, one-way and single-link cuts, slow links (20–200 ms each way with as much jitter), throttled links (64–512 KiB/s), blackholes (bytes held, nothing reset, as with dropped packets), flapping links (isolated and healed every 50–400 ms) and client-side faults (a node's client link that drops every answer, so committed writes go unacknowledged while the leader runs on, or that is cut). Register histories, with read-modify-write updates and hot counters in them, are linearizable; the transactional bank-transfer invariant holds; list-append transactions (every read a `getForUpdate`) show no anomaly at all to `ListAppendChecker` and lose no committed append; every node's persisted Raft term (`raft-meta`) never decreases. Adding faults changed which schedule a given seed produces. |
 | `OverlappingRandomFaultTest`, `ClockSkewRandomFaultTest` | `RandomFaultTest` with a second fault starting while the first holds (for example a pause plus a one-way cut, or two kills: the majority lost, then back), where availability is reported but not asserted and every safety check stays; and with node 1's wall clock 90 s ahead and node 2's 90 s behind. |
