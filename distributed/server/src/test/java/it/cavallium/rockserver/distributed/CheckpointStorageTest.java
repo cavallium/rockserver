@@ -355,6 +355,65 @@ class CheckpointStorageTest {
 		awaitFileNames(tmp, Set.of("snapshot-retried"));
 	}
 
+	/**
+	 * R24-1: Ratis asks for the latest snapshot under its server monitor on every follower append that carries entries
+	 * (RaftServerImpl.appendEntriesAsync, checkInconsistentAppendEntries, ServerState.getSnapshotIndex), and on the
+	 * leader's appender threads. Answering must not touch the disk nor wait for the install lock: the cleanup of failed
+	 * installations runs on the install cleanup thread only, and a hung disk there must not stop the Raft RPCs.
+	 */
+	@Test
+	void latestSnapshotNeverScansTheInstallations() throws IOException {
+		var clock = new AtomicLong();
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT, clock);
+		Path tmp = follower.getTmpDir().toPath();
+		Path replaced = writePartialInstall(tmp, "snapshot-replaced");
+		follower.getLatestSnapshot();
+		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
+		writePartialInstall(tmp, "snapshot-newer");
+		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
+		follower.getLatestSnapshot();
+		clock.addAndGet(CheckpointStorage.INSTALL_SCAN_INTERVAL.toNanos());
+		follower.getLatestSnapshot();
+		assertTrue(Files.exists(replaced), "getLatestSnapshot deleted the partial copy of a replaced installation");
+	}
+
+	/** R24-1: the install cleanup holding the install lock (in a walk of a hung disk) does not hold back Ratis. */
+	@Test
+	void latestSnapshotDoesNotWaitForTheInstallLock() throws Exception {
+		var clock = new AtomicLong();
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT, clock);
+		writePartialInstall(follower.getTmpDir().toPath(), "snapshot-installing");
+		var lockField = CheckpointStorage.class.getDeclaredField("installsLock");
+		lockField.setAccessible(true);
+		Object installsLock = lockField.get(follower);
+		var held = new java.util.concurrent.CountDownLatch(1);
+		var release = new java.util.concurrent.CountDownLatch(1);
+		Thread holder = Thread.ofPlatform().start(() -> {
+			synchronized (installsLock) {
+				held.countDown();
+				try {
+					release.await();
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+			}
+		});
+		try {
+			assertTrue(held.await(10, java.util.concurrent.TimeUnit.SECONDS));
+			clock.addAndGet(CheckpointStorage.INSTALL_PROGRESS_INTERVAL.toNanos());
+			var answer = java.util.concurrent.CompletableFuture.supplyAsync(follower::getLatestSnapshot,
+					command -> Thread.ofPlatform().daemon().start(command));
+			try {
+				answer.get(5, java.util.concurrent.TimeUnit.SECONDS);
+			} catch (java.util.concurrent.TimeoutException blocked) {
+				throw new AssertionError("getLatestSnapshot waited for the install lock", blocked);
+			}
+		} finally {
+			release.countDown();
+			holder.join();
+		}
+	}
+
 	/** DD-20: an installation that writes nothing more is deleted, without waiting for a newer one or a restart. */
 	@Test
 	void anInstallationThatStopsWritingIsDeleted() throws IOException {

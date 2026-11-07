@@ -96,6 +96,25 @@ class NodeStoreTest {
 	}
 
 	/**
+	 * R24-2: the state machine asks for the cluster id under its monitor, which {@code preAppendTransaction} waits for
+	 * under Ratis' append lock, and on every proposal: the id is kept in memory (read when the database opens, set by
+	 * genesis), never read from the database. Answering after close shows that no read reaches the database.
+	 */
+	@Test
+	void clusterIdIsAnsweredFromMemory() throws IOException {
+		Path dbDir = tempDir.resolve("db");
+		try (var store = NodeStore.open(dbDir, null, "first")) {
+			setClusterId(store, "cluster-a");
+		}
+		var store = NodeStore.open(dbDir, null, "second");
+		store.close();
+		assertEquals("cluster-a", store.clusterId());
+		var fresh = NodeStore.open(tempDir.resolve("fresh"), null, "fresh");
+		fresh.close();
+		assertNull(fresh.clusterId());
+	}
+
+	/**
 	 * RocksDB deletes files in its directories from its own threads as soon as it is open (the inputs of the compaction
 	 * that a database restored with many level-0 files starts at once, obsolete WALs): the checks that {@link
 	 * NodeStore#open} runs on the open database must not fail when a file disappears under them. The thread below stands
