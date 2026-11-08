@@ -195,8 +195,12 @@ struct Updates {
 /// The session state shared by every view of one client.
 #[derive(Default)]
 pub(crate) struct SessionWrites {
-    /// The current session; `None` before the first write and after it expired. Held while one is opened.
-    session: tokio::sync::Mutex<Option<Arc<Session>>>,
+    /// The current session; `None` before the first write and after it expired. Only held to read or swap it, never
+    /// across an await: a write that forgets an expired session must not wait for another write's opening (R27-4).
+    session: Mutex<Option<Arc<Session>>>,
+    /// Held by the write opening a session, for its whole retry loop: the others wait for it, each within its own
+    /// deadline.
+    opening: tokio::sync::Mutex<()>,
     updates: Mutex<Updates>,
     numbered_batches: bool,
     /// Copies sent again after an unknown outcome, over the life of this client.
@@ -316,7 +320,7 @@ impl SessionWrites {
     #[cfg(test)]
     pub(crate) fn with_open_session(numbered_batches: bool, id: i64) -> Self {
         let writes = Self::new(numbered_batches);
-        *writes.session.try_lock().unwrap() = Some(Arc::new(Session {
+        *writes.session.lock().unwrap() = Some(Arc::new(Session {
             id,
             numbers: Mutex::new(Numbers::default()),
         }));
@@ -335,12 +339,15 @@ impl SessionWrites {
         O: FnMut(Option<Duration>) -> OF,
         OF: Future<Output = Result<i64, Status>>,
     {
+        if let Some(session) = self.current() {
+            return Ok(session);
+        }
         // Writes wait for the one opening a session; if it fails, the next one opens again, in its own time.
-        let mut slot = tokio::time::timeout_at(deadline, self.session.lock())
+        let _opening = tokio::time::timeout_at(deadline, self.opening.lock())
             .await
             .map_err(|_| not_sent("the deadline came while another write was opening the session"))?;
-        if let Some(session) = slot.as_ref() {
-            return Ok(session.clone());
+        if let Some(session) = self.current() {
+            return Ok(session);
         }
         let mut pause = FIRST_PAUSE;
         loop {
@@ -356,7 +363,7 @@ impl SessionWrites {
                         id,
                         numbers: Mutex::new(Numbers::default()),
                     });
-                    *slot = Some(session.clone());
+                    *self.session.lock().unwrap() = Some(session.clone());
                     return Ok(session);
                 }
                 Err(status) => {
@@ -377,8 +384,14 @@ impl SessionWrites {
         }
     }
 
-    async fn session_expired(&self, expired: &Arc<Session>) {
-        let mut slot = self.session.lock().await;
+    fn current(&self) -> Option<Arc<Session>> {
+        self.session.lock().unwrap().clone()
+    }
+
+    /// Forgets `expired` if it is still the current session. Never waits for an opening: a write opening a session
+    /// holds `opening`, not this slot.
+    fn session_expired(&self, expired: &Arc<Session>) {
+        let mut slot = self.session.lock().unwrap();
         if slot
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, expired))
@@ -439,7 +452,7 @@ impl SessionWrites {
                 if rocksdb_error_type(&status) == Some("SESSION_EXPIRED") {
                     // This copy was refused before it ran. Copies sent earlier are this client's to judge.
                     drop(number);
-                    self.session_expired(&session).await;
+                    self.session_expired(&session);
                     if maybe_applied {
                         return Err(unknown_outcome(&status));
                     }
