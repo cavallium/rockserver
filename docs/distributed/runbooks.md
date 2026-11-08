@@ -19,9 +19,11 @@ example `/srv/rockserver/data/tmp`): a given directory inside the data directory
 the RocksDB copies in it at every start. A given directory outside the data directory, or one that is a symlink to a
 shared directory such as `/tmp`, is warned about at the start and never cleaned by the node, since another JVM of the
 host may be loading its copy there. While the database opens, the node keeps the config it opens it with in
-`DATA-DIR/rockserver-replica-db.conf` and deletes it once the database is open; a node killed during the open (a long
-WAL replay) leaves it, and its next start replaces and deletes it. The randomly named `rockserver-replica-<digits>.conf`
-files that older versions left there are deleted at the start too.
+`DATA-DIR/rockserver-replica-for-db.conf` and deletes it once the database is open; a node killed during the open (a
+long WAL replay) leaves it, and its next start replaces and deletes it. The randomly named
+`rockserver-replica-<digits>.conf` files that older versions left there are deleted at the start too; nothing else is.
+`export-seed` keeps the config of its target next to it, as `rockserver-replica-for-<target name>.conf`, until it ends,
+whatever the target is called (a date such as `DATA-DIR/20261108` is fine).
 
 and `PEERS` for the peer list of the cluster, one `--peer` per member, the same on every node and in every `admin`
 command:

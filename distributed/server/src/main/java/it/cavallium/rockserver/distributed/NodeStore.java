@@ -207,7 +207,7 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
-	 * Writes the config the replica opens its database with to a new temporary file: {@link #REPLICA_OVERRIDES} over
+	 * Writes the config the replica opens its database with to {@link #replicaConfigFile}: {@link #REPLICA_OVERRIDES} over
 	 * the given Rockserver config (HOCON), or over the defaults when there is none.
 	 */
 	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, String nodeId) throws IOException {
