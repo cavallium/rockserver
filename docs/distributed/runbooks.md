@@ -7,9 +7,14 @@ only says what to do and what to check.
 In the commands, `rs` stands for the node's launcher:
 
 ```bash
-alias rs='java -XX:+ExitOnOutOfMemoryError -Djava.io.tmpdir=/srv/rockserver/tmp \
+alias rs='java -XX:+ExitOnOutOfMemoryError \
   -cp rockserver-distributed.jar it.cavallium.rockserver.distributed.ReplicatedServerMain'
 ```
+
+Leave `-Djava.io.tmpdir` out: `run` puts its temporary files in `DATA-DIR/tmp` by itself, and deletes there the 17 MB
+copies of the RocksDB library that killed runs leave behind. With `-Djava.io.tmpdir` given, the library still goes to
+`DATA-DIR/tmp`, but other temporary files of killed runs stay in the given directory; one outside the data directory
+is warned about at the start, and is never cleaned by the node.
 
 and `PEERS` for the peer list of the cluster, one `--peer` per member, the same on every node and in every `admin`
 command:
@@ -27,13 +32,16 @@ PEERS="--peer n1=10.0.0.1:9001/10.0.0.1:5333 --peer n2=10.0.0.2:9001/10.0.0.2:53
 - Every node runs the same version (see "Upgrades").
 - A supervisor (systemd or similar) restarts a node that exits with code 3: that is how a node stops after a replica
   failure or after Raft closed.
-- `-XX:+ExitOnOutOfMemoryError` and `-Djava.io.tmpdir` on a directory of the node, as in the alias.
+- `-XX:+ExitOnOutOfMemoryError`, as in the alias, and no `-Djava.io.tmpdir` (see above). A node upgraded from an
+  alias that set `-Djava.io.tmpdir=/srv/rockserver/tmp`: drop the option, stop the node, delete
+  `/srv/rockserver/tmp/*rocksdbjni*` (copies of killed runs, 17 MB each), start it.
 
 ## Starting an empty cluster
 
 1. Start every node with the same `PEERS` and without `--join`: `rs run --node-id n1 $PEERS --data-dir /srv/rockserver/data`.
 2. Each prints `READY n1` once it serves the API. Check: `rs admin $PEERS status` shows one `LEADER` and the others
-   `FOLLOWER`, with the same commit index soon after.
+   `FOLLOWER`, with the same commit index soon after. `status` asks every member at once, each for up to 3 s, and
+   prints them in the `--peer` order: a member that is down prints `unreachable` and does not hold the others.
 
 ## Seeding a cluster from a single-node database
 

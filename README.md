@@ -193,7 +193,9 @@ it twice. A deadline error counts as an unknown outcome unless the server flagge
 `rockserver-applied: no` trailer; the message text is not read when the trailer is there). A caller that cancels a
 write's future stops the resends: the future ends with `OUTCOME_UNKNOWN` if a copy was sent, or is cancelled if
 none was. A write that could not get a session was never sent: it ends with the failure flagged "not applied"
-(`SERVER_OVERLOADED` when the opening's own outcome was unknown). A synchronous call waits at most its deadline plus 5 s. A write staged in a transaction is sent once, as
+(`SERVER_OVERLOADED` when the opening's own outcome was unknown), also when its own deadline came while it waited
+for a session another write was opening. A synchronous call waits at most its deadline plus 5 s; if that cancels a
+write of which no copy was sent, it throws `READ_DEADLINE_EXCEEDED` flagged "not applied". A write staged in a transaction is sent once, as
 before: if its outcome is unknown, roll the transaction back and run it again, never send the staged write again.
 The connection decides whether it uses sessions once, at its handshake, and logs it: recreate it after upgrading
 the cluster. With a single server, which has no sessions, nothing changes.
@@ -202,7 +204,8 @@ The Rust client (`rust-client`) does the same when the server advertises client 
 writes are numbered and resent with the same pauses, until the context's deadline, or for 30 s
 (`with_session_retry_window`) with a context without one; a copy or session opening that gets no answer at all ends
 with the window too (`OUTCOME_UNKNOWN`, or not sent for an opening), and nothing is sent after it (a write whose
-session opens too late ends not sent, flagged not applied). `RockserverClient::connect` uses one address and
+session opens too late ends not sent, flagged not applied). A write waits for another write's session opening, and
+forgets an expired session, within its own deadline. `RockserverClient::connect` uses one address and
 adds no settings of its own: given a string, it has tonic's defaults, with no HTTP/2 keepalive or connect timeout, so
 resends go back to the same node and a silent node is noticed only by the deadline or the window. For dead-peer
 detection, pass `connect` a tonic `Endpoint` already set up (`http2_keep_alive_interval`, `keep_alive_timeout`,
@@ -242,7 +245,9 @@ changes one voter per command and refuses more (a change of several voters at on
 leader changes meanwhile): replace a lost node with `remove-peer <old>` and then `add-peer <new>`, a running one with
 `add-peer <new>` and then `remove-peer <old>`. See "Replacing a node" in the
 [runbooks](docs/distributed/runbooks.md) and the [design document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
-without it), and see "Heap" there for the heap that a snapshot send needs. A removed node that is started again exits
+without it) and without `-Djava.io.tmpdir` (`run` uses `DATA-DIR/tmp`, where it deletes the RocksDB library copies
+that killed runs leave), and see "Heap" there for the heap that a snapshot send needs. `admin status` asks the members
+at once, each for up to 3 s, so a member that is down prints `unreachable` without holding the others. A removed node that is started again exits
 with 4 once a majority of the current configuration's members can confirm its removal; until they answer (they are
 down, unreachable, or of an older version) it prints `READY` and waits outside the cluster, serving nothing; it
 votes only when its own log missed its removal (then it runs as a follower, whose vote cannot elect a leader without
