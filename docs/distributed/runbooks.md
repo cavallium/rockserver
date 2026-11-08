@@ -18,7 +18,10 @@ directory the JVM started with, `/tmp` by default. To move everything, pass `-Dj
 example `/srv/rockserver/data/tmp`): a given directory inside the data directory is the node's own, and the node deletes
 the RocksDB copies in it at every start. A given directory outside the data directory, or one that is a symlink to a
 shared directory such as `/tmp`, is warned about at the start and never cleaned by the node, since another JVM of the
-host may be loading its copy there.
+host may be loading its copy there. While the database opens, the node keeps the config it opens it with in
+`DATA-DIR/rockserver-replica-db.conf` and deletes it once the database is open; a node killed during the open (a long
+WAL replay) leaves it, and its next start replaces and deletes it. The randomly named `rockserver-replica-<digits>.conf`
+files that older versions left there are deleted at the start too.
 
 and `PEERS` for the peer list of the cluster, one `--peer` per member, the same on every node and in every `admin`
 command:
@@ -211,6 +214,12 @@ later with `rs admin $PEERS backup-status 2026-11-06 <index it printed>`, which 
 the flush (100–300 ms); the files are hard links, so a backup costs space only as compactions replace the files it
 holds.
 
+A node on which the backup failed (a full disk, say) deletes what it had written of it, `backups/<name>/db.tmp` or a
+`db/` without `backup.properties`, since those hard-link the live files too. If it cannot, its log says `cannot delete
+... delete it by hand`: a `<data-dir>/backups/<name>` without `backup.properties` is always a failed or interrupted
+attempt, and can be deleted. A backup of that name that existed already is never touched by the failure of another
+one. `export-seed` likewise leaves neither its target nor `<target>.tmp` when it fails.
+
 Then, for each backup:
 
 1. Copy one node's `<data-dir>/backups/<name>` off the cluster (all of them hold the same data; `backup.properties`
@@ -259,8 +268,11 @@ or it skipped the position because a snapshot install jumped over it), or if no 
 `--timeout-ms` (no leader, every node down) or the answer leaves open whether it was proposed: run it again. The
 nodes of `$PEERS` are first asked at once whether they answer (up to 3 s, or what is left of `--timeout-ms`), and the
 request goes to them in the order they answered; one that does not answer (down, or frozen with its port still
-accepting connections) gets nothing. So a frozen node delays the command by nothing while another answers, also with a
-short `--timeout-ms`, and the command ends within `--timeout-ms`. A node that took the `checksum` request is waited for
+accepting connections) gets nothing. Then the results are asked of every node at once, again and again until each has
+its own, each question within 3 s or what is left of `--timeout-ms` (as for `backup` and `backup-status`). So a frozen
+node delays neither the proposal nor the other nodes' results, also with a short `--timeout-ms`, and the command ends
+within `--timeout-ms`, plus at most 1 s when the proposal itself used the limit up (the nodes are asked for their
+results once more for that long), and the time to close its connections. A node that took the `checksum` request is waited for
 up to `--timeout-ms`, since it bounds the request itself with its own `--request-timeout-ms` and an answer cut short
 would leave open whether the digest runs; `backup` waits at most 30 s per node and then proposes the same backup through
 the next one, which is harmless (its request id makes the second proposal a no-op if the first commits).
@@ -416,8 +428,8 @@ disk problem to look at.
 | Code | `run` | `admin` | `repair-log` | `export-seed`, `restore-backup` |
 |---|---|---|---|---|
 | 0 | Not on a stop by signal: see below | `OK` | The log is valid, or was (with `--dry-run`: could be) repaired | Done |
-| 1 | Did not start: a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`), any other failure of the start (an `Error` too, such as a class that does not load) | `FAILED: ...`: refused (a change of more than one voter included, or a member refused `checksum`/`backup`: not every member supports it), a change failed, the replicas differ (`checksum`), a member failed (`backup`) | Refused: see its output | Failed: see the exception |
-| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError`: also an unknown option, a malformed value (a non-numeric number, an `--election-timeout-ms` that is not MIN:MAX, a `--peer` or `--group-id` that does not parse) or one the node's configuration refuses (`--parallel-apply-threads 1`, a node id not among the peers, a minimum election timeout not below the maximum) | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`, `--unsafe-multi-voter-change` without `add-peer` or `remove-peer`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`) | Wrong usage | Wrong usage |
+| 1 | Did not start: a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`), any other failure of the start (an `Error` too, such as a class that does not load) | `FAILED: ...`: refused (a change of more than one voter included, or a member refused `checksum`/`backup`: not every member supports it), a change failed, the replicas differ (`checksum`), a member failed (`backup`), a member's answer cannot be read (`<id>: cannot read its answer (...)`: a member of another version, asking again would not help) | Refused: see its output | Failed: see the exception |
+| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError`: also an unknown option, a word that is no option's value (a flag given a value, `--join false` or `--pipelined-updates false`, which turned the flag on before), a malformed value (a non-numeric number, an `--election-timeout-ms` that is not MIN:MAX, a `--peer` or `--group-id` that does not parse) or one the node's configuration refuses (`--parallel-apply-threads 1`, a node id not among the peers, a minimum election timeout not below the maximum) | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`, `--unsafe-multi-voter-change` without `add-peer` or `remove-peer`), a word the command does not take (`status now`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`, the argument of `add-peer`, a member id with `=` for `remove-peer`, `transfer-leader` or `snapshot`) | Wrong usage: also an unknown option or a stray word (`--dry-run yes`) | Wrong usage: also an unknown option or a stray word |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
 | 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`), no member took the request in time, or a `checksum` answer that does not tell whether it was proposed: run it again | - | - |
 | 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | The replica's database (`export-seed`) or the backup (`restore-backup`) has a cluster version with capabilities this version lacks; nothing is written: run the newer version |

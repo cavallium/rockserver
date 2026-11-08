@@ -495,6 +495,8 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		long index = position.getIndex();
 		Path dir = config.dataDir().resolve(BACKUPS_DIR).resolve(name);
 		Result result;
+		// Set once this attempt owns the directory: an existing backup of that name was refused before.
+		boolean writing = false;
 		try {
 			Properties existing = Files.exists(dir.resolve(BACKUP_PROPERTIES)) ? readBackupProperties(dir) : null;
 			if (existing != null && existing.getProperty("index") == null) {
@@ -521,6 +523,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 				throw new IOException("A backup named " + name + " exists already, at index " + existing.getProperty("index"));
 			}
 			long start = System.nanoTime();
+			writing = true;
 			// An interrupted attempt leaves a database without properties: start over.
 			NodeStore.deleteRecursively(dir);
 			Files.createDirectories(dir);
@@ -548,6 +551,17 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		} catch (IOException | RuntimeException ex) {
 			LOG.error("{}: backup {} at log index {} failed on this node: {}", config.nodeId(), name, index, ex.toString(), ex);
 			result = new Result(State.FAILED, index, 0, String.valueOf(ex));
+			if (writing) {
+				// What this attempt wrote hard-links the live table and blob files of the moment: left behind (a complete
+				// database without backup.properties, say), it would keep them on disk after compactions replace them,
+				// until a backup of the same name runs again, which a date-named one never does (R29-1).
+				try {
+					NodeStore.deleteRecursively(dir);
+				} catch (IOException | RuntimeException cleanupFailure) {
+					LOG.error("{}: cannot delete {}, what the failed backup {} wrote: delete it by hand", config.nodeId(), dir,
+							name, cleanupFailure);
+				}
+			}
 		}
 		record(name, result);
 	}

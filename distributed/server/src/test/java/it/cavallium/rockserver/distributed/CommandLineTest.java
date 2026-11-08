@@ -21,7 +21,13 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.function.IntConsumer;
+import org.apache.ratis.thirdparty.io.grpc.Server;
+import org.apache.ratis.thirdparty.io.grpc.ServerServiceDefinition;
+import org.apache.ratis.thirdparty.io.grpc.netty.NettyServerBuilder;
+import org.apache.ratis.thirdparty.io.grpc.stub.ServerCalls;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -384,7 +390,9 @@ class CommandLineTest {
 
 			// R28 review 1: with a time limit no longer than the question's own 3 s, the silent member asked first
 			// used up the whole limit, and the command ended "no member took the request" without asking the healthy
-			// ones; it also ran up to 3 s past the limit. The members are asked at once, within the time left.
+			// ones; it also ran up to 3 s past the limit. The members are asked at once, within the time left, for the
+			// proposal and (R29-3) for the results. The bound is the limit plus 2 s, room for the admin's own setup and
+			// the channels' closing on a loaded host (R29 review 3); the old code overran by the silent member's 3 s.
 			var shortLimit = new ArrayList<>(args.subList(0, args.size() - 1));
 			shortLimit.add("2500");
 			long start = System.nanoTime();
@@ -475,6 +483,307 @@ class CommandLineTest {
 			assertTrue(refused.thrown() == null, refused.toString());
 			assertTrue(refused.err().contains("Usage:"), refused.err());
 		}
+	}
+
+	/**
+	 * R28-L1: {@code admin status} asks the members at once (R27-1). Four members listed first that accept connections
+	 * and never answer cost one question time (3 s) together; asked one after another, as before R27-1, they cost about
+	 * 2 s each, so the healthy members listed after them came late.
+	 */
+	@Test
+	void statusDoesNotAskSilentMembersOneAfterAnother() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("status4")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var silent = new ArrayList<java.net.ServerSocket>();
+		try {
+			var args = new ArrayList<String>(List.of("admin"));
+			for (int i = 1; i <= 4; i++) {
+				var socket = new java.net.ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
+				silent.add(socket);
+				args.add("--peer");
+				args.add("d" + i + "=127.0.0.1:" + socket.getLocalPort() + "/127.0.0.1:" + socket.getLocalPort());
+			}
+			for (var id : List.of("n0", "n1", "n2")) {
+				args.add("--peer");
+				args.add(cluster.config(id).self().format());
+			}
+			args.addAll(List.of("--timeout-ms", "60000", "status"));
+			long start = System.nanoTime();
+			var status = run(args.toArray(String[]::new));
+			long tookMs = (System.nanoTime() - start) / 1_000_000;
+			System.out.println("status took " + tookMs + " ms");
+			assertEquals(0, status.code(), status.toString());
+			var lines = status.out().strip().lines().filter(line -> line.matches("^[dn][0-9]: .*")).toList();
+			assertEquals(7, lines.size(), status.out());
+			for (int i = 0; i < 4; i++) {
+				assertTrue(lines.get(i).startsWith("d" + (i + 1) + ": unreachable"), status.out());
+			}
+			assertTrue(lines.subList(4, 7).stream().anyMatch(line -> line.contains("LEADER")), status.out());
+			// One question time (3 s) and the closing of the client, well under 4 x 2 s.
+			assertTrue(tookMs < 6_000, "status took " + tookMs + " ms");
+		} finally {
+			for (var socket : silent) {
+				socket.close();
+			}
+		}
+	}
+
+	/**
+	 * R29-3: after the proposal, {@code checksum} and {@code backup} ask every member for its result at once, each
+	 * within the time left, so silent members listed first (frozen with their ports open) no longer cost 3 s each per
+	 * round, one after another, and the command ends within {@code --timeout-ms} (plus the closing). Before, three of
+	 * them made a 4 s command take more than 9 s.
+	 */
+	@Test
+	void resultsAreAskedOfAllMembersAtOnceWithinTheTimeLimit() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("results")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node ->
+				Capabilities.has(node.stateMachine().ops().clusterVersion(), Capabilities.BACKUP)));
+		var silent = new ArrayList<java.net.ServerSocket>();
+		try {
+			var args = new ArrayList<String>(List.of("admin"));
+			for (int i = 1; i <= 3; i++) {
+				var socket = new java.net.ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
+				silent.add(socket);
+				args.add("--peer");
+				args.add("d" + i + "=127.0.0.1:" + socket.getLocalPort() + "/127.0.0.1:" + socket.getLocalPort());
+			}
+			for (var id : List.of("n0", "n1", "n2")) {
+				args.add("--peer");
+				args.add(cluster.config(id).self().format());
+			}
+			args.addAll(List.of("--timeout-ms", "4000"));
+			for (var command : List.of(List.of("backup", "b6"), List.of("checksum"))) {
+				long start = System.nanoTime();
+				var result = run(with(args, command.toArray(String[]::new)));
+				long tookMs = (System.nanoTime() - start) / 1_000_000;
+				assertTrue(result.out().contains(" at log index "), result.toString());
+				for (var id : List.of("n0", "n1", "n2")) {
+					assertTrue(result.out().contains(id + ": DONE"), result.toString());
+				}
+				for (var id : List.of("d1", "d2", "d3")) {
+					assertTrue(result.out().contains(id + ": no result within the time limit"), result.toString());
+				}
+				assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, result.code(), result.toString());
+				// The limit plus 2 s (R29 review 3): the old code took more than 9 s, 3 s per silent member.
+				assertTrue(tookMs < 6_000, command + " took " + tookMs + " ms with --timeout-ms 4000");
+			}
+		} finally {
+			for (var socket : silent) {
+				socket.close();
+			}
+		}
+	}
+
+	/**
+	 * A member that answers the capabilities question at once and then never answers anything else, as a leader on a
+	 * hung disk would: it keeps what it was asked.
+	 */
+	private static final class HangingMember implements AutoCloseable {
+		final List<byte[]> held = new CopyOnWriteArrayList<>();
+		final Server server;
+
+		HangingMember() throws IOException {
+			ServerCalls.UnaryMethod<byte[], byte[]> ops = (request, response) -> {
+				// A 16-byte group id, then the operation byte and its payload.
+				var rest = java.util.Arrays.copyOfRange(request, 16, request.length);
+				if (rest.length > 0 && rest[0] == ReplicaOps.OP_CAPABILITIES) {
+					response.onNext(ByteBuffer.allocate(2 * Long.BYTES).putLong(Capabilities.SUPPORTED)
+							.putLong(Capabilities.SUPPORTED).array());
+					response.onCompleted();
+				} else {
+					held.add(rest);
+				}
+			};
+			server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress("127.0.0.1", 0))
+					.addService(ServerServiceDefinition.builder(TermService.SERVICE_NAME)
+							.addMethod(TermService.OPS, ServerCalls.asyncUnaryCall(ops)).build())
+					.build()
+					.start();
+		}
+
+		String peer(String id) {
+			return id + "=127.0.0.1:" + server.getPort() + "/127.0.0.1:" + server.getPort();
+		}
+
+		long count(byte op) {
+			return held.stream().filter(request -> request[0] == op).count();
+		}
+
+		@Override
+		public void close() throws InterruptedException {
+			server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+		}
+	}
+
+	/**
+	 * A member that answers the capabilities question after {@code delay} (so that the real members take the
+	 * proposal) and answers every other question with a byte that names no result state, as a member of another or
+	 * mismatched version might.
+	 */
+	private static final class GarbledMember implements AutoCloseable {
+		final Server server;
+
+		GarbledMember(Duration delay) throws IOException {
+			ServerCalls.UnaryMethod<byte[], byte[]> ops = (request, response) -> {
+				var rest = java.util.Arrays.copyOfRange(request, 16, request.length);
+				if (rest.length > 0 && rest[0] == ReplicaOps.OP_CAPABILITIES) {
+					try {
+						Thread.sleep(delay);
+					} catch (InterruptedException ex) {
+						Thread.currentThread().interrupt();
+					}
+					response.onNext(ByteBuffer.allocate(2 * Long.BYTES).putLong(Capabilities.SUPPORTED)
+							.putLong(Capabilities.SUPPORTED).array());
+				} else {
+					response.onNext(new byte[] {Byte.MAX_VALUE});
+				}
+				response.onCompleted();
+			};
+			server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress("127.0.0.1", 0))
+					.addService(ServerServiceDefinition.builder(TermService.SERVICE_NAME)
+							.addMethod(TermService.OPS, ServerCalls.asyncUnaryCall(ops)).build())
+					.build()
+					.start();
+		}
+
+		String peer(String id) {
+			return id + "=127.0.0.1:" + server.getPort() + "/127.0.0.1:" + server.getPort();
+		}
+
+		@Override
+		public void close() throws InterruptedException {
+			server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+		}
+	}
+
+	/**
+	 * R29 review 1: an answer to the result question that cannot be read (here a state byte that names no state) is
+	 * that member's failure, printed with the error, and the command fails with 1: asking again would not help. Before,
+	 * the decoding error ended that member's question silently, and the command printed "no result within the time
+	 * limit" and exited 4 ("run it again").
+	 */
+	@Test
+	void anAnswerThatCannotBeReadIsThatMembersFailure() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("garbled")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node ->
+				Capabilities.has(node.stateMachine().ops().clusterVersion(), Capabilities.BACKUP)));
+		try (var garbled = new GarbledMember(Duration.ofMillis(500))) {
+			var args = new ArrayList<String>(List.of("admin", "--peer", garbled.peer("g1")));
+			for (var id : List.of("n0", "n1", "n2")) {
+				args.add("--peer");
+				args.add(cluster.config(id).self().format());
+			}
+			args.addAll(List.of("--timeout-ms", "15000"));
+			for (var command : List.of(List.of("backup", "b8"), List.of("checksum"))) {
+				var result = run(with(args, command.toArray(String[]::new)));
+				assertTrue(result.out().contains(" at log index "), result.toString());
+				for (var id : List.of("n0", "n1", "n2")) {
+					assertTrue(result.out().contains(id + ": DONE"), result.toString());
+				}
+				assertTrue(result.out().contains("g1: cannot read its answer (java.lang.ArrayIndexOutOfBoundsException"),
+						result.toString());
+				assertTrue(result.out().contains("FAILED: cannot read the answer of [g1]"), result.toString());
+				assertEquals(1, result.code(), result.toString());
+			}
+		}
+	}
+
+	/**
+	 * R28-L2: a member that answers the capabilities question and then hangs on the proposal (a leader on a hung disk).
+	 * The healthy members are reached through links with 400 ms of latency each way, so the hanging member answers the
+	 * question first and gets the proposal. {@code backup} (idempotent, by its request id) waits for it only
+	 * {@link ReplicatedServerMain#proposeAnswerTimeout} (30 s, shortened here) and then proposes the same request through
+	 * the next member: one backup, with the request id the hanging member was sent. {@code checksum} (not idempotent)
+	 * waits for it as long as the time limit allows and ends incomplete within {@code --timeout-ms}, without proposing a
+	 * second digest elsewhere.
+	 */
+	@Test
+	void aMemberThatTookTheProposalAndHangsHoldsOnlyWhatItMay() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("hanging")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node ->
+				Capabilities.has(node.stateMachine().ops().clusterVersion(), Capabilities.BACKUP)));
+		var previousWait = ReplicatedServerMain.proposeAnswerTimeout;
+		ReplicatedServerMain.proposeAnswerTimeout = Duration.ofSeconds(2);
+		var proxies = new ArrayList<LinkProxy>();
+		try (var hanging = new HangingMember()) {
+			var args = new ArrayList<String>(List.of("admin", "--peer", hanging.peer("h1")));
+			for (var id : List.of("n0", "n1", "n2")) {
+				var self = cluster.config(id).self();
+				var proxy = new LinkProxy(new java.net.InetSocketAddress("127.0.0.1", 0),
+						new java.net.InetSocketAddress(self.raftHost(), self.raftPort()));
+				proxy.shape(LinkProxy.Shaping.latency(Duration.ofMillis(400), Duration.ZERO));
+				proxies.add(proxy);
+				args.add("--peer");
+				args.add(id + "=127.0.0.1:" + proxy.listenAddress().getPort() + "/" + self.apiHost() + ":"
+						+ self.apiPort());
+			}
+
+			var backupArgs = new ArrayList<>(args);
+			backupArgs.addAll(List.of("--timeout-ms", "12000"));
+			var backup = run(with(backupArgs, "backup", "b5"));
+			assertEquals(1, hanging.count(ReplicaOps.OP_PROPOSE_BACKUP), backup.toString());
+			assertTrue(backup.out().contains("backup b5 at log index"), backup.toString());
+			for (var id : List.of("n0", "n1", "n2")) {
+				assertTrue(backup.out().contains(id + ": DONE"), backup.toString());
+			}
+			assertTrue(backup.out().contains("h1: no result within the time limit"), backup.toString());
+			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, backup.code(), backup.toString());
+			var sent = hanging.held.stream().filter(request -> request[0] == ReplicaOps.OP_PROPOSE_BACKUP).findFirst()
+					.orElseThrow();
+			long requestId = ByteBuffer.wrap(sent, 1, Long.BYTES).getLong();
+			for (var id : List.of("n0", "n1", "n2")) {
+				var properties = ReplicaOps.readBackupProperties(
+						ReplicaOps.backupsDir(cluster.config(id).dataDir()).resolve("b5"));
+				assertEquals(String.valueOf(requestId), properties.getProperty("request"), id);
+			}
+
+			var checksumArgs = new ArrayList<>(args);
+			checksumArgs.addAll(List.of("--timeout-ms", "4000"));
+			long start = System.nanoTime();
+			var checksum = run(with(checksumArgs, "checksum"));
+			long tookMs = (System.nanoTime() - start) / 1_000_000;
+			assertEquals(1, hanging.count(ReplicaOps.OP_PROPOSE_CHECKSUM), checksum.toString());
+			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, checksum.code(), checksum.toString());
+			assertTrue(checksum.out().contains("does not tell whether the operation was proposed"), checksum.toString());
+			assertTrue(!checksum.out().contains("checksum at log index"), checksum.toString());
+			assertTrue(tookMs >= 3_000 && tookMs < 6_000, "checksum took " + tookMs + " ms with --timeout-ms 4000");
+		} finally {
+			ReplicatedServerMain.proposeAnswerTimeout = previousWait;
+			for (var proxy : proxies) {
+				proxy.close();
+			}
+		}
+	}
+
+	/**
+	 * R29-4: a word that no command expects is wrong usage (exit 2), for every command: before, {@code run},
+	 * {@code repair-log}, {@code export-seed} and {@code restore-backup} ignored it, so a flag given a value
+	 * ({@code --dry-run yes}, {@code --join false}) turned the flag on, and {@code admin status} took any word after it.
+	 * A malformed argument of {@code add-peer} or {@code remove-peer} is wrong usage too, not a stack trace with 1.
+	 */
+	@Test
+	void unexpectedWordsAndMalformedPeerArgumentsExitWithTwo() {
+		var admin = List.of("admin", "--peer", "d1=127.0.0.1:1/127.0.0.1:1", "--timeout-ms", "1000");
+		var missing = temp.resolve("missing").toString();
+		var runs = List.of(
+				run(with(admin, "status", "now")),
+				run(with(admin, "add-peer", "n4=10.0.0.4:9001/10.0.0.4:53x3")),
+				run(with(admin, "add-peer", "n4")),
+				run(with(admin, "remove-peer", "n4=10.0.0.4:9001/10.0.0.4:9002")),
+				run("repair-log", "--data-dir", missing, "--dry-run", "yes"),
+				run("export-seed", "--data-dir", missing, "--target", temp.resolve("seed").toString(), "now"),
+				run("restore-backup", "--backup", missing, "--data-dir", temp.resolve("target").toString(), "again"));
+		for (var refused : runs) {
+			assertEquals(2, refused.code(), refused.toString());
+			assertTrue(refused.thrown() == null, refused.toString());
+			assertTrue(refused.err().contains("Usage:"), refused.err());
+		}
+		assertTrue(runs.get(4).err().contains("--dry-run takes no value"), runs.get(4).err());
+		assertTrue(Files.notExists(temp.resolve("seed")) && Files.notExists(temp.resolve("target")));
 	}
 
 	@Test

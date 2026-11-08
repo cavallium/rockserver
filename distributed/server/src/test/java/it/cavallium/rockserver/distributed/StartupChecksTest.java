@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.RequestType;
@@ -438,16 +439,23 @@ class StartupChecksTest {
 	@Test
 	void runRefusesMalformedValuesWithTwo() throws Exception {
 		for (var bad : List.of(List.of("--snapshot-every", "often"), List.of("--election-timeout-ms", "1000"),
-				List.of("--parallel-apply-threads", "1"), List.of("--peer", "b=nowhere"))) {
+				List.of("--parallel-apply-threads", "1"), List.of("--peer", "b=nowhere"),
+				// R29-4: a flag given a value turned the flag on, and the value was ignored; so was any stray word.
+				List.of("--join", "false"), List.of("--pipelined-updates", "false"), List.of("extra"))) {
 			var command = new java.util.ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 					"-cp", System.getProperty("java.class.path"),
 					"-Djava.io.tmpdir=" + tempDir, "-XX:+ExitOnOutOfMemoryError",
 					ReplicatedServerMain.class.getName(), "run", "--node-id", "a",
 					"--peer", "a=127.0.0.1:1/127.0.0.1:2", "--data-dir", tempDir.resolve("node").toString()));
 			command.addAll(bad);
-			var process = new ProcessBuilder(command).redirectErrorStream(true).start();
-			var output = new String(process.getInputStream().readAllBytes());
-			assertTrue(process.waitFor(60, TimeUnit.SECONDS));
+			var log = tempDir.resolve("run.log");
+			var process = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(log.toFile()).start();
+			// A node that started anyway is stopped.
+			if (!process.waitFor(60, TimeUnit.SECONDS)) {
+				process.destroyForcibly().waitFor();
+				fail(bad + ": still running after 60 s: " + Files.readString(log));
+			}
+			var output = Files.readString(log);
 			assertEquals(2, process.exitValue(), bad + ": " + output);
 			assertTrue(output.contains("Usage:"), bad + ": " + output);
 			assertFalse(Files.exists(tempDir.resolve("node/db")), "it started anyway");

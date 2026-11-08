@@ -16,6 +16,7 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -79,9 +80,12 @@ import org.rocksdb.NativeLibraryLoader;
  * with {@code --allow-skipped} a member that skipped the position (a snapshot install jumped over it) does not count
  * as missing. {@code backup NAME} has every replica write a checkpoint of its database at one log position to
  * {@code <data-dir>/backups/NAME}; it prints where each member wrote it, and prints {@code OK} only if every member of
- * {@code --peer} wrote it; it exits with 1 if a member failed and with 4 if a member gave no result in time, or no
+ * {@code --peer} wrote it; it exits with 1 if a member failed or gave an answer that cannot be read (a member of
+ * another version), and with 4 if a member gave no result in time, or no
  * member took the request in time. Both ask the members at once and propose through one that answers, so that a
- * frozen member listed first does not hold them (see {@code proposeOp}).
+ * frozen member listed first does not hold them (see {@code proposeOp}), and then ask every member for its result at
+ * once, each within the time left (see {@code awaitResults}), so that they end within {@code --timeout-ms}. A node on
+ * which a backup fails deletes what it wrote of it.
  * {@code backup-status NAME INDEX} asks the members again about that backup ({@code INDEX} is the log index that
  * {@code backup} printed), without proposing anything, with the same output and exit codes. {@code restore-backup} prepares an empty data directory to seed a new cluster from such a backup. See
  * {@link ReplicaOps} and {@code docs/distributed/runbooks.md}.</p>
@@ -89,7 +93,8 @@ import org.rocksdb.NativeLibraryLoader;
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
  * (leadership hand-off) on SIGTERM, also one that comes while the node is still starting: the stop then waits for the
  * start (see {@code startAndServe}), and a node so stopped prints no {@code READY}. A malformed or refused option
- * value exits with 2, like an unknown option. Any failure of the start exits with 1, unless it has a code of its own
+ * value exits with 2, like an unknown option or a word that is no option's value (a flag given a value, such as
+ * {@code --join false}): so do the other commands. Any failure of the start exits with 1, unless it has a code of its own
  * below. For {@code add-peer} the new member must already run, with the new peer list and
  * with {@code --join}, however long before the {@code add-peer}. It exits with 3 if its replica failed or its Raft server
  * closed, so that a supervisor notices. {@code repair-log} runs on a stopped node, after a power loss left it unable to read its Raft log: see
@@ -117,7 +122,8 @@ import org.rocksdb.NativeLibraryLoader;
  * <p>{@code export-seed} runs on a stopped node and copies its database into a new directory that can seed a new
  * cluster, the last resort of "No quorum" in the design document (see {@link NodeStore#exportSeed}).</p>
  *
- * <p>{@code admin} refuses an option it does not know, or a malformed value, with exit code 2. Its changes end with
+ * <p>{@code admin} refuses an option it does not know, a malformed value (a malformed {@code add-peer} argument
+ * included), or a word its command does not take, with exit code 2. Its changes end with
  * {@code OK}, or with {@code FAILED: ...} and exit code 1, within {@code --timeout-ms}
  * (10 minutes by default), which must cover the catch-up of a new member. A leader that started a change goes on with it
  * after that: see {@code status}, and run the command again. {@code add-peer} first reads the leader's configuration:
@@ -541,8 +547,9 @@ public final class ReplicatedServerMain {
 		var timeout = Duration.ofMillis(options.longValue("--timeout-ms", DEFAULT_ADMIN_TIMEOUT.toMillis()));
 		boolean unsafe = options.flag(UNSAFE_MULTI_VOTER_CHANGE);
 		boolean allowSkipped = options.flag("--allow-skipped");
-		// A misspelled option would otherwise be ignored, with the word after it (R28-3).
-		options.requireConsumed();
+		// A misspelled option would otherwise be ignored, with the word after it (R28-3). The words are the command,
+		// whose count each command checks (R29-4).
+		options.requireOptionsConsumed();
 		var command = options.positional();
 		if (command.isEmpty()) {
 			usage("missing admin command");
@@ -564,13 +571,18 @@ public final class ReplicatedServerMain {
 				.build()) {
 			RaftClientReply reply = switch (command.getFirst()) {
 				case "status" -> {
+					if (command.size() != 1) {
+						usage("status takes no argument");
+					}
 					printStatus(peers, groupId);
 					yield null;
 				}
-				case "transfer-leader" -> attempt(timeout, () -> client.admin().transferLeadership(
-						RaftPeerId.valueOf(arg(command)), 10_000));
+				case "transfer-leader" -> {
+					var leader = peerId(command);
+					yield attempt(timeout, () -> client.admin().transferLeadership(RaftPeerId.valueOf(leader), 10_000));
+				}
 				case "add-peer" -> {
-					var added = PeerConfig.parse(arg(command));
+					var added = addedPeer(command);
 					// A voter already (a re-run after a timeout, or of a call that succeeded): OK without asking the node,
 					// whose answer can look like a log of its own until it applies the genesis or its snapshot.
 					if (isVoter(added, peers, groupId, deadline) || !requireFitToJoin(added, peers, groupId, deadline)) {
@@ -584,14 +596,14 @@ public final class ReplicatedServerMain {
 					yield changeVoters(client, peers, groupId, members, unsafe, timeout, deadline);
 				}
 				case "remove-peer" -> {
-					var removed = arg(command);
+					var removed = peerId(command);
 					yield changeVoters(client, peers, groupId, peers.stream()
 							.filter(p -> !p.id().equals(removed))
 							.map(ReplicatedServerMain::raftPeer)
 							.toList(), unsafe, timeout, deadline);
 				}
 				case "snapshot" -> {
-					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(arg(command)));
+					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(peerId(command)));
 					yield attempt(timeout, () -> api.create(timeout.toMillis()));
 				}
 				case "checksum" -> {
@@ -601,9 +613,10 @@ public final class ReplicatedServerMain {
 					// Not idempotent: proposed again only after an answer that says nothing was proposed.
 					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0], false, deadline);
 					System.out.println("checksum at log index " + index);
-					var results = awaitResults(peers, groupId, ReplicaOps.OP_CHECKSUM_RESULT,
+					var answers = awaitResults(peers, groupId, ReplicaOps.OP_CHECKSUM_RESULT,
 							ByteBuffer.allocate(Long.BYTES).putLong(index).array(), deadline);
-					exitOn(checksumVerdict(index, peers.stream().map(PeerConfig::id).toList(), results, allowSkipped));
+					exitOn(unreadableVerdict(checksumVerdict(index, peers.stream().map(PeerConfig::id).toList(),
+							answers.results(), allowSkipped), answers.unreadable()));
 					System.out.println("OK");
 					yield null;
 				}
@@ -633,7 +646,7 @@ public final class ReplicatedServerMain {
 					yield awaitBackup(peers, groupId, command.get(1), index, deadline);
 				}
 				default -> {
-					usage("unknown admin command " + command.getFirst());
+					usage("unknown admin command " + command.getFirst() + options.flagHint(command.getFirst()));
 					yield null;
 				}
 			};
@@ -715,6 +728,8 @@ public final class ReplicatedServerMain {
 	 * through the next member: see {@link #proposalWait}.
 	 */
 	static final Duration PROPOSE_ANSWER_TIMEOUT = Duration.ofSeconds(30);
+	/** {@link #PROPOSE_ANSWER_TIMEOUT}, unless a test shortened it. */
+	static volatile Duration proposeAnswerTimeout = PROPOSE_ANSWER_TIMEOUT;
 
 	/**
 	 * Completes with null if {@code peer} answers a question that proposes nothing ({@link ReplicaOps#OP_CAPABILITIES})
@@ -744,7 +759,7 @@ public final class ReplicatedServerMain {
 	 * one's is still pending, so a member that took it and then hangs (a leader on a hung disk) does not hold it.</p>
 	 */
 	static Duration proposalWait(boolean idempotent, Duration remaining) {
-		return idempotent ? min(remaining, PROPOSE_ANSWER_TIMEOUT) : remaining;
+		return idempotent ? min(remaining, proposeAnswerTimeout) : remaining;
 	}
 
 	private static Duration min(Duration a, Duration b) {
@@ -803,6 +818,18 @@ public final class ReplicatedServerMain {
 		return null;
 	}
 
+	/**
+	 * {@code verdict}, unless some members gave an answer that cannot be read (R29 review 1): then 1, as asking again
+	 * would not help (a member of another or mismatched version), unless {@code verdict} already fails with 1.
+	 */
+	static @Nullable Verdict unreadableVerdict(@Nullable Verdict verdict, List<String> unreadable) {
+		if (unreadable.isEmpty() || (verdict != null && verdict.exitCode() == 1)) {
+			return verdict;
+		}
+		return new Verdict(1, "cannot read the answer of " + unreadable + " (a member of another version?): see the"
+				+ " lines above");
+	}
+
 	private static void exitOn(@Nullable Verdict verdict) {
 		if (verdict != null) {
 			System.out.println("FAILED: " + verdict.problem());
@@ -812,46 +839,103 @@ public final class ReplicatedServerMain {
 
 	private static @Nullable RaftClientReply awaitBackup(List<PeerConfig> peers, RaftGroupId groupId, String name,
 			long index, long deadlineNanos) throws InterruptedException {
-		var results = awaitResults(peers, groupId, ReplicaOps.OP_BACKUP_RESULT, ReplicaOps.backupPayload(index, name),
+		var answers = awaitResults(peers, groupId, ReplicaOps.OP_BACKUP_RESULT, ReplicaOps.backupPayload(index, name),
 				deadlineNanos);
-		exitOn(backupVerdict(peers.stream().map(PeerConfig::id).toList(), results));
+		exitOn(unreadableVerdict(backupVerdict(peers.stream().map(PeerConfig::id).toList(), answers.results()),
+				answers.unreadable()));
 		System.out.println("OK");
 		return null;
 	}
 
 	/**
-	 * Asks every member for its result of a cluster operation until each one has a final one, or until the deadline;
-	 * prints them.
+	 * How long {@link #awaitResults} still asks for results when the proposal used up the time limit: one short round, so
+	 * that members that already have their result print it instead of "no result within the time limit".
 	 */
-	private static Map<String, ReplicaOps.Result> awaitResults(List<PeerConfig> peers, RaftGroupId groupId,
+	static final Duration LAST_RESULT_ROUND = Duration.ofSeconds(1);
+
+	/**
+	 * Asks every member for its result of a cluster operation until each one has a final one, or until the deadline;
+	 * prints them, in the {@code --peer} order.
+	 *
+	 * <p>Each member is asked on a virtual thread of its own, again and again until it gives a final result, each
+	 * question bounded by {@link #PEER_ANSWER_TIMEOUT} and by the time left (R29-3): a member that accepts connections
+	 * and never answers (frozen, its port still open) delays no other member, and the command ends within its time
+	 * limit, as {@code status} and the proposal step do. Before, the members were asked one after another for 3 s each,
+	 * so k silent members listed first cost 3k s per round and the command overran {@code --timeout-ms}. If the proposal
+	 * left less than {@link #LAST_RESULT_ROUND}, the members are still asked for that long.</p>
+	 *
+	 * <p>An answer that cannot be read (R29 review 1: a decoding error, as from a member of another version) ends the
+	 * questions to that member: it is printed with the error and listed in {@link Answers#unreadable}, not as "no
+	 * result within the time limit".</p>
+	 */
+	private static Answers awaitResults(List<PeerConfig> peers, RaftGroupId groupId,
 			byte op, byte[] payload, long deadlineNanos) throws InterruptedException {
-		var results = new TreeMap<String, ReplicaOps.Result>();
-		while (results.size() < peers.size() && System.nanoTime() - deadlineNanos < 0) {
-			for (PeerConfig peer : peers) {
-				if (results.containsKey(peer.id())) {
-					continue;
-				}
+		long end = Math.max(deadlineNanos - System.nanoTime(), LAST_RESULT_ROUND.toNanos()) + System.nanoTime();
+		var results = new ConcurrentHashMap<String, ReplicaOps.Result>();
+		var unreadable = new ConcurrentHashMap<String, String>();
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		try {
+			var asked = peers.stream().map(peer -> CompletableFuture.runAsync(() -> {
 				try {
-					var result = ReplicaOps.decodeResult(ReplicaOps.call(peer.raftAddress(), groupId, op, payload,
-							PEER_ANSWER_TIMEOUT).join());
-					if (result.state() != ReplicaOps.State.PENDING) {
-						results.put(peer.id(), result);
+					while (System.nanoTime() - end < 0) {
+						try {
+							var result = ReplicaOps.decodeResult(ReplicaOps.call(peer.raftAddress(), groupId, op, payload,
+									min(PEER_ANSWER_TIMEOUT, remaining(end))).join());
+							if (result.state() != ReplicaOps.State.PENDING) {
+								results.put(peer.id(), result);
+								return;
+							}
+						} catch (CompletionException unanswered) {
+							// Down or busy: asked again.
+						} catch (RuntimeException undecodable) {
+							unreadable.put(peer.id(), undecodable.toString());
+							return;
+						}
+						long left = end - System.nanoTime();
+						if (left > 0) {
+							Thread.sleep(Math.min(TimeUnit.NANOSECONDS.toMillis(left) + 1, SEED_SNAPSHOT_POLL_MS));
+						}
 					}
-				} catch (CompletionException unanswered) {
-					// Down or busy: asked again.
+				} catch (InterruptedException stopped) {
+					Thread.currentThread().interrupt();
+				}
+			}, executor)).toList();
+			for (var answer : asked) {
+				try {
+					// The calls end by their own deadline; the margin is for the last answer to be handled.
+					answer.get(Math.max(0, end - System.nanoTime()) + TimeUnit.MILLISECONDS.toNanos(SEED_SNAPSHOT_POLL_MS),
+							TimeUnit.NANOSECONDS);
+				} catch (TimeoutException late) {
+					// No final result: printed as such below.
+				} catch (ExecutionException failed) {
+					// Not expected (the task catches what a call or the decoding throws), but never swallowed.
+					var peer = peers.get(asked.indexOf(answer));
+					unreadable.putIfAbsent(peer.id(), String.valueOf(failed.getCause()));
 				}
 			}
-			if (results.size() < peers.size()) {
-				Thread.sleep(SEED_SNAPSHOT_POLL_MS);
-			}
+		} finally {
+			// Not awaited: a question still open on a silent member is dropped.
+			executor.shutdownNow();
 		}
+		var printed = new TreeMap<String, ReplicaOps.Result>();
 		for (PeerConfig peer : peers) {
 			var result = results.get(peer.id());
-			System.out.println(peer.id() + ": " + (result == null ? "no result within the time limit"
+			if (result != null) {
+				printed.put(peer.id(), result);
+			}
+			var error = unreadable.get(peer.id());
+			System.out.println(peer.id() + ": " + (error != null ? "cannot read its answer (" + error + ")"
+					: result == null ? "no result within the time limit"
 					: result.state() + (result.keys() > 0 ? " " + result.keys() + " keys" : "") + " " + result.detail()));
 		}
-		return results;
+		return new Answers(printed, peers.stream().map(PeerConfig::id).filter(unreadable::containsKey).toList());
 	}
+
+	/**
+	 * What {@link #awaitResults} got: the final results by member, and the members whose answer could not be read, in
+	 * the {@code --peer} order.
+	 */
+	record Answers(Map<String, ReplicaOps.Result> results, List<String> unreadable) {}
 
 	/** The leader's settled configuration, as {@code admin} read it, with the term the leader reported. */
 	record Membership(String leader, long term, List<RaftPeer> servers, List<RaftPeer> listeners) {}
@@ -1418,6 +1502,27 @@ public final class ReplicatedServerMain {
 		return command.get(1);
 	}
 
+	/** The argument of {@code add-peer}, {@code ID=RAFTHOST:PORT/APIHOST:PORT}; a malformed one is wrong usage (R29-4). */
+	private static PeerConfig addedPeer(List<String> command) {
+		var spec = arg(command);
+		try {
+			return PeerConfig.parse(spec);
+		} catch (IllegalArgumentException ex) {
+			usage("invalid " + command.getFirst() + " argument " + spec + ": " + ex.getMessage());
+			throw new AssertionError(ex);
+		}
+	}
+
+	/** The member id argument of a command; one that is no valid id (blank, or with "=" or ",") is wrong usage (R29-4). */
+	private static String peerId(List<String> command) {
+		var id = arg(command);
+		if (id.isBlank() || id.contains("=") || id.contains(",")) {
+			usage("invalid " + command.getFirst() + " argument " + id + ": expected a member id"
+					+ (id.contains("=") ? ", not ID=RAFTHOST:PORT/APIHOST:PORT" : ""));
+		}
+		return id;
+	}
+
 	private static RaftPeer raftPeer(PeerConfig peer) {
 		return RaftPeer.newBuilder().setId(peer.id()).setAddress(peer.raftAddress()).build();
 	}
@@ -1458,6 +1563,8 @@ public final class ReplicatedServerMain {
 
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();
+		/** The flag right before each word that follows one, to tell why that word is unexpected. */
+		private final java.util.Map<String, String> afterFlag = new java.util.HashMap<>();
 		private final List<String> consumed = new ArrayList<>();
 
 		Options(List<String> args) {
@@ -1471,9 +1578,18 @@ public final class ReplicatedServerMain {
 					}
 					pairs.add(new String[] {arg, args.get(++i)});
 				} else {
+					if (i > 0 && FLAGS.contains(args.get(i - 1))) {
+						afterFlag.putIfAbsent(arg, args.get(i - 1));
+					}
 					positional.add(arg);
 				}
 			}
+		}
+
+		/** Why {@code word} may be there, for a usage message: after a flag, the flag takes no value. */
+		String flagHint(String word) {
+			var flag = afterFlag.get(word);
+			return flag == null ? "" : " (" + flag + " takes no value)";
 		}
 
 		String value(String name) {
@@ -1549,7 +1665,22 @@ public final class ReplicatedServerMain {
 			return positional;
 		}
 
+		/**
+		 * Refuses, as wrong usage, an option that the command did not read and any word that is not an option's value
+		 * (R29-4): before, a flag given a value ({@code --join false}) turned the flag on and the value was ignored.
+		 */
 		void requireConsumed() {
+			requireOptionsConsumed();
+			if (!positional.isEmpty()) {
+				var word = positional.getFirst();
+				var flag = afterFlag.get(word);
+				usage(flag != null ? flag + " takes no value: unexpected " + word
+						: "unexpected argument " + word);
+			}
+		}
+
+		/** Refuses an option that the command did not read; the words are the caller's to check ({@code admin}). */
+		void requireOptionsConsumed() {
 			for (String[] pair : pairs) {
 				if (!consumed.contains(pair[0])) {
 					usage("unknown option " + pair[0]);
