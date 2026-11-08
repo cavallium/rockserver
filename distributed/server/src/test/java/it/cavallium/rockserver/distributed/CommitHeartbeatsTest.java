@@ -125,13 +125,26 @@ class CommitHeartbeatsTest {
 			}
 		});
 		waiting.await();
-		Thread.sleep(50);
+		// Not a fixed sleep (R26-5): a waiter descheduled past it would take the wake below as an early one, which this
+		// condition drops, and park for 10 s.
+		awaitWaiting(signal);
 		signal.signal();
 		waiter.join(TimeUnit.SECONDS.toMillis(5));
 		assertFalse(waiter.isAlive());
 		assertTrue(result[0], "a wake given while waiting wakes, whatever the condition says");
 		assertEquals(1, signal.kept(), "that wake was not an early one");
 		assertEquals(3, signal.awaits());
+	}
+
+	/** Until a thread is inside {@code signal}'s wait, holding its count. */
+	private static void awaitWaiting(CommitHeartbeats.WakeSignal signal) throws InterruptedException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+		while (signal.waiting() == 0) {
+			if (System.nanoTime() > deadline) {
+				throw new AssertionError("the waiter never waited");
+			}
+			Thread.sleep(1);
+		}
 	}
 
 	/**

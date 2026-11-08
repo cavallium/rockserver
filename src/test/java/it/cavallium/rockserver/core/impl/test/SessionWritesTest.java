@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.impl.test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -191,6 +192,97 @@ class SessionWritesTest {
 		var refused = assertThrows(ExecutionException.class, () -> later.get(5, TimeUnit.SECONDS));
 		assertEquals(RocksDBErrorType.SERVER_OVERLOADED,
 				((RocksDBException) refused.getCause()).getErrorUniqueId());
+		assertTrue(((RocksDBException) refused.getCause()).isNotApplied(), "not sent: flagged not applied");
+	}
+
+	/**
+	 * R26-3 review: a write that never got a session and ends because the connection closed was not sent, so it ends
+	 * flagged not applied (as the Rust client's {@code not_sent}), both while it waits between openings and when the
+	 * connection is already closed. Before, both ended {@code SERVER_OVERLOADED} without the flag.
+	 */
+	@Test
+	void aWriteEndedByCloseBeforeItWasSentIsNotApplied() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opens = new AtomicInteger();
+		var sent = new AtomicInteger();
+		var writes = new Writes(_ -> {
+			opens.incrementAndGet();
+			return CompletableFuture.failedFuture(Status.UNAVAILABLE.asRuntimeException());
+		}, (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		var context = RequestContext.latency(Duration.ofSeconds(60));
+		var waiting = writes.send(context, put(0));
+		while (opens.get() < 2) {
+			Thread.sleep(10);
+		}
+		writes.close();
+		var error = assertThrows(ExecutionException.class, () -> waiting.get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId(), rocks(error).getMessage());
+		assertTrue(rocks(error).isNotApplied(), "closed between openings, nothing sent: not applied");
+		var later = writes.send(context, put(0));
+		error = assertThrows(ExecutionException.class, () -> later.get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId());
+		assertTrue(rocks(error).isNotApplied(), "sent on a closed connection, nothing sent: not applied");
+		assertEquals(0, sent.get());
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R26-4 review: nothing is opened once the deadline has passed, as the Rust client's {@code remaining} before every
+	 * opening. A write whose deadline passed before its session was opened ends {@code SERVER_OVERLOADED} flagged not
+	 * applied, without an opening. Before, the opening was sent with a 1 ns gRPC deadline.
+	 */
+	@Test
+	void noSessionIsOpenedOnceTheDeadlineHasPassed() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opens = new AtomicInteger();
+		var writes = new Writes(_ -> {
+			opens.incrementAndGet();
+			return CompletableFuture.completedFuture(3L);
+		}, (_, _) -> CompletableFuture.completedFuture("ok"), executor);
+		var context = RequestContext.latency(Duration.ofNanos(1));
+		Thread.sleep(1);
+		var error = assertThrows(ExecutionException.class,
+				() -> writes.send(context, put(0)).get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId(), rocks(error).getMessage());
+		assertTrue(rocks(error).isNotApplied());
+		assertEquals(0, opens.get(), "no opening after the deadline");
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R26-4 review: an opening of a caller without a deadline, sent with no gRPC deadline, is ended at the window by a
+	 * local timer, as the Rust client's {@code within_window}: the write ends {@code SERVER_OVERLOADED} flagged not
+	 * applied, and so does a caller without a deadline that waits for that opening. Before, only keepalive bounded it
+	 * (here: never, the opening does not answer).
+	 */
+	@Test
+	void anOpeningThatNeverAnswersEndsACallerWithoutDeadlineUnsentAtTheWindow() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var property = "it.cavallium.rockserver.grpc.client.write-retry-window-ms";
+		var previous = System.getProperty(property);
+		System.setProperty(property, "200");
+		Writes writes;
+		try {
+			writes = new Writes(_ -> new CompletableFuture<>(), (_, _) -> CompletableFuture.completedFuture("ok"),
+					executor);
+		} finally {
+			if (previous == null) {
+				System.clearProperty(property);
+			} else {
+				System.setProperty(property, previous);
+			}
+		}
+		var opener = writes.send(RequestContext.batch(), put(0));
+		var joined = writes.send(RequestContext.batch(), put(0));
+		for (var write : List.of(opener, joined)) {
+			var error = assertThrows(ExecutionException.class, () -> write.get(5, TimeUnit.SECONDS));
+			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId(), rocks(error).getMessage());
+			assertTrue(rocks(error).isNotApplied(), "not sent: not applied");
+		}
+		executor.shutdownNow();
 	}
 	/** The request id a copy was sent with. */
 	private static ClientRequestId idOf(Object bound) {
@@ -454,6 +546,112 @@ class SessionWritesTest {
 	}
 
 	/**
+	 * R27-3: a write that joins an opening another write started (with a longer deadline) is bounded by its own
+	 * deadline: it ends then, {@code SERVER_OVERLOADED} flagged not applied (nothing was sent, as the Rust client's
+	 * {@code not_sent} for a joiner whose deadline came while it waited for the session). The opener goes on, and a
+	 * session opened later serves it. Before, the joiner waited for the opener's deadline.
+	 */
+	@Test
+	void aWriteJoiningAnOpeningEndsAtItsOwnDeadlineNotApplied() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opening = new CompletableFuture<Long>();
+		var sent = new AtomicInteger();
+		var writes = new Writes(_ -> opening, (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		var opener = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		long start = System.nanoTime();
+		var joiner = writes.send(RequestContext.latency(Duration.ofMillis(300)), put(0));
+		var error = assertThrows(ExecutionException.class, () -> joiner.get(5, TimeUnit.SECONDS));
+		long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		assertTrue(tookMs < 2_000, "the joiner waited " + tookMs + " ms");
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId(), rocks(error).getMessage());
+		assertTrue(rocks(error).isNotApplied(), "not sent: not applied");
+		assertFalse(opener.isDone(), "the opener has its own deadline");
+		opening.complete(3L);
+		assertEquals("ok", opener.get(5, TimeUnit.SECONDS));
+		assertEquals(1, sent.get(), "only the opener's copy");
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R27 review 2: a write re-issued after its first copy was refused {@code SESSION_EXPIRED} (not applied), which then
+	 * joins the new session another write is opening with a longer deadline, is still bounded by its own deadline, and
+	 * still not applied: the refused copy did not run. Before, the joiner's timer saw that a copy had been sent and let
+	 * it wait for the opener's deadline.
+	 */
+	@Test
+	void aWriteReissuedAfterAnExpiredSessionThatJoinsAnOpeningEndsAtItsOwnDeadlineNotApplied() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opens = new AtomicInteger();
+		var secondOpening = new CompletableFuture<Long>();
+		var copies = Collections.synchronizedList(new ArrayList<CompletableFuture<Object>>());
+		var writes = new Writes(_ -> opens.incrementAndGet() == 1 ? CompletableFuture.completedFuture(3L) : secondOpening,
+				(_, _) -> {
+					var copy = new CompletableFuture<Object>();
+					copies.add(copy);
+					return copy;
+				}, executor);
+		var opener = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		var shortWrite = writes.send(RequestContext.latency(Duration.ofMillis(400)), put(0));
+		long start = System.nanoTime();
+		while (copies.size() < 2 && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5)) {
+			Thread.sleep(5);
+		}
+		assertEquals(2, copies.size(), "both first copies sent in session 3");
+		// The long write meets the expiry first: it opens the new session, which stays pending under its 30 s.
+		copies.get(0).completeExceptionally(RocksDBException.notApplied(RocksDBErrorType.SESSION_EXPIRED,
+				expired().getMessage()));
+		while (opens.get() < 2 && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5)) {
+			Thread.sleep(5);
+		}
+		assertEquals(2, opens.get(), "the long write opens the new session");
+		// The short write's copy is refused too: it is re-issued and joins that opening.
+		copies.get(1).completeExceptionally(expired());
+		var error = assertThrows(ExecutionException.class, () -> shortWrite.get(5, TimeUnit.SECONDS));
+		long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		assertTrue(tookMs < 2_000, "the re-issued write waited " + tookMs + " ms");
+		assertTrue(rocks(error).isNotApplied(), "only a refused copy was sent: not applied, "
+				+ rocks(error).getErrorUniqueId() + ": " + rocks(error).getMessage());
+		assertNotEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId());
+		assertFalse(opener.isDone(), "the opener has its own deadline");
+		secondOpening.complete(4L);
+		while (copies.size() < 3 && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5)) {
+			Thread.sleep(5);
+		}
+		assertEquals(3, copies.size(), "only the opener sends again");
+		copies.get(2).complete("ok");
+		assertEquals("ok", opener.get(5, TimeUnit.SECONDS));
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R27-3: a synchronous wait that ends before any copy was sent (the session is still opening) cancels the write,
+	 * which was not applied: the error is flagged so. Before, it was READ_DEADLINE_EXCEEDED without the flag, which reads
+	 * as an unknown outcome.
+	 */
+	@Test
+	void aSynchronousWaitThatEndsBeforeACopyWasSentIsNotApplied() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var sent = new AtomicInteger();
+		var writes = new Writes(_ -> new CompletableFuture<>(), (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		var result = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		var error = assertThrows(RocksDBException.class, () -> Writes.await(result, TimeUnit.MILLISECONDS.toNanos(200)));
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, error.getErrorUniqueId());
+		assertTrue(error.isNotApplied(), error.getMessage());
+		assertEquals(0, sent.get());
+		// A plain future (not a numbered write) says nothing about what was sent: no flag.
+		var plain = assertThrows(RocksDBException.class,
+				() -> Writes.await(new CompletableFuture<>(), TimeUnit.MILLISECONDS.toNanos(50)));
+		assertFalse(plain.isNotApplied());
+		executor.shutdownNow();
+	}
+
+	/**
 	 * An opening that ended "not applied" at the opener's deadline (the proposer still had it queued), or refused as
 	 * overloaded, does not end a write waiting for it with more time: that write opens again in its own time.
 	 */
@@ -477,6 +675,92 @@ class SessionWritesTest {
 		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks(error).getErrorUniqueId(),
 				"the opener, out of time, ends with its own deadline");
 		assertEquals(3, opens.get(), "opened again after the deadline error, and again after the overload");
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R26-3: a write that could not get a session was never sent, so it ends flagged not applied, whatever the opening
+	 * answered. Before, the opening's own error came back unflagged: gRPC's deadline on the opening (mapped to
+	 * {@code READ_DEADLINE_EXCEEDED}) then read as an unknown outcome, and a refusal such as {@code NOT_IMPLEMENTED}
+	 * did not say that nothing was applied. As in the Rust client.
+	 */
+	@Test
+	void aWriteThatGotNoSessionEndsNotApplied() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var sent = new AtomicInteger();
+		// gRPC's own deadline on every opening, as GrpcConnection maps it: unflagged.
+		var timingOut = new Writes(_ -> CompletableFuture.failedFuture(RocksDBException.of(
+				RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded")), (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		var error = assertThrows(ExecutionException.class,
+				() -> timingOut.send(RequestContext.latency(Duration.ofMillis(300)), put(0)).get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks(error).getErrorUniqueId());
+		assertTrue(rocks(error).isNotApplied(), "nothing was sent: not applied");
+
+		var refusing = new Writes(_ -> CompletableFuture.failedFuture(
+				RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED, "no sessions")), (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		error = assertThrows(ExecutionException.class,
+				() -> refusing.send(RequestContext.latency(Duration.ofSeconds(10)), put(0)).get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.NOT_IMPLEMENTED, rocks(error).getErrorUniqueId());
+		assertTrue(rocks(error).isNotApplied(), "refused before anything was sent: not applied");
+
+		var unknown = new Writes(_ -> CompletableFuture.failedFuture(Status.UNAVAILABLE.asRuntimeException()),
+				(_, _) -> {
+					sent.incrementAndGet();
+					return CompletableFuture.completedFuture("ok");
+				}, executor);
+		error = assertThrows(ExecutionException.class,
+				() -> unknown.send(RequestContext.latency(Duration.ofMillis(300)), put(0)).get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId());
+		assertTrue(rocks(error).isNotApplied(), "an opening of unknown outcome sent no write: not applied");
+		assertEquals(0, sent.get(), "no copy was sent");
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R26-4: for a caller without a deadline the retry window bounds the copies too, not only the resends. A session
+	 * that opens after the window sends no copy: the write ends {@code READ_DEADLINE_EXCEEDED} flagged not applied,
+	 * where a copy sent then and lost would end {@code OUTCOME_UNKNOWN}. As in the Rust client (R20-1).
+	 */
+	@Test
+	void aSessionOpenedAfterTheWindowSendsNoCopyForACallerWithoutDeadline() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var property = "it.cavallium.rockserver.grpc.client.write-retry-window-ms";
+		var previous = System.getProperty(property);
+		System.setProperty(property, "200");
+		Writes writes;
+		var sent = new AtomicInteger();
+		try {
+			writes = new Writes(_ -> {
+				var late = new CompletableFuture<Long>();
+				CompletableFuture.delayedExecutor(500, TimeUnit.MILLISECONDS).execute(() -> late.complete(7L));
+				return late;
+			}, (_, _) -> {
+				sent.incrementAndGet();
+				return CompletableFuture.completedFuture("ok");
+			}, executor);
+		} finally {
+			if (previous == null) {
+				System.clearProperty(property);
+			} else {
+				System.setProperty(property, previous);
+			}
+		}
+		// The opening is started by a caller with a deadline, so the window's timer on an opening (which a caller
+		// without one would start) does not end it: the caller without a deadline waits for it and gets the session
+		// after its window.
+		var timed = writes.send(RequestContext.latency(Duration.ofSeconds(10)), put(0));
+		var error = assertThrows(ExecutionException.class,
+				() -> writes.send(RequestContext.batch(), put(0)).get(5, TimeUnit.SECONDS));
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks(error).getErrorUniqueId());
+		assertTrue(rocks(error).isNotApplied(), "not sent: not applied");
+		assertEquals("ok", timed.get(5, TimeUnit.SECONDS));
+		assertEquals(1, sent.get(), "no copy after the window, only the timed caller's");
 		executor.shutdownNow();
 	}
 

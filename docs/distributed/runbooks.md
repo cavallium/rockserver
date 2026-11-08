@@ -7,9 +7,18 @@ only says what to do and what to check.
 In the commands, `rs` stands for the node's launcher:
 
 ```bash
-alias rs='java -XX:+ExitOnOutOfMemoryError -Djava.io.tmpdir=/srv/rockserver/tmp \
+alias rs='java -XX:+ExitOnOutOfMemoryError \
   -cp rockserver-distributed.jar it.cavallium.rockserver.distributed.ReplicatedServerMain'
 ```
+
+`run` extracts the RocksDB library into `DATA-DIR/tmp` by itself, with or without `-Djava.io.tmpdir`, and deletes
+there the 17 MB copies that killed runs leave behind. It also points `java.io.tmpdir` there for libraries that read the
+property later (Netty), but the JDK's own temporary files (`File.createTempFile`, `Files.createTempFile`) keep the
+directory the JVM started with, `/tmp` by default. To move everything, pass `-Djava.io.tmpdir=DATA-DIR/tmp` (for
+example `/srv/rockserver/data/tmp`): a given directory inside the data directory is the node's own, and the node deletes
+the RocksDB copies in it at every start. A given directory outside the data directory, or one that is a symlink to a
+shared directory such as `/tmp`, is warned about at the start and never cleaned by the node, since another JVM of the
+host may be loading its copy there.
 
 and `PEERS` for the peer list of the cluster, one `--peer` per member, the same on every node and in every `admin`
 command:
@@ -27,13 +36,19 @@ PEERS="--peer n1=10.0.0.1:9001/10.0.0.1:5333 --peer n2=10.0.0.2:9001/10.0.0.2:53
 - Every node runs the same version (see "Upgrades").
 - A supervisor (systemd or similar) restarts a node that exits with code 3: that is how a node stops after a replica
   failure or after Raft closed.
-- `-XX:+ExitOnOutOfMemoryError` and `-Djava.io.tmpdir` on a directory of the node, as in the alias.
+- `-XX:+ExitOnOutOfMemoryError`, as in the alias, and either no `-Djava.io.tmpdir` or one inside the data directory
+  (see above). A node upgraded from an alias that set `-Djava.io.tmpdir=/srv/rockserver/tmp`: drop the option (or set
+  it to `/srv/rockserver/data/tmp`), stop the node, delete `/srv/rockserver/tmp/*rocksdbjni*` (copies of killed runs,
+  17 MB each), start it.
 
 ## Starting an empty cluster
 
 1. Start every node with the same `PEERS` and without `--join`: `rs run --node-id n1 $PEERS --data-dir /srv/rockserver/data`.
 2. Each prints `READY n1` once it serves the API. Check: `rs admin $PEERS status` shows one `LEADER` and the others
-   `FOLLOWER`, with the same commit index soon after.
+   `FOLLOWER`, with the same commit index soon after. `status` asks every member at once, waits up to 3 s in all for
+   the answers, and prints them in the `--peer` order: a member that is down prints `unreachable` and does not hold the
+   others. With an unroutable member the command may take about 5 s more to exit after printing, while it closes its
+   connections.
 
 ## Seeding a cluster from a single-node database
 
@@ -221,6 +236,16 @@ over (clients open new ones by themselves).
    a column that does not open, a full disk) it also removes the `db/` it made, so fix the cause and run the same
    command again. A `db/` left there by an interrupted run (power loss, `kill -9`) is not removed: delete
    `DATA-DIR/db` and run it again.
+   Use copies of one node's backup on every node (`cp -a`, `rsync`, `scp` of the whole `<name>` directory), not the
+   backup each node took itself: those hold the same data, but not the same files. `restore-backup` records the seed
+   digest of the backup's own files (`DATA-DIR/db.seed-digest`), before it opens the database, because the restored
+   `db/` differs on each node (each restore opens it once and writes its own `OPTIONS` and info log, R26-1): the
+   followers compare that digest with the leader's at genesis and stop with exit 3 if it differs. Running
+   `restore-backup` once and copying the stopped `DATA-DIR/db` to every node with `cp -a` or `rsync` works as well,
+   as in "Seeding a cluster", but only together with `DATA-DIR/db.seed-digest`: that file holds the backup's digest,
+   and the restored `db/` (opened once by the restore) digests to another value, so a node that gets `db/` alone
+   records that other value at its first start and the nodes stop at genesis with exit 3. Either copy both to every
+   node, or delete `db.seed-digest` on every node, the one that ran the restore included, before the first start.
 3. Start every node as for a new cluster, without `--join`; the nodes of the old cluster stay stopped. The first leader proposes
    a seeded genesis, as in "Seeding a cluster".
 4. Check: `status`, then `checksum` prints `OK`, then a few known keys read back.

@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -170,16 +171,60 @@ class ClusterOpsTest {
 		try (var listed = Files.list(target)) {
 			assertEquals(2, listed.filter(p -> p.getFileName().toString().contains(".before-restore-")).count());
 		}
-		restored = new InProcessCluster(newRoot, 1, c -> c).startAll();
+		// The other nodes in the two ways the runbook gives. n1: restore-backup from its own copy of the same backup. Each
+		// restore opens its database once and leaves files of its own (OPTIONS, the info log): the seed digest must still
+		// be the same on every node, or the followers stop at genesis (R26-1).
+		Path copy = temp.resolve("copy-n1");
+		copyTree(backup, copy);
+		ReplicaOps.restore(copy, newRoot.resolve("n1"), null);
+		// n2: a copy of the db/ that n0's restore left, stopped, with db.seed-digest. That file holds the backup's digest,
+		// which a digest of the restored db/ is not: a copy without it records the db/ digest at its first start, and the
+		// node stops at genesis (R26-1 review). The runbook says to copy the file too.
+		Path restoredDb = target.resolve("db");
+		Path seedDigestFile = target.resolve("db.seed-digest");
+		String backupDigest = NodeStore.readSeedDigest(restoredDb);
+		assertNotNull(backupDigest);
+		Path onlyDb = temp.resolve("only-db").resolve("db");
+		copyTree(restoredDb, onlyDb);
+		assertNotEquals(backupDigest, NodeStore.recordSeedDigest(onlyDb),
+				"a copy of db/ without db.seed-digest records another digest");
+		copyTree(restoredDb, newRoot.resolve("n2").resolve("db"));
+		Files.copy(seedDigestFile, newRoot.resolve("n2").resolve("db.seed-digest"));
+		assertEquals(backupDigest, NodeStore.recordSeedDigest(newRoot.resolve("n2").resolve("db")),
+				"a copy of db/ with db.seed-digest keeps the backup's digest");
+		restored = new InProcessCluster(newRoot, 3, c -> c).startAll();
 		var newLeader = restored.awaitLeader(TIMEOUT);
 		var newApi = newLeader.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
-		InProcessCluster.await(TIMEOUT, () -> newLeader.stateMachine().store().clusterId() != null);
-		assertTrue(newLeader.stateMachine().store().seeded());
+		// Every node applies the seeded genesis; a follower whose seed digest differs stops there instead (exit 3).
+		InProcessCluster.await(TIMEOUT, () -> restored.runningNodes().stream().allMatch(node ->
+				node.stateMachine().store().clusterId() != null));
+		restored.awaitConverged(TIMEOUT);
+		var seedDigests = new HashSet<String>();
+		for (var node : restored.runningNodes()) {
+			assertNotNull(node.stateMachine().store().clusterId(), node.config().nodeId());
+			assertTrue(node.stateMachine().store().seeded(), node.config().nodeId());
+			seedDigests.add(String.valueOf(node.stateMachine().store().seedDigest()));
+		}
+		assertEquals(3, restored.runningNodes().size());
+		assertEquals(1, seedDigests.size(), "seed digests " + seedDigests);
 		long newColumn = newLeader.stateMachine().store().db().getColumnId("c");
 		for (long i = 0; i < 500; i++) {
 			assertEquals("v" + i, text(newApi.get(0, newColumn, key(i), RequestType.current())));
 		}
 		assertNull(newApi.get(0, newColumn, key(1000), RequestType.current()));
+	}
+
+	private static void copyTree(Path from, Path to) throws java.io.IOException {
+		try (var walk = Files.walk(from)) {
+			for (Path file : walk.toList()) {
+				Path target = to.resolve(from.relativize(file).toString());
+				if (Files.isDirectory(file)) {
+					Files.createDirectories(target);
+				} else {
+					Files.copy(file, target);
+				}
+			}
+		}
 	}
 
 	private void awaitBackup(String name, long index, ReplicaOps.State state) throws Exception {

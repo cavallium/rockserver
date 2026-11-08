@@ -52,7 +52,13 @@ import reactor.core.publisher.Mono;
  * write is sent again, after a short pause, to whichever node the channel then reaches, until the caller's deadline
  * ({@link #RETRY_WINDOW_PROPERTY} for a caller without one). The server applies a numbered write at most once and
  * answers every copy with the first result. The caller gets {@code OUTCOME_UNKNOWN} only when the deadline came
- * before an answer settled it.</p>
+ * before an answer settled it. No copy is sent once the deadline or the window has passed, the first one included: a
+ * write whose session opens later ends {@code READ_DEADLINE_EXCEEDED} flagged
+ * {@linkplain RocksDBException#isNotApplied() not applied}. A write that gets no session at all was never sent, and
+ * ends flagged not applied too: with the opening's own error, or {@code SERVER_OVERLOADED} if the opening's outcome
+ * was unknown, if the deadline passed before an opening was sent, if a caller without a deadline got no answer to its
+ * opening within the window, if its own deadline came while it waited for an opening another write started (that
+ * opening goes on for the other write), or if the connection closed first.</p>
  *
  * <p>Numbered: writes outside transactions, transaction commits, the write that ends an update opened through
  * this connection (whose id this class remembers from the {@code getForUpdate} answer), schema changes (column
@@ -63,7 +69,8 @@ import reactor.core.publisher.Mono;
  *
  * <p>A caller that cancels the future of a write stops it: no copy is sent any more, and the copy in flight is
  * cancelled. If a copy was sent, the future does not become cancelled but ends with {@code OUTCOME_UNKNOWN}, since
- * that copy may have been applied; otherwise it is cancelled, and the write was not applied.</p>
+ * that copy may have been applied; otherwise it is cancelled, and the write was not applied. A synchronous caller whose
+ * bounded wait cancels it so gets {@code READ_DEADLINE_EXCEEDED} flagged not applied.</p>
  */
 final class SessionWrites {
 
@@ -166,10 +173,13 @@ final class SessionWrites {
 		final @Nullable CallResult batch;
 		/** The copy in flight, cancelled if the caller cancels the write. */
 		volatile @Nullable CompletableFuture<?> inFlight;
-		@Nullable Session session;
+		volatile @Nullable Session session;
 		long sequence;
-		/** A copy was sent and its outcome is unknown: no "not applied" answer can end the call any more. */
-		boolean maybeApplied;
+		/**
+		 * A copy was sent and its outcome is unknown: no "not applied" answer can end the call any more. Volatile: the
+		 * joiner's deadline timer ({@link SessionWrites#start}) reads it from another thread.
+		 */
+		volatile boolean maybeApplied;
 		/** Times it was numbered again in a new session, after its first copy met an expired session. */
 		int reissues;
 		long pauseNanos = FIRST_PAUSE_NANOS;
@@ -183,7 +193,11 @@ final class SessionWrites {
 			this.result = new CallResult(() -> this.sent, this::stopped);
 		}
 
-		/** A copy of it was handed to the channel: if it ends without an answer, its outcome is unknown. */
+		/**
+		 * A copy of it was handed to the channel: if it ends without an answer, its outcome is unknown. Cleared when that
+		 * copy was refused {@code SESSION_EXPIRED} before it ran and no earlier copy may have run, until the re-issued
+		 * write sends its own.
+		 */
 		volatile boolean sent;
 
 		/** The caller cancelled it: its number is final, and the copy in flight is cancelled. */
@@ -238,8 +252,9 @@ final class SessionWrites {
 		}
 	}
 
+	/** Flagged not applied (R26-3 review, as the Rust client's {@code not_sent}): the write was never sent. */
 	private static RocksDBException closedBeforeSent() {
-		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+		return RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
 				"The connection is closed; the write was not sent");
 	}
 
@@ -575,7 +590,21 @@ final class SessionWrites {
 		if (call.ended()) {
 			return;
 		}
-		session(call).whenComplete((session, error) -> {
+		var waiting = session(call);
+		if (!waiting.isDone()) {
+			// The opening may be another write's, bounded by that write's deadline (R27-3, as the Rust client's
+			// timeout_at on the opening lock): this one ends at its own, not applied. While this opening is pending no
+			// copy of this round is in flight, and an earlier copy either was refused SESSION_EXPIRED before it ran (a
+			// write re-issued in a new session, the usual joiner after an expiry) or set maybeApplied. Its pending
+			// whenComplete below then finds it ended.
+			long remaining = call.deadlineNanos - System.nanoTime();
+			CompletableFuture.delayedExecutor(Math.max(0, remaining), TimeUnit.NANOSECONDS).execute(() -> {
+				if (!waiting.isDone() && !call.maybeApplied) {
+					call.fail(notSent("the deadline came while a session was being opened"));
+				}
+			});
+		}
+		waiting.whenComplete((session, error) -> {
 			if (call.ended()) {
 				return;
 			}
@@ -591,9 +620,11 @@ final class SessionWrites {
 					later(pause, () -> start(call), call::failClosed);
 					return;
 				}
+				// Flagged (R26-3, as the Rust client): the opening's own error may not say it, as gRPC's deadline on the
+				// opening, mapped to READ_DEADLINE_EXCEEDED, which would otherwise read as an unknown outcome.
 				call.fail(cause instanceof RocksDBException rocks
 						&& rocks.getErrorUniqueId() != RocksDBErrorType.OUTCOME_UNKNOWN
-						? rocks : RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+						? flaggedNotApplied(rocks) : RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
 								"Could not open a client session; the write was not sent: " + describe(cause)));
 				return;
 			}
@@ -618,13 +649,30 @@ final class SessionWrites {
 	}
 
 	private void open(Call call, CompletableFuture<Session> opening, long pauseNanos) {
+		if (opening.isDone()) {
+			// Ended by the window (below) while this attempt waited for its pause.
+			return;
+		}
+		long remaining = call.deadlineNanos - System.nanoTime();
+		if (remaining <= 0) {
+			// As the Rust client's `remaining` before every opening: nothing is opened once the deadline or the window
+			// has passed. The write was not sent.
+			opening.completeExceptionally(notSent("the deadline came before a session was opened"));
+			return;
+		}
 		CompletableFuture<Long> id;
+		var context = call.context.value().withRequestId(null);
 		try {
-			long remaining = call.deadlineNanos - System.nanoTime();
-			var context = call.context.value().withRequestId(null);
-			id = opener.apply(context.hasTimeout() ? context.withTimeoutNanos(Math.max(1, remaining)) : context);
+			id = opener.apply(context.hasTimeout() ? context.withTimeoutNanos(remaining) : context);
 		} catch (RuntimeException ex) {
 			id = CompletableFuture.failedFuture(ex);
+		}
+		if (!context.hasTimeout() && !id.isDone()) {
+			// A caller without a deadline sends the opening with no gRPC deadline: the window ends it here, as the Rust
+			// client's `within_window`, so that neither this write nor one waiting for this opening is bounded only by
+			// keepalive. The opening may still succeed on the server: that leaves an unused session, which expires.
+			CompletableFuture.delayedExecutor(remaining, TimeUnit.NANOSECONDS).execute(() -> opening
+					.completeExceptionally(notSent("no answer to the opening of a session before the retry window ended")));
 		}
 		id.whenComplete((sessionId, error) -> {
 			if (error == null) {
@@ -640,6 +688,12 @@ final class SessionWrites {
 			}
 			opening.completeExceptionally(cause);
 		});
+	}
+
+	/** The opening of a session ended without one: the write was not sent, so it was not applied. */
+	private static RocksDBException notSent(String cause) {
+		return RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
+				"Could not open a client session; the write was not sent: " + cause);
 	}
 
 	private void sessionExpired(Session expired) {
@@ -659,6 +713,19 @@ final class SessionWrites {
 		var context = new BoundRequestContext(call.context.value().withRequestId(id), call.context.startedNanos());
 		if (closed) {
 			call.failClosed();
+			return;
+		}
+		if (System.nanoTime() - call.deadlineNanos >= 0) {
+			// Nothing is sent once the deadline or the window has passed, for either kind of caller (R26-4, as the Rust
+			// client's `remaining`): a session that opened late, or a resend after a long pause. A caller without a
+			// deadline sends its copies with no gRPC deadline, so nothing else would stop a copy sent now, which, lost,
+			// would end OUTCOME_UNKNOWN where not sending it is known not applied.
+			if (call.maybeApplied) {
+				call.failUnknown(RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "the deadline came"));
+			} else {
+				call.fail(RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						"The request deadline expired before the write was sent"));
+			}
 			return;
 		}
 		CompletableFuture<?> answer;
@@ -705,7 +772,12 @@ final class SessionWrites {
 				sessionExpired(session);
 				if (call.maybeApplied) {
 					call.failUnknown(cause);
-				} else if (call.reissues++ == 0) {
+					return;
+				}
+				// No copy of it ran: none is in flight now, and a cancel or a close from here on ends it not applied, until
+				// a new copy is sent (attempt sets the flag again before it reads the cancel).
+				call.sent = false;
+				if (call.reissues++ == 0) {
 					// This copy was the first, and it was not applied: send it as a new write.
 					start(call);
 				} else if (!closed && canPause(call, call.pauseNanos)) {
@@ -740,6 +812,16 @@ final class SessionWrites {
 			call.pauseNanos = Math.min(MAX_PAUSE_NANOS, pause * 2);
 			later(pause, () -> attempt(call, session), call::failClosed);
 		});
+	}
+
+	/** {@code error}, flagged not applied if it is not already (an {@code UPDATE_RETRY} cannot be, and stays as it is). */
+	private static RocksDBException flaggedNotApplied(RocksDBException error) {
+		if (error.isNotApplied() || error instanceof RocksDBRetryException) {
+			return error;
+		}
+		var flagged = RocksDBException.notApplied(error.getErrorUniqueId(), error.getMessage());
+		flagged.initCause(error);
+		return flagged;
 	}
 
 	private static boolean canPause(Call call, long pauseNanos) {
@@ -795,7 +877,8 @@ final class SessionWrites {
 
 	/**
 	 * Waits for {@code answer} for at most {@code waitNanos}. Past that, or if the thread is interrupted (its interrupt
-	 * status is kept), the write is cancelled ({@link CallResult}): {@code OUTCOME_UNKNOWN} if a copy was sent.
+	 * status is kept), the write is cancelled ({@link CallResult}): {@code OUTCOME_UNKNOWN} if a copy was sent, else
+	 * {@code READ_DEADLINE_EXCEEDED} flagged {@linkplain RocksDBException#isNotApplied() not applied}.
 	 */
 	static Object await(CompletableFuture<Object> answer, long waitNanos) {
 		try {
@@ -809,6 +892,12 @@ final class SessionWrites {
 			answer.cancel(true);
 		}
 		if (answer.isCancelled()) {
+			if (answer instanceof CallResult) {
+				// A numbered write is cancelled only if no copy of it was sent (else it ends OUTCOME_UNKNOWN): it was not
+				// applied (R27-3).
+				throw RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+						"No answer came within the deadline of the request; the write was not sent");
+			}
 			throw RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 					"No answer came within the deadline of the request");
 		}

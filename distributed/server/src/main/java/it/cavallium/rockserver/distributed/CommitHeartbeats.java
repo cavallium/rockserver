@@ -573,5 +573,18 @@ final class CommitHeartbeats {
 		long kept() {
 			return kept.get();
 		}
+
+		/**
+		 * Tests only: threads inside {@code await}, counted under the lock once they hold it, so that a wake given after
+		 * this says one is a wake given while it waits, never an early one.
+		 */
+		int waiting() {
+			lock.lock();
+			try {
+				return waiting;
+			} finally {
+				lock.unlock();
+			}
+		}
 	}
 }

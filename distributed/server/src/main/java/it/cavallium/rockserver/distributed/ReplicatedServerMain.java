@@ -152,7 +152,10 @@ public final class ReplicatedServerMain {
 
 	private static final Duration DEFAULT_ADMIN_TIMEOUT = Duration.ofMinutes(10);
 	private static final TimeDuration ADMIN_RETRY_SLEEP = TimeDuration.valueOf(500, TimeUnit.MILLISECONDS);
-	/** How long {@code add-peer} waits for an answer of the new node and of each member, per round. */
+	/**
+	 * How long {@code add-peer} waits for an answer of the new node and of each member, per round, and {@code status}
+	 * for each member.
+	 */
 	private static final Duration PEER_ANSWER_TIMEOUT = Duration.ofSeconds(3);
 	private static final long SEED_SNAPSHOT_POLL_MS = 200;
 	/** The {@code admin} flag that skips the check of one voter per change, here and on the leader. */
@@ -367,14 +370,18 @@ public final class ReplicatedServerMain {
 
 	/**
 	 * RocksDB's Java binding extracts its native library (17 MB) into the temporary directory at every start, and a killed
-	 * JVM leaves it behind: on a shared {@code /tmp} with a quota, nodes then stop being able to start. Without an explicit
-	 * {@code -Djava.io.tmpdir} the node extracts it into {@code DATA-DIR/tmp} itself, before any RocksDB class loads, and
-	 * deletes the copies left there by earlier runs (a loaded library stays usable when its file is deleted).
+	 * JVM leaves it behind: on a shared {@code /tmp} with a quota, nodes then stop being able to start. The node extracts
+	 * it into {@code DATA-DIR/tmp} itself, before any RocksDB class loads, and deletes the copies left there by earlier
+	 * runs (a loaded library stays usable when its file is deleted). It does so with an explicit {@code -Djava.io.tmpdir}
+	 * too (R27-2): that directory gets no copy, and if it is inside {@code DATA-DIR}, so the node's own, the copies older
+	 * versions left there are deleted as well. One outside {@code DATA-DIR} may be shared with other nodes, which may be
+	 * loading their copy at this moment: it is not touched. "Inside" is decided on real paths: a {@code DATA-DIR/tmp} or
+	 * a given directory that is a symlink to a shared one such as {@code /tmp} is outside, and is not cleaned.
 	 *
 	 * <p>Setting {@code java.io.tmpdir} here does not move the JDK's own temporary files: the JDK reads the property once,
 	 * at VM start-up ({@code File.createTempFile} and {@code Files.createTempFile} keep the start-up value). It is set
-	 * for the libraries that read it when they need it, such as Netty for its native transports. Pass
-	 * {@code -Djava.io.tmpdir=DATA-DIR/tmp} to move everything.</p>
+	 * for the libraries that read it when they need it, such as Netty for its native transports, unless
+	 * {@code -Djava.io.tmpdir} was given.</p>
 	 */
 	private static void useNodeTemporaryDirectory(Path dataDir) throws IOException {
 		useNodeTemporaryDirectory(dataDir, ManagementFactory.getRuntimeMXBean().getInputArguments().stream()
@@ -384,27 +391,46 @@ public final class ReplicatedServerMain {
 	/** See {@link #useNodeTemporaryDirectory(Path)}; {@code explicit} if {@code -Djava.io.tmpdir} was given. */
 	static void useNodeTemporaryDirectory(Path dataDir, boolean explicit) throws IOException {
 		var dataRoot = dataDir.toAbsolutePath().normalize();
-		if (explicit) {
-			var given = Path.of(System.getProperty("java.io.tmpdir")).toAbsolutePath().normalize();
-			if (!given.startsWith(dataRoot)) {
-				System.err.println("WARNING: -Djava.io.tmpdir=" + given + " is outside the data directory " + dataRoot
-						+ ": every start leaves a 17 MB copy of the RocksDB library there if the node is killed");
-			}
-			return;
-		}
 		var temporary = dataRoot.resolve("tmp");
 		Files.createDirectories(temporary);
-		try (var entries = Files.list(temporary)) {
-			for (var entry : entries.filter(Files::isRegularFile)
-					.filter(file -> file.getFileName().toString().contains("rocksdbjni")).toList()) {
-				Files.deleteIfExists(entry);
+		// Real paths (R27 review 5): a DATA-DIR/tmp, or a given directory, that is a symlink to a shared directory such
+		// as /tmp is not the node's own, and a copy there may be another JVM's between extracting and loading it.
+		var realRoot = dataRoot.toRealPath();
+		if (temporary.toRealPath().startsWith(realRoot)) {
+			deleteRocksDbCopies(temporary);
+		} else {
+			System.err.println("WARNING: " + temporary + " leads outside the data directory, to " + temporary.toRealPath()
+					+ ": copies of the RocksDB library left there by killed runs are not deleted");
+		}
+		if (explicit) {
+			var given = Path.of(System.getProperty("java.io.tmpdir")).toAbsolutePath().normalize();
+			if (Files.isDirectory(given) && given.toRealPath().startsWith(realRoot)) {
+				// The node's own: no other process extracts into it. This process has not loaded RocksDB yet.
+				deleteRocksDbCopies(given);
+			} else if (!given.startsWith(dataRoot) || Files.isDirectory(given)) {
+				System.err.println("WARNING: -Djava.io.tmpdir=" + given
+						+ (Files.isDirectory(given) ? " (" + given.toRealPath() + ")" : "")
+						+ " is outside the data directory " + realRoot + ": temporary files of killed runs stay there."
+						+ " The RocksDB library goes to " + temporary + " all the same");
 			}
 		}
 		// RocksDB.loadLibrary() asks the same loader with the ROCKSDB_SHAREDLIB_DIR directory (by default none, which
 		// means File.createTempFile, in the start-up java.io.tmpdir); once this call has loaded the library, that call
 		// finds it loaded and extracts nothing.
 		NativeLibraryLoader.getInstance().loadLibrary(temporary.toString());
-		System.setProperty("java.io.tmpdir", temporary.toString());
+		if (!explicit) {
+			System.setProperty("java.io.tmpdir", temporary.toString());
+		}
+	}
+
+	/** Deletes the copies of the RocksDB library in {@code directory}, as earlier runs that were killed left them. */
+	private static void deleteRocksDbCopies(Path directory) throws IOException {
+		try (var entries = Files.list(directory)) {
+			for (var entry : entries.filter(Files::isRegularFile)
+					.filter(file -> file.getFileName().toString().contains("rocksdbjni")).toList()) {
+				Files.deleteIfExists(entry);
+			}
+		}
 	}
 
 	private static void exportSeed(Options options) throws IOException {
@@ -447,15 +473,7 @@ public final class ReplicatedServerMain {
 				.build()) {
 			RaftClientReply reply = switch (command.getFirst()) {
 				case "status" -> {
-					for (PeerConfig peer : peers) {
-						try {
-							var info = client.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId);
-							System.out.println(peer.id() + ": " + info.getRoleInfoProto().getRole()
-									+ ", commit infos " + info.getCommitInfos());
-						} catch (IOException | RuntimeException ex) {
-							System.out.println(peer.id() + ": unreachable (" + ex.getMessage() + ")");
-						}
-					}
+					printStatus(peers, groupId);
 					yield null;
 				}
 				case "transfer-leader" -> attempt(timeout, () -> client.admin().transferLeadership(
@@ -855,6 +873,47 @@ public final class ReplicatedServerMain {
 						+ ". Nothing was proposed");
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
+		}
+	}
+
+	/**
+	 * Prints each member's role and commit infos, in the {@code --peer} order. The members are asked at once, each once
+	 * (no retry) and for at most {@link #PEER_ANSWER_TIMEOUT}: a dead or unroutable member prints "unreachable" after
+	 * that, instead of holding the others for the admin time limit, as the shared client's retries until the deadline
+	 * did (R27-1). Status is what the runbooks tell to look at exactly when members are down.
+	 */
+	private static void printStatus(List<PeerConfig> peers, RaftGroupId groupId) throws InterruptedException {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var infoClient = infoClient(peers, groupId);
+		try {
+			var asked = peers.stream().map(peer -> CompletableFuture.supplyAsync(() -> {
+				try {
+					var info = infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId);
+					return peer.id() + ": " + info.getRoleInfoProto().getRole() + ", commit infos " + info.getCommitInfos();
+				} catch (IOException | RuntimeException ex) {
+					return peer.id() + ": unreachable (" + ex.getMessage() + ")";
+				}
+			}, executor)).toList();
+			long deadline = System.nanoTime() + PEER_ANSWER_TIMEOUT.toNanos();
+			for (int i = 0; i < peers.size(); i++) {
+				String line;
+				try {
+					line = asked.get(i).get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+				} catch (TimeoutException late) {
+					line = peers.get(i).id() + ": unreachable (no answer within " + PEER_ANSWER_TIMEOUT.toMillis() + " ms)";
+				} catch (ExecutionException failed) {
+					line = peers.get(i).id() + ": unreachable (" + failed.getCause() + ")";
+				}
+				System.out.println(line);
+			}
+		} finally {
+			// Not awaited: a request still hanging on a dead member is dropped with the client.
+			executor.shutdownNow();
+			try {
+				infoClient.close();
+			} catch (IOException ignored) {
+				// Only the status was asked.
+			}
 		}
 	}
 

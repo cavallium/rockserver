@@ -696,6 +696,24 @@ final class NodeStore implements Closeable {
 		writeSeedDigestFile(dbDir, recorded + "\nopened " + databaseFilesDigest(dbDir) + "\n");
 	}
 
+	/**
+	 * Records, for the database just restored into {@code dbDir} by {@code restore-backup}, the digest of the backup it
+	 * came from ({@code seedDigest}, taken from the backup's files before anything opened them), with the digest of the
+	 * files the restore left as the {@code opened} line: the first start then keeps the backup's digest (see
+	 * {@link #recordSeedDigest}). Every node restored from a copy of the same backup records the same digest, although
+	 * the restore opened each database and left files of its own ({@code OPTIONS}, with the node's paths; R26-1).
+	 */
+	static void recordRestoredSeedDigest(Path dbDir, String seedDigest) throws IOException {
+		writeSeedDigestFile(dbDir, seedDigest + "\nopened " + databaseFilesDigest(dbDir) + "\n");
+	}
+
+	/** Deletes the seed digest recorded next to {@code dbDir}, if any. */
+	static void deleteSeedDigest(Path dbDir) throws IOException {
+		if (Files.deleteIfExists(seedDigestFile(dbDir))) {
+			syncDirectory(seedDigestFile(dbDir).getParent());
+		}
+	}
+
 	private static void writeSeedDigestFile(Path dbDir, String content) throws IOException {
 		Path file = seedDigestFile(dbDir);
 		Path building = file.resolveSibling(file.getFileName() + ".tmp");
@@ -719,7 +737,7 @@ final class NodeStore implements Closeable {
 		MessageDigest digest = sha256();
 		for (Path relative : files) {
 			String name = relative.getFileName().toString();
-			if (name.equals("LOCK") || name.startsWith("LOG")) {
+			if (isSkippedByDigest(name)) {
 				continue;
 			}
 			Path file = root.resolve(relative);
@@ -739,6 +757,15 @@ final class NodeStore implements Closeable {
 			}
 		}
 		return HexFormat.of().formatHex(digest.digest());
+	}
+
+	/**
+	 * {@code LOCK} and the info logs: {@code LOG*} in the database directory, and in its {@code logs/} directory
+	 * {@code <absolute path>_LOG} and its rotated {@code _LOG.old.<time>}, whose names hold the path of the database, so
+	 * that copies made elsewhere would differ by them (R26-1).
+	 */
+	private static boolean isSkippedByDigest(String name) {
+		return name.equals("LOCK") || name.startsWith("LOG") || name.endsWith("_LOG") || name.contains("_LOG.old.");
 	}
 
 	private static void update(MessageDigest digest, String value) {

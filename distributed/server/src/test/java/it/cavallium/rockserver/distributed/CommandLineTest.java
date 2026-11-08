@@ -300,6 +300,46 @@ class CommandLineTest {
 		return all;
 	}
 
+	/**
+	 * R27-1: {@code admin status} asks the members at once, each once with a time limit of its own, and prints them in
+	 * the {@code --peer} order. A dead member listed first (a closed port, and a socket that accepts but never answers)
+	 * no longer holds the others for the whole admin time limit, which the runbooks' "see the status" relies on.
+	 */
+	@Test
+	void statusAnswersAtOnceWhenMembersAreDown() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("status")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		int closedPort;
+		try (var probe = new java.net.ServerSocket(0)) {
+			closedPort = probe.getLocalPort();
+		}
+		try (var silent = new java.net.ServerSocket(0)) {
+			var args = new ArrayList<String>(List.of("admin",
+					"--peer", "d1=127.0.0.1:" + silent.getLocalPort() + "/127.0.0.1:" + silent.getLocalPort(),
+					"--peer", "d2=127.0.0.1:" + closedPort + "/127.0.0.1:" + closedPort));
+			for (var id : List.of("n0", "n1", "n2")) {
+				args.add("--peer");
+				args.add(cluster.config(id).self().format());
+			}
+			// A long admin time limit, as the default (10 minutes) is: status must not wait for it.
+			args.addAll(List.of("--timeout-ms", "60000", "status"));
+			long start = System.nanoTime();
+			var status = run(args.toArray(String[]::new));
+			long tookMs = (System.nanoTime() - start) / 1_000_000;
+			assertEquals(0, status.code(), status.toString());
+			assertTrue(tookMs < 15_000, "status took " + tookMs + " ms");
+			var lines = status.out().strip().lines().toList();
+			assertEquals(5, lines.size(), status.out());
+			var order = List.of("d1", "d2", "n0", "n1", "n2");
+			for (int i = 0; i < order.size(); i++) {
+				assertTrue(lines.get(i).startsWith(order.get(i) + ": "), status.out());
+			}
+			assertTrue(lines.get(0).contains("unreachable") && lines.get(1).contains("unreachable"), status.out());
+			assertTrue(lines.subList(2, 5).stream().anyMatch(line -> line.contains("LEADER")), status.out());
+			assertTrue(lines.subList(2, 5).stream().noneMatch(line -> line.contains("unreachable")), status.out());
+		}
+	}
+
 	@Test
 	void noCommandAndAnUnknownCommandExitWithTwo() {
 		assertEquals(2, run().code());

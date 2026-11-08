@@ -195,8 +195,12 @@ struct Updates {
 /// The session state shared by every view of one client.
 #[derive(Default)]
 pub(crate) struct SessionWrites {
-    /// The current session; `None` before the first write and after it expired. Held while one is opened.
-    session: tokio::sync::Mutex<Option<Arc<Session>>>,
+    /// The current session; `None` before the first write and after it expired. Only held to read or swap it, never
+    /// across an await: a write that forgets an expired session must not wait for another write's opening (R27-4).
+    session: Mutex<Option<Arc<Session>>>,
+    /// Held by the write opening a session, for its whole retry loop: the others wait for it, each within its own
+    /// deadline.
+    opening: tokio::sync::Mutex<()>,
     updates: Mutex<Updates>,
     numbered_batches: bool,
     /// Copies sent again after an unknown outcome, over the life of this client.
@@ -316,7 +320,7 @@ impl SessionWrites {
     #[cfg(test)]
     pub(crate) fn with_open_session(numbered_batches: bool, id: i64) -> Self {
         let writes = Self::new(numbered_batches);
-        *writes.session.try_lock().unwrap() = Some(Arc::new(Session {
+        *writes.session.lock().unwrap() = Some(Arc::new(Session {
             id,
             numbers: Mutex::new(Numbers::default()),
         }));
@@ -335,12 +339,15 @@ impl SessionWrites {
         O: FnMut(Option<Duration>) -> OF,
         OF: Future<Output = Result<i64, Status>>,
     {
+        if let Some(session) = self.current() {
+            return Ok(session);
+        }
         // Writes wait for the one opening a session; if it fails, the next one opens again, in its own time.
-        let mut slot = tokio::time::timeout_at(deadline, self.session.lock())
+        let _opening = tokio::time::timeout_at(deadline, self.opening.lock())
             .await
             .map_err(|_| not_sent("the deadline came while another write was opening the session"))?;
-        if let Some(session) = slot.as_ref() {
-            return Ok(session.clone());
+        if let Some(session) = self.current() {
+            return Ok(session);
         }
         let mut pause = FIRST_PAUSE;
         loop {
@@ -356,7 +363,7 @@ impl SessionWrites {
                         id,
                         numbers: Mutex::new(Numbers::default()),
                     });
-                    *slot = Some(session.clone());
+                    *self.session.lock().unwrap() = Some(session.clone());
                     return Ok(session);
                 }
                 Err(status) => {
@@ -377,8 +384,14 @@ impl SessionWrites {
         }
     }
 
-    async fn session_expired(&self, expired: &Arc<Session>) {
-        let mut slot = self.session.lock().await;
+    fn current(&self) -> Option<Arc<Session>> {
+        self.session.lock().unwrap().clone()
+    }
+
+    /// Forgets `expired` if it is still the current session. Never waits for an opening: a write opening a session
+    /// holds `opening`, not this slot.
+    fn session_expired(&self, expired: &Arc<Session>) {
+        let mut slot = self.session.lock().unwrap();
         if slot
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, expired))
@@ -439,7 +452,7 @@ impl SessionWrites {
                 if rocksdb_error_type(&status) == Some("SESSION_EXPIRED") {
                     // This copy was refused before it ran. Copies sent earlier are this client's to judge.
                     drop(number);
-                    self.session_expired(&session).await;
+                    self.session_expired(&session);
                     if maybe_applied {
                         return Err(unknown_outcome(&status));
                     }
@@ -918,6 +931,83 @@ mod tests {
         assert_eq!(rocksdb_error_type(&error), Some("SERVER_OVERLOADED"));
         assert!(is_not_applied(&error));
         assert!(sent.lock().unwrap().is_empty(), "nothing sent");
+    }
+
+    #[tokio::test]
+    async fn a_write_whose_session_expired_is_not_held_by_another_write_opening_one() {
+        // R27-4: write C met the expiry first and opens a new session, which takes until C's deadline (3 s). Write
+        // B, with 300 ms, meets the expiry of the same session while C opens: forgetting the expired session must not
+        // wait for C's opening, so B ends near its own deadline, not with C's.
+        let writes = SessionWrites::with_open_session(true, 1);
+        let c_sent = Arc::new(Mutex::new(Vec::new()));
+        let b_sent = Arc::new(Mutex::new(Vec::new()));
+        let opening = Arc::new(tokio::sync::Notify::new());
+        let b_numbered = Arc::new(tokio::sync::Notify::new());
+        let c = writes.run(
+            soon(3_000),
+            true,
+            {
+                let opening = opening.clone();
+                move |timeout: Option<Duration>| {
+                    let opening = opening.clone();
+                    async move {
+                        opening.notify_one();
+                        tokio::time::sleep(timeout.expect("finite")).await;
+                        Err::<i64, Status>(Status::deadline_exceeded("opening took the whole deadline"))
+                    }
+                }
+            },
+            {
+                let b_numbered = b_numbered.clone();
+                let c_sent = c_sent.clone();
+                move |id: ClientRequestId, _: Option<Duration>| {
+                    let b_numbered = b_numbered.clone();
+                    c_sent.lock().unwrap().push(id);
+                    async move {
+                        // Expired once B has its number in the same session.
+                        b_numbered.notified().await;
+                        Err::<&'static str, Status>(expired_status())
+                    }
+                }
+            },
+        );
+        let b = async {
+            let started = Instant::now();
+            let result = writes
+                .run(
+                    soon(300),
+                    true,
+                    fixed_opener(2),
+                    {
+                        let opening = opening.clone();
+                        let b_sent = b_sent.clone();
+                        let b_numbered = b_numbered.clone();
+                        move |id: ClientRequestId, _: Option<Duration>| {
+                            let opening = opening.clone();
+                            b_sent.lock().unwrap().push(id);
+                            b_numbered.notify_one();
+                            async move {
+                                // Answered once C holds the opening.
+                                opening.notified().await;
+                                Err::<&'static str, Status>(expired_status())
+                            }
+                        }
+                    },
+                )
+                .await;
+            (result, started.elapsed())
+        };
+        let (c_result, (b_result, b_took)) = tokio::join!(c, b);
+        assert!(c_result.is_err());
+        assert!(b_took < Duration::from_millis(1_500), "B waited {b_took:?} for C's opening");
+        let error = b_result.unwrap_err();
+        assert!(is_not_applied(&error), "{error:?}");
+        assert_eq!(b_sent.lock().unwrap().len(), 1);
+        assert_eq!(c_sent.lock().unwrap()[0].session_id, b_sent.lock().unwrap()[0].session_id);
+    }
+
+    fn expired_status() -> Status {
+        rocks(Code::FailedPrecondition, "SESSION_EXPIRED", true)
     }
 
     #[tokio::test]

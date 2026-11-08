@@ -384,6 +384,69 @@ class NodeStoreTest {
 		assertTrue(Files.isDirectory(dataDir.resolve("db")));
 	}
 
+	/**
+	 * Every node of a restored cluster runs {@code restore-backup} from its own copy of the same backup, then records its
+	 * seed digest at its first start, and the followers compare it with the leader's at genesis: the restores must leave
+	 * the same files, or the followers stop with exit 3 (R26-1).
+	 */
+	@Test
+	void restoresOfTheSameBackupGiveTheSameSeedDigest() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		Path source = tempDir.resolve("source");
+		try (var store = NodeStore.open(source, null, "source")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			for (int i = 0; i < 200; i++) {
+				put(store, column, i, "v" + i);
+			}
+			setApplied(store, TermIndex.valueOf(1, 200));
+			setClusterId(store, "old-cluster");
+			store.checkpoint(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR));
+		}
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=200\ncluster=old-cluster\n");
+		var digests = new TreeMap<String, String>();
+		var files = new TreeMap<String, Map<String, String>>();
+		for (String node : List.of("n0", "n1", "n2")) {
+			// Each node from its own copy of the backup, as the runbook says.
+			Path copy = tempDir.resolve("copy-" + node);
+			copyTree(backupDir, copy);
+			Path dataDir = tempDir.resolve(node);
+			ReplicaOps.restore(copy, dataDir, null);
+			Path db = dataDir.resolve("db");
+			NodeStore.recordSeedDigest(db);
+			digests.put(node, NodeStore.readSeedDigest(db));
+			files.put(node, fileDigests(db));
+		}
+		assertEquals(1, Set.copyOf(digests.values()).size(), "seed digests " + digests + ", files " + files);
+	}
+
+	private static void copyTree(Path from, Path to) throws IOException {
+		try (Stream<Path> walk = Files.walk(from)) {
+			for (Path file : walk.toList()) {
+				Path target = to.resolve(from.relativize(file).toString());
+				if (Files.isDirectory(file)) {
+					Files.createDirectories(target);
+				} else {
+					Files.copy(file, target);
+				}
+			}
+		}
+	}
+
+	/** Each file of {@code dir} with its size and a digest of its content, to name the files that differ. */
+	private static Map<String, String> fileDigests(Path dir) throws IOException {
+		var result = new TreeMap<String, String>();
+		try (Stream<Path> walk = Files.walk(dir)) {
+			for (Path file : walk.filter(Files::isRegularFile).toList()) {
+				byte[] bytes = Files.readAllBytes(file);
+				result.put(dir.relativize(file).toString(), bytes.length + ":" + java.util.HexFormat.of()
+						.formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes)).substring(0, 12));
+			}
+		} catch (java.security.NoSuchAlgorithmException e) {
+			throw new IllegalStateException(e);
+		}
+		return result;
+	}
+
 	/** {@code export-seed} refuses the database of a newer cluster the same way, and writes no target (R18-1). */
 	@Test
 	void exportSeedRefusesADatabaseOfANewerCluster() throws IOException {
