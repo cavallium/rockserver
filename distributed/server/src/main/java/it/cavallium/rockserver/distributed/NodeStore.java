@@ -181,6 +181,7 @@ final class NodeStore implements Closeable {
 	static NodeStore open(Path dbDir, @Nullable Path rockserverConfig, String name) throws IOException {
 		dbDir = dbDir.toAbsolutePath().normalize();
 		RestoreDirs.of(dbDir).recover();
+		deleteLeftConfigs(dbDir.getParent());
 		Path config = replicaConfig(rockserverConfig, dbDir, name);
 		EmbeddedConnection connection;
 		try {
@@ -241,16 +242,50 @@ final class NodeStore implements Closeable {
 			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
 		}
 		checkVolumesInside(config, dbDir);
-		Path parent = dbDir.toAbsolutePath().normalize().getParent();
-		Files.createDirectories(parent);
-		Path file = Files.createTempFile(parent, "rockserver-replica-", ".conf");
+		Path file = replicaConfigFile(dbDir);
+		Files.createDirectories(file.getParent());
 		try {
+			// Replaces the file that a process killed during an earlier open of this database left (R29-2).
 			Files.writeString(file, config.root().render(ConfigRenderOptions.concise()), StandardCharsets.UTF_8);
 		} catch (IOException | RuntimeException e) {
 			Files.deleteIfExists(file);
 			throw e;
 		}
 		return file;
+	}
+
+	/**
+	 * The config file that the database in {@code dbDir} is opened with, next to it: one name per database, so that a
+	 * process killed while the database opens (WAL replay, a large MANIFEST: the file is deleted only once it opened)
+	 * leaves at most one, which the next open of that database replaces and deletes (R29-2). A random name left one per
+	 * killed start, for good.
+	 */
+	static Path replicaConfigFile(Path dbDir) {
+		Path db = dbDir.toAbsolutePath().normalize();
+		return db.resolveSibling(REPLICA_CONFIG_PREFIX + db.getFileName() + ".conf");
+	}
+
+	private static final String REPLICA_CONFIG_PREFIX = "rockserver-replica-";
+	/** The config files that older versions made with a random name ({@code Files.createTempFile}). */
+	private static final java.util.regex.Pattern LEGACY_REPLICA_CONFIG =
+			java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(REPLICA_CONFIG_PREFIX) + "[0-9]+\\.conf");
+
+	/**
+	 * Deletes from {@code dir} the randomly named config files that older versions' opens left there when the process
+	 * was killed during the open (R29-2). Only that name pattern: the config of another database in the same directory
+	 * (an {@code export-seed} target next to the source) has a name of its own and stays.
+	 */
+	private static void deleteLeftConfigs(@Nullable Path dir) throws IOException {
+		if (dir == null || !Files.isDirectory(dir)) {
+			return;
+		}
+		try (Stream<Path> files = Files.list(dir)) {
+			for (Path file : files.filter(path -> LEGACY_REPLICA_CONFIG.matcher(path.getFileName().toString()).matches())
+					.toList()) {
+				LOG.info("Deleting {}, the database config of an open that was killed", file);
+				Files.deleteIfExists(file);
+			}
+		}
 	}
 
 	/**
@@ -808,6 +843,24 @@ final class NodeStore implements Closeable {
 		}
 		// The copy's config first: when it is refused, nothing has been written yet.
 		Path config = replicaConfig(rockserverConfig, target, dbDir, "export-target");
+		try {
+			return exportSeedInto(dbDir, rockserverConfig, target, config);
+		} catch (IOException | RuntimeException | Error failure) {
+			// Nothing half-made stays (R29-1): the target did not exist before, and a checkpoint that failed removed its
+			// own temporary copy.
+			try {
+				deleteRecursively(target);
+			} catch (IOException | RuntimeException cleanupFailure) {
+				failure.addSuppressed(cleanupFailure);
+			}
+			throw failure;
+		} finally {
+			Files.deleteIfExists(config);
+		}
+	}
+
+	private static ExportedSeed exportSeedInto(Path dbDir, @Nullable Path rockserverConfig, Path target, Path config)
+			throws IOException {
 		TermIndex applied;
 		String clusterId;
 		try (var store = open(dbDir, rockserverConfig, "export-source")) {
@@ -820,9 +873,6 @@ final class NodeStore implements Closeable {
 			}
 			clusterId = store.clusterId();
 			applied = store.checkpoint(target);
-		} catch (IOException | RuntimeException e) {
-			Files.deleteIfExists(config);
-			throw e;
 		}
 		try (var copy = new EmbeddedConnection(target, "export-target", config)) {
 			var db = copy.getEmbeddedDB();
@@ -830,15 +880,6 @@ final class NodeStore implements Closeable {
 				db.deleteColumn(db.getColumnId(META_COLUMN));
 			}
 			db.flush();
-		} catch (IOException | RuntimeException e) {
-			try {
-				deleteRecursively(target);
-			} catch (IOException deleteFailure) {
-				e.addSuppressed(deleteFailure);
-			}
-			throw e;
-		} finally {
-			Files.deleteIfExists(config);
 		}
 		syncTree(target);
 		return new ExportedSeed(applied, clusterId);
@@ -885,25 +926,36 @@ final class NodeStore implements Closeable {
 		}
 		Path building = target.resolveSibling(target.getFileName() + ".tmp");
 		deleteRecursively(building);
-		Files.createDirectories(building);
 		TermIndex applied = applied();
-		RocksDB rocksDB = db().getDb().get();
 		try {
-			rocksDB.disableFileDeletions();
+			Files.createDirectories(building);
+			RocksDB rocksDB = db().getDb().get();
 			try {
-				copyLiveFiles(rocksDB, building);
-			} finally {
-				rocksDB.enableFileDeletions();
+				rocksDB.disableFileDeletions();
+				try {
+					copyLiveFiles(rocksDB, building);
+				} finally {
+					rocksDB.enableFileDeletions();
+				}
+			} catch (RocksDBException e) {
+				throw new IOException("Failed to checkpoint " + dbDir + " into " + target, e);
 			}
-		} catch (RocksDBException e) {
-			throw new IOException("Failed to checkpoint " + dbDir + " into " + target, e);
+			var hook = checkpointBuiltForTesting;
+			if (hook != null) {
+				hook.built(building);
+			}
+			syncTree(building);
+			Files.move(building, target);
+		} catch (IOException | RuntimeException | Error failure) {
+			// What was built hard-links every live table and blob file of the moment: left behind, it would keep them on
+			// disk after compactions replace them, on a node that may be short of space already (R29-1).
+			try {
+				deleteRecursively(building);
+			} catch (IOException | RuntimeException cleanupFailure) {
+				failure.addSuppressed(cleanupFailure);
+			}
+			throw failure;
 		}
-		var hook = checkpointBuiltForTesting;
-		if (hook != null) {
-			hook.built(building);
-		}
-		syncTree(building);
-		Files.move(building, target);
 		syncDirectory(target.getParent());
 		return applied;
 	}

@@ -390,19 +390,20 @@ class CommandLineTest {
 
 			// R28 review 1: with a time limit no longer than the question's own 3 s, the silent member asked first
 			// used up the whole limit, and the command ended "no member took the request" without asking the healthy
-			// ones; it also ran up to 3 s past the limit. The members are asked at once, within the time left.
+			// ones; it also ran up to 3 s past the limit. The members are asked at once, within the time left, for the
+			// proposal and (R29-3) for the results: the bound is the limit plus 1.5 s, not plus the silent member's 3 s.
 			var shortLimit = new ArrayList<>(args.subList(0, args.size() - 1));
 			shortLimit.add("2500");
 			long start = System.nanoTime();
 			var shortBackup = run(with(shortLimit, "backup", "b4"));
 			long backupMillis = (System.nanoTime() - start) / 1_000_000;
 			assertTrue(shortBackup.out().contains("backup b4 at log index"), shortBackup.toString());
-			assertTrue(backupMillis < 4_500, "backup took " + backupMillis + " ms with --timeout-ms 2500");
+			assertTrue(backupMillis < 4_000, "backup took " + backupMillis + " ms with --timeout-ms 2500");
 			start = System.nanoTime();
 			var shortChecksum = run(with(shortLimit, "checksum"));
 			long checksumMillis = (System.nanoTime() - start) / 1_000_000;
 			assertTrue(shortChecksum.out().contains("checksum at log index"), shortChecksum.toString());
-			assertTrue(checksumMillis < 4_500, "checksum took " + checksumMillis + " ms with --timeout-ms 2500");
+			assertTrue(checksumMillis < 4_000, "checksum took " + checksumMillis + " ms with --timeout-ms 2500");
 		}
 	}
 
