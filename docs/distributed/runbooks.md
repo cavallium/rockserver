@@ -255,8 +255,12 @@ over (clients open new ones by themselves).
 `rs admin $PEERS checksum` makes every replica digest its user data at one log position and compare it with the others.
 It prints each node's digest and number of keys, and `OK` only if every node of `$PEERS` gave a digest and all are
 equal. It exits with 1 if they differ, and with 4 if a node gave none (down, failed, not done within `--timeout-ms`,
-or it skipped the position because a snapshot install jumped over it): run it again. `--allow-skipped` accepts nodes
-that skipped the position. The digest reads every key of the
+or it skipped the position because a snapshot install jumped over it), or if no node took the request within
+`--timeout-ms` (no leader, every node down) or the answer leaves open whether it was proposed: run it again. A node of
+`$PEERS` that does not answer at all (down, or frozen with its port still accepting connections) is skipped after a
+few seconds, and the request goes to the next one; a node that took it gets at most 30 s to answer. So a frozen node
+listed first delays the command by seconds, not by `--timeout-ms`, and `backup` behaves the same way.
+`--allow-skipped` accepts nodes that skipped the position (it is refused with any other command). The digest reads every key of the
 database on every node at once, holding a snapshot meanwhile: run it at a quiet time on large databases. With
 `-Dit.cavallium.rockserver.distributed.checksum-every-hours=N` on the nodes, the leader also runs one every N hours,
 counted from the last check of the cluster (also one run by hand), so a leader change does not start the count over.
@@ -406,15 +410,18 @@ disk problem to look at.
 | Code | `run` | `admin` | `repair-log` | `export-seed`, `restore-backup` |
 |---|---|---|---|---|
 | 0 | Not on a stop by signal: see below | `OK` | The log is valid, or was (with `--dry-run`: could be) repaired | Done |
-| 1 | Did not start: a bad option value, a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`) | `FAILED: ...`: refused (a change of more than one voter included), a change failed, the replicas differ (`checksum`), a member failed (`backup`) | Refused: see its output | Failed: see the exception |
-| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError` | Wrong usage | Wrong usage | Wrong usage |
+| 1 | Did not start: a bad option value, a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`), any other failure of the start (an `Error` too, such as a class that does not load) | `FAILED: ...`: refused (a change of more than one voter included, or a member refused `checksum`/`backup`: not every member supports it), a change failed, the replicas differ (`checksum`), a member failed (`backup`) | Refused: see its output | Failed: see the exception |
+| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError` | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`) | Wrong usage | Wrong usage |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
-| 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`): run it again | - | - |
+| 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`), no member took the request in time, or a `checksum` answer that does not tell whether it was proposed: run it again | - | - |
 | 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | The replica's database (`export-seed`) or the backup (`restore-backup`) has a cluster version with capabilities this version lacks; nothing is written: run the newer version |
 
 A stop of `run` by SIGTERM, after its hand-off, ends with 143 and one by SIGINT with 130: the JVM's
 status for a signal (128 plus its number), since the shutdown hook halts with a status of its own only after a
-failure (then 3, 4 or 5, as in the table). A node that is killed (SIGKILL, 137 in a shell) or crashes in native code
+failure (then 3, 4 or 5, as in the table). The hook is registered before the node starts: a SIGTERM while it is still
+starting (opening its database, loading its log, checking its membership) waits for the start to end and then stops
+the node as above, so a stop during a long start takes as long as the rest of the start, which `TimeoutStopSec`
+must cover for a large node (or it ends with SIGKILL, a crash for the node). A node that is killed (SIGKILL, 137 in a shell) or crashes in native code
 (SIGABRT, 134) ends by a signal, and an uncaught exception before the node starts, such as a non-numeric option
 value, ends with 1, as in the table. A supervisor restarts all of these except a stop it asked for. So the codes a
 supervisor must not restart are 2, 4 and 5, and 143 is a clean stop.

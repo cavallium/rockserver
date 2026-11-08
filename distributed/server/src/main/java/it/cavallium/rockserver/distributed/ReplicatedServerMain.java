@@ -72,17 +72,21 @@ import org.rocksdb.NativeLibraryLoader;
  *
  * <p>{@code checksum} has every replica digest its data at one log position and compares the digests; it prints each
  * member's, and prints {@code OK} only if every member of {@code --peer} gave a digest and all of them are equal. It
- * exits with 1 if they differ, and with 4 if a member gave none (down, failed, or not done within {@code --timeout-ms});
+ * exits with 1 if they differ, and with 4 if a member gave none (down, failed, or not done within {@code --timeout-ms})
+ * or if the check was not proposed for sure (no member took it in time, or an answer that does not tell);
  * with {@code --allow-skipped} a member that skipped the position (a snapshot install jumped over it) does not count
  * as missing. {@code backup NAME} has every replica write a checkpoint of its database at one log position to
  * {@code <data-dir>/backups/NAME}; it prints where each member wrote it, and prints {@code OK} only if every member of
- * {@code --peer} wrote it; it exits with 1 if a member failed and with 4 if a member gave no result in time.
+ * {@code --peer} wrote it; it exits with 1 if a member failed and with 4 if a member gave no result in time, or no
+ * member took the request in time. Both skip a member that does not answer at all, after a few seconds, so that a
+ * frozen member listed first does not hold them (see {@code proposeOp}).
  * {@code backup-status NAME INDEX} asks the members again about that backup ({@code INDEX} is the log index that
  * {@code backup} printed), without proposing anything, with the same output and exit codes. {@code restore-backup} prepares an empty data directory to seed a new cluster from such a backup. See
  * {@link ReplicaOps} and {@code docs/distributed/runbooks.md}.</p>
  *
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
- * (leadership hand-off) on SIGTERM. For {@code add-peer} the new member must already run, with the new peer list and
+ * (leadership hand-off) on SIGTERM, also one that comes while the node is still starting: the stop then waits for the
+ * start (see {@code startAndServe}). Any failure of the start exits with 1, unless it has a code of its own below. For {@code add-peer} the new member must already run, with the new peer list and
  * with {@code --join}, however long before the {@code add-peer}. It exits with 3 if its replica failed or its Raft server
  * closed, so that a supervisor notices. {@code repair-log} runs on a stopped node, after a power loss left it unable to read its Raft log: see
  * {@link RaftLogRepair}. It exits with 0 if the log is valid or was repaired (with {@code --dry-run}: could be) and
@@ -109,7 +113,8 @@ import org.rocksdb.NativeLibraryLoader;
  * <p>{@code export-seed} runs on a stopped node and copies its database into a new directory that can seed a new
  * cluster, the last resort of "No quorum" in the design document (see {@link NodeStore#exportSeed}).</p>
  *
- * <p>{@code admin} changes end with {@code OK}, or with {@code FAILED: ...} and exit code 1, within {@code --timeout-ms}
+ * <p>{@code admin} refuses an option it does not know, or a malformed value, with exit code 2. Its changes end with
+ * {@code OK}, or with {@code FAILED: ...} and exit code 1, within {@code --timeout-ms}
  * (10 minutes by default), which must cover the catch-up of a new member. A leader that started a change goes on with it
  * after that: see {@code status}, and run the command again. {@code add-peer} first reads the leader's configuration:
  * for a node that is a voter there at the same address it prints {@code OK} (a re-run) without asking the node. Else
