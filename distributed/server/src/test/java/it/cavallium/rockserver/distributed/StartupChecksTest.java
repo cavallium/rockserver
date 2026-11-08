@@ -290,6 +290,37 @@ class StartupChecksTest {
 		}
 	}
 
+	/**
+	 * R27 review 5: a DATA-DIR/tmp, or a given -Djava.io.tmpdir under DATA-DIR, that is a symlink to a shared directory
+	 * is not the node's own: the copies of the RocksDB library in it may be another JVM's, between extracting and loading,
+	 * and are not deleted. The library is still extracted there (the node's copy is the only new one).
+	 */
+	@Test
+	void aSymlinkedTemporaryDirectoryIsNotCleaned() throws Exception {
+		for (boolean explicit : new boolean[] {false, true}) {
+			var dataDir = Files.createDirectories(tempDir.resolve(explicit ? "symlink-given" : "symlink-node"));
+			var shared = Files.createDirectories(tempDir.resolve(explicit ? "shared-given" : "shared-node"));
+			var othersCopy = Files.writeString(shared.resolve("librocksdbjni333.so"), "another JVM's, being loaded");
+			Path given;
+			if (explicit) {
+				given = Files.createSymbolicLink(dataDir.resolve("jtmp"), shared);
+			} else {
+				Files.createSymbolicLink(dataDir.resolve("tmp"), shared);
+				given = Files.createDirectories(tempDir.resolve("jdk-tmp-symlink"));
+			}
+			var command = List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+					"-cp", System.getProperty("java.class.path"),
+					"-Djava.io.tmpdir=" + given,
+					LoadLibrary.class.getName(), dataDir.toString(), given.toString(), String.valueOf(explicit));
+			var process = new ProcessBuilder(command).redirectErrorStream(true).start();
+			var output = new String(process.getInputStream().readAllBytes());
+			assertTrue(process.waitFor(60, TimeUnit.SECONDS));
+			assertEquals(0, process.exitValue(), output);
+			assertTrue(Files.exists(othersCopy), "a copy in a shared directory behind a symlink was deleted: " + output);
+			assertTrue(output.contains("node: [librocksdbjni"), output);
+		}
+	}
+
 	/** Run by {@link #theRocksDbLibraryIsExtractedIntoTheDataDirectory} in its own JVM, where RocksDB is not loaded. */
 	public static final class LoadLibrary {
 		public static void main(String[] args) throws Exception {
