@@ -430,6 +430,30 @@ class StartupChecksTest {
 		assertFalse(Files.exists(tempDir.resolve("node/db")), "it started anyway");
 	}
 
+	/**
+	 * R28 review 3: a malformed value of {@code run} (a number that is not one, an {@code --election-timeout-ms} without
+	 * MIN:MAX, a value that the node's configuration refuses, a malformed {@code --peer}) is wrong usage, exit 2 with the
+	 * usage, like an unknown option, and not a stack trace with 1. Short JVMs that exit at once.
+	 */
+	@Test
+	void runRefusesMalformedValuesWithTwo() throws Exception {
+		for (var bad : List.of(List.of("--snapshot-every", "often"), List.of("--election-timeout-ms", "1000"),
+				List.of("--parallel-apply-threads", "1"), List.of("--peer", "b=nowhere"))) {
+			var command = new java.util.ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+					"-cp", System.getProperty("java.class.path"),
+					"-Djava.io.tmpdir=" + tempDir, "-XX:+ExitOnOutOfMemoryError",
+					ReplicatedServerMain.class.getName(), "run", "--node-id", "a",
+					"--peer", "a=127.0.0.1:1/127.0.0.1:2", "--data-dir", tempDir.resolve("node").toString()));
+			command.addAll(bad);
+			var process = new ProcessBuilder(command).redirectErrorStream(true).start();
+			var output = new String(process.getInputStream().readAllBytes());
+			assertTrue(process.waitFor(60, TimeUnit.SECONDS));
+			assertEquals(2, process.exitValue(), bad + ": " + output);
+			assertTrue(output.contains("Usage:"), bad + ": " + output);
+			assertFalse(Files.exists(tempDir.resolve("node/db")), "it started anyway");
+		}
+	}
+
 	private static void copy(Path source, Path target) throws IOException {
 		try (Stream<Path> walk = Files.walk(source)) {
 			for (Path path : walk.toList()) {

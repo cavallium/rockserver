@@ -649,7 +649,7 @@ public final class ReplicatedServerMain {
 				}
 				try {
 					var reply = ReplicaOps.call(peer.raftAddress(), groupId, op, payload,
-							min(remaining(deadlineNanos), PROPOSE_ANSWER_TIMEOUT)).join();
+							proposalWait(idempotent, remaining(deadlineNanos))).join();
 					return ByteBuffer.wrap(reply).getLong();
 				} catch (CompletionException ex) {
 					var status = Status.fromThrowable(ex.getCause());
@@ -694,6 +694,11 @@ public final class ReplicatedServerMain {
 			var status = Status.fromThrowable(ex.getCause());
 			return status.getCode() == Status.Code.UNIMPLEMENTED ? null : "did not answer (" + status + ")";
 		}
+	}
+
+	/** How long {@link #proposeOp} waits for the answer of a member that took a proposal, with {@code remaining} left. */
+	static Duration proposalWait(boolean idempotent, Duration remaining) {
+		return min(remaining, PROPOSE_ANSWER_TIMEOUT);
 	}
 
 	private static Duration min(Duration a, Duration b) {

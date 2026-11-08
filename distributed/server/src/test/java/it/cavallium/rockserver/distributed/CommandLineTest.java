@@ -377,7 +377,40 @@ class CommandLineTest {
 				assertTrue(checksum.out().contains(id + ": DONE"), checksum.toString());
 			}
 			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, checksum.code(), checksum.toString());
+
+			// R28 review 1: with a time limit no longer than the question's own 3 s, the silent member asked first
+			// used up the whole limit, and the command ended "no member took the request" without asking the healthy
+			// ones; it also ran up to 3 s past the limit. The members are asked at once, within the time left.
+			var shortLimit = new ArrayList<>(args.subList(0, args.size() - 1));
+			shortLimit.add("2500");
+			long start = System.nanoTime();
+			var shortBackup = run(with(shortLimit, "backup", "b4"));
+			long backupMillis = (System.nanoTime() - start) / 1_000_000;
+			assertTrue(shortBackup.out().contains("backup b4 at log index"), shortBackup.toString());
+			assertTrue(backupMillis < 4_500, "backup took " + backupMillis + " ms with --timeout-ms 2500");
+			start = System.nanoTime();
+			var shortChecksum = run(with(shortLimit, "checksum"));
+			long checksumMillis = (System.nanoTime() - start) / 1_000_000;
+			assertTrue(shortChecksum.out().contains("checksum at log index"), shortChecksum.toString());
+			assertTrue(checksumMillis < 4_500, "checksum took " + checksumMillis + " ms with --timeout-ms 2500");
 		}
+	}
+
+	/**
+	 * R28 review 2: a proposal that a member took waits for that member's answer as long as the admin time limit allows
+	 * when it is not idempotent ({@code checksum}): cutting it short leaves open whether the entry commits (exit 4, and
+	 * "run it again" would start a second full-database digest), and the member bounds it itself with its own
+	 * {@code --request-timeout-ms}, which the command does not know. Only an idempotent one ({@code backup}, by its
+	 * request id) is cut after {@link ReplicatedServerMain#PROPOSE_ANSWER_TIMEOUT} and goes to the next member.
+	 */
+	@Test
+	void onlyAnIdempotentProposalIsCutShortPerMember() {
+		var hour = Duration.ofHours(1);
+		assertEquals(hour, ReplicatedServerMain.proposalWait(false, hour));
+		assertEquals(ReplicatedServerMain.PROPOSE_ANSWER_TIMEOUT, ReplicatedServerMain.proposalWait(true, hour));
+		var second = Duration.ofSeconds(1);
+		assertEquals(second, ReplicatedServerMain.proposalWait(true, second));
+		assertEquals(second, ReplicatedServerMain.proposalWait(false, second));
 	}
 
 	/**
@@ -407,7 +440,8 @@ class CommandLineTest {
 
 	/**
 	 * R28-3: {@code admin} refuses an option it does not know (a misspelled {@code --timout-ms} ran with the 10-minute
-	 * default, and swallowed the next word) and an option of another command ({@code --allow-skipped} is checksum's), and
+	 * default, and swallowed the next word) and an option of another command ({@code --allow-skipped} is checksum's,
+ * {@code --unsafe-multi-voter-change} add-peer's and remove-peer's), and
 	 * a malformed value ({@code --timeout-ms}, {@code --peer}, {@code --group-id}, the index of backup-status) is wrong
 	 * usage too: exit 2 with the usage, not a stack trace with exit 1.
 	 */
@@ -420,6 +454,10 @@ class CommandLineTest {
 		var otherCommands = run(with(peer, "--allow-skipped", "status"));
 		assertEquals(2, otherCommands.code(), otherCommands.toString());
 		assertTrue(otherCommands.err().contains("--allow-skipped"), otherCommands.err());
+		// R28 review 5: add-peer's and remove-peer's flag is refused with the other commands too.
+		var unsafeElsewhere = run(with(peer, "--unsafe-multi-voter-change", "status"));
+		assertEquals(2, unsafeElsewhere.code(), unsafeElsewhere.toString());
+		assertTrue(unsafeElsewhere.err().contains("--unsafe-multi-voter-change"), unsafeElsewhere.err());
 		var badTimeout = run(with(peer, "--timeout-ms", "soon", "status"));
 		assertEquals(2, badTimeout.code(), badTimeout.toString());
 		var badGroup = run(with(peer, "--group-id", "nope", "status"));
@@ -429,7 +467,7 @@ class CommandLineTest {
 		var badIndex = run(with(peer, "--timeout-ms", "1000",
 				"backup-status", "b1", "latest"));
 		assertEquals(2, badIndex.code(), badIndex.toString());
-		for (var refused : List.of(misspelled, otherCommands, badTimeout, badGroup, badPeer, badIndex)) {
+		for (var refused : List.of(misspelled, otherCommands, unsafeElsewhere, badTimeout, badGroup, badPeer, badIndex)) {
 			assertTrue(refused.thrown() == null, refused.toString());
 			assertTrue(refused.err().contains("Usage:"), refused.err());
 		}

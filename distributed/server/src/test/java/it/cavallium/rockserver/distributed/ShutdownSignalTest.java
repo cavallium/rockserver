@@ -151,7 +151,8 @@ class ShutdownSignalTest {
 	 * R28-4: a SIGTERM while {@code run} is still starting its node (opening RocksDB, loading the Raft log, checking its
 	 * membership) is not lost. The shutdown hook is registered before the start: it waits for the start to end, then
 	 * stops the node it returned, as for a running node. Before, the hook was registered only after the start, so the
-	 * JVM exited with RocksDB and Ratis open, whose destructors can hang it until systemd's SIGKILL.
+	 * JVM exited with RocksDB and Ratis open, whose destructors can hang it until systemd's SIGKILL. Nor does a node
+	 * that the signal stops print {@code READY} (R28 review 4).
 	 */
 	@Test
 	void aSignalDuringTheStartWaitsForItAndStopsTheNode() throws Exception {
@@ -180,6 +181,9 @@ class ShutdownSignalTest {
 			release.join();
 			return node;
 		};
+		var oldOut = System.out;
+		var out = new java.io.ByteArrayOutputStream();
+		System.setOut(new java.io.PrintStream(out, true, java.nio.charset.StandardCharsets.UTF_8));
 		try {
 			var main = Thread.ofPlatform().daemon(true).name("test-run").start(() -> {
 				try {
@@ -208,7 +212,11 @@ class ShutdownSignalTest {
 			assertFalse(main.isAlive(), "run ends once its node stopped");
 			assertNull(exited.get(), "a stop by the signal is not a failure");
 			assertNull(halted.get(), "a stop by the signal is not a failure");
+			// R28 review 4: a node that the signal is already stopping does not announce itself ready.
+			var printed = out.toString(java.nio.charset.StandardCharsets.UTF_8);
+			assertFalse(printed.contains("READY " + node.config().nodeId()), printed);
 		} finally {
+			System.setOut(oldOut);
 			release.complete(null);
 			ReplicatedServerMain.exiter = previousExiter;
 			ReplicatedServerMain.halter = previousHalter;
