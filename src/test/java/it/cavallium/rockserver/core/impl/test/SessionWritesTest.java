@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.impl.test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -571,6 +572,57 @@ class SessionWritesTest {
 		opening.complete(3L);
 		assertEquals("ok", opener.get(5, TimeUnit.SECONDS));
 		assertEquals(1, sent.get(), "only the opener's copy");
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R27 review 2: a write re-issued after its first copy was refused {@code SESSION_EXPIRED} (not applied), which then
+	 * joins the new session another write is opening with a longer deadline, is still bounded by its own deadline, and
+	 * still not applied: the refused copy did not run. Before, the joiner's timer saw that a copy had been sent and let
+	 * it wait for the opener's deadline.
+	 */
+	@Test
+	void aWriteReissuedAfterAnExpiredSessionThatJoinsAnOpeningEndsAtItsOwnDeadlineNotApplied() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opens = new AtomicInteger();
+		var secondOpening = new CompletableFuture<Long>();
+		var copies = Collections.synchronizedList(new ArrayList<CompletableFuture<Object>>());
+		var writes = new Writes(_ -> opens.incrementAndGet() == 1 ? CompletableFuture.completedFuture(3L) : secondOpening,
+				(_, _) -> {
+					var copy = new CompletableFuture<Object>();
+					copies.add(copy);
+					return copy;
+				}, executor);
+		var opener = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		var shortWrite = writes.send(RequestContext.latency(Duration.ofMillis(400)), put(0));
+		long start = System.nanoTime();
+		while (copies.size() < 2 && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5)) {
+			Thread.sleep(5);
+		}
+		assertEquals(2, copies.size(), "both first copies sent in session 3");
+		// The long write meets the expiry first: it opens the new session, which stays pending under its 30 s.
+		copies.get(0).completeExceptionally(RocksDBException.notApplied(RocksDBErrorType.SESSION_EXPIRED,
+				expired().getMessage()));
+		while (opens.get() < 2 && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5)) {
+			Thread.sleep(5);
+		}
+		assertEquals(2, opens.get(), "the long write opens the new session");
+		// The short write's copy is refused too: it is re-issued and joins that opening.
+		copies.get(1).completeExceptionally(expired());
+		var error = assertThrows(ExecutionException.class, () -> shortWrite.get(5, TimeUnit.SECONDS));
+		long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		assertTrue(tookMs < 2_000, "the re-issued write waited " + tookMs + " ms");
+		assertTrue(rocks(error).isNotApplied(), "only a refused copy was sent: not applied, "
+				+ rocks(error).getErrorUniqueId() + ": " + rocks(error).getMessage());
+		assertNotEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId());
+		assertFalse(opener.isDone(), "the opener has its own deadline");
+		secondOpening.complete(4L);
+		while (copies.size() < 3 && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5)) {
+			Thread.sleep(5);
+		}
+		assertEquals(3, copies.size(), "only the opener sends again");
+		copies.get(2).complete("ok");
+		assertEquals("ok", opener.get(5, TimeUnit.SECONDS));
 		executor.shutdownNow();
 	}
 
