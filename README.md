@@ -250,7 +250,8 @@ without it) and preferably without `-Djava.io.tmpdir` (`run` extracts the RocksD
 it deletes the copies that killed runs leave, in either case), and see "Heap" there for the heap that a snapshot send
 needs. `admin status` asks the members at once and waits for their answers up to 3 s in all, so a member that is down
 prints `unreachable` without holding the others (closing its connections may take about 5 s more after the output);
-`admin checksum` and `admin backup` skip a member that does not answer within 3 s and propose through the next one, and
+`admin checksum` and `admin backup` ask the members at once and propose through one that answers (within 3 s, or the
+time left of `--timeout-ms`), and
 exit with 4 ("incomplete, run it again") when no member took the request in time. A removed node that is started again exits
 with 4 once a majority of the current configuration's members can confirm its removal; until they answer (they are
 down, unreachable, or of an older version) it prints `READY` and waits outside the cluster, serving nothing; it

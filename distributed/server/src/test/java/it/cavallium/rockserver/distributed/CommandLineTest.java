@@ -354,6 +354,10 @@ class CommandLineTest {
 	void aSilentMemberListedFirstDoesNotHoldAProposalForTheTimeLimit() throws Exception {
 		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("silent")), 3, c -> c).startAll();
 		cluster.awaitLeader(TIMEOUT);
+		// Every member applied the cluster version: the proposal goes to the member that answers first, and one that
+		// has not applied it yet refuses backup and checksum.
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node ->
+				Capabilities.has(node.stateMachine().ops().clusterVersion(), Capabilities.BACKUP)));
 		try (var silent = new java.net.ServerSocket(0)) {
 			var args = new ArrayList<String>(List.of("admin",
 					"--peer", "d1=127.0.0.1:" + silent.getLocalPort() + "/127.0.0.1:" + silent.getLocalPort()));
