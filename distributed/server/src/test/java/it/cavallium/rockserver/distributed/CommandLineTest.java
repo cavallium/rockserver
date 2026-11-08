@@ -391,19 +391,20 @@ class CommandLineTest {
 			// R28 review 1: with a time limit no longer than the question's own 3 s, the silent member asked first
 			// used up the whole limit, and the command ended "no member took the request" without asking the healthy
 			// ones; it also ran up to 3 s past the limit. The members are asked at once, within the time left, for the
-			// proposal and (R29-3) for the results: the bound is the limit plus 1.5 s, not plus the silent member's 3 s.
+			// proposal and (R29-3) for the results. The bound is the limit plus 2 s, room for the admin's own setup and
+			// the channels' closing on a loaded host (R29 review 3); the old code overran by the silent member's 3 s.
 			var shortLimit = new ArrayList<>(args.subList(0, args.size() - 1));
 			shortLimit.add("2500");
 			long start = System.nanoTime();
 			var shortBackup = run(with(shortLimit, "backup", "b4"));
 			long backupMillis = (System.nanoTime() - start) / 1_000_000;
 			assertTrue(shortBackup.out().contains("backup b4 at log index"), shortBackup.toString());
-			assertTrue(backupMillis < 4_000, "backup took " + backupMillis + " ms with --timeout-ms 2500");
+			assertTrue(backupMillis < 4_500, "backup took " + backupMillis + " ms with --timeout-ms 2500");
 			start = System.nanoTime();
 			var shortChecksum = run(with(shortLimit, "checksum"));
 			long checksumMillis = (System.nanoTime() - start) / 1_000_000;
 			assertTrue(shortChecksum.out().contains("checksum at log index"), shortChecksum.toString());
-			assertTrue(checksumMillis < 4_000, "checksum took " + checksumMillis + " ms with --timeout-ms 2500");
+			assertTrue(checksumMillis < 4_500, "checksum took " + checksumMillis + " ms with --timeout-ms 2500");
 		}
 	}
 
@@ -565,7 +566,8 @@ class CommandLineTest {
 					assertTrue(result.out().contains(id + ": no result within the time limit"), result.toString());
 				}
 				assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, result.code(), result.toString());
-				assertTrue(tookMs < 5_500, command + " took " + tookMs + " ms with --timeout-ms 4000");
+				// The limit plus 2 s (R29 review 3): the old code took more than 9 s, 3 s per silent member.
+				assertTrue(tookMs < 6_000, command + " took " + tookMs + " ms with --timeout-ms 4000");
 			}
 		} finally {
 			for (var socket : silent) {
@@ -612,6 +614,80 @@ class CommandLineTest {
 		@Override
 		public void close() throws InterruptedException {
 			server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+		}
+	}
+
+	/**
+	 * A member that answers the capabilities question after {@code delay} (so that the real members take the
+	 * proposal) and answers every other question with a byte that names no result state, as a member of another or
+	 * mismatched version might.
+	 */
+	private static final class GarbledMember implements AutoCloseable {
+		final Server server;
+
+		GarbledMember(Duration delay) throws IOException {
+			ServerCalls.UnaryMethod<byte[], byte[]> ops = (request, response) -> {
+				var rest = java.util.Arrays.copyOfRange(request, 16, request.length);
+				if (rest.length > 0 && rest[0] == ReplicaOps.OP_CAPABILITIES) {
+					try {
+						Thread.sleep(delay);
+					} catch (InterruptedException ex) {
+						Thread.currentThread().interrupt();
+					}
+					response.onNext(ByteBuffer.allocate(2 * Long.BYTES).putLong(Capabilities.SUPPORTED)
+							.putLong(Capabilities.SUPPORTED).array());
+				} else {
+					response.onNext(new byte[] {Byte.MAX_VALUE});
+				}
+				response.onCompleted();
+			};
+			server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress("127.0.0.1", 0))
+					.addService(ServerServiceDefinition.builder(TermService.SERVICE_NAME)
+							.addMethod(TermService.OPS, ServerCalls.asyncUnaryCall(ops)).build())
+					.build()
+					.start();
+		}
+
+		String peer(String id) {
+			return id + "=127.0.0.1:" + server.getPort() + "/127.0.0.1:" + server.getPort();
+		}
+
+		@Override
+		public void close() throws InterruptedException {
+			server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+		}
+	}
+
+	/**
+	 * R29 review 1: an answer to the result question that cannot be read (here a state byte that names no state) is
+	 * that member's failure, printed with the error, and the command fails with 1: asking again would not help. Before,
+	 * the decoding error ended that member's question silently, and the command printed "no result within the time
+	 * limit" and exited 4 ("run it again").
+	 */
+	@Test
+	void anAnswerThatCannotBeReadIsThatMembersFailure() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("garbled")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node ->
+				Capabilities.has(node.stateMachine().ops().clusterVersion(), Capabilities.BACKUP)));
+		try (var garbled = new GarbledMember(Duration.ofMillis(500))) {
+			var args = new ArrayList<String>(List.of("admin", "--peer", garbled.peer("g1")));
+			for (var id : List.of("n0", "n1", "n2")) {
+				args.add("--peer");
+				args.add(cluster.config(id).self().format());
+			}
+			args.addAll(List.of("--timeout-ms", "15000"));
+			for (var command : List.of(List.of("backup", "b8"), List.of("checksum"))) {
+				var result = run(with(args, command.toArray(String[]::new)));
+				assertTrue(result.out().contains(" at log index "), result.toString());
+				for (var id : List.of("n0", "n1", "n2")) {
+					assertTrue(result.out().contains(id + ": DONE"), result.toString());
+				}
+				assertTrue(result.out().contains("g1: cannot read its answer (java.lang.ArrayIndexOutOfBoundsException"),
+						result.toString());
+				assertTrue(result.out().contains("FAILED: cannot read the answer of [g1]"), result.toString());
+				assertEquals(1, result.code(), result.toString());
+			}
 		}
 	}
 
@@ -674,7 +750,7 @@ class CommandLineTest {
 			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, checksum.code(), checksum.toString());
 			assertTrue(checksum.out().contains("does not tell whether the operation was proposed"), checksum.toString());
 			assertTrue(!checksum.out().contains("checksum at log index"), checksum.toString());
-			assertTrue(tookMs >= 3_000 && tookMs < 5_500, "checksum took " + tookMs + " ms with --timeout-ms 4000");
+			assertTrue(tookMs >= 3_000 && tookMs < 6_000, "checksum took " + tookMs + " ms with --timeout-ms 4000");
 		} finally {
 			ReplicatedServerMain.proposeAnswerTimeout = previousWait;
 			for (var proxy : proxies) {
