@@ -82,7 +82,9 @@ import org.rocksdb.NativeLibraryLoader;
  * {@code <data-dir>/backups/NAME}; it prints where each member wrote it, and prints {@code OK} only if every member of
  * {@code --peer} wrote it; it exits with 1 if a member failed and with 4 if a member gave no result in time, or no
  * member took the request in time. Both ask the members at once and propose through one that answers, so that a
- * frozen member listed first does not hold them (see {@code proposeOp}).
+ * frozen member listed first does not hold them (see {@code proposeOp}), and then ask every member for its result at
+ * once, each within the time left (see {@code awaitResults}), so that they end within {@code --timeout-ms}. A node on
+ * which a backup fails deletes what it wrote of it.
  * {@code backup-status NAME INDEX} asks the members again about that backup ({@code INDEX} is the log index that
  * {@code backup} printed), without proposing anything, with the same output and exit codes. {@code restore-backup} prepares an empty data directory to seed a new cluster from such a backup. See
  * {@link ReplicaOps} and {@code docs/distributed/runbooks.md}.</p>
@@ -90,7 +92,8 @@ import org.rocksdb.NativeLibraryLoader;
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
  * (leadership hand-off) on SIGTERM, also one that comes while the node is still starting: the stop then waits for the
  * start (see {@code startAndServe}), and a node so stopped prints no {@code READY}. A malformed or refused option
- * value exits with 2, like an unknown option. Any failure of the start exits with 1, unless it has a code of its own
+ * value exits with 2, like an unknown option or a word that is no option's value (a flag given a value, such as
+ * {@code --join false}): so do the other commands. Any failure of the start exits with 1, unless it has a code of its own
  * below. For {@code add-peer} the new member must already run, with the new peer list and
  * with {@code --join}, however long before the {@code add-peer}. It exits with 3 if its replica failed or its Raft server
  * closed, so that a supervisor notices. {@code repair-log} runs on a stopped node, after a power loss left it unable to read its Raft log: see
@@ -118,7 +121,8 @@ import org.rocksdb.NativeLibraryLoader;
  * <p>{@code export-seed} runs on a stopped node and copies its database into a new directory that can seed a new
  * cluster, the last resort of "No quorum" in the design document (see {@link NodeStore#exportSeed}).</p>
  *
- * <p>{@code admin} refuses an option it does not know, or a malformed value, with exit code 2. Its changes end with
+ * <p>{@code admin} refuses an option it does not know, a malformed value (a malformed {@code add-peer} argument
+ * included), or a word its command does not take, with exit code 2. Its changes end with
  * {@code OK}, or with {@code FAILED: ...} and exit code 1, within {@code --timeout-ms}
  * (10 minutes by default), which must cover the catch-up of a new member. A leader that started a change goes on with it
  * after that: see {@code status}, and run the command again. {@code add-peer} first reads the leader's configuration:
