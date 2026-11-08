@@ -53,7 +53,8 @@ import reactor.core.publisher.Mono;
  * ({@link #RETRY_WINDOW_PROPERTY} for a caller without one). The server applies a numbered write at most once and
  * answers every copy with the first result. The caller gets {@code OUTCOME_UNKNOWN} only when the deadline came
  * before an answer settled it. No copy is sent once the deadline or the window has passed, the first one included: a
- * write whose session opens later ends {@code READ_DEADLINE_EXCEEDED} flagged
+ * write still waiting for its session then ends {@code SERVER_OVERLOADED} (below), one whose session came but whose
+ * copy found the deadline over ends {@code READ_DEADLINE_EXCEEDED}, both flagged
  * {@linkplain RocksDBException#isNotApplied() not applied}. A write that gets no session at all was never sent, and
  * ends flagged not applied too: with the opening's own error, or {@code SERVER_OVERLOADED} if the opening's outcome
  * was unknown, if the deadline passed before an opening was sent, if a caller without a deadline got no answer to its

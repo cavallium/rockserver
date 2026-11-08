@@ -653,7 +653,8 @@ class SessionWritesTest {
 
 	/**
 	 * An opening that ended "not applied" at the opener's deadline (the proposer still had it queued), or refused as
-	 * overloaded, does not end a write waiting for it with more time: that write opens again in its own time.
+	 * overloaded, does not end a write waiting for it with more time: that write opens again in its own time. The opener
+	 * itself ends at its own deadline, still waiting for its opening (R27-3): {@code SERVER_OVERLOADED}, not applied.
 	 */
 	@Test
 	void aSharedOpeningEndedByTheOpenersDeadlineOrOverloadIsOpenedAgain() throws Exception {
@@ -672,8 +673,9 @@ class SessionWritesTest {
 				"The request deadline came before the write was sent; it was not applied"));
 		assertEquals("ok", longWrite.get(5, TimeUnit.SECONDS));
 		var error = assertThrows(ExecutionException.class, () -> shortWrite.get(5, TimeUnit.SECONDS));
-		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks(error).getErrorUniqueId(),
-				"the opener, out of time, ends with its own deadline");
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId(),
+				"the opener, out of time, ends at its own deadline, not sent: " + rocks(error).getMessage());
+		assertTrue(rocks(error).isNotApplied(), "not sent: not applied");
 		assertEquals(3, opens.get(), "opened again after the deadline error, and again after the overload");
 		executor.shutdownNow();
 	}
@@ -724,8 +726,10 @@ class SessionWritesTest {
 
 	/**
 	 * R26-4: for a caller without a deadline the retry window bounds the copies too, not only the resends. A session
-	 * that opens after the window sends no copy: the write ends {@code READ_DEADLINE_EXCEEDED} flagged not applied,
-	 * where a copy sent then and lost would end {@code OUTCOME_UNKNOWN}. As in the Rust client (R20-1).
+	 * that opens after the window sends no copy: the write ends flagged not applied, where a copy sent then and lost
+	 * would end {@code OUTCOME_UNKNOWN}. As in the Rust client (R20-1). Since R27-3 it ends at the window itself, still
+	 * waiting for the other write's opening: {@code SERVER_OVERLOADED}, as Rust's {@code not_sent} for a joiner (it
+	 * was {@code READ_DEADLINE_EXCEEDED} when it waited for the session and then found the window over).
 	 */
 	@Test
 	void aSessionOpenedAfterTheWindowSendsNoCopyForACallerWithoutDeadline() throws Exception {
@@ -757,7 +761,7 @@ class SessionWritesTest {
 		var timed = writes.send(RequestContext.latency(Duration.ofSeconds(10)), put(0));
 		var error = assertThrows(ExecutionException.class,
 				() -> writes.send(RequestContext.batch(), put(0)).get(5, TimeUnit.SECONDS));
-		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, rocks(error).getErrorUniqueId());
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId(), rocks(error).getMessage());
 		assertTrue(rocks(error).isNotApplied(), "not sent: not applied");
 		assertEquals("ok", timed.get(5, TimeUnit.SECONDS));
 		assertEquals(1, sent.get(), "no copy after the window, only the timed caller's");

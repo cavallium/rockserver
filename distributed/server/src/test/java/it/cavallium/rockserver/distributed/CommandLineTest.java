@@ -328,9 +328,12 @@ class CommandLineTest {
 			long tookMs = (System.nanoTime() - start) / 1_000_000;
 			assertEquals(0, status.code(), status.toString());
 			assertTrue(tookMs < 15_000, "status took " + tookMs + " ms");
-			var lines = status.out().strip().lines().toList();
-			assertEquals(5, lines.size(), status.out());
+			// One entry per member, each starting with "<id>: " (the commit infos of an answer span several lines).
 			var order = List.of("d1", "d2", "n0", "n1", "n2");
+			var lines = status.out().strip().lines()
+					.filter(line -> order.stream().anyMatch(id -> line.startsWith(id + ": ")))
+					.toList();
+			assertEquals(5, lines.size(), status.out());
 			for (int i = 0; i < order.size(); i++) {
 				assertTrue(lines.get(i).startsWith(order.get(i) + ": "), status.out());
 			}
