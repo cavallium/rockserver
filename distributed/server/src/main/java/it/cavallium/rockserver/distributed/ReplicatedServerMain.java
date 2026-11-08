@@ -247,39 +247,68 @@ public final class ReplicatedServerMain {
 
 	static volatile NodeStarter starter = ReplicatedNode::start;
 
-	/** The rest of {@code run} once its options are read: starts the node, then {@link #serve}s it. */
+	/**
+	 * The rest of {@code run} once its options are read: registers the shutdown hook, starts the node, then waits until
+	 * it stops ({@link #awaitStop}).
+	 *
+	 * <p>The hook is registered before the start (R28-4): a SIGTERM while the node is still starting (opening RocksDB,
+	 * loading the Raft log, checking its membership at start, which can take minutes for a large node) makes the hook
+	 * wait for the start to end, and then stop the node it returned, as a running one. Without it, the JVM would exit with
+	 * RocksDB and Ratis open, whose destructors can hang it until the supervisor kills it (see
+	 * {@code ReplicatedNode.awaitDatabaseClosed}). A start that fails, also because the shutdown under way refuses what
+	 * it registers, closes what it opened itself, and the hook has nothing to stop.</p>
+	 *
+	 * <p>Any failure of the start ends {@code run} with its exit code, an {@link Error} too (R28-5): Ratis and gRPC leave
+	 * non-daemon threads behind, which would keep the JVM running without a node, and a supervisor restarts only a
+	 * process that ended.</p>
+	 */
 	static void startAndServe(NodeConfig config, @Nullable DirectMemoryWatch directMemoryWatch) {
+		var started = new CompletableFuture<@Nullable ReplicatedNode>();
+		registerShutdownHook(config.nodeId(), started);
 		ReplicatedNode node;
 		try {
 			node = starter.start(config);
 		} catch (ReplicatedNode.RemovedException e) {
+			started.complete(null);
 			System.err.println("Node " + config.nodeId() + " does not start: " + e.getMessage());
 			exit(4);
 			return;
 		} catch (ReplicatedNode.NewerVersionException e) {
+			started.complete(null);
 			System.err.println("Node " + config.nodeId() + " does not start: " + e.getMessage());
 			exit(5);
 			return;
-		} catch (IOException | RuntimeException e) {
-			// Ratis and gRPC leave non-daemon threads behind, which would keep the JVM running without a node.
+		} catch (Throwable e) {
+			// Completed first: the exit runs the hook, which waits for it.
+			started.complete(null);
 			System.err.println("Failed to start node " + config.nodeId() + ":");
 			e.printStackTrace();
 			exit(1);
 			return;
 		}
-		serve(node, directMemoryWatch);
+		started.complete(node);
+		awaitStop(node, directMemoryWatch);
 	}
 
 	/**
-	 * The rest of {@code run} once the node started: registers the shutdown hook, then waits until the node stops and
-	 * exits with {@link #failedExitStatus} if it failed. The main thread's {@code exit} is a {@link System#exit}, which runs
-	 * the hook, and the hook ends with {@link Runtime#halt}: so both give the same status, or the hook's 3 would replace
-	 * the 4 of a node that found out it was removed and the 5 of a replica that met a newer cluster version
-	 * ({@code RestartPreventExitStatus=4 5} relies on those).
+	 * The rest of {@code run} once the node started, for a node started elsewhere (tests): registers the shutdown hook,
+	 * then {@link #awaitStop}.
 	 */
 	static void serve(ReplicatedNode node, @Nullable DirectMemoryWatch directMemoryWatch) {
-		var nodeId = node.config().nodeId();
+		registerShutdownHook(node.config().nodeId(), CompletableFuture.completedFuture(node));
+		awaitStop(node, directMemoryWatch);
+	}
+
+	/**
+	 * Registers the shutdown hook of {@code run}: it waits until {@code started} completes, with the node that started
+	 * (null if the start failed: nothing to stop), and stops that node ({@link #closeOnSignal}).
+	 */
+	private static void registerShutdownHook(String nodeId, CompletableFuture<@Nullable ReplicatedNode> started) {
 		shutdownHooks.accept(new Thread(() -> {
+			var node = started.join();
+			if (node == null) {
+				return;
+			}
 			int status = closeOnSignal(node);
 			// A replica failure that raced the signal: its own stop found the node already closing, so the main thread
 			// below saw a normal stop, and the JVM would exit with the signal's status. Exit with the failure's.
@@ -290,6 +319,17 @@ public final class ReplicatedServerMain {
 				halter.accept(status);
 			}
 		}, "rockserver-shutdown"));
+	}
+
+	/**
+	 * Prints {@code READY}, then waits until the node stops and exits with {@link #failedExitStatus} if it failed. The
+	 * main thread's {@code exit} is a {@link System#exit}, which runs the hook, and the hook ends with
+	 * {@link Runtime#halt}: so both give the same status, or the hook's 3 would replace the 4 of a node that found out
+	 * it was removed and the 5 of a replica that met a newer cluster version ({@code RestartPreventExitStatus=4 5}
+	 * relies on those).
+	 */
+	private static void awaitStop(ReplicatedNode node, @Nullable DirectMemoryWatch directMemoryWatch) {
+		var nodeId = node.config().nodeId();
 		System.out.println("READY " + nodeId);
 		System.out.flush();
 		var failure = node.stopped().join();
@@ -467,13 +507,18 @@ public final class ReplicatedServerMain {
 
 	private static void admin(Options options) throws IOException, InterruptedException {
 		var peers = options.peers();
-		var groupId = RaftGroupId.valueOf(UUID.fromString(options.value("--group-id", NodeConfig.DEFAULT_GROUP_ID)));
-		var timeout = Duration.ofMillis(Long.parseLong(options.value("--timeout-ms",
-				String.valueOf(DEFAULT_ADMIN_TIMEOUT.toMillis()))));
+		var groupId = RaftGroupId.valueOf(options.uuid("--group-id", NodeConfig.DEFAULT_GROUP_ID));
+		var timeout = Duration.ofMillis(options.longValue("--timeout-ms", DEFAULT_ADMIN_TIMEOUT.toMillis()));
 		boolean unsafe = options.flag(UNSAFE_MULTI_VOTER_CHANGE);
+		boolean allowSkipped = options.flag("--allow-skipped");
+		// A misspelled option would otherwise be ignored, with the word after it (R28-3).
+		options.requireConsumed();
 		var command = options.positional();
 		if (command.isEmpty()) {
 			usage("missing admin command");
+		}
+		if (allowSkipped && !command.getFirst().equals("checksum")) {
+			usage("--allow-skipped is an option of checksum only");
 		}
 		long deadline = System.nanoTime() + timeout.toNanos();
 		var group = RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList());
@@ -517,7 +562,6 @@ public final class ReplicatedServerMain {
 					yield attempt(timeout, () -> api.create(timeout.toMillis()));
 				}
 				case "checksum" -> {
-					boolean allowSkipped = options.flag("--allow-skipped");
 					if (command.size() != 1) {
 						usage("checksum takes no argument");
 					}
@@ -546,7 +590,14 @@ public final class ReplicatedServerMain {
 					if (command.size() != 3 || !ReplicaOps.validBackupName(command.get(1))) {
 						usage("backup-status takes a backup name and the log index that backup printed");
 					}
-					yield awaitBackup(peers, groupId, command.get(1), Long.parseLong(command.get(2)), deadline);
+					long index;
+					try {
+						index = Long.parseLong(command.get(2));
+					} catch (NumberFormatException ex) {
+						usage("backup-status takes the log index that backup printed, not " + command.get(2));
+						throw new AssertionError(ex);
+					}
+					yield awaitBackup(peers, groupId, command.get(1), index, deadline);
 				}
 				default -> {
 					usage("unknown admin command " + command.getFirst());
@@ -566,14 +617,34 @@ public final class ReplicatedServerMain {
 	 * Proposes a cluster operation through the first member that takes it; returns the log index of its entry. After an
 	 * answer that leaves open whether the entry was proposed (a timeout, a leader change), it tries again only if the
 	 * operation is {@code idempotent}: otherwise it fails and says so.
+	 *
+	 * <p>No member holds the command for the whole time limit (R28-1): each is first asked whether it answers at all
+	 * ({@link #answers}, within {@link #PEER_ANSWER_TIMEOUT}), and one that does not (down, frozen with its port still
+	 * accepting connections, not in the group) is skipped, with nothing proposed through it; the proposal itself waits
+	 * at most {@link #PROPOSE_ANSWER_TIMEOUT} per member. So a frozen member listed first in {@code --peer} costs a few
+	 * seconds per round, and the others get the request.</p>
+	 *
+	 * <p>Ends with {@link #EXIT_INCOMPLETE} (R28-2) when no member took the request within the time limit, or when the
+	 * answer of a non-idempotent one leaves open whether it was proposed: nothing was compared or written for sure, and
+	 * the command can be run again. A refusal (not every member supports the operation, an invalid argument) exits
+	 * with 1.</p>
 	 */
 	private static long proposeOp(List<PeerConfig> peers, RaftGroupId groupId, byte op, byte[] payload,
 			boolean idempotent, long deadlineNanos) throws InterruptedException {
 		while (true) {
 			String last = null;
 			for (PeerConfig peer : peers) {
+				if (System.nanoTime() - deadlineNanos > 0) {
+					break;
+				}
+				var silence = answers(peer, groupId);
+				if (silence != null) {
+					last = peer.id() + ": " + silence;
+					continue;
+				}
 				try {
-					var reply = ReplicaOps.call(peer.raftAddress(), groupId, op, payload, remaining(deadlineNanos)).join();
+					var reply = ReplicaOps.call(peer.raftAddress(), groupId, op, payload,
+							min(remaining(deadlineNanos), PROPOSE_ANSWER_TIMEOUT)).join();
 					return ByteBuffer.wrap(reply).getLong();
 				} catch (CompletionException ex) {
 					var status = Status.fromThrowable(ex.getCause());
@@ -582,17 +653,46 @@ public final class ReplicatedServerMain {
 						fail(peer.id() + " refused: " + status.getDescription());
 					}
 					if (!idempotent && !notProposed(status.getCode())) {
-						fail("the answer of " + peer.id() + " (" + status + ") does not tell whether the operation was"
-								+ " proposed: look for it in the logs of the members, or run the command again");
+						failIncomplete("the answer of " + peer.id() + " (" + status + ") does not tell whether the operation"
+								+ " was proposed: look for it in the logs of the members, or run the command again");
 					}
 					last = peer.id() + ": " + status;
 				}
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
-				fail("no member took the request within the time limit (--timeout-ms); last answer " + last);
+				failIncomplete("no member took the request within the time limit (--timeout-ms); last answer " + last
+						+ ". Nothing was proposed: run the command again");
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
 		}
+	}
+
+	/**
+	 * How long {@link #proposeOp} waits for one member's answer to a proposal, once that member answered
+	 * {@link #answers}: longer than a member takes to get it to a leader or to give up on it (the node's
+	 * {@code --request-timeout-ms}, 10 seconds by default, with an election), so that a healthy cluster answers within
+	 * it.
+	 */
+	static final Duration PROPOSE_ANSWER_TIMEOUT = Duration.ofSeconds(30);
+
+	/**
+	 * Null if {@code peer} answers a question that proposes nothing ({@link ReplicaOps#OP_CAPABILITIES}) within
+	 * {@link #PEER_ANSWER_TIMEOUT}, else why not. A member of a version without the question (UNIMPLEMENTED) answers.
+	 * A request to a member that did not answer it was never sent there, so skipping it is safe for any operation.
+	 */
+	private static @Nullable String answers(PeerConfig peer, RaftGroupId groupId) {
+		try {
+			ReplicaOps.call(peer.raftAddress(), groupId, ReplicaOps.OP_CAPABILITIES, new byte[0], PEER_ANSWER_TIMEOUT)
+					.join();
+			return null;
+		} catch (CompletionException ex) {
+			var status = Status.fromThrowable(ex.getCause());
+			return status.getCode() == Status.Code.UNIMPLEMENTED ? null : "did not answer (" + status + ")";
+		}
+	}
+
+	private static Duration min(Duration a, Duration b) {
+		return a.compareTo(b) <= 0 ? a : b;
 	}
 
 	/**
@@ -1129,6 +1229,12 @@ public final class ReplicatedServerMain {
 		exit(1);
 	}
 
+	/** Ends a {@code checksum} or {@code backup} that did not happen for sure, with {@link #EXIT_INCOMPLETE}. */
+	private static void failIncomplete(String message) {
+		System.out.println("FAILED: " + message);
+		exit(EXIT_INCOMPLETE);
+	}
+
 	/**
 	 * Fails the command if {@code added} does not run or holds a log of its own. It then waits until every member that
 	 * answers has applied the genesis entry and, on a seeded cluster, holds a snapshot, which it takes right after: a new
@@ -1320,6 +1426,31 @@ public final class ReplicatedServerMain {
 			return result != null ? result : fallback;
 		}
 
+		/** The value of {@code name} as a number, {@code fallback} if not given; a value that is not one is wrong usage. */
+		long longValue(String name, long fallback) {
+			var result = value(name);
+			if (result == null) {
+				return fallback;
+			}
+			try {
+				return Long.parseLong(result);
+			} catch (NumberFormatException ex) {
+				usage("invalid value for " + name + ": " + result + " (not a number)");
+				throw new AssertionError(ex);
+			}
+		}
+
+		/** The value of {@code name} as a UUID, {@code fallback} if not given; a value that is not one is wrong usage. */
+		UUID uuid(String name, String fallback) {
+			var result = value(name, fallback);
+			try {
+				return UUID.fromString(result);
+			} catch (IllegalArgumentException ex) {
+				usage("invalid value for " + name + ": " + result + " (not a UUID)");
+				throw new AssertionError(ex);
+			}
+		}
+
 		boolean flag(String name) {
 			return value(name) != null;
 		}
@@ -1334,7 +1465,14 @@ public final class ReplicatedServerMain {
 
 		List<PeerConfig> peers() {
 			consumed.add("--peer");
-			var peers = pairs.stream().filter(p -> p[0].equals("--peer")).map(p -> PeerConfig.parse(p[1])).toList();
+			var peers = pairs.stream().filter(p -> p[0].equals("--peer")).map(p -> {
+				try {
+					return PeerConfig.parse(p[1]);
+				} catch (IllegalArgumentException ex) {
+					usage("invalid --peer " + p[1] + ": " + ex.getMessage());
+					throw new AssertionError(ex);
+				}
+			}).toList();
 			if (peers.isEmpty()) {
 				usage("at least one --peer is required");
 			}
