@@ -207,7 +207,7 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
-	 * Writes the config the replica opens its database with to a new temporary file: {@link #REPLICA_OVERRIDES} over
+	 * Writes the config the replica opens its database with to {@link #replicaConfigFile}: {@link #REPLICA_OVERRIDES} over
 	 * the given Rockserver config (HOCON), or over the defaults when there is none.
 	 */
 	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, String nodeId) throws IOException {
@@ -259,21 +259,31 @@ final class NodeStore implements Closeable {
 	 * process killed while the database opens (WAL replay, a large MANIFEST: the file is deleted only once it opened)
 	 * leaves at most one, which the next open of that database replaces and deletes (R29-2). A random name left one per
 	 * killed start, for good.
+	 *
+	 * <p>The name is {@code rockserver-replica-for-<db dir name>.conf}: the {@code for-} keeps it out of
+	 * {@link #LEGACY_REPLICA_CONFIG} whatever the directory is called, so that {@link #deleteLeftConfigs} never takes
+	 * the config of a database being opened or exported for a leftover, even when the directory's name is all digits
+	 * (R30-1: {@code rockserver-replica-<db dir name>.conf} did, and deleted an export target's config).
 	 */
 	static Path replicaConfigFile(Path dbDir) {
 		Path db = dbDir.toAbsolutePath().normalize();
-		return db.resolveSibling(REPLICA_CONFIG_PREFIX + db.getFileName() + ".conf");
+		return db.resolveSibling(REPLICA_CONFIG_PREFIX + "for-" + db.getFileName() + ".conf");
 	}
 
 	private static final String REPLICA_CONFIG_PREFIX = "rockserver-replica-";
-	/** The config files that older versions made with a random name ({@code Files.createTempFile}). */
+	/**
+	 * The config files that released versions made with a random name ({@code Files.createTempFile} with prefix
+	 * {@code rockserver-replica-} and suffix {@code .conf}: digits only in between). No {@link #replicaConfigFile}
+	 * matches it.
+	 */
 	private static final java.util.regex.Pattern LEGACY_REPLICA_CONFIG =
 			java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(REPLICA_CONFIG_PREFIX) + "[0-9]+\\.conf");
 
 	/**
-	 * Deletes from {@code dir} the randomly named config files that older versions' opens left there when the process
-	 * was killed during the open (R29-2). Only that name pattern: the config of another database in the same directory
-	 * (an {@code export-seed} target next to the source) has a name of its own and stays.
+	 * Deletes from {@code dir} the randomly named config files that released versions' opens left there when the
+	 * process was killed during the open (R29-2). Only that name pattern, which no {@link #replicaConfigFile} matches
+	 * (R30-1): the config of another database in the same directory (an {@code export-seed} target next to the source,
+	 * whatever its name) stays.
 	 */
 	private static void deleteLeftConfigs(@Nullable Path dir) throws IOException {
 		if (dir == null || !Files.isDirectory(dir)) {

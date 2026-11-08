@@ -794,4 +794,44 @@ class NodeStoreTest {
 					.filter(name -> name.startsWith("rockserver-replica-") && name.endsWith(".conf")).toList());
 		}
 	}
+
+	/**
+	 * R30-1: an {@code export-seed} target next to the source whose name is all digits (a date-named seed kept in
+	 * DATA-DIR so its files hard-link). Its config was named {@code rockserver-replica-<digits>.conf}, which the source's
+	 * open took for a config that an older version's killed open left, and deleted before the copy opened with it: the
+	 * export failed on every retry with that target.
+	 */
+	@Test
+	void anExportIntoAnAllDigitSiblingOfTheSourceWorks() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("node"));
+		Path source = dataDir.resolve("db");
+		try (var store = NodeStore.open(source, null, "source")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			put(store, column, 1, "v1");
+		}
+		Path target = dataDir.resolve("20261108");
+		NodeStore.exportSeed(source, null, target);
+		assertTrue(Files.isRegularFile(target.resolve("CURRENT")));
+		try (var files = Files.list(dataDir)) {
+			assertEquals(List.of(), files.map(path -> path.getFileName().toString())
+					.filter(name -> name.startsWith("rockserver-replica-")).toList());
+		}
+	}
+
+	/**
+	 * R30-1: the config of a database whose directory name is all digits, written for an open in progress, is not one
+	 * that an older version's killed open left: an open of another database in the same directory leaves it alone.
+	 */
+	@Test
+	void theConfigOfAnAllDigitDatabaseIsNotTakenForALeftover() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("node"));
+		Path inUse = NodeStore.replicaConfigFile(dataDir.resolve("20261108"));
+		Files.writeString(inUse, "{}");
+		Path legacy = Files.createTempFile(dataDir, "rockserver-replica-", ".conf");
+		try (var store = NodeStore.open(dataDir.resolve("db"), null, "n0")) {
+			assertNull(store.clusterId());
+		}
+		assertTrue(Files.exists(inUse), inUse + " was deleted");
+		assertFalse(Files.exists(legacy), legacy + " is still there");
+	}
 }
