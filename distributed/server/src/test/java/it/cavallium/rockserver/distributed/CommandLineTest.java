@@ -343,6 +343,98 @@ class CommandLineTest {
 		}
 	}
 
+	/**
+	 * R28-1: {@code admin checksum} and {@code backup} propose through the first member that takes the request, but a
+	 * member listed first that accepts connections and never answers (a frozen JVM, SIGSTOP) no longer holds the proposal
+	 * for the whole admin time limit: it is asked whether it answers at all, for a short time, and skipped. The healthy
+	 * members get the proposal and give their results; the silent one has none, so both end incomplete (exit 4).
+	 * Before, the proposal waited on it until the time limit and then failed, with no member asked.
+	 */
+	@Test
+	void aSilentMemberListedFirstDoesNotHoldAProposalForTheTimeLimit() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("silent")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		try (var silent = new java.net.ServerSocket(0)) {
+			var args = new ArrayList<String>(List.of("admin",
+					"--peer", "d1=127.0.0.1:" + silent.getLocalPort() + "/127.0.0.1:" + silent.getLocalPort()));
+			for (var id : List.of("n0", "n1", "n2")) {
+				args.add("--peer");
+				args.add(cluster.config(id).self().format());
+			}
+			args.addAll(List.of("--timeout-ms", "15000"));
+
+			var backup = run(with(args, "backup", "b2"));
+			assertTrue(backup.out().contains("backup b2 at log index"), backup.toString());
+			for (var id : List.of("n0", "n1", "n2")) {
+				assertTrue(backup.out().contains(id + ": DONE"), backup.toString());
+			}
+			assertTrue(backup.out().contains("d1: no result within the time limit"), backup.toString());
+			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, backup.code(), backup.toString());
+
+			var checksum = run(with(args, "checksum"));
+			assertTrue(checksum.out().contains("checksum at log index"), checksum.toString());
+			for (var id : List.of("n0", "n1", "n2")) {
+				assertTrue(checksum.out().contains(id + ": DONE"), checksum.toString());
+			}
+			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, checksum.code(), checksum.toString());
+		}
+	}
+
+	/**
+	 * R28-2: a {@code checksum} or {@code backup} that no member took within the time limit compared or wrote nothing:
+	 * it is incomplete (exit 4, "run it again"), not a divergence or a failed backup (exit 1). Before, both exited with
+	 * 1, and checksum's answer from a silent member ("does not tell whether the operation was proposed") did too.
+	 */
+	@Test
+	void aProposalThatNoMemberTookIsIncomplete() throws Exception {
+		int closedPort;
+		try (var probe = new java.net.ServerSocket(0)) {
+			closedPort = probe.getLocalPort();
+		}
+		try (var silent = new java.net.ServerSocket(0)) {
+			var args = List.of("admin",
+					"--peer", "d1=127.0.0.1:" + silent.getLocalPort() + "/127.0.0.1:" + silent.getLocalPort(),
+					"--peer", "d2=127.0.0.1:" + closedPort + "/127.0.0.1:" + closedPort,
+					"--timeout-ms", "5000");
+			var checksum = run(with(args, "checksum"));
+			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, checksum.code(), checksum.toString());
+			assertTrue(checksum.out().contains("FAILED: "), checksum.toString());
+			var backup = run(with(args, "backup", "b3"));
+			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, backup.code(), backup.toString());
+			assertTrue(backup.out().contains("FAILED: "), backup.toString());
+		}
+	}
+
+	/**
+	 * R28-3: {@code admin} refuses an option it does not know (a misspelled {@code --timout-ms} ran with the 10-minute
+	 * default, and swallowed the next word) and an option of another command ({@code --allow-skipped} is checksum's), and
+	 * a malformed value ({@code --timeout-ms}, {@code --peer}, {@code --group-id}, the index of backup-status) is wrong
+	 * usage too: exit 2 with the usage, not a stack trace with exit 1.
+	 */
+	@Test
+	void adminRefusesUnknownOptionsAndMalformedValuesWithTwo() {
+		var peer = List.of("admin", "--peer", "d1=127.0.0.1:1/127.0.0.1:1");
+		var misspelled = run(with(peer, "--timout-ms", "3000", "status"));
+		assertEquals(2, misspelled.code(), misspelled.toString());
+		assertTrue(misspelled.err().contains("unknown option --timout-ms"), misspelled.err());
+		var otherCommands = run(with(peer, "--allow-skipped", "status"));
+		assertEquals(2, otherCommands.code(), otherCommands.toString());
+		assertTrue(otherCommands.err().contains("--allow-skipped"), otherCommands.err());
+		var badTimeout = run(with(peer, "--timeout-ms", "soon", "status"));
+		assertEquals(2, badTimeout.code(), badTimeout.toString());
+		var badGroup = run(with(peer, "--group-id", "nope", "status"));
+		assertEquals(2, badGroup.code(), badGroup.toString());
+		var badPeer = run("admin", "--peer", "d1=nowhere", "status");
+		assertEquals(2, badPeer.code(), badPeer.toString());
+		var badIndex = run(with(peer, "--timeout-ms", "1000",
+				"backup-status", "b1", "latest"));
+		assertEquals(2, badIndex.code(), badIndex.toString());
+		for (var refused : List.of(misspelled, otherCommands, badTimeout, badGroup, badPeer, badIndex)) {
+			assertTrue(refused.thrown() == null, refused.toString());
+			assertTrue(refused.err().contains("Usage:"), refused.err());
+		}
+	}
+
 	@Test
 	void noCommandAndAnUnknownCommandExitWithTwo() {
 		assertEquals(2, run().code());

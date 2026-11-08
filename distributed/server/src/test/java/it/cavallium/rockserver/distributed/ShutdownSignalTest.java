@@ -1,7 +1,9 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import it.cavallium.buffer.Buf;
@@ -15,6 +17,7 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -26,8 +29,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * DD-7h: a SIGTERM that races a replica failure. The shutdown hook's stop ({@link ReplicatedServerMain#closeOnSignal})
- * returns only once the failed node stopped, and then gives the failure's exit status, 3. The process version (a real
- * SIGTERM) is still to run.
+ * returns only once the failed node stopped, and then gives the failure's exit status, 3. Also a signal during the start
+ * of {@code run}, and an error thrown by that start (R28-4, R28-5). The process version (a real SIGTERM) is still to
+ * run.
  */
 class ShutdownSignalTest {
 
@@ -140,6 +144,129 @@ class ShutdownSignalTest {
 			ReplicatedServerMain.exiter = previousExiter;
 			ReplicatedServerMain.halter = previousHalter;
 			ReplicatedServerMain.shutdownHooks = previousHooks;
+		}
+	}
+
+	/**
+	 * R28-4: a SIGTERM while {@code run} is still starting its node (opening RocksDB, loading the Raft log, checking its
+	 * membership) is not lost. The shutdown hook is registered before the start: it waits for the start to end, then
+	 * stops the node it returned, as for a running node. Before, the hook was registered only after the start, so the
+	 * JVM exited with RocksDB and Ratis open, whose destructors can hang it until systemd's SIGKILL.
+	 */
+	@Test
+	void aSignalDuringTheStartWaitsForItAndStopsTheNode() throws Exception {
+		cluster = new InProcessCluster(temp, 1, c -> c).startAll();
+		var node = cluster.awaitLeader(TIMEOUT);
+		var previousExiter = ReplicatedServerMain.exiter;
+		var previousHalter = ReplicatedServerMain.halter;
+		var previousHooks = ReplicatedServerMain.shutdownHooks;
+		var previousStarter = ReplicatedServerMain.starter;
+		var exited = new AtomicReference<Integer>();
+		var halted = new AtomicReference<Integer>();
+		var hook = new AtomicReference<Thread>();
+		var starting = new CompletableFuture<Void>();
+		var release = new CompletableFuture<Void>();
+		ReplicatedServerMain.exiter = code -> {
+			exited.set(code);
+			throw new ExitCalled();
+		};
+		ReplicatedServerMain.halter = code -> {
+			halted.set(code);
+			throw new ExitCalled();
+		};
+		ReplicatedServerMain.shutdownHooks = hook::set;
+		ReplicatedServerMain.starter = config -> {
+			starting.complete(null);
+			release.join();
+			return node;
+		};
+		try {
+			var main = Thread.ofPlatform().daemon(true).name("test-run").start(() -> {
+				try {
+					ReplicatedServerMain.startAndServe(node.config(), null);
+				} catch (ExitCalled unexpected) {
+					// Recorded in exited.
+				}
+			});
+			starting.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+			assertNotNull(hook.get(), "the hook is registered before the node starts");
+			// The signal: the JVM runs the hook while the start goes on.
+			var signal = Thread.ofPlatform().daemon(true).name("test-signal").start(() -> {
+				try {
+					hook.get().run();
+				} catch (ExitCalled unexpected) {
+					// Recorded in halted.
+				}
+			});
+			signal.join(300);
+			assertTrue(signal.isAlive(), "the hook waits for the start");
+			release.complete(null);
+			signal.join(TIMEOUT.toMillis());
+			assertFalse(signal.isAlive(), "the hook ends once it stopped the started node");
+			assertTrue(node.stopped().isDone(), "the hook stopped the node that the start returned");
+			main.join(TIMEOUT.toMillis());
+			assertFalse(main.isAlive(), "run ends once its node stopped");
+			assertNull(exited.get(), "a stop by the signal is not a failure");
+			assertNull(halted.get(), "a stop by the signal is not a failure");
+		} finally {
+			release.complete(null);
+			ReplicatedServerMain.exiter = previousExiter;
+			ReplicatedServerMain.halter = previousHalter;
+			ReplicatedServerMain.shutdownHooks = previousHooks;
+			ReplicatedServerMain.starter = previousStarter;
+		}
+	}
+
+	/**
+	 * R28-5: an {@link Error} thrown by the start (a class that does not load from a half-replaced jar, for one) ends
+	 * {@code run} with exit code 1, as an exception does: threads that the start left behind would otherwise keep the JVM
+	 * running without a node, which a supervisor does not restart. A hook registered for the start ends at once.
+	 */
+	@Test
+	void anErrorDuringTheStartExitsWithOne() throws Exception {
+		var previousExiter = ReplicatedServerMain.exiter;
+		var previousHalter = ReplicatedServerMain.halter;
+		var previousHooks = ReplicatedServerMain.shutdownHooks;
+		var previousStarter = ReplicatedServerMain.starter;
+		var exited = new AtomicReference<Integer>();
+		var halted = new AtomicReference<Integer>();
+		var hook = new AtomicReference<Thread>();
+		ReplicatedServerMain.exiter = code -> {
+			exited.set(code);
+			throw new ExitCalled();
+		};
+		ReplicatedServerMain.halter = code -> {
+			halted.set(code);
+			throw new ExitCalled();
+		};
+		ReplicatedServerMain.shutdownHooks = hook::set;
+		ReplicatedServerMain.starter = _ -> {
+			throw new NoClassDefFoundError("Injected: a class of a half-replaced jar");
+		};
+		try {
+			var config = NodeConfig.defaults("n0", List.of(PeerConfig.parse("n0=127.0.0.1:1/127.0.0.1:2")), temp);
+			var thrown = new AtomicReference<Throwable>();
+			try {
+				ReplicatedServerMain.startAndServe(config, null);
+			} catch (ExitCalled expectedExit) {
+				// The exit returned to the test instead.
+			} catch (Throwable unexpected) {
+				thrown.set(unexpected);
+			}
+			assertNull(thrown.get(), () -> "the start's error escaped run: " + thrown.get());
+			assertEquals(1, exited.get(), "the exit status");
+			if (hook.get() != null) {
+				// System.exit runs the hook: with no node started it has nothing to stop.
+				var signal = Thread.ofPlatform().daemon(true).name("test-exit-hook").start(hook.get());
+				signal.join(TIMEOUT.toMillis());
+				assertFalse(signal.isAlive(), "the hook does not wait for a start that failed");
+				assertNull(halted.get());
+			}
+		} finally {
+			ReplicatedServerMain.exiter = previousExiter;
+			ReplicatedServerMain.halter = previousHalter;
+			ReplicatedServerMain.shutdownHooks = previousHooks;
+			ReplicatedServerMain.starter = previousStarter;
 		}
 	}
 

@@ -106,6 +106,13 @@ class SessionWritesTest {
 			call(target, "close", new Class<?>[0]);
 		}
 
+		/** The current session object (its lock is the one its numbering takes). */
+		Object currentSession() throws Exception {
+			var field = TYPE.getDeclaredField("session");
+			field.setAccessible(true);
+			return ((CompletableFuture<?>) field.get(target)).get(5, TimeUnit.SECONDS);
+		}
+
 		long forgottenUpdates() {
 			return (Long) call(target, "forgottenUpdates", new Class<?>[0]);
 		}
@@ -624,6 +631,116 @@ class SessionWritesTest {
 		copies.get(2).complete("ok");
 		assertEquals("ok", opener.get(5, TimeUnit.SECONDS));
 		executor.shutdownNow();
+	}
+
+	/**
+	 * R28-6: a write cancelled while the opening it waits for completes, at the moment it is being numbered, leaves no
+	 * number behind. Before, the numbering set the call's session and then its sequence without the call's lock: a cancel
+	 * in between released the stale sequence 0 (the number of another write still in flight, which the server would then
+	 * count as completed), and the number allocated right after stayed in flight for the life of the session, holding
+	 * back the floor the server purges its records below. The test holds the session's lock so that the cancel lands
+	 * exactly there.
+	 */
+	@Test
+	void aWriteCancelledWhileItIsNumberedLeavesNoNumberBehind() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opening = new CompletableFuture<Long>();
+		var firstSent = new CompletableFuture<Object>();
+		var releaseFirst = new CompletableFuture<Void>();
+		var copies = Collections.synchronizedList(new ArrayList<CompletableFuture<Object>>());
+		var ids = Collections.synchronizedList(new ArrayList<ClientRequestId>());
+		var writes = new Writes(_ -> opening, (bound, command) -> {
+			ids.add(idOf(bound));
+			var copy = new CompletableFuture<Object>();
+			copies.add(copy);
+			if (firstSent.complete(command)) {
+				releaseFirst.join();
+			}
+			return copy;
+		}, executor);
+		var a = put(0);
+		var b = put(0);
+		var resultA = writes.send(RequestContext.latency(Duration.ofSeconds(30)), a);
+		var resultB = writes.send(RequestContext.latency(Duration.ofSeconds(30)), b);
+		// The opening completes on this thread, which numbers and sends both writes, one after the other.
+		var completer = Thread.ofPlatform().daemon(true).start(() -> opening.complete(3L));
+		var first = firstSent.get(5, TimeUnit.SECONDS);
+		var survivor = first == a ? resultA : resultB;
+		var victim = first == a ? resultB : resultA;
+		var session = writes.currentSession();
+		Thread canceller;
+		synchronized (session) {
+			releaseFirst.complete(null);
+			// The completer numbers the other write: it waits for the session's lock.
+			awaitBlocked(completer);
+			canceller = Thread.ofPlatform().daemon(true).start(() -> victim.cancel(true));
+			awaitBlocked(canceller);
+		}
+		canceller.join(5_000);
+		completer.join(5_000);
+		assertTrue(victim.isCancelled(), "no copy of it was sent");
+		assertEquals(1, copies.size(), "only the survivor's copy: " + ids);
+		// The survivor's copy, number 0, is still in flight: a later write must not report it as completed.
+		var third = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		awaitSize(copies, 2);
+		assertEquals(0, ids.get(1).completedBelow(), "number 0 is still in flight: " + ids);
+		copies.get(0).complete("ok");
+		copies.get(1).complete("ok");
+		assertEquals("ok", survivor.get(5, TimeUnit.SECONDS));
+		assertEquals("ok", third.get(5, TimeUnit.SECONDS));
+		// Every earlier number ended: none is left in flight.
+		var fourth = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		awaitSize(copies, 3);
+		assertEquals(ids.get(2).sequence(), ids.get(2).completedBelow(), "no number is left in flight: " + ids);
+		copies.get(2).complete("ok");
+		assertEquals("ok", fourth.get(5, TimeUnit.SECONDS));
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R28-7: the deadline timer of a write that waits for an opening (R27-3) is cancelled once the opening completes:
+	 * the write, its command and its payload are not held until its deadline (for ever with a "forever" timeout) by the
+	 * JDK's shared timer queue. Before, the timer had no handle and kept them.
+	 */
+	@Test
+	void aWriteThatWaitedForAnOpeningIsNotHeldUntilItsDeadline() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opening = new CompletableFuture<Long>();
+		var writes = new Writes(_ -> opening, (_, _) -> CompletableFuture.completedFuture("ok"), executor);
+		var command = writeThroughAnOpening(writes, opening);
+		for (int i = 0; i < 100 && command.get() != null; i++) {
+			System.gc();
+			Thread.sleep(50);
+		}
+		assertTrue(command.get() == null, "the ended write is still held, until its deadline in 10 minutes");
+		executor.shutdownNow();
+	}
+
+	private static java.lang.ref.WeakReference<Put<Void>> writeThroughAnOpening(Writes writes,
+			CompletableFuture<Long> opening) throws Exception {
+		var command = new Put<Void>(0, 1, KEY, Buf.wrap(new byte[1 << 16]), RequestType.none());
+		var result = writes.send(RequestContext.latency(Duration.ofMinutes(10)), command);
+		opening.complete(3L);
+		assertEquals("ok", result.get(5, TimeUnit.SECONDS));
+		return new java.lang.ref.WeakReference<>(command);
+	}
+
+	private static void awaitBlocked(Thread thread) throws InterruptedException {
+		long start = System.nanoTime();
+		while (thread.getState() != Thread.State.BLOCKED && thread.getState() != Thread.State.TERMINATED
+				&& System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5)) {
+			Thread.sleep(1);
+		}
+		assertTrue(thread.getState() == Thread.State.BLOCKED || thread.getState() == Thread.State.TERMINATED,
+				thread + " is " + thread.getState());
+	}
+
+	private static void awaitSize(List<?> list, int size) throws InterruptedException {
+		long start = System.nanoTime();
+		while (list.size() < size && System.nanoTime() - start < TimeUnit.SECONDS.toNanos(5)) {
+			Thread.sleep(5);
+		}
+		assertEquals(size, list.size());
 	}
 
 	/**

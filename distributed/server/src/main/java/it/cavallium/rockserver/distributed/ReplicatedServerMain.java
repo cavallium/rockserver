@@ -236,9 +236,22 @@ public final class ReplicatedServerMain {
 			System.err.flush();
 			Runtime.getRuntime().halt(3);
 		});
+		startAndServe(config, directMemoryWatch);
+	}
+
+	/** How {@code run} starts its node: {@link ReplicatedNode#start}, unless a test replaced it. */
+	@FunctionalInterface
+	interface NodeStarter {
+		ReplicatedNode start(NodeConfig config) throws IOException;
+	}
+
+	static volatile NodeStarter starter = ReplicatedNode::start;
+
+	/** The rest of {@code run} once its options are read: starts the node, then {@link #serve}s it. */
+	static void startAndServe(NodeConfig config, @Nullable DirectMemoryWatch directMemoryWatch) {
 		ReplicatedNode node;
 		try {
-			node = ReplicatedNode.start(config);
+			node = starter.start(config);
 		} catch (ReplicatedNode.RemovedException e) {
 			System.err.println("Node " + config.nodeId() + " does not start: " + e.getMessage());
 			exit(4);
