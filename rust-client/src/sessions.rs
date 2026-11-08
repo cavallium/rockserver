@@ -921,6 +921,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_write_whose_session_expired_is_not_held_by_another_write_opening_one() {
+        // R27-4: write C met the expiry first and opens a new session, which takes until C's deadline (3 s). Write
+        // B, with 300 ms, meets the expiry of the same session while C opens: forgetting the expired session must not
+        // wait for C's opening, so B ends near its own deadline, not with C's.
+        let writes = SessionWrites::with_open_session(true, 1);
+        let c_sent = Arc::new(Mutex::new(Vec::new()));
+        let b_sent = Arc::new(Mutex::new(Vec::new()));
+        let opening = Arc::new(tokio::sync::Notify::new());
+        let b_numbered = Arc::new(tokio::sync::Notify::new());
+        let c = writes.run(
+            soon(3_000),
+            true,
+            {
+                let opening = opening.clone();
+                move |timeout: Option<Duration>| {
+                    let opening = opening.clone();
+                    async move {
+                        opening.notify_one();
+                        tokio::time::sleep(timeout.expect("finite")).await;
+                        Err::<i64, Status>(Status::deadline_exceeded("opening took the whole deadline"))
+                    }
+                }
+            },
+            {
+                let b_numbered = b_numbered.clone();
+                let c_sent = c_sent.clone();
+                move |id: ClientRequestId, _: Option<Duration>| {
+                    let b_numbered = b_numbered.clone();
+                    c_sent.lock().unwrap().push(id);
+                    async move {
+                        // Expired once B has its number in the same session.
+                        b_numbered.notified().await;
+                        Err::<&'static str, Status>(expired_status())
+                    }
+                }
+            },
+        );
+        let b = async {
+            let started = Instant::now();
+            let result = writes
+                .run(
+                    soon(300),
+                    true,
+                    fixed_opener(2),
+                    {
+                        let opening = opening.clone();
+                        let b_sent = b_sent.clone();
+                        let b_numbered = b_numbered.clone();
+                        move |id: ClientRequestId, _: Option<Duration>| {
+                            let opening = opening.clone();
+                            b_sent.lock().unwrap().push(id);
+                            b_numbered.notify_one();
+                            async move {
+                                // Answered once C holds the opening.
+                                opening.notified().await;
+                                Err::<&'static str, Status>(expired_status())
+                            }
+                        }
+                    },
+                )
+                .await;
+            (result, started.elapsed())
+        };
+        let (c_result, (b_result, b_took)) = tokio::join!(c, b);
+        assert!(c_result.is_err());
+        assert!(b_took < Duration::from_millis(1_500), "B waited {b_took:?} for C's opening");
+        let error = b_result.unwrap_err();
+        assert!(is_not_applied(&error), "{error:?}");
+        assert_eq!(b_sent.lock().unwrap().len(), 1);
+        assert_eq!(c_sent.lock().unwrap()[0].session_id, b_sent.lock().unwrap()[0].session_id);
+    }
+
+    fn expired_status() -> Status {
+        rocks(Code::FailedPrecondition, "SESSION_EXPIRED", true)
+    }
+
+    #[tokio::test]
     async fn a_session_opened_after_the_window_ends_a_caller_without_deadline_unsent() {
         // The opening answers, but only once the window has ended (a late lock or a late answer): the copy must
         // not go out, so the write is known not applied, as for a caller with a deadline.

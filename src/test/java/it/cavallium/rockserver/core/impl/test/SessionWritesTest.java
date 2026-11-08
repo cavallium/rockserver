@@ -545,6 +545,61 @@ class SessionWritesTest {
 	}
 
 	/**
+	 * R27-3: a write that joins an opening another write started (with a longer deadline) is bounded by its own
+	 * deadline: it ends then, {@code SERVER_OVERLOADED} flagged not applied (nothing was sent, as the Rust client's
+	 * {@code not_sent} for a joiner whose deadline came while it waited for the session). The opener goes on, and a
+	 * session opened later serves it. Before, the joiner waited for the opener's deadline.
+	 */
+	@Test
+	void aWriteJoiningAnOpeningEndsAtItsOwnDeadlineNotApplied() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var opening = new CompletableFuture<Long>();
+		var sent = new AtomicInteger();
+		var writes = new Writes(_ -> opening, (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		var opener = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		long start = System.nanoTime();
+		var joiner = writes.send(RequestContext.latency(Duration.ofMillis(300)), put(0));
+		var error = assertThrows(ExecutionException.class, () -> joiner.get(5, TimeUnit.SECONDS));
+		long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+		assertTrue(tookMs < 2_000, "the joiner waited " + tookMs + " ms");
+		assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks(error).getErrorUniqueId(), rocks(error).getMessage());
+		assertTrue(rocks(error).isNotApplied(), "not sent: not applied");
+		assertFalse(opener.isDone(), "the opener has its own deadline");
+		opening.complete(3L);
+		assertEquals("ok", opener.get(5, TimeUnit.SECONDS));
+		assertEquals(1, sent.get(), "only the opener's copy");
+		executor.shutdownNow();
+	}
+
+	/**
+	 * R27-3: a synchronous wait that ends before any copy was sent (the session is still opening) cancels the write,
+	 * which was not applied: the error is flagged so. Before, it was READ_DEADLINE_EXCEEDED without the flag, which reads
+	 * as an unknown outcome.
+	 */
+	@Test
+	void aSynchronousWaitThatEndsBeforeACopyWasSentIsNotApplied() throws Exception {
+		var executor = Executors.newVirtualThreadPerTaskExecutor();
+		var sent = new AtomicInteger();
+		var writes = new Writes(_ -> new CompletableFuture<>(), (_, _) -> {
+			sent.incrementAndGet();
+			return CompletableFuture.completedFuture("ok");
+		}, executor);
+		var result = writes.send(RequestContext.latency(Duration.ofSeconds(30)), put(0));
+		var error = assertThrows(RocksDBException.class, () -> Writes.await(result, TimeUnit.MILLISECONDS.toNanos(200)));
+		assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, error.getErrorUniqueId());
+		assertTrue(error.isNotApplied(), error.getMessage());
+		assertEquals(0, sent.get());
+		// A plain future (not a numbered write) says nothing about what was sent: no flag.
+		var plain = assertThrows(RocksDBException.class,
+				() -> Writes.await(new CompletableFuture<>(), TimeUnit.MILLISECONDS.toNanos(50)));
+		assertFalse(plain.isNotApplied());
+		executor.shutdownNow();
+	}
+
+	/**
 	 * An opening that ended "not applied" at the opener's deadline (the proposer still had it queued), or refused as
 	 * overloaded, does not end a write waiting for it with more time: that write opens again in its own time.
 	 */

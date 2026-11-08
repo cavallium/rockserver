@@ -245,7 +245,7 @@ class StartupChecksTest {
 		var command = List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 				"-cp", System.getProperty("java.class.path"),
 				"-Djava.io.tmpdir=" + jdkTemporary,
-				LoadLibrary.class.getName(), dataDir.toString(), jdkTemporary.toString());
+				LoadLibrary.class.getName(), dataDir.toString(), jdkTemporary.toString(), "false");
 		var process = new ProcessBuilder(command).redirectErrorStream(true).start();
 		var output = new String(process.getInputStream().readAllBytes());
 		assertTrue(process.waitFor(60, TimeUnit.SECONDS));
@@ -255,11 +255,47 @@ class StartupChecksTest {
 		assertFalse(Files.exists(stale), "the copy of an earlier run is still there");
 	}
 
+	/**
+	 * R27-2: with an explicit -Djava.io.tmpdir the node still extracts the RocksDB library into DATA-DIR/tmp, and deletes
+	 * the copies earlier runs left there, so a node killed again and again (halt, ExitOnOutOfMemoryError, SIGKILL) no
+	 * longer fills the given directory with 17 MB copies. A given directory inside DATA-DIR is the node's own: the copies
+	 * that older versions left there are deleted too. One outside DATA-DIR (possibly shared) is not touched.
+	 */
+	@Test
+	void anExplicitTemporaryDirectoryGetsNoCopyOfTheRocksDbLibrary() throws Exception {
+		for (boolean inside : new boolean[] {true, false}) {
+			var dataDir = tempDir.resolve(inside ? "explicit-inside" : "explicit-outside");
+			var given = Files.createDirectories(inside ? dataDir.resolve("jtmp") : tempDir.resolve("shared-tmp"));
+			Files.createDirectories(dataDir.resolve("tmp"));
+			var staleInNodeTmp = Files.writeString(dataDir.resolve("tmp/librocksdbjni111.so"), "left by a killed JVM");
+			var staleInGiven = Files.writeString(given.resolve("librocksdbjni222.so"), "left by a killed JVM");
+			var command = List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+					"-cp", System.getProperty("java.class.path"),
+					"-Djava.io.tmpdir=" + given,
+					LoadLibrary.class.getName(), dataDir.toString(), given.toString(), "true");
+			var process = new ProcessBuilder(command).redirectErrorStream(true).start();
+			var output = new String(process.getInputStream().readAllBytes());
+			assertTrue(process.waitFor(60, TimeUnit.SECONDS));
+			assertEquals(0, process.exitValue(), output);
+			assertTrue(output.contains("node: [librocksdbjni"), output);
+			assertFalse(Files.exists(staleInNodeTmp), output);
+			// The operator's choice stays for everything else.
+			assertTrue(output.contains("tmpdir: " + given), output);
+			if (inside) {
+				assertTrue(output.contains("jdk: []"), output);
+			} else {
+				assertTrue(output.contains("jdk: [librocksdbjni222.so]"), output);
+				assertTrue(Files.exists(staleInGiven), "a copy in a shared directory, maybe in use by another node");
+			}
+		}
+	}
+
 	/** Run by {@link #theRocksDbLibraryIsExtractedIntoTheDataDirectory} in its own JVM, where RocksDB is not loaded. */
 	public static final class LoadLibrary {
 		public static void main(String[] args) throws Exception {
 			var dataDir = Path.of(args[0]);
-			ReplicatedServerMain.useNodeTemporaryDirectory(dataDir, false);
+			ReplicatedServerMain.useNodeTemporaryDirectory(dataDir, Boolean.parseBoolean(args[2]));
+			System.out.println("tmpdir: " + System.getProperty("java.io.tmpdir"));
 			RocksDB.loadLibrary();
 			try (var options = new Options()) {
 				options.setCreateIfMissing(true);
