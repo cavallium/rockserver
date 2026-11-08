@@ -53,7 +53,8 @@ import reactor.core.publisher.Mono;
  * ({@link #RETRY_WINDOW_PROPERTY} for a caller without one). The server applies a numbered write at most once and
  * answers every copy with the first result. The caller gets {@code OUTCOME_UNKNOWN} only when the deadline came
  * before an answer settled it. No copy is sent once the deadline or the window has passed, the first one included: a
- * write whose session opens later ends {@code READ_DEADLINE_EXCEEDED} flagged
+ * write still waiting for its session then ends {@code SERVER_OVERLOADED} (below), one whose session came but whose
+ * copy found the deadline over ends {@code READ_DEADLINE_EXCEEDED}, both flagged
  * {@linkplain RocksDBException#isNotApplied() not applied}. A write that gets no session at all was never sent, and
  * ends flagged not applied too: with the opening's own error, or {@code SERVER_OVERLOADED} if the opening's outcome
  * was unknown, if the deadline passed before an opening was sent, if a caller without a deadline got no answer to its
@@ -218,12 +219,42 @@ final class SessionWrites {
 			return false;
 		}
 
-		/** Its number is final: no copy of it is sent any more. */
+		/**
+		 * Set by {@link #finish}: the call ended, and is never numbered again ({@link #number}). Guarded by this call's
+		 * lock. Not {@code result.isDone()}: {@link #fail} finishes before it completes the result.
+		 */
+		private boolean finished;
+
+		/** Its number is final: no copy of it is sent any more, and it is not numbered again. */
 		synchronized void finish() {
+			finished = true;
+			release();
+		}
+
+		/**
+		 * Gives back its number in its session, which is then completed for that session ({@link Session#completedBelow}):
+		 * when it ends, or when a copy was refused because the session expired, before it is numbered again in a new one.
+		 */
+		synchronized void release() {
 			if (session != null) {
 				session.finish(sequence);
 				session = null;
 			}
+		}
+
+		/**
+		 * Numbers it in {@code opened}, unless it ended meanwhile; false then. Under this call's lock, as {@link #finish}
+		 * (R28-6): a cancel, a close or a deadline that ended it between setting the session and the sequence released
+		 * the stale sequence (another write's number still in flight, which the server would then take as completed) and
+		 * left the new number in flight for the life of the session.
+		 */
+		synchronized boolean number(Session opened) {
+			if (finished) {
+				return false;
+			}
+			session = opened;
+			sequence = opened.allocate();
+			return true;
 		}
 
 		void succeed(@Nullable Object value) {
@@ -597,12 +628,17 @@ final class SessionWrites {
 			// copy of this round is in flight, and an earlier copy either was refused SESSION_EXPIRED before it ran (a
 			// write re-issued in a new session, the usual joiner after an expiry) or set maybeApplied. Its pending
 			// whenComplete below then finds it ended.
+			// The timer is cancelled once the opening completes or the call ends (R28-7): a timer of the JDK's shared
+			// queue without a handle held the call, with its command and payload, until its deadline, for ever with a
+			// "forever" timeout.
 			long remaining = call.deadlineNanos - System.nanoTime();
-			CompletableFuture.delayedExecutor(Math.max(0, remaining), TimeUnit.NANOSECONDS).execute(() -> {
-				if (!waiting.isDone() && !call.maybeApplied) {
+			var timer = waiting.copy().orTimeout(Math.max(0, remaining), TimeUnit.NANOSECONDS);
+			timer.whenComplete((_, error) -> {
+				if (error != null && unwrap(error) instanceof TimeoutException && !waiting.isDone() && !call.maybeApplied) {
 					call.fail(notSent("the deadline came while a session was being opened"));
 				}
 			});
+			call.result.whenComplete((_, _) -> timer.cancel(false));
 		}
 		waiting.whenComplete((session, error) -> {
 			if (call.ended()) {
@@ -628,8 +664,9 @@ final class SessionWrites {
 								"Could not open a client session; the write was not sent: " + describe(cause)));
 				return;
 			}
-			call.session = session;
-			call.sequence = session.allocate();
+			if (!call.number(session)) {
+				return;
+			}
 			attempt(call, session);
 		});
 	}
@@ -768,7 +805,8 @@ final class SessionWrites {
 			// client's to judge (maybeApplied), so the flag is not needed here; the final failure carries it.
 			if (cause instanceof RocksDBException rocks
 					&& rocks.getErrorUniqueId() == RocksDBErrorType.SESSION_EXPIRED) {
-				call.finish();
+				// Its number in the expired session is given back; it is numbered again in the new one.
+				call.release();
 				sessionExpired(session);
 				if (call.maybeApplied) {
 					call.failUnknown(cause);

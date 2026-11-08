@@ -163,7 +163,7 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 | `it.cavallium.rockserver.grpc.client.initial-retry-backoff` | `0.05s` with several addresses, `0.5s` with one | First pause of that retry, as a gRPC duration. With several addresses the retry goes to another node, so it need not wait for the failed one. |
 | `it.cavallium.rockserver.grpc.client.max-retry-backoff` | `30s` | Longest pause of that retry. |
 | `it.cavallium.rockserver.grpc.client.retry-backoff-multiplier` | `2` | Growth of that pause. |
-| `it.cavallium.rockserver.grpc.client.write-retry-window-ms` | `30000` | On a replicated cluster, how long a write of a caller without a deadline is sent again after an unknown outcome; no copy is sent after it, the first included (a write whose session opens later ends `READ_DEADLINE_EXCEEDED`, flagged not applied). A caller's deadline bounds it otherwise. |
+| `it.cavallium.rockserver.grpc.client.write-retry-window-ms` | `30000` | On a replicated cluster, how long a write of a caller without a deadline is sent again after an unknown outcome; no copy is sent after it, the first included (a write whose session opens later ends at the window, `SERVER_OVERLOADED` flagged not applied). A caller's deadline bounds it otherwise. |
 | `it.cavallium.rockserver.grpc.client.session-writes` | `true` | `false` turns off client sessions (below) for connections made afterwards: writes are sent once, as to a single server. |
 | `it.cavallium.rockserver.grpc.client.leader-hint` | `listed` | With several addresses, which leader addresses named by the nodes the connection uses for the calls the leader serves: `listed` only those in its list, `any` any, `off` none. A server could otherwise send the client anywhere, and the address the members use among themselves may not be reachable from the client. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-ms` | `0` (off) | On a server in front of another connection, such as a replicated node, the age at which a connection ends, +/-10%. The client then starts again from the top of its list, which is what brings it back to the first address. It has two costs: a silent first address costs every client the connect timeout at every cycle, not once, and calls that outlive the grace below fail with `UNAVAILABLE`, which includes `Compact` and long scans, on a healthy cluster too. Left off, a client stays on the node it failed over to until that node goes away. |
@@ -249,7 +249,10 @@ leader changes meanwhile): replace a lost node with `remove-peer <old>` and then
 without it) and preferably without `-Djava.io.tmpdir` (`run` extracts the RocksDB library into `DATA-DIR/tmp`, where
 it deletes the copies that killed runs leave, in either case), and see "Heap" there for the heap that a snapshot send
 needs. `admin status` asks the members at once and waits for their answers up to 3 s in all, so a member that is down
-prints `unreachable` without holding the others (closing its connections may take about 5 s more after the output). A removed node that is started again exits
+prints `unreachable` without holding the others (closing its connections may take about 5 s more after the output);
+`admin checksum` and `admin backup` ask the members at once and propose through one that answers (within 3 s, or the
+time left of `--timeout-ms`), and
+exit with 4 ("incomplete, run it again") when no member took the request in time. A removed node that is started again exits
 with 4 once a majority of the current configuration's members can confirm its removal; until they answer (they are
 down, unreachable, or of an older version) it prints `READY` and waits outside the cluster, serving nothing; it
 votes only when its own log missed its removal (then it runs as a follower, whose vote cannot elect a leader without
