@@ -740,4 +740,58 @@ class NodeStoreTest {
 	private static Keys intKey(int key) {
 		return new Keys(Buf.wrap(ByteBuffer.allocate(Integer.BYTES).putInt(key).array()));
 	}
+
+	/**
+	 * R29-1: an {@code export-seed} whose checkpoint fails leaves neither {@code <target>.tmp} (hard links to every live
+	 * file of the source) nor the target, so it can be run again as it was.
+	 */
+	@Test
+	void aFailedExportLeavesNoTemporaryCopy() throws IOException {
+		Path source = tempDir.resolve("node/db");
+		try (var store = NodeStore.open(source, null, "source")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			put(store, column, 1, "v1");
+		}
+		Path target = tempDir.resolve("seed");
+		NodeStore.checkpointBuiltForTesting = building -> {
+			throw new IOException("No space left on device (test)");
+		};
+		try {
+			assertThrows(IOException.class, () -> NodeStore.exportSeed(source, null, target));
+		} finally {
+			NodeStore.checkpointBuiltForTesting = null;
+		}
+		assertFalse(Files.exists(target), "a half-made target");
+		assertFalse(Files.exists(tempDir.resolve("seed.tmp")), "the checkpoint's building directory");
+		try (var leftovers = Files.list(tempDir)) {
+			assertTrue(leftovers.noneMatch(path -> path.getFileName().toString().startsWith("rockserver-replica-")));
+		}
+		NodeStore.exportSeed(source, null, target);
+		assertTrue(Files.isRegularFile(target.resolve("CURRENT")));
+	}
+
+	/**
+	 * R29-2: the config file a replica opens its database with is deleted once the database opened, but a process killed
+	 * during the open (WAL replay, a large MANIFEST) left it in DATA-DIR for good, one per killed start. The next open
+	 * removes what earlier opens of that database left.
+	 */
+	@Test
+	void aConfigLeftByAKilledOpenIsRemovedByTheNextOpen() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("node"));
+		// What NodeStore.open of older versions made, and a killed process left behind.
+		var left = List.of(Files.createTempFile(dataDir, "rockserver-replica-", ".conf"),
+				Files.createTempFile(dataDir, "rockserver-replica-", ".conf"));
+		var unrelated = Files.writeString(dataDir.resolve("rockserver-replica-notes.txt"), "not a config of ours");
+		try (var store = NodeStore.open(dataDir.resolve("db"), null, "n0")) {
+			assertNull(store.clusterId());
+		}
+		for (var file : left) {
+			assertFalse(Files.exists(file), file + " is still there");
+		}
+		assertTrue(Files.exists(unrelated));
+		try (var files = Files.list(dataDir)) {
+			assertEquals(List.of(), files.map(path -> path.getFileName().toString())
+					.filter(name -> name.startsWith("rockserver-replica-") && name.endsWith(".conf")).toList());
+		}
+	}
 }

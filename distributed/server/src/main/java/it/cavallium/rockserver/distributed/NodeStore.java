@@ -869,6 +869,15 @@ final class NodeStore implements Closeable {
 	 * applied meanwhile would break this: the copy could hold a later point than the returned position, and a write
 	 * that goes through the WAL could make the file list and the WAL copy disagree.</p>
 	 */
+	/** Tests only: called with a checkpoint's building directory once the live files are in it; may throw. */
+	@FunctionalInterface
+	interface CheckpointHook {
+		void built(Path building) throws IOException;
+	}
+
+	/** Tests only: see {@link CheckpointHook}; null in production. */
+	static volatile @Nullable CheckpointHook checkpointBuiltForTesting;
+
 	TermIndex checkpoint(Path target) throws IOException {
 		target = target.toAbsolutePath();
 		if (Files.exists(target)) {
@@ -888,6 +897,10 @@ final class NodeStore implements Closeable {
 			}
 		} catch (RocksDBException e) {
 			throw new IOException("Failed to checkpoint " + dbDir + " into " + target, e);
+		}
+		var hook = checkpointBuiltForTesting;
+		if (hook != null) {
+			hook.built(building);
 		}
 		syncTree(building);
 		Files.move(building, target);

@@ -348,4 +348,63 @@ class ReplicaOpsTest {
 		assertEquals("5", properties.getProperty("request"));
 		assertTrue(Files.isRegularFile(dir.resolve(ReplicaOps.BACKUP_DB_DIR).resolve("CURRENT")));
 	}
+
+	/**
+	 * R29-1: a backup that fails on a node removes what it wrote. A checkpoint that fails after its live files are in
+	 * {@code db.tmp} (ENOSPC on the MANIFEST or WAL copy) left that directory, hard-linking every live SST and blob file
+	 * of the moment, until a backup of the same name ran again, which a date-named one never does.
+	 */
+	@Test
+	void aBackupWhoseCheckpointFailsLeavesNothingBehind() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		Path dir = ReplicaOps.backupsDir(config.dataDir()).resolve("nightly");
+		try (var store = NodeStore.open(temp.resolve("store"), null, "n0");
+				var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			NodeStore.checkpointBuiltForTesting = building -> {
+				throw new java.io.IOException("No space left on device (test)");
+			};
+			try {
+				ops.backup("nightly", 5, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 10), store);
+			} finally {
+				NodeStore.checkpointBuiltForTesting = null;
+			}
+			var result = ops.backupResult("nightly", 10);
+			assertEquals(ReplicaOps.State.FAILED, result.state(), result.detail());
+		}
+		assertFalse(Files.exists(dir.resolve(ReplicaOps.BACKUP_DB_DIR + ".tmp")), "the checkpoint's building directory");
+		assertFalse(Files.exists(dir), "the failed backup's directory");
+	}
+
+	/**
+	 * R29-1: a backup whose checkpoint is complete but whose {@code backup.properties} cannot be written leaves no
+	 * database without properties behind (it also hard-links the live files). An existing backup of the same name at
+	 * another index is refused and kept.
+	 */
+	@Test
+	void aBackupWhosePropertiesCannotBeWrittenLeavesNoDatabase() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		Path dir = ReplicaOps.backupsDir(config.dataDir()).resolve("nightly");
+		try (var store = NodeStore.open(temp.resolve("store"), null, "n0");
+				var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			// The properties' temporary file cannot be made: a directory with something in it is in its place.
+			NodeStore.checkpointBuiltForTesting = building -> Files.createDirectories(
+					building.resolveSibling(ReplicaOps.BACKUP_PROPERTIES + ".tmp").resolve("blocker"));
+			try {
+				ops.backup("nightly", 5, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 10), store);
+			} finally {
+				NodeStore.checkpointBuiltForTesting = null;
+			}
+			var result = ops.backupResult("nightly", 10);
+			assertEquals(ReplicaOps.State.FAILED, result.state(), result.detail());
+			assertFalse(Files.exists(dir), "a database without backup.properties");
+
+			// A backup that exists already is not touched by the refusal of another one with its name.
+			ops.backup("nightly", 6, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 20), store);
+			assertEquals(ReplicaOps.State.DONE, ops.backupResult("nightly", 20).state());
+			ops.backup("nightly", 7, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 30), store);
+			assertEquals(ReplicaOps.State.FAILED, ops.backupResult("nightly", 30).state());
+		}
+		assertEquals("20", ReplicaOps.readBackupProperties(dir).getProperty("index"));
+		assertTrue(Files.isRegularFile(dir.resolve(ReplicaOps.BACKUP_DB_DIR).resolve("CURRENT")));
+	}
 }

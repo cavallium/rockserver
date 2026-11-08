@@ -715,6 +715,8 @@ public final class ReplicatedServerMain {
 	 * through the next member: see {@link #proposalWait}.
 	 */
 	static final Duration PROPOSE_ANSWER_TIMEOUT = Duration.ofSeconds(30);
+	/** {@link #PROPOSE_ANSWER_TIMEOUT}, unless a test shortened it. */
+	static volatile Duration proposeAnswerTimeout = PROPOSE_ANSWER_TIMEOUT;
 
 	/**
 	 * Completes with null if {@code peer} answers a question that proposes nothing ({@link ReplicaOps#OP_CAPABILITIES})
@@ -744,7 +746,7 @@ public final class ReplicatedServerMain {
 	 * one's is still pending, so a member that took it and then hangs (a leader on a hung disk) does not hold it.</p>
 	 */
 	static Duration proposalWait(boolean idempotent, Duration remaining) {
-		return idempotent ? min(remaining, PROPOSE_ANSWER_TIMEOUT) : remaining;
+		return idempotent ? min(remaining, proposeAnswerTimeout) : remaining;
 	}
 
 	private static Duration min(Duration a, Duration b) {
