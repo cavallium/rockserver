@@ -375,7 +375,8 @@ public final class ReplicatedServerMain {
 	 * runs (a loaded library stays usable when its file is deleted). It does so with an explicit {@code -Djava.io.tmpdir}
 	 * too (R27-2): that directory gets no copy, and if it is inside {@code DATA-DIR}, so the node's own, the copies older
 	 * versions left there are deleted as well. One outside {@code DATA-DIR} may be shared with other nodes, which may be
-	 * loading their copy at this moment: it is not touched.
+	 * loading their copy at this moment: it is not touched. "Inside" is decided on real paths: a {@code DATA-DIR/tmp} or
+	 * a given directory that is a symlink to a shared one such as {@code /tmp} is outside, and is not cleaned.
 	 *
 	 * <p>Setting {@code java.io.tmpdir} here does not move the JDK's own temporary files: the JDK reads the property once,
 	 * at VM start-up ({@code File.createTempFile} and {@code Files.createTempFile} keep the start-up value). It is set
@@ -392,18 +393,25 @@ public final class ReplicatedServerMain {
 		var dataRoot = dataDir.toAbsolutePath().normalize();
 		var temporary = dataRoot.resolve("tmp");
 		Files.createDirectories(temporary);
-		deleteRocksDbCopies(temporary);
+		// Real paths (R27 review 5): a DATA-DIR/tmp, or a given directory, that is a symlink to a shared directory such
+		// as /tmp is not the node's own, and a copy there may be another JVM's between extracting and loading it.
+		var realRoot = dataRoot.toRealPath();
+		if (temporary.toRealPath().startsWith(realRoot)) {
+			deleteRocksDbCopies(temporary);
+		} else {
+			System.err.println("WARNING: " + temporary + " leads outside the data directory, to " + temporary.toRealPath()
+					+ ": copies of the RocksDB library left there by killed runs are not deleted");
+		}
 		if (explicit) {
 			var given = Path.of(System.getProperty("java.io.tmpdir")).toAbsolutePath().normalize();
-			if (given.startsWith(dataRoot)) {
+			if (Files.isDirectory(given) && given.toRealPath().startsWith(realRoot)) {
 				// The node's own: no other process extracts into it. This process has not loaded RocksDB yet.
-				if (Files.isDirectory(given)) {
-					deleteRocksDbCopies(given);
-				}
-			} else {
-				System.err.println("WARNING: -Djava.io.tmpdir=" + given + " is outside the data directory " + dataRoot
-						+ ": temporary files of killed runs stay there. The RocksDB library goes to " + temporary
-						+ " all the same");
+				deleteRocksDbCopies(given);
+			} else if (!given.startsWith(dataRoot) || Files.isDirectory(given)) {
+				System.err.println("WARNING: -Djava.io.tmpdir=" + given
+						+ (Files.isDirectory(given) ? " (" + given.toRealPath() + ")" : "")
+						+ " is outside the data directory " + realRoot + ": temporary files of killed runs stay there."
+						+ " The RocksDB library goes to " + temporary + " all the same");
 			}
 		}
 		// RocksDB.loadLibrary() asks the same loader with the ROCKSDB_SHAREDLIB_DIR directory (by default none, which

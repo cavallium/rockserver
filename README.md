@@ -194,7 +194,8 @@ it twice. A deadline error counts as an unknown outcome unless the server flagge
 write's future stops the resends: the future ends with `OUTCOME_UNKNOWN` if a copy was sent, or is cancelled if
 none was. A write that could not get a session was never sent: it ends with the failure flagged "not applied"
 (`SERVER_OVERLOADED` when the opening's own outcome was unknown), also when its own deadline came while it waited
-for a session another write was opening. A synchronous call waits at most its deadline plus 5 s; if that cancels a
+for a session another write was opening, including after its only copy was refused because its session had expired
+(`SESSION_EXPIRED`: that copy did not run). A synchronous call waits at most its deadline plus 5 s; if that cancels a
 write of which no copy was sent, it throws `READ_DEADLINE_EXCEEDED` flagged "not applied". A write staged in a transaction is sent once, as
 before: if its outcome is unknown, roll the transaction back and run it again, never send the staged write again.
 The connection decides whether it uses sessions once, at its handshake, and logs it: recreate it after upgrading
@@ -245,9 +246,10 @@ changes one voter per command and refuses more (a change of several voters at on
 leader changes meanwhile): replace a lost node with `remove-peer <old>` and then `add-peer <new>`, a running one with
 `add-peer <new>` and then `remove-peer <old>`. See "Replacing a node" in the
 [runbooks](docs/distributed/runbooks.md) and the [design document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
-without it) and without `-Djava.io.tmpdir` (`run` uses `DATA-DIR/tmp`, where it deletes the RocksDB library copies
-that killed runs leave), and see "Heap" there for the heap that a snapshot send needs. `admin status` asks the members
-at once, each for up to 3 s, so a member that is down prints `unreachable` without holding the others. A removed node that is started again exits
+without it) and preferably without `-Djava.io.tmpdir` (`run` extracts the RocksDB library into `DATA-DIR/tmp`, where
+it deletes the copies that killed runs leave, in either case), and see "Heap" there for the heap that a snapshot send
+needs. `admin status` asks the members at once and waits for their answers up to 3 s in all, so a member that is down
+prints `unreachable` without holding the others (closing its connections may take about 5 s more after the output). A removed node that is started again exits
 with 4 once a majority of the current configuration's members can confirm its removal; until they answer (they are
 down, unreachable, or of an older version) it prints `READY` and waits outside the cluster, serving nothing; it
 votes only when its own log missed its removal (then it runs as a follower, whose vote cannot elect a leader without

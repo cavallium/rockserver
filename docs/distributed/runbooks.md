@@ -11,10 +11,14 @@ alias rs='java -XX:+ExitOnOutOfMemoryError \
   -cp rockserver-distributed.jar it.cavallium.rockserver.distributed.ReplicatedServerMain'
 ```
 
-Leave `-Djava.io.tmpdir` out: `run` puts its temporary files in `DATA-DIR/tmp` by itself, and deletes there the 17 MB
-copies of the RocksDB library that killed runs leave behind. With `-Djava.io.tmpdir` given, the library still goes to
-`DATA-DIR/tmp`, but other temporary files of killed runs stay in the given directory; one outside the data directory
-is warned about at the start, and is never cleaned by the node.
+`run` extracts the RocksDB library into `DATA-DIR/tmp` by itself, with or without `-Djava.io.tmpdir`, and deletes
+there the 17 MB copies that killed runs leave behind. It also points `java.io.tmpdir` there for libraries that read the
+property later (Netty), but the JDK's own temporary files (`File.createTempFile`, `Files.createTempFile`) keep the
+directory the JVM started with, `/tmp` by default. To move everything, pass `-Djava.io.tmpdir=DATA-DIR/tmp` (for
+example `/srv/rockserver/data/tmp`): a given directory inside the data directory is the node's own, and the node deletes
+the RocksDB copies in it at every start. A given directory outside the data directory, or one that is a symlink to a
+shared directory such as `/tmp`, is warned about at the start and never cleaned by the node, since another JVM of the
+host may be loading its copy there.
 
 and `PEERS` for the peer list of the cluster, one `--peer` per member, the same on every node and in every `admin`
 command:
@@ -32,16 +36,19 @@ PEERS="--peer n1=10.0.0.1:9001/10.0.0.1:5333 --peer n2=10.0.0.2:9001/10.0.0.2:53
 - Every node runs the same version (see "Upgrades").
 - A supervisor (systemd or similar) restarts a node that exits with code 3: that is how a node stops after a replica
   failure or after Raft closed.
-- `-XX:+ExitOnOutOfMemoryError`, as in the alias, and no `-Djava.io.tmpdir` (see above). A node upgraded from an
-  alias that set `-Djava.io.tmpdir=/srv/rockserver/tmp`: drop the option, stop the node, delete
-  `/srv/rockserver/tmp/*rocksdbjni*` (copies of killed runs, 17 MB each), start it.
+- `-XX:+ExitOnOutOfMemoryError`, as in the alias, and either no `-Djava.io.tmpdir` or one inside the data directory
+  (see above). A node upgraded from an alias that set `-Djava.io.tmpdir=/srv/rockserver/tmp`: drop the option (or set
+  it to `/srv/rockserver/data/tmp`), stop the node, delete `/srv/rockserver/tmp/*rocksdbjni*` (copies of killed runs,
+  17 MB each), start it.
 
 ## Starting an empty cluster
 
 1. Start every node with the same `PEERS` and without `--join`: `rs run --node-id n1 $PEERS --data-dir /srv/rockserver/data`.
 2. Each prints `READY n1` once it serves the API. Check: `rs admin $PEERS status` shows one `LEADER` and the others
-   `FOLLOWER`, with the same commit index soon after. `status` asks every member at once, each for up to 3 s, and
-   prints them in the `--peer` order: a member that is down prints `unreachable` and does not hold the others.
+   `FOLLOWER`, with the same commit index soon after. `status` asks every member at once, waits up to 3 s in all for
+   the answers, and prints them in the `--peer` order: a member that is down prints `unreachable` and does not hold the
+   others. With an unroutable member the command may take about 5 s more to exit after printing, while it closes its
+   connections.
 
 ## Seeding a cluster from a single-node database
 

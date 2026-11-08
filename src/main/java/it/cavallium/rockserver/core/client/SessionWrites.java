@@ -175,8 +175,11 @@ final class SessionWrites {
 		volatile @Nullable CompletableFuture<?> inFlight;
 		volatile @Nullable Session session;
 		long sequence;
-		/** A copy was sent and its outcome is unknown: no "not applied" answer can end the call any more. */
-		boolean maybeApplied;
+		/**
+		 * A copy was sent and its outcome is unknown: no "not applied" answer can end the call any more. Volatile: the
+		 * joiner's deadline timer ({@link SessionWrites#start}) reads it from another thread.
+		 */
+		volatile boolean maybeApplied;
 		/** Times it was numbered again in a new session, after its first copy met an expired session. */
 		int reissues;
 		long pauseNanos = FIRST_PAUSE_NANOS;
@@ -190,7 +193,11 @@ final class SessionWrites {
 			this.result = new CallResult(() -> this.sent, this::stopped);
 		}
 
-		/** A copy of it was handed to the channel: if it ends without an answer, its outcome is unknown. */
+		/**
+		 * A copy of it was handed to the channel: if it ends without an answer, its outcome is unknown. Cleared when that
+		 * copy was refused {@code SESSION_EXPIRED} before it ran and no earlier copy may have run, until the re-issued
+		 * write sends its own.
+		 */
 		volatile boolean sent;
 
 		/** The caller cancelled it: its number is final, and the copy in flight is cancelled. */
@@ -586,11 +593,13 @@ final class SessionWrites {
 		var waiting = session(call);
 		if (!waiting.isDone()) {
 			// The opening may be another write's, bounded by that write's deadline (R27-3, as the Rust client's
-			// timeout_at on the opening lock): this one ends at its own, not applied since nothing was sent. Its pending
+			// timeout_at on the opening lock): this one ends at its own, not applied. While this opening is pending no
+			// copy of this round is in flight, and an earlier copy either was refused SESSION_EXPIRED before it ran (a
+			// write re-issued in a new session, the usual joiner after an expiry) or set maybeApplied. Its pending
 			// whenComplete below then finds it ended.
 			long remaining = call.deadlineNanos - System.nanoTime();
 			CompletableFuture.delayedExecutor(Math.max(0, remaining), TimeUnit.NANOSECONDS).execute(() -> {
-				if (!waiting.isDone() && call.session == null && !call.sent) {
+				if (!waiting.isDone() && !call.maybeApplied) {
 					call.fail(notSent("the deadline came while a session was being opened"));
 				}
 			});
@@ -763,7 +772,12 @@ final class SessionWrites {
 				sessionExpired(session);
 				if (call.maybeApplied) {
 					call.failUnknown(cause);
-				} else if (call.reissues++ == 0) {
+					return;
+				}
+				// No copy of it ran: none is in flight now, and a cancel or a close from here on ends it not applied, until
+				// a new copy is sent (attempt sets the flag again before it reads the cancel).
+				call.sent = false;
+				if (call.reissues++ == 0) {
 					// This copy was the first, and it was not applied: send it as a new write.
 					start(call);
 				} else if (!closed && canPause(call, call.pauseNanos)) {
