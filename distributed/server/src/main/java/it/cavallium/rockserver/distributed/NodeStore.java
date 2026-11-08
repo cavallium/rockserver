@@ -892,6 +892,15 @@ final class NodeStore implements Closeable {
 		return db().get(0, metaColumnId, key(metaKey), RequestType.<Buf>current());
 	}
 
+	/** Tests only: called with a checkpoint's building directory once the live files are in it; may throw. */
+	@FunctionalInterface
+	interface CheckpointHook {
+		void built(Path building) throws IOException;
+	}
+
+	/** Tests only: see {@link CheckpointHook}; null in production. */
+	static volatile @Nullable CheckpointHook checkpointBuiltForTesting;
+
 	/**
 	 * Writes a consistent checkpoint of the live database to {@code target} (must not exist): memtables are
 	 * flushed and SST files hard-linked. Returns the applied position contained in the checkpoint.
@@ -910,15 +919,6 @@ final class NodeStore implements Closeable {
 	 * applied meanwhile would break this: the copy could hold a later point than the returned position, and a write
 	 * that goes through the WAL could make the file list and the WAL copy disagree.</p>
 	 */
-	/** Tests only: called with a checkpoint's building directory once the live files are in it; may throw. */
-	@FunctionalInterface
-	interface CheckpointHook {
-		void built(Path building) throws IOException;
-	}
-
-	/** Tests only: see {@link CheckpointHook}; null in production. */
-	static volatile @Nullable CheckpointHook checkpointBuiltForTesting;
-
 	TermIndex checkpoint(Path target) throws IOException {
 		target = target.toAbsolutePath();
 		if (Files.exists(target)) {

@@ -80,7 +80,8 @@ import org.rocksdb.NativeLibraryLoader;
  * with {@code --allow-skipped} a member that skipped the position (a snapshot install jumped over it) does not count
  * as missing. {@code backup NAME} has every replica write a checkpoint of its database at one log position to
  * {@code <data-dir>/backups/NAME}; it prints where each member wrote it, and prints {@code OK} only if every member of
- * {@code --peer} wrote it; it exits with 1 if a member failed and with 4 if a member gave no result in time, or no
+ * {@code --peer} wrote it; it exits with 1 if a member failed or gave an answer that cannot be read (a member of
+ * another version), and with 4 if a member gave no result in time, or no
  * member took the request in time. Both ask the members at once and propose through one that answers, so that a
  * frozen member listed first does not hold them (see {@code proposeOp}), and then ask every member for its result at
  * once, each within the time left (see {@code awaitResults}), so that they end within {@code --timeout-ms}. A node on
@@ -612,9 +613,10 @@ public final class ReplicatedServerMain {
 					// Not idempotent: proposed again only after an answer that says nothing was proposed.
 					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0], false, deadline);
 					System.out.println("checksum at log index " + index);
-					var results = awaitResults(peers, groupId, ReplicaOps.OP_CHECKSUM_RESULT,
+					var answers = awaitResults(peers, groupId, ReplicaOps.OP_CHECKSUM_RESULT,
 							ByteBuffer.allocate(Long.BYTES).putLong(index).array(), deadline);
-					exitOn(checksumVerdict(index, peers.stream().map(PeerConfig::id).toList(), results, allowSkipped));
+					exitOn(unreadableVerdict(checksumVerdict(index, peers.stream().map(PeerConfig::id).toList(),
+							answers.results(), allowSkipped), answers.unreadable()));
 					System.out.println("OK");
 					yield null;
 				}
@@ -816,6 +818,18 @@ public final class ReplicatedServerMain {
 		return null;
 	}
 
+	/**
+	 * {@code verdict}, unless some members gave an answer that cannot be read (R29 review 1): then 1, as asking again
+	 * would not help (a member of another or mismatched version), unless {@code verdict} already fails with 1.
+	 */
+	static @Nullable Verdict unreadableVerdict(@Nullable Verdict verdict, List<String> unreadable) {
+		if (unreadable.isEmpty() || (verdict != null && verdict.exitCode() == 1)) {
+			return verdict;
+		}
+		return new Verdict(1, "cannot read the answer of " + unreadable + " (a member of another version?): see the"
+				+ " lines above");
+	}
+
 	private static void exitOn(@Nullable Verdict verdict) {
 		if (verdict != null) {
 			System.out.println("FAILED: " + verdict.problem());
@@ -825,9 +839,10 @@ public final class ReplicatedServerMain {
 
 	private static @Nullable RaftClientReply awaitBackup(List<PeerConfig> peers, RaftGroupId groupId, String name,
 			long index, long deadlineNanos) throws InterruptedException {
-		var results = awaitResults(peers, groupId, ReplicaOps.OP_BACKUP_RESULT, ReplicaOps.backupPayload(index, name),
+		var answers = awaitResults(peers, groupId, ReplicaOps.OP_BACKUP_RESULT, ReplicaOps.backupPayload(index, name),
 				deadlineNanos);
-		exitOn(backupVerdict(peers.stream().map(PeerConfig::id).toList(), results));
+		exitOn(unreadableVerdict(backupVerdict(peers.stream().map(PeerConfig::id).toList(), answers.results()),
+				answers.unreadable()));
 		System.out.println("OK");
 		return null;
 	}
@@ -848,11 +863,16 @@ public final class ReplicatedServerMain {
 	 * limit, as {@code status} and the proposal step do. Before, the members were asked one after another for 3 s each,
 	 * so k silent members listed first cost 3k s per round and the command overran {@code --timeout-ms}. If the proposal
 	 * left less than {@link #LAST_RESULT_ROUND}, the members are still asked for that long.</p>
+	 *
+	 * <p>An answer that cannot be read (R29 review 1: a decoding error, as from a member of another version) ends the
+	 * questions to that member: it is printed with the error and listed in {@link Answers#unreadable}, not as "no
+	 * result within the time limit".</p>
 	 */
-	private static Map<String, ReplicaOps.Result> awaitResults(List<PeerConfig> peers, RaftGroupId groupId,
+	private static Answers awaitResults(List<PeerConfig> peers, RaftGroupId groupId,
 			byte op, byte[] payload, long deadlineNanos) throws InterruptedException {
 		long end = Math.max(deadlineNanos - System.nanoTime(), LAST_RESULT_ROUND.toNanos()) + System.nanoTime();
 		var results = new ConcurrentHashMap<String, ReplicaOps.Result>();
+		var unreadable = new ConcurrentHashMap<String, String>();
 		var executor = Executors.newVirtualThreadPerTaskExecutor();
 		try {
 			var asked = peers.stream().map(peer -> CompletableFuture.runAsync(() -> {
@@ -867,6 +887,9 @@ public final class ReplicatedServerMain {
 							}
 						} catch (CompletionException unanswered) {
 							// Down or busy: asked again.
+						} catch (RuntimeException undecodable) {
+							unreadable.put(peer.id(), undecodable.toString());
+							return;
 						}
 						long left = end - System.nanoTime();
 						if (left > 0) {
@@ -882,8 +905,12 @@ public final class ReplicatedServerMain {
 					// The calls end by their own deadline; the margin is for the last answer to be handled.
 					answer.get(Math.max(0, end - System.nanoTime()) + TimeUnit.MILLISECONDS.toNanos(SEED_SNAPSHOT_POLL_MS),
 							TimeUnit.NANOSECONDS);
-				} catch (TimeoutException | ExecutionException late) {
+				} catch (TimeoutException late) {
 					// No final result: printed as such below.
+				} catch (ExecutionException failed) {
+					// Not expected (the task catches what a call or the decoding throws), but never swallowed.
+					var peer = peers.get(asked.indexOf(answer));
+					unreadable.putIfAbsent(peer.id(), String.valueOf(failed.getCause()));
 				}
 			}
 		} finally {
@@ -896,11 +923,19 @@ public final class ReplicatedServerMain {
 			if (result != null) {
 				printed.put(peer.id(), result);
 			}
-			System.out.println(peer.id() + ": " + (result == null ? "no result within the time limit"
+			var error = unreadable.get(peer.id());
+			System.out.println(peer.id() + ": " + (error != null ? "cannot read its answer (" + error + ")"
+					: result == null ? "no result within the time limit"
 					: result.state() + (result.keys() > 0 ? " " + result.keys() + " keys" : "") + " " + result.detail()));
 		}
-		return printed;
+		return new Answers(printed, peers.stream().map(PeerConfig::id).filter(unreadable::containsKey).toList());
 	}
+
+	/**
+	 * What {@link #awaitResults} got: the final results by member, and the members whose answer could not be read, in
+	 * the {@code --peer} order.
+	 */
+	record Answers(Map<String, ReplicaOps.Result> results, List<String> unreadable) {}
 
 	/** The leader's settled configuration, as {@code admin} read it, with the term the leader reported. */
 	record Membership(String leader, long term, List<RaftPeer> servers, List<RaftPeer> listeners) {}
