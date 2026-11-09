@@ -434,9 +434,13 @@ damage; `repair-log` does, so follow its verdict:
 
 1. Stop the node's supervisor, so that it does not restart it meanwhile (`repair-log` refuses while the node runs:
    its `in_use.lock` is locked).
-2. `rs repair-log --data-dir DATA-DIR --dry-run`, with the node's `--group-id` if it runs with one, and read its
-   last line:
-   - `WOULD REPAIR` (exit 0): go on with step 3.
+2. `rs repair-log --data-dir DATA-DIR --dry-run`, with the node's `--group-id` if it runs with one. It prints a
+   few lines on what it found, then exactly one verdict line, the one that starts with `OK:`, `WOULD REPAIR` or
+   `REFUSED:`. `OK` and `REFUSED` end the output; `WOULD REPAIR` is followed by one more line, the assumption the
+   repair rests on ("This is safe only if that entry was never fsynced, ..."), so its output does not end on the
+   verdict. Act on the verdict line:
+   - `WOULD REPAIR (dry run, nothing changed): would drop the torn entry expected to have index N ...` (exit 0): go
+     on with step 3.
    - `OK: every entry is valid` or `OK: no open segment` (exit 0): the log has no torn tail, so repairing changes
      nothing and the same start would fail again. The failure is elsewhere: read the stack trace's cause (a permission,
      a disk error in the kernel log, memory, the Raft disk full), fix it and start the node; if nothing explains it,
@@ -445,9 +449,17 @@ damage; `repair-log` does, so follow its verdict:
      `--group-id` against the node's `run` command and try again: this says nothing about the log.
    - `REFUSED: ... is locked: stop the node first.` (exit 1): the node, or its supervisor's restart, is running. Go
      back to step 1.
-   - Any other `REFUSED` (exit 1, ending "Nothing was changed: replace the node"): the log is damaged, not torn; do not
-     force it, replace the node ("Replacing a node").
-3. `rs repair-log --data-dir DATA-DIR` (the same `--group-id`): `REPAIRED`, with the index of the first entry dropped.
+   - Any other `REFUSED` (exit 1, its line says "Nothing was changed: replace the node"): the log is damaged, not
+     torn; do not force it, replace the node ("Replacing a node").
+   - No verdict line, but a Java stack trace (exit 1, usually an `IOException` such as `AccessDeniedException`): the
+     command itself could not read or lock the log, a denied permission or a disk error (`EIO`), the same causes that
+     can fail the start. Nothing was changed. Fix the cause (the files' owner and mode, the kernel log), then run step
+     2 again and follow its verdict.
+3. `rs repair-log --data-dir DATA-DIR` (the same `--group-id`): its verdict line is `REPAIRED: dropped the torn entry
+   expected to have index N ...`, followed by the same assumption line. A `REFUSED` here (the log changed since the
+   dry run, or the node was started meanwhile) is read as in step 2, a stack trace without a verdict too, except one
+   whose message is `Truncated ... at offset ..., but Ratis then read ... entries instead of ...`: the file was cut,
+   but Ratis then reads it differently than the tool. Do not start the node; replace it.
 4. Start the node: the leader sends it what it dropped, and `status` shows it catching up.
 
 The repair is safe only if the dropped entry was never fsynced, as its output says: disks that lose fsynced data (a

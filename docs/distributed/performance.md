@@ -284,7 +284,10 @@ Other results:
   command says, so disks that lose fsynced data void it (see Durability in the design document). If it answers `OK`,
   the log is not torn and the start failed for another reason (an I/O error, a permission, memory): repairing would
   change nothing. If it refuses because the log is damaged, replace the node under a new id; a refusal for a missing
-  directory (a wrong `--data-dir` or `--group-id`) or a running node says nothing about the log. If too few nodes are left to elect a leader, which replacing a node needs, see
+  directory (a wrong `--data-dir` or `--group-id`) or a running node says nothing about the log. The verdict is the
+  line that starts with `OK:`, `WOULD REPAIR`, `REPAIRED:` or `REFUSED:`, not always the last one (a repair is followed
+  by the assumption above); a stack trace instead of a verdict means the command could not read the log (a
+  permission, a disk error): fix that first. If too few nodes are left to elect a leader, which replacing a node needs, see
   "No quorum" in the design document: there is no override. The runbooks have it step by step ("Node does not start
   after a power loss").
 - **Disk space.** Each retained snapshot keeps the table files it links, also after compaction replaced them.

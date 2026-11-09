@@ -27,7 +27,10 @@ import reactor.core.scheduler.Schedulers;
 /**
  * Defers the SDK's mandatory capability handshake until remote work is requested. The future of a single call, of
  * {@code flushWalAsync} and of {@code openClientSessionAsync} is a {@link DeferredCall}: its cancel and its outcome are
- * those of the real connection's call once that call is made (R47-2).
+ * those of the real connection's call once that call is made (R47-2). A call that fails before then was never sent,
+ * and its failure says so ({@link RocksDBException#isNotApplied()}): {@code READ_DEADLINE_EXCEEDED} for a deadline spent
+ * while connecting, {@code SERVER_OVERLOADED} for a closed client, as the direct client's (R48-4). A failure of the
+ * factory or of the handshake keeps its own exception, a transport failure that callers classify by its gRPC status.
  */
 final class DeferredRockserverConnection implements RocksDBConnection {
 

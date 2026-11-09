@@ -108,12 +108,14 @@ class SnapshotByBytesTest {
 
 	/**
 	 * R48-1: after a restart, Ratis' StateMachineUpdater starts at the log's snapshot index and hands the log over again
-	 * only once a commit arrives; the database is already further. A snapshot asked meanwhile (here before any commit,
-	 * with one node of three up; in a cluster, a snapshot request while the replay has not reached the database's
-	 * position) must not return the database's index: Ratis compares it with its own applied index, logs
+	 * only as commits arrive; the database is already further. A snapshot taken while the replay has not reached the
+	 * database's position (the byte trigger from a replayed group, or {@code admin snapshot}, with the commit index
+	 * below that position) must not return the database's index: Ratis compares it with its own applied index, logs
 	 * "Bug in StateMachine", and purges nothing, while the byte count was reset and a checkpoint made. It answers "no
 	 * snapshot taken" instead, keeping the count, until Ratis has handed over every entry up to the database's
-	 * position; then it takes one as usual.
+	 * position; then it takes one as usual. The test calls {@code takeSnapshot} as Ratis' updater does, with one node
+	 * of three up so that nothing is committed (Ratis itself skips a request until one entry past the snapshot was
+	 * handed over, its creation gap of 1): the window between is timing the test cannot force.
 	 */
 	@Test
 	void noSnapshotPastWhatRatisHandedOverAfterARestart() throws Exception {

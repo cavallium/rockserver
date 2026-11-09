@@ -845,7 +845,7 @@ class RaftLogRepairTest {
 		for (var verdict : List.of("`WOULD REPAIR (dry run, nothing changed)", "`OK: every entry is valid`",
 				"`OK: no open segment`", "does not exist: wrong --data-dir or --group-id?", "is locked: stop the node first.",
 				"Nothing was changed: replace the node", "`REPAIRED: dropped", "This is safe only if",
-				"no verdict line")) {
+				"No verdict line")) {
 			assertTrue(section.contains(verdict), "step 2 does not name " + verdict);
 		}
 	}
